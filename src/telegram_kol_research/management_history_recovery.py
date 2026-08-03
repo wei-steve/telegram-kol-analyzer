@@ -6,6 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
 from sqlalchemy.orm import sessionmaker
@@ -139,6 +140,12 @@ def plan_management_history_recovery(
             for leg in legs:
                 match = _exact_terminal_order_match(snapshot, leg)
                 if match is None:
+                    match = _exact_terminal_position_history_match(
+                        snapshot,
+                        batch=batch,
+                        leg=leg,
+                    )
+                if match is None:
                     return _refusal(
                         int(batch.id),
                         "exact_terminal_order_evidence_missing",
@@ -151,7 +158,14 @@ def plan_management_history_recovery(
                         source_fingerprint=source_fingerprint,
                     )
                 matches.append(match)
-            decision_name = "terminal_exchange_confirmed"
+            used_position_history = any(
+                item["state"] == "position_history_closed" for item in matches
+            )
+            decision_name = (
+                "terminal_position_history_confirmed"
+                if used_position_history
+                else "terminal_exchange_confirmed"
+            )
             exchange_evidence = {
                 "exact_order_matches": len(matches),
                 "positions_complete": True,
@@ -234,12 +248,19 @@ def apply_management_history_recovery(
                     leg.updated_at = now
             batch.status = "resolved"
             batch.reason_code = "history_no_submission_confirmed"
-        elif decision.decision == "terminal_exchange_confirmed":
+        elif decision.decision in {
+            "terminal_exchange_confirmed",
+            "terminal_position_history_confirmed",
+        }:
             for leg in legs:
                 leg.status = "confirmed"
                 leg.updated_at = now
             batch.status = "succeeded"
-            batch.reason_code = "history_exchange_result_confirmed"
+            batch.reason_code = (
+                "history_position_close_confirmed"
+                if decision.decision == "terminal_position_history_confirmed"
+                else "history_exchange_result_confirmed"
+            )
         elif decision.decision == "terminal_position_absent":
             for leg in legs:
                 if leg.status == "planned":
@@ -382,6 +403,56 @@ def _position_present(snapshot: Any, pos_id: str) -> bool:
     )
 
 
+def _exact_terminal_position_history_match(
+    snapshot: Any,
+    *,
+    batch,
+    leg,
+) -> dict[str, str] | None:
+    if not _durable_submission_response_matches(leg):
+        return None
+    try:
+        planned_size = Decimal(str(leg.planned_close_size))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    planned_at_ms = int(_aware_utc(batch.planned_at).timestamp() * 1000)
+    for row in getattr(snapshot, "position_history", ()):
+        if not isinstance(row, Mapping):
+            continue
+        if _first_text(row, *_POSITION_ID_KEYS) != str(leg.pos_id):
+            continue
+        try:
+            position_size = Decimal(str(row.get("pos")))
+            closed_size = Decimal(str(row.get("closePos")))
+            updated_at_ms = int(str(row.get("uTime")))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        if (
+            position_size == planned_size
+            and closed_size == planned_size
+            and updated_at_ms >= planned_at_ms
+        ):
+            return {"state": "position_history_closed"}
+    return None
+
+
+def _durable_submission_response_matches(leg) -> bool:
+    try:
+        payload = json.loads(leg.response_json or "{}")
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, Mapping) or str(payload.get("code")) != "0":
+        return False
+    data = payload.get("data")
+    if not isinstance(data, Mapping) or str(data.get("sCode")) not in {"", "0"}:
+        return False
+    return (
+        _first_text(data, *_ORDER_ID_KEYS) == str(leg.exchange_order_id or "")
+        and _first_text(data, *_CLIENT_ORDER_ID_KEYS)
+        == str(leg.client_order_id or "")
+    )
+
+
 def _source_payload(batch, legs) -> dict[str, Any]:
     return {
         "batch_id": int(batch.id),
@@ -447,6 +518,10 @@ def _first_text(row: Mapping[str, Any], *keys: str) -> str | None:
 
 
 def _isoformat(value: datetime) -> str:
+    return _aware_utc(value).isoformat()
+
+
+def _aware_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
-    return value.astimezone(UTC).isoformat()
+    return value.astimezone(UTC)

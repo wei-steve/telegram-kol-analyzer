@@ -30,6 +30,7 @@ NOW = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
 def _snapshot(**overrides):
     values = {
         "positions": [],
+        "position_history": [],
         "open_orders": [],
         "pending_trigger_orders": [],
         "order_history": [],
@@ -239,6 +240,49 @@ def test_position_absence_without_exact_order_evidence_refuses(tmp_path):
 
     assert decision.status == "refused"
     assert decision.reason_code == "exact_terminal_order_evidence_missing"
+
+
+@pytest.mark.parametrize(
+    ("closed_size", "expected_status"),
+    [("1", "ready"), ("2", "refused")],
+)
+def test_exact_submission_response_and_equal_position_history_can_resolve(
+    tmp_path, closed_size, expected_status
+):
+    from telegram_kol_research.management_history_recovery import (
+        plan_management_history_recovery,
+    )
+
+    session_factory, batch_id = _seed_batch(tmp_path, leg_status="submitted")
+    with session_factory() as session:
+        leg = session.query(StrategyManagementLeg).filter_by(
+            management_batch_id=batch_id
+        ).one()
+        leg.response_json = (
+            '{"code":"0","data":{"ordId":"close-1",'
+            '"clOrdId":"TMCLIENT1","sCode":"0"}}'
+        )
+        session.commit()
+
+    decision = plan_management_history_recovery(
+        session_factory,
+        batch_id=batch_id,
+        snapshot=_snapshot(
+            position_history=[
+                {
+                    "posId": "pos-1",
+                    "pos": closed_size,
+                    "closePos": closed_size,
+                    "uTime": str(int(NOW.timestamp() * 1000) + 1000),
+                }
+            ]
+        ),
+        planned_at=NOW,
+    )
+
+    assert decision.status == expected_status
+    if expected_status == "ready":
+        assert decision.decision == "terminal_position_history_confirmed"
 
 
 def test_partial_failed_restoration_can_resolve_when_exact_position_is_absent(

@@ -3521,6 +3521,12 @@ def recover_management_history(
         session_factory,
         client=client,
     )
+    _load_management_history_position_history(
+        session_factory,
+        batch_id=batch_id,
+        client=client,
+        snapshot=snapshot,
+    )
     decision = plan_management_history_recovery(
         session_factory,
         batch_id=batch_id,
@@ -3579,6 +3585,57 @@ def recover_management_history(
             sort_keys=True,
         )
     )
+
+
+def _load_management_history_position_history(
+    session_factory: sessionmaker,
+    *,
+    batch_id: int,
+    client: Any,
+    snapshot: Any,
+) -> None:
+    """Attach exact closed-position rows for old submitted management legs."""
+
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, int(batch_id))
+        if batch is None:
+            return
+        binding = session.get(ExecutionBinding, int(batch.execution_binding_id))
+        legs = (
+            session.query(StrategyManagementLeg)
+            .filter_by(management_batch_id=batch.id)
+            .order_by(StrategyManagementLeg.id)
+            .all()
+        )
+        submitted_pos_ids = [
+            str(leg.pos_id)
+            for leg in legs
+            if str(leg.status or "") != "planned"
+        ]
+        instrument_id = (
+            f"{str(binding.symbol).upper()}-USDT-SWAP"
+            if binding is not None
+            else None
+        )
+    if not submitted_pos_ids:
+        return
+    method = getattr(client, "list_position_history", None)
+    if method is None or instrument_id is None:
+        snapshot.errors["position_history"] = "unavailable"
+        return
+    rows: list[dict[str, Any]] = []
+    try:
+        for pos_id in submitted_pos_ids:
+            result = method(inst_id=instrument_id, pos_id=pos_id)
+            if not isinstance(result, list) or not all(
+                isinstance(row, dict) for row in result
+            ):
+                raise ValueError("invalid position history schema")
+            rows.extend(result)
+    except Exception:
+        snapshot.errors["position_history"] = "unavailable"
+        return
+    snapshot.position_history = rows
 
 
 @app.command("plan-current-protection-backfill")
