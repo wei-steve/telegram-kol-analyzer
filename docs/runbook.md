@@ -335,12 +335,47 @@ residue sends once per unique fingerprint and then becomes log-only until the
 fingerprint changes.
 
 The management audit reports informational keep-holding history separately as
-`counts.informational_noop`. Only exact historical zero-leg
-`hold_update`/`blocked` rows with reason
-`management_intent_not_supported` qualify; they do not contribute to the
-monitor's `audit_abnormal_count`. All other blocked or leg-bearing rows remain
-abnormal. New `hold_update` recognition is skipped before a Deepcoin client or
-management batch is created.
+`counts.informational_noop`. It also reports completed fail-closed history as
+`counts.terminal_blocked` when the batch has `completed_at` and no leg retains
+`reserved`, `submitted`, `submit_unknown`, `partial`, `inconsistent`,
+`partial_failed`, or `recovery_required`. Both categories remain visible but do
+not contribute to `audit_abnormal_count`. `counts.blocked` therefore means an
+incomplete or actionable blocked batch. `partial_failed`, `recovery_required`,
+and `submit_unknown` remain abnormal regardless of age. New `hold_update`
+recognition is skipped before a Deepcoin client or management batch is created.
+
+### Recover paused management history
+
+Handle exactly one reviewed batch at a time. The default invocation loads a
+complete read-only Deepcoin reconciliation snapshot and writes neither the
+exchange nor the database:
+
+```bash
+.venv/bin/telegram-kol-research recover-management-history \
+  --database-path data/research.db \
+  --batch-id <exact-batch-id>
+```
+
+Review `decision`, `reason_code`, the redacted exact-position references, and
+`evidence_fingerprint`. A refusal is terminal for that attempt: do not infer
+identity from symbol, side, price, size, or timing. Apply only in a newly proven
+safe window and pass the unchanged fingerprint from the dry run:
+
+```bash
+.venv/bin/telegram-kol-research recover-management-history \
+  --database-path data/research.db \
+  --batch-id <exact-batch-id> \
+  --apply \
+  --evidence-fingerprint <reviewed-fingerprint>
+```
+
+The apply recomputes the current read-only exchange decision and compare-and-
+sets the durable source row. Any exchange or database evidence change refuses
+the write. A successful apply updates only the selected management batch and
+legs and appends one `management_history_recovery` execution event. It never
+submits, cancels, or adjusts an exchange order. Immediately rerun the management
+audit, confirm there is no new exchange submission event, and verify all live
+trading settings are unchanged.
 
 After deploying a graceful-shutdown change, perform one controlled restart and
 inspect the old process rather than relying only on the new service's active
