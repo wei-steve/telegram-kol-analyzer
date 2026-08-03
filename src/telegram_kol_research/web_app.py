@@ -3394,6 +3394,7 @@ def create_web_app(
     runtime_agent_production_audit_runner=None,
     runtime_agent_telegram_evidence_runner=None,
     runtime_incident_config: RuntimeIncidentConfig | None = None,
+    runtime_incident_config_loader=None,
     live_position_snapshot_path: str | Path | None = None,
     position_snapshot_now_provider=None,
     position_snapshot_refresh_seconds: float = 5.0,
@@ -3799,12 +3800,17 @@ def create_web_app(
     )
     app.state.runtime_agent_telegram_evidence_lock = threading.Lock()
     if runtime_incident_config is not None:
-        app.state.runtime_incident_config = runtime_incident_config
+        app.state.runtime_incident_config_loader = lambda: runtime_incident_config
+    elif runtime_incident_config_loader is not None:
+        app.state.runtime_incident_config_loader = runtime_incident_config_loader
     else:
-        try:
-            app.state.runtime_incident_config = load_runtime_incident_config()
-        except Exception:
-            app.state.runtime_incident_config = RuntimeIncidentConfig()
+        app.state.runtime_incident_config_loader = load_runtime_incident_config
+    try:
+        app.state.runtime_incident_config = (
+            app.state.runtime_incident_config_loader()
+        )
+    except Exception:
+        app.state.runtime_incident_config = RuntimeIncidentConfig()
     app.state.monitor_incident_capture_lock = threading.Lock()
     app.state.chat_requester = request_grounded_chat_answer
     app.state.prompt_test_runner = run_prompt_draft_test
@@ -4203,9 +4209,13 @@ def create_web_app(
         finally:
             app.state.runtime_agent_telegram_evidence_lock.release()
 
-    def require_monitor_capture_auth(request: Request) -> None:
+    def require_monitor_capture_auth(request: Request) -> RuntimeIncidentConfig:
         client_host = request.client.host if request.client is not None else ""
-        configured_token = app.state.runtime_incident_config.monitor_capture_token
+        try:
+            config = app.state.runtime_incident_config_loader()
+        except Exception:
+            config = RuntimeIncidentConfig()
+        configured_token = config.monitor_capture_token
         supplied_token = request.headers.get("x-monitor-capture-token", "")
         if (
             client_host not in {"127.0.0.1", "::1"}
@@ -4214,6 +4224,7 @@ def create_web_app(
             or not hmac.compare_digest(configured_token, supplied_token)
         ):
             raise HTTPException(status_code=404, detail="not found")
+        return config
 
     @app.get("/api/runtime-incidents/monitor-capture-health")
     def api_runtime_incidents_monitor_capture_health(request: Request):
@@ -4222,7 +4233,7 @@ def create_web_app(
 
     @app.post("/api/runtime-incidents/monitor-capture")
     async def api_runtime_incidents_monitor_capture(request: Request):
-        require_monitor_capture_auth(request)
+        capture_config = require_monitor_capture_auth(request)
         raw_content_length = request.headers.get("content-length")
         try:
             content_length = (
@@ -4313,7 +4324,7 @@ def create_web_app(
             raise HTTPException(status_code=409, detail="capture busy")
         try:
             def persist_capture_projection() -> int:
-                config = app.state.runtime_incident_config
+                config = capture_config
                 captured = len(
                     capture_monitor_state(
                         app.state.session_factory,

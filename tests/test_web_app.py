@@ -5305,6 +5305,37 @@ def test_monitor_incident_writer_rejects_stream_once_hard_cap_is_exceeded(
     assert response.status_code == 422
 
 
+def test_monitor_incident_writer_reloads_capture_policy_per_request(tmp_path):
+    token = "m" * 43
+    capture_types = frozenset()
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_incident_config_loader=lambda: RuntimeIncidentConfig(
+            capture_types=capture_types,
+            monitor_capture_token=token,
+        ),
+    )
+    client = TestClient(app, client=("127.0.0.1", 50000))
+    request = {
+        "headers": {"x-monitor-capture-token": token},
+        "json": {
+            "schema_version": 1,
+            "checked_at": "2026-08-03T00:00:00+00:00",
+            "reason_codes": ["adapter_failure"],
+            "adapter_failures": ["audit"],
+            "notification_error": None,
+        },
+    }
+
+    assert client.post(
+        "/api/runtime-incidents/monitor-capture", **request
+    ).json()["captured"] == 0
+    capture_types = frozenset({"monitor_adapter_failure"})
+    assert client.post(
+        "/api/runtime-incidents/monitor-capture", **request
+    ).json()["captured"] == 1
+
+
 def test_runtime_agent_exchange_snapshot_endpoint_hides_close_failures(
     tmp_path,
 ):

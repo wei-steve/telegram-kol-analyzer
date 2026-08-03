@@ -15,6 +15,7 @@ production_commit: 2449382bd53195950b42ec6052fb4e6dee4fb9cd
 local_tests:
   - "phase-8r.2-bounded-monitor-writer-regression: 732 passed, 1 Linux-only installation probe skipped"
   - "phase-8r.2-bounded-monitor-writer-review: no Critical or Important findings after adding the true streaming request cap and persistence-free authenticated health endpoint"
+  - "phase-8r.2-live-policy-reload-focused: 294 passed, 1 Linux-only installation probe skipped; review found no Critical or Important defects"
   - "phase-8r.2-monitor-policy-contract: 314 passed, 1 Linux-only installation probe skipped"
   - "phase-8r.2-final-source-parity-and-gating-regression: 573 passed"
   - "phase-8r.2-capture-notification-agent-focused: 252 passed"
