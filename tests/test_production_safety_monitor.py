@@ -1885,9 +1885,17 @@ def test_daily_audit_starts_only_after_nine_asia_shanghai(now, last_date, expect
     assert should_run_daily_audit(now=now, last_successful_date=last_date) is expected
 
 
-def test_source_snapshots_differ_retries_exactly_once():
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "source_snapshots_differ",
+        "source_component_changed_during_read",
+        "source_component_set_changed",
+    ],
+)
+def test_transient_private_snapshot_reason_retries_exactly_once(reason):
     results = [
-        {"snapshot_status": "snapshot_unstable", "snapshot_reason": "source_snapshots_differ"},
+        {"snapshot_status": "snapshot_unstable", "snapshot_reason": reason},
         _healthy_audit(),
     ]
     calls = []
@@ -1896,6 +1904,44 @@ def test_source_snapshots_differ_retries_exactly_once():
 
     assert audit == _healthy_audit()
     assert calls == [1, 1]
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "source_component_changed_during_read",
+        "source_component_set_changed",
+    ],
+)
+def test_nonzero_transient_component_change_retries_once(monkeypatch, reason):
+    import telegram_kol_research.production_safety_monitor as monitor_module
+
+    results = [
+        SimpleNamespace(
+            returncode=1,
+            output=json.dumps(
+                {
+                    "snapshot_status": "snapshot_unstable",
+                    "snapshot_reason": reason,
+                }
+            ),
+        ),
+        SimpleNamespace(returncode=0, output=json.dumps(_healthy_audit())),
+    ]
+    monkeypatch.setattr(
+        monitor_module,
+        "_run_bounded_command",
+        lambda *args, **kwargs: results.pop(0),
+    )
+
+    audit = run_daily_management_audit(
+        ProductionSafetyAdapters(
+            database_path=Path("data/research.db")
+        ).run_management_audit
+    )
+
+    assert audit == _healthy_audit()
+    assert results == []
 
 
 def test_source_snapshots_differ_nonzero_first_then_zero_retry_can_succeed(monkeypatch):

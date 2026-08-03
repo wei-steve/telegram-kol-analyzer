@@ -77,6 +77,13 @@ _AUDIT_ALERT_STATES = (
     "recovery_required",
     "submit_unknown",
 )
+_TRANSIENT_AUDIT_SNAPSHOT_REASONS = frozenset(
+    {
+        "source_snapshots_differ",
+        "source_component_changed_during_read",
+        "source_component_set_changed",
+    }
+)
 _NORMAL_EVENT_STATUSES = frozenset(
     {"submitted", "succeeded", "confirmed", "cancelled", "skipped", "resolved", "restored"}
 )
@@ -369,8 +376,9 @@ class ProductionSafetyAdapters:
         if not isinstance(payload, Mapping):
             raise RuntimeError("audit_output_invalid")
         if completed.returncode != 0:
-            if payload.get("snapshot_reason") == "source_snapshots_differ":
-                raise _SourceSnapshotsDiffer("audit_source_snapshots_differ")
+            snapshot_reason = payload.get("snapshot_reason")
+            if snapshot_reason in _TRANSIENT_AUDIT_SNAPSHOT_REASONS:
+                raise _SourceSnapshotsDiffer(f"audit_{snapshot_reason}")
             raise RuntimeError("audit_command_failed")
         return payload
 
@@ -478,7 +486,7 @@ def run_daily_management_audit(run_once) -> Mapping[str, Any]:
         return run_once()
     if not isinstance(first, Mapping):
         raise TypeError("audit result must be a mapping")
-    if first.get("snapshot_reason") != "source_snapshots_differ":
+    if first.get("snapshot_reason") not in _TRANSIENT_AUDIT_SNAPSHOT_REASONS:
         return first
     second = run_once()
     if not isinstance(second, Mapping):
