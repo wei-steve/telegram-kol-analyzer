@@ -1,0 +1,1 @@
+{"rule_id":"cancel_outcome_stale_unknown_v1","facts":{"complete":true,"object_id":"3158","cancel_unknown":true,"transition_window_expired":false,"evidence_references":["cleanup-event:3158"]},"expected_outcome":"normal","expected_severity":"high"}

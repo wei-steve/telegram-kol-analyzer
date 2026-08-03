@@ -18,6 +18,10 @@ RUNTIME_AGENT_MODULES = (
     "runtime_agent_playbooks.py",
     "runtime_agent_policy.py",
     "runtime_agent_executor.py",
+    "runtime_incident_observations.py",
+    "runtime_incident_scanner.py",
+    "runtime_incident_rules.py",
+    "runtime_incident_snapshot.py",
 )
 FORBIDDEN_SYMBOL_FRAGMENTS = (
     "recognize",
@@ -60,6 +64,14 @@ ALLOWED_PACKAGE_IMPORTS_BY_MODULE = {
     "runtime_incident_handoff.py": frozenset(
         {"runtime_agent_contracts", "runtime_incidents"}
     ),
+    "runtime_incident_observations.py": frozenset(
+        {"models", "runtime_incident_scanner"}
+    ),
+    "runtime_incident_scanner.py": frozenset(
+        {"config", "models", "runtime_incident_observations", "runtime_incident_rules"}
+    ),
+    "runtime_incident_rules.py": frozenset({"runtime_incident_scanner"}),
+    "runtime_incident_snapshot.py": frozenset(),
 }
 
 
@@ -146,10 +158,10 @@ def test_phase_7_is_deferred_and_phase_8r_requires_no_action_authority():
 
     assert "phase_7_explicitly_approved: false" in status
     assert "phase_7_disposition: deferred_non_blocking" in status
-    assert "current_phase: 8R.2" in status
-    assert "phase_name: technical-incident-capture" in status
-    assert "phase_status: planned" in status
-    assert 'last_completed_phase: "8R.1"' in status
+    assert "current_phase: 8R.3" in status
+    assert "phase_name: proactive-invariant-scanner" in status
+    assert "phase_status: in_progress" in status
+    assert 'last_completed_phase: "8R.2"' in status
     assert "### Phase 8R proactive read-only incident detection" in runbook
     assert (
         "Phase 8R never enables "

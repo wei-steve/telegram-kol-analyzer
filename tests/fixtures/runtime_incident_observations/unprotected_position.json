@@ -1,0 +1,1 @@
+{"rule_id":"active_position_missing_protection_v1","facts":{"complete":true,"object_id":"fixture-position","position_present":true,"primary_protection_verified":false,"evidence_references":["position:fixture","protection-ledger:fixture"]},"expected_outcome":"abnormal","expected_severity":"critical"}

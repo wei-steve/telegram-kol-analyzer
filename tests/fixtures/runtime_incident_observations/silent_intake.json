@@ -1,0 +1,1 @@
+{"rule_id":"monitor_incident_ledger_silence_v1","facts":{"complete":true,"object_id":"fixture-monitor","monitor_abnormal":true,"incident_present":false,"evidence_references":["monitor-state:fixture"]},"expected_outcome":"abnormal","expected_severity":"low"}

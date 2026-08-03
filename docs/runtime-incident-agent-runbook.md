@@ -423,6 +423,34 @@ service, and enable the timer last. The timer is `Persistent=true` and may run
 an immediate catch-up when enabled; enabling it before the main restart can
 create a real transient `monitor_adapter_failure` and operator alert.
 
+Task 8R.3 adds an independently supervised scanner with these scanner-only
+settings:
+
+- `TELEGRAM_KOL_RUNTIME_SCANNER_ENABLED` defaults to `false`;
+- `TELEGRAM_KOL_RUNTIME_SCANNER_SHADOW_ONLY` must remain `true`;
+- `TELEGRAM_KOL_RUNTIME_SCANNER_RULES` is an exact allowlist with no wildcard;
+- `TELEGRAM_KOL_RUNTIME_SCANNER_INTERVAL_SECONDS` is bounded to 10–3600
+  seconds and defaults to 60.
+
+The first production projection is only
+`cancel_outcome_stale_unknown_v1`. The other reviewed pure rules remain
+non-deployable until their coherent snapshot builders exist; configuration
+silently cannot activate them. The cancel rule observes at most 100 exact
+cancel mutation intents and treats only `reserved`, `submitting`, `submitted`,
+or `recovery_required` beyond the ten-minute window as unknown. `confirmed`,
+`rejected`, and `blocked` are known terminal outcomes.
+
+The main service alone owns schema creation. The scanner opens an existing
+database without bootstrap or migrations and writes only
+`runtime_incident_observations`. Its systemd unit reads only the dedicated
+scanner environment, cannot read checkout configuration/secrets, and has no
+provider, Telegram, exchange, system-bus, or service-control credential. The
+installer refuses an active or enabled scanner and always installs it disabled
+and inactive. In Phase 8R.3 shadow mode the scanner creates no runtime
+incident, Agent claim, or Telegram notification. Immediate rollback is to stop
+and disable only `telegram-kol-runtime-scanner.service` and set its enabled
+flag false; the main service and Runtime Agent are untouched.
+
 At most one runtime stage may be implemented per user turn. New code and
 configuration default off. A first deployment never enables its feature. A
 later enablement requires another complete safe-window check and the exact

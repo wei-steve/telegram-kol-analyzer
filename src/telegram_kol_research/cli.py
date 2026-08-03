@@ -39,6 +39,8 @@ from telegram_kol_research.db import (
     create_existing_session_factory,
     create_session_factory,
 )
+from telegram_kol_research.config import load_runtime_scanner_config
+from telegram_kol_research.runtime_incident_scanner import build_scanner_facts, run_scanner_cycle
 from telegram_kol_research.deepcoin_contract_specs import load_deepcoin_contract_specs
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
 from telegram_kol_research.execution_bindings import (
@@ -3142,6 +3144,46 @@ def runtime_incident_agent_worker(
             on_result=report,
             poll_seconds=poll_seconds,
         )
+    except KeyboardInterrupt:
+        return
+
+
+@app.command("runtime-incident-scanner")
+def runtime_incident_scanner(
+    database_path: Path = typer.Option(Path("data/research.db"), "--database-path"),
+    once: bool = typer.Option(False, "--once"),
+) -> None:
+    """Run the independent shadow-only invariant scanner."""
+    config = load_runtime_scanner_config(environ=dict(os.environ), env_file_paths=[])
+    if not config.enabled:
+        typer.echo('{"abnormal":0,"observations":0,"status":"disabled"}')
+        return
+    if not config.shadow_only:
+        raise typer.BadParameter("scanner must remain shadow-only in Phase 8R.3")
+    if not database_path.is_file():
+        raise typer.BadParameter("scanner database must already exist")
+    session_factory = create_existing_session_factory(database_path)
+
+    def cycle() -> None:
+        observed_at = datetime.now(UTC)
+        result = run_scanner_cycle(
+            session_factory=session_factory,
+            config=config,
+            facts_by_rule=build_scanner_facts(
+                session_factory, rules=config.rules, observed_at=observed_at
+            ),
+            observed_at=observed_at,
+        )
+        typer.echo(json.dumps({"status": "shadow", **result}, sort_keys=True, separators=(",", ":")))
+
+    if once:
+        cycle()
+        return
+    try:
+        while True:
+            cycle()
+            import time
+            time.sleep(config.interval_seconds)
     except KeyboardInterrupt:
         return
 

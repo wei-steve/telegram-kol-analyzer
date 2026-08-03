@@ -2157,6 +2157,50 @@ class RuntimeIncident(Base):
     )
 
 
+class RuntimeIncidentObservation(Base):
+    """Additive shadow record for one stable invariant object/rule pair."""
+
+    __tablename__ = "runtime_incident_observations"
+    __table_args__ = (
+        UniqueConstraint(
+            "rule_id", "rule_version", "object_kind", "object_id",
+            name="uq_runtime_incident_observation_object",
+        ),
+        Index(
+            "ix_runtime_incident_observations_state_last",
+            "state", "last_observed_at",
+        ),
+        CheckConstraint("length(rule_id) BETWEEN 1 AND 96", name="ck_runtime_observation_rule"),
+        CheckConstraint("length(rule_version) BETWEEN 1 AND 32", name="ck_runtime_observation_version"),
+        CheckConstraint("length(object_kind) BETWEEN 1 AND 64", name="ck_runtime_observation_kind"),
+        CheckConstraint("length(object_id) BETWEEN 1 AND 255", name="ck_runtime_observation_object"),
+        CheckConstraint("length(evidence_refs_json) <= 4096", name="ck_runtime_observation_evidence"),
+        CheckConstraint("length(summary_json) <= 2048", name="ck_runtime_observation_summary"),
+        CheckConstraint("consecutive_count >= 0", name="ck_runtime_observation_count"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    rule_id: Mapped[str] = mapped_column(String(96), nullable=False)
+    rule_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    object_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    object_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    consecutive_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    first_observed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    last_observed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    evidence_refs_json: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    summary_json: Mapped[str] = mapped_column(Text, nullable=False)
+    confirmed_incident_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("runtime_incidents.id"), nullable=True
+    )
+    recovered_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now)
+
+
 class RuntimeAgentRecoveryAttempt(Base):
     """Durable idempotency and verification record for one low-risk action."""
 

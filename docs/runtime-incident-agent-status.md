@@ -8,11 +8,14 @@ project: runtime-incident-agent
 design_version: 1
 current_phase: 8R.3
 phase_name: proactive-invariant-scanner
-phase_status: planned
+phase_status: in_progress
 last_completed_phase: "8R.2"
 last_completed_commit: b3c2f14
 production_commit: b3c2f146991953e0b8a2d71cd5364cfff8f9ebb8
 local_tests:
+  - "phase-8r.3-dormant-ledger-rules-scanner-regression: 410 passed, 2 known YAML prompt deprecation warnings"
+  - "phase-8r.3-final-review: no Critical or Important findings after recovery candidates were filtered and prioritized before the bounded observation limit"
+  - "phase-8r.3-review-fixes: ten Critical/Important findings addressed across bootstrap authority, deployable-rule truthfulness, terminal classification, ordered CAS, installer refusal, architecture coverage, pre-limit candidate filtering, single-transaction batching, overflow draining, and starvation-free recovery priority"
   - "phase-8r.2-final-monitor-writer-regression: 296 passed, 1 Linux-only installation probe skipped"
   - "phase-8r.2-dedicated-writer-thread-review: no Critical or Important findings; cancellation drains the worker before releasing the single-flight lock"
   - "phase-8r.2-bounded-monitor-writer-regression: 732 passed, 1 Linux-only installation probe skipped"
@@ -163,7 +166,7 @@ server_verification:
   phase_8r_2_capture_comparison: "Each of the nine closed capture types was enabled alone. Every type reached a zero-capture drain followed by three stable zero passes, with management/protection source hashes unchanged. Results: management_partial_failed 1 incident; provider_retry_exhausted 0; context_worker_exhausted 0; management_submit_unknown 0; management_recovery_required 6; severe_protection_incident 155; monitor_adapter_failure 0 during staged parity; monitor_audit_incomplete 0; notification_delivery_failure 0. No staged incident acquired an Agent or Telegram claim."
   phase_8r_2_final_policy: "Capture is enabled for all nine READ_ONLY_CAPTURE_PROFILE types. Telegram and Runtime Agent selectors remain exactly management_partial_failed, so the newly captured types are capture-only. A Persistent timer catch-up overlapped the bounded main-service restart and correctly produced one pending, unclaimed monitor_adapter_failure incident for transient service/settings unavailability; its operator monitor notification was sent, and the later no-notify diagnostic returned monitor_error null with only the known audit_abnormal baseline. Production now has 163 incidents and zero active incident, notification, or recovery claims."
   phase_8r_2_deployed_tests: "The deployed focused suite reached 294 passing tests before two known 0.2-second lifespan timing tests failed under production host load; both are unrelated to the writer changes and the complete local focused suite passed 296 tests with one installation skip."
-  remaining: "Phase 8R.2 is complete. Next turn may begin only Phase 8R.3: deploy the proactive invariant scanner dormant, prove its rollback, then run it shadow-only under a separately reviewed canary. Do not enable deterministic notification for new rules or widen Agent diagnosis in the same turn."
+  remaining: "Phase 8R.3 implementation is in progress: add the dormant observation ledger and closed scanner contract, implement the reviewed pure read-only rule catalog, then install the independently supervised scanner dormant before one-rule shadow-only activation. Do not enable deterministic notification for new rules or widen Agent diagnosis in this turn."
 enabled_flags:
   - "capture:READ_ONLY_CAPTURE_PROFILE-nine-types"
   - "telegram:deterministic-runtime-incident-reports"

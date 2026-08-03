@@ -16,6 +16,7 @@ def test_database_bootstrap_creates_tables(tmp_path):
     assert "trade_ideas" in tables
     assert "recognition_experiments" in tables
     assert "runtime_incidents" in tables
+    assert "runtime_incident_observations" in tables
     assert "runtime_agent_recovery_attempts" in tables
     assert engine is not None
 

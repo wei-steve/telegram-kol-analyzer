@@ -1,0 +1,1 @@
+{"rule_id":"tp1_break_even_nonterminal_v1","facts":{"complete":true,"object_id":"fixture-break-even","tp1_confirmed":true,"break_even_terminal":false,"transition_window_expired":true,"evidence_references":["break-even:fixture"]},"expected_outcome":"abnormal","expected_severity":"high"}

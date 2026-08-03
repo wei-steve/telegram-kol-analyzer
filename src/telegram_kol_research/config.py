@@ -24,6 +24,19 @@ READ_ONLY_CAPTURE_PROFILE = frozenset(
     }
 )
 
+RUNTIME_SCANNER_RULE_IDS = frozenset(
+    {
+        "terminal_lifecycle_exchange_exposure_v1",
+        "active_position_missing_protection_v1",
+        "cancel_outcome_stale_unknown_v1",
+        "tp1_break_even_nonterminal_v1",
+        "monitor_incident_ledger_silence_v1",
+    }
+)
+RUNTIME_SCANNER_DEPLOYABLE_RULE_IDS = frozenset(
+    {"cancel_outcome_stale_unknown_v1"}
+)
+
 
 @dataclass(slots=True)
 class AppConfig:
@@ -71,6 +84,41 @@ class RuntimeIncidentConfig:
             self.agent_incident_types is None
             or incident_type in self.agent_incident_types
         )
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeScannerConfig:
+    enabled: bool = False
+    shadow_only: bool = True
+    rules: frozenset[str] = frozenset()
+    interval_seconds: float = 60.0
+
+
+def load_runtime_scanner_config(
+    environ: dict[str, str] | None = None,
+    env_file_paths: list[str | os.PathLike[str]] | None = None,
+) -> RuntimeScannerConfig:
+    paths = ["config/runtime_incident_agent.env"] if env_file_paths is None else env_file_paths
+    env = dict(_load_env_file_values(paths) if paths else {})
+    env.update(os.environ if environ is None else environ)
+    requested = {
+        item.strip().lower()
+        for item in env.get("TELEGRAM_KOL_RUNTIME_SCANNER_RULES", "").split(",")
+        if item.strip()
+    }
+    try:
+        interval = float(env.get("TELEGRAM_KOL_RUNTIME_SCANNER_INTERVAL_SECONDS", "60"))
+    except (TypeError, ValueError):
+        interval = 60.0
+    return RuntimeScannerConfig(
+        enabled=_enabled_flag(env.get("TELEGRAM_KOL_RUNTIME_SCANNER_ENABLED")),
+        shadow_only=not (
+            str(env.get("TELEGRAM_KOL_RUNTIME_SCANNER_SHADOW_ONLY", "true"))
+            .strip().lower() in {"0", "false", "no", "off"}
+        ),
+        rules=frozenset(requested.intersection(RUNTIME_SCANNER_DEPLOYABLE_RULE_IDS)),
+        interval_seconds=max(10.0, min(interval, 3600.0)),
+    )
 
 
 def _enabled_flag(value: str | None) -> bool:

@@ -1,0 +1,38 @@
+[Unit]
+Description=Telegram KOL dormant read-only runtime invariant scanner
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/telegram-kol-runtime-scanner.env
+
+[Service]
+Type=simple
+User=telegram-kol-agent
+Group=telegram-kol-agent
+UMask=0077
+WorkingDirectory=/opt/telegram-kol-analyzer
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/telegram-kol-runtime-scanner.env
+ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research runtime-incident-scanner --database-path /opt/telegram-kol-analyzer/data/research.db
+Restart=on-failure
+RestartSec=10
+AmbientCapabilities=
+CapabilityBoundingSet=
+InaccessiblePaths=-/run/dbus/system_bus_socket -/run/systemd/private
+InaccessiblePaths=/opt/telegram-kol-analyzer/config
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateMounts=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+ReadOnlyPaths=/opt/telegram-kol-analyzer
+ReadWritePaths=/opt/telegram-kol-analyzer/data
+
+[Install]
+WantedBy=multi-user.target

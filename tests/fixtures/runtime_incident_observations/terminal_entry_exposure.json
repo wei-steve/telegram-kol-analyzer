@@ -1,0 +1,1 @@
+{"rule_id":"terminal_lifecycle_exchange_exposure_v1","facts":{"complete":true,"object_id":"fixture-lifecycle","lifecycle_terminal":true,"exchange_position_present":true,"live_entry_order_present":false,"evidence_references":["lifecycle:fixture","exchange-position:fixture"]},"expected_outcome":"abnormal","expected_severity":"critical"}
