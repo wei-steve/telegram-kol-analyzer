@@ -1,7 +1,12 @@
 from datetime import UTC, datetime, timedelta
 
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import RawMessage, StrategyLifecycle
+from telegram_kol_research.models import (
+    ExecutionBinding,
+    ExecutionOrderLeg,
+    RawMessage,
+    StrategyLifecycle,
+)
 from telegram_kol_research.strategy_thread_candidates import (
     generate_strategy_thread_candidates,
 )
@@ -248,3 +253,125 @@ def test_thread_and_message_link_helpers_are_idempotent(tmp_path):
 
     assert repeated.id == first.id
     assert repeated_link.id == first_link.id
+
+
+def test_candidate_marks_entered_lifecycle_without_current_risk_as_inactive(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        current_message = RawMessage(
+            chat_id=81,
+            message_id=4168,
+            text="63100没站稳，求稳就找机会出局",
+            posted_at=NOW,
+        )
+        old_binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:81:4139:BTC:long",
+            kol_id="group:81",
+            chat_id=81,
+            message_id=4139,
+            symbol="BTC",
+            side="long",
+            status="active",
+            pos_id="pos-old-compatibility-only",
+        )
+        current_binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:81:4167:BTC:long",
+            kol_id="group:81",
+            chat_id=81,
+            message_id=4167,
+            symbol="BTC",
+            side="long",
+            status="active",
+        )
+        session.add_all([current_message, old_binding, current_binding])
+        session.flush()
+        old_lifecycle = StrategyLifecycle(
+            chat_id=81,
+            message_id=4139,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=NOW - timedelta(hours=12),
+            execution_binding_id=old_binding.id,
+        )
+        current_lifecycle = StrategyLifecycle(
+            chat_id=81,
+            message_id=4167,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=NOW - timedelta(minutes=10),
+            execution_binding_id=current_binding.id,
+        )
+        session.add_all([old_lifecycle, current_lifecycle])
+        session.flush()
+        old_leg = ExecutionOrderLeg(
+            execution_binding_id=old_binding.id,
+            strategy_instance_id=old_binding.strategy_instance_id,
+            leg_index=0,
+            purpose="entry",
+            order_kind="market",
+            order_id="order-old",
+            pos_id="pos-old",
+            attribution_status="verified",
+            status="manually_closed",
+            terminal_reason="manual_position_missing",
+            last_verified_at=NOW - timedelta(hours=1),
+        )
+        live_leg = ExecutionOrderLeg(
+            execution_binding_id=current_binding.id,
+            strategy_instance_id=current_binding.strategy_instance_id,
+            leg_index=0,
+            purpose="entry",
+            order_kind="market",
+            order_id="order-current",
+            pos_id="pos-current",
+            attribution_status="verified",
+            status="active",
+            last_verified_at=NOW,
+        )
+        pending_leg = ExecutionOrderLeg(
+            execution_binding_id=current_binding.id,
+            strategy_instance_id=current_binding.strategy_instance_id,
+            leg_index=1,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="trigger-current",
+            attribution_status="unassigned",
+            status="submitted",
+        )
+        session.add_all([old_leg, live_leg, pending_leg])
+        session.commit()
+        raw_message_id = current_message.id
+        old_lifecycle_id = old_lifecycle.id
+        current_lifecycle_id = current_lifecycle.id
+        pending_leg_id = pending_leg.id
+
+    create_strategy_thread_for_lifecycle(
+        session_factory,
+        lifecycle_id=old_lifecycle_id,
+    )
+    create_strategy_thread_for_lifecycle(
+        session_factory,
+        lifecycle_id=current_lifecycle_id,
+    )
+
+    with session_factory() as session:
+        candidates = generate_strategy_thread_candidates(
+            session,
+            raw_message_id=raw_message_id,
+            symbol="BTC",
+            side="long",
+        )
+
+    by_lifecycle = {candidate.lifecycle_id: candidate for candidate in candidates}
+    old = by_lifecycle[old_lifecycle_id]
+    current = by_lifecycle[current_lifecycle_id]
+    assert old.risk_state == "no_current_risk"
+    assert old.live_verified_pos_ids == ()
+    assert old.pending_entry_leg_ids == ()
+    assert old.uncertain_entry_leg_ids == ()
+    assert current.risk_state == "current_risk"
+    assert current.live_verified_pos_ids == ("pos-current",)
+    assert current.pending_entry_leg_ids == (pending_leg_id,)
+    assert current.uncertain_entry_leg_ids == ()

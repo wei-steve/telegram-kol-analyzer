@@ -23,6 +23,18 @@ REVISION_TERMS = ("更新", "修改", "改为", "调整", "取消", "撤销", "�
 ACTIVE_LIFECYCLE_STATUSES = frozenset(
     {"pending_entry", "entered", "holding", "expired"}
 )
+VERIFIED_ATTRIBUTION_STATUSES = frozenset({"verified", "bound", "confirmed"})
+UNCERTAIN_ATTRIBUTION_STATUSES = frozenset(
+    {"attribution_conflict", "evidence_unavailable"}
+)
+LIVE_ENTRY_STATUSES = frozenset({"active", "partially_filled"})
+PENDING_ENTRY_STATUSES = frozenset({"pending", "submitted", "open"})
+UNCERTAIN_ENTRY_STATUSES = frozenset(
+    {"unknown", "recovery_required", "submitting"}
+)
+EXACT_ENTRY_ORDER_KINDS = frozenset(
+    {"market", "limit", "regular", "trigger", "trigger_limit"}
+)
 REASON_WEIGHTS = {
     "direct_reply_link": 1000,
     "reply_ancestor_link": 800,
@@ -52,6 +64,10 @@ class StrategyThreadCandidate:
     lifecycle_summary: dict[str, Any]
     binding_summary: dict[str, Any] | None
     verified_leg_summaries: tuple[dict[str, Any], ...]
+    risk_state: str
+    live_verified_pos_ids: tuple[str, ...]
+    pending_entry_leg_ids: tuple[int, ...]
+    uncertain_entry_leg_ids: tuple[int, ...]
 
 
 def _overlaps(
@@ -117,12 +133,19 @@ def _reply_link_depths(
 def _binding_context(
     session: Session,
     lifecycle: StrategyLifecycle,
-) -> tuple[dict[str, Any] | None, tuple[dict[str, Any], ...]]:
+) -> tuple[
+    dict[str, Any] | None,
+    tuple[dict[str, Any], ...],
+    str,
+    tuple[str, ...],
+    tuple[int, ...],
+    tuple[int, ...],
+]:
     if lifecycle.execution_binding_id is None:
-        return None, ()
+        return None, (), "no_current_risk", (), (), ()
     binding = session.get(ExecutionBinding, int(lifecycle.execution_binding_id))
     if binding is None:
-        return None, ()
+        return None, (), "uncertain_risk", (), (), ()
     summary = {
         "id": int(binding.id),
         "strategy_instance_id": binding.strategy_instance_id,
@@ -156,7 +179,47 @@ def _binding_context(
         if leg.last_verified_at is not None
         or leg.attribution_status in {"verified", "bound", "confirmed"}
     )
-    return summary, verified
+    entry_legs = tuple(leg for leg in legs if str(leg.purpose) == "entry")
+    live_pos_ids = tuple(
+        dict.fromkeys(
+            str(leg.pos_id).strip()
+            for leg in entry_legs
+            if str(leg.attribution_status or "") in VERIFIED_ATTRIBUTION_STATUSES
+            and str(leg.status or "") in LIVE_ENTRY_STATUSES
+            and str(leg.pos_id or "").strip()
+        )
+    )
+    pending_leg_ids = tuple(
+        int(leg.id)
+        for leg in entry_legs
+        if str(leg.status or "") in PENDING_ENTRY_STATUSES
+        and str(leg.order_kind or "") in EXACT_ENTRY_ORDER_KINDS
+        and bool(str(leg.order_id or leg.client_order_id or "").strip())
+        and not (
+            str(leg.attribution_status or "") in VERIFIED_ATTRIBUTION_STATUSES
+            and str(leg.pos_id or "").strip()
+        )
+    )
+    uncertain_leg_ids = tuple(
+        int(leg.id)
+        for leg in entry_legs
+        if str(leg.attribution_status or "") in UNCERTAIN_ATTRIBUTION_STATUSES
+        or str(leg.status or "") in UNCERTAIN_ENTRY_STATUSES
+    )
+    if uncertain_leg_ids:
+        risk_state = "uncertain_risk"
+    elif live_pos_ids or pending_leg_ids:
+        risk_state = "current_risk"
+    else:
+        risk_state = "no_current_risk"
+    return (
+        summary,
+        verified,
+        risk_state,
+        live_pos_ids,
+        pending_leg_ids,
+        uncertain_leg_ids,
+    )
 
 
 def generate_strategy_thread_candidates(
@@ -242,7 +305,14 @@ def generate_strategy_thread_candidates(
             reasons.append("recent_active_thread")
         ordered_reasons = tuple(reason for reason in REASON_ORDER if reason in reasons)
         score = sum(REASON_WEIGHTS[reason] for reason in ordered_reasons)
-        binding_summary, verified_legs = _binding_context(session, lifecycle)
+        (
+            binding_summary,
+            verified_legs,
+            risk_state,
+            live_verified_pos_ids,
+            pending_entry_leg_ids,
+            uncertain_entry_leg_ids,
+        ) = _binding_context(session, lifecycle)
         candidate = StrategyThreadCandidate(
             thread_id=int(thread.id),
             lifecycle_id=int(lifecycle.id),
@@ -268,6 +338,10 @@ def generate_strategy_thread_candidates(
             },
             binding_summary=binding_summary,
             verified_leg_summaries=verified_legs,
+            risk_state=risk_state,
+            live_verified_pos_ids=live_verified_pos_ids,
+            pending_entry_leg_ids=pending_entry_leg_ids,
+            uncertain_entry_leg_ids=uncertain_entry_leg_ids,
         )
         rank = (
             0 if reply_depth == 1 else 1 if reply_depth is not None else 2,

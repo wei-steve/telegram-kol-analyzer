@@ -55,6 +55,12 @@ _SENSITIVE_KEYS = {
     "local_path",
     "image_url",
     "image_bytes",
+    "payload_json",
+    "request_json",
+    "response_json",
+    "attribution_evidence_json",
+    "readback_evidence_json",
+    "evidence_json",
 }
 
 
