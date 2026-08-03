@@ -2128,6 +2128,10 @@ def monitor_production_safety(
     notify: bool = typer.Option(False, "--notify"),
     force_full_audit: bool = typer.Option(False, "--force-full-audit"),
     test_notification: bool = typer.Option(False, "--test-notification"),
+    runtime_incident_capture_url: str | None = typer.Option(
+        None,
+        "--runtime-incident-capture-url",
+    ),
 ) -> None:
     """Run bounded read-only server safety checks and optional alerts."""
 
@@ -2168,6 +2172,9 @@ def monitor_production_safety(
         )
         return
 
+    runtime_config = load_runtime_incident_config(
+        environment_only=True,
+    )
     outcome = run_production_safety_monitor(
         expectations=MonitorExpectations(
             head=expected_head,
@@ -2185,9 +2192,9 @@ def monitor_production_safety(
         notify=notify,
         force_full_audit=force_full_audit,
         lookback=timedelta(minutes=lookback_minutes),
-        runtime_incident_session_factory=create_existing_session_factory(
-            database_path
-        ),
+        runtime_incident_session_factory=None,
+        runtime_incident_capture_url=runtime_incident_capture_url,
+        runtime_incident_capture_token=runtime_config.monitor_capture_token,
     )
     summary = {
         "audit_ran": outcome.audit_ran,

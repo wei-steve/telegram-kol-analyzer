@@ -32,6 +32,8 @@ from telegram_kol_research.production_safety_monitor import read_loopback_settin
 from telegram_kol_research.production_safety_monitor import run_daily_management_audit
 from telegram_kol_research.production_safety_monitor import run_production_safety_monitor
 from telegram_kol_research.production_safety_monitor import save_monitor_state
+from telegram_kol_research.production_safety_monitor import build_monitor_incident_capture_projection
+from telegram_kol_research.production_safety_monitor import send_monitor_incident_capture
 from telegram_kol_research.production_safety_monitor import send_monitor_test_notification
 from telegram_kol_research.production_safety_monitor import should_run_daily_audit
 from telegram_kol_research.config import RuntimeIncidentConfig
@@ -158,6 +160,53 @@ def test_cli_unreadable_state_reaches_bounded_monitor_handling(tmp_path, monkeyp
     assert summary["reason_codes"] == ["state_invalid"]
     assert "state.json" not in result.output
     assert "PermissionError" not in result.output
+
+
+def test_cli_routes_incident_capture_to_trusted_loopback_writer(monkeypatch):
+    import telegram_kol_research.cli as cli_module
+
+    calls = []
+    monkeypatch.setenv(
+        "TELEGRAM_KOL_RUNTIME_MONITOR_CAPTURE_TOKEN",
+        "m" * 43,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "run_production_safety_monitor",
+        lambda **kwargs: (
+            calls.append(kwargs)
+            or SimpleNamespace(
+                audit_ran=False,
+                result=SimpleNamespace(healthy=True, reason_codes=()),
+                monitor_error=None,
+                notification_status="not_needed",
+                exit_code=0,
+            )
+        ),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "monitor-production-safety",
+            "--expected-head",
+            "a" * 40,
+            "--expected-auto-trade-enabled",
+            "--expected-management-mode",
+            "live",
+            "--expected-max-concurrent-positions",
+            "4",
+            "--runtime-incident-capture-url",
+            "http://127.0.0.1:8000/api/runtime-incidents/monitor-capture",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0]["runtime_incident_session_factory"] is None
+    assert calls[0]["runtime_incident_capture_token"] == "m" * 43
+    assert calls[0]["runtime_incident_capture_url"].endswith(
+        "/api/runtime-incidents/monitor-capture"
+    )
 
 
 def _snapshot(**overrides):
@@ -942,6 +991,62 @@ def test_monitor_missing_notification_config_repeats_one_generation(tmp_path):
         assert row.incident_type == "notification_delivery_failure"
         assert row.generation == 1
         assert row.repeat_count == 3
+
+
+def test_monitor_routes_capture_projection_without_writable_database(tmp_path):
+    submissions = []
+
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=tmp_path / "remote-capture.json",
+        adapters=_RecordingAdapters(service_state="failed"),
+        now=datetime(2026, 8, 3, 0, 0, tzinfo=UTC),
+        notify=False,
+        runtime_incident_capture_url=(
+            "http://127.0.0.1:8000/api/runtime-incidents/monitor-capture"
+        ),
+        runtime_incident_capture_token="m" * 43,
+        send_runtime_incident_capture=lambda url, **kwargs: (
+            submissions.append((url, kwargs)) or 1
+        ),
+    )
+
+    assert outcome.result.healthy is False
+    assert submissions == [
+        (
+            "http://127.0.0.1:8000/api/runtime-incidents/monitor-capture",
+            {
+                "token": "m" * 43,
+                "projection": {
+                    "schema_version": 1,
+                    "checked_at": "2026-08-03T00:00:00+00:00",
+                    "reason_codes": [],
+                    "adapter_failures": [],
+                    "notification_error": None,
+                },
+            },
+        )
+    ]
+
+
+def test_monitor_capture_transport_failure_does_not_change_outcome(tmp_path):
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=tmp_path / "remote-capture-failure.json",
+        adapters=_RecordingAdapters(service_state="failed"),
+        now=datetime(2026, 8, 3, 0, 0, tzinfo=UTC),
+        notify=False,
+        runtime_incident_capture_url=(
+            "http://127.0.0.1:8000/api/runtime-incidents/monitor-capture"
+        ),
+        runtime_incident_capture_token="m" * 43,
+        send_runtime_incident_capture=lambda *args, **kwargs: (
+            _ for _ in ()
+        ).throw(RuntimeError("writer unavailable")),
+    )
+
+    assert outcome.result.reason_codes == ("service_inactive",)
+    assert outcome.monitor_error is None
 
 
 def test_monitor_adapts_each_durable_severe_protection_incident_once(tmp_path):
@@ -1972,6 +2077,97 @@ def test_non_loopback_settings_url_is_rejected_before_http(monkeypatch):
         read_loopback_settings("http://example.com/api/trading-settings")
     with pytest.raises(ValueError, match="loopback"):
         read_loopback_settings("https://127.0.0.1/api/trading-settings")
+
+
+def test_monitor_incident_capture_projection_is_closed_and_bounded():
+    projection = build_monitor_incident_capture_projection(
+        checked_at=datetime(2026, 8, 3, 0, 0, tzinfo=UTC),
+        reason_codes=("audit_abnormal", "adapter_failure", "audit_incomplete"),
+        adapter_failures=("audit", "service", "unknown", "audit"),
+        notification_status="config_missing",
+        monitor_error="notification_config_missing",
+    )
+
+    assert projection == {
+        "schema_version": 1,
+        "checked_at": "2026-08-03T00:00:00+00:00",
+        "reason_codes": ["adapter_failure", "audit_incomplete"],
+        "adapter_failures": ["audit", "service"],
+        "notification_error": "notification_config_missing",
+    }
+
+
+def test_monitor_incident_capture_client_is_fixed_loopback_no_proxy(monkeypatch):
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"accepted": True, "captured": 1}
+
+    class Client:
+        def __init__(self, **kwargs):
+            calls.append(("init", kwargs))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def post(self, *args, **kwargs):
+            calls.append(("post", args, kwargs))
+            return Response()
+
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setattr(monitor_module.httpx, "Client", Client)
+    payload = {
+        "schema_version": 1,
+        "checked_at": "2026-08-03T00:00:00+00:00",
+        "reason_codes": [],
+        "adapter_failures": [],
+        "notification_error": None,
+    }
+
+    assert send_monitor_incident_capture(
+        "http://127.0.0.1:8000/api/runtime-incidents/monitor-capture",
+        token="a" * 43,
+        projection=payload,
+    ) == 1
+    assert calls == [
+        ("init", {"timeout": 3.0, "trust_env": False}),
+        (
+            "post",
+            ("http://127.0.0.1:8000/api/runtime-incidents/monitor-capture",),
+            {
+                "headers": {"x-monitor-capture-token": "a" * 43},
+                "json": payload,
+            },
+        ),
+    ]
+
+
+def test_monitor_incident_capture_client_rejects_non_loopback_before_http(monkeypatch):
+    monkeypatch.setattr(
+        monitor_module.httpx,
+        "Client",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("HTTP called")),
+    )
+
+    with pytest.raises(ValueError, match="loopback"):
+        send_monitor_incident_capture(
+            "http://example.com/api/runtime-incidents/monitor-capture",
+            token="a" * 43,
+            projection={},
+        )
+    with pytest.raises(ValueError, match="loopback"):
+        send_monitor_incident_capture(
+            "http://127.0.0.1:9000/api/runtime-incidents/monitor-capture",
+            token="a" * 43,
+            projection={},
+        )
 
 
 def test_loopback_settings_disable_environment_proxy_trust(monkeypatch):

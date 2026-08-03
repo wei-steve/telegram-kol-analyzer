@@ -7,6 +7,8 @@ from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Callable
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import re
@@ -58,6 +60,13 @@ from telegram_kol_research.deepcoin_execution_actions import close_bound_positio
 from telegram_kol_research.runtime_agent_production_audit import (
     project_bounded_production_audit,
     run_bounded_production_audit_command,
+)
+from telegram_kol_research.runtime_incident_adapters import (
+    capture_monitor_state,
+    capture_notification_failure,
+)
+from telegram_kol_research.production_safety_monitor import (
+    capture_uncaptured_runtime_incident_sources,
 )
 from telegram_kol_research.gate_market_data import GateMarketDataProvider
 from telegram_kol_research.group_config import GroupConfig
@@ -3384,6 +3393,7 @@ def create_web_app(
     source_message_deletion_worker_max_jobs: int = 10,
     runtime_agent_production_audit_runner=None,
     runtime_agent_telegram_evidence_runner=None,
+    runtime_incident_config: RuntimeIncidentConfig | None = None,
     live_position_snapshot_path: str | Path | None = None,
     position_snapshot_now_provider=None,
     position_snapshot_refresh_seconds: float = 5.0,
@@ -3788,10 +3798,14 @@ def create_web_app(
         or default_runtime_agent_telegram_evidence_runner
     )
     app.state.runtime_agent_telegram_evidence_lock = threading.Lock()
-    try:
-        app.state.runtime_incident_config = load_runtime_incident_config()
-    except Exception:
-        app.state.runtime_incident_config = RuntimeIncidentConfig()
+    if runtime_incident_config is not None:
+        app.state.runtime_incident_config = runtime_incident_config
+    else:
+        try:
+            app.state.runtime_incident_config = load_runtime_incident_config()
+        except Exception:
+            app.state.runtime_incident_config = RuntimeIncidentConfig()
+    app.state.monitor_incident_capture_lock = threading.Lock()
     app.state.chat_requester = request_grounded_chat_answer
     app.state.prompt_test_runner = run_prompt_draft_test
     app.state.live_target_titles = live_target_titles or set()
@@ -4188,6 +4202,159 @@ def create_web_app(
                 )
         finally:
             app.state.runtime_agent_telegram_evidence_lock.release()
+
+    def require_monitor_capture_auth(request: Request) -> None:
+        client_host = request.client.host if request.client is not None else ""
+        configured_token = app.state.runtime_incident_config.monitor_capture_token
+        supplied_token = request.headers.get("x-monitor-capture-token", "")
+        if (
+            client_host not in {"127.0.0.1", "::1"}
+            or "x-forwarded-for" in request.headers
+            or not configured_token
+            or not hmac.compare_digest(configured_token, supplied_token)
+        ):
+            raise HTTPException(status_code=404, detail="not found")
+
+    @app.get("/api/runtime-incidents/monitor-capture-health")
+    def api_runtime_incidents_monitor_capture_health(request: Request):
+        require_monitor_capture_auth(request)
+        return {"available": True, "schema_version": 1}
+
+    @app.post("/api/runtime-incidents/monitor-capture")
+    async def api_runtime_incidents_monitor_capture(request: Request):
+        require_monitor_capture_auth(request)
+        raw_content_length = request.headers.get("content-length")
+        try:
+            content_length = (
+                int(raw_content_length)
+                if raw_content_length is not None
+                else None
+            )
+        except ValueError:
+            content_length = -1
+        if content_length is not None and not 0 <= content_length <= 4096:
+            raise HTTPException(status_code=422, detail="invalid capture payload")
+        chunks: list[bytes] = []
+        body_size = 0
+        async for chunk in request.stream():
+            body_size += len(chunk)
+            if body_size > 4096:
+                raise HTTPException(
+                    status_code=422,
+                    detail="invalid capture payload",
+                )
+            chunks.append(chunk)
+        body = b"".join(chunks)
+
+        def strict_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate key")
+                result[key] = value
+            return result
+
+        try:
+            payload = json.loads(
+                body.decode("utf-8"),
+                object_pairs_hook=strict_object,
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError("invalid constant")
+                ),
+            )
+            if not isinstance(payload, dict) or set(payload) != {
+                "schema_version",
+                "checked_at",
+                "reason_codes",
+                "adapter_failures",
+                "notification_error",
+            }:
+                raise ValueError("invalid fields")
+            if payload["schema_version"] != 1:
+                raise ValueError("invalid version")
+            checked_at = datetime.fromisoformat(payload["checked_at"])
+            if checked_at.tzinfo is None:
+                raise ValueError("timestamp must be aware")
+            reason_codes = payload["reason_codes"]
+            adapter_failures = payload["adapter_failures"]
+            notification_error = payload["notification_error"]
+            if (
+                not isinstance(reason_codes, list)
+                or len(reason_codes) > 2
+                or any(
+                    reason not in {"adapter_failure", "audit_incomplete"}
+                    for reason in reason_codes
+                )
+                or len(set(reason_codes)) != len(reason_codes)
+                or not isinstance(adapter_failures, list)
+                or len(adapter_failures) > 6
+                or any(
+                    failure
+                    not in {"service", "head", "settings", "journal", "events", "audit"}
+                    for failure in adapter_failures
+                )
+                or len(set(adapter_failures)) != len(adapter_failures)
+                or notification_error
+                not in {
+                    None,
+                    "notification_config_missing",
+                    "notification_delivery_failed",
+                }
+            ):
+                raise ValueError("invalid values")
+        except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+            raise HTTPException(
+                status_code=422,
+                detail="invalid capture payload",
+            )
+
+        acquired = app.state.monitor_incident_capture_lock.acquire(blocking=False)
+        if not acquired:
+            raise HTTPException(status_code=409, detail="capture busy")
+        try:
+            def persist_capture_projection() -> int:
+                config = app.state.runtime_incident_config
+                captured = len(
+                    capture_monitor_state(
+                        app.state.session_factory,
+                        config=config,
+                        checked_at=checked_at,
+                        reason_codes=tuple(reason_codes),
+                        adapter_failures=tuple(adapter_failures),
+                    )
+                )
+                if notification_error is not None:
+                    source_identity = hashlib.sha256(
+                        json.dumps(
+                            {
+                                "reason_codes": reason_codes,
+                                "adapter_failures": adapter_failures,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    captured += int(
+                        capture_notification_failure(
+                            app.state.session_factory,
+                            config=config,
+                            source_kind="production_safety_monitor_notification",
+                            source_record_id=source_identity,
+                            error_type=notification_error,
+                            occurred_at=checked_at,
+                        )
+                        is not None
+                    )
+                captured += capture_uncaptured_runtime_incident_sources(
+                    app.state.session_factory,
+                    config_loader=lambda: config,
+                )
+                return captured
+
+            captured = await asyncio.to_thread(persist_capture_projection)
+            return {"accepted": True, "captured": captured}
+        finally:
+            app.state.monitor_incident_capture_lock.release()
 
     @app.get("/api/management-batches")
     def api_management_batches(chat_id: int, limit: int = 50):

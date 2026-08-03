@@ -46,6 +46,7 @@ from telegram_kol_research.models import SignalCandidate
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.models import TradeSignal
 from telegram_kol_research.models import StrategyManagementBatch, StrategyManagementLeg
+from telegram_kol_research.models import RuntimeIncident
 from telegram_kol_research.message_recognition import MessageRecognitionResult
 from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
 from telegram_kol_research.telegram_bot_commands import (
@@ -5120,6 +5121,188 @@ def test_runtime_agent_exchange_snapshot_endpoint_refuses_non_loopback_clients(
     assert response.status_code == 404
     assert proxied.status_code == 404
     assert factory_calls == []
+
+
+def test_monitor_incident_writer_requires_loopback_and_dedicated_token(tmp_path):
+    token = "m" * 43
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"monitor_adapter_failure"}),
+            monitor_capture_token=token,
+        ),
+    )
+    payload = {
+        "schema_version": 1,
+        "checked_at": "2026-08-03T00:00:00+00:00",
+        "reason_codes": ["adapter_failure"],
+        "adapter_failures": ["audit"],
+        "notification_error": None,
+    }
+
+    remote = TestClient(app, client=("198.51.100.8", 50000)).post(
+        "/api/runtime-incidents/monitor-capture",
+        headers={"x-monitor-capture-token": token},
+        json=payload,
+    )
+    proxied = TestClient(app, client=("127.0.0.1", 50000)).post(
+        "/api/runtime-incidents/monitor-capture",
+        headers={
+            "x-monitor-capture-token": token,
+            "x-forwarded-for": "198.51.100.8",
+        },
+        json=payload,
+    )
+    missing = TestClient(app, client=("127.0.0.1", 50000)).post(
+        "/api/runtime-incidents/monitor-capture",
+        json=payload,
+    )
+    accepted = TestClient(app, client=("127.0.0.1", 50000)).post(
+        "/api/runtime-incidents/monitor-capture",
+        headers={"x-monitor-capture-token": token},
+        json=payload,
+    )
+
+    assert remote.status_code == proxied.status_code == missing.status_code == 404
+    assert accepted.status_code == 200
+    assert accepted.json() == {"accepted": True, "captured": 1}
+    with app.state.session_factory() as session:
+        row = session.query(RuntimeIncident).one()
+        assert row.incident_type == "monitor_adapter_failure"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"schema_version":1,"schema_version":1}',
+        json.dumps(
+            {
+                "schema_version": 1,
+                "checked_at": "2026-08-03T00:00:00+00:00",
+                "reason_codes": ["audit_abnormal"],
+                "adapter_failures": [],
+                "notification_error": None,
+            }
+        ).encode(),
+        b"x" * 4097,
+    ],
+)
+def test_monitor_incident_writer_rejects_non_closed_payloads(tmp_path, body):
+    token = "m" * 43
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"monitor_adapter_failure"}),
+            monitor_capture_token=token,
+        ),
+    )
+
+    response = TestClient(app, client=("127.0.0.1", 50000)).post(
+        "/api/runtime-incidents/monitor-capture",
+        headers={
+            "x-monitor-capture-token": token,
+            "content-type": "application/json",
+        },
+        content=body,
+    )
+
+    assert response.status_code == 422
+    with app.state.session_factory() as session:
+        assert session.query(RuntimeIncident).count() == 0
+
+
+def test_monitor_incident_writer_refuses_concurrent_capture(tmp_path):
+    token = "m" * 43
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"monitor_adapter_failure"}),
+            monitor_capture_token=token,
+        ),
+    )
+    assert app.state.monitor_incident_capture_lock.acquire(blocking=False)
+    try:
+        response = TestClient(app, client=("127.0.0.1", 50000)).post(
+            "/api/runtime-incidents/monitor-capture",
+            headers={"x-monitor-capture-token": token},
+            json={
+                "schema_version": 1,
+                "checked_at": "2026-08-03T00:00:00+00:00",
+                "reason_codes": ["adapter_failure"],
+                "adapter_failures": ["audit"],
+                "notification_error": None,
+            },
+        )
+    finally:
+        app.state.monitor_incident_capture_lock.release()
+
+    assert response.status_code == 409
+    with app.state.session_factory() as session:
+        assert session.query(RuntimeIncident).count() == 0
+
+
+def test_monitor_incident_writer_health_probe_is_persistence_free(tmp_path):
+    token = "m" * 43
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"management_partial_failed"}),
+            monitor_capture_token=token,
+        ),
+    )
+
+    response = TestClient(app, client=("127.0.0.1", 50000)).get(
+        "/api/runtime-incidents/monitor-capture-health",
+        headers={"x-monitor-capture-token": token},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"available": True, "schema_version": 1}
+    with app.state.session_factory() as session:
+        assert session.query(RuntimeIncident).count() == 0
+
+
+def test_monitor_incident_writer_rejects_oversized_content_length_before_body(
+    tmp_path,
+):
+    token = "m" * 43
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            monitor_capture_token=token,
+        ),
+    )
+
+    response = TestClient(app, client=("127.0.0.1", 50000)).post(
+        "/api/runtime-incidents/monitor-capture",
+        headers={
+            "x-monitor-capture-token": token,
+            "content-length": "5000",
+        },
+        content=b"{}",
+    )
+
+    assert response.status_code == 422
+
+
+def test_monitor_incident_writer_rejects_stream_once_hard_cap_is_exceeded(
+    tmp_path,
+):
+    token = "m" * 43
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            monitor_capture_token=token,
+        ),
+    )
+
+    response = TestClient(app, client=("127.0.0.1", 50000)).post(
+        "/api/runtime-incidents/monitor-capture",
+        headers={"x-monitor-capture-token": token},
+        content=(chunk for chunk in (b"x" * 3000, b"y" * 3000)),
+    )
+
+    assert response.status_code == 422
 
 
 def test_runtime_agent_exchange_snapshot_endpoint_hides_close_failures(

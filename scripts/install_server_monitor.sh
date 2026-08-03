@@ -136,6 +136,15 @@ if [[ ! "$capture_policy" =~ ^TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES=([a-z0
   echo "Runtime incident capture allowlist contains an invalid value." >&2
   exit 1
 fi
+if [[ "$(grep -c '^TELEGRAM_KOL_RUNTIME_MONITOR_CAPTURE_TOKEN=' "$RUNTIME_POLICY_FILE")" -ne 1 ]]; then
+  echo "Runtime policy file must contain exactly one monitor capture token." >&2
+  exit 1
+fi
+monitor_capture_token="$(grep '^TELEGRAM_KOL_RUNTIME_MONITOR_CAPTURE_TOKEN=' "$RUNTIME_POLICY_FILE")"
+if [[ ! "$monitor_capture_token" =~ ^TELEGRAM_KOL_RUNTIME_MONITOR_CAPTURE_TOKEN=[A-Za-z0-9_-]{32,128}$ ]]; then
+  echo "Runtime monitor capture token contains an invalid value." >&2
+  exit 1
+fi
 if [[ -e "$STATE_FILE" || -L "$STATE_FILE" ]]; then
   if [[ ! -f "$STATE_FILE" || -L "$STATE_FILE" ]]; then
     echo "Existing monitor state path must be a regular non-symlink file." >&2
@@ -225,6 +234,7 @@ chmod 0600 "$env_source"
 grep '^TELEGRAM_KOL_SYSTEM_BOT_' "$CREDENTIAL_FILE" > "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=%s\n' "$expected_head" >> "$env_source"
 printf '%s\n' "$capture_policy" >> "$env_source"
+printf '%s\n' "$monitor_capture_token" >> "$env_source"
 
 install -o root -g root -m 0600 "$env_source" "$ENV_FILE"
 install -o root -g root -m 0644 "$SERVICE_SOURCE" "$SERVICE_DEST"

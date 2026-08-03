@@ -53,6 +53,7 @@ def test_monitor_service_uses_dedicated_identity_and_exact_command():
         "--database-path /opt/telegram-kol-analyzer/data/research.db "
         "--state-path /var/lib/telegram-kol-monitor/state.json "
         "--lookback-minutes 35 "
+        "--runtime-incident-capture-url http://127.0.0.1:8000/api/runtime-incidents/monitor-capture "
         "--notify"
     ) in normalized
 
@@ -269,7 +270,9 @@ def test_installer_creates_identity_and_allowlisted_monitor_environment():
     assert "TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID" in installer
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_HEAD" in installer
     assert "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES" in installer
+    assert "TELEGRAM_KOL_RUNTIME_MONITOR_CAPTURE_TOKEN" in installer
     assert "capture_policy" in installer
+    assert "monitor_capture_token" in installer
     assert "TELEGRAM_KOL_RUNTIME_AGENT_LLM_API_KEY" not in installer
     assert "DEEP_API" not in installer
     assert "DEEPCOIN" not in installer.upper()

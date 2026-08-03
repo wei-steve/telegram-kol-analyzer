@@ -13,6 +13,8 @@ last_completed_phase: "8R.1"
 last_completed_commit: 2449382
 production_commit: 2449382bd53195950b42ec6052fb4e6dee4fb9cd
 local_tests:
+  - "phase-8r.2-bounded-monitor-writer-regression: 732 passed, 1 Linux-only installation probe skipped"
+  - "phase-8r.2-bounded-monitor-writer-review: no Critical or Important findings after adding the true streaming request cap and persistence-free authenticated health endpoint"
   - "phase-8r.2-monitor-policy-contract: 314 passed, 1 Linux-only installation probe skipped"
   - "phase-8r.2-final-source-parity-and-gating-regression: 573 passed"
   - "phase-8r.2-capture-notification-agent-focused: 252 passed"
@@ -154,7 +156,7 @@ server_verification:
   phase_8r_2_dormant_deployment: "Commit 7393c4e was deployed after a fresh safe-window gate with latest raw/decision both 9011 and zero recent recognition, evidence, context, management, position-mutation, execution-event, runtime-claim, or recovery work in flight. Main service, Runtime Agent, and monitor timer are active; HTTP is 200. Capture remains exactly management_partial_failed. Telegram and Agent selectors were atomically pinned to exactly management_partial_failed before restart, so absent=legacy-all cannot expose future capture-only types."
   phase_8r_2_monitor_policy: "The monitor installer now copies only the exact non-secret capture allowlist into its root-owned environment; deployed monitor and main policy both remain management_partial_failed. The monitor sandbox still correctly mounts the production SQLite database read-only."
   phase_8r_2_writer_design: "Approved bounded authenticated loopback writer design and implementation plan are committed at 165c4a1. The monitor keeps SQLite read-only; the trusted main service accepts only a closed monitor projection under a dedicated token and applies its own capture policy."
-  remaining: "Phase 8R.2 remains in progress. Execute docs/plans/2026-08-03-monitor-incident-writer.md, deploy it dormant in a fresh safe window, then complete one-type-at-a-time capture comparison with Telegram and Agent selectors unchanged. Do not widen production capture before the writer passes review and the authenticated no-op probe. Do not implement the invariant scanner or any later Phase 8R stage."
+  remaining: "Phase 8R.2 bounded monitor writer is implemented locally and awaiting final review, commit/push, dormant safe-window deployment, authenticated no-op probe, and one-type-at-a-time capture comparison. Telegram and Agent selectors must remain unchanged. Do not implement the invariant scanner or any later Phase 8R stage."
 enabled_flags:
   - "capture:management_partial_failed"
   - "telegram:deterministic-runtime-incident-reports"

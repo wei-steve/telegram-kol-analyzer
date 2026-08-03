@@ -390,6 +390,30 @@ then restart/reload the main service and monitor schedule as one staged policy
 change. The Telegram and Agent selectors remain confined to their existing
 service configuration.
 
+The monitor never writes the production SQLite database. It submits a closed
+projection to
+`http://127.0.0.1:8000/api/runtime-incidents/monitor-capture`; the trusted main
+service applies its own capture policy and performs only the reviewed incident
+append and durable-source scan. The endpoint requires the dedicated
+`TELEGRAM_KOL_RUNTIME_MONITOR_CAPTURE_TOKEN`, rejects non-loopback and forwarded
+requests, strictly bounds the body and schema, and accepts no incident type,
+business identifier, fingerprint, or arbitrary summary. The installer copies
+only this token and the exact capture allowlist into the monitor environment;
+it does not copy provider, exchange, Agent, or business credentials.
+
+Use the authenticated GET endpoint
+`/api/runtime-incidents/monitor-capture-health` for deployment validation. It
+performs no source scan and no database write. Never use an empty POST as a
+health probe: every accepted capture POST intentionally runs the bounded
+durable-source scan after processing its monitor projection.
+
+Failure of this loopback writer is fail-open for monitoring: the independent
+monitor result and operator alert remain authoritative, while the missing
+runtime-incident append is logged without sensitive detail. Roll back by
+clearing newly added capture types first; rotate or remove the dedicated token
+only while the monitor timer is stopped. The database, WAL, and SHM mounts must
+remain read-only in every monitor unit.
+
 At most one runtime stage may be implemented per user turn. New code and
 configuration default off. A first deployment never enables its feature. A
 later enablement requires another complete safe-window check and the exact

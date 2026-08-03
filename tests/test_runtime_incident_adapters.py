@@ -228,6 +228,7 @@ def test_runtime_incident_flags_are_dormant_by_default_and_parse_allowlist():
             "TELEGRAM_KOL_RUNTIME_AGENT_ENABLED": "true",
             "TELEGRAM_KOL_RUNTIME_AGENT_MAX_TOOL_STEPS": "99",
             "TELEGRAM_KOL_RUNTIME_AGENT_MAX_WALL_SECONDS": "12",
+            "TELEGRAM_KOL_RUNTIME_MONITOR_CAPTURE_TOKEN": "m" * 43,
         },
         env_file_paths=[],
     )
@@ -240,6 +241,8 @@ def test_runtime_incident_flags_are_dormant_by_default_and_parse_allowlist():
     )
     assert enabled.telegram_notifications_enabled is True
     assert enabled.agent_enabled is True
+    assert default.monitor_capture_token is None
+    assert enabled.monitor_capture_token == "m" * 43
     assert enabled.agent_max_tool_steps == 4
     assert enabled.agent_max_wall_seconds == 12.0
     assert enabled.prompt_version == "runtime-agent-prompt-v7"
@@ -247,6 +250,16 @@ def test_runtime_incident_flags_are_dormant_by_default_and_parse_allowlist():
     assert RuntimeIncidentConfig(
         capture_types=frozenset({"*"})
     ).captures("management_recovery_required") is False
+
+
+@pytest.mark.parametrize("value", ["short", "x" * 129, "!" * 43])
+def test_monitor_capture_token_fails_closed_when_invalid(value):
+    config = load_runtime_incident_config(
+        environ={"TELEGRAM_KOL_RUNTIME_MONITOR_CAPTURE_TOKEN": value},
+        env_file_paths=[],
+    )
+
+    assert config.monitor_capture_token is None
 
 
 @pytest.mark.parametrize("status", ["unresolved", "hold", "pending_reanalysis"])

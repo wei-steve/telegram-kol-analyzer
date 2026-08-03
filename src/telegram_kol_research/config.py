@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,6 +52,7 @@ class RuntimeIncidentConfig:
     agent_actions_enabled: bool = False
     agent_action_playbooks: frozenset[str] = frozenset()
     agent_action_circuit_threshold: int = 3
+    monitor_capture_token: str | None = None
     feature_policy_version: str = "runtime-incident-phase-6-v1"
     prompt_version: str = "runtime-agent-prompt-v7"
     tool_policy_version: str = "runtime-agent-tools-v2"
@@ -191,6 +193,15 @@ def load_runtime_incident_config(
         )
     except (TypeError, ValueError):
         agent_action_circuit_threshold = 3
+    raw_monitor_capture_token = env.get(
+        "TELEGRAM_KOL_RUNTIME_MONITOR_CAPTURE_TOKEN"
+    )
+    monitor_capture_token = (
+        raw_monitor_capture_token
+        if raw_monitor_capture_token is not None
+        and re.fullmatch(r"[A-Za-z0-9_-]{32,128}", raw_monitor_capture_token)
+        else None
+    )
     return RuntimeIncidentConfig(
         capture_types=capture_types,
         telegram_notifications_enabled=_enabled_flag(
@@ -219,4 +230,5 @@ def load_runtime_incident_config(
         agent_action_circuit_threshold=max(
             1, min(agent_action_circuit_threshold, 5)
         ),
+        monitor_capture_token=monitor_capture_token,
     )

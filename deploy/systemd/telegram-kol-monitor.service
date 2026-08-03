@@ -11,7 +11,7 @@ SupplementaryGroups=systemd-journal
 UMask=0077
 WorkingDirectory=/var/lib/telegram-kol-monitor
 EnvironmentFile=/etc/telegram-kol-monitor.env
-ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research monitor-production-safety --expected-head ${TELEGRAM_KOL_MONITOR_EXPECTED_HEAD} --expected-auto-trade-enabled --expected-management-mode live --expected-max-concurrent-positions 4 --checkout-path /opt/telegram-kol-analyzer --settings-url http://127.0.0.1:8000/api/trading-settings --database-path /opt/telegram-kol-analyzer/data/research.db --state-path /var/lib/telegram-kol-monitor/state.json --lookback-minutes 35 --notify
+ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research monitor-production-safety --expected-head ${TELEGRAM_KOL_MONITOR_EXPECTED_HEAD} --expected-auto-trade-enabled --expected-management-mode live --expected-max-concurrent-positions 4 --checkout-path /opt/telegram-kol-analyzer --settings-url http://127.0.0.1:8000/api/trading-settings --database-path /opt/telegram-kol-analyzer/data/research.db --state-path /var/lib/telegram-kol-monitor/state.json --lookback-minutes 35 --runtime-incident-capture-url http://127.0.0.1:8000/api/runtime-incidents/monitor-capture --notify
 
 AmbientCapabilities=
 CapabilityBoundingSet=

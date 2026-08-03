@@ -52,6 +52,12 @@ _GIT_HEAD = re.compile(r"[0-9a-f]{40}\Z")
 _SAFE_TIMESTAMP = re.compile(r"[0-9T:+.-]{1,40}\Z")
 _SHA256_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
 _ADAPTER_NAMES = frozenset({"service", "head", "settings", "journal", "events", "audit"})
+_MONITOR_CAPTURE_REASON_CODES = frozenset(
+    {"adapter_failure", "audit_incomplete"}
+)
+_MONITOR_CAPTURE_NOTIFICATION_ERRORS = frozenset(
+    {"notification_config_missing", "notification_delivery_failed"}
+)
 _MANAGEMENT_MODES = frozenset({"disabled", "shadow", "live"})
 _SERVICE_STATES = frozenset(
     {
@@ -101,6 +107,74 @@ _STATE_FIELDS = frozenset(
         "last_notification_at",
     }
 )
+
+
+def build_monitor_incident_capture_projection(
+    *,
+    checked_at: datetime,
+    reason_codes: Sequence[str],
+    adapter_failures: Sequence[str],
+    notification_status: str,
+    monitor_error: str | None,
+) -> dict[str, Any]:
+    """Build the only projection accepted by the trusted incident writer."""
+
+    timestamp = _require_aware_datetime(checked_at).isoformat()
+    reasons = sorted(
+        set(reason_codes).intersection(_MONITOR_CAPTURE_REASON_CODES)
+    )
+    failures = sorted(set(adapter_failures).intersection(_ADAPTER_NAMES))
+    notification_error = (
+        monitor_error
+        if notification_status in {"config_missing", "delivery_failed"}
+        and monitor_error in _MONITOR_CAPTURE_NOTIFICATION_ERRORS
+        else None
+    )
+    return {
+        "schema_version": 1,
+        "checked_at": timestamp,
+        "reason_codes": reasons,
+        "adapter_failures": failures,
+        "notification_error": notification_error,
+    }
+
+
+def send_monitor_incident_capture(
+    url: str,
+    *,
+    token: str,
+    projection: Mapping[str, Any],
+) -> int:
+    """Submit one bounded projection over the fixed loopback channel."""
+
+    parsed = urlsplit(str(url))
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "::1"}
+        or parsed.port != 8000
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path != "/api/runtime-incidents/monitor-capture"
+    ):
+        raise ValueError("monitor incident capture URL must be exact loopback HTTP")
+    if not isinstance(token, str) or not 32 <= len(token) <= 128:
+        raise ValueError("monitor incident capture token is invalid")
+    with httpx.Client(timeout=3.0, trust_env=False) as client:
+        response = client.post(
+            url,
+            headers={"x-monitor-capture-token": token},
+            json=dict(projection),
+        )
+        response.raise_for_status()
+        payload = response.json()
+    if not isinstance(payload, Mapping) or payload.get("accepted") is not True:
+        raise ValueError("monitor incident capture response is invalid")
+    captured = payload.get("captured")
+    if not isinstance(captured, int) or isinstance(captured, bool) or captured < 0:
+        raise ValueError("monitor incident capture count is invalid")
+    return min(captured, 102)
 _FINGERPRINT_DETAIL_KEYS = (
     "service_state",
     "head",
@@ -495,6 +569,9 @@ def run_production_safety_monitor(
     send_bot_message=send_system_operator_bot_message,
     runtime_incident_session_factory=None,
     runtime_incident_config: RuntimeIncidentConfig | None = None,
+    runtime_incident_capture_url: str | None = None,
+    runtime_incident_capture_token: str | None = None,
+    send_runtime_incident_capture=send_monitor_incident_capture,
 ) -> MonitorRunOutcome:
     """Collect, evaluate, deduplicate, optionally notify, and persist state."""
 
@@ -670,6 +747,21 @@ def run_production_safety_monitor(
             runtime_incident_session_factory,
             config_loader=incident_config_loader,
         )
+    if runtime_incident_capture_url and runtime_incident_capture_token:
+        try:
+            send_runtime_incident_capture(
+                runtime_incident_capture_url,
+                token=runtime_incident_capture_token,
+                projection=build_monitor_incident_capture_projection(
+                    checked_at=checked_at,
+                    reason_codes=result.reason_codes,
+                    adapter_failures=tuple(failures),
+                    notification_status=notification_status,
+                    monitor_error=monitor_error,
+                ),
+            )
+        except Exception:
+            logger.warning("Monitor incident capture writer is unavailable")
 
     return MonitorRunOutcome(
         result=result,
