@@ -7,6 +7,7 @@ import pytest
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
 from telegram_kol_research.authoritative_recognition import (
     AuthoritativeAssessment,
+    _resolved_mimo_result,
     apply_authoritative_assessment,
     assess_message_authoritatively,
     process_authoritative_message,
@@ -37,6 +38,201 @@ from telegram_kol_research.strategy_threads import (
     create_strategy_thread_for_lifecycle,
     link_message_to_strategy_thread,
 )
+from telegram_kol_research.strategy_thread_candidates import StrategyThreadCandidate
+
+
+def _context_candidate(
+    *,
+    thread_id: int,
+    lifecycle_id: int,
+    root_message_id: int,
+    risk_state: str,
+) -> StrategyThreadCandidate:
+    return StrategyThreadCandidate(
+        thread_id=thread_id,
+        lifecycle_id=lifecycle_id,
+        root_message_id=root_message_id,
+        symbol="BTC",
+        side="long",
+        status="entered",
+        score=320,
+        reasons=("same_chat", "same_symbol", "same_side"),
+        lifecycle_summary={"id": lifecycle_id},
+        binding_summary={"id": lifecycle_id},
+        verified_leg_summaries=(),
+        risk_state=risk_state,
+        live_verified_pos_ids=(f"pos-{lifecycle_id}",) if risk_state == "current_risk" else (),
+        pending_entry_leg_ids=(),
+        uncertain_entry_leg_ids=(lifecycle_id,) if risk_state == "uncertain_risk" else (),
+    )
+
+
+def _context_exit_decision(
+    *,
+    thread_ids=(63,),
+    action="exit_full",
+    confidence=0.62,
+    supporting=(4167, 4168),
+) -> ContextResolutionDecision:
+    return ContextResolutionDecision(
+        decision="exit_thread",
+        target_thread_ids=tuple(thread_ids),
+        management_action=action,
+        confidence=confidence,
+        supporting_message_ids=tuple(supporting),
+        opposing_message_ids=(),
+        conflict_types=("multiple_candidates",),
+        risk_reducing_fanout_allowed=len(thread_ids) > 1,
+        reanalysis_triggers=(),
+        reason="63100没站稳，求稳就找机会出局",
+    )
+
+
+def test_dabiaoke_4168_projects_exact_exit_despite_ghost_lifecycle(tmp_path):
+    session_factory = create_session_factory(tmp_path / "dabiaoke-4168.db")
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=88,
+            message_id=4168,
+            text="63100没站稳，求稳就找机会出局",
+        )
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:88:4167:BTC:long",
+            kol_id="group:88",
+            chat_id=88,
+            message_id=4167,
+            symbol="BTC",
+            side="long",
+            status="active",
+            pos_id="pos-4167",
+        )
+        session.add_all([raw, binding])
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=4167,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 8, 3, 7, 50, tzinfo=UTC),
+            execution_binding_id=binding.id,
+        )
+        session.add(lifecycle)
+        session.commit()
+        raw_id = raw.id
+        lifecycle_id = lifecycle.id
+
+    mimo = MimoAuthoritativeResult(
+        raw_message_id=raw_id,
+        payload={
+            "recognition_result": "非策略",
+            "strategy": {},
+            "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+            "confidence": 0.62,
+        },
+        input_kind="text",
+        model="mimo-v2.5",
+        status="非策略",
+    )
+    current = _context_candidate(
+        thread_id=63,
+        lifecycle_id=lifecycle_id,
+        root_message_id=4167,
+        risk_state="current_risk",
+    )
+    ghost = _context_candidate(
+        thread_id=51,
+        lifecycle_id=4139,
+        root_message_id=4139,
+        risk_state="no_current_risk",
+    )
+    decision = _context_exit_decision()
+    resolved = _resolved_mimo_result(
+        mimo,
+        decision,
+        (current, ghost),
+        current_message_id=4168,
+    )
+    assessment = AuthoritativeAssessment(
+        raw_message_id=raw_id,
+        mimo=resolved,
+        deepseek_payload=None,
+        agreement_status="pending",
+        differences=[],
+        authoritative_generation="dabiaoke-4168",
+        context_resolution=decision,
+    )
+
+    result = apply_authoritative_assessment(session_factory, assessment)
+
+    assert result.status == "非策略"
+    assert resolved.payload["lifecycle_event"]["confidence"] == 0.62
+    with session_factory() as session:
+        candidate = session.query(SignalCandidate).one()
+        item = session.query(MessageInstructionItem).one()
+    assert candidate.target_lifecycle_id == lifecycle_id
+    assert candidate.management_action == "full_exit"
+    assert candidate.confidence == pytest.approx(0.62)
+    assert item.instruction_kind == "management"
+
+
+@pytest.mark.parametrize(
+    ("decision", "competitor_risk"),
+    [
+        (_context_exit_decision(confidence=0.59), "no_current_risk"),
+        (_context_exit_decision(thread_ids=(63, 64)), "no_current_risk"),
+        (_context_exit_decision(), "current_risk"),
+        (_context_exit_decision(), "uncertain_risk"),
+        (_context_exit_decision(action="exit_partial"), "no_current_risk"),
+        (_context_exit_decision(supporting=(4168,)), "no_current_risk"),
+        (_context_exit_decision(supporting=(4167,)), "no_current_risk"),
+    ],
+)
+def test_exact_context_exit_rejects_every_broader_low_confidence_case(
+    decision,
+    competitor_risk,
+):
+    mimo = MimoAuthoritativeResult(
+        raw_message_id=900,
+        payload={
+            "recognition_result": "非策略",
+            "strategy": {},
+            "lifecycle_event": {
+                "event_type": "exit_position",
+                "_exact_context_risk_reduction_authorized": True,
+                "confidence": 0.99,
+            },
+        },
+        input_kind="text",
+        model="mimo-v2.5",
+        status="非策略",
+    )
+    candidates = (
+        _context_candidate(
+            thread_id=63,
+            lifecycle_id=693,
+            root_message_id=4167,
+            risk_state="current_risk",
+        ),
+        _context_candidate(
+            thread_id=64,
+            lifecycle_id=694,
+            root_message_id=4139,
+            risk_state=competitor_risk,
+        ),
+    )
+
+    resolved = _resolved_mimo_result(
+        mimo,
+        decision,
+        candidates,
+        current_message_id=4168,
+    )
+
+    assert resolved.payload["lifecycle_event"]["event_type"] == "none"
+    assert "_exact_context_risk_reduction_authorized" not in resolved.payload[
+        "lifecycle_event"
+    ]
 from telegram_kol_research.source_message_deletion import record_source_message_deleted
 
 

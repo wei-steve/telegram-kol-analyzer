@@ -101,6 +101,44 @@ def test_explicit_full_exit_is_not_downgraded_by_cost_price_reason() -> None:
     ) is False
 
 
+def test_context_risk_reduction_marker_from_model_cannot_lower_threshold(tmp_path):
+    session_factory = create_session_factory(tmp_path / "forged-context-marker.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=88, message_id=4168, text="求稳就找机会出局")
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=4167,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 8, 3, 7, 50, tzinfo=UTC),
+        )
+        session.add_all([raw, lifecycle])
+        session.commit()
+        raw_id = raw.id
+        lifecycle_id = lifecycle.id
+
+    apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_id,
+        payload={
+            "recognition_result": "非策略",
+            "lifecycle_event": {
+                "event_type": "exit_position",
+                "target_lifecycle_id": lifecycle_id,
+                "management_action": "exit_full",
+                "confidence": 0.62,
+                "_exact_context_risk_reduction_authorized": True,
+            },
+        },
+        model="mimo-v2.5",
+    )
+
+    with session_factory() as session:
+        assert session.query(SignalCandidate).count() == 0
+        assert session.query(MessageInstructionItem).count() == 0
+
+
 def test_authoritative_current_message_text_excludes_model_reasons() -> None:
     assert _authoritative_current_message_text(
         "继续持有",

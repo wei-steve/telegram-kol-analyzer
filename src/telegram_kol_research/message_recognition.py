@@ -1035,6 +1035,25 @@ def _call_lifecycle_event_ai(
     return lifecycle if isinstance(lifecycle, dict) else parsed
 
 
+def _is_authorized_exact_context_risk_reduction(
+    decision: dict[str, Any],
+    confidence: float,
+) -> bool:
+    """Recognize the narrow internal exception created by context resolution."""
+
+    return (
+        decision.get("_exact_context_risk_reduction_authorized") is True
+        and 0.60 <= confidence < 0.70
+        and str(decision.get("event_type") or "")
+        in {"exit_position", "exit_full", "full_exit", "close_position"}
+        and str(decision.get("management_action") or "")
+        in {"exit_full", "full_exit"}
+        and _int_or_none(decision.get("target_lifecycle_id")) is not None
+        and decision.get("_explicit_multi_target") is not True
+        and decision.get("targets") in (None, [])
+    )
+
+
 def _apply_lifecycle_event_decision(
     session,
     raw_message: RawMessage,
@@ -1072,8 +1091,16 @@ def _apply_lifecycle_event_decision(
         confidence = float(decision.get("confidence") or 0.0)
     except (TypeError, ValueError):
         confidence = 0.0
-    if event_type == "none" or confidence < 0.7:
+    if event_type == "none" or (
+        confidence < 0.7
+        and not _is_authorized_exact_context_risk_reduction(decision, confidence)
+    ):
         return False
+    exact_context_confidence = (
+        confidence
+        if _is_authorized_exact_context_risk_reduction(decision, confidence)
+        else None
+    )
     if _looks_like_trading_education_content(raw_message.text or ""):
         return False
     if event_type == "exit_position" and _exit_decision_looks_like_management_update(
@@ -1203,6 +1230,7 @@ def _apply_lifecycle_event_decision(
             management_action="full_exit",
             management_fraction=None,
             recognition_generation=authoritative_generation,
+            confidence=exact_context_confidence,
         )
         _remember_applied_candidate(session, candidate, applied_candidate_ids)
         return True
@@ -1229,6 +1257,7 @@ def _apply_lifecycle_event_decision(
                 management_action=normalized_management_action,
                 management_fraction=management_fraction,
                 recognition_generation=authoritative_generation,
+                confidence=exact_context_confidence,
             )
             _remember_applied_candidate(session, candidate, applied_candidate_ids)
             return True
@@ -1248,6 +1277,7 @@ def _apply_lifecycle_event_decision(
             management_action=normalized_management_action,
             management_fraction=management_fraction,
             recognition_generation=authoritative_generation,
+            confidence=exact_context_confidence,
         )
         _remember_applied_candidate(session, candidate, applied_candidate_ids)
         return True
@@ -1811,7 +1841,10 @@ def _apply_deterministic_management_scope_if_matched(
         confidence = float(decision.get("confidence") or 0.0)
     except (TypeError, ValueError):
         confidence = 0.0
-    if confidence < 0.7 or _looks_like_trading_education_content(
+    if (
+        confidence < 0.7
+        and not _is_authorized_exact_context_risk_reduction(decision, confidence)
+    ) or _looks_like_trading_education_content(
         raw_message.text or ""
     ):
         return False
@@ -2262,6 +2295,7 @@ def apply_authoritative_mimo_payload(
     model: str,
     error_message: str | None = None,
     authoritative_generation: str | None = None,
+    _exact_context_risk_reduction_authorized: bool = False,
 ) -> MessageRecognitionResult:
     """Persist only the authoritative MiMo interpretation."""
 
@@ -2302,10 +2336,15 @@ def apply_authoritative_mimo_payload(
             return result
 
         lifecycle_event = (
-            payload.get("lifecycle_event")
+            dict(payload["lifecycle_event"])
             if isinstance(payload.get("lifecycle_event"), dict)
             else {"event_type": "none", "confidence": 0.0}
         )
+        lifecycle_event.pop("_exact_context_risk_reduction_authorized", None)
+        if _exact_context_risk_reduction_authorized:
+            lifecycle_event["_exact_context_risk_reduction_authorized"] = True
+        payload = dict(payload)
+        payload["lifecycle_event"] = lifecycle_event
         current_message_text = _authoritative_current_message_text(
             raw_message.text,
             payload,
@@ -2349,6 +2388,8 @@ def apply_authoritative_mimo_payload(
                     applied_candidate_ids=accepted_candidate_ids,
                     current_message_text=current_message_text,
                 )
+
+        lifecycle_event.pop("_exact_context_risk_reduction_authorized", None)
 
         result = _result_from_ai_payload(
             raw_message_id=raw_message_id,
@@ -3490,6 +3531,7 @@ def _upsert_close_signal_candidate(
     management_action: str | None = None,
     management_fraction: float | None = None,
     recognition_generation: str | None = None,
+    confidence: float | None = None,
 ) -> SignalCandidate:
     desired = {
         "symbol": lifecycle.symbol,
@@ -3531,7 +3573,11 @@ def _upsert_close_signal_candidate(
     if editable:
         for field, value in desired.items():
             setattr(candidate, field, value)
-        candidate.confidence = max(candidate.confidence or 0.0, 0.85)
+        candidate.confidence = (
+            float(confidence)
+            if confidence is not None
+            else max(candidate.confidence or 0.0, 0.85)
+        )
     return candidate
 
 

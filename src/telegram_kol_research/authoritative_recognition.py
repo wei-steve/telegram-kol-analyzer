@@ -85,6 +85,9 @@ ENTERED_HOLDER_LANGUAGE = (
     "保本",
     "继续持有",
 )
+EXACT_CONTEXT_RISK_REDUCTION_MARKER = (
+    "_exact_context_risk_reduction_authorized"
+)
 
 
 @dataclass(frozen=True)
@@ -380,14 +383,29 @@ def _resolved_mimo_result(
     mimo: MimoAuthoritativeResult,
     decision: ContextResolutionDecision,
     candidates: Sequence[StrategyThreadCandidate],
+    *,
+    current_message_id: int,
 ) -> MimoAuthoritativeResult:
     payload = dict(mimo.payload)
+    original_lifecycle_event = payload.get("lifecycle_event")
+    if isinstance(original_lifecycle_event, Mapping):
+        original_lifecycle_event = dict(original_lifecycle_event)
+        original_lifecycle_event.pop(EXACT_CONTEXT_RISK_REDUCTION_MARKER, None)
+        payload["lifecycle_event"] = original_lifecycle_event
     original_strategy = mimo.payload.get("strategy")
     context_payload = decision.to_dict()
     payload["_context_resolution"] = context_payload
     if decision.decision == "new_thread":
         return replace(mimo, payload=payload)
-    if decision.confidence < 0.7 or decision.decision in {"hold", "unresolved"}:
+    exact_risk_reduction_authorized = _authorizes_exact_context_risk_reduction(
+        decision,
+        candidates,
+        current_message_id=current_message_id,
+    )
+    if (
+        decision.confidence < 0.7
+        and not exact_risk_reduction_authorized
+    ) or decision.decision in {"hold", "unresolved"}:
         payload.update(
             recognition_result="非策略",
             reason=decision.reason or "context resolution produced no executable action",
@@ -436,6 +454,8 @@ def _resolved_mimo_result(
         ]
     if decision.management_action is not None:
         lifecycle_event["management_action"] = decision.management_action
+    if exact_risk_reduction_authorized:
+        lifecycle_event[EXACT_CONTEXT_RISK_REDUCTION_MARKER] = True
     payload.update(
         recognition_result="非策略",
         reason=decision.reason,
@@ -444,6 +464,42 @@ def _resolved_mimo_result(
         confidence=decision.confidence,
     )
     return replace(mimo, payload=payload, status="非策略")
+
+
+def _authorizes_exact_context_risk_reduction(
+    decision: ContextResolutionDecision,
+    candidates: Sequence[StrategyThreadCandidate],
+    *,
+    current_message_id: int,
+) -> bool:
+    """Authorize only one fully evidenced, exact, risk-reducing exit."""
+
+    if (
+        decision.decision != "exit_thread"
+        or decision.management_action != "exit_full"
+        or not 0.60 <= float(decision.confidence) < 0.70
+        or len(decision.target_thread_ids) != 1
+    ):
+        return False
+    target_thread_id = int(decision.target_thread_ids[0])
+    matching = [
+        candidate
+        for candidate in candidates
+        if int(candidate.thread_id) == target_thread_id
+    ]
+    if len(matching) != 1 or matching[0].risk_state != "current_risk":
+        return False
+    if any(
+        candidate.risk_state != "no_current_risk"
+        for candidate in candidates
+        if int(candidate.thread_id) != target_thread_id
+    ):
+        return False
+    supporting = {int(message_id) for message_id in decision.supporting_message_ids}
+    return {
+        int(current_message_id),
+        int(matching[0].root_message_id),
+    }.issubset(supporting)
 
 
 def _link_context_resolution(
@@ -585,7 +641,12 @@ def assess_message_authoritatively(
                         )
                     ),
                 )
-                mimo = _resolved_mimo_result(mimo, context_decision, candidates)
+                mimo = _resolved_mimo_result(
+                    mimo,
+                    context_decision,
+                    candidates,
+                    current_message_id=int(context_window.current.message_id),
+                )
                 _link_context_resolution(
                     session_factory,
                     raw_message_id=raw_message_id,
@@ -652,6 +713,15 @@ def apply_authoritative_assessment(
         model=assessment.mimo.model,
         error_message=assessment.mimo.error_message,
         authoritative_generation=assessment.authoritative_generation,
+        _exact_context_risk_reduction_authorized=(
+            assessment.context_resolution is not None
+            and assessment.context_resolution.decision == "exit_thread"
+            and isinstance(assessment.mimo.payload.get("lifecycle_event"), dict)
+            and assessment.mimo.payload["lifecycle_event"].get(
+                EXACT_CONTEXT_RISK_REDUCTION_MARKER
+            )
+            is True
+        ),
     )
     if result.status == "是策略":
         _ensure_entry_strategy_thread(
