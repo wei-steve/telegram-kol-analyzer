@@ -93,29 +93,38 @@ stop and keep automatic management frozen.
 
 ### 2026-08-03 production monitor history recovery
 
-- Reviewed/deployed commit: `4eb6ea3d41dbdf93816dbbd5459c59cc1be34d6f`.
+- Reviewed/deployed commit: `1401f0ff92a4e84c6de13e2eeba888807ec44e52`.
   The service is active, the loopback settings endpoint returns HTTP `200`, and
   the post-deployment warning journal is empty.
 - Local verification passed the complete suite with the one documented legacy
-  CLI monitor smoke case deselected. Production focused verification passed
-  `251 passed, 1 deselected`.
+  CLI monitor smoke case deselected. The final local recovery-focused suite
+  passed `254 passed, 1 deselected`; post-deployment production verification
+  passed `180 passed, 1 deselected` for the recovery, monitor, and CLI smoke
+  coverage.
 - The trading-settings fingerprint stayed
   `27c3be58cf009c0d041d4e4f3ef504b88f8a5cf7f82cd0fd5aab471ebfd31d29`
   across both deployments. Stop rescue remained effective `live`; no trading
   setting changed.
 - The stable post-deployment management audit classifies 38 completed
   fail-closed rows as `terminal_blocked`, with zero actionable `blocked`, zero
-  `partial_failed`, four `recovery_required`, and zero `submit_unknown`.
+  `partial_failed`, two `recovery_required`, and zero `submit_unknown`. The
+  scheduled monitor therefore remains intentionally non-green with only
+  `audit_abnormal`; it is reporting the two genuine unresolved rows rather than
+  the 38 terminal historical rows.
 - Exact dry runs converged batch 28 from restored-protection history after both
   exact positions were absent, batch 38 from one exact filled close order plus
-  exact position absence, and batch 86 from complete no-submission evidence.
-  The workflow appended exactly three `management_history_recovery` events and
-  zero exchange-submission events.
-- Batches 17, 22, 23, and 40 remain unchanged as `recovery_required`. Their
-  exact historical close orders were absent from the complete bounded exchange
-  history, so the operator workflow refused with
-  `exact_terminal_order_evidence_missing`. Position absence alone was not used
-  to guess the outcome.
+  exact position absence, batch 86 from complete no-submission evidence, and
+  batches 23 and 40 from exact closed-position history whose position ID, full
+  closed size, timestamp, durable successful submission response, exchange
+  order ID, and client order ID all matched. The workflow appended exactly five
+  `management_history_recovery` events and zero other execution events after
+  the first recovery.
+- Batches 17 and 22 remain unchanged as `recovery_required`. Their available
+  closed-position history represents a larger whole-position close than each
+  originally planned partial close, and no exact terminal order is available.
+  The operator workflow therefore still refuses with
+  `exact_terminal_order_evidence_missing`; it does not attribute a whole close
+  to a smaller planned partial close by symbol, side, or timing.
 - The apply for batch 28 occurred while eight new raw messages were inside the
   two-minute observation window because the first shell wrapper did not stop
   after its read-only gate returned nonzero. At that point execution ownership,
