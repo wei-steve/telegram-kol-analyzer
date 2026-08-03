@@ -263,6 +263,13 @@ _MANAGEMENT_ALERT_STATES = (
     "partial_failed",
     "recovery_required",
 )
+_TRANSIENT_MANAGEMENT_SNAPSHOT_REASONS = frozenset(
+    {
+        "source_snapshots_differ",
+        "source_component_changed_during_read",
+        "source_component_set_changed",
+    }
+)
 _SAFE_TOKEN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _MAX_MANAGEMENT_PAYLOAD_CHARS = 65_536
 _MAX_MANAGEMENT_PAYLOAD_BYTES = 262_144
@@ -530,12 +537,16 @@ def _build_stable_private_snapshots(
         second_root = temporary_root / "snapshot-2"
         first = _capture_source_components(database_path, first_root)
         second = _capture_source_components(database_path, second_root)
+    except ManagementAuditSnapshotError as exc:
+        if exc.reason in _TRANSIENT_MANAGEMENT_SNAPSHOT_REASONS:
+            return _build_sqlite_online_snapshot(database_path, temporary_root)
+        raise
     except OSError as exc:
         raise ManagementAuditSnapshotError(
             "source_copy_failed", status="snapshot_unavailable"
         ) from exc
     if set(first) != set(second) or any(first[name] != second[name] for name in first):
-        raise ManagementAuditSnapshotError("source_snapshots_differ")
+        return _build_sqlite_online_snapshot(database_path, temporary_root)
     first_path = first_root / "audit.db"
     second_path = second_root / "audit.db"
     _validate_private_snapshot(first_path)
@@ -545,6 +556,36 @@ def _build_stable_private_snapshots(
         "snapshot_validation": "ok",
         "snapshot_copies_verified": 2,
         "snapshot_components": sorted(first),
+    }
+
+
+def _build_sqlite_online_snapshot(
+    database_path: Path,
+    temporary_root: Path,
+) -> tuple[Path, dict]:
+    """Use SQLite's online backup API when live WAL churn defeats file copies."""
+
+    backup_root = temporary_root / "sqlite-online-backup"
+    backup_root.mkdir(mode=0o700)
+    snapshot_path = backup_root / "audit.db"
+    source_uri = database_path.resolve().as_uri() + "?mode=ro"
+    try:
+        with sqlite3.connect(source_uri, uri=True, timeout=30) as source:
+            source.execute("PRAGMA query_only = ON")
+            with sqlite3.connect(snapshot_path) as destination:
+                source.backup(destination, pages=1024, sleep=0.01)
+                destination.commit()
+        _fsync_private_component(snapshot_path)
+        _validate_private_snapshot(snapshot_path)
+    except (OSError, sqlite3.Error) as exc:
+        raise ManagementAuditSnapshotError(
+            "sqlite_online_backup_failed", status="snapshot_unavailable"
+        ) from exc
+    return snapshot_path, {
+        "snapshot_status": "stable",
+        "snapshot_validation": "ok",
+        "snapshot_copies_verified": 1,
+        "snapshot_components": ["sqlite_online_backup"],
     }
 
 

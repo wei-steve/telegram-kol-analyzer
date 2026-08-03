@@ -457,7 +457,7 @@ def test_audit_management_batches_is_bounded_redacted_and_read_only(
         )
         connection.commit()
 
-    before = database_path.read_bytes()
+    before = database_path.read_bytes(), database_path.stat()
     monkeypatch.setattr(
         cli_module,
         "build_deepcoin_client_from_env",
@@ -545,7 +545,8 @@ def test_audit_management_batches_is_bounded_redacted_and_read_only(
     assert "signal:" in text_result.stdout
     assert "pos-secret" not in text_result.stdout
     assert "strategy-secret" not in text_result.stdout
-    assert database_path.read_bytes() == before
+    assert database_path.read_bytes() == before[0]
+    assert database_path.stat() == before[1]
 
 
 def test_audit_management_batches_classifies_informational_hold_as_non_alerting(
@@ -1043,7 +1044,7 @@ def test_audit_management_batches_active_wal_read_only_source_is_unchanged(tmp_p
         connection.close()
 
 
-def test_audit_management_batches_fails_closed_when_snapshot_changes(
+def test_audit_management_batches_recovers_when_snapshot_changes(
     tmp_path, monkeypatch
 ):
     import telegram_kol_research.cli as cli_module
@@ -1076,10 +1077,47 @@ def test_audit_management_batches_fails_closed_when_snapshot_changes(
         ],
     )
 
-    assert result.exit_code == 1
+    assert result.exit_code == 0
     payload = json.loads(result.stdout)
-    assert payload["snapshot_status"] == "snapshot_unstable"
-    assert payload["batches"] == []
+    assert payload["snapshot_status"] == "stable"
+    assert payload["snapshot_components"] == ["sqlite_online_backup"]
+
+
+def test_audit_management_batches_uses_online_backup_after_component_churn(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.cli as cli_module
+
+    database_path = tmp_path / "churning.db"
+    create_session_factory(database_path)
+    before = database_path.read_bytes(), database_path.stat()
+    monkeypatch.setattr(
+        cli_module,
+        "_capture_source_components",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            cli_module.ManagementAuditSnapshotError(
+                "source_component_changed_during_read"
+            )
+        ),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "audit-management-batches",
+            "--database-path",
+            str(database_path),
+            "--output-format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["snapshot_status"] == "stable"
+    assert payload["snapshot_components"] == ["sqlite_online_backup"]
+    assert database_path.read_bytes() == before[0]
+    assert database_path.stat() == before[1]
 
 
 def test_audit_management_batches_fails_closed_on_rollback_journal(tmp_path):
