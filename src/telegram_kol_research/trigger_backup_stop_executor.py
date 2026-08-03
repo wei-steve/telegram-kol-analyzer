@@ -24,7 +24,10 @@ from telegram_kol_research.native_tpsl import match_native_tpsl_order
 from telegram_kol_research.native_tpsl import normalize_native_tpsl
 from telegram_kol_research.position_attribution import has_authoritative_persisted_position
 from telegram_kol_research.position_mutation_gateway import submit_exact_position_sltp
-from telegram_kol_research.position_protection_legs import bind_verified_exchange_order
+from telegram_kol_research.position_protection_legs import (
+    bind_verified_exchange_order,
+    protection_write_block_reason,
+)
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.trigger_backup_stop import BackupStopError
@@ -298,6 +301,13 @@ def _plan_submission(
         )
     if str(binding.status or "").lower() not in {"open", "active"}:
         return _blocked_plan(binding_id, leg_id, pos_id, "binding_not_active")
+    if block_reason := protection_write_block_reason(session, pos_id=pos_id):
+        return _blocked_plan(
+            binding_id,
+            leg_id,
+            pos_id,
+            f"backup_{block_reason}",
+        )
     if _is_manual_operator_binding(leg):
         return _blocked_plan(binding_id, leg_id, pos_id, "manual_binding")
     if not has_authoritative_persisted_position(leg, session=session):

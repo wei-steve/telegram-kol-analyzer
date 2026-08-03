@@ -30,6 +30,7 @@ from telegram_kol_research.models import (
     ExecutionEvent,
     ExecutionOrderLeg,
     PositionProtectionLedger,
+    PositionProtectionLeg,
     RawMessage,
     StrategyLifecycle,
     StrategyManagementBatch,
@@ -53,6 +54,10 @@ from telegram_kol_research.protection_attribution import (
     snapshot_protection_rows,
 )
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
+from telegram_kol_research.position_protection_legs import (
+    bind_filled_position,
+    bind_verified_exchange_order,
+)
 from telegram_kol_research.protection_revisions import record_replacing_protection_revision
 from telegram_kol_research.protection_ledger import list_verified_account_ledger_rows
 from telegram_kol_research.strategy_management_batches import (
@@ -251,6 +256,28 @@ def execute_trigger_protection_stop_rescue(
             evidence={"rescue_id": rescue.id, "intent_id": intent.id, "response": response},
             seen_at=now,
         )
+        primary = (
+            session.query(PositionProtectionLeg)
+            .filter(
+                PositionProtectionLeg.execution_order_leg_id == int(leg.id),
+                PositionProtectionLeg.role == "primary_stop",
+                PositionProtectionLeg.leg_index == 1,
+            )
+            .one_or_none()
+        )
+        if primary is not None:
+            bind_filled_position(session, primary, pos_id=rescue.pos_id)
+            bind_verified_exchange_order(
+                session,
+                primary,
+                exchange_order_id=order_id,
+                readback_evidence={
+                    "source": "trigger_protection_stop_rescue",
+                    "rescue_id": int(rescue.id),
+                    "order_id": order_id,
+                    "pos_id": rescue.pos_id,
+                },
+            )
         transition_trigger_protection_intent(
             session, intent, recovery_state="adopted", adopted_order_id=order_id
         )
@@ -266,6 +293,9 @@ def execute_trigger_protection_stop_rescue(
             ),
             session=session,
         )
+        rescue.status = "verified"
+        rescue.reason_code = "rescue_stop_verified"
+        rescue.updated_at = now
         session.commit()
         return _trigger_protection_rescue_result(rescue)
 

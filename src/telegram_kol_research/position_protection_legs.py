@@ -8,10 +8,64 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from telegram_kol_research.models import ExecutionOrderLeg, PositionProtectionLeg
+from telegram_kol_research.models import (
+    BoundPositionCloseReservation,
+    ExecutionOrderLeg,
+    PositionMutationIntent,
+    PositionProtectionLeg,
+    StrategyManagementBatch,
+    StrategyManagementLeg,
+)
 
 
 _ROLES = frozenset({"primary_stop", "backup_stop", "take_profit"})
+
+
+def protection_write_block_reason(session: Session, *, pos_id: str) -> str | None:
+    """Return a closed reason when an exact close or mutation owns the position."""
+
+    if (
+        session.query(BoundPositionCloseReservation.id)
+        .filter(BoundPositionCloseReservation.pos_id == str(pos_id))
+        .filter(
+            BoundPositionCloseReservation.status.in_(
+                ("reserved", "submitted", "submit_unknown", "recovery_required")
+            )
+        )
+        .first()
+        is not None
+    ):
+        return "close_in_progress"
+    if (
+        session.query(PositionMutationIntent.id)
+        .filter(PositionMutationIntent.pos_id == str(pos_id))
+        .filter(
+            PositionMutationIntent.status.in_(
+                ("reserved", "submitted", "recovery_required")
+            )
+        )
+        .first()
+        is not None
+    ):
+        return "position_mutation_in_progress"
+    if (
+        session.query(StrategyManagementLeg.id)
+        .join(
+            StrategyManagementBatch,
+            StrategyManagementBatch.id
+            == StrategyManagementLeg.management_batch_id,
+        )
+        .filter(StrategyManagementLeg.pos_id == str(pos_id))
+        .filter(
+            StrategyManagementBatch.status.not_in(
+                ("succeeded", "blocked", "resolved")
+            )
+        )
+        .first()
+        is not None
+    ):
+        return "management_in_progress"
+    return None
 
 
 def create_or_get_protection_leg(
@@ -176,6 +230,9 @@ def bind_verified_filled_position_protection(
     )
     for row in rows:
         bind_filled_position(session, row, pos_id=normalized_pos_id)
+        if row.status == "waiting_fill" and not row.exchange_order_id:
+            row.status = "protection_recovery_pending"
+            _touch(row)
     return rows
 
 

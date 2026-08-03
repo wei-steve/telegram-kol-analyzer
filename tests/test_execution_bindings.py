@@ -1237,7 +1237,7 @@ def test_reconcile_binds_verified_fill_to_planned_protection_before_child_adopti
         ).all()
         assert {row.pos_id for row in rows} == {"pos-1"}
         assert all(row.exchange_order_id is None for row in rows)
-        assert all(row.status == "waiting_fill" for row in rows)
+        assert all(row.status == "protection_recovery_pending" for row in rows)
 
 
 @pytest.mark.parametrize("recovery_state", ["failed", "submitting", "resolved"])

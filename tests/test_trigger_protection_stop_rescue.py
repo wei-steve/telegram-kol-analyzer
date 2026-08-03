@@ -17,9 +17,11 @@ from telegram_kol_research.models import (
     TriggerProtectionIntent,
     TriggerProtectionStopRescue,
     PositionProtectionIncident,
+    PositionProtectionLeg,
     BoundPositionCloseReservation,
 )
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
+from telegram_kol_research.position_protection_legs import create_or_get_protection_leg
 from telegram_kol_research.trading_settings import save_trading_settings
 
 
@@ -101,6 +103,18 @@ def test_rescue_submits_stop_only_and_persists_exact_order_before_retry(tmp_path
 
     session_factory = create_session_factory(tmp_path / "research.db")
     intent_id = _saved_deferred_intent(session_factory)
+    with session_factory() as session:
+        intent = session.get(TriggerProtectionIntent, intent_id)
+        create_or_get_protection_leg(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=int(intent.execution_order_leg_id),
+            role="primary_stop",
+            leg_index=1,
+            planned_trigger_price="65000",
+            planned_size=None,
+        )
+        session.commit()
     client = _Client()
 
     planned = plan_trigger_protection_stop_rescue(
@@ -111,7 +125,7 @@ def test_rescue_submits_stop_only_and_persists_exact_order_before_retry(tmp_path
         session_factory, rescue_id=planned.rescue_id, deepcoin_client=client, executed_at=NOW
     )
 
-    assert result["status"] == "submitted"
+    assert result["status"] == "verified"
     assert client.calls == [{
         "instType": "SWAP", "instId": "BTC-USDT-SWAP", "posId": "pos-1", "posSide": "short",
         "mrgPosition": "split", "tdMode": "cross", "slTriggerPx": "65000",
@@ -121,8 +135,15 @@ def test_rescue_submits_stop_only_and_persists_exact_order_before_retry(tmp_path
     retry = execute_trigger_protection_stop_rescue(
         session_factory, rescue_id=planned.rescue_id, deepcoin_client=client, executed_at=NOW
     )
-    assert retry["status"] == "submitted"
+    assert retry["status"] == "verified"
     assert len(client.calls) == 1
+    with session_factory() as session:
+        primary = session.query(PositionProtectionLeg).one()
+        rescue = session.get(TriggerProtectionStopRescue, planned.rescue_id)
+    assert primary.status == "verified"
+    assert primary.pos_id == "pos-1"
+    assert primary.exchange_order_id == "rescue-sl-1"
+    assert rescue.status == "verified"
 
 
 def test_rescue_refuses_unverified_legacy_position_without_exchange_write(tmp_path):
@@ -375,7 +396,7 @@ def test_rescue_worker_obeys_separate_mode_and_shadow_never_writes(
         assert result.planned == 1
         assert result.executed == 1
         assert len(rescues) == 1
-        assert rescues[0].status == "submitted"
+        assert rescues[0].status == "verified"
         assert len(client.calls) == 1
 
 

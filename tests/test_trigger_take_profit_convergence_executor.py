@@ -178,6 +178,47 @@ def test_plan_waits_until_exact_backup_stop_is_verified(tmp_path):
     )
 
 
+def test_take_profit_convergence_never_races_reserved_close(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import (
+        BoundPositionCloseReservation,
+        TriggerTakeProfitConvergence,
+    )
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        plan_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "tp-close-wins.db")
+    convergence_id = _ready_convergence(
+        session_factory,
+        existing_take_profit=False,
+    )
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        session.add(
+            BoundPositionCloseReservation(
+                pos_id="pos-10",
+                execution_binding_id=convergence.execution_binding_id,
+                status="reserved",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+    client = _Client()
+
+    plan = plan_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        planned_at=NOW,
+    )
+
+    assert plan.status == "conflicted"
+    assert plan.reason_code == "convergence_close_in_progress"
+    assert client.submit_calls == []
+
+
 def test_plan_refuses_backup_order_without_persisted_exact_close_position(tmp_path):
     from telegram_kol_research.db import create_session_factory
     from telegram_kol_research.models import PositionBackupStopOrder, TriggerTakeProfitConvergence
@@ -242,6 +283,41 @@ def test_plan_replaces_only_exact_leg_take_profits(tmp_path):
     assert all("slTriggerPx" not in payload for payload in plan.payloads)
     assert all(payload["tpOrdPx"] == "-1" for payload in plan.payloads)
     assert [payload["sz"] for payload in plan.payloads] == ["5", "3", "2"]
+
+
+def test_rescued_fourteen_contract_leg_never_overallocates_take_profits(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        plan_trigger_take_profit_convergence,
+    )
+
+    class FourteenContractClient(_Client):
+        def __init__(self):
+            super().__init__()
+            self.pending[0]["sz"] = "14"
+
+        def list_positions(self, *, inst_id=None):
+            rows = super().list_positions(inst_id=inst_id)
+            rows[0]["pos"] = "14"
+            return rows
+
+    session_factory = create_session_factory(tmp_path / "fourteen-contracts.db")
+    convergence_id = _ready_convergence(
+        session_factory,
+        existing_take_profit=False,
+    )
+
+    plan = plan_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=FourteenContractClient(),
+        planned_at=NOW,
+    )
+
+    assert plan.status == "ready"
+    sizes = [int(payload["sz"]) for payload in plan.payloads]
+    assert sizes == [7, 4, 3]
+    assert sum(sizes) == 14
 
 
 def test_plan_accepts_exact_full_position_primary_stop_with_zero_size(tmp_path):

@@ -130,7 +130,7 @@ def run_trigger_protection_rescue_tick(
                 deepcoin_client=deepcoin_client,
                 executed_at=now,
             )
-            if result["status"] == "submitted":
+            if result["status"] in {"submitted", "verified"}:
                 counts["executed"] += 1
             elif result["status"] in {"submit_unknown", "recovery_required"}:
                 counts["recovery_required"] += 1

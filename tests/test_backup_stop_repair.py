@@ -12,6 +12,7 @@ from telegram_kol_research.execution_bindings import (
     upsert_execution_order_leg,
 )
 from telegram_kol_research.models import (
+    BoundPositionCloseReservation,
     ExecutionOrderLeg,
     PositionBackupStopOrder,
     PositionProtectionLedger,
@@ -144,6 +145,38 @@ def test_repair_plan_flags_local_active_backup_missing_from_exchange(tmp_path):
     )
     assert plan.actions == ()
     assert plan.conflicts == ({"pos_id": "pos-1", "reason": "backup_stop_missing_on_exchange"},)
+
+
+def test_automatic_backup_stop_never_races_reserved_close(tmp_path):
+    from telegram_kol_research.trigger_backup_stop_executor import (
+        submit_verified_trigger_backup_stops,
+    )
+
+    session_factory = create_session_factory(tmp_path / "backup-close-wins.db")
+    _seed(session_factory)
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).one()
+        session.add(
+            BoundPositionCloseReservation(
+                pos_id="pos-1",
+                execution_binding_id=leg.execution_binding_id,
+                status="reserved",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+    client = _Client(verify_after_submit=True)
+
+    submitted = submit_verified_trigger_backup_stops(
+        session_factory,
+        client=client,
+        contract_spec_provider=_provider(),
+        submitted_at=NOW,
+    )
+
+    assert submitted == 0
+    assert client.set_position_sltp_payloads == []
 
 
 def test_targeted_backup_repair_gate_ignores_unrelated_conflicts():

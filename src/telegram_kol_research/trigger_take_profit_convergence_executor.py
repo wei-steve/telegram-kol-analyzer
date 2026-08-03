@@ -20,6 +20,7 @@ from telegram_kol_research.models import (
     utc_now,
 )
 from telegram_kol_research.position_authority_lock import serialized_position_authority_mutation
+from telegram_kol_research.position_protection_legs import protection_write_block_reason
 from telegram_kol_research.position_mutation_gateway import (
     exact_position_write_gate,
     submit_exact_position_sltp,
@@ -334,6 +335,8 @@ def _prepare_plan(session, *, convergence, deepcoin_client, contract_spec_provid
     ):
         return "convergence_exact_leg_not_verified"
     pos_id = str(convergence.pos_id)
+    if block_reason := protection_write_block_reason(session, pos_id=pos_id):
+        return f"convergence_{block_reason}"
     inst_id = f"{str(binding.symbol).upper()}-USDT-SWAP"
     try:
         positions = deepcoin_client.list_positions(inst_id=inst_id)
