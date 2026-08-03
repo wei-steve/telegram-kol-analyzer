@@ -5336,6 +5336,73 @@ def test_monitor_incident_writer_reloads_capture_policy_per_request(tmp_path):
     ).json()["captured"] == 1
 
 
+def test_monitor_incident_writer_does_not_use_shared_asyncio_executor(
+    tmp_path,
+    monkeypatch,
+):
+    token = "m" * 43
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            monitor_capture_token=token,
+        ),
+    )
+
+    async def shared_executor_is_saturated(*args, **kwargs):
+        raise AssertionError("shared asyncio executor used")
+
+    monkeypatch.setattr(
+        web_app_module.asyncio,
+        "to_thread",
+        shared_executor_is_saturated,
+    )
+    response = TestClient(app, client=("127.0.0.1", 50000)).post(
+        "/api/runtime-incidents/monitor-capture",
+        headers={"x-monitor-capture-token": token},
+        json={
+            "schema_version": 1,
+            "checked_at": "2026-08-03T00:00:00+00:00",
+            "reason_codes": [],
+            "adapter_failures": [],
+            "notification_error": None,
+        },
+    )
+
+    assert response.status_code == 200
+
+
+def test_monitor_incident_writer_cancellation_waits_for_worker_completion():
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def writer():
+        started.set()
+        release.wait(timeout=5)
+        finished.set()
+        return 1
+
+    async def scenario():
+        task = asyncio.create_task(
+            web_app_module._run_monitor_capture_writer(writer)
+        )
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.001)
+        assert started.is_set()
+        task.cancel()
+        await asyncio.sleep(0.01)
+        assert task.done() is False
+        assert finished.is_set() is False
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert finished.is_set() is True
+
+    asyncio.run(scenario())
+
+
 def test_runtime_agent_exchange_snapshot_endpoint_hides_close_failures(
     tmp_path,
 ):

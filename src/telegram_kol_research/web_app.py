@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Callable
 import asyncio
+import concurrent.futures
 import hashlib
 import hmac
 import json
@@ -256,6 +257,30 @@ REFRESH_TIMEOUT_SECONDS = 180
 MESSAGE_PAGE_SIZE = 20
 SESSION_LOCK_OWNER_PID_PATTERN = re.compile(r"owner pid=(\d+)")
 logger = logging.getLogger(__name__)
+
+
+async def _run_monitor_capture_writer(writer: Callable[[], int]) -> int:
+    """Run one writer outside the saturated shared executor and drain on cancel."""
+
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="monitor-incident-capture",
+    )
+    loop = asyncio.get_running_loop()
+    future = loop.run_in_executor(executor, writer)
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        while not future.done():
+            try:
+                await asyncio.shield(future)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        raise
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 _TELEGRAM_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 _MANAGEMENT_SECRET_MARKERS = (
@@ -4362,7 +4387,9 @@ def create_web_app(
                 )
                 return captured
 
-            captured = await asyncio.to_thread(persist_capture_projection)
+            captured = await _run_monitor_capture_writer(
+                persist_capture_projection
+            )
             return {"accepted": True, "captured": captured}
         finally:
             app.state.monitor_incident_capture_lock.release()
