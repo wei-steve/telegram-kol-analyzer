@@ -457,7 +457,7 @@ def test_fengge_exit_applies_mimo_while_execution_gate_is_pending(tmp_path, monk
         exit_message = RawMessage(
             chat_id=-1002409877375,
             message_id=8401,
-            text="现价62800附近出局，空仓等待。",
+            text="",
             posted_at=datetime(2026, 7, 13, 4, 21, 50, tzinfo=UTC),
         )
         session.add_all([entry, exit_message])
@@ -495,16 +495,16 @@ def test_fengge_exit_applies_mimo_while_execution_gate_is_pending(tmp_path, monk
         "reason": "当前消息要求出局",
         "strategy": {},
         "lifecycle_event": {
-            "event_type": "exit_position",
+            "event_type": "position_update",
             "target_lifecycle_id": lifecycle_id,
             "symbol": "BTC",
             "side": "short",
             "exit_price": 62800,
             "confidence": 0.95,
-            "reason": "现价出局",
+            "reason": "当前图片是对已有BTC空单的仓位管理",
         },
         "input_reading": {
-            "observed_text": "现价62800附近出局，空仓等待。",
+            "observed_text": "BTC空单，目前成本价附近，出局吧",
             "image_quality": "none",
         },
         "confidence": 0.95,
@@ -545,6 +545,7 @@ def test_fengge_exit_applies_mimo_while_execution_gate_is_pending(tmp_path, monk
     assert result.parse_source == "mimo_authoritative"
     with session_factory() as session:
         candidate = session.query(SignalCandidate).one()
+        item = session.query(MessageInstructionItem).one()
         assert candidate.event_type == "close_signal"
         assert candidate.symbol == "BTC"
         assert candidate.side == "short"
@@ -553,6 +554,8 @@ def test_fengge_exit_applies_mimo_while_execution_gate_is_pending(tmp_path, monk
         assert candidate.management_action == "full_exit"
         assert candidate.management_fraction is None
         assert candidate.recognition_generation == assessment.authoritative_generation
+        assert item.instruction_kind == "management"
+        assert item.signal_candidate_id == candidate.id
         decision = session.query(RecognitionDecision).one()
         assert decision.authoritative_model == "mimo-v2.5"
         assert decision.agreement_status == "pending"

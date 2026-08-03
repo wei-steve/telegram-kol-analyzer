@@ -8,8 +8,10 @@ from telegram_kol_research.ai_recognition_config import AiProviderConfig, AiReco
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.message_recognition import (
     _apply_lifecycle_event_decision,
+    _authoritative_current_message_text,
     _chat_completions_url,
     _ensure_lifecycle_record,
+    _exit_decision_looks_like_management_update,
     _load_lifecycle_event_context,
     _management_action_for_exit_downgrade,
     _parse_explicit_exit_signal,
@@ -86,6 +88,28 @@ def test_exit_downgrade_treats_andy_add_on_breakeven_message_as_combined_managem
         _chat_completions_url("https://api.deepseek.com")
         == "https://api.deepseek.com/v1/chat/completions"
     )
+
+
+def test_explicit_full_exit_is_not_downgraded_by_cost_price_reason() -> None:
+    assert _exit_decision_looks_like_management_update(
+        "",
+        {
+            "event_type": "exit_position",
+            "management_action": "exit_full",
+            "reason": "当前消息明确指示BTC空单成本价附近出局",
+        },
+    ) is False
+
+
+def test_authoritative_current_message_text_excludes_model_reasons() -> None:
+    assert _authoritative_current_message_text(
+        "继续持有",
+        {
+            "reason": "建议全部出局",
+            "input_reading": {"observed_text": "保护成本"},
+            "lifecycle_event": {"reason": "全平"},
+        },
+    ) == "继续持有\n保护成本"
 
 
 def test_normalize_management_intent_extracts_explicit_management_fraction():
@@ -437,6 +461,92 @@ def test_authoritative_prudent_exit_accepts_empty_targets_for_single_lifecycle(t
     assert candidate.target_lifecycle_id == lifecycle_id
     assert candidate.management_action == "full_exit"
     assert item.instruction_kind == "management"
+
+
+def test_authoritative_image_only_exit_uses_current_observed_text(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=4125,
+            posted_at=datetime(2026, 8, 3, 4, 6, tzinfo=UTC),
+            text="",
+        )
+        strategy_id = "deepcoin:88:4100:BTC:short"
+        binding = ExecutionBinding(
+            strategy_instance_id=strategy_id,
+            kol_id="group:88",
+            chat_id=88,
+            message_id=4100,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            pos_id="pos-feiyang",
+            status="active",
+        )
+        session.add_all([raw_message, binding])
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=4100,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 8, 3, 2, tzinfo=UTC),
+            entered_at=datetime(2026, 8, 3, 2, 1, tzinfo=UTC),
+            execution_binding_id=binding.id,
+        )
+        session.add_all(
+            [
+                lifecycle,
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    strategy_instance_id=strategy_id,
+                    leg_index=1,
+                    purpose="entry",
+                    order_kind="market",
+                    order_id="order-feiyang",
+                    pos_id="pos-feiyang",
+                    status="active",
+                    attribution_status="verified",
+                ),
+            ]
+        )
+        session.flush()
+        raw_message_id = raw_message.id
+        lifecycle_id = lifecycle.id
+        session.commit()
+
+    result = apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload={
+            "recognition_result": "非策略",
+            "input_reading": {
+                "observed_text": "BTC空单，目前成本价附近，出局吧",
+            },
+            "lifecycle_event": {
+                "event_type": "position_update",
+                "target_lifecycle_id": lifecycle_id,
+                "symbol": "BTC",
+                "side": "short",
+                "confidence": 0.95,
+                "reason": "当前图片是对已有BTC空单的仓位管理",
+            },
+        },
+        model="mimo-v2.5",
+        authoritative_generation="image-only-full-exit-4125",
+    )
+
+    assert result.status == "非策略"
+    with session_factory() as session:
+        candidate = session.query(SignalCandidate).one()
+        item = session.query(MessageInstructionItem).one()
+    assert candidate.event_type == "close_signal"
+    assert candidate.management_action == "full_exit"
+    assert candidate.target_lifecycle_id == lifecycle_id
+    assert item.instruction_kind == "management"
+    assert item.signal_candidate_id == candidate.id
 
 
 def test_authoritative_empty_targets_without_single_lifecycle_stays_fail_closed(tmp_path):

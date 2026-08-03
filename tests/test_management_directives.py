@@ -170,6 +170,56 @@ def test_full_exit_and_cancel_entry_are_risk_reducing() -> None:
     assert cancel_entry.cancel_deferred_entries is True
 
 
+@pytest.mark.parametrize(
+    "action",
+    ["exit_full", "full_exit", "close_position"],
+)
+def test_structured_full_exit_action_survives_position_update_alias(
+    action: str,
+) -> None:
+    directive = resolve_management_directive(
+        text="",
+        lifecycle_event={
+            "event_type": "position_update",
+            "management_action": action,
+            "symbol": "BTC",
+            "side": "short",
+            "reason": "BTC 空单成本价附近出局",
+        },
+    )
+
+    assert directive.intent == "full_exit"
+    assert directive.risk_reducing is True
+    assert directive.cancel_deferred_entries is True
+
+
+def test_holding_language_near_cost_is_not_a_close() -> None:
+    directive = resolve_management_directive(
+        text="BTC空单目前成本价附近，继续拿着",
+        lifecycle_event={
+            "event_type": "position_update",
+            "symbol": "BTC",
+            "side": "short",
+        },
+    )
+
+    assert directive.intent == "none"
+
+
+def test_partial_protective_language_is_not_a_full_close() -> None:
+    directive = resolve_management_directive(
+        text="BTC空单减仓一半，剩余仓位保护成本",
+        lifecycle_event={
+            "event_type": "position_update",
+            "symbol": "BTC",
+            "side": "short",
+        },
+    )
+
+    assert directive.intent == "partial_then_break_even"
+    assert directive.intent != "full_exit"
+
+
 def test_cancel_pending_orders_wording_is_a_cancel_entry_directive() -> None:
     directive = resolve_management_directive(
         text="已经有入场的继续拿着，取消挂单",

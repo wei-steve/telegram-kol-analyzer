@@ -40,6 +40,7 @@ from telegram_kol_research.message_instruction_items import (
     create_message_instruction_items_in_session,
 )
 from telegram_kol_research.management_directives import (
+    FULL_EXIT_ACTIONS,
     resolve_management_directive,
 )
 from telegram_kol_research.management_scope import (
@@ -1042,7 +1043,13 @@ def _apply_lifecycle_event_decision(
     parse_source: str = "lifecycle_ai",
     authoritative_generation: str | None = None,
     applied_candidate_ids: set[int] | None = None,
+    current_message_text: str | None = None,
 ) -> bool:
+    instruction_text = (
+        raw_message.text or ""
+        if current_message_text is None
+        else current_message_text
+    )
     target_decisions = _expand_lifecycle_event_targets(decision)
     if target_decisions is None:
         return False
@@ -1056,6 +1063,7 @@ def _apply_lifecycle_event_decision(
                 parse_source=parse_source,
                 authoritative_generation=authoritative_generation,
                 applied_candidate_ids=applied_candidate_ids,
+                current_message_text=instruction_text,
             ) or applied
         return applied
 
@@ -1069,7 +1077,7 @@ def _apply_lifecycle_event_decision(
     if _looks_like_trading_education_content(raw_message.text or ""):
         return False
     if event_type == "exit_position" and _exit_decision_looks_like_management_update(
-        raw_message.text,
+        instruction_text,
         decision,
     ):
         decision = dict(decision)
@@ -1077,7 +1085,7 @@ def _apply_lifecycle_event_decision(
         decision["event_type"] = event_type
         if not str(decision.get("management_action") or "").strip():
             decision["management_action"] = _management_action_for_exit_downgrade(
-                raw_message.text,
+                instruction_text,
                 decision,
             )
         if not decision.get("take_profit") and decision.get("exit_price"):
@@ -1086,7 +1094,7 @@ def _apply_lifecycle_event_decision(
 
     try:
         management_directive = resolve_management_directive(
-            text=raw_message.text or "",
+            text=instruction_text,
             lifecycle_event=decision,
         )
         if management_directive.intent == "none":
@@ -1384,36 +1392,45 @@ def _exit_decision_looks_like_management_update(
     text: str | None,
     decision: dict[str, Any],
 ) -> bool:
-    combined = _combined_lifecycle_text(text, decision)
+    management_action = str(decision.get("management_action") or "").strip().lower()
+    if management_action in FULL_EXIT_ACTIONS:
+        return False
+    event_type = str(decision.get("event_type") or "").strip().lower()
+    if event_type in {"exit_full", "full_exit", "close_position"}:
+        return False
+    instruction_text = " ".join((str(text or ""), management_action)).lower()
     if _has_full_exit_instruction(str(text or "").lower()):
         return False
-    return _has_partial_take_profit_terms(combined) or _has_protective_stop_terms(combined)
+    return _has_partial_take_profit_terms(
+        instruction_text
+    ) or _has_protective_stop_terms(instruction_text)
+
+
+def _authoritative_current_message_text(
+    raw_text: str | None,
+    payload: Mapping[str, Any],
+) -> str:
+    input_reading = payload.get("input_reading")
+    input_reading = input_reading if isinstance(input_reading, Mapping) else {}
+    observed_text = str(input_reading.get("observed_text") or "").strip()
+    parts = [str(raw_text or "").strip(), observed_text]
+    return "\n".join(dict.fromkeys(part for part in parts if part))
 
 
 def _management_action_for_exit_downgrade(
     text: str | None,
     decision: dict[str, Any],
 ) -> str:
-    combined = _combined_lifecycle_text(text, decision)
-    has_protective_stop = _has_protective_stop_terms(combined)
-    if "平加仓" in combined and has_protective_stop:
+    management_action = str(decision.get("management_action") or "").strip().lower()
+    instruction_text = " ".join((str(text or ""), management_action)).lower()
+    has_protective_stop = _has_protective_stop_terms(instruction_text)
+    if "平加仓" in instruction_text and has_protective_stop:
         return "partial_take_profit, move_stop_to_protect"
     if has_protective_stop:
         return "move_stop_to_protect"
-    if _has_partial_take_profit_terms(combined):
+    if _has_partial_take_profit_terms(instruction_text):
         return "partial_take_profit"
     return "position_update"
-
-
-def _combined_lifecycle_text(text: str | None, decision: dict[str, Any]) -> str:
-    return " ".join(
-        str(part or "")
-        for part in (
-            text,
-            decision.get("reason"),
-            decision.get("management_action"),
-        )
-    ).lower()
 
 
 def _has_full_exit_instruction(text: str) -> bool:
@@ -1780,8 +1797,15 @@ def _apply_deterministic_management_scope_if_matched(
     parse_source: str,
     authoritative_generation: str | None,
     applied_candidate_ids: set[int] | None,
+    current_message_text: str | None = None,
 ) -> bool:
     """Fan out only deterministic risk reductions to verified live positions."""
+
+    instruction_text = (
+        raw_message.text or ""
+        if current_message_text is None
+        else current_message_text
+    )
 
     try:
         confidence = float(decision.get("confidence") or 0.0)
@@ -1805,13 +1829,14 @@ def _apply_deterministic_management_scope_if_matched(
                 parse_source=parse_source,
                 authoritative_generation=authoritative_generation,
                 applied_candidate_ids=applied_candidate_ids,
+                current_message_text=instruction_text,
             ) or applied
         return applied
 
     scoped_decision = dict(decision)
     if str(scoped_decision.get("event_type") or "") == "exit_position" and (
         _exit_decision_looks_like_management_update(
-            raw_message.text,
+            instruction_text,
             scoped_decision,
         )
     ):
@@ -1819,7 +1844,7 @@ def _apply_deterministic_management_scope_if_matched(
         if not str(scoped_decision.get("management_action") or "").strip():
             scoped_decision["management_action"] = (
                 _management_action_for_exit_downgrade(
-                    raw_message.text,
+                    instruction_text,
                     scoped_decision,
                 )
             )
@@ -1831,7 +1856,7 @@ def _apply_deterministic_management_scope_if_matched(
         scoped_decision["exit_price"] = None
     if not scoped_decision.get("stop_loss"):
         explicit_stop_loss = _extract_explicit_stop_loss_from_management_text(
-            raw_message.text
+            instruction_text
         )
         if explicit_stop_loss is not None:
             scoped_decision["stop_loss"] = explicit_stop_loss
@@ -1843,7 +1868,7 @@ def _apply_deterministic_management_scope_if_matched(
         and raw_management_action
         in {"adjust_stop_loss", "adjust_position_tpsl", "risk_update"}
         and _should_move_stop_to_protect(
-            current_text=raw_message.text,
+            current_text=instruction_text,
             decision=scoped_decision,
             management_action=raw_management_action,
         )
@@ -1852,7 +1877,7 @@ def _apply_deterministic_management_scope_if_matched(
 
     try:
         directive = resolve_management_directive(
-            text=raw_message.text or "",
+            text=instruction_text,
             lifecycle_event=scoped_decision,
         )
     except ValueError as exc:
@@ -1910,6 +1935,7 @@ def _apply_deterministic_management_scope_if_matched(
             parse_source=parse_source,
             authoritative_generation=authoritative_generation,
             applied_candidate_ids=applied_candidate_ids,
+            current_message_text=instruction_text,
         ) or applied
     return applied
 
@@ -2280,6 +2306,10 @@ def apply_authoritative_mimo_payload(
             if isinstance(payload.get("lifecycle_event"), dict)
             else {"event_type": "none", "confidence": 0.0}
         )
+        current_message_text = _authoritative_current_message_text(
+            raw_message.text,
+            payload,
+        )
         event_type = str(lifecycle_event.get("event_type") or "none")
         lifecycle_applied = _apply_low_confidence_group_exit_if_matched(
             session,
@@ -2306,6 +2336,7 @@ def apply_authoritative_mimo_payload(
                         parse_source="mimo_authoritative",
                         authoritative_generation=authoritative_generation,
                         applied_candidate_ids=accepted_candidate_ids,
+                        current_message_text=current_message_text,
                     )
                 )
             if not lifecycle_applied and not management_event:
@@ -2316,6 +2347,7 @@ def apply_authoritative_mimo_payload(
                     parse_source="mimo_authoritative",
                     authoritative_generation=authoritative_generation,
                     applied_candidate_ids=accepted_candidate_ids,
+                    current_message_text=current_message_text,
                 )
 
         result = _result_from_ai_payload(

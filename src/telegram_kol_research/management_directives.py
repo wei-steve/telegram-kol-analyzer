@@ -11,6 +11,7 @@ from typing import Any
 
 DEFAULT_PARTIAL_CLOSE_FRACTION = 0.50
 DEFAULT_TAIL_CLOSE_FRACTION = 0.80
+FULL_EXIT_ACTIONS = frozenset({"exit_full", "full_exit", "close_position"})
 
 _PARTIAL_TERMS = (
     "第一止盈",
@@ -52,6 +53,7 @@ _FULL_EXIT_TERMS = (
     "清仓",
     "止损出局",
     "止盈出局",
+    "出局吧",
 )
 _CANCEL_ENTRY_TERMS = (
     "策略先取消",
@@ -89,13 +91,7 @@ def resolve_management_directive(
     normalized_text = str(text or "").strip().lower()
     event_type = str(lifecycle_event.get("event_type") or "").strip().lower()
     raw_action = str(lifecycle_event.get("management_action") or "").strip().lower()
-    combined = " ".join(
-        (
-            normalized_text,
-            str(lifecycle_event.get("reason") or "").strip().lower(),
-            raw_action,
-        )
-    )
+    combined = " ".join((normalized_text, raw_action))
     symbol = _normalized_optional(lifecycle_event.get("symbol"), upper=True)
     side = _normalized_optional(lifecycle_event.get("side"), upper=False)
     stop_loss = _normalized_optional(lifecycle_event.get("stop_loss"), upper=False)
@@ -150,7 +146,7 @@ def resolve_management_directive(
 
     if event_type in {
         "exit_position", "exit_full", "full_exit", "close_position",
-    } or (
+    } or raw_action in FULL_EXIT_ACTIONS or (
         any(term in combined for term in _FULL_EXIT_TERMS)
         and not any(
             term in combined

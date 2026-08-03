@@ -173,6 +173,14 @@ Design and implementation references:
 
 All production recognition paths use MiMo as the authority for text and media. A successful MiMo decision is first persisted as unclaimable `execution_pending`. Immediately before the existing lifecycle safety and automation path, that exact generation must atomically claim durable ownership with `execution_pending -> execution_running`. A newer recognition may replace an unclaimed pending generation, but cannot overwrite a running generation; if an older generation loses the claim, it performs no lifecycle mutation or auto-trade. Only the exact running generation may persist its automation outcome and transition to claimable `pending` (or back to `completed` for an unchanged completed comparison). A post-submit outcome-write failure intentionally remains `execution_running`, blocking duplicate execution until recovery. DeepSeek semantic comparison runs later in the Web service worker and never sits on the execution critical path. MiMo failure blocks automatic mutation, is notified independently, and does not create a semantic-review job; its terminal audit write uses the same durable status/token guard and is rejected before apply/auto/audit mutation when another generation owns `execution_running`.
 
+Executable current-message evidence is limited to the Telegram raw text plus
+MiMo's authoritative `input_reading.observed_text` for the current image. Model
+`reason` fields are explanatory and never become instruction text. An exact
+structured `exit_full` action cannot be downgraded merely because its rationale
+mentions `成本价`. Projection and execution still require the existing exact
+lifecycle target, verified Deepcoin position ownership, fresh position
+preflight, and idempotent execution claim; symbol/side fallback is forbidden.
+
 MiMo authoritative recognition makes one immediate retry for transient provider
 failures and invalid/schema-incomplete model responses before writing a
 terminal `authoritative_failed` decision. Local deterministic failures such as

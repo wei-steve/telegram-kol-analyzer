@@ -601,6 +601,15 @@ Pending legacy management signals are audit-only. Do not claim, execute, or
 convert them during deployment. Deepcoin triggered-limit lineage is a separate
 branch and must not be repaired or migrated by this rollout.
 
+For image-only position management, treat only the source message text and the
+current MiMo `input_reading.observed_text` as executable wording. Never use a
+model `reason` field to infer a close, partial close, or stop change. Structured
+`exit_full` remains authoritative even when the explanation mentions `成本价`,
+but it must still pass the exact lifecycle, verified `posId`, fresh Deepcoin
+snapshot, and execution-idempotency gates. If any ownership evidence is missing
+or conflicting, stop at the existing safe refusal; never select another
+position by symbol and side.
+
 ## 9. Test the Project
 
 Run the current automated test suite:
