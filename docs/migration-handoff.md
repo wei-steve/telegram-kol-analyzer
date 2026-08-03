@@ -64,6 +64,32 @@ stop and keep automatic management frozen.
   Unknown or conflicting history remains visible as `uncertain_risk` for manual
   review and is never silently removed from current-risk competition.
 
+### 2026-08-03 delayed-entry rescue shadow rollout
+
+- Reviewed/deployed commit: `fa1a1c85d113c59c567b9f66c97560afdad9bd7d`.
+- Production service restarted at `2026-08-03 19:27:51 CST`; subsequent
+  service state was `active`, the local HTTP health request returned `200`, and
+  the post-restart warning journal was empty.
+- The production focused suite passed: `603 passed` with deprecation warnings
+  only.
+- The pre-restart safe-window check found zero running recognition decisions,
+  zero management submissions, zero active/unknown position mutations, zero
+  active stop rescues, and zero new messages in the final two-minute window.
+  Historical residue was listed separately: one old `partial_failed` and six
+  old `recovery_required` management batches, 29 old submitted close
+  reservations, three old pending instruction items, and one old unknown item.
+  None of the live positions intersected an active close reservation or rescue.
+- Stop rescue was absent from persisted settings before deployment, therefore
+  `disabled` by default during restart. After passive health and test checks,
+  only `trigger_protection_stop_rescue_mode` changed to `shadow`; every other
+  trading setting compared equal before and after the update.
+- Shadow baseline and immediate post-enable counts were both zero rescue rows
+  and zero `stop_rescue_shadow_ready` incidents. No natural message or eligible
+  trigger-fill sample arrived after deployment, so natural-sample shadow
+  evidence remains pending. Do not enable `live` until a later explicit
+  approval reviews an organically produced shadow sample and confirms zero
+  Deepcoin writes.
+
 ## Handoff checklist
 
 - Read `AGENTS.md`, `docs/runbook.md`, and `docs/server-deployment.md`.
