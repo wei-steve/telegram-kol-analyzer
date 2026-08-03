@@ -2875,6 +2875,22 @@ def _load_execution_strategy_items(
         SignalCandidate,
         StrategyLifecycle,
     )
+    from telegram_kol_research.runtime_incident_scanner import (
+        _critical_unprotected_positions_in_session,
+    )
+
+    critical_by_binding: dict[int, list[dict[str, object]]] = {}
+    if selected_status == "holding":
+        for risk in _critical_unprotected_positions_in_session(session, limit=100):
+            critical_by_binding.setdefault(
+                int(risk["execution_binding_id"]), []
+            ).append({
+                "execution_order_leg_id": int(risk["execution_order_leg_id"]),
+                "pos_id": str(risk["pos_id"]),
+                "planned_stop": risk["planned_stop"],
+                "exposure_started_at": risk["exposure_started_at"],
+                "rescue_state": risk["rescue_state"],
+            })
 
     lifecycle_status = {
         "holding": "entered",
@@ -2939,6 +2955,13 @@ def _load_execution_strategy_items(
             group_label=labels.get(int(lc.chat_id), str(lc.chat_id)),
             selected_status=selected_status,
         )
+        unprotected_positions = (
+            critical_by_binding.get(int(binding.id), [])
+            if binding is not None
+            else []
+        )
+        item["critical_unprotected"] = bool(unprotected_positions)
+        item["unprotected_positions"] = unprotected_positions
         _apply_lifecycle_display_fields(item, lc, raw_msg, session=session)
         items.append(item)
         if len(items) >= limit:

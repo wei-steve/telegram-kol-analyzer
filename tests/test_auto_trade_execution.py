@@ -522,6 +522,21 @@ def _seed_verified_positions(session_factory, *, chat_id: int, count: int) -> No
             binding_id=binding_id,
             pos_id=f"pos-{chat_id}-{index}",
         )
+        with session_factory() as session:
+            leg = session.query(ExecutionOrderLeg).filter_by(
+                execution_binding_id=binding_id
+            ).one()
+            session.add(PositionProtectionLedger(
+                venue="deepcoin", execution_binding_id=binding_id,
+                execution_order_leg_id=leg.id,
+                strategy_instance_id=f"deepcoin:{chat_id}:{1000 + index}:BTC:long",
+                pos_id=f"pos-{chat_id}-{index}", instrument_id="BTC-USDT-SWAP",
+                side="long", order_id=f"stop-{chat_id}-{index}",
+                purpose="stop_loss", trigger_price="67000", size_text="0",
+                status="verified", evidence_source="test_fixture", evidence_json="{}",
+                last_verified_at=datetime.now(UTC),
+            ))
+            session.commit()
 
 
 def test_count_group_effective_positions_uses_distinct_verified_active_entry_legs(tmp_path):
@@ -806,6 +821,68 @@ def test_group_position_limit_blocks_entry_before_exchange_access(tmp_path):
         payload = json.loads(event.request_json)
         assert payload["current_position_count"] == 4
         assert payload["max_concurrent_positions"] == 4
+
+
+def test_new_entry_is_blocked_by_critical_unprotected_position_in_same_chat(tmp_path):
+    session_factory = create_session_factory(tmp_path / "critical-entry-gate.db")
+    raw_message_id = _persist_candidate(session_factory)
+    save_trading_settings(session_factory, {
+        "auto_trade_enabled": True, "allowed_symbols": ["BTC", "ETH"],
+    })
+    binding_id = upsert_execution_binding(
+        session_factory,
+        ExecutionBindingRecord(
+            strategy_instance_id="deepcoin:100:54:ETH:long", kol_id="group:100",
+            chat_id=100, message_id=54, symbol="ETH", side="long",
+            venue="deepcoin", status="active",
+        ),
+    )
+    _verify_bound_position(session_factory, binding_id=binding_id, pos_id="pos-naked")
+    client = _TickerForbiddenDeepcoinClient()
+
+    result = auto_process_message_trade_signal(
+        session_factory, raw_message_id=raw_message_id, group_config=_group_config(),
+        deepcoin_client=client, contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 8, 3, 8, 1, tzinfo=UTC),
+    )
+
+    assert result == {
+        "status": "blocked",
+        "reason": "critical_unprotected_position_in_chat",
+        "pos_ids": ["pos-naked"],
+    }
+    assert client.ticker_calls == 0
+
+
+def test_critical_unprotected_position_does_not_block_other_chat_entry(tmp_path):
+    session_factory = create_session_factory(tmp_path / "critical-entry-other-chat.db")
+    raw_message_id = _persist_candidate(session_factory)
+    save_trading_settings(session_factory, {
+        "auto_trade_enabled": True,
+        "allowed_symbols": ["BTC", "ETH"],
+        "symbol_entry_thresholds": {"BTC": {
+            "market_leg_threshold": "0", "first_limit_offset": "0", "second_limit_offset": "0",
+        }},
+    })
+    binding_id = upsert_execution_binding(
+        session_factory,
+        ExecutionBindingRecord(
+            strategy_instance_id="deepcoin:200:54:ETH:long", kol_id="group:200",
+            chat_id=200, message_id=54, symbol="ETH", side="long",
+            venue="deepcoin", status="active",
+        ),
+    )
+    _verify_bound_position(session_factory, binding_id=binding_id, pos_id="pos-other-chat-naked")
+    client = _FakeDeepcoinClient()
+
+    result = auto_process_message_trade_signal(
+        session_factory, raw_message_id=raw_message_id, group_config=_group_config(),
+        deepcoin_client=client, contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 8, 3, 8, 1, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    assert len(client.trigger_orders) == 2
 
 
 def test_group_position_limit_isolated_by_chat_below_boundary_reaches_submission(tmp_path):

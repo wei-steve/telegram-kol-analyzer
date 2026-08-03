@@ -56,6 +56,19 @@ def evaluate_rule(rule_id: str, facts: Mapping[str, Any]) -> InvariantObservatio
         "abnormal": outcome == "abnormal",
         "transition_window_expired": bool(facts.get("transition_window_expired", False)),
     }
+    if rule_id == "active_position_missing_protection_v1":
+        for key in (
+            "chat_id",
+            "strategy_instance_id",
+            "execution_binding_id",
+            "execution_order_leg_id",
+            "planned_stop",
+            "exposure_started_at",
+            "rescue_state",
+        ):
+            value = facts.get(key)
+            if value is None or isinstance(value, (str, int, float, bool)):
+                summary[key] = value
     return InvariantObservation(
         rule_id=rule_id,
         rule_version="1",

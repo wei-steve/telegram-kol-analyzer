@@ -29,6 +29,7 @@ from telegram_kol_research.execution_bindings import (
     upsert_execution_order_leg,
 )
 from telegram_kol_research.models import (
+    BoundPositionCloseReservation,
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
@@ -37,6 +38,7 @@ from telegram_kol_research.models import (
     PositionProtectionLedger,
     PositionReconciliationObservation,
     PositionProtectionRevision,
+    PositionMutationIntent,
     PendingTpslSnapshotObservation,
     StrategyLifecycle,
     TriggerProtectionIntent,
@@ -5034,6 +5036,78 @@ def test_reconcile_then_sync_closes_a_previously_verified_missing_position(tmp_p
     assert lifecycle.exit_reason == "manual"
     assert leg.status == "manually_closed"
     assert leg.terminal_reason == "manual_position_missing"
+
+
+def test_confirmed_close_mutation_converges_reservation_without_closing_live_sibling(tmp_path):
+    session_factory = create_session_factory(tmp_path / "close-reservation.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            strategy_instance_id="deepcoin:100:55:BTC:long",
+            pos_id="pos-closed,pos-live", status="active",
+        ),
+    )
+    _add_entry_leg(
+        session_factory, binding_id, leg_index=1, pos_id="pos-closed",
+        status="active", attribution_status="verified",
+    )
+    _add_entry_leg(
+        session_factory, binding_id, leg_index=2, order_id="order-2",
+        client_order_id="client-2", pos_id="pos-live", status="active",
+        attribution_status="verified",
+    )
+    now = datetime(2026, 8, 3, 8, 0)
+    with session_factory() as session:
+        closed_leg = session.query(ExecutionOrderLeg).filter_by(pos_id="pos-closed").one()
+        closed_leg.response_json = json.dumps({"posId": "pos-closed"})
+        session.add(BoundPositionCloseReservation(
+            pos_id="pos-closed", execution_binding_id=binding_id, status="submitted",
+        ))
+        session.add(PositionMutationIntent(
+            idempotency_key="close-pos-closed", venue="deepcoin",
+            operation="close_position", strategy_instance_id="deepcoin:100:55:BTC:long",
+            execution_binding_id=binding_id, execution_order_leg_id=closed_leg.id,
+            pos_id="pos-closed", authority_fingerprint="a" * 64,
+            request_fingerprint="b" * 64, status="submitted", request_json="{}",
+            reserved_at=now, submitted_at=now,
+        ))
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return [{"posId": "pos-live", "pos": "2"}]
+
+        def list_position_history(self, *, inst_id, pos_id=None):
+            assert pos_id == "pos-closed"
+            return []
+
+    sync_manual_closed_deepcoin_positions(
+        session_factory, client=FakeClient(), synced_at=now,
+    )
+    with session_factory() as session:
+        closed_leg = session.query(ExecutionOrderLeg).filter_by(pos_id="pos-closed").one()
+        reservation = session.query(BoundPositionCloseReservation).one()
+        mutation = session.query(PositionMutationIntent).one()
+        assert closed_leg.attribution_status == "evidence_unavailable"
+        assert reservation.status == "submitted"
+        mutation.status = "confirmed"
+        mutation.confirmed_at = now + timedelta(minutes=1)
+        session.commit()
+    sync_manual_closed_deepcoin_positions(
+        session_factory, client=FakeClient(), synced_at=now + timedelta(minutes=1),
+    )
+
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        closed_leg = session.query(ExecutionOrderLeg).filter_by(pos_id="pos-closed").one()
+        live_leg = session.query(ExecutionOrderLeg).filter_by(pos_id="pos-live").one()
+        reservation = session.query(BoundPositionCloseReservation).one()
+    assert (closed_leg.status, closed_leg.terminal_reason) == (
+        "manually_closed", "manual_position_missing",
+    )
+    assert reservation.status == "confirmed"
+    assert binding.status == "active"
+    assert live_leg.status == "active"
 
 
 def test_reconcile_records_complete_owned_position_observation(tmp_path):

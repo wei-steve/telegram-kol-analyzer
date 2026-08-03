@@ -7,11 +7,13 @@ from telegram_kol_research.models import (
     ExecutionOrderLeg,
     RawMessage,
     StrategyLifecycle,
+    PositionProtectionLeg,
     TriggerProtectionIntent,
     TriggerProtectionStopRescue,
 )
 from telegram_kol_research.web_queries import (
     _build_lifecycle_event_timeline,
+    list_execution_strategy_overview,
     load_home_event_rows,
 )
 
@@ -169,3 +171,47 @@ def test_lifecycle_timeline_projects_safe_trigger_protection_recovery(tmp_path):
         "refusal=- · stop_rescue=none"
     )
     assert "must-not-render" not in str(recovery)
+
+
+def test_holding_dashboard_surfaces_critical_unprotected_position(tmp_path):
+    session_factory = create_session_factory(tmp_path / "dashboard-risk.db")
+    started = datetime(2026, 8, 3, 8, 0, tzinfo=UTC)
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:10:20:BTC:long", kol_id="group:10",
+            chat_id=10, message_id=20, symbol="BTC", side="long",
+            venue="deepcoin", status="active",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            execution_binding_id=binding.id, chat_id=10, message_id=20,
+            symbol="BTC", side="long", lifecycle_status="entered",
+            signal_at=started, entered_at=started,
+        )
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id, strategy_instance_id=binding.strategy_instance_id,
+            leg_index=0, purpose="entry", order_kind="market", pos_id="pos-risk",
+            attribution_status="verified", status="active", last_verified_at=started,
+            created_at=started, updated_at=started,
+        )
+        session.add_all([lifecycle, leg])
+        session.flush()
+        session.add(PositionProtectionLeg(
+            venue="deepcoin", execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id, role="primary_stop", leg_index=1,
+            planned_trigger_price="67500", pos_id="pos-risk", status="planned",
+        ))
+        session.commit()
+
+    overview = list_execution_strategy_overview(session_factory, status="holding")
+
+    item = overview["items"][0]
+    assert item["critical_unprotected"] is True
+    assert item["unprotected_positions"] == [{
+        "execution_order_leg_id": 1,
+        "pos_id": "pos-risk",
+        "planned_stop": "67500",
+        "exposure_started_at": started.replace(tzinfo=None).isoformat(),
+        "rescue_state": "not_planned",
+    }]

@@ -448,6 +448,20 @@ def _auto_process_single_message_trade_signal(
             processed_at=now,
         )
 
+    from telegram_kol_research.runtime_incident_scanner import (
+        list_critical_unprotected_positions,
+    )
+
+    unprotected = list_critical_unprotected_positions(
+        session_factory, chat_id=int(raw_message.chat_id), limit=20
+    )
+    if unprotected:
+        return {
+            "status": "blocked",
+            "reason": "critical_unprotected_position_in_chat",
+            "pos_ids": [str(row["pos_id"]) for row in unprotected],
+        }
+
     current_position_count = _count_group_effective_positions(
         session_factory,
         chat_id=raw_message.chat_id,

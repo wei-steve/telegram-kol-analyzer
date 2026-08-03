@@ -24,6 +24,7 @@ from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import PositionAttributionAudit
 from telegram_kol_research.models import PositionProtectionLedger
+from telegram_kol_research.models import PositionMutationIntent
 from telegram_kol_research.models import StrategyManagementBatch
 from telegram_kol_research.models import StrategyManagementLeg
 from telegram_kol_research.models import TriggerProtectionIntent
@@ -648,7 +649,9 @@ def _apply_reconcile_snapshot(
             str(pos_id)
             for (pos_id,) in (
                 session.query(BoundPositionCloseReservation.pos_id)
-                .filter(BoundPositionCloseReservation.status == "reserved")
+                .filter(BoundPositionCloseReservation.status.in_((
+                    "reserved", "submitted", "submit_unknown", "recovery_required",
+                )))
                 .all()
             )
         }
@@ -2679,6 +2682,14 @@ def sync_manual_closed_deepcoin_positions(
                     synced_at=now,
                 ):
                     result.manually_closed += 1
+                else:
+                    _mark_missing_close_history_uncertain(
+                        session,
+                        binding=row,
+                        legs=entry_legs,
+                        active_pos_ids=active_pos_ids,
+                        synced_at=now,
+                    )
                 continue
             if _binding_has_unresolved_entry_leg(session, row):
                 row.status = "open"
@@ -2728,6 +2739,10 @@ def sync_manual_closed_deepcoin_positions(
                         else "manual_position_missing"
                     )
                     leg.updated_at = now
+                    if not take_profit_closed:
+                        _confirm_close_reservation_for_terminal_leg(
+                            session, leg=leg, confirmed_at=now
+                        )
 
             lifecycle = (
                 session.query(StrategyLifecycle)
@@ -2956,11 +2971,7 @@ def _sync_terminal_exited_history_closed_entry_legs(
     synced_at: datetime,
 ) -> bool:
     history_reader = getattr(client, "list_position_history", None)
-    if history_reader is None:
-        return False
     lifecycle = _latest_lifecycle_for_binding(session, binding)
-    if lifecycle is None or not _is_terminal_exited_lifecycle(lifecycle):
-        return False
     nonterminal_legs = [
         leg
         for leg in legs
@@ -2968,20 +2979,33 @@ def _sync_terminal_exited_history_closed_entry_legs(
     ]
     if not nonterminal_legs:
         return False
+    if (
+        lifecycle is None or not _is_terminal_exited_lifecycle(lifecycle)
+    ) and not all(
+        _has_confirmed_close_mutation(session, leg=leg)
+        for leg in nonterminal_legs
+    ):
+        return False
     for leg in nonterminal_legs:
         pos_id = str(leg.pos_id or "")
         if not pos_id or pos_id in active_pos_ids:
             return False
-        if not _position_history_proves_full_close(
-            history_reader,
-            binding=binding,
-            pos_id=pos_id,
+        if not _has_confirmed_close_mutation(session, leg=leg) and (
+            history_reader is None
+            or not _position_history_proves_full_close(
+                history_reader,
+                binding=binding,
+                pos_id=pos_id,
+            )
         ):
             return False
     for leg in nonterminal_legs:
         leg.status = "manually_closed"
         leg.terminal_reason = "manual_position_missing"
         leg.updated_at = synced_at
+        _confirm_close_reservation_for_terminal_leg(
+            session, leg=leg, confirmed_at=synced_at
+        )
     _derive_binding_from_entry_legs(
         session,
         binding=binding,
@@ -2989,7 +3013,53 @@ def _sync_terminal_exited_history_closed_entry_legs(
         live_position_ids=active_pos_ids,
         recovered_at=synced_at,
     )
+    if (
+        lifecycle is not None
+        and lifecycle.lifecycle_status == "entered"
+        and binding.status == "closed"
+    ):
+        lifecycle.lifecycle_status = "exited"
+        lifecycle.exit_reason = (
+            "kol_signal"
+            if lifecycle.management_action == "exit_requested"
+            else "manual"
+        )
+        lifecycle.exited_at = synced_at
+        lifecycle.updated_at = synced_at
     return True
+
+
+def _mark_missing_close_history_uncertain(
+    session,
+    *,
+    binding: ExecutionBinding,
+    legs: list[ExecutionOrderLeg],
+    active_pos_ids: set[str],
+    synced_at: datetime,
+) -> None:
+    changed = False
+    for leg in legs:
+        pos_id = str(leg.pos_id or "")
+        if (
+            not pos_id
+            or pos_id in active_pos_ids
+            or str(leg.attribution_status or "") != "verified"
+            or str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
+        ):
+            continue
+        _transition_leg_attribution(
+            session,
+            leg=leg,
+            event_type="evidence_unavailable",
+            new_state="evidence_unavailable",
+            evidence={"reason": "position_absent_close_history_unavailable"},
+            recovered_at=synced_at,
+        )
+        changed = True
+    if changed:
+        binding.status = "stale"
+        binding.last_exchange_status = "position_close_history_evidence_unavailable"
+        binding.updated_at = synced_at
 
 
 def _latest_lifecycle_for_binding(session, binding: ExecutionBinding):
@@ -3015,8 +3085,6 @@ def _sync_missing_verified_entry_legs(
     synced_at: datetime,
 ) -> int:
     history_reader = getattr(client, "list_position_history", None)
-    if history_reader is None:
-        return 0
     legs = (
         session.query(ExecutionOrderLeg)
         .filter(ExecutionOrderLeg.execution_binding_id == int(binding.id))
@@ -3026,10 +3094,14 @@ def _sync_missing_verified_entry_legs(
     closed = 0
     for leg in legs:
         pos_id = str(leg.pos_id or "")
+        mutation_confirmed = _has_confirmed_close_mutation(session, leg=leg)
         if (
             not pos_id
             or pos_id in active_pos_ids
-            or str(leg.attribution_status or "") != "verified"
+            or (
+                str(leg.attribution_status or "") != "verified"
+                and not mutation_confirmed
+            )
             or str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
         ):
             continue
@@ -3038,15 +3110,31 @@ def _sync_missing_verified_entry_legs(
             or _has_prior_authoritative_position_audit(session, leg=leg)
         ):
             continue
-        if not _position_history_proves_full_close(
-            history_reader,
-            binding=binding,
-            pos_id=pos_id,
+        if not mutation_confirmed and (
+            history_reader is None
+            or not _position_history_proves_full_close(
+                history_reader,
+                binding=binding,
+                pos_id=pos_id,
+            )
         ):
+            _transition_leg_attribution(
+                session,
+                leg=leg,
+                event_type="evidence_unavailable",
+                new_state="evidence_unavailable",
+                evidence={"reason": "position_absent_close_history_unavailable"},
+                recovered_at=synced_at,
+            )
+            binding.last_exchange_status = "position_close_history_evidence_unavailable"
+            binding.updated_at = synced_at
             continue
         leg.status = "manually_closed"
         leg.terminal_reason = "manual_position_missing"
         leg.updated_at = synced_at
+        _confirm_close_reservation_for_terminal_leg(
+            session, leg=leg, confirmed_at=synced_at
+        )
         closed += 1
     if closed:
         _derive_binding_from_entry_legs(
@@ -3057,6 +3145,43 @@ def _sync_missing_verified_entry_legs(
             recovered_at=synced_at,
         )
     return closed
+
+
+def _has_confirmed_close_mutation(session, *, leg: ExecutionOrderLeg) -> bool:
+    pos_id = str(leg.pos_id or "")
+    if not pos_id:
+        return False
+    return (
+        session.query(PositionMutationIntent.id)
+        .filter(PositionMutationIntent.execution_order_leg_id == int(leg.id))
+        .filter(PositionMutationIntent.pos_id == pos_id)
+        .filter(PositionMutationIntent.operation == "close_position")
+        .filter(PositionMutationIntent.status == "confirmed")
+        .first()
+        is not None
+    )
+
+
+def _confirm_close_reservation_for_terminal_leg(
+    session, *, leg: ExecutionOrderLeg, confirmed_at: datetime
+) -> None:
+    """Converge the manual reservation only after its exact close is confirmed."""
+
+    pos_id = str(leg.pos_id or "")
+    if not pos_id:
+        return
+    if not _has_confirmed_close_mutation(session, leg=leg):
+        return
+    reservation = (
+        session.query(BoundPositionCloseReservation)
+        .filter(BoundPositionCloseReservation.pos_id == pos_id)
+        .one_or_none()
+    )
+    if reservation is None or str(reservation.status) == "confirmed":
+        return
+    reservation.status = "confirmed"
+    reservation.last_error = None
+    reservation.updated_at = confirmed_at
 
 
 def _position_history_proves_full_close(

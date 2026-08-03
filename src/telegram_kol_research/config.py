@@ -34,7 +34,7 @@ RUNTIME_SCANNER_RULE_IDS = frozenset(
     }
 )
 RUNTIME_SCANNER_DEPLOYABLE_RULE_IDS = frozenset(
-    {"cancel_outcome_stale_unknown_v1"}
+    {"active_position_missing_protection_v1", "cancel_outcome_stale_unknown_v1"}
 )
 
 

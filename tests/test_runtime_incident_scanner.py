@@ -3,8 +3,17 @@ from datetime import UTC, datetime, timedelta
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.config import load_runtime_scanner_config
-from telegram_kol_research.models import PositionMutationIntent, RuntimeIncidentObservation
+from telegram_kol_research.models import (
+    BoundPositionCloseReservation,
+    ExecutionBinding,
+    ExecutionOrderLeg,
+    PositionMutationIntent,
+    PositionProtectionLedger,
+    PositionProtectionLeg,
+    RuntimeIncidentObservation,
+)
 from telegram_kol_research.runtime_incident_scanner import InvariantObservation, build_scanner_facts
+from telegram_kol_research.runtime_incident_scanner import list_critical_unprotected_positions
 from telegram_kol_research.runtime_incident_scanner import run_scanner_cycle
 from sqlalchemy import event
 
@@ -57,6 +66,146 @@ def test_observation_contract_rejects_sensitive_and_unbounded_values():
             evidence_fingerprint="e" * 64,
             summary={"api_key": "secret"},
         )
+
+
+def test_critical_unprotected_position_projection_is_exact_and_close_aware(tmp_path):
+    sf = create_session_factory(tmp_path / "unprotected.db")
+    now = datetime(2026, 8, 3, 8, 0, tzinfo=UTC)
+    with sf() as session:
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:100:55:BTC:long", kol_id="group:100",
+            chat_id=100, message_id=55, symbol="BTC", side="long",
+            venue="deepcoin", status="active",
+        )
+        session.add(binding)
+        session.flush()
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id, strategy_instance_id=binding.strategy_instance_id,
+            leg_index=0, purpose="entry", order_kind="market", pos_id="pos-naked",
+            attribution_status="verified", status="active", last_verified_at=now.replace(tzinfo=None),
+            created_at=now.replace(tzinfo=None), updated_at=now.replace(tzinfo=None),
+        )
+        session.add(leg)
+        session.flush()
+        session.add(PositionProtectionLeg(
+            venue="deepcoin", execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id, role="primary_stop", leg_index=1,
+            planned_trigger_price="67500", pos_id="pos-naked", status="planned",
+        ))
+        session.commit()
+
+    risks = list_critical_unprotected_positions(sf)
+    assert risks == ({
+        "chat_id": 100,
+        "strategy_instance_id": "deepcoin:100:55:BTC:long",
+        "execution_binding_id": 1,
+        "execution_order_leg_id": 1,
+        "pos_id": "pos-naked",
+        "planned_stop": "67500",
+        "exposure_started_at": now.replace(tzinfo=None).isoformat(),
+        "rescue_state": "not_planned",
+    },)
+    facts = build_scanner_facts(
+        sf, rules=frozenset({"active_position_missing_protection_v1"}), observed_at=now
+    )
+    assert facts["active_position_missing_protection_v1"] == ({
+        "complete": True,
+        "object_id": "pos-naked",
+        "position_present": True,
+        "primary_protection_verified": False,
+        "chat_id": 100,
+        "strategy_instance_id": "deepcoin:100:55:BTC:long",
+        "execution_binding_id": 1,
+        "execution_order_leg_id": 1,
+        "planned_stop": "67500",
+        "exposure_started_at": now.replace(tzinfo=None).isoformat(),
+        "rescue_state": "not_planned",
+        "evidence_references": ("binding:1", "entry-leg:1", "position:pos-naked"),
+    },)
+    with sf() as session:
+        session.get(ExecutionOrderLeg, 1).last_verified_at = (
+            now + timedelta(minutes=5)
+        ).replace(tzinfo=None)
+        session.commit()
+    assert list_critical_unprotected_positions(sf)[0]["exposure_started_at"] == (
+        now.replace(tzinfo=None).isoformat()
+    )
+
+    with sf() as session:
+        session.add(BoundPositionCloseReservation(
+            pos_id="pos-naked", execution_binding_id=1, status="submitted"
+        ))
+        session.commit()
+    assert list_critical_unprotected_positions(sf) == ()
+
+
+def test_critical_projection_bounds_after_protection_filtering(tmp_path):
+    sf = create_session_factory(tmp_path / "bounded-unprotected.db")
+    now = datetime(2026, 8, 3, 8, 0)
+    with sf() as session:
+        for index in range(21):
+            binding = ExecutionBinding(
+                strategy_instance_id=f"strategy-{index}", kol_id="group:100",
+                chat_id=100, message_id=1000 + index, symbol="BTC", side="long",
+                venue="deepcoin", status="active",
+            )
+            session.add(binding)
+            session.flush()
+            leg = ExecutionOrderLeg(
+                execution_binding_id=binding.id, strategy_instance_id=binding.strategy_instance_id,
+                leg_index=0, purpose="entry", order_kind="market", pos_id=f"pos-{index}",
+                attribution_status="verified", status="active", created_at=now, updated_at=now,
+            )
+            session.add(leg)
+            session.flush()
+            if index < 20:
+                session.add(PositionProtectionLedger(
+                    venue="deepcoin", execution_binding_id=binding.id,
+                    execution_order_leg_id=leg.id, strategy_instance_id=binding.strategy_instance_id,
+                    pos_id=f"pos-{index}", instrument_id="BTC-USDT-SWAP", side="long",
+                    order_id=f"stop-{index}", purpose="stop_loss", status="verified",
+                    evidence_source="test", evidence_json="{}",
+                ))
+        session.commit()
+
+    risks = list_critical_unprotected_positions(sf, chat_id=100, limit=20)
+
+    assert [row["pos_id"] for row in risks] == ["pos-20"]
+
+
+def test_uncertain_prior_observations_do_not_starve_new_critical_position(tmp_path):
+    sf = create_session_factory(tmp_path / "unprotected-priority.db")
+    now = datetime(2026, 8, 3, 8, 0)
+    with sf() as session:
+        for index in range(100):
+            session.add(RuntimeIncidentObservation(
+                rule_id="active_position_missing_protection_v1", rule_version="1",
+                fingerprint=f"{index + 1:064x}", object_kind="position",
+                object_id=f"old-uncertain-{index}", severity="critical", state="observing",
+                consecutive_count=1, first_observed_at=now, last_observed_at=now,
+                evidence_refs_json=f'["position:old-uncertain-{index}"]',
+                evidence_fingerprint=f"{index + 1000:064x}", summary_json="{}",
+            ))
+        binding = ExecutionBinding(
+            strategy_instance_id="new-critical", kol_id="group:100", chat_id=100,
+            message_id=9001, symbol="BTC", side="long", venue="deepcoin", status="active",
+        )
+        session.add(binding)
+        session.flush()
+        session.add(ExecutionOrderLeg(
+            execution_binding_id=binding.id, strategy_instance_id=binding.strategy_instance_id,
+            leg_index=0, purpose="entry", order_kind="market", pos_id="new-critical-pos",
+            attribution_status="verified", status="active", created_at=now, updated_at=now,
+        ))
+        session.commit()
+
+    facts = build_scanner_facts(
+        sf, rules=frozenset({"active_position_missing_protection_v1"}),
+        observed_at=now.replace(tzinfo=UTC),
+    )
+
+    assert facts["active_position_missing_protection_v1"][0]["object_id"] == "new-critical-pos"
+    assert len(facts["active_position_missing_protection_v1"]) <= 100
 
 
 def test_cancel_snapshot_is_bounded_read_only_and_respects_transition_window(tmp_path):
