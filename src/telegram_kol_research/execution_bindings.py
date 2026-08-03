@@ -376,6 +376,22 @@ def load_deepcoin_execution_reconciliation_snapshot(
 ) -> _ReconcileSnapshot:
     """Read one coherent account snapshot reusable by reconciliation and planning."""
 
+    snapshot = load_deepcoin_execution_reconciliation_snapshot_read_only(
+        session_factory,
+        client=client,
+    )
+    for observation in snapshot.pending_tpsl_observations:
+        record_pending_tpsl_observation(session_factory, observation=observation)
+    return snapshot
+
+
+def load_deepcoin_execution_reconciliation_snapshot_read_only(
+    session_factory: sessionmaker,
+    *,
+    client: DeepcoinReadOnlyClient,
+) -> _ReconcileSnapshot:
+    """Read one coherent account snapshot without persisting observations."""
+
     with session_factory() as session:
         instruments = {
             f"{str(symbol or '').upper()}-USDT-SWAP"
@@ -384,10 +400,7 @@ def load_deepcoin_execution_reconciliation_snapshot(
             .all()
             if str(symbol or "").strip()
         }
-    snapshot = _load_reconcile_snapshot(client, instruments=instruments)
-    for observation in snapshot.pending_tpsl_observations:
-        record_pending_tpsl_observation(session_factory, observation=observation)
-    return snapshot
+    return _load_reconcile_snapshot(client, instruments=instruments)
 
 
 def _load_reconcile_snapshot(

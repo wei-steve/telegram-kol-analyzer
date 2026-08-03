@@ -44,7 +44,13 @@ from telegram_kol_research.runtime_incident_scanner import build_scanner_facts, 
 from telegram_kol_research.deepcoin_contract_specs import load_deepcoin_contract_specs
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
 from telegram_kol_research.execution_bindings import (
+    load_deepcoin_execution_reconciliation_snapshot_read_only,
     repair_execution_order_legs_from_binding_payloads,
+)
+from telegram_kol_research.management_history_recovery import (
+    ManagementHistoryRecoveryConflict,
+    apply_management_history_recovery,
+    plan_management_history_recovery,
 )
 from telegram_kol_research.entry_protection_ledger_repair import (
     apply_entry_protection_ledger_repair_plan,
@@ -3448,6 +3454,90 @@ def repair_position_attribution(
         expected_fingerprint=expected_fingerprint,
     )
     typer.echo(f"Applied {result.applied} repair action(s).")
+
+
+@app.command("recover-management-history")
+def recover_management_history(
+    database_path: Path = typer.Option(
+        Path("data/research.db"), "--database-path"
+    ),
+    batch_id: int = typer.Option(..., "--batch-id", min=1),
+    apply: bool = typer.Option(False, "--apply"),
+    evidence_fingerprint: str | None = typer.Option(
+        None, "--evidence-fingerprint"
+    ),
+) -> None:
+    """Dry-run or converge one exact paused management batch."""
+
+    resolved_path = database_path.expanduser().resolve()
+    if not resolved_path.is_file():
+        raise typer.BadParameter(
+            "database path must name an existing file; no file was created"
+        )
+    session_factory = create_existing_session_factory(resolved_path)
+    client = build_deepcoin_client_from_env()
+    snapshot = load_deepcoin_execution_reconciliation_snapshot_read_only(
+        session_factory,
+        client=client,
+    )
+    decision = plan_management_history_recovery(
+        session_factory,
+        batch_id=batch_id,
+        snapshot=snapshot,
+        planned_at=datetime.now(UTC),
+    )
+    if not apply:
+        typer.echo(
+            json.dumps(
+                {"mode": "dry_run", "decision": asdict(decision)},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        if decision.status != "ready":
+            raise typer.Exit(code=2)
+        return
+    if evidence_fingerprint is None:
+        typer.echo(
+            json.dumps(
+                {
+                    "mode": "apply",
+                    "status": "refused",
+                    "reason_code": "evidence_fingerprint_required",
+                    "decision": asdict(decision),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(code=2)
+    try:
+        result = apply_management_history_recovery(
+            session_factory,
+            decision=decision,
+            expected_fingerprint=evidence_fingerprint,
+            applied_at=datetime.now(UTC),
+        )
+    except ManagementHistoryRecoveryConflict:
+        typer.echo(
+            json.dumps(
+                {
+                    "mode": "apply",
+                    "status": "refused",
+                    "reason_code": "recovery_evidence_conflict",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(code=2)
+    typer.echo(
+        json.dumps(
+            {"mode": "apply", "result": asdict(result)},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
 
 
 @app.command("plan-current-protection-backfill")
