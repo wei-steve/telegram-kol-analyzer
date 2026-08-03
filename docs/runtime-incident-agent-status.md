@@ -11,7 +11,7 @@ phase_name: proactive-invariant-scanner
 phase_status: in_progress
 last_completed_phase: "8R.2"
 last_completed_commit: b3c2f14
-production_commit: b3c2f146991953e0b8a2d71cd5364cfff8f9ebb8
+production_commit: 36846b5e910f6cf68005c6035aa8265561cb15ea
 local_tests:
   - "phase-8r.3-dormant-ledger-rules-scanner-regression: 410 passed, 2 known YAML prompt deprecation warnings"
   - "phase-8r.3-final-review: no Critical or Important findings after recovery candidates were filtered and prioritized before the bounded observation limit"
@@ -80,8 +80,8 @@ local_tests:
   - "full-suite before final review fixes: 2611 passed, 1 skipped; every subsequently changed path passed the focused suites"
   - "phase-3-post-canary-focused: 127 passed"
 server_verification:
-  status: phase-8r.2-technical-capture-complete
-  deployed_commit: b3c2f146991953e0b8a2d71cd5364cfff8f9ebb8
+  status: phase-8r.3-one-rule-shadow-observation-in-progress
+  deployed_commit: 36846b5e910f6cf68005c6035aa8265561cb15ea
   service: active-http-200
   bounded_restarts: "service restarted without SIGKILL; raw message 8309 crossed the restart with a live pre-restart evidence lease, logged one already-in-progress recovery error, then completed through normal lease expiry recovery"
   listener: monitoring-31-enabled-groups-and-continuing
@@ -166,12 +166,18 @@ server_verification:
   phase_8r_2_capture_comparison: "Each of the nine closed capture types was enabled alone. Every type reached a zero-capture drain followed by three stable zero passes, with management/protection source hashes unchanged. Results: management_partial_failed 1 incident; provider_retry_exhausted 0; context_worker_exhausted 0; management_submit_unknown 0; management_recovery_required 6; severe_protection_incident 155; monitor_adapter_failure 0 during staged parity; monitor_audit_incomplete 0; notification_delivery_failure 0. No staged incident acquired an Agent or Telegram claim."
   phase_8r_2_final_policy: "Capture is enabled for all nine READ_ONLY_CAPTURE_PROFILE types. Telegram and Runtime Agent selectors remain exactly management_partial_failed, so the newly captured types are capture-only. A Persistent timer catch-up overlapped the bounded main-service restart and correctly produced one pending, unclaimed monitor_adapter_failure incident for transient service/settings unavailability; its operator monitor notification was sent, and the later no-notify diagnostic returned monitor_error null with only the known audit_abnormal baseline. Production now has 163 incidents and zero active incident, notification, or recovery claims."
   phase_8r_2_deployed_tests: "The deployed focused suite reached 294 passing tests before two known 0.2-second lifespan timing tests failed under production host load; both are unrelated to the writer changes and the complete local focused suite passed 296 tests with one installation skip."
-  remaining: "Phase 8R.3 implementation is in progress: add the dormant observation ledger and closed scanner contract, implement the reviewed pure read-only rule catalog, then install the independently supervised scanner dormant before one-rule shadow-only activation. Do not enable deterministic notification for new rules or widen Agent diagnosis in this turn."
+  phase_8r_3_dormant_deployment: "Commit 36846b5 was deployed after a fresh safe-window gate with latest raw/decision both 9106 and zero evidence claims, recent context work, recent management work, active position mutations, recent execution events, runtime claims, or incomplete recovery attempts. The main service restarted cleanly and returned HTTP 200; Runtime Agent and monitor timer remained active. The additive runtime_incident_observations table existed with zero rows while the scanner unit was still absent."
+  phase_8r_3_scanner_installation: "The dedicated scanner unit was installed disabled/inactive with enabled=false, shadow_only=true, an empty rule allowlist, and a 60-second interval. A second complete safe-window check passed before enabling exactly cancel_outcome_stale_unknown_v1 in shadow-only mode without restarting the main service."
+  phase_8r_3_shadow_canary: "Shadow observation started 2026-08-03 16:18 CST. Repeated cycles report one rule, zero candidates, zero observations, zero abnormal results, and zero insufficient results. The position-mutation source hash remained dbca2e6790e5ed586bd06341eb27bb3bb29e538cfa49bfa51d01a1789878fd51; scanner-created runtime incidents, Telegram claims, Agent claims, and recovery attempts remained zero. The overall incident ledger continued to receive independent capture-only protection/monitor events under Phase 8R.2 policy."
+  phase_8r_3_rollback: "Stopping and disabling only telegram-kol-runtime-scanner.service made it inactive/disabled while the main service and Runtime Agent stayed active. The scanner was then re-enabled and resumed shadow cycles; no main restart was required."
+  phase_8r_3_deployed_tests: "58 deployed focused tests passed. A root-run no-notify production monitor diagnostic returned monitor_error null with only the known audit_abnormal baseline. Two earlier diagnostics under a manually invoked restricted identity lacked the service unit's supplementary journal group and repeated one capture-only monitor_adapter_failure incident; it remained unclaimed and generated no scanner, Agent, or Telegram action."
+  remaining: "Keep Phase 8R.3 in progress through at least 2026-08-05 16:18 CST. After 48 hours, compare every scanner observation with its source row, confirm the source hash and zero scanner-created incidents/Telegram claims/Agent claims, and re-run the rollback and independent-monitor gates. Do not enable deterministic notification for new rules or widen Agent diagnosis before that review."
 enabled_flags:
   - "capture:READ_ONLY_CAPTURE_PROFILE-nine-types"
   - "telegram:deterministic-runtime-incident-reports"
   - "runtime-agent:read-only-diagnosis"
   - "monitor:independent-system-operator-alerting"
+  - "runtime-scanner:cancel-outcome-stale-unknown-v1-shadow-only"
 known_issues:
   - "The production web process has pre-existing synchronous maintenance windows that can delay loopback HTTP dispatch for tens of seconds. The isolated monitor capture client is bounded to 45 seconds and remains fail-open; this does not block the listener or trading process."
   - "The pre-existing production safety baseline remains `audit_abnormal` (32 blocked, 1 partial_failed, 5 recovery_required in the latest bounded audit); Phase 5 did not alter those historical rows."
