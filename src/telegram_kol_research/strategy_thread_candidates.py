@@ -16,7 +16,10 @@ from telegram_kol_research.models import (
     StrategyMessageLink,
     StrategyThread,
 )
-from telegram_kol_research.strategy_threads import list_relevant_strategy_threads
+from telegram_kol_research.strategy_threads import (
+    ACTIVE_THREAD_STATUSES,
+    list_relevant_strategy_threads,
+)
 
 
 REVISION_TERMS = ("更新", "修改", "改为", "调整", "取消", "撤销", "保护", "保本")
@@ -353,3 +356,52 @@ def generate_strategy_thread_candidates(
     ranked.sort(key=lambda item: item[0])
     bounded = max(1, min(int(max_candidates), 20))
     return tuple(candidate for _, candidate in ranked[:bounded])
+
+
+def exact_single_current_risk_thread(
+    session: Session,
+    *,
+    raw_message_id: int,
+    target_thread_id: int,
+) -> tuple[bool, int | None]:
+    """Exhaustively prove one current-risk thread without model filters.
+
+    The query streams every active thread in the source chat so display ranking,
+    symbol/side hints, and the 20-candidate prompt bound cannot authorize an exit.
+    """
+
+    current = session.get(RawMessage, int(raw_message_id))
+    if current is None:
+        return False, None
+    target_root_message_id: int | None = None
+    target_is_current = False
+    threads = (
+        session.query(StrategyThread)
+        .filter(StrategyThread.chat_id == int(current.chat_id))
+        .filter(StrategyThread.status.in_(ACTIVE_THREAD_STATUSES))
+        .order_by(StrategyThread.id.asc())
+        .yield_per(100)
+    )
+    for thread in threads:
+        lifecycle = (
+            session.get(StrategyLifecycle, int(thread.current_lifecycle_id))
+            if thread.current_lifecycle_id is not None
+            else (
+                session.query(StrategyLifecycle)
+                .filter(StrategyLifecycle.strategy_thread_id == int(thread.id))
+                .order_by(
+                    StrategyLifecycle.signal_at.desc(),
+                    StrategyLifecycle.id.desc(),
+                )
+                .first()
+            )
+        )
+        if lifecycle is None or lifecycle.lifecycle_status not in ACTIVE_LIFECYCLE_STATUSES:
+            continue
+        risk_state = _binding_context(session, lifecycle)[2]
+        if int(thread.id) == int(target_thread_id):
+            target_root_message_id = int(thread.root_message_id)
+            target_is_current = risk_state == "current_risk"
+        elif risk_state != "no_current_risk":
+            return False, target_root_message_id
+    return target_is_current, target_root_message_id

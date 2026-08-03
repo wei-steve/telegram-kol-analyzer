@@ -249,6 +249,22 @@ raw request/response payloads.
 
 Use the rollout in this strict order:
 
+The following invariants are mandatory throughout the rollout:
+
+- contextual full exit requires one exact current-risk target; the internal
+  low-confidence exception is valid only at confidence `>= 0.60` and cannot be
+  forged by model output;
+- full exit covers both live positions and every deferred entry leg;
+- protection created before entry fill remains unowned and is never adopted by
+  a symbol/side/time fallback;
+- complete live-position/no-stop evidence may advance only to an exact stop-only
+  rescue plan;
+- rescue defaults disabled, and live mode requires separate approval plus live
+  automatic-trading and management gates;
+- close/cancel ownership wins over primary SL, backup SL, and TP writes;
+- unresolved critical unprotected exposure blocks only new entries in that
+  exact chat, never close, cancel, rescue, or another chat's entries.
+
 1. Perform a read-only audit first. Inspect the exact trigger-entry leg,
    parent trigger order ID, and exact `pos_id` with a fresh exchange snapshot.
    A missing, ambiguous, or stale observation is a refusal; do not turn it
@@ -262,6 +278,13 @@ Use the rollout in this strict order:
    candidate. Review the planned rescue and its refusal code first; stop after
    that single probe and verify the resulting ledger/order ID before widening
    scope.
+
+Before enabling that probe, verify the strategy dashboard exposes the exact
+binding, entry leg, `pos_id`, planned stop, immutable exposure start, and rescue
+state. The runtime scanner rule `active_position_missing_protection_v1` is
+shadow-only and must be explicitly allowlisted. A stale or terminal observation
+must not block entries; the live gate derives its decision from current exact
+binding/leg/protection state.
 
 Never automatically cancel a legacy opaque take-profit order. An opaque TP is
 a blocking condition for stop rescue, not evidence that it belongs to the

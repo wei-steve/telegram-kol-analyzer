@@ -432,13 +432,29 @@ settings:
 - `TELEGRAM_KOL_RUNTIME_SCANNER_INTERVAL_SECONDS` is bounded to 10–3600
   seconds and defaults to 60.
 
-The first production projection is only
-`cancel_outcome_stale_unknown_v1`. The other reviewed pure rules remain
+The deployable shadow projections are
+`cancel_outcome_stale_unknown_v1` and
+`active_position_missing_protection_v1`. All other reviewed pure rules remain
 non-deployable until their coherent snapshot builders exist; configuration
 silently cannot activate them. The cancel rule observes at most 100 exact
 cancel mutation intents and treats only `reserved`, `submitting`, `submitted`,
 or `recovery_required` beyond the ten-minute window as unknown. `confirmed`,
 `rejected`, and `blocked` are known terminal outcomes.
+
+The unprotected-position rule is operator-visible but remains disabled unless
+explicitly allowlisted. It evaluates only exact live verified entry legs and
+requires no verified/pending primary stop and no close, mutation, or management
+write in progress. Its bounded evidence contains only chat/strategy/binding/
+leg/position identifiers, planned stop, immutable exposure start, and rescue
+state; it excludes raw exchange payloads and credentials. New risks reserve
+scanner capacity so unresolved manual-review observations cannot starve them.
+Recovery of an earlier observation is decided by an exact per-position lookup:
+terminal or currently protected state resolves it, while missing or ambiguous
+evidence remains insufficient rather than proving closure.
+
+This scanner observation is not the automatic-entry gate. The live gate reads
+current exact business state and blocks only new entries for the affected
+`chat_id`; it does not block exact close, cancel, stop rescue, or another chat.
 
 The main service alone owns schema creation. The scanner opens an existing
 database without bootstrap or migrations and writes only

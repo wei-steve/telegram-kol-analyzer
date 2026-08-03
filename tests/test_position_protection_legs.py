@@ -199,7 +199,7 @@ def test_bind_verified_filled_position_to_all_planned_protection_legs(tmp_path):
         }
         assert {row.pos_id for row in rows} == {"pos-1"}
         assert all(row.exchange_order_id is None for row in rows)
-        assert all(row.status == "waiting_fill" for row in rows)
+        assert all(row.status == "protection_recovery_pending" for row in rows)
 
 
 def test_bind_verified_filled_position_rejects_unverified_entry_leg(tmp_path):

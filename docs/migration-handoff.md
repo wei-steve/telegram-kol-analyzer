@@ -36,6 +36,34 @@ Known failed-primary positions are excluded from normal repair. Do not retry a
 `NotEnoughMoneyToClose` failure automatically; preserve any verified second
 stop and keep automatic management frozen.
 
+### Delayed-entry exit and stop-rescue invariants
+
+- A contextual full exit is authoritative only when the resolver selects one
+  exact current-risk strategy. The low-confidence exception is closed: it
+  requires the internal authority marker, exactly one target, confidence at
+  least `0.60`, and no competing current or uncertain risk. Model-supplied
+  fields cannot create that marker.
+- A full exit owns the whole strategy: it closes every exact live position and
+  cancels every remaining deferred entry leg. It must not leave a delayed leg
+  able to reopen the strategy later.
+- Trigger-entry TP/SL observed before the entry fill is unowned. It may not be
+  adopted from symbol, side, price, or timing similarity; the post-fill exact
+  `posId` evidence remains mandatory.
+- A complete snapshot proving one live verified position with no verified or
+  pending primary stop may enter the stop-rescue workflow. Rescue is stop-only,
+  exact-`posId`, idempotent, and records bounded refusal/recovery state.
+- `trigger_protection_stop_rescue_mode` defaults to `disabled`. Effective
+  `live` additionally requires automatic trading enabled and management mode
+  `live`; enabling it is a separate reviewed production approval.
+- Close authority always wins over SL, backup-SL, and TP writes. An active
+  close reservation, mutation, or management batch blocks protection writes.
+- A critical unprotected position blocks only new automatic entries for the
+  same Telegram `chat_id`. Exact close, cancel, reconciliation, and stop rescue
+  remain available; other chats are unaffected.
+- An absent exact position converges to terminal only with sufficient evidence.
+  Unknown or conflicting history remains visible as `uncertain_risk` for manual
+  review and is never silently removed from current-risk competition.
+
 ## Handoff checklist
 
 - Read `AGENTS.md`, `docs/runbook.md`, and `docs/server-deployment.md`.

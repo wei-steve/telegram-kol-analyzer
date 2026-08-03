@@ -139,6 +139,44 @@ def test_context_risk_reduction_marker_from_model_cannot_lower_threshold(tmp_pat
         assert session.query(MessageInstructionItem).count() == 0
 
 
+def test_exact_context_exit_rejects_conflicting_reply_target(tmp_path):
+    session_factory = create_session_factory(tmp_path / "context-reply-conflict.db")
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=88, message_id=4168, reply_to_message_id=4100,
+            text="63100没站稳，求稳就找机会出局",
+        )
+        explicit = StrategyLifecycle(
+            chat_id=88, message_id=4167, symbol="BTC", side="long",
+            lifecycle_status="entered", signal_at=datetime(2026, 8, 3, 7, 50),
+        )
+        reply = StrategyLifecycle(
+            chat_id=88, message_id=4100, symbol="BTC", side="long",
+            lifecycle_status="entered", signal_at=datetime(2026, 8, 2, 7, 50),
+        )
+        session.add_all([raw, explicit, reply])
+        session.flush()
+
+        applied = _apply_lifecycle_event_decision(
+            session,
+            raw,
+            {
+                "event_type": "exit_position",
+                "target_lifecycle_id": explicit.id,
+                "symbol": "BTC",
+                "side": "long",
+                "management_action": "exit_full",
+                "confidence": 0.62,
+                "_exact_context_risk_reduction_authorized": True,
+            },
+            parse_source="mimo_authoritative",
+            authoritative_generation="context-exact-exit",
+        )
+
+        assert applied is False
+        assert session.query(SignalCandidate).count() == 0
+
+
 def test_authoritative_current_message_text_excludes_model_reasons() -> None:
     assert _authoritative_current_message_text(
         "继续持有",

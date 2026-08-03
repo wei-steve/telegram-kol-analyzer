@@ -57,6 +57,7 @@ from telegram_kol_research.recognition_experiments import (
 )
 from telegram_kol_research.strategy_thread_candidates import (
     StrategyThreadCandidate,
+    exact_single_current_risk_thread,
     generate_strategy_thread_candidates,
 )
 from telegram_kol_research.strategy_threads import (
@@ -385,6 +386,7 @@ def _resolved_mimo_result(
     candidates: Sequence[StrategyThreadCandidate],
     *,
     current_message_id: int,
+    exact_risk_reduction_authorized: bool | None = None,
 ) -> MimoAuthoritativeResult:
     payload = dict(mimo.payload)
     original_lifecycle_event = payload.get("lifecycle_event")
@@ -397,11 +399,12 @@ def _resolved_mimo_result(
     payload["_context_resolution"] = context_payload
     if decision.decision == "new_thread":
         return replace(mimo, payload=payload)
-    exact_risk_reduction_authorized = _authorizes_exact_context_risk_reduction(
-        decision,
-        candidates,
-        current_message_id=current_message_id,
-    )
+    if exact_risk_reduction_authorized is None:
+        exact_risk_reduction_authorized = _authorizes_exact_context_risk_reduction(
+            decision,
+            candidates,
+            current_message_id=current_message_id,
+        )
     if (
         decision.confidence < 0.7
         and not exact_risk_reduction_authorized
@@ -500,6 +503,34 @@ def _authorizes_exact_context_risk_reduction(
         int(current_message_id),
         int(matching[0].root_message_id),
     }.issubset(supporting)
+
+
+def _authorizes_exact_context_risk_reduction_from_db(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    decision: ContextResolutionDecision,
+    current_message_id: int,
+) -> bool:
+    """Recheck the narrow exception against every active same-chat thread."""
+
+    if (
+        decision.decision != "exit_thread"
+        or decision.management_action != "exit_full"
+        or not 0.60 <= float(decision.confidence) < 0.70
+        or len(decision.target_thread_ids) != 1
+    ):
+        return False
+    with session_factory() as session:
+        allowed, root_message_id = exact_single_current_risk_thread(
+            session,
+            raw_message_id=int(raw_message_id),
+            target_thread_id=int(decision.target_thread_ids[0]),
+        )
+    if not allowed or root_message_id is None:
+        return False
+    supporting = {int(message_id) for message_id in decision.supporting_message_ids}
+    return {int(current_message_id), int(root_message_id)}.issubset(supporting)
 
 
 def _link_context_resolution(
@@ -646,6 +677,16 @@ def assess_message_authoritatively(
                     context_decision,
                     candidates,
                     current_message_id=int(context_window.current.message_id),
+                    exact_risk_reduction_authorized=(
+                        _authorizes_exact_context_risk_reduction_from_db(
+                            session_factory,
+                            raw_message_id=raw_message_id,
+                            decision=context_decision,
+                            current_message_id=int(
+                                context_window.current.message_id
+                            ),
+                        )
+                    ),
                 )
                 _link_context_resolution(
                     session_factory,

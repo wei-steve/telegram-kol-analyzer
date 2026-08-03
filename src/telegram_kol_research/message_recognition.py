@@ -1138,10 +1138,20 @@ def _apply_lifecycle_event_decision(
             raise
         return False
 
+    reply_target = _resolve_reply_lifecycle_target(session, raw_message)
+    explicit_target_lifecycle_id = _int_or_none(
+        decision.get("target_lifecycle_id")
+    )
+    if (
+        _is_authorized_exact_context_risk_reduction(decision, confidence)
+        and reply_target is not None
+        and explicit_target_lifecycle_id is not None
+        and int(reply_target.id) != explicit_target_lifecycle_id
+    ):
+        return False
     target = _resolve_lifecycle_event_target(session, raw_message, decision)
     if target is None:
         return False
-    reply_target = _resolve_reply_lifecycle_target(session, raw_message)
     if event_type == "cancel_entry" and reply_target is not None:
         if reply_target.id != target.id:
             _record_reply_cancel_manual_review(
@@ -1918,14 +1928,24 @@ def _apply_deterministic_management_scope_if_matched(
             raise
         return False
     reply_target = _resolve_reply_lifecycle_target(session, raw_message)
+    explicit_target_lifecycle_id = _int_or_none(
+        scoped_decision.get("target_lifecycle_id")
+    )
+    if (
+        _is_authorized_exact_context_risk_reduction(
+            scoped_decision, confidence
+        )
+        and reply_target is not None
+        and explicit_target_lifecycle_id is not None
+        and int(reply_target.id) != explicit_target_lifecycle_id
+    ):
+        return False
     try:
         targets = resolve_management_scope_in_session(
             session,
             raw_message=raw_message,
             directive=directive,
-            explicit_target_lifecycle_id=_int_or_none(
-                scoped_decision.get("target_lifecycle_id")
-            ),
+            explicit_target_lifecycle_id=explicit_target_lifecycle_id,
             reply_target_lifecycle_id=(
                 int(reply_target.id) if reply_target is not None else None
             ),

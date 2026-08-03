@@ -8,6 +8,7 @@ from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
 from telegram_kol_research.authoritative_recognition import (
     AuthoritativeAssessment,
     _resolved_mimo_result,
+    _authorizes_exact_context_risk_reduction_from_db,
     apply_authoritative_assessment,
     assess_message_authoritatively,
     process_authoritative_message,
@@ -17,6 +18,7 @@ from telegram_kol_research.context_resolution import ContextResolutionDecision
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ExecutionBinding,
+    ExecutionOrderLeg,
     MessageInstructionItem,
     MessageEvidenceVersion,
     RawMessage,
@@ -25,6 +27,7 @@ from telegram_kol_research.models import (
     SourceMessageDeletionExit,
     StrategyLifecycle,
     StrategyMessageLink,
+    StrategyThread,
 )
 from telegram_kol_research.message_evidence import save_message_evidence_version
 from telegram_kol_research.recognition_experiments import MimoAuthoritativeResult
@@ -233,6 +236,79 @@ def test_exact_context_exit_rejects_every_broader_low_confidence_case(
     assert "_exact_context_risk_reduction_authorized" not in resolved.payload[
         "lifecycle_event"
     ]
+
+
+def test_exact_context_exit_scans_all_same_chat_risk_without_model_filters(tmp_path):
+    session_factory = create_session_factory(tmp_path / "exact-risk-inventory.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=88, message_id=4168, text="求稳就找机会出局")
+        session.add(raw)
+        target_thread_id = None
+        for index in range(22):
+            root_message_id = 4100 + index
+            symbol = "BTC" if index < 21 else "ETH"
+            thread = StrategyThread(
+                chat_id=88, root_message_id=root_message_id,
+                symbol=symbol, side="long", status="active",
+            )
+            session.add(thread)
+            session.flush()
+            binding = None
+            if index in {0, 21}:
+                binding = ExecutionBinding(
+                    strategy_instance_id=f"strategy-{index}", kol_id="group:88",
+                    chat_id=88, message_id=root_message_id, symbol=symbol,
+                    side="long", venue="deepcoin", status="active",
+                )
+                session.add(binding)
+                session.flush()
+            lifecycle = StrategyLifecycle(
+                strategy_thread_id=thread.id,
+                execution_binding_id=(binding.id if binding is not None else None),
+                chat_id=88, message_id=root_message_id, symbol=symbol, side="long",
+                lifecycle_status="entered", signal_at=datetime(2026, 8, 1, index),
+            )
+            session.add(lifecycle)
+            session.flush()
+            thread.current_lifecycle_id = lifecycle.id
+            if binding is not None:
+                session.add(ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    leg_index=0, purpose="entry", order_kind="market",
+                    order_id=f"order-{index}", pos_id=f"pos-{index}",
+                    attribution_status="verified", status="active",
+                ))
+            if index == 0:
+                target_thread_id = thread.id
+        session.commit()
+        raw_id = raw.id
+
+    decision = _context_exit_decision(
+        thread_ids=(target_thread_id,), supporting=(4100, 4168)
+    )
+
+    assert _authorizes_exact_context_risk_reduction_from_db(
+        session_factory,
+        raw_message_id=raw_id,
+        decision=decision,
+        current_message_id=4168,
+    ) is False
+
+    with session_factory() as session:
+        competitor = session.query(ExecutionBinding).filter_by(symbol="ETH").one()
+        competitor.status = "closed"
+        competitor_leg = session.query(ExecutionOrderLeg).filter_by(
+            execution_binding_id=competitor.id
+        ).one()
+        competitor_leg.status = "manually_closed"
+        session.commit()
+    assert _authorizes_exact_context_risk_reduction_from_db(
+        session_factory,
+        raw_message_id=raw_id,
+        decision=decision,
+        current_message_id=4168,
+    ) is True
 from telegram_kol_research.source_message_deletion import record_source_message_deleted
 
 
