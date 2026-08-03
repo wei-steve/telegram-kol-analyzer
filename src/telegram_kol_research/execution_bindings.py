@@ -320,6 +320,15 @@ def reconcile_deepcoin_execution_bindings(
         result = _apply_reconcile_snapshot(
             session_factory, snapshot=snapshot, recovered_at=now
         )
+        from telegram_kol_research.trigger_protection_rescue_worker import (
+            run_trigger_protection_rescue_tick,
+        )
+
+        run_trigger_protection_rescue_tick(
+            session_factory,
+            deepcoin_client=client,
+            processed_at=now,
+        )
         if contract_spec_provider is not None:
             from telegram_kol_research.trigger_backup_stop_executor import (
                 submit_verified_trigger_backup_stops,

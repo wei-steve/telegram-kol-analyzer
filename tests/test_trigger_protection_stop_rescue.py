@@ -16,8 +16,11 @@ from telegram_kol_research.models import (
     StrategyLifecycle,
     TriggerProtectionIntent,
     TriggerProtectionStopRescue,
+    PositionProtectionIncident,
+    BoundPositionCloseReservation,
 )
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
+from telegram_kol_research.trading_settings import save_trading_settings
 
 
 NOW = datetime(2026, 7, 21, 9, 0, tzinfo=UTC)
@@ -74,6 +77,7 @@ def _saved_deferred_intent(session_factory, *, verified=True):
             leg_index=0, purpose="entry", order_kind="trigger_limit", order_id="entry-1",
             pos_id="pos-1", venue="deepcoin", attribution_status=("verified" if verified else "unassigned"),
             attribution_evidence_json='{"policy_version":2}', status="active",
+            request_json='{"sz":"2"}',
         )
         session.add(leg); session.flush()
         intent = TriggerProtectionIntent(
@@ -202,6 +206,59 @@ def test_rescue_blocks_stale_binding_position_before_any_exchange_write(tmp_path
     assert client.calls == []
 
 
+def test_rescue_is_noop_when_exchange_already_has_exact_pending_stop(tmp_path):
+    from telegram_kol_research.strategy_management_planner import plan_trigger_protection_stop_rescue
+
+    session_factory = create_session_factory(tmp_path / "pending-stop.db")
+    intent_id = _saved_deferred_intent(session_factory)
+    client = _Client()
+    client.pending = [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-1",
+            "posSide": "short",
+            "slTriggerPx": "65000",
+            "ordId": "existing-stop",
+        }
+    ]
+
+    result = plan_trigger_protection_stop_rescue(
+        session_factory, intent_id=intent_id, deepcoin_client=client, planned_at=NOW
+    )
+
+    assert result.status == "noop"
+    assert result.reason_code == "rescue_exchange_stop_already_present"
+    assert client.calls == []
+
+
+def test_rescue_blocks_when_exact_position_close_is_reserved(tmp_path):
+    from telegram_kol_research.strategy_management_planner import plan_trigger_protection_stop_rescue
+
+    session_factory = create_session_factory(tmp_path / "close-wins.db")
+    intent_id = _saved_deferred_intent(session_factory)
+    with session_factory() as session:
+        intent = session.get(TriggerProtectionIntent, intent_id)
+        session.add(
+            BoundPositionCloseReservation(
+                pos_id="pos-1",
+                execution_binding_id=intent.execution_binding_id,
+                status="reserved",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+    client = _Client()
+
+    result = plan_trigger_protection_stop_rescue(
+        session_factory, intent_id=intent_id, deepcoin_client=client, planned_at=NOW
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "rescue_close_in_progress"
+    assert client.calls == []
+
+
 def test_rescue_keeps_exchange_response_when_later_ledger_write_fails(monkeypatch, tmp_path):
     import telegram_kol_research.strategy_management_executor as executor
     from telegram_kol_research.strategy_management_planner import plan_trigger_protection_stop_rescue
@@ -258,6 +315,103 @@ def test_rescue_persists_bounded_failure_diagnostics(tmp_path):
         diagnostics = json.loads(rescue.error_json)
     assert diagnostics["type"] == "DeepcoinRequestOutcomeUnknown"
     assert len(diagnostics["message"]) == 512
+
+
+@pytest.mark.parametrize(
+    ("mode", "auto_trade", "management_mode", "expected"),
+    [
+        ("disabled", True, "live", "disabled"),
+        ("shadow", False, "disabled", "shadow"),
+        ("live", True, "live", "live"),
+        ("live", False, "live", "disabled"),
+        ("live", True, "shadow", "disabled"),
+    ],
+)
+def test_rescue_worker_obeys_separate_mode_and_shadow_never_writes(
+    tmp_path,
+    mode,
+    auto_trade,
+    management_mode,
+    expected,
+):
+    from telegram_kol_research.trigger_protection_rescue_worker import (
+        run_trigger_protection_rescue_tick,
+    )
+
+    session_factory = create_session_factory(tmp_path / f"rescue-worker-{mode}-{expected}.db")
+    _saved_deferred_intent(session_factory)
+    save_trading_settings(
+        session_factory,
+        {
+            "trigger_protection_stop_rescue_mode": mode,
+            "auto_trade_enabled": auto_trade,
+            "management_execution_mode": management_mode,
+        },
+    )
+    client = _Client()
+
+    result = run_trigger_protection_rescue_tick(
+        session_factory,
+        deepcoin_client=client,
+        processed_at=NOW,
+    )
+
+    assert result.mode == expected
+    with session_factory() as session:
+        rescues = session.query(TriggerProtectionStopRescue).all()
+        incidents = session.query(PositionProtectionIncident).all()
+    if expected == "disabled":
+        assert result.evaluated == 0
+        assert rescues == []
+        assert incidents == []
+        assert client.calls == []
+    elif expected == "shadow":
+        assert result.shadow_ready == 1
+        assert rescues == []
+        assert len(incidents) == 1
+        assert incidents[0].incident_type == "stop_rescue_shadow_ready"
+        assert client.calls == []
+    else:
+        assert result.planned == 1
+        assert result.executed == 1
+        assert len(rescues) == 1
+        assert rescues[0].status == "submitted"
+        assert len(client.calls) == 1
+
+
+def test_rescue_worker_is_idempotent_after_successful_live_tick(tmp_path):
+    from telegram_kol_research.trigger_protection_rescue_worker import (
+        run_trigger_protection_rescue_tick,
+    )
+
+    session_factory = create_session_factory(tmp_path / "rescue-worker-repeat.db")
+    _saved_deferred_intent(session_factory)
+    save_trading_settings(
+        session_factory,
+        {
+            "trigger_protection_stop_rescue_mode": "live",
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+        },
+    )
+    client = _Client()
+
+    first = run_trigger_protection_rescue_tick(
+        session_factory,
+        deepcoin_client=client,
+        processed_at=NOW,
+    )
+    second = run_trigger_protection_rescue_tick(
+        session_factory,
+        deepcoin_client=client,
+        processed_at=NOW,
+    )
+
+    assert first.executed == 1
+    assert second.executed == 0
+    assert len(client.calls) == 1
+    with session_factory() as session:
+        assert session.query(TriggerProtectionStopRescue).count() == 1
 
 
 def test_init_db_adds_rescue_error_json_to_prior_sqlite_schema(tmp_path):

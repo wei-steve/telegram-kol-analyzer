@@ -19,10 +19,12 @@ from telegram_kol_research.execution_bindings import (
     reconcile_deepcoin_execution_bindings,
 )
 from telegram_kol_research.models import (
+    BoundPositionCloseReservation,
     ExecutionBinding,
     ExecutionOrderLeg,
     PositionProtectionIncident,
     PositionProtectionLedger,
+    PositionMutationIntent,
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
@@ -1977,7 +1979,15 @@ def plan_trigger_protection_stop_rescue(
             )
             if isinstance(prepared, str):
                 return TriggerProtectionStopRescuePlanningResult(
-                    "noop" if prepared == "rescue_managed_stop_already_present" else "blocked",
+                    (
+                        "noop"
+                        if prepared
+                        in {
+                            "rescue_managed_stop_already_present",
+                            "rescue_exchange_stop_already_present",
+                        }
+                        else "blocked"
+                    ),
                     prepared,
                 )
             leg, payload = prepared
@@ -2020,6 +2030,47 @@ def _prepare_trigger_protection_stop_rescue(session, *, intent, deepcoin_client)
     pos_id = str(leg.pos_id)
     if not _binding_has_exact_pos_id(binding.pos_id, pos_id):
         return "rescue_binding_position_mismatch"
+    if (
+        session.query(BoundPositionCloseReservation.id)
+        .filter(BoundPositionCloseReservation.pos_id == pos_id)
+        .filter(
+            BoundPositionCloseReservation.status.in_(
+                ("reserved", "submitted", "submit_unknown", "recovery_required")
+            )
+        )
+        .first()
+        is not None
+    ):
+        return "rescue_close_in_progress"
+    if (
+        session.query(PositionMutationIntent.id)
+        .filter(PositionMutationIntent.pos_id == pos_id)
+        .filter(
+            PositionMutationIntent.status.in_(
+                ("reserved", "submitted", "recovery_required")
+            )
+        )
+        .first()
+        is not None
+    ):
+        return "rescue_position_mutation_in_progress"
+    if (
+        session.query(StrategyManagementLeg.id)
+        .join(
+            StrategyManagementBatch,
+            StrategyManagementBatch.id
+            == StrategyManagementLeg.management_batch_id,
+        )
+        .filter(StrategyManagementLeg.pos_id == pos_id)
+        .filter(
+            StrategyManagementBatch.status.not_in(
+                ("succeeded", "blocked", "resolved")
+            )
+        )
+        .first()
+        is not None
+    ):
+        return "rescue_management_in_progress"
     ledger_rows = list_verified_ledger_rows_for_positions(session, [pos_id])
     if any(
         int(row.execution_binding_id) == int(binding.id)
@@ -2044,6 +2095,20 @@ def _prepare_trigger_protection_stop_rescue(session, *, intent, deepcoin_client)
     ]
     if len(positions) != 1:
         return "rescue_exact_live_position_not_verified"
+    saved_request = _json_dict(leg.request_json)
+    saved_size = _first_present(saved_request, "sz", "size")
+    if saved_size is not None and not _same_positive_number(
+        saved_size,
+        positions[0].get("pos") or positions[0].get("size"),
+    ):
+        return "rescue_position_economics_changed"
+    if any(
+        str(row.get("instId") or "").upper() == inst_id
+        and str(row.get("posId") or row.get("pos_id") or "") == pos_id
+        and _present(row, "slTriggerPx", "slTriggerPrice")
+        for row in pending_tpsl
+    ):
+        return "rescue_exchange_stop_already_present"
     if any(
         str(row.get("instId") or "").upper() == inst_id
         and str(row.get("posId") or row.get("pos_id") or "") == pos_id
@@ -2098,6 +2163,20 @@ def _positive_live_size(value: Any) -> bool:
         return float(str(value)) > 0
     except (TypeError, ValueError):
         return False
+
+
+def _same_positive_number(left: Any, right: Any) -> bool:
+    try:
+        left_value = Decimal(str(left))
+        right_value = Decimal(str(right))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    return (
+        left_value.is_finite()
+        and right_value.is_finite()
+        and left_value > 0
+        and left_value == right_value
+    )
 
 
 def _binding_has_exact_pos_id(binding_pos_id: object, target_pos_id: str) -> bool:

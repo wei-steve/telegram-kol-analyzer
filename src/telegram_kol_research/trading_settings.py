@@ -62,6 +62,9 @@ class TradingSettings:
     auto_trade_enabled: bool = False
     telegram_source_deletion_exit_enabled: bool = False
     management_execution_mode: Literal["disabled", "shadow", "live"] = "disabled"
+    trigger_protection_stop_rescue_mode: Literal[
+        "disabled", "shadow", "live"
+    ] = "disabled"
     default_max_loss_usdt: float = 20.0
     daily_max_loss_usdt: float = 500.0
     max_concurrent_positions: int = 4
@@ -120,6 +123,20 @@ class TradingSettings:
         return (
             self.management_execution_mode == "live" and self.auto_trade_enabled
         )
+
+    @property
+    def effective_trigger_protection_stop_rescue_mode(
+        self,
+    ) -> Literal["disabled", "shadow", "live"]:
+        if self.trigger_protection_stop_rescue_mode == "shadow":
+            return "shadow"
+        if (
+            self.trigger_protection_stop_rescue_mode == "live"
+            and self.auto_trade_enabled
+            and self.management_execution_mode == "live"
+        ):
+            return "live"
+        return "disabled"
 
     def context_resolution_enabled_for_chat(self, chat_id: int) -> bool:
         return (
@@ -236,6 +253,12 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
     management_execution_mode = _management_execution_mode(
         raw.get("management_execution_mode", defaults.management_execution_mode)
     )
+    trigger_protection_stop_rescue_mode = _trigger_protection_stop_rescue_mode(
+        raw.get(
+            "trigger_protection_stop_rescue_mode",
+            defaults.trigger_protection_stop_rescue_mode,
+        )
+    )
     return TradingSettings(
         auto_trade_enabled=_boolean_setting(
             raw,
@@ -248,6 +271,7 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
             defaults.telegram_source_deletion_exit_enabled,
         ),
         management_execution_mode=management_execution_mode,
+        trigger_protection_stop_rescue_mode=trigger_protection_stop_rescue_mode,
         default_max_loss_usdt=_positive_float(
             raw.get("default_max_loss_usdt"),
             defaults.default_max_loss_usdt,
@@ -316,6 +340,21 @@ def _management_execution_mode(
     if normalized not in {"disabled", "shadow", "live"}:
         raise ValueError(
             "management_execution_mode must be disabled, shadow, or live"
+        )
+    return normalized
+
+
+def _trigger_protection_stop_rescue_mode(
+    value: Any,
+) -> Literal["disabled", "shadow", "live"]:
+    if not isinstance(value, str):
+        raise ValueError(
+            "trigger_protection_stop_rescue_mode must be disabled, shadow, or live"
+        )
+    normalized = value.strip().lower()
+    if normalized not in {"disabled", "shadow", "live"}:
+        raise ValueError(
+            "trigger_protection_stop_rescue_mode must be disabled, shadow, or live"
         )
     return normalized
 
