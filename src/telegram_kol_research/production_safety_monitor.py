@@ -161,7 +161,12 @@ def send_monitor_incident_capture(
         raise ValueError("monitor incident capture URL must be exact loopback HTTP")
     if not isinstance(token, str) or not 32 <= len(token) <= 128:
         raise ValueError("monitor incident capture token is invalid")
-    with httpx.Client(timeout=3.0, trust_env=False) as client:
+    # The production web process has pre-existing synchronous maintenance
+    # windows that can delay loopback request dispatch for tens of seconds.
+    # This wait affects only the isolated monitor oneshot; it never blocks the
+    # listener or trading process. Keep it bounded above SQLite's 30s busy
+    # timeout so a healthy writer still has a chance to answer.
+    with httpx.Client(timeout=45.0, trust_env=False) as client:
         response = client.post(
             url,
             headers={"x-monitor-capture-token": token},

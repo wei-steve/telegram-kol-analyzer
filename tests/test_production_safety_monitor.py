@@ -2137,7 +2137,7 @@ def test_monitor_incident_capture_client_is_fixed_loopback_no_proxy(monkeypatch)
         projection=payload,
     ) == 1
     assert calls == [
-        ("init", {"timeout": 3.0, "trust_env": False}),
+        ("init", {"timeout": 45.0, "trust_env": False}),
         (
             "post",
             ("http://127.0.0.1:8000/api/runtime-incidents/monitor-capture",),
