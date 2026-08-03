@@ -2247,6 +2247,122 @@ def _configure_deferred_full_exit(
     return deferred_ids, binding_before
 
 
+def test_dabiaoke_4168_full_exit_cancels_delayed_leg_before_exact_live_close(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "dabiaoke-4168-exit.db")
+    batch = _persist_close_batch(
+        session_factory,
+        sizes=("8", "14"),
+        intent="full_exit",
+        effective_action="full_exit",
+    )
+    deferred_ids, _ = _configure_deferred_full_exit(session_factory, batch)
+    with session_factory() as session:
+        unrelated = ExecutionBinding(
+            strategy_instance_id="deepcoin:100:99:BTC:short",
+            kol_id="alice",
+            chat_id=100,
+            message_id=99,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            pos_id="pos-unrelated",
+            status="active",
+        )
+        session.add(unrelated)
+        session.flush()
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=unrelated.id,
+                strategy_instance_id=unrelated.strategy_instance_id,
+                leg_index=0,
+                purpose="entry",
+                order_kind="market",
+                order_id="entry-unrelated",
+                pos_id="pos-unrelated",
+                venue="deepcoin",
+                attribution_status="verified",
+                status="active",
+            )
+        )
+        session.commit()
+
+    class MixedStrategyClient(_FakeClient):
+        def list_positions(self, *, inst_id=None):
+            return [
+                *super().list_positions(inst_id=inst_id),
+                {
+                    "posId": "pos-unrelated",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "short",
+                    "pos": "5",
+                    "avgPx": "64100",
+                    "mgnMode": "cross",
+                    "mrgPosition": "split",
+                },
+            ]
+
+    client = MixedStrategyClient(
+        session_factory,
+        [{"code": "0", "data": {"ordId": "close-pos-live"}}],
+    )
+    client.trigger_pending = [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "ordId": "deferred-order-1",
+            "clOrdId": "deferred-client-1",
+            "posSide": "short",
+        }
+    ]
+
+    first = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+    repeated = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert first["status"] == "reconciling"
+    assert repeated["status"] == "reconciling"
+    assert client.cancel_trigger_calls == [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "ordId": "deferred-order-1",
+            "clOrdId": "deferred-client-1",
+        }
+    ]
+    assert [payload["closePosId"] for payload, _status in client.calls] == ["pos-1"]
+    assert all(
+        payload["closePosId"] != "pos-unrelated"
+        for payload, _status in client.calls
+    )
+    cancel_index = next(
+        index
+        for index, (operation, _payload) in enumerate(client.call_log)
+        if operation == "cancel_trigger_order"
+    )
+    close_index = next(
+        index
+        for index, (operation, _payload) in enumerate(client.call_log)
+        if operation == "place_order"
+    )
+    assert cancel_index < close_index
+    with session_factory() as session:
+        delayed = session.get(ExecutionOrderLeg, deferred_ids[0])
+        assert delayed.status == "cancelled"
+
+
 def test_full_close_marks_definite_deferred_cancel_rejection_as_race_candidate(tmp_path):
     from telegram_kol_research.strategy_management_executor import execute_management_batch
 
