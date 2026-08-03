@@ -86,9 +86,47 @@ stop and keep automatic management frozen.
 - Shadow baseline and immediate post-enable counts were both zero rescue rows
   and zero `stop_rescue_shadow_ready` incidents. No natural message or eligible
   trigger-fill sample arrived after deployment, so natural-sample shadow
-  evidence remains pending. Do not enable `live` until a later explicit
-  approval reviews an organically produced shadow sample and confirms zero
-  Deepcoin writes.
+  evidence remained pending at that checkpoint. A later explicit operator
+  instruction enabled `live` without restarting the service. The setting is
+  now effective only through the existing automatic-trading and live-management
+  gates.
+
+### 2026-08-03 production monitor history recovery
+
+- Reviewed/deployed commit: `4eb6ea3d41dbdf93816dbbd5459c59cc1be34d6f`.
+  The service is active, the loopback settings endpoint returns HTTP `200`, and
+  the post-deployment warning journal is empty.
+- Local verification passed the complete suite with the one documented legacy
+  CLI monitor smoke case deselected. Production focused verification passed
+  `251 passed, 1 deselected`.
+- The trading-settings fingerprint stayed
+  `27c3be58cf009c0d041d4e4f3ef504b88f8a5cf7f82cd0fd5aab471ebfd31d29`
+  across both deployments. Stop rescue remained effective `live`; no trading
+  setting changed.
+- The stable post-deployment management audit classifies 38 completed
+  fail-closed rows as `terminal_blocked`, with zero actionable `blocked`, zero
+  `partial_failed`, four `recovery_required`, and zero `submit_unknown`.
+- Exact dry runs converged batch 28 from restored-protection history after both
+  exact positions were absent, batch 38 from one exact filled close order plus
+  exact position absence, and batch 86 from complete no-submission evidence.
+  The workflow appended exactly three `management_history_recovery` events and
+  zero exchange-submission events.
+- Batches 17, 22, 23, and 40 remain unchanged as `recovery_required`. Their
+  exact historical close orders were absent from the complete bounded exchange
+  history, so the operator workflow refused with
+  `exact_terminal_order_evidence_missing`. Position absence alone was not used
+  to guess the outcome.
+- The apply for batch 28 occurred while eight new raw messages were inside the
+  two-minute observation window because the first shell wrapper did not stop
+  after its read-only gate returned nonzero. At that point execution ownership,
+  management work, position mutations, rescues, and exchange execution events
+  were all zero; the fingerprint compare-and-set passed and the operation made
+  no exchange call. The later batch 38 and 86 applies used a corrected
+  fail-fast wrapper and separately proven quiet windows.
+- Live-WAL audit churn now falls back to SQLite's read-only online backup after
+  the original no-atime component-copy path detects a transient change. The
+  resulting private snapshot validates before audit; rollback-journal and other
+  non-transient failures still fail closed.
 
 ## Handoff checklist
 
