@@ -6,13 +6,15 @@ used to advance or reinterpret the rollout.
 ```yaml
 project: runtime-incident-agent
 design_version: 1
-current_phase: 8R.2
-phase_name: technical-incident-capture
-phase_status: in_progress
-last_completed_phase: "8R.1"
-last_completed_commit: 2449382
-production_commit: 2449382bd53195950b42ec6052fb4e6dee4fb9cd
+current_phase: 8R.3
+phase_name: proactive-invariant-scanner
+phase_status: planned
+last_completed_phase: "8R.2"
+last_completed_commit: b3c2f14
+production_commit: b3c2f146991953e0b8a2d71cd5364cfff8f9ebb8
 local_tests:
+  - "phase-8r.2-final-monitor-writer-regression: 296 passed, 1 Linux-only installation probe skipped"
+  - "phase-8r.2-dedicated-writer-thread-review: no Critical or Important findings; cancellation drains the worker before releasing the single-flight lock"
   - "phase-8r.2-bounded-monitor-writer-regression: 732 passed, 1 Linux-only installation probe skipped"
   - "phase-8r.2-bounded-monitor-writer-review: no Critical or Important findings after adding the true streaming request cap and persistence-free authenticated health endpoint"
   - "phase-8r.2-live-policy-reload-focused: 294 passed, 1 Linux-only installation probe skipped; review found no Critical or Important defects"
@@ -75,8 +77,8 @@ local_tests:
   - "full-suite before final review fixes: 2611 passed, 1 skipped; every subsequently changed path passed the focused suites"
   - "phase-3-post-canary-focused: 127 passed"
 server_verification:
-  status: phase-8r.1-monitor-repair-complete
-  deployed_commit: 2449382bd53195950b42ec6052fb4e6dee4fb9cd
+  status: phase-8r.2-technical-capture-complete
+  deployed_commit: b3c2f146991953e0b8a2d71cd5364cfff8f9ebb8
   service: active-http-200
   bounded_restarts: "service restarted without SIGKILL; raw message 8309 crossed the restart with a live pre-restart evidence lease, logged one already-in-progress recovery error, then completed through normal lease expiry recovery"
   listener: monitoring-31-enabled-groups-and-continuing
@@ -157,14 +159,18 @@ server_verification:
   phase_8r_2_dormant_deployment: "Commit 7393c4e was deployed after a fresh safe-window gate with latest raw/decision both 9011 and zero recent recognition, evidence, context, management, position-mutation, execution-event, runtime-claim, or recovery work in flight. Main service, Runtime Agent, and monitor timer are active; HTTP is 200. Capture remains exactly management_partial_failed. Telegram and Agent selectors were atomically pinned to exactly management_partial_failed before restart, so absent=legacy-all cannot expose future capture-only types."
   phase_8r_2_monitor_policy: "The monitor installer now copies only the exact non-secret capture allowlist into its root-owned environment; deployed monitor and main policy both remain management_partial_failed. The monitor sandbox still correctly mounts the production SQLite database read-only."
   phase_8r_2_writer_design: "Approved bounded authenticated loopback writer design and implementation plan are committed at 165c4a1. The monitor keeps SQLite read-only; the trusted main service accepts only a closed monitor projection under a dedicated token and applies its own capture policy."
-  remaining: "Phase 8R.2 bounded monitor writer is implemented locally and awaiting final review, commit/push, dormant safe-window deployment, authenticated no-op probe, and one-type-at-a-time capture comparison. Telegram and Agent selectors must remain unchanged. Do not implement the invariant scanner or any later Phase 8R stage."
+  phase_8r_2_writer_deployment: "Commits 578d65e, 941180c, 103363c, and b3c2f14 deployed the bounded loopback writer, per-request capture-policy reload, dedicated writer executor, and a monitor-only 45-second dispatch bound after production exposed pre-existing web-loop scheduling delays. The authenticated health endpoint returned available/schema 1 without changing the incident count. Main service and Runtime Agent are active, HTTP is 200, and the monitor timer is enabled with the production database, WAL, and SHM still mounted read-only."
+  phase_8r_2_capture_comparison: "Each of the nine closed capture types was enabled alone. Every type reached a zero-capture drain followed by three stable zero passes, with management/protection source hashes unchanged. Results: management_partial_failed 1 incident; provider_retry_exhausted 0; context_worker_exhausted 0; management_submit_unknown 0; management_recovery_required 6; severe_protection_incident 155; monitor_adapter_failure 0 during staged parity; monitor_audit_incomplete 0; notification_delivery_failure 0. No staged incident acquired an Agent or Telegram claim."
+  phase_8r_2_final_policy: "Capture is enabled for all nine READ_ONLY_CAPTURE_PROFILE types. Telegram and Runtime Agent selectors remain exactly management_partial_failed, so the newly captured types are capture-only. A Persistent timer catch-up overlapped the bounded main-service restart and correctly produced one pending, unclaimed monitor_adapter_failure incident for transient service/settings unavailability; its operator monitor notification was sent, and the later no-notify diagnostic returned monitor_error null with only the known audit_abnormal baseline. Production now has 163 incidents and zero active incident, notification, or recovery claims."
+  phase_8r_2_deployed_tests: "The deployed focused suite reached 294 passing tests before two known 0.2-second lifespan timing tests failed under production host load; both are unrelated to the writer changes and the complete local focused suite passed 296 tests with one installation skip."
+  remaining: "Phase 8R.2 is complete. Next turn may begin only Phase 8R.3: deploy the proactive invariant scanner dormant, prove its rollback, then run it shadow-only under a separately reviewed canary. Do not enable deterministic notification for new rules or widen Agent diagnosis in the same turn."
 enabled_flags:
-  - "capture:management_partial_failed"
+  - "capture:READ_ONLY_CAPTURE_PROFILE-nine-types"
   - "telegram:deterministic-runtime-incident-reports"
   - "runtime-agent:read-only-diagnosis"
   - "monitor:independent-system-operator-alerting"
 known_issues:
-  - "Phase 8R.2 capture widening is intentionally paused: the independent monitor has a read-only production database sandbox, so monitor failures and durable management/protection scans need a bounded trusted writer or separate incident outbox before production activation. Whole-database monitor write permission was rejected."
+  - "The production web process has pre-existing synchronous maintenance windows that can delay loopback HTTP dispatch for tens of seconds. The isolated monitor capture client is bounded to 45 seconds and remains fail-open; this does not block the listener or trading process."
   - "The pre-existing production safety baseline remains `audit_abnormal` (32 blocked, 1 partial_failed, 5 recovery_required in the latest bounded audit); Phase 5 did not alter those historical rows."
   - "The production notification-bot configuration is absent, so the new read-only Telegram evidence endpoint returns HTTP 503 for strategy-management notification sources. Runtime-incident system-operator evidence is verified; the unsupported production channel fails closed and no credential was added in Phase 6."
   - "Phase 6 production wiring implements the read-only reconciliation-plan, exchange-snapshot-refresh, production-audit, and Telegram-evidence handlers. Claim recovery and AI-job reschedule remain executor_not_configured by reviewed design: the former duplicated the authoritative stale-claim path, while the latter had no source satisfying both non-writing proof and the recognition/contextual-resolution boundary."

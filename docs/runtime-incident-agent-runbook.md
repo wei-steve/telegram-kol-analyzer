@@ -414,6 +414,15 @@ clearing newly added capture types first; rotate or remove the dedicated token
 only while the monitor timer is stopped. The database, WAL, and SHM mounts must
 remain read-only in every monitor unit.
 
+The monitor-only loopback client has a 45-second upper bound because the
+production web loop has observed pre-existing synchronous maintenance windows
+longer than the SQLite 30-second busy timeout. This wait occurs only in the
+isolated monitor oneshot and never in the listener or trading process. During
+deployment, keep the timer stopped, update policy, restart and verify the main
+service, and enable the timer last. The timer is `Persistent=true` and may run
+an immediate catch-up when enabled; enabling it before the main restart can
+create a real transient `monitor_adapter_failure` and operator alert.
+
 At most one runtime stage may be implemented per user turn. New code and
 configuration default off. A first deployment never enables its feature. A
 later enablement requires another complete safe-window check and the exact
