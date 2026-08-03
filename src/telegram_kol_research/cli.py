@@ -999,6 +999,7 @@ def _audit_management_snapshot(
             "status",
             "target_snapshot_json",
             "planned_at",
+            "completed_at",
         }
         leg_required = {
             "id",
@@ -1022,6 +1023,7 @@ def _audit_management_snapshot(
             "counts": {
                 "batches_total": 0,
                 "informational_noop": 0,
+                "terminal_blocked": 0,
                 **{state: 0 for state in _MANAGEMENT_ALERT_STATES},
             },
             "batches_returned": 0,
@@ -1056,11 +1058,33 @@ def _audit_management_snapshot(
                         + informational_predicate
                     ).fetchone()[0]
                 )
+            actionable_leg_states = (
+                "'reserved', 'submitted', 'submit_unknown', 'partial', "
+                "'inconsistent', 'partial_failed', 'recovery_required'"
+            )
+            terminal_blocked_predicate = (
+                "b.status = 'blocked' "
+                "AND b.completed_at IS NOT NULL "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM strategy_management_legs terminal_leg "
+                "WHERE terminal_leg.management_batch_id = b.id "
+                f"AND terminal_leg.status IN ({actionable_leg_states})"
+                ")"
+            )
+            result["counts"]["terminal_blocked"] = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM strategy_management_batches b WHERE "
+                    + terminal_blocked_predicate
+                ).fetchone()[0]
+            )
             for state in _MANAGEMENT_ALERT_STATES:
-                exclusion = (
-                    " AND NOT (" + informational_predicate + ")"
-                    if state == "blocked" and informational_predicate is not None
-                    else ""
+                exclusions = []
+                if state == "blocked":
+                    exclusions.append(terminal_blocked_predicate)
+                    if informational_predicate is not None:
+                        exclusions.append(informational_predicate)
+                exclusion = "".join(
+                    " AND NOT (" + predicate + ")" for predicate in exclusions
                 )
                 result["counts"][state] = int(
                     connection.execute(
@@ -3264,6 +3288,7 @@ def audit_management_batches(
             "counts": {
                 "batches_total": 0,
                 "informational_noop": 0,
+                "terminal_blocked": 0,
                 **{state: 0 for state in _MANAGEMENT_ALERT_STATES},
             },
             "batches_returned": 0,
@@ -3323,6 +3348,7 @@ def audit_management_batches(
             for key in (
                 "batches_total",
                 "informational_noop",
+                "terminal_blocked",
                 *_MANAGEMENT_ALERT_STATES,
             )
         )

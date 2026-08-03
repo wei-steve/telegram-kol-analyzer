@@ -671,6 +671,112 @@ def test_audit_management_batches_keeps_near_match_holds_alerting(
     assert details["audit_abnormal_count"] == 1
 
 
+@pytest.mark.parametrize("leg_status", [None, "planned", "failed"])
+def test_audit_management_batches_classifies_completed_safe_block_as_history(
+    tmp_path, leg_status
+):
+    database_path = tmp_path / "terminal-blocked.db"
+    create_session_factory(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO strategy_management_batches "
+            "(id, idempotency_fingerprint, raw_message_id, recognition_decision_id, "
+            "recognition_generation, target_lifecycle_id, strategy_instance_id, "
+            "execution_binding_id, intent, effective_action, execution_mode, "
+            "partial_round_before, status, reason_code, target_fingerprint, "
+            "target_snapshot_json, planned_at, completed_at, created_at, updated_at) "
+            "VALUES (303, 'terminal-fingerprint', 103, 403, 'terminal-generation', "
+            "503, 'terminal-strategy', 603, 'full_exit', 'full_exit', 'live', 0, "
+            "'blocked', 'safe_preflight_refusal', 'terminal-target', '{}', "
+            "'2026-07-17 00:00:00', '2026-07-17 00:00:01', "
+            "'2026-07-17 00:00:00', '2026-07-17 00:00:01')"
+        )
+        if leg_status is not None:
+            connection.execute(
+                "INSERT INTO strategy_management_legs "
+                "(id, management_batch_id, execution_order_leg_id, pos_id, leg_index, "
+                "status, created_at, updated_at) "
+                "VALUES (703, 303, 803, 'pos-terminal', 1, ?, "
+                "'2026-07-17 00:00:00', '2026-07-17 00:00:01')",
+                (leg_status,),
+            )
+        connection.commit()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "audit-management-batches",
+            "--database-path",
+            str(database_path),
+            "--output-format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    counts = json.loads(result.stdout)["counts"]
+    assert counts["terminal_blocked"] == 1
+    assert counts["blocked"] == 0
+
+
+@pytest.mark.parametrize(
+    "leg_status",
+    [
+        "reserved",
+        "submitted",
+        "submit_unknown",
+        "partial",
+        "inconsistent",
+        "partial_failed",
+        "recovery_required",
+    ],
+)
+def test_audit_management_batches_keeps_completed_block_with_actionable_leg(
+    tmp_path, leg_status
+):
+    database_path = tmp_path / "actionable-blocked.db"
+    create_session_factory(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO strategy_management_batches "
+            "(id, idempotency_fingerprint, raw_message_id, recognition_decision_id, "
+            "recognition_generation, target_lifecycle_id, strategy_instance_id, "
+            "execution_binding_id, intent, effective_action, execution_mode, "
+            "partial_round_before, status, reason_code, target_fingerprint, "
+            "target_snapshot_json, planned_at, completed_at, created_at, updated_at) "
+            "VALUES (304, 'actionable-fingerprint', 104, 404, 'actionable-generation', "
+            "504, 'actionable-strategy', 604, 'full_exit', 'full_exit', 'live', 0, "
+            "'blocked', 'blocked_with_actionable_leg', 'actionable-target', '{}', "
+            "'2026-07-17 00:00:00', '2026-07-17 00:00:01', "
+            "'2026-07-17 00:00:00', '2026-07-17 00:00:01')"
+        )
+        connection.execute(
+            "INSERT INTO strategy_management_legs "
+            "(id, management_batch_id, execution_order_leg_id, pos_id, leg_index, "
+            "status, created_at, updated_at) "
+            "VALUES (704, 304, 804, 'pos-actionable', 1, ?, "
+            "'2026-07-17 00:00:00', '2026-07-17 00:00:01')",
+            (leg_status,),
+        )
+        connection.commit()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "audit-management-batches",
+            "--database-path",
+            str(database_path),
+            "--output-format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    counts = json.loads(result.stdout)["counts"]
+    assert counts["terminal_blocked"] == 0
+    assert counts["blocked"] == 1
+
+
 def _audit_payload_with_management_history(
     tmp_path,
     *,
@@ -871,11 +977,12 @@ def test_audit_management_batches_active_wal_read_only_source_is_unchanged(tmp_p
         connection.execute("PRAGMA wal_autocheckpoint=0")
         connection.executescript(
             """
-            CREATE TABLE strategy_management_batches (
-                id INTEGER, raw_message_id INTEGER, target_lifecycle_id INTEGER,
-                strategy_instance_id TEXT, execution_binding_id INTEGER,
-                intent TEXT, effective_action TEXT, execution_mode TEXT,
-                status TEXT, target_snapshot_json TEXT, planned_at TEXT
+                CREATE TABLE strategy_management_batches (
+                    id INTEGER, raw_message_id INTEGER, target_lifecycle_id INTEGER,
+                    strategy_instance_id TEXT, execution_binding_id INTEGER,
+                    intent TEXT, effective_action TEXT, execution_mode TEXT,
+                    status TEXT, target_snapshot_json TEXT, planned_at TEXT,
+                    completed_at TEXT
             );
             CREATE TABLE strategy_management_legs (
                 id INTEGER, management_batch_id INTEGER, pos_id TEXT,
@@ -1469,11 +1576,12 @@ def test_audit_management_batches_malformed_complete_columns_are_safe(tmp_path):
     with sqlite3.connect(database_path) as connection:
         connection.executescript(
             """
-            CREATE TABLE strategy_management_batches (
-                id TEXT, raw_message_id TEXT, target_lifecycle_id TEXT,
-                strategy_instance_id TEXT, execution_binding_id TEXT,
-                intent TEXT, effective_action TEXT, execution_mode TEXT,
-                status TEXT, target_snapshot_json TEXT, planned_at TEXT
+                CREATE TABLE strategy_management_batches (
+                    id TEXT, raw_message_id TEXT, target_lifecycle_id TEXT,
+                    strategy_instance_id TEXT, execution_binding_id TEXT,
+                    intent TEXT, effective_action TEXT, execution_mode TEXT,
+                    status TEXT, target_snapshot_json TEXT, planned_at TEXT,
+                    completed_at TEXT
             );
             CREATE TABLE strategy_management_legs (
                 id TEXT, management_batch_id TEXT, pos_id TEXT, leg_index TEXT,
@@ -1488,8 +1596,8 @@ def test_audit_management_batches_malformed_complete_columns_are_safe(tmp_path):
             );
             INSERT INTO strategy_management_batches VALUES (
                 'batch-secret-bad', NULL, 'life-secret-bad', 'strategy-secret-bad',
-                'binding-secret-bad', 'bad intent !', 'evil\nraw', 'LIVE!',
-                'unknown state !', '{bad', 'not-a-date'
+                    'binding-secret-bad', 'bad intent !', 'evil\nraw', 'LIVE!',
+                    'unknown state !', '{bad', 'not-a-date', 'also-not-a-date'
             );
             INSERT INTO strategy_management_legs VALUES (
                 'leg-secret-bad', 'batch-secret-bad', 'pos-secret-bad', 'NaN',

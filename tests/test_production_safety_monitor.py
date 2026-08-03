@@ -467,6 +467,26 @@ def test_abnormal_audit_alerts(audit):
     assert "audit_abnormal" in result.reason_codes
 
 
+def test_terminal_blocked_history_is_visible_but_not_alerting():
+    result = evaluate_monitor_snapshot(
+        _snapshot(
+            audit=_healthy_audit(
+                counts={
+                    "terminal_blocked": 36,
+                    "blocked": 0,
+                    "partial_failed": 0,
+                    "submit_unknown": 0,
+                    "recovery_required": 0,
+                }
+            )
+        ),
+        EXPECTATIONS,
+    )
+
+    assert result.healthy is True
+    assert result.reason_codes == ()
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
