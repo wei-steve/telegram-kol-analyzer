@@ -95,6 +95,13 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         "recognition_generation": "ALTER TABLE signal_candidates ADD COLUMN recognition_generation VARCHAR(64)",
         "stop_price_source": "ALTER TABLE signal_candidates ADD COLUMN stop_price_source VARCHAR(32)",
         "review_note": "ALTER TABLE signal_candidates ADD COLUMN review_note TEXT",
+        "management_contract_json": (
+            "ALTER TABLE signal_candidates ADD COLUMN management_contract_json TEXT"
+        ),
+        "management_contract_fingerprint": (
+            "ALTER TABLE signal_candidates "
+            "ADD COLUMN management_contract_fingerprint VARCHAR(64)"
+        ),
     },
     "strategy_revision_batches": {
         "advance_claim_token": (
@@ -261,6 +268,17 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         "last_progress_at": "ALTER TABLE strategy_management_batches ADD COLUMN last_progress_at DATETIME",
         "escalation_state": "ALTER TABLE strategy_management_batches ADD COLUMN escalation_state VARCHAR(32)",
         "escalation_notified_at": "ALTER TABLE strategy_management_batches ADD COLUMN escalation_notified_at DATETIME",
+        "management_contract_json": (
+            "ALTER TABLE strategy_management_batches "
+            "ADD COLUMN management_contract_json TEXT"
+        ),
+        "management_contract_fingerprint": (
+            "ALTER TABLE strategy_management_batches "
+            "ADD COLUMN management_contract_fingerprint VARCHAR(64)"
+        ),
+        "contract_version": (
+            "ALTER TABLE strategy_management_batches ADD COLUMN contract_version INTEGER"
+        ),
     },
     "message_instruction_items": {
         "visibility_first_failed_at": (

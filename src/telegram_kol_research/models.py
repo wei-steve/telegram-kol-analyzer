@@ -523,6 +523,12 @@ class SignalCandidate(Base):
     )
     management_action: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     management_fraction: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    management_contract_json: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+    management_contract_fingerprint: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, index=True
+    )
     recognition_generation: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     entry_text: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     stop_loss_text: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -1045,6 +1051,13 @@ class StrategyManagementBatch(Base):
     )
     requested_fraction: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     effective_fraction: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    management_contract_json: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+    management_contract_fingerprint: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    contract_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     partial_round_before: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="ready")
     reason_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
@@ -1113,6 +1126,59 @@ class StrategyManagementLeg(Base):
     last_exchange_snapshot_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
+class StrategyManagementComponent(Base):
+    """Durable state for one ordered part of a management instruction."""
+
+    __tablename__ = "strategy_management_components"
+    __table_args__ = (
+        Index(
+            "uq_strategy_management_components_idempotency",
+            "idempotency_key",
+            unique=True,
+        ),
+        Index(
+            "uq_strategy_management_components_batch_leg_kind",
+            "management_batch_id",
+            "strategy_management_leg_id",
+            "component_kind",
+            unique=True,
+        ),
+        Index(
+            "ix_strategy_management_components_batch_status_sequence",
+            "management_batch_id",
+            "status",
+            "sequence",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    management_batch_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_management_batches.id"), nullable=False, index=True
+    )
+    strategy_management_leg_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("strategy_management_legs.id"), nullable=True, index=True
+    )
+    component_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending", index=True
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    desired_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    evidence_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    reason_code: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    last_progress_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    execution_deadline_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
 class StrategyManagementMarketDecision(Base):

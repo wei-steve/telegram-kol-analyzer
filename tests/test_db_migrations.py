@@ -81,3 +81,67 @@ def test_runtime_incident_agent_retry_columns_have_additive_compat_migrations():
     assert "ADD COLUMN agent_next_attempt_at DATETIME" in (
         statements["agent_next_attempt_at"]
     )
+
+
+def test_composite_management_schema_is_added_to_existing_database(tmp_path):
+    database_path = tmp_path / "legacy-composite.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE signal_candidates (id INTEGER PRIMARY KEY)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE strategy_management_batches (
+                id INTEGER PRIMARY KEY,
+                idempotency_fingerprint VARCHAR(64) NOT NULL,
+                strategy_instance_id VARCHAR(255) NOT NULL,
+                status VARCHAR(32) NOT NULL
+            )
+            """
+        )
+
+    session_factory = create_session_factory(database_path)
+    inspector = inspect(session_factory.kw["bind"])
+
+    assert {
+        "management_contract_json",
+        "management_contract_fingerprint",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("signal_candidates")
+    }
+    assert {
+        "management_contract_json",
+        "management_contract_fingerprint",
+        "contract_version",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("strategy_management_batches")
+    }
+    assert inspector.has_table("strategy_management_components")
+    assert {
+        "management_batch_id",
+        "strategy_management_leg_id",
+        "component_kind",
+        "sequence",
+        "status",
+        "idempotency_key",
+        "desired_json",
+        "evidence_json",
+        "reason_code",
+        "attempt_count",
+        "last_progress_at",
+        "execution_deadline_at",
+        "created_at",
+        "updated_at",
+        "completed_at",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("strategy_management_components")
+    }
+    indexes = {
+        index["name"]: index
+        for index in inspector.get_indexes("strategy_management_components")
+    }
+    assert indexes["uq_strategy_management_components_idempotency"]["unique"]
+    assert indexes["uq_strategy_management_components_batch_leg_kind"]["unique"]
