@@ -754,11 +754,20 @@ def _composite_management_gate_reason(
     candidate: SignalCandidate,
     settings,
 ) -> str | None:
+    composite_action = (
+        str(candidate.management_action or "").strip().lower()
+        == "partial_then_break_even"
+    )
+    has_contract_json = bool(candidate.management_contract_json)
+    has_contract_fingerprint = bool(
+        candidate.management_contract_fingerprint
+    )
     if not (
-        candidate.management_contract_json
-        and candidate.management_contract_fingerprint
+        composite_action or has_contract_json or has_contract_fingerprint
     ):
         return None
+    if not (has_contract_json and has_contract_fingerprint):
+        return "management_instruction_component_dropped"
     mode = settings.effective_composite_management_v2_mode
     if mode == "disabled":
         return "composite_management_v2_disabled"

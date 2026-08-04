@@ -320,6 +320,12 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
             "ALTER TABLE strategy_management_notifications ADD COLUMN lease_expires_at DATETIME"
         ),
     },
+    "strategy_management_components": {
+        "strategy_management_leg_scope": (
+            "ALTER TABLE strategy_management_components "
+            "ADD COLUMN strategy_management_leg_scope INTEGER NOT NULL DEFAULT -1"
+        ),
+    },
     "recovery_decisions": {
         "reason_codes_json": "ALTER TABLE recovery_decisions ADD COLUMN reason_codes_json TEXT NOT NULL DEFAULT '[]'",
         "entry_range_text": "ALTER TABLE recovery_decisions ADD COLUMN entry_range_text VARCHAR(255)",
@@ -420,6 +426,18 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
 }
 
 SQLITE_COMPAT_INDEXES: dict[str, str] = {
+    "uq_strategy_management_components_batch_scope_kind": (
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "uq_strategy_management_components_batch_scope_kind "
+        "ON strategy_management_components "
+        "(management_batch_id, strategy_management_leg_scope, component_kind)"
+    ),
+    "uq_strategy_management_components_batch_scope_sequence": (
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "uq_strategy_management_components_batch_scope_sequence "
+        "ON strategy_management_components "
+        "(management_batch_id, strategy_management_leg_scope, sequence)"
+    ),
     "ix_raw_messages_source_status": (
         "CREATE INDEX IF NOT EXISTS ix_raw_messages_source_status "
         "ON raw_messages (source_status)"

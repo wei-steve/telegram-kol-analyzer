@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import StrategyManagementComponent
@@ -41,6 +42,31 @@ def test_component_identity_is_immutable_and_unique(tmp_path):
                 desired={"policy": "consume_first_stage"},
                 now=datetime(2026, 8, 4, tzinfo=UTC),
             )
+
+
+def test_database_rejects_duplicate_batch_wide_component_identity(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    now = datetime(2026, 8, 4, tzinfo=UTC)
+    with session_factory() as session:
+        session.add_all(
+            [
+                StrategyManagementComponent(
+                    management_batch_id=1,
+                    strategy_management_leg_id=None,
+                    component_kind="consume_take_profit_stage",
+                    sequence=10,
+                    status="pending",
+                    idempotency_key=f"component-{index}",
+                    desired_json="{}",
+                    evidence_json="[]",
+                    created_at=now,
+                    updated_at=now,
+                )
+                for index in range(2)
+            ]
+        )
+        with pytest.raises(IntegrityError):
+            session.flush()
 
 
 def test_component_transition_is_compare_and_set(tmp_path):
@@ -94,7 +120,7 @@ def test_restart_claims_only_safe_or_stale_local_states(tmp_path):
 
 @pytest.mark.parametrize(
     "protected_status",
-    ["awaiting_exchange", "confirmed", "operator_required"],
+    ["submitting", "awaiting_exchange", "confirmed", "operator_required"],
 )
 def test_restart_never_reclaims_exchange_or_terminal_state_as_new_write(
     tmp_path, protected_status

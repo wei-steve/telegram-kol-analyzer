@@ -78,6 +78,11 @@ def create_management_component(
     component = StrategyManagementComponent(
         management_batch_id=int(management_batch_id),
         strategy_management_leg_id=strategy_management_leg_id,
+        strategy_management_leg_scope=(
+            int(strategy_management_leg_id)
+            if strategy_management_leg_id is not None
+            else -1
+        ),
         component_kind=str(component_kind),
         sequence=int(sequence),
         status="pending",
@@ -160,7 +165,7 @@ def claim_management_component(
                 ),
                 and_(
                     StrategyManagementComponent.status.in_(
-                        ("preflighting", "submitting")
+                        ("preflighting",)
                     ),
                     StrategyManagementComponent.updated_at <= stale_before,
                 ),

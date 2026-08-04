@@ -169,6 +169,60 @@ def test_web_auto_executor_composite_gate_blocks_legacy_exchange_path(
     assert factory_calls == []
 
 
+def test_web_auto_executor_composite_without_contract_fails_closed(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=100,
+            message_id=9003,
+            text="止盈50%，剩余仓位移动止损到开仓价",
+            archived_target_group=True,
+        )
+        session.add(raw)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="BTC",
+                side="long",
+                event_type="position_update",
+                management_action="partial_then_break_even",
+                management_fraction=0.5,
+                recognition_generation="composite-v2-incomplete",
+                parse_source="mimo_authoritative",
+                confidence=0.99,
+            )
+        )
+        session.commit()
+        raw_id = raw.id
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+            "composite_management_v2_mode": "live",
+        },
+    )
+    factory_calls = []
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            session_factory=session_factory,
+            group_config=GroupConfig(groups=[]),
+            deepcoin_client_factory=lambda: factory_calls.append("called"),
+            deepcoin_contract_spec_provider=None,
+            now_provider=lambda: datetime(2026, 8, 4, 3, 0),
+        )
+    )
+
+    result = _run_auto_trade_executor(app, raw_message_id=raw_id)
+
+    assert result == {
+        "status": "skipped",
+        "reason": "management_instruction_component_dropped",
+    }
+    assert factory_calls == []
+
+
 def test_disabled_context_resolution_does_not_extract_reply_evidence(
     tmp_path,
     monkeypatch,

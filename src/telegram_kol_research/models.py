@@ -1133,6 +1133,11 @@ class StrategyManagementComponent(Base):
 
     __tablename__ = "strategy_management_components"
     __table_args__ = (
+        CheckConstraint(
+            "strategy_management_leg_scope = "
+            "COALESCE(strategy_management_leg_id, -1)",
+            name="ck_strategy_management_components_leg_scope",
+        ),
         Index(
             "uq_strategy_management_components_idempotency",
             "idempotency_key",
@@ -1143,6 +1148,20 @@ class StrategyManagementComponent(Base):
             "management_batch_id",
             "strategy_management_leg_id",
             "component_kind",
+            unique=True,
+        ),
+        Index(
+            "uq_strategy_management_components_batch_scope_kind",
+            "management_batch_id",
+            "strategy_management_leg_scope",
+            "component_kind",
+            unique=True,
+        ),
+        Index(
+            "uq_strategy_management_components_batch_scope_sequence",
+            "management_batch_id",
+            "strategy_management_leg_scope",
+            "sequence",
             unique=True,
         ),
         Index(
@@ -1159,6 +1178,9 @@ class StrategyManagementComponent(Base):
     )
     strategy_management_leg_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("strategy_management_legs.id"), nullable=True, index=True
+    )
+    strategy_management_leg_scope: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=-1, server_default=text("-1")
     )
     component_kind: Mapped[str] = mapped_column(String(64), nullable=False)
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
