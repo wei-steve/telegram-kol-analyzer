@@ -17,6 +17,8 @@ DIAGNOSTIC_PATH = (
     PROJECT_ROOT / "deploy" / "systemd" / "telegram-kol-monitor-diagnostic.service"
 )
 INSTALLER_PATH = PROJECT_ROOT / "scripts" / "install_server_monitor.sh"
+RUNBOOK_PATH = PROJECT_ROOT / "docs" / "runbook.md"
+HANDOFF_PATH = PROJECT_ROOT / "docs" / "migration-handoff.md"
 PRODUCTION_ROOT = "/opt/telegram-kol-analyzer"
 
 
@@ -29,6 +31,26 @@ def _state_repair_program() -> str:
     return installer.split("# BEGIN_STATE_METADATA_REPAIR\n", 1)[1].split(
         "# END_STATE_METADATA_REPAIR", 1
     )[0]
+
+
+def test_operator_docs_define_readable_deterministic_monitor_notifications():
+    documentation = (
+        RUNBOOK_PATH.read_text(encoding="utf-8")
+        + "\n"
+        + HANDOFF_PATH.read_text(encoding="utf-8")
+    )
+
+    for required_text in (
+        "🔴 立即处理",
+        "🟡 稍后核查",
+        "🔵 状态提醒",
+        "不是 AI Agent",
+        "最多 10 个",
+        "完整、健康的管理审计",
+        "六小时",
+    ):
+        assert required_text in documentation
+    assert "版本号不参与" in documentation
 
 
 def test_monitor_service_uses_dedicated_identity_and_exact_command():

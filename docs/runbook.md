@@ -324,15 +324,39 @@ production database, call a Deepcoin mutation, or restart the trading service.
 Normal trade notifications are not duplicated: only actionable system
 abnormalities are eligible for monitor alerts.
 
-Monitor alert delivery is reason-aware. High-priority abnormalities, including
-service/settings drift, journal errors, adapter failures, malformed snapshots,
-state-file integrity problems, abnormal execution events, and incomplete audit
-evidence, retain the six-hour repeat reminder while unchanged. Valid HEAD drift
-is deployment context, not a standalone safety failure: the monitor records the
-current and expected versions and includes them with any real alert, but a
-version mismatch alone stays healthy. Stable low-priority `audit_abnormal`
-residue sends once per unique fingerprint and then becomes log-only until the
-fingerprint changes.
+Monitor alerts use deterministic Chinese templates; they are produced by the
+system timer, not an AI model and not the Runtime Incident AI Agent. Every
+message states what happened, the known or unknown trading impact, what the
+operator should do or avoid, the notification source, and a final bounded
+diagnostic section. Internal reason codes are diagnostic data, not the title.
+The source line is fixed as `系统定时安全检查，不是 AI Agent`.
+
+Operator-facing severity is fixed:
+
+- `🔴 立即处理` covers service/settings drift, unknown or recovery-required
+  exchange events, duplicate exact closes, adapter failures, malformed
+  snapshots, and incomplete audit evidence. An unchanged critical fingerprint
+  repeats after six hours.
+- `🟡 稍后核查` covers actionable historical management residue, recent journal
+  errors while the service remains active, and monitor-state integrity. Stable
+  audit residue sends once and remains log-only until a meaningful fact changes.
+- `🔵 状态提醒` is sent once after every previously delivered active cause has
+  been rechecked and cleared. An audit cause can recover only after a new,
+  complete, healthy management audit; a run that skips the audit cannot claim
+  recovery.
+
+The management-audit explanation includes the actionable state counts and at
+most 10 exact management batch IDs. If more exist, the message states both the
+total and that only the first ten are displayed. It never includes raw errors,
+messages, order requests/responses, position identifiers, or credentials.
+也就是说：紧急问题最多每六小时提醒一次；审计通知最多 10 个批次；
+只有新的完整、健康的管理审计才能宣布审计问题已恢复。
+
+Valid HEAD drift remains deployment context, not a standalone safety failure.
+The monitor may record current and expected versions internally, but unrelated
+version numbers are omitted from the operator message and the version number
+does not participate in an `audit_abnormal` fingerprint. A normal code deployment
+therefore cannot retrigger an unchanged historical audit notification.
 
 The management audit reports informational keep-holding history separately as
 `counts.informational_noop`. It also reports completed fail-closed history as
