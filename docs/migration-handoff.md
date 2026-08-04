@@ -172,6 +172,35 @@ version hashes are omitted from the human-facing alert. 版本号不参与
 `audit_abnormal` fingerprinting. Frequent reviewed deployments therefore do not
 retrigger the same historical management notification.
 
+### Human-readable monitor rollout evidence (2026-08-04)
+
+- Reviewed commit `087f992` was deployed from
+  `codex/deepcoin-auto-trading-v1`. Local verification reported 3,241 passed,
+  one skipped, and one pre-existing obsolete compact-summary test deselected;
+  the deployed focused monitor suite reported 228 passed with that same test
+  deselected.
+- The pre-restart quiet-window gate kept the latest raw message and completed
+  decision at 9286 for a bounded 30-second recheck. Recognition, evidence,
+  context, management, position-mutation, stop-rescue, runtime-claim, recovery,
+  and recent execution-event work in flight were all zero.
+- The installed no-notify diagnostic completed its bounded result with
+  `monitor_error=null`; its only reason was the known `audit_abnormal`
+  historical baseline. A separate pure formatter simulation rendered the
+  approved yellow message for management batches 17 and 22, included the
+  system/non-AI source statement, and contained no Git hashes. No Telegram
+  delivery was forced during rollout.
+- After installation, `telegram-kol-monitor.timer` was enabled and active,
+  `telegram-kol.service` was active, and the loopback root route returned HTTP
+  200. The five-field monitor state remained owned by
+  `telegram-kol-monitor:telegram-kol-monitor` at mode `0600`.
+- The Runtime Agent and scanner remained enabled/active with their existing
+  `management_partial_failed` Agent/Telegram selectors. Agent action authority
+  remained false and both shadow and action playbook allowlists remained empty.
+- Immediate monitor rollback is
+  `systemctl disable --now telegram-kol-monitor.timer`. A code rollback still
+  requires reviewed Git reverts followed by the normal server update helper;
+  do not edit the production checkout or monitor environment by hand.
+
 On each reviewed server deployment, first run
 `systemctl disable --now telegram-kol-monitor.timer`, then require both
 `systemctl is-enabled --quiet telegram-kol-monitor.timer` and
