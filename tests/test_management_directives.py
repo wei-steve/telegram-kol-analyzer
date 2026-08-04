@@ -5,6 +5,7 @@ import pytest
 from telegram_kol_research.management_directives import (
     DEFAULT_PARTIAL_CLOSE_FRACTION,
     DEFAULT_TAIL_CLOSE_FRACTION,
+    build_management_instruction_contract,
     resolve_management_directive,
 )
 
@@ -24,6 +25,49 @@ def test_unspecified_partial_defaults_to_half() -> None:
     assert directive.fraction == DEFAULT_PARTIAL_CLOSE_FRACTION == 0.5
     assert directive.risk_reducing is True
     assert directive.fanout_allowed is True
+
+
+def test_miya_partial_with_explicit_stop_preserves_all_components():
+    contract = build_management_instruction_contract(
+        text="BTC多单目前浮盈1100点，止盈50%，剩余仓位止损位移动至62700，做无风险持仓",
+        lifecycle_event={
+            "event_type": "position_update",
+            "management_action": "partial_take_profit",
+            "stop_loss": "62700",
+            "symbol": "BTC",
+            "side": "long",
+        },
+    )
+
+    assert contract.close_fraction == "0.5"
+    assert contract.stop_mode == "explicit_price"
+    assert contract.stop_price == "62700"
+    assert contract.take_profit_consumption == "consume_first_stage"
+    assert contract.required_components == (
+        "consume_take_profit_stage",
+        "converge_partial_close",
+        "replace_remaining_protection",
+    )
+
+
+def test_sanjie_partial_to_entry_preserves_all_components():
+    contract = build_management_instruction_contract(
+        text="比特币多单止盈50%，止损位移动至开仓价！",
+        lifecycle_event={
+            "event_type": "position_update",
+            "management_action": "partial_take_profit",
+            "symbol": "BTC",
+            "side": "long",
+        },
+    )
+
+    assert contract.close_fraction == "0.5"
+    assert contract.stop_mode == "actual_entry_price"
+    assert contract.required_components == (
+        "consume_take_profit_stage",
+        "converge_partial_close",
+        "replace_remaining_protection",
+    )
 
 
 def test_tail_and_optional_exit_choose_tail_reduction() -> None:

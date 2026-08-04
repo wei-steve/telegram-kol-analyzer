@@ -8,6 +8,11 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from telegram_kol_research.strategy_management_contracts import (
+    COMPOSITE_MANAGEMENT_CONTRACT_VERSION,
+    ManagementInstructionContract,
+)
+
 
 DEFAULT_PARTIAL_CLOSE_FRACTION = 0.50
 DEFAULT_TAIL_CLOSE_FRACTION = 0.80
@@ -17,7 +22,6 @@ _PARTIAL_TERMS = (
     "第一止盈",
     "第一个止盈",
     "首个止盈",
-    "止盈位",
     "止盈一部分",
     "部分止盈",
     "分批止盈",
@@ -107,6 +111,9 @@ def resolve_management_directive(
     current_message_stop_source = (
         "current_message_text" if current_message_stop is not None else None
     )
+    has_partial = _has_partial_clause(combined, raw_action)
+    has_break_even = _has_break_even_clause(combined, raw_action)
+    has_protection = has_break_even or current_message_stop is not None
 
     if any(term in combined for term in _CANCEL_ENTRY_TERMS) or event_type == "cancel_entry":
         return ManagementDirective(
@@ -161,7 +168,10 @@ def resolve_management_directive(
             strategy_thread_id=strategy_thread_id,
         )
 
-    if raw_action in {"adjust_stop_loss", "adjust_position_tpsl", "risk_update"}:
+    if (
+        raw_action in {"adjust_stop_loss", "adjust_position_tpsl", "risk_update"}
+        and not has_partial
+    ):
         if stop_loss is None:
             return ManagementDirective(
                 intent="adjust_stop_loss",
@@ -185,7 +195,11 @@ def resolve_management_directive(
             stop_price_source=current_message_stop_source,
         )
 
-    if event_type == "position_update" and current_message_stop is not None:
+    if (
+        event_type == "position_update"
+        and current_message_stop is not None
+        and not has_partial
+    ):
         return _directive(
             "adjust_stop_loss",
             symbol=symbol,
@@ -211,29 +225,9 @@ def resolve_management_directive(
             strategy_thread_id=strategy_thread_id,
         )
 
-    has_partial = (
-        "partial_take_profit" in raw_action
-        or any(term in combined for term in _PARTIAL_TERMS)
-        or bool(_close_percentage_values(combined))
-        or bool(_retained_percentage_values(combined))
-        or "一半" in combined
-        or "半仓" in combined
-    )
-    has_break_even = (
-        any(
-            term in raw_action
-            for term in (
-                "move_stop_to_protect",
-                "move_stop_to_break_even",
-                "breakeven",
-                "break_even",
-            )
-        )
-        or any(term in combined for term in _BREAK_EVEN_TERMS)
-    )
     if has_partial:
         fraction = _management_fraction(lifecycle_event, combined)
-        intent = "partial_then_break_even" if has_break_even else "partial_take_profit"
+        intent = "partial_then_break_even" if has_protection else "partial_take_profit"
         return _directive(
             intent,
             fraction=(
@@ -243,13 +237,13 @@ def resolve_management_directive(
             side=side,
             reason_code=(
                 "partial_then_break_even"
-                if has_break_even
+                if has_protection
                 else "partial_risk_reduction"
             ),
             strategy_thread_id=strategy_thread_id,
-            stop_loss=current_message_stop if has_break_even else None,
+            stop_loss=current_message_stop if has_protection else None,
             stop_price_source=(
-                current_message_stop_source if has_break_even else None
+                current_message_stop_source if has_protection else None
             ),
         )
 
@@ -300,6 +294,82 @@ def resolve_management_directive(
         cancel_deferred_entries=False,
         reason_code="no_actionable_risk_reduction",
         strategy_thread_id=strategy_thread_id,
+    )
+
+
+def build_management_instruction_contract(
+    *,
+    text: str,
+    lifecycle_event: Mapping[str, Any],
+) -> ManagementInstructionContract:
+    """Build the complete immutable contract for one composite instruction."""
+
+    directive = resolve_management_directive(
+        text=text,
+        lifecycle_event=lifecycle_event,
+    )
+    if directive.intent != "partial_then_break_even" or directive.fraction is None:
+        raise ValueError("management_instruction_is_not_composite")
+    if directive.stop_loss is not None:
+        stop_mode = "explicit_price"
+        stop_price = directive.stop_loss
+        stop_price_source = directive.stop_price_source
+    else:
+        stop_mode = "actual_entry_price"
+        stop_price = None
+        stop_price_source = None
+    return ManagementInstructionContract(
+        version=COMPOSITE_MANAGEMENT_CONTRACT_VERSION,
+        target_lifecycle_id=_positive_int_or_none(
+            lifecycle_event.get("target_lifecycle_id")
+        ),
+        strategy_instance_id=_normalized_optional(
+            lifecycle_event.get("strategy_instance_id"), upper=False
+        ),
+        symbol=directive.symbol,
+        side=directive.side,
+        close_fraction=str(directive.fraction),
+        stop_mode=stop_mode,
+        stop_price=stop_price,
+        stop_price_source=stop_price_source,
+        take_profit_consumption="consume_first_stage",
+        cancel_deferred_entries=directive.cancel_deferred_entries,
+        required_components=(
+            "consume_take_profit_stage",
+            "converge_partial_close",
+            "replace_remaining_protection",
+        ),
+        current_message_text=str(text or "").strip(),
+    )
+
+
+def _has_partial_clause(combined: str, raw_action: str) -> bool:
+    return (
+        "partial_take_profit" in raw_action
+        or any(term in combined for term in _PARTIAL_TERMS)
+        or bool(_close_percentage_values(combined))
+        or bool(_retained_percentage_values(combined))
+        or "一半" in combined
+        or "半仓" in combined
+    )
+
+
+def _has_break_even_clause(combined: str, raw_action: str) -> bool:
+    return (
+        any(
+            term in raw_action
+            for term in (
+                "move_stop_to_protect",
+                "move_stop_to_break_even",
+                "breakeven",
+                "break_even",
+            )
+        )
+        or any(term in combined for term in _BREAK_EVEN_TERMS)
+        or (
+            "止损" in combined
+            and any(term in combined for term in ("开仓价", "入场价", "成本价"))
+        )
     )
 
 

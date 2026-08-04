@@ -41,11 +41,16 @@ from telegram_kol_research.message_instruction_items import (
 )
 from telegram_kol_research.management_directives import (
     FULL_EXIT_ACTIONS,
+    build_management_instruction_contract,
     resolve_management_directive,
 )
 from telegram_kol_research.management_scope import (
     ManagementScopeError,
     resolve_management_scope_in_session,
+)
+from telegram_kol_research.strategy_management_contracts import (
+    management_contract_fingerprint,
+    serialize_management_contract,
 )
 from telegram_kol_research.raw_ingest import NormalizedMessageRecord
 from telegram_kol_research.recognition_profiles import BITCOIN_JUNZHANG_PROFILE
@@ -1152,6 +1157,27 @@ def _apply_lifecycle_event_decision(
     target = _resolve_lifecycle_event_target(session, raw_message, decision)
     if target is None:
         return False
+    management_contract_json = None
+    management_contract_fingerprint_value = None
+    if management_directive.intent == "partial_then_break_even":
+        contract_event = dict(decision)
+        contract_event.update(
+            {
+                "target_lifecycle_id": target.id,
+                "symbol": target.symbol,
+                "side": target.side,
+            }
+        )
+        management_contract = build_management_instruction_contract(
+            text=instruction_text,
+            lifecycle_event=contract_event,
+        )
+        management_contract_json = serialize_management_contract(
+            management_contract
+        )
+        management_contract_fingerprint_value = management_contract_fingerprint(
+            management_contract
+        )
     if event_type == "cancel_entry" and reply_target is not None:
         if reply_target.id != target.id:
             _record_reply_cancel_manual_review(
@@ -1338,6 +1364,10 @@ def _apply_lifecycle_event_decision(
                 else management_directive.stop_price_source
             ),
             requested_take_profit=explicit_take_profit,
+            management_contract_json=management_contract_json,
+            management_contract_fingerprint=(
+                management_contract_fingerprint_value
+            ),
         )
         _remember_applied_candidate(session, candidate, applied_candidate_ids)
         return True
@@ -3663,6 +3693,8 @@ def _upsert_management_signal_candidate(
     requested_stop_loss: float | None = None,
     stop_price_source: str | None = None,
     requested_take_profit: str | None = None,
+    management_contract_json: str | None = None,
+    management_contract_fingerprint: str | None = None,
 ) -> SignalCandidate:
     break_even_intent = str(management_action or "").lower() in {
         "move_stop_to_break_even",
@@ -3692,6 +3724,8 @@ def _upsert_management_signal_candidate(
         "leverage_text": None,
         "parse_source": parse_source,
         "recognition_generation": recognition_generation,
+        "management_contract_json": management_contract_json,
+        "management_contract_fingerprint": management_contract_fingerprint,
     }
     candidates = (
         session.query(SignalCandidate)

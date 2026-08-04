@@ -4699,3 +4699,105 @@ def test_recognize_message_now_raises_for_missing_message(tmp_path):
 
     with pytest.raises(LookupError, match="raw message not found"):
         recognize_message_now(session_factory, raw_message_id=999)
+
+
+def _assert_composite_message_contract(
+    tmp_path,
+    monkeypatch,
+    *,
+    text,
+    decision,
+    expected_stop_mode,
+    expected_stop_price,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=8804,
+            message_id=100,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 8, 4, 1, tzinfo=UTC),
+            entered_at=datetime(2026, 8, 4, 1, 1, tzinfo=UTC),
+            entry_price_actual=64000,
+            stop_loss=62000,
+            take_profit="65000/66000/67000",
+        )
+        raw_message = RawMessage(
+            chat_id=8804,
+            message_id=101,
+            posted_at=datetime(2026, 8, 4, 2, tzinfo=UTC),
+            text=text,
+        )
+        session.add_all([lifecycle, raw_message])
+        session.commit()
+        lifecycle_id = lifecycle.id
+        raw_message_id = raw_message.id
+
+    payload = {
+        "event_type": "position_update",
+        "target_lifecycle_id": lifecycle_id,
+        "symbol": "BTC",
+        "side": "long",
+        "management_action": "partial_take_profit",
+        "confidence": 0.95,
+        **decision,
+    }
+    _mock_deepseek_lifecycle_event(monkeypatch, payload)
+
+    recognize_message_now(
+        session_factory,
+        raw_message_id=raw_message_id,
+        ai_recognition_config=AiRecognitionConfig(
+            text_provider=type(
+                "Provider",
+                (),
+                {
+                    "is_configured": True,
+                    "base_url": "http://deepseek.test",
+                    "api_key": "",
+                    "model": "deepseek-chat",
+                    "timeout_seconds": 10,
+                },
+            )(),
+        ),
+    )
+
+    with session_factory() as session:
+        candidate = session.query(SignalCandidate).one()
+    contract = __import__("json").loads(candidate.management_contract_json)
+    assert candidate.management_action == "partial_then_break_even"
+    assert candidate.management_fraction == pytest.approx(0.5)
+    assert candidate.management_contract_fingerprint
+    assert contract["target_lifecycle_id"] == lifecycle_id
+    assert contract["close_fraction"] == "0.5"
+    assert contract["stop_mode"] == expected_stop_mode
+    assert contract["stop_price"] == expected_stop_price
+    assert contract["required_components"] == [
+        "consume_take_profit_stage",
+        "converge_partial_close",
+        "replace_remaining_protection",
+    ]
+
+
+def test_miya_composite_message_persists_complete_contract(tmp_path, monkeypatch):
+    _assert_composite_message_contract(
+        tmp_path,
+        monkeypatch,
+        text="BTC多单目前浮盈1100点，止盈50%，剩余仓位止损位移动至62700，做无风险持仓",
+        decision={"stop_loss": "62700"},
+        expected_stop_mode="explicit_price",
+        expected_stop_price="62700",
+    )
+
+
+def test_sanjie_composite_message_persists_complete_contract(tmp_path, monkeypatch):
+    _assert_composite_message_contract(
+        tmp_path,
+        monkeypatch,
+        text="比特币多单止盈50%，止损位移动至开仓价！",
+        decision={},
+        expected_stop_mode="actual_entry_price",
+        expected_stop_price=None,
+    )
