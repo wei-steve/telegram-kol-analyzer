@@ -1018,6 +1018,107 @@ def test_monitor_fingerprint_is_order_independent_and_canonical():
     assert all(character in "0123456789abcdef" for character in fingerprint)
 
 
+def test_audit_fingerprint_ignores_unrelated_deployment_heads():
+    details = {
+        "audit_abnormal_count": 2,
+        "audit_state_counts": {
+            "blocked": 0,
+            "partial_failed": 0,
+            "recovery_required": 2,
+            "submit_unknown": 0,
+        },
+        "actionable_batch_refs": (
+            ("batch:17", ("recovery_required",)),
+            ("batch:22", ("recovery_required",)),
+        ),
+        "actionable_batches_total": 2,
+        "actionable_batches_truncated": False,
+        "audit_abnormal": True,
+    }
+    first = MonitorResult(
+        healthy=False,
+        reason_codes=("audit_abnormal",),
+        details={**details, "head": REVIEWED_HEAD, "expected_head": OTHER_HEAD},
+    )
+    deployed_later = MonitorResult(
+        healthy=False,
+        reason_codes=("audit_abnormal",),
+        details={**details, "head": OTHER_HEAD, "expected_head": REVIEWED_HEAD},
+    )
+
+    assert fingerprint_monitor_result(first) == fingerprint_monitor_result(
+        deployed_later
+    )
+
+
+@pytest.mark.parametrize(
+    "changed_detail",
+    [
+        {
+            "audit_state_counts": {
+                "blocked": 0,
+                "partial_failed": 0,
+                "recovery_required": 1,
+                "submit_unknown": 1,
+            }
+        },
+        {
+            "actionable_batch_refs": (
+                ("batch:17", ("recovery_required",)),
+                ("batch:23", ("recovery_required",)),
+            )
+        },
+        {
+            "actionable_batch_refs": (
+                ("batch:17", ("recovery_required",)),
+                ("batch:22", ("partial_failed",)),
+            )
+        },
+        {"actionable_batches_total": 3},
+        {"actionable_batches_truncated": True},
+    ],
+)
+def test_audit_fingerprint_changes_for_operator_relevant_facts(changed_detail):
+    base_details = {
+        "audit_abnormal_count": 2,
+        "audit_state_counts": {
+            "blocked": 0,
+            "partial_failed": 0,
+            "recovery_required": 2,
+            "submit_unknown": 0,
+        },
+        "actionable_batch_refs": (
+            ("batch:17", ("recovery_required",)),
+            ("batch:22", ("recovery_required",)),
+        ),
+        "actionable_batches_total": 2,
+        "actionable_batches_truncated": False,
+        "audit_abnormal": True,
+    }
+    changed_details = {**base_details, **changed_detail}
+
+    assert fingerprint_monitor_result(
+        MonitorResult(False, ("audit_abnormal",), base_details)
+    ) != fingerprint_monitor_result(
+        MonitorResult(False, ("audit_abnormal",), changed_details)
+    )
+
+
+def test_journal_fingerprint_ignores_unrelated_setting_details():
+    first = MonitorResult(
+        healthy=False,
+        reason_codes=("journal_errors",),
+        details={"journal_error_count": 2, "auto_trade_enabled": False},
+    )
+    unrelated = MonitorResult(
+        healthy=False,
+        reason_codes=("journal_errors",),
+        details={"journal_error_count": 2, "auto_trade_enabled": True},
+    )
+
+    assert fingerprint_monitor_result(first) == fingerprint_monitor_result(unrelated)
+
+
 def test_changed_monitor_fingerprint_notifies_immediately():
     now = datetime(2026, 7, 16, 10, 0, tzinfo=UTC)
     state = MonitorState(

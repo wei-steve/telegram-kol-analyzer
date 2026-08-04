@@ -187,25 +187,36 @@ def send_monitor_incident_capture(
     if not isinstance(captured, int) or isinstance(captured, bool) or captured < 0:
         raise ValueError("monitor incident capture count is invalid")
     return min(captured, 102)
-_FINGERPRINT_DETAIL_KEYS = (
-    "service_state",
-    "head",
-    "expected_head",
-    "auto_trade_enabled",
-    "expected_auto_trade_enabled",
-    "management_execution_mode",
-    "expected_management_execution_mode",
-    "max_concurrent_positions",
-    "expected_max_concurrent_positions",
-    "journal_error_count",
-    "unknown_event_count",
-    "recovery_event_count",
-    "duplicate_manual_close_count",
-    "audit_abnormal_count",
-    "audit_complete",
-    "audit_abnormal",
-    "adapter_failures",
-)
+_FINGERPRINT_DETAIL_KEYS_BY_REASON = {
+    "service_inactive": ("service_state",),
+    "auto_trade_enabled_drift": (
+        "auto_trade_enabled",
+        "expected_auto_trade_enabled",
+    ),
+    "management_execution_mode_drift": (
+        "management_execution_mode",
+        "expected_management_execution_mode",
+    ),
+    "max_concurrent_positions_drift": (
+        "max_concurrent_positions",
+        "expected_max_concurrent_positions",
+    ),
+    "journal_errors": ("journal_error_count",),
+    "event_unknown_status": ("unknown_event_count",),
+    "event_recovery_status": ("recovery_event_count",),
+    "duplicate_manual_close": ("duplicate_manual_close_count",),
+    "audit_abnormal": (
+        "audit_abnormal_count",
+        "audit_state_counts",
+        "actionable_batch_refs",
+        "actionable_batches_total",
+        "actionable_batches_truncated",
+    ),
+    "audit_incomplete": ("audit_complete",),
+    "adapter_failure": ("adapter_failures",),
+    "malformed_snapshot": (),
+    "state_invalid": (),
+}
 _NOTIFICATION_SUPPRESSION = timedelta(hours=6)
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _DEFAULT_LOOKBACK = timedelta(minutes=35)
@@ -1068,23 +1079,35 @@ def _require_aware_datetime(value: datetime) -> datetime:
 def fingerprint_monitor_result(result: MonitorResult) -> str:
     """Return a canonical SHA-256 for one bounded, secret-free result summary."""
 
-    reason_codes = sorted(
-        set(code for code in result.reason_codes if code in _FIXED_REASON_CODES)
+    unknown_reason = any(
+        code not in _FIXED_REASON_CODES for code in result.reason_codes
+    )
+    reason_codes = (
+        ["unknown_monitor_problem"]
+        if unknown_reason
+        else sorted(set(result.reason_codes))
     )
     if not reason_codes and not result.healthy:
-        reason_codes = ["malformed_snapshot"]
-    details: dict[str, str] = {}
-    for key in _FINGERPRINT_DETAIL_KEYS:
+        reason_codes = ["unknown_monitor_problem"]
+    detail_keys = {
+        key
+        for reason in reason_codes
+        for key in _FINGERPRINT_DETAIL_KEYS_BY_REASON.get(reason, ())
+    }
+    details: dict[str, object] = {}
+    for key in sorted(detail_keys):
         if key not in result.details:
             continue
-        rendered = _safe_detail_value(key, result.details[key])
+        rendered = _safe_fingerprint_detail(key, result.details[key])
         if rendered is not None:
             details[key] = rendered
+    presentation = build_monitor_alert_presentation(result)
     canonical = json.dumps(
         {
             "details": details,
             "healthy": result.healthy is True,
             "reason_codes": reason_codes,
+            "severity": presentation.severity,
         },
         ensure_ascii=True,
         allow_nan=False,
@@ -1092,6 +1115,65 @@ def fingerprint_monitor_result(result: MonitorResult) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
+
+def _safe_fingerprint_detail(key: str, value: object) -> object | None:
+    if key == "audit_state_counts":
+        if not isinstance(value, Mapping):
+            return None
+        rendered: dict[str, int] = {}
+        for state in _AUDIT_ALERT_STATES:
+            count = _safe_count(value.get(state))
+            if count is None:
+                return None
+            rendered[state] = count
+        return rendered
+    if key == "actionable_batch_refs":
+        return _safe_fingerprint_actionable_refs(value)
+    if key == "actionable_batches_truncated":
+        return value if type(value) is bool else None
+    rendered = _safe_detail_value(key, value)
+    return rendered
+
+
+def _safe_fingerprint_actionable_refs(value: object) -> list[dict[str, object]] | None:
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes, bytearray))
+        or len(value) > _MAX_ACTIONABLE_BATCH_REFS
+    ):
+        return None
+    rendered: list[dict[str, object]] = []
+    seen_refs: set[str] = set()
+    state_order = {state: index for index, state in enumerate(_AUDIT_ALERT_STATES)}
+    for item in value:
+        if (
+            not isinstance(item, Sequence)
+            or isinstance(item, (str, bytes, bytearray))
+            or len(item) != 2
+        ):
+            return None
+        batch_ref, states = item
+        if (
+            not isinstance(batch_ref, str)
+            or _ACTIONABLE_BATCH_REF.fullmatch(batch_ref) is None
+            or batch_ref in seen_refs
+            or not isinstance(states, Sequence)
+            or isinstance(states, (str, bytes, bytearray))
+            or not states
+        ):
+            return None
+        normalized_states = tuple(str(state) for state in states)
+        if (
+            any(state not in state_order for state in normalized_states)
+            or len(set(normalized_states)) != len(normalized_states)
+            or tuple(sorted(normalized_states, key=state_order.__getitem__))
+            != normalized_states
+        ):
+            return None
+        seen_refs.add(batch_ref)
+        rendered.append({"batch_ref": batch_ref, "states": list(normalized_states)})
+    return rendered
 
 
 def decide_monitor_notification(
