@@ -239,6 +239,12 @@ def _healthy_audit(**overrides):
             "submit_unknown": 0,
             "recovery_required": 0,
         },
+        "actionable_batches": {
+            "total": 0,
+            "returned": 0,
+            "truncated": False,
+            "items": [],
+        },
         "malformed_row_count": 0,
         "malformed_field_count": 0,
         "legacy_pending_management": {
@@ -248,6 +254,28 @@ def _healthy_audit(**overrides):
         },
     }
     values.update(overrides)
+    if "actionable_batches" not in overrides:
+        items = []
+        batch_id = 1
+        for state in (
+            "blocked",
+            "submit_unknown",
+            "partial_failed",
+            "recovery_required",
+        ):
+            for _ in range(int(values["counts"].get(state, 0))):
+                if len(items) < 10:
+                    items.append(
+                        {"batch_ref": f"batch:{batch_id}", "states": [state]}
+                    )
+                batch_id += 1
+        total = batch_id - 1
+        values["actionable_batches"] = {
+            "total": total,
+            "returned": len(items),
+            "truncated": total > len(items),
+            "items": items,
+        }
     return values
 
 
@@ -465,6 +493,103 @@ def test_abnormal_audit_alerts(audit):
     result = evaluate_monitor_snapshot(_snapshot(audit=audit), EXPECTATIONS)
 
     assert "audit_abnormal" in result.reason_codes
+
+
+def test_audit_projects_actionable_counts_and_batch_references():
+    result = evaluate_monitor_snapshot(
+        _snapshot(
+            audit=_healthy_audit(
+                counts={
+                    "blocked": 0,
+                    "partial_failed": 0,
+                    "submit_unknown": 0,
+                    "recovery_required": 2,
+                },
+                actionable_batches={
+                    "total": 2,
+                    "returned": 2,
+                    "truncated": False,
+                    "items": [
+                        {
+                            "batch_ref": "batch:17",
+                            "states": ["recovery_required"],
+                        },
+                        {
+                            "batch_ref": "batch:22",
+                            "states": ["recovery_required"],
+                        },
+                    ],
+                },
+            )
+        ),
+        EXPECTATIONS,
+    )
+
+    assert result.reason_codes == ("audit_abnormal",)
+    assert result.details["audit_state_counts"] == {
+        "blocked": 0,
+        "partial_failed": 0,
+        "recovery_required": 2,
+        "submit_unknown": 0,
+    }
+    assert result.details["actionable_batch_refs"] == (
+        ("batch:17", ("recovery_required",)),
+        ("batch:22", ("recovery_required",)),
+    )
+    assert result.details["actionable_batches_total"] == 2
+    assert result.details["actionable_batches_truncated"] is False
+
+
+@pytest.mark.parametrize(
+    "actionable_batches",
+    [
+        None,
+        {},
+        {"total": True, "returned": 0, "truncated": False, "items": []},
+        {"total": 1, "returned": 0, "truncated": False, "items": []},
+        {
+            "total": 1,
+            "returned": 1,
+            "truncated": False,
+            "items": [{"batch_ref": "batch:0", "states": ["blocked"]}],
+        },
+        {
+            "total": 1,
+            "returned": 1,
+            "truncated": False,
+            "items": [{"batch_ref": "batch:17", "states": ["unknown"]}],
+        },
+        {
+            "total": 1,
+            "returned": 1,
+            "truncated": False,
+            "items": [
+                {"batch_ref": "batch:17", "states": ["recovery_required"]},
+                {"batch_ref": "batch:17", "states": ["recovery_required"]},
+            ],
+        },
+    ],
+)
+def test_malformed_actionable_batch_projection_fails_closed(actionable_batches):
+    result = evaluate_monitor_snapshot(
+        _snapshot(
+            audit=_healthy_audit(
+                counts={
+                    "blocked": 0,
+                    "partial_failed": 0,
+                    "submit_unknown": 0,
+                    "recovery_required": 1,
+                },
+                actionable_batches=actionable_batches,
+            )
+        ),
+        EXPECTATIONS,
+    )
+
+    assert "audit_incomplete" in result.reason_codes
+    assert "malformed_snapshot" in result.reason_codes
+    assert result.details["audit_abnormal_count"] == 1
+    assert "actionable_batch_refs" not in result.details
 
 
 def test_terminal_blocked_history_is_visible_but_not_alerting():

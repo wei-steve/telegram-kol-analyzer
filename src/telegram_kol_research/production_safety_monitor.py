@@ -213,6 +213,8 @@ _MAX_COMMAND_OUTPUT_BYTES = 1_048_576
 _MAX_HTTP_OUTPUT_BYTES = 65_536
 _MAX_ABNORMAL_EVENTS = 200
 _MAX_JOURNAL_ERRORS = 10_000
+_MAX_ACTIONABLE_BATCH_REFS = 10
+_ACTIONABLE_BATCH_REF = re.compile(r"^batch:([1-9][0-9]{0,18})$")
 MONITOR_TEST_NOTIFICATION_TEXT = (
     "【监控测试】服务器安全监控通知链路验证\n"
     "本消息仅验证系统运维通知，不包含交易指令。"
@@ -1347,6 +1349,7 @@ def _evaluate_audit(
 
     counts = audit.get("counts")
     abnormal_count = 0
+    audit_state_counts: dict[str, int] = {}
     if not isinstance(counts, Mapping):
         incomplete = True
         reasons.add("malformed_snapshot")
@@ -1358,9 +1361,24 @@ def _evaluate_audit(
                 reasons.add("malformed_snapshot")
             else:
                 abnormal_count += count
+                audit_state_counts[state] = count
     if abnormal_count:
         abnormal = True
         details["audit_abnormal_count"] = abnormal_count
+
+    actionable_batch_refs = _safe_actionable_batch_refs(
+        audit.get("actionable_batches"),
+        audit_state_counts=audit_state_counts,
+    )
+    if actionable_batch_refs is None:
+        incomplete = True
+        reasons.add("malformed_snapshot")
+    else:
+        total, truncated, batch_refs = actionable_batch_refs
+        details["audit_state_counts"] = dict(audit_state_counts)
+        details["actionable_batch_refs"] = batch_refs
+        details["actionable_batches_total"] = total
+        details["actionable_batches_truncated"] = truncated
 
     for field in ("malformed_row_count", "malformed_field_count"):
         count = _safe_count(audit.get(field))
@@ -1376,6 +1394,67 @@ def _evaluate_audit(
     if abnormal:
         reasons.add("audit_abnormal")
         details["audit_abnormal"] = True
+
+
+def _safe_actionable_batch_refs(
+    value: object,
+    *,
+    audit_state_counts: Mapping[str, int],
+) -> tuple[int, bool, tuple[tuple[str, tuple[str, ...]], ...]] | None:
+    if not isinstance(value, Mapping) or set(value) != {
+        "total",
+        "returned",
+        "truncated",
+        "items",
+    }:
+        return None
+    total = _safe_count(value.get("total"))
+    returned = _safe_count(value.get("returned"))
+    truncated = value.get("truncated")
+    items = value.get("items")
+    if (
+        total is None
+        or returned is None
+        or type(truncated) is not bool
+        or not isinstance(items, Sequence)
+        or isinstance(items, (str, bytes, bytearray))
+        or returned != min(total, _MAX_ACTIONABLE_BATCH_REFS)
+        or truncated is not (total > _MAX_ACTIONABLE_BATCH_REFS)
+        or len(items) != returned
+    ):
+        return None
+    abnormal_count = sum(audit_state_counts.values())
+    if total > abnormal_count or (abnormal_count > 0) is not (total > 0):
+        return None
+
+    rendered: list[tuple[str, tuple[str, ...]]] = []
+    seen_refs: set[str] = set()
+    state_order = {state: index for index, state in enumerate(_AUDIT_ALERT_STATES)}
+    for item in items:
+        if not isinstance(item, Mapping) or set(item) != {"batch_ref", "states"}:
+            return None
+        batch_ref = item.get("batch_ref")
+        states = item.get("states")
+        if (
+            not isinstance(batch_ref, str)
+            or _ACTIONABLE_BATCH_REF.fullmatch(batch_ref) is None
+            or batch_ref in seen_refs
+            or not isinstance(states, Sequence)
+            or isinstance(states, (str, bytes, bytearray))
+            or not states
+            or any(state not in state_order for state in states)
+        ):
+            return None
+        normalized_states = tuple(str(state) for state in states)
+        if (
+            len(set(normalized_states)) != len(normalized_states)
+            or tuple(sorted(normalized_states, key=state_order.__getitem__))
+            != normalized_states
+        ):
+            return None
+        seen_refs.add(batch_ref)
+        rendered.append((batch_ref, normalized_states))
+    return total, truncated, tuple(rendered)
 
 
 def format_monitor_alert(
