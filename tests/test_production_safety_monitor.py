@@ -632,7 +632,7 @@ def test_malformed_inputs_use_fixed_reason_without_raw_values(field, value):
     assert "boom" not in rendered
 
 
-def test_formatter_uses_fixed_chinese_labels_and_sorted_reason_codes():
+def test_formatter_uses_readable_sections_and_sorted_reason_codes():
     result = evaluate_monitor_snapshot(
         _snapshot(service_state="inactive", head=OTHER_HEAD, journal_error_count=2),
         EXPECTATIONS,
@@ -643,13 +643,172 @@ def test_formatter_uses_fixed_chinese_labels_and_sorted_reason_codes():
         checked_at=datetime(2026, 7, 16, 9, 30, tzinfo=UTC),
     )
 
-    assert text.startswith("【生产安全监控异常】")
-    assert "检查时间：2026-07-16T09:30:00+00:00" in text
-    assert "异常代码：journal_errors,service_inactive" in text
-    assert "服务状态：inactive" in text
-    assert f"当前版本：{OTHER_HEAD[:12]}" in text
-    assert f"期望版本：{REVIEWED_HEAD[:12]}" in text
-    assert "日志错误数：2" in text
+    assert text.startswith("【🔴立即处理：自动交易服务未正常运行】")
+    assert "发生了什么：" in text
+    assert "自动交易服务没有正常运行" in text
+    assert "当前影响：" in text
+    assert "你需要做什么：" in text
+    assert "检查时间：2026-07-16 17:30（北京时间）" in text
+    assert "技术代码：journal_errors,service_inactive" in text
+    assert OTHER_HEAD[:12] not in text
+    assert REVIEWED_HEAD[:12] not in text
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "expected_severity", "expected_problem"),
+    [
+        ("service_inactive", "critical", "自动交易服务没有正常运行"),
+        ("auto_trade_enabled_drift", "critical", "自动交易开关与批准设置不同"),
+        ("management_execution_mode_drift", "critical", "仓位管理模式与批准设置不同"),
+        ("max_concurrent_positions_drift", "critical", "持仓数量限制与批准设置不同"),
+        ("event_unknown_status", "critical", "交易请求已经发出，但交易所结果无法确认"),
+        ("event_recovery_status", "critical", "仓位管理操作没有正常结束"),
+        ("duplicate_manual_close", "critical", "同一仓位可能被重复发起平仓"),
+        ("adapter_failure", "critical", "安全监控无法读取关键生产信息"),
+        ("audit_incomplete", "critical", "仓位管理记录检查没有完整完成"),
+        ("malformed_snapshot", "critical", "安全检查收到无法识别的数据"),
+        ("audit_abnormal", "review", "历史仓位管理任务缺少足够证据"),
+        ("journal_errors", "review", "交易服务近期记录了程序错误"),
+        ("state_invalid", "review", "监控自己的通知记录发生异常"),
+    ],
+)
+def test_alert_presentation_maps_every_reason_to_plain_chinese(
+    reason_code,
+    expected_severity,
+    expected_problem,
+):
+    presentation = monitor_module.build_monitor_alert_presentation(
+        MonitorResult(healthy=False, reason_codes=(reason_code,), details={})
+    )
+
+    assert presentation.severity == expected_severity
+    assert expected_problem in presentation.problems[0]
+    assert presentation.impact
+    assert presentation.operator_action
+
+
+def test_audit_alert_is_readable_for_known_production_batches():
+    text = format_monitor_alert(
+        MonitorResult(
+            healthy=False,
+            reason_codes=("audit_abnormal",),
+            details={
+                "audit_abnormal_count": 2,
+                "audit_state_counts": {
+                    "blocked": 0,
+                    "partial_failed": 0,
+                    "recovery_required": 2,
+                    "submit_unknown": 0,
+                },
+                "actionable_batch_refs": (
+                    ("batch:17", ("recovery_required",)),
+                    ("batch:22", ("recovery_required",)),
+                ),
+                "actionable_batches_total": 2,
+                "actionable_batches_truncated": False,
+            },
+        ),
+        checked_at=datetime(2026, 8, 4, 1, 0, tzinfo=UTC),
+    )
+
+    assert text.startswith("【🟡稍后核查：2条历史交易管理记录无法确认】")
+    assert "发生了什么：" in text
+    assert "当前影响：" in text
+    assert "你需要做什么：" in text
+    assert "不要手动重复平仓" in text
+    assert "管理批次 17、22" in text
+    assert "系统定时安全检查，不是 AI Agent" in text
+    assert "2026-08-04 09:00（北京时间）" in text
+    assert "技术代码：audit_abnormal" in text
+    assert "当前版本" not in text
+    assert "期望版本" not in text
+
+
+def test_submit_unknown_escalates_audit_alert_to_critical():
+    presentation = monitor_module.build_monitor_alert_presentation(
+        MonitorResult(
+            healthy=False,
+            reason_codes=("audit_abnormal",),
+            details={
+                "audit_abnormal_count": 1,
+                "audit_state_counts": {
+                    "blocked": 0,
+                    "partial_failed": 0,
+                    "recovery_required": 0,
+                    "submit_unknown": 1,
+                },
+            },
+        )
+    )
+
+    assert presentation.severity == "critical"
+    assert presentation.title.startswith("🔴立即处理")
+    assert "不要重复下单或平仓" in presentation.operator_action
+
+
+def test_unknown_alert_reason_uses_safe_critical_fallback():
+    presentation = monitor_module.build_monitor_alert_presentation(
+        MonitorResult(
+            healthy=False,
+            reason_codes=("raw-secret-reason",),
+            details={"raw": "bot-token-secret"},
+        )
+    )
+
+    assert presentation.severity == "critical"
+    assert "无法解释的问题" in presentation.title
+    assert "raw-secret-reason" not in repr(presentation)
+    assert "bot-token-secret" not in repr(presentation)
+
+
+def test_alert_presentation_bounds_multiple_plain_language_problems():
+    presentation = monitor_module.build_monitor_alert_presentation(
+        MonitorResult(
+            healthy=False,
+            reason_codes=(
+                "adapter_failure",
+                "audit_incomplete",
+                "journal_errors",
+                "service_inactive",
+            ),
+            details={},
+        )
+    )
+
+    assert presentation.severity == "critical"
+    assert presentation.title == "🔴立即处理：自动交易服务未正常运行"
+    assert len(presentation.problems) == 3
+    assert presentation.additional_problem_count == 1
+
+
+def test_audit_alert_explains_bounded_batch_reference_list():
+    batch_refs = tuple(
+        (f"batch:{batch_id}", ("recovery_required",))
+        for batch_id in range(1, 11)
+    )
+    text = format_monitor_alert(
+        MonitorResult(
+            healthy=False,
+            reason_codes=("audit_abnormal",),
+            details={
+                "audit_abnormal_count": 12,
+                "audit_state_counts": {
+                    "blocked": 0,
+                    "partial_failed": 0,
+                    "recovery_required": 12,
+                    "submit_unknown": 0,
+                },
+                "actionable_batch_refs": batch_refs,
+                "actionable_batches_total": 12,
+                "actionable_batches_truncated": True,
+            },
+        ),
+        checked_at=datetime(2026, 8, 4, 1, 0, tzinfo=UTC),
+    )
+
+    assert "共12个，仅展示前10个" in text
+    assert "管理批次 1、2、3、4、5、6、7、8、9、10" in text
+    assert "batch:11" not in text
 
 
 def test_formatter_is_bounded_and_never_emits_sensitive_or_raw_fields():
@@ -758,7 +917,8 @@ def test_oversized_integer_is_malformed_and_formatter_never_crashes():
     )
     text = format_monitor_alert(injected, checked_at="2026-07-16T09:30:00+00:00")
 
-    assert "日志错误数：invalid" in text
+    assert "安全检查收到无法识别的数据" in text
+    assert "日志错误数" not in text
     assert len(text) <= MAX_ALERT_LENGTH
 
 
@@ -2224,7 +2384,7 @@ def test_eligible_anomaly_sends_once_and_persists_delivery_dedupe(tmp_path):
     assert second.exit_code == 1
     assert len(deliveries) == 1
     assert deliveries[0]["config"] is config
-    assert deliveries[0]["text"].startswith("【生产安全监控异常】")
+    assert deliveries[0]["text"].startswith("【🔴立即处理：自动交易服务未正常运行】")
 
 
 @pytest.mark.parametrize("failure", ["missing", "delivery"])

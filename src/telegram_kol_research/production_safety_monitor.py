@@ -255,6 +255,19 @@ class MonitorResult:
 
 
 @dataclass(frozen=True, slots=True)
+class MonitorAlertPresentation:
+    severity: str
+    title: str
+    problems: tuple[str, ...]
+    impact: str
+    operator_action: str
+    technical_codes: tuple[str, ...]
+    actionable_batch_ids: tuple[int, ...] = ()
+    additional_problem_count: int = 0
+    additional_batch_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class MonitorState:
     last_window_at: str | None = None
     last_full_audit_date: str | None = None
@@ -1462,49 +1475,262 @@ def format_monitor_alert(
     *,
     checked_at: datetime | str,
 ) -> str:
-    """Build one bounded Telegram alert from fixed labels and allowlisted details."""
+    """Build one bounded operator-facing alert from fixed Chinese templates."""
 
-    reason_codes = sorted(
-        code for code in result.reason_codes if code in _FIXED_REASON_CODES
-    )
-    if not reason_codes:
-        reason_codes = ["malformed_snapshot"]
+    presentation = build_monitor_alert_presentation(result)
+    if len(presentation.problems) == 1:
+        problems = presentation.problems[0]
+    else:
+        problems = "\n".join(
+            f"{index}. {problem}"
+            for index, problem in enumerate(presentation.problems, start=1)
+        )
+    if presentation.additional_problem_count:
+        problems += f"\n另外还有{presentation.additional_problem_count}个问题。"
     lines = [
-        "【生产安全监控异常】",
-        f"检查时间：{_safe_checked_at(checked_at)}",
-        f"异常代码：{','.join(reason_codes)}",
+        f"【{presentation.title}】",
+        "",
+        "发生了什么：",
+        problems,
+        "",
+        "当前影响：",
+        presentation.impact,
+        "",
+        "你需要做什么：",
+        presentation.operator_action,
+        "",
+        "通知来源：",
+        "系统定时安全检查，不是 AI Agent。",
+        "",
+        "排查信息：",
+        f"检查时间：{_safe_checked_at_shanghai(checked_at)}",
+        f"技术代码：{','.join(presentation.technical_codes)}",
     ]
-
-    labels = {
-        "service_state": "服务状态",
-        "head": "当前版本",
-        "expected_head": "期望版本",
-        "auto_trade_enabled": "自动交易",
-        "expected_auto_trade_enabled": "期望自动交易",
-        "management_execution_mode": "管理执行模式",
-        "expected_management_execution_mode": "期望管理模式",
-        "max_concurrent_positions": "单组持仓上限",
-        "expected_max_concurrent_positions": "期望持仓上限",
-        "journal_error_count": "日志错误数",
-        "unknown_event_count": "未知事件数",
-        "recovery_event_count": "恢复事件数",
-        "duplicate_manual_close_count": "重复精确平仓数",
-        "audit_abnormal_count": "审计异常数",
-        "audit_complete": "审计完整",
-        "audit_abnormal": "审计异常",
-        "adapter_failures": "适配器失败",
-    }
-    for key, label in labels.items():
-        if key not in result.details:
-            continue
-        rendered = _safe_detail_value(key, result.details[key])
-        if rendered is not None:
-            lines.append(f"{label}：{rendered}")
-
     text = "\n".join(lines)
-    if len(text) > MAX_ALERT_LENGTH:
-        return text[: MAX_ALERT_LENGTH - 1] + "…"
-    return text
+    if len(text) <= MAX_ALERT_LENGTH:
+        return text
+    fallback = (
+        "【🔴立即处理：生产安全检查发现无法解释的问题】\n\n"
+        "当前影响：\n生产安全状态暂时无法确认。\n\n"
+        "你需要做什么：\n不要重复下单或平仓，请联系开发者检查生产安全监控。\n\n"
+        "通知来源：\n系统定时安全检查，不是 AI Agent。"
+    )
+    return fallback[:MAX_ALERT_LENGTH]
+
+
+_ALERT_RULES: Mapping[str, tuple[str, str, str]] = {
+    "service_inactive": (
+        "critical",
+        "自动交易服务未正常运行",
+        "自动交易服务没有正常运行，新的 Telegram 消息可能无法处理。",
+    ),
+    "auto_trade_enabled_drift": (
+        "critical",
+        "自动交易开关与批准设置不同",
+        "自动交易开关与批准设置不同。",
+    ),
+    "management_execution_mode_drift": (
+        "critical",
+        "仓位管理模式与批准设置不同",
+        "仓位管理模式与批准设置不同。",
+    ),
+    "max_concurrent_positions_drift": (
+        "critical",
+        "持仓数量限制与批准设置不同",
+        "持仓数量限制与批准设置不同。",
+    ),
+    "event_unknown_status": (
+        "critical",
+        "交易所结果无法确认",
+        "交易请求已经发出，但交易所结果无法确认。",
+    ),
+    "event_recovery_status": (
+        "critical",
+        "仓位管理操作需要恢复",
+        "仓位管理操作没有正常结束，需要恢复处理。",
+    ),
+    "duplicate_manual_close": (
+        "critical",
+        "发现重复平仓迹象",
+        "同一仓位可能被重复发起平仓。",
+    ),
+    "adapter_failure": (
+        "critical",
+        "生产安全检查未完整运行",
+        "安全监控无法读取关键生产信息。",
+    ),
+    "audit_incomplete": (
+        "critical",
+        "仓位管理记录检查未完成",
+        "仓位管理记录检查没有完整完成。",
+    ),
+    "malformed_snapshot": (
+        "critical",
+        "安全检查数据无法识别",
+        "安全检查收到无法识别的数据。",
+    ),
+    "audit_abnormal": (
+        "review",
+        "历史交易管理记录需要核查",
+        "历史仓位管理任务缺少足够证据，无法确认当时是否完整结束。",
+    ),
+    "journal_errors": (
+        "review",
+        "交易服务近期出现程序错误",
+        "交易服务近期记录了程序错误。",
+    ),
+    "state_invalid": (
+        "review",
+        "监控通知记录发生异常",
+        "监控自己的通知记录发生异常或被重建。",
+    ),
+}
+_ALERT_REASON_PRIORITY = (
+    "event_unknown_status",
+    "duplicate_manual_close",
+    "service_inactive",
+    "auto_trade_enabled_drift",
+    "management_execution_mode_drift",
+    "max_concurrent_positions_drift",
+    "event_recovery_status",
+    "adapter_failure",
+    "audit_incomplete",
+    "malformed_snapshot",
+    "audit_abnormal",
+    "journal_errors",
+    "state_invalid",
+)
+
+
+def build_monitor_alert_presentation(result: MonitorResult) -> MonitorAlertPresentation:
+    """Translate validated monitor facts into one deterministic operator message."""
+
+    known_reasons = tuple(
+        reason for reason in _ALERT_REASON_PRIORITY if reason in result.reason_codes
+    )
+    unknown_reason_present = any(
+        reason not in _ALERT_RULES for reason in result.reason_codes
+    )
+    if not known_reasons or unknown_reason_present:
+        return MonitorAlertPresentation(
+            severity="critical",
+            title="🔴立即处理：生产安全检查发现无法解释的问题",
+            problems=("安全检查发现异常，但通知程序无法生成完整说明。",),
+            impact="生产安全状态暂时无法确认。",
+            operator_action="不要重复下单或平仓，请联系开发者检查生产安全监控。",
+            technical_codes=("unknown_monitor_problem",),
+        )
+
+    audit_counts = result.details.get("audit_state_counts")
+    audit_submit_unknown = (
+        isinstance(audit_counts, Mapping)
+        and _safe_count(audit_counts.get("submit_unknown")) not in {None, 0}
+    )
+    severity = "critical" if any(
+        _ALERT_RULES[reason][0] == "critical" for reason in known_reasons
+    ) or audit_submit_unknown else "review"
+    primary_reason = known_reasons[0]
+    title_text = _ALERT_RULES[primary_reason][1]
+    total = _safe_count(result.details.get("actionable_batches_total"))
+    if primary_reason == "audit_abnormal" and audit_submit_unknown:
+        title_text = "存在结果无法确认的历史交易任务"
+    elif primary_reason == "audit_abnormal" and total is not None and total > 0:
+        title_text = f"{total}条历史交易管理记录无法确认"
+
+    problems = tuple(_ALERT_RULES[reason][2] for reason in known_reasons[:3])
+    batch_ids = _safe_actionable_batch_ids(result.details.get("actionable_batch_refs"))
+    additional_batch_count = max(0, (total or 0) - len(batch_ids))
+
+    if severity == "critical":
+        if {"event_unknown_status", "event_recovery_status", "duplicate_manual_close"}.intersection(
+            known_reasons
+        ) or audit_submit_unknown:
+            impact = "对应订单或仓位的最终状态尚未确认，重复操作可能扩大风险。"
+            operator_action = "不要重复下单或平仓，请先由开发者核对交易所订单和当前仓位。"
+        elif {"adapter_failure", "audit_incomplete", "malformed_snapshot"}.intersection(
+            known_reasons
+        ):
+            impact = "安全检查未能完整完成，当前生产安全状态无法确认。"
+            operator_action = "不要重复下单或平仓，请联系开发者恢复生产安全检查。"
+        elif "service_inactive" in known_reasons:
+            impact = "新的 Telegram 消息可能无法处理，自动交易流程可能已经中断。"
+            operator_action = "不要反复发送交易指令，请联系开发者恢复自动交易服务。"
+        else:
+            impact = "生产风险设置与批准值不同，可能影响自动交易或仓位管理。"
+            operator_action = "暂停新的手动操作，请联系开发者核对并恢复批准设置。"
+    elif known_reasons == ("audit_abnormal",):
+        impact = (
+            "没有检测到交易服务停止或设置变化。仅凭现有历史资料，"
+            "无法进一步确认这些记录是否影响过对应仓位。"
+        )
+        operator_action = "不需要立即操作，也不要手动重复平仓。安排开发者核查"
+        if batch_ids:
+            operator_action += "管理批次 " + "、".join(str(value) for value in batch_ids)
+            if additional_batch_count:
+                operator_action += (
+                    f"（共{total}个，仅展示前{len(batch_ids)}个）"
+                )
+        else:
+            operator_action += "对应管理记录"
+        operator_action += "；状态不变时不会重复提醒。"
+    else:
+        impact = "交易服务仍可能运行，但这些问题的实际影响尚未确认。"
+        operator_action = "不需要手动重复交易，请安排开发者检查相关日志和监控状态。"
+
+    return MonitorAlertPresentation(
+        severity=severity,
+        title=("🔴立即处理：" if severity == "critical" else "🟡稍后核查：")
+        + title_text,
+        problems=problems,
+        impact=impact,
+        operator_action=operator_action,
+        technical_codes=tuple(sorted(known_reasons)),
+        actionable_batch_ids=batch_ids,
+        additional_problem_count=max(0, len(known_reasons) - len(problems)),
+        additional_batch_count=additional_batch_count,
+    )
+
+
+def _safe_actionable_batch_ids(value: object) -> tuple[int, ...]:
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes, bytearray))
+        or len(value) > _MAX_ACTIONABLE_BATCH_REFS
+    ):
+        return ()
+    batch_ids: list[int] = []
+    for item in value:
+        if (
+            not isinstance(item, Sequence)
+            or isinstance(item, (str, bytes, bytearray))
+            or len(item) != 2
+        ):
+            return ()
+        batch_ref = item[0]
+        if not isinstance(batch_ref, str):
+            return ()
+        matched = _ACTIONABLE_BATCH_REF.fullmatch(batch_ref)
+        if matched is None:
+            return ()
+        batch_id = int(matched.group(1))
+        if batch_id in batch_ids:
+            return ()
+        batch_ids.append(batch_id)
+    return tuple(batch_ids)
+
+
+def _safe_checked_at_shanghai(value: datetime | str) -> str:
+    parsed: datetime | None = None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and _SAFE_TIMESTAMP.fullmatch(value):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            parsed = None
+    if parsed is None or parsed.tzinfo is None:
+        return "时间无法确认"
+    return parsed.astimezone(_SHANGHAI).strftime("%Y-%m-%d %H:%M（北京时间）")
 
 
 def _safe_checked_at(value: datetime | str) -> str:
