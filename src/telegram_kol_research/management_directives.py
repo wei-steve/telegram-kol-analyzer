@@ -323,8 +323,10 @@ def build_management_instruction_contract(
         target_lifecycle_id=_positive_int_or_none(
             lifecycle_event.get("target_lifecycle_id")
         ),
-        strategy_instance_id=_normalized_optional(
-            lifecycle_event.get("strategy_instance_id"), upper=False
+        strategy_instance_id=(
+            str(lifecycle_event.get("strategy_instance_id")).strip()
+            if lifecycle_event.get("strategy_instance_id") not in (None, "")
+            else None
         ),
         symbol=directive.symbol,
         side=directive.side,

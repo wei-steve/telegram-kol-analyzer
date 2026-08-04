@@ -60,9 +60,15 @@ from telegram_kol_research.strategy_management_batches import (
     ManagementLegCreate,
     create_management_batch,
     create_management_batch_in_session,
+    create_composite_components_in_session,
     load_management_batch,
     resolve_proven_restored_protection_failure_for_market_successor_in_session,
     resolve_restored_protection_failure_for_full_exit_in_session,
+)
+from telegram_kol_research.strategy_management_contracts import (
+    ManagementInstructionContract,
+    load_management_contract,
+    management_contract_fingerprint,
 )
 from telegram_kol_research.strategy_management_sizing import (
     ManagementSizingError,
@@ -450,6 +456,19 @@ def _plan_strategy_management_batch_locked(
             execution_mode=execution_mode,
         )
     try:
+        composite_contract = _validated_candidate_composite_contract(
+            candidate=candidate,
+            lifecycle=lifecycle,
+            binding=binding,
+            intent=intent,
+        )
+    except ValueError:
+        return ManagementPlanningResult(
+            status="blocked",
+            reason_code="management_instruction_component_dropped",
+            target_lifecycle_id=lifecycle.id,
+        )
+    try:
         requested_fraction = normalize_requested_management_fraction(
             intent, candidate.management_fraction
         )
@@ -457,6 +476,16 @@ def _plan_strategy_management_batch_locked(
         return ManagementPlanningResult(
             status="blocked",
             reason_code="management_fraction_invalid",
+            target_lifecycle_id=lifecycle.id,
+        )
+    if composite_contract is not None and (
+        requested_fraction is None
+        or Decimal(composite_contract.close_fraction or "0")
+        != Decimal(str(requested_fraction))
+    ):
+        return ManagementPlanningResult(
+            status="blocked",
+            reason_code="management_instruction_component_dropped",
             target_lifecycle_id=lifecycle.id,
         )
     idempotency_fingerprint = _idempotency_fingerprint(
@@ -528,11 +557,16 @@ def _plan_strategy_management_batch_locked(
     instrument_id = f"{str(lifecycle.symbol).upper()}-USDT-SWAP"
     try:
         live_positions = list(reconciliation_snapshot.positions)
-        economics = canonical_live_position_economics(
-            live_positions,
-            target_pos_ids=[str(leg.pos_id) for leg in target_entry_legs],
-            instrument_id=instrument_id,
-            side=str(lifecycle.side),
+        economics = tuple(
+            sorted(
+                canonical_live_position_economics(
+                    live_positions,
+                    target_pos_ids=[str(leg.pos_id) for leg in target_entry_legs],
+                    instrument_id=instrument_id,
+                    side=str(lifecycle.side),
+                ),
+                key=lambda row: str(row["pos_id"]),
+            )
         )
         with session_factory() as session:
             current_lifecycle = session.get(StrategyLifecycle, lifecycle.id)
@@ -942,6 +976,29 @@ def _plan_strategy_management_batch_locked(
                 planned_at=now,
                 execution_mode=execution_mode,
             )
+    position_snapshots = []
+    for index, position in enumerate(economics):
+        trusted_start_size = Decimal(str(position["size"]))
+        planned_close_size = Decimal(str(planned_close_sizes[index] or "0"))
+        target_remaining_size = trusted_start_size - planned_close_size
+        position_snapshots.append(
+            {
+                **position,
+                "execution_order_leg_id": target_legs_by_pos_id[
+                    position["pos_id"]
+                ].id,
+                "trusted_start_size": _decimal_text(trusted_start_size),
+                "target_remaining_size": _decimal_text(
+                    target_remaining_size
+                ),
+                "quantity_step": _decimal_text(
+                    Decimal(str(contract_spec.quantity_step))
+                ),
+                "min_quantity": _decimal_text(
+                    Decimal(str(contract_spec.min_quantity))
+                ),
+            }
+        )
     target_snapshot = {
         "execution_mode": execution_mode,
         "identity": {
@@ -951,13 +1008,7 @@ def _plan_strategy_management_batch_locked(
             "manageable_entry_leg_ids": [leg.id for leg in target_entry_legs],
             "deferred_entry_leg_ids": [leg.id for leg in entry_leg_plan.deferred_legs],
         },
-        "positions": [
-            {
-                **position,
-                "execution_order_leg_id": target_legs_by_pos_id[position["pos_id"]].id,
-            }
-            for position in economics
-        ],
+        "positions": position_snapshots,
         "deferred_entry_legs": [
             {
                 "execution_order_leg_id": leg.id,
@@ -1127,6 +1178,22 @@ def _plan_strategy_management_batch_locked(
                             partial_policy_state=partial_policy_state,
                         )
                     ),
+                    management_contract_json=(
+                        candidate.management_contract_json
+                        if composite_contract is not None
+                        else None
+                    ),
+                    management_contract_fingerprint=(
+                        candidate.management_contract_fingerprint
+                        if composite_contract is not None
+                        else None
+                    ),
+                    contract_version=(
+                        composite_contract.version
+                        if composite_contract is not None
+                        else None
+                    ),
+                    create_composite_components=composite_contract is not None,
                 )
             else:
                 batch_id = _replace_retryable_preflight_blocked_batch_in_session(
@@ -1161,6 +1228,7 @@ def _plan_strategy_management_batch_locked(
                         )
                     ),
                     partial_policy_state=partial_policy_state,
+                    composite_contract=composite_contract,
                 )
             session.commit()
     except ManagementPlanningStateChanged:
@@ -1183,6 +1251,43 @@ def management_target_fingerprint(target_snapshot: Any) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _decimal_text(value: Decimal) -> str:
+    normalized = format(value.normalize(), "f")
+    return "0" if normalized in {"", "-0"} else normalized
+
+
+def _validated_candidate_composite_contract(
+    *,
+    candidate: SignalCandidate,
+    lifecycle: StrategyLifecycle,
+    binding: ExecutionBinding,
+    intent: str,
+) -> ManagementInstructionContract | None:
+    has_json = bool(candidate.management_contract_json)
+    has_fingerprint = bool(candidate.management_contract_fingerprint)
+    if not (has_json or has_fingerprint):
+        return None
+    if not (has_json and has_fingerprint) or intent != "partial_then_break_even":
+        raise ValueError("management_instruction_component_dropped")
+    contract = load_management_contract(str(candidate.management_contract_json))
+    if (
+        management_contract_fingerprint(contract)
+        != candidate.management_contract_fingerprint
+        or contract.target_lifecycle_id != lifecycle.id
+        or contract.strategy_instance_id != binding.strategy_instance_id
+        or contract.symbol != str(lifecycle.symbol).upper()
+        or contract.side != str(lifecycle.side).lower()
+        or contract.required_components
+        != (
+            "consume_take_profit_stage",
+            "converge_partial_close",
+            "replace_remaining_protection",
+        )
+    ):
+        raise ValueError("management_instruction_component_dropped")
+    return contract
 
 
 def require_unchanged_target_fingerprint(
@@ -1841,6 +1946,7 @@ def _replace_retryable_preflight_blocked_batch_in_session(
     status: str,
     reason_code: str | None,
     partial_policy_state: _PartialPolicyState,
+    composite_contract: ManagementInstructionContract | None,
 ) -> int:
     _require_frozen_identity_and_policy_current(
         session, identity, partial_policy_state=partial_policy_state
@@ -1875,6 +1981,19 @@ def _replace_retryable_preflight_blocked_batch_in_session(
     batch.requested_fraction = requested_fraction
     batch.effective_fraction = effective_fraction
     batch.partial_round_before = partial_round_before
+    batch.management_contract_json = (
+        identity.candidate.management_contract_json
+        if composite_contract is not None
+        else None
+    )
+    batch.management_contract_fingerprint = (
+        identity.candidate.management_contract_fingerprint
+        if composite_contract is not None
+        else None
+    )
+    batch.contract_version = (
+        composite_contract.version if composite_contract is not None else None
+    )
     batch.status = status
     batch.reason_code = reason_code
     batch.target_fingerprint = target_fingerprint
@@ -1927,6 +2046,12 @@ def _replace_retryable_preflight_blocked_batch_in_session(
             )
         )
     session.flush()
+    if composite_contract is not None:
+        create_composite_components_in_session(
+            session,
+            batch=batch,
+            planned_at=planned_at,
+        )
     return int(batch.id)
 
 

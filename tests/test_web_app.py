@@ -111,7 +111,6 @@ def test_web_auto_executor_disabled_management_skips_client_factory(tmp_path):
     ("composite_mode", "reason"),
     [
         ("disabled", "composite_management_v2_disabled"),
-        ("shadow", "composite_management_v2_shadow_write_blocked"),
     ],
 )
 def test_web_auto_executor_composite_gate_blocks_legacy_exchange_path(

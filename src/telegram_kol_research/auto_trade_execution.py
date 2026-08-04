@@ -771,10 +771,6 @@ def _composite_management_gate_reason(
     mode = settings.effective_composite_management_v2_mode
     if mode == "disabled":
         return "composite_management_v2_disabled"
-    if mode == "shadow":
-        # Task 4 wires the durable shadow planner. Until then, fail closed
-        # instead of handing a composite contract to the lossy legacy path.
-        return "composite_management_v2_shadow_write_blocked"
     return None
 
 
@@ -931,6 +927,12 @@ def _auto_process_management_signal(
             processed_at=processed_at,
         )
 
+    management_execution_mode = (
+        settings.effective_composite_management_v2_mode
+        if candidate.management_contract_json
+        and candidate.management_contract_fingerprint
+        else settings.management_execution_mode
+    )
     result = plan_strategy_management_batch(
         session_factory,
         raw_message_id=raw_message_id,
@@ -938,17 +940,17 @@ def _auto_process_management_signal(
         contract_spec_provider=contract_spec_provider,
         planned_at=processed_at,
         candidate_id=candidate_id,
-        shadow_only=settings.management_execution_mode == "shadow",
-        execution_mode=settings.management_execution_mode,
+        shadow_only=management_execution_mode == "shadow",
+        execution_mode=management_execution_mode,
     )
     if result.status != "ready" or result.batch is None:
         return {
             "status": "blocked" if result.status == "blocked" else result.status,
             "reason": result.reason_code,
             "batch_id": result.batch_id,
-            "execution_mode": settings.management_execution_mode,
+            "execution_mode": management_execution_mode,
         }
-    if settings.management_execution_mode == "shadow":
+    if management_execution_mode == "shadow":
         return {
             "status": "shadow_planned",
             "management_action": result.batch.effective_action,

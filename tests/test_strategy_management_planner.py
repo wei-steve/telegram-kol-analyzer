@@ -21,10 +21,16 @@ from telegram_kol_research.models import (
     SourceMessageDeletionExit,
     StrategyLifecycle,
     StrategyManagementBatch,
+    StrategyManagementComponent,
     StrategyManagementLeg,
 )
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 from telegram_kol_research.source_message_deletion import record_source_message_deleted
+from telegram_kol_research.strategy_management_contracts import (
+    ManagementInstructionContract,
+    management_contract_fingerprint,
+    serialize_management_contract,
+)
 
 
 PLANNED_AT = datetime(2026, 7, 15, 8, 0, tzinfo=UTC)
@@ -214,6 +220,7 @@ def _persist_exact_management_target(
     requested_stop_loss=None,
     stop_price_source=None,
     management_text="B strategy exit",
+    composite_contract=False,
 ):
     with session_factory() as session:
         entry_a = RawMessage(
@@ -333,6 +340,45 @@ def _persist_exact_management_target(
                 differences_json="[]",
             )
         )
+        contract_json = None
+        contract_fingerprint = None
+        if composite_contract:
+            contract = ManagementInstructionContract(
+                version=2,
+                target_lifecycle_id=lifecycle_b.id,
+                strategy_instance_id=binding_b.strategy_instance_id,
+                symbol="BTC",
+                side=side,
+                close_fraction=(
+                    "0.5" if management_fraction is None
+                    else str(management_fraction)
+                ),
+                stop_mode=(
+                    "explicit_price"
+                    if requested_stop_loss is not None
+                    else "actual_entry_price"
+                ),
+                stop_price=(
+                    str(requested_stop_loss)
+                    if requested_stop_loss is not None
+                    else None
+                ),
+                stop_price_source=(
+                    "current_message_text"
+                    if requested_stop_loss is not None
+                    else None
+                ),
+                take_profit_consumption="consume_first_stage",
+                cancel_deferred_entries=True,
+                required_components=(
+                    "consume_take_profit_stage",
+                    "converge_partial_close",
+                    "replace_remaining_protection",
+                ),
+                current_message_text=management_text,
+            )
+            contract_json = serialize_management_contract(contract)
+            contract_fingerprint = management_contract_fingerprint(contract)
         session.add(
             SignalCandidate(
                 raw_message_id=management.id,
@@ -342,7 +388,9 @@ def _persist_exact_management_target(
                 target_lifecycle_id=lifecycle_b.id,
                 management_action=intent,
                 management_fraction=(
-                    0.3
+                    0.5
+                    if composite_contract
+                    else 0.3
                     if intent in {"partial_take_profit", "partial_then_break_even"}
                     and management_fraction == "default"
                     else management_fraction
@@ -350,6 +398,8 @@ def _persist_exact_management_target(
                     else None
                 ),
                 recognition_generation="generation-b",
+                management_contract_json=contract_json,
+                management_contract_fingerprint=contract_fingerprint,
                 stop_loss_text=requested_stop_loss,
                 stop_price_source=stop_price_source,
                 parse_source="mimo_authoritative",
@@ -2091,6 +2141,7 @@ def test_partial_then_break_even_plans_durable_close_and_protection_phases(
         session_factory,
         intent="partial_then_break_even",
         management_fraction=None,
+        composite_contract=True,
     )
     _disable_reconciliation(monkeypatch, planner)
     with session_factory() as session:
@@ -2163,6 +2214,192 @@ def test_partial_then_break_even_plans_durable_close_and_protection_phases(
         "stop_loss_text": None,
     }
     assert result.batch.legs[0].old_tpsl["order_ids"] == ["sl-old", "tp-old"]
+    with session_factory() as session:
+        candidate = (
+            session.query(SignalCandidate)
+            .filter(SignalCandidate.raw_message_id == raw_id)
+            .one()
+        )
+        batch = session.get(StrategyManagementBatch, result.batch.id)
+        components = (
+            session.query(StrategyManagementComponent)
+            .filter(
+                StrategyManagementComponent.management_batch_id
+                == result.batch.id
+            )
+            .order_by(StrategyManagementComponent.sequence.asc())
+            .all()
+        )
+    assert batch.management_contract_json == candidate.management_contract_json
+    assert batch.management_contract_fingerprint == (
+        candidate.management_contract_fingerprint
+    )
+    assert batch.contract_version == 2
+    assert [component.component_kind for component in components] == [
+        "consume_take_profit_stage",
+        "converge_partial_close",
+        "replace_remaining_protection",
+    ]
+    assert [component.sequence for component in components] == [0, 1, 2]
+    assert all(
+        component.strategy_management_leg_id == result.batch.legs[0].id
+        for component in components
+    )
+    desired = [json.loads(component.desired_json) for component in components]
+    assert desired[0]["trusted_start_size"] == "10"
+    assert desired[0]["target_remaining_size"] == "5"
+    assert desired[0]["avg_entry_price"] == "62000"
+    assert desired[0]["quantity_step"] == "1"
+    assert desired[0]["min_quantity"] == "1"
+
+
+def test_composite_split_positions_create_deterministic_per_leg_components(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "split-composite.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="partial_then_break_even",
+        management_fraction=0.5,
+        pos_ids=("pos-c", "pos-b"),
+        composite_contract=True,
+    )
+    with session_factory() as session:
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=binding_id)
+            .all()
+        )
+        for leg in legs:
+            for order_id, purpose, trigger_price, size_text in (
+                (f"tp-{leg.pos_id}", "take_profit", "61000", "8"),
+                (f"sl-{leg.pos_id}", "stop_loss", "63000", "0"),
+            ):
+                upsert_protection_ledger_row(
+                    session,
+                    venue="deepcoin",
+                    execution_binding_id=binding_id,
+                    execution_order_leg_id=leg.id,
+                    strategy_instance_id=leg.strategy_instance_id,
+                    pos_id=leg.pos_id,
+                    instrument_id="BTC-USDT-SWAP",
+                    side="short",
+                    order_id=order_id,
+                    purpose=purpose,
+                    trigger_price=trigger_price,
+                    size_text=size_text,
+                    status="verified",
+                    evidence_source="entry_protection_response",
+                    evidence={"match": "exact_written_order"},
+                    seen_at=PLANNED_AT,
+                )
+        session.commit()
+    _disable_reconciliation(monkeypatch, planner)
+    pending = [
+        {
+            "triggerOrderType": "TPSL",
+            "ordId": f"{purpose}-{pos_id}",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "posId": pos_id,
+            "tpTriggerPx": "61000" if purpose == "tp" else None,
+            "slTriggerPx": "63000" if purpose == "sl" else None,
+            "sz": "8" if purpose == "tp" else "0",
+            "cTime": "1721000000000",
+        }
+        for pos_id in ("pos-b", "pos-c")
+        for purpose in ("tp", "sl")
+    ]
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin(
+            [
+                _position("pos-c", size="8", avg_px="62100"),
+                _position("pos-b", size="10", avg_px="62000"),
+            ],
+            tpsl_orders=pending,
+        ),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert [leg.pos_id for leg in result.batch.legs] == ["pos-b", "pos-c"]
+    assert [component.component_kind for component in result.batch.components] == [
+        "consume_take_profit_stage",
+        "converge_partial_close",
+        "replace_remaining_protection",
+    ] * 2
+    assert [component.sequence for component in result.batch.components] == [
+        0, 1, 2, 0, 1, 2
+    ]
+    assert [
+        component.desired["pos_id"] for component in result.batch.components
+    ] == ["pos-b"] * 3 + ["pos-c"] * 3
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["fingerprint", "missing", "extra", "reordered"],
+)
+def test_composite_contract_or_component_shape_mismatch_blocks(
+    monkeypatch, tmp_path, mutation
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / f"{mutation}.db")
+    raw_id, _, _ = _persist_exact_management_target(
+        session_factory,
+        intent="partial_then_break_even",
+        management_fraction=0.5,
+        composite_contract=True,
+    )
+    with session_factory() as session:
+        candidate = (
+            session.query(SignalCandidate)
+            .filter(SignalCandidate.raw_message_id == raw_id)
+            .one()
+        )
+        payload = json.loads(candidate.management_contract_json)
+        if mutation == "fingerprint":
+            candidate.management_contract_fingerprint = "0" * 64
+        else:
+            components = payload["required_components"]
+            if mutation == "missing":
+                payload["required_components"] = components[:-1]
+            elif mutation == "extra":
+                payload["required_components"] = [
+                    *components,
+                    "cancel_deferred_entries",
+                ]
+            else:
+                payload["required_components"] = list(reversed(components))
+            candidate.management_contract_json = json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            candidate.management_contract_fingerprint = __import__(
+                "hashlib"
+            ).sha256(candidate.management_contract_json.encode()).hexdigest()
+        session.commit()
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert (result.status, result.reason_code) == (
+        "blocked",
+        "management_instruction_component_dropped",
+    )
 
 
 def test_risk_reduction_protection_recovery_snapshots_exact_owned_orders(

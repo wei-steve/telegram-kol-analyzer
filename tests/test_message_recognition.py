@@ -4730,7 +4730,19 @@ def _assert_composite_message_contract(
             posted_at=datetime(2026, 8, 4, 2, tzinfo=UTC),
             text=text,
         )
-        session.add_all([lifecycle, raw_message])
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:8804:100:BTC:long",
+            kol_id="group:8804",
+            chat_id=8804,
+            message_id=100,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            status="active",
+        )
+        session.add_all([lifecycle, raw_message, binding])
+        session.flush()
+        lifecycle.execution_binding_id = binding.id
         session.commit()
         lifecycle_id = lifecycle.id
         raw_message_id = raw_message.id
@@ -4771,6 +4783,7 @@ def _assert_composite_message_contract(
     assert candidate.management_fraction == pytest.approx(0.5)
     assert candidate.management_contract_fingerprint
     assert contract["target_lifecycle_id"] == lifecycle_id
+    assert contract["strategy_instance_id"] == "deepcoin:8804:100:BTC:long"
     assert contract["close_fraction"] == "0.5"
     assert contract["stop_mode"] == expected_stop_mode
     assert contract["stop_price"] == expected_stop_price

@@ -20,8 +20,16 @@ from telegram_kol_research.db import MANAGEMENT_MARKET_DECISION_BATCH_INDEX_NAME
 from telegram_kol_research.db import REQUIRED_MANAGEMENT_UNIQUE_INDEX_NAMES
 from telegram_kol_research.models import ACTIVE_MANAGEMENT_BATCH_SQL_PREDICATE
 from telegram_kol_research.models import StrategyManagementBatch
+from telegram_kol_research.models import StrategyManagementComponent
 from telegram_kol_research.models import StrategyManagementLeg
 from telegram_kol_research.models import PositionProtectionLedger
+from telegram_kol_research.strategy_management_components import (
+    create_management_component,
+)
+from telegram_kol_research.strategy_management_contracts import (
+    load_management_contract,
+    management_contract_fingerprint,
+)
 
 
 RECOVERABLE_BATCH_STATUSES = frozenset(
@@ -493,6 +501,9 @@ class ManagementBatchRecord:
     reason_code: str | None
     target_fingerprint: str
     target_snapshot: Any
+    management_contract_json: str | None
+    management_contract_fingerprint: str | None
+    contract_version: int | None
     planned_at: datetime
     started_at: datetime | None
     reconciled_at: datetime | None
@@ -505,6 +516,27 @@ class ManagementBatchRecord:
     created_at: datetime
     updated_at: datetime
     legs: tuple[ManagementLegRecord, ...]
+    components: tuple["ManagementComponentRecord", ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ManagementComponentRecord:
+    id: int
+    management_batch_id: int
+    strategy_management_leg_id: int | None
+    component_kind: str
+    sequence: int
+    status: str
+    idempotency_key: str
+    desired: Any
+    evidence: Any
+    reason_code: str | None
+    attempt_count: int
+    last_progress_at: datetime | None
+    execution_deadline_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
 
 
 def create_management_batch(
@@ -595,6 +627,10 @@ def create_management_batch_in_session(
     visibility_retry_attempts: int = 0,
     visibility_next_attempt_at: datetime | None = None,
     validate_current_state: Callable[[Session], None] | None = None,
+    management_contract_json: str | None = None,
+    management_contract_fingerprint: str | None = None,
+    contract_version: int | None = None,
+    create_composite_components: bool = False,
 ) -> int:
     """Insert a batch in the caller transaction after an immediate state gate."""
 
@@ -614,6 +650,9 @@ def create_management_batch_in_session(
         execution_mode=execution_mode,
         requested_fraction=requested_fraction,
         effective_fraction=effective_fraction,
+        management_contract_json=management_contract_json,
+        management_contract_fingerprint=management_contract_fingerprint,
+        contract_version=contract_version,
         partial_round_before=partial_round_before,
         status=status,
         reason_code=reason_code,
@@ -659,6 +698,12 @@ def create_management_batch_in_session(
             )
         )
     session.flush()
+    if create_composite_components:
+        create_composite_components_in_session(
+            session,
+            batch=batch,
+            planned_at=planned_at,
+        )
     if batch.status in {
         "blocked",
         "partial_failed",
@@ -671,6 +716,156 @@ def create_management_batch_in_session(
 
         persist_strategy_management_notification_in_session(session, batch)
     return batch.id
+
+
+def create_composite_components_in_session(
+    session: Session,
+    *,
+    batch: StrategyManagementBatch,
+    planned_at: datetime,
+) -> None:
+    if not (
+        batch.management_contract_json
+        and batch.management_contract_fingerprint
+        and batch.contract_version is not None
+    ):
+        raise ManagementSchemaSafetyError(
+            "management_instruction_component_dropped"
+        )
+    contract = load_management_contract(batch.management_contract_json)
+    if (
+        contract.version != batch.contract_version
+        or management_contract_fingerprint(contract)
+        != batch.management_contract_fingerprint
+    ):
+        raise ManagementSchemaSafetyError(
+            "management_instruction_component_dropped"
+        )
+    expected_components = (
+        "consume_take_profit_stage",
+        "converge_partial_close",
+        "replace_remaining_protection",
+    )
+    if contract.required_components != expected_components:
+        raise ManagementSchemaSafetyError(
+            "management_instruction_component_dropped"
+        )
+    legs = (
+        session.query(StrategyManagementLeg)
+        .filter(StrategyManagementLeg.management_batch_id == batch.id)
+        .order_by(
+            StrategyManagementLeg.pos_id.asc(),
+            StrategyManagementLeg.id.asc(),
+        )
+        .all()
+    )
+    if not legs:
+        raise ManagementSchemaSafetyError(
+            "management_instruction_component_dropped"
+        )
+    target_snapshot = _decode_json(batch.target_snapshot_json) or {}
+    positions = {
+        str(row.get("pos_id")): row
+        for row in target_snapshot.get("positions", [])
+        if isinstance(row, dict) and row.get("pos_id") not in (None, "")
+    }
+    for leg in legs:
+        position = positions.get(str(leg.pos_id))
+        if position is None:
+            raise ManagementSchemaSafetyError(
+                "management_instruction_component_dropped"
+            )
+        desired_base = {
+            "contract_fingerprint": batch.management_contract_fingerprint,
+            "pos_id": str(leg.pos_id),
+            "execution_order_leg_id": int(leg.execution_order_leg_id),
+            "trusted_start_size": str(position["trusted_start_size"]),
+            "target_remaining_size": str(position["target_remaining_size"]),
+            "avg_entry_price": str(position["avg_entry_price"]),
+            "quantity_step": str(position["quantity_step"]),
+            "min_quantity": str(position["min_quantity"]),
+        }
+        for sequence, component_kind in enumerate(expected_components):
+            desired = {
+                **desired_base,
+                "component_kind": component_kind,
+            }
+            idempotency_key = hashlib.sha256(
+                (
+                    f"{batch.management_contract_fingerprint}|"
+                    f"{batch.id}|{leg.id}|{component_kind}"
+                ).encode("utf-8")
+            ).hexdigest()
+            create_management_component(
+                session,
+                management_batch_id=batch.id,
+                strategy_management_leg_id=leg.id,
+                component_kind=component_kind,
+                sequence=sequence,
+                idempotency_key=idempotency_key,
+                desired=desired,
+                now=planned_at,
+                execution_deadline_at=batch.execution_deadline_at,
+            )
+    if not management_component_set_is_complete_in_session(session, batch=batch):
+        raise ManagementSchemaSafetyError(
+            "management_instruction_component_dropped"
+        )
+
+
+def management_component_set_is_complete_in_session(
+    session: Session,
+    *,
+    batch: StrategyManagementBatch,
+) -> bool:
+    if not (
+        batch.management_contract_json
+        and batch.management_contract_fingerprint
+        and batch.contract_version is not None
+    ):
+        return False
+    try:
+        contract = load_management_contract(batch.management_contract_json)
+    except ValueError:
+        return False
+    if (
+        contract.version != batch.contract_version
+        or management_contract_fingerprint(contract)
+        != batch.management_contract_fingerprint
+    ):
+        return False
+    legs = (
+        session.query(StrategyManagementLeg)
+        .filter(StrategyManagementLeg.management_batch_id == batch.id)
+        .order_by(StrategyManagementLeg.pos_id.asc(), StrategyManagementLeg.id.asc())
+        .all()
+    )
+    if not legs:
+        return False
+    components = (
+        session.query(StrategyManagementComponent)
+        .filter(StrategyManagementComponent.management_batch_id == batch.id)
+        .order_by(
+            StrategyManagementComponent.strategy_management_leg_scope.asc(),
+            StrategyManagementComponent.sequence.asc(),
+            StrategyManagementComponent.id.asc(),
+        )
+        .all()
+    )
+    expected = [
+        (leg.id, sequence, kind)
+        for leg in legs
+        for sequence, kind in enumerate(contract.required_components)
+    ]
+    actual = [
+        (
+            component.strategy_management_leg_id,
+            component.sequence,
+            component.component_kind,
+        )
+        for component in components
+    ]
+    return actual == expected
 
 
 def load_management_batch(
@@ -928,6 +1123,16 @@ def _batch_to_record(session, batch: StrategyManagementBatch) -> ManagementBatch
         .order_by(StrategyManagementLeg.leg_index.asc(), StrategyManagementLeg.id.asc())
         .all()
     )
+    components = (
+        session.query(StrategyManagementComponent)
+        .filter(StrategyManagementComponent.management_batch_id == batch.id)
+        .order_by(
+            StrategyManagementComponent.strategy_management_leg_scope.asc(),
+            StrategyManagementComponent.sequence.asc(),
+            StrategyManagementComponent.id.asc(),
+        )
+        .all()
+    )
     return ManagementBatchRecord(
         id=batch.id,
         idempotency_fingerprint=batch.idempotency_fingerprint,
@@ -947,6 +1152,9 @@ def _batch_to_record(session, batch: StrategyManagementBatch) -> ManagementBatch
         reason_code=batch.reason_code,
         target_fingerprint=batch.target_fingerprint,
         target_snapshot=_decode_json(batch.target_snapshot_json),
+        management_contract_json=batch.management_contract_json,
+        management_contract_fingerprint=batch.management_contract_fingerprint,
+        contract_version=batch.contract_version,
         planned_at=_utc(batch.planned_at),
         started_at=_utc(batch.started_at),
         reconciled_at=_utc(batch.reconciled_at),
@@ -959,6 +1167,30 @@ def _batch_to_record(session, batch: StrategyManagementBatch) -> ManagementBatch
         created_at=_utc(batch.created_at),
         updated_at=_utc(batch.updated_at),
         legs=tuple(_leg_to_record(leg) for leg in legs),
+        components=tuple(_component_to_record(component) for component in components),
+    )
+
+
+def _component_to_record(
+    component: StrategyManagementComponent,
+) -> ManagementComponentRecord:
+    return ManagementComponentRecord(
+        id=component.id,
+        management_batch_id=component.management_batch_id,
+        strategy_management_leg_id=component.strategy_management_leg_id,
+        component_kind=component.component_kind,
+        sequence=component.sequence,
+        status=component.status,
+        idempotency_key=component.idempotency_key,
+        desired=_decode_json(component.desired_json),
+        evidence=_decode_json(component.evidence_json),
+        reason_code=component.reason_code,
+        attempt_count=int(component.attempt_count or 0),
+        last_progress_at=_utc(component.last_progress_at),
+        execution_deadline_at=_utc(component.execution_deadline_at),
+        created_at=_utc(component.created_at),
+        updated_at=_utc(component.updated_at),
+        completed_at=_utc(component.completed_at),
     )
 
 

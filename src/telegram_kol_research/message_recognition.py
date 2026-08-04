@@ -1161,9 +1161,25 @@ def _apply_lifecycle_event_decision(
     management_contract_fingerprint_value = None
     if management_directive.intent == "partial_then_break_even":
         contract_event = dict(decision)
+        target_binding = (
+            session.get(ExecutionBinding, int(target.execution_binding_id))
+            if target.execution_binding_id is not None
+            else None
+        )
+        exact_strategy_instance_id = (
+            str(target_binding.strategy_instance_id)
+            if target_binding is not None
+            and target_binding.strategy_instance_id
+            and target_binding.chat_id == target.chat_id
+            and target_binding.message_id == target.message_id
+            and str(target_binding.symbol).upper() == str(target.symbol).upper()
+            and str(target_binding.side).lower() == str(target.side).lower()
+            else None
+        )
         contract_event.update(
             {
                 "target_lifecycle_id": target.id,
+                "strategy_instance_id": exact_strategy_instance_id,
                 "symbol": target.symbol,
                 "side": target.side,
             }
