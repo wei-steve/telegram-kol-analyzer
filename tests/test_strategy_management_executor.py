@@ -5849,3 +5849,239 @@ def test_composite_close_refuses_position_drift_without_write(
     assert result.status == "operator_required"
     assert result.reason_code == reason
     assert client.close_calls == []
+
+
+def _prepare_composite_protection_component(session_factory, *, retained_size="5"):
+    from telegram_kol_research.models import StrategyManagementComponent
+
+    batch_id, _ = _persist_composite_consumption_component(session_factory)
+    with session_factory() as session:
+        components = (
+            session.query(StrategyManagementComponent)
+            .filter(StrategyManagementComponent.management_batch_id == batch_id)
+            .order_by(StrategyManagementComponent.sequence.asc())
+            .all()
+        )
+        for component in components[:2]:
+            component.status = "confirmed"
+            component.completed_at = NOW
+        existing_tp = session.query(PositionProtectionLedger).filter_by(
+            order_id="tp-first"
+        ).one()
+        existing_tp.status = "cancelled"
+        owner = {
+            "venue": "deepcoin",
+            "execution_binding_id": existing_tp.execution_binding_id,
+            "execution_order_leg_id": existing_tp.execution_order_leg_id,
+            "strategy_instance_id": existing_tp.strategy_instance_id,
+            "pos_id": existing_tp.pos_id,
+            "instrument_id": existing_tp.instrument_id,
+            "side": existing_tp.side,
+            "evidence_source": "test",
+            "evidence_json": "{}",
+            "first_seen_at": NOW,
+            "last_seen_at": NOW,
+            "created_at": NOW,
+            "updated_at": NOW,
+        }
+        session.add_all(
+            [
+                PositionProtectionLedger(
+                    **owner,
+                    order_id="tp-retained",
+                    purpose="take_profit",
+                    trigger_price="66000",
+                    size_text=retained_size,
+                    status="verified",
+                ),
+                PositionProtectionLedger(
+                    **owner,
+                    order_id="stop-old-primary",
+                    purpose="stop_loss",
+                    trigger_price="62000",
+                    size_text="5",
+                    status="verified",
+                ),
+                PositionProtectionLedger(
+                    **owner,
+                    order_id="stop-old-backup",
+                    purpose="backup_stop",
+                    trigger_price="61800",
+                    size_text="5",
+                    status="verified",
+                ),
+            ]
+        )
+        session.commit()
+        return batch_id, components[2].id
+
+
+class _CompositeProtectionClient(_CompositeCloseClient):
+    def __init__(self, *, duplicate_ids=False, readback_failure=False, cancel_rejected=False):
+        super().__init__(current_size="5")
+        self.duplicate_ids = duplicate_ids
+        self.readback_failure = readback_failure
+        self.cancel_rejected = cancel_rejected
+        self.events = []
+        self.pending = [
+            {
+                "ordId": "tp-retained", "posId": "pos-composite",
+                "instId": "BTC-USDT-SWAP", "posSide": "long",
+                "triggerOrderType": "TPSL", "tpTriggerPx": "66000", "sz": "5",
+            },
+            {
+                "ordId": "stop-old-primary", "posId": "pos-composite",
+                "instId": "BTC-USDT-SWAP", "posSide": "long",
+                "triggerOrderType": "TPSL", "slTriggerPx": "62000", "sz": "5",
+            },
+            {
+                "ordId": "stop-old-backup", "posId": "pos-composite",
+                "instId": "BTC-USDT-SWAP", "posSide": "long",
+                "triggerOrderType": "TPSL", "slTriggerPx": "61800", "sz": "5",
+            },
+        ]
+        self._set_count = 0
+
+    def list_positions(self, *, inst_id=None):
+        rows = super().list_positions(inst_id=inst_id)
+        rows[0]["markPx"] = "65000"
+        return rows
+
+    def set_position_sltp(self, payload):
+        self._set_count += 1
+        role = "primary" if self._set_count == 1 else "backup"
+        self.events.append(f"set_{role}")
+        order_id = "stop-new" if self.duplicate_ids else f"stop-new-{role}"
+        if not self.readback_failure:
+            self.pending.append(
+                {
+                    "ordId": order_id, "posId": "pos-composite",
+                    "instId": "BTC-USDT-SWAP", "posSide": "long",
+                    "triggerOrderType": "TPSL",
+                    "slTriggerPx": payload["slTriggerPx"], "sz": payload["sz"],
+                }
+            )
+        return {"code": "0", "data": {"ordId": order_id}}
+
+    def list_trigger_orders_pending(self, *, inst_id):
+        self.events.append("readback")
+        return list(self.pending)
+
+    def cancel_position_sltp(self, payload):
+        order_id = payload["ordId"]
+        self.events.append(f"cancel_{order_id}")
+        if self.cancel_rejected:
+            raise DeepcoinDefiniteRejection("cancel rejected")
+        self.pending = [row for row in self.pending if row["ordId"] != order_id]
+        return {"code": "0", "data": {"ordId": order_id}}
+
+
+def _execute_composite_protection(session_factory, batch_id, component_id, client):
+    from telegram_kol_research.strategy_management_composite_executor import (
+        execute_protection_replacement_component,
+    )
+
+    return execute_protection_replacement_component(
+        session_factory,
+        batch_id=batch_id,
+        component_id=component_id,
+        deepcoin_client=client,
+        live_execution_gate=lambda: True,
+        now_provider=lambda: NOW,
+        price_tick="0.1",
+        backup_buffer_bps="20",
+    )
+
+
+def test_composite_protection_creates_and_owns_both_stops_before_cancelling_old(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "protection-order.db")
+    batch_id, component_id = _prepare_composite_protection_component(session_factory)
+    client = _CompositeProtectionClient()
+
+    result = _execute_composite_protection(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "confirmed"
+    assert client.events[:6] == [
+        "set_primary", "readback", "set_backup", "readback",
+        "cancel_stop-old-backup", "readback",
+    ] or client.events[:6] == [
+        "set_primary", "readback", "set_backup", "readback",
+        "cancel_stop-old-primary", "readback",
+    ]
+    first_cancel = next(i for i, event in enumerate(client.events) if event.startswith("cancel_"))
+    assert client.events.index("set_backup") < first_cancel
+    with session_factory() as session:
+        new_rows = session.query(PositionProtectionLedger).filter(
+            PositionProtectionLedger.order_id.in_(
+                ("stop-new-primary", "stop-new-backup")
+            )
+        ).all()
+        assert {row.purpose for row in new_rows} == {"stop_loss", "backup_stop"}
+        assert all(row.status == "verified" for row in new_rows)
+
+
+def test_composite_protection_readback_failure_retains_old_stops(tmp_path):
+    session_factory = create_session_factory(tmp_path / "protection-readback.db")
+    batch_id, component_id = _prepare_composite_protection_component(session_factory)
+    client = _CompositeProtectionClient(readback_failure=True)
+
+    result = _execute_composite_protection(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "awaiting_exchange"
+    assert not any(event.startswith("cancel_") for event in client.events)
+
+
+def test_composite_protection_duplicate_new_order_id_retains_old_stops(tmp_path):
+    session_factory = create_session_factory(tmp_path / "protection-duplicate.db")
+    batch_id, component_id = _prepare_composite_protection_component(session_factory)
+    client = _CompositeProtectionClient(duplicate_ids=True)
+
+    result = _execute_composite_protection(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "operator_required"
+    assert result.reason_code == "duplicate_new_stop_order_id"
+    assert not any(event.startswith("cancel_") for event in client.events)
+
+
+def test_composite_protection_old_cancel_failure_keeps_new_verified_stops(tmp_path):
+    session_factory = create_session_factory(tmp_path / "protection-cancel.db")
+    batch_id, component_id = _prepare_composite_protection_component(session_factory)
+    client = _CompositeProtectionClient(cancel_rejected=True)
+
+    result = _execute_composite_protection(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "recovery_required"
+    with session_factory() as session:
+        new_rows = session.query(PositionProtectionLedger).filter(
+            PositionProtectionLedger.order_id.in_(
+                ("stop-new-primary", "stop-new-backup")
+            )
+        ).all()
+        assert len(new_rows) == 2
+        assert all(row.status == "verified" for row in new_rows)
+
+
+def test_composite_protection_refuses_oversized_retained_tp_before_any_write(tmp_path):
+    session_factory = create_session_factory(tmp_path / "protection-oversized.db")
+    batch_id, component_id = _prepare_composite_protection_component(
+        session_factory, retained_size="6"
+    )
+    client = _CompositeProtectionClient()
+
+    result = _execute_composite_protection(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "operator_required"
+    assert result.reason_code == "retained_take_profit_exceeds_position"
+    assert client.events == []

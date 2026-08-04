@@ -12,6 +12,7 @@ from telegram_kol_research.protection_ledger import (
     list_verified_ledger_rows_for_positions,
     load_account_protection_ownership,
     upsert_protection_ledger_row,
+    retained_take_profit_total,
 )
 
 
@@ -218,6 +219,46 @@ def test_upsert_protection_ledger_row_skips_empty_order_id(tmp_path):
         assert list_verified_ledger_rows_for_positions(
             session, ["1001124164749504"]
         ) == []
+
+
+def test_retained_take_profit_total_requires_exact_owner_and_position_bound():
+    rows = [
+        {
+            "order_id": "tp-2",
+            "purpose": "take_profit",
+            "status": "verified",
+            "execution_binding_id": 1,
+            "execution_order_leg_id": 2,
+            "pos_id": "pos-1",
+            "size_text": "3",
+        },
+        {
+            "order_id": "tp-3",
+            "purpose": "take_profit",
+            "status": "verified",
+            "execution_binding_id": 1,
+            "execution_order_leg_id": 2,
+            "pos_id": "pos-1",
+            "size_text": "2",
+        },
+    ]
+
+    assert retained_take_profit_total(
+        rows,
+        execution_binding_id=1,
+        execution_order_leg_id=2,
+        pos_id="pos-1",
+        live_position_size="5",
+    ) == "5"
+
+    with pytest.raises(ValueError, match="retained_take_profit_exceeds_position"):
+        retained_take_profit_total(
+            rows,
+            execution_binding_id=1,
+            execution_order_leg_id=2,
+            pos_id="pos-1",
+            live_position_size="4",
+        )
 
 
 def test_load_account_protection_ownership_indexes_exact_active_rows(tmp_path):

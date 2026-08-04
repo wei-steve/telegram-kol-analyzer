@@ -24,7 +24,10 @@ ALLOWED_COMPONENT_TRANSITIONS = {
         {"submitting", "definitely_rejected", "recovery_required", "operator_required"}
     ),
     "submitting": frozenset(
-        {"awaiting_exchange", "confirmed", "definitely_rejected", "recovery_required"}
+        {
+            "awaiting_exchange", "confirmed", "definitely_rejected",
+            "recovery_required", "operator_required",
+        }
     ),
     "awaiting_exchange": frozenset(
         {"confirmed", "definitely_rejected", "recovery_required", "operator_required"}

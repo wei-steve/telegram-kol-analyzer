@@ -585,7 +585,7 @@ class PositionMutationGateway:
                 if (
                     str(protection.status or "").lower() != "verified"
                     or protection.purpose
-                    not in {"stop_loss", "take_profit"}
+                    not in {"stop_loss", "backup_stop", "take_profit"}
                 ):
                     return "protection_order_not_active"
                 if (
@@ -766,6 +766,7 @@ def submit_exact_position_sltp(
     live_execution_gate: Callable[[], bool],
     now_provider: Callable[[], Any],
     require_readback: bool = False,
+    ledger_purpose: str | None = None,
 ) -> Mapping[str, Any]:
     """Compatibility adapter that rebuilds authority before one exact TPSL set."""
 
@@ -846,7 +847,7 @@ def submit_exact_position_sltp(
                 instrument_id=authority.instrument_id,
                 side=authority.side,
                 order_id=order_id,
-                purpose=purpose,
+                purpose=ledger_purpose or purpose,
                 trigger_price=str(payload[trigger_field]),
                 size_text=(str(payload["sz"]) if "sz" in payload else None),
                 status="verified",

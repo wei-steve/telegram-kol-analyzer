@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
@@ -12,6 +13,54 @@ from telegram_kol_research.models import PositionProtectionLedger, utc_now
 
 
 _ACTIVE_OWNERSHIP_STATUSES = frozenset({"verified", "protected"})
+
+
+def retained_take_profit_total(
+    rows: Iterable[object],
+    *,
+    execution_binding_id: int,
+    execution_order_leg_id: int,
+    pos_id: str,
+    live_position_size: object,
+) -> str:
+    """Validate exact retained TP ownership and bound its aggregate size."""
+
+    try:
+        live_size = Decimal(str(live_position_size))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("retained_take_profit_size_invalid") from exc
+    if not live_size.is_finite() or live_size <= 0:
+        raise ValueError("retained_take_profit_size_invalid")
+    seen: set[str] = set()
+    total = Decimal("0")
+    for row in rows:
+        purpose = str(_field(row, "purpose") or "").lower()
+        status = str(_field(row, "status") or "").lower()
+        if purpose != "take_profit" or status not in _ACTIVE_OWNERSHIP_STATUSES:
+            continue
+        order_id = str(_field(row, "order_id") or "")
+        if (
+            not order_id
+            or order_id in seen
+            or int(_field(row, "execution_binding_id") or 0)
+            != int(execution_binding_id)
+            or int(_field(row, "execution_order_leg_id") or 0)
+            != int(execution_order_leg_id)
+            or str(_field(row, "pos_id") or "") != str(pos_id)
+        ):
+            raise ValueError("retained_take_profit_owner_conflict")
+        seen.add(order_id)
+        try:
+            size = Decimal(str(_field(row, "size_text")))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ValueError("retained_take_profit_size_invalid") from exc
+        if not size.is_finite() or size <= 0:
+            raise ValueError("retained_take_profit_size_invalid")
+        total += size
+    if total > live_size:
+        raise ValueError("retained_take_profit_exceeds_position")
+    normalized = format(total.normalize(), "f")
+    return "0" if normalized == "-0" else normalized
 
 
 @dataclass(frozen=True, slots=True)

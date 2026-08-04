@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from typing import Any
+
+from telegram_kol_research.trigger_backup_stop import calculate_backup_stop_price
 
 
 class BreakEvenMarketPolicyError(ValueError):
@@ -26,6 +28,67 @@ class BreakEvenProtectionDecision:
     market: BreakEvenMarketDecision
     action: str
     effective_stop_price: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CompositeStopReplacementDecision:
+    action: str
+    primary_stop: str
+    backup_stop: str
+
+
+def plan_composite_stop_replacement(
+    *,
+    side: Any,
+    requested_stop: Any,
+    market_price: Any,
+    price_tick: Any,
+    backup_buffer_bps: Any,
+    existing_stop_prices: list[Any] | tuple[Any, ...],
+) -> CompositeStopReplacementDecision:
+    """Choose safely rounded primary/backup stops before any exchange write."""
+
+    normalized_side = str(side or "").lower()
+    if normalized_side not in {"long", "short"}:
+        raise BreakEvenMarketPolicyError("break_even_side_invalid")
+    requested = _positive_decimal(
+        requested_stop, reason="requested_stop_invalid"
+    )
+    market = _positive_decimal(market_price, reason="break_even_market_price_invalid")
+    tick = _positive_decimal(price_tick, reason="price_tick_invalid")
+    rounding = ROUND_FLOOR if normalized_side == "long" else ROUND_CEILING
+    primary = (requested / tick).to_integral_value(rounding=rounding) * tick
+    if (normalized_side == "long" and primary >= market) or (
+        normalized_side == "short" and primary <= market
+    ):
+        raise BreakEvenMarketPolicyError("requested_stop_market_side_invalid")
+    existing = [
+        _positive_decimal(value, reason="break_even_existing_stop_invalid")
+        for value in existing_stop_prices
+    ]
+    tighter = [
+        stop for stop in existing
+        if (stop >= primary if normalized_side == "long" else stop <= primary)
+        and (
+            stop < market if normalized_side == "long" else stop > market
+        )
+    ]
+    action = "replace"
+    if tighter:
+        primary = max(tighter) if normalized_side == "long" else min(tighter)
+        action = "keep_tighter_stop"
+    primary_text = _format_decimal(primary)
+    backup = calculate_backup_stop_price(
+        primary_stop=primary_text,
+        side=normalized_side,
+        price_tick=_format_decimal(tick),
+        buffer_bps=backup_buffer_bps,
+    )
+    return CompositeStopReplacementDecision(
+        action=action,
+        primary_stop=primary_text,
+        backup_stop=backup,
+    )
 
 
 def assess_break_even_market(

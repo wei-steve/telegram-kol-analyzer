@@ -20,6 +20,7 @@ from telegram_kol_research.position_mutation_authority import (
 from telegram_kol_research.position_mutation_gateway import (
     PositionMutationGateway,
     reconcile_submitted_position_mutation_intents,
+    submit_exact_position_sltp,
 )
 from telegram_kol_research.strategy_management_batches import (
     management_component_set_is_complete_in_session,
@@ -41,6 +42,11 @@ from telegram_kol_research.strategy_management_sizing import (
     ManagementSizingError,
     target_remaining_close_delta,
 )
+from telegram_kol_research.strategy_management_market_policy import (
+    BreakEvenMarketPolicyError,
+    plan_composite_stop_replacement,
+)
+from telegram_kol_research.protection_ledger import retained_take_profit_total
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,6 +494,269 @@ def execute_partial_close_component(
     )
 
 
+def execute_protection_replacement_component(
+    session_factory,
+    *,
+    batch_id: int,
+    component_id: int,
+    deepcoin_client: Any,
+    live_execution_gate: Callable[[], bool],
+    now_provider: Callable[[], Any],
+    price_tick: str,
+    backup_buffer_bps: str,
+) -> CompositeComponentExecutionResult:
+    """Own two replacement stops before cancelling either old stop."""
+
+    now = now_provider()
+    loaded = _load_component(
+        session_factory, batch_id, component_id,
+        expected_kind="replace_remaining_protection",
+    )
+    if isinstance(loaded, CompositeComponentExecutionResult):
+        return loaded
+    batch, component, leg, contract, desired = loaded
+    if component.status in PROTECTED_RECONCILIATION_STATUSES:
+        return _result(component)
+    with session_factory() as session:
+        predecessors = session.query(StrategyManagementComponent).filter(
+            StrategyManagementComponent.management_batch_id == batch.id,
+            StrategyManagementComponent.strategy_management_leg_id == leg.id,
+            StrategyManagementComponent.sequence < component.sequence,
+        ).all()
+        if len(predecessors) != 2 or any(row.status != "confirmed" for row in predecessors):
+            return CompositeComponentExecutionResult(
+                status="recovery_required", component_id=component.id,
+                reason_code="composite_predecessor_not_confirmed",
+            )
+    with session_factory() as session:
+        if not claim_management_component(
+            session, component_id=component.id, now=now,
+            stale_before=now - timedelta(minutes=5),
+        ):
+            session.rollback()
+            return _current_result(session_factory, component.id)
+        session.commit()
+    try:
+        positions = deepcoin_client.list_positions(inst_id=desired["instrument_id"])
+        if not isinstance(positions, list):
+            raise RuntimeError("positions_snapshot_incomplete")
+        live_position = _unique_live_position(positions, desired["pos_id"])
+        if live_position is None:
+            raise RuntimeError("target_live_position_not_unique")
+        if target_remaining_close_delta(
+            trusted_start_size=desired["trusted_start_size"],
+            target_remaining_size=desired["target_remaining_size"],
+            current_size=live_position.get("pos"),
+            quantity_step=desired["quantity_step"],
+            min_quantity=desired["min_quantity"],
+        ) != "0":
+            raise RuntimeError("partial_close_component_not_converged")
+        with session_factory() as session:
+            ledger_rows = session.query(PositionProtectionLedger).filter(
+                PositionProtectionLedger.execution_binding_id == batch.execution_binding_id,
+                PositionProtectionLedger.execution_order_leg_id == leg.execution_order_leg_id,
+                PositionProtectionLedger.pos_id == leg.pos_id,
+            ).all()
+            retained_total = retained_take_profit_total(
+                ledger_rows,
+                execution_binding_id=batch.execution_binding_id,
+                execution_order_leg_id=leg.execution_order_leg_id,
+                pos_id=leg.pos_id,
+                live_position_size=live_position.get("pos"),
+            )
+            old_stops = [
+                row for row in ledger_rows
+                if row.status == "verified"
+                and row.purpose in {"stop_loss", "backup_stop"}
+            ]
+            old_stop_prices = [str(row.trigger_price) for row in old_stops]
+            old_stop_ids = [str(row.order_id) for row in old_stops]
+        requested_stop = (
+            contract.stop_price
+            if contract.stop_mode == "explicit_price"
+            else desired["avg_entry_price"]
+        )
+        market_price = (
+            live_position.get("markPx")
+            or live_position.get("last")
+            or live_position.get("lastPx")
+        )
+        decision = plan_composite_stop_replacement(
+            side=contract.side,
+            requested_stop=requested_stop,
+            market_price=market_price,
+            price_tick=price_tick,
+            backup_buffer_bps=backup_buffer_bps,
+            existing_stop_prices=old_stop_prices,
+        )
+    except (ValueError, ManagementSizingError, BreakEvenMarketPolicyError, RuntimeError) as exc:
+        reason = str(exc)
+        terminal = reason in {
+            "retained_take_profit_exceeds_position",
+            "position_size_increased_after_snapshot",
+            "position_below_target_remaining",
+            "requested_stop_market_side_invalid",
+        }
+        _transition(
+            session_factory, component.id, "preflighting",
+            "operator_required" if terminal else "recovery_required",
+            now, reason, {"phase": "protection_preflight"},
+        )
+        return _current_result(session_factory, component.id)
+
+    plan = {
+        "primary_stop": decision.primary_stop,
+        "backup_stop": decision.backup_stop,
+        "old_stop_order_ids": old_stop_ids,
+        "retained_take_profit_total": retained_total,
+    }
+    _persist_protection_plan_and_enter_submitting(
+        session_factory, component_id=component.id, plan=plan, now=now
+    )
+    payload_base = {
+        "instId": desired["instrument_id"],
+        "posSide": contract.side,
+        "posId": desired["pos_id"],
+        "sz": desired["target_remaining_size"],
+        "slTriggerPxType": "last",
+        "slOrdPx": "-1",
+    }
+    created_order_ids: list[str] = []
+    for role, stop_price in (
+        ("primary", decision.primary_stop),
+        ("backup", decision.backup_stop),
+    ):
+        try:
+            response = submit_exact_position_sltp(
+                session_factory=session_factory,
+                deepcoin_client=deepcoin_client,
+                pos_id=desired["pos_id"],
+                payload={**payload_base, "slTriggerPx": stop_price},
+                idempotency_key=f"{component.id}:set:{role}",
+                live_execution_gate=live_execution_gate,
+                now_provider=now_provider,
+                require_readback=True,
+                ledger_purpose="stop_loss" if role == "primary" else "backup_stop",
+            )
+            order_id = _response_order_id(response)
+            if not order_id:
+                raise RuntimeError("protection_replacement_missing_order_id")
+            if order_id in created_order_ids:
+                _transition(
+                    session_factory, component.id, "submitting", "operator_required",
+                    now_provider(), "duplicate_new_stop_order_id",
+                    {"new_order_ids": created_order_ids + [order_id]},
+                )
+                return _current_result(session_factory, component.id)
+            created_order_ids.append(order_id)
+        except Exception as exc:
+            _transition(
+                session_factory, component.id, "submitting", "awaiting_exchange",
+                now_provider(), "replacement_stop_readback_unresolved",
+                {"role": role, "error_type": type(exc).__name__},
+            )
+            return _current_result(session_factory, component.id)
+
+    # Both new stops are now read back and canonically owned. Only now may old
+    # protection be cancelled.
+    for old_order_id in sorted(old_stop_ids):
+        positions = deepcoin_client.list_positions(inst_id=desired["instrument_id"])
+        live_position = _unique_live_position(positions, desired["pos_id"])
+        try:
+            with session_factory() as session:
+                authority = build_position_mutation_authority(
+                    session, venue="deepcoin", pos_id=desired["pos_id"],
+                    live_position=live_position,
+                )
+            result = PositionMutationGateway(
+                session_factory=session_factory,
+                deepcoin_client=deepcoin_client,
+                live_execution_gate=live_execution_gate,
+                now_provider=now_provider,
+            ).cancel_owned_position_sltp(
+                authority=authority,
+                order_id=old_order_id,
+                idempotency_key=f"{component.id}:cancel-old:{old_order_id}",
+            )
+        except Exception as exc:
+            _transition(
+                session_factory, component.id, "submitting", "awaiting_exchange",
+                now_provider(), "old_stop_cancel_unresolved",
+                {"order_id": old_order_id, "error_type": type(exc).__name__},
+            )
+            return _current_result(session_factory, component.id)
+        if result.status != "submitted":
+            target_status = (
+                "awaiting_exchange" if result.status == "recovery_required"
+                else "recovery_required"
+            )
+            _transition(
+                session_factory, component.id, "submitting", target_status,
+                now_provider(), "old_stop_cancel_unresolved",
+                {"order_id": old_order_id, "intent_id": result.intent_id},
+            )
+            return _current_result(session_factory, component.id)
+        pending = deepcoin_client.list_trigger_orders_pending(
+            inst_id=desired["instrument_id"]
+        )
+        if old_order_id in _pending_ids(pending):
+            _transition(
+                session_factory, component.id, "submitting", "awaiting_exchange",
+                now_provider(), "old_stop_cancel_pending",
+                {"order_id": old_order_id, "intent_id": result.intent_id},
+            )
+            return _current_result(session_factory, component.id)
+        reconcile_submitted_position_mutation_intents(
+            session_factory, pending_trigger_orders=pending,
+            order_history=[], trade_fills=[], reconciled_at=now_provider(),
+        )
+    try:
+        final_positions = deepcoin_client.list_positions(
+            inst_id=desired["instrument_id"]
+        )
+        final_position = _unique_live_position(final_positions, desired["pos_id"])
+        if final_position is None:
+            raise ValueError("target_live_position_not_unique")
+        with session_factory() as session:
+            final_rows = session.query(PositionProtectionLedger).filter(
+                PositionProtectionLedger.execution_binding_id == batch.execution_binding_id,
+                PositionProtectionLedger.execution_order_leg_id == leg.execution_order_leg_id,
+                PositionProtectionLedger.pos_id == leg.pos_id,
+            ).all()
+            retained_take_profit_total(
+                final_rows,
+                execution_binding_id=batch.execution_binding_id,
+                execution_order_leg_id=leg.execution_order_leg_id,
+                pos_id=leg.pos_id,
+                live_position_size=final_position.get("pos"),
+            )
+            verified_new = {
+                row.order_id: row.purpose
+                for row in final_rows
+                if row.order_id in created_order_ids and row.status == "verified"
+            }
+        if verified_new != {
+            created_order_ids[0]: "stop_loss",
+            created_order_ids[1]: "backup_stop",
+        }:
+            raise ValueError("replacement_stop_ownership_incomplete")
+    except Exception as exc:
+        _transition(
+            session_factory, component.id, "submitting", "operator_required",
+            now_provider(), str(exc), {"phase": "protection_final_invariant"},
+        )
+        return _current_result(session_factory, component.id)
+    _transition(
+        session_factory, component.id, "submitting", "confirmed", now_provider(),
+        evidence={
+            "new_stop_order_ids": created_order_ids,
+            "cancelled_old_stop_order_ids": sorted(old_stop_ids),
+            "retained_take_profit_total": retained_total,
+        },
+    )
+    return _current_result(session_factory, component.id)
+
+
 def _load_component(
     session_factory, batch_id: int, component_id: int, *, expected_kind: str
 ):
@@ -656,6 +925,41 @@ def _persist_close_plan_and_enter_submitting(
         ):
             raise RuntimeError("management_component_submit_claim_lost")
         session.commit()
+
+
+def _persist_protection_plan_and_enter_submitting(
+    session_factory, *, component_id: int, plan: dict[str, Any], now: Any
+) -> None:
+    with session_factory() as session:
+        component = session.get(StrategyManagementComponent, component_id)
+        if component is None or component.status != "preflighting":
+            raise RuntimeError("management_component_not_preflighting")
+        desired = json.loads(component.desired_json)
+        desired["protection_replacement_execution"] = plan
+        component.desired_json = json.dumps(
+            desired, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        if not transition_management_component(
+            session, component_id=component_id, expected_status="preflighting",
+            new_status="submitting", now=now,
+            evidence={"phase": "create_new_stops", **plan},
+        ):
+            raise RuntimeError("management_component_submit_claim_lost")
+        session.commit()
+
+
+def _response_order_id(response: Any) -> str | None:
+    if not isinstance(response, dict):
+        return None
+    for key in ("ordId", "orderId", "id"):
+        if response.get(key) not in (None, ""):
+            return str(response[key])
+    data = response.get("data")
+    if isinstance(data, dict):
+        return _response_order_id(data)
+    if isinstance(data, list) and len(data) == 1:
+        return _response_order_id(data[0])
+    return None
 
 
 def _terminalize_retry_exhausted(session_factory, component_id, now, reason):

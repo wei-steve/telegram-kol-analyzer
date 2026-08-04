@@ -6,6 +6,7 @@ from telegram_kol_research.strategy_management_market_policy import (
     BreakEvenMarketPolicyError,
     assess_break_even_market,
     assess_break_even_with_existing_stop,
+    plan_composite_stop_replacement,
 )
 
 
@@ -104,3 +105,55 @@ def test_weaker_stop_never_overrides_market_side_decision(
     )
 
     assert decision.action == action
+
+
+@pytest.mark.parametrize(
+    ("side", "requested", "market", "tick", "expected_primary", "expected_backup"),
+    [
+        ("long", "62700.08", "64000", "0.1", "62700", "62574.6"),
+        ("short", "62841.61", "62000", "0.1", "62841.7", "62967.4"),
+    ],
+)
+def test_composite_stop_plan_rounds_safely_and_builds_backup(
+    side, requested, market, tick, expected_primary, expected_backup
+):
+    decision = plan_composite_stop_replacement(
+        side=side,
+        requested_stop=requested,
+        market_price=market,
+        price_tick=tick,
+        backup_buffer_bps="20",
+        existing_stop_prices=[],
+    )
+
+    assert decision.action == "replace"
+    assert decision.primary_stop == expected_primary
+    assert decision.backup_stop == expected_backup
+
+
+def test_composite_stop_plan_keeps_an_already_tighter_stop():
+    decision = plan_composite_stop_replacement(
+        side="long",
+        requested_stop="62700",
+        market_price="64000",
+        price_tick="0.1",
+        backup_buffer_bps="20",
+        existing_stop_prices=["63000"],
+    )
+
+    assert decision.action == "keep_tighter_stop"
+    assert decision.primary_stop == "63000"
+
+
+def test_composite_stop_plan_refuses_market_already_through_stop():
+    with pytest.raises(
+        BreakEvenMarketPolicyError, match="requested_stop_market_side_invalid"
+    ):
+        plan_composite_stop_replacement(
+            side="long",
+            requested_stop="62700",
+            market_price="62600",
+            price_tick="0.1",
+            backup_buffer_bps="20",
+            existing_stop_prices=[],
+        )
