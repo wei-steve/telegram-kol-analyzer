@@ -643,6 +643,38 @@ def test_require_readback_confirms_intent_and_ledger_atomically(tmp_path):
         assert ledger.status == "verified"
 
 
+def test_require_readback_is_restart_idempotent_after_confirmation(tmp_path):
+    session_factory, _, _, _, _ = _seed(tmp_path)
+
+    class ReadbackClient(FakeDeepcoinClient):
+        def list_trigger_orders_pending(self, *, inst_id):
+            return [
+                {
+                    "ordId": "ord-new-stop", "instId": inst_id,
+                    "posId": "pos-sister", "posSide": "long",
+                    "slTriggerPx": "62000", "sz": "0",
+                }
+            ]
+
+    client = ReadbackClient()
+    kwargs = dict(
+        session_factory=session_factory,
+        deepcoin_client=client,
+        pos_id="pos-sister",
+        payload={"instId": "BTC-USDT-SWAP", "slTriggerPx": "62000", "sz": "0"},
+        idempotency_key="management:readback:restart",
+        live_execution_gate=lambda: True,
+        now_provider=lambda: NOW,
+        require_readback=True,
+    )
+
+    first = submit_exact_position_sltp(**kwargs)
+    second = submit_exact_position_sltp(**kwargs)
+
+    assert first == second
+    assert len(client.set_position_sltp_calls) == 1
+
+
 def test_close_uses_exact_close_position_id(tmp_path):
     session_factory, binding_id, leg_id, _, _ = _seed(tmp_path)
     client = FakeDeepcoinClient()

@@ -822,6 +822,33 @@ def submit_exact_position_sltp(
         raise DeepcoinRequestOutcomeUnknown(
             "position_sltp_pending_readback"
         )
+    if result.status == "confirmed":
+        with session_factory() as session:
+            ledger = session.query(PositionProtectionLedger).filter(
+                PositionProtectionLedger.venue == authority.venue,
+                PositionProtectionLedger.order_id == order_id,
+            ).one_or_none()
+            if (
+                ledger is None
+                or ledger.status != "verified"
+                or ledger.execution_binding_id != authority.execution_binding_id
+                or ledger.execution_order_leg_id != authority.execution_order_leg_id
+                or ledger.pos_id != authority.pos_id
+                or ledger.purpose != (ledger_purpose or purpose)
+                or not _decimal_values_equal(
+                    str(ledger.trigger_price), str(payload[trigger_field])
+                )
+                or (
+                    "sz" in payload
+                    and not _decimal_values_equal(
+                        str(ledger.size_text), str(payload["sz"])
+                    )
+                )
+            ):
+                raise DeepcoinRequestOutcomeUnknown(
+                    "position_sltp_confirmed_ledger_mismatch"
+                )
+        return response
     confirmed_at = now_provider()
     try:
         with session_factory() as session:

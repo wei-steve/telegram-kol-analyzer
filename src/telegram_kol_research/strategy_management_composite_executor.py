@@ -569,6 +569,14 @@ def execute_protection_replacement_component(
                 if row.status == "verified"
                 and row.purpose in {"stop_loss", "backup_stop"}
             ]
+            prior_plan = desired.get("protection_replacement_execution") or {}
+            prior_old_ids = [
+                str(value) for value in prior_plan.get("old_stop_order_ids") or []
+            ]
+            if prior_old_ids:
+                old_stops = [
+                    row for row in ledger_rows if row.order_id in prior_old_ids
+                ]
             old_stop_prices = [str(row.trigger_price) for row in old_stops]
             old_stop_ids = [str(row.order_id) for row in old_stops]
         requested_stop = (
@@ -685,7 +693,7 @@ def execute_protection_replacement_component(
                 {"order_id": old_order_id, "error_type": type(exc).__name__},
             )
             return _current_result(session_factory, component.id)
-        if result.status != "submitted":
+        if result.status not in {"submitted", "confirmed"}:
             target_status = (
                 "awaiting_exchange" if result.status == "recovery_required"
                 else "recovery_required"

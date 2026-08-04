@@ -57,6 +57,10 @@ from telegram_kol_research.strategy_management_sizing import (
     allocate_close_sizes,
 )
 from telegram_kol_research.trading_settings import load_trading_settings
+from telegram_kol_research.strategy_management_composite_reconciliation import (
+    has_recoverable_composite_components,
+    reconcile_composite_management_components,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -111,6 +115,7 @@ def run_strategy_management_worker_tick(
     contract_spec_provider=None,
     take_profit_convergence_runner: Callable[..., int] = execute_ready_trigger_take_profit_convergences,
     instruction_planner: Callable[..., Any] = plan_strategy_management_batch,
+    composite_reconciler: Callable[..., Any] = reconcile_composite_management_components,
 ) -> StrategyManagementWorkerResult:
     """Process a bounded amount of work, isolating every durable batch failure."""
 
@@ -152,6 +157,24 @@ def run_strategy_management_worker_tick(
         if snapshot is None:
             snapshot = snapshot_loader(session_factory, client=get_client())
         return snapshot
+
+    should_reconcile_composite = (
+        composite_reconciler is not reconcile_composite_management_components
+        or (
+            callable(session_factory)
+            and has_recoverable_composite_components(session_factory)
+        )
+    )
+    if should_reconcile_composite:
+        try:
+            composite_reconciler(
+                session_factory,
+                deepcoin_client=get_client(),
+                reconciled_at=now,
+                allow_new_writes=bool(allow_execution),
+            )
+        except Exception:
+            logger.exception("composite management reconciliation failed")
 
     if (
         allow_execution

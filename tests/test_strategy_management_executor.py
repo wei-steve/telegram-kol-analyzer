@@ -5917,11 +5917,15 @@ def _prepare_composite_protection_component(session_factory, *, retained_size="5
 
 
 class _CompositeProtectionClient(_CompositeCloseClient):
-    def __init__(self, *, duplicate_ids=False, readback_failure=False, cancel_rejected=False):
+    def __init__(
+        self, *, duplicate_ids=False, readback_failure=False,
+        cancel_rejected=False, cancel_unknown_once=False,
+    ):
         super().__init__(current_size="5")
         self.duplicate_ids = duplicate_ids
         self.readback_failure = readback_failure
         self.cancel_rejected = cancel_rejected
+        self.cancel_unknown_once = cancel_unknown_once
         self.events = []
         self.pending = [
             {
@@ -5973,6 +5977,9 @@ class _CompositeProtectionClient(_CompositeCloseClient):
         if self.cancel_rejected:
             raise DeepcoinDefiniteRejection("cancel rejected")
         self.pending = [row for row in self.pending if row["ordId"] != order_id]
+        if self.cancel_unknown_once:
+            self.cancel_unknown_once = False
+            raise DeepcoinRequestOutcomeUnknown("cancel timeout")
         return {"code": "0", "data": {"ordId": order_id}}
 
 
@@ -6085,3 +6092,127 @@ def test_composite_protection_refuses_oversized_retained_tp_before_any_write(tmp
     assert result.status == "operator_required"
     assert result.reason_code == "retained_take_profit_exceeds_position"
     assert client.events == []
+
+
+def _reconcile_composite_components(session_factory, client):
+    from telegram_kol_research.strategy_management_composite_reconciliation import (
+        reconcile_composite_management_components,
+    )
+
+    return reconcile_composite_management_components(
+        session_factory,
+        deepcoin_client=client,
+        reconciled_at=NOW,
+        allow_new_writes=False,
+    )
+
+
+def test_composite_restart_reconciles_unknown_tp_cancel_without_second_write(tmp_path):
+    session_factory = create_session_factory(tmp_path / "restart-tp.db")
+    batch_id, component_id = _persist_composite_consumption_component(session_factory)
+    client = _CompositeConsumptionClient("unknown")
+    _execute_consumption(session_factory, batch_id, component_id, client)
+    client.pending = []
+
+    result = _reconcile_composite_components(session_factory, client)
+
+    assert result.reconciled == 1
+    assert len(client.cancel_calls) == 1
+    with session_factory() as session:
+        from telegram_kol_research.models import StrategyManagementComponent
+
+        assert session.get(StrategyManagementComponent, component_id).status == "confirmed"
+
+
+def test_composite_restart_partial_fill_retries_only_unresolved_delta(tmp_path):
+    session_factory = create_session_factory(tmp_path / "restart-close.db")
+    batch_id, component_id = _prepare_composite_close_component(session_factory)
+    client = _CompositeCloseClient("partial_unknown")
+    first = _execute_composite_close(session_factory, batch_id, component_id, client)
+    assert first.status == "awaiting_exchange"
+    with session_factory() as session:
+        from telegram_kol_research.models import StrategyManagementComponent
+
+        component = session.get(StrategyManagementComponent, component_id)
+        execution = json.loads(component.desired_json)["partial_close_execution"]
+    client.history = [
+        {
+            "ordId": "close-partial", "clOrdId": execution["client_order_id"],
+            "state": "cancelled", "instId": "BTC-USDT-SWAP",
+            "posSide": "long", "closePosId": "pos-composite", "sz": "5",
+        }
+    ]
+
+    reconciled = _reconcile_composite_components(session_factory, client)
+    client.close_outcome = "confirmed"
+    second = _execute_composite_close(session_factory, batch_id, component_id, client)
+
+    assert reconciled.recoverable == 1
+    assert second.status == "confirmed"
+    assert [call["sz"] for call in client.close_calls] == ["5", "2"]
+
+
+def test_composite_restart_closes_transition_gap_after_exchange_confirmation(tmp_path):
+    session_factory = create_session_factory(tmp_path / "restart-close-confirm.db")
+    batch_id, component_id = _prepare_composite_close_component(session_factory)
+    client = _CompositeCloseClient("confirmed")
+    result = _execute_composite_close(session_factory, batch_id, component_id, client)
+    assert result.status == "confirmed"
+    with session_factory() as session:
+        from telegram_kol_research.models import StrategyManagementComponent
+
+        component = session.get(StrategyManagementComponent, component_id)
+        execution = json.loads(component.desired_json)["partial_close_execution"]
+        component.status = "submitting"
+        component.completed_at = None
+        session.commit()
+    client.history = [
+        {
+            "ordId": "close-composite", "clOrdId": execution["client_order_id"],
+            "state": "filled", "instId": "BTC-USDT-SWAP",
+            "posSide": "long", "closePosId": "pos-composite", "sz": "5",
+        }
+    ]
+
+    reconciled = _reconcile_composite_components(session_factory, client)
+
+    assert reconciled.reconciled == 1
+    assert len(client.close_calls) == 1
+    with session_factory() as session:
+        assert session.get(StrategyManagementComponent, component_id).status == "confirmed"
+
+
+def test_composite_restart_unresolved_protection_write_stays_read_only(tmp_path):
+    session_factory = create_session_factory(tmp_path / "restart-protection.db")
+    batch_id, component_id = _prepare_composite_protection_component(session_factory)
+    client = _CompositeProtectionClient(readback_failure=True)
+    first = _execute_composite_protection(
+        session_factory, batch_id, component_id, client
+    )
+    assert first.status == "awaiting_exchange"
+    writes_before = client._set_count
+
+    reconciled = _reconcile_composite_components(session_factory, client)
+
+    assert reconciled.awaiting == 1
+    assert client._set_count == writes_before
+
+
+def test_composite_restart_resumes_after_old_cancel_is_exchange_confirmed(tmp_path):
+    session_factory = create_session_factory(tmp_path / "restart-old-cancel.db")
+    batch_id, component_id = _prepare_composite_protection_component(session_factory)
+    client = _CompositeProtectionClient(cancel_unknown_once=True)
+    first = _execute_composite_protection(
+        session_factory, batch_id, component_id, client
+    )
+    assert first.status == "awaiting_exchange"
+    set_writes = client._set_count
+
+    reconciled = _reconcile_composite_components(session_factory, client)
+    second = _execute_composite_protection(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert reconciled.recoverable == 1
+    assert second.status == "confirmed"
+    assert client._set_count == set_writes

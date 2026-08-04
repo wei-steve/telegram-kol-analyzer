@@ -202,6 +202,27 @@ def test_worker_runs_ready_take_profit_convergence_only_when_execution_enabled()
     assert disabled.executed == 0
 
 
+def test_worker_keeps_composite_recovery_active_when_new_execution_is_disabled():
+    calls = []
+
+    def composite_reconciler(*_args, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(reconciled=1, executed=0, awaiting=0)
+
+    run_strategy_management_worker_tick(
+        object(),
+        deepcoin_client_factory=lambda: object(),
+        max_batches=1,
+        batch_lister=lambda *_args, **_kwargs: [],
+        allow_execution=False,
+        processed_at=NOW,
+        composite_reconciler=composite_reconciler,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["allow_new_writes"] is False
+
+
 def test_worker_reconciles_backup_stops_before_running_take_profit_lane():
     calls = []
 
