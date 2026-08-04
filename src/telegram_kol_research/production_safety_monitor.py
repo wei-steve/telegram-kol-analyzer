@@ -1232,12 +1232,19 @@ def decide_monitor_notification(
                 ),
                 kind="none",
             )
-        if active_reasons.intersection({"audit_abnormal", "audit_incomplete"}) and not (
-            audit_rechecked_healthy
-        ):
+        unresolved_audit_reasons = active_reasons.intersection(
+            {"audit_abnormal", "audit_incomplete"}
+        )
+        if unresolved_audit_reasons and not audit_rechecked_healthy:
             return MonitorNotificationDecision(
                 should_notify=False,
-                next_state=state,
+                next_state=MonitorState(
+                    last_window_at=state.last_window_at,
+                    last_full_audit_date=state.last_full_audit_date,
+                    anomaly_fingerprint=state.anomaly_fingerprint,
+                    last_notification_at=state.last_notification_at,
+                    active_reason_codes=tuple(sorted(unresolved_audit_reasons)),
+                ),
                 kind="none",
             )
         return MonitorNotificationDecision(
@@ -1267,6 +1274,17 @@ def decide_monitor_notification(
             next_state=state,
             kind="none",
         )
+    active_reason_codes = {
+        reason
+        for reason in result.reason_codes
+        if reason in _FIXED_REASON_CODES
+    }
+    if not audit_rechecked_healthy:
+        active_reason_codes.update(
+            reason
+            for reason in state.active_reason_codes
+            if reason in {"audit_abnormal", "audit_incomplete"}
+        )
     return MonitorNotificationDecision(
         should_notify=True,
         next_state=MonitorState(
@@ -1274,13 +1292,7 @@ def decide_monitor_notification(
             last_full_audit_date=state.last_full_audit_date,
             anomaly_fingerprint=fingerprint,
             last_notification_at=now_rendered,
-            active_reason_codes=tuple(
-                sorted(
-                    reason
-                    for reason in result.reason_codes
-                    if reason in _FIXED_REASON_CODES
-                )
-            ),
+            active_reason_codes=tuple(sorted(active_reason_codes)),
         ),
         kind="anomaly",
     )

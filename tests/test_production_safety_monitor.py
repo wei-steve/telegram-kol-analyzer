@@ -1168,6 +1168,46 @@ def test_changed_monitor_fingerprint_notifies_immediately():
     assert decision.next_state.last_notification_at == now.isoformat()
 
 
+def test_partial_recovery_replaces_active_causes_before_final_recovery():
+    started_at = datetime(2026, 8, 4, 0, 0, tzinfo=UTC)
+    initial = MonitorResult(
+        healthy=False,
+        reason_codes=("service_inactive", "auto_trade_enabled_drift"),
+        details={
+            "service_state": "inactive",
+            "auto_trade_enabled": True,
+            "expected_auto_trade_enabled": False,
+        },
+    )
+    first = decide_monitor_notification(initial, MonitorState(), now=started_at)
+
+    remaining = MonitorResult(
+        healthy=False,
+        reason_codes=("auto_trade_enabled_drift",),
+        details={
+            "auto_trade_enabled": True,
+            "expected_auto_trade_enabled": False,
+        },
+    )
+    partial = decide_monitor_notification(
+        remaining,
+        first.next_state,
+        now=started_at + timedelta(minutes=30),
+    )
+    recovered = decide_monitor_notification(
+        MonitorResult(healthy=True, reason_codes=(), details={}),
+        partial.next_state,
+        now=started_at + timedelta(hours=1),
+    )
+
+    assert partial.should_notify is True
+    assert partial.kind == "anomaly"
+    assert partial.next_state.active_reason_codes == ("auto_trade_enabled_drift",)
+    assert recovered.should_notify is True
+    assert recovered.kind == "recovery"
+    assert recovered.next_state.active_reason_codes == ()
+
+
 def test_same_monitor_notification_is_suppressed_for_six_hours():
     now = datetime(2026, 7, 16, 10, 0, tzinfo=UTC)
     result = MonitorResult(
@@ -1363,6 +1403,53 @@ def test_skipped_audit_cannot_claim_recovery_before_complete_healthy_audit(tmp_p
     assert deliveries[-1]["text"].startswith(
         "【🔵状态提醒：生产安全监控已恢复正常】"
     )
+
+
+def test_new_non_audit_alert_cannot_discard_an_unrechecked_audit_cause(tmp_path):
+    state_path = tmp_path / "mixed-cause-recovery-state.json"
+    config = SimpleNamespace(bot_token="token", chat_id="chat")
+    deliveries = []
+    abnormal_audit = _healthy_audit(
+        counts={
+            "blocked": 0,
+            "partial_failed": 0,
+            "submit_unknown": 0,
+            "recovery_required": 1,
+        }
+    )
+
+    run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(audit=abnormal_audit),
+        now=datetime(2026, 8, 4, 1, 0, tzinfo=UTC),
+        notify=True,
+        force_full_audit=True,
+        load_bot_config=lambda: config,
+        send_bot_message=lambda **payload: deliveries.append(payload),
+    )
+    run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(service_state="inactive"),
+        now=datetime(2026, 8, 5, 0, 0, tzinfo=UTC),
+        notify=True,
+        load_bot_config=lambda: config,
+        send_bot_message=lambda **payload: deliveries.append(payload),
+    )
+    service_recovered = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(),
+        now=datetime(2026, 8, 5, 0, 30, tzinfo=UTC),
+        notify=True,
+        load_bot_config=lambda: config,
+        send_bot_message=lambda **payload: deliveries.append(payload),
+    )
+
+    assert service_recovered.notification_status == "not_needed"
+    assert len(deliveries) == 2
+    assert load_monitor_state(state_path).active_reason_codes == ("audit_abnormal",)
 
 
 def test_failed_recovery_delivery_preserves_active_cause_and_retries(tmp_path):
