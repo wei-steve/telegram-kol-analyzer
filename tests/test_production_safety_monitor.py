@@ -954,6 +954,15 @@ def test_oversized_integer_is_malformed_and_formatter_never_crashes():
                 "last_notification_at": None,
             }
         ),
+        json.dumps(
+            {
+                "last_window_at": None,
+                "last_full_audit_date": None,
+                "anomaly_fingerprint": "a" * 64,
+                "last_notification_at": "2026-07-16T09:00:00+00:00",
+                "active_reason_codes": ["raw_unknown_reason"],
+            }
+        ),
     ],
 )
 def test_missing_or_malformed_monitor_state_defaults_safely(tmp_path, contents):
@@ -994,9 +1003,29 @@ def test_monitor_state_is_persisted_atomically_with_exact_fields_and_mode(
         "last_full_audit_date",
         "anomaly_fingerprint",
         "last_notification_at",
+        "active_reason_codes",
     }
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert load_monitor_state(path) == state
+
+
+def test_legacy_four_field_monitor_state_loads_without_speculative_causes(tmp_path):
+    path = tmp_path / "legacy-state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "last_window_at": "2026-08-04T01:00:00+00:00",
+                "last_full_audit_date": None,
+                "anomaly_fingerprint": "a" * 64,
+                "last_notification_at": "2026-08-04T01:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = load_monitor_state(path)
+
+    assert state.active_reason_codes == ()
 
 
 def test_monitor_fingerprint_is_order_independent_and_canonical():
@@ -1243,6 +1272,149 @@ def test_healthy_monitor_result_silently_clears_active_fingerprint():
         anomaly_fingerprint=None,
         last_notification_at=previous_notification,
     )
+
+
+def test_service_failure_then_complete_check_sends_one_recovery_notice(tmp_path):
+    state_path = tmp_path / "service-recovery-state.json"
+    config = SimpleNamespace(bot_token="token", chat_id="chat")
+    deliveries = []
+
+    failed = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(service_state="inactive"),
+        now=datetime(2026, 8, 4, 0, 0, tzinfo=UTC),
+        notify=True,
+        load_bot_config=lambda: config,
+        send_bot_message=lambda **payload: deliveries.append(payload),
+    )
+    recovered = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(),
+        now=datetime(2026, 8, 4, 0, 30, tzinfo=UTC),
+        notify=True,
+        load_bot_config=lambda: config,
+        send_bot_message=lambda **payload: deliveries.append(payload),
+    )
+
+    assert failed.notification_status == "sent"
+    assert recovered.notification_status == "sent"
+    assert len(deliveries) == 2
+    assert deliveries[1]["text"].startswith(
+        "【🔵状态提醒：生产安全监控已恢复正常】"
+    )
+    assert "无需处理" in deliveries[1]["text"]
+    assert "系统定时安全检查，不是 AI Agent" in deliveries[1]["text"]
+    state = load_monitor_state(state_path)
+    assert state.active_reason_codes == ()
+    assert state.anomaly_fingerprint is None
+
+
+def test_skipped_audit_cannot_claim_recovery_before_complete_healthy_audit(tmp_path):
+    state_path = tmp_path / "audit-recovery-state.json"
+    config = SimpleNamespace(bot_token="token", chat_id="chat")
+    deliveries = []
+    abnormal_audit = _healthy_audit(
+        counts={
+            "blocked": 0,
+            "partial_failed": 0,
+            "submit_unknown": 0,
+            "recovery_required": 1,
+        }
+    )
+
+    first = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(audit=abnormal_audit),
+        now=datetime(2026, 8, 4, 1, 0, tzinfo=UTC),
+        notify=True,
+        force_full_audit=True,
+        load_bot_config=lambda: config,
+        send_bot_message=lambda **payload: deliveries.append(payload),
+    )
+    skipped = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(),
+        now=datetime(2026, 8, 5, 0, 0, tzinfo=UTC),
+        notify=True,
+        load_bot_config=lambda: config,
+        send_bot_message=lambda **payload: deliveries.append(payload),
+    )
+    pending_state = load_monitor_state(state_path)
+    recovered = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(audit=_healthy_audit()),
+        now=datetime(2026, 8, 5, 1, 0, tzinfo=UTC),
+        notify=True,
+        force_full_audit=True,
+        load_bot_config=lambda: config,
+        send_bot_message=lambda **payload: deliveries.append(payload),
+    )
+
+    assert first.notification_status == "sent"
+    assert skipped.notification_status == "not_needed"
+    assert pending_state.active_reason_codes == ("audit_abnormal",)
+    assert len(deliveries) == 2
+    assert recovered.notification_status == "sent"
+    assert deliveries[-1]["text"].startswith(
+        "【🔵状态提醒：生产安全监控已恢复正常】"
+    )
+
+
+def test_failed_recovery_delivery_preserves_active_cause_and_retries(tmp_path):
+    state_path = tmp_path / "recovery-retry-state.json"
+    config = SimpleNamespace(bot_token="token", chat_id="chat")
+    deliveries = []
+    recovery_attempts = 0
+
+    def send(**payload):
+        nonlocal recovery_attempts
+        text = payload["text"]
+        if text.startswith("【🔵状态提醒"):
+            recovery_attempts += 1
+            if recovery_attempts == 1:
+                raise RuntimeError("raw delivery secret")
+        deliveries.append(payload)
+
+    run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(service_state="inactive"),
+        now=datetime(2026, 8, 4, 0, 0, tzinfo=UTC),
+        notify=True,
+        load_bot_config=lambda: config,
+        send_bot_message=send,
+    )
+    failed_recovery = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(),
+        now=datetime(2026, 8, 4, 0, 30, tzinfo=UTC),
+        notify=True,
+        load_bot_config=lambda: config,
+        send_bot_message=send,
+    )
+    pending_state = load_monitor_state(state_path)
+    successful_recovery = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=_RecordingAdapters(),
+        now=datetime(2026, 8, 4, 1, 0, tzinfo=UTC),
+        notify=True,
+        load_bot_config=lambda: config,
+        send_bot_message=send,
+    )
+
+    assert failed_recovery.notification_status == "delivery_failed"
+    assert failed_recovery.monitor_error == "notification_delivery_failed"
+    assert pending_state.active_reason_codes == ("service_inactive",)
+    assert successful_recovery.notification_status == "sent"
+    assert recovery_attempts == 2
+    assert load_monitor_state(state_path).active_reason_codes == ()
 
 
 class _RecordingAdapters:

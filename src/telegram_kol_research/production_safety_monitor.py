@@ -106,7 +106,7 @@ _FIXED_REASON_CODES = frozenset(
     }
 )
 _LOW_REPEAT_REASON_CODES = frozenset({"audit_abnormal"})
-_STATE_FIELDS = frozenset(
+_LEGACY_STATE_FIELDS = frozenset(
     {
         "last_window_at",
         "last_full_audit_date",
@@ -114,6 +114,7 @@ _STATE_FIELDS = frozenset(
         "last_notification_at",
     }
 )
+_STATE_FIELDS = _LEGACY_STATE_FIELDS | {"active_reason_codes"}
 
 
 def build_monitor_incident_capture_projection(
@@ -284,12 +285,14 @@ class MonitorState:
     last_full_audit_date: str | None = None
     anomaly_fingerprint: str | None = None
     last_notification_at: str | None = None
+    active_reason_codes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class MonitorNotificationDecision:
     should_notify: bool
     next_state: MonitorState
+    kind: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -686,8 +689,19 @@ def run_production_safety_monitor(
         last_full_audit_date=successful_audit_date,
         anomaly_fingerprint=state.anomaly_fingerprint,
         last_notification_at=state.last_notification_at,
+        active_reason_codes=state.active_reason_codes,
     )
-    decision = decide_monitor_notification(result, base_state, now=checked_at)
+    audit_rechecked_healthy = (
+        audit_ran
+        and audit is not None
+        and _audit_result_is_healthy(audit)
+    )
+    decision = decide_monitor_notification(
+        result,
+        base_state,
+        now=checked_at,
+        audit_rechecked_healthy=audit_rechecked_healthy,
+    )
     if state_integrity_alert_pending and not result.healthy:
         # A fingerprint without a delivery timestamp is the four-field schema's
         # durable marker for a repaired state-integrity alert awaiting delivery.
@@ -698,13 +712,18 @@ def run_production_safety_monitor(
             last_full_audit_date=base_state.last_full_audit_date,
             anomaly_fingerprint=fingerprint_monitor_result(result),
             last_notification_at=None,
+            active_reason_codes=base_state.active_reason_codes,
         )
     else:
         next_state = decision.next_state if not decision.should_notify else base_state
-    notification_status = "not_needed" if result.healthy else "disabled"
+    notification_status = (
+        "not_needed"
+        if result.healthy and not decision.should_notify
+        else "disabled"
+    )
     monitor_error = None
 
-    if not result.healthy and decision.should_notify and notify:
+    if decision.should_notify and notify:
         try:
             config = load_bot_config()
         except Exception:
@@ -717,7 +736,11 @@ def run_production_safety_monitor(
                 _run_maybe_awaitable(
                     send_bot_message(
                         config=config,
-                        text=format_monitor_alert(result, checked_at=checked_at),
+                        text=(
+                            format_monitor_recovery(checked_at=checked_at)
+                            if decision.kind == "recovery"
+                            else format_monitor_alert(result, checked_at=checked_at)
+                        ),
                     )
                 )
             except Exception:
@@ -748,6 +771,15 @@ def run_production_safety_monitor(
                             continuing_result
                         ),
                         last_notification_at=decision.next_state.last_notification_at,
+                        active_reason_codes=tuple(sorted(continuing_reasons)),
+                    )
+                elif state_integrity_alert_pending:
+                    next_state = MonitorState(
+                        last_window_at=decision.next_state.last_window_at,
+                        last_full_audit_date=decision.next_state.last_full_audit_date,
+                        anomaly_fingerprint=decision.next_state.anomaly_fingerprint,
+                        last_notification_at=decision.next_state.last_notification_at,
+                        active_reason_codes=(),
                     )
     elif not result.healthy and not decision.should_notify:
         notification_status = "suppressed"
@@ -1181,20 +1213,42 @@ def decide_monitor_notification(
     state: MonitorState,
     *,
     now: datetime,
+    audit_rechecked_healthy: bool = False,
 ) -> MonitorNotificationDecision:
     """Apply fingerprint change and reason-aware repeat-notification policy."""
 
     _monitor_state_payload(state)
     now_rendered = _canonical_aware_datetime(now)
     if result.healthy:
+        active_reasons = set(state.active_reason_codes)
+        if not active_reasons:
+            return MonitorNotificationDecision(
+                should_notify=False,
+                next_state=MonitorState(
+                    last_window_at=state.last_window_at,
+                    last_full_audit_date=state.last_full_audit_date,
+                    anomaly_fingerprint=None,
+                    last_notification_at=state.last_notification_at,
+                ),
+                kind="none",
+            )
+        if active_reasons.intersection({"audit_abnormal", "audit_incomplete"}) and not (
+            audit_rechecked_healthy
+        ):
+            return MonitorNotificationDecision(
+                should_notify=False,
+                next_state=state,
+                kind="none",
+            )
         return MonitorNotificationDecision(
-            should_notify=False,
+            should_notify=True,
             next_state=MonitorState(
                 last_window_at=state.last_window_at,
                 last_full_audit_date=state.last_full_audit_date,
                 anomaly_fingerprint=None,
-                last_notification_at=state.last_notification_at,
+                last_notification_at=now_rendered,
             ),
+            kind="recovery",
         )
 
     fingerprint = fingerprint_monitor_result(result)
@@ -1208,7 +1262,11 @@ def decide_monitor_notification(
             last_notification = datetime.fromisoformat(state.last_notification_at)
             should_notify = now - last_notification >= _NOTIFICATION_SUPPRESSION
     if not should_notify:
-        return MonitorNotificationDecision(should_notify=False, next_state=state)
+        return MonitorNotificationDecision(
+            should_notify=False,
+            next_state=state,
+            kind="none",
+        )
     return MonitorNotificationDecision(
         should_notify=True,
         next_state=MonitorState(
@@ -1216,7 +1274,15 @@ def decide_monitor_notification(
             last_full_audit_date=state.last_full_audit_date,
             anomaly_fingerprint=fingerprint,
             last_notification_at=now_rendered,
+            active_reason_codes=tuple(
+                sorted(
+                    reason
+                    for reason in result.reason_codes
+                    if reason in _FIXED_REASON_CODES
+                )
+            ),
         ),
+        kind="anomaly",
     )
 
 
@@ -1600,6 +1666,32 @@ def format_monitor_alert(
     return fallback[:MAX_ALERT_LENGTH]
 
 
+def format_monitor_recovery(*, checked_at: datetime | str) -> str:
+    """Render one fixed recovery notice after every active cause was rechecked."""
+
+    return "\n".join(
+        (
+            "【🔵状态提醒：生产安全监控已恢复正常】",
+            "",
+            "发生了什么：",
+            "系统已重新完成相关安全检查，先前记录的问题当前不再出现。",
+            "",
+            "当前影响：",
+            "生产安全监控当前未发现仍在持续的同类问题。",
+            "",
+            "你需要做什么：",
+            "无需处理，继续正常观察即可。",
+            "",
+            "通知来源：",
+            "系统定时安全检查，不是 AI Agent。",
+            "",
+            "排查信息：",
+            f"检查时间：{_safe_checked_at_shanghai(checked_at)}",
+            "技术代码：monitor_recovered",
+        )
+    )
+
+
 _ALERT_RULES: Mapping[str, tuple[str, str, str]] = {
     "service_inactive": (
         "critical",
@@ -1893,19 +1985,23 @@ def _reject_json_constant(value: str) -> None:
 
 
 def _monitor_state_from_payload(payload: object) -> MonitorState:
-    if not isinstance(payload, dict) or set(payload) != _STATE_FIELDS:
+    if not isinstance(payload, dict) or set(payload) not in {
+        _LEGACY_STATE_FIELDS,
+        _STATE_FIELDS,
+    }:
         raise ValueError("invalid monitor state schema")
     state = MonitorState(
         last_window_at=payload["last_window_at"],
         last_full_audit_date=payload["last_full_audit_date"],
         anomaly_fingerprint=payload["anomaly_fingerprint"],
         last_notification_at=payload["last_notification_at"],
+        active_reason_codes=tuple(payload.get("active_reason_codes", ())),
     )
     _monitor_state_payload(state)
     return state
 
 
-def _monitor_state_payload(state: MonitorState) -> dict[str, str | None]:
+def _monitor_state_payload(state: MonitorState) -> dict[str, object]:
     if not isinstance(state, MonitorState):
         raise TypeError("state must be MonitorState")
     if state.last_window_at is not None:
@@ -1924,11 +2020,23 @@ def _monitor_state_payload(state: MonitorState) -> dict[str, str | None]:
         raise ValueError("invalid anomaly fingerprint")
     if state.last_notification_at is not None:
         _validate_canonical_aware_datetime(state.last_notification_at)
+    if (
+        not isinstance(state.active_reason_codes, tuple)
+        or len(state.active_reason_codes) > len(_FIXED_REASON_CODES)
+        or any(
+            not isinstance(reason, str) or reason not in _FIXED_REASON_CODES
+            for reason in state.active_reason_codes
+        )
+        or len(set(state.active_reason_codes)) != len(state.active_reason_codes)
+        or tuple(sorted(state.active_reason_codes)) != state.active_reason_codes
+    ):
+        raise ValueError("invalid active monitor reasons")
     return {
         "last_window_at": state.last_window_at,
         "last_full_audit_date": state.last_full_audit_date,
         "anomaly_fingerprint": state.anomaly_fingerprint,
         "last_notification_at": state.last_notification_at,
+        "active_reason_codes": list(state.active_reason_codes),
     }
 
 
