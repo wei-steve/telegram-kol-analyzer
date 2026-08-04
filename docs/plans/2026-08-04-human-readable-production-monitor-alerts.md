@@ -89,7 +89,10 @@ the projection cannot drift. It must:
 - derive a sorted, deduplicated state list from only the four fixed alert
   states.
 
-Render each ID through the existing `_identity_ref("batch", ...)` validator.
+Validate each database ID with `_canonical_positive_id` and render it as
+`batch:<positive-int>` so the operator can locate the exact batch named in the
+notification. Other source, message, position, and order identities remain
+redacted through their existing validators.
 Set `total` from the same membership predicate rather than from the length of
 the bounded list. Keep `output_complete` fail-closed if any selected reference
 or state is malformed.

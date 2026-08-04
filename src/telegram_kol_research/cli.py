@@ -1080,6 +1080,12 @@ def _audit_management_snapshot(
             "malformed_field_count": 0,
             "output_complete": False,
             "batches": [],
+            "actionable_batches": {
+                "total": 0,
+                "returned": 0,
+                "truncated": False,
+                "items": [],
+            },
         }
         if schema_available:
             result["counts"]["batches_total"] = int(
@@ -1124,6 +1130,7 @@ def _audit_management_snapshot(
                     + terminal_blocked_predicate
                 ).fetchone()[0]
             )
+            actionable_state_predicates: list[str] = []
             for state in _MANAGEMENT_ALERT_STATES:
                 exclusions = []
                 if state == "blocked":
@@ -1133,6 +1140,17 @@ def _audit_management_snapshot(
                 exclusion = "".join(
                     " AND NOT (" + predicate + ")" for predicate in exclusions
                 )
+                state_predicate = (
+                    "(b.status = '"
+                    + state
+                    + "' OR EXISTS (SELECT 1 FROM strategy_management_legs alert_leg "
+                    "WHERE alert_leg.management_batch_id = b.id "
+                    "AND alert_leg.status = '"
+                    + state
+                    + "'))"
+                    + exclusion
+                )
+                actionable_state_predicates.append("(" + state_predicate + ")")
                 result["counts"][state] = int(
                     connection.execute(
                         "SELECT COUNT(DISTINCT b.id) "
@@ -1143,6 +1161,52 @@ def _audit_management_snapshot(
                         (state, state),
                     ).fetchone()[0]
                 )
+            actionable_predicate = " OR ".join(actionable_state_predicates)
+            actionable_total = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM strategy_management_batches b WHERE "
+                    + actionable_predicate
+                ).fetchone()[0]
+            )
+            actionable_rows = connection.execute(
+                "SELECT b.id, b.status FROM strategy_management_batches b WHERE "
+                + actionable_predicate
+                + " ORDER BY b.id ASC LIMIT 11"
+            ).fetchall()
+            actionable_items = []
+            for actionable_row in actionable_rows[:10]:
+                batch_id = _canonical_positive_id(
+                    {"batch_id": actionable_row["id"]},
+                    "batch_id",
+                )
+                states = []
+                for state, state_predicate in zip(
+                    _MANAGEMENT_ALERT_STATES,
+                    actionable_state_predicates,
+                    strict=True,
+                ):
+                    if connection.execute(
+                        "SELECT 1 FROM strategy_management_batches b "
+                        "WHERE b.id = ? AND " + state_predicate,
+                        (actionable_row["id"],),
+                    ).fetchone() is not None:
+                        states.append(state)
+                if batch_id is None or not states:
+                    result["malformed_row_count"] += 1
+                    result["malformed_field_count"] += 1
+                    continue
+                actionable_items.append(
+                    {
+                        "batch_ref": f"batch:{batch_id}",
+                        "states": states,
+                    }
+                )
+            result["actionable_batches"] = {
+                "total": actionable_total,
+                "returned": len(actionable_items),
+                "truncated": actionable_total > len(actionable_items),
+                "items": actionable_items,
+            }
             has_raw_source = _has_columns(
                 connection, "raw_messages", {"id", "chat_id", "message_id"}
             )
@@ -3345,6 +3409,12 @@ def audit_management_batches(
             "malformed_field_count": 0,
             "output_complete": False,
             "batches": [],
+            "actionable_batches": {
+                "total": 0,
+                "returned": 0,
+                "truncated": False,
+                "items": [],
+            },
             "legacy_pending_management": {
                 "status": "not_checked",
                 "candidate_pending_count": None,

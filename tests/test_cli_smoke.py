@@ -508,14 +508,24 @@ def test_audit_management_batches_is_bounded_redacted_and_read_only(
     assert payload["batches"][0]["legs"][0]["malformed_json_fields"] == [
         "last_error"
     ]
+    assert payload["actionable_batches"] == {
+        "total": 2,
+        "returned": 2,
+        "truncated": False,
+        "items": [
+            {
+                "batch_ref": "batch:982134701",
+                "states": ["submit_unknown", "recovery_required"],
+            },
+            {"batch_ref": "batch:982134702", "states": ["blocked"]},
+        ],
+    }
     assert "pos-secret" not in result.stdout
     assert "strategy-secret" not in result.stdout
     assert "kol-secret" not in result.stdout
     for identity in (
         "-1001234567890",
         "398475612",
-        "982134701",
-        "982134702",
         "876543211",
         "789654341",
         "675849351",
@@ -715,9 +725,16 @@ def test_audit_management_batches_classifies_completed_safe_block_as_history(
     )
 
     assert result.exit_code == 0, result.stdout
-    counts = json.loads(result.stdout)["counts"]
+    payload = json.loads(result.stdout)
+    counts = payload["counts"]
     assert counts["terminal_blocked"] == 1
     assert counts["blocked"] == 0
+    assert payload["actionable_batches"] == {
+        "total": 0,
+        "returned": 0,
+        "truncated": False,
+        "items": [],
+    }
 
 
 @pytest.mark.parametrize(
@@ -773,9 +790,75 @@ def test_audit_management_batches_keeps_completed_block_with_actionable_leg(
     )
 
     assert result.exit_code == 0, result.stdout
-    counts = json.loads(result.stdout)["counts"]
+    payload = json.loads(result.stdout)
+    counts = payload["counts"]
     assert counts["terminal_blocked"] == 0
     assert counts["blocked"] == 1
+    expected_states = ["blocked"]
+    if leg_status in {"submit_unknown", "partial_failed", "recovery_required"}:
+        expected_states.append(leg_status)
+    assert payload["actionable_batches"] == {
+        "total": 1,
+        "returned": 1,
+        "truncated": False,
+        "items": [{"batch_ref": "batch:304", "states": expected_states}],
+    }
+
+
+def test_audit_management_batches_bounds_actionable_batch_references(tmp_path):
+    database_path = tmp_path / "bounded-actionable.db"
+    create_session_factory(database_path)
+    with sqlite3.connect(database_path) as connection:
+        for batch_id in range(1, 13):
+            connection.execute(
+                "INSERT INTO strategy_management_batches "
+                "(id, idempotency_fingerprint, raw_message_id, recognition_decision_id, "
+                "recognition_generation, target_lifecycle_id, strategy_instance_id, "
+                "execution_binding_id, intent, effective_action, execution_mode, "
+                "partial_round_before, status, reason_code, target_fingerprint, "
+                "target_snapshot_json, planned_at, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'full_exit', 'full_exit', 'live', "
+                "0, 'blocked', 'manual_review_required', ?, '{}', "
+                "'2026-07-17 00:00:00', '2026-07-17 00:00:00', "
+                "'2026-07-17 00:00:00')",
+                (
+                    batch_id,
+                    f"bounded-fingerprint-{batch_id}",
+                    100 + batch_id,
+                    200 + batch_id,
+                    f"bounded-generation-{batch_id}",
+                    300 + batch_id,
+                    f"bounded-strategy-{batch_id}",
+                    400 + batch_id,
+                    f"bounded-target-{batch_id}",
+                ),
+            )
+        connection.commit()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "audit-management-batches",
+            "--database-path",
+            str(database_path),
+            "--output-format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    actionable = json.loads(result.stdout)["actionable_batches"]
+    assert actionable == {
+        "total": 12,
+        "returned": 10,
+        "truncated": True,
+        "items": [
+            {"batch_ref": f"batch:{batch_id}", "states": ["blocked"]}
+            for batch_id in range(1, 11)
+        ],
+    }
+    assert "manual_review_required" not in result.stdout
+    assert "bounded-fingerprint" not in result.stdout
 
 
 def _audit_payload_with_management_history(
