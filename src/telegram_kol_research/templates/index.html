@@ -344,6 +344,14 @@
               <option value="live" {% if trading_settings.management_execution_mode == 'live' %}selected{% endif %}>实盘：高风险，可写入交易所</option>
             </select>
           </label>
+          <label>
+            复合仓位管理 V2 模式
+            <select name="composite_management_v2_mode">
+              <option value="disabled" {% if trading_settings.composite_management_v2_mode == 'disabled' %}selected{% endif %}>禁用：保存完整指令，但禁止复合交易写入</option>
+              <option value="shadow" {% if trading_settings.composite_management_v2_mode == 'shadow' %}selected{% endif %}>影子：生成组件与快照，交易所零写入</option>
+              <option value="live" {% if trading_settings.composite_management_v2_mode == 'live' %}selected{% endif %}>实盘：还需全局自动交易与策略管理均为实盘</option>
+            </select>
+          </label>
           <label>默认单笔最大亏损 USDT<input name="default_max_loss_usdt" type="number" min="1" step="1" value="{{ trading_settings.default_max_loss_usdt }}" /></label>
           <label>每日最大亏损 USDT<input name="daily_max_loss_usdt" type="number" min="1" step="1" value="{{ trading_settings.daily_max_loss_usdt }}" /></label>
           <label>每群组最大有效持仓数<input name="max_concurrent_positions" type="number" min="1" step="1" value="{{ trading_settings.max_concurrent_positions }}" /></label>

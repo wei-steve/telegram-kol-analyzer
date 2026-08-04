@@ -160,6 +160,59 @@ def test_management_execution_mode_normalizes_allowed_string():
     assert settings.live_management_execution_enabled is True
 
 
+def test_composite_management_v2_mode_defaults_disabled():
+    settings = TradingSettings()
+
+    assert settings.composite_management_v2_mode == "disabled"
+    assert settings.effective_composite_management_v2_mode == "disabled"
+
+
+def test_composite_management_v2_live_requires_both_existing_live_gates():
+    global_off = trading_settings_from_payload(
+        {
+            "composite_management_v2_mode": "live",
+            "auto_trade_enabled": False,
+            "management_execution_mode": "live",
+        }
+    )
+    management_off = trading_settings_from_payload(
+        {
+            "composite_management_v2_mode": "live",
+            "auto_trade_enabled": True,
+            "management_execution_mode": "shadow",
+        }
+    )
+    enabled = trading_settings_from_payload(
+        {
+            "composite_management_v2_mode": "live",
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+        }
+    )
+
+    assert global_off.effective_composite_management_v2_mode == "disabled"
+    assert management_off.effective_composite_management_v2_mode == "disabled"
+    assert enabled.effective_composite_management_v2_mode == "live"
+
+
+def test_composite_management_v2_shadow_never_enables_exchange_writes():
+    settings = trading_settings_from_payload(
+        {
+            "composite_management_v2_mode": "shadow",
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+        }
+    )
+
+    assert settings.effective_composite_management_v2_mode == "shadow"
+
+
+@pytest.mark.parametrize("value", [True, False, "unsafe", [], {}, 1, None])
+def test_composite_management_v2_mode_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="composite_management_v2_mode"):
+        trading_settings_from_payload({"composite_management_v2_mode": value})
+
+
 def test_trigger_protection_stop_rescue_defaults_disabled_and_round_trips(tmp_path):
     session_factory = create_session_factory(tmp_path / "rescue-settings.db")
 

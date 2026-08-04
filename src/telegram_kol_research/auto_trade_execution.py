@@ -347,6 +347,34 @@ def _auto_process_single_message_trade_signal(
                 ),
             )
             return {"status": "skipped", "reason": reason}
+        composite_gate_reason = _composite_management_gate_reason(
+            management_loaded[1], settings
+        )
+        if composite_gate_reason is not None:
+            raw_message, candidate, _source, _has_media = management_loaded
+            record_execution_event(
+                session_factory,
+                ExecutionEventRecord(
+                    action="management_auto_trade_skipped",
+                    status="skipped",
+                    kol_id=f"group:{raw_message.chat_id}",
+                    chat_id=raw_message.chat_id,
+                    message_id=raw_message.message_id,
+                    symbol=candidate.symbol,
+                    side=candidate.side,
+                    reason=composite_gate_reason,
+                    request={
+                        "raw_message_id": raw_message.id,
+                        "candidate_id": candidate.id,
+                        "management_action": candidate.management_action,
+                        "management_contract_fingerprint": (
+                            candidate.management_contract_fingerprint
+                        ),
+                    },
+                    created_at=now,
+                ),
+            )
+            return {"status": "skipped", "reason": composite_gate_reason}
         if deepcoin_client is None:
             return {"status": "blocked", "reason": "deepcoin_client_unavailable"}
         return _auto_process_management_signal(
@@ -718,7 +746,27 @@ def disabled_management_message_needs_no_client(
     return loaded is not None and (
         _is_informational_management_candidate(loaded[1])
         or not settings.management_planning_enabled
+        or _composite_management_gate_reason(loaded[1], settings) is not None
     )
+
+
+def _composite_management_gate_reason(
+    candidate: SignalCandidate,
+    settings,
+) -> str | None:
+    if not (
+        candidate.management_contract_json
+        and candidate.management_contract_fingerprint
+    ):
+        return None
+    mode = settings.effective_composite_management_v2_mode
+    if mode == "disabled":
+        return "composite_management_v2_disabled"
+    if mode == "shadow":
+        # Task 4 wires the durable shadow planner. Until then, fail closed
+        # instead of handing a composite contract to the lossy legacy path.
+        return "composite_management_v2_shadow_write_blocked"
+    return None
 
 
 def _is_informational_management_candidate(candidate: SignalCandidate) -> bool:

@@ -107,6 +107,68 @@ def test_web_auto_executor_disabled_management_skips_client_factory(tmp_path):
         assert event.action == "management_auto_trade_skipped"
 
 
+@pytest.mark.parametrize(
+    ("composite_mode", "reason"),
+    [
+        ("disabled", "composite_management_v2_disabled"),
+        ("shadow", "composite_management_v2_shadow_write_blocked"),
+    ],
+)
+def test_web_auto_executor_composite_gate_blocks_legacy_exchange_path(
+    tmp_path, composite_mode, reason
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=100,
+            message_id=9002,
+            text="止盈50%，剩余仓位移动止损到开仓价",
+            archived_target_group=True,
+        )
+        session.add(raw)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="BTC",
+                side="long",
+                event_type="position_update",
+                management_action="partial_then_break_even",
+                management_fraction=0.5,
+                management_contract_json="{}",
+                management_contract_fingerprint="contract-fingerprint",
+                recognition_generation="composite-v2-gate",
+                parse_source="mimo_authoritative",
+                confidence=0.99,
+            )
+        )
+        session.commit()
+        raw_id = raw.id
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+            "composite_management_v2_mode": composite_mode,
+        },
+    )
+    factory_calls = []
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            session_factory=session_factory,
+            group_config=GroupConfig(groups=[]),
+            deepcoin_client_factory=lambda: factory_calls.append("called"),
+            deepcoin_contract_spec_provider=None,
+            now_provider=lambda: datetime(2026, 8, 4, 3, 0),
+        )
+    )
+
+    result = _run_auto_trade_executor(app, raw_message_id=raw_id)
+
+    assert result == {"status": "skipped", "reason": reason}
+    assert factory_calls == []
+
+
 def test_disabled_context_resolution_does_not_extract_reply_evidence(
     tmp_path,
     monkeypatch,
@@ -1072,6 +1134,39 @@ def test_management_execution_mode_api_rejects_invalid_value(tmp_path):
 
     assert response.status_code == 422
     assert "management_execution_mode" in response.json()["detail"]
+
+
+def test_composite_management_v2_mode_api_round_trips_shadow(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.post(
+        "/api/trading-settings",
+        json={"composite_management_v2_mode": "shadow"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["composite_management_v2_mode"] == "shadow"
+    assert (
+        client.get("/api/trading-settings").json()[
+            "composite_management_v2_mode"
+        ]
+        == "shadow"
+    )
+
+
+@pytest.mark.parametrize("value", [True, False, "unsafe", [], {}, 1, None])
+def test_composite_management_v2_mode_api_rejects_invalid_values(
+    tmp_path, value
+):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.post(
+        "/api/trading-settings",
+        json={"composite_management_v2_mode": value},
+    )
+
+    assert response.status_code == 422
+    assert "composite_management_v2_mode" in response.json()["detail"]
 
 
 @pytest.mark.parametrize("value", ["false", "0", 0, 1])
