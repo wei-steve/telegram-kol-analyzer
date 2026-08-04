@@ -5755,6 +5755,8 @@ class _CompositeCloseClient(_CompositeConsumptionClient):
             raise DeepcoinRequestOutcomeUnknown("partial close timeout")
         if self.close_outcome == "confirmed":
             self.current_size = "5"
+        if self.close_outcome == "overfilled":
+            self.current_size = "4"
         return {"code": "0", "data": {"ordId": "close-composite"}}
 
 
@@ -5826,6 +5828,19 @@ def test_composite_close_definite_rejection_retries_from_fresh_unchanged_positio
     assert second.status == "confirmed"
     assert [call["sz"] for call in client.close_calls] == ["5", "5"]
     assert client.close_calls[0]["clOrdId"] != client.close_calls[1]["clOrdId"]
+
+
+def test_composite_close_post_write_below_target_requires_operator(tmp_path):
+    session_factory = create_session_factory(tmp_path / "close-overfilled.db")
+    batch_id, component_id = _prepare_composite_close_component(session_factory)
+    client = _CompositeCloseClient("overfilled")
+
+    result = _execute_composite_close(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "operator_required"
+    assert result.reason_code == "position_below_target_remaining"
 
 
 @pytest.mark.parametrize(

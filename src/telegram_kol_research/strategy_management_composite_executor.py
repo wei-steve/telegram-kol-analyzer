@@ -468,13 +468,24 @@ def execute_partial_close_component(
         return _current_result(
             session_factory, component_id, close_intent_ids=intent_ids
         )
-    if target_remaining_close_delta(
-        trusted_start_size=desired["trusted_start_size"],
-        target_remaining_size=desired["target_remaining_size"],
-        current_size=remaining,
-        quantity_step=desired["quantity_step"],
-        min_quantity=desired["min_quantity"],
-    ) == "0":
+    try:
+        unresolved_delta = target_remaining_close_delta(
+            trusted_start_size=desired["trusted_start_size"],
+            target_remaining_size=desired["target_remaining_size"],
+            current_size=remaining,
+            quantity_step=desired["quantity_step"],
+            min_quantity=desired["min_quantity"],
+        )
+    except ManagementSizingError as exc:
+        _transition(
+            session_factory, component_id, "submitting", "operator_required",
+            now_provider(), str(exc),
+            {"intent_id": result.intent_id, "remaining_size": remaining},
+        )
+        return _current_result(
+            session_factory, component_id, close_intent_ids=intent_ids
+        )
+    if unresolved_delta == "0":
         _transition(
             session_factory, component_id, "submitting", "confirmed",
             now_provider(), evidence={
