@@ -71,6 +71,8 @@ class PositionMutationGateway:
         authority: PositionMutationAuthority,
         order_id: str,
         idempotency_key: str,
+        before_submit: Callable[[int], None] | None = None,
+        retry_pending_order: Mapping[str, Any] | None = None,
     ) -> PositionMutationResult:
         payload = {
             "instType": "SWAP",
@@ -94,8 +96,35 @@ class PositionMutationGateway:
         )
         intent_id = int(intent.id)
         current = self._intent_result(intent_id)
+        if current.status == "rejected" and retry_pending_order is not None:
+            # Re-arm only from fresh exact pending-order proof, never from a
+            # caller assertion or a stale component snapshot.
+            if not _pending_cancel_retry_matches_authority(
+                retry_pending_order,
+                authority=authority,
+                order_id=order_id,
+            ):
+                return current
+            # Re-arm the same exchange-write identity instead of creating a
+            # second ambiguous cancel intent for the same order.
+            transitioned = transition_position_mutation_intent(
+                self._session_factory,
+                intent_id,
+                expected_statuses={"rejected"},
+                new_status="reserved",
+                transitioned_at=self._now(),
+            )
+            if transitioned:
+                current = self._intent_result(intent_id)
         if current.status != "reserved":
             return current
+
+        # The component orchestrator uses this hook to durably link the
+        # reserved intent and enter its protected ``submitting`` state before
+        # this gateway can make an exchange write.  A persistence failure here
+        # deliberately leaves the intent reserved and performs no write.
+        if before_submit is not None:
+            before_submit(intent_id)
 
         reason = self._validate_persisted_authority(
             authority=authority,
@@ -658,6 +687,30 @@ def _authority_fingerprint(authority: PositionMutationAuthority) -> str:
     )
 
 
+def _pending_cancel_retry_matches_authority(
+    row: Mapping[str, Any],
+    *,
+    authority: PositionMutationAuthority,
+    order_id: str,
+) -> bool:
+    observed_order_id = str(
+        row.get("ordId") or row.get("orderId") or row.get("order_id") or ""
+    )
+    observed_side = str(row.get("posSide") or row.get("side") or "").lower()
+    observed_side = {"buy": "long", "sell": "short"}.get(
+        observed_side, observed_side
+    )
+    return (
+        observed_order_id == str(order_id)
+        and str(row.get("posId") or row.get("pos_id") or "")
+        == authority.pos_id
+        and str(row.get("instId") or row.get("instrument_id") or "").upper()
+        == authority.instrument_id.upper()
+        and observed_side == authority.side.lower()
+        and str(row.get("triggerOrderType") or "TPSL").upper() == "TPSL"
+    )
+
+
 def _protection_fingerprint(row: PositionProtectionLedger) -> str:
     return _fingerprint(
         {
@@ -757,18 +810,62 @@ def submit_exact_position_sltp(
         authority=authority,
         purpose=purpose,
         trigger_price=str(payload[trigger_field]),
+        size=(str(payload["sz"]) if "sz" in payload else None),
     ):
         raise DeepcoinRequestOutcomeUnknown(
             "position_sltp_pending_readback"
         )
-    transition_position_mutation_intent(
-        session_factory,
-        result.intent_id,
-        expected_statuses={"submitted"},
-        new_status="confirmed",
-        transitioned_at=now_provider(),
-        response=response,
-    )
+    confirmed_at = now_provider()
+    try:
+        with session_factory() as session:
+            intent = session.get(PositionMutationIntent, result.intent_id)
+            binding = session.get(
+                ExecutionBinding, authority.execution_binding_id
+            )
+            if (
+                intent is None
+                or intent.status != "submitted"
+                or binding is None
+            ):
+                raise DeepcoinRequestOutcomeUnknown(
+                    "position_sltp_readback_persistence_state_changed"
+                )
+            upsert_protection_ledger_row(
+                session,
+                venue=authority.venue,
+                execution_binding_id=authority.execution_binding_id,
+                execution_order_leg_id=authority.execution_order_leg_id,
+                strategy_instance_id=authority.strategy_instance_id,
+                pos_id=authority.pos_id,
+                instrument_id=authority.instrument_id,
+                side=authority.side,
+                order_id=order_id,
+                purpose=purpose,
+                trigger_price=str(payload[trigger_field]),
+                size_text=(str(payload["sz"]) if "sz" in payload else None),
+                status="verified",
+                evidence_source="position_mutation_intent_readback",
+                evidence={
+                    "intent_id": int(intent.id),
+                    "require_readback": True,
+                },
+                seen_at=confirmed_at,
+            )
+            intent.response_json = json.dumps(
+                dict(response), ensure_ascii=False, sort_keys=True
+            )
+            _confirm_intent(
+                intent,
+                order_id=order_id,
+                reconciled_at=confirmed_at,
+            )
+            session.commit()
+    except DeepcoinRequestOutcomeUnknown:
+        raise
+    except Exception as exc:
+        raise DeepcoinRequestOutcomeUnknown(
+            "position_sltp_readback_ledger_persistence_failed"
+        ) from exc
     return response
 
 
@@ -1128,6 +1225,7 @@ def reconcile_submitted_position_mutation_intents(
                 authority=authority,
                 purpose=purpose,
                 trigger_price=trigger_price,
+                size=(str(request["sz"]) if "sz" in request else None),
             ):
                 continue
             binding = session.get(
@@ -1211,6 +1309,7 @@ def _set_position_sltp_readback_matches(
     authority: PositionMutationAuthority,
     purpose: str,
     trigger_price: str,
+    size: str | None = None,
 ) -> bool:
     trigger_keys = (
         ("slTriggerPx", "slTriggerPrice", "triggerPrice")
@@ -1244,7 +1343,14 @@ def _set_position_sltp_readback_matches(
             ),
             None,
         )
-        if _decimal_values_equal(observed_trigger, trigger_price):
+        observed_size = row.get("sz") or row.get("size")
+        if (
+            _decimal_values_equal(observed_trigger, trigger_price)
+            and (
+                size is None
+                or _decimal_values_equal(str(observed_size), str(size))
+            )
+        ):
             return True
     return False
 

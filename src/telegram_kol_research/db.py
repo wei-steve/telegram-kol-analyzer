@@ -36,12 +36,24 @@ MANAGEMENT_LEG_BATCH_POSITION_INDEX_NAME = (
 MANAGEMENT_MARKET_DECISION_BATCH_INDEX_NAME = (
     "uq_strategy_management_market_decisions_batch"
 )
+MANAGEMENT_COMPONENT_IDEMPOTENCY_INDEX_NAME = (
+    "uq_strategy_management_components_idempotency"
+)
+MANAGEMENT_COMPONENT_BATCH_SCOPE_KIND_INDEX_NAME = (
+    "uq_strategy_management_components_batch_scope_kind"
+)
+MANAGEMENT_COMPONENT_BATCH_SCOPE_SEQUENCE_INDEX_NAME = (
+    "uq_strategy_management_components_batch_scope_sequence"
+)
 REQUIRED_MANAGEMENT_UNIQUE_INDEX_NAMES = frozenset(
     {
         MANAGEMENT_BATCH_IDEMPOTENCY_INDEX_NAME,
         MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_NAME,
         MANAGEMENT_LEG_BATCH_POSITION_INDEX_NAME,
         MANAGEMENT_MARKET_DECISION_BATCH_INDEX_NAME,
+        MANAGEMENT_COMPONENT_IDEMPOTENCY_INDEX_NAME,
+        MANAGEMENT_COMPONENT_BATCH_SCOPE_KIND_INDEX_NAME,
+        MANAGEMENT_COMPONENT_BATCH_SCOPE_SEQUENCE_INDEX_NAME,
     }
 )
 
@@ -426,6 +438,11 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
 }
 
 SQLITE_COMPAT_INDEXES: dict[str, str] = {
+    MANAGEMENT_COMPONENT_IDEMPOTENCY_INDEX_NAME: (
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "uq_strategy_management_components_idempotency "
+        "ON strategy_management_components (idempotency_key)"
+    ),
     "uq_strategy_management_components_batch_scope_kind": (
         "CREATE UNIQUE INDEX IF NOT EXISTS "
         "uq_strategy_management_components_batch_scope_kind "
@@ -720,6 +737,20 @@ def _management_unique_index_has_duplicates(connection, index_name: str) -> bool
         MANAGEMENT_MARKET_DECISION_BATCH_INDEX_NAME: (
             "SELECT 1 FROM strategy_management_market_decisions "
             "GROUP BY management_batch_id HAVING COUNT(*) > 1 LIMIT 1"
+        ),
+        MANAGEMENT_COMPONENT_IDEMPOTENCY_INDEX_NAME: (
+            "SELECT 1 FROM strategy_management_components "
+            "GROUP BY idempotency_key HAVING COUNT(*) > 1 LIMIT 1"
+        ),
+        MANAGEMENT_COMPONENT_BATCH_SCOPE_KIND_INDEX_NAME: (
+            "SELECT 1 FROM strategy_management_components "
+            "GROUP BY management_batch_id, strategy_management_leg_scope, "
+            "component_kind HAVING COUNT(*) > 1 LIMIT 1"
+        ),
+        MANAGEMENT_COMPONENT_BATCH_SCOPE_SEQUENCE_INDEX_NAME: (
+            "SELECT 1 FROM strategy_management_components "
+            "GROUP BY management_batch_id, strategy_management_leg_scope, "
+            "sequence HAVING COUNT(*) > 1 LIMIT 1"
         ),
     }
     query = duplicate_queries.get(index_name)

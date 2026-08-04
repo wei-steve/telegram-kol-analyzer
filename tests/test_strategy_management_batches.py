@@ -12,6 +12,7 @@ from telegram_kol_research import models
 from telegram_kol_research.db import MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_NAME
 from telegram_kol_research.db import MANAGEMENT_BATCH_IDEMPOTENCY_INDEX_NAME
 from telegram_kol_research.db import MANAGEMENT_LEG_BATCH_POSITION_INDEX_NAME
+from telegram_kol_research.db import MANAGEMENT_COMPONENT_BATCH_SCOPE_SEQUENCE_INDEX_NAME
 from telegram_kol_research.db import create_session_factory
 
 
@@ -632,6 +633,7 @@ def test_management_repository_lists_recoverable_batches_oldest_first(tmp_path):
         MANAGEMENT_BATCH_IDEMPOTENCY_INDEX_NAME,
         MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_NAME,
         MANAGEMENT_LEG_BATCH_POSITION_INDEX_NAME,
+        MANAGEMENT_COMPONENT_BATCH_SCOPE_SEQUENCE_INDEX_NAME,
     ],
 )
 def test_management_mutations_fail_closed_when_required_index_is_missing(
@@ -684,6 +686,28 @@ def test_management_mutations_fail_closed_when_required_index_is_missing(
                         strategy="strategy-existing",
                     )
                 )
+            )
+        elif missing_index == MANAGEMENT_COMPONENT_BATCH_SCOPE_SEQUENCE_INDEX_NAME:
+            component_model = models.StrategyManagementComponent
+            leg = session.query(leg_model).filter_by(
+                management_batch_id=created.id
+            ).one()
+            session.add_all(
+                [
+                    component_model(
+                        management_batch_id=created.id,
+                        strategy_management_leg_id=leg.id,
+                        strategy_management_leg_scope=leg.id,
+                        component_kind=kind,
+                        sequence=0,
+                        idempotency_key=f"duplicate-component-{index}",
+                        desired_json="{}",
+                        evidence_json="[]",
+                    )
+                    for index, kind in enumerate(
+                        ("consume_take_profit_stage", "converge_partial_close")
+                    )
+                ]
             )
         else:
             session.add(

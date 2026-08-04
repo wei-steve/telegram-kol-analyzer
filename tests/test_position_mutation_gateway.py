@@ -14,6 +14,7 @@ from telegram_kol_research.position_mutation_gateway import (
     PositionMutationGateway,
     position_authority_fingerprint,
     reconcile_submitted_position_mutation_intents,
+    submit_exact_position_sltp,
 )
 from telegram_kol_research.position_mutation_intents import (
     reserve_position_mutation_intent,
@@ -591,6 +592,55 @@ def test_submitted_set_intent_is_confirmed_only_by_exact_pending_readback(
     )
     assert replay.status == "confirmed"
     assert len(client.set_position_sltp_calls) == 1
+
+
+def test_require_readback_confirms_intent_and_ledger_atomically(tmp_path):
+    session_factory, binding_id, leg_id, _, _ = _seed(tmp_path)
+
+    class ReadbackClient(FakeDeepcoinClient):
+        def list_trigger_orders_pending(self, *, inst_id):
+            assert inst_id == "BTC-USDT-SWAP"
+            return [
+                {
+                    "ordId": "ord-new-stop",
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-sister",
+                    "posSide": "long",
+                    "slTriggerPx": "62000.000",
+                    "sz": "0",
+                }
+            ]
+
+    client = ReadbackClient()
+
+    response = submit_exact_position_sltp(
+        session_factory=session_factory,
+        deepcoin_client=client,
+        pos_id="pos-sister",
+        payload={
+            "instId": "BTC-USDT-SWAP",
+            "slTriggerPx": "62000",
+            "sz": "0",
+        },
+        idempotency_key="management:readback:atomic-ledger",
+        live_execution_gate=lambda: True,
+        now_provider=lambda: NOW,
+        require_readback=True,
+    )
+
+    assert response["data"]["ordId"] == "ord-new-stop"
+    with session_factory() as session:
+        intent = session.query(PositionMutationIntent).one()
+        ledger = (
+            session.query(PositionProtectionLedger)
+            .filter(PositionProtectionLedger.order_id == "ord-new-stop")
+            .one()
+        )
+        assert intent.status == "confirmed"
+        assert intent.order_id == "ord-new-stop"
+        assert ledger.execution_binding_id == binding_id
+        assert ledger.execution_order_leg_id == leg_id
+        assert ledger.status == "verified"
 
 
 def test_close_uses_exact_close_position_id(tmp_path):

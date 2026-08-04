@@ -5361,3 +5361,356 @@ def test_explicit_stop_on_triggered_market_side_blocks_before_any_write(tmp_path
 
     assert client.cancel_calls == []
     assert client.set_calls == []
+
+
+def _persist_composite_consumption_component(session_factory):
+    from telegram_kol_research.models import StrategyManagementComponent
+    from telegram_kol_research.strategy_management_contracts import (
+        ManagementInstructionContract,
+        management_contract_fingerprint,
+        serialize_management_contract,
+    )
+
+    contract = ManagementInstructionContract(
+        version=2,
+        target_lifecycle_id=1,
+        strategy_instance_id="strategy-composite",
+        symbol="BTC",
+        side="long",
+        close_fraction="0.5",
+        stop_mode="actual_entry_price",
+        stop_price=None,
+        stop_price_source=None,
+        take_profit_consumption="consume_first_stage",
+        cancel_deferred_entries=True,
+        required_components=(
+            "consume_take_profit_stage",
+            "converge_partial_close",
+            "replace_remaining_protection",
+        ),
+        current_message_text="止盈50%，止损移动至开仓价",
+    )
+    contract_json = serialize_management_contract(contract)
+    fingerprint = management_contract_fingerprint(contract)
+    with session_factory() as session:
+        raw = RawMessage(chat_id=701, message_id=2, text="manage", posted_at=NOW)
+        session.add(raw)
+        session.flush()
+        decision = RecognitionDecision(
+            raw_message_id=raw.id,
+            input_kind="text",
+            authoritative_model="mimo",
+            authoritative_status="非策略",
+            authoritative_payload_json="{}",
+            agreement_status="authoritative_only",
+            differences_json="[]",
+        )
+        lifecycle = StrategyLifecycle(
+            id=1,
+            chat_id=701,
+            message_id=1,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=NOW,
+        )
+        binding = ExecutionBinding(
+            strategy_instance_id="strategy-composite",
+            kol_id="miya",
+            chat_id=701,
+            message_id=1,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            margin_mode="cross",
+            position_mode="split",
+            pos_id="pos-composite",
+            status="active",
+        )
+        session.add_all([decision, lifecycle, binding])
+        session.flush()
+        lifecycle.execution_binding_id = binding.id
+        entry_leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            leg_index=0,
+            purpose="entry",
+            order_kind="market",
+            pos_id="pos-composite",
+            venue="deepcoin",
+            attribution_status="verified",
+            response_json='{"data":{"posId":"pos-composite"}}',
+            status="active",
+        )
+        session.add(entry_leg)
+        session.flush()
+        batch = StrategyManagementBatch(
+            idempotency_fingerprint="composite-batch",
+            raw_message_id=raw.id,
+            recognition_decision_id=decision.id,
+            recognition_generation="composite-generation",
+            target_lifecycle_id=lifecycle.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            execution_binding_id=binding.id,
+            intent="partial_then_break_even",
+            effective_action="partial_then_break_even",
+            execution_mode="live",
+            requested_fraction=0.5,
+            effective_fraction=0.5,
+            management_contract_json=contract_json,
+            management_contract_fingerprint=fingerprint,
+            contract_version=2,
+            status="ready",
+            target_fingerprint="target-composite",
+            target_snapshot_json=json.dumps(
+                {
+                    "positions": [
+                        {
+                            "pos_id": "pos-composite",
+                            "trusted_start_size": "10",
+                            "target_remaining_size": "5",
+                            "avg_entry_price": "64000",
+                            "quantity_step": "1",
+                            "min_quantity": "1",
+                        }
+                    ]
+                }
+            ),
+            planned_at=NOW,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(batch)
+        session.flush()
+        management_leg = StrategyManagementLeg(
+            management_batch_id=batch.id,
+            execution_order_leg_id=entry_leg.id,
+            pos_id="pos-composite",
+            leg_index=0,
+            status="planned",
+            preflight_size="10",
+            planned_close_size="5",
+            avg_entry_price="64000",
+            quantity_step="1",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(management_leg)
+        session.flush()
+        components = []
+        for sequence, kind in enumerate(contract.required_components):
+            component = StrategyManagementComponent(
+                management_batch_id=batch.id,
+                strategy_management_leg_id=management_leg.id,
+                strategy_management_leg_scope=management_leg.id,
+                component_kind=kind,
+                sequence=sequence,
+                status="pending",
+                idempotency_key=f"component:{kind}",
+                desired_json=json.dumps(
+                    {
+                        "contract_fingerprint": fingerprint,
+                        "pos_id": "pos-composite",
+                        "execution_order_leg_id": entry_leg.id,
+                        "trusted_start_size": "10",
+                        "target_remaining_size": "5",
+                        "avg_entry_price": "64000",
+                        "quantity_step": "1",
+                        "min_quantity": "1",
+                        "component_kind": kind,
+                    },
+                    sort_keys=True,
+                ),
+                evidence_json="[]",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            session.add(component)
+            components.append(component)
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=binding.id,
+                execution_order_leg_id=entry_leg.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                pos_id="pos-composite",
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id="tp-first",
+                purpose="take_profit",
+                trigger_price="65000",
+                size_text="5",
+                status="verified",
+                evidence_source="native_tpsl_pending_readback",
+                evidence_json="{}",
+                first_seen_at=NOW,
+                last_seen_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+        return batch.id, components[0].id
+
+
+class _CompositeConsumptionClient:
+    def __init__(self, outcome="success"):
+        self.outcomes = [outcome]
+        self.pending = [
+            {
+                "ordId": "tp-first",
+                "posId": "pos-composite",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "triggerOrderType": "TPSL",
+                "tpTriggerPx": "65000",
+                "sz": "5",
+            }
+        ]
+        self.history = []
+        self.fills = []
+        self.cancel_calls = []
+        self.close_calls = []
+        self.on_cancel = None
+
+    def list_positions(self, *, inst_id=None):
+        return [
+            {
+                "posId": "pos-composite",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "pos": "10",
+                "avgPx": "64000",
+                "mgnMode": "cross",
+                "mrgPosition": "split",
+            }
+        ]
+
+    def list_trigger_orders_pending(self, *, inst_id):
+        return list(self.pending)
+
+    def list_trigger_orders_history(self, *, inst_id):
+        return list(self.history)
+
+    def list_order_history(self, *, inst_id):
+        return list(self.history)
+
+    def list_trade_fills(self, *, inst_id):
+        return list(self.fills)
+
+    def cancel_position_sltp(self, payload):
+        if self.on_cancel is not None:
+            self.on_cancel()
+        self.cancel_calls.append(dict(payload))
+        outcome = self.outcomes.pop(0) if self.outcomes else "success"
+        if outcome == "unknown":
+            raise DeepcoinRequestOutcomeUnknown("cancel timeout")
+        if outcome == "filled_race":
+            self.pending = []
+            self.history = [{"ordId": "tp-first", "state": "filled", "posId": "pos-composite"}]
+            self.fills = [{"ordId": "tp-first", "posId": "pos-composite", "fillSz": "5"}]
+            raise DeepcoinDefiniteRejection("already filled")
+        if outcome == "rejected":
+            raise DeepcoinDefiniteRejection("cancel rejected")
+        self.pending = []
+        return {"code": "0", "data": {"ordId": "tp-first"}}
+
+
+def _execute_consumption(session_factory, batch_id, component_id, client):
+    from telegram_kol_research.strategy_management_composite_executor import (
+        execute_take_profit_consumption_component,
+    )
+
+    return execute_take_profit_consumption_component(
+        session_factory,
+        batch_id=batch_id,
+        component_id=component_id,
+        deepcoin_client=client,
+        live_execution_gate=lambda: True,
+        now_provider=lambda: NOW,
+    )
+
+
+def test_composite_pending_first_tp_is_cancelled_before_any_close(tmp_path):
+    session_factory = create_session_factory(tmp_path / "consume.db")
+    batch_id, component_id = _persist_composite_consumption_component(session_factory)
+    client = _CompositeConsumptionClient()
+    observed = {}
+
+    def observe_durable_prewrite_state():
+        from telegram_kol_research.models import StrategyManagementComponent
+
+        with session_factory() as session:
+            component = session.get(StrategyManagementComponent, component_id)
+            observed["status"] = component.status
+            observed["desired"] = json.loads(component.desired_json)
+
+    client.on_cancel = observe_durable_prewrite_state
+
+    result = _execute_consumption(session_factory, batch_id, component_id, client)
+
+    assert result.status == "confirmed"
+    assert len(client.cancel_calls) == 1
+    assert client.close_calls == []
+    assert observed["status"] == "submitting"
+    assert observed["desired"]["take_profit_consumption_execution"][
+        "cancel_order_ids"
+    ] == ["tp-first"]
+
+
+def test_composite_cancel_unknown_awaits_exchange_and_restart_never_resubmits(tmp_path):
+    session_factory = create_session_factory(tmp_path / "consume-unknown.db")
+    batch_id, component_id = _persist_composite_consumption_component(session_factory)
+    client = _CompositeConsumptionClient("unknown")
+
+    first = _execute_consumption(session_factory, batch_id, component_id, client)
+    second = _execute_consumption(session_factory, batch_id, component_id, client)
+
+    assert first.status == second.status == "awaiting_exchange"
+    assert len(client.cancel_calls) == 1
+    assert client.close_calls == []
+
+
+def test_composite_tp_fill_during_cancel_counts_as_fulfilled(tmp_path):
+    session_factory = create_session_factory(tmp_path / "consume-fill.db")
+    batch_id, component_id = _persist_composite_consumption_component(session_factory)
+    client = _CompositeConsumptionClient("filled_race")
+
+    result = _execute_consumption(session_factory, batch_id, component_id, client)
+
+    assert result.status == "confirmed"
+    assert result.proven_filled_quantity == "5"
+    assert len(client.cancel_calls) == 1
+    assert client.close_calls == []
+
+
+def test_composite_rejected_cancel_retries_only_with_fresh_pending_proof(tmp_path):
+    session_factory = create_session_factory(tmp_path / "consume-retry.db")
+    batch_id, component_id = _persist_composite_consumption_component(session_factory)
+    client = _CompositeConsumptionClient("rejected")
+
+    first = _execute_consumption(session_factory, batch_id, component_id, client)
+    client.pending = []
+    second = _execute_consumption(session_factory, batch_id, component_id, client)
+    client.pending = [_CompositeConsumptionClient().pending[0]]
+    client.outcomes = ["success"]
+    third = _execute_consumption(session_factory, batch_id, component_id, client)
+
+    assert first.status == "recovery_required"
+    assert second.status == "recovery_required"
+    assert len(client.cancel_calls) == 2
+    assert third.status == "confirmed"
+
+
+def test_composite_incomplete_exchange_snapshot_never_writes(tmp_path):
+    session_factory = create_session_factory(tmp_path / "consume-incomplete.db")
+    batch_id, component_id = _persist_composite_consumption_component(session_factory)
+    client = _CompositeConsumptionClient()
+    client.list_trade_fills = None
+
+    result = _execute_consumption(session_factory, batch_id, component_id, client)
+
+    assert result.status == "recovery_required"
+    assert result.reason_code == "take_profit_exchange_snapshot_incomplete"
+    assert client.cancel_calls == []
+    assert client.close_calls == []

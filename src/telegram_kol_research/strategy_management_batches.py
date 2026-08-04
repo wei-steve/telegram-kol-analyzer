@@ -17,6 +17,9 @@ from telegram_kol_research.db import MANAGEMENT_BATCH_ACTIVE_STRATEGY_INDEX_NAME
 from telegram_kol_research.db import MANAGEMENT_BATCH_IDEMPOTENCY_INDEX_NAME
 from telegram_kol_research.db import MANAGEMENT_LEG_BATCH_POSITION_INDEX_NAME
 from telegram_kol_research.db import MANAGEMENT_MARKET_DECISION_BATCH_INDEX_NAME
+from telegram_kol_research.db import MANAGEMENT_COMPONENT_IDEMPOTENCY_INDEX_NAME
+from telegram_kol_research.db import MANAGEMENT_COMPONENT_BATCH_SCOPE_KIND_INDEX_NAME
+from telegram_kol_research.db import MANAGEMENT_COMPONENT_BATCH_SCOPE_SEQUENCE_INDEX_NAME
 from telegram_kol_research.db import REQUIRED_MANAGEMENT_UNIQUE_INDEX_NAMES
 from telegram_kol_research.models import ACTIVE_MANAGEMENT_BATCH_SQL_PREDICATE
 from telegram_kol_research.models import StrategyManagementBatch
@@ -1256,6 +1259,18 @@ def _require_management_unique_indexes(session) -> None:
         MANAGEMENT_MARKET_DECISION_BATCH_INDEX_NAME: (
             "strategy_management_market_decisions",
             ["management_batch_id"],
+        ),
+        MANAGEMENT_COMPONENT_IDEMPOTENCY_INDEX_NAME: (
+            "strategy_management_components",
+            ["idempotency_key"],
+        ),
+        MANAGEMENT_COMPONENT_BATCH_SCOPE_KIND_INDEX_NAME: (
+            "strategy_management_components",
+            ["management_batch_id", "strategy_management_leg_scope", "component_kind"],
+        ),
+        MANAGEMENT_COMPONENT_BATCH_SCOPE_SEQUENCE_INDEX_NAME: (
+            "strategy_management_components",
+            ["management_batch_id", "strategy_management_leg_scope", "sequence"],
         ),
     }
     inspector = inspect(session.connection())

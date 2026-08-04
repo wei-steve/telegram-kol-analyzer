@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any, Iterable
+from typing import Any
 
 from telegram_kol_research.position_take_profit_orders import (
     canonical_take_profit_evidence_rows,
