@@ -354,6 +354,13 @@ class PositionMutationGateway:
         if current.status != "reserved":
             return current
 
+        if operation == "close_position" and self._has_other_unresolved_close(
+            pos_id=authority.pos_id,
+            execution_order_leg_id=authority.execution_order_leg_id,
+            exclude_intent_id=intent_id,
+        ):
+            return self._block(intent_id, "position_mutation_unresolved")
+
         if before_submit is not None:
             before_submit(intent_id)
 
@@ -408,6 +415,22 @@ class PositionMutationGateway:
             intent_id=intent_id,
             response=response,
         )
+
+    def _has_other_unresolved_close(
+        self, *, pos_id: str, execution_order_leg_id: int,
+        exclude_intent_id: int,
+    ) -> bool:
+        with self._session_factory() as session:
+            return session.query(PositionMutationIntent.id).filter(
+                PositionMutationIntent.pos_id == str(pos_id),
+                PositionMutationIntent.execution_order_leg_id
+                == int(execution_order_leg_id),
+                PositionMutationIntent.operation == "close_position",
+                PositionMutationIntent.id != int(exclude_intent_id),
+                PositionMutationIntent.status.in_((
+                    "reserved", "submitting", "submitted", "recovery_required"
+                )),
+            ).first() is not None
 
     def _reserve_and_block(
         self,

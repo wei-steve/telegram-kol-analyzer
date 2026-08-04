@@ -713,6 +713,55 @@ def test_close_uses_exact_close_position_id(tmp_path):
     ]
 
 
+def test_close_blocks_when_another_position_mutation_outcome_is_unresolved(tmp_path):
+    session_factory, binding_id, leg_id, _, _ = _seed(tmp_path)
+    client = FakeDeepcoinClient()
+    authority = _authority(
+        binding_id=binding_id,
+        leg_id=leg_id,
+        position=SISTER_POSITION,
+        strategy="strategy-sister",
+    )
+    prior = reserve_position_mutation_intent(
+        session_factory,
+        idempotency_key="existing-unknown-close",
+        operation="close_position",
+        strategy_instance_id="strategy-sister",
+        execution_binding_id=binding_id,
+        execution_order_leg_id=leg_id,
+        pos_id="pos-sister",
+        order_id=None,
+        authority_fingerprint="prior-authority",
+        request_fingerprint="prior-request",
+        request={"closePosId": "pos-sister", "sz": "1"},
+        reserved_at=NOW,
+    )
+    transition_position_mutation_intent(
+        session_factory,
+        prior.id,
+        expected_statuses={"reserved"},
+        new_status="recovery_required",
+        transitioned_at=NOW,
+    )
+    gateway = PositionMutationGateway(
+        session_factory=session_factory,
+        deepcoin_client=client,
+        live_execution_gate=lambda: True,
+        now_provider=lambda: NOW,
+    )
+
+    result = gateway.close_exact_position(
+        authority=authority,
+        size="1",
+        client_order_id="close-new",
+        idempotency_key="new-close",
+    )
+
+    assert result.status == "blocked"
+    assert result.reason == "position_mutation_unresolved"
+    assert client.place_order_calls == []
+
+
 def test_failed_terminal_cas_returns_durable_current_status(tmp_path):
     session_factory, binding_id, leg_id, _, _ = _seed(tmp_path)
     gateway = PositionMutationGateway(
