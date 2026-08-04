@@ -228,6 +228,35 @@ def _seed_partial_close_observation(session_factory, batch, *, size="1"):
         session.commit()
 
 
+@pytest.mark.parametrize(
+    ("current_size", "intent_status", "expected_status", "expected_delta"),
+    [
+        ("8", "confirmed", "confirmed", "0"),
+        ("12", "rejected", "recovery_required", "4"),
+        ("12", "recovery_required", "awaiting_exchange", None),
+    ],
+)
+def test_composite_close_reconciliation_requires_terminal_exchange_evidence(
+    current_size, intent_status, expected_status, expected_delta
+):
+    from telegram_kol_research.strategy_management_reconciliation import (
+        classify_composite_close_reconciliation,
+    )
+
+    result = classify_composite_close_reconciliation(
+        trusted_start_size="16",
+        target_remaining_size="8",
+        pre_submit_size="16",
+        current_size=current_size,
+        quantity_step="1",
+        min_quantity="1",
+        intent_status=intent_status,
+    )
+
+    assert result.status == expected_status
+    assert result.unresolved_delta == expected_delta
+
+
 def test_confirmed_partial_close_plans_one_shadow_break_even_convergence(tmp_path):
     sf = create_session_factory(tmp_path / "research.db")
     save_trading_settings(sf, {

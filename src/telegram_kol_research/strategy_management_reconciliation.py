@@ -38,6 +38,10 @@ from telegram_kol_research.strategy_management_market_decisions import (
     load_break_even_market_decision_in_session,
 )
 from telegram_kol_research.trading_settings import load_trading_settings
+from telegram_kol_research.strategy_management_sizing import (
+    ManagementSizingError,
+    target_remaining_close_delta,
+)
 
 
 _ACTIVE_RECONCILIATION_STATUSES = frozenset(
@@ -76,6 +80,60 @@ class ManagementReconciliationResult:
     succeeded: int = 0
     pending: int = 0
     frozen: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class CompositeCloseReconciliation:
+    status: str
+    unresolved_delta: str | None = None
+    reason_code: str | None = None
+
+
+def classify_composite_close_reconciliation(
+    *,
+    trusted_start_size: object,
+    target_remaining_size: object,
+    pre_submit_size: object,
+    current_size: object,
+    quantity_step: object,
+    min_quantity: object,
+    intent_status: str,
+) -> CompositeCloseReconciliation:
+    """Classify close progress only after the exact intent becomes terminal."""
+
+    if str(intent_status) not in {"confirmed", "rejected"}:
+        return CompositeCloseReconciliation(status="awaiting_exchange")
+    try:
+        if Decimal(str(current_size)) > Decimal(str(pre_submit_size)):
+            return CompositeCloseReconciliation(
+                status="operator_required",
+                reason_code="position_size_increased_after_close_submission",
+            )
+        delta = target_remaining_close_delta(
+            trusted_start_size=trusted_start_size,
+            target_remaining_size=target_remaining_size,
+            current_size=current_size,
+            quantity_step=quantity_step,
+            min_quantity=min_quantity,
+        )
+    except (ManagementSizingError, InvalidOperation, ValueError) as exc:
+        return CompositeCloseReconciliation(
+            status="operator_required", reason_code=str(exc)
+        )
+    if delta == "0":
+        return CompositeCloseReconciliation(
+            status="confirmed", unresolved_delta="0"
+        )
+    if str(intent_status) == "rejected":
+        return CompositeCloseReconciliation(
+            status="recovery_required", unresolved_delta=delta,
+            reason_code="partial_close_terminal_with_unresolved_delta",
+        )
+    return CompositeCloseReconciliation(
+        status="operator_required",
+        unresolved_delta=delta,
+        reason_code="confirmed_close_did_not_reach_target",
+    )
 
 
 @serialized_position_authority_mutation

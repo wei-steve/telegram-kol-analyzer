@@ -5714,3 +5714,138 @@ def test_composite_incomplete_exchange_snapshot_never_writes(tmp_path):
     assert result.reason_code == "take_profit_exchange_snapshot_incomplete"
     assert client.cancel_calls == []
     assert client.close_calls == []
+
+
+def _prepare_composite_close_component(session_factory):
+    from telegram_kol_research.models import StrategyManagementComponent
+
+    batch_id, _ = _persist_composite_consumption_component(session_factory)
+    with session_factory() as session:
+        components = (
+            session.query(StrategyManagementComponent)
+            .filter(StrategyManagementComponent.management_batch_id == batch_id)
+            .order_by(StrategyManagementComponent.sequence.asc())
+            .all()
+        )
+        components[0].status = "confirmed"
+        components[0].completed_at = NOW
+        session.commit()
+        return batch_id, components[1].id
+
+
+class _CompositeCloseClient(_CompositeConsumptionClient):
+    def __init__(self, outcome="confirmed", *, current_size="10"):
+        super().__init__()
+        self.close_outcome = outcome
+        self.current_size = current_size
+
+    def list_positions(self, *, inst_id=None):
+        rows = super().list_positions(inst_id=inst_id)
+        rows[0]["pos"] = self.current_size
+        return rows
+
+    def place_order(self, payload):
+        self.close_calls.append(dict(payload))
+        if self.close_outcome == "unknown":
+            raise DeepcoinRequestOutcomeUnknown("close timeout")
+        if self.close_outcome == "rejected":
+            raise DeepcoinDefiniteRejection("close rejected")
+        if self.close_outcome == "partial_unknown":
+            self.current_size = "7"
+            raise DeepcoinRequestOutcomeUnknown("partial close timeout")
+        if self.close_outcome == "confirmed":
+            self.current_size = "5"
+        return {"code": "0", "data": {"ordId": "close-composite"}}
+
+
+def _execute_composite_close(session_factory, batch_id, component_id, client):
+    from telegram_kol_research.strategy_management_composite_executor import (
+        execute_partial_close_component,
+    )
+
+    return execute_partial_close_component(
+        session_factory,
+        batch_id=batch_id,
+        component_id=component_id,
+        deepcoin_client=client,
+        live_execution_gate=lambda: True,
+        now_provider=lambda: NOW,
+    )
+
+
+def test_composite_close_submits_exact_delta_and_confirms_target_remaining(tmp_path):
+    session_factory = create_session_factory(tmp_path / "close-confirmed.db")
+    batch_id, component_id = _prepare_composite_close_component(session_factory)
+    client = _CompositeCloseClient()
+
+    result = _execute_composite_close(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "confirmed"
+    assert [call["sz"] for call in client.close_calls] == ["5"]
+    assert client.close_calls[0]["closePosId"] == "pos-composite"
+
+
+def test_composite_close_unknown_never_retries_on_restart(tmp_path):
+    session_factory = create_session_factory(tmp_path / "close-unknown.db")
+    batch_id, component_id = _prepare_composite_close_component(session_factory)
+    client = _CompositeCloseClient("unknown")
+
+    first = _execute_composite_close(session_factory, batch_id, component_id, client)
+    second = _execute_composite_close(session_factory, batch_id, component_id, client)
+
+    assert first.status == second.status == "awaiting_exchange"
+    assert len(client.close_calls) == 1
+
+
+def test_composite_close_http_acceptance_without_target_evidence_stays_awaiting(tmp_path):
+    session_factory = create_session_factory(tmp_path / "close-accepted.db")
+    batch_id, component_id = _prepare_composite_close_component(session_factory)
+    client = _CompositeCloseClient("accepted")
+
+    first = _execute_composite_close(session_factory, batch_id, component_id, client)
+    second = _execute_composite_close(session_factory, batch_id, component_id, client)
+
+    assert first.status == second.status == "awaiting_exchange"
+    assert len(client.close_calls) == 1
+
+
+def test_composite_close_definite_rejection_retries_from_fresh_unchanged_position(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "close-rejected.db")
+    batch_id, component_id = _prepare_composite_close_component(session_factory)
+    client = _CompositeCloseClient("rejected")
+
+    first = _execute_composite_close(session_factory, batch_id, component_id, client)
+    client.close_outcome = "confirmed"
+    second = _execute_composite_close(session_factory, batch_id, component_id, client)
+
+    assert first.status == "recovery_required"
+    assert second.status == "confirmed"
+    assert [call["sz"] for call in client.close_calls] == ["5", "5"]
+    assert client.close_calls[0]["clOrdId"] != client.close_calls[1]["clOrdId"]
+
+
+@pytest.mark.parametrize(
+    ("current_size", "reason"),
+    [
+        ("11", "position_size_increased_after_snapshot"),
+        ("4", "position_below_target_remaining"),
+    ],
+)
+def test_composite_close_refuses_position_drift_without_write(
+    tmp_path, current_size, reason
+):
+    session_factory = create_session_factory(tmp_path / f"close-{current_size}.db")
+    batch_id, component_id = _prepare_composite_close_component(session_factory)
+    client = _CompositeCloseClient(current_size=current_size)
+
+    result = _execute_composite_close(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "operator_required"
+    assert result.reason_code == reason
+    assert client.close_calls == []

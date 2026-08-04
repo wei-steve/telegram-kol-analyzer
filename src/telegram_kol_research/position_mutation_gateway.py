@@ -273,6 +273,7 @@ class PositionMutationGateway:
         size: str,
         client_order_id: str | None,
         idempotency_key: str,
+        before_submit: Callable[[int], None] | None = None,
     ) -> PositionMutationResult:
         binding, reason = self._load_verified_binding(authority)
         if reason is not None or binding is None:
@@ -314,6 +315,7 @@ class PositionMutationGateway:
             order_id=None,
             payload=payload,
             idempotency_key=idempotency_key,
+            before_submit=before_submit,
             submit=lambda: self._call_client_write(
                 "_place_position_close_unchecked",
                 "place_order",
@@ -330,6 +332,7 @@ class PositionMutationGateway:
         payload: Mapping[str, Any],
         idempotency_key: str,
         submit: Callable[[], Mapping[str, Any]],
+        before_submit: Callable[[int], None] | None = None,
     ) -> PositionMutationResult:
         intent = reserve_position_mutation_intent(
             self._session_factory,
@@ -350,6 +353,9 @@ class PositionMutationGateway:
         current = self._intent_result(intent_id)
         if current.status != "reserved":
             return current
+
+        if before_submit is not None:
+            before_submit(intent_id)
 
         _, reason = self._load_verified_binding(authority)
         if reason is not None:

@@ -131,3 +131,49 @@ def test_allocate_close_sizes_has_no_step_count_while_loop():
                 if isinstance(child, ast.Name)
             }
             assert not range_names.intersection({"target", "remaining", "remaining_steps"})
+
+
+@pytest.mark.parametrize(
+    ("current", "expected"),
+    [("16", "8"), ("12", "4"), ("8", "0")],
+)
+def test_target_remaining_close_delta_converges_only_the_unresolved_amount(
+    current, expected
+):
+    assert _sizing().target_remaining_close_delta(
+        trusted_start_size="16",
+        target_remaining_size="8",
+        current_size=current,
+        quantity_step="1",
+        min_quantity="1",
+    ) == expected
+
+
+def test_target_remaining_close_delta_refuses_below_target():
+    sizing = _sizing()
+
+    with pytest.raises(
+        sizing.ManagementSizingError, match="position_below_target_remaining"
+    ):
+        sizing.target_remaining_close_delta(
+            trusted_start_size="16",
+            target_remaining_size="8",
+            current_size="7",
+            quantity_step="1",
+            min_quantity="1",
+        )
+
+
+def test_target_remaining_close_delta_refuses_size_increase():
+    sizing = _sizing()
+
+    with pytest.raises(
+        sizing.ManagementSizingError, match="position_size_increased_after_snapshot"
+    ):
+        sizing.target_remaining_close_delta(
+            trusted_start_size="16",
+            target_remaining_size="8",
+            current_size="17",
+            quantity_step="1",
+            min_quantity="1",
+        )

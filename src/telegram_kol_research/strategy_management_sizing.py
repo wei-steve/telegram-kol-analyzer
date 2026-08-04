@@ -10,6 +10,46 @@ class ManagementSizingError(ValueError):
     """Raised when a close cannot be represented safely for every position."""
 
 
+def target_remaining_close_delta(
+    *,
+    trusted_start_size: object,
+    target_remaining_size: object,
+    current_size: object,
+    quantity_step: object,
+    min_quantity: object,
+) -> str:
+    """Return only the exact unresolved close delta for an immutable target."""
+
+    try:
+        trusted = Decimal(str(trusted_start_size))
+        target = Decimal(str(target_remaining_size))
+        current = Decimal(str(current_size))
+        step = Decimal(str(quantity_step))
+        minimum = Decimal(str(min_quantity))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ManagementSizingError("management_size_invalid") from exc
+    if (
+        any(not value.is_finite() for value in (trusted, target, current, step, minimum))
+        or trusted <= 0
+        or target < 0
+        or target > trusted
+        or current <= 0
+        or step <= 0
+        or minimum <= 0
+    ):
+        raise ManagementSizingError("management_size_invalid")
+    if current > trusted:
+        raise ManagementSizingError("position_size_increased_after_snapshot")
+    if current < target:
+        raise ManagementSizingError("position_below_target_remaining")
+    delta = current - target
+    if delta == 0:
+        return "0"
+    if delta < minimum or (delta / step) != (delta / step).to_integral_value():
+        raise ManagementSizingError("target_remaining_delta_not_executable")
+    return _format_decimal(delta)
+
+
 def effective_action(
     *, round_before: int, fraction: float | None
 ) -> tuple[str, float]:
