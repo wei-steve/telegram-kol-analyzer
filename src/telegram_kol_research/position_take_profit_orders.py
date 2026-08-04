@@ -21,6 +21,37 @@ from telegram_kol_research.models import (
 from telegram_kol_research.native_tpsl import native_tpsl_take_profit_is_market
 
 
+def canonical_take_profit_evidence_rows(rows) -> tuple[dict[str, object], ...]:
+    """Return stable, side-effect-free evidence dictionaries for TP planning."""
+
+    normalized = []
+    for row in rows:
+        value = (
+            dict(row)
+            if isinstance(row, dict)
+            else {
+                key: getattr(row, key, None)
+                for key in (
+                    "order_id",
+                    "execution_binding_id",
+                    "execution_order_leg_id",
+                    "pos_id",
+                    "instrument_id",
+                    "side",
+                    "purpose",
+                    "status",
+                    "size_text",
+                    "trigger_price",
+                    "stage_index",
+                    "created_at",
+                    "id",
+                )
+            }
+        )
+        normalized.append(value)
+    return tuple(normalized)
+
+
 def record_take_profit_order(
     session: Session,
     *,
