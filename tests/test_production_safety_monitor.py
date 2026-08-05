@@ -339,13 +339,22 @@ def test_composite_monitor_reader_detects_persisted_faults_without_writes(tmp_pa
         "INSERT INTO strategy_management_batches VALUES (1, 'succeeded', ?)",
         (contract,),
     )
+    connection.execute(
+        "INSERT INTO strategy_management_batches VALUES (2, 'executing', ?)",
+        (contract,),
+    )
     connection.execute("INSERT INTO strategy_management_legs VALUES (1, 1, 11, 'pos-1')")
+    connection.execute("INSERT INTO strategy_management_legs VALUES (2, 2, 12, 'pos-2')")
     connection.executemany(
         "INSERT INTO strategy_management_components VALUES (?, 1, 1, ?, ?, ?, ?, ?, ?)",
         [
             (1, "converge_partial_close", "confirmed", json.dumps({"target_remaining_size": "5"}), "[]", stale, stale),
             (2, "replace_remaining_protection", "pending", "{}", "[]", stale, stale),
         ],
+    )
+    connection.execute(
+        "INSERT INTO strategy_management_components VALUES (3, 2, 2, 'consume_take_profit_stage', 'pending', '{}', '[]', ?, ?)",
+        (stale, stale),
     )
     connection.executemany(
         "INSERT INTO position_mutation_intents VALUES (?, ?, 'close_position', 'submitted')",

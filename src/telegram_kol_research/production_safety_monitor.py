@@ -669,8 +669,13 @@ def read_composite_management_invariants(
             "pending", "preflighting", "submitting", "awaiting_exchange",
             "recovery_required",
         }
+        batch_status_by_id = {int(row[0]): str(row[1]) for row in batches}
         for row in components:
-            if str(row[4]) not in active_component_states:
+            if (
+                str(row[4]) not in active_component_states
+                or batch_status_by_id.get(int(row[1]))
+                in {"succeeded", "blocked", "resolved"}
+            ):
                 continue
             rendered = row[7] or row[8]
             try:
@@ -698,7 +703,6 @@ def read_composite_management_invariants(
             reasons.add("duplicate_composite_close_submission")
 
         leg_by_id = {int(row[0]): row for row in legs}
-        batch_status_by_id = {int(row[0]): str(row[1]) for row in batches}
         for component in components:
             is_confirmed = str(component[4]) == "confirmed"
             succeeded_batch = batch_status_by_id.get(int(component[1])) == "succeeded"
