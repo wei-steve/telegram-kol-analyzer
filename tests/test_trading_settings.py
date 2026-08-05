@@ -1,4 +1,5 @@
 from decimal import Decimal
+import json
 
 import pytest
 
@@ -12,6 +13,7 @@ from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.trading_settings import TradingSettings
 from telegram_kol_research.trading_settings import trading_settings_from_payload
+from telegram_kol_research.models import TradingSetting
 
 
 def test_load_trading_settings_returns_safe_defaults(tmp_path):
@@ -71,6 +73,29 @@ def test_entry_preamble_legacy_allowlist_is_ignored(value):
     settings = trading_settings_from_payload({"entry_preamble_live_chat_ids": value})
 
     assert not hasattr(settings, "entry_preamble_live_chat_ids")
+
+
+def test_saving_settings_preserves_legacy_entry_preamble_allowlist_in_storage(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add(
+            TradingSetting(
+                key="global",
+                value_json=json.dumps(
+                    {
+                        "entry_preamble_mode": "disabled",
+                        "entry_preamble_live_chat_ids": [-1002, -1001],
+                    }
+                ),
+            )
+        )
+        session.commit()
+
+    save_trading_settings(session_factory, {"auto_trade_enabled": False})
+
+    with session_factory() as session:
+        stored = json.loads(session.query(TradingSetting).filter_by(key="global").one().value_json)
+    assert stored["entry_preamble_live_chat_ids"] == [-1002, -1001]
 
 
 def test_context_resolution_requires_live_trading_and_allowlisted_chat():

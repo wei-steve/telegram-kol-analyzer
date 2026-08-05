@@ -200,20 +200,28 @@ def save_trading_settings(
             .one_or_none()
         )
         merged_payload = dict(payload)
-        if row is not None and "symbol_entry_thresholds" not in merged_payload:
+        persisted_payload: dict[str, Any] = {}
+        if row is not None:
             try:
-                persisted_payload = json.loads(row.value_json)
+                parsed_persisted = json.loads(row.value_json)
             except json.JSONDecodeError:
-                persisted_payload = {}
+                parsed_persisted = {}
+            if isinstance(parsed_persisted, dict):
+                persisted_payload = parsed_persisted
+        if row is not None and "symbol_entry_thresholds" not in merged_payload:
             if (
-                isinstance(persisted_payload, dict)
-                and "symbol_entry_thresholds" in persisted_payload
+                "symbol_entry_thresholds" in persisted_payload
             ):
                 merged_payload["symbol_entry_thresholds"] = persisted_payload[
                     "symbol_entry_thresholds"
                 ]
         settings = trading_settings_from_payload(merged_payload)
-        value_json = json.dumps(settings.to_dict(), ensure_ascii=False, sort_keys=True)
+        stored_payload = settings.to_dict()
+        if "entry_preamble_live_chat_ids" in persisted_payload:
+            stored_payload["entry_preamble_live_chat_ids"] = persisted_payload[
+                "entry_preamble_live_chat_ids"
+            ]
+        value_json = json.dumps(stored_payload, ensure_ascii=False, sort_keys=True)
         if row is None:
             row = TradingSetting(key=TRADING_SETTINGS_KEY, value_json=value_json)
             session.add(row)
