@@ -805,3 +805,27 @@ than a safety incident. Once present, missing completion evidence, duplicate
 close submissions, oversized retained TP, missing verified stops, and stalled
 components are fixed critical invariants. Live enablement requires a later
 reviewed shadow report and explicit approval.
+
+## Position-management liveness v2 handoff
+
+Position ownership and protection-order ownership remain separate authorities.
+An account-wide authoritative `execution_order_legs.pos_id` assignment permits
+an exact-position operation; `position_protection_ledger` permits cancellation
+or replacement of a particular order. Symbol/side similarity and an unowned
+pending TPSL authorize neither operation.
+
+`position_management_liveness_v2_mode` defaults to `disabled`. `shadow` may
+compute mutual-unique assignment, capability, backup-stop, and staged-TP plans,
+but writes no exchange mutation. `live` is effective only with
+`auto_trade_enabled=true` and `management_execution_mode=live`. Recovery is
+dry-run first through `recover-position-management-liveness`; apply requires
+the reviewed fingerprint and reruns authoritative ownership plus coherent
+snapshot preflight under the account lock.
+
+`recovery_disposition=retry` permits read-only evidence collection;
+`exact_backup` permits only a fully preflighted exact SL fallback;
+`manual_review` and `terminal` prohibit automatic action. `submit_unknown` and
+`recovery_required` are frozen states, not retry queues. Rollback sets the v2
+mode to `disabled` and leaves confirmed exchange orders, ledger rows, recovery
+records, and incident history intact. Never delete them to make rollback appear
+clean.

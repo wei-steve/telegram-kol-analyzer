@@ -191,3 +191,27 @@ the same command skips matching completed evidence and resumes from remaining
 messages. When `next_scan_cursor` is present, pass that opaque value through
 `--scan-cursor` for the next bounded page. See
 [`docs/runbook.md`](docs/runbook.md) before using `--retry-failed`.
+
+## Exact-position management liveness recovery
+
+`execution_order_legs.pos_id` with authoritative attribution proves who owns a
+position. `position_protection_ledger` separately proves which exact position
+owns a stop or take-profit order. A strategy match never substitutes for either
+proof. The `position_management_liveness_v2_mode` rollout is `disabled` by
+default: `disabled` does no new liveness-v2 exchange write, `shadow` persists
+bounded planning evidence only, and effective `live` additionally requires
+global auto trading plus live management execution.
+
+Review one exact position without changing exchange state:
+
+```bash
+PYTHONPATH=src python -m telegram_kol_research.cli \
+  recover-position-management-liveness \
+  --database-path data/research.db --pos-id <exact-pos-id>
+```
+
+Apply only the unchanged reviewed output with `--apply
+--expected-fingerprint <fingerprint>`. Unknown submission outcomes are frozen,
+reconciled read-only, and never blindly retried. See
+[`docs/runbook.md`](docs/runbook.md) for capability rules, audit SQL,
+`recovery_disposition` meanings, and rollback.

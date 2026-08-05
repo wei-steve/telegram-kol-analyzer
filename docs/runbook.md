@@ -1314,3 +1314,89 @@ WHERE idempotency_key LIKE :component_id || ':%' ORDER BY id;
 `submitting`、`submitted`、`recovery_required` 或未知结果一律禁止重新发单。
 将模式切为 `disabled` 只会阻止新批次，不会把已发出的未知结果当作回滚。
 米娅和三姐的历史消息永不自动重放；历史补操作必须单独只读规划、人工批准和交易所回读。
+
+## 精确仓位管理活性 v2
+
+`execution_order_legs.pos_id` 只有在账户级唯一、`verified`、具有权威持久化证据且未终态时，
+才证明“这个精确仓位归谁管”。`position_protection_ledger` 另外证明“这个止损/止盈订单
+归哪个 `posId`”。策略、币种、方向或价格相似不能替代任一证明。
+
+| 操作 | 必需证据 | 不得放宽的条件 |
+| --- | --- | --- |
+| 撤销/替换保护单 | 权威精确仓位 + 该 order ID 已验证归属 | 未归属或归属冲突不可撤 |
+| 新增精确备用止损 | 权威仓位、完整快照、已保存 SL、清算安全 | 已有/未知止损或 mutation 不可写 |
+| 新增分段止盈 | 权威仓位、精确 owned stop、完整 TPSL 快照 | 未知/未归属 TP 或总量超仓不可写 |
+| 精确减仓 | 权威仓位、完整快照、无 active/unknown mutation | 保留 TP 不安全时不可部分减仓 |
+| 精确全平 | 权威仓位、完整快照、无 active/unknown mutation | 某条腿的止损归属待恢复不应全局阻断其他仓位 |
+
+`position_management_liveness_v2_mode=disabled` 不产生新的 v2 交易所写；`shadow` 只计算并持久化
+有界证据；`live` 还必须同时满足全局自动交易和 live 管理开关。先做只读规划：
+
+```bash
+.venv/bin/telegram-kol-research recover-position-management-liveness \
+  --database-path data/research.db --pos-id <exact-pos-id>
+```
+
+只有快照、账本、intent、合约规格和预计 payload 都未变时，才可用指纹执行：
+
+```bash
+.venv/bin/telegram-kol-research recover-position-management-liveness \
+  --database-path data/research.db --pos-id <exact-pos-id> \
+  --apply --expected-fingerprint <reviewed-fingerprint>
+```
+
+`recovery_disposition=retry` 只允许重做只读证据收集，`exact_backup` 只允许通过全部预检的
+精确 SL fallback，`manual_review`/`terminal` 禁止自动操作。任何 `submit_unknown` 或
+`recovery_required` 都必须冻结：查精确 client/order/posId、仓位、待执行 TPSL、历史与成交，
+不得重发。在策略详情中查 `protection_states`、`backup_stops`、`protection_incidents`、
+`trigger_protection_recovery` 和 `take_profit_orders.convergence`。
+
+回滚时只把 v2 模式设为 `disabled`并停止新任务。不删除已确认的交易所订单、账本、intent、
+convergence、incident 或 unknown-outcome 记录；它们是对账和避免重发的安全边界。
+
+### 只读审计 SQL
+
+```sql
+-- 1. 已验证仓位不应同时缺少所有精确 owned stop。
+SELECT l.id AS leg_id, l.pos_id FROM execution_order_legs l
+WHERE l.venue='deepcoin' AND l.purpose='entry'
+  AND l.attribution_status='verified' AND l.status IN ('active','partially_filled')
+  AND NOT EXISTS (SELECT 1 FROM position_protection_ledger p
+    WHERE p.execution_order_leg_id=l.id AND p.pos_id=l.pos_id
+      AND p.purpose IN ('stop_loss','combined') AND p.status IN ('verified','active'))
+  AND NOT EXISTS (SELECT 1 FROM position_backup_stop_orders b
+    WHERE b.execution_order_leg_id=l.id AND b.pos_id=l.pos_id
+      AND b.status='active' AND b.order_id IS NOT NULL);
+
+-- 2. active TP 总量不得超过最新的精确仓位快照。
+SELECT c.id, c.pos_id, SUM(CAST(t.size_text AS REAL)) AS tp_size,
+       CAST(o.size_text AS REAL) AS position_size
+FROM trigger_take_profit_convergences c
+JOIN position_take_profit_orders t ON t.execution_order_leg_id=c.execution_order_leg_id
+JOIN position_reconciliation_observations o ON o.pos_id=c.pos_id
+WHERE c.status IN ('ready','reserved','submitted') AND t.status='active'
+  AND o.id=(SELECT MAX(o2.id) FROM position_reconciliation_observations o2 WHERE o2.pos_id=c.pos_id)
+GROUP BY c.id, c.pos_id HAVING tp_size > position_size;
+
+-- 3. 一个 order ID 不得有多个 verified protection owner。
+SELECT venue, order_id, COUNT(DISTINCT pos_id) AS owner_count
+FROM position_protection_ledger WHERE status IN ('verified','active')
+GROUP BY venue, order_id HAVING owner_count > 1;
+
+-- 4. 超过 escalation deadline 的 recovery_required 必须已进入 runtime incident。
+SELECT i.id, i.execution_order_leg_id, i.next_attempt_at
+FROM trigger_protection_intents i
+WHERE i.recovery_state='recovery_required' AND i.next_attempt_at <= CURRENT_TIMESTAMP
+  AND NOT EXISTS (SELECT 1 FROM runtime_incidents r
+    WHERE r.source_kind='position_protection_incident'
+      AND r.source_record_id LIKE 'trigger-intent-' || i.id || '-%');
+
+-- 5. 终态仓位不得保留 live convergence work。
+SELECT c.id, c.pos_id, l.status AS leg_status, b.status AS binding_status
+FROM trigger_take_profit_convergences c
+JOIN execution_order_legs l ON l.id=c.execution_order_leg_id
+JOIN execution_bindings b ON b.id=c.execution_binding_id
+WHERE c.status IN ('ready','reserved')
+  AND (l.status IN ('closed','cancelled','failed','rejected','expired')
+       OR b.status IN ('closed','cancelled','failed','rejected','expired'));
+```
