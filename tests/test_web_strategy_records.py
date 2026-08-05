@@ -320,6 +320,45 @@ def test_strategy_record_detail_is_semantic_read_only_and_escapes_evidence(tmp_p
     assert "[REDACTED]" in response.text
 
 
+def test_strategy_record_detail_renders_recoverable_stop_without_owner_false_alarm(
+    tmp_path,
+):
+    client, lifecycle_id = _client(tmp_path)
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).filter_by(purpose="entry").one()
+        session.add(TriggerProtectionIntent(
+            venue="deepcoin",
+            execution_binding_id=leg.execution_binding_id,
+            execution_order_leg_id=leg.id,
+            request_fingerprint="d" * 64,
+            pre_submit_tpsl_baseline_json="[]",
+            correlation_id="web-recoverable-stop",
+            recovery_state="failed",
+            recovery_disposition="exact_backup",
+        ))
+        session.add(PositionBackupStopOrder(
+            venue="deepcoin",
+            execution_binding_id=leg.execution_binding_id,
+            execution_order_leg_id=leg.id,
+            pos_id="pos-web-record",
+            instrument_id="BTC-USDT-SWAP",
+            side="long",
+            trigger_price="59500",
+            order_id="web-backup-exact",
+            client_order_id="web-backup-exact-client",
+            status="active",
+            request_json="{}",
+        ))
+        session.commit()
+
+    response = client.get(f"/strategy-records/{lifecycle_id}")
+
+    assert response.status_code == 200
+    assert "原生止损归属待恢复；精确仓位可继续风险降低操作" in response.text
+    assert "持仓归属</dt><dd>已验证" in response.text
+
+
 def test_strategy_record_detail_renders_safe_trigger_recovery_audit_fields(tmp_path):
     client, lifecycle_id = _client(tmp_path)
     with client.app.state.session_factory() as session:

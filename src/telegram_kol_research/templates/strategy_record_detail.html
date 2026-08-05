@@ -161,6 +161,11 @@
             <dt>第二止损</dt><dd>{{ protection.backup_stop_price or '未创建' }} · {{ protection.backup_stop_status }}</dd>
             <dt>第二止损订单</dt><dd><span class="strategy-identifier">{{ protection.backup_order_id or '-' }}</span></dd>
             <dt>状态结论</dt><dd>{{ protection.operator_message }}</dd>
+            <dt>持仓归属</dt><dd>{{ '已验证' if protection.position_owner_verified else '未验证' }}</dd>
+            <dt>原生止损归属</dt><dd>{{ '待恢复' if protection.native_stop_assignment_pending else '无待恢复项' }}</dd>
+            <dt>精确备用止损</dt><dd>{{ '已验证' if protection.exact_backup_stop_verified else '未验证' }}</dd>
+            <dt>风险降低能力</dt><dd>{{ '可用' if protection.risk_reduction_capability_available else '不可用' }}</dd>
+            {% if protection.manual_review_required %}<dt>人工复核</dt><dd>必需</dd>{% endif %}
             {% if protection.backup_stop_blocker %}<dt>阻塞原因</dt><dd>{{ protection.backup_stop_blocker }}</dd>{% endif %}
           </dl>
         </article>

@@ -2174,6 +2174,25 @@ def test_monitor_adapts_each_durable_severe_protection_incident_once(tmp_path):
         ) == source_snapshot
 
 
+def test_protection_incident_classification_distinguishes_recoverable_and_terminal():
+    from telegram_kol_research.production_safety_monitor import (
+        classify_protection_incident,
+    )
+
+    assert classify_protection_incident(
+        "native_stop_assignment_pending", exact_backup_verified=True
+    ) == "warning"
+    assert classify_protection_incident(
+        "take_profit_convergence_ready", exact_backup_verified=True
+    ) == "healthy"
+    assert classify_protection_incident(
+        "convergence_submit_unknown", exact_backup_verified=True
+    ) == "critical"
+    assert classify_protection_incident(
+        "position_owner_unverified", exact_backup_verified=False
+    ) == "critical"
+
+
 def test_monitor_notification_failure_is_adapted_without_changing_outcome(tmp_path):
     session_factory = create_session_factory(tmp_path / "monitor-notify-failure.db")
     adapters = _RecordingAdapters(service_state="failed")

@@ -1164,6 +1164,8 @@ def load_strategy_record_detail(
                 primary_rows=primary_stop_rows,
                 backup_rows=backup_stop_rows,
                 incidents=protection_incident_rows,
+                intents=trigger_protection_intents,
+                convergences=trigger_take_profit_convergences,
             ),
             "protection_incidents": [
                 _protection_incident_detail(row) for row in protection_incident_rows
@@ -1389,6 +1391,15 @@ def _trigger_protection_recovery_detail(
                 "parent_order_id": intent.parent_trigger_order_id,
                 "pos_id": pos_id,
                 "recovery_state": str(intent.recovery_state),
+                **(
+                    {
+                        "recovery_disposition": _bounded_reason_code(
+                            intent.recovery_disposition
+                        )
+                    }
+                    if intent.recovery_disposition
+                    else {}
+                ),
                 "retry_attempts": int(intent.retry_attempts),
                 "adopted_tpsl_order_ids": adopted_order_ids,
                 "refusal_code": refusal_code,
@@ -1460,6 +1471,8 @@ def _protection_state_detail(
     primary_rows: list[PositionProtectionLedger],
     backup_rows: list[PositionBackupStopOrder],
     incidents: list[PositionProtectionIncident],
+    intents: list[TriggerProtectionIntent] = (),
+    convergences: list[TriggerTakeProfitConvergence] = (),
 ) -> list[dict[str, object]]:
     """Project exact primary/backup protection health without exposing raw payloads."""
 
@@ -1488,8 +1501,58 @@ def _protection_state_detail(
             row for row in incidents
             if int(row.execution_order_leg_id) == leg_id and str(row.pos_id) == pos_id
         ]
+        matching_intents = [
+            row for row in intents if int(row.execution_order_leg_id) == leg_id
+        ]
+        intent = matching_intents[-1] if matching_intents else None
+        convergence = next(
+            (
+                row for row in reversed(convergences)
+                if int(row.execution_order_leg_id) == leg_id
+                and str(row.pos_id or pos_id) == pos_id
+            ),
+            None,
+        )
         primary_status = str(primary.status) if primary is not None else "not_verified"
         backup_status = str(backup.status) if backup is not None else "not_created"
+        position_owner_verified = any(
+            int(leg.id) == leg_id
+            and str(leg.attribution_status or "") in {"verified", "bound"}
+            and str(leg.pos_id or "") == pos_id
+            for leg in order_legs
+        )
+        exact_backup_stop_verified = bool(
+            backup is not None
+            and backup_status == "active"
+            and str(backup.order_id or "").strip()
+        )
+        native_stop_assignment_pending = bool(
+            intent is not None
+            and str(intent.recovery_state) in {"pending", "retrying", "failed"}
+            and str(intent.recovery_disposition or "retry") in {"retry", "exact_backup"}
+            and primary_status not in {"verified", "active"}
+        )
+        convergence_status = str(convergence.status) if convergence is not None else "none"
+        take_profit_convergence_waiting = convergence_status in {
+            "waiting_position", "waiting_backup_stop"
+        }
+        take_profit_convergence_ready = convergence_status in {
+            "ready", "reserved", "submitted"
+        }
+        manual_review_required = bool(
+            intent is not None
+            and str(intent.recovery_disposition or "") in {"manual_review", "terminal"}
+        ) or bool(
+            convergence is not None
+            and (
+                convergence_status == "submit_unknown"
+                or str(convergence.reason_code or "")
+                in {"convergence_exact_leg_not_verified", "convergence_submit_unknown"}
+            )
+        )
+        risk_reduction_capability_available = bool(
+            position_owner_verified and not manual_review_required
+        )
         blocker = next(
             (
                 str(row.incident_type)
@@ -1498,7 +1561,13 @@ def _protection_state_detail(
             ),
             None,
         )
-        if primary_status == "stop_trigger_failed" and backup_status == "active":
+        if not position_owner_verified:
+            message = "持仓归属未验证"
+        elif manual_review_required:
+            message = "仓位管理需要人工复核"
+        elif native_stop_assignment_pending and risk_reduction_capability_available:
+            message = "原生止损归属待恢复；精确仓位可继续风险降低操作"
+        elif primary_status == "stop_trigger_failed" and backup_status == "active":
             message = "主止损失败，第二止损有效"
         elif backup is None:
             message = "第二止损未创建/证据未知"
@@ -1518,6 +1587,13 @@ def _protection_state_detail(
                 "backup_stop_status": backup_status,
                 "backup_order_id": str(backup.order_id) if backup and backup.order_id else None,
                 "backup_stop_blocker": blocker,
+                "position_owner_verified": position_owner_verified,
+                "native_stop_assignment_pending": native_stop_assignment_pending,
+                "exact_backup_stop_verified": exact_backup_stop_verified,
+                "take_profit_convergence_waiting": take_profit_convergence_waiting,
+                "take_profit_convergence_ready": take_profit_convergence_ready,
+                "risk_reduction_capability_available": risk_reduction_capability_available,
+                "manual_review_required": manual_review_required,
                 "operator_message": message,
             }
         )

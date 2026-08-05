@@ -592,6 +592,13 @@ def test_load_strategy_record_detail_builds_full_evidence_chain(tmp_path):
         "backup_stop_status": "active",
         "backup_order_id": "backup-stop-1",
         "backup_stop_blocker": None,
+        "position_owner_verified": True,
+        "native_stop_assignment_pending": False,
+        "exact_backup_stop_verified": True,
+        "take_profit_convergence_waiting": False,
+        "take_profit_convergence_ready": False,
+        "risk_reduction_capability_available": True,
+        "manual_review_required": False,
         "operator_message": "主止损失败，第二止损有效",
     }]
 
@@ -744,6 +751,53 @@ def test_strategy_detail_projects_exact_protection_revision_history(tmp_path):
         },
     ]
     assert "foreign" not in str(detail["execution"]["protection_revisions"])
+
+
+def test_verified_position_with_recoverable_stop_ambiguity_keeps_risk_reduction_available(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "recoverable-stop-detail.db")
+    with session_factory() as session:
+        binding, lifecycle, leg = _seed_trigger_entry_strategy(session)
+        session.add(TriggerProtectionIntent(
+            venue="deepcoin",
+            execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id,
+            request_fingerprint="b" * 64,
+            pre_submit_tpsl_baseline_json="[]",
+            correlation_id="recoverable-stop-detail",
+            recovery_state="failed",
+            recovery_disposition="exact_backup",
+        ))
+        session.add(PositionBackupStopOrder(
+            venue="deepcoin",
+            execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id,
+            pos_id="pos-adopted",
+            instrument_id="BTC-USDT-SWAP",
+            side="long",
+            trigger_price="59500",
+            order_id="backup-exact-1",
+            client_order_id="backup-exact-client-1",
+            status="active",
+            request_json="{}",
+        ))
+        session.commit()
+        lifecycle_id = int(lifecycle.id)
+
+    detail = load_strategy_record_detail(
+        session_factory, lifecycle_id=lifecycle_id, group_labels_by_chat_id={}
+    )
+
+    state = detail["execution"]["protection_states"][0]
+    assert state["position_owner_verified"] is True
+    assert state["native_stop_assignment_pending"] is True
+    assert state["exact_backup_stop_verified"] is True
+    assert state["risk_reduction_capability_available"] is True
+    assert state["manual_review_required"] is False
+    assert state["operator_message"] == (
+        "原生止损归属待恢复；精确仓位可继续风险降低操作"
+    )
 
 
 def test_strategy_detail_marks_ambiguous_trigger_protection_refusal_actionable(tmp_path):

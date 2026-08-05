@@ -1243,6 +1243,7 @@ def capture_uncaptured_runtime_incident_sources(
     """Best-effort scan durable sources outside listener and trading paths."""
 
     from telegram_kol_research.models import (
+        PositionBackupStopOrder,
         PositionProtectionIncident,
         RuntimeIncident,
         StrategyManagementBatch,
@@ -1357,10 +1358,27 @@ def capture_uncaptured_runtime_incident_sources(
                         int(source.id),
                         str(source.incident_type),
                         source.created_at,
+                        bool(
+                            session.query(PositionBackupStopOrder.id)
+                            .filter(
+                                PositionBackupStopOrder.execution_order_leg_id
+                                == source.execution_order_leg_id,
+                                PositionBackupStopOrder.pos_id == source.pos_id,
+                                PositionBackupStopOrder.status == "active",
+                                PositionBackupStopOrder.order_id.is_not(None),
+                            )
+                            .first()
+                        ),
                     )
                     for source in sources
                 ]
-            for source_id, incident_type, created_at in projected_sources:
+            for source_id, incident_type, created_at, exact_backup_verified in projected_sources:
+                classification = classify_protection_incident(
+                    incident_type,
+                    exact_backup_verified=exact_backup_verified,
+                )
+                if classification == "healthy":
+                    continue
                 occurred_at = created_at
                 if occurred_at.tzinfo is None:
                     occurred_at = occurred_at.replace(tzinfo=UTC)
@@ -1368,7 +1386,7 @@ def capture_uncaptured_runtime_incident_sources(
                     session_factory,
                     config=config,
                     source_record_id=str(source_id),
-                    severity="high",
+                    severity="high" if classification == "critical" else "medium",
                     reason_code=incident_type,
                     occurred_at=occurred_at,
                 )
@@ -1380,6 +1398,39 @@ def capture_uncaptured_runtime_incident_sources(
             type(exc).__name__,
         )
         return 0
+
+
+def classify_protection_incident(
+    incident_type: str,
+    *,
+    exact_backup_verified: bool,
+) -> str:
+    """Map bounded protection state to operator severity."""
+
+    normalized = str(incident_type or "").strip().lower()
+    if normalized in {
+        "backup_stop_shadow_ready",
+        "stop_rescue_shadow_ready",
+        "take_profit_convergence_ready",
+        "take_profit_convergence_completed",
+    }:
+        return "healthy"
+    if normalized in {
+        "backup_exchange_outcome_unknown",
+        "convergence_submit_unknown",
+        "immutable_ownership_conflict",
+        "position_owner_unverified",
+    }:
+        return "critical"
+    if exact_backup_verified and normalized in {
+        "protection_assignment_not_mutual_unique",
+        "trigger_protection_assignment_not_mutual_unique",
+        "backup_stop_blocked",
+        "native_stop_assignment_pending",
+        "stop_trigger_failed",
+    }:
+        return "warning"
+    return "critical"
 
 
 def send_monitor_test_notification(
