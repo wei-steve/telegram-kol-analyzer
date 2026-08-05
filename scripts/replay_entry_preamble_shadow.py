@@ -80,9 +80,21 @@ def replay_entry_preamble_shadow(
                 """,
                 raw_ids,
             ).fetchall()
+            candidate_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(signal_candidates)"
+                ).fetchall()
+            }
+            management_projection = (
+                "management_action"
+                if "management_action" in candidate_columns
+                else "NULL AS management_action"
+            )
             candidate_rows = connection.execute(
                 f"""
-                SELECT raw_message_id, symbol, side, event_type
+                SELECT raw_message_id, symbol, side, event_type,
+                       {management_projection}
                 FROM signal_candidates
                 WHERE raw_message_id IN ({placeholders})
                 """,
@@ -139,12 +151,14 @@ def replay_entry_preamble_shadow(
                 risk_multiplier=multiplier,
             )
         )
-    for raw_id, symbol, side, event_type in candidate_rows:
+    for raw_id, symbol, side, event_type, management_action in candidate_rows:
         kind = {
             "entry_signal": "complete_entry",
             "strategy_revision": "replacement",
             "close_signal": "cancel_entry",
         }.get(str(event_type))
+        if str(management_action or "") in {"cancel_entry", "cancel"}:
+            kind = "cancel_entry"
         if kind is None:
             continue
         raw = raw_by_id[int(raw_id)]

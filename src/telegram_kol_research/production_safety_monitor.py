@@ -612,6 +612,8 @@ def read_entry_preamble_invariants(
         "entry_preambles",
         "entry_strategy_assemblies",
         "execution_bindings",
+        "raw_messages",
+        "signal_candidates",
     }
     reasons: set[str] = set()
     uri = f"file:{database_path}?mode=ro"
@@ -625,21 +627,48 @@ def read_entry_preamble_invariants(
         }
         if not required_tables.issubset(available):
             return ()
-        if connection.execute(
+        pending_rows = connection.execute(
             """
-            SELECT 1 FROM entry_preambles
-            WHERE status = 'pending' AND created_at < ? LIMIT 1
-            """,
-            (stale_before.isoformat(sep=" "),),
-        ).fetchone():
+            SELECT p.chat_id, p.symbol, p.side, p.created_at,
+                   r.posted_at, r.message_id, r.id
+            FROM entry_preambles AS p
+            JOIN raw_messages AS r ON r.id = p.raw_message_id
+            WHERE p.status = 'pending'
+            ORDER BY r.posted_at, r.message_id, r.id
+            LIMIT 1001
+            """
+        ).fetchall()
+        boundary_rows = connection.execute(
+            """
+            SELECT r.chat_id, r.posted_at, r.message_id, r.id
+            FROM signal_candidates AS c
+            JOIN raw_messages AS r ON r.id = c.raw_message_id
+            WHERE c.event_type IN ('entry_signal', 'strategy_revision', 'close_signal')
+               OR c.management_action IN ('cancel_entry', 'cancel')
+            ORDER BY r.posted_at, r.message_id, r.id
+            LIMIT 1001
+            """
+        ).fetchall()
+        boundary_keys: dict[int, list[tuple[str, int, int]]] = {}
+        for chat_id, posted_at, message_id, raw_id in boundary_rows:
+            boundary_keys.setdefault(int(chat_id), []).append(
+                (str(posted_at or ""), int(message_id), int(raw_id))
+            )
+        eligible = []
+        for row in pending_rows:
+            source_key = (str(row[4] or ""), int(row[5]), int(row[6]))
+            if any(
+                key > source_key for key in boundary_keys.get(int(row[0]), [])
+            ):
+                continue
+            eligible.append(row)
+        if any(str(row[3]) < stale_before.isoformat(sep=" ") for row in eligible):
             reasons.add("stale_entry_preamble_unresolved")
-        if connection.execute(
-            """
-            SELECT 1 FROM entry_preambles
-            WHERE status = 'pending'
-            GROUP BY chat_id, symbol, side HAVING COUNT(*) > 1 LIMIT 1
-            """
-        ).fetchone():
+        targets: dict[tuple[int, str, str], int] = {}
+        for row in eligible:
+            target = (int(row[0]), str(row[1]), str(row[2]))
+            targets[target] = targets.get(target, 0) + 1
+        if any(count > 1 for count in targets.values()):
             reasons.add("entry_preamble_ambiguous")
         evidence_rows = connection.execute(
             """

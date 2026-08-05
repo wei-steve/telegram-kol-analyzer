@@ -327,9 +327,11 @@ def test_entry_preamble_monitor_reader_detects_faults_without_writes(tmp_path):
     connection.executescript(
         """
         CREATE TABLE entry_preambles (
-          id INTEGER PRIMARY KEY, chat_id INTEGER, symbol TEXT, side TEXT,
-          status TEXT, created_at TEXT
+          id INTEGER PRIMARY KEY, raw_message_id INTEGER, chat_id INTEGER,
+          message_id INTEGER, symbol TEXT, side TEXT, status TEXT, created_at TEXT
         );
+        CREATE TABLE raw_messages (id INTEGER PRIMARY KEY, chat_id INTEGER, message_id INTEGER, posted_at TEXT);
+        CREATE TABLE signal_candidates (id INTEGER PRIMARY KEY, raw_message_id INTEGER, event_type TEXT, management_action TEXT);
         CREATE TABLE entry_strategy_assemblies (
           id INTEGER PRIMARY KEY, strategy_instance_id TEXT, fingerprint TEXT
         );
@@ -337,8 +339,11 @@ def test_entry_preamble_monitor_reader_detects_faults_without_writes(tmp_path):
           id INTEGER PRIMARY KEY, strategy_instance_id TEXT, payload_json TEXT
         );
         INSERT INTO entry_preambles VALUES
-          (1, 9, 'BTCUSDT', 'long', 'pending', '2026-08-04 00:00:00'),
-          (2, 9, 'BTCUSDT', 'long', 'pending', '2026-08-04 00:01:00');
+          (1, 101, 9, 9901, 'BTCUSDT', 'long', 'pending', '2026-08-04 00:00:00'),
+          (2, 102, 9, 9902, 'BTCUSDT', 'long', 'pending', '2026-08-04 00:01:00');
+        INSERT INTO raw_messages VALUES
+          (101, 9, 9901, '2026-08-04 00:00:00'),
+          (102, 9, 9902, '2026-08-04 00:01:00');
         INSERT INTO entry_strategy_assemblies VALUES
           (1, 'strategy-1', 'assembly-fingerprint');
         INSERT INTO execution_bindings VALUES
@@ -359,6 +364,36 @@ def test_entry_preamble_monitor_reader_detects_faults_without_writes(tmp_path):
         "live_entry_preamble_binding_evidence_missing",
     }
     assert database.read_bytes() == before
+
+
+def test_entry_preamble_monitor_ignores_shadow_preamble_behind_entry_boundary(tmp_path):
+    database = tmp_path / "entry-preamble-shadow-monitor.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE entry_preambles (id INTEGER PRIMARY KEY, raw_message_id INTEGER, chat_id INTEGER, message_id INTEGER, symbol TEXT, side TEXT, status TEXT, created_at TEXT);
+        CREATE TABLE raw_messages (id INTEGER PRIMARY KEY, chat_id INTEGER, message_id INTEGER, posted_at TEXT);
+        CREATE TABLE signal_candidates (id INTEGER PRIMARY KEY, raw_message_id INTEGER, event_type TEXT, management_action TEXT);
+        CREATE TABLE entry_strategy_assemblies (id INTEGER PRIMARY KEY, strategy_instance_id TEXT, fingerprint TEXT);
+        CREATE TABLE execution_bindings (id INTEGER PRIMARY KEY, strategy_instance_id TEXT, payload_json TEXT);
+        INSERT INTO raw_messages VALUES
+          (101, 9, 9901, '2026-08-04 00:00:00'),
+          (102, 9, 9902, '2026-08-04 00:01:00'),
+          (103, 9, 9903, '2026-08-04 00:02:00');
+        INSERT INTO entry_preambles VALUES
+          (1, 101, 9, 9901, 'BTCUSDT', 'long', 'pending', '2026-08-04 00:00:00'),
+          (2, 103, 9, 9903, 'BTCUSDT', 'long', 'pending', '2026-08-04 00:02:00');
+        INSERT INTO signal_candidates VALUES (1, 102, 'entry_signal', NULL);
+        """
+    )
+    connection.commit()
+
+    codes = read_entry_preamble_invariants(
+        database,
+        now=datetime(2026, 8, 4, 0, 3, tzinfo=UTC),
+    )
+
+    assert codes == ()
 
 
 def test_composite_monitor_reader_detects_persisted_faults_without_writes(tmp_path):

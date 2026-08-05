@@ -124,6 +124,16 @@ def persist_authoritative_entry_preamble(
         return None
     if mode not in {"shadow", "live"}:
         raise ValueError("entry preamble mode must be disabled, shadow, or live")
+    strategy = payload.get("strategy")
+    lifecycle = payload.get("lifecycle_event")
+    if (
+        payload.get("recognition_result") != "非策略"
+        or not isinstance(strategy, Mapping)
+        or bool(strategy)
+        or not isinstance(lifecycle, Mapping)
+        or str(lifecycle.get("event_type") or "") != "none"
+    ):
+        return None
     evidence = normalize_entry_preamble_evidence(payload.get("entry_context"))
     if evidence is None:
         return None

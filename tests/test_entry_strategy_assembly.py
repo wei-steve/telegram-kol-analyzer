@@ -262,6 +262,36 @@ def test_live_assembly_atomically_consumes_once_and_reuses_result(tmp_path):
         assert session.query(EntryStrategyAssembly).count() == 1
 
 
+def test_disabled_retry_does_not_reuse_existing_live_multiplier(tmp_path):
+    from telegram_kol_research.entry_strategy_assembly import assemble_entry_strategy
+
+    session_factory = create_session_factory(tmp_path / "disabled-retry.db")
+    strategy_raw_id, candidate_id, _ = _persist_pair(session_factory)
+    assemble_entry_strategy(
+        session_factory,
+        strategy_raw_message_id=strategy_raw_id,
+        signal_candidate_id=candidate_id,
+        strategy_instance_id="crash-before-binding",
+        mode="live",
+        live_chat_ids={-1002337721508},
+        assembled_at=NOW + timedelta(minutes=2),
+    )
+
+    retry = assemble_entry_strategy(
+        session_factory,
+        strategy_raw_message_id=strategy_raw_id,
+        signal_candidate_id=candidate_id,
+        strategy_instance_id="crash-before-binding",
+        mode="disabled",
+        live_chat_ids=set(),
+        assembled_at=NOW + timedelta(minutes=3),
+    )
+
+    assert retry.status == "disabled"
+    assert retry.proposed_risk_multiplier == Decimal("1")
+    assert retry.effective_risk_multiplier == Decimal("1")
+
+
 def test_shadow_reports_proposal_without_consuming_or_changing_effective_risk(tmp_path):
     from telegram_kol_research.entry_strategy_assembly import assemble_entry_strategy
 

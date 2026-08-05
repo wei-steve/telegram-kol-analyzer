@@ -320,6 +320,15 @@ def assemble_entry_strategy(
             raise ValueError("candidate does not belong to strategy message")
         if candidate.event_type != "entry_signal" or not candidate.symbol or not candidate.side:
             raise ValueError("candidate is not a complete entry")
+        if mode == "disabled":
+            return EntryAssemblyResult(
+                status="disabled",
+                reason_code=None,
+                mode=mode,
+                proposed_risk_multiplier=Decimal("1"),
+                effective_risk_multiplier=Decimal("1"),
+                strategy_message_id=int(strategy_message.message_id),
+            )
         existing = (
             session.query(EntryStrategyAssembly)
             .filter(
@@ -333,16 +342,6 @@ def assemble_entry_strategy(
             if preamble is None:
                 raise RuntimeError("entry strategy assembly lost its preamble")
             return _result_from_assembly(existing, preamble, mode=mode)
-        if mode == "disabled":
-            return EntryAssemblyResult(
-                status="disabled",
-                reason_code=None,
-                mode=mode,
-                proposed_risk_multiplier=Decimal("1"),
-                effective_risk_multiplier=Decimal("1"),
-                strategy_message_id=int(strategy_message.message_id),
-            )
-
         decision = select_entry_preamble(
             strategy_posted_at=strategy_message.posted_at,
             strategy_message_id=int(strategy_message.message_id),
