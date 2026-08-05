@@ -382,7 +382,6 @@ def assemble_entry_strategy(
     signal_candidate_id: int,
     strategy_instance_id: str,
     mode: str,
-    live_chat_ids: set[int],
     assembled_at: datetime,
 ) -> EntryAssemblyResult:
     """Propose or atomically persist one strategy/preamble assembly."""
@@ -407,10 +406,7 @@ def assemble_entry_strategy(
             .one_or_none()
         )
         if existing is not None:
-            if (
-                mode != "live"
-                or int(strategy_message.chat_id) not in live_chat_ids
-            ):
+            if mode != "live":
                 return EntryAssemblyResult(
                     status="blocked",
                     reason_code="existing_entry_assembly_not_live_authorized",
@@ -456,7 +452,7 @@ def assemble_entry_strategy(
         preamble = session.get(EntryPreamble, int(decision.preamble_id))
         if preamble is None:
             raise RuntimeError("selected preamble disappeared")
-        if mode == "shadow" or int(strategy_message.chat_id) not in live_chat_ids:
+        if mode == "shadow":
             _, fingerprint = _proposed_evidence(
                 preamble=preamble,
                 strategy_message=strategy_message,

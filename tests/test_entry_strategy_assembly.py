@@ -250,7 +250,6 @@ def test_live_assembly_atomically_consumes_once_and_reuses_result(tmp_path):
         signal_candidate_id=candidate_id,
         strategy_instance_id="deepcoin:-1002337721508:9902:BTC:short",
         mode="live",
-        live_chat_ids={-1002337721508},
         assembled_at=NOW + timedelta(minutes=2),
     )
 
@@ -275,18 +274,16 @@ def test_non_live_retry_blocks_existing_live_assembly(tmp_path):
         signal_candidate_id=candidate_id,
         strategy_instance_id="crash-before-binding",
         mode="live",
-        live_chat_ids={-1002337721508},
         assembled_at=NOW + timedelta(minutes=2),
     )
 
-    for mode, allowlist in (("disabled", set()), ("shadow", set()), ("live", set())):
+    for mode in ("disabled", "shadow"):
         retry = assemble_entry_strategy(
             session_factory,
             strategy_raw_message_id=strategy_raw_id,
             signal_candidate_id=candidate_id,
             strategy_instance_id="crash-before-binding",
             mode=mode,
-            live_chat_ids=allowlist,
             assembled_at=NOW + timedelta(minutes=3),
         )
 
@@ -307,7 +304,6 @@ def test_shadow_reports_proposal_without_consuming_or_changing_effective_risk(tm
         signal_candidate_id=candidate_id,
         strategy_instance_id="deepcoin:-1002337721508:9902:BTC:short",
         mode="shadow",
-        live_chat_ids=set(),
         assembled_at=NOW + timedelta(minutes=2),
     )
 
@@ -363,7 +359,6 @@ def test_expired_extraction_claim_does_not_defer_assembly(tmp_path):
         signal_candidate_id=candidate_id,
         strategy_instance_id="expired-claim-strategy",
         mode="shadow",
-        live_chat_ids=set(),
         assembled_at=NOW + timedelta(minutes=2),
     )
 
@@ -391,7 +386,6 @@ def test_unclaimed_prior_message_defers_following_entry(tmp_path):
         signal_candidate_id=candidate_id,
         strategy_instance_id="queued-prior",
         mode="live",
-        live_chat_ids={-1002337721508},
         assembled_at=NOW + timedelta(minutes=2),
     )
 
@@ -435,7 +429,6 @@ def test_completed_preamble_evidence_without_persisted_row_defers_entry(tmp_path
         signal_candidate_id=candidate_id,
         strategy_instance_id="release-gap",
         mode="live",
-        live_chat_ids={-1002337721508},
         assembled_at=NOW + timedelta(minutes=2),
     )
 
@@ -486,7 +479,6 @@ def test_incomplete_authoritative_application_gap_defers_entry(tmp_path, normali
         signal_candidate_id=candidate_id,
         strategy_instance_id=f"gap-{hash(normalized_json)}",
         mode="live",
-        live_chat_ids={-1002337721508},
         assembled_at=NOW + timedelta(minutes=2),
     )
 
@@ -515,7 +507,7 @@ def test_live_assembly_fingerprint_is_unique_across_chats_with_same_message_ids(
             session.commit()
 
     results = [
-        assemble_entry_strategy(session_factory, strategy_raw_message_id=raw_id, signal_candidate_id=candidate_id, strategy_instance_id=f"strategy-{chat_id}", mode="live", live_chat_ids={chat_id}, assembled_at=NOW + timedelta(minutes=2))
+        assemble_entry_strategy(session_factory, strategy_raw_message_id=raw_id, signal_candidate_id=candidate_id, strategy_instance_id=f"strategy-{chat_id}", mode="live", assembled_at=NOW + timedelta(minutes=2))
         for raw_id, candidate_id, chat_id in pairs
     ]
 
