@@ -199,7 +199,6 @@ def save_trading_settings(
             .filter(TradingSetting.key == TRADING_SETTINGS_KEY)
             .one_or_none()
         )
-        merged_payload = dict(payload)
         persisted_payload: dict[str, Any] = {}
         if row is not None:
             try:
@@ -208,13 +207,7 @@ def save_trading_settings(
                 parsed_persisted = {}
             if isinstance(parsed_persisted, dict):
                 persisted_payload = parsed_persisted
-        if row is not None and "symbol_entry_thresholds" not in merged_payload:
-            if (
-                "symbol_entry_thresholds" in persisted_payload
-            ):
-                merged_payload["symbol_entry_thresholds"] = persisted_payload[
-                    "symbol_entry_thresholds"
-                ]
+        merged_payload = {**persisted_payload, **payload}
         settings = trading_settings_from_payload(merged_payload)
         stored_payload = settings.to_dict()
         if "entry_preamble_live_chat_ids" in persisted_payload:

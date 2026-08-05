@@ -98,6 +98,30 @@ def test_saving_settings_preserves_legacy_entry_preamble_allowlist_in_storage(tm
     assert stored["entry_preamble_live_chat_ids"] == [-1002, -1001]
 
 
+def test_saving_only_entry_preamble_mode_preserves_all_other_settings(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 77,
+            "allowed_symbols": ["SOL"],
+            "management_execution_mode": "live",
+        },
+    )
+
+    updated = save_trading_settings(
+        session_factory,
+        {"entry_preamble_mode": "live"},
+    )
+
+    assert updated.entry_preamble_mode == "live"
+    assert updated.auto_trade_enabled is True
+    assert updated.default_max_loss_usdt == 77
+    assert updated.allowed_symbols == ["SOL"]
+    assert updated.management_execution_mode == "live"
+
+
 def test_context_resolution_requires_live_trading_and_allowlisted_chat():
     settings = trading_settings_from_payload(
         {
