@@ -22,6 +22,9 @@ trading; there is no separate chat allowlist.
 5. Confirm the production safety monitor reports none of:
    `stale_entry_preamble_unresolved`, `entry_preamble_ambiguous`, or
    `live_entry_preamble_binding_evidence_missing`.
+6. Confirm the monitor was installed with
+   `--expected-entry-preamble-mode disabled`; a settings/expectation mismatch
+   raises `entry_preamble_mode_drift`.
 
 Historical messages created before this feature may not have an
 `entry_preambles` row even when their raw text said “半仓操作”. Do not fabricate or
@@ -31,7 +34,10 @@ that already contain authoritative preamble evidence.
 ## Live gate
 
 After explicit approval and a second check that no time-sensitive operation is
-active, change only `entry_preamble_mode` to `live`. This immediately affects
+active, stop the monitor timer, change only the trading setting
+`entry_preamble_mode` to `live`, then reinstall and re-enable the monitor with
+`--expected-entry-preamble-mode live`. Run the diagnostic unit and require a
+healthy result before returning the timer to service. This immediately affects
 new matching entries in all configured trading groups. An entry without a
 matching preamble continues to use its configured full risk budget.
 For a 20 USDT configured risk budget and a 50% multiplier, verify the operator
@@ -48,7 +54,9 @@ missing evidence, edits, or deletions must fail closed.
 
 ## Immediate rollback
 
-Set `entry_preamble_mode=disabled`. This prevents new persistence and assembly
+Stop the monitor timer, set `entry_preamble_mode=disabled`, and reinstall the
+monitor with `--expected-entry-preamble-mode disabled` before re-enabling it.
+This prevents new persistence and assembly
 and does not alter existing orders or positions. Do not delete existing preamble,
 assembly, recovery, draft, or execution-binding evidence. If a live order was
 already submitted, manage it through the normal attributed-position workflow;

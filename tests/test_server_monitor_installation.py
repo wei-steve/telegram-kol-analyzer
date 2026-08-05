@@ -69,6 +69,7 @@ def test_monitor_service_uses_dedicated_identity_and_exact_command():
         "--expected-head ${TELEGRAM_KOL_MONITOR_EXPECTED_HEAD} "
         "--expected-auto-trade-enabled "
         "--expected-management-mode live "
+        "--expected-entry-preamble-mode ${TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_PREAMBLE_MODE} "
         "--expected-max-concurrent-positions 4 "
         "--checkout-path /opt/telegram-kol-analyzer "
         "--settings-url http://127.0.0.1:8000/api/trading-settings "
@@ -291,6 +292,9 @@ def test_installer_creates_identity_and_allowlisted_monitor_environment():
     assert "TELEGRAM_KOL_SYSTEM_BOT_TOKEN" in installer
     assert "TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID" in installer
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_HEAD" in installer
+    assert "TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_PREAMBLE_MODE" in installer
+    assert "--expected-entry-preamble-mode" in installer
+    assert "disabled|shadow|live" in installer
     assert "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES" in installer
     assert "TELEGRAM_KOL_RUNTIME_MONITOR_CAPTURE_TOKEN" in installer
     assert "capture_policy" in installer

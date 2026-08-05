@@ -2240,6 +2240,10 @@ def monitor_production_safety(
         ...,
         "--expected-management-mode",
     ),
+    expected_entry_preamble_mode: str = typer.Option(
+        ...,
+        "--expected-entry-preamble-mode",
+    ),
     expected_max_concurrent_positions: int = typer.Option(
         ...,
         "--expected-max-concurrent-positions",
@@ -2318,6 +2322,7 @@ def monitor_production_safety(
             auto_trade_enabled=expected_auto_trade_enabled,
             management_execution_mode=expected_management_mode,
             max_concurrent_positions=expected_max_concurrent_positions,
+            entry_preamble_mode=expected_entry_preamble_mode,
         ),
         state_path=Path(state_path),
         adapters=ProductionSafetyAdapters(

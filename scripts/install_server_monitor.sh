@@ -7,17 +7,27 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 
 enable_timer=false
-case "$#:$*" in
-  "0:")
-    ;;
-  "1:--enable")
-    enable_timer=true
-    ;;
-  *)
-    echo "Usage: $0 [--enable]" >&2
-    exit 2
-    ;;
-esac
+expected_entry_preamble_mode=disabled
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --enable)
+      enable_timer=true
+      shift
+      ;;
+    --expected-entry-preamble-mode)
+      if [[ "$#" -lt 2 || ! "$2" =~ ^(disabled|shadow|live)$ ]]; then
+        echo "--expected-entry-preamble-mode requires disabled, shadow, or live." >&2
+        exit 2
+      fi
+      expected_entry_preamble_mode="$2"
+      shift 2
+      ;;
+    *)
+      echo "Usage: $0 [--enable] [--expected-entry-preamble-mode disabled|shadow|live]" >&2
+      exit 2
+      ;;
+  esac
+done
 
 PRODUCTION_ROOT="/opt/telegram-kol-analyzer"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -239,6 +249,7 @@ trap 'rm -f "$env_source"' EXIT
 chmod 0600 "$env_source"
 grep '^TELEGRAM_KOL_SYSTEM_BOT_' "$CREDENTIAL_FILE" > "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=%s\n' "$expected_head" >> "$env_source"
+printf 'TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_PREAMBLE_MODE=%s\n' "$expected_entry_preamble_mode" >> "$env_source"
 printf '%s\n' "$capture_policy" >> "$env_source"
 printf '%s\n' "$monitor_capture_token" >> "$env_source"
 

@@ -64,6 +64,7 @@ EXPECTATIONS = MonitorExpectations(
     auto_trade_enabled=True,
     management_execution_mode="live",
     max_concurrent_positions=4,
+    entry_preamble_mode="live",
 )
 
 
@@ -150,6 +151,8 @@ def test_cli_unreadable_state_reaches_bounded_monitor_handling(tmp_path, monkeyp
             "--expected-auto-trade-enabled",
             "--expected-management-mode",
             "live",
+            "--expected-entry-preamble-mode",
+            "live",
             "--expected-max-concurrent-positions",
             "4",
             "--state-path",
@@ -196,6 +199,8 @@ def test_cli_routes_incident_capture_to_trusted_loopback_writer(monkeypatch):
             "--expected-auto-trade-enabled",
             "--expected-management-mode",
             "live",
+            "--expected-entry-preamble-mode",
+            "live",
             "--expected-max-concurrent-positions",
             "4",
             "--runtime-incident-capture-url",
@@ -204,6 +209,7 @@ def test_cli_routes_incident_capture_to_trusted_loopback_writer(monkeypatch):
     )
 
     assert result.exit_code == 0, result.output
+    assert calls[0]["expectations"].entry_preamble_mode == "live"
     assert calls[0]["runtime_incident_session_factory"] is None
     assert calls[0]["runtime_incident_capture_token"] == "m" * 43
     assert calls[0]["runtime_incident_capture_url"].endswith(
@@ -219,6 +225,7 @@ def _snapshot(**overrides):
             "auto_trade_enabled": True,
             "management_execution_mode": "live",
             "max_concurrent_positions": 4,
+            "entry_preamble_mode": "live",
         },
         "journal_error_count": 0,
         "abnormal_events": (),
@@ -652,10 +659,12 @@ def test_monitor_inputs_and_result_are_frozen():
                     "auto_trade_enabled": False,
                     "management_execution_mode": "shadow",
                     "max_concurrent_positions": 8,
+                    "entry_preamble_mode": "shadow",
                 }
             ),
             (
                 "auto_trade_enabled_drift",
+                "entry_preamble_mode_drift",
                 "management_execution_mode_drift",
                 "max_concurrent_positions_drift",
             ),
@@ -685,6 +694,22 @@ def test_head_drift_is_version_context_not_safety_failure():
     }
 
 
+def test_entry_preamble_mode_drift_retains_only_valid_modes():
+    settings = dict(_snapshot().settings)
+    settings["entry_preamble_mode"] = "shadow"
+
+    result = evaluate_monitor_snapshot(_snapshot(settings=settings), EXPECTATIONS)
+
+    assert result.reason_codes == ("entry_preamble_mode_drift",)
+    assert result.details == {
+        "entry_preamble_mode": "shadow",
+        "expected_entry_preamble_mode": "live",
+    }
+    alert = format_monitor_alert(result, checked_at="2026-08-06T00:00:00+00:00")
+    assert "前置仓位提示模式与批准设置不同" in alert
+    assert "entry_preamble_mode_drift" in alert
+
+
 @pytest.mark.parametrize("invalid_expected", [1, "true", None])
 def test_malformed_expected_auto_trade_value_is_never_compared_or_retained(
     invalid_expected,
@@ -694,6 +719,7 @@ def test_malformed_expected_auto_trade_value_is_never_compared_or_retained(
         auto_trade_enabled=invalid_expected,
         management_execution_mode="live",
         max_concurrent_positions=4,
+        entry_preamble_mode="live",
     )
 
     result = evaluate_monitor_snapshot(_snapshot(), expectations)
@@ -1208,6 +1234,7 @@ def test_realistic_short_bot_token_is_rejected_from_every_string_detail():
                 "auto_trade_enabled": False,
                 "management_execution_mode": bot_token,
                 "max_concurrent_positions": 8,
+                "entry_preamble_mode": bot_token,
             },
             adapter_failures=(bot_token,),
         ),
@@ -1216,6 +1243,7 @@ def test_realistic_short_bot_token_is_rejected_from_every_string_detail():
             auto_trade_enabled=True,
             management_execution_mode=bot_token,
             max_concurrent_positions=4,
+            entry_preamble_mode=bot_token,
         ),
     )
 

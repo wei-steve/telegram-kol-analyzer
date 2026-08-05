@@ -586,6 +586,10 @@ such as `BTC 多单半仓操作` is neither persisted nor applied. `shadow` pers
 authoritative normalized evidence and reports the proposed multiplier, but the
 effective multiplier remains `1`. `live` applies the multiplier to every group
 already configured for automatic trading; there is no separate chat allowlist.
+The production safety monitor independently checks this value against
+`TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_PREAMBLE_MODE`. Install it with the same
+approved mode via `--expected-entry-preamble-mode`; any mismatch alerts as
+`entry_preamble_mode_drift`.
 
 `半仓操作` means `configured risk budget × 50%`; it does not mean half of
 the account balance, half of the order quantity, or half leverage. Sizing must

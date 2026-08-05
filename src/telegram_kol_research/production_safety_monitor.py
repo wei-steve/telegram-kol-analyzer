@@ -97,6 +97,7 @@ _FIXED_REASON_CODES = frozenset(
         "audit_abnormal",
         "audit_incomplete",
         "auto_trade_enabled_drift",
+        "entry_preamble_mode_drift",
         "duplicate_manual_close",
         "event_recovery_status",
         "event_unknown_status",
@@ -206,6 +207,10 @@ _FINGERPRINT_DETAIL_KEYS_BY_REASON = {
         "management_execution_mode",
         "expected_management_execution_mode",
     ),
+    "entry_preamble_mode_drift": (
+        "entry_preamble_mode",
+        "expected_entry_preamble_mode",
+    ),
     "max_concurrent_positions_drift": (
         "max_concurrent_positions",
         "expected_max_concurrent_positions",
@@ -263,6 +268,7 @@ class MonitorExpectations:
     auto_trade_enabled: bool
     management_execution_mode: str
     max_concurrent_positions: int
+    entry_preamble_mode: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -953,6 +959,7 @@ def read_loopback_settings(
         "auto_trade_enabled": payload.get("auto_trade_enabled"),
         "management_execution_mode": payload.get("management_execution_mode"),
         "max_concurrent_positions": payload.get("max_concurrent_positions"),
+        "entry_preamble_mode": payload.get("entry_preamble_mode"),
     }
 
 
@@ -1861,6 +1868,19 @@ def _evaluate_settings(
         details["max_concurrent_positions"] = position_limit
         details["expected_max_concurrent_positions"] = expected_limit
 
+    entry_preamble_mode = _safe_entry_preamble_mode(
+        settings.get("entry_preamble_mode")
+    )
+    expected_entry_preamble_mode = _safe_entry_preamble_mode(
+        expectations.entry_preamble_mode
+    )
+    if entry_preamble_mode is None or expected_entry_preamble_mode is None:
+        reasons.add("malformed_snapshot")
+    elif entry_preamble_mode != expected_entry_preamble_mode:
+        reasons.add("entry_preamble_mode_drift")
+        details["entry_preamble_mode"] = entry_preamble_mode
+        details["expected_entry_preamble_mode"] = expected_entry_preamble_mode
+
 
 def _evaluate_events(
     events: object,
@@ -2180,6 +2200,11 @@ _ALERT_RULES: Mapping[str, tuple[str, str, str]] = {
         "仓位管理模式与批准设置不同",
         "仓位管理模式与批准设置不同。",
     ),
+    "entry_preamble_mode_drift": (
+        "critical",
+        "前置仓位提示模式与批准设置不同",
+        "前置仓位提示模式与批准设置不同。",
+    ),
     "max_concurrent_positions_drift": (
         "critical",
         "持仓数量限制与批准设置不同",
@@ -2258,6 +2283,7 @@ _ALERT_REASON_PRIORITY = (
     "service_inactive",
     "auto_trade_enabled_drift",
     "management_execution_mode_drift",
+    "entry_preamble_mode_drift",
     "max_concurrent_positions_drift",
     "event_recovery_status",
     "adapter_failure",
@@ -2418,6 +2444,8 @@ def _safe_detail_value(key: str, value: object) -> str | None:
         return head[:12] if head is not None else "invalid"
     if key in {"management_execution_mode", "expected_management_execution_mode"}:
         return _safe_management_mode(value) or "invalid"
+    if key in {"entry_preamble_mode", "expected_entry_preamble_mode"}:
+        return _safe_entry_preamble_mode(value) or "invalid"
     if type(value) is bool:
         return "true" if value else "false"
     if _safe_count(value) is not None:
@@ -2439,6 +2467,12 @@ def _safe_git_head(value: object) -> str | None:
 
 def _safe_management_mode(value: object) -> str | None:
     if not isinstance(value, str) or value not in _MANAGEMENT_MODES:
+        return None
+    return value
+
+
+def _safe_entry_preamble_mode(value: object) -> str | None:
+    if value not in {"disabled", "shadow", "live"}:
         return None
     return value
 
