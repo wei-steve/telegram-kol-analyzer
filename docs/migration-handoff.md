@@ -778,3 +778,23 @@ Sibling TPSL rows may be written only when they share the returned order's
 exchange timestamp group, match the remaining requested TP/SL exactly, and are
 unique. Price-only, symbol/side-only, or non-unique historical rows stay
 unrepaired and must continue rendering as unverified rather than owned.
+
+## Composite-management v2 handoff
+
+The v2 contract preserves every clause of one MiMo-authoritative management
+message and executes ordered durable components. DeepSeek remains advisory and
+cannot replace the contract, choose a target, or authorize an exchange write.
+Completion requires confirmed evidence for TP consumption, exact partial-close
+convergence, and create-before-cancel main/backup protection replacement.
+
+Admission disable and recovery are different: `disabled` prevents new planning
+and writes, while an already-submitted unknown outcome remains durably frozen
+for read-only exchange reconciliation. There is no blind retry, ownership
+fallback, or automatic historical replay. Miya and Sanjie history must never be
+fed back through the live listener after migration.
+
+Missing v2 tables during a version transition are deployment context rather
+than a safety incident. Once present, missing completion evidence, duplicate
+close submissions, oversized retained TP, missing verified stops, and stalled
+components are fixed critical invariants. Live enablement requires a later
+reviewed shadow report and explicit approval.

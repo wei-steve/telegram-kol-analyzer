@@ -543,6 +543,22 @@ regenerate the dry run and obtain separate approval for the next head. A
 confirmed full exit terminates the old lifecycle; later steps for that
 lifecycle must be `terminally_skipped`.
 
+## Deploy composite-management v2 dormant
+
+Deploy v2 with `management_execution_mode=disabled`. Never use a current
+Telegram message, Miya/Sanjie history, or a synthetic live signal as a probe.
+Before pulling or restarting, prove read-only that there is no active batch or
+component, no active/unknown mutation/close/protection/rescue intent, every live
+position has exact ownership and verified protection, listener/checkpoint and
+reconciliation are healthy, and the production safety monitor has no safety
+reason code. Any in-flight or time-sensitive operation defers deployment.
+
+After the reviewed branch is pushed, use `scripts/server_git_update.ps1` and
+confirm the deployed SHA, migrations, disabled mode, service PID replacement,
+clean journal, and zero new exchange writes. Shadow replay may use only captured
+immutable input plus fake/read-only adapters. Enabling shadow or live is a
+separate approval and is not authorized by this dormant deployment.
+
 Apply cleanup:
 
 ```bash

@@ -1231,3 +1231,32 @@ TP1 成交；新的反向策略消息本身不能结束旧策略，也不能授�
 `disabled`。上线前先使用 `shadow`：它会保存行情和逐腿决策，但不会撤单、改止损或平仓。
 遇到 `automatic_break_even_*` 保护异常告警时，按告警中的任务 ID 和 `posId` 核对；在所有未知
 mutation 得到确定终态前不得切回 live。
+
+## 复合仓位管理 v2
+
+`止盈50% + 止损移到开仓价`是一份不可丢失子句的合同，按顺序持久化为
+`consume_take_profit_stage` → `converge_partial_close` →
+`replace_remaining_protection`。只有所有必需组件都为 `confirmed` 且均有交易所回读证据，才能称为完成。
+
+只读排查顺序：先核对原消息、MiMo 权威 payload 和不可变合同；再按 `sequence`
+查询组件状态、期望值、证据和最后进展时间；然后依次核对第一止盈终态、精确平仓差额、剩余仓位、保留止盈总量、新主止损和备用止损。
+
+```sql
+SELECT b.id, b.status, b.reason_code, c.id, c.sequence,
+       c.component_kind, c.status, c.reason_code,
+       c.last_progress_at, c.evidence_json
+FROM strategy_management_batches b
+JOIN strategy_management_components c ON c.management_batch_id = b.id
+WHERE b.id = :batch_id ORDER BY c.sequence, c.id;
+
+SELECT id, operation, pos_id, status, idempotency_key, updated_at
+FROM position_mutation_intents
+WHERE idempotency_key LIKE :component_id || ':%' ORDER BY id;
+```
+
+稳定告警码为 `completed_batch_missing_component_evidence`、
+`duplicate_composite_close_submission`、`live_position_retained_tp_oversized`、
+`composite_position_without_verified_stop` 和 `stalled_composite_component`。
+`submitting`、`submitted`、`recovery_required` 或未知结果一律禁止重新发单。
+将模式切为 `disabled` 只会阻止新批次，不会把已发出的未知结果当作回滚。
+米娅和三姐的历史消息永不自动重放；历史补操作必须单独只读规划、人工批准和交易所回读。
