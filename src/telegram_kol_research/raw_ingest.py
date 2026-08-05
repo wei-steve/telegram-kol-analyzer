@@ -9,6 +9,9 @@ from typing import Any
 
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.entry_preambles import (
+    invalidate_pending_entry_preamble_in_session,
+)
 from telegram_kol_research.models import MediaAsset, RawMessage, SyncCheckpoint
 from telegram_kol_research.time_utils import parse_datetime_to_utc_naive
 
@@ -115,6 +118,20 @@ def persist_normalized_messages(
                 inserted_current_message = True
                 inserted_message_keys.append((record.chat_id, record.message_id))
             else:
+                source_changed = any(
+                    (
+                        raw_message.text != record.text,
+                        raw_message.raw_payload != record.raw_payload,
+                        raw_message.reply_to_message_id != record.reply_to_message_id,
+                        raw_message.edit_date != record.edit_date,
+                    )
+                )
+                if source_changed:
+                    invalidate_pending_entry_preamble_in_session(
+                        session,
+                        raw_message_id=int(raw_message.id),
+                        now=record.edit_date or datetime.now(),
+                    )
                 raw_message.sender_id = record.sender_id
                 raw_message.sender_name = record.sender_name
                 raw_message.text = record.text

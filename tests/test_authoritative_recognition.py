@@ -379,6 +379,12 @@ def test_reanalysis_reuses_saved_mimo_evidence_without_model_call(
     monkeypatch,
 ):
     session_factory = create_session_factory(tmp_path / "reuse-evidence.db")
+    from telegram_kol_research.trading_settings import save_trading_settings
+
+    save_trading_settings(
+        session_factory,
+        {"entry_preamble_mode": "shadow"},
+    )
     with session_factory() as session:
         raw = RawMessage(chat_id=101, message_id=1462, text="更新上面的计划")
         session.add(raw)
@@ -431,6 +437,12 @@ def test_reanalysis_reuses_saved_mimo_evidence_without_model_call(
     assert assessment.mimo.input_kind == "text+image"
     assert assessment.mimo.payload["evidence"]["images"][0]["asset_id"] == 7
     assert assessment.mimo.payload["entry_context"]["risk_multiplier"] == "0.5"
+    with session_factory() as session:
+        from telegram_kol_research.models import EntryPreamble
+
+        preamble = session.query(EntryPreamble).one()
+        assert preamble.message_id == 1462
+        assert preamble.risk_multiplier == "0.5"
 
 
 def test_context_resolution_triggers_are_closed_and_auditable():

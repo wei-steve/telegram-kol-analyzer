@@ -267,7 +267,7 @@ class EntryPreamble(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     raw_message_id: Mapped[int] = mapped_column(
-        ForeignKey("raw_messages.id"), nullable=False, unique=True, index=True
+        ForeignKey("raw_messages.id"), nullable=False, index=True
     )
     chat_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     message_id: Mapped[int] = mapped_column(Integer, nullable=False)

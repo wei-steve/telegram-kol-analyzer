@@ -14,6 +14,10 @@ from typing import Any
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.entry_preambles import (
+    invalidate_pending_entry_preamble_in_session,
+)
+
 from telegram_kol_research.models import (
     ExecutionBinding,
     RawMessage,
@@ -309,6 +313,11 @@ def _bind_deletion_event_in_session(
     raw_message.source_status = "deleted"
     raw_message.deleted_at = event.occurred_at
     raw_message.deletion_event_fingerprint = event.event_fingerprint
+    invalidate_pending_entry_preamble_in_session(
+        session,
+        raw_message_id=int(raw_message.id),
+        now=updated_at,
+    )
     event.raw_message_id = raw_message.id
     event.binding_state = "bound"
     event.updated_at = updated_at

@@ -21,6 +21,9 @@ from telegram_kol_research.contextual_message_window import (
     ContextualMessageWindow,
     build_contextual_message_window,
 )
+from telegram_kol_research.entry_preambles import (
+    persist_authoritative_entry_preamble,
+)
 from telegram_kol_research.message_recognition import (
     MessageRecognitionResult,
     apply_authoritative_mimo_payload,
@@ -41,6 +44,7 @@ from telegram_kol_research.models import (
     SignalCandidate,
     StrategyLifecycle,
     StrategyThread,
+    utc_now,
 )
 from telegram_kol_research.recognition_decisions import (
     RecognitionDecisionRecord,
@@ -64,6 +68,7 @@ from telegram_kol_research.strategy_threads import (
     create_strategy_thread_for_lifecycle,
     link_message_to_strategy_thread,
 )
+from telegram_kol_research.trading_settings import load_trading_settings
 
 
 CONTEXT_TRIGGER_ORDER = (
@@ -730,6 +735,17 @@ def assess_message_authoritatively(
         saved = save_terminal_authoritative_decision(session_factory, decision)
     else:
         saved = save_pending_authoritative_decision(session_factory, decision)
+        if saved.comparison_claim_token:
+            settings = load_trading_settings(session_factory)
+            persist_authoritative_entry_preamble(
+                session_factory,
+                raw_message_id=int(raw_message_id),
+                evidence_version_id=int(evidence_row.id),
+                recognition_generation=str(saved.comparison_claim_token),
+                payload=mimo.payload,
+                mode=settings.entry_preamble_mode,
+                now=utc_now(),
+            )
     return AuthoritativeAssessment(
         raw_message_id=raw_message_id,
         mimo=mimo,
