@@ -201,6 +201,19 @@ def reconcile_strategy_management_batches(
         for batch in batches:
             if batch.effective_action not in _CLOSE_ACTIONS:
                 continue
+            if (
+                batch.status == "reconciling"
+                and batch.reason_code
+                == "management_subset_close_exchange_confirmed"
+            ):
+                # The original legs are already exchange-confirmed and their
+                # entry rows were intentionally terminalized.  This parent is
+                # only a durable wait handle for capability recovery; running
+                # normal identity checks again would misclassify that proven
+                # terminal state before the worker can create its successor.
+                counts["checked"] += 1
+                counts["pending"] += 1
+                continue
             legs = (
                 session.query(StrategyManagementLeg)
                 .filter(StrategyManagementLeg.management_batch_id == batch.id)
@@ -372,7 +385,17 @@ def reconcile_strategy_management_batches(
                     batch.completed_at = now
                     counts["succeeded"] += 1
                 if batch.effective_action in {"full_close", "full_exit"}:
-                    _terminalize_full_close(session, batch=batch, legs=legs, now=now)
+                    fully_terminal = _terminalize_full_close(
+                        session, batch=batch, legs=legs, now=now
+                    )
+                    if not fully_terminal:
+                        batch.status = "reconciling"
+                        batch.reason_code = (
+                            "management_subset_close_exchange_confirmed"
+                        )
+                        batch.completed_at = None
+                        counts["succeeded"] -= 1
+                        counts["pending"] += 1
                 else:
                     _confirm_partial_close(session, batch=batch, now=now)
                     if automatic_break_even_enabled and batch.effective_action in {
@@ -884,7 +907,10 @@ def _identity_is_exact(session, batch, legs) -> bool:
         (int(leg.execution_order_leg_id), str(leg.pos_id)) for leg in legs
     }
     deferred_leg_ids = _snapshot_deferred_entry_leg_ids(batch)
-    if deferred_leg_ids is None:
+    capability_deferred_leg_ids = (
+        _snapshot_capability_deferred_entry_leg_ids(batch)
+    )
+    if deferred_leg_ids is None or capability_deferred_leg_ids is None:
         return False
     seen: set[str] = set()
     for leg in legs:
@@ -912,12 +938,24 @@ def _identity_is_exact(session, batch, legs) -> bool:
         .all()
     )
     accepted_deferred_ids: set[int] = set()
+    accepted_capability_deferred_ids: set[int] = set()
     for row in all_entry_rows:
         if row.strategy_instance_id != batch.strategy_instance_id:
             return False
         row_identity = (int(row.id), str(row.pos_id)) if row.pos_id else None
         if row_identity in managed_identity:
             continue
+        if int(row.id) in capability_deferred_leg_ids:
+            if (
+                row.pos_id
+                and row.attribution_status == "verified"
+                and str(row.status or "").lower()
+                in _MANAGEABLE_ENTRY_LEG_STATES
+                and row.terminal_reason is None
+            ):
+                accepted_capability_deferred_ids.add(int(row.id))
+                continue
+            return False
         if (
             row.pos_id
             and str(row.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
@@ -942,7 +980,10 @@ def _identity_is_exact(session, batch, legs) -> bool:
                 accepted_deferred_ids.add(int(row.id))
                 continue
         return False
-    return accepted_deferred_ids == deferred_leg_ids
+    return (
+        accepted_deferred_ids == deferred_leg_ids
+        and accepted_capability_deferred_ids == capability_deferred_leg_ids
+    )
 
 
 def _snapshot_deferred_entry_leg_ids(batch) -> set[int] | None:
@@ -956,6 +997,26 @@ def _snapshot_deferred_entry_leg_ids(batch) -> set[int] | None:
     if not isinstance(identity, dict):
         return None
     values = identity.get("deferred_entry_leg_ids", [])
+    if (
+        not isinstance(values, list)
+        or any(type(value) is not int or value <= 0 for value in values)
+        or len(set(values)) != len(values)
+    ):
+        return None
+    return set(values)
+
+
+def _snapshot_capability_deferred_entry_leg_ids(batch) -> set[int] | None:
+    try:
+        snapshot = json.loads(batch.target_snapshot_json or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(snapshot, dict):
+        return None
+    identity = snapshot.get("identity")
+    if not isinstance(identity, dict):
+        return None
+    values = identity.get("capability_deferred_entry_leg_ids", [])
     if (
         not isinstance(values, list)
         or any(type(value) is not int or value <= 0 for value in values)
@@ -986,7 +1047,7 @@ def _is_management_cancelled_deferred_entry_leg(entry: ExecutionOrderLeg) -> boo
     )
 
 
-def _terminalize_full_close(session, *, batch, legs, now: datetime) -> None:
+def _terminalize_full_close(session, *, batch, legs, now: datetime) -> bool:
     binding = session.get(ExecutionBinding, batch.execution_binding_id)
     lifecycle = session.get(StrategyLifecycle, batch.target_lifecycle_id)
     if binding is None or lifecycle is None:
@@ -999,6 +1060,40 @@ def _terminalize_full_close(session, *, batch, legs, now: datetime) -> None:
         entry.terminal_reason = "management_full_close_confirmed"
         entry.last_verified_at = now
         entry.updated_at = now
+    remaining_entries = (
+        session.query(ExecutionOrderLeg)
+        .filter(
+            ExecutionOrderLeg.execution_binding_id == batch.execution_binding_id,
+            ExecutionOrderLeg.purpose == "entry",
+            ExecutionOrderLeg.pos_id.is_not(None),
+        )
+        .all()
+    )
+    remaining_active = [
+        entry for entry in remaining_entries
+        if str(entry.status or "").lower() not in TERMINAL_ENTRY_LEG_STATES
+        and str(entry.attribution_status or "") == "verified"
+        and str(entry.pos_id or "").strip()
+    ]
+    raw = session.get(RawMessage, batch.raw_message_id)
+    lifecycle.management_signal_message_id = (
+        int(raw.message_id) if raw is not None else None
+    )
+    if remaining_active:
+        binding.status = "active"
+        binding.pos_id = ",".join(sorted(
+            str(entry.pos_id) for entry in remaining_active
+        ))
+        binding.last_exchange_status = "management_subset_close_confirmed"
+        binding.recovered_at = now
+        binding.updated_at = now
+        lifecycle.management_action = "subset_full_close_confirmed"
+        lifecycle.management_note = (
+            "Exchange confirmed the safe subset; capability-deferred exact "
+            "positions remain active."
+        )
+        lifecycle.updated_at = now
+        return False
     binding.status = "closed"
     binding.pos_id = None
     binding.last_exchange_status = "management_full_close_confirmed"
@@ -1007,12 +1102,9 @@ def _terminalize_full_close(session, *, batch, legs, now: datetime) -> None:
     lifecycle.lifecycle_status = "exited"
     lifecycle.exit_reason = "kol_signal"
     lifecycle.exited_at = now
-    raw = session.get(RawMessage, batch.raw_message_id)
-    lifecycle.management_signal_message_id = (
-        int(raw.message_id) if raw is not None else None
-    )
     lifecycle.management_action = "full_close_confirmed"
     lifecycle.updated_at = now
+    return True
 
 
 def _confirm_partial_close(session, *, batch, now: datetime) -> None:

@@ -19,12 +19,14 @@ from telegram_kol_research.strategy_management_batches import (
     ManagementBatchRecord,
     TEMPORARY_VISIBILITY_REASONS,
     claim_worker_batch,
+    create_capability_deferred_successor_batch,
     create_race_resolved_successor_batch,
     list_worker_batches,
     load_management_batch,
     transition_batch,
 )
 from telegram_kol_research.strategy_management_executor import (
+    _MANAGEABLE_ENTRY_LEG_STATES,
     ManagementBatchExecutionError,
     execute_management_batch,
     validate_management_restart_snapshot,
@@ -44,6 +46,8 @@ from telegram_kol_research.message_instruction_items import (
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionMutationIntent,
+    StrategyLifecycle,
     StrategyManagementBatch,
 )
 from telegram_kol_research.position_attribution import (
@@ -113,6 +117,7 @@ def run_strategy_management_worker_tick(
     executor: Callable[..., Any] = execute_management_batch,
     binding_reconciler: Callable[..., Any] = reconcile_deepcoin_execution_bindings,
     race_successor_resolver: Callable[..., bool] | None = None,
+    capability_successor_resolver: Callable[..., bool] | None = None,
     restart_validator: Callable[..., None] = validate_management_restart_snapshot,
     cursor: StrategyManagementWorkerCursor | None = None,
     contract_spec_provider=None,
@@ -347,6 +352,25 @@ def run_strategy_management_worker_tick(
             )
         )
 
+    def resolve_capability_successor(
+        *, batch_id: int, current_snapshot: Any
+    ) -> bool:
+        if capability_successor_resolver is None:
+            return _resolve_capability_deferred_successor(
+                session_factory,
+                batch_id=batch_id,
+                snapshot=current_snapshot,
+                resolved_at=now,
+            )
+        return bool(
+            capability_successor_resolver(
+                session_factory,
+                batch_id=batch_id,
+                snapshot=current_snapshot,
+                resolved_at=now,
+            )
+        )
+
     for batch in batches:
         try:
             if batch.status == "blocked" and batch.reason_code in TEMPORARY_VISIBILITY_REASONS:
@@ -400,6 +424,30 @@ def run_strategy_management_worker_tick(
                     snapshot=current_snapshot,
                 )
                 resolve_race_successor(batch_id=batch.id, current_snapshot=current_snapshot)
+                counts["recovered"] += 1
+                continue
+            if (
+                batch.status == "reconciling"
+                and batch.reason_code
+                == "management_subset_close_exchange_confirmed"
+            ):
+                current_snapshot = get_snapshot()
+                reconciler(
+                    session_factory,
+                    snapshot=current_snapshot,
+                    reconciled_at=now,
+                    batch_ids=(batch.id,),
+                )
+                refreshed = load_management_batch(session_factory, batch.id)
+                if (
+                    refreshed.status == "reconciling"
+                    and refreshed.reason_code
+                    == "management_subset_close_exchange_confirmed"
+                ):
+                    resolve_capability_successor(
+                        batch_id=batch.id,
+                        current_snapshot=current_snapshot,
+                    )
                 counts["recovered"] += 1
                 continue
             if (
@@ -854,4 +902,318 @@ def _resolve_deferred_entry_cancel_race_successor(
             return load_management_batch(session_factory, parent.id).status == "resolved"
         except LookupError:
             return False
+    return True
+
+
+def _resolve_capability_deferred_successor(
+    session_factory, *, batch_id: int, snapshot: Any, resolved_at: datetime
+) -> bool:
+    """Plan the still-open exact subset after its mutation barrier clears."""
+
+    try:
+        if (
+            load_trading_settings(
+                session_factory
+            ).effective_position_management_liveness_v2_mode
+            != "live"
+        ):
+            return False
+        parent = load_management_batch(session_factory, int(batch_id))
+        if (
+            parent.status != "reconciling"
+            or parent.reason_code
+            != "management_subset_close_exchange_confirmed"
+            or parent.effective_action not in {"full_close", "full_exit"}
+            or not isinstance(parent.target_snapshot, dict)
+            or getattr(snapshot, "errors", None)
+        ):
+            return False
+        identity = parent.target_snapshot.get("identity")
+        contract_spec = parent.target_snapshot.get("contract_spec")
+        if not isinstance(identity, dict) or not isinstance(contract_spec, dict):
+            return False
+        deferred_ids = {
+            int(value)
+            for value in identity.get(
+                "capability_deferred_entry_leg_ids", []
+            )
+            if isinstance(value, int)
+            or (isinstance(value, str) and value.isdigit())
+        }
+        deferred_pos_ids = {
+            str(value)
+            for value in identity.get("capability_deferred_pos_ids", [])
+            if isinstance(value, str) and value.strip()
+        }
+        if not deferred_ids or not deferred_pos_ids:
+            return False
+        quantity_step = str(contract_spec["quantity_step"])
+        min_quantity = str(contract_spec["min_quantity"])
+        with session_factory() as session:
+            binding = session.get(ExecutionBinding, parent.execution_binding_id)
+            if (
+                binding is None
+                or binding.strategy_instance_id != parent.strategy_instance_id
+                or str(binding.venue or "").lower() != "deepcoin"
+                or str(binding.status or "").lower()
+                not in {"active", "open", "partial"}
+            ):
+                return False
+            entries = (
+                session.query(ExecutionOrderLeg)
+                .filter(ExecutionOrderLeg.id.in_(deferred_ids))
+                .all()
+            )
+            if {int(entry.id) for entry in entries} != deferred_ids:
+                return False
+            entries_by_id = {int(entry.id): entry for entry in entries}
+            ordered_entries = [
+                entries_by_id[leg_id] for leg_id in sorted(deferred_ids)
+            ]
+            if {
+                str(entry.pos_id) for entry in ordered_entries if entry.pos_id
+            } != deferred_pos_ids:
+                return False
+            bound_pos_ids = {
+                value.strip()
+                for value in str(binding.pos_id or "").split(",")
+                if value.strip()
+            }
+            if bound_pos_ids != deferred_pos_ids:
+                return False
+            unresolved = (
+                session.query(PositionMutationIntent.id)
+                .filter(PositionMutationIntent.venue == "deepcoin")
+                .filter(PositionMutationIntent.pos_id.in_(deferred_pos_ids))
+                .filter(
+                    PositionMutationIntent.status.in_(
+                        (
+                            "reserved",
+                            "submitted",
+                            "submit_unknown",
+                            "recovery_required",
+                        )
+                    )
+                )
+                .first()
+            )
+            if unresolved is not None:
+                return False
+            live_rows_by_pos_id: dict[str, list[dict[str, Any]]] = {
+                pos_id: [] for pos_id in deferred_pos_ids
+            }
+            for row in getattr(snapshot, "positions", ()):
+                if not isinstance(row, dict):
+                    continue
+                pos_id = str(
+                    row.get("posId")
+                    or row.get("pos_id")
+                    or row.get("id")
+                    or ""
+                )
+                if pos_id in live_rows_by_pos_id:
+                    live_rows_by_pos_id[pos_id].append(row)
+            if any(
+                len(rows) > 1 for rows in live_rows_by_pos_id.values()
+            ):
+                return False
+            gone_pos_ids = {
+                pos_id
+                for pos_id, rows in live_rows_by_pos_id.items()
+                if not rows
+            }
+            live_pos_ids = deferred_pos_ids - gone_pos_ids
+            entries_by_pos_id = {
+                str(entry.pos_id): entry for entry in ordered_entries
+            }
+            for pos_id in gone_pos_ids:
+                entry = entries_by_pos_id[pos_id]
+                if (
+                    entry.execution_binding_id != binding.id
+                    or entry.strategy_instance_id
+                    != parent.strategy_instance_id
+                    or str(entry.status or "").lower()
+                    not in _MANAGEABLE_ENTRY_LEG_STATES
+                    or entry.attribution_status != "verified"
+                    or entry.terminal_reason is not None
+                ):
+                    return False
+                confirmed_close = (
+                    session.query(PositionMutationIntent.id)
+                    .filter(
+                        PositionMutationIntent.venue == "deepcoin",
+                        PositionMutationIntent.operation == "close_position",
+                        PositionMutationIntent.strategy_instance_id
+                        == parent.strategy_instance_id,
+                        PositionMutationIntent.execution_binding_id
+                        == binding.id,
+                        PositionMutationIntent.execution_order_leg_id
+                        == entry.id,
+                        PositionMutationIntent.pos_id == pos_id,
+                        PositionMutationIntent.status == "confirmed",
+                    )
+                    .first()
+                )
+                if confirmed_close is None:
+                    return False
+            live_entries = [
+                entry
+                for entry in ordered_entries
+                if str(entry.pos_id) in live_pos_ids
+            ]
+            for entry in live_entries:
+                if (
+                    entry.execution_binding_id != binding.id
+                    or entry.strategy_instance_id != parent.strategy_instance_id
+                    or str(entry.status or "").lower()
+                    not in _MANAGEABLE_ENTRY_LEG_STATES
+                    or entry.attribution_status != "verified"
+                    or entry.terminal_reason is not None
+                    or not str(entry.pos_id or "")
+                ):
+                    return False
+                owner = require_verified_position_ownership(
+                    session, venue="deepcoin", pos_id=str(entry.pos_id)
+                )
+                if int(owner.id) != int(entry.id):
+                    return False
+                require_equivalent_live_position_economics(
+                    owner,
+                    live_positions=snapshot.positions,
+                    session=session,
+                )
+            if not live_entries:
+                lifecycle = session.get(
+                    StrategyLifecycle, parent.target_lifecycle_id
+                )
+                stored_parent = session.get(
+                    StrategyManagementBatch, parent.id
+                )
+                if lifecycle is None or stored_parent is None:
+                    return False
+                for pos_id in gone_pos_ids:
+                    entry = entries_by_pos_id[pos_id]
+                    entry.status = "closed"
+                    entry.terminal_reason = (
+                        "position_mutation_close_confirmed"
+                    )
+                    entry.last_verified_at = resolved_at
+                    entry.updated_at = resolved_at
+                binding.pos_id = None
+                binding.status = "closed"
+                binding.last_exchange_status = (
+                    "management_full_close_confirmed"
+                )
+                binding.recovered_at = resolved_at
+                lifecycle.lifecycle_status = "exited"
+                lifecycle.exit_reason = "kol_signal"
+                lifecycle.exited_at = resolved_at
+                lifecycle.management_action = "full_close_confirmed"
+                lifecycle.updated_at = resolved_at
+                stored_parent.status = "succeeded"
+                stored_parent.reason_code = (
+                    "management_full_close_exchange_confirmed"
+                )
+                stored_parent.reconciled_at = resolved_at
+                stored_parent.completed_at = resolved_at
+                stored_parent.updated_at = resolved_at
+                session.commit()
+                return True
+            ordered_entries = live_entries
+            economics = canonical_live_position_economics(
+                snapshot.positions,
+                target_pos_ids=[str(entry.pos_id) for entry in ordered_entries],
+                instrument_id=f"{str(binding.symbol).upper()}-USDT-SWAP",
+                side=str(binding.side),
+            )
+        close_sizes = allocate_close_sizes(
+            (position["size"] for position in economics),
+            fraction=1.0,
+            quantity_step=quantity_step,
+            min_quantity=min_quantity,
+        )
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        PositionAttributionError,
+        ManagementSizingError,
+    ):
+        return False
+    except Exception:
+        logger.exception(
+            "capability-deferred resolution failed for batch %s", batch_id
+        )
+        return False
+
+    positions_by_id = {
+        position["pos_id"]: position for position in economics
+    }
+    close_sizes_by_pos_id = {
+        position["pos_id"]: close_size
+        for position, close_size in zip(economics, close_sizes)
+    }
+    successor_snapshot = {
+        "execution_mode": parent.execution_mode,
+        "identity": {
+            "target_lifecycle_id": parent.target_lifecycle_id,
+            "execution_binding_id": parent.execution_binding_id,
+            "strategy_instance_id": parent.strategy_instance_id,
+            "manageable_entry_leg_ids": [
+                int(entry.id) for entry in ordered_entries
+            ],
+            "deferred_entry_leg_ids": [],
+            "capability_deferred_entry_leg_ids": [],
+            "capability_deferred_pos_ids": [],
+        },
+        "positions": [
+            {
+                **positions_by_id[str(entry.pos_id)],
+                "execution_order_leg_id": int(entry.id),
+            }
+            for entry in ordered_entries
+        ],
+        "deferred_entry_legs": [],
+        "contract_spec": contract_spec,
+        "protection": {},
+    }
+    legs = [
+        ManagementLegCreate(
+            execution_order_leg_id=int(entry.id),
+            pos_id=str(entry.pos_id),
+            leg_index=index,
+            preflight_size=positions_by_id[str(entry.pos_id)]["size"],
+            planned_close_size=close_sizes_by_pos_id[str(entry.pos_id)],
+            avg_entry_price=positions_by_id[str(entry.pos_id)][
+                "avg_entry_price"
+            ],
+            quantity_step=quantity_step,
+            last_exchange_snapshot=positions_by_id[str(entry.pos_id)],
+        )
+        for index, entry in enumerate(ordered_entries)
+    ]
+    try:
+        create_capability_deferred_successor_batch(
+            session_factory,
+            parent_batch_id=parent.id,
+            resolved_position_ids=[
+                str(entry.pos_id) for entry in ordered_entries
+            ],
+            target_snapshot=successor_snapshot,
+            legs=legs,
+            terminalized_entry_leg_ids=[
+                int(entries_by_pos_id[pos_id].id)
+                for pos_id in sorted(gone_pos_ids)
+            ],
+            remaining_binding_pos_ids=[
+                str(entry.pos_id) for entry in ordered_entries
+            ],
+            planned_at=resolved_at,
+        )
+    except Exception:
+        logger.exception(
+            "capability-deferred successor creation failed for batch %s",
+            batch_id,
+        )
+        return False
     return True

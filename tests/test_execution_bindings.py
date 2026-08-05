@@ -604,6 +604,7 @@ def _filled_entry_history(prefix, pos_id, fill_time):
 
 def test_reconcile_assigns_second_identical_split_stop_globally(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
+    _enable_liveness_live(session_factory)
     _seed_identical_filled_stop_intents(
         session_factory,
         first_already_owned=True,
@@ -662,6 +663,7 @@ def test_reconcile_assigns_second_identical_split_stop_globally(tmp_path):
 
 def test_reconcile_keeps_true_anonymous_stop_ambiguity_recoverable(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
+    _enable_liveness_live(session_factory)
     _seed_identical_filled_stop_intents(
         session_factory,
         first_already_owned=False,
@@ -705,6 +707,59 @@ def test_reconcile_keeps_true_anonymous_stop_ambiguity_recoverable(tmp_path):
     assert ledger_rows == []
     assert {intent.recovery_state for intent in intents} == {"retrying"}
     assert {intent.recovery_disposition for intent in intents} == {"exact_backup"}
+
+
+def test_shadow_global_assignment_is_evidence_only_and_not_authoritative(tmp_path):
+    session_factory = create_session_factory(tmp_path / "assignment-shadow.db")
+    save_trading_settings(session_factory, {
+        "position_management_liveness_v2_mode": "shadow",
+    })
+    _seed_identical_filled_stop_intents(
+        session_factory, first_already_owned=True,
+    )
+    positions = [
+        {
+            "instId": "ETH-USDT-SWAP", "posId": "first-pos",
+            "posSide": "short", "pos": "3.4",
+            "cTime": "2026-08-05T17:40:00Z",
+        },
+        {
+            "instId": "ETH-USDT-SWAP", "posId": "second-pos",
+            "posSide": "short", "pos": "3.4",
+            "cTime": "2026-08-05T18:00:00Z",
+        },
+    ]
+    pending = [
+        _anonymous_stop("second-stop", "2026-08-05T18:00:03Z"),
+        _anonymous_stop("first-stop", "2026-08-05T17:40:25Z"),
+    ]
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient(
+            pending,
+            positions=positions,
+            order_history_rows=[
+                _filled_entry_history("first", "first-pos", "2026-08-05T17:40:00Z"),
+                _filled_entry_history("second", "second-pos", "2026-08-05T18:00:00Z"),
+            ],
+        ),
+        recovered_at=datetime(2026, 8, 5, 18, 1),
+    )
+
+    with session_factory() as session:
+        ledger_orders = {
+            row.order_id for row in session.query(PositionProtectionLedger).all()
+        }
+        incidents = session.query(PositionProtectionIncident).filter_by(
+            incident_type="trigger_protection_assignment_shadow_plan"
+        ).all()
+    assert ledger_orders == {"first-stop"}
+    assert incidents
+    assert any(
+        json.loads(row.evidence_json).get("proposed_order_id") == "second-stop"
+        for row in incidents
+    )
 
 
 def test_reconcile_protection_adoption_records_unique_exact_trigger_entry_tpsl(tmp_path):

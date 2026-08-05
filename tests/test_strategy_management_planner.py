@@ -15,6 +15,7 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
     PositionProtectionIncident,
+    PositionMutationIntent,
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
@@ -31,6 +32,7 @@ from telegram_kol_research.strategy_management_contracts import (
     management_contract_fingerprint,
     serialize_management_contract,
 )
+from telegram_kol_research.trading_settings import save_trading_settings
 
 
 PLANNED_AT = datetime(2026, 7, 15, 8, 0, tzinfo=UTC)
@@ -997,6 +999,11 @@ def test_full_exit_records_independent_close_capability_for_each_exact_position(
 ):
     planner = _planner()
     session_factory = create_session_factory(tmp_path / "research.db")
+    save_trading_settings(session_factory, {
+        "auto_trade_enabled": True,
+        "management_execution_mode": "live",
+        "position_management_liveness_v2_mode": "live",
+    })
     raw_id, _, _ = _persist_exact_management_target(
         session_factory,
         intent="full_exit",
@@ -1033,6 +1040,58 @@ def test_full_exit_records_independent_close_capability_for_each_exact_position(
         and row["may_cancel_owned_protection"] is False
         for row in capabilities.values()
     )
+
+
+def test_live_capability_defers_only_the_position_with_unresolved_mutation(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "per-position-capability.db")
+    save_trading_settings(session_factory, {
+        "auto_trade_enabled": True,
+        "management_execution_mode": "live",
+        "position_management_liveness_v2_mode": "live",
+    })
+    raw_id, _, _ = _persist_exact_management_target(
+        session_factory,
+        intent="full_exit",
+        pos_ids=("pos-safe", "pos-unresolved"),
+    )
+    with session_factory() as session:
+        unresolved_leg = session.query(ExecutionOrderLeg).filter_by(
+            pos_id="pos-unresolved"
+        ).one()
+        binding = session.get(ExecutionBinding, unresolved_leg.execution_binding_id)
+        session.add(PositionMutationIntent(
+            idempotency_key="test-unresolved-pos",
+            venue="deepcoin", operation="close_position",
+            strategy_instance_id=binding.strategy_instance_id,
+            execution_binding_id=binding.id,
+            execution_order_leg_id=unresolved_leg.id,
+            pos_id="pos-unresolved",
+            authority_fingerprint="a" * 64,
+            request_fingerprint="b" * 64,
+            status="submit_unknown", request_json="{}", reserved_at=PLANNED_AT,
+        ))
+        session.commit()
+        unresolved_leg_id = int(unresolved_leg.id)
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([
+            _position("pos-safe"), _position("pos-unresolved")
+        ]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert [leg.pos_id for leg in result.batch.legs] == ["pos-safe"]
+    assert result.batch.target_snapshot["identity"][
+        "capability_deferred_entry_leg_ids"
+    ] == [unresolved_leg_id]
 
 
 def test_full_exit_replaces_its_zero_leg_protection_recovery_block(

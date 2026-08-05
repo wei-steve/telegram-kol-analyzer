@@ -22,6 +22,9 @@ from telegram_kol_research.db import MANAGEMENT_COMPONENT_BATCH_SCOPE_KIND_INDEX
 from telegram_kol_research.db import MANAGEMENT_COMPONENT_BATCH_SCOPE_SEQUENCE_INDEX_NAME
 from telegram_kol_research.db import REQUIRED_MANAGEMENT_UNIQUE_INDEX_NAMES
 from telegram_kol_research.models import ACTIVE_MANAGEMENT_BATCH_SQL_PREDICATE
+from telegram_kol_research.models import ExecutionBinding
+from telegram_kol_research.models import ExecutionOrderLeg
+from telegram_kol_research.models import PositionMutationIntent
 from telegram_kol_research.models import StrategyManagementBatch
 from telegram_kol_research.models import StrategyManagementComponent
 from telegram_kol_research.models import StrategyManagementLeg
@@ -373,6 +376,159 @@ def race_resolved_successor_fingerprint(
     }
     encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def capability_deferred_successor_fingerprint(
+    *,
+    parent_batch_id: int,
+    parent_target_fingerprint: str,
+    resolved_position_ids: Sequence[str],
+) -> str:
+    """Return one stable key for the unfinished capability-deferred subset."""
+
+    canonical = {
+        "kind": "capability_deferred_management_successor_v1",
+        "parent_batch_id": int(parent_batch_id),
+        "parent_target_fingerprint": str(parent_target_fingerprint),
+        "resolved_position_ids": sorted(
+            {str(value) for value in resolved_position_ids}
+        ),
+    }
+    encoded = json.dumps(
+        canonical, sort_keys=True, separators=(",", ":")
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def create_capability_deferred_successor_batch(
+    session_factory: sessionmaker,
+    *,
+    parent_batch_id: int,
+    resolved_position_ids: Sequence[str],
+    target_snapshot: dict[str, Any],
+    legs: Sequence[ManagementLegCreate],
+    terminalized_entry_leg_ids: Sequence[int] = (),
+    remaining_binding_pos_ids: Sequence[str] = (),
+    planned_at: datetime | None = None,
+) -> ManagementBatchRecord:
+    """Resolve the partial parent into one durable unfinished continuation."""
+
+    now = planned_at or datetime.now(UTC)
+    successor_id: int
+    with session_factory() as session:
+        _require_management_unique_indexes(session)
+        parent = session.get(StrategyManagementBatch, int(parent_batch_id))
+        if (
+            parent is None
+            or parent.status != "reconciling"
+            or parent.reason_code
+            != "management_subset_close_exchange_confirmed"
+        ):
+            raise ManagementSchemaSafetyError(
+                "capability_deferred_successor_parent_not_ready"
+            )
+        terminalized_ids = {int(value) for value in terminalized_entry_leg_ids}
+        remaining_pos_ids = {
+            str(value) for value in remaining_binding_pos_ids if str(value)
+        }
+        if terminalized_ids:
+            terminalized_entries = (
+                session.query(ExecutionOrderLeg)
+                .filter(ExecutionOrderLeg.id.in_(terminalized_ids))
+                .all()
+            )
+            if {int(entry.id) for entry in terminalized_entries} != terminalized_ids:
+                raise ManagementSchemaSafetyError(
+                    "capability_deferred_terminal_leg_missing"
+                )
+            for entry in terminalized_entries:
+                if (
+                    entry.execution_binding_id != parent.execution_binding_id
+                    or entry.strategy_instance_id != parent.strategy_instance_id
+                    or not str(entry.pos_id or "")
+                    or session.query(PositionMutationIntent.id)
+                    .filter(
+                        PositionMutationIntent.venue == "deepcoin",
+                        PositionMutationIntent.operation == "close_position",
+                        PositionMutationIntent.strategy_instance_id
+                        == parent.strategy_instance_id,
+                        PositionMutationIntent.execution_binding_id
+                        == parent.execution_binding_id,
+                        PositionMutationIntent.execution_order_leg_id
+                        == entry.id,
+                        PositionMutationIntent.pos_id == str(entry.pos_id),
+                        PositionMutationIntent.status == "confirmed",
+                    )
+                    .first()
+                    is None
+                ):
+                    raise ManagementSchemaSafetyError(
+                        "capability_deferred_terminal_evidence_invalid"
+                    )
+            binding = session.get(ExecutionBinding, parent.execution_binding_id)
+            if binding is None:
+                raise ManagementSchemaSafetyError(
+                    "capability_deferred_binding_missing"
+                )
+            for entry in terminalized_entries:
+                entry.status = "closed"
+                entry.terminal_reason = "position_mutation_close_confirmed"
+                entry.last_verified_at = now
+                entry.updated_at = now
+            binding.pos_id = ",".join(sorted(remaining_pos_ids)) or None
+            binding.updated_at = now
+        successor_snapshot = dict(target_snapshot)
+        successor_snapshot["capability_deferred_successor_of"] = parent.id
+        successor_fingerprint = capability_deferred_successor_fingerprint(
+            parent_batch_id=parent.id,
+            parent_target_fingerprint=parent.target_fingerprint,
+            resolved_position_ids=resolved_position_ids,
+        )
+        existing = (
+            session.query(StrategyManagementBatch)
+            .filter(
+                StrategyManagementBatch.idempotency_fingerprint
+                == successor_fingerprint
+            )
+            .one_or_none()
+        )
+        if existing is not None:
+            successor_id = int(existing.id)
+        else:
+            parent.status = "resolved"
+            parent.reason_code = "management_subset_continued_by_successor"
+            parent.completed_at = now
+            parent.updated_at = now
+            target_fingerprint = hashlib.sha256(
+                json.dumps(
+                    successor_snapshot,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            successor_id = create_management_batch_in_session(
+                session,
+                idempotency_fingerprint=successor_fingerprint,
+                raw_message_id=parent.raw_message_id,
+                recognition_decision_id=parent.recognition_decision_id,
+                recognition_generation=parent.recognition_generation,
+                target_lifecycle_id=parent.target_lifecycle_id,
+                strategy_instance_id=parent.strategy_instance_id,
+                execution_binding_id=parent.execution_binding_id,
+                intent=parent.intent,
+                effective_action=parent.effective_action,
+                execution_mode=parent.execution_mode,
+                requested_fraction=parent.requested_fraction,
+                effective_fraction=parent.effective_fraction,
+                partial_round_before=parent.partial_round_before,
+                target_fingerprint=target_fingerprint,
+                target_snapshot=successor_snapshot,
+                legs=legs,
+                planned_at=now,
+                status="ready",
+            )
+        session.commit()
+    return load_management_batch(session_factory, successor_id)
 
 
 def create_race_resolved_successor_batch(

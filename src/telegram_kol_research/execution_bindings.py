@@ -25,6 +25,7 @@ from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import PositionAttributionAudit
 from telegram_kol_research.models import PositionProtectionLedger
+from telegram_kol_research.models import PositionProtectionIncident
 from telegram_kol_research.models import PositionMutationIntent
 from telegram_kol_research.models import StrategyManagementBatch
 from telegram_kol_research.models import StrategyManagementLeg
@@ -52,6 +53,7 @@ from telegram_kol_research.position_authority_lock import (
     position_authority_lock,
     serialized_position_authority_mutation,
 )
+from telegram_kol_research.trading_settings import load_trading_settings
 
 PENDING_ENTRY_RECOVERY_WINDOW_HOURS = 3
 _MANAGEMENT_POSITION_RESERVATION_STATUSES = frozenset(
@@ -613,6 +615,9 @@ def _apply_reconcile_snapshot(
     recovered_at: datetime,
 ) -> ExecutionReconciliationResult:
     result = ExecutionReconciliationResult()
+    liveness_rollout_mode = load_trading_settings(
+        session_factory
+    ).effective_position_management_liveness_v2_mode
     active_positions = [row for row in snapshot.positions if _has_nonzero_size(row)]
     live_position_ids = {
         pos_id
@@ -859,6 +864,7 @@ def _apply_reconcile_snapshot(
             snapshot=snapshot,
             recovered_at=recovered_at,
             result=result,
+            liveness_rollout_mode=liveness_rollout_mode,
         )
         _ready_verified_trigger_take_profit_convergences(
             session, legs=legs, snapshot=snapshot, recovered_at=recovered_at
@@ -1136,6 +1142,7 @@ def _adopt_verified_trigger_entry_protection(
     snapshot: _ReconcileSnapshot,
     recovered_at: datetime,
     result: ExecutionReconciliationResult,
+    liveness_rollout_mode: str,
 ) -> None:
     """Adopt strict trigger-entry protection from the bounded read snapshot."""
 
@@ -1165,7 +1172,8 @@ def _adopt_verified_trigger_entry_protection(
             )
 
     intent_leg_ids = _reconcile_saved_trigger_protection_intents(
-        session, legs=legs, snapshot=snapshot, recovered_at=recovered_at, result=result
+        session, legs=legs, snapshot=snapshot, recovered_at=recovered_at,
+        result=result, liveness_rollout_mode=liveness_rollout_mode,
     )
 
     eligible_legs = [
@@ -1328,6 +1336,53 @@ def _adopt_verified_trigger_entry_protection(
 _TRIGGER_PROTECTION_RETRY_LIMIT = 5
 
 
+def _record_trigger_assignment_shadow_plan(
+    session, *, global_plan, contexts_by_leg, observed_at
+) -> None:
+    """Persist bounded non-authoritative evidence for the global assignment."""
+
+    for leg_id in sorted(contexts_by_leg):
+        context = contexts_by_leg[leg_id]
+        action = global_plan.actions.get(leg_id)
+        refusal = global_plan.refusals.get(leg_id)
+        evidence = {
+            "mode": "shadow",
+            "schema_version": 1,
+            "snapshot_fingerprint": global_plan.assignment.snapshot_fingerprint,
+            "leg_id": int(leg_id),
+            "pos_id": str(context.entry_leg.pos_id),
+            "proposed_order_id": str(action.order_id) if action else None,
+            "reason_code": str(refusal.reason) if refusal else None,
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                evidence, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        existing = (
+            session.query(PositionProtectionIncident)
+            .filter(PositionProtectionIncident.fingerprint == fingerprint)
+            .one_or_none()
+        )
+        if existing is not None:
+            existing.updated_at = observed_at
+            continue
+        session.add(PositionProtectionIncident(
+            venue="deepcoin",
+            execution_binding_id=int(context.entry_leg.execution_binding_id),
+            execution_order_leg_id=int(leg_id),
+            pos_id=str(context.entry_leg.pos_id),
+            incident_type="trigger_protection_assignment_shadow_plan",
+            fingerprint=fingerprint,
+            evidence_json=json.dumps(
+                evidence, sort_keys=True, separators=(",", ":")
+            ),
+            delivery_status="not_required",
+            created_at=observed_at,
+            updated_at=observed_at,
+        ))
+
+
 def _retry_saved_trigger_protection_intents_for_unavailable_snapshot(
     session, *, legs, snapshot, recovered_at, result
 ) -> None:
@@ -1368,7 +1423,7 @@ def _retry_saved_trigger_protection_intents_for_unavailable_snapshot(
 
 
 def _reconcile_saved_trigger_protection_intents(
-    session, *, legs, snapshot, recovered_at, result
+    session, *, legs, snapshot, recovered_at, result, liveness_rollout_mode
 ) -> set[int]:
     """Apply saved trigger intents using only this bounded, read-only snapshot."""
     from telegram_kol_research.entry_protection_ledger_repair import (
@@ -1489,48 +1544,60 @@ def _reconcile_saved_trigger_protection_intents(
                 live_position=live_position_result.position,
             )
         )
-    global_plan = plan_trigger_protection_intent_assignments(
-        contexts=tuple(assignment_contexts),
-        pending_tpsl_rows=snapshot.pending_trigger_orders,
-        existing_ledger_rows=existing_ledger_rows,
-        snapshot_complete=True,
+    global_plan = (
+        plan_trigger_protection_intent_assignments(
+            contexts=tuple(assignment_contexts),
+            pending_tpsl_rows=snapshot.pending_trigger_orders,
+            existing_ledger_rows=existing_ledger_rows,
+            snapshot_complete=True,
+        )
+        if liveness_rollout_mode in {"shadow", "live"}
+        else None
     )
     globally_processed_leg_ids: set[int] = set()
     contexts_by_leg = {
         int(context.entry_leg.id): context for context in assignment_contexts
     }
-    for leg_id, action in global_plan.actions.items():
-        context = contexts_by_leg[leg_id]
-        row = finalize_trigger_protection_adoption(
+    if global_plan is not None and liveness_rollout_mode == "shadow":
+        _record_trigger_assignment_shadow_plan(
             session,
-            action=action,
-            intent=context.intent,
-            seen_at=recovered_at,
+            global_plan=global_plan,
+            contexts_by_leg=contexts_by_leg,
+            observed_at=recovered_at,
         )
-        existing_ledger_rows.append(row)
-        result.protection_adopted += 1
-        globally_processed_leg_ids.add(leg_id)
-    for leg_id, refusal in global_plan.refusals.items():
-        if refusal.reason != "trigger_protection_assignment_not_mutual_unique":
-            continue
-        context = contexts_by_leg[leg_id]
-        result.protection_adoption_deferred += 1
-        _record_protection_adoption_refusal(
-            session,
-            leg=context.entry_leg,
-            refusal=refusal,
-            created_at=recovered_at,
-        )
-        _schedule_trigger_intent_retry(
-            session,
-            context.intent,
-            recovered_at,
-            transition_trigger_protection_intent,
-            recovery_disposition="exact_backup",
-            last_reason_code="protection_assignment_not_mutual_unique",
-            last_evidence=refusal.evidence,
-        )
-        globally_processed_leg_ids.add(leg_id)
+    if global_plan is not None and liveness_rollout_mode == "live":
+        for leg_id, action in global_plan.actions.items():
+            context = contexts_by_leg[leg_id]
+            row = finalize_trigger_protection_adoption(
+                session,
+                action=action,
+                intent=context.intent,
+                seen_at=recovered_at,
+            )
+            existing_ledger_rows.append(row)
+            result.protection_adopted += 1
+            globally_processed_leg_ids.add(leg_id)
+        for leg_id, refusal in global_plan.refusals.items():
+            if refusal.reason != "trigger_protection_assignment_not_mutual_unique":
+                continue
+            context = contexts_by_leg[leg_id]
+            result.protection_adoption_deferred += 1
+            _record_protection_adoption_refusal(
+                session,
+                leg=context.entry_leg,
+                refusal=refusal,
+                created_at=recovered_at,
+            )
+            _schedule_trigger_intent_retry(
+                session,
+                context.intent,
+                recovered_at,
+                transition_trigger_protection_intent,
+                recovery_disposition="exact_backup",
+                last_reason_code="protection_assignment_not_mutual_unique",
+                last_evidence=refusal.evidence,
+            )
+            globally_processed_leg_ids.add(leg_id)
     for intent, leg in eligible:
         if not _trigger_intent_due(intent, recovered_at):
             continue

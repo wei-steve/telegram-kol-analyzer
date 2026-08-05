@@ -15,9 +15,13 @@ from telegram_kol_research.execution_bindings import (
     upsert_execution_order_leg,
 )
 from telegram_kol_research.models import (
+    ExecutionBinding,
+    ExecutionOrderLeg,
     MessageInstructionItem,
+    PositionMutationIntent,
     RawMessage,
     SignalCandidate,
+    StrategyLifecycle,
     StrategyManagementBatch,
 )
 from telegram_kol_research.models import PositionProtectionIncident
@@ -32,10 +36,12 @@ from telegram_kol_research.strategy_management_executor import (
 )
 from telegram_kol_research.strategy_management_worker import (
     StrategyManagementWorkerCursor,
+    _resolve_capability_deferred_successor,
     _resolve_deferred_entry_cancel_race_successor,
     _advance_temporary_visibility_retry,
     run_strategy_management_worker_tick,
 )
+from telegram_kol_research.trading_settings import save_trading_settings
 
 
 NOW = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
@@ -477,6 +483,42 @@ def test_cancel_race_snapshot_read_failure_leaves_parent_paused():
     assert resolver_called == []
 
 
+def test_subset_parent_reconciles_then_schedules_capability_successor(
+    monkeypatch,
+):
+    parent = _batch(
+        batch_id=73,
+        strategy="deepcoin:100:10:BTC:short",
+        status="reconciling",
+        action="full_exit",
+    )
+    parent.reason_code = "management_subset_close_exchange_confirmed"
+    events = []
+    monkeypatch.setattr(
+        "telegram_kol_research.strategy_management_worker.load_management_batch",
+        lambda *_args, **_kwargs: parent,
+    )
+
+    result = run_strategy_management_worker_tick(
+        object(),
+        deepcoin_client_factory=lambda: object(),
+        batch_lister=lambda *_args, **_kwargs: [parent],
+        snapshot_loader=lambda *_args, **_kwargs: events.append("snapshot")
+        or object(),
+        reconciler=lambda *_args, **kwargs: events.append(
+            ("reconcile", tuple(kwargs["batch_ids"]))
+        ),
+        capability_successor_resolver=lambda *_args, **kwargs: events.append(
+            ("successor", kwargs["batch_id"])
+        )
+        or True,
+        processed_at=NOW,
+    )
+
+    assert events == ["snapshot", ("reconcile", (73,)), ("successor", 73)]
+    assert result.recovered == 1
+
+
 def test_cancel_race_successor_requires_exact_verified_live_position(tmp_path):
     session_factory = create_session_factory(tmp_path / "race-successor.db")
     strategy = "deepcoin:100:10:BTC:short"
@@ -637,6 +679,153 @@ def test_cancel_race_successor_creation_is_idempotent_on_repeat_tick(tmp_path):
     )
     with session_factory() as session:
         assert session.query(StrategyManagementBatch).count() == 2
+
+
+@pytest.mark.parametrize("deferred_position_still_live", [True, False])
+def test_capability_deferred_subset_finishes_after_mutation_resolves(
+    tmp_path, deferred_position_still_live,
+):
+    session_factory = create_session_factory(tmp_path / "capability-successor.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+            "position_management_liveness_v2_mode": "live",
+        },
+    )
+    strategy = "deepcoin:100:10:BTC:short"
+    binding_id = upsert_execution_binding(
+        session_factory,
+        ExecutionBindingRecord(
+            kol_id="mia", chat_id=100, message_id=10, symbol="BTC",
+            side="short", strategy_instance_id=strategy, status="active",
+            pos_id="pos-safe,pos-deferred",
+        ),
+    )
+    safe_entry_id = upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id, strategy_instance_id=strategy,
+            leg_index=0, order_id="entry-safe", pos_id="pos-safe",
+            order_kind="market", attribution_status="verified",
+            attribution_evidence={"policy_version": 2}, status="closed",
+        ),
+    )
+    deferred_entry_id = upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id, strategy_instance_id=strategy,
+            leg_index=1, order_id="entry-deferred", pos_id="pos-deferred",
+            order_kind="market", attribution_status="verified",
+            attribution_evidence={"policy_version": 2},
+            status="partial_closed",
+        ),
+    )
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=100, message_id=10, symbol="BTC", side="short",
+            lifecycle_status="entered", signal_at=NOW, entered_at=NOW,
+            execution_binding_id=binding_id,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = int(lifecycle.id)
+    parent = create_management_batch(
+        session_factory, idempotency_fingerprint="capability-parent",
+        raw_message_id=10, recognition_decision_id=1,
+        recognition_generation="g1", target_lifecycle_id=lifecycle_id,
+        strategy_instance_id=strategy, execution_binding_id=binding_id,
+        intent="full_exit", effective_action="full_exit",
+        execution_mode="live", requested_fraction=None,
+        effective_fraction=1.0, partial_round_before=0,
+        target_fingerprint="capability-parent-target",
+        target_snapshot={
+            "identity": {
+                "manageable_entry_leg_ids": [safe_entry_id],
+                "capability_deferred_entry_leg_ids": [deferred_entry_id],
+                "capability_deferred_pos_ids": ["pos-deferred"],
+            },
+            "contract_spec": {"quantity_step": 1, "min_quantity": 1},
+        },
+        legs=[], planned_at=NOW,
+    )
+    transition_batch(
+        session_factory, parent.id, expected_statuses={"ready"},
+        new_status="reconciling",
+        reason_code="management_subset_close_exchange_confirmed",
+        transitioned_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        binding.pos_id = "pos-deferred"
+        mutation = PositionMutationIntent(
+            idempotency_key="capability-deferred-unknown",
+            venue="deepcoin", operation="close_position",
+            strategy_instance_id=strategy, execution_binding_id=binding_id,
+            execution_order_leg_id=deferred_entry_id,
+            pos_id="pos-deferred", authority_fingerprint="a" * 64,
+            request_fingerprint="b" * 64, status="submit_unknown",
+            request_json="{}", reserved_at=NOW,
+        )
+        session.add(mutation)
+        session.commit()
+        mutation_id = int(mutation.id)
+    snapshot = SimpleNamespace(
+        errors={},
+        positions=([{
+            "instId": "BTC-USDT-SWAP", "posId": "pos-deferred",
+            "posSide": "short", "pos": "3", "avgPx": "66500",
+            "mgnMode": "cross", "mrgPosition": "split",
+        }] if deferred_position_still_live else []),
+    )
+
+    assert not _resolve_capability_deferred_successor(
+        session_factory, batch_id=parent.id, snapshot=snapshot,
+        resolved_at=NOW,
+    )
+    with session_factory() as session:
+        mutation = session.get(PositionMutationIntent, mutation_id)
+        mutation.status = "confirmed"
+        session.commit()
+
+    worker_result = run_strategy_management_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: object(),
+        batch_lister=lambda *_args, **_kwargs: [
+            load_management_batch(session_factory, parent.id)
+        ],
+        snapshot_loader=lambda *_args, **_kwargs: snapshot,
+        processed_at=NOW,
+    )
+    assert worker_result.recovered == 1
+    final_parent = load_management_batch(session_factory, parent.id)
+    if deferred_position_still_live:
+        successor = load_management_batch(session_factory, parent.id + 1)
+        assert successor.status == "ready"
+        assert successor.target_snapshot[
+            "capability_deferred_successor_of"
+        ] == parent.id
+        assert [
+            (leg.pos_id, leg.planned_close_size) for leg in successor.legs
+        ] == [("pos-deferred", "3")]
+        assert final_parent.status == "resolved"
+        assert final_parent.reason_code == (
+            "management_subset_continued_by_successor"
+        )
+    else:
+        assert final_parent.status == "succeeded"
+        assert final_parent.reason_code == (
+            "management_full_close_exchange_confirmed"
+        )
+        with session_factory() as session:
+            binding = session.get(ExecutionBinding, binding_id)
+            deferred = session.get(ExecutionOrderLeg, deferred_entry_id)
+            lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        assert (binding.status, binding.pos_id) == ("closed", None)
+        assert deferred.status == "closed"
+        assert deferred.terminal_reason == "position_mutation_close_confirmed"
+        assert lifecycle.lifecycle_status == "exited"
 
 
 def test_disabled_or_shadow_mode_never_claims_or_executes_ready_batches():

@@ -14,6 +14,12 @@ from telegram_kol_research.db import MANAGEMENT_BATCH_IDEMPOTENCY_INDEX_NAME
 from telegram_kol_research.db import MANAGEMENT_LEG_BATCH_POSITION_INDEX_NAME
 from telegram_kol_research.db import MANAGEMENT_COMPONENT_BATCH_SCOPE_SEQUENCE_INDEX_NAME
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.execution_bindings import (
+    ExecutionBindingRecord,
+    ExecutionOrderLegRecord,
+    upsert_execution_binding,
+    upsert_execution_order_leg,
+)
 
 
 def _management_models():
@@ -348,6 +354,96 @@ def test_race_resolved_successor_resolves_parent_before_creating_active_batch(tm
         assert parent_row.reason_code == "deferred_entry_cancel_race_resolved"
 
 
+def test_capability_successor_insert_failure_rolls_back_mixed_terminalization(
+    monkeypatch, tmp_path,
+):
+    repository = _repository()
+    session_factory = create_session_factory(tmp_path / "mixed-atomic.db")
+    strategy = "deepcoin:100:10:BTC:short"
+    binding_id = upsert_execution_binding(
+        session_factory,
+        ExecutionBindingRecord(
+            kol_id="mia", chat_id=100, message_id=10, symbol="BTC",
+            side="short", strategy_instance_id=strategy, status="active",
+            pos_id="pos-gone,pos-live",
+        ),
+    )
+    gone_id = upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id, strategy_instance_id=strategy,
+            leg_index=0, order_id="entry-gone", pos_id="pos-gone",
+            order_kind="market", attribution_status="verified",
+            attribution_evidence={"policy_version": 2},
+            status="partial_closed",
+        ),
+    )
+    live_id = upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id, strategy_instance_id=strategy,
+            leg_index=1, order_id="entry-live", pos_id="pos-live",
+            order_kind="market", attribution_status="verified",
+            attribution_evidence={"policy_version": 2}, status="active",
+        ),
+    )
+    parent = repository.create_management_batch(
+        session_factory, idempotency_fingerprint="mixed-parent",
+        raw_message_id=10, recognition_decision_id=1,
+        recognition_generation="g1", target_lifecycle_id=1,
+        strategy_instance_id=strategy, execution_binding_id=binding_id,
+        intent="full_exit", effective_action="full_exit",
+        execution_mode="live", requested_fraction=None,
+        effective_fraction=1.0, partial_round_before=0,
+        target_fingerprint="mixed-target", target_snapshot={}, legs=[],
+        planned_at=datetime(2026, 8, 6, tzinfo=UTC),
+    )
+    repository.transition_batch(
+        session_factory, parent.id, expected_statuses={"ready"},
+        new_status="reconciling",
+        reason_code="management_subset_close_exchange_confirmed",
+    )
+    with session_factory() as session:
+        session.add(models.PositionMutationIntent(
+            idempotency_key="mixed-gone-confirmed", venue="deepcoin",
+            operation="close_position", strategy_instance_id=strategy,
+            execution_binding_id=binding_id,
+            execution_order_leg_id=gone_id, pos_id="pos-gone",
+            authority_fingerprint="a" * 64,
+            request_fingerprint="b" * 64, status="confirmed",
+            request_json="{}", reserved_at=datetime(2026, 8, 6, tzinfo=UTC),
+        ))
+        session.commit()
+    monkeypatch.setattr(
+        repository,
+        "create_management_batch_in_session",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("injected successor insert failure")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="injected successor insert failure"):
+        repository.create_capability_deferred_successor_batch(
+            session_factory, parent_batch_id=parent.id,
+            resolved_position_ids=["pos-live"],
+            target_snapshot={"identity": {}},
+            legs=[repository.ManagementLegCreate(
+                execution_order_leg_id=live_id, pos_id="pos-live",
+                leg_index=0, preflight_size="3", planned_close_size="3",
+            )],
+            terminalized_entry_leg_ids=[gone_id],
+            remaining_binding_pos_ids=["pos-live"],
+            planned_at=datetime(2026, 8, 6, tzinfo=UTC),
+        )
+
+    with session_factory() as session:
+        stored_parent = session.get(models.StrategyManagementBatch, parent.id)
+        gone = session.get(models.ExecutionOrderLeg, gone_id)
+        binding = session.get(models.ExecutionBinding, binding_id)
+        assert stored_parent.status == "reconciling"
+        assert gone.status == "partial_closed"
+        assert binding.pos_id == "pos-gone,pos-live"
+        assert session.query(models.StrategyManagementBatch).count() == 1
 def test_worker_lists_deferred_entry_cancel_race_parent(tmp_path):
     repository = _repository()
     session_factory = create_session_factory(tmp_path / "race-worker.db")

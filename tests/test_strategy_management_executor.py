@@ -957,7 +957,7 @@ def test_break_even_by_market_submitted_restart_hands_off_to_reconciliation(
         executed_at=NOW,
     )
 
-    assert result["status"] == "reconciling"
+    assert result["status"] == "reconciling", result
     assert result["reason"] == "break_even_market_restart_requires_reconciliation"
     assert client.call_log == []
 
@@ -3106,6 +3106,44 @@ def test_final_close_preflight_allows_strict_other_strategy_position(tmp_path):
     )
     assert result["status"] == "reconciling"
     assert len(client.calls) == 2
+
+
+def test_full_exit_executes_safe_subset_with_exact_capability_deferred_leg(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "subset-full-exit.db")
+    batch = _persist_close_batch(
+        session_factory,
+        sizes=("3",),
+        intent="full_exit",
+        effective_action="full_exit",
+    )
+    with session_factory() as session:
+        deferred = session.query(ExecutionOrderLeg).filter_by(pos_id="pos-2").one()
+        stored = session.get(StrategyManagementBatch, batch.id)
+        snapshot = json.loads(stored.target_snapshot_json)
+        snapshot["identity"]["capability_deferred_entry_leg_ids"] = [
+            int(deferred.id)
+        ]
+        snapshot["identity"]["capability_deferred_pos_ids"] = ["pos-2"]
+        stored.target_snapshot_json = json.dumps(snapshot, sort_keys=True)
+        session.commit()
+
+    client = _FakeClient(session_factory, [{"code": "0", "data": {"ordId": "close-1"}}])
+    result = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "reconciling", result
+    assert len(client.calls) == 1
+    assert client.calls[0][0]["closePosId"] == "pos-1"
 
 
 def test_definite_failure_continues_later_leg_and_is_partial_failed(tmp_path):

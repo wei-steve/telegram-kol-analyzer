@@ -271,7 +271,7 @@ def test_confirmed_partial_close_plans_one_shadow_break_even_convergence(tmp_pat
     _reconcile_management(sf, positions=[_position("pos-1", "1")])
 
     stored = load_management_batch(sf, batch.id)
-    assert stored.status == "succeeded"
+    assert stored.status == "succeeded", (stored.status, stored.reason_code)
     with sf() as session:
         rows = session.query(StrategyBreakEvenConvergence).all()
         assert len(rows) == 1
@@ -766,6 +766,56 @@ def test_full_close_terminalizes_only_after_every_exact_position_disappears(tmp_
     assert lifecycle.exited_at.replace(tzinfo=UTC) == NOW
     assert all(entry.status == "closed" for entry in entries)
     assert all(entry.terminal_reason == "management_full_close_confirmed" for entry in entries)
+
+
+def test_subset_full_close_preserves_capability_deferred_position_and_lifecycle(
+    tmp_path,
+):
+    sf = create_session_factory(tmp_path / "subset-full-close.db")
+    batch = _persist_batch(
+        sf, action="full_close", sizes=("2",), preflight=("2",)
+    )
+    with sf() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        deferred = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            leg_index=2, purpose="entry", order_kind="market",
+            order_id="entry-deferred", pos_id="pos-deferred",
+            venue="deepcoin", attribution_status="verified",
+            attribution_evidence_json='{"policy_version":2}', status="active",
+        )
+        session.add(deferred)
+        session.flush()
+        binding.pos_id = "pos-1,pos-deferred"
+        stored = session.get(StrategyManagementBatch, batch.id)
+        snapshot = json.loads(stored.target_snapshot_json)
+        snapshot.setdefault("identity", {})[
+            "capability_deferred_entry_leg_ids"
+        ] = [int(deferred.id)]
+        snapshot["identity"]["capability_deferred_pos_ids"] = ["pos-deferred"]
+        stored.target_snapshot_json = json.dumps(snapshot, sort_keys=True)
+        session.commit()
+        deferred_id = int(deferred.id)
+
+    _reconcile(sf, _Client(positions=[_position("pos-deferred", "2")]))
+
+    stored = load_management_batch(sf, batch.id)
+    with sf() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        lifecycle = session.get(StrategyLifecycle, batch.target_lifecycle_id)
+        deferred = session.get(ExecutionOrderLeg, deferred_id)
+        closed = session.get(
+            ExecutionOrderLeg, stored.legs[0].execution_order_leg_id
+        )
+    assert stored.status == "reconciling", (stored.status, stored.reason_code)
+    assert stored.completed_at is None
+    assert stored.reason_code == "management_subset_close_exchange_confirmed"
+    assert (binding.status, binding.pos_id) == ("active", "pos-deferred")
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.management_action == "subset_full_close_confirmed"
+    assert deferred.status == "active"
+    assert closed.status == "closed"
 
 
 def test_full_close_ignores_prior_terminal_entry_leg_and_wins_reconcile_race(

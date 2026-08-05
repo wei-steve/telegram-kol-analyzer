@@ -1542,6 +1542,7 @@ def classify_protection_incident(
         "stop_rescue_shadow_ready",
         "take_profit_convergence_ready",
         "take_profit_convergence_completed",
+        "trigger_protection_assignment_shadow_plan",
     }:
         return "healthy"
     if normalized in {

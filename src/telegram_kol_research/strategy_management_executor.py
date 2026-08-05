@@ -2813,7 +2813,34 @@ def _preflight_exact_position_identity(
     ignored_owned_pos_ids: set[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     expected_pos_ids = {leg.pos_id for leg in batch.legs}
-    ignored = set(ignored_owned_pos_ids or ()) - expected_pos_ids
+    identity = (
+        batch.target_snapshot.get("identity", {})
+        if isinstance(batch.target_snapshot, dict)
+        else {}
+    )
+    capability_deferred_pos_ids = identity.get(
+        "capability_deferred_pos_ids", []
+    )
+    if (
+        not isinstance(capability_deferred_pos_ids, list)
+        or any(
+            not isinstance(pos_id, str) or not pos_id.strip()
+            for pos_id in capability_deferred_pos_ids
+        )
+        or len(set(capability_deferred_pos_ids))
+        != len(capability_deferred_pos_ids)
+    ):
+        raise ManagementBatchExecutionError(
+            f"{error_prefix}_binding_position_set_drift"
+        )
+    capability_deferred_pos_ids = set(capability_deferred_pos_ids)
+    if capability_deferred_pos_ids.intersection(expected_pos_ids):
+        raise ManagementBatchExecutionError(
+            f"{error_prefix}_binding_position_set_drift"
+        )
+    ignored = (
+        set(ignored_owned_pos_ids or ()) | capability_deferred_pos_ids
+    ) - expected_pos_ids
     if any(
         _first_text(row, "instId", "inst_id") == inst_id
         and (_first_text(row, "posSide", "pos_side", "side") or "").lower()
@@ -2829,7 +2856,7 @@ def _preflight_exact_position_identity(
         for value in str(binding.pos_id or "").split(",")
         if value.strip()
     }
-    if bound_pos_ids != expected_pos_ids:
+    if bound_pos_ids != expected_pos_ids | capability_deferred_pos_ids:
         raise ManagementBatchExecutionError(
             f"{error_prefix}_binding_position_set_drift"
         )
@@ -3539,6 +3566,11 @@ def _require_exact_entry_legs(
             error_code="batch_entry_set_not_exact",
         )
         deferred_snapshot_ids = set(deferred_snapshot_id_list)
+        capability_deferred_id_list = _parse_capability_deferred_entry_leg_ids(
+            getattr(stored_batch, "target_snapshot_json", None),
+            error_code="batch_entry_set_not_exact",
+        )
+        capability_deferred_ids = set(capability_deferred_id_list)
         all_entries = (
             session.query(ExecutionOrderLeg)
             .filter(ExecutionOrderLeg.execution_binding_id == batch.execution_binding_id)
@@ -3575,6 +3607,7 @@ def _require_exact_entry_legs(
         }
         current_identity: set[tuple[int, str]] = set()
         current_deferred_ids: set[int] = set()
+        current_capability_deferred_ids: set[int] = set()
         accepted_cancelled_deferred_ids: set[int] = set()
         if not all_entries:
             raise ManagementBatchExecutionError("batch_entry_set_not_exact")
@@ -3593,6 +3626,19 @@ def _require_exact_entry_legs(
                     raise ManagementBatchExecutionError("batch_entry_set_not_exact")
                 current_identity.add(identity)
                 continue
+            if int(entry.id) in capability_deferred_ids:
+                if (
+                    not entry.pos_id
+                    or entry.attribution_status != "verified"
+                    or status in TERMINAL_ENTRY_LEG_STATES
+                    or status not in _MANAGEABLE_ENTRY_LEG_STATES
+                    or entry.terminal_reason is not None
+                ):
+                    raise ManagementBatchExecutionError(
+                        "batch_entry_set_not_exact"
+                    )
+                current_capability_deferred_ids.add(int(entry.id))
+                continue
             if (
                 int(entry.id) in deferred_snapshot_ids
                 and _is_management_cancelled_deferred_entry_leg(entry)
@@ -3607,6 +3653,7 @@ def _require_exact_entry_legs(
             raise ManagementBatchExecutionError("batch_entry_set_not_exact")
         if (
             current_identity != batch_identity
+            or current_capability_deferred_ids != capability_deferred_ids
             or (
                 current_deferred_ids | accepted_cancelled_deferred_ids
             )
@@ -3817,6 +3864,30 @@ def _parse_exact_deferred_entry_leg_ids(
         target_snapshot = json.loads(target_snapshot_json)
         identity = target_snapshot["identity"]
         deferred_leg_ids = identity["deferred_entry_leg_ids"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise ManagementBatchExecutionError(error_code) from exc
+    if (
+        not isinstance(target_snapshot, dict)
+        or not isinstance(identity, dict)
+        or not isinstance(deferred_leg_ids, list)
+        or any(type(leg_id) is not int or leg_id <= 0 for leg_id in deferred_leg_ids)
+        or len(set(deferred_leg_ids)) != len(deferred_leg_ids)
+    ):
+        raise ManagementBatchExecutionError(error_code)
+    return deferred_leg_ids
+
+
+def _parse_capability_deferred_entry_leg_ids(
+    target_snapshot_json: Any,
+    *,
+    error_code: str,
+) -> list[int]:
+    try:
+        target_snapshot = json.loads(target_snapshot_json)
+        identity = target_snapshot["identity"]
+        deferred_leg_ids = identity.get(
+            "capability_deferred_entry_leg_ids", []
+        )
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         raise ManagementBatchExecutionError(error_code) from exc
     if (

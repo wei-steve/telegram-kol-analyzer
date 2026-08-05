@@ -78,6 +78,7 @@ from telegram_kol_research.strategy_management_sizing import (
     allocate_close_sizes,
     effective_action,
 )
+from telegram_kol_research.trading_settings import load_trading_settings
 
 
 PARTIAL_INTENTS = frozenset({"partial_take_profit", "partial_then_break_even"})
@@ -437,6 +438,9 @@ def _plan_strategy_management_batch_locked(
     execution_mode: str = "live",
 ) -> ManagementPlanningResult:
     now = planned_at
+    liveness_rollout_mode = load_trading_settings(
+        session_factory
+    ).effective_position_management_liveness_v2_mode
 
     identity_or_result = _load_exact_identity(
         session_factory,
@@ -933,6 +937,7 @@ def _plan_strategy_management_batch_locked(
                     )
 
     management_capabilities: dict[str, dict[str, Any]] = {}
+    capability_deferred_pos_ids: set[str] = set()
     with session_factory() as session:
         unresolved_mutation_pos_ids = {
             str(pos_id)
@@ -987,7 +992,17 @@ def _plan_strategy_management_batch_locked(
             in {"partial_close", "partial_then_break_even", BREAK_EVEN_BY_MARKET_ACTION}
             else capabilities.may_replace_owned_protection
         )
-        if not required_capability:
+        if liveness_rollout_mode == "live" and not required_capability:
+            capability_deferred_pos_ids.add(pos_id)
+
+    capability_deferred_legs: tuple[ExecutionOrderLeg, ...] = ()
+    if liveness_rollout_mode == "disabled":
+        management_capabilities = {}
+    elif liveness_rollout_mode == "live" and capability_deferred_pos_ids:
+        if (
+            effective_action_name not in {"full_close", "full_exit"}
+            or len(capability_deferred_pos_ids) == len(economics)
+        ):
             return _persist_blocked(
                 session_factory,
                 identity=identity,
@@ -995,12 +1010,32 @@ def _plan_strategy_management_batch_locked(
                 intent=intent,
                 reason_code=(
                     "position_mutation_in_progress"
-                    if pos_id in unresolved_mutation_pos_ids
+                    if capability_deferred_pos_ids.intersection(
+                        unresolved_mutation_pos_ids
+                    )
                     else "position_management_capability_unavailable"
                 ),
                 planned_at=now,
                 execution_mode=execution_mode,
             )
+        economics = tuple(
+            position for position in economics
+            if str(position["pos_id"]) not in capability_deferred_pos_ids
+        )
+        capability_deferred_legs = tuple(
+            leg for leg in target_entry_legs
+            if str(leg.pos_id) in capability_deferred_pos_ids
+        )
+        target_entry_legs = tuple(
+            leg for leg in target_entry_legs
+            if str(leg.pos_id) not in capability_deferred_pos_ids
+        )
+        target_legs_by_pos_id = _leg_by_pos_id(target_entry_legs)
+        protection_by_pos_id = {
+            pos_id: protection
+            for pos_id, protection in protection_by_pos_id.items()
+            if pos_id not in capability_deferred_pos_ids
+        }
 
     if intent == "adjust_stop_loss" and candidate.stop_loss_text not in (None, ""):
         explicit_stop = Decimal(str(candidate.stop_loss_text))
@@ -1082,6 +1117,12 @@ def _plan_strategy_management_batch_locked(
             "strategy_instance_id": binding.strategy_instance_id,
             "manageable_entry_leg_ids": [leg.id for leg in target_entry_legs],
             "deferred_entry_leg_ids": [leg.id for leg in entry_leg_plan.deferred_legs],
+            "capability_deferred_entry_leg_ids": [
+                leg.id for leg in capability_deferred_legs
+            ],
+            "capability_deferred_pos_ids": sorted(
+                str(leg.pos_id) for leg in capability_deferred_legs
+            ),
         },
         "positions": position_snapshots,
         "deferred_entry_legs": [
@@ -1092,7 +1133,7 @@ def _plan_strategy_management_batch_locked(
                 "status": leg.status,
                 "attribution_status": leg.attribution_status,
             }
-            for leg in entry_leg_plan.deferred_legs
+            for leg in (*entry_leg_plan.deferred_legs, *capability_deferred_legs)
         ],
         "contract_spec": contract_spec.to_dict(),
         "protection": protection_by_pos_id,
