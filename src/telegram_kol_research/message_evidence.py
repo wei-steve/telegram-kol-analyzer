@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from datetime import timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -21,6 +23,73 @@ from telegram_kol_research.models import (
     RawMessage,
     utc_now,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class EntryPreambleEvidence:
+    symbol: str
+    side: str
+    risk_multiplier: Decimal
+    confidence: float
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        multiplier = format(self.risk_multiplier, "f")
+        if "." in multiplier:
+            multiplier = multiplier.rstrip("0").rstrip(".")
+        return {
+            "kind": "entry_preamble",
+            "symbol": self.symbol,
+            "side": self.side,
+            "risk_multiplier": multiplier,
+            "confidence": self.confidence,
+            "reason": self.reason,
+        }
+
+
+def normalize_entry_preamble_evidence(value: Any) -> EntryPreambleEvidence | None:
+    """Validate a model-produced, explicitly non-executable sizing fragment."""
+
+    if not isinstance(value, Mapping):
+        return None
+    if str(value.get("kind") or "") != "entry_preamble":
+        return None
+    symbol = str(value.get("symbol") or "").strip().upper()
+    side = str(value.get("side") or "").strip().lower()
+    if not symbol or side not in {"long", "short"}:
+        return None
+    raw_multiplier = value.get("risk_multiplier")
+    if isinstance(raw_multiplier, bool):
+        return None
+    try:
+        risk_multiplier = Decimal(str(raw_multiplier).strip())
+    except (InvalidOperation, AttributeError, TypeError, ValueError):
+        return None
+    if (
+        not risk_multiplier.is_finite()
+        or risk_multiplier <= Decimal("0")
+        or risk_multiplier > Decimal("1")
+    ):
+        return None
+    raw_confidence = value.get("confidence")
+    if isinstance(raw_confidence, bool):
+        return None
+    try:
+        confidence = float(raw_confidence)
+    except (TypeError, ValueError):
+        return None
+    if not 0.0 <= confidence <= 1.0:
+        return None
+    reason = str(value.get("reason") or "").strip()
+    if not reason:
+        return None
+    return EntryPreambleEvidence(
+        symbol=symbol,
+        side=side,
+        risk_multiplier=risk_multiplier,
+        confidence=confidence,
+        reason=reason,
+    )
 
 
 def claim_message_evidence_extraction(
@@ -256,6 +325,16 @@ def normalize_mimo_evidence(
         "summary": payload.get("summary"),
         "confidence": confidence,
     }
+    if "entry_context" in payload:
+        entry_context = normalize_entry_preamble_evidence(
+            payload.get("entry_context")
+        )
+        if entry_context is None:
+            normalized_evidence[
+                "entry_context_rejection_reason"
+            ] = "entry_context_invalid"
+        else:
+            normalized_evidence["entry_context"] = entry_context.to_dict()
     return (
         extraction_status,
         confidence,

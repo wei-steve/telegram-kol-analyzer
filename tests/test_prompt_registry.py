@@ -24,6 +24,19 @@ from telegram_kol_research.prompt_registry import (
     save_prompt_draft,
     seed_prompt_definition,
 )
+from telegram_kol_research.prompt_defaults import DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
+
+
+def test_shared_prompt_defines_non_executable_entry_preamble_contract():
+    prompt = DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
+
+    assert '"entry_context"' in prompt
+    assert '"kind": "entry_preamble"' in prompt
+    assert '"risk_multiplier": "0.5"' in prompt
+    assert "半仓" in prompt
+    assert "非执行" in prompt
+    assert "轻仓" in prompt
+    assert "满仓" in prompt
 
 
 def _seed(content: str = "published A") -> PromptSeed:

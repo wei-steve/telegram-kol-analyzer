@@ -63,6 +63,12 @@ DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT = """
 - 一条出局消息不是新开仓，recognition_result 可以是“非策略”，但 lifecycle_event.event_type 必须是 exit_position。
 - 持仓管理不是新开仓，但不得遗漏 position_update。
 
+【新开仓前置仓位指令】
+- 当当前消息有明确标的、方向和“半仓操作”或明确百分比仓位，但还没有完整入场/止损/止盈策略时，可输出 entry_context。
+- entry_context 是非执行的前置语义片段，可以和 recognition_result=“非策略”同时出现；它不得单独下单。
+- “半仓”统一解释为该币种已配置最大亏损预算乘以 50%，risk_multiplier 输出“0.5”；“30% 仓位”输出“0.3”。
+- 仅接受大于 0 且小于等于 1 的明确倍率。“轻仓”、“满仓”、杠杆倍数、“加仓”均不生成 entry_context，不得猜测倍率。
+
 【图文证据分离】
 - 当前文字/caption 与每张图片必须分别提取证据，不得静默合并。
 - text.fields 和 images[].fields 中的每个字段必须包含 value、source、confidence；source 只能是 text、image 或 both。
@@ -82,6 +88,14 @@ DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT = """
     "take_profit": null,
     "leverage": null,
     "order_type": null
+  },
+  "entry_context": {
+    "kind": "entry_preamble",
+    "symbol": "BTC",
+    "side": "short",
+    "risk_multiplier": "0.5",
+    "confidence": 0.95,
+    "reason": "半仓操作，等待后续完整策略"
   },
   "lifecycle_event": {
     "event_type": "none | entry_confirm | cancel_entry | exit_position | position_update",

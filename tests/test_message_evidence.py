@@ -1,12 +1,92 @@
 from datetime import UTC, datetime
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.message_evidence import (
     load_current_message_evidence,
+    normalize_mimo_evidence,
     save_message_evidence_version,
 )
 from telegram_kol_research.models import RawMessage
+
+
+@pytest.mark.parametrize(
+    ("entry_context", "expected_multiplier"),
+    [
+        (
+            {
+                "kind": "entry_preamble",
+                "symbol": "btc",
+                "side": "SHORT",
+                "risk_multiplier": "0.5",
+                "confidence": 0.96,
+                "reason": "半仓操作",
+            },
+            "0.5",
+        ),
+        (
+            {
+                "kind": "entry_preamble",
+                "symbol": "ETH",
+                "side": "long",
+                "risk_multiplier": "0.30",
+                "confidence": 0.91,
+                "reason": "30% 仓位",
+            },
+            "0.3",
+        ),
+    ],
+)
+def test_normalize_mimo_evidence_accepts_explicit_entry_preamble(
+    entry_context, expected_multiplier
+):
+    *_, normalized = normalize_mimo_evidence(
+        {
+            "recognition_result": "非策略",
+            "confidence": 0.9,
+            "entry_context": entry_context,
+        },
+        input_kind="text",
+        error_message=None,
+    )
+
+    assert normalized["entry_context"] == {
+        "kind": "entry_preamble",
+        "symbol": entry_context["symbol"].upper(),
+        "side": entry_context["side"].lower(),
+        "risk_multiplier": expected_multiplier,
+        "confidence": entry_context["confidence"],
+        "reason": entry_context["reason"],
+    }
+    assert "entry_context_rejection_reason" not in normalized
+
+
+@pytest.mark.parametrize(
+    "entry_context",
+    [
+        {"kind": "entry_preamble", "symbol": "BTC", "side": "short", "risk_multiplier": "0"},
+        {"kind": "entry_preamble", "symbol": "BTC", "side": "short", "risk_multiplier": "1.1"},
+        {"kind": "entry_preamble", "symbol": "", "side": "short", "risk_multiplier": "0.5"},
+        {"kind": "entry_preamble", "symbol": "BTC", "side": "flat", "risk_multiplier": "0.5"},
+        {"kind": "other", "symbol": "BTC", "side": "short", "risk_multiplier": "0.5"},
+    ],
+)
+def test_malformed_entry_preamble_is_omitted_without_failing_recognition(entry_context):
+    extraction_status, *_, normalized = normalize_mimo_evidence(
+        {
+            "recognition_result": "非策略",
+            "confidence": 0.8,
+            "entry_context": entry_context,
+        },
+        input_kind="text",
+        error_message=None,
+    )
+
+    assert extraction_status == "completed"
+    assert "entry_context" not in normalized
+    assert normalized["entry_context_rejection_reason"] == "entry_context_invalid"
 
 
 def _message(session_factory) -> RawMessage:

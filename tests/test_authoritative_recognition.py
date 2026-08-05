@@ -402,6 +402,14 @@ def test_reanalysis_reuses_saved_mimo_evidence_without_model_call(
             "strategy": {},
             "lifecycle_event": {"event_type": "none"},
             "conflicts": [],
+            "entry_context": {
+                "kind": "entry_preamble",
+                "symbol": "BTC",
+                "side": "short",
+                "risk_multiplier": "0.5",
+                "confidence": 0.95,
+                "reason": "半仓操作",
+            },
         },
     )
     monkeypatch.setattr(
@@ -422,6 +430,7 @@ def test_reanalysis_reuses_saved_mimo_evidence_without_model_call(
     assert assessment.mimo.model == "mimo-v2.5"
     assert assessment.mimo.input_kind == "text+image"
     assert assessment.mimo.payload["evidence"]["images"][0]["asset_id"] == 7
+    assert assessment.mimo.payload["entry_context"]["risk_multiplier"] == "0.5"
 
 
 def test_context_resolution_triggers_are_closed_and_auditable():

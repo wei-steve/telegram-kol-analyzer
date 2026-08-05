@@ -348,6 +348,12 @@ def _load_current_mimo_evidence_result(
             "conflicts": normalized.get("conflicts", []),
         },
     }
+    entry_context = normalized.get("entry_context")
+    if isinstance(entry_context, dict):
+        payload["entry_context"] = entry_context
+    rejection_reason = normalized.get("entry_context_rejection_reason")
+    if rejection_reason:
+        payload["entry_context_rejection_reason"] = str(rejection_reason)
     status = str(payload.get("recognition_result") or "")
     if status not in {"是策略", "非策略"}:
         lifecycle = payload["lifecycle_event"]
