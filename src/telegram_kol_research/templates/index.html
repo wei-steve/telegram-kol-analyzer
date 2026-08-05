@@ -353,6 +353,14 @@
             </select>
           </label>
           <label>
+            仓位管理活性 V2 模式
+            <select name="position_management_liveness_v2_mode">
+              <option value="disabled" {% if trading_settings.position_management_liveness_v2_mode == 'disabled' %}selected{% endif %}>禁用：保持原有运行路径</option>
+              <option value="shadow" {% if trading_settings.position_management_liveness_v2_mode == 'shadow' %}selected{% endif %}>影子：记录精确能力与恢复证据，不写入交易所</option>
+              <option value="live" {% if trading_settings.position_management_liveness_v2_mode == 'live' %}selected{% endif %}>实盘：还需全局自动交易与策略管理实盘</option>
+            </select>
+          </label>
+          <label>
             前置仓位指令组装模式
             <select name="entry_preamble_mode">
               <option value="disabled" {% if trading_settings.entry_preamble_mode == 'disabled' %}selected{% endif %}>关闭：不使用之前的仓位提示</option>

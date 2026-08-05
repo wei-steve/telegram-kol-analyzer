@@ -2837,6 +2837,7 @@ function bindTradingSettingsForm() {
         .filter((value) => Number.isSafeInteger(value) && value !== 0),
       management_execution_mode: String(formData.get('management_execution_mode') || 'disabled'),
       composite_management_v2_mode: String(formData.get('composite_management_v2_mode') || 'disabled'),
+      position_management_liveness_v2_mode: String(formData.get('position_management_liveness_v2_mode') || 'disabled'),
       entry_preamble_mode: String(formData.get('entry_preamble_mode') || 'disabled'),
       default_max_loss_usdt: numericValue('default_max_loss_usdt', 20),
       daily_max_loss_usdt: numericValue('daily_max_loss_usdt', 500),

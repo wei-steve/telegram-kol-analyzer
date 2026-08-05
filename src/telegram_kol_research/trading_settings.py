@@ -68,6 +68,9 @@ class TradingSettings:
     trigger_protection_stop_rescue_mode: Literal[
         "disabled", "shadow", "live"
     ] = "disabled"
+    position_management_liveness_v2_mode: Literal[
+        "disabled", "shadow", "live"
+    ] = "disabled"
     entry_preamble_mode: Literal["disabled", "shadow", "live"] = "disabled"
     default_max_loss_usdt: float = 20.0
     daily_max_loss_usdt: float = 500.0
@@ -150,6 +153,20 @@ class TradingSettings:
             return "shadow"
         if (
             self.trigger_protection_stop_rescue_mode == "live"
+            and self.auto_trade_enabled
+            and self.management_execution_mode == "live"
+        ):
+            return "live"
+        return "disabled"
+
+    @property
+    def effective_position_management_liveness_v2_mode(
+        self,
+    ) -> Literal["disabled", "shadow", "live"]:
+        if self.position_management_liveness_v2_mode == "shadow":
+            return "shadow"
+        if (
+            self.position_management_liveness_v2_mode == "live"
             and self.auto_trade_enabled
             and self.management_execution_mode == "live"
         ):
@@ -284,6 +301,13 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
             defaults.trigger_protection_stop_rescue_mode,
         )
     )
+    position_management_liveness_v2_mode = _rollout_mode(
+        raw.get(
+            "position_management_liveness_v2_mode",
+            defaults.position_management_liveness_v2_mode,
+        ),
+        field_name="position_management_liveness_v2_mode",
+    )
     entry_preamble_mode = _entry_preamble_mode(
         raw.get("entry_preamble_mode", defaults.entry_preamble_mode)
     )
@@ -301,6 +325,7 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         management_execution_mode=management_execution_mode,
         composite_management_v2_mode=composite_management_v2_mode,
         trigger_protection_stop_rescue_mode=trigger_protection_stop_rescue_mode,
+        position_management_liveness_v2_mode=position_management_liveness_v2_mode,
         entry_preamble_mode=entry_preamble_mode,
         default_max_loss_usdt=_positive_float(
             raw.get("default_max_loss_usdt"),
@@ -401,6 +426,19 @@ def _trigger_protection_stop_rescue_mode(
         raise ValueError(
             "trigger_protection_stop_rescue_mode must be disabled, shadow, or live"
         )
+    return normalized
+
+
+def _rollout_mode(
+    value: Any,
+    *,
+    field_name: str,
+) -> Literal["disabled", "shadow", "live"]:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be disabled, shadow, or live")
+    normalized = value.strip().lower()
+    if normalized not in {"disabled", "shadow", "live"}:
+        raise ValueError(f"{field_name} must be disabled, shadow, or live")
     return normalized
 
 

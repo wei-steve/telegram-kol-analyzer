@@ -210,6 +210,36 @@ def test_exact_backup_allows_tp_without_native_primary_ownership(tmp_path):
     assert [payload["sz"] for payload in plan.payloads] == ["1.7", "1", "0.7"]
 
 
+def test_liveness_v2_shadow_plans_take_profit_without_exchange_write(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import PositionProtectionLeg
+    from telegram_kol_research.trading_settings import save_trading_settings
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        execute_ready_trigger_take_profit_convergences,
+    )
+
+    session_factory = create_session_factory(tmp_path / "liveness-shadow-tp.db")
+    _ready_convergence(session_factory, existing_take_profit=False)
+    save_trading_settings(
+        session_factory,
+        {"position_management_liveness_v2_mode": "shadow"},
+    )
+    client = _Client()
+
+    completed = execute_ready_trigger_take_profit_convergences(
+        session_factory,
+        deepcoin_client=client,
+        processed_at=NOW,
+    )
+
+    assert completed == 0
+    assert client.submit_calls == []
+    with session_factory() as session:
+        assert session.query(PositionProtectionLeg).filter_by(
+            role="take_profit"
+        ).count() == 3
+
+
 def test_unknown_targeting_tp_still_blocks_additive_tp(tmp_path):
     from telegram_kol_research.db import create_session_factory
     from telegram_kol_research.trigger_take_profit_convergence_executor import (

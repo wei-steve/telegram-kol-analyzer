@@ -69,7 +69,9 @@ def submit_verified_trigger_backup_stops(
     list_pending = getattr(client, "list_trigger_orders_pending", None)
     if not callable(list_positions) or not callable(list_pending):
         return 0
-    backup_stop_buffer_bps = load_trading_settings(session_factory).trigger_backup_stop_buffer_bps
+    settings = load_trading_settings(session_factory)
+    backup_stop_buffer_bps = settings.trigger_backup_stop_buffer_bps
+    rollout_mode = settings.effective_position_management_liveness_v2_mode
     with session_factory() as session:
         candidates = _eligible_candidates(session)
     submitted = 0
@@ -92,6 +94,15 @@ def submit_verified_trigger_backup_stops(
                     session,
                     plan=plan,
                     incident_type="backup_stop_blocked",
+                    observed_at=submitted_at,
+                )
+                session.commit()
+                continue
+            if rollout_mode == "shadow":
+                _record_incident(
+                    session,
+                    plan=plan,
+                    incident_type="backup_stop_shadow_ready",
                     observed_at=submitted_at,
                 )
                 session.commit()

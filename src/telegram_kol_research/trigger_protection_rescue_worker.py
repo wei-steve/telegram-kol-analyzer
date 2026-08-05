@@ -47,9 +47,10 @@ def run_trigger_protection_rescue_tick(
     """Evaluate due trigger intents and optionally execute one exact rescue each."""
 
     now = processed_at or datetime.now(UTC)
-    mode = load_trading_settings(
-        session_factory
-    ).effective_trigger_protection_stop_rescue_mode
+    settings = load_trading_settings(session_factory)
+    mode = settings.effective_trigger_protection_stop_rescue_mode
+    if settings.effective_position_management_liveness_v2_mode == "shadow":
+        mode = "shadow" if mode != "disabled" else "disabled"
     if mode == "disabled":
         return TriggerProtectionRescueTickResult(mode=mode)
     bounded_limit = max(1, min(int(limit), 100))

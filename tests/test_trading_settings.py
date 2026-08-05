@@ -312,6 +312,50 @@ def test_trigger_protection_stop_rescue_defaults_disabled_and_round_trips(tmp_pa
     assert reloaded.effective_trigger_protection_stop_rescue_mode == "shadow"
 
 
+def test_position_management_liveness_v2_defaults_disabled_and_round_trips(tmp_path):
+    session_factory = create_session_factory(tmp_path / "liveness-v2-settings.db")
+
+    defaults = load_trading_settings(session_factory)
+    saved = save_trading_settings(
+        session_factory,
+        {"position_management_liveness_v2_mode": " SHADOW "},
+    )
+    reloaded = load_trading_settings(session_factory)
+
+    assert defaults.position_management_liveness_v2_mode == "disabled"
+    assert defaults.effective_position_management_liveness_v2_mode == "disabled"
+    assert saved.position_management_liveness_v2_mode == "shadow"
+    assert reloaded.effective_position_management_liveness_v2_mode == "shadow"
+
+
+def test_live_position_management_liveness_v2_requires_both_execution_gates():
+    global_off = trading_settings_from_payload({
+        "position_management_liveness_v2_mode": "live",
+        "auto_trade_enabled": False,
+        "management_execution_mode": "live",
+    })
+    management_off = trading_settings_from_payload({
+        "position_management_liveness_v2_mode": "live",
+        "auto_trade_enabled": True,
+        "management_execution_mode": "shadow",
+    })
+    enabled = trading_settings_from_payload({
+        "position_management_liveness_v2_mode": "live",
+        "auto_trade_enabled": True,
+        "management_execution_mode": "live",
+    })
+
+    assert global_off.effective_position_management_liveness_v2_mode == "disabled"
+    assert management_off.effective_position_management_liveness_v2_mode == "disabled"
+    assert enabled.effective_position_management_liveness_v2_mode == "live"
+
+
+@pytest.mark.parametrize("value", [True, False, "unsafe", [], {}, 1, None])
+def test_position_management_liveness_v2_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="position_management_liveness_v2_mode"):
+        trading_settings_from_payload({"position_management_liveness_v2_mode": value})
+
+
 def test_live_trigger_protection_stop_rescue_requires_both_execution_gates():
     disabled_globally = trading_settings_from_payload(
         {

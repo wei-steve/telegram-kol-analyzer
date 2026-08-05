@@ -36,6 +36,7 @@ from telegram_kol_research.position_take_profit_orders import (
 from telegram_kol_research.position_protection_legs import bind_verified_exchange_order
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 from telegram_kol_research.take_profit_plan import TakeProfitPlanError, build_take_profit_plan
+from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.native_tpsl import (
     NativeTpslExpectation,
     NativeTpslOrder,
@@ -266,6 +267,9 @@ def execute_ready_trigger_take_profit_convergences(
 ) -> int:
     """Run a bounded set of durable ready tasks; terminal tasks are skipped."""
 
+    rollout_mode = load_trading_settings(
+        session_factory
+    ).effective_position_management_liveness_v2_mode
     with session_factory() as session:
         identifiers = [
             int(row.id)
@@ -279,6 +283,15 @@ def execute_ready_trigger_take_profit_convergences(
         ]
     completed = 0
     for convergence_id in identifiers:
+        if rollout_mode == "shadow":
+            plan_trigger_take_profit_convergence(
+                session_factory,
+                convergence_id=convergence_id,
+                deepcoin_client=deepcoin_client,
+                contract_spec_provider=contract_spec_provider,
+                planned_at=processed_at,
+            )
+            continue
         result = execute_trigger_take_profit_convergence(
             session_factory,
             convergence_id=convergence_id,
