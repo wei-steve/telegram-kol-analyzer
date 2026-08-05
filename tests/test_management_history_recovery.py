@@ -285,6 +285,213 @@ def test_exact_submission_response_and_equal_position_history_can_resolve(
         assert decision.decision == "terminal_position_history_confirmed"
 
 
+def _add_prior_close_batch(session_factory, current_batch_id, *, leg_status):
+    with session_factory() as session:
+        current = session.get(StrategyManagementBatch, current_batch_id)
+        current_leg = session.query(StrategyManagementLeg).filter_by(
+            management_batch_id=current_batch_id
+        ).one()
+        ids = {
+            "raw": current.raw_message_id,
+            "decision": current.recognition_decision_id,
+            "lifecycle": current.target_lifecycle_id,
+            "binding": current.execution_binding_id,
+            "entry": current_leg.execution_order_leg_id,
+            "strategy": current.strategy_instance_id,
+        }
+    return create_management_batch(
+        session_factory,
+        idempotency_fingerprint=("p" if leg_status == "confirmed" else "q") * 64,
+        raw_message_id=ids["raw"],
+        recognition_decision_id=ids["decision"],
+        recognition_generation=f"generation-prior-{leg_status}",
+        target_lifecycle_id=ids["lifecycle"],
+        strategy_instance_id=ids["strategy"],
+        execution_binding_id=ids["binding"],
+        intent="partial_take_profit",
+        effective_action="partial_close",
+        requested_fraction=0.5,
+        effective_fraction=0.5,
+        partial_round_before=0,
+        target_fingerprint=("u" if leg_status == "confirmed" else "v") * 64,
+        target_snapshot={"identity": {"execution_binding_id": ids["binding"]}},
+        legs=[
+            ManagementLegCreate(
+                execution_order_leg_id=ids["entry"],
+                pos_id="pos-1",
+                leg_index=0,
+                preflight_size="2",
+                planned_close_size="1",
+                client_order_id="TMPRIOR",
+                exchange_order_id="close-prior",
+                status=leg_status,
+            )
+        ],
+        planned_at=NOW - timedelta(minutes=5),
+        status="succeeded" if leg_status == "confirmed" else "blocked",
+        reason_code=(
+            "history_exchange_result_confirmed"
+            if leg_status == "confirmed"
+            else "management_reconciliation_identity_mismatch"
+        ),
+    )
+
+
+def test_exact_cumulative_close_chain_can_resolve_lifetime_position_history(
+    tmp_path,
+):
+    from telegram_kol_research.management_history_recovery import (
+        plan_management_history_recovery,
+    )
+
+    session_factory, batch_id = _seed_batch(tmp_path, leg_status="submitted")
+    with session_factory() as session:
+        current = session.get(StrategyManagementBatch, batch_id)
+        current_leg = session.query(StrategyManagementLeg).filter_by(
+            management_batch_id=batch_id
+        ).one()
+        current_leg.response_json = (
+            '{"code":"0","data":{"ordId":"close-1",'
+            '"clOrdId":"TMCLIENT1","sCode":"0"}}'
+        )
+        ids = {
+            "raw": current.raw_message_id,
+            "decision": current.recognition_decision_id,
+            "lifecycle": current.target_lifecycle_id,
+            "binding": current.execution_binding_id,
+            "entry": current_leg.execution_order_leg_id,
+            "strategy": current.strategy_instance_id,
+        }
+        session.commit()
+    create_management_batch(
+        session_factory,
+        idempotency_fingerprint="p" * 64,
+        raw_message_id=ids["raw"],
+        recognition_decision_id=ids["decision"],
+        recognition_generation="generation-prior",
+        target_lifecycle_id=ids["lifecycle"],
+        strategy_instance_id=ids["strategy"],
+        execution_binding_id=ids["binding"],
+        intent="partial_take_profit",
+        effective_action="partial_close",
+        requested_fraction=0.5,
+        effective_fraction=0.5,
+        partial_round_before=0,
+        target_fingerprint="u" * 64,
+        target_snapshot={"identity": {"execution_binding_id": ids["binding"]}},
+        legs=[
+            ManagementLegCreate(
+                execution_order_leg_id=ids["entry"],
+                pos_id="pos-1",
+                leg_index=0,
+                preflight_size="2",
+                planned_close_size="1",
+                client_order_id="TMPRIOR",
+                exchange_order_id="close-prior",
+                status="confirmed",
+            )
+        ],
+        planned_at=NOW - timedelta(minutes=5),
+        status="succeeded",
+        reason_code="history_exchange_result_confirmed",
+    )
+
+    decision = plan_management_history_recovery(
+        session_factory,
+        batch_id=batch_id,
+        snapshot=_snapshot(
+            position_history=[
+                {
+                    "posId": "pos-1",
+                    "pos": "2",
+                    "closePos": "2",
+                    "uTime": str(int(NOW.timestamp() * 1000) + 1000),
+                }
+            ]
+        ),
+        planned_at=NOW,
+    )
+
+    assert decision.status == "ready"
+    assert decision.decision == "terminal_position_history_confirmed"
+
+
+def test_single_close_history_cannot_bypass_unconfirmed_prior_leg(tmp_path):
+    from telegram_kol_research.management_history_recovery import (
+        plan_management_history_recovery,
+    )
+
+    session_factory, batch_id = _seed_batch(tmp_path, leg_status="submitted")
+    with session_factory() as session:
+        current_leg = session.query(StrategyManagementLeg).filter_by(
+            management_batch_id=batch_id
+        ).one()
+        current_leg.response_json = (
+            '{"code":"0","data":{"ordId":"close-1",'
+            '"clOrdId":"TMCLIENT1","sCode":"0"}}'
+        )
+        session.commit()
+    _add_prior_close_batch(session_factory, batch_id, leg_status="submitted")
+
+    decision = plan_management_history_recovery(
+        session_factory,
+        batch_id=batch_id,
+        snapshot=_snapshot(
+            position_history=[
+                {
+                    "posId": "pos-1",
+                    "pos": "1",
+                    "closePos": "1",
+                    "uTime": str(int(NOW.timestamp() * 1000) + 1000),
+                }
+            ]
+        ),
+        planned_at=NOW,
+    )
+
+    assert decision.status == "refused"
+    assert decision.reason_code == "exact_terminal_order_evidence_missing"
+
+
+@pytest.mark.parametrize("nonfinite", ["NaN", "Infinity", "-Infinity"])
+def test_nonfinite_position_history_refuses_safely(tmp_path, nonfinite):
+    from telegram_kol_research.management_history_recovery import (
+        plan_management_history_recovery,
+    )
+
+    session_factory, batch_id = _seed_batch(tmp_path, leg_status="submitted")
+    with session_factory() as session:
+        leg = session.query(StrategyManagementLeg).filter_by(
+            management_batch_id=batch_id
+        ).one()
+        leg.response_json = (
+            '{"code":"0","data":{"ordId":"close-1",'
+            '"clOrdId":"TMCLIENT1","sCode":"0"}}'
+        )
+        leg.preflight_size = nonfinite
+        leg.planned_close_size = nonfinite
+        session.commit()
+
+    decision = plan_management_history_recovery(
+        session_factory,
+        batch_id=batch_id,
+        snapshot=_snapshot(
+            position_history=[
+                {
+                    "posId": "pos-1",
+                    "pos": nonfinite,
+                    "closePos": nonfinite,
+                    "uTime": str(int(NOW.timestamp() * 1000) + 1000),
+                }
+            ]
+        ),
+        planned_at=NOW,
+    )
+
+    assert decision.status == "refused"
+    assert decision.reason_code == "exact_terminal_order_evidence_missing"
+
+
 def test_partial_failed_restoration_can_resolve_when_exact_position_is_absent(
     tmp_path,
 ):

@@ -142,6 +142,7 @@ def plan_management_history_recovery(
                 if match is None:
                     match = _exact_terminal_position_history_match(
                         snapshot,
+                        session=session,
                         batch=batch,
                         leg=leg,
                     )
@@ -406,6 +407,7 @@ def _position_present(snapshot: Any, pos_id: str) -> bool:
 def _exact_terminal_position_history_match(
     snapshot: Any,
     *,
+    session,
     batch,
     leg,
 ) -> dict[str, str] | None:
@@ -414,6 +416,8 @@ def _exact_terminal_position_history_match(
     try:
         planned_size = Decimal(str(leg.planned_close_size))
     except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not planned_size.is_finite() or planned_size <= 0:
         return None
     planned_at_ms = int(_aware_utc(batch.planned_at).timestamp() * 1000)
     for row in getattr(snapshot, "position_history", ()):
@@ -428,12 +432,74 @@ def _exact_terminal_position_history_match(
         except (InvalidOperation, TypeError, ValueError):
             continue
         if (
-            position_size == planned_size
-            and closed_size == planned_size
-            and updated_at_ms >= planned_at_ms
+            not position_size.is_finite()
+            or not closed_size.is_finite()
+            or position_size <= 0
+            or closed_size <= 0
+        ):
+            continue
+        if updated_at_ms >= planned_at_ms and _has_exact_cumulative_close_chain(
+            session,
+            batch=batch,
+            leg=leg,
+            position_size=position_size,
+            closed_size=closed_size,
         ):
             return {"state": "position_history_closed"}
     return None
+
+
+def _has_exact_cumulative_close_chain(
+    session,
+    *,
+    batch,
+    leg,
+    position_size: Decimal,
+    closed_size: Decimal,
+) -> bool:
+    rows = (
+        session.query(StrategyManagementLeg, StrategyManagementBatch)
+        .join(
+            StrategyManagementBatch,
+            StrategyManagementBatch.id
+            == StrategyManagementLeg.management_batch_id,
+        )
+        .filter(
+            StrategyManagementBatch.execution_binding_id
+            == batch.execution_binding_id,
+            StrategyManagementLeg.execution_order_leg_id
+            == leg.execution_order_leg_id,
+            StrategyManagementLeg.pos_id == leg.pos_id,
+            StrategyManagementBatch.planned_at <= batch.planned_at,
+        )
+        .order_by(StrategyManagementBatch.planned_at, StrategyManagementLeg.id)
+        .all()
+    )
+    if not rows or int(rows[-1][0].id) != int(leg.id):
+        return False
+    expected_preflight = position_size
+    for index, (candidate, _candidate_batch) in enumerate(rows):
+        try:
+            preflight = Decimal(str(candidate.preflight_size))
+            close_size = Decimal(str(candidate.planned_close_size))
+        except (InvalidOperation, TypeError, ValueError):
+            return False
+        if not preflight.is_finite() or not close_size.is_finite():
+            return False
+        is_current = int(candidate.id) == int(leg.id)
+        if (
+            preflight != expected_preflight
+            or close_size <= 0
+            or close_size > preflight
+            or (
+                not is_current
+                and str(candidate.status) not in {"confirmed", "succeeded"}
+            )
+            or (is_current and index != len(rows) - 1)
+        ):
+            return False
+        expected_preflight -= close_size
+    return expected_preflight == 0 and position_size == closed_size
 
 
 def _durable_submission_response_matches(leg) -> bool:
