@@ -274,6 +274,36 @@ def test_stray_entry_context_on_executable_message_is_not_persisted(tmp_path, pa
         assert session.query(models.EntryPreamble).count() == 0
 
 
+def test_prompt_shaped_null_strategy_persists_standalone_preamble(tmp_path):
+    from telegram_kol_research.entry_preambles import persist_authoritative_entry_preamble
+
+    session_factory = create_session_factory(tmp_path / "null-strategy.db")
+    raw_id, evidence_id = _message_and_evidence(session_factory)
+    result = persist_authoritative_entry_preamble(
+        session_factory,
+        raw_message_id=raw_id,
+        evidence_version_id=evidence_id,
+        recognition_generation="generation-1",
+        payload={
+            "recognition_result": "非策略",
+            "strategy": {
+                "symbol": None,
+                "side": None,
+                "entry": None,
+                "stop_loss": None,
+                "take_profit": None,
+                "leverage": None,
+            },
+            "lifecycle_event": {"event_type": "none"},
+            "entry_context": _half_risk_evidence().to_dict(),
+        },
+        mode="shadow",
+        now=datetime(2026, 8, 5, 12, 1, tzinfo=UTC),
+    )
+
+    assert result is not None
+
+
 def test_source_edit_invalidates_pending_preamble_in_same_ingest(tmp_path):
     session_factory = create_session_factory(tmp_path / "edit.db")
     persist_normalized_messages(

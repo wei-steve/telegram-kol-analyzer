@@ -262,7 +262,7 @@ def test_live_assembly_atomically_consumes_once_and_reuses_result(tmp_path):
         assert session.query(EntryStrategyAssembly).count() == 1
 
 
-def test_disabled_retry_does_not_reuse_existing_live_multiplier(tmp_path):
+def test_non_live_retry_blocks_existing_live_assembly(tmp_path):
     from telegram_kol_research.entry_strategy_assembly import assemble_entry_strategy
 
     session_factory = create_session_factory(tmp_path / "disabled-retry.db")
@@ -277,19 +277,20 @@ def test_disabled_retry_does_not_reuse_existing_live_multiplier(tmp_path):
         assembled_at=NOW + timedelta(minutes=2),
     )
 
-    retry = assemble_entry_strategy(
-        session_factory,
-        strategy_raw_message_id=strategy_raw_id,
-        signal_candidate_id=candidate_id,
-        strategy_instance_id="crash-before-binding",
-        mode="disabled",
-        live_chat_ids=set(),
-        assembled_at=NOW + timedelta(minutes=3),
-    )
+    for mode, allowlist in (("disabled", set()), ("shadow", set()), ("live", set())):
+        retry = assemble_entry_strategy(
+            session_factory,
+            strategy_raw_message_id=strategy_raw_id,
+            signal_candidate_id=candidate_id,
+            strategy_instance_id="crash-before-binding",
+            mode=mode,
+            live_chat_ids=allowlist,
+            assembled_at=NOW + timedelta(minutes=3),
+        )
 
-    assert retry.status == "disabled"
-    assert retry.proposed_risk_multiplier == Decimal("1")
-    assert retry.effective_risk_multiplier == Decimal("1")
+        assert retry.status == "blocked"
+        assert retry.reason_code == "existing_entry_assembly_not_live_authorized"
+        assert retry.effective_risk_multiplier == Decimal("1")
 
 
 def test_shadow_reports_proposal_without_consuming_or_changing_effective_risk(tmp_path):

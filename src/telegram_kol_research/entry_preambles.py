@@ -21,6 +21,18 @@ def _canonical_json(value: Mapping[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _has_meaningful_value(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, Mapping):
+        return any(_has_meaningful_value(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_has_meaningful_value(item) for item in value)
+    return True
+
+
 def _preamble_fingerprint(
     *,
     raw_message_id: int,
@@ -129,7 +141,7 @@ def persist_authoritative_entry_preamble(
     if (
         payload.get("recognition_result") != "非策略"
         or not isinstance(strategy, Mapping)
-        or bool(strategy)
+        or _has_meaningful_value(strategy)
         or not isinstance(lifecycle, Mapping)
         or str(lifecycle.get("event_type") or "") != "none"
     ):

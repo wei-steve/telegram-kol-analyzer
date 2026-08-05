@@ -627,48 +627,38 @@ def read_entry_preamble_invariants(
         }
         if not required_tables.issubset(available):
             return ()
-        pending_rows = connection.execute(
-            """
-            SELECT p.chat_id, p.symbol, p.side, p.created_at,
-                   r.posted_at, r.message_id, r.id
+        eligibility = """
             FROM entry_preambles AS p
-            JOIN raw_messages AS r ON r.id = p.raw_message_id
+            JOIN raw_messages AS source ON source.id = p.raw_message_id
             WHERE p.status = 'pending'
-            ORDER BY r.posted_at, r.message_id, r.id
-            LIMIT 1001
-            """
-        ).fetchall()
-        boundary_rows = connection.execute(
-            """
-            SELECT r.chat_id, r.posted_at, r.message_id, r.id
-            FROM signal_candidates AS c
-            JOIN raw_messages AS r ON r.id = c.raw_message_id
-            WHERE c.event_type IN ('entry_signal', 'strategy_revision', 'close_signal')
-               OR c.management_action IN ('cancel_entry', 'cancel')
-            ORDER BY r.posted_at, r.message_id, r.id
-            LIMIT 1001
-            """
-        ).fetchall()
-        boundary_keys: dict[int, list[tuple[str, int, int]]] = {}
-        for chat_id, posted_at, message_id, raw_id in boundary_rows:
-            boundary_keys.setdefault(int(chat_id), []).append(
-                (str(posted_at or ""), int(message_id), int(raw_id))
-            )
-        eligible = []
-        for row in pending_rows:
-            source_key = (str(row[4] or ""), int(row[5]), int(row[6]))
-            if any(
-                key > source_key for key in boundary_keys.get(int(row[0]), [])
-            ):
-                continue
-            eligible.append(row)
-        if any(str(row[3]) < stale_before.isoformat(sep=" ") for row in eligible):
+              AND NOT EXISTS (
+                SELECT 1
+                FROM signal_candidates AS c
+                JOIN raw_messages AS boundary ON boundary.id = c.raw_message_id
+                WHERE boundary.chat_id = p.chat_id
+                  AND (
+                    c.event_type IN ('entry_signal', 'strategy_revision', 'close_signal')
+                    OR c.management_action IN ('cancel_entry', 'cancel')
+                  )
+                  AND (
+                    boundary.posted_at > source.posted_at
+                    OR (boundary.posted_at = source.posted_at AND boundary.message_id > source.message_id)
+                    OR (boundary.posted_at = source.posted_at AND boundary.message_id = source.message_id AND boundary.id > source.id)
+                  )
+              )
+        """
+        stale = connection.execute(
+            "SELECT 1 " + eligibility + " AND p.created_at < ? LIMIT 1",
+            (stale_before.isoformat(sep=" "),),
+        ).fetchone()
+        if stale:
             reasons.add("stale_entry_preamble_unresolved")
-        targets: dict[tuple[int, str, str], int] = {}
-        for row in eligible:
-            target = (int(row[0]), str(row[1]), str(row[2]))
-            targets[target] = targets.get(target, 0) + 1
-        if any(count > 1 for count in targets.values()):
+        ambiguous = connection.execute(
+            "SELECT 1 "
+            + eligibility
+            + " GROUP BY p.chat_id, p.symbol, p.side HAVING COUNT(*) > 1 LIMIT 1"
+        ).fetchone()
+        if ambiguous:
             reasons.add("entry_preamble_ambiguous")
         evidence_rows = connection.execute(
             """

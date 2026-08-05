@@ -396,6 +396,43 @@ def test_entry_preamble_monitor_ignores_shadow_preamble_behind_entry_boundary(tm
     assert codes == ()
 
 
+def test_entry_preamble_monitor_does_not_truncate_recent_boundary(tmp_path):
+    database = tmp_path / "entry-preamble-large-monitor.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE entry_preambles (id INTEGER PRIMARY KEY, raw_message_id INTEGER, chat_id INTEGER, message_id INTEGER, symbol TEXT, side TEXT, status TEXT, created_at TEXT);
+        CREATE TABLE raw_messages (id INTEGER PRIMARY KEY, chat_id INTEGER, message_id INTEGER, posted_at TEXT);
+        CREATE TABLE signal_candidates (id INTEGER PRIMARY KEY, raw_message_id INTEGER, event_type TEXT, management_action TEXT);
+        CREATE TABLE entry_strategy_assemblies (id INTEGER PRIMARY KEY, strategy_instance_id TEXT, fingerprint TEXT);
+        CREATE TABLE execution_bindings (id INTEGER PRIMARY KEY, strategy_instance_id TEXT, payload_json TEXT);
+        INSERT INTO raw_messages VALUES (1, 9, 9901, '2026-08-04 00:00:00');
+        INSERT INTO entry_preambles VALUES (1, 1, 9, 9901, 'BTCUSDT', 'long', 'pending', '2026-08-04 00:00:00');
+        """
+    )
+    unrelated = [
+        (index + 2, 99, index + 1, f"2026-08-04 00:{index // 60:02d}:{index % 60:02d}")
+        for index in range(1001)
+    ]
+    connection.executemany("INSERT INTO raw_messages VALUES (?, ?, ?, ?)", unrelated)
+    connection.executemany(
+        "INSERT INTO signal_candidates VALUES (?, ?, 'entry_signal', NULL)",
+        [(index + 1, row[0]) for index, row in enumerate(unrelated)],
+    )
+    connection.execute(
+        "INSERT INTO raw_messages VALUES (2005, 9, 9902, '2026-08-05 00:00:00')"
+    )
+    connection.execute(
+        "INSERT INTO signal_candidates VALUES (2005, 2005, 'entry_signal', NULL)"
+    )
+    connection.commit()
+
+    assert read_entry_preamble_invariants(
+        database,
+        now=datetime(2026, 8, 6, tzinfo=UTC),
+    ) == ()
+
+
 def test_composite_monitor_reader_detects_persisted_faults_without_writes(tmp_path):
     database = tmp_path / "composite-monitor.db"
     connection = sqlite3.connect(database)
