@@ -38,6 +38,7 @@ from telegram_kol_research.message_instruction_items import (
     finish_message_instruction_item,
     has_message_instruction_items,
     list_message_instruction_item_results,
+    should_defer_instruction_result,
 )
 from telegram_kol_research.price_normalization import extract_normalized_prices
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
@@ -222,10 +223,7 @@ def execute_message_instruction_items(
             result = {"type": type(exc).__name__, "message": str(exc)}
         else:
             finish_status = _instruction_finish_status(result)
-        if (
-            str(result.get("status") or "").lower() == "deferred"
-            and result.get("reason") == "target_strategy_binding_not_visible_yet"
-        ):
+        if should_defer_instruction_result(result):
             defer_message_instruction_item_for_visibility(
                 session_factory,
                 item_id=item.id,

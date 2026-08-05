@@ -33,6 +33,23 @@ from telegram_kol_research.models import (
 NOW = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "target_strategy_binding_not_visible_yet",
+        "preceding_entry_context_unresolved",
+    ],
+)
+def test_visibility_deferral_reasons_include_preceding_entry_context(reason):
+    from telegram_kol_research.message_instruction_items import (
+        should_defer_instruction_result,
+    )
+
+    assert should_defer_instruction_result(
+        {"status": "deferred", "reason": reason}
+    ) is True
+
+
 def _persist_dual_instruction_message(session_factory):
     with session_factory() as session:
         raw = RawMessage(chat_id=100, message_id=55, text="close old and open new")

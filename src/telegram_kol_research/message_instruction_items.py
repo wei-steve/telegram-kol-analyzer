@@ -31,6 +31,19 @@ SUMMARY_NOTIFICATION_LEASE = timedelta(minutes=5)
 VISIBILITY_RETRY_DELAYS = (5, 15, 30, 60, 120, 300)
 VISIBILITY_RETRY_DEADLINE = timedelta(hours=6)
 VISIBILITY_RETRY_CLAIM_LEASE = timedelta(minutes=5)
+VISIBILITY_DEFER_REASONS = frozenset(
+    {
+        "target_strategy_binding_not_visible_yet",
+        "preceding_entry_context_unresolved",
+    }
+)
+
+
+def should_defer_instruction_result(result: dict) -> bool:
+    return (
+        str(result.get("status") or "") == "deferred"
+        and str(result.get("reason") or "") in VISIBILITY_DEFER_REASONS
+    )
 
 
 def create_message_instruction_items_in_session(
