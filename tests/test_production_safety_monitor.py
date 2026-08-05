@@ -29,6 +29,7 @@ from telegram_kol_research.production_safety_monitor import format_monitor_alert
 from telegram_kol_research.production_safety_monitor import load_monitor_state
 from telegram_kol_research.production_safety_monitor import read_abnormal_execution_events
 from telegram_kol_research.production_safety_monitor import read_loopback_settings
+from telegram_kol_research.production_safety_monitor import read_composite_management_invariants
 from telegram_kol_research.production_safety_monitor import run_daily_management_audit
 from telegram_kol_research.production_safety_monitor import run_production_safety_monitor
 from telegram_kol_research.production_safety_monitor import save_monitor_state
@@ -285,6 +286,89 @@ def test_exact_healthy_snapshot_has_no_reasons():
     assert result.healthy is True
     assert result.reason_codes == ()
     assert result.details == {}
+
+
+def test_monitor_surfaces_each_composite_management_invariant():
+    codes = (
+        "completed_batch_missing_component_evidence",
+        "duplicate_composite_close_submission",
+        "live_position_retained_tp_oversized",
+        "composite_position_without_verified_stop",
+        "stalled_composite_component",
+    )
+
+    result = evaluate_monitor_snapshot(
+        _snapshot(composite_invariant_codes=codes), EXPECTATIONS
+    )
+
+    assert result.healthy is False
+    assert result.reason_codes == tuple(sorted(codes))
+
+
+def test_composite_monitor_reader_detects_persisted_faults_without_writes(tmp_path):
+    database = tmp_path / "composite-monitor.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE strategy_management_batches (
+          id INTEGER PRIMARY KEY, status TEXT, management_contract_json TEXT
+        );
+        CREATE TABLE strategy_management_legs (
+          id INTEGER PRIMARY KEY, management_batch_id INTEGER,
+          execution_order_leg_id INTEGER, pos_id TEXT
+        );
+        CREATE TABLE strategy_management_components (
+          id INTEGER PRIMARY KEY, management_batch_id INTEGER,
+          strategy_management_leg_id INTEGER, component_kind TEXT,
+          status TEXT, desired_json TEXT, evidence_json TEXT,
+          last_progress_at TEXT, updated_at TEXT
+        );
+        CREATE TABLE position_mutation_intents (
+          id INTEGER PRIMARY KEY, idempotency_key TEXT, operation TEXT,
+          status TEXT
+        );
+        CREATE TABLE position_protection_ledger (
+          id INTEGER PRIMARY KEY, execution_order_leg_id INTEGER, pos_id TEXT,
+          purpose TEXT, size_text TEXT, status TEXT
+        );
+        """
+    )
+    contract = json.dumps({"required_components": ["converge_partial_close", "replace_remaining_protection"]})
+    stale = "2026-07-30 00:00:00"
+    connection.execute(
+        "INSERT INTO strategy_management_batches VALUES (1, 'succeeded', ?)",
+        (contract,),
+    )
+    connection.execute("INSERT INTO strategy_management_legs VALUES (1, 1, 11, 'pos-1')")
+    connection.executemany(
+        "INSERT INTO strategy_management_components VALUES (?, 1, 1, ?, ?, ?, ?, ?, ?)",
+        [
+            (1, "converge_partial_close", "confirmed", json.dumps({"target_remaining_size": "5"}), "[]", stale, stale),
+            (2, "replace_remaining_protection", "pending", "{}", "[]", stale, stale),
+        ],
+    )
+    connection.executemany(
+        "INSERT INTO position_mutation_intents VALUES (?, ?, 'close_position', 'submitted')",
+        [(1, "1:close:attempt:1"), (2, "1:close:attempt:2")],
+    )
+    connection.execute(
+        "INSERT INTO position_protection_ledger VALUES (1, 11, 'pos-1', 'take_profit', '6', 'verified')"
+    )
+    connection.commit()
+    before = database.read_bytes()
+
+    codes = read_composite_management_invariants(
+        database, now=datetime(2026, 8, 5, tzinfo=UTC)
+    )
+
+    assert set(codes) == {
+        "completed_batch_missing_component_evidence",
+        "duplicate_composite_close_submission",
+        "live_position_retained_tp_oversized",
+        "composite_position_without_verified_stop",
+        "stalled_composite_component",
+    }
+    assert database.read_bytes() == before
 
 
 def test_monitor_inputs_and_result_are_frozen():

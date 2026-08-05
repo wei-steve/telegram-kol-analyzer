@@ -18,6 +18,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -51,7 +52,9 @@ _SAFE_EVENT_VALUE = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
 _GIT_HEAD = re.compile(r"[0-9a-f]{40}\Z")
 _SAFE_TIMESTAMP = re.compile(r"[0-9T:+.-]{1,40}\Z")
 _SHA256_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
-_ADAPTER_NAMES = frozenset({"service", "head", "settings", "journal", "events", "audit"})
+_ADAPTER_NAMES = frozenset(
+    {"service", "head", "settings", "journal", "events", "audit", "composite"}
+)
 _MONITOR_CAPTURE_REASON_CODES = frozenset(
     {"adapter_failure", "audit_incomplete"}
 )
@@ -103,6 +106,11 @@ _FIXED_REASON_CODES = frozenset(
         "max_concurrent_positions_drift",
         "service_inactive",
         "state_invalid",
+        "completed_batch_missing_component_evidence",
+        "duplicate_composite_close_submission",
+        "live_position_retained_tp_oversized",
+        "composite_position_without_verified_stop",
+        "stalled_composite_component",
     }
 )
 _LOW_REPEAT_REASON_CODES = frozenset({"audit_abnormal"})
@@ -217,6 +225,11 @@ _FINGERPRINT_DETAIL_KEYS_BY_REASON = {
     "adapter_failure": ("adapter_failures",),
     "malformed_snapshot": (),
     "state_invalid": (),
+    "completed_batch_missing_component_evidence": ("composite_invariant_codes",),
+    "duplicate_composite_close_submission": ("composite_invariant_codes",),
+    "live_position_retained_tp_oversized": ("composite_invariant_codes",),
+    "composite_position_without_verified_stop": ("composite_invariant_codes",),
+    "stalled_composite_component": ("composite_invariant_codes",),
 }
 _NOTIFICATION_SUPPRESSION = timedelta(hours=6)
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -255,6 +268,7 @@ class MonitorSnapshot:
     journal_error_count: int
     abnormal_events: Sequence[Mapping[str, Any]]
     audit: Mapping[str, Any] | None
+    composite_invariant_codes: Sequence[str] = ()
     adapter_failures: Sequence[str] = ()
     state_invalid: bool = False
 
@@ -379,6 +393,9 @@ class ProductionSafetyAdapters:
             since=since,
             limit=limit,
         )
+
+    def read_composite_invariants(self, *, now: datetime) -> tuple[str, ...]:
+        return read_composite_management_invariants(self.database_path, now=now)
 
     def run_management_audit(self) -> Mapping[str, Any]:
         completed = _run_bounded_command(
@@ -561,6 +578,169 @@ def read_abnormal_execution_events(
     )
 
 
+def read_composite_management_invariants(
+    database_path: str | Path,
+    *,
+    now: datetime,
+    stale_after: timedelta = timedelta(minutes=15),
+    connect=sqlite3.connect,
+) -> tuple[str, ...]:
+    """Read only bounded composite-v2 safety invariants from persisted evidence."""
+
+    checked_at = _require_aware_datetime(now).astimezone(UTC).replace(tzinfo=None)
+    stale_before = checked_at - stale_after
+    required_tables = {
+        "strategy_management_batches",
+        "strategy_management_legs",
+        "strategy_management_components",
+        "position_mutation_intents",
+        "position_protection_ledger",
+    }
+    uri = f"file:{database_path}?mode=ro"
+    reasons: set[str] = set()
+    with connect(uri, uri=True) as connection:
+        available = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        # A pre-v2 checkout is version context, not a production safety failure.
+        if not required_tables.issubset(available):
+            return ()
+        batches = connection.execute(
+            """
+            SELECT id, status, management_contract_json
+            FROM strategy_management_batches
+            WHERE management_contract_json IS NOT NULL
+            ORDER BY id DESC LIMIT 200
+            """
+        ).fetchall()
+        batch_ids = [int(row[0]) for row in batches]
+        if not batch_ids:
+            return ()
+        placeholders = ",".join("?" for _ in batch_ids)
+        legs = connection.execute(
+            f"""
+            SELECT id, management_batch_id, execution_order_leg_id, pos_id
+            FROM strategy_management_legs
+            WHERE management_batch_id IN ({placeholders})
+            """,
+            batch_ids,
+        ).fetchall()
+        components = connection.execute(
+            f"""
+            SELECT id, management_batch_id, strategy_management_leg_id,
+                   component_kind, status, desired_json, evidence_json,
+                   last_progress_at, updated_at
+            FROM strategy_management_components
+            WHERE management_batch_id IN ({placeholders})
+            ORDER BY id
+            """,
+            batch_ids,
+        ).fetchall()
+
+        components_by_batch: dict[int, list[tuple]] = {}
+        for row in components:
+            components_by_batch.setdefault(int(row[1]), []).append(row)
+        for batch_id, status, contract_json in batches:
+            try:
+                contract = json.loads(contract_json or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                contract = {}
+            rows = components_by_batch.get(int(batch_id), [])
+            if str(status) == "succeeded":
+                by_kind = {str(row[3]): row for row in rows}
+                required = {
+                    str(item.get("component_kind") if isinstance(item, dict) else item)
+                    for item in (contract.get("required_components") or [])
+                }
+                for kind in required:
+                    row = by_kind.get(kind)
+                    try:
+                        evidence = json.loads(row[6] or "[]") if row else []
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        evidence = []
+                    if row is None or str(row[4]) != "confirmed" or not evidence:
+                        reasons.add("completed_batch_missing_component_evidence")
+                        break
+
+        active_component_states = {
+            "pending", "preflighting", "submitting", "awaiting_exchange",
+            "recovery_required",
+        }
+        for row in components:
+            if str(row[4]) not in active_component_states:
+                continue
+            rendered = row[7] or row[8]
+            try:
+                progressed_at = datetime.fromisoformat(str(rendered))
+            except (TypeError, ValueError):
+                reasons.add("stalled_composite_component")
+                continue
+            if progressed_at.tzinfo is not None:
+                progressed_at = progressed_at.astimezone(UTC).replace(tzinfo=None)
+            if progressed_at <= stale_before:
+                reasons.add("stalled_composite_component")
+
+        duplicate = connection.execute(
+            """
+            SELECT substr(idempotency_key, 1, instr(idempotency_key, ':close:') - 1),
+                   COUNT(*)
+            FROM position_mutation_intents
+            WHERE operation = 'close_position'
+              AND instr(idempotency_key, ':close:') > 1
+              AND status IN ('submitting', 'submitted', 'confirmed', 'recovery_required')
+            GROUP BY 1 HAVING COUNT(*) > 1 LIMIT 1
+            """
+        ).fetchone()
+        if duplicate is not None:
+            reasons.add("duplicate_composite_close_submission")
+
+        leg_by_id = {int(row[0]): row for row in legs}
+        batch_status_by_id = {int(row[0]): str(row[1]) for row in batches}
+        for component in components:
+            is_confirmed = str(component[4]) == "confirmed"
+            succeeded_batch = batch_status_by_id.get(int(component[1])) == "succeeded"
+            if (not is_confirmed and not succeeded_batch) or component[2] is None:
+                continue
+            leg = leg_by_id.get(int(component[2]))
+            if leg is None:
+                continue
+            ledger = connection.execute(
+                """
+                SELECT purpose, size_text, status
+                FROM position_protection_ledger
+                WHERE execution_order_leg_id = ? AND pos_id = ?
+                """,
+                (int(leg[2]), str(leg[3])),
+            ).fetchall()
+            if str(component[3]) == "converge_partial_close" and is_confirmed:
+                try:
+                    desired = json.loads(component[5] or "{}")
+                    remaining = Decimal(str(desired["target_remaining_size"]))
+                    retained = sum(
+                        Decimal(str(row[1]))
+                        for row in ledger
+                        if row[0] == "take_profit"
+                        and row[2] == "verified"
+                        and row[1] not in (None, "")
+                    )
+                except (KeyError, TypeError, ValueError, InvalidOperation, json.JSONDecodeError):
+                    continue
+                if retained > remaining:
+                    reasons.add("live_position_retained_tp_oversized")
+            elif str(component[3]) == "replace_remaining_protection":
+                verified_stops = {
+                    str(row[0]) for row in ledger
+                    if row[0] in {"stop_loss", "backup_stop"}
+                    and row[2] == "verified"
+                }
+                if verified_stops != {"stop_loss", "backup_stop"}:
+                    reasons.add("composite_position_without_verified_stop")
+    return tuple(sorted(reasons))
+
+
 def read_loopback_settings(
     url: str,
     *,
@@ -651,6 +831,17 @@ def run_production_safety_monitor(
         failures,
         (),
     )
+    composite_reader = getattr(adapters, "read_composite_invariants", None)
+    composite_invariant_codes = (
+        _read_adapter(
+            lambda: composite_reader(now=checked_at),
+            "composite",
+            failures,
+            (),
+        )
+        if callable(composite_reader)
+        else ()
+    )
     window_sources_complete = not {"journal", "events"}.intersection(failures)
 
     audit = None
@@ -675,6 +866,7 @@ def run_production_safety_monitor(
             journal_error_count=journal_error_count,
             abnormal_events=abnormal_events,
             audit=audit,
+            composite_invariant_codes=composite_invariant_codes,
             adapter_failures=tuple(failures),
             state_invalid=state_integrity_alert_pending,
         ),
@@ -1150,6 +1342,13 @@ def fingerprint_monitor_result(result: MonitorResult) -> str:
 
 
 def _safe_fingerprint_detail(key: str, value: object) -> object | None:
+    if key == "composite_invariant_codes":
+        if not isinstance(value, Sequence) or isinstance(
+            value, (str, bytes, bytearray)
+        ):
+            return None
+        codes = tuple(sorted(set(value)))
+        return list(codes) if set(codes) <= _COMPOSITE_INVARIANT_CODES else None
     if key == "audit_state_counts":
         if not isinstance(value, Mapping):
             return None
@@ -1350,6 +1549,9 @@ def evaluate_monitor_snapshot(
         reasons.add("state_invalid")
 
     _evaluate_events(snapshot.abnormal_events, reasons, details)
+    _evaluate_composite_invariants(
+        snapshot.composite_invariant_codes, reasons, details
+    )
     if snapshot.audit is not None:
         _evaluate_audit(snapshot.audit, reasons, details)
 
@@ -1359,6 +1561,38 @@ def evaluate_monitor_snapshot(
         reason_codes=reason_codes,
         details=details,
     )
+
+
+_COMPOSITE_INVARIANT_CODES = frozenset(
+    {
+        "completed_batch_missing_component_evidence",
+        "duplicate_composite_close_submission",
+        "live_position_retained_tp_oversized",
+        "composite_position_without_verified_stop",
+        "stalled_composite_component",
+    }
+)
+
+
+def _evaluate_composite_invariants(
+    values: object,
+    reasons: set[str],
+    details: dict[str, Any],
+) -> None:
+    if not isinstance(values, Sequence) or isinstance(
+        values, (str, bytes, bytearray)
+    ):
+        reasons.add("malformed_snapshot")
+        return
+    observed: set[str] = set()
+    for value in values:
+        if not isinstance(value, str) or value not in _COMPOSITE_INVARIANT_CODES:
+            reasons.add("malformed_snapshot")
+            continue
+        observed.add(value)
+    reasons.update(observed)
+    if observed:
+        details["composite_invariant_codes"] = tuple(sorted(observed))
 
 
 def _evaluate_settings(
@@ -1770,9 +2004,30 @@ _ALERT_RULES: Mapping[str, tuple[str, str, str]] = {
         "监控通知记录发生异常",
         "监控自己的通知记录发生异常或被重建。",
     ),
+    "completed_batch_missing_component_evidence": (
+        "critical", "复合仓位管理完成证据不足",
+        "批次已标记完成，但存在组件未确认或缺少交易所证据。",
+    ),
+    "duplicate_composite_close_submission": (
+        "critical", "复合指令可能重复平仓", "同一组件存在多个已发出的平仓意图。",
+    ),
+    "live_position_retained_tp_oversized": (
+        "critical", "保留止盈数量超过剩余仓位", "剩余止盈单总量大于已核验的剩余仓位。",
+    ),
+    "composite_position_without_verified_stop": (
+        "critical", "复合管理后缺少已核验止损", "剩余仓位没有同时核验主止损和备用止损。",
+    ),
+    "stalled_composite_component": (
+        "critical", "复合仓位管理组件停滞", "有组件超过时限未取得持久化进展。",
+    ),
 }
 _ALERT_REASON_PRIORITY = (
     "event_unknown_status",
+    "duplicate_composite_close_submission",
+    "composite_position_without_verified_stop",
+    "live_position_retained_tp_oversized",
+    "completed_batch_missing_component_evidence",
+    "stalled_composite_component",
     "duplicate_manual_close",
     "service_inactive",
     "auto_trade_enabled_drift",
