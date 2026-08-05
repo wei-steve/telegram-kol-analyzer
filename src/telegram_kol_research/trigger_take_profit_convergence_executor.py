@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,7 +21,11 @@ from telegram_kol_research.models import (
     utc_now,
 )
 from telegram_kol_research.position_authority_lock import serialized_position_authority_mutation
-from telegram_kol_research.position_protection_legs import protection_write_block_reason
+from telegram_kol_research.position_protection_legs import (
+    bind_filled_position,
+    create_or_get_protection_leg,
+    protection_write_block_reason,
+)
 from telegram_kol_research.position_mutation_gateway import (
     exact_position_write_gate,
     submit_exact_position_sltp,
@@ -364,16 +369,14 @@ def _prepare_plan(session, *, convergence, deepcoin_client, contract_spec_provid
         .filter(PositionProtectionLedger.purpose.in_(("stop_loss", "combined")))
         .all()
     )
-    has_stop = _has_verified_native_primary_stop(
+    verified_primary = _verified_native_primary_stop_row(
         stop_rows=stop_rows,
         position=matches[0],
         open_positions=positions,
         pending=pending,
         position_size=size,
     )
-    if not has_stop:
-        return "convergence_verified_stop_missing"
-    if not has_verified_exact_backup_stop(
+    has_backup = has_verified_exact_backup_stop(
         session,
         binding_id=int(binding.id),
         leg_id=int(leg.id),
@@ -383,8 +386,9 @@ def _prepare_plan(session, *, convergence, deepcoin_client, contract_spec_provid
         pending=pending,
         position=matches[0],
         open_positions=positions,
-    ):
-        return "convergence_waiting_backup_stop"
+    )
+    if verified_primary is None and not has_backup:
+        return "convergence_verified_stop_missing"
     targets = _targets(convergence.desired_take_profits_json)
     if isinstance(targets, str):
         return targets
@@ -428,32 +432,35 @@ def _prepare_plan(session, *, convergence, deepcoin_client, contract_spec_provid
         .count()
     )
     if existing_protection_targets == 0:
-        primary = next(
-            (
-                row
-                for row in stop_rows
-                if str(row.order_id or "").strip() and row.trigger_price is not None
-            ),
-            None,
-        )
-        if primary is None:
-            return "convergence_verified_stop_missing"
         try:
-            from telegram_kol_research.position_protection_legs import (
-                materialize_verified_position_protection,
-            )
+            if verified_primary is not None:
+                from telegram_kol_research.position_protection_legs import (
+                    materialize_verified_position_protection,
+                )
 
-            materialize_verified_position_protection(
-                session,
-                venue="deepcoin",
-                execution_order_leg_id=int(leg.id),
-                pos_id=pos_id,
-                primary_order_id=str(primary.order_id),
-                primary_stop=str(primary.trigger_price),
-                take_profits=[
-                    (payload["tpTriggerPx"], payload["sz"]) for payload in payloads
-                ],
-            )
+                materialize_verified_position_protection(
+                    session,
+                    venue="deepcoin",
+                    execution_order_leg_id=int(leg.id),
+                    pos_id=pos_id,
+                    primary_order_id=str(verified_primary.order_id),
+                    primary_stop=str(verified_primary.trigger_price),
+                    take_profits=[
+                        (payload["tpTriggerPx"], payload["sz"]) for payload in payloads
+                    ],
+                )
+            else:
+                for index, payload in enumerate(payloads, start=1):
+                    target = create_or_get_protection_leg(
+                        session,
+                        venue="deepcoin",
+                        execution_order_leg_id=int(leg.id),
+                        role="take_profit",
+                        leg_index=index,
+                        planned_trigger_price=payload["tpTriggerPx"],
+                        planned_size=payload["sz"],
+                    )
+                    bind_filled_position(session, target, pos_id=pos_id)
         except ValueError:
             return "convergence_protection_leg_conflict"
     active_orders = (
@@ -531,6 +538,8 @@ def has_verified_exact_backup_stop(
         .filter(PositionBackupStopOrder.execution_binding_id == binding_id)
         .filter(PositionBackupStopOrder.execution_order_leg_id == leg_id)
         .filter(PositionBackupStopOrder.pos_id == pos_id)
+        .filter(PositionBackupStopOrder.instrument_id == inst_id)
+        .filter(PositionBackupStopOrder.side == side)
         .filter(PositionBackupStopOrder.status == "active")
         .filter(PositionBackupStopOrder.order_id.is_not(None))
         .order_by(PositionBackupStopOrder.id.asc())
@@ -551,15 +560,43 @@ def has_verified_exact_backup_stop(
             continue
         if (
             str(request.get("instId") or "").upper() != inst_id
-            or str(request.get("posId") or request.get("closePosId") or "") != pos_id
+            or str(request.get("posId") or "") != pos_id
             or str(request.get("posSide") or "").lower() != side
             or str(request.get("slOrdPx") or request.get("price") or "") != "-1"
-            or not _present(request, "slTriggerPx", "slTriggerPrice", "triggerPrice")
+            or _positive_decimal(
+                request.get("slTriggerPx")
+                or request.get("slTriggerPrice")
+                or request.get("triggerPrice")
+            )
+            != _positive_decimal(row.trigger_price)
+        ):
+            continue
+        same_order_pending = [
+            item
+            for item in pending
+            if isinstance(item, dict)
+            and str(item.get("ordId") or item.get("orderId") or "")
+            == str(row.order_id)
+        ]
+        if len(same_order_pending) != 1:
+            continue
+        pending_match = same_order_pending[0]
+        if not (
+            str(pending_match.get("instId") or "").upper() == inst_id
+            and str(pending_match.get("posId") or "") == pos_id
+            and str(pending_match.get("posSide") or "").lower() == side
+            and _positive_decimal(
+                pending_match.get("slTriggerPx")
+                or pending_match.get("slTriggerPrice")
+                or pending_match.get("triggerPrice")
+            )
+            == _positive_decimal(row.trigger_price)
+            and _native_stop_loss_is_market(pending_match)
         ):
             continue
         match = match_native_tpsl_order(
             position,
-            [item for item in pending if isinstance(item, dict)],
+            [pending_match],
             NativeTpslExpectation(
                 purpose="stop_loss", trigger_price=str(row.trigger_price), size="0",
                 ord_id=str(row.order_id),
@@ -571,6 +608,115 @@ def has_verified_exact_backup_stop(
     return False
 
 
+def has_verified_exact_owned_stop(
+    session,
+    *,
+    binding_id: int,
+    leg_id: int,
+    pos_id: str,
+    inst_id: str,
+    side: str,
+    stop_rows: list[PositionProtectionLedger],
+    pending: list[dict[str, object]],
+    position: dict[str, object],
+    open_positions: list[dict[str, object]],
+    position_size: Decimal,
+) -> bool:
+    """Accept one verified exact stop source; never require two independent stops."""
+
+    return _has_verified_native_primary_stop(
+        stop_rows=stop_rows,
+        position=position,
+        open_positions=open_positions,
+        pending=pending,
+        position_size=position_size,
+    ) or has_verified_exact_backup_stop(
+        session,
+        binding_id=binding_id,
+        leg_id=leg_id,
+        pos_id=pos_id,
+        inst_id=inst_id,
+        side=side,
+        pending=pending,
+        position=position,
+        open_positions=open_positions,
+    )
+
+
+def exact_owned_stop_evidence_fingerprint(
+    session,
+    *,
+    binding_id: int,
+    leg_id: int,
+    pos_id: str,
+    inst_id: str,
+    side: str,
+    stop_rows: list[PositionProtectionLedger],
+    pending: list[dict[str, object]],
+    position: dict[str, object],
+    open_positions: list[dict[str, object]],
+    position_size: Decimal,
+) -> str | None:
+    """Fingerprint the bounded local-and-exchange proof that unlocked TP writes."""
+
+    if not has_verified_exact_owned_stop(
+        session,
+        binding_id=binding_id,
+        leg_id=leg_id,
+        pos_id=pos_id,
+        inst_id=inst_id,
+        side=side,
+        stop_rows=stop_rows,
+        pending=pending,
+        position=position,
+        open_positions=open_positions,
+        position_size=position_size,
+    ):
+        return None
+    backup_rows = (
+        session.query(PositionBackupStopOrder)
+        .filter(PositionBackupStopOrder.execution_binding_id == binding_id)
+        .filter(PositionBackupStopOrder.execution_order_leg_id == leg_id)
+        .filter(PositionBackupStopOrder.pos_id == pos_id)
+        .filter(PositionBackupStopOrder.status == "active")
+        .filter(PositionBackupStopOrder.order_id.is_not(None))
+        .all()
+    )
+    owned_order_ids = sorted({
+        str(row.order_id)
+        for row in [*stop_rows, *backup_rows]
+        if str(row.order_id or "").strip()
+    })
+    exchange_rows = []
+    for raw in pending:
+        if not isinstance(raw, dict):
+            continue
+        order_id = str(raw.get("ordId") or raw.get("orderId") or "")
+        if order_id not in owned_order_ids:
+            continue
+        exchange_rows.append({
+            key: raw.get(key)
+            for key in (
+                "instId", "posId", "closePosId", "posSide", "ordId",
+                "orderId", "triggerOrderType", "slTriggerPx", "slOrdPx",
+                "triggerPrice", "orderType", "sz",
+            )
+            if raw.get(key) is not None
+        })
+    evidence = {
+        "binding_id": binding_id,
+        "leg_id": leg_id,
+        "pos_id": pos_id,
+        "inst_id": inst_id,
+        "side": side,
+        "owned_order_ids": owned_order_ids,
+        "pending": exchange_rows,
+    }
+    return hashlib.sha256(
+        json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
 def _has_verified_native_primary_stop(
     *,
     stop_rows: list[PositionProtectionLedger],
@@ -579,6 +725,23 @@ def _has_verified_native_primary_stop(
     pending: list[dict[str, object]],
     position_size: Decimal,
 ) -> bool:
+    return _verified_native_primary_stop_row(
+        stop_rows=stop_rows,
+        position=position,
+        open_positions=open_positions,
+        pending=pending,
+        position_size=position_size,
+    ) is not None
+
+
+def _verified_native_primary_stop_row(
+    *,
+    stop_rows: list[PositionProtectionLedger],
+    position: dict[str, object],
+    open_positions: list[dict[str, object]],
+    pending: list[dict[str, object]],
+    position_size: Decimal,
+) -> PositionProtectionLedger | None:
     for row in stop_rows:
         if not row.order_id or row.trigger_price is None:
             continue
@@ -595,8 +758,8 @@ def _has_verified_native_primary_stop(
                 open_positions=[item for item in open_positions if isinstance(item, dict)],
             )
             if match.status == "verified" and match.order is not None:
-                return True
-    return False
+                return row
+    return None
 
 
 def _verified_native_take_profit(
@@ -739,5 +902,24 @@ def _split_ids(value: object) -> set[str]:
     return {item.strip() for item in str(value or "").split(",") if item.strip()}
 
 
-def _present(row: dict, *keys: str) -> bool:
-    return any(row.get(key) not in (None, "", 0, "0") for key in keys)
+def _native_stop_loss_is_market(payload: dict[str, object]) -> bool:
+    values = [
+        payload.get(key)
+        for key in ("slOrdPx", "slPrice")
+        if payload.get(key) not in (None, "")
+    ]
+    if not values:
+        return False
+    return all(
+        (price := _decimal(value)) is not None
+        and price in {Decimal("-1"), Decimal("0")}
+        for value in values
+    )
+
+
+def _decimal(value: object) -> Decimal | None:
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None

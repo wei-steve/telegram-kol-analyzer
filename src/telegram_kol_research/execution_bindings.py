@@ -7,6 +7,7 @@ import math
 import hashlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from sqlalchemy import func, or_
@@ -1001,7 +1002,7 @@ def _ready_verified_trigger_take_profit_convergences(
         mark_trigger_take_profit_convergence_ready,
     )
     from telegram_kol_research.trigger_take_profit_convergence_executor import (
-        has_verified_exact_backup_stop,
+        exact_owned_stop_evidence_fingerprint,
     )
 
     leg_ids = [int(leg.id) for leg in legs if leg.id is not None]
@@ -1039,7 +1040,12 @@ def _ready_verified_trigger_take_profit_convergences(
             continue
         binding = session.get(ExecutionBinding, row.execution_binding_id)
         inst_id = f"{str(binding.symbol).upper()}-USDT-SWAP" if binding is not None else ""
-        position_id = str(row.pos_id or leg.pos_id or "")
+        position_id = str(leg.pos_id or "")
+        if row.pos_id not in (None, position_id):
+            row.status = "conflicted"
+            row.reason_code = "convergence_exact_leg_not_verified"
+            row.updated_at = recovered_at
+            continue
         positions = [item for item in snapshot.positions if isinstance(item, dict)]
         position_matches = [
             item for item in positions
@@ -1049,27 +1055,57 @@ def _ready_verified_trigger_take_profit_convergences(
             and str(item.get("posSide") or item.get("side") or "").lower()
             == str(binding.side).lower()
             and str(item.get("mrgPosition") or item.get("posMode") or "").lower() == "split"
+            and _positive_position_size(item) is not None
         ]
         if (
             binding is None
             or not position_id
             or len(position_matches) != 1
-            or not has_verified_exact_backup_stop(
-                session,
-                binding_id=int(binding.id),
-                leg_id=int(leg.id),
-                pos_id=position_id,
-                inst_id=inst_id,
-                side=str(binding.side).lower(),
-                pending=snapshot.pending_trigger_orders,
-                position=position_matches[0],
-                open_positions=positions,
-            )
         ):
             row.status = "waiting_backup_stop"
             row.reason_code = "convergence_waiting_backup_stop"
             row.updated_at = recovered_at
             continue
+        position_size = _positive_position_size(position_matches[0])
+        assert position_size is not None
+        stop_rows = (
+            session.query(PositionProtectionLedger)
+            .filter(PositionProtectionLedger.execution_binding_id == int(binding.id))
+            .filter(PositionProtectionLedger.execution_order_leg_id == int(leg.id))
+            .filter(PositionProtectionLedger.pos_id == position_id)
+            .filter(PositionProtectionLedger.status == "verified")
+            .filter(PositionProtectionLedger.purpose.in_(("stop_loss", "combined")))
+            .all()
+        )
+        stop_evidence_fingerprint = exact_owned_stop_evidence_fingerprint(
+            session,
+            binding_id=int(binding.id),
+            leg_id=int(leg.id),
+            pos_id=position_id,
+            inst_id=inst_id,
+            side=str(binding.side).lower(),
+            stop_rows=stop_rows,
+            pending=snapshot.pending_trigger_orders,
+            position=position_matches[0],
+            open_positions=positions,
+            position_size=position_size,
+        )
+        if stop_evidence_fingerprint is None:
+            row.status = "waiting_backup_stop"
+            row.reason_code = "convergence_waiting_backup_stop"
+            row.updated_at = recovered_at
+            continue
+        row.pos_id = position_id
+        row.request_json = json.dumps(
+            {
+                "readiness": {
+                    "pos_id": position_id,
+                    "owned_stop_evidence_fingerprint": stop_evidence_fingerprint,
+                }
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         if str(row.status) == "conflicted":
             row.status = "waiting_backup_stop"
             row.reason_code = "convergence_waiting_backup_stop"
@@ -4015,6 +4051,17 @@ def _has_nonzero_size(position: dict[str, Any]) -> bool:
         return math.isfinite(parsed) and abs(parsed) > 0
     except (TypeError, ValueError):
         return False
+
+
+def _positive_position_size(position: dict[str, Any]) -> Decimal | None:
+    value = position.get("pos")
+    if value in (None, ""):
+        value = position.get("size")
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return parsed if parsed.is_finite() and parsed > 0 else None
 
 
 def _is_open_order_state(order: dict[str, Any]) -> bool:

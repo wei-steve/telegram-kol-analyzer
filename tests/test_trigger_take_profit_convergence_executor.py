@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 
 NOW = datetime(2026, 7, 22, 10, 15, tzinfo=UTC)
 
@@ -60,6 +62,20 @@ class _Client:
             "sz": payload["sz"],
         })
         return {"code": "0", "data": {"ordId": order_id}}
+
+
+class _ExactBackupOnlyClient(_Client):
+    def __init__(self):
+        super().__init__()
+        self.contract_spec_provider = _ContractSpecProvider(
+            quantity_step="0.1", min_quantity="0.1"
+        )
+        self.pending = [row for row in self.pending if row["ordId"] == "backup-1"]
+
+    def list_positions(self, *, inst_id=None):
+        rows = super().list_positions(inst_id=inst_id)
+        rows[0]["pos"] = "3.4"
+        return rows
 
 
 def _ready_convergence(
@@ -152,7 +168,183 @@ def _ready_convergence(
         return convergence.id
 
 
-def test_plan_waits_until_exact_backup_stop_is_verified(tmp_path):
+def _remove_native_primary_ownership(session_factory):
+    from telegram_kol_research.models import PositionProtectionLedger
+
+    with session_factory() as session:
+        session.query(PositionProtectionLedger).filter(
+            PositionProtectionLedger.order_id == "sl-1"
+        ).delete()
+        session.commit()
+
+
+def test_exact_backup_allows_tp_without_native_primary_ownership(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        plan_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "exact-backup-only.db")
+    convergence_id = _ready_convergence(
+        session_factory,
+        existing_take_profit=False,
+        desired_take_profits=[
+            {"price": "1890", "allocation_pct": "50"},
+            {"price": "1860", "allocation_pct": "30"},
+            {"price": "1825", "allocation_pct": "20"},
+        ],
+    )
+    _remove_native_primary_ownership(session_factory)
+
+    plan = plan_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=_ExactBackupOnlyClient(),
+        planned_at=NOW,
+    )
+
+    assert plan.status == "ready"
+    assert [payload["tpTriggerPx"] for payload in plan.payloads] == [
+        "1890", "1860", "1825"
+    ]
+    assert [payload["sz"] for payload in plan.payloads] == ["1.7", "1", "0.7"]
+
+
+def test_unknown_targeting_tp_still_blocks_additive_tp(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        plan_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "exact-backup-unknown-tp.db")
+    convergence_id = _ready_convergence(
+        session_factory, existing_take_profit=False
+    )
+    _remove_native_primary_ownership(session_factory)
+    client = _ExactBackupOnlyClient()
+    client.pending.append({
+        "instId": "BTC-USDT-SWAP", "posId": "pos-10", "posSide": "short",
+        "ordId": "unknown-tp", "triggerOrderType": "TPSL",
+        "tpTriggerPx": "64000", "tpOrdPx": "-1", "sz": "1",
+    })
+
+    plan = plan_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        planned_at=NOW,
+    )
+
+    assert (plan.status, plan.reason_code, plan.payloads) == (
+        "conflicted", "convergence_unowned_take_profit_present", ()
+    )
+    assert client.submit_calls == []
+
+
+@pytest.mark.parametrize(
+    "pending_patch",
+    (
+        {"posId": None},
+        {"slOrdPx": "67300"},
+    ),
+)
+def test_exact_backup_requires_exact_market_pending_readback(tmp_path, pending_patch):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        plan_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "strict-backup-readback.db")
+    convergence_id = _ready_convergence(
+        session_factory, existing_take_profit=False
+    )
+    _remove_native_primary_ownership(session_factory)
+    client = _ExactBackupOnlyClient()
+    client.pending[0].update(pending_patch)
+
+    plan = plan_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        planned_at=NOW,
+    )
+
+    assert (plan.status, plan.reason_code) == (
+        "conflicted", "convergence_verified_stop_missing"
+    )
+
+
+def test_exact_backup_requires_matching_local_instrument_and_side(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import PositionBackupStopOrder
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        plan_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "strict-backup-ledger.db")
+    convergence_id = _ready_convergence(
+        session_factory, existing_take_profit=False
+    )
+    _remove_native_primary_ownership(session_factory)
+    with session_factory() as session:
+        backup = session.query(PositionBackupStopOrder).one()
+        backup.instrument_id = "ETH-USDT-SWAP"
+        backup.side = "long"
+        session.commit()
+
+    plan = plan_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=_ExactBackupOnlyClient(),
+        planned_at=NOW,
+    )
+
+    assert (plan.status, plan.reason_code) == (
+        "conflicted", "convergence_verified_stop_missing"
+    )
+
+
+@pytest.mark.parametrize("evidence_problem", ("request_price", "duplicate_order"))
+def test_exact_backup_rejects_inconsistent_or_ambiguous_evidence(
+    tmp_path, evidence_problem
+):
+    import json
+
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import PositionBackupStopOrder
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        plan_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "strict-backup-evidence.db")
+    convergence_id = _ready_convergence(
+        session_factory, existing_take_profit=False
+    )
+    _remove_native_primary_ownership(session_factory)
+    client = _ExactBackupOnlyClient()
+    if evidence_problem == "request_price":
+        with session_factory() as session:
+            backup = session.query(PositionBackupStopOrder).one()
+            request = json.loads(backup.request_json)
+            request["slTriggerPx"] = "67400"
+            backup.request_json = json.dumps(request)
+            session.commit()
+    else:
+        client.pending.append(dict(client.pending[0]))
+
+    plan = plan_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        planned_at=NOW,
+    )
+
+    assert (plan.status, plan.reason_code) == (
+        "conflicted", "convergence_verified_stop_missing"
+    )
+
+
+def test_plan_accepts_verified_native_primary_without_backup(tmp_path):
     from telegram_kol_research.db import create_session_factory
     from telegram_kol_research.models import TriggerTakeProfitConvergence
     from telegram_kol_research.trigger_take_profit_convergence_executor import (
@@ -168,14 +360,12 @@ def test_plan_waits_until_exact_backup_stop_is_verified(tmp_path):
         session_factory, convergence_id=convergence_id, deepcoin_client=_Client(), planned_at=NOW
     )
 
-    assert (plan.status, plan.reason_code, plan.payloads) == (
-        "waiting_backup_stop", "convergence_waiting_backup_stop", ()
-    )
+    assert plan.status == "ready"
+    assert plan.reason_code is None
+    assert len(plan.payloads) == 3
     with session_factory() as session:
         convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
-    assert (convergence.status, convergence.reason_code) == (
-        "waiting_backup_stop", "convergence_waiting_backup_stop"
-    )
+    assert (convergence.status, convergence.reason_code) == ("ready", None)
 
 
 def test_take_profit_convergence_never_races_reserved_close(tmp_path):
@@ -221,7 +411,11 @@ def test_take_profit_convergence_never_races_reserved_close(tmp_path):
 
 def test_plan_refuses_backup_order_without_persisted_exact_close_position(tmp_path):
     from telegram_kol_research.db import create_session_factory
-    from telegram_kol_research.models import PositionBackupStopOrder, TriggerTakeProfitConvergence
+    from telegram_kol_research.models import (
+        PositionBackupStopOrder,
+        PositionProtectionLedger,
+        TriggerTakeProfitConvergence,
+    )
     from telegram_kol_research.trigger_take_profit_convergence_executor import (
         plan_trigger_take_profit_convergence,
     )
@@ -232,6 +426,9 @@ def test_plan_refuses_backup_order_without_persisted_exact_close_position(tmp_pa
     )
     with session_factory() as session:
         convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        session.query(PositionProtectionLedger).filter(
+            PositionProtectionLedger.order_id == "sl-1"
+        ).delete()
         session.add(PositionBackupStopOrder(
             venue="deepcoin", execution_binding_id=convergence.execution_binding_id,
             execution_order_leg_id=convergence.execution_order_leg_id, pos_id="pos-10",
@@ -245,7 +442,9 @@ def test_plan_refuses_backup_order_without_persisted_exact_close_position(tmp_pa
         session_factory, convergence_id=convergence_id, deepcoin_client=_Client(), planned_at=NOW
     )
 
-    assert (plan.status, plan.reason_code) == ("waiting_backup_stop", "convergence_waiting_backup_stop")
+    assert (plan.status, plan.reason_code) == (
+        "conflicted", "convergence_verified_stop_missing"
+    )
 
 
 def test_plan_replaces_only_exact_leg_take_profits(tmp_path):
