@@ -90,6 +90,7 @@ def select_entry_preamble(
     normalized_symbol = str(symbol).strip().upper()
     normalized_side = str(side).strip().lower()
     candidates: list[PriorMessageFact] = []
+    unresolved = False
     for fact in sorted(
         prior_facts,
         key=lambda item: _source_key(
@@ -101,14 +102,11 @@ def select_entry_preamble(
         if fact.kind == "unrelated":
             continue
         if fact.kind == "unresolved":
-            return EntryAssemblyDecision(
-                status="unresolved",
-                reason_code="preceding_entry_context_unresolved",
-                preamble_id=None,
-                risk_multiplier=Decimal("1"),
-            )
+            unresolved = True
+            continue
         if fact.kind in HARD_BOUNDARY_KINDS:
             candidates.clear()
+            unresolved = False
             continue
         if fact.kind != "entry_preamble":
             continue
@@ -131,6 +129,13 @@ def select_entry_preamble(
             )
         candidates.append(fact)
 
+    if unresolved:
+        return EntryAssemblyDecision(
+            status="unresolved",
+            reason_code="preceding_entry_context_unresolved",
+            preamble_id=None,
+            risk_multiplier=Decimal("1"),
+        )
     if not candidates:
         return EntryAssemblyDecision("none", None, None, Decimal("1"))
     if len(candidates) != 1:
@@ -149,7 +154,9 @@ def select_entry_preamble(
     )
 
 
-def _load_prior_facts(session, *, strategy_message: RawMessage) -> list[PriorMessageFact]:
+def _load_prior_facts(
+    session, *, strategy_message: RawMessage, assembled_at: datetime
+) -> list[PriorMessageFact]:
     raw_messages = (
         session.query(RawMessage)
         .filter(RawMessage.chat_id == int(strategy_message.chat_id))
@@ -185,7 +192,10 @@ def _load_prior_facts(session, *, strategy_message: RawMessage) -> list[PriorMes
     unresolved_ids = {
         int(row[0])
         for row in session.query(MessageEvidenceExtractionClaim.raw_message_id)
-        .filter(MessageEvidenceExtractionClaim.raw_message_id.in_(raw_ids))
+        .filter(
+            MessageEvidenceExtractionClaim.raw_message_id.in_(raw_ids),
+            MessageEvidenceExtractionClaim.lease_expires_at > assembled_at,
+        )
         .all()
     }
     facts: list[PriorMessageFact] = []
@@ -272,7 +282,10 @@ def _proposed_evidence(
     candidate: SignalCandidate,
 ) -> tuple[dict[str, object], str]:
     evidence: dict[str, object] = {
+        "chat_id": int(strategy_message.chat_id),
+        "preamble_raw_message_id": int(preamble.raw_message_id),
         "preamble_message_id": int(preamble.message_id),
+        "strategy_raw_message_id": int(strategy_message.id),
         "strategy_message_id": int(strategy_message.message_id),
         "symbol": str(candidate.symbol).upper(),
         "side": str(candidate.side).lower(),
@@ -337,7 +350,9 @@ def assemble_entry_strategy(
             symbol=str(candidate.symbol),
             side=str(candidate.side),
             prior_facts=_load_prior_facts(
-                session, strategy_message=strategy_message
+                session,
+                strategy_message=strategy_message,
+                assembled_at=assembled_at,
             ),
         )
         if decision.status != "ready" or decision.preamble_id is None:

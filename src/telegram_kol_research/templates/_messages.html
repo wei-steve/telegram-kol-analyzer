@@ -331,6 +331,7 @@
               {% if message.entry_preamble_assembly %}
                 <div class="message-entry-preamble-assembly" role="status">
                   <strong>{{ message.entry_preamble_assembly.risk_calculation }}</strong>
+                  {% if message.entry_preamble_assembly.proposed_risk_calculation %}<small>{{ message.entry_preamble_assembly.proposed_risk_calculation }}</small>{% endif %}
                   <small>{{ message.entry_preamble_assembly.message_pair }} · 模式 {{ message.entry_preamble_assembly.mode }}</small>
                 </div>
               {% endif %}

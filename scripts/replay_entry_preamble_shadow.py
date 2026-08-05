@@ -61,6 +61,57 @@ def replay_entry_preamble_shadow(
             """,
             (int(strategy_raw_message_id),),
         ).fetchall()
+        if preamble is not None and len(strategy) == 1:
+            history = connection.execute(
+                """
+                SELECT id, message_id, posted_at
+                FROM raw_messages WHERE chat_id = ?
+                """,
+                (int(strategy[0][0]),),
+            ).fetchall()
+            raw_by_id = {int(row[0]): row for row in history}
+            raw_ids = tuple(raw_by_id)
+            placeholders = ",".join("?" for _ in raw_ids)
+            preamble_rows = connection.execute(
+                f"""
+                SELECT id, raw_message_id, symbol, side, risk_multiplier
+                FROM entry_preambles
+                WHERE status = 'pending' AND raw_message_id IN ({placeholders})
+                """,
+                raw_ids,
+            ).fetchall()
+            candidate_rows = connection.execute(
+                f"""
+                SELECT raw_message_id, symbol, side, event_type
+                FROM signal_candidates
+                WHERE raw_message_id IN ({placeholders})
+                """,
+                raw_ids,
+            ).fetchall()
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            claim_rows = (
+                connection.execute(
+                    f"""
+                    SELECT raw_message_id
+                    FROM message_evidence_extraction_claims
+                    WHERE raw_message_id IN ({placeholders})
+                      AND lease_expires_at > CURRENT_TIMESTAMP
+                    """,
+                    raw_ids,
+                ).fetchall()
+                if "message_evidence_extraction_claims" in tables
+                else []
+            )
+        else:
+            raw_by_id = {}
+            preamble_rows = []
+            candidate_rows = []
+            claim_rows = []
     if preamble is None:
         raise LookupError("preamble evidence not found")
     if len(strategy) != 1:
@@ -69,35 +120,70 @@ def replay_entry_preamble_shadow(
         raise ValueError("preamble is not pending")
     if int(preamble[1]) != int(strategy[0][0]):
         raise ValueError("preamble and strategy are from different chats")
-    try:
-        multiplier = Decimal(str(preamble[5]))
-    except InvalidOperation as exc:
-        raise ValueError("persisted multiplier is invalid") from exc
+    facts: list[PriorMessageFact] = []
+    for row in preamble_rows:
+        raw = raw_by_id[int(row[1])]
+        try:
+            multiplier = Decimal(str(row[4]))
+        except InvalidOperation:
+            multiplier = Decimal("1")
+        facts.append(
+            PriorMessageFact(
+                raw_message_id=int(row[1]),
+                message_id=int(raw[1]),
+                posted_at=_posted_at(raw[2]),
+                kind="entry_preamble",
+                symbol=str(row[2]),
+                side=str(row[3]),
+                preamble_id=int(row[0]),
+                risk_multiplier=multiplier,
+            )
+        )
+    for raw_id, symbol, side, event_type in candidate_rows:
+        kind = {
+            "entry_signal": "complete_entry",
+            "strategy_revision": "replacement",
+            "close_signal": "cancel_entry",
+        }.get(str(event_type))
+        if kind is None:
+            continue
+        raw = raw_by_id[int(raw_id)]
+        facts.append(
+            PriorMessageFact(
+                raw_message_id=int(raw_id),
+                message_id=int(raw[1]),
+                posted_at=_posted_at(raw[2]),
+                kind=kind,
+                symbol=str(symbol or "") or None,
+                side=str(side or "") or None,
+            )
+        )
+    for (raw_id,) in claim_rows:
+        raw = raw_by_id[int(raw_id)]
+        facts.append(
+            PriorMessageFact(
+                raw_message_id=int(raw_id),
+                message_id=int(raw[1]),
+                posted_at=_posted_at(raw[2]),
+                kind="unresolved",
+            )
+        )
     decision = select_entry_preamble(
         strategy_posted_at=_posted_at(strategy[0][2]),
         strategy_message_id=int(strategy[0][1]),
         strategy_raw_message_id=int(strategy_raw_message_id),
         symbol=str(strategy[0][3]),
         side=str(strategy[0][4]),
-        prior_facts=[
-            PriorMessageFact(
-                raw_message_id=int(preamble_raw_message_id),
-                message_id=int(preamble[2]),
-                posted_at=_posted_at(preamble[7]),
-                kind="entry_preamble",
-                symbol=str(preamble[3]),
-                side=str(preamble[4]),
-                preamble_id=int(preamble[0]),
-                risk_multiplier=multiplier,
-            )
-        ],
+        prior_facts=facts,
     )
     proposed = configured_risk_usdt * decision.risk_multiplier
     return {
         "configured_risk_budget_usdt": _decimal_text(configured_risk_usdt),
         "decision": "proposed" if decision.status == "ready" else decision.status,
         "mode": "shadow",
-        "preamble_message_id": int(preamble[2]),
+        "preamble_message_id": (
+            int(preamble[2]) if decision.preamble_id == int(preamble[0]) else None
+        ),
         "proposed_effective_risk_budget_usdt": _decimal_text(proposed),
         "reason_codes": [decision.reason_code] if decision.reason_code else [],
         "risk_multiplier": _decimal_text(decision.risk_multiplier),

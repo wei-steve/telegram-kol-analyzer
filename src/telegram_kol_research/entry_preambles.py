@@ -61,6 +61,14 @@ def persist_entry_preamble_in_session(
     )
     if existing is not None:
         return existing
+    session.execute(
+        update(EntryPreamble)
+        .where(
+            EntryPreamble.raw_message_id == int(raw_message.id),
+            EntryPreamble.status == "pending",
+        )
+        .values(status="invalidated", invalidated_at=now, updated_at=now)
+    )
     row = EntryPreamble(
         raw_message_id=int(raw_message.id),
         chat_id=int(raw_message.chat_id),

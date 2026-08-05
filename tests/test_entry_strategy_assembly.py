@@ -9,6 +9,7 @@ from telegram_kol_research.models import (
     EntryPreamble,
     EntryStrategyAssembly,
     MessageEvidenceVersion,
+    MessageEvidenceExtractionClaim,
     RawMessage,
     SignalCandidate,
 )
@@ -156,6 +157,26 @@ def test_selector_blocks_ambiguous_preambles_and_defers_unresolved_predecessor()
     assert unresolved.reason_code == "preceding_entry_context_unresolved"
 
 
+def test_selector_hard_boundary_clears_older_unresolved_fact():
+    from telegram_kol_research.entry_strategy_assembly import select_entry_preamble
+
+    decision = select_entry_preamble(
+        strategy_posted_at=NOW + timedelta(minutes=5),
+        strategy_message_id=9903,
+        strategy_raw_message_id=103,
+        symbol="BTC",
+        side="short",
+        prior_facts=[
+            _fact(raw_id=99, message_id=9899, kind="unresolved"),
+            _fact(raw_id=100, message_id=9900, kind="complete_entry"),
+            _fact(raw_id=101, message_id=9901, kind="entry_preamble", symbol="BTC", side="short", preamble_id=7, multiplier="0.5"),
+        ],
+    )
+
+    assert decision.status == "ready"
+    assert decision.preamble_id == 7
+
+
 def _persist_pair(session_factory):
     with session_factory() as session:
         preamble_message = RawMessage(
@@ -262,3 +283,70 @@ def test_shadow_reports_proposal_without_consuming_or_changing_effective_risk(tm
     with session_factory() as session:
         assert session.get(EntryPreamble, preamble_id).status == "pending"
         assert session.query(EntryStrategyAssembly).count() == 0
+
+
+def test_expired_extraction_claim_does_not_defer_assembly(tmp_path):
+    from telegram_kol_research.entry_strategy_assembly import assemble_entry_strategy
+
+    session_factory = create_session_factory(tmp_path / "expired-claim.db")
+    strategy_raw_id, candidate_id, _ = _persist_pair(session_factory)
+    with session_factory() as session:
+        earlier = RawMessage(
+            chat_id=-1002337721508,
+            message_id=9899,
+            posted_at=NOW - timedelta(minutes=1),
+            text="old",
+        )
+        session.add(earlier)
+        session.flush()
+        session.add(
+            MessageEvidenceExtractionClaim(
+                raw_message_id=earlier.id,
+                input_fingerprint="expired",
+                claim_token="expired-claim",
+                claimed_at=NOW - timedelta(minutes=2),
+                lease_expires_at=NOW - timedelta(seconds=1),
+            )
+        )
+        session.commit()
+
+    result = assemble_entry_strategy(
+        session_factory,
+        strategy_raw_message_id=strategy_raw_id,
+        signal_candidate_id=candidate_id,
+        strategy_instance_id="expired-claim-strategy",
+        mode="shadow",
+        live_chat_ids=set(),
+        assembled_at=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "proposed"
+
+
+def test_live_assembly_fingerprint_is_unique_across_chats_with_same_message_ids(tmp_path):
+    from telegram_kol_research.entry_strategy_assembly import assemble_entry_strategy
+
+    session_factory = create_session_factory(tmp_path / "cross-chat.db")
+    pairs = []
+    for offset, chat_id in enumerate((-1001, -1002), start=1):
+        with session_factory() as session:
+            preamble_raw = RawMessage(chat_id=chat_id, message_id=9901, posted_at=NOW, text="half")
+            strategy_raw = RawMessage(chat_id=chat_id, message_id=9902, posted_at=NOW + timedelta(minutes=1), text="entry")
+            session.add_all([preamble_raw, strategy_raw])
+            session.flush()
+            evidence = MessageEvidenceVersion(raw_message_id=preamble_raw.id, version=1, input_fingerprint=f"fp-{offset}", model="mimo", prompt_versions_json="{}", extraction_status="completed", confidence=1, text_evidence_json="{}", image_evidence_json="{}", normalized_evidence_json="{}")
+            session.add(evidence)
+            session.flush()
+            persist_entry_preamble_in_session(session, raw_message=preamble_raw, evidence_version_id=evidence.id, recognition_generation="g1", evidence=EntryPreambleEvidence(symbol="BTC", side="short", risk_multiplier=Decimal("0.5"), confidence=1, reason="half"), now=NOW)
+            candidate = SignalCandidate(raw_message_id=strategy_raw.id, symbol="BTC", side="short", event_type="entry_signal", parse_source="mimo", confidence=1)
+            session.add(candidate)
+            session.flush()
+            pairs.append((strategy_raw.id, candidate.id, chat_id))
+            session.commit()
+
+    results = [
+        assemble_entry_strategy(session_factory, strategy_raw_message_id=raw_id, signal_candidate_id=candidate_id, strategy_instance_id=f"strategy-{chat_id}", mode="live", live_chat_ids={chat_id}, assembled_at=NOW + timedelta(minutes=2))
+        for raw_id, candidate_id, chat_id in pairs
+    ]
+
+    assert len({result.assembly_fingerprint for result in results}) == 2

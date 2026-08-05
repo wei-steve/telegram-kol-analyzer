@@ -23,6 +23,9 @@ def format_entry_preamble_assembly_summary(
         mode = str(evidence["mode"])
         configured = float(evidence["configured_risk_budget_usdt"])
         multiplier = float(evidence["risk_multiplier"])
+        applied_multiplier = float(
+            evidence.get("applied_risk_multiplier", evidence["risk_multiplier"])
+        )
         effective = float(evidence["effective_risk_budget_usdt"])
         preamble_message_id = int(evidence["preamble_message_id"])
         strategy_message_id = int(evidence["strategy_message_id"])
@@ -32,6 +35,7 @@ def format_entry_preamble_assembly_summary(
         mode not in {"shadow", "live"}
         or configured < 0
         or not 0 < multiplier <= 1
+        or not 0 < applied_multiplier <= 1
         or effective < 0
         or preamble_message_id <= 0
         or strategy_message_id <= 0
@@ -41,11 +45,13 @@ def format_entry_preamble_assembly_summary(
     def compact(value: float) -> str:
         return f"{value:.8f}".rstrip("0").rstrip(".")
 
-    percent = compact(multiplier * 100)
-    return {
+    proposed_percent = compact(multiplier * 100)
+    applied_percent = compact(applied_multiplier * 100)
+    multiplier_label = "实际倍率" if mode == "shadow" else "仓位倍率"
+    summary = {
         "mode": mode,
         "risk_calculation": (
-            f"基础风险预算 {compact(configured)} USDT × 仓位倍率 {percent}% "
+            f"基础风险预算 {compact(configured)} USDT × {multiplier_label} {applied_percent}% "
             f"= 实际风险预算 {compact(effective)} USDT"
         ),
         "message_pair": (
@@ -57,6 +63,14 @@ def format_entry_preamble_assembly_summary(
         "preamble_message_id": preamble_message_id,
         "strategy_message_id": strategy_message_id,
     }
+    if mode == "shadow" and applied_multiplier != multiplier:
+        summary["applied_risk_multiplier"] = applied_multiplier
+        summary["proposed_risk_calculation"] = (
+            f"影子建议：基础风险预算 {compact(configured)} USDT × "
+            f"仓位倍率 {proposed_percent}% = 建议风险预算 "
+            f"{compact(configured * multiplier)} USDT"
+        )
+    return summary
 
 
 def render_leaderboard_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

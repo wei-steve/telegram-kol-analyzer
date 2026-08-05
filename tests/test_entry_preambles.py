@@ -139,6 +139,38 @@ def test_persist_entry_preamble_is_idempotent_for_authoritative_evidence(tmp_pat
         assert session.query(models.EntryPreamble).count() == 1
 
 
+def test_reassessment_supersedes_older_pending_generation(tmp_path):
+    from telegram_kol_research.entry_preambles import persist_entry_preamble_in_session
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, evidence_id = _message_and_evidence(session_factory)
+    now = datetime(2026, 8, 5, 12, 1, tzinfo=UTC)
+    with session_factory() as session:
+        raw = session.get(RawMessage, raw_id)
+        first = persist_entry_preamble_in_session(
+            session,
+            raw_message=raw,
+            evidence_version_id=evidence_id,
+            recognition_generation="generation-1",
+            evidence=_half_risk_evidence(),
+            now=now,
+        )
+        second = persist_entry_preamble_in_session(
+            session,
+            raw_message=raw,
+            evidence_version_id=evidence_id,
+            recognition_generation="generation-2",
+            evidence=_half_risk_evidence(),
+            now=now,
+        )
+        session.commit()
+
+        assert first.status == "invalidated"
+        assert first.invalidated_at == now.replace(tzinfo=None)
+        assert second.status == "pending"
+        assert session.query(models.EntryPreamble).filter_by(status="pending").count() == 1
+
+
 def test_invalidate_changes_only_pending_entry_preamble(tmp_path):
     from telegram_kol_research.entry_preambles import (
         invalidate_pending_entry_preamble_in_session,
