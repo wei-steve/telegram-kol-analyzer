@@ -33,6 +33,7 @@ from telegram_kol_research.models import (
     utc_now,
 )
 from telegram_kol_research.time_utils import normalize_to_utc_naive, utc_naive_to_local
+from telegram_kol_research.reporting import format_entry_preamble_assembly_summary
 
 STRATEGY_TIME_DISPLAY_FIELDS = (
     "posted_at",
@@ -52,6 +53,21 @@ def _safe_json_dict(value: str | None) -> dict[str, object]:
     except (TypeError, ValueError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _serialize_entry_preamble_binding(
+    binding: ExecutionBinding,
+) -> dict[str, object] | None:
+    payload = _safe_json_dict(binding.payload_json)
+    draft = payload.get("draft")
+    evidence = (
+        draft.get("entry_preamble_assembly")
+        if isinstance(draft, dict)
+        else None
+    )
+    if evidence is None:
+        evidence = payload.get("entry_preamble_assembly")
+    return format_entry_preamble_assembly_summary(evidence)
 
 
 def load_home_event_rows(
@@ -478,6 +494,29 @@ def _serialize_raw_messages(
     for batch in all_management_batches:
         management_batch_by_msg_id.setdefault(batch.raw_message_id, batch)
 
+    message_keys = {(int(row.chat_id), int(row.message_id)) for row in raw_messages}
+    binding_rows = (
+        session.query(ExecutionBinding)
+        .filter(
+            or_(
+                *[
+                    (ExecutionBinding.chat_id == chat_id)
+                    & (ExecutionBinding.message_id == message_id)
+                    for chat_id, message_id in message_keys
+                ]
+            )
+        )
+        .order_by(ExecutionBinding.id.asc())
+        .all()
+        if message_keys
+        else []
+    )
+    bindings_by_message_key: dict[tuple[int, int], list[ExecutionBinding]] = {}
+    for binding in binding_rows:
+        bindings_by_message_key.setdefault(
+            (int(binding.chat_id), int(binding.message_id)), []
+        ).append(binding)
+
     all_experiments = (
         session.query(RecognitionExperiment)
         .filter(RecognitionExperiment.raw_message_id.in_(raw_message_ids))
@@ -580,6 +619,14 @@ def _serialize_raw_messages(
         )
         decision = decisions_by_msg_id.get(raw_message.id)
         semantic_review = _serialize_semantic_review(decision)
+        matching_bindings = bindings_by_message_key.get(
+            (int(raw_message.chat_id), int(raw_message.message_id)), []
+        )
+        entry_preamble_assembly = (
+            _serialize_entry_preamble_binding(matching_bindings[0])
+            if len(matching_bindings) == 1
+            else None
+        )
         rows.append(
             {
                 "raw_message_id": raw_message.id,
@@ -608,6 +655,7 @@ def _serialize_raw_messages(
                     decision,
                     management_batch_by_msg_id.get(raw_message.id),
                 ),
+                "entry_preamble_assembly": entry_preamble_assembly,
                 "decision_card": _build_message_decision_card(
                     decision=decision,
                     semantic_review=semantic_review,

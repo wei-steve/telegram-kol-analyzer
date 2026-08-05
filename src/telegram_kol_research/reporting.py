@@ -12,6 +12,53 @@ from telegram_kol_research.analytics import compute_summary_metrics
 from telegram_kol_research.models import RawMessage, SignalCandidate, Source, TradeIdea
 
 
+def format_entry_preamble_assembly_summary(
+    evidence: object,
+) -> dict[str, object] | None:
+    """Project persisted sizing evidence into a bounded operator-facing summary."""
+
+    if not isinstance(evidence, dict):
+        return None
+    try:
+        mode = str(evidence["mode"])
+        configured = float(evidence["configured_risk_budget_usdt"])
+        multiplier = float(evidence["risk_multiplier"])
+        effective = float(evidence["effective_risk_budget_usdt"])
+        preamble_message_id = int(evidence["preamble_message_id"])
+        strategy_message_id = int(evidence["strategy_message_id"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    if (
+        mode not in {"shadow", "live"}
+        or configured < 0
+        or not 0 < multiplier <= 1
+        or effective < 0
+        or preamble_message_id <= 0
+        or strategy_message_id <= 0
+    ):
+        return None
+
+    def compact(value: float) -> str:
+        return f"{value:.8f}".rstrip("0").rstrip(".")
+
+    percent = compact(multiplier * 100)
+    return {
+        "mode": mode,
+        "risk_calculation": (
+            f"基础风险预算 {compact(configured)} USDT × 仓位倍率 {percent}% "
+            f"= 实际风险预算 {compact(effective)} USDT"
+        ),
+        "message_pair": (
+            f"前置消息 {preamble_message_id} / 策略消息 {strategy_message_id}"
+        ),
+        "configured_risk_budget_usdt": configured,
+        "risk_multiplier": multiplier,
+        "effective_risk_budget_usdt": effective,
+        "preamble_message_id": preamble_message_id,
+        "strategy_message_id": strategy_message_id,
+    }
+
+
 def render_leaderboard_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Order leaderboard rows by quality-adjusted rank."""
 

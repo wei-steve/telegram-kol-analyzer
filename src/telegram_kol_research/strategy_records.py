@@ -15,6 +15,7 @@ from sqlalchemy import and_, case, exists, func, or_, select
 from sqlalchemy.orm import aliased
 
 from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
+from telegram_kol_research.reporting import format_entry_preamble_assembly_summary
 from telegram_kol_research.models import (
     ContextResolutionAttempt,
     ExecutionBinding,
@@ -1788,6 +1789,14 @@ def _role_recognition_decision_detail(
 
 
 def _binding_detail(row: ExecutionBinding) -> dict[str, object]:
+    payload = _safe_json_value(row.payload_json)
+    assembly_evidence = None
+    if isinstance(payload, dict):
+        draft = payload.get("draft")
+        if isinstance(draft, dict):
+            assembly_evidence = draft.get("entry_preamble_assembly")
+        if assembly_evidence is None:
+            assembly_evidence = payload.get("entry_preamble_assembly")
     return {
         "id": int(row.id),
         "strategy_instance_id": row.strategy_instance_id,
@@ -1801,7 +1810,10 @@ def _binding_detail(row: ExecutionBinding) -> dict[str, object]:
         "pos_id": row.pos_id,
         "status": row.status,
         "last_exchange_status": row.last_exchange_status,
-        "payload": _safe_json_value(row.payload_json),
+        "payload": payload,
+        "entry_preamble_assembly": format_entry_preamble_assembly_summary(
+            assembly_evidence
+        ),
     }
 
 

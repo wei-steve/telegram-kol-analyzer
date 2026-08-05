@@ -8,6 +8,7 @@ from sqlalchemy import event
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ContextResolutionAttempt,
+    ExecutionBinding,
     MediaAsset,
     MessageEvidenceVersion,
     RawMessage,
@@ -53,6 +54,56 @@ def test_load_group_messages_includes_media_and_orders_newest_first_within_page(
 
     assert [row["message_id"] for row in rows] == [2, 1]
     assert rows[0]["media_assets"][0]["local_path"] == "data/media/9/2.jpg"
+
+
+def test_load_group_messages_projects_bounded_entry_preamble_assembly(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add(
+            RawMessage(
+                chat_id=9,
+                message_id=9902,
+                posted_at=datetime(2026, 4, 2, tzinfo=UTC),
+                text="BTC strategy",
+            )
+        )
+        session.add(
+            ExecutionBinding(
+                strategy_instance_id="entry-preamble-ui",
+                kol_id="chen",
+                chat_id=9,
+                message_id=9902,
+                symbol="BTCUSDT",
+                side="long",
+                venue="deepcoin",
+                payload_json=json.dumps(
+                    {
+                        "draft": {
+                            "entry_preamble_assembly": {
+                                "mode": "live",
+                                "configured_risk_budget_usdt": 20,
+                                "risk_multiplier": "0.5",
+                                "effective_risk_budget_usdt": 10,
+                                "preamble_message_id": 9901,
+                                "strategy_message_id": 9902,
+                                "secret": "must-not-render",
+                            }
+                        }
+                    }
+                ),
+            )
+        )
+        session.commit()
+
+    row = load_group_messages(session_factory, chat_id=9, limit=10)[0]
+
+    assert row["entry_preamble_assembly"]["risk_calculation"] == (
+        "基础风险预算 20 USDT × 仓位倍率 50% = 实际风险预算 10 USDT"
+    )
+    assert row["entry_preamble_assembly"]["message_pair"] == (
+        "前置消息 9901 / 策略消息 9902"
+    )
+    assert "secret" not in row["entry_preamble_assembly"]
 
 
 def test_load_group_messages_projects_safe_context_resolution_observability(tmp_path):

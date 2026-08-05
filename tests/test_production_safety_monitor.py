@@ -30,6 +30,7 @@ from telegram_kol_research.production_safety_monitor import load_monitor_state
 from telegram_kol_research.production_safety_monitor import read_abnormal_execution_events
 from telegram_kol_research.production_safety_monitor import read_loopback_settings
 from telegram_kol_research.production_safety_monitor import read_composite_management_invariants
+from telegram_kol_research.production_safety_monitor import read_entry_preamble_invariants
 from telegram_kol_research.production_safety_monitor import run_daily_management_audit
 from telegram_kol_research.production_safety_monitor import run_production_safety_monitor
 from telegram_kol_research.production_safety_monitor import save_monitor_state
@@ -303,6 +304,61 @@ def test_monitor_surfaces_each_composite_management_invariant():
 
     assert result.healthy is False
     assert result.reason_codes == tuple(sorted(codes))
+
+
+def test_monitor_surfaces_each_entry_preamble_invariant():
+    codes = (
+        "stale_entry_preamble_unresolved",
+        "entry_preamble_ambiguous",
+        "live_entry_preamble_binding_evidence_missing",
+    )
+
+    result = evaluate_monitor_snapshot(
+        _snapshot(entry_preamble_invariant_codes=codes), EXPECTATIONS
+    )
+
+    assert result.healthy is False
+    assert result.reason_codes == tuple(sorted(codes))
+
+
+def test_entry_preamble_monitor_reader_detects_faults_without_writes(tmp_path):
+    database = tmp_path / "entry-preamble-monitor.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE entry_preambles (
+          id INTEGER PRIMARY KEY, chat_id INTEGER, symbol TEXT, side TEXT,
+          status TEXT, created_at TEXT
+        );
+        CREATE TABLE entry_strategy_assemblies (
+          id INTEGER PRIMARY KEY, strategy_instance_id TEXT, fingerprint TEXT
+        );
+        CREATE TABLE execution_bindings (
+          id INTEGER PRIMARY KEY, strategy_instance_id TEXT, payload_json TEXT
+        );
+        INSERT INTO entry_preambles VALUES
+          (1, 9, 'BTCUSDT', 'long', 'pending', '2026-08-04 00:00:00'),
+          (2, 9, 'BTCUSDT', 'long', 'pending', '2026-08-04 00:01:00');
+        INSERT INTO entry_strategy_assemblies VALUES
+          (1, 'strategy-1', 'assembly-fingerprint');
+        INSERT INTO execution_bindings VALUES
+          (1, 'strategy-1', '{"draft":{}}');
+        """
+    )
+    connection.commit()
+    before = database.read_bytes()
+
+    codes = read_entry_preamble_invariants(
+        database,
+        now=datetime(2026, 8, 5, tzinfo=UTC),
+    )
+
+    assert set(codes) == {
+        "stale_entry_preamble_unresolved",
+        "entry_preamble_ambiguous",
+        "live_entry_preamble_binding_evidence_missing",
+    }
+    assert database.read_bytes() == before
 
 
 def test_composite_monitor_reader_detects_persisted_faults_without_writes(tmp_path):

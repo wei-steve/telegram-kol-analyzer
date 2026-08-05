@@ -328,6 +328,12 @@
                   {% if execution_outcome.detail %}<small>{{ execution_outcome.detail }}</small>{% endif %}
                 </div>
               {% endif %}
+              {% if message.entry_preamble_assembly %}
+                <div class="message-entry-preamble-assembly" role="status">
+                  <strong>{{ message.entry_preamble_assembly.risk_calculation }}</strong>
+                  <small>{{ message.entry_preamble_assembly.message_pair }} · 模式 {{ message.entry_preamble_assembly.mode }}</small>
+                </div>
+              {% endif %}
               {% if semantic_review %}
                 {% if semantic_review.severity in ['normal', 'critical', 'context'] %}
                   <details class="semantic-review semantic-review-{{ semantic_review.severity }}"

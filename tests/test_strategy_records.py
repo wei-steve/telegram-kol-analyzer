@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+import json
 
 from sqlalchemy import event
 import pytest
@@ -392,7 +393,22 @@ def test_load_strategy_record_detail_builds_full_evidence_chain(tmp_path):
         )
         binding.pos_id = "pos-1"
         binding.order_id = "order-1"
-        binding.payload_json = '{"passphrase":"must-not-render"}'
+        binding.payload_json = json.dumps(
+            {
+                "passphrase": "must-not-render",
+                "draft": {
+                    "entry_preamble_assembly": {
+                        "mode": "live",
+                        "configured_risk_budget_usdt": 20,
+                        "risk_multiplier": "0.5",
+                        "effective_risk_budget_usdt": 10,
+                        "preamble_message_id": 9901,
+                        "strategy_message_id": 9902,
+                        "prompt": "must-not-render",
+                    }
+                },
+            }
+        )
         binding.created_at = NOW - timedelta(hours=5, minutes=20)
         session.add(binding)
         session.flush()
@@ -535,6 +551,16 @@ def test_load_strategy_record_detail_builds_full_evidence_chain(tmp_path):
     ]
     assert all(item["source"] for item in detail["timeline"])
     assert detail["execution"]["binding"]["pos_id"] == "pos-1"
+    assert detail["execution"]["binding"]["entry_preamble_assembly"] == {
+        "mode": "live",
+        "risk_calculation": "基础风险预算 20 USDT × 仓位倍率 50% = 实际风险预算 10 USDT",
+        "message_pair": "前置消息 9901 / 策略消息 9902",
+        "configured_risk_budget_usdt": 20.0,
+        "risk_multiplier": 0.5,
+        "effective_risk_budget_usdt": 10.0,
+        "preamble_message_id": 9901,
+        "strategy_message_id": 9902,
+    }
     assert detail["execution"]["management_batches"][0]["legs"][0]["pos_id"] == "pos-1"
     assert detail["evidence"]["raw_message"]["text"] == "BTC 现价做多"
     assert detail["evidence"]["media"][0]["kind"] == "photo"

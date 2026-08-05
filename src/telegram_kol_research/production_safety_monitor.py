@@ -230,6 +230,11 @@ _FINGERPRINT_DETAIL_KEYS_BY_REASON = {
     "live_position_retained_tp_oversized": ("composite_invariant_codes",),
     "composite_position_without_verified_stop": ("composite_invariant_codes",),
     "stalled_composite_component": ("composite_invariant_codes",),
+    "stale_entry_preamble_unresolved": ("entry_preamble_invariant_codes",),
+    "entry_preamble_ambiguous": ("entry_preamble_invariant_codes",),
+    "live_entry_preamble_binding_evidence_missing": (
+        "entry_preamble_invariant_codes",
+    ),
 }
 _NOTIFICATION_SUPPRESSION = timedelta(hours=6)
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -269,6 +274,7 @@ class MonitorSnapshot:
     abnormal_events: Sequence[Mapping[str, Any]]
     audit: Mapping[str, Any] | None
     composite_invariant_codes: Sequence[str] = ()
+    entry_preamble_invariant_codes: Sequence[str] = ()
     adapter_failures: Sequence[str] = ()
     state_invalid: bool = False
 
@@ -406,6 +412,9 @@ class ProductionSafetyAdapters:
             now=now,
             live_position_snapshot_path=snapshot_path,
         )
+
+    def read_entry_preamble_invariants(self, *, now: datetime) -> tuple[str, ...]:
+        return read_entry_preamble_invariants(self.database_path, now=now)
 
     def run_management_audit(self) -> Mapping[str, Any]:
         completed = _run_bounded_command(
@@ -586,6 +595,80 @@ def read_abnormal_execution_events(
         {"action": row[0], "status": row[1], "pos_id": row[2]}
         for row in rows
     )
+
+
+def read_entry_preamble_invariants(
+    database_path: str | Path,
+    *,
+    now: datetime,
+    stale_after: timedelta = timedelta(hours=6),
+    connect=sqlite3.connect,
+) -> tuple[str, ...]:
+    """Read bounded preamble/strategy evidence invariants without write access."""
+
+    checked_at = _require_aware_datetime(now).astimezone(UTC).replace(tzinfo=None)
+    stale_before = checked_at - stale_after
+    required_tables = {
+        "entry_preambles",
+        "entry_strategy_assemblies",
+        "execution_bindings",
+    }
+    reasons: set[str] = set()
+    uri = f"file:{database_path}?mode=ro"
+    with connect(uri, uri=True) as connection:
+        connection.execute("PRAGMA query_only = ON")
+        available = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if not required_tables.issubset(available):
+            return ()
+        if connection.execute(
+            """
+            SELECT 1 FROM entry_preambles
+            WHERE status = 'pending' AND created_at < ? LIMIT 1
+            """,
+            (stale_before.isoformat(sep=" "),),
+        ).fetchone():
+            reasons.add("stale_entry_preamble_unresolved")
+        if connection.execute(
+            """
+            SELECT 1 FROM entry_preambles
+            WHERE status = 'pending'
+            GROUP BY chat_id, symbol, side HAVING COUNT(*) > 1 LIMIT 1
+            """
+        ).fetchone():
+            reasons.add("entry_preamble_ambiguous")
+        evidence_rows = connection.execute(
+            """
+            SELECT a.fingerprint, b.payload_json
+            FROM entry_strategy_assemblies AS a
+            LEFT JOIN execution_bindings AS b
+              ON b.strategy_instance_id = a.strategy_instance_id
+            ORDER BY a.id DESC LIMIT 200
+            """
+        ).fetchall()
+        for fingerprint, payload_json in evidence_rows:
+            try:
+                payload = json.loads(payload_json or "{}")
+                draft = payload.get("draft") if isinstance(payload, dict) else None
+                evidence = (
+                    draft.get("entry_preamble_assembly")
+                    if isinstance(draft, dict)
+                    else None
+                )
+                if evidence is None and isinstance(payload, dict):
+                    evidence = payload.get("entry_preamble_assembly")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                evidence = None
+            if not isinstance(evidence, dict) or str(
+                evidence.get("assembly_fingerprint") or ""
+            ) != str(fingerprint):
+                reasons.add("live_entry_preamble_binding_evidence_missing")
+                break
+    return tuple(sorted(reasons))
 
 
 def read_composite_management_invariants(
@@ -919,6 +1002,19 @@ def run_production_safety_monitor(
         if callable(composite_reader)
         else ()
     )
+    entry_preamble_reader = getattr(
+        adapters, "read_entry_preamble_invariants", None
+    )
+    entry_preamble_invariant_codes = (
+        _read_adapter(
+            lambda: entry_preamble_reader(now=checked_at),
+            "entry_preamble",
+            failures,
+            (),
+        )
+        if callable(entry_preamble_reader)
+        else ()
+    )
     window_sources_complete = not {"journal", "events"}.intersection(failures)
 
     audit = None
@@ -944,6 +1040,7 @@ def run_production_safety_monitor(
             abnormal_events=abnormal_events,
             audit=audit,
             composite_invariant_codes=composite_invariant_codes,
+            entry_preamble_invariant_codes=entry_preamble_invariant_codes,
             adapter_failures=tuple(failures),
             state_invalid=state_integrity_alert_pending,
         ),
@@ -1629,6 +1726,9 @@ def evaluate_monitor_snapshot(
     _evaluate_composite_invariants(
         snapshot.composite_invariant_codes, reasons, details
     )
+    _evaluate_entry_preamble_invariants(
+        snapshot.entry_preamble_invariant_codes, reasons, details
+    )
     if snapshot.audit is not None:
         _evaluate_audit(snapshot.audit, reasons, details)
 
@@ -1670,6 +1770,36 @@ def _evaluate_composite_invariants(
     reasons.update(observed)
     if observed:
         details["composite_invariant_codes"] = tuple(sorted(observed))
+
+
+_ENTRY_PREAMBLE_INVARIANT_CODES = frozenset(
+    {
+        "stale_entry_preamble_unresolved",
+        "entry_preamble_ambiguous",
+        "live_entry_preamble_binding_evidence_missing",
+    }
+)
+
+
+def _evaluate_entry_preamble_invariants(
+    values: object,
+    reasons: set[str],
+    details: dict[str, Any],
+) -> None:
+    if not isinstance(values, Sequence) or isinstance(
+        values, (str, bytes, bytearray)
+    ):
+        reasons.add("malformed_snapshot")
+        return
+    observed: set[str] = set()
+    for value in values:
+        if value not in _ENTRY_PREAMBLE_INVARIANT_CODES:
+            reasons.add("malformed_snapshot")
+            continue
+        observed.add(value)
+    reasons.update(observed)
+    if observed:
+        details["entry_preamble_invariant_codes"] = tuple(sorted(observed))
 
 
 def _evaluate_settings(
