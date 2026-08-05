@@ -279,10 +279,15 @@ def _load_prior_facts(
         if evidence is None:
             needs_resolution = not (durable_preamble or durable_candidate)
         else:
+            normalized_valid = True
             try:
                 normalized = json.loads(evidence.normalized_evidence_json or "{}")
             except (TypeError, ValueError, json.JSONDecodeError):
                 normalized = {}
+                normalized_valid = False
+            if not isinstance(normalized, dict):
+                normalized = {}
+                normalized_valid = False
             has_entry_context = isinstance(normalized, dict) and isinstance(
                 normalized.get("entry_context"), dict
             )
@@ -291,10 +296,29 @@ def _load_prior_facts(
             )
             if evidence.extraction_status != "completed":
                 needs_resolution = True
+            elif not normalized_valid:
+                needs_resolution = True
             elif has_entry_context and not current_preamble_persisted:
                 needs_resolution = True
-            elif normalized.get("recognition_result") == "是策略" and not durable_candidate:
-                needs_resolution = True
+            else:
+                effective_status = str(
+                    normalized.get("recognition_result") or ""
+                )
+                if effective_status not in {"是策略", "非策略"}:
+                    strategy = normalized.get("strategy")
+                    lifecycle = normalized.get("lifecycle_event")
+                    effective_status = (
+                        "是策略"
+                        if bool(strategy)
+                        or (
+                            isinstance(lifecycle, dict)
+                            and str(lifecycle.get("event_type") or "none")
+                            != "none"
+                        )
+                        else "非策略"
+                    )
+                if effective_status == "是策略" and not durable_candidate:
+                    needs_resolution = True
         if needs_resolution and raw_id not in unresolved_ids:
             facts.append(
                 PriorMessageFact(

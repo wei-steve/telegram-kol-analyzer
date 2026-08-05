@@ -2,6 +2,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from importlib.util import find_spec
 
+import pytest
+
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.entry_preambles import persist_entry_preamble_in_session
 from telegram_kol_research.message_evidence import EntryPreambleEvidence
@@ -432,6 +434,57 @@ def test_completed_preamble_evidence_without_persisted_row_defers_entry(tmp_path
         strategy_raw_message_id=strategy_raw_id,
         signal_candidate_id=candidate_id,
         strategy_instance_id="release-gap",
+        mode="live",
+        live_chat_ids={-1002337721508},
+        assembled_at=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "unresolved"
+
+
+@pytest.mark.parametrize(
+    "normalized_json",
+    [
+        '{"strategy":{"symbol":"BTC","side":"short"},"lifecycle_event":{"event_type":"none"}}',
+        '{"strategy":{},"lifecycle_event":{"event_type":"position_update"}}',
+        "{malformed",
+    ],
+)
+def test_incomplete_authoritative_application_gap_defers_entry(tmp_path, normalized_json):
+    from telegram_kol_research.entry_strategy_assembly import assemble_entry_strategy
+
+    session_factory = create_session_factory(tmp_path / "application-gap.db")
+    strategy_raw_id, candidate_id, _ = _persist_pair(session_factory)
+    with session_factory() as session:
+        gap = RawMessage(
+            chat_id=-1002337721508,
+            message_id=99015,
+            posted_at=NOW + timedelta(seconds=30),
+            text="pending authoritative application",
+        )
+        session.add(gap)
+        session.flush()
+        session.add(
+            MessageEvidenceVersion(
+                raw_message_id=gap.id,
+                version=1,
+                input_fingerprint="application-gap",
+                model="mimo-v2.5",
+                prompt_versions_json="{}",
+                extraction_status="completed",
+                confidence=0.9,
+                text_evidence_json="{}",
+                image_evidence_json="{}",
+                normalized_evidence_json=normalized_json,
+            )
+        )
+        session.commit()
+
+    result = assemble_entry_strategy(
+        session_factory,
+        strategy_raw_message_id=strategy_raw_id,
+        signal_candidate_id=candidate_id,
+        strategy_instance_id=f"gap-{hash(normalized_json)}",
         mode="live",
         live_chat_ids={-1002337721508},
         assembled_at=NOW + timedelta(minutes=2),
