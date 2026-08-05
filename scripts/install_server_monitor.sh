@@ -175,6 +175,12 @@ if ! runuser -u "$MONITOR_USER" -- test -r "$PRODUCTION_ROOT/data/research.db"; 
   echo "Monitor identity cannot read the production database." >&2
   exit 1
 fi
+LIVE_POSITION_SNAPSHOT="$PRODUCTION_ROOT/data/web_cache/deepcoin_live_positions.json"
+if [[ -e "$LIVE_POSITION_SNAPSHOT" ]] && \
+   ! runuser -u "$MONITOR_USER" -- test -r "$LIVE_POSITION_SNAPSHOT"; then
+  echo "Monitor identity cannot read the live-position snapshot." >&2
+  exit 1
+fi
 
 state_directory_locked=false
 restore_state_directory() {

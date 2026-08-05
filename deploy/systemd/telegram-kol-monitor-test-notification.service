@@ -48,4 +48,5 @@ BindReadOnlyPaths=/opt/telegram-kol-analyzer/data/research.db
 BindReadOnlyPaths=-/opt/telegram-kol-analyzer/data/research.db-wal
 BindReadOnlyPaths=-/opt/telegram-kol-analyzer/data/research.db-shm
 BindReadOnlyPaths=-/opt/telegram-kol-analyzer/data/research.db-journal
+BindReadOnlyPaths=-/opt/telegram-kol-analyzer/data/web_cache/deepcoin_live_positions.json
 ReadWritePaths=/var/lib/telegram-kol-monitor

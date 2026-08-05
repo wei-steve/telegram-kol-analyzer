@@ -177,16 +177,12 @@ def plan_take_profit_consumption(
             excess -= current
             continue
         if excess > 0:
-            desired = current - excess
-            resize_rows.append(
-                {
-                    "order_id": row["order_id"],
-                    "from_size": _decimal_text(current),
-                    "to_size": _decimal_text(desired),
-                }
-            )
-            row = {**row, "desired_size": _decimal_text(desired)}
+            # Deepcoin has no atomic resize. Cancelling the whole exact owned
+            # TP is conservative and avoids a cancel/create gap or duplicate
+            # reduce-only exposure. Later stages remain bounded below size.
+            cancel_ids.append(row["order_id"])
             excess = Decimal("0")
+            continue
         bounded_retained.append(row)
 
     cancel_actions = tuple(

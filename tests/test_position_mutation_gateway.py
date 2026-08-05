@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+import json
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
@@ -377,6 +378,59 @@ def test_rejected_close_readback_never_confirms_intent(tmp_path):
         assert intent.order_id == "ord-close-rejected"
 
 
+def test_partially_filled_then_cancelled_close_becomes_terminal_for_delta_recovery(tmp_path):
+    session_factory, binding_id, leg_id, _, _ = _seed(tmp_path)
+    gateway = PositionMutationGateway(
+        session_factory=session_factory,
+        deepcoin_client=FakeDeepcoinClient(),
+        live_execution_gate=lambda: True,
+        now_provider=lambda: NOW,
+    )
+    result = gateway.close_exact_position(
+        authority=_authority(
+            binding_id=binding_id,
+            leg_id=leg_id,
+            position=SISTER_POSITION,
+            strategy="strategy-sister",
+        ),
+        size="5",
+        client_order_id="close-partial-terminal",
+        idempotency_key="component:close:partial-terminal",
+    )
+    with session_factory() as session:
+        intent = session.get(PositionMutationIntent, result.intent_id)
+        intent.status = "recovery_required"
+        intent.response_json = None
+        session.commit()
+    terminal = {
+        "ordId": "ord-partial-terminal",
+        "clOrdId": "close-partial-terminal",
+        "instId": "BTC-USDT-SWAP",
+        "posSide": "long",
+        "closePosId": "pos-sister",
+        "sz": "5",
+        "status": "cancelled",
+    }
+    fill = {
+        **terminal,
+        "fillSz": "3",
+        "status": "filled",
+    }
+
+    confirmed = reconcile_submitted_position_mutation_intents(
+        session_factory,
+        order_history=[terminal],
+        trade_fills=[fill],
+        reconciled_at=NOW,
+    )
+
+    assert confirmed == 1
+    with session_factory() as session:
+        intent = session.get(PositionMutationIntent, result.intent_id)
+        assert intent.status == "confirmed"
+        assert intent.order_id == "ord-partial-terminal"
+
+
 def test_stale_position_fingerprint_blocks_write(tmp_path):
     session_factory, binding_id, leg_id, _, _ = _seed(tmp_path)
     client = FakeDeepcoinClient()
@@ -592,6 +646,58 @@ def test_submitted_set_intent_is_confirmed_only_by_exact_pending_readback(
     )
     assert replay.status == "confirmed"
     assert len(client.set_position_sltp_calls) == 1
+
+
+def test_submitting_backup_stop_recovers_with_persisted_role(tmp_path):
+    session_factory, binding_id, leg_id, _, _ = _seed(tmp_path)
+    client = FakeDeepcoinClient()
+    gateway = PositionMutationGateway(
+        session_factory=session_factory,
+        deepcoin_client=client,
+        live_execution_gate=lambda: True,
+        now_provider=lambda: NOW,
+    )
+    result = gateway.set_exact_position_sltp(
+        authority=_authority(
+            binding_id=binding_id,
+            leg_id=leg_id,
+            position=SISTER_POSITION,
+            strategy="strategy-sister",
+        ),
+        purpose="stop_loss",
+        ledger_purpose="backup_stop",
+        trigger_price="61000",
+        size="10",
+        idempotency_key="component:backup:crash-window",
+    )
+    with session_factory() as session:
+        intent = session.get(PositionMutationIntent, result.intent_id)
+        assert json.loads(intent.request_json)["_ledger_purpose"] == "backup_stop"
+        intent.status = "submitting"
+        intent.response_json = None
+        session.commit()
+
+    confirmed = reconcile_submitted_position_mutation_intents(
+        session_factory,
+        pending_trigger_orders=[{
+            "ordId": "ord-new-stop",
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-sister",
+            "posSide": "long",
+            "slTriggerPx": "61000",
+            "sz": "10",
+        }],
+        reconciled_at=NOW,
+    )
+
+    assert confirmed == 1
+    with session_factory() as session:
+        intent = session.get(PositionMutationIntent, result.intent_id)
+        assert intent.status == "confirmed"
+        ledger = session.query(PositionProtectionLedger).filter_by(
+            order_id="ord-new-stop"
+        ).one()
+        assert ledger.purpose == "backup_stop"
 
 
 def test_require_readback_confirms_intent_and_ledger_atomically(tmp_path):

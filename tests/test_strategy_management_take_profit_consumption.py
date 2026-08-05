@@ -106,10 +106,10 @@ def test_several_stages_consume_first_and_bound_retained_total():
         ],
     )
 
-    assert result.cancel_order_ids == ("tp-1",)
-    assert [row["order_id"] for row in result.retained_rows] == ["tp-2", "tp-3"]
-    assert [row["desired_size"] for row in result.retained_rows] == ["2", "3"]
-    assert result.resize_rows == ({"order_id": "tp-2", "from_size": "3", "to_size": "2"},)
+    assert result.cancel_order_ids == ("tp-1", "tp-2")
+    assert [row["order_id"] for row in result.retained_rows] == ["tp-3"]
+    assert [row["desired_size"] for row in result.retained_rows] == ["3"]
+    assert result.resize_rows == ()
 
 
 def test_first_take_profit_already_filled_counts_exact_quantity():
@@ -174,10 +174,8 @@ def test_retained_total_above_target_removes_earliest_rows_deterministically():
         target="3",
     )
 
-    assert result.cancel_order_ids == ("tp-1", "tp-2")
-    assert result.retained_rows == (
-        {"order_id": "tp-3", "current_size": "4", "desired_size": "3"},
-    )
+    assert result.cancel_order_ids == ("tp-1", "tp-2", "tp-3")
+    assert result.retained_rows == ()
 
 
 def test_manual_partial_close_is_not_take_profit_fill_proof():

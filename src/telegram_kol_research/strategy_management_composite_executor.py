@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 from telegram_kol_research.models import (
     PositionProtectionLedger,
+    RawMessage,
     StrategyManagementBatch,
     StrategyManagementComponent,
     StrategyManagementLeg,
@@ -23,7 +24,10 @@ from telegram_kol_research.position_mutation_gateway import (
     submit_exact_position_sltp,
 )
 from telegram_kol_research.strategy_management_batches import (
+    claim_ready_batch,
+    load_management_batch,
     management_component_set_is_complete_in_session,
+    transition_batch,
 )
 from telegram_kol_research.strategy_management_components import (
     PROTECTED_RECONCILIATION_STATUSES,
@@ -47,6 +51,10 @@ from telegram_kol_research.strategy_management_market_policy import (
     plan_composite_stop_replacement,
 )
 from telegram_kol_research.protection_ledger import retained_take_profit_total
+from telegram_kol_research.strategy_records import (
+    CompositeManagementCompletionError,
+    validate_composite_management_completion,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +65,255 @@ class CompositeComponentExecutionResult:
     proven_filled_quantity: str = "0"
     cancel_intent_ids: tuple[int, ...] = ()
     close_intent_ids: tuple[int, ...] = ()
+
+
+def execute_composite_management_batch(
+    session_factory,
+    *,
+    batch_id: int,
+    deepcoin_client: Any,
+    contract_spec_provider: Any,
+    live_execution_gate: Callable[[], bool],
+    now_provider: Callable[[], Any],
+    backup_buffer_bps: str = "20",
+):
+    """Run only ordered v2 components, then atomically validate completion."""
+
+    batch = load_management_batch(session_factory, int(batch_id))
+    if not (
+        batch.management_contract_json
+        and batch.management_contract_fingerprint
+        and batch.contract_version is not None
+        and batch.components
+    ):
+        raise ValueError("management_contract_requires_component_executor")
+    if not _composite_component_topology_is_exact(batch):
+        _freeze_composite_batch(
+            session_factory, batch.id, now_provider(),
+            "management_instruction_component_topology_invalid",
+        )
+        return load_management_batch(session_factory, batch.id)
+    if batch.status == "ready":
+        claimed = claim_ready_batch(
+            session_factory, batch.id, claimed_at=now_provider()
+        )
+        batch = claimed or load_management_batch(session_factory, batch.id)
+    if batch.status == "succeeded":
+        return batch
+    if batch.status != "executing":
+        raise ValueError(f"composite_batch_not_executable:{batch.status}")
+
+    executors = {
+        "consume_take_profit_stage": execute_take_profit_consumption_component,
+        "converge_partial_close": execute_partial_close_component,
+        "replace_remaining_protection": execute_protection_replacement_component,
+    }
+    for sequence in range(3):
+        current = load_management_batch(session_factory, batch.id)
+        if not _composite_component_topology_is_exact(current):
+            _freeze_composite_batch(
+                session_factory, batch.id, now_provider(),
+                "management_instruction_component_topology_invalid",
+            )
+            return load_management_batch(session_factory, batch.id)
+        rows = [row for row in current.components if row.sequence == sequence]
+        if not rows:
+            _freeze_composite_batch(
+                session_factory, batch.id, now_provider(),
+                "management_instruction_component_dropped",
+            )
+            return load_management_batch(session_factory, batch.id)
+        for component in rows:
+            if component.status == "confirmed":
+                continue
+            if component.status == "operator_required":
+                _freeze_composite_batch(
+                    session_factory, batch.id, now_provider(),
+                    component.reason_code or "composite_component_operator_required",
+                )
+                return load_management_batch(session_factory, batch.id)
+            if component.status in {"submitting", "awaiting_exchange"}:
+                return current
+            kwargs = {
+                "batch_id": batch.id,
+                "component_id": component.id,
+                "deepcoin_client": deepcoin_client,
+                "live_execution_gate": live_execution_gate,
+                "now_provider": now_provider,
+            }
+            if component.component_kind == "replace_remaining_protection":
+                instrument_id = _component_instrument_id(
+                    session_factory, component.strategy_management_leg_id
+                )
+                spec = (
+                    contract_spec_provider.get_contract_spec(instrument_id)
+                    if contract_spec_provider is not None and instrument_id
+                    else None
+                )
+                if spec is None or getattr(spec, "price_tick", None) is None:
+                    _freeze_composite_batch(
+                        session_factory, batch.id, now_provider(),
+                        "target_contract_spec_unavailable",
+                    )
+                    return load_management_batch(session_factory, batch.id)
+                kwargs.update(
+                    price_tick=str(spec.price_tick),
+                    backup_buffer_bps=str(backup_buffer_bps),
+                )
+            result = executors[component.component_kind](
+                session_factory, **kwargs
+            )
+            if result.status == "operator_required":
+                _freeze_composite_batch(
+                    session_factory, batch.id, now_provider(),
+                    result.reason_code or "composite_component_operator_required",
+                )
+                return load_management_batch(session_factory, batch.id)
+            if result.status != "confirmed":
+                return load_management_batch(session_factory, batch.id)
+
+    try:
+        return _complete_composite_batch(
+            session_factory,
+            batch_id=batch.id,
+            deepcoin_client=deepcoin_client,
+            completed_at=now_provider(),
+        )
+    except (CompositeManagementCompletionError, RuntimeError, ValueError) as exc:
+        _freeze_composite_batch(
+            session_factory, batch.id, now_provider(), str(exc)
+        )
+        return load_management_batch(session_factory, batch.id)
+
+
+def _component_instrument_id(session_factory, management_leg_id: int | None):
+    if management_leg_id is None:
+        return None
+    with session_factory() as session:
+        leg = session.get(StrategyManagementLeg, int(management_leg_id))
+        if leg is None:
+            return None
+        values = {
+            str(row[0] or "").upper()
+            for row in session.query(PositionProtectionLedger.instrument_id)
+            .filter(
+                PositionProtectionLedger.execution_order_leg_id
+                == leg.execution_order_leg_id,
+                PositionProtectionLedger.pos_id == leg.pos_id,
+            )
+            .all()
+        }
+    return next(iter(values)) if len(values) == 1 and "" not in values else None
+
+
+def _composite_component_topology_is_exact(batch) -> bool:
+    try:
+        contract = json.loads(batch.management_contract_json or "{}")
+        required = tuple(
+            str(item.get("component_kind") if isinstance(item, dict) else item)
+            for item in (contract.get("required_components") or [])
+        )
+        expected = {
+            (int(leg.id), kind, sequence)
+            for leg in batch.legs
+            for sequence, kind in enumerate(required)
+        }
+        actual = [
+            (
+                int(component.strategy_management_leg_id),
+                str(component.component_kind),
+                int(component.sequence),
+            )
+            for component in batch.components
+        ]
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return bool(batch.legs and required) and len(actual) == len(expected) and set(actual) == expected
+
+
+def _freeze_composite_batch(session_factory, batch_id, now, reason):
+    transition_batch(
+        session_factory,
+        int(batch_id),
+        expected_statuses={"ready", "executing"},
+        new_status="recovery_required",
+        transitioned_at=now,
+        reason_code=str(reason)[:128],
+    )
+
+
+def _complete_composite_batch(
+    session_factory, *, batch_id: int, deepcoin_client: Any, completed_at: Any
+):
+    from telegram_kol_research.system_operator_bot import (
+        persist_composite_management_completion_in_session,
+    )
+
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, int(batch_id))
+        if batch is None or batch.status != "executing":
+            raise RuntimeError("composite_batch_completion_state_changed")
+        raw = session.get(RawMessage, int(batch.raw_message_id))
+        components = (
+            session.query(StrategyManagementComponent)
+            .filter(StrategyManagementComponent.management_batch_id == batch.id)
+            .order_by(StrategyManagementComponent.sequence, StrategyManagementComponent.id)
+            .all()
+        )
+        expected_leg_ids = {
+            str(row[0])
+            for row in session.query(StrategyManagementLeg.id).filter(
+                StrategyManagementLeg.management_batch_id == batch.id
+            ).all()
+        }
+        instruments = {
+            str(row[0] or "").upper()
+            for row in session.query(PositionProtectionLedger.instrument_id)
+            .filter(PositionProtectionLedger.execution_binding_id == batch.execution_binding_id)
+            .all()
+        }
+        if raw is None or not instruments or "" in instruments:
+            raise RuntimeError("composite_completion_evidence_incomplete")
+        pending = []
+        for instrument_id in sorted(instruments):
+            rows = deepcoin_client.list_trigger_orders_pending(inst_id=instrument_id)
+            if not isinstance(rows, list):
+                raise RuntimeError("composite_completion_pending_snapshot_incomplete")
+            pending.extend(rows)
+        contract = json.loads(batch.management_contract_json or "{}")
+        validate_composite_management_completion(
+            source_text=raw.text or "",
+            contract=contract,
+            batch_status="succeeded",
+            components=components,
+            pending_orders=pending,
+            expected_leg_ids=expected_leg_ids,
+        )
+        evidence = [json.loads(row.evidence_json or "[]") for row in components]
+        flattened = [item for rows in evidence for item in rows if isinstance(item, dict)]
+        remaining = [item.get("remaining_size") for item in flattened if item.get("remaining_size") is not None]
+        retained = [item.get("retained_take_profit_total") for item in flattened if item.get("retained_take_profit_total") is not None]
+        batch.status = "succeeded"
+        batch.reason_code = "composite_management_exchange_confirmed"
+        batch.reconciled_at = completed_at
+        batch.completed_at = completed_at
+        batch.updated_at = completed_at
+        persist_composite_management_completion_in_session(
+            session,
+            batch,
+            summary={
+                "batch_id": batch.id,
+                "overall_state": "succeeded",
+                "first_take_profit": "已消费并核验",
+                "partial_close": (
+                    f"剩余 {','.join(map(str, remaining))}" if remaining else "已核验"
+                ),
+                "protection": "主备止损已核验",
+                "retained_take_profit_total": ",".join(map(str, retained)) or "0",
+            },
+        )
+        session.commit()
+        return load_management_batch(session_factory, batch.id)
 
 
 def execute_take_profit_consumption_component(
@@ -158,17 +415,6 @@ def execute_take_profit_consumption_component(
             component_id,
             proven_filled_quantity=plan.proven_filled_quantity,
         )
-
-    if len(plan.cancel_actions) != 1:
-        _transition(
-            session_factory,
-            component_id,
-            "preflighting",
-            "operator_required",
-            now,
-            "take_profit_multi_cancel_not_supported",
-        )
-        return _current_result(session_factory, component_id)
 
     action = plan.cancel_actions[0]
     live_position = _unique_live_position(snapshot["positions"], desired["pos_id"])
@@ -292,6 +538,79 @@ def execute_take_profit_consumption_component(
         trade_fills=refreshed["fills"],
         reconciled_at=now_provider(),
     )
+    for extra_action in plan.cancel_actions[1:]:
+        try:
+            latest = _exchange_snapshot(
+                deepcoin_client, desired["instrument_id"]
+            )
+            latest_position = _unique_live_position(
+                latest["positions"], desired["pos_id"]
+            )
+            if latest_position is None:
+                raise RuntimeError("target_live_position_not_unique")
+            with session_factory() as session:
+                latest_authority = build_position_mutation_authority(
+                    session,
+                    venue="deepcoin",
+                    pos_id=desired["pos_id"],
+                    live_position=latest_position,
+                )
+            extra_result = gateway.cancel_owned_position_sltp(
+                authority=latest_authority,
+                order_id=extra_action["order_id"],
+                idempotency_key=(
+                    f"{component.id}:cancel:{extra_action['order_id']}:"
+                    f"attempt:{attempt_number}"
+                ),
+                before_submit=lambda intent_id: _append_tp_cancel_intent(
+                    session_factory, component_id, intent_id
+                ),
+            )
+            intent_ids.append(extra_result.intent_id)
+            if extra_result.status != "submitted":
+                target = (
+                    "awaiting_exchange"
+                    if extra_result.status == "recovery_required"
+                    else "recovery_required"
+                )
+                _transition(
+                    session_factory, component_id, "submitting", target,
+                    now_provider(), "take_profit_cancel_outcome_unresolved",
+                    {"intent_id": extra_result.intent_id},
+                )
+                return _current_result(
+                    session_factory, component_id, intent_ids=intent_ids
+                )
+            latest = _exchange_snapshot(
+                deepcoin_client, desired["instrument_id"]
+            )
+            if extra_action["order_id"] in _pending_ids(latest["pending"]):
+                _transition(
+                    session_factory, component_id, "submitting",
+                    "awaiting_exchange", now_provider(),
+                    "take_profit_cancel_pending_after_submit",
+                    {"intent_id": extra_result.intent_id},
+                )
+                return _current_result(
+                    session_factory, component_id, intent_ids=intent_ids
+                )
+            reconcile_submitted_position_mutation_intents(
+                session_factory,
+                pending_trigger_orders=latest["pending"],
+                order_history=latest["history"],
+                trade_fills=latest["fills"],
+                reconciled_at=now_provider(),
+            )
+        except Exception as exc:
+            _transition(
+                session_factory, component_id, "submitting",
+                "awaiting_exchange", now_provider(),
+                "take_profit_multi_cancel_readback_incomplete",
+                {"error_type": type(exc).__name__},
+            )
+            return _current_result(
+                session_factory, component_id, intent_ids=intent_ids
+            )
     _transition(
         session_factory, component_id, "submitting", "confirmed",
         now_provider(), None, {"intent_id": result.intent_id},
@@ -528,6 +847,20 @@ def execute_protection_replacement_component(
     batch, component, leg, contract, desired = loaded
     if component.status in PROTECTED_RECONCILIATION_STATUSES:
         return _result(component)
+    if component.attempt_count >= 3:
+        with session_factory() as session:
+            current = session.get(StrategyManagementComponent, component_id)
+            if current and current.status in {"pending", "recovery_required"}:
+                transition_management_component(
+                    session,
+                    component_id=component_id,
+                    expected_status=current.status,
+                    new_status="operator_required",
+                    now=now,
+                    reason_code="protection_replacement_retry_exhausted",
+                )
+                session.commit()
+        return _current_result(session_factory, component_id)
     with session_factory() as session:
         predecessors = session.query(StrategyManagementComponent).filter(
             StrategyManagementComponent.management_batch_id == batch.id,
@@ -547,6 +880,11 @@ def execute_protection_replacement_component(
             session.rollback()
             return _current_result(session_factory, component.id)
         session.commit()
+    with session_factory() as session:
+        claimed = session.get(StrategyManagementComponent, component_id)
+        if claimed is None or claimed.status != "preflighting":
+            return _current_result(session_factory, component_id)
+        attempt_number = int(claimed.attempt_count)
     try:
         positions = deepcoin_client.list_positions(inst_id=desired["instrument_id"])
         if not isinstance(positions, list):
@@ -681,6 +1019,9 @@ def execute_protection_replacement_component(
     for old_order_id in sorted(old_stop_ids):
         positions = deepcoin_client.list_positions(inst_id=desired["instrument_id"])
         live_position = _unique_live_position(positions, desired["pos_id"])
+        pending_before_cancel = deepcoin_client.list_trigger_orders_pending(
+            inst_id=desired["instrument_id"]
+        )
         try:
             with session_factory() as session:
                 authority = build_position_mutation_authority(
@@ -696,6 +1037,11 @@ def execute_protection_replacement_component(
                 authority=authority,
                 order_id=old_order_id,
                 idempotency_key=f"{component.id}:cancel-old:{old_order_id}",
+                retry_pending_order=(
+                    _pending_row(pending_before_cancel, old_order_id)
+                    if attempt_number > 1
+                    else None
+                ),
             )
         except Exception as exc:
             _transition(
@@ -898,14 +1244,26 @@ def _persist_plan_and_enter_submitting(
         if component is None or component.status != "preflighting":
             raise RuntimeError("management_component_not_preflighting")
         desired = json.loads(component.desired_json)
+        existing = desired.get("take_profit_consumption_execution")
+        planned_ids = list(plan.cancel_order_ids)
+        intent_ids = [int(intent_id)]
+        if existing is not None:
+            original_ids = [
+                str(value) for value in existing.get("cancel_order_ids") or []
+            ]
+            if not set(planned_ids).issubset(set(original_ids)):
+                raise RuntimeError("management_instruction_component_dropped")
+            planned_ids = original_ids
+            intent_ids = [
+                int(value) for value in existing.get("cancel_intent_ids") or []
+            ]
+            if int(intent_id) not in intent_ids:
+                intent_ids.append(int(intent_id))
         execution = {
-            "cancel_order_ids": list(plan.cancel_order_ids),
-            "cancel_intent_ids": [int(intent_id)],
+            "cancel_order_ids": planned_ids,
+            "cancel_intent_ids": intent_ids,
             "evidence_tier": plan.evidence_tier,
         }
-        existing = desired.get("take_profit_consumption_execution")
-        if existing is not None and existing.get("cancel_order_ids") != execution["cancel_order_ids"]:
-            raise RuntimeError("management_instruction_component_dropped")
         desired["take_profit_consumption_execution"] = execution
         component.desired_json = json.dumps(
             desired, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -916,6 +1274,24 @@ def _persist_plan_and_enter_submitting(
             evidence={"intent_id": int(intent_id), "cancel_order_ids": list(plan.cancel_order_ids)},
         ):
             raise RuntimeError("management_component_submit_claim_lost")
+        session.commit()
+
+
+def _append_tp_cancel_intent(session_factory, component_id: int, intent_id: int):
+    with session_factory() as session:
+        component = session.get(StrategyManagementComponent, int(component_id))
+        if component is None or component.status != "submitting":
+            raise RuntimeError("management_component_not_submitting")
+        desired = json.loads(component.desired_json or "{}")
+        execution = desired.get("take_profit_consumption_execution") or {}
+        intent_ids = [int(value) for value in execution.get("cancel_intent_ids", [])]
+        if int(intent_id) not in intent_ids:
+            intent_ids.append(int(intent_id))
+        execution["cancel_intent_ids"] = intent_ids
+        desired["take_profit_consumption_execution"] = execution
+        component.desired_json = json.dumps(
+            desired, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
         session.commit()
 
 

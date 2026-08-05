@@ -196,6 +196,7 @@ class PositionMutationGateway:
         *,
         authority: PositionMutationAuthority,
         purpose: str,
+        ledger_purpose: str | None = None,
         trigger_price: str,
         size: str | None,
         idempotency_key: str,
@@ -258,6 +259,10 @@ class PositionMutationGateway:
             operation="set_position_sltp",
             order_id=None,
             payload=payload,
+            persisted_request={
+                **payload,
+                "_ledger_purpose": ledger_purpose or purpose,
+            },
             idempotency_key=idempotency_key,
             submit=lambda: self._call_client_write(
                 "_set_position_sltp_unchecked",
@@ -330,6 +335,7 @@ class PositionMutationGateway:
         operation: str,
         order_id: str | None,
         payload: Mapping[str, Any],
+        persisted_request: Mapping[str, Any] | None = None,
         idempotency_key: str,
         submit: Callable[[], Mapping[str, Any]],
         before_submit: Callable[[int], None] | None = None,
@@ -345,7 +351,7 @@ class PositionMutationGateway:
             order_id=order_id,
             authority_fingerprint=_authority_fingerprint(authority),
             request_fingerprint=_fingerprint(payload),
-            request=payload,
+            request=persisted_request or payload,
             reserved_at=self._now(),
             venue=authority.venue,
         )
@@ -813,6 +819,7 @@ def submit_exact_position_sltp(
     ).set_exact_position_sltp(
         authority=authority,
         purpose=purpose,
+        ledger_purpose=ledger_purpose or purpose,
         trigger_price=str(payload[trigger_field]),
         size=(str(payload["sz"]) if "sz" in payload else None),
         idempotency_key=idempotency_key,
@@ -1129,7 +1136,7 @@ def reconcile_submitted_position_mutation_intents(
                     )
                 ),
                 PositionMutationIntent.status.in_(
-                    ("submitted", "recovery_required")
+                    ("submitting", "submitted", "recovery_required")
                 ),
             )
             .order_by(PositionMutationIntent.id.asc())
@@ -1173,11 +1180,58 @@ def reconcile_submitted_position_mutation_intents(
                 }
                 if len(matching_order_ids) == 1:
                     candidate_order_id = next(iter(matching_order_ids))
-                    if not (
-                        candidate_order_id in confirmed_close_order_ids
-                        and candidate_order_id in rejected_close_order_ids
-                    ):
-                        order_id = candidate_order_id
+                    order_id = candidate_order_id
+            if not order_id and intent.operation == "set_position_sltp":
+                persisted_purpose = str(
+                    request.get("_ledger_purpose") or ""
+                ) or (
+                    "stop_loss"
+                    if request.get("slTriggerPx") not in (None, "")
+                    else "take_profit"
+                )
+                exchange_purpose = (
+                    "stop_loss"
+                    if persisted_purpose in {"stop_loss", "backup_stop"}
+                    else "take_profit"
+                )
+                trigger_field = (
+                    "slTriggerPx"
+                    if exchange_purpose == "stop_loss"
+                    else "tpTriggerPx"
+                )
+                authority = PositionMutationAuthority(
+                    venue=str(intent.venue),
+                    strategy_instance_id=str(intent.strategy_instance_id),
+                    execution_binding_id=int(intent.execution_binding_id),
+                    execution_order_leg_id=int(intent.execution_order_leg_id),
+                    pos_id=str(intent.pos_id),
+                    instrument_id=str(request.get("instId") or ""),
+                    side=str(request.get("posSide") or ""),
+                    position_fingerprint="readback-only",
+                    protection_fingerprint=None,
+                )
+                matching_ids = {
+                    candidate_id
+                    for row in rows
+                    if (
+                        candidate_id := str(
+                            row.get("ordId")
+                            or row.get("orderId")
+                            or row.get("order_id")
+                            or ""
+                        )
+                    )
+                    and _set_position_sltp_readback_matches(
+                        [row],
+                        order_id=candidate_id,
+                        authority=authority,
+                        purpose=exchange_purpose,
+                        trigger_price=str(request.get(trigger_field) or ""),
+                        size=(str(request["sz"]) if "sz" in request else None),
+                    )
+                }
+                if len(matching_ids) == 1:
+                    order_id = next(iter(matching_ids))
             if not order_id:
                 continue
             if intent.operation == "cancel_position_sltp":
@@ -1210,6 +1264,33 @@ def reconcile_submitted_position_mutation_intents(
                     order_id in confirmed_close_order_ids
                     and order_id in rejected_close_order_ids
                 ):
+                    exact_fill_rows = [
+                        row for row in confirmed_close_rows
+                        if str(
+                            row.get("ordId")
+                            or row.get("orderId")
+                            or row.get("order_id")
+                            or ""
+                        ) == order_id
+                        and _close_readback_matches_request(row, request)
+                    ]
+                    if not exact_fill_rows:
+                        continue
+                    _confirm_intent(
+                        intent,
+                        order_id=order_id,
+                        reconciled_at=reconciled_at,
+                    )
+                    intent.response_json = json.dumps(
+                        {
+                            "ordId": order_id,
+                            "status": "partially_filled_terminal",
+                            "reconciled_from_exchange_readback": True,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    confirmed += 1
                     continue
                 rejected_matches = [
                     row
@@ -1249,7 +1330,7 @@ def reconcile_submitted_position_mutation_intents(
                 )
                 confirmed += 1
                 continue
-            purpose = (
+            purpose = str(request.get("_ledger_purpose") or "") or (
                 "stop_loss"
                 if request.get("slTriggerPx") not in (None, "")
                 else "take_profit"
@@ -1258,10 +1339,14 @@ def reconcile_submitted_position_mutation_intents(
             )
             if purpose is None:
                 continue
+            exchange_purpose = (
+                "stop_loss" if purpose in {"stop_loss", "backup_stop"}
+                else "take_profit"
+            )
             trigger_price = str(
                 request[
                     "slTriggerPx"
-                    if purpose == "stop_loss"
+                    if exchange_purpose == "stop_loss"
                     else "tpTriggerPx"
                 ]
             )
@@ -1280,7 +1365,7 @@ def reconcile_submitted_position_mutation_intents(
                 rows,
                 order_id=order_id,
                 authority=authority,
-                purpose=purpose,
+                purpose=exchange_purpose,
                 trigger_price=trigger_price,
                 size=(str(request["sz"]) if "sz" in request else None),
             ):

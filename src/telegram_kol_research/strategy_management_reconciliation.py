@@ -130,9 +130,9 @@ def classify_composite_close_reconciliation(
             reason_code="partial_close_terminal_with_unresolved_delta",
         )
     return CompositeCloseReconciliation(
-        status="operator_required",
+        status="recovery_required",
         unresolved_delta=delta,
-        reason_code="confirmed_close_did_not_reach_target",
+        reason_code="confirmed_partial_close_has_unresolved_delta",
     )
 
 

@@ -61,6 +61,9 @@ from telegram_kol_research.strategy_management_composite_reconciliation import (
     has_recoverable_composite_components,
     reconcile_composite_management_components,
 )
+from telegram_kol_research.strategy_management_composite_executor import (
+    execute_composite_management_batch,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -116,6 +119,7 @@ def run_strategy_management_worker_tick(
     take_profit_convergence_runner: Callable[..., int] = execute_ready_trigger_take_profit_convergences,
     instruction_planner: Callable[..., Any] = plan_strategy_management_batch,
     composite_reconciler: Callable[..., Any] = reconcile_composite_management_components,
+    composite_executor: Callable[..., Any] = execute_composite_management_batch,
 ) -> StrategyManagementWorkerResult:
     """Process a bounded amount of work, isolating every durable batch failure."""
 
@@ -361,6 +365,29 @@ def run_strategy_management_worker_tick(
                     _advance_temporary_visibility_retry(session_factory, batch_id=batch.id, now=now)
                 counts["recovered"] += 1
                 continue
+            if batch.management_contract_json and batch.status == "executing":
+                if not allow_execution:
+                    counts["skipped"] += 1
+                    continue
+                settings = load_trading_settings(session_factory)
+                composite_executor(
+                    session_factory,
+                    batch_id=batch.id,
+                    deepcoin_client=get_client(),
+                    contract_spec_provider=contract_spec_provider,
+                    live_execution_gate=lambda: (
+                        load_trading_settings(
+                            session_factory
+                        ).effective_composite_management_v2_mode
+                        == "live"
+                    ),
+                    now_provider=lambda: now,
+                    backup_buffer_bps=str(
+                        settings.trigger_backup_stop_buffer_bps
+                    ),
+                )
+                counts["recovered"] += 1
+                continue
             if (
                 batch.status == "recovery_required"
                 and batch.reason_code == "deferred_entry_cancel_race_detected"
@@ -407,6 +434,26 @@ def run_strategy_management_worker_tick(
                     claimed_at=now,
                 ):
                     counts["skipped"] += 1
+                    continue
+                if batch.management_contract_json:
+                    settings = load_trading_settings(session_factory)
+                    composite_executor(
+                        session_factory,
+                        batch_id=batch.id,
+                        deepcoin_client=get_client(),
+                        contract_spec_provider=contract_spec_provider,
+                        live_execution_gate=lambda: (
+                            load_trading_settings(
+                                session_factory
+                            ).effective_composite_management_v2_mode
+                            == "live"
+                        ),
+                        now_provider=lambda: now,
+                        backup_buffer_bps=str(
+                            settings.trigger_backup_stop_buffer_bps
+                        ),
+                    )
+                    counts["executed"] += 1
                     continue
                 if batch.status == "ready" and batch.effective_action in _CLOSE_ACTIONS:
                     try:

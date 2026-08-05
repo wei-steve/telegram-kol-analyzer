@@ -112,15 +112,54 @@ def _reconcile_tp_component(session_factory, component_id, desired, status, now)
     execution = desired.get("take_profit_consumption_execution") or {}
     intent_ids = [int(value) for value in execution.get("cancel_intent_ids") or []]
     with session_factory() as session:
-        intents = [session.get(PositionMutationIntent, value) for value in intent_ids]
-        intent_statuses = {row.status for row in intents if row is not None}
-    if intent_ids and intent_statuses == {"confirmed"}:
+        persisted = session.query(PositionMutationIntent).filter(
+            PositionMutationIntent.idempotency_key.like(
+                f"{int(component_id)}:cancel:%"
+            )
+        ).all()
+        intents = {
+            int(row.id): row for row in persisted
+        }
+        for value in intent_ids:
+            row = session.get(PositionMutationIntent, value)
+            if row is not None:
+                intents[int(row.id)] = row
+        intent_statuses = {row.status for row in intents.values()}
+    planned_ids = {
+        str(value) for value in execution.get("cancel_order_ids") or []
+    }
+    reserved = [row for row in intents.values() if row.status == "reserved"]
+    if reserved:
+        for row in reserved:
+            transition_position_mutation_intent(
+                session_factory,
+                row.id,
+                expected_statuses={"reserved"},
+                new_status="blocked",
+                transitioned_at=now,
+                error={"reason": "component_restart_before_exchange_submit"},
+            )
+        _component_transition(
+            session_factory, component_id, status, "recovery_required", now,
+            "take_profit_reserved_before_write",
+        )
+        return "recoverable"
+    if intent_statuses.intersection(
+        {"submitting", "submitted", "recovery_required"}
+    ):
+        return "awaiting"
+    confirmed_order_ids = {
+        str(row.order_id)
+        for row in intents.values()
+        if row.order_id and row.status == "confirmed"
+    }
+    if intents and planned_ids and planned_ids.issubset(confirmed_order_ids):
         _component_transition(session_factory, component_id, status, "confirmed", now,
                               "take_profit_cancel_exchange_confirmed")
         return "reconciled"
-    if "rejected" in intent_statuses:
+    if intents and intent_statuses.issubset({"confirmed", "rejected", "blocked"}):
         _component_transition(session_factory, component_id, status, "recovery_required", now,
-                              "take_profit_cancel_terminal_rejected")
+                              "take_profit_cancel_terminal_incomplete")
         return "recoverable"
     return "awaiting"
 

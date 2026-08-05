@@ -74,6 +74,34 @@ def test_break_even_stop_accepts_only_explicit_current_message_price() -> None:
     assert _planned_stop_price(batch=batch, leg=leg) == "64500"
 
 
+def test_legacy_executor_rejects_contract_batch_before_exchange_write(tmp_path):
+    from telegram_kol_research.strategy_management_executor import (
+        ManagementBatchExecutionError,
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "legacy-contract.db")
+    batch = _persist_close_batch(session_factory, sizes=("1", "2"))
+    with session_factory() as session:
+        row = session.get(StrategyManagementBatch, batch.id)
+        row.management_contract_json = '{"version":2}'
+        row.management_contract_fingerprint = "c" * 64
+        row.contract_version = 2
+        session.commit()
+    client = SimpleNamespace()
+
+    with pytest.raises(
+        ManagementBatchExecutionError,
+        match="management_contract_requires_component_executor",
+    ):
+        execute_management_batch(
+            session_factory,
+            batch_id=batch.id,
+            deepcoin_client=client,
+            executed_at=NOW,
+        )
+
+
 def _persist_close_batch(
     session_factory,
     *,
@@ -5658,6 +5686,62 @@ def test_composite_pending_first_tp_is_cancelled_before_any_close(tmp_path):
     ] == ["tp-first"]
 
 
+def test_composite_consumption_executes_all_conservative_owned_tp_cancels(tmp_path):
+    session_factory = create_session_factory(tmp_path / "consume-multiple.db")
+    batch_id, component_id = _persist_composite_consumption_component(session_factory)
+    with session_factory() as session:
+        first = session.query(PositionProtectionLedger).filter_by(
+            order_id="tp-first"
+        ).one()
+        session.add(PositionProtectionLedger(
+            venue=first.venue,
+            execution_binding_id=first.execution_binding_id,
+            execution_order_leg_id=first.execution_order_leg_id,
+            strategy_instance_id=first.strategy_instance_id,
+            pos_id=first.pos_id,
+            instrument_id=first.instrument_id,
+            side=first.side,
+            order_id="tp-second",
+            purpose="take_profit",
+            trigger_price="66000",
+            size_text="6",
+            status="verified",
+            evidence_source="test",
+            evidence_json='{"stage":2}',
+            first_seen_at=NOW,
+            last_seen_at=NOW,
+            created_at=NOW,
+            updated_at=NOW,
+        ))
+        session.commit()
+
+    class MultiClient(_CompositeConsumptionClient):
+        def __init__(self):
+            super().__init__()
+            self.pending.append({
+                "ordId": "tp-second", "posId": "pos-composite",
+                "instId": "BTC-USDT-SWAP", "posSide": "long",
+                "triggerOrderType": "TPSL", "tpTriggerPx": "66000", "sz": "6",
+            })
+
+        def cancel_position_sltp(self, payload):
+            self.cancel_calls.append(dict(payload))
+            self.pending = [
+                row for row in self.pending if row["ordId"] != payload["ordId"]
+            ]
+            return {"code": "0", "data": {"ordId": payload["ordId"]}}
+
+    client = MultiClient()
+    result = _execute_consumption(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "confirmed"
+    assert [call["ordId"] for call in client.cancel_calls] == [
+        "tp-first", "tp-second"
+    ]
+
+
 def test_composite_cancel_unknown_awaits_exchange_and_restart_never_resubmits(tmp_path):
     session_factory = create_session_factory(tmp_path / "consume-unknown.db")
     batch_id, component_id = _persist_composite_consumption_component(session_factory)
@@ -5714,6 +5798,124 @@ def test_composite_incomplete_exchange_snapshot_never_writes(tmp_path):
     assert result.reason_code == "take_profit_exchange_snapshot_incomplete"
     assert client.cancel_calls == []
     assert client.close_calls == []
+
+
+def test_composite_batch_with_componentless_second_leg_freezes_before_writes(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_composite_executor import (
+        execute_composite_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "componentless-leg.db")
+    batch_id, _component_id = _persist_composite_consumption_component(
+        session_factory
+    )
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, batch_id)
+        first_leg = session.query(ExecutionOrderLeg).filter_by(
+            execution_binding_id=batch.execution_binding_id
+        ).one()
+        second_entry = ExecutionOrderLeg(
+            execution_binding_id=first_leg.execution_binding_id,
+            strategy_instance_id=first_leg.strategy_instance_id,
+            leg_index=1,
+            purpose="entry",
+            order_kind="market",
+            pos_id="pos-composite-2",
+            venue="deepcoin",
+            attribution_status="verified",
+            response_json='{"data":{"posId":"pos-composite-2"}}',
+            status="active",
+        )
+        session.add(second_entry)
+        session.flush()
+        session.add(
+            StrategyManagementLeg(
+                management_batch_id=batch.id,
+                execution_order_leg_id=second_entry.id,
+                pos_id="pos-composite-2",
+                leg_index=1,
+                status="planned",
+                preflight_size="10",
+                planned_close_size="5",
+                avg_entry_price="64000",
+                quantity_step="1",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+    client = _CompositeConsumptionClient()
+
+    result = execute_composite_management_batch(
+        session_factory,
+        batch_id=batch_id,
+        deepcoin_client=client,
+        contract_spec_provider=None,
+        live_execution_gate=lambda: True,
+        now_provider=lambda: NOW,
+    )
+
+    assert result.status == "recovery_required"
+    assert result.reason_code == "management_instruction_component_topology_invalid"
+    assert client.cancel_calls == []
+    assert client.close_calls == []
+
+
+def test_composite_completion_boundary_validates_and_persists_success_notification(tmp_path):
+    from telegram_kol_research.models import (
+        StrategyManagementComponent,
+        StrategyManagementNotification,
+    )
+    from telegram_kol_research.strategy_management_composite_executor import (
+        _complete_composite_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "complete-composite.db")
+    batch_id, _ = _persist_composite_consumption_component(session_factory)
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, batch_id)
+        batch.status = "executing"
+        raw = session.get(RawMessage, batch.raw_message_id)
+        raw.text = "止盈50%，止损移动至开仓价"
+        components = session.query(StrategyManagementComponent).filter_by(
+            management_batch_id=batch_id
+        ).all()
+        for component in components:
+            component.status = "confirmed"
+            if component.component_kind == "consume_take_profit_stage":
+                component.desired_json = json.dumps({
+                    **json.loads(component.desired_json),
+                    "take_profit_consumption_execution": {
+                        "cancel_order_ids": ["tp-first"]
+                    },
+                })
+                component.evidence_json = '[{"intent_id":1}]'
+            elif component.component_kind == "converge_partial_close":
+                component.evidence_json = '[{"remaining_size":"5"}]'
+            else:
+                component.evidence_json = '[{"new_stop_order_ids":["stop-a","stop-b"],"retained_take_profit_total":"0"}]'
+        session.query(PositionProtectionLedger).filter_by(
+            order_id="tp-first"
+        ).one().status = "cancelled"
+        session.commit()
+
+    client = _CompositeConsumptionClient()
+    client.pending = []
+    completed = _complete_composite_batch(
+        session_factory,
+        batch_id=batch_id,
+        deepcoin_client=client,
+        completed_at=NOW,
+    )
+
+    assert completed.status == "succeeded"
+    with session_factory() as session:
+        notification = session.query(StrategyManagementNotification).one()
+        payload = json.loads(notification.payload_json)
+        assert payload["notification_kind"] == "composite_completion"
+        assert payload["overall_state"] == "succeeded"
 
 
 def _prepare_composite_close_component(session_factory):
@@ -6027,12 +6229,8 @@ def test_composite_protection_creates_and_owns_both_stops_before_cancelling_old(
     )
 
     assert result.status == "confirmed"
-    assert client.events[:6] == [
+    assert client.events[:4] == [
         "set_primary", "readback", "set_backup", "readback",
-        "cancel_stop-old-backup", "readback",
-    ] or client.events[:6] == [
-        "set_primary", "readback", "set_backup", "readback",
-        "cancel_stop-old-primary", "readback",
     ]
     first_cancel = next(i for i, event in enumerate(client.events) if event.startswith("cancel_"))
     assert client.events.index("set_backup") < first_cancel
@@ -6093,6 +6291,46 @@ def test_composite_protection_old_cancel_failure_keeps_new_verified_stops(tmp_pa
         assert all(row.status == "verified" for row in new_rows)
 
 
+def test_composite_protection_retries_rejected_old_cancel_from_fresh_pending(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "protection-retry.db")
+    batch_id, component_id = _prepare_composite_protection_component(session_factory)
+    client = _CompositeProtectionClient(cancel_rejected=True)
+
+    first = _execute_composite_protection(
+        session_factory, batch_id, component_id, client
+    )
+    client.cancel_rejected = False
+    second = _execute_composite_protection(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert first.status == "recovery_required"
+    assert second.status == "confirmed"
+
+
+def test_composite_protection_retry_exhaustion_requires_operator(tmp_path):
+    session_factory = create_session_factory(tmp_path / "protection-exhausted.db")
+    batch_id, component_id = _prepare_composite_protection_component(session_factory)
+    with session_factory() as session:
+        from telegram_kol_research.models import StrategyManagementComponent
+
+        component = session.get(StrategyManagementComponent, component_id)
+        component.status = "recovery_required"
+        component.attempt_count = 3
+        session.commit()
+    client = _CompositeProtectionClient()
+
+    result = _execute_composite_protection(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "operator_required"
+    assert result.reason_code == "protection_replacement_retry_exhausted"
+    assert client.events == []
+
+
 def test_composite_protection_refuses_oversized_retained_tp_before_any_write(tmp_path):
     session_factory = create_session_factory(tmp_path / "protection-oversized.db")
     batch_id, component_id = _prepare_composite_protection_component(
@@ -6137,6 +6375,247 @@ def test_composite_restart_reconciles_unknown_tp_cancel_without_second_write(tmp
         from telegram_kol_research.models import StrategyManagementComponent
 
         assert session.get(StrategyManagementComponent, component_id).status == "confirmed"
+
+
+def _persist_tp_cancel_recovery_intent(
+    session_factory, *, component_id, status, suffix, request_fingerprint,
+    order_id="tp-first",
+):
+    from telegram_kol_research.models import (
+        PositionMutationIntent,
+        StrategyManagementComponent,
+    )
+
+    with session_factory() as session:
+        component = session.get(StrategyManagementComponent, component_id)
+        leg = session.get(StrategyManagementLeg, component.strategy_management_leg_id)
+        batch = session.get(StrategyManagementBatch, component.management_batch_id)
+        intent = PositionMutationIntent(
+            idempotency_key=f"{component_id}:cancel:{order_id}:{suffix}",
+            venue="deepcoin",
+            operation="cancel_position_sltp",
+            strategy_instance_id=batch.strategy_instance_id,
+            execution_binding_id=batch.execution_binding_id,
+            execution_order_leg_id=leg.execution_order_leg_id,
+            pos_id=leg.pos_id,
+            order_id=order_id,
+            authority_fingerprint="a" * 64,
+            request_fingerprint=request_fingerprint,
+            status=status,
+            request_json="{}",
+            reserved_at=NOW,
+            confirmed_at=NOW if status == "confirmed" else None,
+        )
+        session.add(intent)
+        session.flush()
+        desired = json.loads(component.desired_json)
+        desired["take_profit_consumption_execution"] = {
+            "cancel_order_ids": ["tp-first"],
+            "cancel_intent_ids": [intent.id],
+        }
+        component.desired_json = json.dumps(desired, sort_keys=True)
+        component.status = "submitting"
+        component.started_at = NOW
+        session.commit()
+        return intent.id
+
+
+def test_composite_restart_blocks_reserved_tp_intent_before_any_exchange_write(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "restart-tp-reserved.db")
+    _batch_id, component_id = _persist_composite_consumption_component(
+        session_factory
+    )
+    intent_id = _persist_tp_cancel_recovery_intent(
+        session_factory,
+        component_id=component_id,
+        status="reserved",
+        suffix="reserved",
+        request_fingerprint="b" * 64,
+    )
+    client = _CompositeConsumptionClient()
+
+    result = _reconcile_composite_components(session_factory, client)
+
+    assert result.recoverable == 1
+    assert client.cancel_calls == []
+    with session_factory() as session:
+        from telegram_kol_research.models import (
+            PositionMutationIntent,
+            StrategyManagementComponent,
+        )
+
+        assert session.get(PositionMutationIntent, intent_id).status == "blocked"
+        assert (
+            session.get(StrategyManagementComponent, component_id).status
+            == "recovery_required"
+        )
+
+
+def test_composite_tp_recovery_accepts_later_confirmation_after_rejected_attempt(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "restart-tp-history.db")
+    _batch_id, component_id = _persist_composite_consumption_component(
+        session_factory
+    )
+    rejected_id = _persist_tp_cancel_recovery_intent(
+        session_factory,
+        component_id=component_id,
+        status="rejected",
+        suffix="attempt-1",
+        request_fingerprint="c" * 64,
+    )
+    confirmed_id = _persist_tp_cancel_recovery_intent(
+        session_factory,
+        component_id=component_id,
+        status="confirmed",
+        suffix="attempt-2",
+        request_fingerprint="d" * 64,
+    )
+    client = _CompositeConsumptionClient()
+    client.pending = []
+
+    result = _reconcile_composite_components(session_factory, client)
+
+    assert result.reconciled == 1
+    with session_factory() as session:
+        from telegram_kol_research.models import (
+            PositionMutationIntent,
+            StrategyManagementComponent,
+        )
+
+        assert session.get(PositionMutationIntent, rejected_id).status == "rejected"
+        assert session.get(PositionMutationIntent, confirmed_id).status == "confirmed"
+        assert (
+            session.get(StrategyManagementComponent, component_id).status
+            == "confirmed"
+        )
+
+
+def test_composite_tp_recovery_unfreezes_terminal_incomplete_multi_cancel(tmp_path):
+    session_factory = create_session_factory(tmp_path / "restart-tp-multi-gap.db")
+    _batch_id, component_id = _persist_composite_consumption_component(
+        session_factory
+    )
+    _persist_tp_cancel_recovery_intent(
+        session_factory,
+        component_id=component_id,
+        status="confirmed",
+        suffix="attempt-1",
+        request_fingerprint="e" * 64,
+    )
+    with session_factory() as session:
+        from telegram_kol_research.models import StrategyManagementComponent
+
+        component = session.get(StrategyManagementComponent, component_id)
+        desired = json.loads(component.desired_json)
+        desired["take_profit_consumption_execution"]["cancel_order_ids"] = [
+            "tp-first",
+            "tp-second",
+        ]
+        component.desired_json = json.dumps(desired, sort_keys=True)
+        session.commit()
+    client = _CompositeConsumptionClient()
+    client.pending = []
+
+    result = _reconcile_composite_components(session_factory, client)
+
+    assert result.recoverable == 1
+    with session_factory() as session:
+        from telegram_kol_research.models import StrategyManagementComponent
+
+        assert (
+            session.get(StrategyManagementComponent, component_id).status
+            == "recovery_required"
+        )
+
+
+def test_composite_tp_recovery_allows_confirmed_history_outside_current_plan(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "restart-tp-shrunk.db")
+    _batch_id, component_id = _persist_composite_consumption_component(
+        session_factory
+    )
+    _persist_tp_cancel_recovery_intent(
+        session_factory,
+        component_id=component_id,
+        status="confirmed",
+        suffix="current",
+        request_fingerprint="f" * 64,
+    )
+    _persist_tp_cancel_recovery_intent(
+        session_factory,
+        component_id=component_id,
+        status="confirmed",
+        suffix="historical",
+        request_fingerprint="1" * 64,
+        order_id="tp-historical",
+    )
+    client = _CompositeConsumptionClient()
+    client.pending = []
+
+    result = _reconcile_composite_components(session_factory, client)
+
+    assert result.reconciled == 1
+    with session_factory() as session:
+        from telegram_kol_research.models import StrategyManagementComponent
+
+        assert (
+            session.get(StrategyManagementComponent, component_id).status
+            == "confirmed"
+        )
+
+
+def test_composite_tp_retry_preserves_original_multi_cancel_plan(tmp_path):
+    from telegram_kol_research.strategy_management_composite_executor import (
+        _persist_plan_and_enter_submitting,
+    )
+    from telegram_kol_research.strategy_management_take_profit_consumption import (
+        TakeProfitConsumptionPlan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "restart-tp-plan.db")
+    _batch_id, component_id = _persist_composite_consumption_component(
+        session_factory
+    )
+    with session_factory() as session:
+        from telegram_kol_research.models import StrategyManagementComponent
+
+        component = session.get(StrategyManagementComponent, component_id)
+        desired = json.loads(component.desired_json)
+        desired["take_profit_consumption_execution"] = {
+            "cancel_order_ids": ["tp-first", "tp-second"],
+            "cancel_intent_ids": [91],
+            "evidence_tier": "owned_pending",
+        }
+        component.desired_json = json.dumps(desired, sort_keys=True)
+        component.status = "preflighting"
+        session.commit()
+
+    _persist_plan_and_enter_submitting(
+        session_factory,
+        component_id=component_id,
+        intent_id=92,
+        plan=TakeProfitConsumptionPlan(
+            cancel_order_ids=("tp-second",),
+            evidence_tier="owned_pending",
+        ),
+        now=NOW,
+    )
+
+    with session_factory() as session:
+        from telegram_kol_research.models import StrategyManagementComponent
+
+        component = session.get(StrategyManagementComponent, component_id)
+        execution = json.loads(component.desired_json)[
+            "take_profit_consumption_execution"
+        ]
+        assert execution["cancel_order_ids"] == ["tp-first", "tp-second"]
+        assert execution["cancel_intent_ids"] == [91, 92]
+        assert component.status == "submitting"
 
 
 def test_composite_restart_partial_fill_retries_only_unresolved_delta(tmp_path):

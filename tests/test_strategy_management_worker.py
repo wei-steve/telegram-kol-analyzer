@@ -41,7 +41,7 @@ from telegram_kol_research.strategy_management_worker import (
 NOW = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
 
 
-def _batch(*, batch_id: int, strategy: str, status: str, action="partial_close", legs=()):
+def _batch(*, batch_id: int, strategy: str, status: str, action="partial_close", legs=(), management_contract_json=None):
     return SimpleNamespace(
         id=batch_id,
         strategy_instance_id=strategy,
@@ -49,6 +49,7 @@ def _batch(*, batch_id: int, strategy: str, status: str, action="partial_close",
         effective_action=action,
         reason_code=None,
         legs=tuple(legs),
+        management_contract_json=management_contract_json,
     )
 
 
@@ -221,6 +222,40 @@ def test_worker_keeps_composite_recovery_active_when_new_execution_is_disabled()
 
     assert len(calls) == 1
     assert calls[0]["allow_new_writes"] is False
+
+
+def test_worker_routes_contract_batch_only_to_composite_executor(monkeypatch):
+    import telegram_kol_research.strategy_management_worker as worker_module
+
+    calls = []
+    monkeypatch.setattr(
+        worker_module,
+        "load_trading_settings",
+        lambda *_args: SimpleNamespace(
+            effective_composite_management_v2_mode="live",
+            trigger_backup_stop_buffer_bps=20,
+        ),
+    )
+    batch = _batch(
+        batch_id=41,
+        strategy="composite",
+        status="ready",
+        management_contract_json='{"version":2}',
+    )
+
+    result = run_strategy_management_worker_tick(
+        object(),
+        deepcoin_client_factory=lambda: object(),
+        batch_lister=lambda *_args, **_kwargs: [batch],
+        claimer=lambda *_args, **_kwargs: True,
+        composite_executor=lambda *_args, **kwargs: calls.append(kwargs),
+        executor=lambda *_args, **_kwargs: pytest.fail("legacy executor called"),
+        take_profit_convergence_runner=lambda *_args, **_kwargs: 0,
+        processed_at=NOW,
+    )
+
+    assert result.executed == 1
+    assert calls[0]["batch_id"] == 41
 
 
 def test_worker_reconciles_backup_stops_before_running_take_profit_lane():

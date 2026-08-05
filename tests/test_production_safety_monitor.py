@@ -361,13 +361,23 @@ def test_composite_monitor_reader_detects_persisted_faults_without_writes(tmp_pa
         [(1, "1:close:attempt:1"), (2, "1:close:attempt:2")],
     )
     connection.execute(
-        "INSERT INTO position_protection_ledger VALUES (1, 11, 'pos-1', 'take_profit', '6', 'verified')"
+        "INSERT INTO position_protection_ledger VALUES (1, 11, 'pos-1', 'take_profit', '4', 'verified')"
     )
     connection.commit()
     before = database.read_bytes()
+    live_snapshot = tmp_path / "deepcoin_live_positions.json"
+    live_snapshot.write_text(json.dumps({
+        "captured_at": "2026-08-05T00:00:00+00:00",
+        "payload": {"_live_source": {"positions": [
+            {"posId": "pos-1", "pos": "3"},
+            {"posId": "pos-2", "pos": "2"},
+        ]}},
+    }), encoding="utf-8")
 
     codes = read_composite_management_invariants(
-        database, now=datetime(2026, 8, 5, tzinfo=UTC)
+        database,
+        now=datetime(2026, 8, 5, tzinfo=UTC),
+        live_position_snapshot_path=live_snapshot,
     )
 
     assert set(codes) == {
@@ -378,6 +388,95 @@ def test_composite_monitor_reader_detects_persisted_faults_without_writes(tmp_pa
         "stalled_composite_component",
     }
     assert database.read_bytes() == before
+
+
+def test_composite_monitor_allows_confirmed_partial_fill_attempt_history(tmp_path):
+    database = tmp_path / "composite-retry-monitor.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE strategy_management_batches (id INTEGER PRIMARY KEY, status TEXT, management_contract_json TEXT);
+        CREATE TABLE strategy_management_legs (id INTEGER PRIMARY KEY, management_batch_id INTEGER, execution_order_leg_id INTEGER, pos_id TEXT);
+        CREATE TABLE strategy_management_components (id INTEGER PRIMARY KEY, management_batch_id INTEGER, strategy_management_leg_id INTEGER, component_kind TEXT, status TEXT, desired_json TEXT, evidence_json TEXT, last_progress_at TEXT, updated_at TEXT);
+        CREATE TABLE position_mutation_intents (id INTEGER PRIMARY KEY, idempotency_key TEXT, operation TEXT, status TEXT);
+        CREATE TABLE position_protection_ledger (id INTEGER PRIMARY KEY, execution_order_leg_id INTEGER, pos_id TEXT, purpose TEXT, size_text TEXT, status TEXT);
+        INSERT INTO strategy_management_batches VALUES (1, 'succeeded', '{}');
+        INSERT INTO position_mutation_intents VALUES (1, '9:close:attempt:1', 'close_position', 'confirmed');
+        INSERT INTO position_mutation_intents VALUES (2, '9:close:attempt:2', 'close_position', 'confirmed');
+        """
+    )
+    connection.commit()
+
+    assert read_composite_management_invariants(
+        database, now=datetime(2026, 8, 5, tzinfo=UTC)
+    ) == ()
+
+
+def test_composite_monitor_checks_completion_evidence_for_every_leg(tmp_path):
+    database = tmp_path / "composite-multileg-monitor.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE strategy_management_batches (id INTEGER PRIMARY KEY, status TEXT, management_contract_json TEXT);
+        CREATE TABLE strategy_management_legs (id INTEGER PRIMARY KEY, management_batch_id INTEGER, execution_order_leg_id INTEGER, pos_id TEXT);
+        CREATE TABLE strategy_management_components (id INTEGER PRIMARY KEY, management_batch_id INTEGER, strategy_management_leg_id INTEGER, component_kind TEXT, status TEXT, desired_json TEXT, evidence_json TEXT, last_progress_at TEXT, updated_at TEXT);
+        CREATE TABLE position_mutation_intents (id INTEGER PRIMARY KEY, idempotency_key TEXT, operation TEXT, status TEXT);
+        CREATE TABLE position_protection_ledger (id INTEGER PRIMARY KEY, execution_order_leg_id INTEGER, pos_id TEXT, purpose TEXT, size_text TEXT, status TEXT);
+        """
+    )
+    contract = json.dumps({"required_components": ["consume_take_profit_stage"]})
+    connection.execute(
+        "INSERT INTO strategy_management_batches VALUES (1, 'succeeded', ?)",
+        (contract,),
+    )
+    connection.executemany(
+        "INSERT INTO strategy_management_legs VALUES (?, 1, ?, ?)",
+        [(1, 11, "pos-1"), (2, 12, "pos-2")],
+    )
+    now_text = "2026-08-05 00:00:00"
+    connection.executemany(
+        "INSERT INTO strategy_management_components VALUES (?, 1, ?, 'consume_take_profit_stage', 'confirmed', '{}', ?, ?, ?)",
+        [
+            (1, 1, '[{"order_id":"tp-1"}]', now_text, now_text),
+        ],
+    )
+    connection.commit()
+
+    assert read_composite_management_invariants(
+        database, now=datetime(2026, 8, 5, tzinfo=UTC)
+    ) == ("completed_batch_missing_component_evidence",)
+
+
+def test_composite_monitor_rejects_duplicate_component_for_same_leg(tmp_path):
+    database = tmp_path / "composite-duplicate-component-monitor.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE strategy_management_batches (id INTEGER PRIMARY KEY, status TEXT, management_contract_json TEXT);
+        CREATE TABLE strategy_management_legs (id INTEGER PRIMARY KEY, management_batch_id INTEGER, execution_order_leg_id INTEGER, pos_id TEXT);
+        CREATE TABLE strategy_management_components (id INTEGER PRIMARY KEY, management_batch_id INTEGER, strategy_management_leg_id INTEGER, component_kind TEXT, status TEXT, desired_json TEXT, evidence_json TEXT, last_progress_at TEXT, updated_at TEXT);
+        CREATE TABLE position_mutation_intents (id INTEGER PRIMARY KEY, idempotency_key TEXT, operation TEXT, status TEXT);
+        CREATE TABLE position_protection_ledger (id INTEGER PRIMARY KEY, execution_order_leg_id INTEGER, pos_id TEXT, purpose TEXT, size_text TEXT, status TEXT);
+        """
+    )
+    contract = json.dumps({"required_components": ["consume_take_profit_stage"]})
+    connection.execute(
+        "INSERT INTO strategy_management_batches VALUES (1, 'succeeded', ?)",
+        (contract,),
+    )
+    connection.execute(
+        "INSERT INTO strategy_management_legs VALUES (1, 1, 11, 'pos-1')"
+    )
+    now_text = "2026-08-05 00:00:00"
+    connection.executemany(
+        "INSERT INTO strategy_management_components VALUES (?, 1, 1, 'consume_take_profit_stage', 'confirmed', '{}', '[{\"ok\":true}]', ?, ?)",
+        [(1, now_text, now_text), (2, now_text, now_text)],
+    )
+    connection.commit()
+
+    assert read_composite_management_invariants(
+        database, now=datetime(2026, 8, 5, tzinfo=UTC)
+    ) == ("completed_batch_missing_component_evidence",)
 
 
 def test_monitor_inputs_and_result_are_frozen():

@@ -94,6 +94,89 @@ def test_composite_completion_rejects_pending_consumed_tp_and_false_success():
         )
 
 
+def test_composite_completion_requires_evidence_for_every_position_leg():
+    from telegram_kol_research.strategy_records import (
+        CompositeManagementCompletionError,
+        validate_composite_management_completion,
+    )
+
+    components = []
+    for leg_id in (11, 12):
+        for kind in (
+            "consume_take_profit_stage",
+            "converge_partial_close",
+            "replace_remaining_protection",
+        ):
+            components.append({
+                "strategy_management_leg_id": leg_id,
+                "component_kind": kind,
+                "status": "confirmed",
+                "desired": {},
+                "evidence": [{"leg_id": leg_id}],
+            })
+    components[2]["evidence"] = []
+
+    with pytest.raises(
+        CompositeManagementCompletionError,
+        match="completed_batch_missing_component_evidence",
+    ):
+        validate_composite_management_completion(
+            source_text="止盈50%，止损移动至开仓价",
+            contract={
+                "close_fraction": "0.5",
+                "stop_mode": "actual_entry_price",
+                "required_components": [
+                    "consume_take_profit_stage",
+                    "converge_partial_close",
+                    "replace_remaining_protection",
+                ],
+            },
+            batch_status="succeeded",
+            components=components,
+            pending_orders=[],
+        )
+
+
+def test_composite_completion_rejects_componentless_expected_leg():
+    from telegram_kol_research.strategy_records import (
+        CompositeManagementCompletionError,
+        validate_composite_management_completion,
+    )
+
+    kinds = (
+        "consume_take_profit_stage",
+        "converge_partial_close",
+        "replace_remaining_protection",
+    )
+    components = [
+        {
+            "strategy_management_leg_id": "1",
+            "component_kind": kind,
+            "status": "confirmed",
+            "evidence": [{"ok": True}],
+            "desired": {},
+        }
+        for kind in kinds
+    ]
+
+    with pytest.raises(
+        CompositeManagementCompletionError,
+        match="management_instruction_component_topology_invalid",
+    ):
+        validate_composite_management_completion(
+            source_text="止盈50%，止损移动至开仓价",
+            contract={
+                "close_fraction": "0.5",
+                "stop_mode": "actual_entry_price",
+                "required_components": list(kinds),
+            },
+            batch_status="succeeded",
+            components=components,
+            pending_orders=[],
+            expected_leg_ids={"1", "2"},
+        )
+
+
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
 
 

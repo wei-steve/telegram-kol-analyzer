@@ -326,6 +326,7 @@ class ProductionSafetyAdapters:
     """Bounded observation-only adapters used by the server monitor."""
 
     database_path: Path
+    live_position_snapshot_path: Path | None = None
     checkout_path: Path = Path(".")
     settings_url: str = "http://127.0.0.1:8000/api/trading-settings"
     service_name: str = "telegram-kol.service"
@@ -395,7 +396,16 @@ class ProductionSafetyAdapters:
         )
 
     def read_composite_invariants(self, *, now: datetime) -> tuple[str, ...]:
-        return read_composite_management_invariants(self.database_path, now=now)
+        snapshot_path = self.live_position_snapshot_path or (
+            self.database_path.parent
+            / "web_cache"
+            / "deepcoin_live_positions.json"
+        )
+        return read_composite_management_invariants(
+            self.database_path,
+            now=now,
+            live_position_snapshot_path=snapshot_path,
+        )
 
     def run_management_audit(self) -> Mapping[str, Any]:
         completed = _run_bounded_command(
@@ -583,6 +593,7 @@ def read_composite_management_invariants(
     *,
     now: datetime,
     stale_after: timedelta = timedelta(minutes=15),
+    live_position_snapshot_path: str | Path | None = None,
     connect=sqlite3.connect,
 ) -> tuple[str, ...]:
     """Read only bounded composite-v2 safety invariants from persisted evidence."""
@@ -613,12 +624,19 @@ def read_composite_management_invariants(
             SELECT id, status, management_contract_json
             FROM strategy_management_batches
             WHERE management_contract_json IS NOT NULL
-            ORDER BY id DESC LIMIT 200
+            ORDER BY id DESC
             """
         ).fetchall()
         batch_ids = [int(row[0]) for row in batches]
         if not batch_ids:
             return ()
+        live_position_sizes = (
+            _read_fresh_live_position_sizes(
+                live_position_snapshot_path, now=now
+            )
+            if live_position_snapshot_path is not None
+            else {}
+        )
         placeholders = ",".join("?" for _ in batch_ids)
         legs = connection.execute(
             f"""
@@ -643,6 +661,9 @@ def read_composite_management_invariants(
         components_by_batch: dict[int, list[tuple]] = {}
         for row in components:
             components_by_batch.setdefault(int(row[1]), []).append(row)
+        leg_scopes_by_batch: dict[int, set[str]] = {}
+        for row in legs:
+            leg_scopes_by_batch.setdefault(int(row[1]), set()).add(str(row[0]))
         for batch_id, status, contract_json in batches:
             try:
                 contract = json.loads(contract_json or "{}")
@@ -650,20 +671,35 @@ def read_composite_management_invariants(
                 contract = {}
             rows = components_by_batch.get(int(batch_id), [])
             if str(status) == "succeeded":
-                by_kind = {str(row[3]): row for row in rows}
+                by_scope_kind: dict[tuple[str, str], list[tuple]] = {}
+                for row in rows:
+                    by_scope_kind.setdefault(
+                        (str(row[2]), str(row[3])), []
+                    ).append(row)
                 required = {
                     str(item.get("component_kind") if isinstance(item, dict) else item)
                     for item in (contract.get("required_components") or [])
                 }
-                for kind in required:
-                    row = by_kind.get(kind)
-                    try:
-                        evidence = json.loads(row[6] or "[]") if row else []
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        evidence = []
-                    if row is None or str(row[4]) != "confirmed" or not evidence:
-                        reasons.add("completed_batch_missing_component_evidence")
-                        break
+                scopes = leg_scopes_by_batch.get(int(batch_id), set())
+                if required and not scopes:
+                    reasons.add("completed_batch_missing_component_evidence")
+                for scope in scopes:
+                    for kind in required:
+                        matches = by_scope_kind.get((scope, kind), [])
+                        row = matches[0] if len(matches) == 1 else None
+                        try:
+                            evidence = json.loads(row[6] or "[]") if row else []
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            evidence = []
+                        if (
+                            row is None
+                            or str(row[4]) != "confirmed"
+                            or not evidence
+                        ):
+                            reasons.add(
+                                "completed_batch_missing_component_evidence"
+                            )
+                            break
 
         active_component_states = {
             "pending", "preflighting", "submitting", "awaiting_exchange",
@@ -695,7 +731,7 @@ def read_composite_management_invariants(
             FROM position_mutation_intents
             WHERE operation = 'close_position'
               AND instr(idempotency_key, ':close:') > 1
-              AND status IN ('submitting', 'submitted', 'confirmed', 'recovery_required')
+              AND status IN ('submitting', 'submitted', 'recovery_required')
             GROUP BY 1 HAVING COUNT(*) > 1 LIMIT 1
             """
         ).fetchone()
@@ -732,7 +768,12 @@ def read_composite_management_invariants(
                     )
                 except (KeyError, TypeError, ValueError, InvalidOperation, json.JSONDecodeError):
                     continue
-                if retained > remaining:
+                live_size = (
+                    live_position_sizes.get(str(leg[3]), Decimal("0"))
+                    if live_position_snapshot_path is not None
+                    else remaining
+                )
+                if retained > live_size:
                     reasons.add("live_position_retained_tp_oversized")
             elif str(component[3]) == "replace_remaining_protection":
                 verified_stops = {
@@ -743,6 +784,38 @@ def read_composite_management_invariants(
                 if verified_stops != {"stop_loss", "backup_stop"}:
                     reasons.add("composite_position_without_verified_stop")
     return tuple(sorted(reasons))
+
+
+def _read_fresh_live_position_sizes(
+    path: str | Path, *, now: datetime, max_age: timedelta = timedelta(minutes=5)
+) -> dict[str, Decimal]:
+    source = Path(path)
+    if source.stat().st_size > _MAX_HTTP_OUTPUT_BYTES:
+        raise RuntimeError("live_position_snapshot_invalid")
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        captured_at = datetime.fromisoformat(str(payload["captured_at"]))
+        if captured_at.tzinfo is None:
+            captured_at = captured_at.replace(tzinfo=UTC)
+        checked_at = _require_aware_datetime(now).astimezone(UTC)
+        if captured_at.astimezone(UTC) < checked_at - max_age:
+            raise RuntimeError("live_position_snapshot_stale")
+        live_source = payload["payload"]["_live_source"]
+        positions = live_source["positions"]
+        if not isinstance(positions, list):
+            raise TypeError("positions_not_list")
+        result: dict[str, Decimal] = {}
+        for row in positions:
+            pos_id = str(row.get("posId") or "")
+            if not pos_id or pos_id in result:
+                raise ValueError("position_identity_invalid")
+            size = Decimal(str(row.get("pos")))
+            if size < 0:
+                raise ValueError("position_size_invalid")
+            result[pos_id] = size
+        return result
+    except (OSError, KeyError, TypeError, ValueError, InvalidOperation, json.JSONDecodeError) as exc:
+        raise RuntimeError("live_position_snapshot_invalid") from exc
 
 
 def read_loopback_settings(

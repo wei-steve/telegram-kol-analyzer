@@ -1160,6 +1160,10 @@ def execute_management_batch(
 
     now = executed_at or datetime.now(UTC)
     batch = load_management_batch(session_factory, int(batch_id))
+    if batch.management_contract_json or batch.management_contract_fingerprint:
+        raise ManagementBatchExecutionError(
+            "management_contract_requires_component_executor"
+        )
     if batch.status in {"ready", "protection_ready", "executing"}:
         try:
             _require_remediation_live_gate(session_factory, batch=batch)

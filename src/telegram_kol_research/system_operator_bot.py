@@ -350,6 +350,34 @@ def format_composite_management_notification(payload: dict[str, Any]) -> str | N
     return "\n".join(lines)[:COMPOSITE_MANAGEMENT_MESSAGE_MAX_CHARS]
 
 
+def persist_composite_management_completion_in_session(
+    session, batch, *, summary: dict[str, Any]
+) -> bool:
+    """Persist one success-only composite completion outbox row."""
+
+    from telegram_kol_research.models import StrategyManagementNotification
+
+    payload = {**summary, "notification_kind": "composite_completion"}
+    rendered = format_composite_management_notification(payload)
+    if rendered is None:
+        return False
+    fingerprint = _management_payload_fingerprint(payload)
+    row = StrategyManagementNotification(
+        management_batch_id=int(batch.id),
+        state="succeeded",
+        payload_fingerprint=fingerprint,
+        payload_json=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        status="pending",
+    )
+    try:
+        with session.begin_nested():
+            session.add(row)
+            session.flush()
+    except IntegrityError:
+        return False
+    return True
+
+
 def format_pending_entry_expiry_review_message(payload: dict[str, Any]) -> str:
     lifecycle_id = payload.get("lifecycle_id")
     message_id = payload.get("message_id") or "-"
@@ -671,9 +699,13 @@ def split_strategy_management_notification(
 ) -> list[str]:
     """Return deterministic line-bounded Telegram messages below 4096 chars."""
 
-    return _split_telegram_notification_text(
-        format_strategy_management_notification(payload), max_chars=max_chars
-    )
+    if payload.get("notification_kind") == "composite_completion":
+        rendered = format_composite_management_notification(payload)
+        if rendered is None:
+            return []
+    else:
+        rendered = format_strategy_management_notification(payload)
+    return _split_telegram_notification_text(rendered, max_chars=max_chars)
 
 
 def _split_telegram_notification_text(text: str, *, max_chars: int) -> list[str]:

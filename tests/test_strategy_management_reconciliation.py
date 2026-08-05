@@ -232,6 +232,7 @@ def _seed_partial_close_observation(session_factory, batch, *, size="1"):
     ("current_size", "intent_status", "expected_status", "expected_delta"),
     [
         ("8", "confirmed", "confirmed", "0"),
+        ("10", "confirmed", "recovery_required", "2"),
         ("12", "rejected", "recovery_required", "4"),
         ("12", "recovery_required", "awaiting_exchange", None),
     ],

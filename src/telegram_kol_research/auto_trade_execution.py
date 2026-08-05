@@ -64,6 +64,9 @@ from telegram_kol_research.strategy_management_planner import (
 from telegram_kol_research.strategy_management_executor import (
     execute_management_batch,
 )
+from telegram_kol_research.strategy_management_composite_executor import (
+    execute_composite_management_batch,
+)
 from telegram_kol_research.strategy_revision_planner import (
     advance_strategy_revision,
     plan_strategy_revision,
@@ -324,7 +327,16 @@ def _auto_process_single_message_trade_signal(
                 ),
             )
             return {"status": "skipped", "reason": reason}
-        if not settings.management_planning_enabled:
+        composite_candidate = bool(
+            management_loaded[1].management_contract_json
+            and management_loaded[1].management_contract_fingerprint
+        )
+        planning_enabled = settings.management_planning_enabled or (
+            composite_candidate
+            and settings.effective_composite_management_v2_mode
+            in {"shadow", "live"}
+        )
+        if not planning_enabled:
             raw_message, candidate, _source, _has_media = management_loaded
             reason = "management_execution_disabled"
             record_execution_event(
@@ -957,6 +969,36 @@ def _auto_process_management_signal(
             "batch_id": result.batch.id,
         }
 
+    if result.batch.management_contract_json:
+        composite = execute_composite_management_batch(
+            session_factory,
+            batch_id=result.batch.id,
+            deepcoin_client=deepcoin_client,
+            contract_spec_provider=contract_spec_provider,
+            live_execution_gate=lambda: (
+                load_trading_settings(
+                    session_factory
+                ).effective_composite_management_v2_mode
+                == "live"
+            ),
+            now_provider=lambda: processed_at,
+            backup_buffer_bps=str(settings.trigger_backup_stop_buffer_bps),
+        )
+        component_states = {row.status for row in composite.components}
+        if composite.status == "succeeded":
+            status = "succeeded"
+        elif component_states.intersection(
+            {"submitting", "awaiting_exchange", "recovery_required", "operator_required"}
+        ):
+            status = "recovery_required"
+        else:
+            status = "submitted"
+        return {
+            "status": status,
+            "reason": composite.reason_code,
+            "batch_id": composite.id,
+            "submitted": status == "submitted",
+        }
     return execute_management_batch(
         session_factory,
         batch_id=result.batch.id,

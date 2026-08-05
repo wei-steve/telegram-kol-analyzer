@@ -88,6 +88,7 @@ def validate_composite_management_completion(
     batch_status: str,
     components: list,
     pending_orders: list,
+    expected_leg_ids: set[str] | None = None,
 ) -> dict:
     """Fail closed when source, contract, execution, and exchange evidence differ."""
 
@@ -119,10 +120,28 @@ def validate_composite_management_completion(
             "source_stop_clause_missing_component"
         )
 
-    by_kind = {
-        str(_composite_value(component, "component_kind", "")): component
+    component_keys = [
+        (
+            str(_composite_value(component, "strategy_management_leg_id", "batch")),
+            str(_composite_value(component, "component_kind", "")),
+        )
         for component in components
-    }
+    ]
+    by_scope_kind = dict(zip(component_keys, components, strict=True))
+    if len(by_scope_kind) != len(component_keys):
+        raise CompositeManagementCompletionError(
+            "management_instruction_component_topology_invalid"
+        )
+    if expected_leg_ids is not None:
+        expected_keys = {
+            (str(scope), kind)
+            for scope in expected_leg_ids
+            for kind in required
+        }
+        if set(component_keys) != expected_keys:
+            raise CompositeManagementCompletionError(
+                "management_instruction_component_topology_invalid"
+            )
     pending_ids = {
         str(
             _composite_value(order, "ordId")
@@ -132,8 +151,12 @@ def validate_composite_management_completion(
         )
         for order in pending_orders
     }
-    consume = by_kind.get("consume_take_profit_stage")
-    if consume is not None:
+    consumes = [
+        component
+        for (_scope, kind), component in by_scope_kind.items()
+        if kind == "consume_take_profit_stage"
+    ]
+    for consume in consumes:
         desired = _composite_json(
             _composite_value(
                 consume,
@@ -150,32 +173,42 @@ def validate_composite_management_completion(
             )
 
     if str(batch_status).lower() == "succeeded":
-        for kind in required:
-            component = by_kind.get(kind)
-            evidence = _composite_json(
-                _composite_value(
-                    component,
-                    "evidence",
-                    _composite_value(component, "evidence_json") if component else None,
-                ),
-                [],
-            )
-            if (
-                component is None
-                or str(_composite_value(component, "status", "")).lower()
-                != "confirmed"
-                or not evidence
-            ):
-                raise CompositeManagementCompletionError(
-                    "completed_batch_missing_component_evidence"
+        scopes = (
+            {str(value) for value in expected_leg_ids}
+            if expected_leg_ids is not None
+            else ({scope for scope, _kind in by_scope_kind} or {"batch"})
+        )
+        for scope in scopes:
+            for kind in required:
+                component = by_scope_kind.get((scope, kind))
+                evidence = _composite_json(
+                    _composite_value(
+                        component,
+                        "evidence",
+                        (
+                            _composite_value(component, "evidence_json")
+                            if component
+                            else None
+                        ),
+                    ),
+                    [],
                 )
+                if (
+                    component is None
+                    or str(_composite_value(component, "status", "")).lower()
+                    != "confirmed"
+                    or not evidence
+                ):
+                    raise CompositeManagementCompletionError(
+                        "completed_batch_missing_component_evidence"
+                    )
 
     return {
         "batch_status": str(batch_status),
         "required_components": sorted(required),
         "component_statuses": {
-            kind: str(_composite_value(component, "status", ""))
-            for kind, component in sorted(by_kind.items())
+            f"{scope}:{kind}": str(_composite_value(component, "status", ""))
+            for (scope, kind), component in sorted(by_scope_kind.items())
         },
     }
 
