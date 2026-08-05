@@ -41,10 +41,10 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     assert settings.context_resolution_live_chat_ids == []
     assert settings.context_resolution_enabled_for_chat(100) is False
     assert settings.entry_preamble_mode == "disabled"
-    assert settings.entry_preamble_live_chat_ids == []
+    assert not hasattr(settings, "entry_preamble_live_chat_ids")
 
 
-def test_entry_preamble_rollout_settings_normalize_and_round_trip(tmp_path):
+def test_entry_preamble_rollout_settings_ignore_legacy_allowlist(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
 
     saved = save_trading_settings(
@@ -56,12 +56,8 @@ def test_entry_preamble_rollout_settings_normalize_and_round_trip(tmp_path):
     )
 
     assert saved.entry_preamble_mode == "live"
-    assert saved.entry_preamble_live_chat_ids == [-1002, -1001]
+    assert not hasattr(saved, "entry_preamble_live_chat_ids")
     assert load_trading_settings(session_factory).entry_preamble_mode == "live"
-    assert load_trading_settings(session_factory).entry_preamble_live_chat_ids == [
-        -1002,
-        -1001,
-    ]
 
 
 @pytest.mark.parametrize("value", ["unsafe", True, [], {}, 1, None])
@@ -71,9 +67,10 @@ def test_entry_preamble_mode_fails_closed(value):
 
 
 @pytest.mark.parametrize("value", ["-1001", [0], [-1001, "-1002"], {}])
-def test_entry_preamble_live_chat_ids_reject_malformed_values(value):
-    with pytest.raises(ValueError, match="entry_preamble_live_chat_ids"):
-        trading_settings_from_payload({"entry_preamble_live_chat_ids": value})
+def test_entry_preamble_legacy_allowlist_is_ignored(value):
+    settings = trading_settings_from_payload({"entry_preamble_live_chat_ids": value})
+
+    assert not hasattr(settings, "entry_preamble_live_chat_ids")
 
 
 def test_context_resolution_requires_live_trading_and_allowlisted_chat():

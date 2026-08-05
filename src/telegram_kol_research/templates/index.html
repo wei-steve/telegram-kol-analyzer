@@ -355,14 +355,10 @@
           <label>
             前置仓位指令组装模式
             <select name="entry_preamble_mode">
-              <option value="disabled" {% if trading_settings.entry_preamble_mode == 'disabled' %}selected{% endif %}>禁用：不保存也不组装前置指令</option>
-              <option value="shadow" {% if trading_settings.entry_preamble_mode == 'shadow' %}selected{% endif %}>影子：只记录拟组装结果，不改变下单风险</option>
-              <option value="live" {% if trading_settings.entry_preamble_mode == 'live' %}selected{% endif %}>实盘：仅对白名单群组应用风险倍率</option>
+              <option value="disabled" {% if trading_settings.entry_preamble_mode == 'disabled' %}selected{% endif %}>关闭：不使用之前的仓位提示</option>
+              <option value="shadow" {% if trading_settings.entry_preamble_mode == 'shadow' %}selected{% endif %}>测试：只记录，不改变真实下单</option>
+              <option value="live" {% if trading_settings.entry_preamble_mode == 'live' %}selected{% endif %}>实盘：所有已配置交易群组</option>
             </select>
-          </label>
-          <label>
-            前置仓位指令实盘群组 ID（逗号分隔）
-            <input name="entry_preamble_live_chat_ids" type="text" value="{{ trading_settings.entry_preamble_live_chat_ids|join(',') }}" placeholder="-1001234567890" />
           </label>
           <label>默认单笔最大亏损 USDT<input name="default_max_loss_usdt" type="number" min="1" step="1" value="{{ trading_settings.default_max_loss_usdt }}" /></label>
           <label>每日最大亏损 USDT<input name="daily_max_loss_usdt" type="number" min="1" step="1" value="{{ trading_settings.daily_max_loss_usdt }}" /></label>

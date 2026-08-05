@@ -69,7 +69,6 @@ class TradingSettings:
         "disabled", "shadow", "live"
     ] = "disabled"
     entry_preamble_mode: Literal["disabled", "shadow", "live"] = "disabled"
-    entry_preamble_live_chat_ids: list[int] = field(default_factory=list)
     default_max_loss_usdt: float = 20.0
     daily_max_loss_usdt: float = 500.0
     max_concurrent_positions: int = 4
@@ -302,12 +301,6 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         composite_management_v2_mode=composite_management_v2_mode,
         trigger_protection_stop_rescue_mode=trigger_protection_stop_rescue_mode,
         entry_preamble_mode=entry_preamble_mode,
-        entry_preamble_live_chat_ids=_parse_entry_preamble_chat_ids(
-            raw.get(
-                "entry_preamble_live_chat_ids",
-                defaults.entry_preamble_live_chat_ids,
-            )
-        ),
         default_max_loss_usdt=_positive_float(
             raw.get("default_max_loss_usdt"),
             defaults.default_max_loss_usdt,
@@ -452,21 +445,6 @@ def _parse_context_resolution_chat_ids(value: Any) -> list[int]:
     if len(set(value)) != len(value):
         raise ValueError("context_resolution_live_chat_ids must not contain duplicates")
     return list(value)
-
-
-def _parse_entry_preamble_chat_ids(value: Any) -> list[int]:
-    if not isinstance(value, list):
-        raise ValueError(
-            "entry_preamble_live_chat_ids must be a list of nonzero integers"
-        )
-    if any(
-        isinstance(item, bool) or not isinstance(item, int) or item == 0
-        for item in value
-    ):
-        raise ValueError(
-            "entry_preamble_live_chat_ids must be a list of nonzero integers"
-        )
-    return list(dict.fromkeys(value))
 
 
 def _parse_symbol_list(value: Any, fallback: list[str]) -> list[str]:

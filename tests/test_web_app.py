@@ -1177,7 +1177,7 @@ def test_management_execution_mode_api_persists_shadow_with_auto_trade_disabled(
     assert client.get("/api/trading-settings").json()["management_execution_mode"] == "shadow"
 
 
-def test_entry_preamble_rollout_api_round_trips_shadow_and_allowlist(tmp_path):
+def test_entry_preamble_rollout_api_ignores_legacy_allowlist(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
     response = client.post(
@@ -1190,10 +1190,10 @@ def test_entry_preamble_rollout_api_round_trips_shadow_and_allowlist(tmp_path):
 
     assert response.status_code == 200
     assert response.json()["entry_preamble_mode"] == "shadow"
-    assert response.json()["entry_preamble_live_chat_ids"] == [-1002, -1001]
-    assert client.get("/api/trading-settings").json()[
-        "entry_preamble_live_chat_ids"
-    ] == [-1002, -1001]
+    assert "entry_preamble_live_chat_ids" not in response.json()
+    assert "entry_preamble_live_chat_ids" not in client.get(
+        "/api/trading-settings"
+    ).json()
 
 
 def test_entry_preamble_rollout_api_rejects_invalid_mode(tmp_path):

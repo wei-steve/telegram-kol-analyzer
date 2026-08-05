@@ -725,9 +725,11 @@ def test_entry_preamble_rollout_controls_are_explicitly_dormant_by_default(tmp_p
 
     assert response.status_code == 200
     assert 'name="entry_preamble_mode"' in response.text
-    assert 'name="entry_preamble_live_chat_ids"' in response.text
+    assert 'name="entry_preamble_live_chat_ids"' not in response.text
     assert 'value="disabled" selected' in response.text
     assert '前置仓位指令组装模式' in response.text
+    assert '测试：只记录，不改变真实下单' in response.text
+    assert '实盘：所有已配置交易群组' in response.text
 
 
 def test_more_panel_labels_position_limit_as_per_group(tmp_path):
