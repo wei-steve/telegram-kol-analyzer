@@ -718,6 +718,18 @@ def test_management_execution_mode_form_labels_shadow_and_live_risk(tmp_path):
     assert '实盘：高风险，可写入交易所' in response.text
 
 
+def test_entry_preamble_rollout_controls_are_explicitly_dormant_by_default(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/more-panel")
+
+    assert response.status_code == 200
+    assert 'name="entry_preamble_mode"' in response.text
+    assert 'name="entry_preamble_live_chat_ids"' in response.text
+    assert 'value="disabled" selected' in response.text
+    assert '前置仓位指令组装模式' in response.text
+
+
 def test_more_panel_labels_position_limit_as_per_group(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
