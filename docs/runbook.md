@@ -401,6 +401,16 @@ submits, cancels, or adjusts an exchange order. Immediately rerun the management
 audit, confirm there is no new exchange submission event, and verify all live
 trading settings are unchanged.
 
+For a position that was first partially closed and later fully closed, Deepcoin
+position history reports the lifetime original and closed sizes rather than the
+last batch delta. Recovery accepts that history only when every management close
+leg for the exact binding, entry leg, and `posId` forms one gap-free size chain:
+the first preflight equals the lifetime position size, each following preflight
+equals the prior remainder, every prior leg is confirmed/succeeded, the reviewed
+current leg has its exact successful order response, and the chain ends at zero.
+Missing, duplicate, non-terminal, non-finite, or discontinuous evidence remains
+a refusal.
+
 After deploying a graceful-shutdown change, perform one controlled restart and
 inspect the old process rather than relying only on the new service's active
 state:

@@ -120,11 +120,13 @@ stop and keep automatic management frozen.
   `management_history_recovery` events and zero other execution events after
   the first recovery.
 - Batches 17 and 22 remain unchanged as `recovery_required`. Their available
-  closed-position history represents a larger whole-position close than each
-  originally planned partial close, and no exact terminal order is available.
-  The operator workflow therefore still refuses with
-  `exact_terminal_order_evidence_missing`; it does not attribute a whole close
-  to a smaller planned partial close by symbol, side, or timing.
+  closed-position history represents the whole position lifetime: batch 17
+  followed a confirmed 10-of-20 partial close with a 10-of-10 close; batch 22
+  followed confirmed 3-of-5 and 3-of-6 partial closes with exact 2-of-2 and
+  3-of-3 closes. Commit `5002486` adds a fail-closed cumulative-chain proof for
+  this Deepcoin history shape. It has not yet been deployed or applied; both
+  rows remain untouched until a fresh dry run returns `ready` in a separately
+  proven quiet window.
 - The apply for batch 28 occurred while eight new raw messages were inside the
   two-minute observation window because the first shell wrapper did not stop
   after its read-only gate returned nonzero. At that point execution ownership,
