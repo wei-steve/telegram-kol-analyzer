@@ -991,6 +991,50 @@ def test_full_exit_bypasses_open_protection_incident_for_exact_position(
     }
 
 
+def test_full_exit_records_independent_close_capability_for_each_exact_position(
+    monkeypatch,
+    tmp_path,
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, _ = _persist_exact_management_target(
+        session_factory,
+        intent="full_exit",
+        pos_ids=("pos-b-1", "pos-b-2"),
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    client = _ReadOnlyDeepcoin(
+        [_position("pos-b-1"), _position("pos-b-2")],
+        tpsl_orders=[
+            {
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "triggerOrderType": "TPSL",
+                "slTriggerPx": "63000",
+                "sz": "0",
+                "ordId": "anonymous-stop",
+            }
+        ],
+    )
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    capabilities = result.batch.target_snapshot["management_capabilities"]
+    assert set(capabilities) == {"pos-b-1", "pos-b-2"}
+    assert all(
+        row["may_close_exact_position"] is True
+        and row["may_cancel_owned_protection"] is False
+        for row in capabilities.values()
+    )
+
+
 def test_full_exit_replaces_its_zero_leg_protection_recovery_block(
     monkeypatch, tmp_path
 ):

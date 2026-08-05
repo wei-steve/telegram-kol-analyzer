@@ -55,6 +55,9 @@ from telegram_kol_research.protection_ledger import (
     list_verified_ledger_rows_for_positions,
 )
 from telegram_kol_research.position_authority_lock import position_authority_lock
+from telegram_kol_research.position_management_capabilities import (
+    evaluate_position_management_capabilities,
+)
 from telegram_kol_research.strategy_management_batches import (
     ManagementBatchRecord,
     ManagementLegCreate,
@@ -927,6 +930,76 @@ def _plan_strategy_management_batch_locked(
                         execution_mode=execution_mode,
                     )
 
+    management_capabilities: dict[str, dict[str, Any]] = {}
+    with session_factory() as session:
+        unresolved_mutation_pos_ids = {
+            str(pos_id)
+            for (pos_id,) in (
+                session.query(PositionMutationIntent.pos_id)
+                .filter(PositionMutationIntent.venue == "deepcoin")
+                .filter(
+                    PositionMutationIntent.pos_id.in_(
+                        [str(position["pos_id"]) for position in economics]
+                    )
+                )
+                .filter(
+                    PositionMutationIntent.status.in_(
+                        (
+                            "reserved",
+                            "submitted",
+                            "submit_unknown",
+                            "recovery_required",
+                        )
+                    )
+                )
+                .all()
+            )
+        }
+    for position in economics:
+        pos_id = str(position["pos_id"])
+        protection = protection_by_pos_id.get(pos_id) or {}
+        exact_owned_stop = protection.get("stop_loss") not in (None, "")
+        capabilities = evaluate_position_management_capabilities(
+            exact_position_verified=True,
+            native_stop_owned=exact_owned_stop,
+            exact_owned_stop=exact_owned_stop,
+            conflicting_unknown_take_profit=False,
+            retained_take_profit_safe=True,
+            snapshot_complete=True,
+            active_or_unknown_mutation=pos_id in unresolved_mutation_pos_ids,
+        )
+        management_capabilities[pos_id] = {
+            "may_cancel_owned_protection": capabilities.may_cancel_owned_protection,
+            "may_replace_owned_protection": capabilities.may_replace_owned_protection,
+            "may_add_exact_backup_stop": capabilities.may_add_exact_backup_stop,
+            "may_add_exact_take_profit": capabilities.may_add_exact_take_profit,
+            "may_reduce_exact_position": capabilities.may_reduce_exact_position,
+            "may_close_exact_position": capabilities.may_close_exact_position,
+            "reason_codes": list(capabilities.reason_codes),
+        }
+        required_capability = (
+            capabilities.may_close_exact_position
+            if effective_action_name in {"full_close", "full_exit"}
+            else capabilities.may_reduce_exact_position
+            if effective_action_name
+            in {"partial_close", "partial_then_break_even", BREAK_EVEN_BY_MARKET_ACTION}
+            else capabilities.may_replace_owned_protection
+        )
+        if not required_capability:
+            return _persist_blocked(
+                session_factory,
+                identity=identity,
+                raw_message_id=raw_message_id,
+                intent=intent,
+                reason_code=(
+                    "position_mutation_in_progress"
+                    if pos_id in unresolved_mutation_pos_ids
+                    else "position_management_capability_unavailable"
+                ),
+                planned_at=now,
+                execution_mode=execution_mode,
+            )
+
     if intent == "adjust_stop_loss" and candidate.stop_loss_text not in (None, ""):
         explicit_stop = Decimal(str(candidate.stop_loss_text))
         verified_stops: list[Decimal] = []
@@ -1021,6 +1094,7 @@ def _plan_strategy_management_batch_locked(
         ],
         "contract_spec": contract_spec.to_dict(),
         "protection": protection_by_pos_id,
+        "management_capabilities": management_capabilities,
     }
     if protection_recovery_for_risk_reduction:
         target_snapshot["protection_recovery"] = {
