@@ -263,7 +263,16 @@ def test_position_audit_prefers_verified_composite_backup_and_ignores_cancelled_
                 "request_json": '{"slTriggerPx":"62674.4"}',
             }
         ],
-        take_profit_orders=[],
+        take_profit_orders=[
+            {
+                "id": 100,
+                "pos_id": "pos-1",
+                "order_id": "old-tp",
+                "trigger_price": "65700",
+                "size_text": "18",
+                "status": "active",
+            }
+        ],
         pending_trigger_orders=[
             {
                 "ordId": "new-primary",

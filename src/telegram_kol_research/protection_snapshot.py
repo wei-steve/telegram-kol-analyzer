@@ -57,9 +57,17 @@ def build_position_protection_audit(
         row for row in backup_rows
         if _row_status_is_current(row, _CURRENT_BACKUP_STATUSES)
     ]
+    terminal_ledger_take_profit_ids = {
+        order_id
+        for row in ledger_rows
+        if _text(_field(row, "purpose")) == "take_profit"
+        and not _row_status_is_current(row, _CURRENT_LEDGER_STATUSES)
+        and (order_id := _text(_field(row, "order_id")))
+    }
     current_take_profit_rows = [
         row for row in take_profit_rows
         if _row_status_is_current(row, _CURRENT_TAKE_PROFIT_STATUSES)
+        and _text(_field(row, "order_id")) not in terminal_ledger_take_profit_ids
     ]
 
     primary_rows = [
