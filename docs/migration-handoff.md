@@ -119,14 +119,17 @@ stop and keep automatic management frozen.
   order ID, and client order ID all matched. The workflow appended exactly five
   `management_history_recovery` events and zero other execution events after
   the first recovery.
-- Batches 17 and 22 remain unchanged as `recovery_required`. Their available
+- Batches 17 and 22 had remained `recovery_required` because their available
   closed-position history represents the whole position lifetime: batch 17
   followed a confirmed 10-of-20 partial close with a 10-of-10 close; batch 22
   followed confirmed 3-of-5 and 3-of-6 partial closes with exact 2-of-2 and
   3-of-3 closes. Commit `5002486` adds a fail-closed cumulative-chain proof for
-  this Deepcoin history shape. It has not yet been deployed or applied; both
-  rows remain untouched until a fresh dry run returns `ready` in a separately
-  proven quiet window.
+  this Deepcoin history shape. It was deployed in server HEAD `665448f`; fresh
+  dry runs returned `terminal_position_history_confirmed`, and two separately
+  proven quiet windows applied batches 17 and 22 one at a time. Both batches
+  are now `succeeded`, all three legs are `confirmed`, and exactly two
+  `management_history_recovery` events were appended with no other execution
+  event or exchange mutation.
 - The apply for batch 28 occurred while eight new raw messages were inside the
   two-minute observation window because the first shell wrapper did not stop
   after its read-only gate returned nonzero. At that point execution ownership,

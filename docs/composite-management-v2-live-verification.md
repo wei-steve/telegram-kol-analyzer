@@ -36,13 +36,13 @@ Record timestamps and sanitized counts only:
 - production safety monitor result: `audit_abnormal` because the two legacy
   recovery batches remain actionable
 
-Safe window decision on 2026-08-05: **not proven; deployment deferred**. The
-monitor is non-healthy because batches 17 and 22 remain actionable. Their exact
-root cause is now proven: Deepcoin returns lifetime cumulative closed-position
-sizes after a partial-close-then-final-close sequence, while the deployed
-recovery code accepts only a single batch delta. Local commit `5002486` adds an
-exact gap-free cumulative close-chain proof. No service restart, database write,
-or exchange mutation was performed during this investigation.
+The first safe-window decision on 2026-08-05 was **not proven**, so deployment
+was deferred. After the cumulative-history fix passed review, a fresh gate found
+zero running recognition, active management, active/unknown mutations, active
+rescues, new two-minute messages, and new two-minute execution events. The
+reviewed branch was then deployed dormant. Separate fresh zero-count gates were
+required before applying batch 17 and batch 22; both exact fingerprinted
+recoveries succeeded without any exchange write.
 
 If any management, close, protection, rescue, or time-sensitive strategy action
 is in flight, stop before deployment and record the exact unresolved identity.
@@ -51,11 +51,25 @@ is in flight, stop before deployment and record the exact unresolved identity.
 
 - reviewed feature commit SHA: `697d105`
 - push target: `origin/codex/deepcoin-auto-trading-v1`
-- server deployed SHA: pending
-- schema/migration status: pending
-- `management_execution_mode=disabled`: pending
-- service restart and clean journal: pending
-- exchange writes caused by verification: must remain `0`
+- server deployed SHA: `665448fd522338777020916dba83ded29dc34456`
+- schema/migration status: service startup and focused server tests passed
+- `composite_management_v2_mode=disabled`: confirmed after deployment;
+  existing `management_execution_mode=live` was unchanged
+- service restart and clean journal: service active; zero warning journal lines
+  since the controlled restart
+- exchange writes caused by verification and history recovery: confirmed `0`
+
+Post-deployment evidence:
+
+- focused server tests: 94 passed
+- cumulative-history recovery tests: 18 passed locally; independent review had
+  no remaining Critical/Important findings
+- batches 17 and 22: `succeeded`; three legs: `confirmed`
+- post-recovery management audit: zero actionable batches, zero blocked,
+  `partial_failed`, `recovery_required`, and `submit_unknown`
+- monitor diagnostic: healthy with no reason codes; timer active and enabled
+- execution-event delta: exactly two `management_history_recovery` events and
+  no other event after the pre-recovery baseline
 
 ## Shadow replay
 
