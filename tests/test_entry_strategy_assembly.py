@@ -339,6 +339,20 @@ def test_expired_extraction_claim_does_not_defer_assembly(tmp_path):
                 lease_expires_at=NOW - timedelta(seconds=1),
             )
         )
+        session.add(
+            MessageEvidenceVersion(
+                raw_message_id=earlier.id,
+                version=1,
+                input_fingerprint="expired",
+                model="mimo-v2.5",
+                prompt_versions_json="{}",
+                extraction_status="completed",
+                confidence=0.9,
+                text_evidence_json="{}",
+                image_evidence_json="{}",
+                normalized_evidence_json='{"recognition_result":"非策略","strategy":{},"lifecycle_event":{"event_type":"none"}}',
+            )
+        )
         session.commit()
 
     result = assemble_entry_strategy(
@@ -352,6 +366,78 @@ def test_expired_extraction_claim_does_not_defer_assembly(tmp_path):
     )
 
     assert result.status == "proposed"
+
+
+def test_unclaimed_prior_message_defers_following_entry(tmp_path):
+    from telegram_kol_research.entry_strategy_assembly import assemble_entry_strategy
+
+    session_factory = create_session_factory(tmp_path / "queued-prior.db")
+    strategy_raw_id, candidate_id, _ = _persist_pair(session_factory)
+    with session_factory() as session:
+        queued = RawMessage(
+            chat_id=-1002337721508,
+            message_id=99015,
+            posted_at=NOW + timedelta(seconds=30),
+            text="queued before claim",
+        )
+        session.add(queued)
+        session.commit()
+
+    result = assemble_entry_strategy(
+        session_factory,
+        strategy_raw_message_id=strategy_raw_id,
+        signal_candidate_id=candidate_id,
+        strategy_instance_id="queued-prior",
+        mode="live",
+        live_chat_ids={-1002337721508},
+        assembled_at=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "unresolved"
+    assert result.reason_code == "preceding_entry_context_unresolved"
+
+
+def test_completed_preamble_evidence_without_persisted_row_defers_entry(tmp_path):
+    from telegram_kol_research.entry_strategy_assembly import assemble_entry_strategy
+
+    session_factory = create_session_factory(tmp_path / "release-gap.db")
+    strategy_raw_id, candidate_id, _ = _persist_pair(session_factory)
+    with session_factory() as session:
+        gap = RawMessage(
+            chat_id=-1002337721508,
+            message_id=99015,
+            posted_at=NOW + timedelta(seconds=30),
+            text="BTC short half",
+        )
+        session.add(gap)
+        session.flush()
+        session.add(
+            MessageEvidenceVersion(
+                raw_message_id=gap.id,
+                version=1,
+                input_fingerprint="release-gap",
+                model="mimo-v2.5",
+                prompt_versions_json="{}",
+                extraction_status="completed",
+                confidence=0.96,
+                text_evidence_json="{}",
+                image_evidence_json="{}",
+                normalized_evidence_json='{"recognition_result":"非策略","strategy":{},"lifecycle_event":{"event_type":"none"},"entry_context":{"kind":"entry_preamble","symbol":"BTC","side":"short","risk_multiplier":"0.5","confidence":0.96,"reason":"half"}}',
+            )
+        )
+        session.commit()
+
+    result = assemble_entry_strategy(
+        session_factory,
+        strategy_raw_message_id=strategy_raw_id,
+        signal_candidate_id=candidate_id,
+        strategy_instance_id="release-gap",
+        mode="live",
+        live_chat_ids={-1002337721508},
+        assembled_at=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "unresolved"
 
 
 def test_live_assembly_fingerprint_is_unique_across_chats_with_same_message_ids(tmp_path):

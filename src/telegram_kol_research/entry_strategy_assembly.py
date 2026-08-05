@@ -16,6 +16,7 @@ from telegram_kol_research.models import (
     EntryPreamble,
     EntryStrategyAssembly,
     MessageEvidenceExtractionClaim,
+    MessageEvidenceVersion,
     RawMessage,
     SignalCandidate,
 )
@@ -189,6 +190,21 @@ def _load_prior_facts(
         .filter(SignalCandidate.raw_message_id.in_(raw_ids))
         .all()
     )
+    evidence_rows = (
+        session.query(MessageEvidenceVersion)
+        .filter(
+            MessageEvidenceVersion.raw_message_id.in_(raw_ids),
+            MessageEvidenceVersion.superseded_at.is_(None),
+        )
+        .order_by(
+            MessageEvidenceVersion.raw_message_id.asc(),
+            MessageEvidenceVersion.version.desc(),
+        )
+        .all()
+    )
+    current_evidence_by_raw_id: dict[int, MessageEvidenceVersion] = {}
+    for row in evidence_rows:
+        current_evidence_by_raw_id.setdefault(int(row.raw_message_id), row)
     unresolved_ids = {
         int(row[0])
         for row in session.query(MessageEvidenceExtractionClaim.raw_message_id)
@@ -199,6 +215,7 @@ def _load_prior_facts(
         .all()
     }
     facts: list[PriorMessageFact] = []
+    preamble_evidence_ids_by_raw_id: dict[int, set[int]] = {}
     for preamble in preambles:
         raw = raw_by_id[int(preamble.raw_message_id)]
         try:
@@ -217,6 +234,10 @@ def _load_prior_facts(
                 risk_multiplier=multiplier,
             )
         )
+        preamble_evidence_ids_by_raw_id.setdefault(
+            int(preamble.raw_message_id), set()
+        ).add(int(preamble.evidence_version_id))
+    candidate_raw_ids = {int(row.raw_message_id) for row in candidates}
     for candidate in candidates:
         raw = raw_by_id[int(candidate.raw_message_id)]
         if candidate.event_type == "entry_signal":
@@ -250,6 +271,39 @@ def _load_prior_facts(
                 kind="unresolved",
             )
         )
+    for raw_id, raw in raw_by_id.items():
+        evidence = current_evidence_by_raw_id.get(raw_id)
+        durable_preamble = bool(preamble_evidence_ids_by_raw_id.get(raw_id))
+        durable_candidate = raw_id in candidate_raw_ids
+        needs_resolution = False
+        if evidence is None:
+            needs_resolution = not (durable_preamble or durable_candidate)
+        else:
+            try:
+                normalized = json.loads(evidence.normalized_evidence_json or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                normalized = {}
+            has_entry_context = isinstance(normalized, dict) and isinstance(
+                normalized.get("entry_context"), dict
+            )
+            current_preamble_persisted = int(evidence.id) in (
+                preamble_evidence_ids_by_raw_id.get(raw_id) or set()
+            )
+            if evidence.extraction_status != "completed":
+                needs_resolution = True
+            elif has_entry_context and not current_preamble_persisted:
+                needs_resolution = True
+            elif normalized.get("recognition_result") == "是策略" and not durable_candidate:
+                needs_resolution = True
+        if needs_resolution and raw_id not in unresolved_ids:
+            facts.append(
+                PriorMessageFact(
+                    raw_message_id=raw_id,
+                    message_id=int(raw.message_id),
+                    posted_at=raw.posted_at,
+                    kind="unresolved",
+                )
+            )
     return facts
 
 
