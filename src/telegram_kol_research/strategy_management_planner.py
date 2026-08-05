@@ -166,6 +166,8 @@ class TriggerProtectionStopRescuePlanningResult:
     status: str
     reason_code: str | None = None
     rescue_id: int | None = None
+    payload: dict[str, str] | None = None
+    cancel_order_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -2203,7 +2205,12 @@ def plan_trigger_protection_stop_rescue(
             )
             session.add(rescue)
             session.commit()
-            return TriggerProtectionStopRescuePlanningResult("ready", rescue_id=int(rescue.id))
+            return TriggerProtectionStopRescuePlanningResult(
+                "ready",
+                rescue_id=int(rescue.id),
+                payload=dict(payload),
+                cancel_order_ids=(),
+            )
 
 
 def _prepare_trigger_protection_stop_rescue(session, *, intent, deepcoin_client):
@@ -2246,7 +2253,7 @@ def _prepare_trigger_protection_stop_rescue(session, *, intent, deepcoin_client)
         .filter(PositionMutationIntent.pos_id == pos_id)
         .filter(
             PositionMutationIntent.status.in_(
-                ("reserved", "submitted", "recovery_required")
+                ("reserved", "submitted", "submit_unknown", "recovery_required")
             )
         )
         .first()
@@ -2328,6 +2335,30 @@ def _prepare_trigger_protection_stop_rescue(session, *, intent, deepcoin_client)
     stop_loss = _first_present(request, "slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")
     if stop_loss is None:
         return "rescue_stop_loss_not_saved"
+    liquidation_price = _first_present(
+        positions[0],
+        "liqPx",
+        "liquidationPrice",
+    )
+    if liquidation_price is None:
+        return "rescue_liquidation_price_unavailable"
+    if not _stop_is_before_liquidation(
+        side=str(binding.side),
+        stop_loss=stop_loss,
+        liquidation_price=liquidation_price,
+    ):
+        return "rescue_stop_not_liquidation_safe"
+    capabilities = evaluate_position_management_capabilities(
+        exact_position_verified=True,
+        native_stop_owned=False,
+        exact_owned_stop=False,
+        conflicting_unknown_take_profit=False,
+        retained_take_profit_safe=True,
+        snapshot_complete=True,
+        active_or_unknown_mutation=False,
+    )
+    if not capabilities.may_add_exact_backup_stop:
+        return "rescue_exact_backup_capability_unavailable"
     return leg, {
         "instType": "SWAP", "instId": inst_id, "posId": pos_id,
         "posSide": str(binding.side).lower(), "mrgPosition": "split",
@@ -2378,6 +2409,27 @@ def _same_positive_number(left: Any, right: Any) -> bool:
     )
 
 
+def _stop_is_before_liquidation(
+    *,
+    side: str,
+    stop_loss: Any,
+    liquidation_price: Any,
+) -> bool:
+    try:
+        stop = Decimal(str(stop_loss))
+        liquidation = Decimal(str(liquidation_price))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    if not stop.is_finite() or not liquidation.is_finite() or stop <= 0 or liquidation <= 0:
+        return False
+    normalized_side = str(side).lower()
+    if normalized_side == "short":
+        return stop < liquidation
+    if normalized_side == "long":
+        return stop > liquidation
+    return False
+
+
 def _binding_has_exact_pos_id(binding_pos_id: object, target_pos_id: str) -> bool:
     """Require an exact persisted binding membership before live rescue checks."""
 
@@ -2389,6 +2441,9 @@ def _binding_has_exact_pos_id(binding_pos_id: object, target_pos_id: str) -> boo
 
 
 def _rescue_intent_is_deferred_or_ambiguous(session, intent) -> bool:
+    disposition = str(intent.recovery_disposition or "").strip()
+    if disposition:
+        return disposition in {"retry", "exact_backup"}
     if intent.recovery_state in {"pending", "retrying"}:
         return True
     if intent.recovery_state != "failed":

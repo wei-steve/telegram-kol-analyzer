@@ -36,7 +36,7 @@ class _Client:
     def list_positions(self, *, inst_id=None):
         return [{
             "instId": "BTC-USDT-SWAP", "posId": "pos-1", "posSide": "short",
-            "pos": "2", "avgPx": "64000",
+            "pos": "2", "avgPx": "64000", "liqPx": "68000",
             "mgnMode": "cross", "posMode": "split",
         }]
 
@@ -433,6 +433,33 @@ def test_rescue_worker_is_idempotent_after_successful_live_tick(tmp_path):
     assert len(client.calls) == 1
     with session_factory() as session:
         assert session.query(TriggerProtectionStopRescue).count() == 1
+
+
+def test_rescue_worker_excludes_structured_manual_review_disposition(tmp_path):
+    from telegram_kol_research.trigger_protection_rescue_worker import (
+        run_trigger_protection_rescue_tick,
+    )
+
+    session_factory = create_session_factory(tmp_path / "rescue-worker-manual.db")
+    intent_id = _saved_deferred_intent(session_factory)
+    with session_factory() as session:
+        intent = session.get(TriggerProtectionIntent, intent_id)
+        intent.recovery_state = "failed"
+        intent.recovery_disposition = "manual_review"
+        session.commit()
+    save_trading_settings(
+        session_factory,
+        {"trigger_protection_stop_rescue_mode": "shadow"},
+    )
+
+    result = run_trigger_protection_rescue_tick(
+        session_factory,
+        deepcoin_client=_Client(),
+        processed_at=NOW,
+    )
+
+    assert result.discovered == 0
+    assert result.evaluated == 0
 
 
 def test_init_db_adds_rescue_error_json_to_prior_sqlite_schema(tmp_path):
