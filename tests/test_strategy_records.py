@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import event
+import pytest
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
@@ -33,6 +34,64 @@ from telegram_kol_research.strategy_records import (
     load_strategy_record_detail,
     load_strategy_record_summaries,
 )
+
+
+def test_composite_completion_rejects_missing_source_clauses_and_evidence():
+    from telegram_kol_research.strategy_records import (
+        CompositeManagementCompletionError,
+        validate_composite_management_completion,
+    )
+
+    with pytest.raises(
+        CompositeManagementCompletionError,
+        match="source_close_clause_missing_from_contract",
+    ):
+        validate_composite_management_completion(
+            source_text="止盈50%，止损移动至开仓价",
+            contract={"close_fraction": None, "stop_mode": "actual_entry_price", "required_components": ["replace_remaining_protection"]},
+            batch_status="ready", components=[], pending_orders=[],
+        )
+    with pytest.raises(
+        CompositeManagementCompletionError,
+        match="source_stop_clause_missing_component",
+    ):
+        validate_composite_management_completion(
+            source_text="止盈50%，止损移动至开仓价",
+            contract={"close_fraction": "0.5", "stop_mode": "actual_entry_price", "required_components": ["converge_partial_close"]},
+            batch_status="ready", components=[], pending_orders=[],
+        )
+
+
+def test_composite_completion_rejects_pending_consumed_tp_and_false_success():
+    from telegram_kol_research.strategy_records import (
+        CompositeManagementCompletionError,
+        validate_composite_management_completion,
+    )
+
+    components = [
+        {"component_kind": "consume_take_profit_stage", "status": "confirmed", "desired": {"take_profit_consumption_execution": {"cancel_order_ids": ["tp-1"]}}, "evidence": [{"intent_id": 1}]},
+        {"component_kind": "converge_partial_close", "status": "confirmed", "desired": {}, "evidence": [{"remaining_size": "5"}]},
+        {"component_kind": "replace_remaining_protection", "status": "confirmed", "desired": {}, "evidence": [{"new_stop_order_ids": ["sl-1", "sl-2"]}]},
+    ]
+    contract = {"close_fraction": "0.5", "stop_mode": "actual_entry_price", "required_components": [row["component_kind"] for row in components]}
+    with pytest.raises(
+        CompositeManagementCompletionError,
+        match="consumed_take_profit_still_pending",
+    ):
+        validate_composite_management_completion(
+            source_text="止盈50%，止损移动至开仓价", contract=contract,
+            batch_status="executing", components=components,
+            pending_orders=[{"ordId": "tp-1"}],
+        )
+    components[1]["evidence"] = []
+    with pytest.raises(
+        CompositeManagementCompletionError,
+        match="completed_batch_missing_component_evidence",
+    ):
+        validate_composite_management_completion(
+            source_text="止盈50%，止损移动至开仓价", contract=contract,
+            batch_status="succeeded", components=components, pending_orders=[],
+        )
 
 
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)

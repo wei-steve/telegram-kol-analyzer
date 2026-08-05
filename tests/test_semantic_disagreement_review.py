@@ -7,6 +7,24 @@ import json
 
 import pytest
 
+
+def test_composite_semantic_review_input_preserves_mimo_authority_and_outcomes():
+    from telegram_kol_research.semantic_disagreement_review import (
+        build_composite_semantic_review_input,
+    )
+
+    value = build_composite_semantic_review_input(
+        authoritative_payload={"management_action": "partial_then_break_even"},
+        contract={"close_fraction": "0.5", "stop_mode": "actual_entry_price"},
+        components=[{"component_kind": "converge_partial_close", "status": "confirmed"}],
+        outcomes={"remaining_size": "5"},
+    )
+    assert value["authority"] == "mimo"
+    assert value["advisory_only"] is True
+    assert value["authoritative_payload"]["management_action"] == "partial_then_break_even"
+    assert value["contract"]["close_fraction"] == "0.5"
+    assert value["actual_outcomes"]["remaining_size"] == "5"
+
 from telegram_kol_research.semantic_disagreement_review import (
     decide_semantic_severity,
     normalize_mimo_action,

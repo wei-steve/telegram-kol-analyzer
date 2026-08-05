@@ -7,6 +7,23 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+
+def test_composite_completion_notification_is_bounded_and_blocks_recovering_state():
+    from telegram_kol_research.system_operator_bot import (
+        format_composite_management_notification,
+    )
+
+    assert format_composite_management_notification(
+        {"batch_id": 7, "overall_state": "recovery_required", "first_take_profit": "已撤销", "partial_close": "剩余 5", "protection": "主备止损已核验", "retained_take_profit_total": "5", "error": "Authorization: bearer secret-value"}
+    ) is None
+    rendered = format_composite_management_notification(
+        {"batch_id": 7, "overall_state": "succeeded", "first_take_profit": "已消费", "partial_close": "剩余 5", "protection": "主备止损已核验", "retained_take_profit_total": "5"}
+    )
+    assert "第一止盈: 已消费" in rendered
+    assert "剩余仓位: 剩余 5" in rendered
+    assert "保留止盈总量: 5" in rendered
+    assert len(rendered) <= 1200
+
 import telegram_kol_research.telegram_bot_commands as bot_commands_module
 import telegram_kol_research.system_operator_bot as operator_bot_module
 from telegram_kol_research.config import RuntimeIncidentConfig

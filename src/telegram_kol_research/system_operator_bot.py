@@ -326,6 +326,30 @@ def _safe_runtime_incident_value(value: Any, *, limit: int) -> str:
     return _truncate_text(text, limit=max(1, int(limit)))
 
 
+COMPOSITE_MANAGEMENT_MESSAGE_MAX_CHARS = 1200
+
+
+def format_composite_management_notification(payload: dict[str, Any]) -> str | None:
+    """Render only a fully successful composite-management outcome."""
+
+    if str(payload.get("overall_state") or "").lower() != "succeeded":
+        return None
+    fields = (
+        ("批次", "batch_id"),
+        ("第一止盈", "first_take_profit"),
+        ("剩余仓位", "partial_close"),
+        ("保护单", "protection"),
+        ("保留止盈总量", "retained_take_profit_total"),
+        ("总体状态", "overall_state"),
+    )
+    lines = ["【复合仓位管理已完成】"]
+    for label, key in fields:
+        lines.append(
+            f"{label}: {_safe_runtime_incident_value(payload.get(key), limit=180)}"
+        )
+    return "\n".join(lines)[:COMPOSITE_MANAGEMENT_MESSAGE_MAX_CHARS]
+
+
 def format_pending_entry_expiry_review_message(payload: dict[str, Any]) -> str:
     lifecycle_id = payload.get("lifecycle_id")
     message_id = payload.get("message_id") or "-"

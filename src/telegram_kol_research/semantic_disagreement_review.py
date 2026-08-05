@@ -29,7 +29,10 @@ from telegram_kol_research.ai_recognition_config import (
 from telegram_kol_research.models import (
     RawMessage,
     RecognitionDecision,
+    SignalCandidate,
     StrategyLifecycle,
+    StrategyManagementBatch,
+    StrategyManagementComponent,
     utc_now,
 )
 from telegram_kol_research.prompt_defaults import (
@@ -156,6 +159,25 @@ class SemanticReviewRun:
     prompt_versions: dict[str, int]
 
 
+def build_composite_semantic_review_input(
+    *,
+    authoritative_payload: dict[str, Any],
+    contract: dict[str, Any],
+    components: list[dict[str, Any]],
+    outcomes: dict[str, Any],
+) -> dict[str, Any]:
+    """Expose composite evidence to the reviewer without transferring authority."""
+
+    return {
+        "authority": "mimo",
+        "advisory_only": True,
+        "authoritative_payload": authoritative_payload,
+        "contract": contract,
+        "components": components,
+        "actual_outcomes": outcomes,
+    }
+
+
 def _chat_completions_url(base_url: str) -> str:
     normalized = base_url.strip().rstrip("/")
     if normalized.endswith("/v1"):
@@ -278,6 +300,62 @@ def run_deepseek_semantic_review(
             raise LookupError("recognition decision not found")
         authoritative_payload = json.loads(decision_row.authoritative_payload_json)
         message_time = raw_message.posted_at or raw_message.created_at
+        composite_input = None
+        candidate = (
+            session.query(SignalCandidate)
+            .filter(
+                SignalCandidate.raw_message_id == raw_message_id,
+                SignalCandidate.management_contract_json.is_not(None),
+            )
+            .order_by(SignalCandidate.id.desc())
+            .first()
+        )
+        if candidate is not None:
+            batch = (
+                session.query(StrategyManagementBatch)
+                .filter(StrategyManagementBatch.raw_message_id == raw_message_id)
+                .order_by(StrategyManagementBatch.id.desc())
+                .first()
+            )
+            component_rows = (
+                session.query(StrategyManagementComponent)
+                .filter(
+                    StrategyManagementComponent.management_batch_id == batch.id
+                )
+                .order_by(
+                    StrategyManagementComponent.sequence.asc(),
+                    StrategyManagementComponent.id.asc(),
+                )
+                .all()
+                if batch is not None
+                else []
+            )
+            components = [
+                {
+                    "component_kind": row.component_kind,
+                    "sequence": row.sequence,
+                    "status": row.status,
+                    "reason_code": row.reason_code,
+                    "desired": json.loads(row.desired_json or "{}"),
+                    "evidence": json.loads(row.evidence_json or "[]"),
+                }
+                for row in component_rows
+            ]
+            composite_input = build_composite_semantic_review_input(
+                authoritative_payload=authoritative_payload,
+                contract=json.loads(candidate.management_contract_json or "{}"),
+                components=components,
+                outcomes={
+                    "batch_id": batch.id if batch is not None else None,
+                    "batch_status": batch.status if batch is not None else "not_planned",
+                    "target_snapshot": (
+                        json.loads(batch.target_snapshot_json or "{}")
+                        if batch is not None
+                        else {}
+                    ),
+                    "component_evidence": [row["evidence"] for row in components],
+                },
+            )
         context = {
             "source": {
                 "raw_message_id": raw_message.id,
@@ -309,6 +387,8 @@ def run_deepseek_semantic_review(
                 "version_number": prompt.version_number,
             },
         }
+        if composite_input is not None:
+            context["composite_management"] = composite_input
         chat_id = raw_message.chat_id
         current_message_text = raw_message.text or ""
         input_kind = decision_row.input_kind

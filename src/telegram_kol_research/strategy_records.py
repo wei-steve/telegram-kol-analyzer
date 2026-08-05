@@ -58,6 +58,127 @@ FINISHED_LIFECYCLE_STATUSES = frozenset(
     {"cancelled", "exited", "expired", "finished", "invalidated", "rejected"}
 )
 
+
+class CompositeManagementCompletionError(ValueError):
+    """Raised when a composite batch cannot be truthfully called complete."""
+
+
+def _composite_value(row, name: str, default=None):
+    if isinstance(row, dict):
+        return row.get(name, default)
+    return getattr(row, name, default)
+
+
+def _composite_json(value, default):
+    if value is None:
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return default
+    return parsed if isinstance(parsed, type(default)) else default
+
+
+def validate_composite_management_completion(
+    *,
+    source_text: str,
+    contract: dict,
+    batch_status: str,
+    components: list,
+    pending_orders: list,
+) -> dict:
+    """Fail closed when source, contract, execution, and exchange evidence differ."""
+
+    source = str(source_text or "")
+    close_fraction = contract.get("close_fraction")
+    source_has_half_close = bool(
+        re.search(r"(?:止盈|减仓|平仓|卖出)[^\n]{0,16}50\s*[%％]|50\s*[%％]", source)
+    )
+    try:
+        contract_has_half_close = abs(float(close_fraction) - 0.5) < 1e-9
+    except (TypeError, ValueError):
+        contract_has_half_close = False
+    if source_has_half_close and not contract_has_half_close:
+        raise CompositeManagementCompletionError(
+            "source_close_clause_missing_from_contract"
+        )
+
+    required = {
+        str(item.get("component_kind") if isinstance(item, dict) else item)
+        for item in (contract.get("required_components") or [])
+    }
+    source_has_stop_move = bool(
+        re.search(r"止损[^\n]{0,24}(?:移|推|开仓价|成本|保本|价格)", source)
+    )
+    if (source_has_stop_move or contract.get("stop_mode")) and (
+        "replace_remaining_protection" not in required
+    ):
+        raise CompositeManagementCompletionError(
+            "source_stop_clause_missing_component"
+        )
+
+    by_kind = {
+        str(_composite_value(component, "component_kind", "")): component
+        for component in components
+    }
+    pending_ids = {
+        str(
+            _composite_value(order, "ordId")
+            or _composite_value(order, "order_id")
+            or _composite_value(order, "orderId")
+            or ""
+        )
+        for order in pending_orders
+    }
+    consume = by_kind.get("consume_take_profit_stage")
+    if consume is not None:
+        desired = _composite_json(
+            _composite_value(
+                consume,
+                "desired",
+                _composite_value(consume, "desired_json"),
+            ),
+            {},
+        )
+        execution = desired.get("take_profit_consumption_execution") or {}
+        cancelled_ids = {str(value) for value in execution.get("cancel_order_ids", [])}
+        if cancelled_ids & pending_ids:
+            raise CompositeManagementCompletionError(
+                "consumed_take_profit_still_pending"
+            )
+
+    if str(batch_status).lower() == "succeeded":
+        for kind in required:
+            component = by_kind.get(kind)
+            evidence = _composite_json(
+                _composite_value(
+                    component,
+                    "evidence",
+                    _composite_value(component, "evidence_json") if component else None,
+                ),
+                [],
+            )
+            if (
+                component is None
+                or str(_composite_value(component, "status", "")).lower()
+                != "confirmed"
+                or not evidence
+            ):
+                raise CompositeManagementCompletionError(
+                    "completed_batch_missing_component_evidence"
+                )
+
+    return {
+        "batch_status": str(batch_status),
+        "required_components": sorted(required),
+        "component_statuses": {
+            kind: str(_composite_value(component, "status", ""))
+            for kind, component in sorted(by_kind.items())
+        },
+    }
+
 ATTENTION_LABELS = MappingProxyType(
     {
         "recognition_failed": ("critical", "AI识别失败"),
