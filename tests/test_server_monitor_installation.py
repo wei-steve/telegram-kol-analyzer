@@ -294,6 +294,8 @@ def test_installer_creates_identity_and_allowlisted_monitor_environment():
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_HEAD" in installer
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_PREAMBLE_MODE" in installer
     assert "--expected-entry-preamble-mode" in installer
+    assert 'expected_entry_preamble_mode=""' in installer
+    assert 'echo "--expected-entry-preamble-mode is required."' in installer
     assert "disabled|shadow|live" in installer
     assert "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES" in installer
     assert "TELEGRAM_KOL_RUNTIME_MONITOR_CAPTURE_TOKEN" in installer

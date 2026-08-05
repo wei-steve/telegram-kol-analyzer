@@ -486,7 +486,9 @@ without enabling or starting the timer:
 
 ```bash
 cd /opt/telegram-kol-analyzer
-sudo ./scripts/install_server_monitor.sh
+approved_entry_preamble_mode=disabled # replace with the currently approved value
+sudo ./scripts/install_server_monitor.sh \
+  --expected-entry-preamble-mode "$approved_entry_preamble_mode"
 if systemctl is-enabled --quiet telegram-kol-monitor.timer || \
    systemctl is-active --quiet telegram-kol-monitor.timer; then
   echo "unexpected enabled or active monitor timer" >&2
@@ -497,8 +499,10 @@ fi
 The installer refuses any path other than the validated
 `/opt/telegram-kol-analyzer` Git root. It freezes that checkout's current
 `git rev-parse HEAD` with only the allowlisted operator-bot fields in the
-root-owned `0600` `/etc/telegram-kol-monitor.env`. Rerun the installer after each later
-reviewed deployment to advance that expected-commit baseline. Before enabling,
+root-owned `0600` `/etc/telegram-kol-monitor.env`. The mode argument is required
+so a routine reinstall cannot silently reset an approved live mode. Rerun the
+installer after each later reviewed deployment to advance that expected-commit
+baseline. Before enabling,
 start the installed static diagnostic unit. It runs the full audit without
 notification delivery under the same dedicated identity, read-only mounts,
 credentials isolation, and sandbox as the scheduled monitor:
@@ -523,7 +527,8 @@ Confirm exactly one message beginning `【监控测试】` arrived, then enable 
 the monitor timer and inspect its schedule and latest result:
 
 ```bash
-sudo ./scripts/install_server_monitor.sh --enable
+sudo ./scripts/install_server_monitor.sh --enable \
+  --expected-entry-preamble-mode "$approved_entry_preamble_mode"
 systemctl is-active telegram-kol-monitor.timer
 systemctl list-timers telegram-kol-monitor.timer --no-pager
 journalctl -u telegram-kol-monitor.service -n 50 --no-pager

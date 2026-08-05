@@ -52,6 +52,11 @@ The persisted execution binding must contain the same assembly fingerprint as
 the immutable `entry_strategy_assemblies` row. Ambiguity, invalid multiplier,
 missing evidence, edits, or deletions must fail closed.
 
+“Stop the monitor timer” means run
+`systemctl disable --now telegram-kol-monitor.timer` and prove the timer is
+both inactive and disabled. Merely stopping an enabled timer is insufficient;
+the monitor installer rejects that state.
+
 ## Immediate rollback
 
 Stop the monitor timer, set `entry_preamble_mode=disabled`, and reinstall the

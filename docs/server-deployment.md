@@ -139,7 +139,9 @@ pass, run the helper from the fixed production Git root:
 
 ```bash
 cd /opt/telegram-kol-analyzer
-sudo ./scripts/install_server_monitor.sh
+approved_entry_preamble_mode=disabled # replace with the currently approved value
+sudo ./scripts/install_server_monitor.sh \
+  --expected-entry-preamble-mode "$approved_entry_preamble_mode"
 if systemctl is-enabled --quiet telegram-kol-monitor.timer || \
    systemctl is-active --quiet telegram-kol-monitor.timer; then
   exit 1
@@ -155,7 +157,8 @@ the timer, follow the diagnostic and single notification-test instructions in
 `docs/runbook.md`. After both pass, enable only the timer:
 
 ```bash
-sudo ./scripts/install_server_monitor.sh --enable
+sudo ./scripts/install_server_monitor.sh --enable \
+  --expected-entry-preamble-mode "$approved_entry_preamble_mode"
 systemctl is-active telegram-kol-monitor.timer
 systemctl list-timers telegram-kol-monitor.timer --no-pager
 journalctl -u telegram-kol-monitor.service -n 50 --no-pager

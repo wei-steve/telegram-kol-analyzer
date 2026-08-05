@@ -7,7 +7,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 
 enable_timer=false
-expected_entry_preamble_mode=disabled
+expected_entry_preamble_mode=""
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --enable)
@@ -28,6 +28,10 @@ while [[ "$#" -gt 0 ]]; do
       ;;
   esac
 done
+if [[ -z "$expected_entry_preamble_mode" ]]; then
+  echo "--expected-entry-preamble-mode is required." >&2
+  exit 2
+fi
 
 PRODUCTION_ROOT="/opt/telegram-kol-analyzer"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
