@@ -366,6 +366,32 @@ def test_entry_preamble_monitor_reader_detects_faults_without_writes(tmp_path):
     assert database.read_bytes() == before
 
 
+def test_entry_preamble_monitor_accepts_valid_bindings_from_multiple_chats(tmp_path):
+    database = tmp_path / "entry-preamble-multi-chat-monitor.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE entry_preambles (id INTEGER PRIMARY KEY, raw_message_id INTEGER, chat_id INTEGER, message_id INTEGER, symbol TEXT, side TEXT, status TEXT, created_at TEXT);
+        CREATE TABLE raw_messages (id INTEGER PRIMARY KEY, chat_id INTEGER, message_id INTEGER, posted_at TEXT);
+        CREATE TABLE signal_candidates (id INTEGER PRIMARY KEY, raw_message_id INTEGER, event_type TEXT, management_action TEXT);
+        CREATE TABLE entry_strategy_assemblies (id INTEGER PRIMARY KEY, strategy_instance_id TEXT, fingerprint TEXT);
+        CREATE TABLE execution_bindings (id INTEGER PRIMARY KEY, strategy_instance_id TEXT, payload_json TEXT);
+        INSERT INTO entry_strategy_assemblies VALUES
+          (1, 'chat-100-strategy', 'fingerprint-100'),
+          (2, 'chat-200-strategy', 'fingerprint-200');
+        INSERT INTO execution_bindings VALUES
+          (1, 'chat-100-strategy', '{"draft":{"entry_preamble_assembly":{"assembly_fingerprint":"fingerprint-100"}}}'),
+          (2, 'chat-200-strategy', '{"draft":{"entry_preamble_assembly":{"assembly_fingerprint":"fingerprint-200"}}}');
+        """
+    )
+    connection.commit()
+
+    assert read_entry_preamble_invariants(
+        database,
+        now=datetime(2026, 8, 5, tzinfo=UTC),
+    ) == ()
+
+
 def test_entry_preamble_monitor_ignores_shadow_preamble_behind_entry_boundary(tmp_path):
     database = tmp_path / "entry-preamble-shadow-monitor.db"
     connection = sqlite3.connect(database)

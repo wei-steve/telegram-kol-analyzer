@@ -1,11 +1,11 @@
 # Entry preamble live verification
 
-This feature must be deployed dormant. The initial production setting is
-`entry_preamble_mode=disabled` with an empty
-`entry_preamble_live_chat_ids` list. Deploying code does not authorize a mode
-change.
+Deploy code while `entry_preamble_mode=disabled`. Deploying code does not
+authorize a mode change. After the checks below, `live` applies explicit
+entry-sizing preambles to every group already configured for automatic
+trading; there is no separate chat allowlist.
 
-## Shadow gate
+## Pre-activation gate
 
 1. Confirm there is no time-sensitive entry, cancellation, stop update, or
    position-management operation in progress.
@@ -13,26 +13,27 @@ change.
    default change into a draft, validate it, run current historical tests for
    both MiMo and DeepSeek, and publish with a non-empty change note. Seeding at
    process startup will not replace an existing published prompt.
-3. Set only `entry_preamble_mode=shadow`; keep the live chat allowlist empty.
-4. Verify a known pair produces bounded evidence containing the mode, symbol,
-   side, multiplier, configured/effective risk budgets, preamble message ID,
-   strategy message ID, and assembly fingerprint. The effective execution
-   multiplier must remain `1` in shadow.
+3. Run the focused server tests and controlled historical prompt comparisons.
+   Do not submit a synthetic order to Deepcoin and do not fabricate normalized
+   Telegram evidence.
+4. Verify fixtures from at least two configured chats produce bounded evidence
+   containing the mode, symbol, side, multiplier, configured/effective risk
+   budgets, preamble message ID, strategy message ID, and assembly fingerprint.
 5. Confirm the production safety monitor reports none of:
    `stale_entry_preamble_unresolved`, `entry_preamble_ambiguous`, or
    `live_entry_preamble_binding_evidence_missing`.
 
 Historical messages created before this feature may not have an
 `entry_preambles` row even when their raw text said “半仓操作”. Do not fabricate or
-edit normalized evidence in SQLite. Use a newly received shadow-only pair, or
-run the read-only replay against rows that already contain authoritative
-preamble evidence.
+edit normalized evidence in SQLite. Use the read-only replay only against rows
+that already contain authoritative preamble evidence.
 
 ## Live gate
 
-Live promotion requires separate explicit approval after reviewed shadow
-evidence. Add only the approved chat ID to
-`entry_preamble_live_chat_ids`, then change `entry_preamble_mode` to `live`.
+After explicit approval and a second check that no time-sensitive operation is
+active, change only `entry_preamble_mode` to `live`. This immediately affects
+new matching entries in all configured trading groups. An entry without a
+matching preamble continues to use its configured full risk budget.
 For a 20 USDT configured risk budget and a 50% multiplier, verify the operator
 record says:
 
@@ -47,9 +48,8 @@ missing evidence, edits, or deletions must fail closed.
 
 ## Immediate rollback
 
-Set `entry_preamble_mode=disabled` and clear
-`entry_preamble_live_chat_ids`. This prevents new persistence and assembly and
-does not alter existing orders or positions. Do not delete existing preamble,
+Set `entry_preamble_mode=disabled`. This prevents new persistence and assembly
+and does not alter existing orders or positions. Do not delete existing preamble,
 assembly, recovery, draft, or execution-binding evidence. If a live order was
 already submitted, manage it through the normal attributed-position workflow;
 never replay the Telegram entry message.

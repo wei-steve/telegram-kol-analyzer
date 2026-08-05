@@ -584,8 +584,8 @@ Percentage and contract-size rules for live management:
 `entry_preamble_mode` defaults to `disabled`. In this mode an earlier message
 such as `BTC 多单半仓操作` is neither persisted nor applied. `shadow` persists
 authoritative normalized evidence and reports the proposed multiplier, but the
-effective multiplier remains `1`. `live` applies the multiplier only when the
-chat ID is also present in `entry_preamble_live_chat_ids`.
+effective multiplier remains `1`. `live` applies the multiplier to every group
+already configured for automatic trading; there is no separate chat allowlist.
 
 `半仓操作` means `configured risk budget × 50%`; it does not mean half of
 the account balance, half of the order quantity, or half leverage. Sizing must
@@ -593,7 +593,7 @@ show both the configured and effective risk budgets and the two Telegram
 message IDs. Raw prompts, provider responses, and credentials must not appear
 in operator output.
 
-Before shadow verification, update `trading.analysis.shared` through the Web
+Before live activation, update `trading.analysis.shared` through the Web
 prompt center using the normal `draft -> validate -> historical test ->
 publish` workflow. The application seed only creates a missing definition and
 never overwrites the current published production prompt. Both MiMo and
