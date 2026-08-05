@@ -701,11 +701,13 @@ def _persist_candidate(
     symbol="BTC",
     side="long",
     parse_source=None,
+    chat_id=100,
+    message_id=55,
 ):
     with session_factory() as session:
         raw = RawMessage(
-            chat_id=100,
-            message_id=55,
+            chat_id=chat_id,
+            message_id=message_id,
             sender_id=200,
             sender_name="Alice",
             posted_at=datetime(2026, 6, 12, 8, 0),
@@ -790,8 +792,9 @@ def _persist_half_risk_preamble_before(session_factory, *, strategy_raw_message_
         return preamble.id
 
 
-def test_live_entry_preamble_multiplies_usdt_risk_before_contract_sizing(tmp_path):
-    session_factory = create_session_factory(tmp_path / "half-risk-live.db")
+@pytest.mark.parametrize("chat_id", [100, 200])
+def test_live_entry_preamble_multiplies_usdt_risk_before_contract_sizing(tmp_path, chat_id):
+    session_factory = create_session_factory(tmp_path / f"half-risk-live-{chat_id}.db")
     strategy_raw_id = _persist_candidate(
         session_factory,
         text="BTC short 63900-64200 SL 64900 TP 62800",
@@ -800,6 +803,7 @@ def test_live_entry_preamble_multiplies_usdt_risk_before_contract_sizing(tmp_pat
         take_profit_text="62800",
         symbol="BTC",
         side="short",
+        chat_id=chat_id,
     )
     preamble_id = _persist_half_risk_preamble_before(
         session_factory, strategy_raw_message_id=strategy_raw_id
@@ -811,14 +815,13 @@ def test_live_entry_preamble_multiplies_usdt_risk_before_contract_sizing(tmp_pat
             "default_max_loss_usdt": 20,
             "allowed_symbols": ["BTC"],
             "entry_preamble_mode": "live",
-            "entry_preamble_live_chat_ids": [100],
         },
     )
 
     result = auto_process_message_trade_signal(
         session_factory,
         raw_message_id=strategy_raw_id,
-        group_config=_group_config(),
+        group_config=_group_config(chat_id=chat_id),
         deepcoin_client=_FakeDeepcoinClient(),
         contract_spec_provider=_StaticContractSpecProvider(),
         processed_at=datetime(2026, 8, 5, 12, 2, tzinfo=UTC),
@@ -908,7 +911,6 @@ def test_invalid_persisted_entry_preamble_multiplier_blocks_before_trade_signal(
             "default_max_loss_usdt": 20,
             "allowed_symbols": ["BTC"],
             "entry_preamble_mode": "live",
-            "entry_preamble_live_chat_ids": [100],
         },
     )
 
@@ -959,12 +961,12 @@ def test_auto_process_skips_symbol_price_scale_review_candidate_before_exchange_
     }
 
 
-def _group_config():
+def _group_config(*, chat_id=100):
     return GroupConfig(
         groups=[
             TargetGroupConfig(
                 chat_title="Auto Group",
-                chat_id=100,
+                chat_id=chat_id,
                 enabled=True,
                 trading_mode="auto_trade",
                 max_loss_usdt=20.0,

@@ -579,7 +579,6 @@ def _auto_process_single_message_trade_signal(
         signal_candidate_id=int(candidate.id),
         strategy_instance_id=strategy_instance_id,
         mode=settings.entry_preamble_mode,
-        live_chat_ids=set(settings.entry_preamble_live_chat_ids),
         assembled_at=now,
     )
     if assembly.status == "unresolved":
