@@ -16,6 +16,12 @@ from telegram_kol_research.models import (
     TriggerProtectionIntent,
 )
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
+from telegram_kol_research.trigger_protection_assignment import (
+    ProtectionAssignmentResult,
+    ProtectionOrderCandidate,
+    ProtectionOwner,
+    assign_trigger_protection_orders,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +147,21 @@ class TriggerProtectionLivePositionResult:
     def __post_init__(self) -> None:
         if (self.position is None) == (self.refusal is None):
             raise ValueError("live position result must have exactly one outcome")
+
+
+@dataclass(frozen=True, slots=True)
+class TriggerProtectionAssignmentContext:
+    entry_leg: ExecutionOrderLeg
+    intent: TriggerProtectionIntent
+    parent_event: ExecutionEvent
+    live_position: TriggerProtectionLivePosition
+
+
+@dataclass(frozen=True, slots=True)
+class TriggerProtectionAssignmentPlan:
+    actions: dict[int, EntryProtectionLedgerRepairAction]
+    refusals: dict[int, EntryProtectionLedgerRepairRefusal]
+    assignment: ProtectionAssignmentResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -1081,6 +1102,241 @@ def plan_verified_trigger_entry_protection_adoption(
     )
 
 
+def plan_trigger_protection_intent_assignments(
+    *,
+    contexts: tuple[TriggerProtectionAssignmentContext, ...],
+    pending_tpsl_rows: list[dict[str, Any]],
+    existing_ledger_rows: list[PositionProtectionLedger],
+    snapshot_complete: bool,
+) -> TriggerProtectionAssignmentPlan:
+    """Plan all anonymous stop-only adoptions from one coherent snapshot."""
+
+    owners: list[ProtectionOwner] = []
+    contexts_by_leg: dict[int, TriggerProtectionAssignmentContext] = {}
+    refusals: dict[int, EntryProtectionLedgerRepairRefusal] = {}
+    baseline_order_ids: set[str] = set()
+    for context in sorted(contexts, key=lambda item: int(item.entry_leg.id or 0)):
+        leg = context.entry_leg
+        intent = context.intent
+        event = context.parent_event
+        live_position = context.live_position
+        leg_id = int(leg.id or 0)
+        binding_id = int(leg.execution_binding_id or 0)
+        pos_id = str(leg.pos_id or "").strip()
+        request = _loads_json(leg.request_json)
+        event_request = _loads_json(event.request_json)
+        expected_rows = _expected_protection_rows(request)
+        expected_purposes = {str(row.get("purpose") or "") for row in expected_rows}
+        instrument_id = _request_instrument_id(request)
+        side = _request_side(request)
+        size_text = _request_size_text(request)
+        expected_parent = str(intent.parent_trigger_order_id or "").strip()
+        baseline_ids = _baseline_order_ids(intent.pre_submit_tpsl_baseline_json)
+        if baseline_ids is None:
+            refusals[leg_id] = _assignment_refusal(
+                event,
+                binding_id,
+                pos_id,
+                "trigger_protection_baseline_invalid",
+            )
+            continue
+        baseline_order_ids.update(baseline_ids)
+        if expected_purposes != {"stop_loss"}:
+            continue
+        if (
+            not leg_id
+            or not binding_id
+            or int(intent.execution_binding_id or 0) != binding_id
+            or int(intent.execution_order_leg_id or 0) != leg_id
+            or str(intent.venue or "").lower() != "deepcoin"
+            or str(leg.venue or "").lower() != "deepcoin"
+            or str(leg.purpose or "") != "entry"
+            or str(leg.order_kind or "") != "trigger_limit"
+            or str(leg.attribution_status or "") != "verified"
+            or str(leg.status or "").lower() != "active"
+            or not pos_id
+            or not instrument_id
+            or not side
+            or not size_text
+            or not expected_parent
+            or not _same_nonempty_text(expected_parent, leg.order_id)
+            or not _same_nonempty_text(expected_parent, event.order_id)
+            or event.action != "create_trigger_entry"
+            or str(event.venue or "").lower() != "deepcoin"
+            or int(event.execution_binding_id or 0) != binding_id
+            or _trigger_protection_fingerprint(request) != intent.request_fingerprint
+            or _trigger_protection_fingerprint(event_request)
+            != intent.request_fingerprint
+            or live_position.pos_id != pos_id
+            or live_position.instrument_id.upper() != instrument_id.upper()
+            or live_position.side.lower() != side.lower()
+            or not _same_numeric_text(live_position.size_text, size_text)
+        ):
+            refusals[leg_id] = _assignment_refusal(
+                event,
+                binding_id,
+                pos_id,
+                "trigger_protection_intent_identity_invalid",
+            )
+            continue
+        owners.append(
+            ProtectionOwner(
+                leg_id=leg_id,
+                binding_id=binding_id,
+                pos_id=pos_id,
+                instrument_id=instrument_id,
+                side=side,
+                size_text=size_text,
+                stop_price=str(expected_rows[0]["trigger_price"]),
+                position_created_at=live_position.created_at,
+            )
+        )
+        contexts_by_leg[leg_id] = context
+
+    candidates: list[ProtectionOrderCandidate] = []
+    candidate_rows: dict[str, dict[str, Any]] = {}
+    for row in pending_tpsl_rows:
+        if not isinstance(row, dict):
+            continue
+        order_id = _row_order_id(row)
+        instrument_id = _request_instrument_id(row)
+        side = _request_side(row)
+        size_text = _row_size_text(row)
+        stop_price = _first_nonzero_text(
+            row,
+            "slTriggerPx",
+            "slTriggerPrice",
+            "closeSLTriggerPrice",
+        )
+        take_profit = _first_nonzero_text(
+            row,
+            "tpTriggerPx",
+            "tpTriggerPrice",
+            "closeTPTriggerPrice",
+        )
+        if (
+            not order_id
+            or order_id in baseline_order_ids
+            or str(row.get("triggerOrderType") or "TPSL").upper() != "TPSL"
+            or not instrument_id
+            or not side
+            or not size_text
+            or not stop_price
+            or take_profit is not None
+        ):
+            continue
+        candidates.append(
+            ProtectionOrderCandidate(
+                order_id=order_id,
+                instrument_id=instrument_id,
+                side=side,
+                size_text=size_text,
+                stop_price=stop_price,
+                created_at=_row_creation_time(row),
+                explicit_pos_ids=tuple(sorted(_row_position_ids(row))),
+            )
+        )
+        candidate_rows[order_id] = row
+
+    existing_order_owners: dict[str, str] = {}
+    conflicted_order_ids: set[str] = set()
+    for ledger in existing_ledger_rows:
+        if (
+            str(ledger.venue or "").lower() != "deepcoin"
+            or str(ledger.status or "").lower() != "verified"
+            or not str(ledger.order_id or "").strip()
+            or not str(ledger.pos_id or "").strip()
+        ):
+            continue
+        order_id = str(ledger.order_id).strip()
+        pos_id = str(ledger.pos_id).strip()
+        previous = existing_order_owners.get(order_id)
+        if previous is not None and previous != pos_id:
+            conflicted_order_ids.add(order_id)
+        existing_order_owners[order_id] = pos_id
+    for order_id in conflicted_order_ids:
+        existing_order_owners[order_id] = "__immutable_owner_conflict__"
+
+    assignment = assign_trigger_protection_orders(
+        owners=tuple(owners),
+        candidates=tuple(candidates),
+        existing_order_owners=existing_order_owners,
+        snapshot_complete=snapshot_complete,
+    )
+    actions: dict[int, EntryProtectionLedgerRepairAction] = {}
+    for leg_id, order_id in assignment.assignments.items():
+        context = contexts_by_leg[leg_id]
+        owner = next(owner for owner in owners if owner.leg_id == leg_id)
+        row = candidate_rows[order_id]
+        actions[leg_id] = EntryProtectionLedgerRepairAction(
+            event_id=int(context.parent_event.id),
+            binding_id=owner.binding_id,
+            leg_id=leg_id,
+            strategy_instance_id=context.entry_leg.strategy_instance_id,
+            pos_id=owner.pos_id,
+            instrument_id=owner.instrument_id,
+            side=owner.side,
+            order_id=order_id,
+            purpose="stop_loss",
+            trigger_price=owner.stop_price,
+            size_text=_row_size_text(row) or owner.size_text,
+            evidence={
+                "assignment_method": "account_wide_mutual_unique",
+                "intent_id": (
+                    int(context.intent.id)
+                    if context.intent.id is not None
+                    else None
+                ),
+                "match": "verified_filled_leg_unique_child",
+                "parent_trigger_order_id": context.intent.parent_trigger_order_id,
+                "snapshot_fingerprint": assignment.snapshot_fingerprint,
+                "source": "pending",
+            },
+        )
+    for conflict in assignment.conflicts:
+        for leg_id in conflict.owner_leg_ids:
+            context = contexts_by_leg.get(leg_id)
+            if context is None or leg_id in actions or leg_id in refusals:
+                continue
+            refusals[leg_id] = _assignment_refusal(
+                context.parent_event,
+                int(context.entry_leg.execution_binding_id),
+                str(context.entry_leg.pos_id),
+                f"trigger_{conflict.reason_code}",
+                list(conflict.candidate_order_ids),
+                extra_evidence={
+                    "snapshot_fingerprint": assignment.snapshot_fingerprint
+                },
+            )
+    return TriggerProtectionAssignmentPlan(
+        actions=dict(sorted(actions.items())),
+        refusals=dict(sorted(refusals.items())),
+        assignment=assignment,
+    )
+
+
+def _assignment_refusal(
+    event: ExecutionEvent,
+    binding_id: int,
+    pos_id: str,
+    reason: str,
+    candidate_ids: list[str] | None = None,
+    *,
+    extra_evidence: dict[str, Any] | None = None,
+) -> EntryProtectionLedgerRepairRefusal:
+    evidence: dict[str, Any] = {
+        "candidate_order_ids": sorted(set(candidate_ids or []))
+    }
+    evidence.update(extra_evidence or {})
+    return EntryProtectionLedgerRepairRefusal(
+        event_id=int(event.id) if event.id is not None else None,
+        binding_id=binding_id or None,
+        pos_id=pos_id or None,
+        reason=reason,
+        evidence=evidence,
+    )
+
+
 def plan_trigger_protection_intent_adoption(
     session,
     *,
@@ -1154,7 +1410,49 @@ def plan_trigger_protection_intent_adoption(
     baseline_ids = _baseline_order_ids(intent.pre_submit_tpsl_baseline_json)
     if baseline_ids is None:
         return _intent_refusal(parent_event, binding_id, pos_id, "trigger_protection_baseline_invalid")
+    anonymous_stop_key = _anonymous_stop_request_key(request)
+    sibling_can_own_anonymous_stop = anonymous_stop_key is not None and any(
+        _other_intent_can_own_anonymous_stop(
+            intent=intent,
+            other_intent=other_intent,
+            anonymous_stop_key=anonymous_stop_key,
+            existing_intent_requests=existing_intent_requests,
+            existing_intent_owner_states=existing_intent_owner_states,
+        )
+        for other_intent in existing_intents
+    )
+    if expected_purposes == {"stop_loss"} and not sibling_can_own_anonymous_stop:
+        global_plan = plan_trigger_protection_intent_assignments(
+            contexts=(
+                TriggerProtectionAssignmentContext(
+                    entry_leg=entry_leg,
+                    intent=intent,
+                    parent_event=parent_event,
+                    live_position=live_position,
+                ),
+            ),
+            pending_tpsl_rows=pending_tpsl_rows,
+            existing_ledger_rows=existing_ledger_rows,
+            snapshot_complete=True,
+        )
+        action = global_plan.actions.get(int(entry_leg.id or 0))
+        if action is not None:
+            return TriggerProtectionIntentAdoptionResult(action=action)
+        refusal = global_plan.refusals.get(int(entry_leg.id or 0))
+        if (
+            refusal is not None
+            and refusal.reason
+            == "trigger_protection_assignment_not_mutual_unique"
+        ):
+            return _intent_refusal(
+                parent_event,
+                binding_id,
+                pos_id,
+                "trigger_protection_candidate_not_unique",
+                list(refusal.evidence.get("candidate_order_ids") or []),
+            )
     candidates: list[tuple[dict[str, Any], str]] = []
+    prefill_candidate_ids: list[str] = []
     pending_order_ids = {
         _row_order_id(row)
         for row in pending_tpsl_rows
@@ -1222,15 +1520,20 @@ def plan_trigger_protection_intent_adoption(
                 if candidate_created_at < _coerce_utc_naive(
                     live_position.created_at
                 ):
-                    return _intent_refusal(
-                        parent_event,
-                        binding_id,
-                        pos_id,
-                        "trigger_protection_candidate_predates_fill",
-                        [_row_order_id(row)],
-                    )
+                    order_id = _row_order_id(row)
+                    if order_id:
+                        prefill_candidate_ids.append(order_id)
+                    continue
                 candidates.append((row, source))
     if not candidates:
+        if prefill_candidate_ids:
+            return _intent_refusal(
+                parent_event,
+                binding_id,
+                pos_id,
+                "trigger_protection_candidate_predates_fill",
+                prefill_candidate_ids,
+            )
         return TriggerProtectionIntentAdoptionResult(
             deferred=TriggerProtectionIntentAdoptionDeferred(
                 reason="trigger_protection_not_yet_observable",
@@ -1245,7 +1548,6 @@ def plan_trigger_protection_intent_adoption(
     row, source = candidates[0]
     order_id = _row_order_id(row)
     assert order_id is not None
-    anonymous_stop_key = _anonymous_stop_request_key(request)
     if not _row_position_ids(row) and any(
         _other_intent_can_own_anonymous_stop(
             intent=intent,

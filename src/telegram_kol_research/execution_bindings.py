@@ -1325,6 +1325,9 @@ def _retry_saved_trigger_protection_intents_for_unavailable_snapshot(
             recovered_at,
             transition_trigger_protection_intent,
             consume_attempt=False,
+            recovery_disposition="wait",
+            last_reason_code="snapshot_incomplete",
+            last_evidence={"snapshot_sources": sources},
         )
 
 
@@ -1334,10 +1337,12 @@ def _reconcile_saved_trigger_protection_intents(
     """Apply saved trigger intents using only this bounded, read-only snapshot."""
     from telegram_kol_research.entry_protection_ledger_repair import (
         EntryProtectionLedgerRepairRefusal,
+        TriggerProtectionAssignmentContext,
         TriggerProtectionOwnerState,
         build_trigger_protection_live_position,
         finalize_trigger_protection_adoption,
         plan_trigger_protection_intent_adoption,
+        plan_trigger_protection_intent_assignments,
     )
     from telegram_kol_research.trigger_protection_intents import (
         transition_trigger_protection_intent,
@@ -1389,6 +1394,9 @@ def _reconcile_saved_trigger_protection_intents(
                 recovered_at,
                 transition_trigger_protection_intent,
                 consume_attempt=False,
+                recovery_disposition="wait",
+                last_reason_code="snapshot_incomplete",
+                last_evidence={"snapshot_sources": errors},
             )
         return handled
 
@@ -1416,8 +1424,81 @@ def _reconcile_saved_trigger_protection_intents(
     events = session.query(ExecutionEvent).filter(
         ExecutionEvent.venue == "deepcoin", ExecutionEvent.action == "create_trigger_entry"
     ).order_by(ExecutionEvent.id.asc()).all()
+    assignment_contexts: list[TriggerProtectionAssignmentContext] = []
     for intent, leg in eligible:
         if not _trigger_intent_due(intent, recovered_at):
+            continue
+        parent_events = [
+            event
+            for event in events
+            if int(event.execution_binding_id or 0)
+            == int(leg.execution_binding_id)
+            and _same_present_text(event.order_id, leg.order_id)
+            and _same_present_text(event.client_order_id, leg.client_order_id)
+        ]
+        if len(parent_events) != 1:
+            continue
+        live_position_result = build_trigger_protection_live_position(
+            entry_leg=leg,
+            position_rows=snapshot.positions,
+            observed_at=recovered_at,
+        )
+        if live_position_result.position is None:
+            continue
+        assignment_contexts.append(
+            TriggerProtectionAssignmentContext(
+                entry_leg=leg,
+                intent=intent,
+                parent_event=parent_events[0],
+                live_position=live_position_result.position,
+            )
+        )
+    global_plan = plan_trigger_protection_intent_assignments(
+        contexts=tuple(assignment_contexts),
+        pending_tpsl_rows=snapshot.pending_trigger_orders,
+        existing_ledger_rows=existing_ledger_rows,
+        snapshot_complete=True,
+    )
+    globally_processed_leg_ids: set[int] = set()
+    contexts_by_leg = {
+        int(context.entry_leg.id): context for context in assignment_contexts
+    }
+    for leg_id, action in global_plan.actions.items():
+        context = contexts_by_leg[leg_id]
+        row = finalize_trigger_protection_adoption(
+            session,
+            action=action,
+            intent=context.intent,
+            seen_at=recovered_at,
+        )
+        existing_ledger_rows.append(row)
+        result.protection_adopted += 1
+        globally_processed_leg_ids.add(leg_id)
+    for leg_id, refusal in global_plan.refusals.items():
+        if refusal.reason != "trigger_protection_assignment_not_mutual_unique":
+            continue
+        context = contexts_by_leg[leg_id]
+        result.protection_adoption_deferred += 1
+        _record_protection_adoption_refusal(
+            session,
+            leg=context.entry_leg,
+            refusal=refusal,
+            created_at=recovered_at,
+        )
+        _schedule_trigger_intent_retry(
+            session,
+            context.intent,
+            recovered_at,
+            transition_trigger_protection_intent,
+            recovery_disposition="exact_backup",
+            last_reason_code="protection_assignment_not_mutual_unique",
+            last_evidence=refusal.evidence,
+        )
+        globally_processed_leg_ids.add(leg_id)
+    for intent, leg in eligible:
+        if not _trigger_intent_due(intent, recovered_at):
+            continue
+        if int(leg.id) in globally_processed_leg_ids:
             continue
         parent_events = [event for event in events if int(event.execution_binding_id or 0) == int(leg.execution_binding_id)
                          and _same_present_text(event.order_id, leg.order_id)
@@ -1472,7 +1553,15 @@ def _reconcile_saved_trigger_protection_intents(
                 event_id=int(parent.id), binding_id=int(leg.execution_binding_id), pos_id=str(leg.pos_id),
                 reason=adoption.deferred.reason, evidence=adoption.deferred.evidence,
             ), created_at=recovered_at)
-            _schedule_trigger_intent_retry(session, intent, recovered_at, transition_trigger_protection_intent)
+            _schedule_trigger_intent_retry(
+                session,
+                intent,
+                recovered_at,
+                transition_trigger_protection_intent,
+                recovery_disposition="retry",
+                last_reason_code="candidate_not_yet_observable",
+                last_evidence=adoption.deferred.evidence,
+            )
         elif adoption.refusal is not None:
             _refuse_trigger_intent(session, leg, intent, adoption.refusal, recovered_at, result, transition_trigger_protection_intent)
     return handled
@@ -1496,6 +1585,9 @@ def _schedule_trigger_intent_retry(
     transition,
     *,
     consume_attempt: bool = True,
+    recovery_disposition: str | None = None,
+    last_reason_code: str | None = None,
+    last_evidence: dict[str, Any] | None = None,
 ) -> None:
     current_attempts = int(intent.retry_attempts or 0)
     attempts = min(
@@ -1503,13 +1595,28 @@ def _schedule_trigger_intent_retry(
         _TRIGGER_PROTECTION_RETRY_LIMIT,
     )
     if attempts >= _TRIGGER_PROTECTION_RETRY_LIMIT:
-        transition(session, intent, recovery_state="failed", retry_attempts=attempts)
+        transition(
+            session,
+            intent,
+            recovery_state="failed",
+            retry_attempts=attempts,
+            recovery_disposition=recovery_disposition,
+            last_reason_code=last_reason_code,
+            last_evidence=last_evidence,
+        )
     else:
         backoff_attempt = max(attempts, 1)
-        transition(session, intent, recovery_state="retrying", retry_attempts=attempts,
-                   next_attempt_at=now + timedelta(
-                       minutes=min(5 * 2 ** (backoff_attempt - 1), 60)
-                   ))
+        transition(
+            session,
+            intent,
+            recovery_state="retrying",
+            retry_attempts=attempts,
+            next_attempt_at=now
+            + timedelta(minutes=min(5 * 2 ** (backoff_attempt - 1), 60)),
+            recovery_disposition=recovery_disposition,
+            last_reason_code=last_reason_code,
+            last_evidence=last_evidence,
+        )
 
 
 def _refuse_trigger_intent(session, leg, intent, refusal, now, result, transition) -> None:

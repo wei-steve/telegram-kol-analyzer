@@ -1088,6 +1088,38 @@ def test_pending_trigger_protection_candidate_before_position_is_refused(tmp_pat
     assert result.refusal.reason == "trigger_protection_candidate_predates_fill"
 
 
+def test_prefill_candidate_does_not_block_newer_unique_candidate(tmp_path):
+    old_row = _pending_tpsl_row(
+        "tpsl-old",
+        purpose="combined",
+        price="1860",
+        stop_price="1900",
+        ctime="2026-07-20T00:11:13Z",
+        inst_id="ETH-USDT-SWAP",
+        side="short",
+        size="4.4",
+    )
+    old_row["posId"] = "pos-1"
+    new_row = dict(old_row)
+    new_row.update(
+        {
+            "ordId": "tpsl-newer",
+            "cTime": "2026-07-20T00:11:15Z",
+            "uTime": "2026-07-20T00:11:15Z",
+        }
+    )
+
+    result = _plan_intent_adoption(
+        tmp_path,
+        pending_rows=[old_row, new_row],
+        live_position_created_at=datetime(2026, 7, 20, 0, 11, 14),
+    )
+
+    assert result.refusal is None
+    assert result.action is not None
+    assert result.action.order_id == "tpsl-newer"
+
+
 def test_history_trigger_protection_candidate_before_position_is_refused(tmp_path):
     history = _pending_tpsl_row(
         "tpsl-history",

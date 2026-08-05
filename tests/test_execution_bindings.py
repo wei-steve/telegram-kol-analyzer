@@ -220,12 +220,14 @@ class _ProtectionAdoptionReconciliationClient:
         history_rows=None,
         pending_error=None,
         positions=None,
+        order_history_rows=None,
     ):
         self.pending_rows = list(pending_rows or [])
         self.pending_error = pending_error
         self.history_rows = list(history_rows or [])
         self.pending_calls = 0
         self.positions = positions
+        self.order_history_rows = order_history_rows
 
     def list_positions(self):
         default = [
@@ -253,6 +255,8 @@ class _ProtectionAdoptionReconciliationClient:
         return self.pending_rows
 
     def list_order_history(self, *, inst_id=None):
+        if self.order_history_rows is not None:
+            return list(self.order_history_rows)
         return [
             {
                 "instId": "ETH-USDT-SWAP",
@@ -425,6 +429,272 @@ def _pending_combined_tpsl(order_id):
         "cTime": "1784512861000",
         "uTime": "1784512861000",
     }
+
+
+def _seed_identical_filled_stop_intents(
+    session_factory,
+    *,
+    first_already_owned: bool,
+):
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            symbol="ETH",
+            side="short",
+            order_id="first-entry",
+            client_order_id="first-client",
+            status="open",
+        ),
+    )
+    leg_ids = []
+    for leg_index, prefix, pos_id in (
+        (1, "first", "first-pos"),
+        (2, "second", "second-pos"),
+    ):
+        request = {
+            "clOrdId": f"{prefix}-client",
+            "instId": "ETH-USDT-SWAP",
+            "orderType": "limit",
+            "posSide": "short",
+            "price": "1900",
+            "side": "sell",
+            "slOrdPx": -1,
+            "slTriggerPx": "1935",
+            "sz": "3.4",
+            "tdMode": "cross",
+            "triggerPrice": "1900",
+        }
+        leg_id = upsert_execution_order_leg(
+            session_factory,
+            ExecutionOrderLegRecord(
+                execution_binding_id=binding_id,
+                leg_index=leg_index,
+                order_kind="trigger_limit",
+                strategy_instance_id="deepcoin:100:55:ETH:short",
+                order_id=f"{prefix}-entry",
+                client_order_id=f"{prefix}-client",
+                pos_id=pos_id,
+                status="active",
+                attribution_status="verified",
+                attribution_evidence={"evidence_type": "test_exact_position"},
+                request=request,
+            ),
+        )
+        leg_ids.append(leg_id)
+        with session_factory() as session:
+            session.add(
+                ExecutionEvent(
+                    execution_binding_id=binding_id,
+                    strategy_instance_id="deepcoin:100:55:ETH:short",
+                    venue="deepcoin",
+                    action="create_trigger_entry",
+                    status="submitted",
+                    symbol="ETH",
+                    side="short",
+                    order_id=f"{prefix}-entry",
+                    client_order_id=f"{prefix}-client",
+                    reason="live_signal_auto_trade",
+                    request_json=json.dumps(request),
+                    response_json=json.dumps(
+                        {"data": {"ordId": f"{prefix}-entry"}}
+                    ),
+                    created_at=datetime(2026, 8, 5, 17, 30 + leg_index),
+                )
+            )
+            fingerprint_request = dict(request)
+            fingerprint_request["tpTriggerPx"] = None
+            fingerprint_request["slTriggerPx"] = request["slTriggerPx"]
+            session.add(
+                TriggerProtectionIntent(
+                    venue="deepcoin",
+                    execution_binding_id=binding_id,
+                    execution_order_leg_id=leg_id,
+                    request_fingerprint=hashlib.sha256(
+                        json.dumps(
+                            fingerprint_request,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode()
+                    ).hexdigest(),
+                    pre_submit_tpsl_baseline_json="[]",
+                    correlation_id=f"{prefix}-intent",
+                    parent_trigger_order_id=f"{prefix}-entry",
+                    recovery_state=(
+                        "adopted"
+                        if prefix == "first" and first_already_owned
+                        else "pending"
+                    ),
+                    adopted_order_id=(
+                        "first-stop"
+                        if prefix == "first" and first_already_owned
+                        else None
+                    ),
+                )
+            )
+            create_or_get_protection_leg(
+                session,
+                venue="deepcoin",
+                execution_order_leg_id=leg_id,
+                role="primary_stop",
+                leg_index=1,
+                planned_trigger_price="1935",
+                planned_size="3.4",
+            )
+            if prefix == "first" and first_already_owned:
+                session.add(
+                    PositionProtectionLedger(
+                        venue="deepcoin",
+                        execution_binding_id=binding_id,
+                        execution_order_leg_id=leg_id,
+                        strategy_instance_id="deepcoin:100:55:ETH:short",
+                        pos_id="first-pos",
+                        instrument_id="ETH-USDT-SWAP",
+                        side="short",
+                        order_id="first-stop",
+                        purpose="stop_loss",
+                        trigger_price="1935",
+                        size_text="3.4",
+                        status="verified",
+                        evidence_source="test",
+                    )
+                )
+            session.commit()
+    return tuple(leg_ids)
+
+
+def _anonymous_stop(order_id, created_at):
+    return {
+        "ordId": order_id,
+        "instId": "ETH-USDT-SWAP",
+        "posId": "",
+        "posSide": "short",
+        "triggerOrderType": "TPSL",
+        "sz": "3.4",
+        "slTriggerPx": "1935",
+        "slOrdPx": "-1",
+        "cTime": created_at,
+        "uTime": created_at,
+    }
+
+
+def _filled_entry_history(prefix, pos_id, fill_time):
+    return {
+        "instId": "ETH-USDT-SWAP",
+        "ordId": f"{prefix}-entry",
+        "clOrdId": f"{prefix}-client",
+        "posId": pos_id,
+        "state": "filled",
+        "posSide": "short",
+        "fillSz": "3.4",
+        "avgPx": "1900",
+        "fillTime": fill_time,
+    }
+
+
+def test_reconcile_assigns_second_identical_split_stop_globally(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_identical_filled_stop_intents(
+        session_factory,
+        first_already_owned=True,
+    )
+    positions = [
+        {
+            "instId": "ETH-USDT-SWAP",
+            "posId": "first-pos",
+            "posSide": "short",
+            "pos": "3.4",
+            "cTime": "2026-08-05T17:40:00Z",
+        },
+        {
+            "instId": "ETH-USDT-SWAP",
+            "posId": "second-pos",
+            "posSide": "short",
+            "pos": "3.4",
+            "cTime": "2026-08-05T18:00:00Z",
+        },
+    ]
+    pending = [
+        _anonymous_stop("second-stop", "2026-08-05T18:00:03Z"),
+        _anonymous_stop("first-stop", "2026-08-05T17:40:25Z"),
+    ]
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient(
+            pending,
+            positions=positions,
+            order_history_rows=[
+                _filled_entry_history(
+                    "first", "first-pos", "2026-08-05T17:40:00Z"
+                ),
+                _filled_entry_history(
+                    "second", "second-pos", "2026-08-05T18:00:00Z"
+                ),
+            ],
+        ),
+        recovered_at=datetime(2026, 8, 5, 18, 1),
+    )
+
+    with session_factory() as session:
+        intents = session.query(TriggerProtectionIntent).order_by(
+            TriggerProtectionIntent.execution_order_leg_id.asc()
+        ).all()
+        ledger_by_order = {
+            row.order_id: row for row in session.query(PositionProtectionLedger).all()
+        }
+    assert intents[0].recovery_state == "adopted"
+    assert intents[1].recovery_state == "adopted"
+    assert intents[1].adopted_order_id == "second-stop"
+    assert ledger_by_order["second-stop"].pos_id == "second-pos"
+    assert result.protection_adopted == 1
+
+
+def test_reconcile_keeps_true_anonymous_stop_ambiguity_recoverable(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_identical_filled_stop_intents(
+        session_factory,
+        first_already_owned=False,
+    )
+    positions = [
+        {
+            "instId": "ETH-USDT-SWAP",
+            "posId": pos_id,
+            "posSide": "short",
+            "pos": "3.4",
+            "cTime": "2026-08-05T17:40:00Z",
+        }
+        for pos_id in ("first-pos", "second-pos")
+    ]
+    pending = [
+        _anonymous_stop("first-stop", "2026-08-05T17:40:25Z"),
+        _anonymous_stop("second-stop", "2026-08-05T17:40:26Z"),
+    ]
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient(
+            pending,
+            positions=positions,
+            order_history_rows=[
+                _filled_entry_history(
+                    "first", "first-pos", "2026-08-05T17:40:00Z"
+                ),
+                _filled_entry_history(
+                    "second", "second-pos", "2026-08-05T17:40:00Z"
+                ),
+            ],
+        ),
+        recovered_at=datetime(2026, 8, 5, 18, 1),
+    )
+
+    with session_factory() as session:
+        intents = session.query(TriggerProtectionIntent).all()
+        ledger_rows = session.query(PositionProtectionLedger).all()
+    assert result.protection_adopted == 0
+    assert ledger_rows == []
+    assert {intent.recovery_state for intent in intents} == {"retrying"}
+    assert {intent.recovery_disposition for intent in intents} == {"exact_backup"}
 
 
 def test_reconcile_protection_adoption_records_unique_exact_trigger_entry_tpsl(tmp_path):
@@ -1282,6 +1552,8 @@ def test_reconcile_defers_saved_intent_once_and_backs_off_duplicate_delivery(tmp
     assert second.protection_adoption_deferred == 0
     assert intent.recovery_state == "retrying"
     assert intent.retry_attempts == 1
+    assert intent.recovery_disposition == "retry"
+    assert intent.last_reason_code == "candidate_not_yet_observable"
     assert len(audits) == 1
 
 
@@ -1347,6 +1619,8 @@ def test_reconcile_saved_intent_records_unavailable_snapshot_and_retries(tmp_pat
     assert result.protection_snapshot_unavailable == 1
     assert intent.recovery_state == "retrying"
     assert intent.retry_attempts == 1
+    assert intent.recovery_disposition == "wait"
+    assert intent.last_reason_code == "snapshot_incomplete"
     assert json.loads(audit.evidence_json)["reason"] == "trigger_protection_snapshot_unavailable"
 
 
