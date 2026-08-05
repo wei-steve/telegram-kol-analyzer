@@ -11,6 +11,7 @@ from telegram_kol_research.models import (
     ExecutionOrderLeg,
     MediaAsset,
     PositionAttributionAudit,
+    PendingTpslSnapshotObservation,
     PositionProtectionLedger,
     PositionProtectionRevision,
     PositionBackupStopOrder,
@@ -592,14 +593,14 @@ def test_load_strategy_record_detail_builds_full_evidence_chain(tmp_path):
         "backup_stop_status": "active",
         "backup_order_id": "backup-stop-1",
         "backup_stop_blocker": None,
-        "position_owner_verified": True,
+            "position_owner_verified": False,
         "native_stop_assignment_pending": False,
         "exact_backup_stop_verified": True,
         "take_profit_convergence_waiting": False,
         "take_profit_convergence_ready": False,
-        "risk_reduction_capability_available": True,
+        "risk_reduction_capability_available": False,
         "manual_review_required": False,
-        "operator_message": "主止损失败，第二止损有效",
+            "operator_message": "持仓归属未验证",
     }]
 
 
@@ -781,6 +782,11 @@ def test_verified_position_with_recoverable_stop_ambiguity_keeps_risk_reduction_
             client_order_id="backup-exact-client-1",
             status="active",
             request_json="{}",
+        ))
+        session.add(PendingTpslSnapshotObservation(
+            venue="deepcoin", instrument_id="BTC-USDT-SWAP",
+            response_count=1, order_ids_json='["backup-exact-1"]',
+            complete=True, observed_at=NOW,
         ))
         session.commit()
         lifecycle_id = int(lifecycle.id)
@@ -1470,6 +1476,7 @@ def _seed_trigger_entry_strategy(session):
         pos_id="pos-adopted",
         venue="deepcoin",
         attribution_status="verified",
+        attribution_evidence_json='{"policy_version":2}',
         status="active",
         created_at=NOW,
         updated_at=NOW,

@@ -1248,8 +1248,10 @@ def capture_uncaptured_runtime_incident_sources(
         RuntimeIncident,
         StrategyManagementBatch,
         StrategyManagementLeg,
+        TriggerProtectionIntent,
+        TriggerTakeProfitConvergence,
     )
-    from sqlalchemy import String, and_, cast, exists, or_
+    from sqlalchemy import String, and_, cast, exists, func, literal, or_
 
     try:
         config = config_loader()
@@ -1391,6 +1393,133 @@ def capture_uncaptured_runtime_incident_sources(
                     occurred_at=occurred_at,
                 )
                 captured += int(row is not None)
+            now = datetime.now(UTC)
+            with session_factory() as session:
+                convergence_source_id = (
+                    literal("tp-convergence-")
+                    + cast(TriggerTakeProfitConvergence.id, String)
+                    + literal("-")
+                    + TriggerTakeProfitConvergence.status
+                    + literal("-")
+                    + func.coalesce(
+                        TriggerTakeProfitConvergence.reason_code, "none"
+                    )
+                )
+                convergence_already_captured = exists().where(and_(
+                    RuntimeIncident.source_kind
+                    == "position_protection_incident",
+                    RuntimeIncident.source_record_id == convergence_source_id,
+                    RuntimeIncident.incident_type
+                    == "severe_protection_incident",
+                ))
+                intent_source_id = (
+                    literal("trigger-intent-")
+                    + cast(TriggerProtectionIntent.id, String)
+                    + literal("-")
+                    + TriggerProtectionIntent.recovery_state
+                    + literal("-")
+                    + func.coalesce(
+                        TriggerProtectionIntent.recovery_disposition, "none"
+                    )
+                    + literal("-")
+                    + cast(TriggerProtectionIntent.retry_attempts, String)
+                    + literal("-")
+                    + func.coalesce(
+                        func.strftime(
+                            "%Y%m%d%H%M%S",
+                            TriggerProtectionIntent.next_attempt_at,
+                        ),
+                        "none",
+                    )
+                    + literal("-")
+                    + func.coalesce(
+                        TriggerProtectionIntent.last_reason_code, "none"
+                    )
+                )
+                intent_already_captured = exists().where(and_(
+                    RuntimeIncident.source_kind
+                    == "position_protection_incident",
+                    RuntimeIncident.source_record_id == intent_source_id,
+                    RuntimeIncident.incident_type
+                    == "severe_protection_incident",
+                ))
+                exact_backup_exists = exists().where(and_(
+                    PositionBackupStopOrder.execution_order_leg_id
+                    == TriggerProtectionIntent.execution_order_leg_id,
+                    PositionBackupStopOrder.status == "active",
+                    PositionBackupStopOrder.order_id.is_not(None),
+                ))
+                convergence_rows = (
+                    session.query(TriggerTakeProfitConvergence)
+                    .filter(or_(
+                        TriggerTakeProfitConvergence.status == "submit_unknown",
+                        TriggerTakeProfitConvergence.status == "conflicted",
+                        TriggerTakeProfitConvergence.reason_code.like("%immutable%"),
+                        TriggerTakeProfitConvergence.reason_code.like("%unowned%"),
+                    ))
+                    .filter(~convergence_already_captured)
+                    .order_by(TriggerTakeProfitConvergence.id.asc())
+                    .limit(bounded_limit)
+                    .all()
+                )
+                intent_rows = (
+                    session.query(TriggerProtectionIntent)
+                    .filter(or_(
+                        TriggerProtectionIntent.recovery_disposition.in_((
+                            "manual_review", "terminal",
+                        )),
+                        TriggerProtectionIntent.recovery_state.in_((
+                            "submit_unknown", "recovery_required",
+                        )),
+                        and_(
+                            TriggerProtectionIntent.recovery_state.in_((
+                                "pending", "retrying", "failed",
+                            )),
+                            TriggerProtectionIntent.next_attempt_at.is_not(None),
+                            TriggerProtectionIntent.next_attempt_at <= now,
+                            ~exact_backup_exists,
+                        ),
+                    ))
+                    .filter(~intent_already_captured)
+                    .order_by(TriggerProtectionIntent.id.asc())
+                    .limit(bounded_limit)
+                    .all()
+                )
+                projected_transitions = [
+                    (
+                        f"tp-convergence-{int(row.id)}-{row.status}-{row.reason_code or 'none'}",
+                        str(row.reason_code or f"convergence_{row.status}"),
+                        row.updated_at,
+                        "critical",
+                    )
+                    for row in convergence_rows
+                ] + [
+                    (
+                        _trigger_intent_transition_source_id(row),
+                        str(
+                            row.last_reason_code
+                            or row.recovery_disposition
+                            or f"trigger_protection_{row.recovery_state}"
+                        ),
+                        row.updated_at,
+                        "high",
+                    )
+                    for row in intent_rows
+                ]
+            projected_transitions = projected_transitions[:bounded_limit]
+            for source_record_id, reason_code, updated_at, severity in projected_transitions:
+                occurred_at = updated_at
+                if occurred_at.tzinfo is None:
+                    occurred_at = occurred_at.replace(tzinfo=UTC)
+                row = capture_protection_state(
+                    session_factory,
+                    config=config,
+                    source_record_id=source_record_id,
+                    severity=severity,
+                    reason_code=reason_code,
+                    occurred_at=occurred_at,
+                )
+                captured += int(row is not None)
         return captured
     except Exception as exc:
         logger.warning(
@@ -1431,6 +1560,20 @@ def classify_protection_incident(
     }:
         return "warning"
     return "critical"
+
+
+def _trigger_intent_transition_source_id(intent) -> str:
+    next_attempt = getattr(intent, "next_attempt_at", None)
+    next_attempt_marker = (
+        next_attempt.strftime("%Y%m%d%H%M%S")
+        if isinstance(next_attempt, datetime)
+        else "none"
+    )
+    return (
+        f"trigger-intent-{int(intent.id)}-{intent.recovery_state}-"
+        f"{intent.recovery_disposition or 'none'}-{int(intent.retry_attempts)}-"
+        f"{next_attempt_marker}-{intent.last_reason_code or 'none'}"
+    )
 
 
 def send_monitor_test_notification(

@@ -48,9 +48,13 @@ def run_trigger_protection_rescue_tick(
 
     now = processed_at or datetime.now(UTC)
     settings = load_trading_settings(session_factory)
-    mode = settings.effective_trigger_protection_stop_rescue_mode
-    if settings.effective_position_management_liveness_v2_mode == "shadow":
-        mode = "shadow" if mode != "disabled" else "disabled"
+    liveness_mode = settings.effective_position_management_liveness_v2_mode
+    if liveness_mode == "disabled":
+        return TriggerProtectionRescueTickResult(mode="disabled")
+    # The liveness-v2 gate is authoritative for this exact-position lane: it
+    # is both the enable switch and the kill switch.  Keeping the legacy gate
+    # in this decision would make liveness=live unable to enable the fallback.
+    mode = liveness_mode
     if mode == "disabled":
         return TriggerProtectionRescueTickResult(mode=mode)
     bounded_limit = max(1, min(int(limit), 100))

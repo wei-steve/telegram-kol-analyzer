@@ -365,6 +365,7 @@ def test_rescue_worker_obeys_separate_mode_and_shadow_never_writes(
         session_factory,
         {
             "trigger_protection_stop_rescue_mode": mode,
+            "position_management_liveness_v2_mode": mode,
             "auto_trade_enabled": auto_trade,
             "management_execution_mode": management_mode,
         },
@@ -411,6 +412,7 @@ def test_rescue_worker_is_idempotent_after_successful_live_tick(tmp_path):
         session_factory,
         {
             "trigger_protection_stop_rescue_mode": "live",
+            "position_management_liveness_v2_mode": "live",
             "auto_trade_enabled": True,
             "management_execution_mode": "live",
         },

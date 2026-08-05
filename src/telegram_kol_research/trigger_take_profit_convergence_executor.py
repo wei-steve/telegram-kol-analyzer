@@ -270,6 +270,8 @@ def execute_ready_trigger_take_profit_convergences(
     rollout_mode = load_trading_settings(
         session_factory
     ).effective_position_management_liveness_v2_mode
+    if rollout_mode == "disabled":
+        return 0
     with session_factory() as session:
         identifiers = [
             int(row.id)

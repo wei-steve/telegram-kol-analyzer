@@ -9,6 +9,7 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    PendingTpslSnapshotObservation,
     PositionBackupStopOrder,
     PositionProtectionLedger,
     PositionProtectionRevision,
@@ -112,7 +113,9 @@ def _seed_strategy_records(database_path):
             pos_id="pos-web-record",
             venue="deepcoin",
             attribution_status="verified",
-            attribution_evidence_json='{"evidence_type":"direct_fill"}',
+            attribution_evidence_json=(
+                '{"evidence_type":"direct_fill","policy_version":2}'
+            ),
             status="filled",
             request_json='{"token":"must-not-render","size":"1"}',
             response_json='{"code":"0","order":"exchange-order-web-1"}',
@@ -349,6 +352,11 @@ def test_strategy_record_detail_renders_recoverable_stop_without_owner_false_ala
             client_order_id="web-backup-exact-client",
             status="active",
             request_json="{}",
+        ))
+        session.add(PendingTpslSnapshotObservation(
+            venue="deepcoin", instrument_id="BTC-USDT-SWAP",
+            response_count=1, order_ids_json='["web-backup-exact"]',
+            complete=True, observed_at=NOW,
         ))
         session.commit()
 

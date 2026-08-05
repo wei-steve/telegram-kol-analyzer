@@ -72,6 +72,8 @@ def submit_verified_trigger_backup_stops(
     settings = load_trading_settings(session_factory)
     backup_stop_buffer_bps = settings.trigger_backup_stop_buffer_bps
     rollout_mode = settings.effective_position_management_liveness_v2_mode
+    if rollout_mode == "disabled":
+        return 0
     with session_factory() as session:
         candidates = _eligible_candidates(session)
     submitted = 0

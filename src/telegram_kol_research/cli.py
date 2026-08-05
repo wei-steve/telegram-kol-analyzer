@@ -83,6 +83,10 @@ from telegram_kol_research.position_management_remediation import (
     apply_position_management_remediation_action,
     build_position_management_remediation_plan,
 )
+from telegram_kol_research.position_management_liveness_recovery import (
+    apply_position_management_liveness_recovery,
+    build_position_management_liveness_recovery_plan,
+)
 from telegram_kol_research.production_safety_monitor import (
     MonitorExpectations,
     ProductionSafetyAdapters,
@@ -2316,6 +2320,11 @@ def monitor_production_safety(
     runtime_config = load_runtime_incident_config(
         environment_only=True,
     )
+    runtime_incident_session_factory = (
+        None
+        if runtime_incident_capture_url
+        else create_existing_session_factory(database_path)
+    )
     outcome = run_production_safety_monitor(
         expectations=MonitorExpectations(
             head=expected_head,
@@ -2334,7 +2343,7 @@ def monitor_production_safety(
         notify=notify,
         force_full_audit=force_full_audit,
         lookback=timedelta(minutes=lookback_minutes),
-        runtime_incident_session_factory=None,
+        runtime_incident_session_factory=runtime_incident_session_factory,
         runtime_incident_capture_url=runtime_incident_capture_url,
         runtime_incident_capture_token=runtime_config.monitor_capture_token,
     )
@@ -4101,6 +4110,74 @@ def repair_position_management(
         typer.echo(f"Refusing apply: {exc}", err=True)
         raise typer.Exit(code=2) from exc
     typer.echo(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
+
+
+@app.command("recover-position-management-liveness")
+def recover_position_management_liveness(
+    database_path: Path = typer.Option(
+        Path("data/research.db"), "--database-path"
+    ),
+    pos_id: str = typer.Option(..., "--pos-id"),
+    apply: bool = typer.Option(False, "--apply"),
+    expected_fingerprint: str | None = typer.Option(
+        None, "--expected-fingerprint"
+    ),
+    deepcoin_contract_specs_path: Path = typer.Option(
+        Path("config/deepcoin_contract_specs.yaml"),
+        "--deepcoin-contract-specs-path",
+    ),
+) -> None:
+    """Dry-run or apply one exact reviewed management-liveness recovery."""
+
+    normalized_pos_id = str(pos_id or "").strip()
+    if not normalized_pos_id:
+        raise typer.BadParameter("--pos-id must name one exact position")
+    if apply and not expected_fingerprint:
+        typer.echo(
+            "Refusing apply: --expected-fingerprint is required.", err=True
+        )
+        raise typer.Exit(code=2)
+    resolved_path = database_path.expanduser().resolve()
+    if not resolved_path.is_file():
+        typer.echo(
+            "Refusing recovery: database does not exist; no file was created.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    session_factory = create_existing_session_factory(resolved_path)
+    client = build_deepcoin_client_from_env()
+    contract_spec_provider = load_deepcoin_contract_specs(
+        deepcoin_contract_specs_path
+    )
+    if apply:
+        try:
+            result = apply_position_management_liveness_recovery(
+                session_factory,
+                pos_id=normalized_pos_id,
+                expected_fingerprint=str(expected_fingerprint),
+                deepcoin_client=client,
+                contract_spec_provider=contract_spec_provider,
+                applied_at=datetime.now(UTC),
+            )
+        except ValueError as exc:
+            typer.echo(f"Refusing apply: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
+        typer.echo(json.dumps(
+            {"mode": "apply", "result": asdict(result)},
+            ensure_ascii=False, sort_keys=True,
+        ))
+        return
+    plan = build_position_management_liveness_recovery_plan(
+        session_factory,
+        pos_id=normalized_pos_id,
+        deepcoin_client=client,
+        contract_spec_provider=contract_spec_provider,
+        planned_at=datetime.now(UTC),
+    )
+    typer.echo(json.dumps(
+        {"mode": "dry_run", "plan": asdict(plan)},
+        ensure_ascii=False, indent=2, sort_keys=True,
+    ))
 
 
 @app.command("archive-unbound-holdings")

@@ -52,6 +52,7 @@ from telegram_kol_research.position_protection_legs import create_or_get_protect
 from telegram_kol_research.trigger_backup_stop_executor import (
     submit_verified_trigger_backup_stops,
 )
+from telegram_kol_research.trading_settings import save_trading_settings
 
 
 def _binding(**overrides):
@@ -329,6 +330,14 @@ def _backup_stop_provider():
     })
 
 
+def _enable_liveness_live(session_factory):
+    save_trading_settings(session_factory, {
+        "auto_trade_enabled": True,
+        "management_execution_mode": "live",
+        "position_management_liveness_v2_mode": "live",
+    })
+
+
 def _seed_exact_backup_candidate(
     session_factory,
     *,
@@ -337,6 +346,7 @@ def _seed_exact_backup_candidate(
     order_kind="market",
     with_primary=True,
 ):
+    _enable_liveness_live(session_factory)
     binding_id = upsert_execution_binding(
         session_factory,
         _binding(
@@ -770,6 +780,7 @@ def test_reconcile_legacy_trigger_adoption_rejects_prefill_candidate(tmp_path):
 def test_reconcile_submits_one_exact_backup_stop_when_explicitly_enabled(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_trigger_protection_adoption(session_factory)
+    _enable_liveness_live(session_factory)
 
     class BackupStopClient(_ProtectionAdoptionReconciliationClient):
         def __init__(self):

@@ -14,7 +14,12 @@ from urllib.parse import urlencode
 from sqlalchemy import and_, case, exists, func, or_, select
 from sqlalchemy.orm import aliased
 
-from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
+from telegram_kol_research.position_attribution import (
+    TERMINAL_ENTRY_LEG_STATES,
+    has_authoritative_persisted_position,
+    PositionAttributionError,
+    require_verified_position_ownership,
+)
 from telegram_kol_research.reporting import format_entry_preamble_assembly_summary
 from telegram_kol_research.models import (
     ContextResolutionAttempt,
@@ -26,6 +31,8 @@ from telegram_kol_research.models import (
     MessageEvidenceVersion,
     PositionAttributionAudit,
     PositionBackupStopOrder,
+    PositionMutationIntent,
+    PendingTpslSnapshotObservation,
     PositionProtectionIncident,
     PositionProtectionLedger,
     PositionProtectionRevision,
@@ -45,6 +52,12 @@ from telegram_kol_research.models import (
     TriggerProtectionStopRescue,
     TriggerTakeProfitConvergence,
     TelegramSourceMessageEvent,
+)
+from telegram_kol_research.position_management_capabilities import (
+    evaluate_position_management_capabilities,
+)
+from telegram_kol_research.deepcoin_normalization import (
+    normalize_deepcoin_swap_instrument,
 )
 
 
@@ -657,6 +670,42 @@ def load_strategy_record_detail(
             if entry_leg_ids
             else []
         )
+        entry_pos_ids = {
+            str(row.pos_id) for row in order_legs
+            if row.purpose == "entry" and str(row.pos_id or "")
+        }
+        authoritative_owner_leg_ids: set[int] = set()
+        for entry_pos_id in entry_pos_ids:
+            try:
+                owner = require_verified_position_ownership(
+                    session, venue="deepcoin", pos_id=entry_pos_id
+                )
+            except PositionAttributionError:
+                continue
+            authoritative_owner_leg_ids.add(int(owner.id))
+        active_position_mutations = (
+            session.query(PositionMutationIntent)
+            .filter(PositionMutationIntent.pos_id.in_(entry_pos_ids))
+            .filter(PositionMutationIntent.status.in_((
+                "reserved", "submitted", "submit_unknown", "recovery_required",
+            )))
+            .all()
+            if entry_pos_ids else []
+        )
+        pending_snapshot = (
+            session.query(PendingTpslSnapshotObservation)
+            .filter(
+                PendingTpslSnapshotObservation.venue == "deepcoin",
+                PendingTpslSnapshotObservation.instrument_id
+                == normalize_deepcoin_swap_instrument(binding.symbol),
+            )
+            .order_by(
+                PendingTpslSnapshotObservation.observed_at.desc(),
+                PendingTpslSnapshotObservation.id.desc(),
+            )
+            .first()
+            if binding is not None else None
+        )
 
         lifecycle_entry_message = (
             session.query(RawMessage)
@@ -1166,6 +1215,11 @@ def load_strategy_record_detail(
                 incidents=protection_incident_rows,
                 intents=trigger_protection_intents,
                 convergences=trigger_take_profit_convergences,
+                active_mutations=active_position_mutations,
+                snapshot_complete=bool(
+                    pending_snapshot is not None and pending_snapshot.complete
+                ),
+                authoritative_owner_leg_ids=authoritative_owner_leg_ids,
             ),
             "protection_incidents": [
                 _protection_incident_detail(row) for row in protection_incident_rows
@@ -1473,6 +1527,9 @@ def _protection_state_detail(
     incidents: list[PositionProtectionIncident],
     intents: list[TriggerProtectionIntent] = (),
     convergences: list[TriggerTakeProfitConvergence] = (),
+    active_mutations: list[PositionMutationIntent] = (),
+    snapshot_complete: bool = False,
+    authoritative_owner_leg_ids: set[int] = frozenset(),
 ) -> list[dict[str, object]]:
     """Project exact primary/backup protection health without exposing raw payloads."""
 
@@ -1517,8 +1574,10 @@ def _protection_state_detail(
         backup_status = str(backup.status) if backup is not None else "not_created"
         position_owner_verified = any(
             int(leg.id) == leg_id
-            and str(leg.attribution_status or "") in {"verified", "bound"}
+            and str(leg.attribution_status or "") == "verified"
             and str(leg.pos_id or "") == pos_id
+            and has_authoritative_persisted_position(leg)
+            and int(leg.id) in authoritative_owner_leg_ids
             for leg in order_legs
         )
         exact_backup_stop_verified = bool(
@@ -1550,8 +1609,35 @@ def _protection_state_detail(
                 in {"convergence_exact_leg_not_verified", "convergence_submit_unknown"}
             )
         )
+        active_or_unknown_mutation = any(
+            str(row.pos_id) == pos_id for row in active_mutations
+        )
+        conflicting_unknown_take_profit = bool(
+            convergence is not None
+            and (
+                convergence_status == "submit_unknown"
+                or "unowned" in str(convergence.reason_code or "")
+                or "immutable" in str(convergence.reason_code or "")
+            )
+        )
+        capabilities = evaluate_position_management_capabilities(
+            exact_position_verified=position_owner_verified,
+            native_stop_owned=primary_status in {"verified", "active"},
+            exact_owned_stop=(
+                primary_status in {"verified", "active"}
+                or exact_backup_stop_verified
+            ),
+            conflicting_unknown_take_profit=conflicting_unknown_take_profit,
+            retained_take_profit_safe=not conflicting_unknown_take_profit,
+            snapshot_complete=snapshot_complete,
+            active_or_unknown_mutation=active_or_unknown_mutation,
+        )
         risk_reduction_capability_available = bool(
-            position_owner_verified and not manual_review_required
+            not manual_review_required
+            and (
+                capabilities.may_reduce_exact_position
+                or capabilities.may_close_exact_position
+            )
         )
         blocker = next(
             (

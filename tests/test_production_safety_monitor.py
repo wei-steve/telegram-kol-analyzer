@@ -43,11 +43,14 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionBackupStopOrder,
     PositionProtectionIncident,
     RawMessage,
     RuntimeIncident,
     StrategyManagementBatch,
     StrategyManagementLeg,
+    TriggerProtectionIntent,
+    TriggerTakeProfitConvergence,
 )
 from telegram_kol_research.strategy_management_batches import (
     ManagementLegCreate,
@@ -2172,6 +2175,93 @@ def test_monitor_adapts_each_durable_severe_protection_incident_once(tmp_path):
             source.delivery_status,
             source.updated_at,
         ) == source_snapshot
+
+
+def test_monitor_captures_tp_unknown_and_protection_deadline_once(tmp_path):
+    session_factory = create_session_factory(tmp_path / "protection-transitions.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:1:2:ETH:short",
+            kol_id="kol", chat_id=1, message_id=2, symbol="ETH", side="short",
+            venue="deepcoin", pos_id="pos-1", status="active",
+        )
+        session.add(binding)
+        session.flush()
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            leg_index=0, purpose="entry", order_kind="trigger_limit",
+            venue="deepcoin", pos_id="pos-1", status="active",
+        )
+        session.add(leg)
+        session.flush()
+        session.add(TriggerTakeProfitConvergence(
+            venue="deepcoin", execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id,
+            desired_take_profits_json="[]", pos_id="pos-1",
+            status="submit_unknown", reason_code="convergence_submit_unknown",
+            updated_at=datetime(2026, 7, 16, 0, 20),
+        ))
+        session.add(TriggerProtectionIntent(
+            venue="deepcoin", execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id, request_fingerprint="f" * 64,
+            pre_submit_tpsl_baseline_json="[]", correlation_id="deadline-1",
+            recovery_state="failed", recovery_disposition="retry",
+            last_reason_code="protection_retry_deadline_expired",
+            next_attempt_at=datetime(2026, 7, 16, 0, 10),
+            updated_at=datetime(2026, 7, 16, 0, 20),
+        ))
+        session.commit()
+
+    kwargs = {
+        "expectations": EXPECTATIONS,
+        "state_path": tmp_path / "state.json",
+        "adapters": _RecordingAdapters(),
+        "notify": False,
+        "runtime_incident_session_factory": session_factory,
+        "runtime_incident_config": RuntimeIncidentConfig(
+            capture_types=frozenset({"severe_protection_incident"})
+        ),
+    }
+    run_production_safety_monitor(
+        **kwargs, now=datetime(2026, 7, 16, 0, 30, tzinfo=UTC)
+    )
+    run_production_safety_monitor(
+        **kwargs, now=datetime(2026, 7, 16, 0, 31, tzinfo=UTC)
+    )
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).one()
+        intent.retry_attempts = 2
+        intent.next_attempt_at = datetime(2026, 7, 16, 0, 25)
+        session.commit()
+    run_production_safety_monitor(
+        **kwargs, now=datetime(2026, 7, 16, 0, 32, tzinfo=UTC)
+    )
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).one()
+        intent.recovery_disposition = "manual_review"
+        session.add(PositionBackupStopOrder(
+            venue="deepcoin",
+            execution_binding_id=intent.execution_binding_id,
+            execution_order_leg_id=intent.execution_order_leg_id,
+            pos_id="pos-1", instrument_id="ETH-USDT-SWAP", side="short",
+            trigger_price="1935", order_id="backup-active-1",
+            client_order_id="backup-active-client-1", status="active",
+            request_json="{}",
+        ))
+        session.commit()
+    run_production_safety_monitor(
+        **kwargs, now=datetime(2026, 7, 16, 0, 33, tzinfo=UTC)
+    )
+
+    with session_factory() as session:
+        rows = session.query(RuntimeIncident).order_by(RuntimeIncident.id).all()
+    assert len(rows) == 4
+    assert all(row.repeat_count == 1 for row in rows)
+    assert any(row.source_record_id.startswith("tp-convergence-") for row in rows)
+    assert sum(
+        row.source_record_id.startswith("trigger-intent-") for row in rows
+    ) == 3
 
 
 def test_protection_incident_classification_distinguishes_recoverable_and_terminal():

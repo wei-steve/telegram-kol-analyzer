@@ -240,6 +240,49 @@ def test_liveness_v2_shadow_plans_take_profit_without_exchange_write(tmp_path):
         ).count() == 3
 
 
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"position_management_liveness_v2_mode": "disabled"},
+        {
+            "position_management_liveness_v2_mode": "live",
+            "auto_trade_enabled": False,
+            "management_execution_mode": "live",
+        },
+        {
+            "position_management_liveness_v2_mode": "live",
+            "auto_trade_enabled": True,
+            "management_execution_mode": "shadow",
+        },
+    ],
+)
+def test_liveness_v2_disabled_or_global_off_never_executes_ready_tp(
+    tmp_path, settings
+):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import PositionProtectionLeg
+    from telegram_kol_research.trading_settings import save_trading_settings
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        execute_ready_trigger_take_profit_convergences,
+    )
+
+    session_factory = create_session_factory(tmp_path / "liveness-disabled-tp.db")
+    _ready_convergence(session_factory, existing_take_profit=False)
+    save_trading_settings(session_factory, settings)
+    client = _Client()
+
+    completed = execute_ready_trigger_take_profit_convergences(
+        session_factory, deepcoin_client=client, processed_at=NOW,
+    )
+
+    assert completed == 0
+    assert client.submit_calls == []
+    with session_factory() as session:
+        assert session.query(PositionProtectionLeg).filter_by(
+            role="take_profit"
+        ).count() == 0
+
+
 def test_unknown_targeting_tp_still_blocks_additive_tp(tmp_path):
     from telegram_kol_research.db import create_session_factory
     from telegram_kol_research.trigger_take_profit_convergence_executor import (

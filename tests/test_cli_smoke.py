@@ -47,12 +47,43 @@ def test_cli_help_renders():
     assert "repair-position-attribution" in result.stdout
     assert "repair-entry-protection-ledger" in result.stdout
     assert "repair-position-management" in result.stdout
+    assert "recover-position-management-liveness" in result.stdout
     assert "audit-management-batches" in result.stdout
     assert "archive-unbound-holdings" in result.stdout
     assert "monitor-production-safety" in result.stdout
     assert "audit-tpsl-ownership" in result.stdout
     assert "audit-kol-pnl" in result.stdout
     assert "backfill-canonical-tpsl-ledger" in result.stdout
+
+
+def test_recover_position_management_liveness_help_requires_exact_review_inputs():
+    result = CliRunner().invoke(
+        app, ["recover-position-management-liveness", "--help"]
+    )
+
+    assert result.exit_code == 0
+    assert "--database-path" in result.output
+    assert "--pos-id" in result.output
+    assert "--apply" in result.output
+    assert "--expected-fingerprint" in result.output
+
+
+def test_recover_position_management_liveness_apply_requires_fingerprint(tmp_path):
+    database_path = tmp_path / "recovery.db"
+    create_session_factory(database_path)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "recover-position-management-liveness",
+            "--database-path", str(database_path),
+            "--pos-id", "pos-1",
+            "--apply",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--expected-fingerprint" in result.output
 
 
 def test_repair_entry_protection_ledger_apply_requires_bounded_trigger_identity(
