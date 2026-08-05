@@ -81,6 +81,37 @@ No historical Telegram row may be reclaimed or automatically replayed.
 
 ## Live enablement
 
-Not approved by this document. A separate decision must review shadow evidence,
-all monitor invariants, rollback/disable behavior, and the current exchange
-state immediately before changing the mode.
+Live enablement was approved by the operator on 2026-08-06 after the separate
+review required above.
+
+Before enablement, the exact Miya and Sanjie recognition and shadow admission
+selection passed twice with zero real exchange adapters: 8 focused tests passed
+locally and the same 8 passed on the deployed server. The broader local
+contract, gate, planner, executor, and fault-injection selection passed 346
+tests. Repeated contract serialization and fingerprint tests remained stable.
+
+The pre-enable live audit found one additional observability defect: composite
+backup stops existed as verified `position_protection_ledger` rows, while the
+position audit still preferred an older terminal backup-stop table row and a
+stale take-profit row. Commits `1c27d44` and `0e64398` made current ledger state
+authoritative, excluded terminal rows from current protection, and made a
+terminal ledger TP suppress a stale active TP row with the same order ID. The
+focused local regression and adjacent safety selection passed 478 tests; the
+deployed focused selection passed 13 tests. Independent review found no
+remaining Critical or Important issue.
+
+The final safe-window gate immediately before enablement reported zero running
+recognition, active management batches/components, active or unknown position
+mutations, active protection rescues, two-minute raw messages, and two-minute
+execution events. Database and loopback API readback then both reported
+`composite_management_v2_mode=live` and effective mode `live`. Activation
+created no management batch, component, mutation, or execution event. The main
+service and monitor timer remained active, and the bounded no-notify production
+safety diagnostic completed healthy with `monitor_error=null` and no reason
+codes.
+
+Rollback remains an atomic setting change back to `disabled`. Admission can be
+disabled without abandoning reconciliation for an already submitted v2
+component. No historical message or synthetic real trade was replayed during
+activation; production verification continues only from naturally arriving
+messages.
