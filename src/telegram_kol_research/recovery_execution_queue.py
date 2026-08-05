@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
@@ -112,6 +114,13 @@ def _preview_row(
         "risk_budget_usdt": row.max_loss_usdt,
         "source": source_payload,
     }
+    entry_preamble_assembly = (
+        json.loads(row.entry_preamble_assembly_json)
+        if row.entry_preamble_assembly_json
+        else None
+    )
+    if entry_preamble_assembly is not None:
+        payload_preview["entry_preamble_assembly"] = entry_preamble_assembly
     instrument_id = _to_deepcoin_swap_instrument(contract)
     contract_spec = (
         contract_spec_provider.get_contract_spec(instrument_id)
@@ -122,6 +131,10 @@ def _preview_row(
         payload_preview,
         contract_spec=contract_spec,
     )
+    if entry_preamble_assembly is not None:
+        deepcoin_order_draft[
+            "entry_preamble_assembly"
+        ] = entry_preamble_assembly
     return {
         "kol_id": row.kol_id,
         "chat_id": row.chat_id,

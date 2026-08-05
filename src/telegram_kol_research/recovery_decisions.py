@@ -64,6 +64,16 @@ def persist_recovery_evaluations(
             record.entry_range_text = _format_entry_range(decision.entry_range)
             record.stop_loss_text = signal.stop_loss_text
             record.max_loss_usdt = decision.max_loss_usdt
+            record.entry_preamble_assembly_json = (
+                json.dumps(
+                    signal.entry_preamble_assembly,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if signal.entry_preamble_assembly is not None
+                else None
+            )
             record.run_at = normalized_run_at
             record.updated_at = datetime.now(UTC)
             upserted += 1
@@ -87,7 +97,7 @@ def list_recovery_decisions(
             .limit(limit)
             .all()
         )
-        return [
+        results = [
             {
                 "kol_id": row.kol_id,
                 "chat_id": row.chat_id,
@@ -105,6 +115,12 @@ def list_recovery_decisions(
             }
             for row in rows
         ]
+        for result, row in zip(results, rows, strict=True):
+            if row.entry_preamble_assembly_json:
+                result["entry_preamble_assembly"] = json.loads(
+                    row.entry_preamble_assembly_json
+                )
+        return results
 
 
 def apply_recovery_review_decision(
@@ -155,7 +171,7 @@ def _format_entry_range(entry_range: tuple[float, float] | None) -> str | None:
 
 
 def _row_to_dict(row: RecoveryDecisionRecord) -> dict[str, object]:
-    return {
+    result = {
         "kol_id": row.kol_id,
         "chat_id": row.chat_id,
         "message_id": row.message_id,
@@ -170,6 +186,11 @@ def _row_to_dict(row: RecoveryDecisionRecord) -> dict[str, object]:
         "reviewed_at": row.reviewed_at,
         "review_note": row.review_note,
     }
+    if row.entry_preamble_assembly_json:
+        result["entry_preamble_assembly"] = json.loads(
+            row.entry_preamble_assembly_json
+        )
+    return result
 
 
 def _storage_time(value: datetime) -> datetime:

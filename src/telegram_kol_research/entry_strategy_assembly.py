@@ -118,6 +118,17 @@ def select_entry_preamble(
         ):
             candidates.clear()
             continue
+        if (
+            not fact.risk_multiplier.is_finite()
+            or fact.risk_multiplier <= Decimal("0")
+            or fact.risk_multiplier > Decimal("1")
+        ):
+            return EntryAssemblyDecision(
+                "blocked",
+                "entry_preamble_multiplier_invalid",
+                None,
+                Decimal("1"),
+            )
         candidates.append(fact)
 
     if not candidates:
@@ -254,6 +265,25 @@ def _result_from_assembly(
     )
 
 
+def _proposed_evidence(
+    *,
+    preamble: EntryPreamble,
+    strategy_message: RawMessage,
+    candidate: SignalCandidate,
+) -> tuple[dict[str, object], str]:
+    evidence: dict[str, object] = {
+        "preamble_message_id": int(preamble.message_id),
+        "strategy_message_id": int(strategy_message.message_id),
+        "symbol": str(candidate.symbol).upper(),
+        "side": str(candidate.side).lower(),
+        "risk_multiplier": str(preamble.risk_multiplier),
+    }
+    evidence_json = json.dumps(
+        evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return evidence, hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()
+
+
 def assemble_entry_strategy(
     session_factory: sessionmaker,
     *,
@@ -323,6 +353,11 @@ def assemble_entry_strategy(
         if preamble is None:
             raise RuntimeError("selected preamble disappeared")
         if mode == "shadow" or int(strategy_message.chat_id) not in live_chat_ids:
+            _, fingerprint = _proposed_evidence(
+                preamble=preamble,
+                strategy_message=strategy_message,
+                candidate=candidate,
+            )
             return EntryAssemblyResult(
                 status="proposed",
                 reason_code=None,
@@ -332,19 +367,17 @@ def assemble_entry_strategy(
                 preamble_id=int(preamble.id),
                 preamble_message_id=int(preamble.message_id),
                 strategy_message_id=int(strategy_message.message_id),
+                assembly_fingerprint=fingerprint,
             )
 
-        evidence = {
-            "preamble_message_id": int(preamble.message_id),
-            "strategy_message_id": int(strategy_message.message_id),
-            "symbol": str(candidate.symbol).upper(),
-            "side": str(candidate.side).lower(),
-            "risk_multiplier": str(preamble.risk_multiplier),
-        }
+        evidence, fingerprint = _proposed_evidence(
+            preamble=preamble,
+            strategy_message=strategy_message,
+            candidate=candidate,
+        )
         evidence_json = json.dumps(
             evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
-        fingerprint = hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()
         assembly = EntryStrategyAssembly(
             entry_preamble_id=int(preamble.id),
             strategy_raw_message_id=int(strategy_message.id),

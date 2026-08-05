@@ -21,6 +21,7 @@ from telegram_kol_research.deepcoin_order_builder import build_deepcoin_order_dr
 from telegram_kol_research.execution_events import ExecutionEventRecord
 from telegram_kol_research.execution_events import record_execution_event
 from telegram_kol_research.execution_bindings import build_strategy_instance_id
+from telegram_kol_research.entry_strategy_assembly import assemble_entry_strategy
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -565,6 +566,52 @@ def _auto_process_single_message_trade_signal(
         if reference_price is not None:
             entry_range = (reference_price, reference_price)
 
+    strategy_instance_id = build_strategy_instance_id(
+        venue="deepcoin",
+        chat_id=int(raw_message.chat_id),
+        message_id=int(raw_message.message_id),
+        symbol=symbol,
+        side=side,
+    )
+    assembly = assemble_entry_strategy(
+        session_factory,
+        strategy_raw_message_id=int(raw_message.id),
+        signal_candidate_id=int(candidate.id),
+        strategy_instance_id=strategy_instance_id,
+        mode=settings.entry_preamble_mode,
+        live_chat_ids=set(settings.entry_preamble_live_chat_ids),
+        assembled_at=now,
+    )
+    if assembly.status == "unresolved":
+        return {"status": "deferred", "reason": assembly.reason_code}
+    if assembly.status == "blocked":
+        return {"status": "blocked", "reason": assembly.reason_code}
+    configured_risk = Decimal(
+        str(_resolve_signal_max_loss_usdt(runtime_config, symbol=symbol))
+    )
+    multiplier = assembly.effective_risk_multiplier
+    if (
+        not multiplier.is_finite()
+        or multiplier <= Decimal("0")
+        or multiplier > Decimal("1")
+    ):
+        return {
+            "status": "blocked",
+            "reason": "entry_preamble_multiplier_invalid",
+        }
+    effective_risk = configured_risk * multiplier
+    assembly_evidence = {
+        "mode": assembly.mode,
+        "status": assembly.status,
+        "configured_risk_budget_usdt": float(configured_risk),
+        "risk_multiplier": str(assembly.proposed_risk_multiplier),
+        "applied_risk_multiplier": str(multiplier),
+        "effective_risk_budget_usdt": float(effective_risk),
+        "preamble_message_id": assembly.preamble_message_id,
+        "strategy_message_id": int(raw_message.message_id),
+        "assembly_fingerprint": assembly.assembly_fingerprint,
+    }
+
     signal = RecoverySignal(
         kol_id=str(runtime_config["kol_id"]),
         chat_id=raw_message.chat_id,
@@ -578,7 +625,8 @@ def _auto_process_single_message_trade_signal(
         parse_source=candidate.parse_source,
         confidence=candidate.confidence,
         trading_mode="auto_trade",
-        max_loss_usdt=_resolve_signal_max_loss_usdt(runtime_config, symbol=symbol),
+        max_loss_usdt=float(effective_risk),
+        entry_preamble_assembly=assembly_evidence,
         symbol_whitelist=[str(item).upper() for item in runtime_config["symbol_whitelist"]],
     )
     decision = RecoveryDecision(
@@ -644,6 +692,7 @@ def _auto_process_single_message_trade_signal(
         )
         execution_plan = "range_hybrid_market_half_limit_half"
     if auto_draft is not None:
+        auto_draft["entry_preamble_assembly"] = assembly_evidence
         trade_signal = enqueue_trade_signal(
             session_factory,
             venue="deepcoin",
@@ -663,6 +712,7 @@ def _auto_process_single_message_trade_signal(
                 },
                 "deepcoin_order_draft": auto_draft,
                 "execution_plan": execution_plan,
+                "entry_preamble_assembly": assembly_evidence,
             },
             strategy_instance_id=str(auto_draft.get("strategy_instance_id") or ""),
             enqueued_at=now,
@@ -686,7 +736,12 @@ def _auto_process_single_message_trade_signal(
             submitted_at=now,
             max_order_legs=1 if entry_execution_type == "market" else None,
         )
-    return {"status": "submitted", "entry_execution_type": entry_execution_type, "result": submit_result}
+    return {
+        "status": "submitted",
+        "entry_execution_type": entry_execution_type,
+        "entry_preamble_assembly": assembly_evidence,
+        "result": submit_result,
+    }
 
 
 def _record_entry_auto_trade_skip(

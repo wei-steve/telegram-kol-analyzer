@@ -2160,6 +2160,9 @@ class RecoveryDecisionRecord(Base):
     entry_range_text: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     stop_loss_text: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     max_loss_usdt: Mapped[float] = mapped_column(Float, default=20.0, nullable=False)
+    entry_preamble_assembly_json: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
     review_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False, index=True)
     reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     review_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

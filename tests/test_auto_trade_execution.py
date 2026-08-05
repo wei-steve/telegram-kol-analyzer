@@ -1,5 +1,5 @@
 ﻿import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -19,7 +19,7 @@ from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.message_instruction_items import create_message_instruction_items_in_session
-from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, MediaAsset, MessageInstructionItem, PositionProtectionLeg, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal, TriggerProtectionIntent, TriggerTakeProfitConvergence
+from telegram_kol_research.models import EntryPreamble, EntryStrategyAssembly, ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, MediaAsset, MessageEvidenceVersion, MessageInstructionItem, PositionProtectionLeg, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal, TriggerProtectionIntent, TriggerTakeProfitConvergence
 from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
 from telegram_kol_research.recovery_live_submit import _trigger_protection_lock_key
 from telegram_kol_research.recovery_live_submit import _trigger_protection_request_fingerprint
@@ -737,6 +737,197 @@ def _persist_candidate(
             )
         session.commit()
         return raw.id
+
+
+def _persist_half_risk_preamble_before(session_factory, *, strategy_raw_message_id):
+    from decimal import Decimal
+
+    from telegram_kol_research.entry_preambles import persist_entry_preamble_in_session
+    from telegram_kol_research.message_evidence import EntryPreambleEvidence
+
+    with session_factory() as session:
+        strategy = session.get(RawMessage, strategy_raw_message_id)
+        preamble_message = RawMessage(
+            chat_id=strategy.chat_id,
+            message_id=strategy.message_id - 1,
+            sender_id=strategy.sender_id,
+            sender_name=strategy.sender_name,
+            posted_at=strategy.posted_at - timedelta(minutes=1),
+            text="BTC换手入场做空，半仓操作做个短线空单。",
+            archived_target_group=True,
+        )
+        session.add(preamble_message)
+        session.flush()
+        evidence = MessageEvidenceVersion(
+            raw_message_id=preamble_message.id,
+            version=1,
+            input_fingerprint=f"sha256:preamble:{strategy_raw_message_id}",
+            model="mimo-v2.5",
+            prompt_versions_json="{}",
+            extraction_status="completed",
+            confidence=0.96,
+            text_evidence_json="{}",
+            image_evidence_json='{"images":[]}',
+            normalized_evidence_json="{}",
+        )
+        session.add(evidence)
+        session.flush()
+        preamble = persist_entry_preamble_in_session(
+            session,
+            raw_message=preamble_message,
+            evidence_version_id=evidence.id,
+            recognition_generation="generation-half-risk",
+            evidence=EntryPreambleEvidence(
+                symbol="BTC",
+                side="short",
+                risk_multiplier=Decimal("0.5"),
+                confidence=0.96,
+                reason="半仓操作",
+            ),
+            now=datetime(2026, 6, 12, 7, 59, tzinfo=UTC),
+        )
+        session.commit()
+        return preamble.id
+
+
+def test_live_entry_preamble_multiplies_usdt_risk_before_contract_sizing(tmp_path):
+    session_factory = create_session_factory(tmp_path / "half-risk-live.db")
+    strategy_raw_id = _persist_candidate(
+        session_factory,
+        text="BTC short 63900-64200 SL 64900 TP 62800",
+        entry_text="63900-64200",
+        stop_loss_text="64900",
+        take_profit_text="62800",
+        symbol="BTC",
+        side="short",
+    )
+    preamble_id = _persist_half_risk_preamble_before(
+        session_factory, strategy_raw_message_id=strategy_raw_id
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC"],
+            "entry_preamble_mode": "live",
+            "entry_preamble_live_chat_ids": [100],
+        },
+    )
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=strategy_raw_id,
+        group_config=_group_config(),
+        deepcoin_client=_FakeDeepcoinClient(),
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 8, 5, 12, 2, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    assert result["entry_preamble_assembly"]["configured_risk_budget_usdt"] == 20.0
+    assert result["entry_preamble_assembly"]["risk_multiplier"] == "0.5"
+    assert result["entry_preamble_assembly"]["effective_risk_budget_usdt"] == 10.0
+    with session_factory() as session:
+        decision = session.query(RecoveryDecisionRecord).one()
+        binding = session.query(ExecutionBinding).one()
+        preamble = session.get(EntryPreamble, preamble_id)
+        assert decision.max_loss_usdt == 10.0
+        assert preamble.status == "consumed"
+        assert session.query(EntryStrategyAssembly).count() == 1
+        binding_payload = json.loads(binding.payload_json)
+    draft = binding_payload["draft"]
+    assert draft["risk_budget_usdt"] == 10.0
+    assert sum(
+        leg["estimated_stop_loss_usdt"] for leg in draft["order_legs"]
+    ) <= 10.0
+    assert draft["entry_preamble_assembly"]["preamble_message_id"] == 54
+
+
+def test_shadow_entry_preamble_reports_half_but_executes_configured_risk(tmp_path):
+    session_factory = create_session_factory(tmp_path / "half-risk-shadow.db")
+    strategy_raw_id = _persist_candidate(
+        session_factory,
+        text="BTC short 63900-64200 SL 64900 TP 62800",
+        entry_text="63900-64200",
+        stop_loss_text="64900",
+        take_profit_text="62800",
+        symbol="BTC",
+        side="short",
+    )
+    preamble_id = _persist_half_risk_preamble_before(
+        session_factory, strategy_raw_message_id=strategy_raw_id
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC"],
+            "entry_preamble_mode": "shadow",
+        },
+    )
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=strategy_raw_id,
+        group_config=_group_config(),
+        deepcoin_client=_FakeDeepcoinClient(),
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 8, 5, 12, 2, tzinfo=UTC),
+    )
+
+    assert result["entry_preamble_assembly"]["risk_multiplier"] == "0.5"
+    assert result["entry_preamble_assembly"]["effective_risk_budget_usdt"] == 20.0
+    with session_factory() as session:
+        assert session.query(RecoveryDecisionRecord).one().max_loss_usdt == 20.0
+        assert session.get(EntryPreamble, preamble_id).status == "pending"
+
+
+def test_invalid_persisted_entry_preamble_multiplier_blocks_before_trade_signal(tmp_path):
+    session_factory = create_session_factory(tmp_path / "invalid-risk.db")
+    strategy_raw_id = _persist_candidate(
+        session_factory,
+        text="BTC short 63900-64200 SL 64900 TP 62800",
+        entry_text="63900-64200",
+        stop_loss_text="64900",
+        take_profit_text="62800",
+        symbol="BTC",
+        side="short",
+    )
+    preamble_id = _persist_half_risk_preamble_before(
+        session_factory, strategy_raw_message_id=strategy_raw_id
+    )
+    with session_factory() as session:
+        session.get(EntryPreamble, preamble_id).risk_multiplier = "1.1"
+        session.commit()
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC"],
+            "entry_preamble_mode": "live",
+            "entry_preamble_live_chat_ids": [100],
+        },
+    )
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=strategy_raw_id,
+        group_config=_group_config(),
+        deepcoin_client=_FakeDeepcoinClient(),
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 8, 5, 12, 2, tzinfo=UTC),
+    )
+
+    assert result == {
+        "status": "blocked",
+        "reason": "entry_preamble_multiplier_invalid",
+    }
+    with session_factory() as session:
+        assert session.query(TradeSignal).count() == 0
+        assert session.query(RecoveryDecisionRecord).count() == 0
 
 
 def test_auto_process_skips_symbol_price_scale_review_candidate_before_exchange_access(
