@@ -578,6 +578,41 @@ Percentage and contract-size rules for live management:
   still open until reconciliation reports `交易所已确认执行`. Protection
   updates use the separate `Deepcoin 已接受保护单更新` label.
 - Never replay old Telegram management messages to repair a missed action.
+
+## Entry preamble sizing context
+
+`entry_preamble_mode` defaults to `disabled`. In this mode an earlier message
+such as `BTC 多单半仓操作` is neither persisted nor applied. `shadow` persists
+authoritative normalized evidence and reports the proposed multiplier, but the
+effective multiplier remains `1`. `live` applies the multiplier only when the
+chat ID is also present in `entry_preamble_live_chat_ids`.
+
+`半仓操作` means `configured risk budget × 50%`; it does not mean half of
+the account balance, half of the order quantity, or half leverage. Sizing must
+show both the configured and effective risk budgets and the two Telegram
+message IDs. Raw prompts, provider responses, and credentials must not appear
+in operator output.
+
+Before shadow verification, update `trading.analysis.shared` through the Web
+prompt center using the normal `draft -> validate -> historical test ->
+publish` workflow. The application seed only creates a missing definition and
+never overwrites the current published production prompt. Both MiMo and
+DeepSeek historical comparisons must cover the current active prompt versions
+before publication is allowed.
+
+Use the read-only replay with database row IDs, not Telegram message IDs:
+
+```bash
+python scripts/replay_entry_preamble_shadow.py \
+  --database-path /path/to/research.db \
+  --preamble-raw-message-id 9334 \
+  --strategy-raw-message-id 9335 \
+  --configured-risk-usdt 20
+```
+
+The script opens SQLite with `mode=ro&immutable=1` plus `query_only` and cannot
+submit exchange requests. Promotion and rollback criteria are in
+`docs/entry-preamble-live-verification.md`.
   Reconcile the current exchange snapshot first and wait for a new instruction
   or an explicitly reviewed operator action.
 
