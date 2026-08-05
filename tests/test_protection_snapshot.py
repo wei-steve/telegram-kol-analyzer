@@ -187,6 +187,183 @@ def test_position_audit_marks_legacy_generic_backup_as_unprotected():
     assert audit["protected"] is False
 
 
+def test_position_audit_prefers_verified_composite_backup_and_ignores_cancelled_tp():
+    audit = build_position_protection_audit(
+        position={
+            "posId": "pos-1",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "pos": "9",
+        },
+        protection_ledger=[
+            {
+                "id": 10,
+                "pos_id": "pos-1",
+                "purpose": "stop_loss",
+                "order_id": "old-primary",
+                "trigger_price": "62800",
+                "size_text": "18",
+                "status": "cancelled",
+            },
+            {
+                "id": 11,
+                "pos_id": "pos-1",
+                "purpose": "take_profit",
+                "order_id": "old-tp",
+                "trigger_price": "65700",
+                "size_text": "18",
+                "status": "cancelled",
+            },
+            {
+                "id": 12,
+                "pos_id": "pos-1",
+                "purpose": "stop_loss",
+                "order_id": "new-primary",
+                "trigger_price": "63900",
+                "size_text": "9",
+                "status": "verified",
+                "evidence_source": "position_mutation_intent_readback",
+            },
+            {
+                "id": 13,
+                "pos_id": "pos-1",
+                "purpose": "backup_stop",
+                "order_id": "new-backup",
+                "trigger_price": "63772.2",
+                "size_text": "9",
+                "status": "verified",
+                "evidence_source": "position_mutation_intent_readback",
+            },
+            {
+                "id": 14,
+                "pos_id": "pos-1",
+                "purpose": "backup_stop",
+                "order_id": "failed-backup",
+                "trigger_price": "63600",
+                "size_text": "9",
+                "status": "stop_trigger_failed",
+            },
+            {
+                "id": 15,
+                "pos_id": "pos-1",
+                "purpose": "backup_stop",
+                "order_id": "missing-backup",
+                "trigger_price": "63500",
+                "size_text": "9",
+                "status": "protection_missing",
+            },
+        ],
+        backup_stops=[
+            {
+                "id": 99,
+                "pos_id": "pos-1",
+                "order_id": "stale-backup",
+                "trigger_price": "62674.4",
+                "status": "missing",
+                "request_json": '{"slTriggerPx":"62674.4"}',
+            }
+        ],
+        take_profit_orders=[],
+        pending_trigger_orders=[
+            {
+                "ordId": "new-primary",
+                "triggerOrderType": "TPSL",
+                "instId": "BTC-USDT-SWAP",
+                "posId": "pos-1",
+                "posSide": "long",
+                "sz": "9",
+                "slTriggerPx": "63900",
+            },
+            {
+                "ordId": "new-backup",
+                "triggerOrderType": "TPSL",
+                "instId": "BTC-USDT-SWAP",
+                "posId": "pos-1",
+                "posSide": "long",
+                "sz": "9",
+                "slTriggerPx": "63772.2",
+            },
+        ],
+    )
+
+    assert audit["primary_stop"]["order_id"] == "new-primary"
+    assert audit["backup_stop"] == {
+        "protocol": "native",
+        "verification_status": "verified",
+        "matching_strategy": "order_id",
+        "order_id": "new-backup",
+    }
+    assert audit["take_profits"] == []
+    assert audit["has_verified_backup_stop"] is True
+    assert audit["readback_complete"] is True
+    assert audit["automation_safe"] is True
+    assert audit["protected"] is True
+
+
+def test_position_audit_flags_terminal_local_order_that_is_still_pending():
+    audit = build_position_protection_audit(
+        position={
+            "posId": "pos-1",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "pos": "9",
+        },
+        protection_ledger=[
+            {
+                "id": 1,
+                "pos_id": "pos-1",
+                "purpose": "stop_loss",
+                "order_id": "primary",
+                "trigger_price": "63900",
+                "size_text": "9",
+                "status": "verified",
+            },
+            {
+                "id": 2,
+                "pos_id": "pos-1",
+                "purpose": "backup_stop",
+                "order_id": "backup",
+                "trigger_price": "63772.2",
+                "size_text": "9",
+                "status": "verified",
+            },
+            {
+                "id": 3,
+                "pos_id": "pos-1",
+                "purpose": "take_profit",
+                "order_id": "cancelled-tp-still-pending",
+                "trigger_price": "65700",
+                "size_text": "9",
+                "status": "cancelled",
+            },
+        ],
+        backup_stops=[],
+        take_profit_orders=[],
+        pending_trigger_orders=[
+            {
+                "ordId": order_id,
+                "triggerOrderType": "TPSL",
+                "instId": "BTC-USDT-SWAP",
+                "posId": "pos-1",
+                "posSide": "long",
+                "sz": "9",
+                trigger_field: trigger_price,
+            }
+            for order_id, trigger_field, trigger_price in (
+                ("primary", "slTriggerPx", "63900"),
+                ("backup", "slTriggerPx", "63772.2"),
+                ("cancelled-tp-still-pending", "tpTriggerPx", "65700"),
+            )
+        ],
+    )
+
+    assert audit["take_profits"] == []
+    assert audit["manual_order_ids"] == ["cancelled-tp-still-pending"]
+    assert audit["has_unowned_orders"] is True
+    assert audit["automation_safe"] is False
+    assert audit["protected"] is False
+
+
 def test_position_audit_does_not_borrow_other_positions_ledger_orders():
     positions = [
         {"posId": "pos-a", "instId": "BTC-USDT-SWAP", "posSide": "long", "pos": "3"},

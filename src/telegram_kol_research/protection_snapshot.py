@@ -16,6 +16,13 @@ from telegram_kol_research.protection_ledger import AccountProtectionOwnership
 
 
 _PAGINATION_KEYS = frozenset({"cursor", "nextcursor", "page", "total", "hasmore"})
+_CURRENT_LEDGER_STATUSES = frozenset({"active", "pending_readback", "protected", "verified"})
+_CURRENT_BACKUP_STATUSES = frozenset(
+    {"active", "pending_readback", "submitting", "unknown_exchange_outcome"}
+)
+_CURRENT_TAKE_PROFIT_STATUSES = frozenset(
+    {"active", "cancel_requested", "pending_readback", "submitting"}
+)
 
 
 def build_position_protection_audit(
@@ -42,24 +49,49 @@ def build_position_protection_audit(
     ledger_rows = [row for row in protection_ledger if _field(row, "pos_id") == pos_id]
     backup_rows = [row for row in backup_stops if _field(row, "pos_id") == pos_id]
     take_profit_rows = [row for row in take_profit_orders if _field(row, "pos_id") == pos_id]
+    current_ledger_rows = [
+        row for row in ledger_rows
+        if _row_status_is_current(row, _CURRENT_LEDGER_STATUSES)
+    ]
+    current_backup_rows = [
+        row for row in backup_rows
+        if _row_status_is_current(row, _CURRENT_BACKUP_STATUSES)
+    ]
+    current_take_profit_rows = [
+        row for row in take_profit_rows
+        if _row_status_is_current(row, _CURRENT_TAKE_PROFIT_STATUSES)
+    ]
 
     primary_rows = [
-        row for row in ledger_rows
+        row for row in current_ledger_rows
         if _text(_field(row, "purpose")) in {"stop_loss", "combined"}
     ]
     primary = _primary_stop_summary(position, pending, scope, primary_rows)
-    backup = _backup_stop_summary(position, pending, scope, backup_rows)
+    backup = _backup_stop_summary(
+        position,
+        pending,
+        scope,
+        ledger_rows=[
+            row for row in current_ledger_rows
+            if _text(_field(row, "purpose")) == "backup_stop"
+        ],
+        backup_rows=current_backup_rows,
+    )
     take_profits = _take_profit_summaries(
         position,
         pending,
         scope,
-        ledger_rows=ledger_rows,
-        take_profit_rows=take_profit_rows,
+        ledger_rows=current_ledger_rows,
+        take_profit_rows=current_take_profit_rows,
     )
 
     known_order_ids = {
         order_id
-        for row in [*ledger_rows, *backup_rows, *take_profit_rows]
+        for row in [
+            *current_ledger_rows,
+            *current_backup_rows,
+            *current_take_profit_rows,
+        ]
         if (order_id := _text(_field(row, "order_id")))
     }
     if account_ownership is None:
@@ -166,7 +198,8 @@ def _primary_stop_summary(position, pending, scope, rows):
     }
 
 
-def _backup_stop_summary(position, pending, scope, rows):
+def _backup_stop_summary(position, pending, scope, *, ledger_rows, backup_rows):
+    rows = ledger_rows or backup_rows
     if not rows:
         return {
             "protocol": "none",
@@ -176,7 +209,12 @@ def _backup_stop_summary(position, pending, scope, rows):
         }
     row = _latest_row(rows)
     request = _json_value(_field(row, "request_json"))
-    protocol = "native" if any(key in request for key in ("slTriggerPx", "slTriggerPrice")) else "generic"
+    protocol = (
+        "native"
+        if _text(_field(row, "purpose")) == "backup_stop"
+        or any(key in request for key in ("slTriggerPx", "slTriggerPrice"))
+        else "generic"
+    )
     if protocol == "generic":
         return {
             "protocol": "generic",
@@ -193,7 +231,10 @@ def _backup_stop_summary(position, pending, scope, rows):
 def _take_profit_summaries(position, pending, scope, *, ledger_rows, take_profit_rows):
     rows_by_id: dict[str, object] = {}
     for row in [
-        *[row for row in ledger_rows if _text(_field(row, "purpose")) == "take_profit"],
+        *[
+            row for row in ledger_rows
+            if _text(_field(row, "purpose")) == "take_profit"
+        ],
         *take_profit_rows,
     ]:
         if (order_id := _text(_field(row, "order_id"))):
@@ -266,6 +307,11 @@ def _unowned_native_order_can_affect_position(order, position):
 
 def _latest_row(rows):
     return sorted(rows, key=lambda row: str(_field(row, "id") or ""))[-1]
+
+
+def _row_status_is_current(row, allowed_statuses) -> bool:
+    status = (_text(_field(row, "status")) or "").lower()
+    return not status or status in allowed_statuses
 
 
 def _field(value, name):
