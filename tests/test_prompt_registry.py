@@ -34,9 +34,12 @@ def test_shared_prompt_defines_non_executable_entry_preamble_contract():
     assert '"kind": "entry_preamble"' in prompt
     assert '"risk_multiplier": "0.5"' in prompt
     assert "半仓" in prompt
+    assert "最大亏损预算乘以 50%" in prompt
+    assert "30% 仓位" in prompt
     assert "非执行" in prompt
     assert "轻仓" in prompt
     assert "满仓" in prompt
+    assert "不得猜测倍率" in prompt
 
 
 def _seed(content: str = "published A") -> PromptSeed:
