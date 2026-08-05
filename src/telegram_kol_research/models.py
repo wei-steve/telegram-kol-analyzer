@@ -248,6 +248,85 @@ class MessageEvidenceVersion(Base):
     )
 
 
+class EntryPreamble(Base):
+    """Durable, non-executable sizing context for a later entry strategy."""
+
+    __tablename__ = "entry_preambles"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'consumed', 'expired', 'invalidated')",
+            name="ck_entry_preambles_status",
+        ),
+        Index(
+            "ix_entry_preambles_chat_status_created",
+            "chat_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False, unique=True, index=True
+    )
+    chat_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    message_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+    risk_multiplier: Mapped[str] = mapped_column(String(32), nullable=False)
+    evidence_version_id: Mapped[int] = mapped_column(
+        ForeignKey("message_evidence_versions.id"), nullable=False
+    )
+    recognition_generation: Mapped[str] = mapped_column(String(64), nullable=False)
+    fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="pending",
+        server_default=sql_text("'pending'"),
+        index=True,
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    invalidated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+
+class EntryStrategyAssembly(Base):
+    """Immutable evidence that one preamble was attached to one entry strategy."""
+
+    __tablename__ = "entry_strategy_assemblies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    entry_preamble_id: Mapped[int] = mapped_column(
+        ForeignKey("entry_preambles.id"), nullable=False, unique=True
+    )
+    strategy_raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False, index=True
+    )
+    signal_candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("signal_candidates.id"), nullable=False, unique=True
+    )
+    strategy_instance_id: Mapped[str] = mapped_column(
+        String(255), nullable=False, unique=True
+    )
+    risk_multiplier: Mapped[str] = mapped_column(String(32), nullable=False)
+    evidence_json: Mapped[str] = mapped_column(Text, nullable=False)
+    fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+
 class MessageEvidenceExtractionClaim(Base):
     __tablename__ = "message_evidence_extraction_claims"
 

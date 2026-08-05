@@ -18,7 +18,35 @@ def test_database_bootstrap_creates_tables(tmp_path):
     assert "runtime_incidents" in tables
     assert "runtime_incident_observations" in tables
     assert "runtime_agent_recovery_attempts" in tables
+    assert "entry_preambles" in tables
+    assert "entry_strategy_assemblies" in tables
     assert engine is not None
+
+
+def test_entry_preamble_tables_are_added_to_existing_database(tmp_path):
+    database_path = tmp_path / "research.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE legacy_rows (id INTEGER PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute("INSERT INTO legacy_rows (id, value) VALUES (1, 'keep')")
+
+    create_session_factory(database_path)
+    create_session_factory(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        legacy_value = connection.execute(
+            "SELECT value FROM legacy_rows WHERE id = 1"
+        ).fetchone()[0]
+
+    assert {"entry_preambles", "entry_strategy_assemblies"} <= tables
+    assert legacy_value == "keep"
 
 
 def test_cleanup_notification_columns_are_added_to_existing_execution_events(tmp_path):
