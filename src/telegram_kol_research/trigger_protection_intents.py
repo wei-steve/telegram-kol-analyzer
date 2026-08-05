@@ -15,6 +15,10 @@ from telegram_kol_research.models import ExecutionOrderLeg, TriggerProtectionInt
 ALLOWED_TRIGGER_PROTECTION_RECOVERY_STATES = frozenset(
     {"pending", "submitting", "retrying", "adopted", "failed", "resolved"}
 )
+ALLOWED_TRIGGER_PROTECTION_RECOVERY_DISPOSITIONS = frozenset(
+    {"wait", "retry", "exact_backup", "manual_review", "terminal"}
+)
+MAX_TRIGGER_PROTECTION_EVIDENCE_BYTES = 16_384
 
 
 def create_or_get_trigger_protection_intent(
@@ -110,6 +114,9 @@ def transition_trigger_protection_intent(
     retry_attempts: int | None = None,
     next_attempt_at: datetime | None = None,
     adopted_order_id: str | None = None,
+    recovery_disposition: str | None = None,
+    last_reason_code: str | None = None,
+    last_evidence: dict[str, object] | None = None,
 ) -> TriggerProtectionIntent:
     """Apply an idempotent recovery-state update and optionally adopt one order."""
 
@@ -117,6 +124,22 @@ def transition_trigger_protection_intent(
         raise ValueError("unknown trigger-protection recovery state")
     if retry_attempts is not None and retry_attempts < 0:
         raise ValueError("retry attempts must be nonnegative")
+    if recovery_disposition is not None:
+        if recovery_disposition not in ALLOWED_TRIGGER_PROTECTION_RECOVERY_DISPOSITIONS:
+            raise ValueError("unknown trigger-protection recovery disposition")
+    elif recovery_state == "failed" and not intent.recovery_disposition:
+        recovery_disposition = "manual_review"
+    if last_reason_code is not None:
+        if (
+            not isinstance(last_reason_code, str)
+            or not last_reason_code
+            or last_reason_code != last_reason_code.strip()
+            or len(last_reason_code) > 128
+        ):
+            raise ValueError("trigger-protection reason code is invalid")
+    normalized_evidence_json = None
+    if last_evidence is not None:
+        normalized_evidence_json = _normalized_recovery_evidence(last_evidence)
     adopted_changed = False
     if adopted_order_id is not None:
         adopted_order_id = _normalized_identity(adopted_order_id)
@@ -140,6 +163,15 @@ def transition_trigger_protection_intent(
     if next_attempt_at is not None:
         changed = changed or intent.next_attempt_at != next_attempt_at
         intent.next_attempt_at = next_attempt_at
+    if recovery_disposition is not None:
+        changed = changed or intent.recovery_disposition != recovery_disposition
+        intent.recovery_disposition = recovery_disposition
+    if last_reason_code is not None:
+        changed = changed or intent.last_reason_code != last_reason_code
+        intent.last_reason_code = last_reason_code
+    if normalized_evidence_json is not None:
+        changed = changed or intent.last_evidence_json != normalized_evidence_json
+        intent.last_evidence_json = normalized_evidence_json
     if changed or adopted_changed:
         intent.updated_at = utc_now()
         session.flush()
@@ -246,3 +278,20 @@ def _normalized_required_string(value: str, *, label: str) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise ValueError(f"immutable evidence requires a normalized {label}")
     return value.lower() if label == "venue" else value
+
+
+def _normalized_recovery_evidence(value: object) -> str:
+    if not isinstance(value, dict):
+        raise ValueError("trigger-protection evidence must be a dictionary")
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("trigger-protection evidence must be JSON serializable") from exc
+    if len(encoded.encode("utf-8")) > MAX_TRIGGER_PROTECTION_EVIDENCE_BYTES:
+        raise ValueError("trigger-protection evidence exceeds the size limit")
+    return encoded

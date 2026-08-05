@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import json
 
 import pytest
 from sqlalchemy import create_engine, inspect
@@ -243,6 +244,94 @@ def test_transition_is_idempotent_and_updates_recovery_fields(tmp_path):
         assert intent.recovery_state == "retrying"
         assert intent.retry_attempts == 2
         assert intent.next_attempt_at.replace(tzinfo=UTC) == NOW
+
+
+def test_transition_persists_structured_recovery_evidence(tmp_path):
+    session_factory = create_session_factory(tmp_path / "intents.db")
+    leg_id = _leg(session_factory)
+    with session_factory() as session:
+        intent = create_or_get_trigger_protection_intent(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=leg_id,
+            request_fingerprint="9" * 64,
+            pre_submit_tpsl_baseline_json="{}",
+            correlation_id="corr-structured-recovery",
+        )
+
+        transition_trigger_protection_intent(
+            session,
+            intent,
+            recovery_state="retrying",
+            recovery_disposition="retry",
+            last_reason_code="candidate_visibility_pending",
+            last_evidence={"candidate_order_ids": ["stop-2"]},
+        )
+        session.commit()
+
+        assert intent.last_reason_code == "candidate_visibility_pending"
+        assert intent.recovery_disposition == "retry"
+        assert json.loads(intent.last_evidence_json) == {
+            "candidate_order_ids": ["stop-2"]
+        }
+        assert intent.last_evidence_json == '{"candidate_order_ids":["stop-2"]}'
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        ({"recovery_disposition": "guess"}, "disposition"),
+        ({"last_reason_code": "x" * 129}, "reason code"),
+        ({"last_evidence": ["not", "a", "dictionary"]}, "evidence"),
+        ({"last_evidence": {"payload": "x" * 20_000}}, "evidence"),
+    ],
+)
+def test_transition_rejects_invalid_structured_recovery_fields(
+    tmp_path,
+    extra,
+    message,
+):
+    session_factory = create_session_factory(tmp_path / "intents.db")
+    leg_id = _leg(session_factory)
+    with session_factory() as session:
+        intent = create_or_get_trigger_protection_intent(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=leg_id,
+            request_fingerprint="8" * 64,
+            pre_submit_tpsl_baseline_json="{}",
+            correlation_id="corr-invalid-structured-recovery",
+        )
+
+        with pytest.raises(ValueError, match=message):
+            transition_trigger_protection_intent(
+                session,
+                intent,
+                recovery_state="retrying",
+                **extra,
+            )
+
+
+def test_failed_legacy_transition_defaults_to_manual_review(tmp_path):
+    session_factory = create_session_factory(tmp_path / "intents.db")
+    leg_id = _leg(session_factory)
+    with session_factory() as session:
+        intent = create_or_get_trigger_protection_intent(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=leg_id,
+            request_fingerprint="7" * 64,
+            pre_submit_tpsl_baseline_json="{}",
+            correlation_id="corr-legacy-failed",
+        )
+
+        transition_trigger_protection_intent(
+            session,
+            intent,
+            recovery_state="failed",
+        )
+
+        assert intent.recovery_disposition == "manual_review"
 
 
 def test_identity_claims_strip_surrounding_whitespace_and_reject_blank_values(tmp_path):

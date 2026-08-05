@@ -83,6 +83,46 @@ def test_runtime_incident_agent_retry_columns_have_additive_compat_migrations():
     )
 
 
+def test_trigger_protection_recovery_columns_are_added_without_rewriting_rows(
+    tmp_path,
+):
+    database_path = tmp_path / "legacy-trigger-protection.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE trigger_protection_intents (
+                id INTEGER PRIMARY KEY,
+                venue VARCHAR(64) NOT NULL,
+                execution_order_leg_id INTEGER NOT NULL,
+                parent_trigger_order_id VARCHAR(255),
+                adopted_order_id VARCHAR(255),
+                recovery_state VARCHAR(32) NOT NULL,
+                next_attempt_at DATETIME
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO trigger_protection_intents "
+            "(id, venue, execution_order_leg_id, recovery_state) "
+            "VALUES (81, 'deepcoin', 434, 'failed')"
+        )
+
+    session_factory = create_session_factory(database_path)
+    inspector = inspect(session_factory.kw["bind"])
+    columns = {
+        column["name"]: str(column["type"])
+        for column in inspector.get_columns("trigger_protection_intents")
+    }
+
+    assert columns["last_reason_code"] == "VARCHAR(128)"
+    assert columns["recovery_disposition"] == "VARCHAR(32)"
+    assert columns["last_evidence_json"] == "TEXT"
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT id, recovery_state FROM trigger_protection_intents WHERE id = 81"
+        ).fetchone() == (81, "failed")
+
+
 def test_composite_management_schema_is_added_to_existing_database(tmp_path):
     database_path = tmp_path / "legacy-composite.db"
     with sqlite3.connect(database_path) as connection:

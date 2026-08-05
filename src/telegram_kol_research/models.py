@@ -1554,6 +1554,13 @@ class TriggerProtectionIntent(Base):
     recovery_state: Mapped[str] = mapped_column(
         String(32), nullable=False, default="pending"
     )
+    recovery_disposition: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True
+    )
+    last_reason_code: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True
+    )
+    last_evidence_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     retry_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     adopted_order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
