@@ -1177,3 +1177,205 @@ def test_unexplained_partial_position_change_freezes_submitted_convergence(tmp_p
         convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
     assert convergence.status == "conflicted"
     assert convergence.reason_code == "convergence_partial_position_unexplained"
+
+
+def test_terminal_entry_leg_expires_absent_take_profits_and_completes_convergence(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import (
+        ExecutionBinding,
+        ExecutionOrderLeg,
+        PositionTakeProfitOrder,
+        TriggerTakeProfitConvergence,
+    )
+    from telegram_kol_research.position_take_profit_orders import (
+        reconcile_trigger_take_profit_order_history,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id = _ready_convergence(session_factory)
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        convergence.status = "submitted"
+        leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+        binding = session.get(ExecutionBinding, convergence.execution_binding_id)
+        leg.status = "manually_closed"
+        leg.terminal_reason = "manual_position_missing"
+        binding.status = "closed"
+        session.commit()
+
+        reconcile_trigger_take_profit_order_history(
+            session,
+            positions=[],
+            pending_orders=[],
+            trigger_history=[],
+            observed_at=NOW,
+            position_snapshot_complete=True,
+            pending_snapshot_complete_by_instrument={"BTC-USDT-SWAP": True},
+        )
+        session.commit()
+
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        orders = session.query(PositionTakeProfitOrder).all()
+    assert convergence.status == "completed"
+    assert convergence.reason_code == "convergence_position_terminal"
+    assert [(row.order_id, row.status) for row in orders] == [("tp-old-1", "expired")]
+    assert all(row.completed_at is not None for row in orders)
+
+
+def test_terminal_entry_leg_does_not_expire_take_profit_still_pending_on_exchange(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import (
+        ExecutionOrderLeg,
+        PositionTakeProfitOrder,
+        TriggerTakeProfitConvergence,
+    )
+    from telegram_kol_research.position_take_profit_orders import (
+        reconcile_trigger_take_profit_order_history,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id = _ready_convergence(session_factory)
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        convergence.status = "submitted"
+        leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+        leg.status = "manually_closed"
+        leg.terminal_reason = "manual_position_missing"
+        session.commit()
+
+        reconcile_trigger_take_profit_order_history(
+            session,
+            positions=[],
+            pending_orders=[{"ordId": "tp-old-1"}],
+            trigger_history=[],
+            observed_at=NOW,
+            position_snapshot_complete=True,
+            pending_snapshot_complete_by_instrument={"BTC-USDT-SWAP": True},
+        )
+        session.commit()
+
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        order = session.query(PositionTakeProfitOrder).one()
+    assert convergence.status == "submitted"
+    assert convergence.reason_code is None
+    assert order.status == "active"
+    assert order.completed_at is None
+
+
+def test_terminal_entry_leg_fails_closed_when_pending_snapshot_is_incomplete(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import (
+        ExecutionOrderLeg,
+        PositionTakeProfitOrder,
+        TriggerTakeProfitConvergence,
+    )
+    from telegram_kol_research.position_take_profit_orders import (
+        reconcile_trigger_take_profit_order_history,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id = _ready_convergence(session_factory)
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        convergence.status = "submitted"
+        leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+        leg.status = "manually_closed"
+        leg.terminal_reason = "manual_position_missing"
+        session.commit()
+        reconcile_trigger_take_profit_order_history(
+            session,
+            positions=[],
+            pending_orders=[],
+            trigger_history=[],
+            observed_at=NOW,
+            position_snapshot_complete=True,
+            pending_snapshot_complete_by_instrument={"BTC-USDT-SWAP": False},
+        )
+        session.commit()
+
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        order = session.query(PositionTakeProfitOrder).one()
+    assert convergence.status == "submitted"
+    assert order.status == "active"
+
+
+def test_terminal_entry_leg_fails_closed_when_position_id_is_still_live(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import (
+        ExecutionOrderLeg,
+        PositionTakeProfitOrder,
+        TriggerTakeProfitConvergence,
+    )
+    from telegram_kol_research.position_take_profit_orders import (
+        reconcile_trigger_take_profit_order_history,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id = _ready_convergence(session_factory)
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        convergence.status = "submitted"
+        leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+        leg.status = "manually_closed"
+        leg.terminal_reason = "manual_position_missing"
+        session.commit()
+        reconcile_trigger_take_profit_order_history(
+            session,
+            positions=[{"posId": "pos-10", "pos": "10"}],
+            pending_orders=[],
+            trigger_history=[],
+            observed_at=NOW,
+            position_snapshot_complete=True,
+            pending_snapshot_complete_by_instrument={"BTC-USDT-SWAP": True},
+        )
+        session.commit()
+
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        order = session.query(PositionTakeProfitOrder).one()
+    assert convergence.status == "submitted"
+    assert order.status == "active"
+
+
+def test_terminal_entry_leg_conflicts_on_mismatched_take_profit_owner(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import (
+        ExecutionOrderLeg,
+        PositionTakeProfitOrder,
+        TriggerTakeProfitConvergence,
+    )
+    from telegram_kol_research.position_take_profit_orders import (
+        reconcile_trigger_take_profit_order_history,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id = _ready_convergence(session_factory)
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        convergence.status = "submitted"
+        leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+        leg.status = "manually_closed"
+        leg.terminal_reason = "manual_position_missing"
+        order = session.query(PositionTakeProfitOrder).one()
+        order.pos_id = "wrong-pos"
+        session.commit()
+        reconcile_trigger_take_profit_order_history(
+            session,
+            positions=[],
+            pending_orders=[],
+            trigger_history=[],
+            observed_at=NOW,
+            position_snapshot_complete=True,
+            pending_snapshot_complete_by_instrument={"BTC-USDT-SWAP": True},
+        )
+        session.commit()
+
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        order = session.query(PositionTakeProfitOrder).one()
+    assert convergence.status == "conflicted"
+    assert convergence.reason_code == "convergence_take_profit_ownership_mismatch"
+    assert order.status == "active"

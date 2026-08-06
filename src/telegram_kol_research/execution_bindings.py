@@ -888,6 +888,12 @@ def _apply_reconcile_snapshot(
             order_history=snapshot.order_history,
             trade_fills=snapshot.trade_fills,
             observed_at=recovered_at,
+            position_snapshot_complete=True,
+            pending_snapshot_complete_by_instrument=(
+                _pending_tpsl_snapshot_completeness(
+                    snapshot.pending_tpsl_observations
+                )
+            ),
         )
         from telegram_kol_research.protection_health import (
             reconcile_position_protection_health,
@@ -953,12 +959,9 @@ def _record_owned_position_observations(
         if _has_nonzero_size(row)
         and (pos_id := _first_string(row, "posId", "pos_id", "id"))
     }
-    completeness_by_instrument = {
-        str(row.get("instrument_id") or "").strip().upper(): bool(
-            row.get("complete")
-        )
-        for row in snapshot.pending_tpsl_observations
-    }
+    completeness_by_instrument = _pending_tpsl_snapshot_completeness(
+        snapshot.pending_tpsl_observations
+    )
     pending_by_position: dict[str, list[dict[str, Any]]] = {}
     for row in snapshot.pending_trigger_orders:
         pos_id = _first_string(row, "posId", "pos_id", "closePosId")
@@ -992,6 +995,22 @@ def _record_owned_position_observations(
             ),
             observed_at=observed_at,
         )
+
+
+def _pending_tpsl_snapshot_completeness(
+    observations: list[dict[str, Any]],
+) -> dict[str, bool]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in observations:
+        if not isinstance(row, dict):
+            continue
+        instrument_id = str(row.get("instrument_id") or "").strip().upper()
+        if instrument_id:
+            grouped.setdefault(instrument_id, []).append(row)
+    return {
+        instrument_id: len(rows) == 1 and rows[0].get("complete") is True
+        for instrument_id, rows in grouped.items()
+    }
 
 
 def _ready_verified_trigger_take_profit_convergences(

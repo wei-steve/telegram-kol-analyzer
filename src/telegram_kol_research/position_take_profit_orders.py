@@ -19,6 +19,7 @@ from telegram_kol_research.models import (
     utc_now,
 )
 from telegram_kol_research.native_tpsl import native_tpsl_take_profit_is_market
+from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
 
 
 def canonical_take_profit_evidence_rows(rows) -> tuple[dict[str, object], ...]:
@@ -169,6 +170,8 @@ def reconcile_trigger_take_profit_order_history(
     order_history: list[dict] | None = None,
     trade_fills: list[dict] | None = None,
     observed_at: datetime | None = None,
+    position_snapshot_complete: bool = False,
+    pending_snapshot_complete_by_instrument: dict[str, bool] | None = None,
 ) -> None:
     """Reconcile TP audit records from read-only exchange observations.
 
@@ -263,6 +266,57 @@ def reconcile_trigger_take_profit_order_history(
     for convergence in convergences:
         if not convergence.pos_id:
             continue
+        orders = (
+            session.query(PositionTakeProfitOrder)
+            .filter(PositionTakeProfitOrder.trigger_take_profit_convergence_id == convergence.id)
+            .all()
+        )
+        if not orders:
+            continue
+        if not _take_profit_orders_match_convergence(orders, convergence=convergence):
+            convergence.status = "conflicted"
+            convergence.reason_code = "convergence_take_profit_ownership_mismatch"
+            convergence.completed_at = now
+            convergence.updated_at = now
+            continue
+        binding = session.get(ExecutionBinding, convergence.execution_binding_id)
+        instrument_id = (
+            f"{str(binding.symbol).upper()}-USDT-SWAP" if binding is not None else ""
+        )
+        pending_snapshot_complete = bool(
+            pending_snapshot_complete_by_instrument
+            and pending_snapshot_complete_by_instrument.get(instrument_id) is True
+        )
+        if (
+            position_snapshot_complete
+            and pending_snapshot_complete
+            and _exact_convergence_leg_is_terminal(session, convergence=convergence)
+            and not _position_id_is_live(
+                positions,
+                pos_id=str(convergence.pos_id),
+            )
+        ):
+            for row in orders:
+                if row.status != "active" or row.order_id in pending_ids:
+                    continue
+                evidence = _load_evidence(row.evidence_json)
+                evidence["terminalization"] = {
+                    "reason_code": "position_terminal_order_absent",
+                    "observed_at": now.isoformat(),
+                }
+                row.status = "expired"
+                row.evidence_json = _json(evidence)
+                row.completed_at = now
+                row.updated_at = now
+            if not any(
+                row.status in {"active", "cancel_requested", "submit_unknown", "conflicted"}
+                for row in orders
+            ):
+                convergence.status = "completed"
+                convergence.reason_code = "convergence_position_terminal"
+                convergence.completed_at = now
+                convergence.updated_at = now
+            continue
         live_size = _live_position_size(
             positions,
             pos_id=str(convergence.pos_id),
@@ -270,13 +324,6 @@ def reconcile_trigger_take_profit_order_history(
             session=session,
         )
         if live_size is None:
-            continue
-        orders = (
-            session.query(PositionTakeProfitOrder)
-            .filter(PositionTakeProfitOrder.trigger_take_profit_convergence_id == convergence.id)
-            .all()
-        )
-        if not orders:
             continue
         planned_size = sum((_decimal_or_zero(row.size_text) for row in orders), Decimal("0"))
         terminal_fills = any(row.status == "filled" for row in orders)
@@ -286,6 +333,53 @@ def reconcile_trigger_take_profit_order_history(
             convergence.completed_at = now
             convergence.updated_at = now
     session.flush()
+
+
+def _exact_convergence_leg_is_terminal(
+    session: Session,
+    *,
+    convergence: TriggerTakeProfitConvergence,
+) -> bool:
+    leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+    binding = session.get(ExecutionBinding, convergence.execution_binding_id)
+    binding_pos_ids = {
+        item.strip()
+        for item in str(binding.pos_id or "").split(",")
+        if item.strip()
+    } if binding is not None else set()
+    return bool(
+        leg is not None
+        and binding is not None
+        and int(leg.execution_binding_id) == int(convergence.execution_binding_id)
+        and str(leg.purpose) == "entry"
+        and str(leg.venue).lower() == str(convergence.venue).lower()
+        and str(leg.pos_id or "") == str(convergence.pos_id or "")
+        and str(convergence.pos_id or "") in binding_pos_ids
+        and str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
+    )
+
+
+def _take_profit_orders_match_convergence(
+    orders: list[PositionTakeProfitOrder],
+    *,
+    convergence: TriggerTakeProfitConvergence,
+) -> bool:
+    return all(
+        str(row.venue).lower() == str(convergence.venue).lower()
+        and int(row.execution_binding_id) == int(convergence.execution_binding_id)
+        and int(row.execution_order_leg_id) == int(convergence.execution_order_leg_id)
+        and str(row.pos_id) == str(convergence.pos_id)
+        for row in orders
+    )
+
+
+def _position_id_is_live(positions: list[dict], *, pos_id: str) -> bool:
+    return any(
+        isinstance(row, dict)
+        and str(row.get("posId") or row.get("pos_id") or "") == pos_id
+        and _decimal_or_zero(row.get("pos")) > 0
+        for row in positions
+    )
 
 
 def _conflicting_position_mutations(
