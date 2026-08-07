@@ -10,6 +10,7 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
     MessageInstructionItem,
+    PositionProtectionIncident,
     RawMessage,
     SignalCandidate,
     StrategyLifecycle,
@@ -20,6 +21,7 @@ from telegram_kol_research.position_management_remediation import (
     _project_canonical_remediation_candidate,
     _require_exchange_snapshot_fingerprint,
     _require_batch_matches_confirmed_action,
+    _require_batch_health_matches_confirmed_action,
     _select_executable_action,
     apply_position_management_remediation_action,
     build_position_management_remediation_plan,
@@ -62,6 +64,55 @@ def test_confirmed_break_even_action_requires_market_managed_batch():
         ValueError, match="planned batch does not match confirmed remediation action"
     ):
         _require_batch_matches_confirmed_action(action=action, batch=batch)
+
+
+def test_confirmed_remediation_requires_same_current_health_evidence():
+    action = SimpleNamespace(
+        evidence={
+            "protection_health": [
+                {
+                    "pos_id": "pos-1",
+                    "classification": "healthy_current_evidence",
+                    "evidence_fingerprint": "a" * 64,
+                    "exchange_snapshot_fingerprint": "b" * 64,
+                    "source_incident_ids": [7],
+                    "reason_codes": [],
+                    "primary_order_id": "primary",
+                    "backup_order_id": "backup",
+                    "take_profit_order_ids": ["tp"],
+                }
+            ]
+        }
+    )
+    matching_batch = SimpleNamespace(
+        target_snapshot={
+            "protection_health": {
+                "pos-1": {
+                    "classification": "healthy_current_evidence",
+                    "evidence_fingerprint": "a" * 64,
+                    "exchange_snapshot_fingerprint": "b" * 64,
+                    "source_incident_ids": [7],
+                    "reason_codes": [],
+                    "primary_order_id": "primary",
+                    "backup_order_id": "backup",
+                    "take_profit_order_ids": ["tp"],
+                }
+            }
+        }
+    )
+
+    _require_batch_health_matches_confirmed_action(
+        action=action,
+        batch=matching_batch,
+    )
+    matching_batch.target_snapshot["protection_health"]["pos-1"][
+        "evidence_fingerprint"
+    ] = "c" * 64
+    with pytest.raises(ValueError, match="protection health changed"):
+        _require_batch_health_matches_confirmed_action(
+            action=action,
+            batch=matching_batch,
+        )
 
 
 class _ReadOnlyClient:
@@ -1193,6 +1244,52 @@ def test_build_remediation_plan_is_read_only_and_fingerprinted(tmp_path):
     assert len(action.fingerprint) == 64
     assert len(plan.snapshot_fingerprint) == 64
     assert plan.conflicts == ()
+
+
+def test_remediation_action_fingerprint_includes_current_protection_health(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _raw_id, _lifecycle_id = _persist_failed_partial_management(session_factory)
+    with session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+        leg = session.query(ExecutionOrderLeg).filter_by(pos_id="pos-1").one()
+        session.add(
+            PositionProtectionIncident(
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                pos_id="pos-1",
+                incident_type="protection_missing",
+                fingerprint="health-remediation".ljust(64, "x"),
+                evidence_json="{}",
+                delivery_status="pending",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=_ReadOnlyClient(),
+        now=NOW,
+    )
+
+    health = plan.actions[0].evidence["protection_health"]
+    assert health == [
+        {
+            "pos_id": "pos-1",
+            "classification": "recovery_required",
+            "evidence_fingerprint": health[0]["evidence_fingerprint"],
+            "exchange_snapshot_fingerprint": plan.actions[0].evidence[
+                "exchange_snapshot_fingerprint"
+            ],
+            "source_incident_ids": [1],
+            "reason_codes": ["verified_backup_stop_missing"],
+            "primary_order_id": None,
+            "backup_order_id": None,
+            "take_profit_order_ids": [],
+        }
+    ]
+    assert len(health[0]["evidence_fingerprint"]) == 64
 
 
 def test_snapshot_change_invalidates_action_fingerprint(tmp_path):

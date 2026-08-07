@@ -1301,6 +1301,130 @@ def test_historical_protection_incident_allows_partial_take_profit_from_complete
     assert client.write_calls == []
 
 
+def test_zero_submission_historical_protection_block_is_superseded_by_current_evidence(
+    monkeypatch,
+    tmp_path,
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="partial_take_profit",
+        management_fraction=0.5,
+        side="long",
+    )
+    _persist_open_protection_incident(session_factory, binding_id=binding_id)
+    _persist_complete_current_protection(
+        session_factory,
+        binding_id=binding_id,
+        side="long",
+        size="6",
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    position = _position("pos-b", size="6", avg_px="64289.7", side="long")
+
+    blocked = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([position]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+    recovered = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin(
+            [position],
+            tpsl_orders=_complete_current_tpsl(side="long", size="6"),
+        ),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT + timedelta(seconds=1),
+    )
+
+    assert (blocked.status, blocked.reason_code) == (
+        "blocked",
+        "protection_recovery_required",
+    )
+    assert recovered.status == "ready"
+    assert recovered.batch.id == blocked.batch.id
+    assert recovered.batch.legs[0].planned_close_size == "3"
+    supersession = recovered.batch.target_snapshot["preflight_supersession"]
+    assert supersession["predecessor_batch_id"] == blocked.batch.id
+    assert supersession["predecessor_reason_code"] == (
+        "protection_recovery_required"
+    )
+    assert supersession["predecessor_target_fingerprint"]
+    assert supersession["current_evidence_fingerprints"]
+
+
+def test_historical_protection_block_with_any_mutation_intent_is_never_superseded(
+    monkeypatch,
+    tmp_path,
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="partial_take_profit",
+        management_fraction=0.5,
+        side="long",
+    )
+    _persist_open_protection_incident(session_factory, binding_id=binding_id)
+    _persist_complete_current_protection(
+        session_factory,
+        binding_id=binding_id,
+        side="long",
+        size="6",
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    position = _position("pos-b", size="6", avg_px="64289.7", side="long")
+    blocked = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([position]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).filter_by(pos_id="pos-b").one()
+        binding = session.get(ExecutionBinding, binding_id)
+        session.add(
+            PositionMutationIntent(
+                idempotency_key="historical-block-mutation",
+                venue="deepcoin",
+                operation="close_position",
+                strategy_instance_id=binding.strategy_instance_id,
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                pos_id="pos-b",
+                authority_fingerprint="a" * 64,
+                request_fingerprint="b" * 64,
+                status="submit_unknown",
+                request_json="{}",
+                reserved_at=PLANNED_AT,
+            )
+        )
+        session.commit()
+
+    refused = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin(
+            [position],
+            tpsl_orders=_complete_current_tpsl(side="long", size="6"),
+        ),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT + timedelta(seconds=1),
+    )
+
+    assert refused.status == "blocked"
+    assert refused.batch.id == blocked.batch.id
+    assert refused.reason_code == "protection_recovery_required"
+    with session_factory() as session:
+        assert session.query(StrategyManagementBatch).count() == 1
+        assert session.query(StrategyManagementLeg).count() == 0
+
+
 def test_break_even_plans_one_market_managed_leg_per_exact_position_without_ticker(
     monkeypatch, tmp_path
 ):

@@ -20,10 +20,17 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
     MessageInstructionItem,
+    PositionProtectionIncident,
     RawMessage,
     SignalCandidate,
     StrategyLifecycle,
     StrategyManagementBatch,
+)
+from telegram_kol_research.protection_health import (
+    classify_current_position_protection_health,
+)
+from telegram_kol_research.protection_ledger import (
+    load_account_protection_ownership,
 )
 from telegram_kol_research.remediation_snapshot import (
     remediation_snapshot_payload,
@@ -155,6 +162,10 @@ def build_position_management_remediation_plan(
     static_steps: list[PositionRemediationStep] = []
     conflicts: list[dict[str, Any]] = []
     with session_factory() as session:
+        account_ownership = load_account_protection_ownership(
+            session,
+            live_pos_ids=live_positions,
+        )
         candidates = (
             session.query(SignalCandidate)
             .filter(SignalCandidate.parse_source == "mimo_authoritative")
@@ -570,6 +581,75 @@ def build_position_management_remediation_plan(
                     "preserve_quantity": effective_intent
                     in {"move_stop_to_break_even", "adjust_stop_loss"},
                 }
+                protection_health_evidence = []
+                for entry_leg in entry_legs:
+                    incident_rows = (
+                        session.query(PositionProtectionIncident)
+                        .filter(
+                            PositionProtectionIncident.venue == "deepcoin",
+                            PositionProtectionIncident.execution_binding_id
+                            == int(binding.id),
+                            PositionProtectionIncident.execution_order_leg_id
+                            == int(entry_leg.id),
+                            PositionProtectionIncident.pos_id
+                            == str(entry_leg.pos_id),
+                            PositionProtectionIncident.incident_type.in_(
+                                (
+                                    "stop_trigger_failed",
+                                    "protection_missing",
+                                    "protection_unknown",
+                                    "backup_exchange_outcome_unknown",
+                                    "protection_position_conflict",
+                                )
+                            ),
+                        )
+                        .order_by(PositionProtectionIncident.id)
+                        .all()
+                    )
+                    if not incident_rows:
+                        continue
+                    health = classify_current_position_protection_health(
+                        session,
+                        venue="deepcoin",
+                        execution_binding_id=int(binding.id),
+                        execution_order_leg_id=int(entry_leg.id),
+                        pos_id=str(entry_leg.pos_id),
+                        position=live_positions.get(str(entry_leg.pos_id)),
+                        open_positions=live_position_rows,
+                        pending_trigger_orders=list(
+                            snapshot.pending_trigger_orders
+                        ),
+                        pending_tpsl_observations=list(
+                            snapshot.pending_tpsl_observations
+                        ),
+                        snapshot_errors=dict(snapshot.errors),
+                        account_ownership=account_ownership,
+                        exchange_snapshot_fingerprint=(
+                            exchange_snapshot_fingerprint
+                        ),
+                        source_incident_ids=tuple(
+                            int(row.id) for row in incident_rows
+                        ),
+                    )
+                    protection_health_evidence.append(
+                        {
+                            "pos_id": health.pos_id,
+                            "classification": health.classification,
+                            "evidence_fingerprint": health.evidence_fingerprint,
+                            "exchange_snapshot_fingerprint": (
+                                health.exchange_snapshot_fingerprint
+                            ),
+                            "source_incident_ids": list(
+                                health.source_incident_ids
+                            ),
+                            "reason_codes": list(health.reason_codes),
+                            "primary_order_id": health.primary_order_id,
+                            "backup_order_id": health.backup_order_id,
+                            "take_profit_order_ids": list(
+                                health.take_profit_order_ids
+                            ),
+                        }
+                    )
                 evidence = {
                     "candidate_id": int(candidate.id),
                     "instruction_item_id": int(item.id) if item is not None else None,
@@ -596,6 +676,8 @@ def build_position_management_remediation_plan(
                         current_effective_intent=effective_intent,
                     ),
                 }
+                if protection_health_evidence:
+                    evidence["protection_health"] = protection_health_evidence
                 action_core = {
                     "action_kind": effective_intent,
                     "raw_message_id": int(raw_message.id),
@@ -869,6 +951,10 @@ def apply_position_management_remediation_action(
             f"remediation planning did not become ready:{result.reason_code}"
         )
     _require_batch_matches_confirmed_action(action=action, batch=result.batch)
+    _require_batch_health_matches_confirmed_action(
+        action=action,
+        batch=result.batch,
+    )
     refreshed_plan = build_position_management_remediation_plan(
         session_factory,
         deepcoin_client=deepcoin_client,
@@ -1110,6 +1196,54 @@ def _require_batch_matches_confirmed_action(*, action, batch) -> None:
             != str(_first_text(confirmed, "avgPx", "avgPrice", "avg_entry_price"))
         ):
             raise ValueError("planned position economics changed after confirmation")
+
+
+def _require_batch_health_matches_confirmed_action(*, action, batch) -> None:
+    """Bind reviewed database/exchange health to the plan-only batch."""
+
+    expected_rows = action.evidence.get("protection_health") or []
+    if not expected_rows:
+        return
+    snapshot = batch.target_snapshot if isinstance(batch.target_snapshot, dict) else {}
+    actual_by_pos_id = snapshot.get("protection_health")
+    if not isinstance(actual_by_pos_id, dict):
+        raise ValueError("remediation protection health changed before promotion")
+    expected_by_pos_id = {
+        str(row.get("pos_id") or ""): {
+            key: row.get(key)
+            for key in (
+                "classification",
+                "evidence_fingerprint",
+                "exchange_snapshot_fingerprint",
+                "source_incident_ids",
+                "reason_codes",
+                "primary_order_id",
+                "backup_order_id",
+                "take_profit_order_ids",
+            )
+        }
+        for row in expected_rows
+        if isinstance(row, dict) and str(row.get("pos_id") or "")
+    }
+    actual = {
+        str(pos_id): {
+            key: row.get(key)
+            for key in (
+                "classification",
+                "evidence_fingerprint",
+                "exchange_snapshot_fingerprint",
+                "source_incident_ids",
+                "reason_codes",
+                "primary_order_id",
+                "backup_order_id",
+                "take_profit_order_ids",
+            )
+        }
+        for pos_id, row in actual_by_pos_id.items()
+        if isinstance(row, dict)
+    }
+    if not expected_by_pos_id or actual != expected_by_pos_id:
+        raise ValueError("remediation protection health changed before promotion")
 
 
 def _require_exchange_snapshot_fingerprint(*, deepcoin_client, action) -> None:

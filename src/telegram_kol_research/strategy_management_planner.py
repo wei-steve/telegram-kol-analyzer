@@ -524,7 +524,14 @@ def _plan_strategy_management_batch_locked(
         session_factory, idempotency_fingerprint=idempotency_fingerprint
     )
     retry_blocked_batch_id = (
-        existing.id if _retryable_preflight_blocked_batch(existing, now=now) else None
+        existing.id
+        if _retryable_preflight_blocked_batch(
+            existing,
+            session_factory=session_factory,
+            entry_legs=identity.entry_legs,
+            now=now,
+        )
+        else None
     )
     if existing is not None and retry_blocked_batch_id is None:
         return ManagementPlanningResult(
@@ -1250,6 +1257,17 @@ def _plan_strategy_management_batch_locked(
     }
     if protection_health_by_pos_id:
         target_snapshot["protection_health"] = protection_health_by_pos_id
+    if retry_blocked_batch_id is not None and existing is not None:
+        target_snapshot["preflight_supersession"] = {
+            "version": 1,
+            "predecessor_batch_id": int(existing.id),
+            "predecessor_reason_code": str(existing.reason_code or ""),
+            "predecessor_target_fingerprint": str(existing.target_fingerprint),
+            "current_evidence_fingerprints": sorted(
+                str(row["evidence_fingerprint"])
+                for row in protection_health_by_pos_id.values()
+            ),
+        }
     if protection_recovery_for_risk_reduction:
         target_snapshot["protection_recovery"] = {
             "version": 1,
@@ -2099,7 +2117,11 @@ def _persist_blocked(
 
 
 def _retryable_preflight_blocked_batch(
-    batch: ManagementBatchRecord | None, *, now: datetime | None = None
+    batch: ManagementBatchRecord | None,
+    *,
+    session_factory: sessionmaker,
+    entry_legs,
+    now: datetime | None = None,
 ) -> bool:
     if batch is None:
         return False
@@ -2116,6 +2138,28 @@ def _retryable_preflight_blocked_batch(
             return False
     if batch.legs:
         return False
+    if batch.started_at is not None:
+        return False
+    leg_ids = {
+        int(leg.id)
+        for leg in entry_legs
+        if getattr(leg, "id", None) is not None
+    }
+    if not leg_ids:
+        return False
+    with session_factory() as session:
+        mutation_exists = (
+            session.query(PositionMutationIntent.id)
+            .filter(
+                PositionMutationIntent.execution_binding_id
+                == int(batch.execution_binding_id),
+                PositionMutationIntent.execution_order_leg_id.in_(leg_ids),
+            )
+            .first()
+            is not None
+        )
+    if mutation_exists:
+        return False
     snapshot = batch.target_snapshot if isinstance(batch.target_snapshot, dict) else {}
     if snapshot.get("blocked_reason") != batch.reason_code:
         return False
@@ -2128,8 +2172,7 @@ def _is_retryable_preflight_reason(batch: ManagementBatchRecord) -> bool:
         return True
     return bool(
         batch.reason_code == "protection_recovery_required"
-        and batch.intent == "full_exit"
-        and batch.effective_action == "full_exit"
+        and batch.intent in SUPPORTED_INTENTS
     )
 
 
@@ -2189,7 +2232,23 @@ def _replace_retryable_preflight_blocked_batch_in_session(
     )
     if current_legs:
         raise ManagementPlanningStateChanged("retryable_management_batch_has_legs")
+    current_mutation = (
+        session.query(PositionMutationIntent.id)
+        .filter(
+            PositionMutationIntent.execution_binding_id
+            == int(batch.execution_binding_id),
+            PositionMutationIntent.execution_order_leg_id.in_(
+                [int(leg.id) for leg in identity.entry_legs]
+            ),
+        )
+        .first()
+    )
+    if current_mutation is not None:
+        raise ManagementPlanningStateChanged(
+            "retryable_management_batch_has_mutation_intent"
+        )
     snapshot = json.loads(batch.target_snapshot_json or "{}")
+    supersession = target_snapshot.get("preflight_supersession")
     if (
         batch.idempotency_fingerprint != idempotency_fingerprint
         or batch.raw_message_id != raw_message_id
@@ -2199,11 +2258,40 @@ def _replace_retryable_preflight_blocked_batch_in_session(
         or batch.strategy_instance_id != str(identity.binding.strategy_instance_id)
         or batch.intent != intent
         or batch.status != "blocked"
+        or batch.started_at is not None
         or not _is_retryable_preflight_reason(batch)
         or not isinstance(snapshot, dict)
         or snapshot.get("blocked_reason") != batch.reason_code
+        or not isinstance(supersession, dict)
+        or supersession.get("version") != 1
+        or supersession.get("predecessor_batch_id") != batch.id
+        or supersession.get("predecessor_reason_code") != batch.reason_code
+        or supersession.get("predecessor_target_fingerprint")
+        != batch.target_fingerprint
     ):
         raise ManagementPlanningStateChanged("retryable_management_batch_changed")
+    if (
+        batch.reason_code == "protection_recovery_required"
+        and batch.intent != "full_exit"
+    ):
+        protection_health = target_snapshot.get("protection_health")
+        if (
+            not isinstance(protection_health, dict)
+            or not protection_health
+            or any(
+                not isinstance(row, dict)
+                or row.get("classification") != "healthy_current_evidence"
+                for row in protection_health.values()
+            )
+            or supersession.get("current_evidence_fingerprints")
+            != sorted(
+                str(row.get("evidence_fingerprint") or "")
+                for row in protection_health.values()
+            )
+        ):
+            raise ManagementPlanningStateChanged(
+                "retryable_management_batch_current_evidence_missing"
+            )
     batch.effective_action = effective_action
     batch.execution_mode = execution_mode
     batch.requested_fraction = requested_fraction
