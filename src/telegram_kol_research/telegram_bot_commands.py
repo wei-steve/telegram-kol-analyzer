@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 from sqlalchemy.orm import sessionmaker
@@ -15,7 +17,16 @@ from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.strategy_alerts import StrategyAlertConfig
 from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
 from telegram_kol_research.web_queries import list_holding_strategies, list_pending_strategies
-from telegram_kol_research.models import ExecutionBinding, StrategyLifecycle, utc_now
+from telegram_kol_research.models import (
+    ExecutionBinding,
+    ExecutionOrderLeg,
+    StrategyLifecycle,
+    utc_now,
+)
+from telegram_kol_research.execution_bindings import (
+    binding_has_unresolved_entry_leg,
+    reconcile_deepcoin_execution_bindings,
+)
 from telegram_kol_research.deepcoin_execution_actions import (
     cancel_pending_entry_legs,
     execute_deepcoin_management_signal,
@@ -31,7 +42,39 @@ EXPIRY_EXPIRE_CANCEL_COMMAND = "expiry_expire_cancel"
 EXPIRY_EXPIRE_KEEP_COMMAND = "expiry_expire_keep"
 EXPIRY_REFRESH_COMMAND = "expiry_refresh"
 EXPIRY_REVIEW_CONTINUE_HOURS = 3
+EXPIRY_REFRESH_ELIGIBLE_LIFECYCLE_STATUSES = frozenset({"pending_entry", "entered"})
+EXPIRY_LEG_STATUS_LABELS = {
+    "active": "已入场",
+    "partially_filled": "部分成交",
+    "partial_filled": "部分成交",
+    "partial": "部分成交",
+    "pending": "挂单中",
+    "open": "挂单中",
+    "submitted": "已提交",
+    "cancelled": "已取消",
+    "manually_cancelled": "已取消",
+    "exchange_cancelled": "已取消",
+    "closed": "已结束",
+    "expired": "已失效",
+    "invalidated": "已失效",
+    "unknown": "状态待确认",
+}
+EXPIRY_LIFECYCLE_STATUS_LABELS = {
+    "pending_entry": "待入场",
+    "entered": "已入场",
+    "cancelled": "已取消",
+    "expired": "已过期",
+    "exited": "已离场",
+    "invalidated": "已失效",
+}
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class ExpiryReviewRefreshResult:
+    answer_text: str
+    status_text: str
+    keep_actions: bool
 
 
 def _log_system_operator_callback_processed(*, update_id: int, callback_data: str) -> None:
@@ -213,6 +256,161 @@ def _expiry_callback_needs_deepcoin_client(callback_data: str) -> bool:
         EXPIRY_EXPIRE_CANCEL_COMMAND,
         EXPIRY_REFRESH_COMMAND,
     }
+
+
+def refresh_expiry_review_status(
+    session_factory: sessionmaker,
+    identifier: str,
+    *,
+    deepcoin_client,
+    now: datetime | None = None,
+) -> ExpiryReviewRefreshResult:
+    lifecycle_id = _parse_operator_lifecycle_identifier(session_factory, identifier)
+    if lifecycle_id is None:
+        return ExpiryReviewRefreshResult(
+            answer_text="未找到对应策略。",
+            status_text="更新失败，未找到对应策略；未改变策略或挂单状态。",
+            keep_actions=True,
+        )
+
+    event_at = now or utc_now()
+    if deepcoin_client is None:
+        return ExpiryReviewRefreshResult(
+            answer_text=f"策略 #{lifecycle_id} 状态更新失败。",
+            status_text="更新失败，Deepcoin 客户端不可用；未改变策略或挂单状态。",
+            keep_actions=True,
+        )
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=deepcoin_client,
+        recovered_at=event_at,
+    )
+
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        if lifecycle is None:
+            return ExpiryReviewRefreshResult(
+                answer_text=f"未找到策略 #{lifecycle_id}。",
+                status_text="更新失败，策略已不存在；未改变策略或挂单状态。",
+                keep_actions=True,
+            )
+        binding = _load_expiry_refresh_binding(session, lifecycle)
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == binding.id)
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .order_by(ExecutionOrderLeg.leg_index.asc(), ExecutionOrderLeg.id.asc())
+            .all()
+            if binding is not None
+            else []
+        )
+        keep_actions = bool(
+            lifecycle.lifecycle_status in EXPIRY_REFRESH_ELIGIBLE_LIFECYCLE_STATUSES
+            and (
+                binding is None
+                or binding.last_exchange_status
+                == "position_attribution_evidence_unavailable"
+                or binding_has_unresolved_entry_leg(session, binding)
+            )
+        )
+        status_text = _format_expiry_refresh_status(
+            lifecycle=lifecycle,
+            legs=legs,
+            refreshed_at=event_at,
+        )
+    return ExpiryReviewRefreshResult(
+        answer_text=f"策略 #{lifecycle_id} 状态已更新。",
+        status_text=status_text,
+        keep_actions=keep_actions,
+    )
+
+
+def _load_expiry_refresh_binding(session, lifecycle: StrategyLifecycle) -> ExecutionBinding | None:
+    if lifecycle.execution_binding_id is not None:
+        binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
+        if binding is not None:
+            return binding
+    return (
+        session.query(ExecutionBinding)
+        .filter(ExecutionBinding.venue == "deepcoin")
+        .filter(ExecutionBinding.chat_id == lifecycle.chat_id)
+        .filter(ExecutionBinding.message_id == lifecycle.message_id)
+        .filter(ExecutionBinding.symbol == lifecycle.symbol)
+        .filter(ExecutionBinding.side == lifecycle.side)
+        .order_by(ExecutionBinding.id.desc())
+        .first()
+    )
+
+
+def _format_expiry_refresh_status(
+    *,
+    lifecycle: StrategyLifecycle,
+    legs: list[ExecutionOrderLeg],
+    refreshed_at: datetime,
+) -> str:
+    lifecycle_status = str(lifecycle.lifecycle_status or "unknown").lower()
+    lifecycle_label = EXPIRY_LIFECYCLE_STATUS_LABELS.get(
+        lifecycle_status, lifecycle_status or "未知"
+    )
+    entered = sum(1 for leg in legs if _expiry_leg_is_entered(leg))
+    pending = sum(1 for leg in legs if _expiry_leg_is_pending(leg))
+    cancelled = sum(1 for leg in legs if _expiry_leg_label(leg) == "已取消")
+    progress_parts = [f"{entered}/{len(legs)} 条腿已入场"]
+    if pending:
+        progress_parts.append(f"{pending}/{len(legs)} 条腿挂单中")
+    if cancelled:
+        progress_parts.append(f"{cancelled}/{len(legs)} 条腿已取消")
+    if not legs:
+        progress_parts = ["状态待确认"]
+    lines = [
+        f"策略状态：{lifecycle_label}",
+        f"入场进度：{'，'.join(progress_parts)}",
+    ]
+    for leg in legs:
+        label = _expiry_leg_label(leg)
+        identifiers = []
+        if leg.pos_id:
+            identifiers.append(f"仓位 ID: {_bounded_identifier(leg.pos_id)}")
+        if leg.order_id and not leg.pos_id:
+            identifiers.append(f"订单 ID: {_bounded_identifier(leg.order_id)}")
+        suffix = f"（{'；'.join(identifiers)}）" if identifiers else ""
+        lines.append(f"第{leg.leg_index}腿：{label}{suffix}")
+    local_time = refreshed_at
+    if local_time.tzinfo is None:
+        local_time = local_time.replace(tzinfo=ZoneInfo("UTC"))
+    local_time = local_time.astimezone(ZoneInfo("Asia/Shanghai"))
+    lines.append(
+        f"更新时间：{local_time.strftime('%Y-%m-%d %H:%M:%S')} Asia/Shanghai"
+    )
+    return "\n".join(lines)
+
+
+def _expiry_leg_is_entered(leg: ExecutionOrderLeg) -> bool:
+    return bool(leg.pos_id and str(leg.attribution_status or "") == "verified")
+
+
+def _expiry_leg_is_pending(leg: ExecutionOrderLeg) -> bool:
+    return not _expiry_leg_is_entered(leg) and str(leg.status or "").lower() in {
+        "open",
+        "pending",
+        "submitted",
+        "partially_filled",
+        "partial_filled",
+        "partial",
+    }
+
+
+def _expiry_leg_label(leg: ExecutionOrderLeg) -> str:
+    if _expiry_leg_is_entered(leg):
+        return "已入场"
+    status = str(leg.status or "unknown").lower()
+    return EXPIRY_LEG_STATUS_LABELS.get(status, f"{status or '未知'}")
+
+
+def _bounded_identifier(value: Any, *, limit: int = 80) -> str:
+    text = str(value or "").strip()
+    return text if len(text) <= limit else f"{text[: limit - 3]}..."
 
 
 def process_system_operator_command(

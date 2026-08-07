@@ -2143,6 +2143,249 @@ def test_expiry_callback_deepcoin_client_requirement(callback_data, expected):
     )
 
 
+def test_refresh_expiry_review_status_reports_active_and_pending_legs(
+    tmp_path, monkeypatch
+):
+    refreshed_at = datetime(2026, 8, 7, 6, 30, tzinfo=UTC)
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="miya",
+            chat_id=88,
+            message_id=3251,
+            symbol="ETH",
+            side="short",
+            venue="deepcoin",
+            status="active",
+            order_id="entry-filled,entry-pending",
+            pos_id="pos-filled",
+            strategy_instance_id="deepcoin:88:3251:ETH:short",
+        )
+        session.add(binding)
+        session.flush()
+        session.add_all(
+            [
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    leg_index=1,
+                    purpose="entry",
+                    order_kind="market",
+                    order_id="entry-filled",
+                    pos_id="pos-filled",
+                    status="active",
+                    attribution_status="verified",
+                ),
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    leg_index=2,
+                    purpose="entry",
+                    order_kind="trigger_limit",
+                    order_id="entry-pending",
+                    status="pending",
+                    attribution_status="unassigned",
+                ),
+            ]
+        )
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=3251,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 8, 7, 0, 0, tzinfo=UTC),
+            entered_at=datetime(2026, 8, 7, 1, 0, tzinfo=UTC),
+            execution_binding_id=binding.id,
+            management_action="expiry_review_requested",
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    calls = []
+
+    def fake_reconcile(factory, *, client, recovered_at):
+        calls.append((factory, client, recovered_at))
+
+    monkeypatch.setattr(
+        bot_commands_module,
+        "reconcile_deepcoin_execution_bindings",
+        fake_reconcile,
+        raising=False,
+    )
+    deepcoin_client = object()
+
+    result = bot_commands_module.refresh_expiry_review_status(
+        session_factory,
+        str(lifecycle_id),
+        deepcoin_client=deepcoin_client,
+        now=refreshed_at,
+    )
+
+    assert calls == [(session_factory, deepcoin_client, refreshed_at)]
+    assert result.keep_actions is True
+    assert "策略状态：已入场" in result.status_text
+    assert "入场进度：1/2 条腿已入场，1/2 条腿挂单中" in result.status_text
+    assert "第1腿：已入场" in result.status_text
+    assert "仓位 ID: pos-filled" in result.status_text
+    assert "第2腿：挂单中" in result.status_text
+    assert "订单 ID: entry-pending" in result.status_text
+    assert "更新时间：2026-08-07 14:30:00 Asia/Shanghai" in result.status_text
+
+
+def _create_expiry_refresh_lifecycle(session_factory, *, lifecycle_status, leg_specs):
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="miya",
+            chat_id=99,
+            message_id=4001,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            status="active",
+            strategy_instance_id="deepcoin:99:4001:BTC:long",
+        )
+        session.add(binding)
+        session.flush()
+        for index, spec in enumerate(leg_specs, start=1):
+            session.add(
+                ExecutionOrderLeg(
+                    execution_binding_id=binding.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    leg_index=index,
+                    purpose="entry",
+                    order_kind="trigger_limit",
+                    order_id=spec.get("order_id", f"order-{index}"),
+                    pos_id=spec.get("pos_id"),
+                    status=spec["status"],
+                    attribution_status=spec.get("attribution_status", "unassigned"),
+                )
+            )
+        lifecycle = StrategyLifecycle(
+            chat_id=99,
+            message_id=4001,
+            symbol="BTC",
+            side="long",
+            lifecycle_status=lifecycle_status,
+            signal_at=datetime(2026, 8, 7, 0, 0, tzinfo=UTC),
+            execution_binding_id=binding.id,
+            management_action="expiry_review_requested",
+            exit_reason="cancelled" if lifecycle_status == "exited" else None,
+        )
+        session.add(lifecycle)
+        session.commit()
+        return lifecycle.id
+
+
+def test_refresh_expiry_review_status_all_entered_removes_actions(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    lifecycle_id = _create_expiry_refresh_lifecycle(
+        session_factory,
+        lifecycle_status="entered",
+        leg_specs=[
+            {"status": "active", "pos_id": "pos-1", "attribution_status": "verified"},
+            {"status": "active", "pos_id": "pos-2", "attribution_status": "verified"},
+        ],
+    )
+    monkeypatch.setattr(
+        bot_commands_module, "reconcile_deepcoin_execution_bindings", lambda *a, **k: None
+    )
+
+    result = bot_commands_module.refresh_expiry_review_status(
+        session_factory,
+        str(lifecycle_id),
+        deepcoin_client=object(),
+        now=datetime(2026, 8, 7, 6, 30, tzinfo=UTC),
+    )
+
+    assert result.keep_actions is False
+    assert "入场进度：2/2 条腿已入场" in result.status_text
+
+
+def test_refresh_expiry_review_status_entered_and_cancelled_removes_actions(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    lifecycle_id = _create_expiry_refresh_lifecycle(
+        session_factory,
+        lifecycle_status="entered",
+        leg_specs=[
+            {"status": "active", "pos_id": "pos-1", "attribution_status": "verified"},
+            {"status": "cancelled"},
+        ],
+    )
+    monkeypatch.setattr(
+        bot_commands_module, "reconcile_deepcoin_execution_bindings", lambda *a, **k: None
+    )
+
+    result = bot_commands_module.refresh_expiry_review_status(
+        session_factory,
+        str(lifecycle_id),
+        deepcoin_client=object(),
+        now=datetime(2026, 8, 7, 6, 30, tzinfo=UTC),
+    )
+
+    assert result.keep_actions is False
+    assert "第2腿：已取消" in result.status_text
+
+
+def test_refresh_expiry_review_status_group_cancelled_lifecycle_removes_actions(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    lifecycle_id = _create_expiry_refresh_lifecycle(
+        session_factory,
+        lifecycle_status="exited",
+        leg_specs=[{"status": "pending"}],
+    )
+    monkeypatch.setattr(
+        bot_commands_module, "reconcile_deepcoin_execution_bindings", lambda *a, **k: None
+    )
+
+    result = bot_commands_module.refresh_expiry_review_status(
+        session_factory,
+        str(lifecycle_id),
+        deepcoin_client=object(),
+        now=datetime(2026, 8, 7, 6, 30, tzinfo=UTC),
+    )
+
+    assert result.keep_actions is False
+    assert "策略状态：已离场" in result.status_text
+
+
+def test_refresh_expiry_review_status_missing_binding_keeps_actions_conservatively(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=100,
+            message_id=4002,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 8, 7, 0, 0, tzinfo=UTC),
+            management_action="expiry_review_requested",
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+    monkeypatch.setattr(
+        bot_commands_module, "reconcile_deepcoin_execution_bindings", lambda *a, **k: None
+    )
+
+    result = bot_commands_module.refresh_expiry_review_status(
+        session_factory,
+        str(lifecycle_id),
+        deepcoin_client=object(),
+        now=datetime(2026, 8, 7, 6, 30, tzinfo=UTC),
+    )
+
+    assert result.keep_actions is True
+    assert "入场进度：状态待确认" in result.status_text
+
+
 def test_process_expiry_continue_keeps_pending_and_suppresses_repeat_review(tmp_path):
     continued_at = datetime(2026, 7, 3, 0, 0, tzinfo=UTC)
     session_factory = create_session_factory(tmp_path / "research.db")
