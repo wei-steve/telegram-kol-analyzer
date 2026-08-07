@@ -17,6 +17,7 @@ from telegram_kol_research.message_recognition import (
     _parse_explicit_exit_signal,
     _result_from_ai_payload,
     _upsert_ai_signal_candidate,
+    _validate_explicit_management_targets_in_session,
     apply_authoritative_mimo_payload,
     recognize_message_now,
 )
@@ -778,6 +779,53 @@ def test_authoritative_multi_target_partial_take_profit_persists_one_candidate_p
         (eth_id, "ETH", "short", 0.5),
     }
     assert [item.instruction_kind for item in items] == ["management", "management"]
+
+
+@pytest.mark.parametrize("management_action", ["exit_full", None])
+def test_persistence_validator_accepts_context_approved_multi_target_full_exit(
+    tmp_path,
+    management_action,
+):
+    session_factory = create_session_factory(tmp_path / "multi-exit-policy.db")
+    with session_factory() as session:
+        btc = _add_exact_live_lifecycle(
+            session, chat_id=88, message_id=3430, symbol="BTC", side="short"
+        )
+        eth = _add_exact_live_lifecycle(
+            session, chat_id=88, message_id=3431, symbol="ETH", side="short"
+        )
+        raw = RawMessage(
+            chat_id=88,
+            message_id=3432,
+            posted_at=datetime(2026, 7, 21, 18, 5, tzinfo=UTC),
+            text="BTC ETH 空单全部平仓",
+        )
+        session.add(raw)
+        session.flush()
+
+        accepted = _validate_explicit_management_targets_in_session(
+            session,
+            raw_message=raw,
+            instruction_text=raw.text,
+            target_decisions=[
+                {
+                    "event_type": "exit_position",
+                    "management_action": management_action,
+                    "target_lifecycle_id": btc.id,
+                    "symbol": "BTC",
+                    "side": "short",
+                },
+                {
+                    "event_type": "exit_position",
+                    "management_action": management_action,
+                    "target_lifecycle_id": eth.id,
+                    "symbol": "ETH",
+                    "side": "short",
+                },
+            ],
+        )
+
+        assert accepted is True
 
 
 def test_authoritative_multi_target_persistence_is_all_or_nothing(tmp_path):

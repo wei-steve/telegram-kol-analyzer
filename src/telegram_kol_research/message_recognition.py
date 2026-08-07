@@ -42,6 +42,7 @@ from telegram_kol_research.message_instruction_items import (
 from telegram_kol_research.management_directives import (
     FULL_EXIT_ACTIONS,
     build_management_instruction_contract,
+    multi_target_action_policy,
     resolve_management_directive,
 )
 from telegram_kol_research.management_scope import (
@@ -1837,16 +1838,24 @@ def _validate_explicit_management_targets_in_session(
     target_decisions: list[dict[str, Any]],
     instruction_text: str,
 ) -> bool:
-    """Validate the complete explicit target set before creating any work."""
+    """Validate explicit targets against the shared closed fanout policy."""
 
     if len(target_decisions) < 2:
         return False
     for target_decision in target_decisions:
-        if (
-            str(target_decision.get("event_type") or "") != "position_update"
-            or str(target_decision.get("management_action") or "")
-            != "partial_take_profit"
-        ):
+        event_type = str(target_decision.get("event_type") or "").strip()
+        raw_action = str(
+            target_decision.get("management_action") or ""
+        ).strip()
+        effective_action = raw_action or {
+            "cancel_entry": "cancel_pending_entry",
+            "exit_position": "exit_full",
+            "exit_full": "exit_full",
+            "full_exit": "exit_full",
+            "close_position": "exit_full",
+        }.get(event_type, "")
+        policy = multi_target_action_policy(effective_action)
+        if not policy.risk_reducing or not policy.fanout_allowed:
             return False
         try:
             directive = resolve_management_directive(
@@ -1858,9 +1867,12 @@ def _validate_explicit_management_targets_in_session(
             )
             if (
                 target_id is None
-                or directive.intent != "partial_take_profit"
                 or not directive.risk_reducing
                 or not directive.fanout_allowed
+                or (
+                    policy.requires_fraction
+                    and directive.fraction is None
+                )
             ):
                 return False
             resolved = resolve_management_scope_in_session(

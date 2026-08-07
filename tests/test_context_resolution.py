@@ -98,6 +98,33 @@ def test_exact_multi_target_partial_take_profit_preserves_target_order():
     assert decision.target_thread_ids == (13, 12)
 
 
+@pytest.mark.parametrize(
+    ("decision_name", "management_action"),
+    [
+        ("cancel_thread", "cancel_pending_entry"),
+        ("exit_thread", "exit_full"),
+        ("exit_thread", "exit_partial"),
+    ],
+)
+def test_context_multi_target_contract_uses_closed_risk_reduction_policy(
+    decision_name,
+    management_action,
+):
+    decision = parse_context_resolution_decision(
+        _valid_payload(
+            decision=decision_name,
+            target_thread_ids=[12, 13],
+            management_action=management_action,
+            risk_reducing_fanout_allowed=True,
+        ),
+        allowed_thread_ids={12, 13},
+        allowed_message_ids={1460, 1462},
+    )
+
+    assert decision.target_thread_ids == (12, 13)
+    assert decision.management_action == management_action
+
+
 @pytest.mark.parametrize("management_action", ["move_stop_to_protect", "risk_update"])
 def test_multi_target_management_fanout_refuses_non_partial_actions(management_action):
     with pytest.raises(ContextResolutionError) as raised:

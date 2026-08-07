@@ -26,6 +26,9 @@ from telegram_kol_research.models import (
     RawMessage,
     utc_now,
 )
+from telegram_kol_research.management_directives import (
+    multi_target_action_policy,
+)
 from telegram_kol_research.runtime_incident_adapters import (
     capture_context_worker_state,
     capture_runtime_incident_best_effort,
@@ -164,9 +167,26 @@ class ContextResolutionDecision:
 
 
 def _fanout_allowed(decision: str, management_action: str | None) -> bool:
-    return decision in {"cancel_thread", "exit_thread"} or (
-        decision == "manage_thread"
-        and management_action == "partial_take_profit"
+    effective_action = management_action
+    if effective_action is None:
+        effective_action = {
+            "cancel_thread": "cancel_pending_entry",
+            "exit_thread": "exit_full",
+        }.get(decision)
+    policy = multi_target_action_policy(effective_action)
+    return policy.fanout_allowed and (
+        (
+            decision == "cancel_thread"
+            and policy.action == "cancel_pending_entry"
+        )
+        or (
+            decision == "exit_thread"
+            and policy.action in {"exit_full", "exit_partial"}
+        )
+        or (
+            decision == "manage_thread"
+            and policy.action == "partial_take_profit"
+        )
     )
 
 

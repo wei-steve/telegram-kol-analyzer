@@ -18,6 +18,48 @@ DEFAULT_PARTIAL_CLOSE_FRACTION = 0.50
 DEFAULT_TAIL_CLOSE_FRACTION = 0.80
 FULL_EXIT_ACTIONS = frozenset({"exit_full", "full_exit", "close_position"})
 
+
+@dataclass(frozen=True, slots=True)
+class MultiTargetActionPolicy:
+    action: str
+    risk_reducing: bool
+    fanout_allowed: bool
+    requires_fraction: bool = False
+
+
+_MULTI_TARGET_ACTIONS = {
+    "partial_take_profit": MultiTargetActionPolicy(
+        "partial_take_profit", True, True, True
+    ),
+    "exit_full": MultiTargetActionPolicy("exit_full", True, True),
+    "exit_partial": MultiTargetActionPolicy(
+        "exit_partial", True, True, True
+    ),
+    "cancel_pending_entry": MultiTargetActionPolicy(
+        "cancel_pending_entry", True, True
+    ),
+}
+_MULTI_TARGET_ACTION_ALIASES = {
+    "full_exit": "exit_full",
+    "close_position": "exit_full",
+    "cancel_entry": "cancel_pending_entry",
+}
+
+
+def multi_target_action_policy(action: str | None) -> MultiTargetActionPolicy:
+    """Return the closed fanout policy shared by parsing and persistence."""
+
+    normalized = str(action or "").strip().lower()
+    canonical = _MULTI_TARGET_ACTION_ALIASES.get(normalized, normalized)
+    return _MULTI_TARGET_ACTIONS.get(
+        canonical,
+        MultiTargetActionPolicy(
+            action=canonical or "none",
+            risk_reducing=False,
+            fanout_allowed=False,
+        ),
+    )
+
 _PARTIAL_TERMS = (
     "第一止盈",
     "第一个止盈",
@@ -116,6 +158,7 @@ def resolve_management_directive(
     has_protection = has_break_even or current_message_stop is not None
 
     if any(term in combined for term in _CANCEL_ENTRY_TERMS) or event_type == "cancel_entry":
+        policy = multi_target_action_policy("cancel_pending_entry")
         return ManagementDirective(
             intent="cancel_entry",
             fraction=None,
@@ -123,7 +166,7 @@ def resolve_management_directive(
             side=side,
             stop_loss=stop_loss,
             risk_reducing=True,
-            fanout_allowed=False,
+            fanout_allowed=policy.fanout_allowed,
             cancel_deferred_entries=True,
             reason_code="explicit_cancel_entry",
             strategy_thread_id=strategy_thread_id,
@@ -149,6 +192,31 @@ def resolve_management_directive(
             reason_code="risk_increasing_fanout_forbidden",
             strategy_thread_id=strategy_thread_id,
             stop_price_source=current_message_stop_source,
+        )
+
+    if raw_action == "exit_partial":
+        fraction = _management_fraction(lifecycle_event, combined)
+        if fraction is None:
+            return ManagementDirective(
+                intent="partial_take_profit",
+                fraction=None,
+                symbol=symbol,
+                side=side,
+                stop_loss=stop_loss,
+                risk_reducing=False,
+                fanout_allowed=False,
+                cancel_deferred_entries=False,
+                reason_code="partial_exit_fraction_required",
+                strategy_thread_id=strategy_thread_id,
+                stop_price_source=current_message_stop_source,
+            )
+        return _directive(
+            "partial_take_profit",
+            fraction=fraction,
+            symbol=symbol,
+            side=side,
+            reason_code="explicit_partial_exit",
+            strategy_thread_id=strategy_thread_id,
         )
 
     if event_type in {

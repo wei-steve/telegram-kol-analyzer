@@ -2,12 +2,70 @@ from __future__ import annotations
 
 import pytest
 
+from telegram_kol_research import management_directives as management_directives_module
 from telegram_kol_research.management_directives import (
     DEFAULT_PARTIAL_CLOSE_FRACTION,
     DEFAULT_TAIL_CLOSE_FRACTION,
     build_management_instruction_contract,
     resolve_management_directive,
 )
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "partial_take_profit",
+        "exit_full",
+        "exit_partial",
+        "cancel_pending_entry",
+    ],
+)
+def test_closed_multi_target_policy_allows_independent_risk_reductions(action):
+    assert hasattr(management_directives_module, "multi_target_action_policy")
+    policy = management_directives_module.multi_target_action_policy(action)
+
+    assert policy.risk_reducing is True
+    assert policy.fanout_allowed is True
+
+
+@pytest.mark.parametrize(
+    "action",
+    ["add_position", "reverse", "revise_entry", "replace_shared_stop"],
+)
+def test_closed_multi_target_policy_rejects_unsafe_actions(action):
+    assert hasattr(management_directives_module, "multi_target_action_policy")
+    policy = management_directives_module.multi_target_action_policy(action)
+
+    assert policy.fanout_allowed is False
+
+
+def test_cancel_entry_directive_is_safe_for_independent_targets():
+    directive = resolve_management_directive(
+        text="BTC ETH 挂单全部取消",
+        lifecycle_event={
+            "event_type": "cancel_entry",
+            "management_action": "cancel_pending_entry",
+        },
+    )
+
+    assert directive.intent == "cancel_entry"
+    assert directive.risk_reducing is True
+    assert directive.fanout_allowed is True
+
+
+def test_structured_partial_exit_uses_its_bounded_fraction():
+    directive = resolve_management_directive(
+        text="",
+        lifecycle_event={
+            "event_type": "exit_position",
+            "management_action": "exit_partial",
+            "management_fraction": 0.25,
+        },
+    )
+
+    assert directive.intent == "partial_take_profit"
+    assert directive.fraction == pytest.approx(0.25)
+    assert directive.fanout_allowed is True
 
 
 def test_unspecified_partial_defaults_to_half() -> None:
@@ -291,7 +349,7 @@ def test_cancel_pending_orders_wording_is_a_cancel_entry_directive() -> None:
 
     assert directive.intent == "cancel_entry"
     assert directive.cancel_deferred_entries is True
-    assert directive.fanout_allowed is False
+    assert directive.fanout_allowed is True
     assert directive.strategy_thread_id == 42
 
 
