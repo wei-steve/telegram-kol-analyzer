@@ -19,6 +19,7 @@ last_completed_phase: "8R.2"
 last_completed_commit: b3c2f14
 production_commit: f26e71b0d5d16c9301f815fe959f61d8ccf0c4de
 local_tests:
+  - "runtime-notification-watermark-local: 171 focused and adjacent tests passed; deployment remains pending with the production Telegram selector unchanged"
   - "position-compliance-multi-target-shadow-canary: 4 focused tests passed; redacted message-3465 fixture produced exact BTC-short and ETH-short 50% target plans in an isolated temporary database"
   - "position-compliance-dormant-rules: 30 passed; both rules remain non-deployable with no production projection or selector change"
   - "phase-8r.3-dormant-ledger-rules-scanner-regression: 410 passed, 2 known YAML prompt deprecation warnings"
