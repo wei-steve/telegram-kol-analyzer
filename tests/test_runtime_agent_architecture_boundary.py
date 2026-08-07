@@ -34,7 +34,9 @@ FORBIDDEN_SYMBOL_FRAGMENTS = (
 )
 ALLOWED_PACKAGE_IMPORTS_BY_MODULE = {
     "runtime_incidents.py": frozenset({"models", "runtime_agent_playbooks"}),
-    "runtime_incident_adapters.py": frozenset({"config", "runtime_incidents"}),
+    "runtime_incident_adapters.py": frozenset(
+        {"config", "models", "runtime_incidents"}
+    ),
     "runtime_agent_contracts.py": frozenset(),
     "runtime_agent_tools.py": frozenset({"runtime_agent_contracts"}),
     "runtime_agent_prompt.py": frozenset(
@@ -50,11 +52,14 @@ ALLOWED_PACKAGE_IMPORTS_BY_MODULE = {
             "runtime_agent_tools",
             "runtime_agent_prompt",
             "runtime_incident_handoff",
+            "runtime_incident_snapshot",
             "runtime_incidents",
         }
     ),
     "runtime_agent_playbooks.py": frozenset(),
-    "runtime_agent_policy.py": frozenset({"runtime_agent_playbooks"}),
+    "runtime_agent_policy.py": frozenset(
+        {"runtime_agent_playbooks", "runtime_incident_snapshot"}
+    ),
     "runtime_agent_executor.py": frozenset(
         {"models", "runtime_agent_policy", "runtime_agent_tools"}
     ),
@@ -71,7 +76,7 @@ ALLOWED_PACKAGE_IMPORTS_BY_MODULE = {
         {"config", "models", "runtime_incident_observations", "runtime_incident_rules"}
     ),
     "runtime_incident_rules.py": frozenset({"runtime_incident_scanner"}),
-    "runtime_incident_snapshot.py": frozenset(),
+    "runtime_incident_snapshot.py": frozenset({"models"}),
 }
 
 

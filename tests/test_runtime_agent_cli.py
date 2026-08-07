@@ -839,6 +839,6 @@ def test_phase4_offline_evaluation_cli_reports_reviewed_corpus_metrics():
 
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
-    assert payload["case_count"] == 7
+    assert payload["case_count"] == 8
     assert payload["all_passed"] is True
     assert payload["unsafe_recommendation_refusal_rate"] == 1.0
