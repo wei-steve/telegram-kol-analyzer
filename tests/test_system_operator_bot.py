@@ -423,6 +423,182 @@ def test_runtime_incident_delivery_claims_only_exact_notification_types(
         assert session.get(RuntimeIncident, capture_only.id).notification_status == "pending"
 
 
+def test_runtime_incident_notification_watermark_claims_only_later_exact_type(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "runtime-watermark.db")
+    historical = _record_runtime_incident(
+        session_factory,
+        incident_type="severe_protection_incident",
+    )
+    other_type = _record_runtime_incident(
+        session_factory,
+        source_record_id="42",
+        incident_type="management_partial_failed",
+        fingerprint="b" * 64,
+    )
+    later = _record_runtime_incident(
+        session_factory,
+        source_record_id="43",
+        incident_type="severe_protection_incident",
+        fingerprint="c" * 64,
+    )
+
+    claim = operator_bot_module.claim_next_runtime_incident_notification(
+        session_factory,
+        claimed_at=NOW,
+        notification_types=frozenset({"severe_protection_incident"}),
+        after_incident_id=historical.id,
+    )
+
+    assert claim is not None
+    assert claim["incident"].id == later.id
+    with session_factory() as session:
+        assert session.get(RuntimeIncident, historical.id).notification_status == "pending"
+        assert session.get(RuntimeIncident, other_type.id).notification_status == "pending"
+
+
+def test_runtime_incident_notification_watermark_leaves_only_history_pending(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "runtime-watermark-only-old.db")
+    historical = _record_runtime_incident(
+        session_factory,
+        incident_type="severe_protection_incident",
+    )
+
+    claim = operator_bot_module.claim_next_runtime_incident_notification(
+        session_factory,
+        claimed_at=NOW,
+        notification_types=frozenset({"severe_protection_incident"}),
+        after_incident_id=historical.id,
+    )
+
+    assert claim is None
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, historical.id)
+        assert row.notification_status == "pending"
+        assert row.notification_claim_token is None
+
+
+def test_runtime_incident_notification_watermark_excludes_old_retry_states(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "runtime-watermark-retry.db")
+    failed = _record_runtime_incident(
+        session_factory,
+        incident_type="severe_protection_incident",
+    )
+    stale = _record_runtime_incident(
+        session_factory,
+        source_record_id="42",
+        incident_type="severe_protection_incident",
+        fingerprint="b" * 64,
+    )
+    with session_factory() as session:
+        session.get(RuntimeIncident, failed.id).notification_status = "failed"
+        stale_row = session.get(RuntimeIncident, stale.id)
+        stale_row.notification_status = "delivering"
+        stale_row.notification_claimed_at = NOW - timedelta(seconds=31)
+        session.commit()
+    later = _record_runtime_incident(
+        session_factory,
+        source_record_id="43",
+        incident_type="severe_protection_incident",
+        fingerprint="c" * 64,
+    )
+
+    claim = operator_bot_module.claim_next_runtime_incident_notification(
+        session_factory,
+        claimed_at=NOW,
+        lease_seconds=30,
+        notification_types=frozenset({"severe_protection_incident"}),
+        after_incident_id=stale.id,
+    )
+
+    assert claim is not None
+    assert claim["incident"].id == later.id
+    with session_factory() as session:
+        assert session.get(RuntimeIncident, failed.id).notification_status == "failed"
+        assert session.get(RuntimeIncident, stale.id).notification_status == "delivering"
+
+
+def test_runtime_incident_notification_watermark_none_preserves_oldest_first(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "runtime-watermark-legacy.db")
+    historical = _record_runtime_incident(session_factory)
+    _record_runtime_incident(
+        session_factory,
+        source_record_id="42",
+        fingerprint="b" * 64,
+    )
+
+    claim = operator_bot_module.claim_next_runtime_incident_notification(
+        session_factory,
+        claimed_at=NOW,
+        after_incident_id=None,
+    )
+
+    assert claim is not None
+    assert claim["incident"].id == historical.id
+
+
+def test_runtime_incident_delivery_watermark_skips_history_then_delivers_new(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "runtime-watermark-delivery.db")
+    historical = _record_runtime_incident(
+        session_factory,
+        incident_type="severe_protection_incident",
+    )
+    deliveries = []
+
+    async def capture(**kwargs):
+        deliveries.append(kwargs["text"])
+
+    monkeypatch.setattr(
+        operator_bot_module,
+        "send_system_operator_bot_message",
+        capture,
+    )
+    runtime_config = RuntimeIncidentConfig(
+        telegram_notifications_enabled=True,
+        telegram_notification_types=frozenset({"severe_protection_incident"}),
+        telegram_notification_after_incident_id=historical.id,
+    )
+
+    first = asyncio.run(
+        operator_bot_module.deliver_runtime_incident_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            runtime_config=runtime_config,
+            claimed_at=NOW,
+        )
+    )
+    later = _record_runtime_incident(
+        session_factory,
+        source_record_id="42",
+        incident_type="severe_protection_incident",
+        fingerprint="b" * 64,
+    )
+    second = asyncio.run(
+        operator_bot_module.deliver_runtime_incident_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            runtime_config=runtime_config,
+            claimed_at=NOW,
+        )
+    )
+
+    assert (first, second) == (0, 1)
+    assert len(deliveries) == 1
+    assert f"事件ID: {later.id}" in deliveries[0]
+    with session_factory() as session:
+        assert session.get(RuntimeIncident, historical.id).notification_status == "pending"
+
+
 def test_runtime_incident_notification_retries_failure_and_deduplicates_success(
     tmp_path,
     monkeypatch,
