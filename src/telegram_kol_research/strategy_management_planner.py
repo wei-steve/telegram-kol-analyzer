@@ -1255,6 +1255,11 @@ def _plan_strategy_management_batch_locked(
         "protection": protection_by_pos_id,
         "management_capabilities": management_capabilities,
     }
+    partial_protection_maintenance = bool(
+        intent == "partial_take_profit"
+        and effective_action_name == "partial_close"
+        and protection_by_pos_id
+    )
     if protection_health_by_pos_id:
         target_snapshot["protection_health"] = protection_health_by_pos_id
     if retry_blocked_batch_id is not None and existing is not None:
@@ -1280,6 +1285,25 @@ def _plan_strategy_management_batch_locked(
                     ),
                     "owned_order_ids": list(
                         protection_by_pos_id[str(position["pos_id"])]["order_ids"]
+                    ),
+                }
+                for position in economics
+            ],
+        }
+    if partial_protection_maintenance:
+        target_snapshot["protection_maintenance"] = {
+            "version": 1,
+            "mode": "resize_after_reduction",
+            "positions": [
+                {
+                    "pos_id": str(position["pos_id"]),
+                    "execution_order_leg_id": int(
+                        target_legs_by_pos_id[str(position["pos_id"])].id
+                    ),
+                    "owned_order_ids": list(
+                        protection_by_pos_id[str(position["pos_id"])][
+                            "order_ids"
+                        ]
                     ),
                 }
                 for position in economics
@@ -1319,7 +1343,10 @@ def _plan_strategy_management_batch_locked(
                         else {}
                     ),
                 }
-                if intent in PROTECTION_INTENTS
+                if (
+                    intent in PROTECTION_INTENTS
+                    or partial_protection_maintenance
+                )
                 and effective_action_name not in {"full_close", "full_exit"}
                 and (
                     effective_action_name != BREAK_EVEN_BY_MARKET_ACTION

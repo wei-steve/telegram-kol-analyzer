@@ -371,9 +371,10 @@ def reconcile_strategy_management_batches(
             if all(status == "confirmed" for status in statuses):
                 batch.reconciled_at = now
                 batch.updated_at = now
-                if (
-                    batch.effective_action == "partial_then_break_even"
-                    and not automatic_break_even_enabled
+                protection_saga = _partial_protection_saga_enabled(batch)
+                if protection_saga and (
+                    batch.effective_action != "partial_then_break_even"
+                    or not automatic_break_even_enabled
                 ):
                     batch.status = "protection_ready"
                     batch.reason_code = "management_close_confirmed_protection_ready"
@@ -398,10 +399,14 @@ def reconcile_strategy_management_batches(
                         counts["pending"] += 1
                 else:
                     _confirm_partial_close(session, batch=batch, now=now)
-                    if automatic_break_even_enabled and batch.effective_action in {
-                        "partial_close",
-                        "partial_then_break_even",
-                    }:
+                    if (
+                        automatic_break_even_enabled
+                        and not _partial_take_profit_maintenance_enabled(batch)
+                        and batch.effective_action in {
+                            "partial_close",
+                            "partial_then_break_even",
+                        }
+                    ):
                         confirmed_partial_batch_ids.append(int(batch.id))
             elif "failed" in statuses:
                 _freeze_batch(
@@ -660,7 +665,7 @@ def _load_json_object(value: str | None) -> dict[str, Any]:
 def _composite_protection_phase_started(batch, legs) -> bool:
     """Keep close reconciliation permanently out after phase hand-off."""
 
-    if batch.effective_action != "partial_then_break_even":
+    if not _partial_protection_saga_enabled(batch):
         return False
     reason = str(batch.reason_code or "")
     return bool(
@@ -668,6 +673,22 @@ def _composite_protection_phase_started(batch, legs) -> bool:
         or reason.startswith("protection_")
         or reason.startswith("all_position_protection_")
         or any(str(leg.status or "") in _PROTECTION_PHASE_LEG_STATES for leg in legs)
+    )
+
+
+def _partial_protection_saga_enabled(batch) -> bool:
+    return bool(
+        batch.effective_action == "partial_then_break_even"
+        or _partial_take_profit_maintenance_enabled(batch)
+    )
+
+
+def _partial_take_profit_maintenance_enabled(batch) -> bool:
+    snapshot = _load_json_object(batch.target_snapshot_json)
+    return bool(
+        batch.intent == "partial_take_profit"
+        and batch.effective_action == "partial_close"
+        and isinstance(snapshot.get("protection_maintenance"), dict)
     )
 
 

@@ -1294,6 +1294,27 @@ def test_historical_protection_incident_allows_partial_take_profit_from_complete
     assert health["primary_order_id"] == "healthy-primary"
     assert health["backup_order_id"] == "healthy-backup"
     assert health["take_profit_order_ids"] == ["healthy-tp"]
+    assert result.batch.target_snapshot["protection_maintenance"] == {
+        "version": 1,
+        "mode": "resize_after_reduction",
+        "positions": [
+            {
+                "pos_id": "pos-b",
+                "execution_order_leg_id": result.batch.legs[
+                    0
+                ].execution_order_leg_id,
+                "owned_order_ids": [
+                    "healthy-backup",
+                    "healthy-primary",
+                    "healthy-tp",
+                ],
+            }
+        ],
+    }
+    assert result.batch.legs[0].planned_tpsl == {
+        "intent": "partial_take_profit",
+        "stop_loss_text": None,
+    }
     with session_factory() as session:
         observations = session.query(PositionProtectionHealthObservation).all()
         assert len(observations) == 1

@@ -3927,6 +3927,134 @@ def test_partial_then_break_even_waits_for_close_confirmation_before_protection(
     assert any(call["ordId"] == "tp-2" for call in client.cancel_calls)
 
 
+def test_partial_take_profit_preserves_stops_and_converges_remaining_protection(
+    tmp_path,
+):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+    from telegram_kol_research.strategy_management_reconciliation import (
+        reconcile_strategy_management_batches,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(
+        session_factory,
+        action="partial_close",
+        stop_loss=None,
+        keep_close_plan=True,
+    )
+    with session_factory() as session:
+        stored = session.get(StrategyManagementBatch, batch.id)
+        stored.intent = "partial_take_profit"
+        snapshot = json.loads(stored.target_snapshot_json)
+        snapshot["protection_maintenance"] = {
+            "version": 1,
+            "mode": "resize_after_reduction",
+            "positions": [
+                {
+                    "pos_id": leg.pos_id,
+                    "execution_order_leg_id": leg.execution_order_leg_id,
+                    "owned_order_ids": [
+                        row["ordId"] for row in rows_by_pos[leg.pos_id]
+                    ],
+                }
+                for leg in batch.legs
+            ],
+        }
+        stored.target_snapshot_json = json.dumps(snapshot)
+        session.commit()
+    client = _ProtectionClient(session_factory, rows_by_pos)
+
+    close_result = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert close_result["status"] == "reconciling"
+    assert [entry[0] for entry in client.call_log[:5]] == [
+        "cancel_position_sltp",
+        "cancel_position_sltp",
+        "cancel_position_sltp",
+        "cancel_position_sltp",
+        "cancel_position_sltp",
+    ]
+    assert [entry[0] for entry in client.call_log[5:]] == [
+        "place_order",
+        "place_order",
+    ]
+    stored = load_management_batch(session_factory, batch.id)
+    close_orders = [
+        {
+            "ordId": leg.exchange_order_id,
+            "clOrdId": leg.client_order_id,
+            "instId": "BTC-USDT-SWAP",
+        }
+        for leg in stored.legs
+    ]
+    snapshot = SimpleNamespace(
+        positions=[
+            {
+                "posId": "pos-1",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "1",
+                "avgPx": "64000",
+                "mgnMode": "cross",
+                "mrgPosition": "split",
+                "cTime": "1000",
+            },
+            {
+                "posId": "pos-2",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "2",
+                "avgPx": "64500",
+                "mgnMode": "cross",
+                "mrgPosition": "split",
+                "cTime": "1001",
+            },
+        ],
+        open_orders=[],
+        order_history=close_orders,
+        trade_fills=[],
+        errors={},
+    )
+    reconcile_strategy_management_batches(
+        session_factory,
+        snapshot=snapshot,
+        reconciled_at=NOW,
+    )
+    assert load_management_batch(session_factory, batch.id).status == (
+        "protection_ready"
+    )
+
+    client.positions = list(snapshot.positions)
+    protection_result = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert protection_result["status"] == "succeeded"
+    stops = [row for row in client.set_calls if "slTriggerPx" in row]
+    assert [(row["posId"], row["slTriggerPx"]) for row in stops] == [
+        ("pos-1", "65500"),
+        ("pos-2", "65700"),
+    ]
+    take_profits = [row for row in client.set_calls if "tpTriggerPx" in row]
+    assert [
+        (row["posId"], row["tpTriggerPx"], row["sz"])
+        for row in take_profits
+    ] == [
+        ("pos-1", "62000", "1"),
+        ("pos-2", "62500", "2"),
+    ], client.set_calls
+
+
 def test_close_preflight_falls_back_from_inline_price_to_exact_ledger(tmp_path):
     from telegram_kol_research.strategy_management_executor import (
         _preflight_exact_protection_rows,
@@ -3989,22 +4117,36 @@ def test_close_preflight_falls_back_from_inline_price_to_exact_ledger(tmp_path):
     } == {"tp-2", "sl-2"}
 
 
-def test_partial_then_break_even_cancel_unknown_never_submits_close(tmp_path):
+@pytest.mark.parametrize(
+    ("action", "marker_name", "marker_mode"),
+    [
+        ("partial_then_break_even", "protection_recovery", "replace_after_reduction"),
+        ("partial_close", "protection_maintenance", "resize_after_reduction"),
+    ],
+)
+def test_partial_protection_cancel_unknown_never_submits_close(
+    action, marker_name, marker_mode, tmp_path
+):
     from telegram_kol_research.strategy_management_executor import execute_management_batch
 
     session_factory = create_session_factory(tmp_path / "research.db")
     batch, rows_by_pos = _persist_protection_batch(
         session_factory,
-        action="partial_then_break_even",
+        action=action,
         stop_loss=None,
         keep_close_plan=True,
     )
+    if action == "partial_close":
+        with session_factory() as session:
+            stored = session.get(StrategyManagementBatch, batch.id)
+            stored.intent = "partial_take_profit"
+            session.commit()
     with session_factory() as session:
         stored = session.get(StrategyManagementBatch, batch.id)
         snapshot = json.loads(stored.target_snapshot_json)
-        snapshot["protection_recovery"] = {
+        snapshot[marker_name] = {
             "version": 1,
-            "mode": "replace_after_reduction",
+            "mode": marker_mode,
             "positions": [
                 {
                     "pos_id": leg.pos_id,

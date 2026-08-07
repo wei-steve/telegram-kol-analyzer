@@ -1158,7 +1158,7 @@ def execute_management_batch(
             )
             raise
     if batch.effective_action in _PROTECTION_ACTIONS or (
-        batch.effective_action == "partial_then_break_even"
+        _partial_protection_saga_enabled(batch)
         and (
             batch.status == "protection_ready"
             or batch.reason_code == "protection_phase_executing"
@@ -1672,7 +1672,7 @@ def _execute_protection_batch(
         for leg in batch.legs:
             old_rows = list(current_protection_rows_by_pos_id[leg.pos_id])
             replacement_rows = old_rows
-            if batch.effective_action == "partial_then_break_even":
+            if _partial_protection_saga_enabled(batch):
                 replacement_rows = _resize_protection_rows_for_remaining_position(
                     batch=batch,
                     leg=leg,
@@ -1684,8 +1684,12 @@ def _execute_protection_batch(
                 (
                     leg,
                     old_rows,
-                    _adjusted_protection_rows(
-                        batch=batch, leg=leg, old_rows=replacement_rows
+                    (
+                        replacement_rows
+                        if _partial_take_profit_maintenance_enabled(batch)
+                        else _adjusted_protection_rows(
+                            batch=batch, leg=leg, old_rows=replacement_rows
+                        )
                     ),
                     _protection_payload_common(
                         binding=binding,
@@ -1724,12 +1728,15 @@ def _execute_protection_batch(
             continue
         expected_leg_statuses = (
             {"confirmed"}
-            if batch.effective_action == "partial_then_break_even"
+            if _partial_protection_saga_enabled(batch)
             else {"planned"}
         )
-        replacement_rows, retained_rows = _partition_replacement_rows(
-            old_rows=old_rows, new_rows=new_rows
-        )
+        if skip_old_cancel:
+            replacement_rows, retained_rows = list(new_rows), []
+        else:
+            replacement_rows, retained_rows = _partition_replacement_rows(
+                old_rows=old_rows, new_rows=new_rows
+            )
         retained_order_ids = {str(item["order_id"]) for item in retained_rows}
         old_replaced_order_ids = [
             str(item["order_id"])
@@ -2000,7 +2007,7 @@ def _preflight_exact_protection_positions(
     for leg in batch.legs:
         position = positions_by_id[leg.pos_id]
         expected_size = leg.preflight_size
-        if batch.effective_action == "partial_then_break_even" and after_partial_close:
+        if _partial_protection_saga_enabled(batch) and after_partial_close:
             try:
                 expected_size = str(
                     Decimal(str(leg.preflight_size))
@@ -2128,11 +2135,15 @@ def _require_exact_risk_reduction_protection_recovery_marker(
     batch: ManagementBatchRecord,
 ) -> None:
     snapshot = batch.target_snapshot
-    marker = (
-        snapshot.get("protection_recovery")
-        if isinstance(snapshot, dict)
-        else None
-    )
+    marker_name = None
+    marker = None
+    if isinstance(snapshot, dict):
+        if isinstance(snapshot.get("protection_recovery"), dict):
+            marker_name = "protection_recovery"
+            marker = snapshot[marker_name]
+        elif isinstance(snapshot.get("protection_maintenance"), dict):
+            marker_name = "protection_maintenance"
+            marker = snapshot[marker_name]
     if marker is None:
         return
     positions = marker.get("positions") if isinstance(marker, dict) else None
@@ -2150,10 +2161,23 @@ def _require_exact_risk_reduction_protection_recovery_marker(
         for order_id in position["owned_order_ids"]
     ]
     if (
-        batch.effective_action != "partial_then_break_even"
-        or not isinstance(marker, dict)
+        not isinstance(marker, dict)
         or marker.get("version") != 1
-        or marker.get("mode") != "replace_after_reduction"
+        or (
+            marker_name == "protection_recovery"
+            and (
+                batch.effective_action != "partial_then_break_even"
+                or marker.get("mode") != "replace_after_reduction"
+            )
+        )
+        or (
+            marker_name == "protection_maintenance"
+            and (
+                batch.intent != "partial_take_profit"
+                or batch.effective_action != "partial_close"
+                or marker.get("mode") != "resize_after_reduction"
+            )
+        )
         or positions != expected
         or any(not position["owned_order_ids"] for position in expected)
         or len(all_order_ids) != len(set(all_order_ids))
@@ -2165,8 +2189,28 @@ def _require_exact_risk_reduction_protection_recovery_marker(
 
 def _risk_reduction_recovery_enabled(batch: ManagementBatchRecord) -> bool:
     snapshot = batch.target_snapshot
-    return isinstance(snapshot, dict) and isinstance(
-        snapshot.get("protection_recovery"), dict
+    return isinstance(snapshot, dict) and (
+        isinstance(snapshot.get("protection_recovery"), dict)
+        or isinstance(snapshot.get("protection_maintenance"), dict)
+    )
+
+
+def _partial_take_profit_maintenance_enabled(
+    batch: ManagementBatchRecord,
+) -> bool:
+    snapshot = batch.target_snapshot
+    return bool(
+        batch.intent == "partial_take_profit"
+        and batch.effective_action == "partial_close"
+        and isinstance(snapshot, dict)
+        and isinstance(snapshot.get("protection_maintenance"), dict)
+    )
+
+
+def _partial_protection_saga_enabled(batch: ManagementBatchRecord) -> bool:
+    return bool(
+        batch.effective_action == "partial_then_break_even"
+        or _partial_take_profit_maintenance_enabled(batch)
     )
 
 
@@ -2992,7 +3036,7 @@ def _protection_rows_match_expected_snapshot(
 ) -> bool:
     if current_rows == expected_rows:
         return True
-    if batch.effective_action != "partial_then_break_even":
+    if not _partial_protection_saga_enabled(batch):
         return False
     if len(current_rows) != len(expected_rows):
         return False
