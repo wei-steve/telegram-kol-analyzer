@@ -1,4 +1,5 @@
 from telegram_kol_research.context_resolution_prompt import (
+    CONTEXT_RESOLUTION_PROMPT_VERSION,
     CONTEXT_RESOLUTION_SYSTEM_PROMPT,
     build_context_resolution_request,
 )
@@ -45,3 +46,19 @@ def test_context_prompt_limits_management_fanout_to_explicit_partial_profit():
     assert "partial_take_profit" in CONTEXT_RESOLUTION_SYSTEM_PROMPT
     assert "明确点名" in CONTEXT_RESOLUTION_SYSTEM_PROMPT
     assert "增加风险" in CONTEXT_RESOLUTION_SYSTEM_PROMPT
+
+
+def test_context_prompt_v2_states_target_cardinality_and_commentary_example():
+    assert CONTEXT_RESOLUTION_PROMPT_VERSION == "context-resolution-v2"
+    assert (
+        "new_thread、hold、unresolved 的 target_thread_ids 必须是 []"
+        in CONTEXT_RESOLUTION_SYSTEM_PROMPT
+    )
+    assert (
+        "revise_thread、manage_thread、cancel_thread、exit_thread"
+        in CONTEXT_RESOLUTION_SYSTEM_PROMPT
+    )
+    assert "仅讨论已有策略不等于产生可执行目标" in CONTEXT_RESOLUTION_SYSTEM_PROMPT
+    assert '"decision":"hold"' in CONTEXT_RESOLUTION_SYSTEM_PROMPT
+    assert '"target_thread_ids":[]' in CONTEXT_RESOLUTION_SYSTEM_PROMPT
+    assert "9758" not in CONTEXT_RESOLUTION_SYSTEM_PROMPT

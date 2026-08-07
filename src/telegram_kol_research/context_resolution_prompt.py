@@ -7,7 +7,7 @@ from dataclasses import asdict, is_dataclass
 from typing import Any
 
 
-CONTEXT_RESOLUTION_PROMPT_VERSION = "context-resolution-v1"
+CONTEXT_RESOLUTION_PROMPT_VERSION = "context-resolution-v2"
 CONTEXT_RESOLUTION_SYSTEM_PROMPT = """
 你是交易消息“策略线程归属”解析器。MiMo 已完成当前消息的图文读取；你只根据提供的结构化证据、消息时间线、Telegram 引用关系、候选策略和脱敏交易所状态做二次判断。
 
@@ -33,6 +33,14 @@ CONTEXT_RESOLUTION_SYSTEM_PROMPT = """
   "reanalysis_triggers": [],
   "reason": "简短、可审计的判断依据"
 }
+
+target_thread_ids 规则：
+- new_thread、hold、unresolved 的 target_thread_ids 必须是 []。
+- revise_thread、manage_thread、cancel_thread、exit_thread 必须填写一个或多个候选 thread_id。
+- 仅讨论已有策略不等于产生可执行目标。
+
+示例：消息回顾某个已有策略但没有提出开仓、修改、取消、平仓或仓位管理指令时：
+{"decision":"hold","target_thread_ids":[],"management_action":null,"confidence":0.9,"supporting_message_ids":[],"opposing_message_ids":[],"conflict_types":[],"risk_reducing_fanout_allowed":false,"reanalysis_triggers":[],"reason":"仅为复盘，没有可执行指令"}
 
 management_action 只能是：
 null | cancel_pending_entry | exit_full | exit_partial | partial_take_profit |
