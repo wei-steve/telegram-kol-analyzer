@@ -1455,7 +1455,6 @@ SELECT comparison_status, COUNT(*) FROM recognition_decisions
     OR comparison_status IS NULL
     OR comparison_status NOT IN
        ('completed','pending','running','execution_pending','execution_running')
-    OR comparison_claim_token IS NOT NULL
  GROUP BY comparison_status;
 SELECT extraction_status, COUNT(*) FROM message_evidence_versions
  WHERE superseded_at IS NULL
@@ -1484,6 +1483,8 @@ SELECT status, COUNT(*) FROM position_mutation_intents
 ```
 
 任一查询返回行，或监听、对账、保护健康检查不正常，都延后重启和模式切换。
+`execution_pending` 上的 `comparison_claim_token` 是同步执行代际标识，不是后台
+worker claim；只有 `execution_running` 表示正在执行交易状态变更。
 `pending`/`open` 入场单是可跨重启的稳定交易所状态。任何 `submit_unknown`、
 `recovery_required` 或 `partial_failed` 默认阻断发布；只有同时证明该行属于不会被
 新旧 worker 接纳的旧类型、对应开关发布前后均为 `disabled`，并完成交易所只读
