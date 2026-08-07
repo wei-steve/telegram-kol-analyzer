@@ -26,10 +26,8 @@
 
 **Files:**
 - Modify: `tests/test_db_migrations.py`
-- Modify: `tests/test_context_resolution.py`
 - Modify: `src/telegram_kol_research/models.py:429-482`
 - Modify: `src/telegram_kol_research/db.py:141-164`
-- Modify: `src/telegram_kol_research/context_resolution.py:365-450`
 
 **Step 1: Write the failing schema tests**
 
@@ -93,24 +91,13 @@ Add to `SQLITE_COMPAT_COLUMNS["context_resolution_attempts"]`:
 ),
 ```
 
-Extend `_upsert_attempt` with an optional already-bounded JSON string:
-
-```python
-rejected_response_diagnostic_json: str | None = None,
-```
-
-Set it when creating a row. When updating, replace it only when the argument
-is non-`None`, so a successful second response retains the first rejected
-diagnostic. Do not put raw provider output into this field.
-
 **Step 4: Run the tests and verify GREEN**
 
 Run:
 
 ```bash
 .venv/bin/python -m pytest -q \
-  tests/test_db_migrations.py \
-  tests/test_context_resolution.py
+  tests/test_db_migrations.py
 ```
 
 Expected: PASS.
@@ -120,9 +107,7 @@ Expected: PASS.
 ```bash
 git add src/telegram_kol_research/models.py \
   src/telegram_kol_research/db.py \
-  src/telegram_kol_research/context_resolution.py \
-  tests/test_db_migrations.py \
-  tests/test_context_resolution.py
+  tests/test_db_migrations.py
 git commit -m "feat: record bounded context rejection diagnostics"
 ```
 
@@ -272,6 +257,16 @@ Expected: FAIL because both calls receive the same prompt and no rejected
 diagnostic is stored.
 
 **Step 3: Add bounded diagnostic projection**
+
+First extend `_upsert_attempt` with an optional already-bounded JSON string:
+
+```python
+rejected_response_diagnostic_json: str | None = None,
+```
+
+Set it when creating a row. When updating, replace it only when the argument
+is non-`None`, so a successful second response retains the first rejected
+diagnostic. Do not put raw provider output into this field.
 
 Implement a helper that accepts only decoded mappings:
 

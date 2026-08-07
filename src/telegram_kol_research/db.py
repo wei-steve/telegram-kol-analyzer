@@ -161,6 +161,10 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         "last_error": (
             "ALTER TABLE context_resolution_attempts ADD COLUMN last_error TEXT"
         ),
+        "rejected_response_diagnostic_json": (
+            "ALTER TABLE context_resolution_attempts "
+            "ADD COLUMN rejected_response_diagnostic_json TEXT"
+        ),
     },
     "message_instruction_items": {
         "retired_at": (

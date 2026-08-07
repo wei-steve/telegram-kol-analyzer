@@ -458,6 +458,9 @@ class ContextResolutionAttempt(Base):
         Text, nullable=False, default="{}"
     )
     decision_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    rejected_response_diagnostic_json: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     error_class: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     reanalysis_triggers_json: Mapped[str] = mapped_column(

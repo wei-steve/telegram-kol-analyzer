@@ -34,6 +34,57 @@ def test_old_lifecycle_table_has_compatible_thread_column_migration():
     )
 
 
+def test_context_resolution_rejected_diagnostic_has_additive_compat_migration(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "context-diagnostic.db")
+    columns = {
+        column["name"]
+        for column in inspect(session_factory.kw["bind"]).get_columns(
+            "context_resolution_attempts"
+        )
+    }
+
+    assert "rejected_response_diagnostic_json" in columns
+    assert (
+        SQLITE_COMPAT_COLUMNS["context_resolution_attempts"][
+            "rejected_response_diagnostic_json"
+        ]
+        == "ALTER TABLE context_resolution_attempts "
+        "ADD COLUMN rejected_response_diagnostic_json TEXT"
+    )
+
+
+def test_context_resolution_rejected_diagnostic_migrates_without_rewriting_rows(
+    tmp_path,
+):
+    database_path = tmp_path / "legacy-context-resolution.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE context_resolution_attempts "
+            "(id INTEGER PRIMARY KEY, status VARCHAR(32) NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO context_resolution_attempts (id, status) "
+            "VALUES (81, 'exhausted')"
+        )
+
+    session_factory = create_session_factory(database_path)
+    columns = {
+        column["name"]
+        for column in inspect(session_factory.kw["bind"]).get_columns(
+            "context_resolution_attempts"
+        )
+    }
+
+    assert "rejected_response_diagnostic_json" in columns
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT id, status, rejected_response_diagnostic_json "
+            "FROM context_resolution_attempts WHERE id = 81"
+        ).fetchone() == (81, "exhausted", None)
+
+
 def test_runtime_incident_table_is_added_to_an_existing_database(tmp_path):
     database_path = tmp_path / "legacy.db"
     with sqlite3.connect(database_path) as connection:
