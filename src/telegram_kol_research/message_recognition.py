@@ -1939,6 +1939,7 @@ class TargetAdmission:
     accepted: bool
     reason_code: str | None
     collision_group: str | None
+    pos_ids: tuple[str, ...]
 
 
 def _effective_multi_target_action(decision: Mapping[str, Any]) -> str:
@@ -1994,6 +1995,7 @@ def _admit_explicit_management_targets_in_session(
                 accepted=False,
                 reason_code=reason_code[:128],
                 collision_group=None,
+                pos_ids=(),
             )
             with session.begin_nested():
                 _persist_target_admission_in_session(
@@ -2003,30 +2005,74 @@ def _admit_explicit_management_targets_in_session(
                     admission=admission,
                 )
             admissions.append(admission)
-    colliding_groups = {
-        admission.collision_group
-        for admission in admissions
-        if admission.accepted
-        and admission.collision_group is not None
-        and sum(
-            candidate.accepted
-            and candidate.collision_group == admission.collision_group
-            for candidate in admissions
+    remaining = {index for index, admission in enumerate(admissions) if admission.accepted}
+    collision_groups_by_index: dict[int, str] = {}
+    while remaining:
+        first = remaining.pop()
+        component = {first}
+        first_target_id = _int_or_none(
+            admissions[first].decision.get("target_lifecycle_id")
         )
-        > 1
-    }
-    if not colliding_groups:
+        resources = set(admissions[first].pos_ids) or {f"lifecycle:{first_target_id}"}
+        while True:
+            overlapping = {
+                index
+                for index in remaining
+                if resources
+                & (
+                    set(admissions[index].pos_ids)
+                    or {
+                        f"lifecycle:{_int_or_none(admissions[index].decision.get('target_lifecycle_id'))}"
+                    }
+                )
+            }
+            if not overlapping:
+                break
+            remaining.difference_update(overlapping)
+            component.update(overlapping)
+            for index in overlapping:
+                resources.update(
+                    admissions[index].pos_ids
+                    or (
+                        f"lifecycle:{_int_or_none(admissions[index].decision.get('target_lifecycle_id'))}",
+                    )
+                )
+        if len(component) < 2:
+            continue
+        component_pos_ids = {
+            pos_id for index in component for pos_id in admissions[index].pos_ids
+        }
+        fallback_target_id = min(
+            target_id
+            for index in component
+            if (
+                target_id := _int_or_none(
+                    admissions[index].decision.get("target_lifecycle_id")
+                )
+            )
+            is not None
+        )
+        collision_group = collision_group_fingerprint(
+            component_pos_ids,
+            fallback_lifecycle_id=fallback_target_id,
+        )
+        collision_groups_by_index.update(
+            {index: collision_group for index in component}
+        )
+    if not collision_groups_by_index:
         return admissions
     isolated: list[TargetAdmission] = []
-    for admission in admissions:
-        if admission.collision_group not in colliding_groups:
+    for index, admission in enumerate(admissions):
+        collision_group = collision_groups_by_index.get(index)
+        if collision_group is None:
             isolated.append(admission)
             continue
         refused = TargetAdmission(
             decision=admission.decision,
             accepted=False,
             reason_code="target_collision",
-            collision_group=admission.collision_group,
+            collision_group=collision_group,
+            pos_ids=admission.pos_ids,
         )
         with session.begin_nested():
             _persist_target_admission_in_session(
@@ -2107,6 +2153,7 @@ def _admit_one_explicit_management_target_in_session(
             pos_ids,
             fallback_lifecycle_id=target_id,
         ),
+        pos_ids=tuple(sorted(pos_ids)),
     )
 
 

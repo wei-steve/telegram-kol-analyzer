@@ -1111,7 +1111,7 @@ def test_live_multi_target_admission_refuses_one_target_and_continues_others(
         assert target_rows["ETH"].message_instruction_item_id is None
 
 
-def test_live_multi_target_admission_freezes_only_exact_pos_id_collision(tmp_path):
+def test_live_multi_target_admission_freezes_overlapping_pos_id_sets(tmp_path):
     session_factory = create_session_factory(tmp_path / "multi-target-collision.db")
     with session_factory() as session:
         btc = _add_exact_live_lifecycle(
@@ -1120,8 +1120,23 @@ def test_live_multi_target_admission_freezes_only_exact_pos_id_collision(tmp_pat
         eth = _add_exact_live_lifecycle(
             session, chat_id=88, message_id=3471, symbol="ETH", side="short"
         )
+        btc_binding = session.get(ExecutionBinding, btc.execution_binding_id)
         eth_binding = session.get(ExecutionBinding, eth.execution_binding_id)
-        eth_binding.pos_id = "pos-btc"
+        btc_binding.pos_id = "pos-shared"
+        eth_binding.pos_id = None
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=eth_binding.id,
+                strategy_instance_id=eth_binding.strategy_instance_id,
+                leg_index=2,
+                purpose="entry",
+                order_kind="market",
+                order_id="order-eth-overlap",
+                pos_id="pos-shared",
+                status="active",
+                attribution_status="verified",
+            )
+        )
         raw = RawMessage(
             chat_id=88,
             message_id=3472,
