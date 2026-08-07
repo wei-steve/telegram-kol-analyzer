@@ -18,6 +18,8 @@ def test_context_resolution_schema_is_created(tmp_path):
     assert inspector.has_table("runtime_incident_observations")
     assert inspector.has_table("runtime_agent_recovery_attempts")
     assert inspector.has_table("position_protection_health_observations")
+    assert inspector.has_table("management_message_envelopes")
+    assert inspector.has_table("management_message_targets")
     assert "strategy_thread_id" in {
         column["name"]
         for column in inspector.get_columns("strategy_lifecycles")
@@ -79,6 +81,26 @@ def test_position_protection_health_table_is_added_without_rewriting_legacy_rows
         assert connection.execute(
             "SELECT id, display_name FROM sources WHERE id = 91"
         ).fetchone() == (91, "Legacy Source")
+
+
+def test_multi_target_management_schema_is_idempotent(tmp_path):
+    database_path = tmp_path / "multi-target.db"
+
+    first_factory = create_session_factory(database_path)
+    second_factory = create_session_factory(database_path)
+    inspector = inspect(second_factory.kw["bind"])
+
+    assert inspector.has_table("management_message_envelopes")
+    assert inspector.has_table("management_message_targets")
+    assert {
+        index["name"]
+        for index in inspector.get_indexes("management_message_envelopes")
+    } >= {"uq_management_message_envelopes_decision"}
+    assert {
+        index["name"]
+        for index in inspector.get_indexes("management_message_targets")
+    } >= {"uq_management_message_targets_idempotency"}
+    assert first_factory.kw["bind"].url.database == str(database_path)
 
 
 def test_old_lifecycle_table_has_compatible_thread_column_migration():

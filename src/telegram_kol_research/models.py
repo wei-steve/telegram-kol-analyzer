@@ -626,6 +626,138 @@ class SignalCandidate(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class ManagementMessageEnvelope(Base):
+    """Immutable projection of one authoritative multi-target decision."""
+
+    __tablename__ = "management_message_envelopes"
+    __table_args__ = (
+        Index(
+            "uq_management_message_envelopes_decision",
+            "raw_message_id",
+            "decision_fingerprint",
+            unique=True,
+        ),
+        CheckConstraint(
+            "length(decision_fingerprint) = 64",
+            name="ck_management_message_envelopes_decision_fingerprint",
+        ),
+        CheckConstraint(
+            "length(shared_parameters_json) <= 4096",
+            name="ck_management_message_envelopes_parameters_bounded",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False, index=True
+    )
+    decision_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    normalized_action: Mapped[str] = mapped_column(String(64), nullable=False)
+    shared_parameters_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}", server_default=sql_text("'{}'")
+    )
+    projection_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="shadow", server_default=sql_text("'shadow'")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+
+
+class ManagementMessageTarget(Base):
+    """Durable admission and execution state for one declared lifecycle target."""
+
+    __tablename__ = "management_message_targets"
+    __table_args__ = (
+        Index(
+            "uq_management_message_targets_idempotency",
+            "raw_message_id",
+            "target_lifecycle_id",
+            "normalized_action",
+            "parameter_fingerprint",
+            unique=True,
+        ),
+        Index(
+            "ix_management_message_targets_envelope_ordinal",
+            "envelope_id",
+            "target_ordinal",
+        ),
+        Index(
+            "ix_management_message_targets_collision_state",
+            "collision_group_fingerprint",
+            "execution_state",
+        ),
+        CheckConstraint(
+            "length(parameters_json) <= 4096",
+            name="ck_management_message_targets_parameters_bounded",
+        ),
+        CheckConstraint(
+            "length(parameter_fingerprint) = 64",
+            name="ck_management_message_targets_parameter_fingerprint",
+        ),
+        CheckConstraint(
+            "length(collision_group_fingerprint) = 64",
+            name="ck_management_message_targets_collision_fingerprint",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    envelope_id: Mapped[int] = mapped_column(
+        ForeignKey("management_message_envelopes.id"), nullable=False, index=True
+    )
+    raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False, index=True
+    )
+    target_lifecycle_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_lifecycles.id"), nullable=False, index=True
+    )
+    target_ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+    normalized_action: Mapped[str] = mapped_column(String(64), nullable=False)
+    parameters_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}", server_default=sql_text("'{}'")
+    )
+    parameter_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    collision_group_fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False
+    )
+    admission_state: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="identified",
+        server_default=sql_text("'identified'"), index=True
+    )
+    execution_state: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="not_started",
+        server_default=sql_text("'not_started'"), index=True
+    )
+    closed_reason_code: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True
+    )
+    signal_candidate_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("signal_candidates.id"), nullable=True, index=True
+    )
+    message_instruction_item_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("message_instruction_items.id"), nullable=True, index=True
+    )
+    latest_runtime_incident_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("runtime_incidents.id"), nullable=True, index=True
+    )
+    admitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    execution_started_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    terminal_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+
+
 class MessageInstructionItem(Base):
     __tablename__ = "message_instruction_items"
     __table_args__ = (
