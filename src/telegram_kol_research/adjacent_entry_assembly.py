@@ -73,6 +73,7 @@ class AdjacentEntryDecision:
     allocations: tuple[Decimal, ...]
     supplemental_prices: tuple[Decimal, ...]
     boundary_evidence: tuple[int, ...]
+    pending_raw_message_ids: tuple[int, ...] = ()
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -143,7 +144,10 @@ def select_adjacent_entry_fragments(
         facts=facts,
         cutoff=normalized_cutoff,
     )
-    if any(fact.kind == "unresolved" for fact in segment):
+    pending_raw_message_ids = tuple(
+        int(fact.raw_message_id) for fact in segment if fact.kind == "unresolved"
+    )
+    if pending_raw_message_ids:
         return AdjacentEntryDecision(
             status="pending",
             reason_code="adjacent_entry_context_pending",
@@ -152,6 +156,7 @@ def select_adjacent_entry_fragments(
             allocations=(),
             supplemental_prices=(),
             boundary_evidence=tuple(boundary_ids),
+            pending_raw_message_ids=pending_raw_message_ids,
         )
 
     symbol = str(strategy.symbol).strip().upper()

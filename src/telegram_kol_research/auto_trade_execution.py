@@ -487,6 +487,22 @@ def _auto_process_single_message_trade_signal(
             processed_at=now,
         )
 
+    from telegram_kol_research.entry_assembly_admission import (
+        assess_entry_assembly_admission,
+    )
+
+    admission = assess_entry_assembly_admission(
+        session_factory,
+        strategy_raw_message_id=int(raw_message.id),
+        signal_candidate_id=int(candidate.id),
+        mode=settings.entry_message_assembly_v2_mode,
+        assessed_at=now,
+    )
+    if admission.status == "deferred":
+        return {"status": "deferred", "reason": admission.reason_code}
+    if admission.status == "blocked":
+        return {"status": "blocked", "reason": admission.reason_code}
+
     from telegram_kol_research.runtime_incident_scanner import (
         list_critical_unprotected_positions,
     )

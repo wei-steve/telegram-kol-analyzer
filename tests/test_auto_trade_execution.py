@@ -19,7 +19,7 @@ from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.message_instruction_items import create_message_instruction_items_in_session
-from telegram_kol_research.models import EntryPreamble, EntryStrategyAssembly, ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, MediaAsset, MessageEvidenceVersion, MessageInstructionItem, PositionProtectionLeg, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal, TriggerProtectionIntent, TriggerTakeProfitConvergence
+from telegram_kol_research.models import EntryPreamble, EntryStrategyAssembly, ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, MediaAsset, MessageEvidenceExtractionClaim, MessageEvidenceVersion, MessageInstructionItem, PositionProtectionLeg, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal, TriggerProtectionIntent, TriggerTakeProfitConvergence
 from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
 from telegram_kol_research.recovery_live_submit import _trigger_protection_lock_key
 from telegram_kol_research.recovery_live_submit import _trigger_protection_request_fingerprint
@@ -845,6 +845,65 @@ def test_live_entry_preamble_multiplies_usdt_risk_before_contract_sizing(tmp_pat
         leg["estimated_stop_loss_usdt"] for leg in draft["order_legs"]
     ) <= 10.0
     assert draft["entry_preamble_assembly"]["preamble_message_id"] == 54
+
+
+def test_live_adjacent_admission_defers_before_exchange_or_trade_signal(tmp_path):
+    session_factory = create_session_factory(tmp_path / "adjacent-defer.db")
+    strategy_raw_id = _persist_candidate(
+        session_factory,
+        text="BTC short 63900-64200 SL 64900 TP 62800",
+        entry_text="63900-64200",
+        stop_loss_text="64900",
+        take_profit_text="62800",
+        symbol="BTC",
+        side="short",
+    )
+    with session_factory() as session:
+        strategy = session.get(RawMessage, strategy_raw_id)
+        later = RawMessage(
+            chat_id=strategy.chat_id,
+            message_id=strategy.message_id + 1,
+            posted_at=strategy.posted_at + timedelta(seconds=1),
+            text="50%仓位",
+        )
+        session.add(later)
+        session.flush()
+        session.add(
+            MessageEvidenceExtractionClaim(
+                raw_message_id=later.id,
+                input_fingerprint="later",
+                claim_token="later-active",
+                claimed_at=datetime(2026, 8, 5, 12, 0, tzinfo=UTC),
+                lease_expires_at=datetime(2026, 8, 5, 12, 5, tzinfo=UTC),
+            )
+        )
+        session.commit()
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "allowed_symbols": ["BTC"],
+            "entry_message_assembly_v2_mode": "live",
+        },
+    )
+    client = _TickerForbiddenDeepcoinClient()
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=strategy_raw_id,
+        group_config=_group_config(),
+        deepcoin_client=client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 8, 5, 12, 2, tzinfo=UTC),
+    )
+
+    assert result == {
+        "status": "deferred",
+        "reason": "adjacent_entry_context_pending",
+    }
+    assert client.ticker_calls == 0
+    with session_factory() as session:
+        assert session.query(TradeSignal).count() == 0
 
 
 def test_shadow_entry_preamble_reports_half_but_executes_configured_risk(tmp_path):

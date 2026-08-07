@@ -420,6 +420,43 @@ class EntryAssemblyFragment(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now)
 
 
+class EntryAssemblyAttempt(Base):
+    """Durable admission wait keyed to one source-order assembly cutoff."""
+
+    __tablename__ = "entry_assembly_attempts"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('shadow', 'pending', 'claimed', 'woken', 'expired')",
+            name="ck_entry_assembly_attempts_status",
+        ),
+        Index(
+            "ix_entry_assembly_attempts_status_updated",
+            "status",
+            "updated_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy_raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False, index=True
+    )
+    signal_candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("signal_candidates.id"), nullable=False
+    )
+    candidate_generation: Mapped[str] = mapped_column(String(128), nullable=False)
+    cutoff_posted_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    cutoff_message_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    cutoff_raw_message_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    blocking_raw_message_ids_json: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    wake_claim_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    wake_claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    woken_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now)
+
+
 class MessageEvidenceExtractionClaim(Base):
     __tablename__ = "message_evidence_extraction_claims"
 

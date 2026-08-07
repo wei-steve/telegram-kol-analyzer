@@ -1019,6 +1019,35 @@ def process_authoritative_message(
             semantic_review_status=finalized.comparison_status,
             authoritative_generation=None,
         )
+    if auto_trade_executor is not None:
+        from telegram_kol_research.entry_assembly_admission import (
+            claim_ready_entry_assembly_wakeups,
+            finish_entry_assembly_wakeup,
+        )
+
+        wake_now = utc_now()
+        wake_strategy_ids = claim_ready_entry_assembly_wakeups(
+            session_factory,
+            completed_raw_message_id=int(raw_message_id),
+            now=wake_now,
+        )
+        for wake_strategy_id in wake_strategy_ids:
+            try:
+                auto_trade_executor(int(wake_strategy_id))
+            except Exception:
+                finish_entry_assembly_wakeup(
+                    session_factory,
+                    strategy_raw_message_id=int(wake_strategy_id),
+                    succeeded=False,
+                    now=utc_now(),
+                )
+                raise
+            finish_entry_assembly_wakeup(
+                session_factory,
+                strategy_raw_message_id=int(wake_strategy_id),
+                succeeded=True,
+                now=utc_now(),
+            )
     return AuthoritativeProcessingResult(
         assessment=assessment,
         recognition=recognition,
