@@ -340,6 +340,7 @@ def _entry_status_for_alert(
                 StrategyRevisionLeg.revision_batch_id == int(batch.id),
                 StrategyRevisionLeg.action == "cancel_pending",
                 StrategyRevisionLeg.status == "cancelled",
+                StrategyRevisionLeg.response_json.is_not(None),
             ).count()
             try:
                 market = json.loads(batch.market_snapshot_json or "{}")

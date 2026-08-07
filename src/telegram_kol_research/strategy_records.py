@@ -541,6 +541,7 @@ def load_strategy_record_detail(
                 StrategyRevisionLeg.revision_batch_id == int(entry_revision_batch.id),
                 StrategyRevisionLeg.action == "cancel_pending",
                 StrategyRevisionLeg.status == "cancelled",
+                StrategyRevisionLeg.response_json.is_not(None),
             )
             .scalar()
             if entry_revision_batch is not None

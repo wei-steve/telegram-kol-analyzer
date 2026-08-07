@@ -177,6 +177,24 @@ def replay_database(
                 continue
             if abs(source_time - target_time) > 1800:
                 continue
+            eligible_targets = []
+            for candidate in targets:
+                if int(candidate[1]) != int(source_chat):
+                    continue
+                try:
+                    candidate_time = datetime.fromisoformat(
+                        str(candidate[3])
+                    ).timestamp()
+                except ValueError:
+                    continue
+                distance = abs(candidate_time - source_time)
+                if distance <= 1800:
+                    eligible_targets.append(
+                        (distance, int(candidate[2]), int(candidate[0]))
+                    )
+            eligible_targets.sort()
+            if not eligible_targets or eligible_targets[0][2] != int(target_id):
+                continue
             for kind, payload in _text_fragments(str(text or "")):
                 identity = (
                     int(source_message_id), kind, json.dumps(payload, sort_keys=True)

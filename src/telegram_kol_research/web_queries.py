@@ -583,6 +583,7 @@ def _serialize_raw_messages(
             StrategyRevisionLeg.revision_batch_id.in_(revision_ids),
             StrategyRevisionLeg.action == "cancel_pending",
             StrategyRevisionLeg.status == "cancelled",
+            StrategyRevisionLeg.response_json.is_not(None),
         )
         .group_by(StrategyRevisionLeg.revision_batch_id)
         .all()

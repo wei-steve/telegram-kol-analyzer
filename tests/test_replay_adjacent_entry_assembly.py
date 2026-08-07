@@ -85,6 +85,38 @@ def test_adjacent_entry_replay_can_reconstruct_unbackfilled_text_evidence(tmp_pa
     assert record["source_message_ids"] == [9901]
 
 
+def test_text_replay_assigns_explicit_sizing_to_only_nearest_strategy(tmp_path):
+    database = tmp_path / "nearest.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE raw_messages (id INTEGER PRIMARY KEY, chat_id INTEGER, message_id INTEGER, posted_at TEXT, text TEXT);
+        CREATE TABLE signal_candidates (id INTEGER PRIMARY KEY, raw_message_id INTEGER, event_type TEXT, symbol TEXT, side TEXT);
+        CREATE TABLE entry_strategy_fragments (id INTEGER PRIMARY KEY, raw_message_id INTEGER, target_strategy_raw_message_id INTEGER, chat_id INTEGER, symbol TEXT, side TEXT, fragment_kind TEXT, payload_json TEXT, source_relationship TEXT, status TEXT);
+        INSERT INTO raw_messages VALUES
+          (1, 2, 100, '2026-08-01 01:00:00', 'BTC strategy'),
+          (2, 2, 101, '2026-08-01 01:10:00', 'BTC strategy'),
+          (3, 2, 102, '2026-08-01 01:11:00', '50%仓位');
+        INSERT INTO signal_candidates VALUES
+          (1, 1, 'entry_signal', 'BTCUSDT', 'long'),
+          (2, 2, 'entry_signal', 'BTCUSDT', 'long');
+        """
+    )
+    connection.commit()
+    connection.close()
+    script = Path(__file__).parents[1] / "scripts" / "replay_adjacent_entry_assembly.py"
+    completed = subprocess.run(
+        [sys.executable, str(script), "--database-path", str(database)],
+        check=True, capture_output=True, text=True,
+    )
+    records = {
+        row["strategy_message_id"]: row
+        for row in json.loads(completed.stdout)["records"]
+    }
+    assert records[101]["effective_risk_budget_usdt"] == "10"
+    assert records[100]["effective_risk_budget_usdt"] == "20"
+
+
 def test_adjacent_entry_replay_script_has_no_exchange_write_dependency():
     script = Path(__file__).parents[1] / "scripts" / "replay_adjacent_entry_assembly.py"
     source = script.read_text()
