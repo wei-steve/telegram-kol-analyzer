@@ -3941,7 +3941,7 @@ def test_message_recognition_api_delivers_completed_instruction_summary(
         database_path=tmp_path / "manual-summary.db",
         ai_recognition_config_path=tmp_path / "ai_recognition.yaml",
     )
-    app.state.notification_bot_config = SystemOperatorBotConfig(
+    app.state.system_operator_bot_config = SystemOperatorBotConfig(
         bot_token="system-token",
         chat_id="system-chat",
     )
@@ -4086,7 +4086,7 @@ def test_message_recognition_api_suppresses_low_value_authoritative_failure(
         database_path=tmp_path / "research.db",
         ai_recognition_config_path=tmp_path / "ai_recognition.yaml",
     )
-    app.state.notification_bot_config = SystemOperatorBotConfig(
+    app.state.system_operator_bot_config = SystemOperatorBotConfig(
         bot_token="system-token",
         chat_id="system-chat",
     )

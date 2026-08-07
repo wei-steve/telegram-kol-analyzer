@@ -3606,7 +3606,8 @@ def create_web_app(
                     reply_evidence_processor=app.state.reply_evidence_processor,
                     context_resolution_scheduler=app.state.context_resolution_scheduler,
                     context_resolution_worker=app.state.context_resolution_worker,
-                    system_operator_bot_config=app.state.notification_bot_config,
+                    system_operator_bot_config=app.state.system_operator_bot_config,
+                    notification_bot_config=app.state.notification_bot_config,
                     operation_lock=app.state.telegram_operation_lock,
                     source_deletion_recorder=app.state.source_deletion_recorder,
                 )
@@ -3623,7 +3624,8 @@ def create_web_app(
                         strategy_alert_config=app.state.strategy_alert_config,
                         strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
                         authoritative_processor=app.state.authoritative_processor,
-                        system_operator_bot_config=app.state.notification_bot_config,
+                        system_operator_bot_config=app.state.system_operator_bot_config,
+                        notification_bot_config=app.state.notification_bot_config,
                         startup_delay_seconds=app.state.reconcile_startup_delay_seconds,
                     )
                 )
@@ -4019,7 +4021,8 @@ def create_web_app(
                 reply_evidence_processor=app.state.reply_evidence_processor,
                 context_resolution_scheduler=app.state.context_resolution_scheduler,
                 context_resolution_worker=app.state.context_resolution_worker,
-                system_operator_bot_config=app.state.notification_bot_config,
+                system_operator_bot_config=app.state.system_operator_bot_config,
+                notification_bot_config=app.state.notification_bot_config,
                 operation_lock=app.state.telegram_operation_lock,
                 source_deletion_recorder=app.state.source_deletion_recorder,
             )
@@ -4038,7 +4041,8 @@ def create_web_app(
                     strategy_alert_config=app.state.strategy_alert_config,
                     strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
                     authoritative_processor=app.state.authoritative_processor,
-                    system_operator_bot_config=app.state.notification_bot_config,
+                    system_operator_bot_config=app.state.system_operator_bot_config,
+                    notification_bot_config=app.state.notification_bot_config,
                     startup_delay_seconds=0,
                 )
             )
@@ -6014,13 +6018,13 @@ def create_web_app(
                     )
             if (
                 conflict_payload is not None
-                and system_operator_bot_enabled(app.state.notification_bot_config)
+                and system_operator_bot_enabled(app.state.system_operator_bot_config)
             ):
                 notification_scheduled = _handle_authoritative_failure_notification(
                     session_factory=app.state.session_factory,
                     raw_message_id=raw_message_id,
                     sender=send_ai_recognition_conflict_review,
-                    config=app.state.notification_bot_config,
+                    config=app.state.system_operator_bot_config,
                     payload=conflict_payload,
                 )
             else:
@@ -6030,7 +6034,7 @@ def create_web_app(
                 session_factory=app.state.session_factory,
                 raw_message_id=raw_message_id,
                 chat_title=raw_message.sender_name,
-                system_operator_bot_config=app.state.notification_bot_config,
+                notification_bot_config=app.state.notification_bot_config,
                 claimed_at=app.state.now_provider(),
             )
         except LookupError as exc:
@@ -6636,7 +6640,8 @@ def create_web_app(
                             "strategy_alert_config": app.state.strategy_alert_config,
                             "strategy_alert_enabled_for_title": app.state.strategy_alert_enabled_for_title,
                             "authoritative_processor": app.state.authoritative_processor,
-                            "system_operator_bot_config": app.state.notification_bot_config,
+                            "system_operator_bot_config": app.state.system_operator_bot_config,
+                            "notification_bot_config": app.state.notification_bot_config,
                         },
                     )
                     return await asyncio.wait_for(

@@ -86,7 +86,7 @@ async def _deliver_authoritative_instruction_summary(
     session_factory,
     raw_message_id: int,
     chat_title: str | None,
-    system_operator_bot_config: Any | None,
+    notification_bot_config: Any | None,
     claimed_at=None,
 ) -> bool:
     automation = getattr(processing_result, "automation", None)
@@ -94,12 +94,12 @@ async def _deliver_authoritative_instruction_summary(
         not isinstance(automation, dict)
         or not isinstance(automation.get("items"), list)
         or not automation["items"]
-        or not system_operator_bot_enabled(system_operator_bot_config)
+        or not system_operator_bot_enabled(notification_bot_config)
     ):
         return False
     return await deliver_message_instruction_summary_notification(
         session_factory,
-        config=system_operator_bot_config,
+        config=notification_bot_config,
         raw_message_id=raw_message_id,
         chat_title=chat_title,
         claimed_at=claimed_at,
@@ -128,6 +128,7 @@ async def persist_live_message_event(
         AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS
     ),
     system_operator_bot_config: Any | None = None,
+    notification_bot_config: Any | None = None,
     system_operator_conflict_sender=send_ai_recognition_conflict_review,
 ) -> dict[str, int]:
     """Normalize and persist one live Telegram event into the existing raw ingest flow.
@@ -297,7 +298,7 @@ async def persist_live_message_event(
                     session_factory=session_factory,
                     raw_message_id=raw_message.id,
                     chat_title=chat_title,
-                    system_operator_bot_config=system_operator_bot_config,
+                    notification_bot_config=notification_bot_config,
                 )
                 if context_resolution_scheduler is not None:
                     await asyncio.to_thread(
@@ -662,6 +663,7 @@ async def run_live_listener(
     context_resolution_scheduler: Callable[..., int] | None = None,
     context_resolution_worker: Callable[[], Any] | None = None,
     system_operator_bot_config: Any | None = None,
+    notification_bot_config: Any | None = None,
     operation_lock: Any | None = None,
     source_deletion_recorder: Callable[..., Any] | None = None,
 ) -> None:
@@ -696,6 +698,7 @@ async def run_live_listener(
             "context_resolution_scheduler": context_resolution_scheduler,
             "context_resolution_worker": context_resolution_worker,
             "system_operator_bot_config": system_operator_bot_config,
+            "notification_bot_config": notification_bot_config,
         }
         if operation_lock is None:
             await persist_live_message_event(**persist_kwargs)
@@ -774,6 +777,7 @@ def launch_live_listener_task(
     context_resolution_scheduler: Callable[..., int] | None = None,
     context_resolution_worker: Callable[[], Any] | None = None,
     system_operator_bot_config: Any | None = None,
+    notification_bot_config: Any | None = None,
     operation_lock: Any | None = None,
     source_deletion_recorder: Callable[..., Any] | None = None,
 ) -> asyncio.Task[None]:
@@ -798,6 +802,7 @@ def launch_live_listener_task(
             "context_resolution_scheduler": context_resolution_scheduler,
             "context_resolution_worker": context_resolution_worker,
             "system_operator_bot_config": system_operator_bot_config,
+            "notification_bot_config": notification_bot_config,
             "operation_lock": operation_lock,
             "source_deletion_recorder": source_deletion_recorder,
         },
@@ -846,6 +851,7 @@ async def run_reconcile_once(
     strategy_alert_processor=process_strategy_alert_for_record,
     authoritative_processor: Callable[[int], Any] | None = None,
     system_operator_bot_config: Any | None = None,
+    notification_bot_config: Any | None = None,
     system_operator_conflict_sender=send_ai_recognition_conflict_review,
     authoritative_failure_retry_delay_seconds: float = (
         AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS
@@ -856,10 +862,10 @@ async def run_reconcile_once(
     """Fetch a recent overlap window and persist only messages newer than the history checkpoint."""
 
     repair_history_checkpoints(session_factory)
-    if system_operator_bot_enabled(system_operator_bot_config):
+    if system_operator_bot_enabled(notification_bot_config):
         await deliver_pending_message_instruction_summaries(
             session_factory,
-            config=system_operator_bot_config,
+            config=notification_bot_config,
         )
     dialogs = await discover_dialogs_fn(client)
     matched_dialogs = filter_target_dialogs(dialogs, target_titles)
@@ -944,7 +950,7 @@ async def run_reconcile_once(
                 session_factory=session_factory,
                 raw_message_id=raw_message.id,
                 chat_title=chat_titles_by_id.get(raw_message.chat_id, ""),
-                system_operator_bot_config=system_operator_bot_config,
+                notification_bot_config=notification_bot_config,
             )
             recovered_messages += 1
         for raw_message in expired_messages:
@@ -1073,7 +1079,7 @@ async def run_reconcile_once(
                     session_factory=session_factory,
                     raw_message_id=raw_message.id,
                     chat_title=str(dialog.get("title") or ""),
-                    system_operator_bot_config=system_operator_bot_config,
+                    notification_bot_config=notification_bot_config,
                 )
             with session_factory() as session:
                 inserted_candidates += max(
@@ -1132,6 +1138,7 @@ async def run_periodic_reconcile(
     strategy_alert_enabled_for_title: Callable[[str], bool] | None = None,
     authoritative_processor: Callable[[int], Any] | None = None,
     system_operator_bot_config: Any | None = None,
+    notification_bot_config: Any | None = None,
     authoritative_failure_retry_delay_seconds: float = (
         AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS
     ),
@@ -1151,6 +1158,7 @@ async def run_periodic_reconcile(
                 strategy_alert_enabled_for_title=strategy_alert_enabled_for_title,
                 authoritative_processor=authoritative_processor,
                 system_operator_bot_config=system_operator_bot_config,
+                notification_bot_config=notification_bot_config,
                 authoritative_failure_retry_delay_seconds=authoritative_failure_retry_delay_seconds,
             )
         else:
@@ -1166,6 +1174,7 @@ async def run_periodic_reconcile(
                     strategy_alert_enabled_for_title=strategy_alert_enabled_for_title,
                     authoritative_processor=authoritative_processor,
                     system_operator_bot_config=system_operator_bot_config,
+                    notification_bot_config=notification_bot_config,
                     authoritative_failure_retry_delay_seconds=authoritative_failure_retry_delay_seconds,
                 )
         await asyncio.sleep(interval_seconds)

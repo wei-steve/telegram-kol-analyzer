@@ -21,8 +21,18 @@ def test_web_app_starts_live_listener_when_targets_are_configured(tmp_path):
         strategy_alert_config=None,
         strategy_alert_enabled_for_title=None,
         system_operator_bot_config=None,
+        notification_bot_config=None,
     ):
-        calls.append((client, set(target_titles), str(media_root), strategy_alert_config, system_operator_bot_config))
+        calls.append(
+            (
+                client,
+                set(target_titles),
+                str(media_root),
+                strategy_alert_config,
+                system_operator_bot_config,
+                notification_bot_config,
+            )
+        )
 
     async def fake_reconcile_runner(
         *,
@@ -66,6 +76,7 @@ def test_web_app_starts_live_listener_when_targets_are_configured(tmp_path):
             {"Demo Group"},
             str((tmp_path / "media").resolve()),
             app.state.strategy_alert_config,
+            app.state.system_operator_bot_config,
             app.state.notification_bot_config,
         )
     ]

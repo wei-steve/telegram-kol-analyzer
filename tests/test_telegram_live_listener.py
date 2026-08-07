@@ -659,12 +659,17 @@ def test_authoritative_live_path_delivers_instruction_summary_once_after_complet
                 bot_token="system-token",
                 chat_id="system-chat",
             ),
+            notification_bot_config=SystemOperatorBotConfig(
+                bot_token="notification-token",
+                chat_id="notification-chat",
+            ),
         )
     )
 
     assert len(deliveries) == 1
     assert deliveries[0]["raw_message_id"] > 0
     assert deliveries[0]["chat_title"] == "VIP BTC Room"
+    assert deliveries[0]["config"].bot_token == "notification-token"
 
 
 def test_authoritative_mimo_failure_keeps_independent_nonblocking_alert(

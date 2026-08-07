@@ -333,9 +333,9 @@ def test_reconcile_suppresses_operator_notification_for_expired_gap(tmp_path):
             broker=None,
             target_titles={"VIP BTC Room"},
             authoritative_processor=lambda raw_message_id: None,
-            system_operator_bot_config=SystemOperatorBotConfig(
-                bot_token="system-token",
-                chat_id="system-chat",
+            notification_bot_config=SystemOperatorBotConfig(
+                bot_token="notification-token",
+                chat_id="notification-chat",
             ),
             system_operator_conflict_sender=sender,
             discover_dialogs_fn=_fake_discover_dialogs,
@@ -571,9 +571,9 @@ def test_reconcile_delivers_completed_instruction_summaries(tmp_path, monkeypatc
             broker=None,
             target_titles={"VIP BTC Room"},
             authoritative_processor=authoritative_processor,
-            system_operator_bot_config=SystemOperatorBotConfig(
-                bot_token="system-token",
-                chat_id="system-chat",
+            notification_bot_config=SystemOperatorBotConfig(
+                bot_token="notification-token",
+                chat_id="notification-chat",
             ),
             discover_dialogs_fn=_fake_discover_dialogs,
             fetch_dialog_messages_fn=_fake_fetch_dialog_messages,
@@ -629,9 +629,9 @@ def test_reconcile_retries_failed_summary_without_new_messages(tmp_path, monkeyp
             session_factory=session_factory,
             broker=None,
             target_titles={"VIP BTC Room"},
-            system_operator_bot_config=SystemOperatorBotConfig(
-                bot_token="system-token",
-                chat_id="system-chat",
+            notification_bot_config=SystemOperatorBotConfig(
+                bot_token="notification-token",
+                chat_id="notification-chat",
             ),
             discover_dialogs_fn=no_dialogs,
             fetch_dialog_messages_fn=_fake_fetch_dialog_messages,
