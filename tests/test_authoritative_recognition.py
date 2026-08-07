@@ -15,10 +15,14 @@ from telegram_kol_research.authoritative_recognition import (
     process_authoritative_message,
     requires_context_resolution,
 )
-from telegram_kol_research.context_resolution import ContextResolutionDecision
+from telegram_kol_research.context_resolution import (
+    ContextResolutionDecision,
+    resolve_contextual_strategy,
+)
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ExecutionBinding,
+    ExecutionEvent,
     ExecutionOrderLeg,
     MessageInstructionItem,
     MessageEvidenceVersion,
@@ -27,8 +31,10 @@ from telegram_kol_research.models import (
     SignalCandidate,
     SourceMessageDeletionExit,
     StrategyLifecycle,
+    StrategyManagementBatch,
     StrategyMessageLink,
     StrategyThread,
+    PositionMutationIntent,
 )
 from telegram_kol_research.message_evidence import save_message_evidence_version
 from telegram_kol_research.recognition_experiments import MimoAuthoritativeResult
@@ -598,6 +604,112 @@ def test_unambiguous_entry_skips_injected_context_resolver(tmp_path, monkeypatch
     assert assessment.context_resolution is None
     assert assessment.context_resolution_triggers == ()
     assert result.status == "是策略"
+
+
+def test_commentary_target_contract_corrects_hold_without_business_writes(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "commentary-contract.db")
+    with session_factory() as session:
+        root = RawMessage(chat_id=92, message_id=1600, text="ETH short plan")
+        current = RawMessage(
+            chat_id=92,
+            message_id=1601,
+            text="继续持有此前 ETH 空单，仅作复盘，没有新指令",
+        )
+        lifecycle = StrategyLifecycle(
+            chat_id=92,
+            message_id=1600,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 8, 7, 2, 37, tzinfo=UTC),
+            entry_range_low=1900,
+            entry_range_high=1900,
+            stop_loss=1938,
+        )
+        session.add_all([root, current, lifecycle])
+        session.commit()
+        root_id = root.id
+        current_id = current.id
+        lifecycle_id = lifecycle.id
+    thread = create_strategy_thread_for_lifecycle(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+    )
+    link_message_to_strategy_thread(
+        session_factory,
+        strategy_thread_id=thread.id,
+        raw_message_id=root_id,
+        relation_kind="root",
+        resolver="deterministic",
+        confidence=1.0,
+        decision_version="v1",
+    )
+    first_pass = {
+        "recognition_result": "非策略",
+        "reason": "commentary matching a recent active ETH short",
+        "strategy": {},
+        "lifecycle_event": {"event_type": "none", "confidence": 0.8},
+        "confidence": 0.8,
+    }
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: MimoAuthoritativeResult(
+            raw_message_id=current_id,
+            payload=first_pass,
+            input_kind="text",
+            model="mimo-v2.5",
+            status="非策略",
+        ),
+    )
+    context_prompts = []
+
+    def model_caller(**kwargs):
+        context_prompts.append(kwargs["system_prompt"])
+        corrected = "上一次响应违反 target_not_allowed" in kwargs["system_prompt"]
+        return {
+            "decision": "hold",
+            "target_thread_ids": [] if corrected else [thread.id],
+            "management_action": None,
+            "confidence": 0.9,
+            "supporting_message_ids": [1600, 1601],
+            "opposing_message_ids": [],
+            "conflict_types": [],
+            "risk_reducing_fanout_allowed": False,
+            "reanalysis_triggers": [],
+            "reason": "commentary only",
+        }
+
+    def context_resolver(**kwargs):
+        return resolve_contextual_strategy(
+            **kwargs,
+            model_caller=model_caller,
+        )
+
+    executor_calls = []
+    result = process_authoritative_message(
+        session_factory,
+        raw_message_id=current_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+        auto_trade_executor=executor_calls.append,
+        context_resolver=context_resolver,
+    )
+
+    assert result.assessment.agreement_status != "authoritative_failed"
+    assert result.assessment.context_resolution.decision == "hold"
+    assert result.recognition.status == "非策略"
+    assert result.automation == {"status": "skipped", "reason": "mimo_no_action"}
+    assert executor_calls == []
+    assert len(context_prompts) == 2
+    assert "上一次响应违反 target_not_allowed" not in context_prompts[0]
+    assert "上一次响应违反 target_not_allowed" in context_prompts[1]
+    with session_factory() as session:
+        assert session.query(StrategyManagementBatch).count() == 0
+        assert session.query(PositionMutationIntent).count() == 0
+        assert session.query(ExecutionEvent).count() == 0
 
 
 def test_revision_is_resolved_before_instruction_projection(tmp_path, monkeypatch):
