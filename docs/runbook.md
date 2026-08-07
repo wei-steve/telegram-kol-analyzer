@@ -1447,12 +1447,11 @@ WHERE c.status IN ('ready','reserved')
   --message-id 558 --message-id 538
 ```
 
-重启或切换模式前，必须用只读 SQL 证明没有进行中的识别、入场、撤单、修订和管理操作：
+重启或切换模式前，必须用只读 SQL 证明没有正在持有 claim、正在写交易所或会在 worker 重启后自动继续的操作：
 
 ```sql
 SELECT comparison_status, COUNT(*) FROM recognition_decisions
- WHERE comparison_status IN
-       ('pending','running','execution_pending','execution_running')
+ WHERE comparison_status IN ('running','execution_running')
     OR comparison_status IS NULL
     OR comparison_status NOT IN
        ('completed','pending','running','execution_pending','execution_running')
@@ -1469,17 +1468,27 @@ SELECT extraction_status, COUNT(*) FROM message_evidence_versions
  GROUP BY extraction_status;
 SELECT status, COUNT(*) FROM execution_order_legs
  WHERE purpose='entry' AND status IN
- ('pending','planned','submitted','open','partially_filled','submitting',
-  'cancel_submitting','submit_unknown') GROUP BY status;
+ ('submitting','cancel_submitting') GROUP BY status;
 SELECT status, COUNT(*) FROM strategy_revision_batches
- WHERE status NOT IN ('shadow_planned','succeeded','blocked') GROUP BY status;
+ WHERE status IN ('planned','cancelling_old_entries','old_entries_terminal',
+                  'submitting_replacements','rebuilding','reconciling',
+                  'recovery_required') GROUP BY status;
 SELECT status, COUNT(*) FROM strategy_management_batches
- WHERE status NOT IN ('shadow_planned','succeeded','blocked','cancelled') GROUP BY status;
+ WHERE status IN ('ready','executing','reserved','submitted','submit_unknown',
+                  'reconciling','partial_failed','protection_ready',
+                  'recovery_required')
+ GROUP BY status;
 SELECT status, COUNT(*) FROM position_mutation_intents
- WHERE status IN ('reserved','submitting','submitted','submit_unknown','recovery_required') GROUP BY status;
+ WHERE status IN ('reserved','submitting','submitted','recovery_required')
+ GROUP BY status;
 ```
 
 任一查询返回行，或监听、对账、保护健康检查不正常，都延后重启和模式切换。
+`pending`/`open` 入场单是可跨重启的稳定交易所状态。任何 `submit_unknown`、
+`recovery_required` 或 `partial_failed` 默认阻断发布；只有同时证明该行属于不会被
+新旧 worker 接纳的旧类型、对应开关发布前后均为 `disabled`，并完成交易所只读
+读回且保留全部证据时，才允许仅重启发布。该例外绝不允许模式切换，也不得自动
+重试、删除证据或把未知结果改写为成功。
 通过窗口检查后，每次只改一个字段，保留完整设置 payload：
 
 ```bash

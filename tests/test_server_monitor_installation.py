@@ -307,7 +307,19 @@ def test_installer_creates_identity_and_allowlisted_monitor_environment():
     assert "monitor_capture_token" in installer
     assert "TELEGRAM_KOL_RUNTIME_AGENT_LLM_API_KEY" not in installer
     assert "DEEP_API" not in installer
-    assert "DEEPCOIN" not in installer.upper()
+    env_block = installer.split('env_source="$(mktemp)"', 1)[1].split(
+        'install -o root -g root -m 0600 "$env_source" "$ENV_FILE"', 1
+    )[0]
+    assert env_block.strip() == """trap 'rm -f "$env_source"' EXIT
+chmod 0600 "$env_source"
+grep '^TELEGRAM_KOL_SYSTEM_BOT_' "$CREDENTIAL_FILE" > "$env_source"
+printf 'TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=%s\\n' "$expected_head" >> "$env_source"
+printf 'TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_PREAMBLE_MODE=%s\\n' "$expected_entry_preamble_mode" >> "$env_source"
+printf 'TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_MESSAGE_ASSEMBLY_V2_MODE=%s\\n' "$expected_entry_message_assembly_v2_mode" >> "$env_source"
+printf 'TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_REVISION_V2_MODE=%s\\n' "$expected_entry_revision_v2_mode" >> "$env_source"
+printf '%s\\n' "$capture_policy" >> "$env_source"
+printf '%s\\n' "$monitor_capture_token" >> "$env_source"
+""".strip()  # noqa: E501
     assert 'install -o root -g root -m 0600 "$env_source" "$ENV_FILE"' in installer
     assert 'install -d -o root -g root -m 0700 "$STATE_DIRECTORY"' in installer
     assert 'chown "$MONITOR_USER:$MONITOR_GROUP" "$STATE_DIRECTORY"' in installer

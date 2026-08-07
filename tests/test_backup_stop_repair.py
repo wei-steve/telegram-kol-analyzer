@@ -389,6 +389,14 @@ def test_background_submission_uses_native_tpsl_and_waits_for_readback(tmp_path)
 
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed(session_factory)
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+            "position_management_liveness_v2_mode": "live",
+        },
+    )
     client = _Client()
 
     submitted = submit_verified_trigger_backup_stops(
@@ -484,6 +492,14 @@ def test_background_submission_verifies_returned_unscoped_native_tpsl_with_two_s
 
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed(session_factory)
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+            "position_management_liveness_v2_mode": "live",
+        },
+    )
     client = _TwoSplitPositionsClient()
 
     submitted = submit_verified_trigger_backup_stops(
@@ -505,6 +521,14 @@ def test_background_submission_does_not_activate_fallback_without_response_order
 
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed(session_factory)
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+            "position_management_liveness_v2_mode": "live",
+        },
+    )
     client = _SingleSplitNativeReadbackClient()
 
     submitted = submit_verified_trigger_backup_stops(
@@ -526,6 +550,14 @@ def test_background_submission_rereads_full_positions_after_submit_race_without_
 
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed(session_factory)
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+            "position_management_liveness_v2_mode": "live",
+        },
+    )
     client = _TwoSplitPositionsClient(
         reveal_second_after_submit=True,
         response_has_order_id=False,
