@@ -10,10 +10,12 @@ current_phase: 8R.3
 phase_name: proactive-invariant-scanner
 phase_status: in_progress
 position_compliance_rules_status: dormant_non_deployable
+position_compliance_rollout_status: multi_target_shadow_canary_passed
 last_completed_phase: "8R.2"
 last_completed_commit: b3c2f14
-production_commit: 36846b5e910f6cf68005c6035aa8265561cb15ea
+production_commit: f26e71b0d5d16c9301f815fe959f61d8ccf0c4de
 local_tests:
+  - "position-compliance-multi-target-shadow-canary: 4 focused tests passed; redacted message-3465 fixture produced exact BTC-short and ETH-short 50% target plans in an isolated temporary database"
   - "position-compliance-dormant-rules: 30 passed; both rules remain non-deployable with no production projection or selector change"
   - "phase-8r.3-dormant-ledger-rules-scanner-regression: 410 passed, 2 known YAML prompt deprecation warnings"
   - "phase-8r.3-final-review: no Critical or Important findings after recovery candidates were filtered and prioritized before the bounded observation limit"
@@ -83,7 +85,7 @@ local_tests:
   - "phase-3-post-canary-focused: 127 passed"
 server_verification:
   status: phase-8r.3-one-rule-shadow-observation-in-progress
-  deployed_commit: 36846b5e910f6cf68005c6035aa8265561cb15ea
+  deployed_commit: f26e71b0d5d16c9301f815fe959f61d8ccf0c4de
   service: active-http-200
   bounded_restarts: "service restarted without SIGKILL; raw message 8309 crossed the restart with a live pre-restart evidence lease, logged one already-in-progress recovery error, then completed through normal lease expiry recovery"
   listener: monitoring-31-enabled-groups-and-continuing
@@ -174,6 +176,7 @@ server_verification:
   phase_8r_3_rollback: "Stopping and disabling only telegram-kol-runtime-scanner.service made it inactive/disabled while the main service and Runtime Agent stayed active. The scanner was then re-enabled and resumed shadow cycles; no main restart was required."
   phase_8r_3_deployed_tests: "58 deployed focused tests passed. A root-run no-notify production monitor diagnostic returned monitor_error null with only the known audit_abnormal baseline. Two earlier diagnostics under a manually invoked restricted identity lacked the service unit's supplementary journal group and repeated one capture-only monitor_adapter_failure incident; it remained unclaimed and generated no scanner, Agent, or Telegram action."
   position_compliance_dormant_rules: "Local-only catalog addition defines terminal high-risk management without an executable instruction and verified replacement primary/backup role gaps. Both rule IDs are excluded from the deployable allowlist, have no scanner fact projection, and caused no production restart, selector change, or runtime behavior change."
+  position_compliance_multi_target_shadow_canary: "Approved read-only shadow canary ran on deployed commit f26e71b with the redacted message-3465 fixture in an automatically removed temporary database. It produced exactly two ordered management plans: BTC short 50% partial take profit and ETH short 50% partial take profit, each bound to one exact synthetic lifecycle. The shadow database contained two management instruction items, zero strategy-management batches, zero execution events, and zero position-mutation intents. Production batch, execution-event, and mutation counts and maximum IDs were identical before and after; the complete four-position exchange snapshot fingerprint was unchanged. No Deepcoin write, Telegram delivery, production-row mutation, service restart, selector change, or historical message replay occurred."
   remaining: "Keep Phase 8R.3 in progress through at least 2026-08-05 16:18 CST. After 48 hours, compare every scanner observation with its source row, confirm the source hash and zero scanner-created incidents/Telegram claims/Agent claims, and re-run the rollback and independent-monitor gates. Do not enable deterministic notification for new rules or widen Agent diagnosis before that review."
 enabled_flags:
   - "capture:READ_ONLY_CAPTURE_PROFILE-nine-types"
