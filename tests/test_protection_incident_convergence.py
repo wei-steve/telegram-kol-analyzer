@@ -10,6 +10,7 @@ from telegram_kol_research.models import (
     PositionProtectionIncident,
     PositionProtectionLedger,
     PositionProtectionRevision,
+    PositionTakeProfitOrder,
 )
 from telegram_kol_research.protection_incident_convergence import (
     audit_protection_incident_convergence,
@@ -123,6 +124,153 @@ def _complete_replacement(session, *, binding, leg, pos_id):
             request_json="{}",
         )
     )
+
+
+def _legacy_current_protection(session, *, binding, leg, incident, pos_id):
+    revision = PositionProtectionRevision(
+        execution_binding_id=binding.id,
+        execution_order_leg_id=leg.id,
+        strategy_instance_id=binding.strategy_instance_id,
+        pos_id=pos_id,
+        source="entry_protection",
+        status="active",
+        protection_json=json.dumps({"order_ids": ["legacy-primary"]}),
+        created_at=incident.created_at - timedelta(hours=1),
+        updated_at=incident.created_at - timedelta(hours=1),
+    )
+    session.add(revision)
+    rows = (
+        ("legacy-primary", "stop_loss", "64100", "6"),
+        ("legacy-backup", "stop_loss", "63971.8", None),
+        ("legacy-tp", "take_profit", "67000", "6"),
+    )
+    for order_id, purpose, trigger_price, size_text in rows:
+        session.add(
+            PositionProtectionLedger(
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                pos_id=pos_id,
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id=order_id,
+                purpose=purpose,
+                trigger_price=trigger_price,
+                size_text=size_text,
+                status="verified",
+                evidence_source="position_mutation_intent_readback",
+                evidence_json="{}",
+            )
+        )
+    session.add(
+        PositionBackupStopOrder(
+            execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id,
+            pos_id=pos_id,
+            instrument_id="BTC-USDT-SWAP",
+            side="long",
+            trigger_price="63971.8",
+            order_id="legacy-backup",
+            client_order_id=f"backup-{pos_id}",
+            status="active",
+            request_json='{"slTriggerPx":"63971.8"}',
+        )
+    )
+    session.add(
+        PositionTakeProfitOrder(
+            execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id,
+            pos_id=pos_id,
+            order_id="legacy-tp",
+            trigger_price="67000",
+            size_text="6",
+            status="active",
+        )
+    )
+
+
+def test_legacy_current_exchange_evidence_without_pending_pos_id_resolves(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding, leg, first = _incident(
+            session, suffix="b", pos_id="pos-legacy-current"
+        )
+        _legacy_current_protection(
+            session,
+            binding=binding,
+            leg=leg,
+            incident=first,
+            pos_id="pos-legacy-current",
+        )
+        session.add(
+            PositionProtectionIncident(
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                pos_id="pos-legacy-current",
+                incident_type="backup_stop_blocked",
+                fingerprint="c" * 64,
+                evidence_json='{"reason_code":"readback_unavailable"}',
+                delivery_status="pending",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    snapshot = SimpleNamespace(
+        positions=[
+            {
+                "posId": "pos-legacy-current",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "pos": "6",
+            }
+        ],
+        pending_trigger_orders=[
+            {
+                "ordId": "legacy-primary",
+                "triggerOrderType": "TPSL",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "sz": "6",
+                "slTriggerPx": "64100",
+            },
+            {
+                "ordId": "legacy-backup",
+                "triggerOrderType": "TPSL",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "sz": "0",
+                "slTriggerPx": "63971.8",
+            },
+            {
+                "ordId": "legacy-tp",
+                "triggerOrderType": "TPSL",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "sz": "6",
+                "tpTriggerPx": "67000",
+            },
+        ],
+        pending_tpsl_observations=[
+            {"instrument_id": "BTC-USDT-SWAP", "complete": True}
+        ],
+        errors={},
+    )
+
+    result = audit_protection_incident_convergence(
+        session_factory, snapshot=snapshot, limit=100
+    )
+
+    assert result["counts"]["resolved_by_current_exchange_evidence"] == 2
+    assert result["counts"]["current_risk"] == 0
+    rendered = json.dumps(result)
+    assert "pos-legacy-current" not in rendered
+    assert "legacy-primary" not in rendered
+    assert "legacy-backup" not in rendered
+    assert "legacy-tp" not in rendered
 
 
 def test_audit_classifies_live_before_history_and_redacts_output(tmp_path):
