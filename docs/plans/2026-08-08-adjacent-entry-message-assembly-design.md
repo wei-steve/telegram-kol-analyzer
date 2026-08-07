@@ -309,3 +309,21 @@ Historical Telegram messages are never resent to create real trades.
 - Both feature switches disable new behavior without damaging existing durable
   evidence or the current production path.
 
+## Operational gate and rollback clarification
+
+Every restart and every mode transition requires a fresh read-only proof that
+recognition, entry submission, cancellation, entry revision, management, and
+position mutation have no in-flight or unknown-outcome work. A failed or stale
+check means there is no safe window. Deployment begins with both v2 modes
+disabled; server tests and the read-only historical replay precede assembly
+shadow. Assembly live precedes revision shadow. Initial revision live is
+restricted to exact unfilled legs; partial-fill risk reduction and supplemental
+entry actions remain hard-closed by separate planner arguments (both default
+false) until natural shadow evidence proves exact ownership and uninterrupted
+verified protection and a later reviewed production wiring explicitly enables
+each argument.
+
+Rollback disables both modes to stop new admission and the automatic revision
+worker. Operators continue bounded read-only reconciliation of every durable batch. It never deletes fragment, assembly,
+replacement, intent, order, or read-back evidence and never retries an unknown
+exchange result.

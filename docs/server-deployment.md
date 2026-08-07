@@ -581,3 +581,28 @@ min_free_disk_gb: 10
 The cleanup protects media linked to signal candidates or strategy lifecycle
 records. When a file is removed, `media_assets.local_path` is cleared so the web
 UI shows the media label and any OCR text instead of a broken image.
+
+## Deploy adjacent-entry assembly v2 dormant
+
+发布前从 `GET /api/trading-settings` 保存完整设置快照，确认
+`entry_message_assembly_v2_mode=disabled` 且 `entry_revision_v2_mode=disabled`。运行
+[`docs/runbook.md`](runbook.md) 中五类只读在途操作查询；只有结果全空、监听和对账新鲜、止损保护健康且安全监控无原因码时才有可部署窗口。
+
+已评审分支推送后，在 Windows 管理端执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1
+```
+
+部署后核对服务器 SHA、editable package、`telegram-kol.service` active 状态、日志、监听新鲜度和两个 disabled 开关。再运行：
+
+```bash
+.venv/bin/pytest -q tests/test_replay_adjacent_entry_assembly.py \
+  tests/test_production_safety_monitor.py -k 'adjacent_entry or entry_revision'
+.venv/bin/python scripts/replay_adjacent_entry_assembly.py \
+  --database-path data/research.db --configured-risk-usdt 20 \
+  --message-id 4154 --message-id 9902 --message-id 9936 \
+  --message-id 558 --message-id 538
+```
+
+回放必须显示陈哥半仓和米娅50% 样本为 10U、陈哥正常仓位为 20U、飞扬补仓价在总风险上限内，且交易所写入计数为零。本次 dormant 发布不授权开启 shadow 或 live。

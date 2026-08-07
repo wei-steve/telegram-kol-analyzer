@@ -30,6 +30,7 @@ from telegram_kol_research.models import (
     StrategyThread,
     StrategyManagementBatch,
     StrategyRevisionBatch,
+    StrategyRevisionLeg,
     TriggerProtectionIntent,
     TriggerProtectionStopRescue,
     utc_now,
@@ -79,12 +80,14 @@ def _serialize_entry_revision_batch(
     batch: StrategyRevisionBatch,
     *,
     replacement_count: int,
+    confirmed_change_count: int,
 ) -> dict[str, object] | None:
     return format_entry_revision_summary(
         {
             "status": batch.status,
             "reason_code": batch.reason_code,
             "replacement_count": replacement_count,
+            "confirmed_change_count": confirmed_change_count,
             "market_snapshot": _safe_json_dict(batch.market_snapshot_json),
         }
     )
@@ -559,6 +562,31 @@ def _serialize_raw_messages(
         .group_by(EntryRevisionReplacement.revision_batch_id)
         .all()
     ) if revision_ids else {}
+    confirmed_replacement_counts = dict(
+        session.query(
+            EntryRevisionReplacement.revision_batch_id,
+            func.count(EntryRevisionReplacement.id),
+        )
+        .filter(
+            EntryRevisionReplacement.revision_batch_id.in_(revision_ids),
+            EntryRevisionReplacement.status == "verified",
+        )
+        .group_by(EntryRevisionReplacement.revision_batch_id)
+        .all()
+    ) if revision_ids else {}
+    confirmed_cancel_counts = dict(
+        session.query(
+            StrategyRevisionLeg.revision_batch_id,
+            func.count(StrategyRevisionLeg.id),
+        )
+        .filter(
+            StrategyRevisionLeg.revision_batch_id.in_(revision_ids),
+            StrategyRevisionLeg.action == "cancel_pending",
+            StrategyRevisionLeg.status == "cancelled",
+        )
+        .group_by(StrategyRevisionLeg.revision_batch_id)
+        .all()
+    ) if revision_ids else {}
 
     all_experiments = (
         session.query(RecognitionExperiment)
@@ -679,6 +707,10 @@ def _serialize_raw_messages(
             _serialize_entry_revision_batch(
                 latest_revision,
                 replacement_count=int(replacement_counts.get(int(latest_revision.id), 0)),
+                confirmed_change_count=(
+                    int(confirmed_replacement_counts.get(int(latest_revision.id), 0))
+                    + int(confirmed_cancel_counts.get(int(latest_revision.id), 0))
+                ),
             )
             if latest_revision is not None
             else None

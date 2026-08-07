@@ -121,6 +121,9 @@ _FIXED_REASON_CODES = frozenset(
         "entry_revision_risk_budget_exceeded",
         "entry_revision_replacement_before_old_terminal",
         "live_entry_revision_protection_unverified",
+        "adjacent_entry_invariant_scan_incomplete",
+        "entry_message_assembly_v2_mode_drift",
+        "entry_revision_v2_mode_drift",
     }
 )
 _LOW_REPEAT_REASON_CODES = frozenset({"audit_abnormal"})
@@ -220,6 +223,14 @@ _FINGERPRINT_DETAIL_KEYS_BY_REASON = {
         "entry_preamble_mode",
         "expected_entry_preamble_mode",
     ),
+    "entry_message_assembly_v2_mode_drift": (
+        "entry_message_assembly_v2_mode",
+        "expected_entry_message_assembly_v2_mode",
+    ),
+    "entry_revision_v2_mode_drift": (
+        "entry_revision_v2_mode",
+        "expected_entry_revision_v2_mode",
+    ),
     "max_concurrent_positions_drift": (
         "max_concurrent_positions",
         "expected_max_concurrent_positions",
@@ -278,6 +289,8 @@ class MonitorExpectations:
     management_execution_mode: str
     max_concurrent_positions: int
     entry_preamble_mode: str
+    entry_message_assembly_v2_mode: str | None = None
+    entry_revision_v2_mode: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -714,7 +727,7 @@ def read_adjacent_entry_invariants(
     database_path: str | Path,
     *,
     now: datetime,
-    stale_after: timedelta = timedelta(minutes=15),
+    stale_after: timedelta = timedelta(minutes=30),
     connect=sqlite3.connect,
 ) -> tuple[str, ...]:
     """Read bounded v2 assembly/revision invariants through a query-only handle."""
@@ -725,7 +738,7 @@ def read_adjacent_entry_invariants(
         "entry_strategy_fragments", "entry_assembly_fragments",
         "entry_strategy_assemblies", "execution_bindings",
         "strategy_revision_batches", "strategy_revision_legs",
-        "entry_revision_replacements",
+        "entry_revision_replacements", "position_protection_ledger",
     }
     reasons: set[str] = set()
     uri = f"file:{database_path}?mode=ro"
@@ -744,41 +757,71 @@ def read_adjacent_entry_invariants(
             (stale_before.isoformat(sep=" "),),
         ).fetchone():
             reasons.add("stale_adjacent_entry_admission")
-        if connection.execute(
-            "SELECT 1 FROM entry_strategy_fragments AS f "
+        revision_rows = connection.execute(
+            "SELECT id, execution_binding_id, status, target_snapshot_json, "
+            "market_snapshot_json, replacement_json FROM strategy_revision_batches "
+            "WHERE revision_kind = 'entry_sizing' AND status NOT IN ('shadow_planned','blocked') "
+            "ORDER BY id DESC LIMIT 501"
+        ).fetchall()
+        if len(revision_rows) > 500:
+            reasons.add("adjacent_entry_invariant_scan_incomplete")
+            revision_rows = revision_rows[:500]
+        revision_fragment_ids: set[int] = set()
+        for _, _, _, target_json, _, _ in revision_rows:
+            try:
+                target = json.loads(target_json or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                target = {}
+            if isinstance(target, dict) and isinstance(target.get("fragment_ids"), list):
+                revision_fragment_ids.update(
+                    int(value) for value in target["fragment_ids"][:20]
+                    if type(value) is int and value > 0
+                )
+        consumed_without_assembly = connection.execute(
+            "SELECT f.id FROM entry_strategy_fragments AS f "
             "LEFT JOIN entry_assembly_fragments AS link "
             "ON link.entry_strategy_fragment_id = f.id "
-            "WHERE f.status = 'consumed' AND link.id IS NULL LIMIT 1"
-        ).fetchone():
+            "WHERE f.status = 'consumed' AND link.id IS NULL LIMIT 501"
+        ).fetchall()
+        if len(consumed_without_assembly) > 500:
+            reasons.add("adjacent_entry_invariant_scan_incomplete")
+        if any(int(row[0]) not in revision_fragment_ids for row in consumed_without_assembly[:500]):
             reasons.add("consumed_entry_fragment_missing_assembly")
 
-        bindings = {
-            str(row[0]): row[1]
-            for row in connection.execute(
-                "SELECT strategy_instance_id, payload_json FROM execution_bindings"
-            ).fetchall()
-        }
-        for strategy_instance_id, fingerprint, evidence_json in connection.execute(
-            "SELECT strategy_instance_id, fingerprint, evidence_json "
-            "FROM entry_strategy_assemblies ORDER BY id DESC LIMIT 500"
-        ).fetchall():
+        assembly_rows = connection.execute(
+            "SELECT a.id, a.strategy_instance_id, a.fingerprint, a.evidence_json, "
+            "b.payload_json, EXISTS(SELECT 1 FROM entry_assembly_fragments af "
+            "JOIN entry_strategy_fragments f ON f.id=af.entry_strategy_fragment_id "
+            "WHERE af.entry_strategy_assembly_id=a.id AND f.status='consumed') "
+            "FROM entry_strategy_assemblies a LEFT JOIN execution_bindings b "
+            "ON b.strategy_instance_id=a.strategy_instance_id "
+            "ORDER BY a.id DESC LIMIT 501"
+        ).fetchall()
+        if len(assembly_rows) > 500:
+            reasons.add("adjacent_entry_invariant_scan_incomplete")
+        for _, strategy_instance_id, fingerprint, evidence_json, payload_json, is_live in assembly_rows[:500]:
             try:
                 evidence = json.loads(evidence_json or "{}")
             except (TypeError, ValueError, json.JSONDecodeError):
                 evidence = {}
             if not isinstance(evidence, dict):
                 evidence = {}
+            draft = evidence.get("order_draft_snapshot")
+            legs = draft.get("order_legs") if isinstance(draft, dict) else None
             try:
-                estimated = Decimal(str(evidence.get("estimated_risk_usdt")))
+                estimated = sum(
+                    (Decimal(str(leg.get("estimated_stop_loss_usdt"))) for leg in legs),
+                    Decimal("0"),
+                ) if isinstance(legs, list) else None
                 effective = Decimal(str(evidence.get("effective_risk_budget_usdt")))
-                if estimated > effective:
+                if estimated is not None and estimated > effective:
                     reasons.add("entry_revision_risk_budget_exceeded")
-            except (InvalidOperation, TypeError, ValueError):
+            except (InvalidOperation, TypeError, ValueError, AttributeError):
                 pass
-            if evidence.get("mode") != "live":
+            if not is_live:
                 continue
             try:
-                payload = json.loads(bindings.get(str(strategy_instance_id)) or "{}")
+                payload = json.loads(payload_json or "{}")
                 draft = payload.get("draft") if isinstance(payload, dict) else None
                 bound = draft.get("entry_preamble_assembly") if isinstance(draft, dict) else None
                 if bound is None and isinstance(payload, dict):
@@ -793,29 +836,53 @@ def read_adjacent_entry_invariants(
         submitted_batches = {
             int(row[0]) for row in connection.execute(
                 "SELECT DISTINCT revision_batch_id FROM entry_revision_replacements "
-                "WHERE status IN ('submitted','verified')"
+                "WHERE status IN ('submitted','pending_readback','verified') LIMIT 501"
             ).fetchall()
         }
+        if len(submitted_batches) > 500:
+            reasons.add("adjacent_entry_invariant_scan_incomplete")
         for batch_id in submitted_batches:
             if connection.execute(
                 "SELECT 1 FROM strategy_revision_legs WHERE revision_batch_id = ? "
-                "AND action = 'cancel' AND status NOT IN "
-                "('cancelled','filled','rejected','expired','skipped','verified') LIMIT 1",
+                "AND action = 'cancel_pending' AND status != 'cancelled' LIMIT 1",
                 (batch_id,),
             ).fetchone():
                 reasons.add("entry_revision_replacement_before_old_terminal")
-        for status, snapshot_json in connection.execute(
-            "SELECT status, market_snapshot_json FROM strategy_revision_batches "
-            "WHERE revision_kind = 'entry_sizing' "
-            "AND status IN ('rebuilding','reconciling','succeeded')"
-        ).fetchall():
-            del status
+        for _, binding_id, status, _, snapshot_json, replacement_json in revision_rows:
+            try:
+                replacement = json.loads(replacement_json or "{}")
+                replacement_legs = replacement.get("order_legs")
+                replacement_estimated = sum(
+                    (
+                        Decimal(str(leg.get("estimated_stop_loss_usdt")))
+                        for leg in replacement_legs
+                    ),
+                    Decimal("0"),
+                )
+                replacement_budget = Decimal(str(replacement.get("risk_budget_usdt")))
+                if replacement_estimated > replacement_budget:
+                    reasons.add("entry_revision_risk_budget_exceeded")
+            except (
+                AttributeError,
+                InvalidOperation,
+                TypeError,
+                ValueError,
+            ):
+                pass
+            if status not in {"rebuilding", "reconciling", "succeeded", "recovery_required"}:
+                continue
             try:
                 snapshot = json.loads(snapshot_json or "{}")
             except (TypeError, ValueError, json.JSONDecodeError):
                 snapshot = {}
-            if isinstance(snapshot, dict) and snapshot.get("position") is not None \
-                    and snapshot.get("verified_stop") is None:
+            position = snapshot.get("position") if isinstance(snapshot, dict) else None
+            pos_id = position.get("posId") or position.get("pos_id") if isinstance(position, dict) else None
+            if pos_id and not connection.execute(
+                "SELECT 1 FROM position_protection_ledger WHERE execution_binding_id=? "
+                "AND pos_id=? AND purpose IN ('stop_loss','combined') "
+                "AND status IN ('verified','active') LIMIT 1",
+                (binding_id, str(pos_id)),
+            ).fetchone():
                 reasons.add("live_entry_revision_protection_unverified")
     return tuple(sorted(reasons))
 
@@ -1084,6 +1151,10 @@ def read_loopback_settings(
         "management_execution_mode": payload.get("management_execution_mode"),
         "max_concurrent_positions": payload.get("max_concurrent_positions"),
         "entry_preamble_mode": payload.get("entry_preamble_mode"),
+        "entry_message_assembly_v2_mode": payload.get(
+            "entry_message_assembly_v2_mode"
+        ),
+        "entry_revision_v2_mode": payload.get("entry_revision_v2_mode"),
     }
 
 
@@ -2132,6 +2203,13 @@ _ENTRY_PREAMBLE_INVARIANT_CODES = frozenset(
         "stale_entry_preamble_unresolved",
         "entry_preamble_ambiguous",
         "live_entry_preamble_binding_evidence_missing",
+        "stale_adjacent_entry_admission",
+        "consumed_entry_fragment_missing_assembly",
+        "live_entry_assembly_binding_evidence_missing",
+        "entry_revision_risk_budget_exceeded",
+        "entry_revision_replacement_before_old_terminal",
+        "live_entry_revision_protection_unverified",
+        "adjacent_entry_invariant_scan_incomplete",
     }
 )
 
@@ -2209,6 +2287,22 @@ def _evaluate_settings(
         reasons.add("entry_preamble_mode_drift")
         details["entry_preamble_mode"] = entry_preamble_mode
         details["expected_entry_preamble_mode"] = expected_entry_preamble_mode
+
+    for field, reason in (
+        ("entry_message_assembly_v2_mode", "entry_message_assembly_v2_mode_drift"),
+        ("entry_revision_v2_mode", "entry_revision_v2_mode_drift"),
+    ):
+        expected = getattr(expectations, field)
+        if expected is None:
+            continue
+        actual_mode = _safe_entry_preamble_mode(settings.get(field))
+        expected_mode = _safe_entry_preamble_mode(expected)
+        if actual_mode is None or expected_mode is None:
+            reasons.add("malformed_snapshot")
+        elif actual_mode != expected_mode:
+            reasons.add(reason)
+            details[field] = actual_mode
+            details[f"expected_{field}"] = expected_mode
 
 
 def _evaluate_events(
@@ -2773,7 +2867,12 @@ def _safe_detail_value(key: str, value: object) -> str | None:
         return head[:12] if head is not None else "invalid"
     if key in {"management_execution_mode", "expected_management_execution_mode"}:
         return _safe_management_mode(value) or "invalid"
-    if key in {"entry_preamble_mode", "expected_entry_preamble_mode"}:
+    if key in {
+        "entry_preamble_mode", "expected_entry_preamble_mode",
+        "entry_message_assembly_v2_mode",
+        "expected_entry_message_assembly_v2_mode",
+        "entry_revision_v2_mode", "expected_entry_revision_v2_mode",
+    }:
         return _safe_entry_preamble_mode(value) or "invalid"
     if type(value) is bool:
         return "true" if value else "false"

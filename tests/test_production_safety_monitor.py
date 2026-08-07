@@ -379,27 +379,59 @@ def test_entry_preamble_monitor_reader_detects_faults_without_writes(tmp_path):
     assert database.read_bytes() == before
 
 
+def test_monitor_detects_adjacent_entry_rollout_mode_drift():
+    expectations = MonitorExpectations(
+        head=REVIEWED_HEAD,
+        auto_trade_enabled=True,
+        management_execution_mode="live",
+        max_concurrent_positions=4,
+        entry_preamble_mode="live",
+        entry_message_assembly_v2_mode="disabled",
+        entry_revision_v2_mode="disabled",
+    )
+    result = evaluate_monitor_snapshot(
+        _snapshot(
+            settings={
+                "auto_trade_enabled": True,
+                "management_execution_mode": "live",
+                "max_concurrent_positions": 4,
+                "entry_preamble_mode": "live",
+                "entry_message_assembly_v2_mode": "live",
+                "entry_revision_v2_mode": "shadow",
+            }
+        ),
+        expectations,
+    )
+    assert set(result.reason_codes) == {
+        "entry_message_assembly_v2_mode_drift",
+        "entry_revision_v2_mode_drift",
+    }
+
+
 def test_adjacent_entry_monitor_detects_all_v2_faults_without_writes(tmp_path):
     database = tmp_path / "adjacent-entry-monitor.db"
     connection = sqlite3.connect(database)
     connection.executescript(
         """
         CREATE TABLE entry_strategy_fragments (id INTEGER PRIMARY KEY, status TEXT, created_at TEXT);
-        CREATE TABLE entry_assembly_fragments (id INTEGER PRIMARY KEY, entry_strategy_fragment_id INTEGER);
+        CREATE TABLE entry_assembly_fragments (id INTEGER PRIMARY KEY, entry_strategy_assembly_id INTEGER, entry_strategy_fragment_id INTEGER);
         CREATE TABLE entry_strategy_assemblies (id INTEGER PRIMARY KEY, strategy_instance_id TEXT, fingerprint TEXT, evidence_json TEXT);
         CREATE TABLE execution_bindings (id INTEGER PRIMARY KEY, strategy_instance_id TEXT, payload_json TEXT);
-        CREATE TABLE strategy_revision_batches (id INTEGER PRIMARY KEY, revision_kind TEXT, status TEXT, market_snapshot_json TEXT);
+        CREATE TABLE strategy_revision_batches (id INTEGER PRIMARY KEY, execution_binding_id INTEGER, revision_kind TEXT, status TEXT, target_snapshot_json TEXT, market_snapshot_json TEXT, replacement_json TEXT);
         CREATE TABLE strategy_revision_legs (id INTEGER PRIMARY KEY, revision_batch_id INTEGER, action TEXT, status TEXT);
         CREATE TABLE entry_revision_replacements (id INTEGER PRIMARY KEY, revision_batch_id INTEGER, status TEXT);
+        CREATE TABLE position_protection_ledger (id INTEGER PRIMARY KEY, execution_binding_id INTEGER, pos_id TEXT, purpose TEXT, status TEXT);
         INSERT INTO entry_strategy_fragments VALUES
           (1, 'pending', '2026-08-08 00:00:00'),
-          (2, 'consumed', '2026-08-08 00:00:00');
+          (2, 'consumed', '2026-08-08 00:00:00'),
+          (3, 'consumed', '2026-08-08 00:00:00');
+        INSERT INTO entry_assembly_fragments VALUES (1, 1, 3);
         INSERT INTO entry_strategy_assemblies VALUES
-          (1, 'strategy-1', 'fp-1', '{"mode":"live","estimated_risk_usdt":"11","effective_risk_budget_usdt":"10"}');
+          (1, 'strategy-1', 'fp-1', '{"effective_risk_budget_usdt":"10","order_draft_snapshot":{"order_legs":[{"estimated_stop_loss_usdt":"11"}]}}');
         INSERT INTO execution_bindings VALUES (1, 'strategy-1', '{"draft":{}}');
         INSERT INTO strategy_revision_batches VALUES
-          (1, 'entry_sizing', 'rebuilding', '{"position":{"pos_id":"p1"},"verified_stop":null}');
-        INSERT INTO strategy_revision_legs VALUES (1, 1, 'cancel', 'submitted');
+          (1, 1, 'entry_sizing', 'rebuilding', '{"fragment_ids":[]}', '{"position":{"posId":"p1"},"verified_stop":null}', '{"risk_budget_usdt":"10","order_legs":[]}');
+        INSERT INTO strategy_revision_legs VALUES (1, 1, 'cancel_pending', 'cancel_submitting');
         INSERT INTO entry_revision_replacements VALUES (1, 1, 'submitted');
         """
     )
@@ -3579,10 +3611,13 @@ def test_loopback_settings_disable_environment_proxy_trust(monkeypatch):
     monkeypatch.delenv("NO_PROXY", raising=False)
     monkeypatch.setattr(monitor_module.httpx, "stream", stream)
 
-    assert (
-        read_loopback_settings("http://127.0.0.1:8000/api/trading-settings")
-        == _snapshot().settings
-    )
+    assert read_loopback_settings(
+        "http://127.0.0.1:8000/api/trading-settings"
+    ) == {
+        **_snapshot().settings,
+        "entry_message_assembly_v2_mode": None,
+        "entry_revision_v2_mode": None,
+    }
     assert calls == [
         (
             ("GET", "http://127.0.0.1:8000/api/trading-settings"),

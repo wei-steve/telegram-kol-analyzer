@@ -51,6 +51,7 @@ from telegram_kol_research.models import (
     StrategyManagementBatch,
     StrategyManagementLeg,
     StrategyRevisionBatch,
+    StrategyRevisionLeg,
     StrategyMessageLink,
     StrategyThread,
     TriggerProtectionIntent,
@@ -522,6 +523,24 @@ def load_strategy_record_detail(
             .filter(
                 EntryRevisionReplacement.revision_batch_id
                 == int(entry_revision_batch.id)
+            )
+            .scalar()
+            if entry_revision_batch is not None
+            else 0
+        )
+        entry_revision_confirmed_change_count = (
+            session.query(func.count(EntryRevisionReplacement.id))
+            .filter(
+                EntryRevisionReplacement.revision_batch_id
+                == int(entry_revision_batch.id),
+                EntryRevisionReplacement.status == "verified",
+            )
+            .scalar()
+            + session.query(func.count(StrategyRevisionLeg.id))
+            .filter(
+                StrategyRevisionLeg.revision_batch_id == int(entry_revision_batch.id),
+                StrategyRevisionLeg.action == "cancel_pending",
+                StrategyRevisionLeg.status == "cancelled",
             )
             .scalar()
             if entry_revision_batch is not None
@@ -1218,6 +1237,7 @@ def load_strategy_record_detail(
                         "status": entry_revision_batch.status,
                         "reason_code": entry_revision_batch.reason_code,
                         "replacement_count": entry_revision_replacement_count,
+                        "confirmed_change_count": entry_revision_confirmed_change_count,
                         "market_snapshot": _safe_json_value(
                             entry_revision_batch.market_snapshot_json
                         ),

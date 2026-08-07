@@ -25,7 +25,14 @@ def format_entry_assembly_summary(
 
     if not isinstance(evidence, dict):
         return None
-    if evidence.get("preamble_message_id") not in (None, ""):
+    is_v2 = any(
+        key in evidence
+        for key in (
+            "fragment_ids", "entry_allocations", "allocations",
+            "supplemental_entry_prices", "supplemental_prices", "status",
+        )
+    )
+    if not is_v2 and evidence.get("preamble_message_id") not in (None, ""):
         return format_entry_preamble_assembly_summary(evidence)
     try:
         mode = str(evidence["mode"])
@@ -47,7 +54,10 @@ def format_entry_assembly_summary(
     ):
         return None
     fragment_ids = []
-    for value in list(evidence.get("fragment_ids") or [])[:5]:
+    raw_fragment_ids = evidence.get("fragment_ids")
+    if not isinstance(raw_fragment_ids, (list, tuple)):
+        raw_fragment_ids = []
+    for value in raw_fragment_ids[:5]:
         try:
             parsed = int(value)
         except (TypeError, ValueError):
@@ -55,7 +65,10 @@ def format_entry_assembly_summary(
         if parsed > 0:
             fragment_ids.append(parsed)
     allocations = []
-    for value in list(evidence.get("entry_allocations") or [])[:5]:
+    raw_allocations = evidence.get("entry_allocations", evidence.get("allocations"))
+    if not isinstance(raw_allocations, (list, tuple)):
+        raw_allocations = []
+    for value in raw_allocations[:5]:
         try:
             parsed = float(value)
         except (TypeError, ValueError, OverflowError):
@@ -63,7 +76,12 @@ def format_entry_assembly_summary(
         if math.isfinite(parsed) and 0 < parsed <= 1:
             allocations.append(parsed)
     supplemental = []
-    for value in list(evidence.get("supplemental_entry_prices") or [])[:5]:
+    raw_supplemental = evidence.get(
+        "supplemental_entry_prices", evidence.get("supplemental_prices")
+    )
+    if not isinstance(raw_supplemental, (list, tuple)):
+        raw_supplemental = []
+    for value in raw_supplemental[:5]:
         try:
             parsed = float(value)
         except (TypeError, ValueError, OverflowError):
@@ -139,11 +157,21 @@ def format_entry_revision_summary(
     reason = str(evidence.get("reason_code") or "")[:64]
     if reason and not re.fullmatch(r"[a-z0-9_:-]+", reason):
         reason = "entry_revision_reason_redacted"
+    try:
+        replacement_count = max(
+            0, min(int(evidence.get("replacement_count") or 0), 5)
+        )
+        confirmed_change_count = max(
+            0, min(int(evidence.get("confirmed_change_count") or 0), 10)
+        )
+    except (TypeError, ValueError, OverflowError):
+        replacement_count = 0
+        confirmed_change_count = 0
     result: dict[str, object] = {
         "status": status,
         "label": labels[status],
-        "orders_changed": status == "succeeded",
-        "replacement_count": max(0, min(int(evidence.get("replacement_count") or 0), 5)),
+        "orders_changed": confirmed_change_count > 0,
+        "replacement_count": replacement_count,
     }
     if reason:
         result["reason_code"] = reason

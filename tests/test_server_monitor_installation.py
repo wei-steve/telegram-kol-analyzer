@@ -70,6 +70,8 @@ def test_monitor_service_uses_dedicated_identity_and_exact_command():
         "--expected-auto-trade-enabled "
         "--expected-management-mode live "
         "--expected-entry-preamble-mode ${TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_PREAMBLE_MODE} "
+        "--expected-entry-message-assembly-v2-mode ${TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_MESSAGE_ASSEMBLY_V2_MODE} "
+        "--expected-entry-revision-v2-mode ${TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_REVISION_V2_MODE} "
         "--expected-max-concurrent-positions 4 "
         "--checkout-path /opt/telegram-kol-analyzer "
         "--settings-url http://127.0.0.1:8000/api/trading-settings "
@@ -293,6 +295,8 @@ def test_installer_creates_identity_and_allowlisted_monitor_environment():
     assert "TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID" in installer
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_HEAD" in installer
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_PREAMBLE_MODE" in installer
+    assert "TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_MESSAGE_ASSEMBLY_V2_MODE" in installer
+    assert "TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_REVISION_V2_MODE" in installer
     assert "--expected-entry-preamble-mode" in installer
     assert 'expected_entry_preamble_mode=""' in installer
     assert 'echo "--expected-entry-preamble-mode is required."' in installer

@@ -42,7 +42,7 @@ def test_format_entry_revision_summary_is_truthful_and_bounded():
         }
     )
     succeeded = format_entry_revision_summary(
-        {"status": "succeeded", "replacement_count": 2}
+        {"status": "succeeded", "replacement_count": 2, "confirmed_change_count": 2}
     )
     recovery = format_entry_revision_summary(
         {
@@ -59,6 +59,20 @@ def test_format_entry_revision_summary_is_truthful_and_bounded():
     assert recovery["label"] == "入场修订需要人工处理"
     assert recovery["reason_code"] == "entry_revision_verified_stop_missing"
     assert "secret" not in str(planned)
+    assert format_entry_revision_summary(
+        {
+            "status": "succeeded",
+            "replacement_count": 0,
+            "confirmed_change_count": 0,
+        }
+    )["orders_changed"] is False
+    assert format_entry_revision_summary(
+        {
+            "status": "recovery_required",
+            "confirmed_change_count": 1,
+            "reason_code": "replacement_readback_failed",
+        }
+    )["orders_changed"] is True
 
 
 def test_render_leaderboard_rows_orders_by_quality_adjusted_rank():

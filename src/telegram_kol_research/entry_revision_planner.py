@@ -575,6 +575,8 @@ def plan_post_submit_entry_fragment_revisions(
     fragment_ids: tuple[int, ...],
     mode: str,
     planned_at: datetime | None = None,
+    allow_partial_fill_live: bool = False,
+    allow_supplemental_live: bool = False,
 ) -> tuple[EntryRevisionPlanResult, ...]:
     """Turn explicit post-submit fragments into one immutable revision target."""
 
@@ -755,6 +757,14 @@ def plan_post_submit_entry_fragment_revisions(
                 classified.append((leg, "retain_filled"))
             else:
                 return (_blocked("revision_order_position_state_conflict"),)
+        if mode == "live" and any(
+            action == "retain_filled" for _, action in classified
+        ) and not allow_partial_fill_live:
+            return (_blocked("revision_partial_fill_live_not_enabled"),)
+        if mode == "live" and any(
+            row.fragment_kind == "supplemental_entry" for row in fragments
+        ) and not allow_supplemental_live:
+            return (_blocked("revision_supplemental_live_not_enabled"),)
         target_fingerprint = hashlib.sha256(
             _canonical_json(
                 {

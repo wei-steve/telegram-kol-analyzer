@@ -865,7 +865,87 @@ def format_message_instruction_summary(payload: dict[str, Any]) -> str:
         lines.append("未持久化可展示的指令结果。")
     elif management_failed and entry_attempted:
         lines.append("仓位管理异常；后续开仓已继续尝试。")
+    assembly = payload.get("entry_assembly")
+    revision = payload.get("entry_revision")
+    if isinstance(assembly, dict):
+        lines.append(_safe_management_text(assembly.get("state_label"), limit=48))
+        lines.append(_safe_management_text(assembly.get("risk_calculation"), limit=96))
+    if isinstance(revision, dict):
+        lines.append(_safe_management_text(revision.get("label"), limit=48))
+        if revision.get("orders_changed") is True:
+            lines.append("订单已变更: 是（已读回确认）")
     return wrap_ai_agent_notification("\n".join(lines))
+
+
+def _load_entry_status_for_instruction_summary(
+    session_factory,
+    *,
+    raw_message_id: int,
+) -> dict[str, object]:
+    from telegram_kol_research.models import (
+        EntryRevisionReplacement,
+        ExecutionBinding,
+        RawMessage,
+        StrategyRevisionBatch,
+        StrategyRevisionLeg,
+    )
+
+    with session_factory() as session:
+        raw = session.get(RawMessage, int(raw_message_id))
+        if raw is None:
+            return {}
+        batch = (
+            session.query(StrategyRevisionBatch)
+            .filter(StrategyRevisionBatch.raw_message_id == int(raw.id))
+            .order_by(StrategyRevisionBatch.id.desc())
+            .first()
+        )
+        binding = (
+            session.get(ExecutionBinding, int(batch.execution_binding_id))
+            if batch is not None
+            else session.query(ExecutionBinding)
+            .filter(
+                ExecutionBinding.chat_id == int(raw.chat_id),
+                ExecutionBinding.message_id == int(raw.message_id),
+            )
+            .order_by(ExecutionBinding.id.desc())
+            .first()
+        )
+        assembly = None
+        if binding is not None:
+            try:
+                binding_payload = json.loads(binding.payload_json or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                binding_payload = {}
+            draft = binding_payload.get("draft") if isinstance(binding_payload, dict) else None
+            evidence = draft.get("entry_preamble_assembly") if isinstance(draft, dict) else None
+            assembly = format_entry_assembly_summary(evidence)
+        revision = None
+        if batch is not None:
+            replacements = session.query(EntryRevisionReplacement).filter(
+                EntryRevisionReplacement.revision_batch_id == int(batch.id)
+            )
+            confirmed = replacements.filter(
+                EntryRevisionReplacement.status == "verified"
+            ).count() + session.query(StrategyRevisionLeg).filter(
+                StrategyRevisionLeg.revision_batch_id == int(batch.id),
+                StrategyRevisionLeg.action == "cancel_pending",
+                StrategyRevisionLeg.status == "cancelled",
+            ).count()
+            try:
+                market = json.loads(batch.market_snapshot_json or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                market = {}
+            revision = format_entry_revision_summary(
+                {
+                    "status": batch.status,
+                    "reason_code": batch.reason_code,
+                    "replacement_count": replacements.count(),
+                    "confirmed_change_count": confirmed,
+                    "market_snapshot": market,
+                }
+            )
+    return {"entry_assembly": assembly, "entry_revision": revision}
 
 
 def split_message_instruction_summary(
@@ -1939,6 +2019,11 @@ async def deliver_message_instruction_summary_notification(
     )
     if payload is None:
         return False
+    payload.update(
+        _load_entry_status_for_instruction_summary(
+            session_factory, raw_message_id=raw_message_id
+        )
+    )
     completed_at = claimed_at or datetime.now(UTC)
     try:
         await send_message_instruction_summary_notification(

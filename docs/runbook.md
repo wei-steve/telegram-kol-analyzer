@@ -1424,3 +1424,81 @@ WHERE c.status IN ('ready','reserved')
   AND (l.status IN ('closed','cancelled','failed','rejected','expired')
        OR b.status IN ('closed','cancelled','failed','rejected','expired'));
 ```
+
+## 相邻入场消息组装 v2
+
+两个独立开关必须按顺序推进：`entry_message_assembly_v2_mode` 先于
+`entry_revision_v2_mode`，且修订开关不得超过组装开关的阶段。发布顺序是：
+
+1. 两者均为 `disabled` 时发布；
+2. 运行服务器聚焦测试和只读历史回放；
+3. 仅将组装设为 `shadow`，检查自然消息方案和安全不变式；
+4. 组装设为 `live`，修订仍为 `disabled`；
+5. 修订设为 `shadow`；
+6. 评审自然影子证据后，仅开放未成交旧单的 live 修订；当前生产调用保持 `allow_partial_fill_live=false` 和 `allow_supplemental_live=false`；
+7. 只有精确归属、连续止损保护和恢复路径均有自然影子证据，并且两个细分门禁经单独代码评审和发布后，才可开放部分成交与补仓动作。
+
+历史回放仅读 SQLite，不导入交易所适配器：
+
+```bash
+.venv/bin/python scripts/replay_adjacent_entry_assembly.py \
+  --database-path data/research.db --configured-risk-usdt 20 \
+  --message-id 4154 --message-id 9902 --message-id 9936 \
+  --message-id 558 --message-id 538
+```
+
+重启或切换模式前，必须用只读 SQL 证明没有进行中的识别、入场、撤单、修订和管理操作：
+
+```sql
+SELECT comparison_status, COUNT(*) FROM recognition_decisions
+ WHERE comparison_status IN
+       ('pending','running','execution_pending','execution_running')
+    OR comparison_status IS NULL
+    OR comparison_status NOT IN
+       ('completed','pending','running','execution_pending','execution_running')
+    OR comparison_claim_token IS NOT NULL
+ GROUP BY comparison_status;
+SELECT extraction_status, COUNT(*) FROM message_evidence_versions
+ WHERE superseded_at IS NULL
+   AND extraction_status IN ('pending','processing','running')
+ GROUP BY extraction_status;
+SELECT extraction_status, COUNT(*) FROM message_evidence_versions
+ WHERE superseded_at IS NULL AND (
+   extraction_status IS NULL OR extraction_status NOT IN
+   ('completed','failed','expired','pending','processing','running'))
+ GROUP BY extraction_status;
+SELECT status, COUNT(*) FROM execution_order_legs
+ WHERE purpose='entry' AND status IN
+ ('pending','planned','submitted','open','partially_filled','submitting',
+  'cancel_submitting','submit_unknown') GROUP BY status;
+SELECT status, COUNT(*) FROM strategy_revision_batches
+ WHERE status NOT IN ('shadow_planned','succeeded','blocked') GROUP BY status;
+SELECT status, COUNT(*) FROM strategy_management_batches
+ WHERE status NOT IN ('shadow_planned','succeeded','blocked','cancelled') GROUP BY status;
+SELECT status, COUNT(*) FROM position_mutation_intents
+ WHERE status IN ('reserved','submitting','submitted','submit_unknown','recovery_required') GROUP BY status;
+```
+
+任一查询返回行，或监听、对账、保护健康检查不正常，都延后重启和模式切换。
+通过窗口检查后，每次只改一个字段，保留完整设置 payload：
+
+```bash
+curl -fsS http://127.0.0.1:8000/api/trading-settings > /tmp/trading-settings.before.json
+jq '.entry_message_assembly_v2_mode="shadow"' \
+  /tmp/trading-settings.before.json > /tmp/trading-settings.next.json
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data-binary @/tmp/trading-settings.next.json \
+  http://127.0.0.1:8000/api/trading-settings
+```
+
+后续 `live`/`shadow` 切换使用同一流程，但每个阶段都要重做窗口和证据评审。
+回滚时立即把两个模式设为 `disabled`，这会停止新接纳和自动 revision worker。现有 batch 改由运维使用只读查询与交易所读回对账至确定终态；不得删除证据、重发未知结果请求或宣称订单已改变。
+
+```bash
+curl -fsS http://127.0.0.1:8000/api/trading-settings \
+  | jq '.entry_message_assembly_v2_mode="disabled" | .entry_revision_v2_mode="disabled"' \
+  > /tmp/trading-settings.rollback.json
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data-binary @/tmp/trading-settings.rollback.json \
+  http://127.0.0.1:8000/api/trading-settings
+```

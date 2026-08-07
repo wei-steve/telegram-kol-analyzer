@@ -3988,6 +3988,46 @@ def test_index_page_renders_message_cards_with_hierarchy_and_media_labels(tmp_pa
     assert "/local-media/77/2.mp4" not in response.text
 
 
+def test_message_tab_renders_bounded_adjacent_entry_assembly(tmp_path):
+    database_path = tmp_path / "entry-assembly-render.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        session.add(RawMessage(chat_id=77, message_id=9902, text="BTC strategy"))
+        session.add(
+            ExecutionBinding(
+                strategy_instance_id="render-entry-v2",
+                kol_id="chen",
+                chat_id=77,
+                message_id=9902,
+                symbol="BTCUSDT",
+                side="long",
+                venue="deepcoin",
+                payload_json=json.dumps({"draft": {"entry_preamble_assembly": {
+                    "mode": "live", "status": "assembled",
+                    "configured_risk_budget_usdt": 20,
+                    "risk_multiplier": "0.5",
+                    "effective_risk_budget_usdt": 10,
+                    "strategy_message_id": 9902,
+                    "fragment_ids": [11, 12],
+                    "allocations": [0.5, 0.5],
+                    "supplemental_prices": [63400],
+                    "api_key": "secret-value",
+                }}}),
+            )
+        )
+        session.commit()
+
+    response = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/77/detail/tab/messages"
+    )
+
+    assert response.status_code == 200
+    assert "配置20U × 50% = 实际风险预算10U" in response.text
+    assert "整单100%；两档各50%" in response.text
+    assert "补仓价 63400" in response.text
+    assert "secret-value" not in response.text
+
+
 def test_message_detail_renders_authoritative_semantic_review_states(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)

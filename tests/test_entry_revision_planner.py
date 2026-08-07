@@ -357,11 +357,20 @@ def test_post_submit_fragment_creates_new_revision_target_without_second_assembl
     )
     assert immature == ()
 
+    gated = plan_post_submit_entry_fragment_revisions(
+        session_factory,
+        fragment_ids=(fragment_id,),
+        mode="live",
+        planned_at=NOW + timedelta(minutes=31),
+    )
+    assert gated[0].reason_code == "revision_supplemental_live_not_enabled"
+
     results = plan_post_submit_entry_fragment_revisions(
         session_factory,
         fragment_ids=(fragment_id,),
         mode="live",
         planned_at=NOW + timedelta(minutes=31),
+        allow_supplemental_live=True,
     )
 
     assert len(results) == 1
@@ -590,6 +599,7 @@ def test_sequential_post_submit_revisions_build_on_latest_succeeded_generation(t
         fragment_ids=(second_fragment_id,),
         mode="live",
         planned_at=NOW + timedelta(minutes=33),
+        allow_supplemental_live=True,
     )[0]
 
     assert second_plan.status == "planned"

@@ -15,7 +15,20 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.llm_chat import _load_env_file_values
-from telegram_kol_research.models import RawMessage, SignalCandidate, StrategyAlert, StrategyLifecycle
+from telegram_kol_research.models import (
+    EntryRevisionReplacement,
+    ExecutionBinding,
+    RawMessage,
+    SignalCandidate,
+    StrategyAlert,
+    StrategyLifecycle,
+    StrategyRevisionBatch,
+    StrategyRevisionLeg,
+)
+from telegram_kol_research.reporting import (
+    format_entry_assembly_summary,
+    format_entry_revision_summary,
+)
 from telegram_kol_research.prompt_composition import render_registered_prompt, render_template_strict
 from telegram_kol_research.prompt_defaults import STRATEGY_ALERT_PROMPT, seed_default_prompt_registry
 from telegram_kol_research.prompt_registry import PromptInvocationRecord, record_prompt_invocation
@@ -271,6 +284,79 @@ def format_structured_strategy_alert_message(
     return "\n".join(lines)
 
 
+def _entry_status_for_alert(
+    session_factory: sessionmaker,
+    *,
+    record: NormalizedMessageRecord,
+) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+    with session_factory() as session:
+        binding = (
+            session.query(ExecutionBinding)
+            .filter(
+                ExecutionBinding.chat_id == int(record.chat_id),
+                ExecutionBinding.message_id == int(record.message_id),
+            )
+            .order_by(ExecutionBinding.id.desc())
+            .first()
+        )
+        raw = (
+            session.query(RawMessage)
+            .filter(
+                RawMessage.chat_id == int(record.chat_id),
+                RawMessage.message_id == int(record.message_id),
+            )
+            .one_or_none()
+        )
+        batch = None
+        if raw is not None:
+            batch = (
+                session.query(StrategyRevisionBatch)
+                .filter(StrategyRevisionBatch.raw_message_id == int(raw.id))
+                .order_by(StrategyRevisionBatch.id.desc())
+                .first()
+            )
+        if batch is not None and binding is None:
+            binding = session.get(ExecutionBinding, int(batch.execution_binding_id))
+        assembly = None
+        if binding is not None:
+            try:
+                payload = json.loads(binding.payload_json or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            draft = payload.get("draft") if isinstance(payload, dict) else None
+            evidence = draft.get("entry_preamble_assembly") if isinstance(draft, dict) else None
+            if evidence is None and isinstance(payload, dict):
+                evidence = payload.get("entry_preamble_assembly")
+            assembly = format_entry_assembly_summary(evidence)
+        revision = None
+        if batch is not None:
+            replacement_count = session.query(EntryRevisionReplacement).filter(
+                EntryRevisionReplacement.revision_batch_id == int(batch.id)
+            ).count()
+            confirmed = session.query(EntryRevisionReplacement).filter(
+                EntryRevisionReplacement.revision_batch_id == int(batch.id),
+                EntryRevisionReplacement.status == "verified",
+            ).count() + session.query(StrategyRevisionLeg).filter(
+                StrategyRevisionLeg.revision_batch_id == int(batch.id),
+                StrategyRevisionLeg.action == "cancel_pending",
+                StrategyRevisionLeg.status == "cancelled",
+            ).count()
+            try:
+                market = json.loads(batch.market_snapshot_json or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                market = {}
+            revision = format_entry_revision_summary(
+                {
+                    "status": batch.status,
+                    "reason_code": batch.reason_code,
+                    "replacement_count": replacement_count,
+                    "confirmed_change_count": confirmed,
+                    "market_snapshot": market,
+                }
+            )
+    return assembly, revision
+
+
 def build_strategy_alert_event_from_recognition(
     *,
     session_factory: sessionmaker,
@@ -425,10 +511,15 @@ async def process_strategy_alert_for_record(
         recognition_result=recognition_result,
     )
     if event is not None:
+        entry_assembly, entry_revision = _entry_status_for_alert(
+            session_factory, record=record
+        )
         message = format_structured_strategy_alert_message(
             chat_title=chat_title,
             event=event,
             message_id=record.message_id,
+            entry_assembly=entry_assembly,
+            entry_revision=entry_revision,
         )
         try:
             await _retry_async(
