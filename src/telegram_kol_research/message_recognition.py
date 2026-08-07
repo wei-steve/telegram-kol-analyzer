@@ -63,6 +63,10 @@ from telegram_kol_research.management_message_targets import (
     management_parameter_fingerprint,
     project_management_targets_in_session,
 )
+from telegram_kol_research.runtime_incident_adapters import (
+    capture_management_target_failure,
+    capture_runtime_incident_best_effort,
+)
 from telegram_kol_research.strategy_management_contracts import (
     management_contract_fingerprint,
     serialize_management_contract,
@@ -2950,7 +2954,76 @@ def apply_authoritative_mimo_payload(
             config=active_multi_target_management_config,
         )
         session.commit()
+        _capture_committed_multi_target_failures(
+            session_factory,
+            raw_message_id=raw_message_id,
+        )
         return result
+
+
+def _capture_committed_multi_target_failures(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+) -> None:
+    """Report target failures only after authoritative business work commits."""
+
+    try:
+        with session_factory() as session:
+            rows = (
+                session.query(ManagementMessageTarget)
+                .filter(
+                    ManagementMessageTarget.raw_message_id == int(raw_message_id),
+                    ManagementMessageTarget.admission_state.in_(
+                        ("admitted", "refused")
+                    ),
+                )
+                .order_by(ManagementMessageTarget.id.asc())
+                .all()
+            )
+            failures = []
+            for row in rows:
+                if row.admission_state == "refused":
+                    failures.append(
+                        (
+                            int(row.id),
+                            "management_target_collision"
+                            if row.closed_reason_code == "target_collision"
+                            else "management_target_refused",
+                            row.closed_reason_code or "target_refused",
+                            "high"
+                            if row.closed_reason_code == "target_collision"
+                            else "medium",
+                        )
+                    )
+                elif row.message_instruction_item_id is None:
+                    failures.append(
+                        (
+                            int(row.id),
+                            "management_target_orchestration_failed",
+                            "admitted_target_instruction_missing",
+                            "high",
+                        )
+                    )
+    except Exception as exc:
+        logger.warning(
+            "Management target incident discovery failed open: raw_message_id=%s "
+            "error=%s",
+            int(raw_message_id),
+            type(exc).__name__,
+        )
+        return
+
+    for target_id, incident_type, reason_code, severity in failures:
+        capture_runtime_incident_best_effort(
+            capture_management_target_failure,
+            session_factory,
+            target_id=target_id,
+            incident_type=incident_type,
+            reason_code=reason_code,
+            severity=severity,
+            occurred_at=utc_now(),
+        )
 
 
 def _project_multi_target_management_shadow_in_session(

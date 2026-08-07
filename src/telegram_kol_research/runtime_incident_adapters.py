@@ -15,6 +15,7 @@ from telegram_kol_research.config import (
     RuntimeIncidentConfig,
     load_runtime_incident_config,
 )
+from telegram_kol_research.models import ManagementMessageTarget, utc_now
 from telegram_kol_research.runtime_incidents import record_runtime_incident
 
 
@@ -40,6 +41,18 @@ _MANAGEMENT_INCIDENTS = {
 }
 _SHADOW_OBSERVATION_ONLY_MANAGEMENT_REASONS = frozenset(
     {"protection_recovery_required"}
+)
+MANAGEMENT_TARGET_INCIDENT_TYPES = frozenset(
+    {
+        "management_target_refused",
+        "management_target_orchestration_failed",
+        "management_target_visibility_exhausted",
+        "management_target_drift",
+        "management_target_collision",
+    }
+)
+MANAGEMENT_ENVELOPE_INCIDENT_TYPES = frozenset(
+    {"unclassified_operation_failure"}
 )
 
 
@@ -248,6 +261,107 @@ def capture_management_state(
             source_status=str(status).lower(),
             reason_code=_safe_label(reason_code),
         ),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
+def _capture_management_failure(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    source_kind: str,
+    source_record_id: int,
+    incident_type: str,
+    reason_code: str | None,
+    severity: str,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None,
+):
+    return _capture(
+        session_factory,
+        config=config,
+        source_kind=source_kind,
+        source_record_id=str(int(source_record_id)),
+        incident_type=incident_type,
+        severity=str(severity).strip().lower(),
+        redacted_summary=_summary(
+            component=source_kind,
+            source_status="terminal_failure",
+            reason_code=_safe_label(reason_code),
+        ),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
+def capture_management_target_failure(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    target_id: int,
+    incident_type: str,
+    reason_code: str | None,
+    severity: str,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture one committed target failure without affecting sibling work."""
+
+    if incident_type not in MANAGEMENT_TARGET_INCIDENT_TYPES:
+        raise ValueError("unsupported management target incident type")
+    incident = _capture_management_failure(
+        session_factory,
+        config=config,
+        source_kind="management_message_target",
+        source_record_id=target_id,
+        incident_type=incident_type,
+        reason_code=reason_code,
+        severity=severity,
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+    if incident is None:
+        return None
+    try:
+        with session_factory() as session:
+            target = session.get(ManagementMessageTarget, int(target_id))
+            if target is not None:
+                target.latest_runtime_incident_id = int(incident.id)
+                target.updated_at = utc_now()
+                session.commit()
+    except Exception as exc:
+        logger.warning(
+            "Management target incident link failed open: target_id=%s error=%s",
+            int(target_id),
+            type(exc).__name__,
+        )
+    return incident
+
+
+def capture_management_envelope_failure(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    envelope_id: int,
+    incident_type: str,
+    reason_code: str | None,
+    severity: str,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture a committed whole-message infrastructure failure."""
+
+    if incident_type not in MANAGEMENT_ENVELOPE_INCIDENT_TYPES:
+        raise ValueError("unsupported management envelope incident type")
+    return _capture_management_failure(
+        session_factory,
+        config=config,
+        source_kind="management_message_envelope",
+        source_record_id=envelope_id,
+        incident_type=incident_type,
+        reason_code=reason_code,
+        severity=severity,
         occurred_at=occurred_at,
         recorder=recorder,
     )

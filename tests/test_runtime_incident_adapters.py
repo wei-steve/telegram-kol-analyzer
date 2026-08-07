@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 import pytest
 
 from telegram_kol_research.config import (
+    MULTI_TARGET_CAPTURE_PROFILE,
     READ_ONLY_CAPTURE_PROFILE,
     RuntimeIncidentConfig,
     load_runtime_incident_config,
@@ -12,6 +13,10 @@ from telegram_kol_research.config import (
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import RuntimeIncident
 from telegram_kol_research.runtime_incident_adapters import (
+    MANAGEMENT_ENVELOPE_INCIDENT_TYPES,
+    MANAGEMENT_TARGET_INCIDENT_TYPES,
+    capture_management_envelope_failure,
+    capture_management_target_failure,
     capture_runtime_incident_best_effort,
     capture_context_worker_state,
     capture_management_state,
@@ -39,6 +44,13 @@ def test_read_only_capture_profile_is_closed_and_excludes_business_ambiguity():
             "notification_delivery_failure",
         }
     )
+
+
+def test_multi_target_capture_profile_is_separate_and_closed():
+    assert MULTI_TARGET_CAPTURE_PROFILE == (
+        MANAGEMENT_TARGET_INCIDENT_TYPES | MANAGEMENT_ENVELOPE_INCIDENT_TYPES
+    )
+    assert READ_ONLY_CAPTURE_PROFILE.isdisjoint(MULTI_TARGET_CAPTURE_PROFILE)
     assert READ_ONLY_CAPTURE_PROFILE.isdisjoint(
         {
             "unresolved",
@@ -85,6 +97,84 @@ def test_safety_gate_divergence_remains_observation_only():
     )
     assert result is None
     assert calls == []
+
+
+@pytest.mark.parametrize("incident_type", sorted(MANAGEMENT_TARGET_INCIDENT_TYPES))
+def test_management_target_failures_are_scoped_redacted_and_deduplicated(
+    tmp_path,
+    incident_type,
+):
+    session_factory = create_session_factory(tmp_path / f"{incident_type}.db")
+
+    first = capture_management_target_failure(
+        session_factory,
+        config=_enabled(incident_type),
+        target_id=41,
+        incident_type=incident_type,
+        reason_code="Authorization: bearer secret-value",
+        severity="high",
+        occurred_at=NOW,
+    )
+    second = capture_management_target_failure(
+        session_factory,
+        config=_enabled(incident_type),
+        target_id=41,
+        incident_type=incident_type,
+        reason_code="Authorization: bearer secret-value",
+        severity="high",
+        occurred_at=NOW,
+    )
+
+    assert first is not None
+    assert second.id == first.id
+    assert second.repeat_count == 2
+    assert second.source_kind == "management_message_target"
+    assert second.source_record_id == "41"
+    assert "secret-value" not in second.redacted_summary
+
+
+@pytest.mark.parametrize("incident_type", sorted(MANAGEMENT_ENVELOPE_INCIDENT_TYPES))
+def test_management_envelope_failures_use_envelope_scope(tmp_path, incident_type):
+    session_factory = create_session_factory(tmp_path / f"{incident_type}.db")
+
+    captured = capture_management_envelope_failure(
+        session_factory,
+        config=_enabled(incident_type),
+        envelope_id=73,
+        incident_type=incident_type,
+        reason_code="database_unavailable",
+        severity="critical",
+        occurred_at=NOW,
+    )
+
+    assert captured is not None
+    assert captured.source_kind == "management_message_envelope"
+    assert captured.source_record_id == "73"
+
+
+def test_management_failure_adapters_reject_unknown_types(tmp_path):
+    session_factory = create_session_factory(tmp_path / "unsupported.db")
+
+    with pytest.raises(ValueError, match="unsupported management target"):
+        capture_management_target_failure(
+            session_factory,
+            config=_enabled("unknown"),
+            target_id=1,
+            incident_type="unknown",
+            reason_code="unknown",
+            severity="high",
+            occurred_at=NOW,
+        )
+    with pytest.raises(ValueError, match="unsupported management envelope"):
+        capture_management_envelope_failure(
+            session_factory,
+            config=_enabled("unknown"),
+            envelope_id=1,
+            incident_type="unknown",
+            reason_code="unknown",
+            severity="high",
+            occurred_at=NOW,
+        )
 
 
 def test_notification_type_allowlist_preserves_legacy_and_supports_capture_only():

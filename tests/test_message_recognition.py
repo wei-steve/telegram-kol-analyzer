@@ -36,6 +36,7 @@ from telegram_kol_research.models import (
     ManagementMessageTarget,
     MessageRecognition,
     RawMessage,
+    RuntimeIncident,
     SignalCandidate,
     StrategyLifecycle,
     TradingSetting,
@@ -1014,7 +1015,12 @@ def test_authoritative_multi_target_persistence_is_all_or_nothing(tmp_path):
 def test_live_multi_target_admission_refuses_one_target_and_continues_others(
     tmp_path,
     target_order,
+    monkeypatch,
 ):
+    monkeypatch.setenv(
+        "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES",
+        "management_target_refused",
+    )
     session_factory = create_session_factory(
         tmp_path / f"multi-target-isolated-{'-'.join(target_order)}.db"
     )
@@ -1109,6 +1115,11 @@ def test_live_multi_target_admission_refuses_one_target_and_continues_others(
         assert target_rows["ETH"].closed_reason_code == "target_not_verified"
         assert target_rows["ETH"].signal_candidate_id is None
         assert target_rows["ETH"].message_instruction_item_id is None
+        incident = session.query(RuntimeIncident).one()
+        assert incident.source_kind == "management_message_target"
+        assert incident.source_record_id == str(target_rows["ETH"].id)
+        assert incident.incident_type == "management_target_refused"
+        assert target_rows["ETH"].latest_runtime_incident_id == incident.id
 
 
 def test_live_multi_target_admission_freezes_overlapping_pos_id_sets(tmp_path):

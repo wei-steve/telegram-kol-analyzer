@@ -46,9 +46,14 @@ from telegram_kol_research.message_instruction_items import (
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
+    ManagementMessageTarget,
     PositionMutationIntent,
     StrategyLifecycle,
     StrategyManagementBatch,
+)
+from telegram_kol_research.runtime_incident_adapters import (
+    capture_management_target_failure,
+    capture_runtime_incident_best_effort,
 )
 from telegram_kol_research.position_attribution import (
     PositionAttributionError,
@@ -217,7 +222,7 @@ def run_strategy_management_worker_tick(
                     and planning_result.reason_code
                     == "target_strategy_binding_not_visible_yet"
                 ):
-                    defer_message_instruction_item_for_visibility(
+                    defer_status = defer_message_instruction_item_for_visibility(
                         session_factory,
                         item_id=item.id,
                         result={
@@ -227,6 +232,17 @@ def run_strategy_management_worker_tick(
                         },
                         now=now,
                     )
+                    if defer_status == "failed":
+                        _capture_committed_instruction_target_failure(
+                            session_factory,
+                            item_id=item.id,
+                            incident_type="management_target_visibility_exhausted",
+                            reason_code=(
+                                "target_strategy_binding_visibility_retry_expired"
+                            ),
+                            severity="high",
+                            occurred_at=now,
+                        )
                     counts["recovered"] += 1
                     continue
                 if planning_result.status != "ready" or planning_result.batch is None:
@@ -240,6 +256,17 @@ def run_strategy_management_worker_tick(
                             "batch_id": planning_result.batch_id,
                         },
                         now=now,
+                    )
+                    _capture_committed_instruction_target_failure(
+                        session_factory,
+                        item_id=item.id,
+                        incident_type="management_target_orchestration_failed",
+                        reason_code=(
+                            planning_result.reason_code
+                            or "management_planning_failed"
+                        ),
+                        severity="high",
+                        occurred_at=now,
                     )
                     counts["failed"] += 1
                     continue
@@ -278,6 +305,18 @@ def run_strategy_management_worker_tick(
                     now=now,
                 )
                 if finish_status == "failed":
+                    _capture_committed_instruction_target_failure(
+                        session_factory,
+                        item_id=item.id,
+                        incident_type="management_target_orchestration_failed",
+                        reason_code=str(
+                            execution_result.get("reason")
+                            or execution_result.get("status")
+                            or "management_execution_failed"
+                        ),
+                        severity="high",
+                        occurred_at=now,
+                    )
                     counts["failed"] += 1
                 else:
                     counts["executed"] += 1
@@ -288,6 +327,14 @@ def run_strategy_management_worker_tick(
                     status="unknown",
                     result={"type": type(exc).__name__, "message": str(exc)},
                     now=now,
+                )
+                _capture_committed_instruction_target_failure(
+                    session_factory,
+                    item_id=item.id,
+                    incident_type="management_target_orchestration_failed",
+                    reason_code=type(exc).__name__,
+                    severity="critical",
+                    occurred_at=now,
                 )
                 counts["failed"] += 1
                 logger.exception(
@@ -301,6 +348,14 @@ def run_strategy_management_worker_tick(
                     status="failed",
                     result={"type": type(exc).__name__, "message": str(exc)},
                     now=now,
+                )
+                _capture_committed_instruction_target_failure(
+                    session_factory,
+                    item_id=item.id,
+                    incident_type="management_target_orchestration_failed",
+                    reason_code=type(exc).__name__,
+                    severity="high",
+                    occurred_at=now,
                 )
                 counts["failed"] += 1
                 logger.exception(
@@ -617,6 +672,47 @@ def run_strategy_management_worker_tick(
             counts["failed"] += 1
             logger.exception("strategy management batch %s failed", batch.id)
     return StrategyManagementWorkerResult(**counts)
+
+
+def _capture_committed_instruction_target_failure(
+    session_factory,
+    *,
+    item_id: int,
+    incident_type: str,
+    reason_code: str,
+    severity: str,
+    occurred_at: datetime,
+) -> None:
+    """Capture only after the instruction and target state transaction commits."""
+
+    try:
+        with session_factory() as session:
+            target_id = (
+                session.query(ManagementMessageTarget.id)
+                .filter(
+                    ManagementMessageTarget.message_instruction_item_id
+                    == int(item_id)
+                )
+                .scalar()
+            )
+    except Exception as exc:
+        logger.warning(
+            "Management target incident discovery failed open: item_id=%s error=%s",
+            int(item_id),
+            type(exc).__name__,
+        )
+        return
+    if target_id is None:
+        return
+    capture_runtime_incident_best_effort(
+        capture_management_target_failure,
+        session_factory,
+        target_id=int(target_id),
+        incident_type=incident_type,
+        reason_code=reason_code,
+        severity=severity,
+        occurred_at=occurred_at,
+    )
 
 
 def _advance_temporary_visibility_retry(session_factory, *, batch_id: int, now: datetime) -> None:

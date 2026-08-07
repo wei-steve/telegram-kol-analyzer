@@ -27,6 +27,16 @@ READ_ONLY_CAPTURE_PROFILE = frozenset(
     }
 )
 _SQLITE_MAX_INTEGER = 2**63 - 1
+MULTI_TARGET_CAPTURE_PROFILE = frozenset(
+    {
+        "management_target_refused",
+        "management_target_orchestration_failed",
+        "management_target_visibility_exhausted",
+        "management_target_drift",
+        "management_target_collision",
+        "unclassified_operation_failure",
+    }
+)
 
 RUNTIME_SCANNER_RULE_IDS = frozenset(
     {

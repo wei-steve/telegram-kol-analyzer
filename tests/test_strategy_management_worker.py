@@ -17,9 +17,12 @@ from telegram_kol_research.execution_bindings import (
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
+    ManagementMessageEnvelope,
+    ManagementMessageTarget,
     MessageInstructionItem,
     PositionMutationIntent,
     RawMessage,
+    RuntimeIncident,
     SignalCandidate,
     StrategyLifecycle,
     StrategyManagementBatch,
@@ -184,6 +187,105 @@ def test_worker_retries_due_visibility_item_and_finishes_same_item(tmp_path):
         item = session.get(MessageInstructionItem, item_id)
         assert item.status == "submitted"
         assert item.visibility_retry_attempts == 1
+
+
+def test_worker_captures_target_orchestration_failure_after_item_commit(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES",
+        "management_target_orchestration_failed",
+    )
+    session_factory = create_session_factory(tmp_path / "target-incident.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=100, message_id=31, text="BTC exit")
+        lifecycle = StrategyLifecycle(
+            chat_id=100,
+            message_id=30,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=NOW,
+        )
+        session.add_all((raw, lifecycle))
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=raw.id,
+            symbol="BTC",
+            side="short",
+            event_type="close_signal",
+            target_lifecycle_id=lifecycle.id,
+            management_action="full_exit",
+        )
+        envelope = ManagementMessageEnvelope(
+            raw_message_id=raw.id,
+            decision_fingerprint="d" * 64,
+            normalized_action="exit_full",
+            shared_parameters_json="{}",
+            projection_mode="live",
+        )
+        session.add_all((candidate, envelope))
+        session.flush()
+        item = MessageInstructionItem(
+            raw_message_id=raw.id,
+            signal_candidate_id=candidate.id,
+            sequence=0,
+            instruction_kind="management",
+            idempotency_key="o" * 64,
+            status="pending",
+            visibility_first_failed_at=NOW - timedelta(seconds=5),
+            visibility_retry_attempts=1,
+            visibility_next_attempt_at=NOW,
+        )
+        session.add(item)
+        session.flush()
+        target = ManagementMessageTarget(
+            envelope_id=envelope.id,
+            raw_message_id=raw.id,
+            target_lifecycle_id=lifecycle.id,
+            target_ordinal=0,
+            symbol="BTC",
+            side="short",
+            normalized_action="exit_full",
+            parameters_json="{}",
+            parameter_fingerprint="p" * 64,
+            collision_group_fingerprint="c" * 64,
+            admission_state="admitted",
+            execution_state="pending",
+            signal_candidate_id=candidate.id,
+            message_instruction_item_id=item.id,
+        )
+        session.add(target)
+        session.commit()
+        item_id, target_id = item.id, target.id
+
+    blocked = SimpleNamespace(
+        status="blocked",
+        reason_code="target_position_snapshot_unavailable",
+        batch=None,
+        batch_id=None,
+    )
+    run_strategy_management_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: object(),
+        max_batches=1,
+        batch_lister=lambda *_args, **_kwargs: [],
+        binding_reconciler=lambda *_args, **_kwargs: None,
+        take_profit_convergence_runner=lambda *_args, **_kwargs: 0,
+        instruction_planner=lambda *_args, **_kwargs: blocked,
+        contract_spec_provider=object(),
+        processed_at=NOW,
+    )
+
+    with session_factory() as session:
+        assert session.get(MessageInstructionItem, item_id).status == "failed"
+        target = session.get(ManagementMessageTarget, target_id)
+        assert target.execution_state == "failed"
+        incident = session.query(RuntimeIncident).one()
+        assert incident.incident_type == "management_target_orchestration_failed"
+        assert incident.source_record_id == str(target_id)
+        assert target.latest_runtime_incident_id == incident.id
 
 
 def test_worker_runs_ready_take_profit_convergence_only_when_execution_enabled():
