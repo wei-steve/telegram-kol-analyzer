@@ -195,3 +195,122 @@ def test_management_event_never_persists_entry_fragments(tmp_path):
     )
 
     assert rows == ()
+
+
+def test_management_reanalysis_invalidates_older_pending_fragment(tmp_path):
+    from telegram_kol_research.entry_strategy_fragments import (
+        persist_authoritative_entry_fragments,
+    )
+
+    session_factory = create_session_factory(tmp_path / "management-supersedes.db")
+    raw_id, evidence_id = _message_and_evidence(session_factory)
+    first = persist_authoritative_entry_fragments(
+        session_factory,
+        raw_message_id=raw_id,
+        evidence_version_id=evidence_id,
+        recognition_generation="generation-1",
+        payload=_payload(_risk()),
+        mode="live",
+        now=NOW,
+    )[0]
+
+    assert persist_authoritative_entry_fragments(
+        session_factory,
+        raw_message_id=raw_id,
+        evidence_version_id=evidence_id,
+        recognition_generation="generation-2",
+        payload={
+            "recognition_result": "非策略",
+            "strategy": {},
+            "lifecycle_event": {"event_type": "position_update"},
+            "entry_fragments": [],
+        },
+        mode="live",
+        now=NOW + timedelta(seconds=1),
+    ) == ()
+
+    with session_factory() as session:
+        assert session.get(EntryStrategyFragment, first.id).status == "invalidated"
+
+
+def test_delayed_older_evidence_cannot_replace_current_fragments(tmp_path):
+    from telegram_kol_research.entry_strategy_fragments import (
+        persist_authoritative_entry_fragments,
+    )
+
+    session_factory = create_session_factory(tmp_path / "out-of-order.db")
+    raw_id, evidence_v1_id = _message_and_evidence(session_factory)
+    with session_factory() as session:
+        evidence_v1 = session.get(MessageEvidenceVersion, evidence_v1_id)
+        evidence_v1.superseded_at = NOW
+        evidence_v2 = MessageEvidenceVersion(
+            raw_message_id=raw_id,
+            version=2,
+            input_fingerprint="sha256:fragment-v2",
+            model="mimo-v2.5",
+            prompt_versions_json="{}",
+            extraction_status="completed",
+            confidence=0.96,
+            text_evidence_json="{}",
+            image_evidence_json='{"images":[]}',
+            normalized_evidence_json="{}",
+        )
+        session.add(evidence_v2)
+        session.commit()
+        evidence_v2_id = evidence_v2.id
+
+    current = persist_authoritative_entry_fragments(
+        session_factory,
+        raw_message_id=raw_id,
+        evidence_version_id=evidence_v2_id,
+        recognition_generation="generation-new",
+        payload=_payload(_risk("1", "正常仓位操作")),
+        mode="live",
+        now=NOW + timedelta(seconds=1),
+    )[0]
+    stale = persist_authoritative_entry_fragments(
+        session_factory,
+        raw_message_id=raw_id,
+        evidence_version_id=evidence_v1_id,
+        recognition_generation="generation-old-late",
+        payload=_payload(_risk()),
+        mode="live",
+        now=NOW + timedelta(seconds=2),
+    )
+
+    assert stale == ()
+    with session_factory() as session:
+        row = session.get(EntryStrategyFragment, current.id)
+        assert row.status == "pending"
+        assert session.query(EntryStrategyFragment).count() == 1
+
+
+def test_same_evidence_is_idempotent_across_recognition_tokens(tmp_path):
+    from telegram_kol_research.entry_strategy_fragments import (
+        persist_authoritative_entry_fragments,
+    )
+
+    session_factory = create_session_factory(tmp_path / "token-idempotency.db")
+    raw_id, evidence_id = _message_and_evidence(session_factory)
+    first = persist_authoritative_entry_fragments(
+        session_factory,
+        raw_message_id=raw_id,
+        evidence_version_id=evidence_id,
+        recognition_generation="token-one",
+        payload=_payload(_risk()),
+        mode="live",
+        now=NOW,
+    )[0]
+    repeated = persist_authoritative_entry_fragments(
+        session_factory,
+        raw_message_id=raw_id,
+        evidence_version_id=evidence_id,
+        recognition_generation="token-two",
+        payload=_payload(_risk()),
+        mode="live",
+        now=NOW + timedelta(seconds=1),
+    )[0]
+
+    assert repeated.id == first.id
+    with session_factory() as session:
+        assert session.query(EntryStrategyFragment).count() == 1

@@ -440,6 +440,19 @@ def normalize_mimo_evidence(
             ] = "entry_context_invalid"
         else:
             normalized_evidence["entry_context"] = entry_context.to_dict()
+            if "entry_fragments" not in payload:
+                normalized_evidence["entry_fragments"] = [
+                    {
+                        "kind": "risk_multiplier",
+                        "symbol": entry_context.symbol,
+                        "side": entry_context.side,
+                        "risk_multiplier": entry_context.to_dict()[
+                            "risk_multiplier"
+                        ],
+                        "confidence": entry_context.confidence,
+                        "reason": entry_context.reason,
+                    }
+                ]
     if "entry_fragments" in payload:
         raw_fragments = payload.get("entry_fragments")
         entry_fragments = normalize_entry_strategy_fragments(raw_fragments)

@@ -199,6 +199,36 @@ def test_normalize_mimo_evidence_keeps_valid_entry_fragments_and_rejects_bad_ite
     assert normalized["entry_fragments_rejected_count"] == 1
 
 
+def test_legacy_entry_context_is_adapted_when_fragment_array_is_absent():
+    *_, normalized = normalize_mimo_evidence(
+        {
+            "recognition_result": "非策略",
+            "confidence": 0.9,
+            "entry_context": {
+                "kind": "entry_preamble",
+                "symbol": "BTC",
+                "side": "short",
+                "risk_multiplier": "0.5",
+                "confidence": 0.95,
+                "reason": "半仓操作",
+            },
+        },
+        input_kind="text",
+        error_message=None,
+    )
+
+    assert normalized["entry_fragments"] == [
+        {
+            "kind": "risk_multiplier",
+            "symbol": "BTC",
+            "side": "short",
+            "risk_multiplier": "0.5",
+            "confidence": 0.95,
+            "reason": "半仓操作",
+        }
+    ]
+
+
 def _message(session_factory) -> RawMessage:
     with session_factory() as session:
         row = RawMessage(

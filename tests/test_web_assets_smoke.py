@@ -16,6 +16,15 @@ def test_static_assets_are_served(tmp_path):
     assert response.status_code == 200
 
 
+def test_trading_settings_js_submits_adjacent_entry_modes(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    source = client.get("/static/app.js").text
+
+    assert "entry_message_assembly_v2_mode: String(formData.get('entry_message_assembly_v2_mode')" in source
+    assert "entry_revision_v2_mode: String(formData.get('entry_revision_v2_mode')" in source
+
+
 def test_trading_symbol_assets_preserve_decimal_threshold_state(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 

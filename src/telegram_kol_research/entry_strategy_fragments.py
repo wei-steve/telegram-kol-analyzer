@@ -15,6 +15,7 @@ from telegram_kol_research.message_evidence import (
     normalize_entry_strategy_fragments,
 )
 from telegram_kol_research.models import EntryStrategyFragment, RawMessage
+from telegram_kol_research.models import MessageEvidenceVersion
 
 
 def _canonical_json(value: Mapping[str, Any]) -> str:
@@ -25,13 +26,11 @@ def _fingerprint(
     *,
     raw_message_id: int,
     evidence_version_id: int,
-    recognition_generation: str,
     evidence: EntryStrategyFragmentEvidence,
 ) -> str:
     payload = {
         "raw_message_id": int(raw_message_id),
         "evidence_version_id": int(evidence_version_id),
-        "recognition_generation": str(recognition_generation),
         "fragment": evidence.to_dict(),
     }
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
@@ -55,25 +54,48 @@ def persist_authoritative_entry_fragments(
         raise ValueError(
             "entry message assembly v2 mode must be disabled, shadow, or live"
         )
-    lifecycle = payload.get("lifecycle_event")
-    if not isinstance(lifecycle, Mapping) or str(
-        lifecycle.get("event_type") or "none"
-    ) != "none":
-        return ()
-    evidence_rows = normalize_entry_strategy_fragments(payload.get("entry_fragments"))
-    fingerprints = [
-        _fingerprint(
-            raw_message_id=raw_message_id,
-            evidence_version_id=evidence_version_id,
-            recognition_generation=recognition_generation,
-            evidence=evidence,
-        )
-        for evidence in evidence_rows
-    ]
     with session_factory() as session:
         raw_message = session.get(RawMessage, int(raw_message_id))
         if raw_message is None:
             raise LookupError("raw message not found")
+        evidence_version = session.get(
+            MessageEvidenceVersion, int(evidence_version_id)
+        )
+        current_evidence_id = (
+            session.query(MessageEvidenceVersion.id)
+            .filter(
+                MessageEvidenceVersion.raw_message_id == int(raw_message_id),
+                MessageEvidenceVersion.superseded_at.is_(None),
+            )
+            .order_by(MessageEvidenceVersion.version.desc())
+            .limit(1)
+            .scalar()
+        )
+        if (
+            evidence_version is None
+            or int(evidence_version.raw_message_id) != int(raw_message_id)
+            or evidence_version.superseded_at is not None
+            or current_evidence_id != int(evidence_version_id)
+        ):
+            return ()
+        lifecycle = payload.get("lifecycle_event")
+        lifecycle_is_entry_context = (
+            isinstance(lifecycle, Mapping)
+            and str(lifecycle.get("event_type") or "none") == "none"
+        )
+        evidence_rows = (
+            normalize_entry_strategy_fragments(payload.get("entry_fragments"))
+            if lifecycle_is_entry_context
+            else ()
+        )
+        fingerprints = [
+            _fingerprint(
+                raw_message_id=raw_message_id,
+                evidence_version_id=evidence_version_id,
+                evidence=evidence,
+            )
+            for evidence in evidence_rows
+        ]
         invalidation = update(EntryStrategyFragment).where(
             EntryStrategyFragment.raw_message_id == int(raw_message_id),
             EntryStrategyFragment.status == "pending",
