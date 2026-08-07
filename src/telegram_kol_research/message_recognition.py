@@ -31,6 +31,7 @@ from telegram_kol_research.models import (
     MediaAsset,
     MessageInstructionItem,
     MessageRecognition,
+    ManagementMessageEnvelope,
     ManagementMessageTarget,
     RawMessage,
     SignalCandidate,
@@ -64,6 +65,7 @@ from telegram_kol_research.management_message_targets import (
     project_management_targets_in_session,
 )
 from telegram_kol_research.runtime_incident_adapters import (
+    capture_management_envelope_failure,
     capture_management_target_failure,
     capture_runtime_incident_best_effort,
 )
@@ -2821,7 +2823,7 @@ def apply_authoritative_mimo_payload(
             raw_message.text,
             payload,
         )
-        _project_multi_target_management_shadow_in_session(
+        projection_failure_reason = _project_multi_target_management_shadow_in_session(
             session,
             raw_message_id=raw_message_id,
             lifecycle_event=lifecycle_event,
@@ -2946,18 +2948,29 @@ def apply_authoritative_mimo_payload(
             raw_message_id=raw_message_id,
             accepted_candidate_ids=accepted_candidate_ids,
         )
-        _project_multi_target_management_shadow_in_session(
-            session,
-            raw_message_id=raw_message_id,
-            lifecycle_event=lifecycle_event,
-            authoritative_generation=authoritative_generation,
-            config=active_multi_target_management_config,
+        projection_failure_reason = (
+            _project_multi_target_management_shadow_in_session(
+                session,
+                raw_message_id=raw_message_id,
+                lifecycle_event=lifecycle_event,
+                authoritative_generation=authoritative_generation,
+                config=active_multi_target_management_config,
+            )
+            or projection_failure_reason
         )
         session.commit()
         _capture_committed_multi_target_failures(
             session_factory,
             raw_message_id=raw_message_id,
         )
+        if projection_failure_reason is not None:
+            _capture_committed_multi_target_envelope_failure(
+                session_factory,
+                raw_message_id=raw_message_id,
+                lifecycle_event=lifecycle_event,
+                authoritative_generation=authoritative_generation,
+                reason_code=projection_failure_reason,
+            )
         return result
 
 
@@ -3026,6 +3039,56 @@ def _capture_committed_multi_target_failures(
         )
 
 
+def _capture_committed_multi_target_envelope_failure(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    lifecycle_event: Mapping[str, Any],
+    authoritative_generation: str | None,
+    reason_code: str,
+) -> None:
+    try:
+        fingerprint = management_decision_fingerprint(
+            {
+                **lifecycle_event,
+                "management_action": _effective_multi_target_action(
+                    lifecycle_event
+                ),
+            },
+            authoritative_generation=authoritative_generation,
+        )
+        with session_factory() as session:
+            envelope_id = (
+                session.query(ManagementMessageEnvelope.id)
+                .filter(
+                    ManagementMessageEnvelope.raw_message_id
+                    == int(raw_message_id),
+                    ManagementMessageEnvelope.decision_fingerprint
+                    == fingerprint,
+                )
+                .scalar()
+            )
+    except Exception as exc:
+        logger.warning(
+            "Management envelope incident discovery failed open: "
+            "raw_message_id=%s error=%s",
+            int(raw_message_id),
+            type(exc).__name__,
+        )
+        return
+    if envelope_id is None:
+        return
+    capture_runtime_incident_best_effort(
+        capture_management_envelope_failure,
+        session_factory,
+        envelope_id=int(envelope_id),
+        incident_type="unclassified_operation_failure",
+        reason_code=reason_code,
+        severity="high",
+        occurred_at=utc_now(),
+    )
+
+
 def _project_multi_target_management_shadow_in_session(
     session,
     *,
@@ -3033,7 +3096,7 @@ def _project_multi_target_management_shadow_in_session(
     lifecycle_event: Mapping[str, Any],
     authoritative_generation: str | None,
     config: MultiTargetManagementConfig,
-) -> None:
+) -> str | None:
     """Record an additive projection without changing authoritative work."""
 
     targets = lifecycle_event.get("targets")
@@ -3042,7 +3105,7 @@ def _project_multi_target_management_shadow_in_session(
         or not isinstance(targets, list)
         or len(targets) < 2
     ):
-        return
+        return None
     try:
         projected_decision = dict(lifecycle_event)
         projected_decision["management_action"] = (
@@ -3058,6 +3121,7 @@ def _project_multi_target_management_shadow_in_session(
             ),
             projection_mode="shadow" if config.shadow_only else "live",
         )
+        return None
     except Exception as exc:
         logger.warning(
             "Multi-target shadow projection failed open: raw_message_id=%s "
@@ -3065,6 +3129,7 @@ def _project_multi_target_management_shadow_in_session(
             int(raw_message_id),
             type(exc).__name__,
         )
+        return type(exc).__name__
 
 
 def _format_ai_strategy_summary(strategy: dict[str, Any]) -> str | None:

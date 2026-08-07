@@ -857,6 +857,67 @@ def test_authoritative_shadow_projection_records_targets_without_changing_work(
         assert session.query(MessageInstructionItem).count() == 2
 
 
+def test_shadow_projection_failure_captures_committed_envelope_after_commit(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES",
+        "unclassified_operation_failure",
+    )
+    session_factory = create_session_factory(tmp_path / "envelope-failure.db")
+    with session_factory() as session:
+        btc = _add_exact_live_lifecycle(
+            session, chat_id=88, message_id=3400, symbol="BTC", side="short"
+        )
+        eth = _add_exact_live_lifecycle(
+            session, chat_id=88, message_id=3401, symbol="ETH", side="short"
+        )
+        raw = RawMessage(chat_id=88, message_id=3402, text="BTC ETH partial")
+        session.add(raw)
+        session.flush()
+        raw_id, btc_id, eth_id = raw.id, btc.id, eth.id
+        session.commit()
+
+    apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_id,
+        payload={
+            "recognition_result": "非策略",
+            "lifecycle_event": {
+                "event_type": "position_update",
+                "management_action": "partial_take_profit",
+                "management_fraction": 0.5,
+                "confidence": 0.95,
+                "targets": [
+                    {
+                        "target_lifecycle_id": btc_id,
+                        "symbol": "BTC",
+                        "side": "short",
+                    },
+                    {
+                        "target_lifecycle_id": eth_id,
+                        "symbol": "ETH",
+                    },
+                ],
+            },
+        },
+        model="mimo-v2.5",
+        authoritative_generation="envelope-failure",
+        multi_target_management_config=config_module.MultiTargetManagementConfig(
+            projection_enabled=True,
+            shadow_only=True,
+        ),
+    )
+
+    with session_factory() as session:
+        envelope = session.query(ManagementMessageEnvelope).one()
+        incident = session.query(RuntimeIncident).one()
+        assert incident.source_kind == "management_message_envelope"
+        assert incident.source_record_id == str(envelope.id)
+        assert incident.incident_type == "unclassified_operation_failure"
+
+
 @pytest.mark.parametrize("management_action", ["exit_full", None])
 def test_persistence_validator_accepts_context_approved_multi_target_full_exit(
     tmp_path,
