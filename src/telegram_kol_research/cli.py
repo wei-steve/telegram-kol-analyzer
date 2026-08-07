@@ -3624,7 +3624,8 @@ def audit_protection_incidents(
     for item in audit["incidents"]:
         typer.echo(
             f"- incident={item['incident_ref']} position={item['position_ref']} "
-            f"classification={item['classification']} type={item['incident_type']}"
+            f"classification={item['classification']} "
+            f"type={item['incident_type_ref']}"
         )
 
 

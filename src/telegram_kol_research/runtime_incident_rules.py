@@ -20,6 +20,17 @@ _RULES = {
     ),
     "verified_replacement_role_gap_v1": ("high", "protection-revision"),
 }
+_REQUIRED_BOOLEAN_FACTS = {
+    "terminal_high_risk_management_without_instruction_v1": (
+        "terminal_high_risk_management",
+        "executable_instruction_present",
+    ),
+    "verified_replacement_role_gap_v1": (
+        "replacement_verified",
+        "primary_role_verified",
+        "backup_role_verified",
+    ),
+}
 
 
 def _abnormal(rule_id: str, facts: Mapping[str, Any]) -> bool:
@@ -61,7 +72,12 @@ def evaluate_rule(rule_id: str, facts: Mapping[str, Any]) -> InvariantObservatio
     evidence_fingerprint = sha256(
         json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    if not bool(facts.get("complete")):
+    required_boolean_facts = _REQUIRED_BOOLEAN_FACTS.get(rule_id, ())
+    projection_valid = isinstance(facts.get("complete"), bool) and all(
+        field in facts and isinstance(facts[field], bool)
+        for field in required_boolean_facts
+    )
+    if facts.get("complete") is not True or not projection_valid:
         outcome = "evidence_insufficient"
     else:
         outcome = "abnormal" if _abnormal(rule_id, facts) else "normal"

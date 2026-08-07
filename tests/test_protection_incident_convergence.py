@@ -24,7 +24,7 @@ def _incident(session, *, suffix, pos_id, binding_status="active"):
         strategy_instance_id=f"strategy-{suffix}",
         kol_id="kol",
         chat_id=1,
-        message_id=int(suffix),
+        message_id=int(suffix) if str(suffix).isdigit() else 99,
         symbol="BTC",
         side="long",
         status=binding_status,
@@ -152,6 +152,9 @@ def test_audit_classifies_live_before_history_and_redacts_output(tmp_path):
             {"ordId": "backup-current", "posId": "pos-resolved"},
             {"ordId": "tp-current", "posId": "pos-resolved"},
         ],
+        pending_tpsl_observations=[
+            {"instrument_id": "BTC-USDT-SWAP", "complete": True}
+        ],
         errors={},
     )
 
@@ -194,6 +197,9 @@ def test_incomplete_exchange_snapshot_never_resolves_and_marks_output_incomplete
         snapshot=SimpleNamespace(
             positions=[{"posId": "pos-resolved", "pos": "1"}],
             pending_trigger_orders=[],
+            pending_tpsl_observations=[
+                {"instrument_id": "BTC-USDT-SWAP", "complete": False}
+            ],
             errors={"pending_trigger_orders": "unavailable"},
         ),
         limit=100,
@@ -221,3 +227,63 @@ def test_audit_is_bounded_and_reports_truncation(tmp_path):
     assert result["incidents_returned"] == 2
     assert result["incidents_truncated"] is True
     assert result["output_complete"] is False
+
+
+def test_incomplete_pending_pagination_cannot_resolve_current_incident(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        resolved = _incident(session, suffix="9", pos_id="pos-resolved")
+        _complete_replacement(
+            session, binding=resolved[0], leg=resolved[1], pos_id="pos-resolved"
+        )
+        session.commit()
+
+    result = audit_protection_incident_convergence(
+        session_factory,
+        snapshot=SimpleNamespace(
+            positions=[{"posId": "pos-resolved", "pos": "1"}],
+            pending_trigger_orders=[
+                {"ordId": order_id, "posId": "pos-resolved"}
+                for order_id in ("primary-current", "backup-current", "tp-current")
+            ],
+            pending_tpsl_observations=[
+                {"instrument_id": "BTC-USDT-SWAP", "complete": False}
+            ],
+            errors={},
+        ),
+        limit=100,
+    )
+
+    assert result["counts"]["resolved_by_current_exchange_evidence"] == 0
+    assert result["counts"]["evidence_insufficient"] == 1
+    assert result["output_complete"] is False
+
+
+def test_hostile_incident_type_is_hashed_and_never_rendered(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    hostile = "api_key=secret-value\n" + "x" * 500
+    with session_factory() as session:
+        _binding, _leg, incident = _incident(
+            session, suffix="a", pos_id="pos-hostile", binding_status="closed"
+        )
+        incident.incident_type = hostile
+        incident.evidence_json = '{"password":"also-secret"}'
+        session.commit()
+
+    result = audit_protection_incident_convergence(
+        session_factory,
+        snapshot=SimpleNamespace(
+            positions=[],
+            pending_trigger_orders=[],
+            pending_tpsl_observations=[],
+            errors={},
+        ),
+        limit=100,
+    )
+
+    rendered = json.dumps(result)
+    assert hostile not in rendered
+    assert "secret-value" not in rendered
+    assert "also-secret" not in rendered
+    assert "incident_type" not in result["incidents"][0]
+    assert result["incidents"][0]["incident_type_ref"].startswith("type:")

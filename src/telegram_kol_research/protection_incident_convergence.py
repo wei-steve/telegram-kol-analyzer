@@ -11,6 +11,7 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
     PositionProtectionIncident,
+    PositionProtectionLedger,
     PositionProtectionRevision,
 )
 from telegram_kol_research.protection_health import (
@@ -43,7 +44,11 @@ def audit_protection_incident_convergence(
 
     bounded_limit = max(1, min(int(limit), 100))
     snapshot_errors = dict(getattr(snapshot, "errors", {}) or {})
-    exchange_complete = not snapshot_errors
+    pending_observations = [
+        row
+        for row in list(getattr(snapshot, "pending_tpsl_observations", []) or [])
+        if isinstance(row, dict)
+    ]
     positions = [
         row
         for row in list(getattr(snapshot, "positions", []) or [])
@@ -59,43 +64,51 @@ def audit_protection_incident_convergence(
         for row in positions
         if _position_is_live(row) and (pos_id := _text(row, "posId", "pos_id"))
     }
+    exchange_complete = (
+        not snapshot_errors
+        and all(row.get("complete") is True for row in pending_observations)
+        and (not live_pos_ids or bool(pending_observations))
+    )
 
+    counts: Counter[str] = Counter()
+    buckets: dict[str, list[dict[str, str]]] = {
+        name: [] for name in PROTECTION_INCIDENT_CLASSIFICATIONS
+    }
+    incident_total = 0
     with session_factory() as session:
         incidents = (
             session.query(PositionProtectionIncident)
             .order_by(PositionProtectionIncident.created_at, PositionProtectionIncident.id)
-            .all()
+            .yield_per(100)
         )
-        classified = [
-            (
-                _classify_incident(
-                    session,
-                    incident=incident,
-                    live_pos_ids=live_pos_ids,
-                    pending=pending,
-                    exchange_complete=exchange_complete,
-                ),
-                incident,
+        for incident in incidents:
+            classification = _classify_incident(
+                session,
+                incident=incident,
+                live_pos_ids=live_pos_ids,
+                pending=pending,
+                pending_observations=pending_observations,
+                exchange_complete=exchange_complete,
             )
-            for incident in incidents
-        ]
+            incident_total += 1
+            counts[classification] += 1
+            bucket = buckets[classification]
+            if len(bucket) < bounded_limit:
+                bucket.append(
+                    {
+                        "incident_ref": _ref("incident", incident.id),
+                        "position_ref": _ref("position", incident.pos_id),
+                        "classification": classification,
+                        "incident_type_ref": _ref("type", incident.incident_type),
+                    }
+                )
 
-    counts = Counter(classification for classification, _incident in classified)
-    priority = {
-        "resolved_by_current_exchange_evidence": 0,
-        "current_risk": 1,
-        "historical_terminal": 2,
-        "evidence_insufficient": 3,
-    }
-    classified.sort(
-        key=lambda item: (
-            priority[item[0]],
-            item[1].created_at,
-            int(item[1].id),
-        )
-    )
-    returned = classified[:bounded_limit]
-    truncated = len(classified) > bounded_limit
+    returned = [
+        item
+        for name in PROTECTION_INCIDENT_CLASSIFICATIONS
+        for item in buckets[name]
+    ][:bounded_limit]
+    truncated = incident_total > bounded_limit
     return {
         "schema_version": 1,
         "mode": "read_only",
@@ -104,7 +117,7 @@ def audit_protection_incident_convergence(
             name: int(counts.get(name, 0))
             for name in PROTECTION_INCIDENT_CLASSIFICATIONS
         },
-        "incident_total": len(classified),
+        "incident_total": incident_total,
         "incidents_returned": len(returned),
         "incidents_truncated": truncated,
         "exchange_snapshot_complete": exchange_complete,
@@ -112,15 +125,7 @@ def audit_protection_incident_convergence(
         "output_complete": (
             exchange_complete and bool(database_evidence_stable) and not truncated
         ),
-        "incidents": [
-            {
-                "incident_ref": _ref("incident", incident.id),
-                "position_ref": _ref("position", incident.pos_id),
-                "classification": classification,
-                "incident_type": str(incident.incident_type),
-            }
-            for classification, incident in returned
-        ],
+        "incidents": returned,
     }
 
 
@@ -130,6 +135,7 @@ def _classify_incident(
     incident: PositionProtectionIncident,
     live_pos_ids: set[str],
     pending: list[dict[str, Any]],
+    pending_observations: list[dict[str, Any]],
     exchange_complete: bool,
 ) -> str:
     if not exchange_complete or not str(incident.pos_id or "").strip():
@@ -138,7 +144,12 @@ def _classify_incident(
         if (
             current_protection_incident_health_status(session, incident=incident)
             == "resolved_by_verified_replacement"
-            and _replacement_visible_on_exchange(session, incident=incident, pending=pending)
+            and _replacement_visible_on_exchange(
+                session,
+                incident=incident,
+                pending=pending,
+                pending_observations=pending_observations,
+            )
         ):
             return "resolved_by_current_exchange_evidence"
         return "current_risk"
@@ -157,7 +168,9 @@ def _classify_incident(
     return "evidence_insufficient"
 
 
-def _replacement_visible_on_exchange(session, *, incident, pending) -> bool:
+def _replacement_visible_on_exchange(
+    session, *, incident, pending, pending_observations
+) -> bool:
     revision = (
         session.query(PositionProtectionRevision)
         .filter(
@@ -182,6 +195,28 @@ def _replacement_visible_on_exchange(session, *, incident, pending) -> bool:
     expected = {
         str(value) for value in payload.get("order_ids", []) if str(value or "")
     }
+    instruments = {
+        str(row.instrument_id)
+        for row in session.query(PositionProtectionLedger)
+        .filter(
+            PositionProtectionLedger.venue == str(incident.venue).lower(),
+            PositionProtectionLedger.execution_binding_id
+            == int(incident.execution_binding_id),
+            PositionProtectionLedger.execution_order_leg_id
+            == int(incident.execution_order_leg_id),
+            PositionProtectionLedger.pos_id == str(incident.pos_id),
+            PositionProtectionLedger.status == "verified",
+            PositionProtectionLedger.order_id.in_(sorted(expected)),
+        )
+        .all()
+    }
+    complete_instruments = {
+        str(row.get("instrument_id") or "")
+        for row in pending_observations
+        if row.get("complete") is True
+    }
+    if len(instruments) != 1 or not instruments.issubset(complete_instruments):
+        return False
     visible = {
         order_id
         for row in pending

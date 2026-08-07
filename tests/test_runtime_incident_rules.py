@@ -1,6 +1,7 @@
 from telegram_kol_research.runtime_incident_rules import evaluate_rule
 import json
 from pathlib import Path
+import pytest
 
 
 def test_terminal_exposure_requires_complete_snapshot():
@@ -115,3 +116,102 @@ def test_verified_replacement_role_gap_rule_requires_primary_and_backup():
         "verified_replacement_role_gap_v1",
         {**base, "complete": False},
     ).outcome == "evidence_insufficient"
+
+
+@pytest.mark.parametrize(
+    ("rule_id", "valid", "field"),
+    [
+        (
+            "terminal_high_risk_management_without_instruction_v1",
+            {
+                "terminal_high_risk_management": True,
+                "executable_instruction_present": False,
+            },
+            "terminal_high_risk_management",
+        ),
+        (
+            "terminal_high_risk_management_without_instruction_v1",
+            {
+                "terminal_high_risk_management": True,
+                "executable_instruction_present": False,
+            },
+            "executable_instruction_present",
+        ),
+        (
+            "verified_replacement_role_gap_v1",
+            {
+                "replacement_verified": True,
+                "primary_role_verified": True,
+                "backup_role_verified": True,
+            },
+            "replacement_verified",
+        ),
+        (
+            "verified_replacement_role_gap_v1",
+            {
+                "replacement_verified": True,
+                "primary_role_verified": True,
+                "backup_role_verified": True,
+            },
+            "primary_role_verified",
+        ),
+        (
+            "verified_replacement_role_gap_v1",
+            {
+                "replacement_verified": True,
+                "primary_role_verified": True,
+                "backup_role_verified": True,
+            },
+            "backup_role_verified",
+        ),
+    ],
+)
+def test_position_compliance_rules_reject_missing_or_non_boolean_facts(
+    rule_id, valid, field
+):
+    base = {
+        "complete": True,
+        "object_id": "1",
+        "evidence_references": ["snapshot:1"],
+        **valid,
+    }
+    missing = dict(base)
+    missing.pop(field)
+    wrong_type = {**base, field: "true"}
+
+    assert evaluate_rule(rule_id, missing).outcome == "evidence_insufficient"
+    assert evaluate_rule(rule_id, wrong_type).outcome == "evidence_insufficient"
+
+
+@pytest.mark.parametrize(
+    ("rule_id", "facts"),
+    [
+        (
+            "terminal_high_risk_management_without_instruction_v1",
+            {
+                "terminal_high_risk_management": True,
+                "executable_instruction_present": False,
+            },
+        ),
+        (
+            "verified_replacement_role_gap_v1",
+            {
+                "replacement_verified": True,
+                "primary_role_verified": True,
+                "backup_role_verified": True,
+            },
+        ),
+    ],
+)
+def test_position_compliance_rules_require_boolean_complete(rule_id, facts):
+    result = evaluate_rule(
+        rule_id,
+        {
+            "complete": "false",
+            "object_id": "1",
+            "evidence_references": ["snapshot:1"],
+            **facts,
+        },
+    )
+
+    assert result.outcome == "evidence_insufficient"
