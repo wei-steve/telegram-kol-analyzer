@@ -87,6 +87,11 @@ def audit_protection_incident_convergence(
         not snapshot_errors
         and all(row.get("complete") is True for row in pending_observations)
         and (not live_pos_ids or bool(pending_observations))
+        and all(
+            (instrument_id := _text(row, "instId", "inst_id").upper())
+            and instrument_id in complete_instruments
+            for row in live_positions.values()
+        )
     )
 
     counts: Counter[str] = Counter()
@@ -322,6 +327,23 @@ def _current_protection_visible_on_exchange(
         and owner.pos_id == pos_id
         for order_id in selected_order_ids
     )
+    position_side = _text(position, "posSide", "pos_side", "side").lower()
+    current_ledger_by_order = {
+        str(row.order_id): row
+        for row in ledger_rows
+        if str(row.status or "").lower() in {"verified", "protected"}
+        and str(row.order_id or "").strip()
+    }
+    local_rows_match = bool(position_side) and all(
+        (row := current_ledger_by_order.get(order_id)) is not None
+        and str(row.instrument_id or "").upper() == instrument_id
+        and str(row.side or "").lower() == position_side
+        for order_id in selected_order_ids
+    )
+    backup_row_matches = bool(
+        str(active_backups[0].instrument_id or "").upper() == instrument_id
+        and str(active_backups[0].side or "").lower() == position_side
+    )
     result = bool(
         audit.get("protected") is True
         and int(audit.get("verified_take_profit_count") or 0) >= 1
@@ -329,6 +351,8 @@ def _current_protection_visible_on_exchange(
         and selected_backup_id == backup_order_id
         and primary_order_id != selected_backup_id
         and owners_are_exact
+        and local_rows_match
+        and backup_row_matches
     )
     cache[scope] = result
     return result

@@ -1,6 +1,9 @@
 import json
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+
+import pytest
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
@@ -189,6 +192,51 @@ def _legacy_current_protection(session, *, binding, leg, incident, pos_id):
     )
 
 
+def _legacy_current_snapshot(*, pending_orders=None, observations=None):
+    return SimpleNamespace(
+        positions=[
+            {
+                "posId": "pos-legacy-current",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "pos": "6",
+            }
+        ],
+        pending_trigger_orders=pending_orders
+        if pending_orders is not None
+        else [
+            {
+                "ordId": "legacy-primary",
+                "triggerOrderType": "TPSL",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "sz": "6",
+                "slTriggerPx": "64100",
+            },
+            {
+                "ordId": "legacy-backup",
+                "triggerOrderType": "TPSL",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "sz": "0",
+                "slTriggerPx": "63971.8",
+            },
+            {
+                "ordId": "legacy-tp",
+                "triggerOrderType": "TPSL",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "sz": "6",
+                "tpTriggerPx": "67000",
+            },
+        ],
+        pending_tpsl_observations=observations
+        if observations is not None
+        else [{"instrument_id": "BTC-USDT-SWAP", "complete": True}],
+        errors={},
+    )
+
+
 def test_legacy_current_exchange_evidence_without_pending_pos_id_resolves(
     tmp_path,
 ):
@@ -219,46 +267,7 @@ def test_legacy_current_exchange_evidence_without_pending_pos_id_resolves(
         )
         session.commit()
 
-    snapshot = SimpleNamespace(
-        positions=[
-            {
-                "posId": "pos-legacy-current",
-                "instId": "BTC-USDT-SWAP",
-                "posSide": "long",
-                "pos": "6",
-            }
-        ],
-        pending_trigger_orders=[
-            {
-                "ordId": "legacy-primary",
-                "triggerOrderType": "TPSL",
-                "instId": "BTC-USDT-SWAP",
-                "posSide": "long",
-                "sz": "6",
-                "slTriggerPx": "64100",
-            },
-            {
-                "ordId": "legacy-backup",
-                "triggerOrderType": "TPSL",
-                "instId": "BTC-USDT-SWAP",
-                "posSide": "long",
-                "sz": "0",
-                "slTriggerPx": "63971.8",
-            },
-            {
-                "ordId": "legacy-tp",
-                "triggerOrderType": "TPSL",
-                "instId": "BTC-USDT-SWAP",
-                "posSide": "long",
-                "sz": "6",
-                "tpTriggerPx": "67000",
-            },
-        ],
-        pending_tpsl_observations=[
-            {"instrument_id": "BTC-USDT-SWAP", "complete": True}
-        ],
-        errors={},
-    )
+    snapshot = _legacy_current_snapshot()
 
     result = audit_protection_incident_convergence(
         session_factory, snapshot=snapshot, limit=100
@@ -271,6 +280,141 @@ def test_legacy_current_exchange_evidence_without_pending_pos_id_resolves(
     assert "legacy-primary" not in rendered
     assert "legacy-backup" not in rendered
     assert "legacy-tp" not in rendered
+
+
+def test_current_evidence_rejects_wrong_local_instrument(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding, leg, incident = _incident(
+            session, suffix="d", pos_id="pos-legacy-current"
+        )
+        _legacy_current_protection(
+            session,
+            binding=binding,
+            leg=leg,
+            incident=incident,
+            pos_id="pos-legacy-current",
+        )
+        session.flush()
+        primary = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id="legacy-primary")
+            .one()
+        )
+        primary.instrument_id = "ETH-USDT-SWAP"
+        session.commit()
+
+    result = audit_protection_incident_convergence(
+        session_factory,
+        snapshot=_legacy_current_snapshot(),
+        limit=100,
+    )
+
+    assert result["counts"]["resolved_by_current_exchange_evidence"] == 0
+    assert result["counts"]["current_risk"] == 1
+
+
+@pytest.mark.parametrize(
+    "missing_order_id",
+    ("legacy-primary", "legacy-backup", "legacy-tp"),
+)
+def test_current_evidence_rejects_missing_required_order(
+    tmp_path,
+    missing_order_id,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding, leg, incident = _incident(
+            session, suffix="e", pos_id="pos-legacy-current"
+        )
+        _legacy_current_protection(
+            session,
+            binding=binding,
+            leg=leg,
+            incident=incident,
+            pos_id="pos-legacy-current",
+        )
+        session.commit()
+    pending = [
+        row
+        for row in _legacy_current_snapshot().pending_trigger_orders
+        if row["ordId"] != missing_order_id
+    ]
+
+    result = audit_protection_incident_convergence(
+        session_factory,
+        snapshot=_legacy_current_snapshot(pending_orders=pending),
+        limit=100,
+    )
+
+    assert result["counts"]["resolved_by_current_exchange_evidence"] == 0
+    assert result["counts"]["current_risk"] == 1
+
+
+def test_current_evidence_requires_target_instrument_completeness(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding, leg, incident = _incident(
+            session, suffix="f", pos_id="pos-legacy-current"
+        )
+        _legacy_current_protection(
+            session,
+            binding=binding,
+            leg=leg,
+            incident=incident,
+            pos_id="pos-legacy-current",
+        )
+        session.commit()
+
+    result = audit_protection_incident_convergence(
+        session_factory,
+        snapshot=_legacy_current_snapshot(
+            observations=[
+                {"instrument_id": "ETH-USDT-SWAP", "complete": True}
+            ]
+        ),
+        limit=100,
+    )
+
+    assert result["counts"]["resolved_by_current_exchange_evidence"] == 0
+    assert result["counts"]["evidence_insufficient"] == 1
+
+
+def test_current_evidence_rejects_unowned_order_for_exact_position(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding, leg, incident = _incident(
+            session, suffix="g", pos_id="pos-legacy-current"
+        )
+        _legacy_current_protection(
+            session,
+            binding=binding,
+            leg=leg,
+            incident=incident,
+            pos_id="pos-legacy-current",
+        )
+        session.commit()
+    pending = deepcopy(_legacy_current_snapshot().pending_trigger_orders)
+    pending.append(
+        {
+            "ordId": "manual-stop",
+            "triggerOrderType": "TPSL",
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-legacy-current",
+            "posSide": "long",
+            "sz": "0",
+            "slTriggerPx": "63800",
+        }
+    )
+
+    result = audit_protection_incident_convergence(
+        session_factory,
+        snapshot=_legacy_current_snapshot(pending_orders=pending),
+        limit=100,
+    )
+
+    assert result["counts"]["resolved_by_current_exchange_evidence"] == 0
+    assert result["counts"]["current_risk"] == 1
 
 
 def test_audit_classifies_live_before_history_and_redacts_output(tmp_path):
@@ -292,8 +436,16 @@ def test_audit_classifies_live_before_history_and_redacts_output(tmp_path):
 
     snapshot = SimpleNamespace(
         positions=[
-            {"posId": "pos-resolved", "pos": "1"},
-            {"posId": "pos-risk", "pos": "1"},
+            {
+                "posId": "pos-resolved",
+                "instId": "BTC-USDT-SWAP",
+                "pos": "1",
+            },
+            {
+                "posId": "pos-risk",
+                "instId": "BTC-USDT-SWAP",
+                "pos": "1",
+            },
         ],
         pending_trigger_orders=[
             {"ordId": "primary-current", "posId": "pos-resolved"},
