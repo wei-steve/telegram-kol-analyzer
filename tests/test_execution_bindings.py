@@ -106,6 +106,43 @@ def test_read_only_reconcile_surfaces_incomplete_snapshot_after_local_apply(
     assert applied == [snapshot]
 
 
+def test_live_reconcile_runs_due_stop_rescue_before_retry_rescheduling(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.strategy_management_reconciliation as management
+    import telegram_kol_research.trigger_protection_rescue_worker as rescue_worker
+
+    session_factory = create_session_factory(tmp_path / "rescue-order.db")
+    snapshot = execution_bindings_module._ReconcileSnapshot()
+    calls = []
+    expected_result = object()
+    monkeypatch.setattr(
+        rescue_worker,
+        "run_trigger_protection_rescue_tick",
+        lambda *args, **kwargs: calls.append("rescue"),
+    )
+    monkeypatch.setattr(
+        execution_bindings_module,
+        "_apply_reconcile_snapshot",
+        lambda *args, **kwargs: (calls.append("reconcile"), expected_result)[1],
+    )
+    monkeypatch.setattr(
+        management,
+        "reconcile_strategy_management_batches",
+        lambda *args, **kwargs: calls.append("management"),
+    )
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=object(),
+        snapshot=snapshot,
+        recovered_at=datetime(2026, 8, 7, 14, 0),
+    )
+
+    assert result is expected_result
+    assert calls == ["rescue", "reconcile", "management"]
+
+
 def _add_entry_leg(
     session_factory,
     binding_id,
@@ -862,6 +899,31 @@ def test_reconcile_legacy_trigger_adoption_rejects_prefill_candidate(tmp_path):
         assert session.query(PositionProtectionLedger).count() == 0
     assert result.protection_adopted == 0
     assert result.protection_adoption_refused == 1
+
+
+def test_saved_intent_persists_prefill_refusal_reason_for_terminal_recovery(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "saved-prefill.db")
+    _seed_trigger_protection_adoption(session_factory)
+    _save_trigger_protection_intent(session_factory)
+    candidate = _pending_combined_tpsl("saved-prefill")
+    candidate["cTime"] = "1784512859000"
+    candidate["uTime"] = "1784512859000"
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient([candidate]),
+        recovered_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).one()
+    assert result.protection_adoption_refused == 1
+    assert intent.last_reason_code == "trigger_protection_candidate_predates_fill"
+    assert json.loads(intent.last_evidence_json)["candidate_order_ids"] == [
+        "saved-prefill"
+    ]
 
 
 def test_reconcile_submits_one_exact_backup_stop_when_explicitly_enabled(tmp_path):

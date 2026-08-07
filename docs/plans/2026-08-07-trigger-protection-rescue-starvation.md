@@ -13,7 +13,7 @@
 ### Task 1: Reproduce rescue starvation
 
 **Files:**
-- Modify: `tests/test_trigger_protection_rescue_worker.py`
+- Modify: `tests/test_trigger_protection_stop_rescue.py`
 - Modify: `tests/test_execution_bindings.py`
 
 **Step 1:** Add a test whose due retry would be rescheduled by reconciliation and assert the rescue executor is called before that reschedule.
@@ -37,7 +37,7 @@
 ### Task 3: Recover evidence-backed exhausted intents
 
 **Files:**
-- Modify: `tests/test_trigger_protection_rescue_worker.py`
+- Modify: `tests/test_trigger_protection_stop_rescue.py`
 - Modify: `tests/test_strategy_management_planner.py`
 - Modify: `src/telegram_kol_research/trigger_protection_rescue_worker.py`
 - Modify: `src/telegram_kol_research/strategy_management_planner.py`
@@ -56,7 +56,7 @@
 ### Task 4: Regression and review
 
 **Files:**
-- Test: `tests/test_trigger_protection_rescue_worker.py`
+- Test: `tests/test_trigger_protection_stop_rescue.py`
 - Test: `tests/test_strategy_management_planner.py`
 - Test: `tests/test_execution_bindings.py`
 - Test: `tests/test_position_management_liveness_recovery.py`

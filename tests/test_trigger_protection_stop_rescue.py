@@ -18,6 +18,7 @@ from telegram_kol_research.models import (
     TriggerProtectionStopRescue,
     PositionProtectionIncident,
     PositionProtectionLeg,
+    PositionAttributionAudit,
     BoundPositionCloseReservation,
 )
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
@@ -462,6 +463,55 @@ def test_rescue_worker_excludes_structured_manual_review_disposition(tmp_path):
 
     assert result.discovered == 0
     assert result.evaluated == 0
+
+
+def test_rescue_worker_reconsiders_manual_review_with_predates_fill_evidence(
+    tmp_path,
+):
+    from telegram_kol_research.trigger_protection_rescue_worker import (
+        run_trigger_protection_rescue_tick,
+    )
+
+    session_factory = create_session_factory(tmp_path / "rescue-worker-predates.db")
+    intent_id = _saved_deferred_intent(session_factory)
+    with session_factory() as session:
+        intent = session.get(TriggerProtectionIntent, intent_id)
+        intent.recovery_state = "failed"
+        intent.recovery_disposition = "manual_review"
+        session.add(
+            PositionAttributionAudit(
+                execution_binding_id=int(intent.execution_binding_id),
+                execution_order_leg_id=int(intent.execution_order_leg_id),
+                venue="deepcoin",
+                pos_id="pos-1",
+                event_type="protection_adoption_refused",
+                prior_state=None,
+                new_state="evidence_unavailable",
+                fingerprint="predates-fill-" + "a" * 50,
+                evidence_json=json.dumps(
+                    {"reason": "trigger_protection_candidate_predates_fill"}
+                ),
+                created_at=NOW,
+            )
+        )
+        session.commit()
+    save_trading_settings(
+        session_factory,
+        {
+            "trigger_protection_stop_rescue_mode": "shadow",
+            "position_management_liveness_v2_mode": "shadow",
+        },
+    )
+
+    result = run_trigger_protection_rescue_tick(
+        session_factory,
+        deepcoin_client=_Client(),
+        processed_at=NOW,
+    )
+
+    assert result.discovered == 1
+    assert result.evaluated == 1
+    assert result.shadow_ready == 1
 
 
 def test_init_db_adds_rescue_error_json_to_prior_sqlite_schema(tmp_path):
