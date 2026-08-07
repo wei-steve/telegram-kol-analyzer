@@ -42,6 +42,8 @@ DORMANT_POSITION_COMPLIANCE_RULE_IDS = frozenset(
     {
         "terminal_high_risk_management_without_instruction_v1",
         "verified_replacement_role_gap_v1",
+        "admitted_target_item_nonterminal_after_deadline_v1",
+        "management_target_batch_state_inconsistent_v1",
     }
 )
 

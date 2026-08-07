@@ -23,6 +23,14 @@ _RULES = {
         "medium",
         "management-safety-gate",
     ),
+    "admitted_target_item_nonterminal_after_deadline_v1": (
+        "high",
+        "management-target",
+    ),
+    "management_target_batch_state_inconsistent_v1": (
+        "high",
+        "management-target",
+    ),
 }
 _REQUIRED_BOOLEAN_FACTS = {
     "terminal_high_risk_management_without_instruction_v1": (
@@ -40,6 +48,14 @@ _REQUIRED_BOOLEAN_FACTS = {
         "exact_scope_match",
         "fingerprint_generation_match",
         "hard_reason_present",
+    ),
+    "admitted_target_item_nonterminal_after_deadline_v1": (
+        "target_admitted",
+        "instruction_item_terminal",
+        "execution_deadline_expired",
+    ),
+    "management_target_batch_state_inconsistent_v1": (
+        "target_state_consistent_with_batch",
     ),
 }
 
@@ -72,6 +88,14 @@ def _abnormal(rule_id: str, facts: Mapping[str, Any]) -> bool:
             and bool(facts.get("fingerprint_generation_match"))
             and not bool(facts.get("hard_reason_present"))
         )
+    if rule_id == "admitted_target_item_nonterminal_after_deadline_v1":
+        return (
+            bool(facts.get("target_admitted"))
+            and not bool(facts.get("instruction_item_terminal"))
+            and bool(facts.get("execution_deadline_expired"))
+        )
+    if rule_id == "management_target_batch_state_inconsistent_v1":
+        return not bool(facts.get("target_state_consistent_with_batch"))
     return bool(facts.get("monitor_abnormal")) and not bool(facts.get("incident_present"))
 
 

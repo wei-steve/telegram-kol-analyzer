@@ -182,6 +182,8 @@ def test_position_compliance_rules_are_reviewed_but_remain_non_deployable():
         {
             "terminal_high_risk_management_without_instruction_v1",
             "verified_replacement_role_gap_v1",
+            "admitted_target_item_nonterminal_after_deadline_v1",
+            "management_target_batch_state_inconsistent_v1",
         }
     )
     assert dormant_rules.issubset(RUNTIME_SCANNER_RULE_IDS)
@@ -204,6 +206,8 @@ def test_dormant_position_compliance_rules_have_no_production_projection(tmp_pat
         {
             "terminal_high_risk_management_without_instruction_v1",
             "verified_replacement_role_gap_v1",
+            "admitted_target_item_nonterminal_after_deadline_v1",
+            "management_target_batch_state_inconsistent_v1",
         }
     )
 

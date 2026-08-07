@@ -147,6 +147,56 @@ def test_verified_replacement_role_gap_rule_requires_primary_and_backup():
     ).outcome == "evidence_insufficient"
 
 
+def test_admitted_management_target_item_must_finish_by_deadline():
+    base = {
+        "complete": True,
+        "object_id": "target-1",
+        "target_admitted": True,
+        "instruction_item_terminal": False,
+        "execution_deadline_expired": True,
+        "evidence_references": [
+            "management-target:1",
+            "instruction-item:2",
+        ],
+    }
+
+    assert evaluate_rule(
+        "admitted_target_item_nonterminal_after_deadline_v1", base
+    ).outcome == "abnormal"
+    assert evaluate_rule(
+        "admitted_target_item_nonterminal_after_deadline_v1",
+        {**base, "instruction_item_terminal": True},
+    ).outcome == "normal"
+    assert evaluate_rule(
+        "admitted_target_item_nonterminal_after_deadline_v1",
+        {**base, "execution_deadline_expired": False},
+    ).outcome == "normal"
+
+
+def test_management_target_state_must_be_consistent_with_its_batch():
+    base = {
+        "complete": True,
+        "object_id": "target-1",
+        "target_state_consistent_with_batch": False,
+        "evidence_references": [
+            "management-target:1",
+            "management-batch:2",
+        ],
+    }
+
+    assert evaluate_rule(
+        "management_target_batch_state_inconsistent_v1", base
+    ).outcome == "abnormal"
+    assert evaluate_rule(
+        "management_target_batch_state_inconsistent_v1",
+        {**base, "target_state_consistent_with_batch": True},
+    ).outcome == "normal"
+    assert evaluate_rule(
+        "management_target_batch_state_inconsistent_v1",
+        {**base, "complete": False},
+    ).outcome == "evidence_insufficient"
+
+
 @pytest.mark.parametrize(
     ("rule_id", "valid", "field"),
     [
@@ -193,6 +243,38 @@ def test_verified_replacement_role_gap_rule_requires_primary_and_backup():
             },
             "backup_role_verified",
         ),
+        (
+            "admitted_target_item_nonterminal_after_deadline_v1",
+            {
+                "target_admitted": True,
+                "instruction_item_terminal": False,
+                "execution_deadline_expired": True,
+            },
+            "target_admitted",
+        ),
+        (
+            "admitted_target_item_nonterminal_after_deadline_v1",
+            {
+                "target_admitted": True,
+                "instruction_item_terminal": False,
+                "execution_deadline_expired": True,
+            },
+            "instruction_item_terminal",
+        ),
+        (
+            "admitted_target_item_nonterminal_after_deadline_v1",
+            {
+                "target_admitted": True,
+                "instruction_item_terminal": False,
+                "execution_deadline_expired": True,
+            },
+            "execution_deadline_expired",
+        ),
+        (
+            "management_target_batch_state_inconsistent_v1",
+            {"target_state_consistent_with_batch": False},
+            "target_state_consistent_with_batch",
+        ),
     ],
 )
 def test_position_compliance_rules_reject_missing_or_non_boolean_facts(
@@ -229,6 +311,18 @@ def test_position_compliance_rules_reject_missing_or_non_boolean_facts(
                 "primary_role_verified": True,
                 "backup_role_verified": True,
             },
+        ),
+        (
+            "admitted_target_item_nonterminal_after_deadline_v1",
+            {
+                "target_admitted": True,
+                "instruction_item_terminal": False,
+                "execution_deadline_expired": True,
+            },
+        ),
+        (
+            "management_target_batch_state_inconsistent_v1",
+            {"target_state_consistent_with_batch": False},
         ),
     ],
 )
