@@ -7,10 +7,11 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
+    PositionAttributionAudit,
     PositionProtectionIncident,
     TriggerProtectionIntent,
 )
@@ -60,6 +61,30 @@ def run_trigger_protection_rescue_tick(
     bounded_limit = max(1, min(int(limit), 100))
     with position_authority_lock():
         with session_factory() as session:
+            deferred_manual_review_evidence = (
+                session.query(PositionAttributionAudit.id)
+                .filter(
+                    PositionAttributionAudit.execution_order_leg_id
+                    == TriggerProtectionIntent.execution_order_leg_id,
+                    PositionAttributionAudit.event_type
+                    == "protection_adoption_refused",
+                    or_(
+                        PositionAttributionAudit.evidence_json.contains(
+                            "ambiguous"
+                        ),
+                        PositionAttributionAudit.evidence_json.contains(
+                            "not_unique"
+                        ),
+                        PositionAttributionAudit.evidence_json.contains(
+                            "deferred"
+                        ),
+                        PositionAttributionAudit.evidence_json.contains(
+                            "predates_fill"
+                        ),
+                    ),
+                )
+                .exists()
+            )
             intent_ids = [
                 int(row[0])
                 for row in (
@@ -74,7 +99,13 @@ def run_trigger_protection_rescue_tick(
                         or_(
                             TriggerProtectionIntent.recovery_disposition.is_(None),
                             TriggerProtectionIntent.recovery_disposition.in_(
-                                ("retry", "exact_backup", "manual_review")
+                                ("retry", "exact_backup")
+                            ),
+                            and_(
+                                TriggerProtectionIntent.recovery_state == "failed",
+                                TriggerProtectionIntent.recovery_disposition
+                                == "manual_review",
+                                deferred_manual_review_evidence,
                             ),
                         )
                     )
