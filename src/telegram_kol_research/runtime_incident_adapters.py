@@ -38,6 +38,9 @@ _MANAGEMENT_INCIDENTS = {
     "partial_failed": ("management_partial_failed", "high"),
     "recovery_required": ("management_recovery_required", "critical"),
 }
+_SHADOW_OBSERVATION_ONLY_MANAGEMENT_REASONS = frozenset(
+    {"protection_recovery_required"}
+)
 
 
 def capture_runtime_incident_best_effort(
@@ -223,6 +226,12 @@ def capture_management_state(
     occurred_at: datetime,
     recorder: Callable[..., Any] | None = None,
 ):
+    if (
+        str(status).lower() == "blocked"
+        and str(reason_code or "").lower()
+        in _SHADOW_OBSERVATION_ONLY_MANAGEMENT_REASONS
+    ):
+        return None
     mapping = _MANAGEMENT_INCIDENTS.get(str(status).lower())
     if mapping is None:
         return None

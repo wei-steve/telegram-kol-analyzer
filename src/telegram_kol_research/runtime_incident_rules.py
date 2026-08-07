@@ -19,6 +19,10 @@ _RULES = {
         "management-recognition",
     ),
     "verified_replacement_role_gap_v1": ("high", "protection-revision"),
+    "management_safety_gate_divergence_v1": (
+        "medium",
+        "management-safety-gate",
+    ),
 }
 _REQUIRED_BOOLEAN_FACTS = {
     "terminal_high_risk_management_without_instruction_v1": (
@@ -29,6 +33,13 @@ _REQUIRED_BOOLEAN_FACTS = {
         "replacement_verified",
         "primary_role_verified",
         "backup_role_verified",
+    ),
+    "management_safety_gate_divergence_v1": (
+        "historical_only_refusal",
+        "current_protection_healthy",
+        "exact_scope_match",
+        "fingerprint_generation_match",
+        "hard_reason_present",
     ),
 }
 
@@ -52,6 +63,14 @@ def _abnormal(rule_id: str, facts: Mapping[str, Any]) -> bool:
         return bool(facts.get("replacement_verified")) and not (
             bool(facts.get("primary_role_verified"))
             and bool(facts.get("backup_role_verified"))
+        )
+    if rule_id == "management_safety_gate_divergence_v1":
+        return (
+            bool(facts.get("historical_only_refusal"))
+            and bool(facts.get("current_protection_healthy"))
+            and bool(facts.get("exact_scope_match"))
+            and bool(facts.get("fingerprint_generation_match"))
+            and not bool(facts.get("hard_reason_present"))
         )
     return bool(facts.get("monitor_abnormal")) and not bool(facts.get("incident_present"))
 
@@ -95,6 +114,24 @@ def evaluate_rule(rule_id: str, facts: Mapping[str, Any]) -> InvariantObservatio
             "planned_stop",
             "exposure_started_at",
             "rescue_state",
+        ):
+            value = facts.get(key)
+            if value is None or isinstance(value, (str, int, float, bool)):
+                summary[key] = value
+    elif rule_id == "management_safety_gate_divergence_v1":
+        for key in (
+            "management_batch_id",
+            "execution_binding_id",
+            "health_observation_id",
+            "execution_order_leg_id",
+            "pos_id",
+            "refusal_reason_code",
+            "target_fingerprint",
+            "health_evidence_fingerprint",
+            "health_scope_fingerprint",
+            "exchange_snapshot_fingerprint",
+            "refused_at",
+            "health_observed_at",
         ):
             value = facts.get(key)
             if value is None or isinstance(value, (str, int, float, bool)):

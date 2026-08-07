@@ -14,7 +14,9 @@ from telegram_kol_research.models import (
     PositionMutationIntent,
     PositionProtectionLedger,
     PositionProtectionLeg,
+    PositionProtectionHealthObservation,
     RuntimeIncidentObservation,
+    StrategyManagementBatch,
 )
 from telegram_kol_research.runtime_incident_scanner import InvariantObservation, build_scanner_facts
 from telegram_kol_research.runtime_incident_scanner import list_critical_unprotected_positions
@@ -28,6 +30,124 @@ def test_scanner_defaults_are_dormant_and_fail_closed():
     assert config.shadow_only is True
     assert config.rules == frozenset()
     assert config.interval_seconds == 60.0
+
+
+def _seed_safety_gate_refusal(
+    session_factory,
+    *,
+    reason_code="protection_recovery_required",
+    classification="healthy_current_evidence",
+    binding_id=71,
+    health_binding_id=None,
+):
+    planned_at = datetime(2026, 8, 7, 8, 0)
+    with session_factory() as session:
+        batch = StrategyManagementBatch(
+            idempotency_fingerprint="a" * 64,
+            raw_message_id=1,
+            recognition_decision_id=1,
+            recognition_generation="recognition-v1",
+            target_lifecycle_id=1,
+            strategy_instance_id="deepcoin:1:1:BTC:long",
+            execution_binding_id=binding_id,
+            intent="partial_take_profit",
+            effective_action="partial_close",
+            execution_mode="live",
+            status="blocked",
+            reason_code=reason_code,
+            target_fingerprint="b" * 64,
+            target_snapshot_json="{}",
+            planned_at=planned_at,
+            created_at=planned_at,
+            updated_at=planned_at,
+        )
+        session.add(batch)
+        session.flush()
+        health = PositionProtectionHealthObservation(
+            venue="deepcoin",
+            execution_binding_id=(
+                binding_id if health_binding_id is None else health_binding_id
+            ),
+            execution_order_leg_id=81,
+            pos_id="pos-81",
+            classification=classification,
+            evidence_fingerprint="c" * 64,
+            exchange_snapshot_fingerprint="d" * 64,
+            source_incident_ids_json="[91]",
+            summary_json="{}",
+            observed_at=planned_at + timedelta(seconds=1),
+            created_at=planned_at + timedelta(seconds=1),
+        )
+        session.add(health)
+        session.commit()
+        return batch.id
+
+
+def test_safety_gate_divergence_projection_is_exact_bounded_and_shadow_only(tmp_path):
+    sf = create_session_factory(tmp_path / "divergence.db")
+    batch_id = _seed_safety_gate_refusal(sf)
+    config = load_runtime_scanner_config(
+        environ={
+            "TELEGRAM_KOL_RUNTIME_SCANNER_ENABLED": "true",
+            "TELEGRAM_KOL_RUNTIME_SCANNER_SHADOW_ONLY": "true",
+            "TELEGRAM_KOL_RUNTIME_SCANNER_RULES": (
+                "management_safety_gate_divergence_v1"
+            ),
+        },
+        env_file_paths=[],
+    )
+
+    facts = build_scanner_facts(
+        sf, rules=config.rules, observed_at=datetime(2026, 8, 7, 8, 1, tzinfo=UTC)
+    )
+    assert len(facts["management_safety_gate_divergence_v1"]) == 1
+    candidate = facts["management_safety_gate_divergence_v1"][0]
+    assert candidate["object_id"] == str(batch_id)
+    assert candidate["evidence_references"][:3] == (
+        f"management-batch:{batch_id}",
+        "binding:71",
+        "protection-health:1",
+    )
+
+    counts = run_scanner_cycle(
+        session_factory=sf,
+        config=config,
+        facts_by_rule=facts,
+        observed_at=datetime(2026, 8, 7, 8, 1, tzinfo=UTC),
+    )
+    assert counts == {"rules": 1, "observations": 1, "abnormal": 1, "insufficient": 0}
+    with sf() as session:
+        row = session.query(RuntimeIncidentObservation).one()
+        assert row.rule_id == "management_safety_gate_divergence_v1"
+        assert session.query(StrategyManagementBatch).count() == 1
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "classification", "health_binding_id"),
+    [
+        ("protection_recovery_required", "evidence_insufficient", None),
+        ("protection_recovery_required", "recovery_required", None),
+        ("target_position_snapshot_unavailable", "healthy_current_evidence", None),
+        ("protection_recovery_required", "healthy_current_evidence", 72),
+    ],
+)
+def test_safety_gate_divergence_projection_rejects_nonmatching_or_hard_evidence(
+    tmp_path, reason_code, classification, health_binding_id
+):
+    sf = create_session_factory(tmp_path / "no-divergence.db")
+    _seed_safety_gate_refusal(
+        sf,
+        reason_code=reason_code,
+        classification=classification,
+        health_binding_id=health_binding_id,
+    )
+
+    facts = build_scanner_facts(
+        sf,
+        rules=frozenset({"management_safety_gate_divergence_v1"}),
+        observed_at=datetime(2026, 8, 7, 8, 1, tzinfo=UTC),
+    )
+    assert facts["management_safety_gate_divergence_v1"] == ()
 
 
 def test_scanner_rejects_unknown_rules_and_bounds_interval():

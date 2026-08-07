@@ -49,6 +49,35 @@ def test_rule_catalog_covers_normal_abnormal_and_transition_windows():
         assert evaluate_rule(rule_id, payload).outcome == "abnormal"
 
 
+def test_safety_gate_divergence_requires_historical_only_refusal_and_healthy_current_evidence():
+    base = {
+        "complete": True,
+        "object_id": "41",
+        "historical_only_refusal": True,
+        "current_protection_healthy": True,
+        "exact_scope_match": True,
+        "fingerprint_generation_match": True,
+        "hard_reason_present": False,
+        "evidence_references": ["management-batch:41", "protection-health:9"],
+    }
+
+    abnormal = evaluate_rule("management_safety_gate_divergence_v1", base)
+    assert abnormal.outcome == "abnormal"
+    assert abnormal.object_kind == "management-safety-gate"
+    for field in (
+        "current_protection_healthy",
+        "exact_scope_match",
+        "fingerprint_generation_match",
+    ):
+        assert evaluate_rule(
+            "management_safety_gate_divergence_v1", {**base, field: False}
+        ).outcome == "normal"
+    assert evaluate_rule(
+        "management_safety_gate_divergence_v1",
+        {**base, "hard_reason_present": True},
+    ).outcome == "normal"
+
+
 def test_terminal_cleanup_event_3158_is_normal_during_reviewed_transition():
     result = evaluate_rule(
         "cancel_outcome_stale_unknown_v1",

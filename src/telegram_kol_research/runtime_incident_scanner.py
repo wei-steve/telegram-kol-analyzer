@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta
+from hashlib import sha256
+import json
 from math import isfinite
 import re
 from types import MappingProxyType
@@ -19,6 +21,7 @@ from telegram_kol_research.models import (
     PositionMutationIntent,
     PositionProtectionLedger,
     PositionProtectionLeg,
+    PositionProtectionHealthObservation,
     RuntimeIncidentObservation,
     StrategyManagementBatch,
     StrategyManagementLeg,
@@ -342,7 +345,159 @@ def build_scanner_facts(session_factory, *, rules: frozenset[str], observed_at):
                 }
                 for row in rows
             )
+    if "management_safety_gate_divergence_v1" in rules:
+        result["management_safety_gate_divergence_v1"] = (
+            _management_safety_gate_divergence_facts(
+                session_factory,
+                observed_at=observed_at,
+                limit=100,
+            )
+        )
     return result
+
+
+def _management_safety_gate_divergence_facts(
+    session_factory,
+    *,
+    observed_at,
+    limit: int,
+) -> tuple[Mapping, ...]:
+    """Project only exact, zero-write historical refusals with later healthy evidence."""
+
+    bounded_limit = max(1, min(int(limit), 100))
+    with session_factory() as session:
+        batches = (
+            session.query(StrategyManagementBatch)
+            .filter(StrategyManagementBatch.status == "blocked")
+            .filter(
+                StrategyManagementBatch.reason_code
+                == "protection_recovery_required"
+            )
+            .filter(StrategyManagementBatch.started_at.is_(None))
+            .filter(
+                ~exists().where(
+                    StrategyManagementLeg.management_batch_id
+                    == StrategyManagementBatch.id
+                )
+            )
+            .filter(
+                ~exists().where(
+                    PositionMutationIntent.execution_binding_id
+                    == StrategyManagementBatch.execution_binding_id
+                )
+            )
+            .order_by(StrategyManagementBatch.id.asc())
+            .limit(bounded_limit)
+            .all()
+        )
+        projected: list[Mapping] = []
+        for batch in batches:
+            health_rows = (
+                session.query(PositionProtectionHealthObservation)
+                .filter(
+                    PositionProtectionHealthObservation.execution_binding_id
+                    == batch.execution_binding_id,
+                    PositionProtectionHealthObservation.observed_at
+                    >= batch.planned_at,
+                    PositionProtectionHealthObservation.observed_at
+                    <= observed_at.replace(tzinfo=None),
+                )
+                .order_by(
+                    PositionProtectionHealthObservation.observed_at.desc(),
+                    PositionProtectionHealthObservation.id.desc(),
+                )
+                .limit(100)
+                .all()
+            )
+            latest_by_scope = {}
+            for health in health_rows:
+                scope = (int(health.execution_order_leg_id), str(health.pos_id))
+                latest_by_scope.setdefault(scope, health)
+            latest = tuple(latest_by_scope.values())
+            snapshot_fingerprints = {
+                str(row.exchange_snapshot_fingerprint) for row in latest
+            }
+            if not 1 <= len(latest) <= 4 or len(snapshot_fingerprints) != 1 or any(
+                row.classification != "healthy_current_evidence"
+                or not re.fullmatch(r"[0-9a-f]{64}", row.evidence_fingerprint or "")
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}", row.exchange_snapshot_fingerprint or ""
+                )
+                or not _bounded_incident_ids(row.source_incident_ids_json)
+                for row in latest
+            ):
+                continue
+            health = latest[0]
+            scope_fingerprint = _scope_health_fingerprint(latest)
+            references = [
+                f"management-batch:{batch.id}",
+                f"binding:{batch.execution_binding_id}",
+            ]
+            for row in sorted(latest, key=lambda item: int(item.id)):
+                references.extend(
+                    (
+                        f"protection-health:{row.id}",
+                        f"entry-leg:{row.execution_order_leg_id}",
+                        f"position:{row.pos_id}",
+                    )
+                )
+            projected.append(
+                {
+                    "complete": True,
+                    "object_id": str(batch.id),
+                    "historical_only_refusal": True,
+                    "current_protection_healthy": True,
+                    "exact_scope_match": True,
+                    "fingerprint_generation_match": True,
+                    "hard_reason_present": False,
+                    "management_batch_id": int(batch.id),
+                    "execution_binding_id": int(batch.execution_binding_id),
+                    "health_observation_id": int(health.id),
+                    "execution_order_leg_id": int(health.execution_order_leg_id),
+                    "pos_id": str(health.pos_id),
+                    "refusal_reason_code": str(batch.reason_code),
+                    "target_fingerprint": str(batch.target_fingerprint),
+                    "health_evidence_fingerprint": str(health.evidence_fingerprint),
+                    "health_scope_fingerprint": scope_fingerprint,
+                    "exchange_snapshot_fingerprint": str(
+                        health.exchange_snapshot_fingerprint
+                    ),
+                    "refused_at": batch.planned_at.isoformat(),
+                    "health_observed_at": health.observed_at.isoformat(),
+                    "evidence_references": tuple(references),
+                }
+            )
+        return tuple(projected)
+
+
+def _bounded_incident_ids(value: str) -> bool:
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(decoded, list)
+        and 1 <= len(decoded) <= 100
+        and all(isinstance(item, int) and item > 0 for item in decoded)
+    )
+
+
+def _scope_health_fingerprint(rows) -> str:
+    material = [
+        (
+            int(row.execution_order_leg_id),
+            str(row.pos_id),
+            str(row.evidence_fingerprint),
+            str(row.exchange_snapshot_fingerprint),
+        )
+        for row in sorted(
+            rows,
+            key=lambda item: (int(item.execution_order_leg_id), str(item.pos_id)),
+        )
+    ]
+    return sha256(
+        json.dumps(material, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _active_position_missing_protection_facts(row: Mapping) -> Mapping:

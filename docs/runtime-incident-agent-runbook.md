@@ -496,7 +496,14 @@ settings:
 
 The deployable shadow projections are
 `cancel_outcome_stale_unknown_v1` and
-`active_position_missing_protection_v1`. All other reviewed pure rules remain
+`active_position_missing_protection_v1`. The
+`management_safety_gate_divergence_v1` projection is also deployable but
+defaults disabled: it compares only a zero-write management refusal whose sole
+reason is `protection_recovery_required` with later healthy observations for
+the same exact binding, entry-leg, position, and exchange-snapshot generation.
+It writes a bounded `runtime_incident_observations` row only. It does not create
+a runtime incident, notify Telegram, clear or bypass a management gate, grant
+Agent authority, or perform an exchange write. All other reviewed pure rules remain
 non-deployable until their coherent snapshot builders exist; configuration
 silently cannot activate them. The cancel rule observes at most 100 exact
 cancel mutation intents and treats only `reserved`, `submitting`, `submitted`,
@@ -539,6 +546,17 @@ and inactive. In Phase 8R.3 shadow mode the scanner creates no runtime
 incident, Agent claim, or Telegram notification. Immediate rollback is to stop
 and disable only `telegram-kol-runtime-scanner.service` and set its enabled
 flag false; the main service and Runtime Agent are untouched.
+
+To stage the safety-gate divergence rule, first deploy with the rule absent
+from `TELEGRAM_KOL_RUNTIME_SCANNER_RULES` and keep
+`TELEGRAM_KOL_RUNTIME_SCANNER_SHADOW_ONLY=true`. After a separately approved
+safe-window check, add exactly `management_safety_gate_divergence_v1` to the
+scanner rule allowlist and restart only the scanner sidecar. Verify that source
+management batches, health observations, runtime incidents, Agent claims,
+notifications, and exchange writes are unchanged except for the additive
+scanner observation. To disable the rule, remove only that exact ID and restart
+the scanner sidecar. To roll back immediately, stop and disable
+`telegram-kol-runtime-scanner.service`; no main-service restart is required.
 
 At most one runtime stage may be implemented per user turn. New code and
 configuration default off. A first deployment never enables its feature. A

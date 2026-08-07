@@ -34,10 +34,15 @@ RUNTIME_SCANNER_RULE_IDS = frozenset(
         "monitor_incident_ledger_silence_v1",
         "terminal_high_risk_management_without_instruction_v1",
         "verified_replacement_role_gap_v1",
+        "management_safety_gate_divergence_v1",
     }
 )
 RUNTIME_SCANNER_DEPLOYABLE_RULE_IDS = frozenset(
-    {"active_position_missing_protection_v1", "cancel_outcome_stale_unknown_v1"}
+    {
+        "active_position_missing_protection_v1",
+        "cancel_outcome_stale_unknown_v1",
+        "management_safety_gate_divergence_v1",
+    }
 )
 
 

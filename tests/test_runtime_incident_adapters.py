@@ -72,6 +72,21 @@ def test_capture_and_telegram_type_allowlists_are_independent():
     assert config.diagnoses("monitor_adapter_failure") is False
 
 
+def test_safety_gate_divergence_remains_observation_only():
+    calls = []
+    result = capture_management_state(
+        object(),
+        config=RuntimeIncidentConfig(capture_types=frozenset({"*"})),
+        batch_id=41,
+        status="blocked",
+        reason_code="protection_recovery_required",
+        occurred_at=NOW,
+        recorder=lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    assert result is None
+    assert calls == []
+
+
 def test_notification_type_allowlist_preserves_legacy_and_supports_capture_only():
     legacy = load_runtime_incident_config(
         environ={"TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_ENABLED": "true"},
