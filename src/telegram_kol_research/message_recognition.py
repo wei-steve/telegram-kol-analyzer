@@ -27,6 +27,7 @@ from telegram_kol_research.config import (
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
+    ExecutionOrderLeg,
     MediaAsset,
     MessageInstructionItem,
     MessageRecognition,
@@ -56,6 +57,8 @@ from telegram_kol_research.management_scope import (
     resolve_management_scope_in_session,
 )
 from telegram_kol_research.management_message_targets import (
+    collision_group_fingerprint,
+    link_management_targets_to_instruction_items_in_session,
     management_decision_fingerprint,
     management_parameter_fingerprint,
     project_management_targets_in_session,
@@ -2000,7 +2003,40 @@ def _admit_explicit_management_targets_in_session(
                     admission=admission,
                 )
             admissions.append(admission)
-    return admissions
+    colliding_groups = {
+        admission.collision_group
+        for admission in admissions
+        if admission.accepted
+        and admission.collision_group is not None
+        and sum(
+            candidate.accepted
+            and candidate.collision_group == admission.collision_group
+            for candidate in admissions
+        )
+        > 1
+    }
+    if not colliding_groups:
+        return admissions
+    isolated: list[TargetAdmission] = []
+    for admission in admissions:
+        if admission.collision_group not in colliding_groups:
+            isolated.append(admission)
+            continue
+        refused = TargetAdmission(
+            decision=admission.decision,
+            accepted=False,
+            reason_code="target_collision",
+            collision_group=admission.collision_group,
+        )
+        with session.begin_nested():
+            _persist_target_admission_in_session(
+                session,
+                raw_message_id=raw_message.id,
+                target_decision=admission.decision,
+                admission=refused,
+            )
+        isolated.append(refused)
+    return isolated
 
 
 def _admit_one_explicit_management_target_in_session(
@@ -2043,11 +2079,34 @@ def _admit_one_explicit_management_target_in_session(
         or str(target_decision.get("side") or "").lower() != target.side
     ):
         raise ValueError("target_identity_mismatch")
+    lifecycle = session.get(StrategyLifecycle, target_id)
+    binding = (
+        session.get(ExecutionBinding, lifecycle.execution_binding_id)
+        if lifecycle is not None and lifecycle.execution_binding_id is not None
+        else None
+    )
+    pos_ids = (
+        {str(binding.pos_id)}
+        if binding is not None and binding.pos_id not in (None, "")
+        else set()
+    )
+    if binding is not None and not pos_ids:
+        pos_ids.update(
+            str(pos_id)
+            for (pos_id,) in session.query(ExecutionOrderLeg.pos_id)
+            .filter(ExecutionOrderLeg.execution_binding_id == binding.id)
+            .filter(ExecutionOrderLeg.pos_id.is_not(None))
+            .filter(ExecutionOrderLeg.pos_id != "")
+            .all()
+        )
     return TargetAdmission(
         decision=target_decision,
         accepted=True,
         reason_code=None,
-        collision_group=None,
+        collision_group=collision_group_fingerprint(
+            pos_ids,
+            fallback_lifecycle_id=target_id,
+        ),
     )
 
 
@@ -2077,6 +2136,8 @@ def _persist_target_admission_in_session(
         raise ValueError("target_projection_missing")
     row.admission_state = "admitted" if admission.accepted else "refused"
     row.closed_reason_code = admission.reason_code
+    if admission.collision_group is not None:
+        row.collision_group_fingerprint = admission.collision_group
     row.admitted_at = utc_now() if admission.accepted else None
     row.updated_at = utc_now()
     session.flush()
@@ -2944,6 +3005,10 @@ def _project_authoritative_instruction_items(
     )
     for item in obsolete_pending_items:
         item.retired_at = utc_now()
+    link_management_targets_to_instruction_items_in_session(
+        session,
+        raw_message_id=raw_message_id,
+    )
     session.flush()
 
 

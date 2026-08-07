@@ -23,6 +23,8 @@ from telegram_kol_research.message_instruction_items import (
 )
 from telegram_kol_research.models import (
     ExecutionBinding,
+    ManagementMessageEnvelope,
+    ManagementMessageTarget,
     MessageInstructionItem,
     RawMessage,
     SignalCandidate,
@@ -31,6 +33,147 @@ from telegram_kol_research.models import (
 
 
 NOW = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
+
+
+def _persist_targeted_management_items(session_factory, *, same_collision=False):
+    with session_factory() as session:
+        raw = RawMessage(chat_id=100, message_id=3465, text="BTC ETH partial TP")
+        session.add(raw)
+        session.flush()
+        envelope = ManagementMessageEnvelope(
+            raw_message_id=raw.id,
+            decision_fingerprint="d" * 64,
+            normalized_action="partial_take_profit",
+            shared_parameters_json='{"management_fraction":0.5}',
+            projection_mode="live",
+        )
+        session.add(envelope)
+        session.flush()
+        rows = []
+        for ordinal, symbol in enumerate(("BTC", "ETH")):
+            lifecycle = StrategyLifecycle(
+                chat_id=100,
+                message_id=3400 + ordinal,
+                symbol=symbol,
+                side="short",
+                lifecycle_status="entered",
+                signal_at=NOW,
+            )
+            session.add(lifecycle)
+            session.flush()
+            candidate = SignalCandidate(
+                raw_message_id=raw.id,
+                symbol=symbol,
+                side="short",
+                event_type="position_update",
+                target_lifecycle_id=lifecycle.id,
+                management_action="partial_take_profit",
+                management_fraction=0.5,
+            )
+            session.add(candidate)
+            session.flush()
+            item = MessageInstructionItem(
+                raw_message_id=raw.id,
+                signal_candidate_id=candidate.id,
+                sequence=ordinal,
+                instruction_kind="management",
+                idempotency_key=(f"{ordinal + 1}" * 64)[:64],
+                status="pending",
+            )
+            session.add(item)
+            session.flush()
+            collision = "a" * 64 if same_collision else chr(97 + ordinal) * 64
+            target = ManagementMessageTarget(
+                envelope_id=envelope.id,
+                raw_message_id=raw.id,
+                target_lifecycle_id=lifecycle.id,
+                target_ordinal=ordinal,
+                symbol=symbol,
+                side="short",
+                normalized_action="partial_take_profit",
+                parameters_json='{"management_fraction":0.5}',
+                parameter_fingerprint="p" * 64,
+                collision_group_fingerprint=collision,
+                admission_state="admitted",
+                execution_state="pending",
+                signal_candidate_id=candidate.id,
+                message_instruction_item_id=item.id,
+            )
+            session.add(target)
+            session.flush()
+            rows.append((target.id, item.id))
+        raw_id = raw.id
+        session.commit()
+    return raw_id, rows
+
+
+@pytest.mark.parametrize("finish_status", ["failed", "unknown"])
+def test_terminal_target_does_not_block_next_disjoint_target(
+    tmp_path,
+    finish_status,
+):
+    session_factory = create_session_factory(
+        tmp_path / f"target-continue-{finish_status}.db"
+    )
+    raw_id, rows = _persist_targeted_management_items(session_factory)
+
+    first = claim_next_message_instruction_item(
+        session_factory, raw_message_id=raw_id, now=NOW
+    )
+    assert first is not None
+    finish_message_instruction_item(
+        session_factory,
+        item_id=first.id,
+        status=finish_status,
+        result={"status": finish_status},
+        now=NOW,
+    )
+    second = claim_next_message_instruction_item(
+        session_factory, raw_message_id=raw_id, now=NOW
+    )
+
+    assert second is not None
+    assert second.id == rows[1][1]
+    with session_factory() as session:
+        first_target = session.get(ManagementMessageTarget, rows[0][0])
+        second_target = session.get(ManagementMessageTarget, rows[1][0])
+        assert first_target.execution_state == (
+            "submit_unknown" if finish_status == "unknown" else "failed"
+        )
+        assert second_target.execution_state == "executing"
+
+
+def test_submit_unknown_blocks_only_same_collision_group(tmp_path):
+    session_factory = create_session_factory(tmp_path / "target-collision.db")
+    raw_id, rows = _persist_targeted_management_items(
+        session_factory,
+        same_collision=True,
+    )
+    first = claim_next_message_instruction_item(
+        session_factory, raw_message_id=raw_id, now=NOW
+    )
+    assert first is not None
+    finish_message_instruction_item(
+        session_factory,
+        item_id=first.id,
+        status="unknown",
+        result={"status": "submit_unknown"},
+        now=NOW,
+    )
+
+    assert (
+        claim_next_message_instruction_item(
+            session_factory,
+            raw_message_id=raw_id,
+            now=NOW,
+        )
+        is None
+    )
+    with session_factory() as session:
+        assert (
+            session.get(ManagementMessageTarget, rows[1][0]).execution_state
+            == "pending"
+        )
 
 
 @pytest.mark.parametrize(

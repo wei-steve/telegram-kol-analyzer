@@ -14,6 +14,8 @@ from sqlalchemy.orm import Session
 from telegram_kol_research.models import (
     ManagementMessageEnvelope,
     ManagementMessageTarget,
+    MessageInstructionItem,
+    SignalCandidate,
 )
 
 
@@ -109,6 +111,22 @@ def management_decision_fingerprint(
 
 def management_parameter_fingerprint(decision: Mapping[str, Any]) -> str:
     return _sha256(_canonical_json(_decision_parameters(decision)))
+
+
+def collision_group_fingerprint(
+    pos_ids: Collection[str],
+    *,
+    fallback_lifecycle_id: int,
+) -> str:
+    normalized = sorted(
+        {str(pos_id).strip() for pos_id in pos_ids if str(pos_id).strip()}
+    )
+    stable = (
+        "pos_ids\0" + "\0".join(normalized)
+        if normalized
+        else f"lifecycle\0{int(fallback_lifecycle_id)}"
+    )
+    return _sha256(stable)
 
 
 def derive_envelope_status(states: Collection[str]) -> str:
@@ -298,3 +316,68 @@ def transition_target_execution_state_in_session(
         target.terminal_at = now
     session.flush()
     return target
+
+
+def link_management_targets_to_instruction_items_in_session(
+    session: Session,
+    *,
+    raw_message_id: int,
+) -> int:
+    """Link admitted target rows to authoritative candidate/item snapshots."""
+
+    items_by_candidate_id = {
+        int(item.signal_candidate_id): item
+        for item in session.query(MessageInstructionItem)
+        .filter(MessageInstructionItem.raw_message_id == int(raw_message_id))
+        .filter(MessageInstructionItem.retired_at.is_(None))
+        .all()
+    }
+    candidates = (
+        session.query(SignalCandidate)
+        .filter(SignalCandidate.raw_message_id == int(raw_message_id))
+        .filter(SignalCandidate.target_lifecycle_id.is_not(None))
+        .all()
+    )
+    linked = 0
+    for candidate in candidates:
+        item = items_by_candidate_id.get(int(candidate.id))
+        if item is None:
+            continue
+        action = str(candidate.management_action or "").strip().lower()
+        action = {
+            "full_exit": "exit_full",
+            "close_position": "exit_full",
+            "cancel_entry": "cancel_pending_entry",
+        }.get(action, action)
+        parameters = {
+            "management_fraction": candidate.management_fraction,
+            "take_profit": candidate.take_profit_text,
+            "stop_loss": candidate.stop_loss_text,
+        }
+        parameters = {
+            key: value
+            for key, value in parameters.items()
+            if value not in (None, "")
+        }
+        row = (
+            session.query(ManagementMessageTarget)
+            .filter(
+                ManagementMessageTarget.raw_message_id == int(raw_message_id),
+                ManagementMessageTarget.target_lifecycle_id
+                == int(candidate.target_lifecycle_id),
+                ManagementMessageTarget.normalized_action == action,
+                ManagementMessageTarget.parameter_fingerprint
+                == _sha256(_canonical_json(parameters)),
+                ManagementMessageTarget.admission_state == "admitted",
+            )
+            .one_or_none()
+        )
+        if row is None:
+            continue
+        row.signal_candidate_id = int(candidate.id)
+        row.message_instruction_item_id = int(item.id)
+        if row.execution_state == "not_started":
+            row.execution_state = "pending"
+        linked += 1
+    session.flush()
+    return linked

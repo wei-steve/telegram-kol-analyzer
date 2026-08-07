@@ -1102,8 +1102,77 @@ def test_live_multi_target_admission_refuses_one_target_and_continues_others(
         assert len(items) == 1
         assert target_rows["BTC"].admission_state == "admitted"
         assert target_rows["BTC"].closed_reason_code is None
+        assert target_rows["BTC"].signal_candidate_id == candidates[0].id
+        assert target_rows["BTC"].message_instruction_item_id == items[0].id
+        assert target_rows["BTC"].execution_state == "pending"
         assert target_rows["ETH"].admission_state == "refused"
         assert target_rows["ETH"].closed_reason_code == "target_not_verified"
+        assert target_rows["ETH"].signal_candidate_id is None
+        assert target_rows["ETH"].message_instruction_item_id is None
+
+
+def test_live_multi_target_admission_freezes_only_exact_pos_id_collision(tmp_path):
+    session_factory = create_session_factory(tmp_path / "multi-target-collision.db")
+    with session_factory() as session:
+        btc = _add_exact_live_lifecycle(
+            session, chat_id=88, message_id=3470, symbol="BTC", side="short"
+        )
+        eth = _add_exact_live_lifecycle(
+            session, chat_id=88, message_id=3471, symbol="ETH", side="short"
+        )
+        eth_binding = session.get(ExecutionBinding, eth.execution_binding_id)
+        eth_binding.pos_id = "pos-btc"
+        raw = RawMessage(
+            chat_id=88,
+            message_id=3472,
+            posted_at=datetime(2026, 7, 21, 18, 5, tzinfo=UTC),
+            text="BTC ETH空单可以止盈一部分",
+        )
+        session.add(raw)
+        session.flush()
+        raw_id, btc_id, eth_id = raw.id, btc.id, eth.id
+        session.commit()
+
+    result = apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_id,
+        payload={
+            "recognition_result": "非策略",
+            "lifecycle_event": {
+                "event_type": "position_update",
+                "management_action": "partial_take_profit",
+                "management_fraction": 0.5,
+                "confidence": 0.95,
+                "targets": [
+                    {
+                        "target_lifecycle_id": btc_id,
+                        "symbol": "BTC",
+                        "side": "short",
+                    },
+                    {
+                        "target_lifecycle_id": eth_id,
+                        "symbol": "ETH",
+                        "side": "short",
+                    },
+                ],
+            },
+        },
+        model="mimo-v2.5",
+        authoritative_generation="multi-target-collision",
+        multi_target_management_config=config_module.MultiTargetManagementConfig(
+            projection_enabled=True,
+            shadow_only=False,
+            live_actions=frozenset({"partial_take_profit"}),
+        ),
+    )
+
+    assert result.status == "识别失败"
+    with session_factory() as session:
+        assert session.query(SignalCandidate).count() == 0
+        assert session.query(MessageInstructionItem).count() == 0
+        rows = session.query(ManagementMessageTarget).all()
+        assert {row.closed_reason_code for row in rows} == {"target_collision"}
+        assert len({row.collision_group_fingerprint for row in rows}) == 1
 
 
 def test_multi_target_rejects_target_level_policy_overrides_before_persistence(tmp_path):

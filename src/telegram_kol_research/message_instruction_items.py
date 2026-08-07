@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, aliased, sessionmaker
 from telegram_kol_research.execution_bindings import build_strategy_instance_id
 from telegram_kol_research.models import (
     ExecutionBinding,
+    ManagementMessageTarget,
     MessageInstructionItem,
     RawMessage,
     SignalCandidate,
@@ -158,8 +159,14 @@ def claim_next_message_instruction_item(
     with session_factory() as session:
         pending_item = aliased(MessageInstructionItem)
         executing_item = aliased(MessageInstructionItem)
+        pending_target = aliased(ManagementMessageTarget)
+        blocking_target = aliased(ManagementMessageTarget)
         next_item_id = (
             select(pending_item.id)
+            .outerjoin(
+                pending_target,
+                pending_target.message_instruction_item_id == pending_item.id,
+            )
             .where(
                 pending_item.raw_message_id == int(raw_message_id),
                 pending_item.status == "pending",
@@ -168,6 +175,18 @@ def claim_next_message_instruction_item(
                     select(executing_item.id).where(
                         executing_item.raw_message_id == int(raw_message_id),
                         executing_item.status == "executing",
+                    )
+                ),
+                ~exists(
+                    select(blocking_target.id).where(
+                        blocking_target.raw_message_id
+                        == pending_item.raw_message_id,
+                        blocking_target.id != pending_target.id,
+                        blocking_target.collision_group_fingerprint
+                        == pending_target.collision_group_fingerprint,
+                        blocking_target.execution_state.in_(
+                            ("submit_unknown", "recovery_required")
+                        ),
                     )
                 ),
             )
@@ -192,6 +211,19 @@ def claim_next_message_instruction_item(
         if item_id is None:
             session.commit()
             return None
+
+        session.execute(
+            update(ManagementMessageTarget)
+            .where(
+                ManagementMessageTarget.message_instruction_item_id == item_id,
+                ManagementMessageTarget.execution_state == "pending",
+            )
+            .values(
+                execution_state="executing",
+                execution_started_at=now,
+                updated_at=now,
+            )
+        )
 
         session.commit()
         item = session.get(MessageInstructionItem, item_id)
@@ -240,6 +272,12 @@ def defer_message_instruction_item_for_visibility(
             item.summary_notification_claim_token = None
             item.summary_notification_claimed_at = None
             item.updated_at = now
+            _update_linked_target_state_in_session(
+                session,
+                item_id=item.id,
+                state="failed",
+                now=now,
+            )
             session.commit()
             return "failed"
 
@@ -254,6 +292,12 @@ def defer_message_instruction_item_for_visibility(
         item.visibility_retry_attempts = attempts
         item.visibility_next_attempt_at = now + timedelta(seconds=delay)
         item.updated_at = now
+        _update_linked_target_state_in_session(
+            session,
+            item_id=item.id,
+            state="pending",
+            now=now,
+        )
         session.commit()
         return "pending"
 
@@ -370,6 +414,18 @@ def claim_next_visibility_retry_instruction_item(
         if item_id is None:
             session.commit()
             return None
+        session.execute(
+            update(ManagementMessageTarget)
+            .where(
+                ManagementMessageTarget.message_instruction_item_id == item_id,
+                ManagementMessageTarget.execution_state == "pending",
+            )
+            .values(
+                execution_state="executing",
+                execution_started_at=now,
+                updated_at=now,
+            )
+        )
         session.commit()
         item = session.get(MessageInstructionItem, item_id)
         if item is None:
@@ -415,7 +471,45 @@ def finish_message_instruction_item(
         if update_result.rowcount != 1:
             session.rollback()
             raise RuntimeError("instruction item is missing or not executing")
+        result_status = str(result.get("status") or "").strip().lower()
+        target_state = {
+            "submitted": "submitted",
+            "succeeded": "confirmed",
+            "failed": "failed",
+            "unknown": (
+                "recovery_required"
+                if result_status == "recovery_required"
+                else "submit_unknown"
+            ),
+        }[status]
+        _update_linked_target_state_in_session(
+            session,
+            item_id=int(item_id),
+            state=target_state,
+            now=now,
+        )
         session.commit()
+
+
+def _update_linked_target_state_in_session(
+    session: Session,
+    *,
+    item_id: int,
+    state: str,
+    now: datetime,
+) -> None:
+    values = {"execution_state": state, "updated_at": now}
+    if state == "executing":
+        values["execution_started_at"] = now
+    if state in {"confirmed", "failed"}:
+        values["terminal_at"] = now
+    session.execute(
+        update(ManagementMessageTarget)
+        .where(
+            ManagementMessageTarget.message_instruction_item_id == int(item_id)
+        )
+        .values(**values)
+    )
 
 
 def list_message_instruction_item_results(
