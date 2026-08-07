@@ -76,6 +76,29 @@ def test_selector_matches_same_chat_symbol_and_side_across_unrelated_message():
     assert decision.risk_multiplier == Decimal("0.5")
 
 
+def test_legacy_preamble_fact_adapts_to_v2_risk_fragment():
+    from telegram_kol_research.entry_strategy_assembly import (
+        adapt_prior_fact_to_adjacent_entry_fact,
+    )
+
+    adapted = adapt_prior_fact_to_adjacent_entry_fact(
+        _fact(
+            raw_id=100,
+            message_id=9901,
+            kind="entry_preamble",
+            symbol="BTC",
+            side="short",
+            preamble_id=7,
+            multiplier="0.5",
+        )
+    )
+
+    assert adapted.kind == "fragment"
+    assert adapted.fragment_id == -7
+    assert adapted.fragment_kind == "risk_multiplier"
+    assert adapted.payload == {"risk_multiplier": "0.5"}
+
+
 def test_selector_does_not_cross_mismatch_or_hard_boundary():
     from telegram_kol_research.entry_strategy_assembly import select_entry_preamble
 

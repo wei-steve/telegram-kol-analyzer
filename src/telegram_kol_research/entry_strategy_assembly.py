@@ -12,6 +12,7 @@ from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.adjacent_entry_assembly import AdjacentEntryFact
 from telegram_kol_research.models import (
     EntryPreamble,
     EntryStrategyAssembly,
@@ -59,6 +60,33 @@ class EntryAssemblyResult:
     strategy_message_id: int | None = None
     assembly_id: int | None = None
     assembly_fingerprint: str | None = None
+
+
+def adapt_prior_fact_to_adjacent_entry_fact(
+    fact: PriorMessageFact,
+) -> AdjacentEntryFact:
+    """Expose legacy preamble facts through the v2 pure-selector contract."""
+
+    if fact.kind != "entry_preamble" or fact.preamble_id is None:
+        return AdjacentEntryFact(
+            raw_message_id=fact.raw_message_id,
+            message_id=fact.message_id,
+            posted_at=fact.posted_at,
+            kind=fact.kind,
+            symbol=fact.symbol,
+            side=fact.side,
+        )
+    return AdjacentEntryFact(
+        raw_message_id=fact.raw_message_id,
+        message_id=fact.message_id,
+        posted_at=fact.posted_at,
+        kind="fragment",
+        symbol=fact.symbol,
+        side=fact.side,
+        fragment_id=-int(fact.preamble_id),
+        fragment_kind="risk_multiplier",
+        payload={"risk_multiplier": str(fact.risk_multiplier)},
+    )
 
 
 def _source_key(
