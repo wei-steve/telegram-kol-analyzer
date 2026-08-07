@@ -438,7 +438,7 @@ def test_rescue_worker_is_idempotent_after_successful_live_tick(tmp_path):
         assert session.query(TriggerProtectionStopRescue).count() == 1
 
 
-def test_rescue_worker_excludes_structured_manual_review_disposition(tmp_path):
+def test_rescue_worker_blocks_manual_review_without_deferred_evidence(tmp_path):
     from telegram_kol_research.trigger_protection_rescue_worker import (
         run_trigger_protection_rescue_tick,
     )
@@ -452,7 +452,10 @@ def test_rescue_worker_excludes_structured_manual_review_disposition(tmp_path):
         session.commit()
     save_trading_settings(
         session_factory,
-        {"trigger_protection_stop_rescue_mode": "shadow"},
+        {
+            "trigger_protection_stop_rescue_mode": "shadow",
+            "position_management_liveness_v2_mode": "shadow",
+        },
     )
 
     result = run_trigger_protection_rescue_tick(
@@ -461,8 +464,10 @@ def test_rescue_worker_excludes_structured_manual_review_disposition(tmp_path):
         processed_at=NOW,
     )
 
-    assert result.discovered == 0
-    assert result.evaluated == 0
+    assert result.discovered == 1
+    assert result.evaluated == 1
+    assert result.blocked == 1
+    assert result.shadow_ready == 0
 
 
 def test_rescue_worker_reconsiders_manual_review_with_predates_fill_evidence(

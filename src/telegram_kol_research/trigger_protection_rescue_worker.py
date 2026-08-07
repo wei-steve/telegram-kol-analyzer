@@ -74,7 +74,7 @@ def run_trigger_protection_rescue_tick(
                         or_(
                             TriggerProtectionIntent.recovery_disposition.is_(None),
                             TriggerProtectionIntent.recovery_disposition.in_(
-                                ("retry", "exact_backup")
+                                ("retry", "exact_backup", "manual_review")
                             ),
                         )
                     )

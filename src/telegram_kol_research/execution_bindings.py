@@ -325,17 +325,19 @@ def reconcile_deepcoin_execution_bindings(
             snapshot = load_deepcoin_execution_reconciliation_snapshot(
                 session_factory, client=client
             )
-        result = _apply_reconcile_snapshot(
-            session_factory, snapshot=snapshot, recovered_at=now
-        )
         from telegram_kol_research.trigger_protection_rescue_worker import (
             run_trigger_protection_rescue_tick,
         )
 
+        # Rescue an already-attributed due intent before reconciliation can
+        # reschedule that same intent and make it invisible to the due query.
         run_trigger_protection_rescue_tick(
             session_factory,
             deepcoin_client=client,
             processed_at=now,
+        )
+        result = _apply_reconcile_snapshot(
+            session_factory, snapshot=snapshot, recovered_at=now
         )
         if contract_spec_provider is not None:
             from telegram_kol_research.trigger_backup_stop_executor import (
@@ -1776,7 +1778,14 @@ def _refuse_trigger_intent(session, leg, intent, refusal, now, result, transitio
     if "conflict" in str(refusal.reason) or "owned" in str(refusal.reason):
         result.protection_adoption_conflicting += 1
     _record_protection_adoption_refusal(session, leg=leg, refusal=refusal, created_at=now)
-    _schedule_trigger_intent_retry(session, intent, now, transition)
+    _schedule_trigger_intent_retry(
+        session,
+        intent,
+        now,
+        transition,
+        last_reason_code=str(refusal.reason),
+        last_evidence=dict(refusal.evidence),
+    )
 
 
 def _record_protection_adoption_refusal(
