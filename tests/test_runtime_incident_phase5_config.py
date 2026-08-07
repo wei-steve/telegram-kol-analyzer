@@ -31,9 +31,18 @@ def test_multi_target_live_actions_are_closed_and_normalized():
 
     assert config.projection_enabled is True
     assert config.shadow_only is False
-    assert config.live_actions == frozenset(
-        {"partial_take_profit", "exit_full"}
+    assert config.live_actions == frozenset({"partial_take_profit"})
+
+
+def test_multi_target_live_gate_cannot_bypass_action_graduation():
+    config = config_module.MultiTargetManagementConfig(
+        projection_enabled=True,
+        shadow_only=False,
+        live_actions=frozenset({"partial_take_profit", "exit_full"}),
     )
+
+    assert config.action_is_live("partial_take_profit") is True
+    assert config.action_is_live("exit_full") is False
 
 
 def test_phase5_shadow_playbooks_are_dormant_and_exact_allowlisted():

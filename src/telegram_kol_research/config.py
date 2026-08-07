@@ -9,7 +9,7 @@ from pathlib import Path
 
 from telegram_kol_research.llm_chat import _load_env_file_values
 from telegram_kol_research.management_directives import (
-    MULTI_TARGET_ACTION_NAMES,
+    MULTI_TARGET_LIVE_ACTION_NAMES,
 )
 
 
@@ -118,6 +118,7 @@ class MultiTargetManagementConfig:
         return (
             self.projection_enabled
             and not self.shadow_only
+            and str(action).strip().lower() in MULTI_TARGET_LIVE_ACTION_NAMES
             and str(action).strip().lower() in self.live_actions
         )
 
@@ -151,7 +152,7 @@ def load_multi_target_management_config(
             in {"0", "false", "no", "off"}
         ),
         live_actions=frozenset(
-            requested_actions.intersection(MULTI_TARGET_ACTION_NAMES)
+            requested_actions.intersection(MULTI_TARGET_LIVE_ACTION_NAMES)
         ),
     )
 

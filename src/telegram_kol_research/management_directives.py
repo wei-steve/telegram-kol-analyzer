@@ -40,6 +40,9 @@ _MULTI_TARGET_ACTIONS = {
     ),
 }
 MULTI_TARGET_ACTION_NAMES = frozenset(_MULTI_TARGET_ACTIONS)
+# Actions graduate to live independently after shadow parity.  The remaining
+# closed actions stay recognizable and projectable, but cannot execute yet.
+MULTI_TARGET_LIVE_ACTION_NAMES = frozenset({"partial_take_profit"})
 _MULTI_TARGET_ACTION_ALIASES = {
     "full_exit": "exit_full",
     "close_position": "exit_full",
