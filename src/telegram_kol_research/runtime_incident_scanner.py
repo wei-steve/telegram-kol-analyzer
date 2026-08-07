@@ -35,6 +35,12 @@ _LIVE_EXPOSURE_STATES = frozenset(
 _PENDING_OR_VERIFIED_PRIMARY_STATES = frozenset(
     {"submitting", "submitted", "pending_readback", "verified"}
 )
+DORMANT_POSITION_COMPLIANCE_RULE_IDS = frozenset(
+    {
+        "terminal_high_risk_management_without_instruction_v1",
+        "verified_replacement_role_gap_v1",
+    }
+)
 
 
 def _critical_unprotected_positions_in_session(
@@ -206,7 +212,7 @@ class InvariantObservation:
 
 
 def build_scanner_facts(session_factory, *, rules: frozenset[str], observed_at):
-    """Build only bounded read-only projections required by enabled rules."""
+    """Build only deployed projections; dormant catalog rules yield no facts."""
     result: dict[str, tuple[Mapping, ...]] = {}
     if "active_position_missing_protection_v1" in rules:
         risks = list_critical_unprotected_positions(

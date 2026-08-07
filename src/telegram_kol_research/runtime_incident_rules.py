@@ -14,6 +14,11 @@ _RULES = {
     "cancel_outcome_stale_unknown_v1": ("high", "cancel-operation"),
     "tp1_break_even_nonterminal_v1": ("high", "break-even"),
     "monitor_incident_ledger_silence_v1": ("low", "monitor"),
+    "terminal_high_risk_management_without_instruction_v1": (
+        "high",
+        "management-recognition",
+    ),
+    "verified_replacement_role_gap_v1": ("high", "protection-revision"),
 }
 
 
@@ -28,6 +33,15 @@ def _abnormal(rule_id: str, facts: Mapping[str, Any]) -> bool:
         return bool(facts.get("cancel_unknown")) and bool(facts.get("transition_window_expired"))
     if rule_id == "tp1_break_even_nonterminal_v1":
         return bool(facts.get("tp1_confirmed")) and not bool(facts.get("break_even_terminal")) and bool(facts.get("transition_window_expired"))
+    if rule_id == "terminal_high_risk_management_without_instruction_v1":
+        return bool(facts.get("terminal_high_risk_management")) and not bool(
+            facts.get("executable_instruction_present")
+        )
+    if rule_id == "verified_replacement_role_gap_v1":
+        return bool(facts.get("replacement_verified")) and not (
+            bool(facts.get("primary_role_verified"))
+            and bool(facts.get("backup_role_verified"))
+        )
     return bool(facts.get("monitor_abnormal")) and not bool(facts.get("incident_present"))
 
 

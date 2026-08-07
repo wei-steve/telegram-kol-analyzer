@@ -9,10 +9,12 @@ design_version: 1
 current_phase: 8R.3
 phase_name: proactive-invariant-scanner
 phase_status: in_progress
+position_compliance_rules_status: dormant_non_deployable
 last_completed_phase: "8R.2"
 last_completed_commit: b3c2f14
 production_commit: 36846b5e910f6cf68005c6035aa8265561cb15ea
 local_tests:
+  - "position-compliance-dormant-rules: 30 passed; both rules remain non-deployable with no production projection or selector change"
   - "phase-8r.3-dormant-ledger-rules-scanner-regression: 410 passed, 2 known YAML prompt deprecation warnings"
   - "phase-8r.3-final-review: no Critical or Important findings after recovery candidates were filtered and prioritized before the bounded observation limit"
   - "phase-8r.3-review-fixes: ten Critical/Important findings addressed across bootstrap authority, deployable-rule truthfulness, terminal classification, ordered CAS, installer refusal, architecture coverage, pre-limit candidate filtering, single-transaction batching, overflow draining, and starvation-free recovery priority"
@@ -171,6 +173,7 @@ server_verification:
   phase_8r_3_shadow_canary: "Shadow observation started 2026-08-03 16:18 CST. Repeated cycles report one rule, zero candidates, zero observations, zero abnormal results, and zero insufficient results. The position-mutation source hash remained dbca2e6790e5ed586bd06341eb27bb3bb29e538cfa49bfa51d01a1789878fd51; scanner-created runtime incidents, Telegram claims, Agent claims, and recovery attempts remained zero. The overall incident ledger continued to receive independent capture-only protection/monitor events under Phase 8R.2 policy."
   phase_8r_3_rollback: "Stopping and disabling only telegram-kol-runtime-scanner.service made it inactive/disabled while the main service and Runtime Agent stayed active. The scanner was then re-enabled and resumed shadow cycles; no main restart was required."
   phase_8r_3_deployed_tests: "58 deployed focused tests passed. A root-run no-notify production monitor diagnostic returned monitor_error null with only the known audit_abnormal baseline. Two earlier diagnostics under a manually invoked restricted identity lacked the service unit's supplementary journal group and repeated one capture-only monitor_adapter_failure incident; it remained unclaimed and generated no scanner, Agent, or Telegram action."
+  position_compliance_dormant_rules: "Local-only catalog addition defines terminal high-risk management without an executable instruction and verified replacement primary/backup role gaps. Both rule IDs are excluded from the deployable allowlist, have no scanner fact projection, and caused no production restart, selector change, or runtime behavior change."
   remaining: "Keep Phase 8R.3 in progress through at least 2026-08-05 16:18 CST. After 48 hours, compare every scanner observation with its source row, confirm the source hash and zero scanner-created incidents/Telegram claims/Agent claims, and re-run the rollback and independent-monitor gates. Do not enable deterministic notification for new rules or widen Agent diagnosis before that review."
 enabled_flags:
   - "capture:READ_ONLY_CAPTURE_PROFILE-nine-types"

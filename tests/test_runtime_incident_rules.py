@@ -69,3 +69,49 @@ def test_reviewed_rule_fixtures_replay_with_expected_outcomes():
         result = evaluate_rule(case["rule_id"], case["facts"])
         assert result.outcome == case["expected_outcome"], path.name
         assert result.severity == case["expected_severity"], path.name
+
+
+def test_terminal_high_risk_management_without_instruction_rule_is_closed():
+    base = {
+        "complete": True,
+        "object_id": "decision-1",
+        "terminal_high_risk_management": True,
+        "executable_instruction_present": False,
+        "evidence_references": ["recognition-decision:1"],
+    }
+
+    assert evaluate_rule(
+        "terminal_high_risk_management_without_instruction_v1", base
+    ).outcome == "abnormal"
+    assert evaluate_rule(
+        "terminal_high_risk_management_without_instruction_v1",
+        {**base, "executable_instruction_present": True},
+    ).outcome == "normal"
+    assert evaluate_rule(
+        "terminal_high_risk_management_without_instruction_v1",
+        {**base, "complete": False},
+    ).outcome == "evidence_insufficient"
+
+
+def test_verified_replacement_role_gap_rule_requires_primary_and_backup():
+    base = {
+        "complete": True,
+        "object_id": "revision-1",
+        "replacement_verified": True,
+        "primary_role_verified": True,
+        "backup_role_verified": True,
+        "evidence_references": ["protection-revision:1"],
+    }
+
+    assert evaluate_rule(
+        "verified_replacement_role_gap_v1", base
+    ).outcome == "normal"
+    for missing_role in ("primary_role_verified", "backup_role_verified"):
+        assert evaluate_rule(
+            "verified_replacement_role_gap_v1",
+            {**base, missing_role: False},
+        ).outcome == "abnormal"
+    assert evaluate_rule(
+        "verified_replacement_role_gap_v1",
+        {**base, "complete": False},
+    ).outcome == "evidence_insufficient"

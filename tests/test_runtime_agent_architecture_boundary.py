@@ -171,3 +171,6 @@ def test_phase_7_is_deferred_and_phase_8r_requires_no_action_authority():
         "Phase 8R never populates either the shadow or action playbook "
         "allowlist" in runbook
     )
+    assert "terminal_high_risk_management_without_instruction_v1" in runbook
+    assert "verified_replacement_role_gap_v1" in runbook
+    assert "position_compliance_rules_status: dormant_non_deployable" in status

@@ -2,7 +2,11 @@ import pytest
 from datetime import UTC, datetime, timedelta
 
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.config import load_runtime_scanner_config
+from telegram_kol_research.config import (
+    RUNTIME_SCANNER_DEPLOYABLE_RULE_IDS,
+    RUNTIME_SCANNER_RULE_IDS,
+    load_runtime_scanner_config,
+)
 from telegram_kol_research.models import (
     BoundPositionCloseReservation,
     ExecutionBinding,
@@ -51,6 +55,45 @@ def test_scanner_refuses_rules_without_a_deployed_snapshot_projection():
         env_file_paths=[],
     )
     assert config.rules == frozenset({"cancel_outcome_stale_unknown_v1"})
+
+
+def test_position_compliance_rules_are_reviewed_but_remain_non_deployable():
+    dormant_rules = frozenset(
+        {
+            "terminal_high_risk_management_without_instruction_v1",
+            "verified_replacement_role_gap_v1",
+        }
+    )
+    assert dormant_rules.issubset(RUNTIME_SCANNER_RULE_IDS)
+    assert dormant_rules.isdisjoint(RUNTIME_SCANNER_DEPLOYABLE_RULE_IDS)
+
+    config = load_runtime_scanner_config(
+        environ={
+            "TELEGRAM_KOL_RUNTIME_SCANNER_ENABLED": "true",
+            "TELEGRAM_KOL_RUNTIME_SCANNER_RULES": ",".join(sorted(dormant_rules)),
+        },
+        env_file_paths=[],
+    )
+    assert config.enabled is True
+    assert config.rules == frozenset()
+
+
+def test_dormant_position_compliance_rules_have_no_production_projection(tmp_path):
+    sf = create_session_factory(tmp_path / "dormant.db")
+    dormant_rules = frozenset(
+        {
+            "terminal_high_risk_management_without_instruction_v1",
+            "verified_replacement_role_gap_v1",
+        }
+    )
+
+    assert build_scanner_facts(
+        sf,
+        rules=dormant_rules,
+        observed_at=datetime(2026, 8, 7, tzinfo=UTC),
+    ) == {}
+    with sf() as session:
+        assert session.query(RuntimeIncidentObservation).count() == 0
 
 
 def test_observation_contract_rejects_sensitive_and_unbounded_values():

@@ -441,6 +441,17 @@ cancel mutation intents and treats only `reserved`, `submitting`, `submitted`,
 or `recovery_required` beyond the ten-minute window as unknown. `confirmed`,
 `rejected`, and `blocked` are known terminal outcomes.
 
+The reviewed position-compliance catalog also contains
+`terminal_high_risk_management_without_instruction_v1` and
+`verified_replacement_role_gap_v1`. Both are pure-rule contracts only. They
+remain absent from `RUNTIME_SCANNER_DEPLOYABLE_RULE_IDS`, have no production
+projection, and cannot be activated through scanner configuration. The first
+detects a terminal high-risk management recognition with no executable
+instruction; the second detects a verified replacement that lacks either the
+exact primary-stop or backup-stop role. Adding either production projection,
+notification selector, or Agent selector requires a later separately approved
+runtime stage.
+
 The unprotected-position rule is operator-visible but remains disabled unless
 explicitly allowlisted. It evaluates only exact live verified entry legs and
 requires no verified/pending primary stop and no close, mutation, or management
