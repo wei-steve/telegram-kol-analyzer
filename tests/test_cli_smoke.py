@@ -597,6 +597,59 @@ def test_audit_management_batches_is_bounded_redacted_and_read_only(
     assert database_path.stat() == before[1]
 
 
+def test_audit_protection_incidents_cli_is_read_only_and_has_no_apply(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.cli as cli_module
+
+    database_path = tmp_path / "protection.db"
+    create_session_factory(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    monkeypatch.setattr(
+        cli_module,
+        "build_deepcoin_client_from_env",
+        lambda: SimpleNamespace(
+            list_positions=lambda: [],
+            list_open_orders=lambda: [],
+            list_trigger_orders_pending=lambda **_kwargs: [],
+            list_order_history=lambda **_kwargs: [],
+            list_trade_fills=lambda **_kwargs: [],
+            list_trigger_order_history=lambda **_kwargs: [],
+        ),
+    )
+
+    help_result = CliRunner().invoke(app, ["audit-protection-incidents", "--help"])
+    assert help_result.exit_code == 0
+    assert "--apply" not in help_result.stdout
+
+    before = database_path.read_bytes(), database_path.stat()
+    result = CliRunner().invoke(
+        app,
+        [
+            "audit-protection-incidents",
+            "--database-path",
+            str(database_path),
+            "--limit",
+            "100",
+            "--output-format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["counts"] == {
+        "current_risk": 0,
+        "evidence_insufficient": 0,
+        "historical_terminal": 0,
+        "resolved_by_current_exchange_evidence": 0,
+    }
+    assert payload["output_complete"] is True
+    after = database_path.read_bytes(), database_path.stat()
+    assert after == before
+
+
 def test_audit_management_batches_classifies_informational_hold_as_non_alerting(
     tmp_path,
 ):

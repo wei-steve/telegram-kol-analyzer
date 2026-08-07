@@ -978,6 +978,30 @@ review. The old dry-run output and fingerprint are then void. If the rebuilt
 plan differs, contains an unexpected action, or contains an unresolved refusal,
 stop and investigate read-only; do not edit the production database directly.
 
+## 11b. Audit Historical Protection-Incident Convergence
+
+The first production run of this audit is observation-only. It sends no
+notification, writes no business row, and has no `--apply` mode:
+
+```bash
+.venv/bin/telegram-kol-research audit-protection-incidents \
+  --database-path data/research.db --limit 100 --output-format json
+```
+
+The command reads a private coherent SQLite snapshot and one coherent read-only
+Deepcoin snapshot. It returns counts plus at most 100 redacted incident
+references. Treat `output_complete=false` as an explicit refusal: truncation,
+unstable database evidence, and incomplete exchange reads can never prove
+resolution.
+
+Review every `current_risk` item before considering any later incident selector
+or notification change. `resolved_by_current_exchange_evidence` requires a
+newer exact complete replacement whose primary stop, backup stop, and take
+profit are all visible for the same binding, entry leg, and `posId`.
+`historical_terminal` is informational history; `evidence_insufficient` remains
+unresolved. Never convert this audit output directly into an exchange write,
+database edit, Telegram delivery, or replay of the original management message.
+
 ## 12. Record External Manual Position Closure
 
 ### Terminal lifecycle / entry-order invariant

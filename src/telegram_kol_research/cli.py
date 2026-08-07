@@ -17,6 +17,7 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -86,6 +87,10 @@ from telegram_kol_research.position_management_remediation import (
 from telegram_kol_research.position_management_liveness_recovery import (
     apply_position_management_liveness_recovery,
     build_position_management_liveness_recovery_plan,
+)
+from telegram_kol_research.protection_incident_convergence import (
+    PROTECTION_INCIDENT_CLASSIFICATIONS,
+    audit_protection_incident_convergence,
 )
 from telegram_kol_research.production_safety_monitor import (
     MonitorExpectations,
@@ -3534,6 +3539,93 @@ def audit_management_batches(
         "audit_payload="
         + json.dumps(audit, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     )
+
+
+@app.command("audit-protection-incidents")
+def audit_protection_incidents(
+    database_path: Path = typer.Option(
+        Path("data/research.db"), "--database-path"
+    ),
+    limit: int = typer.Option(100, "--limit", min=1, max=100),
+    output_format: str = typer.Option("text", "--output-format"),
+) -> None:
+    """Classify historical protection incidents without writes or alerts."""
+
+    normalized_format = str(output_format).strip().lower()
+    if normalized_format not in {"json", "text"}:
+        raise typer.BadParameter("output-format must be one of: text, json")
+    resolved_path = database_path.expanduser().resolve()
+    if not resolved_path.is_file():
+        raise typer.BadParameter(
+            "database path must name an existing file; no file was created"
+        )
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="protection-incident-audit-"
+        ) as temporary:
+            snapshot_path, snapshot_info = _build_stable_private_snapshots(
+                resolved_path, Path(temporary)
+            )
+            snapshot_session_factory = create_existing_session_factory(snapshot_path)
+            try:
+                exchange_snapshot = (
+                    load_deepcoin_execution_reconciliation_snapshot_read_only(
+                        snapshot_session_factory,
+                        client=build_deepcoin_client_from_env(),
+                    )
+                )
+            except Exception:
+                exchange_snapshot = SimpleNamespace(
+                    positions=[],
+                    pending_trigger_orders=[],
+                    errors={"exchange_snapshot": "unavailable"},
+                )
+            audit = audit_protection_incident_convergence(
+                snapshot_session_factory,
+                snapshot=exchange_snapshot,
+                limit=limit,
+                database_evidence_stable=(
+                    snapshot_info.get("snapshot_status") == "stable"
+                    and snapshot_info.get("snapshot_validation") == "ok"
+                ),
+            )
+            audit = {**snapshot_info, **audit}
+    except (ManagementAuditSnapshotError, OSError, sqlite3.Error):
+        audit = {
+            "schema_version": 1,
+            "mode": "read_only",
+            "snapshot_status": "snapshot_unavailable",
+            "snapshot_validation": "not_run",
+            "limit": limit,
+            "counts": {
+                name: 0 for name in PROTECTION_INCIDENT_CLASSIFICATIONS
+            },
+            "incident_total": 0,
+            "incidents_returned": 0,
+            "incidents_truncated": False,
+            "exchange_snapshot_complete": False,
+            "database_evidence_stable": False,
+            "output_complete": False,
+            "incidents": [],
+        }
+    if normalized_format == "json":
+        typer.echo(json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    typer.echo(
+        " ".join(
+            (
+                f"snapshot_status={audit.get('snapshot_status', 'unknown')}",
+                f"output_complete={str(audit['output_complete']).lower()}",
+                f"incident_total={audit['incident_total']}",
+                *(f"{name}={audit['counts'][name]}" for name in PROTECTION_INCIDENT_CLASSIFICATIONS),
+            )
+        )
+    )
+    for item in audit["incidents"]:
+        typer.echo(
+            f"- incident={item['incident_ref']} position={item['position_ref']} "
+            f"classification={item['classification']} type={item['incident_type']}"
+        )
 
 
 @app.command("repair-position-attribution")

@@ -1,0 +1,223 @@
+import json
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+
+from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.models import (
+    ExecutionBinding,
+    ExecutionOrderLeg,
+    PositionBackupStopOrder,
+    PositionProtectionIncident,
+    PositionProtectionLedger,
+    PositionProtectionRevision,
+)
+from telegram_kol_research.protection_incident_convergence import (
+    audit_protection_incident_convergence,
+)
+
+
+NOW = datetime(2026, 8, 7, 2, 0, tzinfo=UTC)
+
+
+def _incident(session, *, suffix, pos_id, binding_status="active"):
+    binding = ExecutionBinding(
+        strategy_instance_id=f"strategy-{suffix}",
+        kol_id="kol",
+        chat_id=1,
+        message_id=int(suffix),
+        symbol="BTC",
+        side="long",
+        status=binding_status,
+    )
+    session.add(binding)
+    session.flush()
+    leg = ExecutionOrderLeg(
+        execution_binding_id=binding.id,
+        strategy_instance_id=binding.strategy_instance_id,
+        leg_index=0,
+        purpose="entry",
+        order_kind="market",
+        pos_id=pos_id,
+        status="active" if binding_status == "active" else "closed",
+    )
+    session.add(leg)
+    session.flush()
+    incident = PositionProtectionIncident(
+        execution_binding_id=binding.id,
+        execution_order_leg_id=leg.id,
+        pos_id=pos_id,
+        incident_type="protection_missing",
+        fingerprint=(suffix * 64)[:64],
+        evidence_json='{"secret":"must-not-render"}',
+        delivery_status="pending",
+        created_at=NOW - timedelta(hours=1),
+        updated_at=NOW - timedelta(hours=1),
+    )
+    session.add(incident)
+    session.flush()
+    return binding, leg, incident
+
+
+def _complete_replacement(session, *, binding, leg, pos_id):
+    replacements = [
+        ("primary_stop", "stop_loss", "primary-current", "64100"),
+        ("backup_stop", "backup_stop", "backup-current", "63900"),
+        ("take_profit", "take_profit", "tp-current", "66000"),
+    ]
+    for role, purpose, order_id, price in replacements:
+        session.add(
+            PositionProtectionLedger(
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                pos_id=pos_id,
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id=order_id,
+                purpose=purpose,
+                trigger_price=price,
+                size_text="1",
+                status="verified",
+                evidence_source="management_tpsl_readback",
+                evidence_json="{}",
+            )
+        )
+    session.add(
+        PositionProtectionRevision(
+            execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            pos_id=pos_id,
+            source="management_tpsl_readback",
+            status="active",
+            protection_json=json.dumps(
+                {
+                    "roles": [item[0] for item in replacements],
+                    "order_ids": [item[2] for item in replacements],
+                    "replacements": [
+                        {
+                            "role": role,
+                            "order_id": order_id,
+                            "trigger_price": price,
+                            "size_text": "1",
+                        }
+                        for role, _purpose, order_id, price in replacements
+                    ],
+                }
+            ),
+            created_at=NOW,
+            updated_at=NOW,
+        )
+    )
+    session.add(
+        PositionBackupStopOrder(
+            execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id,
+            pos_id=pos_id,
+            instrument_id="BTC-USDT-SWAP",
+            side="long",
+            trigger_price="63900",
+            order_id="backup-current",
+            client_order_id=f"backup-{pos_id}",
+            status="active",
+            request_json="{}",
+        )
+    )
+
+
+def test_audit_classifies_live_before_history_and_redacts_output(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        resolved = _incident(session, suffix="1", pos_id="pos-resolved")
+        _complete_replacement(
+            session, binding=resolved[0], leg=resolved[1], pos_id="pos-resolved"
+        )
+        _incident(session, suffix="2", pos_id="pos-risk")
+        _incident(
+            session,
+            suffix="3",
+            pos_id="pos-terminal",
+            binding_status="closed",
+        )
+        _incident(session, suffix="4", pos_id="pos-unknown")
+        session.commit()
+
+    snapshot = SimpleNamespace(
+        positions=[
+            {"posId": "pos-resolved", "pos": "1"},
+            {"posId": "pos-risk", "pos": "1"},
+        ],
+        pending_trigger_orders=[
+            {"ordId": "primary-current", "posId": "pos-resolved"},
+            {"ordId": "backup-current", "posId": "pos-resolved"},
+            {"ordId": "tp-current", "posId": "pos-resolved"},
+        ],
+        errors={},
+    )
+
+    result = audit_protection_incident_convergence(
+        session_factory, snapshot=snapshot, limit=100
+    )
+
+    assert result["counts"] == {
+        "resolved_by_current_exchange_evidence": 1,
+        "current_risk": 1,
+        "historical_terminal": 1,
+        "evidence_insufficient": 1,
+    }
+    assert [item["classification"] for item in result["incidents"]] == [
+        "resolved_by_current_exchange_evidence",
+        "current_risk",
+        "historical_terminal",
+        "evidence_insufficient",
+    ]
+    assert result["output_complete"] is True
+    rendered = json.dumps(result)
+    assert "must-not-render" not in rendered
+    assert "primary-current" not in rendered
+    assert "pos-resolved" not in rendered
+
+
+def test_incomplete_exchange_snapshot_never_resolves_and_marks_output_incomplete(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        resolved = _incident(session, suffix="5", pos_id="pos-resolved")
+        _complete_replacement(
+            session, binding=resolved[0], leg=resolved[1], pos_id="pos-resolved"
+        )
+        session.commit()
+
+    result = audit_protection_incident_convergence(
+        session_factory,
+        snapshot=SimpleNamespace(
+            positions=[{"posId": "pos-resolved", "pos": "1"}],
+            pending_trigger_orders=[],
+            errors={"pending_trigger_orders": "unavailable"},
+        ),
+        limit=100,
+    )
+
+    assert result["counts"]["resolved_by_current_exchange_evidence"] == 0
+    assert result["counts"]["evidence_insufficient"] == 1
+    assert result["output_complete"] is False
+
+
+def test_audit_is_bounded_and_reports_truncation(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        for suffix in ("6", "7", "8"):
+            _incident(session, suffix=suffix, pos_id=f"pos-{suffix}")
+        session.commit()
+
+    result = audit_protection_incident_convergence(
+        session_factory,
+        snapshot=SimpleNamespace(positions=[], pending_trigger_orders=[], errors={}),
+        limit=2,
+    )
+
+    assert result["incident_total"] == 3
+    assert result["incidents_returned"] == 2
+    assert result["incidents_truncated"] is True
+    assert result["output_complete"] is False
