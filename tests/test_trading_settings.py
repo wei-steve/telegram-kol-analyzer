@@ -43,6 +43,8 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     assert settings.context_resolution_live_chat_ids == []
     assert settings.context_resolution_enabled_for_chat(100) is False
     assert settings.entry_preamble_mode == "disabled"
+    assert settings.entry_message_assembly_v2_mode == "disabled"
+    assert settings.entry_revision_v2_mode == "disabled"
     assert not hasattr(settings, "entry_preamble_live_chat_ids")
 
 
@@ -66,6 +68,29 @@ def test_entry_preamble_rollout_settings_ignore_legacy_allowlist(tmp_path):
 def test_entry_preamble_mode_fails_closed(value):
     with pytest.raises(ValueError, match="entry_preamble_mode"):
         trading_settings_from_payload({"entry_preamble_mode": value})
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["entry_message_assembly_v2_mode", "entry_revision_v2_mode"],
+)
+def test_adjacent_entry_modes_round_trip_live(tmp_path, field_name):
+    session_factory = create_session_factory(tmp_path / "research.db")
+
+    saved = save_trading_settings(session_factory, {field_name: " LIVE "})
+
+    assert getattr(saved, field_name) == "live"
+    assert getattr(load_trading_settings(session_factory), field_name) == "live"
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["entry_message_assembly_v2_mode", "entry_revision_v2_mode"],
+)
+@pytest.mark.parametrize("value", ["unsafe", True, [], {}, 1, None])
+def test_adjacent_entry_modes_fail_closed(field_name, value):
+    with pytest.raises(ValueError, match=field_name):
+        trading_settings_from_payload({field_name: value})
 
 
 @pytest.mark.parametrize("value", ["-1001", [0], [-1001, "-1002"], {}])

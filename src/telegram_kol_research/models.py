@@ -327,6 +327,99 @@ class EntryStrategyAssembly(Base):
     )
 
 
+class EntryStrategyFragment(Base):
+    """Authoritative, non-executable entry context from one source message."""
+
+    __tablename__ = "entry_strategy_fragments"
+    __table_args__ = (
+        CheckConstraint(
+            "fragment_kind IN ('risk_multiplier', 'leg_allocation', "
+            "'supplemental_entry')",
+            name="ck_entry_strategy_fragments_kind",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'assembled', 'consumed', 'invalidated', "
+            "'expired', 'blocked')",
+            name="ck_entry_strategy_fragments_status",
+        ),
+        CheckConstraint(
+            "source_relationship IN ('before_strategy', 'after_strategy', "
+            "'unresolved')",
+            name="ck_entry_strategy_fragments_relationship",
+        ),
+        Index(
+            "ix_entry_strategy_fragments_chat_status_created",
+            "chat_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False, index=True
+    )
+    chat_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    message_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+    fragment_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_version_id: Mapped[int] = mapped_column(
+        ForeignKey("message_evidence_versions.id"), nullable=False
+    )
+    recognition_generation: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_strategy_raw_message_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=True, index=True
+    )
+    target_signal_candidate_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("signal_candidates.id"), nullable=True
+    )
+    target_strategy_thread_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("strategy_threads.id"), nullable=True
+    )
+    target_lifecycle_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("strategy_lifecycles.id"), nullable=True
+    )
+    source_relationship: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="unresolved", server_default="unresolved"
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending", server_default="pending", index=True
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    assembled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    invalidated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    expired_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    blocked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now)
+
+
+class EntryAssemblyFragment(Base):
+    """Immutable association between an entry assembly and one fragment."""
+
+    __tablename__ = "entry_assembly_fragments"
+    __table_args__ = (
+        UniqueConstraint(
+            "entry_strategy_assembly_id",
+            "entry_strategy_fragment_id",
+            name="uq_entry_assembly_fragments_pair",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    entry_strategy_assembly_id: Mapped[int] = mapped_column(
+        ForeignKey("entry_strategy_assemblies.id"), nullable=False, index=True
+    )
+    entry_strategy_fragment_id: Mapped[int] = mapped_column(
+        ForeignKey("entry_strategy_fragments.id"), nullable=False, unique=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now)
+
+
 class MessageEvidenceExtractionClaim(Base):
     __tablename__ = "message_evidence_extraction_claims"
 

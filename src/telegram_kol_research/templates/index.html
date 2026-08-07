@@ -368,6 +368,22 @@
               <option value="live" {% if trading_settings.entry_preamble_mode == 'live' %}selected{% endif %}>实盘：所有已配置交易群组</option>
             </select>
           </label>
+          <label>
+            相邻入场消息组装
+            <select name="entry_message_assembly_v2_mode">
+              <option value="disabled" {% if trading_settings.entry_message_assembly_v2_mode == 'disabled' %}selected{% endif %}>关闭：保持现有入场路径</option>
+              <option value="shadow" {% if trading_settings.entry_message_assembly_v2_mode == 'shadow' %}selected{% endif %}>影子：只记录组装建议</option>
+              <option value="live" {% if trading_settings.entry_message_assembly_v2_mode == 'live' %}selected{% endif %}>实盘：按相邻消息组装</option>
+            </select>
+          </label>
+          <label>
+            已提交入场修订
+            <select name="entry_revision_v2_mode">
+              <option value="disabled" {% if trading_settings.entry_revision_v2_mode == 'disabled' %}selected{% endif %}>关闭：不修订已提交订单</option>
+              <option value="shadow" {% if trading_settings.entry_revision_v2_mode == 'shadow' %}selected{% endif %}>影子：只生成修订计划</option>
+              <option value="live" {% if trading_settings.entry_revision_v2_mode == 'live' %}selected{% endif %}>实盘：精确撤单与重建</option>
+            </select>
+          </label>
           <label>默认单笔最大亏损 USDT<input name="default_max_loss_usdt" type="number" min="1" step="1" value="{{ trading_settings.default_max_loss_usdt }}" /></label>
           <label>每日最大亏损 USDT<input name="daily_max_loss_usdt" type="number" min="1" step="1" value="{{ trading_settings.daily_max_loss_usdt }}" /></label>
           <label>每群组最大有效持仓数<input name="max_concurrent_positions" type="number" min="1" step="1" value="{{ trading_settings.max_concurrent_positions }}" /></label>

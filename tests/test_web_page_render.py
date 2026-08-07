@@ -732,6 +732,18 @@ def test_entry_preamble_rollout_controls_are_explicitly_dormant_by_default(tmp_p
     assert '实盘：所有已配置交易群组' in response.text
 
 
+def test_adjacent_entry_rollout_controls_are_dormant_by_default(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/more-panel")
+
+    assert response.status_code == 200
+    assert 'name="entry_message_assembly_v2_mode"' in response.text
+    assert 'name="entry_revision_v2_mode"' in response.text
+    assert "相邻入场消息组装" in response.text
+    assert "已提交入场修订" in response.text
+
+
 def test_more_panel_labels_position_limit_as_per_group(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 

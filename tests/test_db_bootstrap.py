@@ -20,6 +20,8 @@ def test_database_bootstrap_creates_tables(tmp_path):
     assert "runtime_agent_recovery_attempts" in tables
     assert "entry_preambles" in tables
     assert "entry_strategy_assemblies" in tables
+    assert "entry_strategy_fragments" in tables
+    assert "entry_assembly_fragments" in tables
     assert engine is not None
 
 
@@ -45,8 +47,35 @@ def test_entry_preamble_tables_are_added_to_existing_database(tmp_path):
             "SELECT value FROM legacy_rows WHERE id = 1"
         ).fetchone()[0]
 
-    assert {"entry_preambles", "entry_strategy_assemblies"} <= tables
+    assert {
+        "entry_preambles",
+        "entry_strategy_assemblies",
+        "entry_strategy_fragments",
+        "entry_assembly_fragments",
+    } <= tables
     assert legacy_value == "keep"
+
+
+def test_entry_fragment_schema_enforces_kind_status_and_unique_association(tmp_path):
+    database_path = tmp_path / "research.db"
+    create_session_factory(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        fragment_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='entry_strategy_fragments'"
+        ).fetchone()[0]
+        link_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='entry_assembly_fragments'"
+        ).fetchone()[0]
+
+    assert "risk_multiplier" in fragment_sql
+    assert "leg_allocation" in fragment_sql
+    assert "supplemental_entry" in fragment_sql
+    assert "pending" in fragment_sql
+    assert "blocked" in fragment_sql
+    assert "UNIQUE (entry_strategy_assembly_id, entry_strategy_fragment_id)" in link_sql
 
 
 def test_cleanup_notification_columns_are_added_to_existing_execution_events(tmp_path):

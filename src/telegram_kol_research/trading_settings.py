@@ -72,6 +72,10 @@ class TradingSettings:
         "disabled", "shadow", "live"
     ] = "disabled"
     entry_preamble_mode: Literal["disabled", "shadow", "live"] = "disabled"
+    entry_message_assembly_v2_mode: Literal[
+        "disabled", "shadow", "live"
+    ] = "disabled"
+    entry_revision_v2_mode: Literal["disabled", "shadow", "live"] = "disabled"
     default_max_loss_usdt: float = 20.0
     daily_max_loss_usdt: float = 500.0
     max_concurrent_positions: int = 4
@@ -311,6 +315,17 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
     entry_preamble_mode = _entry_preamble_mode(
         raw.get("entry_preamble_mode", defaults.entry_preamble_mode)
     )
+    entry_message_assembly_v2_mode = _rollout_mode(
+        raw.get(
+            "entry_message_assembly_v2_mode",
+            defaults.entry_message_assembly_v2_mode,
+        ),
+        field_name="entry_message_assembly_v2_mode",
+    )
+    entry_revision_v2_mode = _rollout_mode(
+        raw.get("entry_revision_v2_mode", defaults.entry_revision_v2_mode),
+        field_name="entry_revision_v2_mode",
+    )
     return TradingSettings(
         auto_trade_enabled=_boolean_setting(
             raw,
@@ -327,6 +342,8 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         trigger_protection_stop_rescue_mode=trigger_protection_stop_rescue_mode,
         position_management_liveness_v2_mode=position_management_liveness_v2_mode,
         entry_preamble_mode=entry_preamble_mode,
+        entry_message_assembly_v2_mode=entry_message_assembly_v2_mode,
+        entry_revision_v2_mode=entry_revision_v2_mode,
         default_max_loss_usdt=_positive_float(
             raw.get("default_max_loss_usdt"),
             defaults.default_max_loss_usdt,

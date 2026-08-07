@@ -1208,6 +1208,34 @@ def test_entry_preamble_rollout_api_rejects_invalid_mode(tmp_path):
     assert "entry_preamble_mode" in response.json()["detail"]
 
 
+def test_adjacent_entry_rollout_api_round_trips_shadow(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.post(
+        "/api/trading-settings",
+        json={
+            "entry_message_assembly_v2_mode": "shadow",
+            "entry_revision_v2_mode": "shadow",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["entry_message_assembly_v2_mode"] == "shadow"
+    assert response.json()["entry_revision_v2_mode"] == "shadow"
+
+
+def test_adjacent_entry_rollout_api_rejects_invalid_mode(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.post(
+        "/api/trading-settings",
+        json={"entry_message_assembly_v2_mode": "unsafe"},
+    )
+
+    assert response.status_code == 422
+    assert "entry_message_assembly_v2_mode" in response.json()["detail"]
+
+
 def test_management_execution_mode_api_rejects_invalid_value(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
