@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
+    EntryPreamble,
     MessageEvidenceExtractionClaim,
     MessageEvidenceVersion,
     RawMessage,
@@ -108,7 +109,7 @@ def test_live_admission_persists_defer_and_wakes_once_on_terminal_evidence(tmp_p
         now=NOW + timedelta(seconds=4),
     )
 
-    assert first == (strategy_id,)
+    assert tuple(item.strategy_raw_message_id for item in first) == (strategy_id,)
     assert repeated == ()
 
 
@@ -133,6 +134,135 @@ def test_shadow_records_proposal_without_deferring(tmp_path):
     assert decision.proposed_status == "deferred"
     with session_factory() as session:
         assert session.query(EntryAssemblyAttempt).one().status == "shadow"
+
+
+def test_failed_wakeup_releases_claim_for_durable_retry(tmp_path):
+    from telegram_kol_research.entry_assembly_admission import (
+        assess_entry_assembly_admission,
+        claim_ready_entry_assembly_wakeups,
+        finish_entry_assembly_wakeup,
+    )
+
+    session_factory = create_session_factory(tmp_path / "wakeup-retry.db")
+    strategy_id, candidate_id, later_id = _persist_strategy_and_later_claim(
+        session_factory
+    )
+    assess_entry_assembly_admission(
+        session_factory,
+        strategy_raw_message_id=strategy_id,
+        signal_candidate_id=candidate_id,
+        mode="live",
+        assessed_at=NOW + timedelta(seconds=2),
+    )
+
+    first_claims = claim_ready_entry_assembly_wakeups(
+        session_factory,
+        completed_raw_message_id=later_id,
+        now=NOW + timedelta(seconds=3),
+    )
+    assert tuple(item.strategy_raw_message_id for item in first_claims) == (strategy_id,)
+    first_claim = first_claims[0]
+    finish_entry_assembly_wakeup(
+        session_factory,
+        attempt_id=first_claim.attempt_id,
+        claim_token=first_claim.claim_token,
+        succeeded=False,
+        now=NOW + timedelta(seconds=4),
+    )
+
+    retried = claim_ready_entry_assembly_wakeups(
+        session_factory,
+        completed_raw_message_id=later_id,
+        now=NOW + timedelta(seconds=5),
+    )
+    assert tuple(item.strategy_raw_message_id for item in retried) == (strategy_id,)
+
+
+def test_stale_wakeup_claim_is_reclaimed_on_later_worker_scan(tmp_path):
+    from telegram_kol_research.entry_assembly_admission import (
+        assess_entry_assembly_admission,
+        claim_ready_entry_assembly_wakeups,
+    )
+
+    session_factory = create_session_factory(tmp_path / "stale-wakeup.db")
+    strategy_id, candidate_id, later_id = _persist_strategy_and_later_claim(
+        session_factory
+    )
+    assess_entry_assembly_admission(
+        session_factory,
+        strategy_raw_message_id=strategy_id,
+        signal_candidate_id=candidate_id,
+        mode="live",
+        assessed_at=NOW + timedelta(seconds=2),
+    )
+    first = claim_ready_entry_assembly_wakeups(
+        session_factory,
+        completed_raw_message_id=later_id,
+        now=NOW + timedelta(seconds=3),
+    )
+    assert len(first) == 1
+
+    recovered = claim_ready_entry_assembly_wakeups(
+        session_factory,
+        completed_raw_message_id=999999,
+        now=NOW + timedelta(minutes=6),
+    )
+
+    assert len(recovered) == 1
+    assert recovered[0].attempt_id == first[0].attempt_id
+
+
+def test_two_blockers_are_removed_without_lost_wakeup(tmp_path):
+    from telegram_kol_research.entry_assembly_admission import (
+        assess_entry_assembly_admission,
+        claim_ready_entry_assembly_wakeups,
+    )
+
+    session_factory = create_session_factory(tmp_path / "two-blockers.db")
+    strategy_id, candidate_id, first_later_id = _persist_strategy_and_later_claim(
+        session_factory
+    )
+    with session_factory() as session:
+        first_later = session.get(RawMessage, first_later_id)
+        second_later = RawMessage(
+            chat_id=first_later.chat_id,
+            message_id=first_later.message_id + 1,
+            posted_at=first_later.posted_at + timedelta(seconds=1),
+            text="more context",
+        )
+        session.add(second_later)
+        session.flush()
+        session.add(
+            MessageEvidenceExtractionClaim(
+                raw_message_id=second_later.id,
+                input_fingerprint="second",
+                claim_token="second-claim",
+                claimed_at=NOW,
+                lease_expires_at=NOW + timedelta(minutes=5),
+            )
+        )
+        second_later_id = second_later.id
+        session.commit()
+    assess_entry_assembly_admission(
+        session_factory,
+        strategy_raw_message_id=strategy_id,
+        signal_candidate_id=candidate_id,
+        mode="live",
+        assessed_at=NOW + timedelta(seconds=3),
+    )
+
+    assert claim_ready_entry_assembly_wakeups(
+        session_factory,
+        completed_raw_message_id=first_later_id,
+        now=NOW + timedelta(seconds=4),
+    ) == ()
+    final = claim_ready_entry_assembly_wakeups(
+        session_factory,
+        completed_raw_message_id=second_later_id,
+        now=NOW + timedelta(seconds=5),
+    )
+
+    assert tuple(item.strategy_raw_message_id for item in final) == (strategy_id,)
 
 
 def test_different_chat_and_later_hard_boundary_do_not_defer(tmp_path):
@@ -175,3 +305,161 @@ def test_different_chat_and_later_hard_boundary_do_not_defer(tmp_path):
     )
 
     assert decision.status == "ready"
+
+
+def test_completed_fragment_evidence_without_durable_fragment_stays_deferred(tmp_path):
+    from telegram_kol_research.entry_assembly_admission import (
+        assess_entry_assembly_admission,
+    )
+
+    session_factory = create_session_factory(tmp_path / "fragment-apply-gap.db")
+    strategy_id, candidate_id, later_id = _persist_strategy_and_later_claim(
+        session_factory
+    )
+    with session_factory() as session:
+        session.query(MessageEvidenceExtractionClaim).filter_by(
+            raw_message_id=later_id
+        ).delete()
+        session.add(
+            MessageEvidenceVersion(
+                raw_message_id=later_id,
+                version=1,
+                input_fingerprint="later-input",
+                model="mimo",
+                prompt_versions_json="{}",
+                extraction_status="completed",
+                confidence=1,
+                text_evidence_json="{}",
+                image_evidence_json="{}",
+                normalized_evidence_json='{"recognition_result":"非策略","strategy":{},"lifecycle_event":{"event_type":"none"},"entry_fragments":[{"kind":"risk_multiplier","symbol":"BTC","side":"short","risk_multiplier":"0.5","confidence":1,"reason":"50%"}]}',
+            )
+        )
+        session.commit()
+
+    decision = assess_entry_assembly_admission(
+        session_factory,
+        strategy_raw_message_id=strategy_id,
+        signal_candidate_id=candidate_id,
+        mode="live",
+        assessed_at=NOW + timedelta(seconds=2),
+    )
+
+    assert decision.status == "deferred"
+
+
+def test_completed_strategy_evidence_without_candidate_stays_deferred(tmp_path):
+    from telegram_kol_research.entry_assembly_admission import (
+        assess_entry_assembly_admission,
+    )
+
+    session_factory = create_session_factory(tmp_path / "candidate-apply-gap.db")
+    strategy_id, candidate_id, later_id = _persist_strategy_and_later_claim(
+        session_factory
+    )
+    with session_factory() as session:
+        session.query(MessageEvidenceExtractionClaim).filter_by(
+            raw_message_id=later_id
+        ).delete()
+        session.add(
+            MessageEvidenceVersion(
+                raw_message_id=later_id,
+                version=1,
+                input_fingerprint="later-input",
+                model="mimo",
+                prompt_versions_json="{}",
+                extraction_status="completed",
+                confidence=1,
+                text_evidence_json="{}",
+                image_evidence_json="{}",
+                normalized_evidence_json='{"recognition_result":"是策略","strategy":{"symbol":"ETH","side":"long"},"lifecycle_event":{"event_type":"none"}}',
+            )
+        )
+        session.commit()
+
+    decision = assess_entry_assembly_admission(
+        session_factory,
+        strategy_raw_message_id=strategy_id,
+        signal_candidate_id=candidate_id,
+        mode="live",
+        assessed_at=NOW + timedelta(seconds=2),
+    )
+
+    assert decision.status == "deferred"
+
+
+def test_preamble_outside_adjacent_time_window_is_not_selected(tmp_path):
+    from telegram_kol_research.entry_assembly_admission import (
+        assess_entry_assembly_admission,
+    )
+
+    session_factory = create_session_factory(tmp_path / "expired-adjacency.db")
+    with session_factory() as session:
+        old = RawMessage(
+            chat_id=100,
+            message_id=900,
+            posted_at=NOW - timedelta(minutes=31),
+            text="half",
+        )
+        strategy = RawMessage(
+            chat_id=100,
+            message_id=1000,
+            posted_at=NOW,
+            text="entry",
+        )
+        session.add_all([old, strategy])
+        session.flush()
+        evidence = MessageEvidenceVersion(
+            raw_message_id=old.id,
+            version=1,
+            input_fingerprint="old",
+            model="mimo",
+            prompt_versions_json="{}",
+            extraction_status="completed",
+            confidence=1,
+            text_evidence_json="{}",
+            image_evidence_json="{}",
+            normalized_evidence_json="{}",
+        )
+        session.add(evidence)
+        session.flush()
+        session.add(
+            EntryPreamble(
+                raw_message_id=old.id,
+                chat_id=100,
+                message_id=900,
+                symbol="BTC",
+                side="short",
+                risk_multiplier="0.5",
+                evidence_version_id=evidence.id,
+                recognition_generation="old",
+                fingerprint="9" * 64,
+                status="pending",
+                reason="half",
+                created_at=old.posted_at,
+                updated_at=old.posted_at,
+            )
+        )
+        candidate = SignalCandidate(
+            raw_message_id=strategy.id,
+            symbol="BTC",
+            side="short",
+            event_type="entry_signal",
+            parse_source="mimo_authoritative",
+            confidence=1,
+        )
+        session.add(candidate)
+        session.flush()
+        ids = strategy.id, candidate.id
+        session.commit()
+
+    decision = assess_entry_assembly_admission(
+        session_factory,
+        strategy_raw_message_id=ids[0],
+        signal_candidate_id=ids[1],
+        mode="live",
+        assessed_at=NOW,
+    )
+
+    assert decision.status == "ready"
+    assert decision.selection.risk_multiplier == 1
+    assert decision.selection.legacy_preamble_ids == ()

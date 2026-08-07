@@ -626,7 +626,7 @@ def test_v2_live_assembly_atomically_consumes_multiple_fragments(tmp_path):
             symbol="BTC",
             side="short",
             fragment_kind="supplemental_entry",
-            payload_json='{"prices":["63400"]}',
+            payload_json='{"entry_price":"63400"}',
             evidence_version_id=evidence_after.id,
             recognition_generation="g-after",
             source_relationship="unresolved",
@@ -671,3 +671,154 @@ def test_v2_live_assembly_atomically_consumes_multiple_fragments(tmp_path):
             session.get(EntryStrategyFragment, ids[3]).status,
         } == {"consumed"}
         assert session.get(EntryPreamble, ids[4]).status == "consumed"
+
+
+def test_v2_live_adapts_pending_legacy_preamble(tmp_path):
+    from telegram_kol_research.entry_strategy_assembly import (
+        assemble_adjacent_entry_strategy,
+    )
+
+    session_factory = create_session_factory(tmp_path / "v2-legacy.db")
+    strategy_raw_id, candidate_id, preamble_id = _persist_pair(session_factory)
+    with session_factory() as session:
+        preamble = session.get(EntryPreamble, preamble_id)
+        evidence = session.get(MessageEvidenceVersion, preamble.evidence_version_id)
+        evidence.normalized_evidence_json = (
+            '{"entry_fragments":[{"kind":"risk_multiplier","symbol":"BTC",'
+            '"side":"short","risk_multiplier":"0.5","confidence":0.96,'
+            '"reason":"half"}]}'
+        )
+        session.commit()
+
+    result = assemble_adjacent_entry_strategy(
+        session_factory,
+        strategy_raw_message_id=strategy_raw_id,
+        signal_candidate_id=candidate_id,
+        strategy_instance_id="deepcoin:-1002337721508:9902:BTC:short",
+        mode="live",
+        assembled_at=NOW + timedelta(minutes=2),
+        configured_risk_budget_usdt=Decimal("20"),
+        strategy_snapshot={
+            "entry_prices": ["63900", "64200"],
+            "stop_loss": "64900",
+            "take_profit": "62800",
+            "entry_execution_type": "limit",
+        },
+    )
+
+    assert result.effective_risk_multiplier == Decimal("0.5")
+    assert result.effective_risk_budget_usdt == Decimal("10.0")
+    assert result.legacy_preamble_ids == (preamble_id,)
+    with session_factory() as session:
+        assert session.get(EntryPreamble, preamble_id).status == "consumed"
+
+
+def test_v2_order_draft_snapshot_is_immutable(tmp_path):
+    from telegram_kol_research.entry_strategy_assembly import (
+        assemble_adjacent_entry_strategy,
+        finalize_adjacent_entry_assembly_draft,
+    )
+
+    session_factory = create_session_factory(tmp_path / "v2-draft-cas.db")
+    strategy_raw_id, candidate_id, _ = _persist_pair(session_factory)
+    assembly = assemble_adjacent_entry_strategy(
+        session_factory,
+        strategy_raw_message_id=strategy_raw_id,
+        signal_candidate_id=candidate_id,
+        strategy_instance_id="deepcoin:-1002337721508:9902:BTC:short",
+        mode="live",
+        assembled_at=NOW + timedelta(minutes=2),
+        configured_risk_budget_usdt=Decimal("20"),
+        strategy_snapshot={"entry_prices": ["63900", "64200"]},
+    )
+    draft = {
+        "strategy_instance_id": "deepcoin:-1002337721508:9902:BTC:short",
+        "instrument_id": "BTC-USDT-SWAP",
+        "risk_budget_usdt": 10,
+        "order_legs": [
+            {
+                "price": 64200,
+                "order_type": "limit",
+                "allocation_pct": 100,
+                "risk_budget_usdt": 10,
+                "quantity": 0.01,
+            }
+        ],
+    }
+
+    first = finalize_adjacent_entry_assembly_draft(
+        session_factory, assembly_id=assembly.assembly_id, order_draft=draft
+    )
+    repeated = finalize_adjacent_entry_assembly_draft(
+        session_factory, assembly_id=assembly.assembly_id, order_draft=draft
+    )
+
+    assert repeated == first
+    conflicting = {**draft, "risk_budget_usdt": 9}
+    with pytest.raises(RuntimeError, match="entry_assembly_draft_conflict"):
+        finalize_adjacent_entry_assembly_draft(
+            session_factory,
+            assembly_id=assembly.assembly_id,
+            order_draft=conflicting,
+        )
+
+
+def test_v2_legacy_preamble_does_not_mask_conflicting_expected_fragments(tmp_path):
+    from telegram_kol_research.entry_strategy_assembly import (
+        assemble_adjacent_entry_strategy,
+    )
+
+    session_factory = create_session_factory(tmp_path / "v2-legacy-conflict.db")
+    strategy_raw_id, candidate_id, preamble_id = _persist_pair(session_factory)
+    with session_factory() as session:
+        preamble = session.get(EntryPreamble, preamble_id)
+        evidence = session.get(MessageEvidenceVersion, preamble.evidence_version_id)
+        evidence.normalized_evidence_json = (
+            '{"entry_fragments":['
+            '{"kind":"risk_multiplier","symbol":"BTC","side":"short",'
+            '"risk_multiplier":"0.5","confidence":0.96,"reason":"half"},'
+            '{"kind":"risk_multiplier","symbol":"BTC","side":"short",'
+            '"risk_multiplier":"0.3","confidence":0.96,"reason":"thirty"}'
+            "]}"
+        )
+        session.commit()
+
+    result = assemble_adjacent_entry_strategy(
+        session_factory,
+        strategy_raw_message_id=strategy_raw_id,
+        signal_candidate_id=candidate_id,
+        strategy_instance_id="deepcoin:-1002337721508:9902:BTC:short",
+        mode="live",
+        assembled_at=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "unresolved"
+
+
+def test_v2_legacy_preamble_does_not_mask_mismatched_expected_fragment(tmp_path):
+    from telegram_kol_research.entry_strategy_assembly import (
+        assemble_adjacent_entry_strategy,
+    )
+
+    session_factory = create_session_factory(tmp_path / "v2-legacy-mismatch.db")
+    strategy_raw_id, candidate_id, preamble_id = _persist_pair(session_factory)
+    with session_factory() as session:
+        preamble = session.get(EntryPreamble, preamble_id)
+        evidence = session.get(MessageEvidenceVersion, preamble.evidence_version_id)
+        evidence.normalized_evidence_json = (
+            '{"entry_fragments":[{"kind":"risk_multiplier","symbol":"ETH",'
+            '"side":"long","risk_multiplier":"0.5","confidence":0.96,'
+            '"reason":"half"}]}'
+        )
+        session.commit()
+
+    result = assemble_adjacent_entry_strategy(
+        session_factory,
+        strategy_raw_message_id=strategy_raw_id,
+        signal_candidate_id=candidate_id,
+        strategy_instance_id="deepcoin:-1002337721508:9902:BTC:short",
+        mode="live",
+        assembled_at=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "unresolved"

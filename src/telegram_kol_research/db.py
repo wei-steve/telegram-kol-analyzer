@@ -650,8 +650,9 @@ def _make_sqlite_entry_assembly_preamble_nullable(engine: Engine) -> None:
     if engine.dialect.name != "sqlite":
         return
     raw_connection = engine.raw_connection()
+    cursor = raw_connection.cursor()
+    foreign_keys_enabled = False
     try:
-        cursor = raw_connection.cursor()
         columns = cursor.execute(
             "PRAGMA table_info(entry_strategy_assemblies)"
         ).fetchall()
@@ -660,9 +661,13 @@ def _make_sqlite_entry_assembly_preamble_nullable(engine: Engine) -> None:
         )
         if preamble_column is None or int(preamble_column[3]) == 0:
             return
-        foreign_keys_enabled = int(cursor.execute("PRAGMA foreign_keys").fetchone()[0])
+        foreign_keys_enabled = bool(
+            int(cursor.execute("PRAGMA foreign_keys").fetchone()[0])
+        )
         if foreign_keys_enabled:
             cursor.execute("PRAGMA foreign_keys=OFF")
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("DROP TABLE IF EXISTS entry_strategy_assemblies_nullable")
         cursor.execute(
             """
             CREATE TABLE entry_strategy_assemblies_nullable (
@@ -704,9 +709,12 @@ def _make_sqlite_entry_assembly_preamble_nullable(engine: Engine) -> None:
             "ON entry_strategy_assemblies (strategy_raw_message_id)"
         )
         raw_connection.commit()
+    except Exception:
+        raw_connection.rollback()
+        raise
+    finally:
         if foreign_keys_enabled:
             cursor.execute("PRAGMA foreign_keys=ON")
-    finally:
         raw_connection.close()
 
 

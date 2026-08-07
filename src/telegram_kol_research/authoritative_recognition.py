@@ -1031,20 +1031,22 @@ def process_authoritative_message(
             completed_raw_message_id=int(raw_message_id),
             now=wake_now,
         )
-        for wake_strategy_id in wake_strategy_ids:
+        for wake_claim in wake_strategy_ids:
             try:
-                auto_trade_executor(int(wake_strategy_id))
+                auto_trade_executor(int(wake_claim.strategy_raw_message_id))
             except Exception:
                 finish_entry_assembly_wakeup(
                     session_factory,
-                    strategy_raw_message_id=int(wake_strategy_id),
+                    attempt_id=int(wake_claim.attempt_id),
+                    claim_token=str(wake_claim.claim_token),
                     succeeded=False,
                     now=utc_now(),
                 )
                 raise
             finish_entry_assembly_wakeup(
                 session_factory,
-                strategy_raw_message_id=int(wake_strategy_id),
+                attempt_id=int(wake_claim.attempt_id),
+                claim_token=str(wake_claim.claim_token),
                 succeeded=True,
                 now=utc_now(),
             )

@@ -18,6 +18,7 @@ HARD_BOUNDARY_KINDS = frozenset(
         "expired_adjacency",
     }
 )
+MAX_SUPPLEMENTAL_ENTRY_PRICES = 3
 
 
 def source_order_key(
@@ -74,6 +75,7 @@ class AdjacentEntryDecision:
     supplemental_prices: tuple[Decimal, ...]
     boundary_evidence: tuple[int, ...]
     pending_raw_message_ids: tuple[int, ...] = ()
+    legacy_preamble_ids: tuple[int, ...] = ()
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -114,20 +116,27 @@ def _bounded_segment(
     after = [fact for fact in eligible if fact.source_key > strategy.source_key]
     boundary_ids: list[int] = []
 
-    before_start = 0
-    for index, fact in enumerate(before):
-        if fact.kind in HARD_BOUNDARY_KINDS:
-            before_start = index + 1
-            boundary_ids.append(int(fact.raw_message_id))
-    bounded_before = before[before_start:]
+    before_boundaries = [fact for fact in before if fact.kind in HARD_BOUNDARY_KINDS]
+    if before_boundaries:
+        nearest_before_key = max(fact.source_key for fact in before_boundaries)
+        bounded_before = [
+            fact for fact in before if fact.source_key > nearest_before_key
+        ]
+        boundary_ids.extend(int(fact.raw_message_id) for fact in before_boundaries)
+    else:
+        bounded_before = before
 
-    after_end = len(after)
-    for index, fact in enumerate(after):
-        if fact.kind in HARD_BOUNDARY_KINDS:
-            after_end = index
-            boundary_ids.append(int(fact.raw_message_id))
-            break
-    return [*bounded_before, *after[:after_end]], boundary_ids
+    after_boundaries = [fact for fact in after if fact.kind in HARD_BOUNDARY_KINDS]
+    if after_boundaries:
+        nearest_after_key = min(fact.source_key for fact in after_boundaries)
+        bounded_after = [fact for fact in after if fact.source_key < nearest_after_key]
+        nearest_boundaries = [
+            fact for fact in after_boundaries if fact.source_key == nearest_after_key
+        ]
+        boundary_ids.extend(int(fact.raw_message_id) for fact in nearest_boundaries)
+    else:
+        bounded_after = after
+    return [*bounded_before, *bounded_after], boundary_ids
 
 
 def select_adjacent_entry_fragments(
@@ -214,7 +223,12 @@ def select_adjacent_entry_fragments(
                 )
             allocations = normalized
         elif fact.fragment_kind == "supplemental_entry":
-            prices = fact.payload.get("prices")
+            entry_price = fact.payload.get("entry_price")
+            prices = (
+                [entry_price]
+                if entry_price not in (None, "")
+                else fact.payload.get("prices")
+            )
             if not isinstance(prices, (list, tuple)):
                 continue
             for value in prices:
@@ -222,23 +236,46 @@ def select_adjacent_entry_fragments(
                 if parsed is not None and parsed > 0 and parsed not in supplemental_prices:
                     supplemental_prices.append(parsed)
 
+    fragment_ids = tuple(
+        int(fact.fragment_id)
+        for fact in selected
+        if int(fact.fragment_id) > 0
+    )
+    legacy_preamble_ids = tuple(
+        abs(int(fact.fragment_id))
+        for fact in selected
+        if int(fact.fragment_id) < 0
+    )
+    if len(supplemental_prices) > MAX_SUPPLEMENTAL_ENTRY_PRICES:
+        return AdjacentEntryDecision(
+            "blocked",
+            "entry_leg_count_exceeded",
+            fragment_ids,
+            Decimal("1"),
+            allocations,
+            (),
+            tuple(boundary_ids),
+            legacy_preamble_ids=legacy_preamble_ids,
+        )
     distinct_multipliers = tuple(dict.fromkeys(multipliers))
     if len(distinct_multipliers) > 1:
         return AdjacentEntryDecision(
             "blocked",
             "entry_risk_multiplier_conflict",
-            tuple(int(fact.fragment_id) for fact in selected),
+            fragment_ids,
             Decimal("1"),
             allocations,
             tuple(supplemental_prices),
             tuple(boundary_ids),
+            legacy_preamble_ids=legacy_preamble_ids,
         )
     return AdjacentEntryDecision(
         status="ready",
         reason_code=None,
-        fragment_ids=tuple(int(fact.fragment_id) for fact in selected),
+        fragment_ids=fragment_ids,
         risk_multiplier=(distinct_multipliers[0] if distinct_multipliers else Decimal("1")),
         allocations=allocations,
         supplemental_prices=tuple(supplemental_prices),
         boundary_evidence=tuple(boundary_ids),
+        legacy_preamble_ids=legacy_preamble_ids,
     )

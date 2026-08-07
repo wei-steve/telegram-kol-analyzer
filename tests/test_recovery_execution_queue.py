@@ -88,8 +88,8 @@ def test_recovery_execution_preview_lists_approved_limit_orders_only(tmp_path):
         68090.0,
     ]
     assert [leg["quantity"] for leg in row["deepcoin_order_draft"]["order_legs"]] == [
-        0.072464,
-        0.072464,
+        0.072463,
+        0.072463,
     ]
 
 

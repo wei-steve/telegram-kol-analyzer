@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from datetime import UTC, datetime
 from collections.abc import Callable
 from decimal import Decimal
@@ -24,6 +25,7 @@ from telegram_kol_research.execution_bindings import build_strategy_instance_id
 from telegram_kol_research.entry_strategy_assembly import (
     assemble_adjacent_entry_strategy,
     assemble_entry_strategy,
+    finalize_adjacent_entry_assembly_draft,
 )
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.models import (
@@ -592,6 +594,15 @@ def _auto_process_single_message_trade_signal(
         symbol=symbol,
         side=side,
     )
+    configured_risk = Decimal(
+        str(_resolve_signal_max_loss_usdt(runtime_config, symbol=symbol))
+    )
+    strategy_snapshot = {
+        "entry_prices": [str(entry_range[0]), str(entry_range[1])],
+        "stop_loss": candidate.stop_loss_text,
+        "take_profit": candidate.take_profit_text,
+        "entry_execution_type": entry_execution_type,
+    }
     if settings.entry_message_assembly_v2_mode == "live":
         assembly = assemble_adjacent_entry_strategy(
             session_factory,
@@ -600,6 +611,9 @@ def _auto_process_single_message_trade_signal(
             strategy_instance_id=strategy_instance_id,
             mode="live",
             assembled_at=now,
+            admission_decision=admission,
+            configured_risk_budget_usdt=configured_risk,
+            strategy_snapshot=strategy_snapshot,
         )
     else:
         legacy_assembly = assemble_entry_strategy(
@@ -618,37 +632,20 @@ def _auto_process_single_message_trade_signal(
                 strategy_instance_id=strategy_instance_id,
                 mode="shadow",
                 assembled_at=now,
+                admission_decision=admission,
+                configured_risk_budget_usdt=configured_risk,
+                strategy_snapshot=strategy_snapshot,
             )
-            assembly = (
-                v2_proposal
-                if v2_proposal.fragment_ids
-                else legacy_assembly
+            assembly = _overlay_v2_shadow_proposal(
+                legacy_assembly=legacy_assembly,
+                v2_proposal=v2_proposal,
             )
-            if v2_proposal.fragment_ids:
-                assembly = type(v2_proposal)(
-                    status=v2_proposal.status,
-                    reason_code=v2_proposal.reason_code,
-                    mode=v2_proposal.mode,
-                    proposed_risk_multiplier=v2_proposal.proposed_risk_multiplier,
-                    effective_risk_multiplier=legacy_assembly.effective_risk_multiplier,
-                    preamble_id=legacy_assembly.preamble_id,
-                    preamble_message_id=legacy_assembly.preamble_message_id,
-                    strategy_message_id=v2_proposal.strategy_message_id,
-                    assembly_id=legacy_assembly.assembly_id,
-                    assembly_fingerprint=v2_proposal.assembly_fingerprint,
-                    fragment_ids=v2_proposal.fragment_ids,
-                    allocations=v2_proposal.allocations,
-                    supplemental_prices=v2_proposal.supplemental_prices,
-                )
         else:
             assembly = legacy_assembly
     if assembly.status == "unresolved":
         return {"status": "deferred", "reason": assembly.reason_code}
     if assembly.status == "blocked":
         return {"status": "blocked", "reason": assembly.reason_code}
-    configured_risk = Decimal(
-        str(_resolve_signal_max_loss_usdt(runtime_config, symbol=symbol))
-    )
     multiplier = assembly.effective_risk_multiplier
     if (
         not multiplier.is_finite()
@@ -659,7 +656,14 @@ def _auto_process_single_message_trade_signal(
             "status": "blocked",
             "reason": "entry_preamble_multiplier_invalid",
         }
-    effective_risk = configured_risk * multiplier
+    if settings.entry_message_assembly_v2_mode == "live":
+        configured_risk = assembly.configured_risk_budget_usdt or configured_risk
+        effective_risk = (
+            assembly.effective_risk_budget_usdt
+            or configured_risk * multiplier
+        )
+    else:
+        effective_risk = configured_risk * multiplier
     assembly_evidence = {
         "mode": assembly.mode,
         "status": assembly.status,
@@ -672,6 +676,7 @@ def _auto_process_single_message_trade_signal(
         "strategy_message_id": int(raw_message.message_id),
         "assembly_fingerprint": assembly.assembly_fingerprint,
         "fragment_ids": list(assembly.fragment_ids),
+        "legacy_preamble_ids": list(assembly.legacy_preamble_ids),
         "entry_allocations": [str(value) for value in assembly.allocations],
         "supplemental_entry_prices": [
             str(value) for value in assembly.supplemental_prices
@@ -705,40 +710,16 @@ def _auto_process_single_message_trade_signal(
         ),
         symbol_whitelist=[str(item).upper() for item in runtime_config["symbol_whitelist"]],
     )
-    decision = RecoveryDecision(
-        action="eligible_for_recovery_limit_order",
-        reason_codes=[f"live_signal_auto_trade_{entry_execution_type}"],
-        entry_range=signal.entry_range,
-        max_loss_usdt=signal.max_loss_usdt,
-    )
-    persist_recovery_evaluations(
-        session_factory,
-        [RecoveryEvaluation(signal=signal, decision=decision)],
-        run_at=now,
-    )
-    apply_recovery_review_decision(
-        session_factory,
-        chat_id=signal.chat_id,
-        message_id=signal.message_id,
-        symbol=symbol,
-        side=side,
-        review_status="approved_for_order",
-        note="auto_trade_live_signal",
-        reviewed_at=now,
-    )
-    confirm_recovery_order_dry_run(
-        session_factory,
-        chat_id=signal.chat_id,
-        message_id=signal.message_id,
-        symbol=symbol,
-        side=side,
-        contract_spec_provider=contract_spec_provider,
-        persist_ready_confirmation=True,
-        confirmed_at=now,
-    )
     auto_draft = None
     execution_plan = None
-    if signal.entry_allocations or signal.supplemental_entry_prices:
+    if (
+        signal.entry_allocations
+        or signal.supplemental_entry_prices
+        or (
+            settings.entry_message_assembly_v2_mode == "live"
+            and (assembly.fragment_ids or assembly.legacy_preamble_ids)
+        )
+    ):
         auto_draft = _build_auto_adjacent_deepcoin_draft(
             signal=signal,
             runtime_kol_id=str(runtime_config["kol_id"]),
@@ -780,6 +761,48 @@ def _auto_process_single_message_trade_signal(
             contract_spec_provider=contract_spec_provider,
         )
         execution_plan = "range_hybrid_market_half_limit_half"
+    if auto_draft is not None:
+        if (
+            settings.entry_message_assembly_v2_mode == "live"
+            and assembly.assembly_id is not None
+        ):
+            finalized_fingerprint = finalize_adjacent_entry_assembly_draft(
+                session_factory,
+                assembly_id=int(assembly.assembly_id),
+                order_draft=auto_draft,
+            )
+            assembly_evidence["assembly_fingerprint"] = finalized_fingerprint
+    decision = RecoveryDecision(
+        action="eligible_for_recovery_limit_order",
+        reason_codes=[f"live_signal_auto_trade_{entry_execution_type}"],
+        entry_range=signal.entry_range,
+        max_loss_usdt=signal.max_loss_usdt,
+    )
+    persist_recovery_evaluations(
+        session_factory,
+        [RecoveryEvaluation(signal=signal, decision=decision)],
+        run_at=now,
+    )
+    apply_recovery_review_decision(
+        session_factory,
+        chat_id=signal.chat_id,
+        message_id=signal.message_id,
+        symbol=symbol,
+        side=side,
+        review_status="approved_for_order",
+        note="auto_trade_live_signal",
+        reviewed_at=now,
+    )
+    confirm_recovery_order_dry_run(
+        session_factory,
+        chat_id=signal.chat_id,
+        message_id=signal.message_id,
+        symbol=symbol,
+        side=side,
+        contract_spec_provider=contract_spec_provider,
+        persist_ready_confirmation=True,
+        confirmed_at=now,
+    )
     if auto_draft is not None:
         auto_draft["entry_preamble_assembly"] = assembly_evidence
         trade_signal = enqueue_trade_signal(
@@ -831,6 +854,22 @@ def _auto_process_single_message_trade_signal(
         "entry_preamble_assembly": assembly_evidence,
         "result": submit_result,
     }
+
+
+def _overlay_v2_shadow_proposal(*, legacy_assembly, v2_proposal):
+    """Attach shadow evidence without changing any legacy execution decision."""
+
+    if not v2_proposal.fragment_ids:
+        return legacy_assembly
+    return replace(
+        v2_proposal,
+        status=legacy_assembly.status,
+        reason_code=legacy_assembly.reason_code,
+        effective_risk_multiplier=legacy_assembly.effective_risk_multiplier,
+        preamble_id=legacy_assembly.preamble_id,
+        preamble_message_id=legacy_assembly.preamble_message_id,
+        assembly_id=legacy_assembly.assembly_id,
+    )
 
 
 def _record_entry_auto_trade_skip(

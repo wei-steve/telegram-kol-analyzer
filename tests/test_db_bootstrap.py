@@ -1206,6 +1206,9 @@ def test_database_bootstrap_makes_legacy_assembly_preamble_nullable(tmp_path):
         """,
         ("f" * 64,),
     )
+    conn.execute(
+        "CREATE TABLE entry_strategy_assemblies_nullable (stale INTEGER)"
+    )
     conn.commit()
     conn.close()
 

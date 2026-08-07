@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -65,6 +66,10 @@ class EntryAssemblyResult:
     fragment_ids: tuple[int, ...] = ()
     allocations: tuple[Decimal, ...] = ()
     supplemental_prices: tuple[Decimal, ...] = ()
+    legacy_preamble_ids: tuple[int, ...] = ()
+    configured_risk_budget_usdt: Decimal | None = None
+    effective_risk_budget_usdt: Decimal | None = None
+    planned_entry_leg_count: int | None = None
 
 
 def adapt_prior_fact_to_adjacent_entry_fact(
@@ -431,6 +436,24 @@ def _v2_result_from_assembly(
             Decimal(str(value))
             for value in evidence.get("supplemental_prices", [])
         ),
+        legacy_preamble_ids=tuple(
+            int(value) for value in evidence.get("legacy_preamble_ids", [])
+        ),
+        configured_risk_budget_usdt=(
+            Decimal(str(evidence["configured_risk_budget_usdt"]))
+            if evidence.get("configured_risk_budget_usdt") is not None
+            else None
+        ),
+        effective_risk_budget_usdt=(
+            Decimal(str(evidence["effective_risk_budget_usdt"]))
+            if evidence.get("effective_risk_budget_usdt") is not None
+            else None
+        ),
+        planned_entry_leg_count=(
+            int(evidence["planned_entry_leg_count"])
+            if evidence.get("planned_entry_leg_count") is not None
+            else None
+        ),
     )
 
 
@@ -442,6 +465,9 @@ def assemble_adjacent_entry_strategy(
     strategy_instance_id: str,
     mode: str,
     assembled_at: datetime,
+    admission_decision=None,
+    configured_risk_budget_usdt: Decimal | None = None,
+    strategy_snapshot: Mapping[str, object] | None = None,
 ) -> EntryAssemblyResult:
     """Propose or atomically consume a source-ordered multi-fragment assembly."""
 
@@ -498,7 +524,7 @@ def assemble_adjacent_entry_strategy(
         assess_entry_assembly_admission,
     )
 
-    admission = assess_entry_assembly_admission(
+    admission = admission_decision or assess_entry_assembly_admission(
         session_factory,
         strategy_raw_message_id=int(strategy_raw_message_id),
         signal_candidate_id=int(signal_candidate_id),
@@ -528,6 +554,7 @@ def assemble_adjacent_entry_strategy(
             "symbol": str(candidate.symbol or "").upper(),
             "side": str(candidate.side or "").lower(),
             "fragment_ids": list(selection.fragment_ids),
+            "legacy_preamble_ids": list(selection.legacy_preamble_ids),
             "risk_multiplier": str(selection.risk_multiplier),
             "allocations": [str(value) for value in selection.allocations],
             "supplemental_prices": [
@@ -539,6 +566,40 @@ def assemble_adjacent_entry_strategy(
                 int(admission.cutoff[2]),
             ],
         }
+        if configured_risk_budget_usdt is not None:
+            configured_budget = Decimal(str(configured_risk_budget_usdt))
+            if not configured_budget.is_finite() or configured_budget <= 0:
+                raise ValueError("configured risk budget must be positive and finite")
+            evidence["configured_risk_budget_usdt"] = str(configured_budget)
+            evidence["effective_risk_budget_usdt"] = str(
+                configured_budget * selection.risk_multiplier
+            )
+        if strategy_snapshot is not None:
+            bounded_snapshot = {
+                key: strategy_snapshot.get(key)
+                for key in (
+                    "entry_prices",
+                    "stop_loss",
+                    "take_profit",
+                    "entry_execution_type",
+                )
+            }
+            evidence["strategy_snapshot"] = bounded_snapshot
+            raw_entry_prices = bounded_snapshot.get("entry_prices")
+            base_prices = (
+                list(raw_entry_prices)
+                if isinstance(raw_entry_prices, (list, tuple))
+                else []
+            )
+            unique_prices: list[Decimal] = []
+            for value in base_prices:
+                parsed = Decimal(str(value))
+                if parsed not in unique_prices:
+                    unique_prices.append(parsed)
+            for value in selection.supplemental_prices:
+                if value not in unique_prices:
+                    unique_prices.append(value)
+            evidence["planned_entry_leg_count"] = len(unique_prices)
         fragment_rows = (
             session.query(EntryStrategyFragment)
             .filter(EntryStrategyFragment.id.in_(selection.fragment_ids))
@@ -551,8 +612,18 @@ def assemble_adjacent_entry_strategy(
             if selection.fragment_ids
             else []
         )
+        legacy_preambles = (
+            session.query(EntryPreamble)
+            .filter(EntryPreamble.id.in_(selection.legacy_preamble_ids))
+            .order_by(EntryPreamble.message_id.asc(), EntryPreamble.id.asc())
+            .all()
+            if selection.legacy_preamble_ids
+            else []
+        )
         if len(fragment_rows) != len(selection.fragment_ids) or any(
             row.status != "pending" for row in fragment_rows
+        ) or len(legacy_preambles) != len(selection.legacy_preamble_ids) or any(
+            row.status != "pending" for row in legacy_preambles
         ):
             existing = (
                 session.query(EntryStrategyAssembly)
@@ -580,22 +651,49 @@ def assemble_adjacent_entry_strategy(
             }
             for row in fragment_rows
         ]
+        evidence["legacy_preamble_generations"] = [
+            {
+                "preamble_id": int(row.id),
+                "evidence_version_id": int(row.evidence_version_id),
+                "recognition_generation": str(row.recognition_generation),
+                "fingerprint": str(row.fingerprint),
+            }
+            for row in legacy_preambles
+        ]
         evidence_json = json.dumps(
             evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
         fingerprint = hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()
-        if mode == "shadow" or not fragment_rows:
+        if mode == "shadow" or not (fragment_rows or legacy_preambles):
             return EntryAssemblyResult(
-                status="proposed" if fragment_rows else "none",
+                status="proposed" if (fragment_rows or legacy_preambles) else "none",
                 reason_code=None,
                 mode=mode,
                 proposed_risk_multiplier=selection.risk_multiplier,
                 effective_risk_multiplier=Decimal("1"),
                 strategy_message_id=int(strategy_message.message_id),
-                assembly_fingerprint=fingerprint if fragment_rows else None,
+                assembly_fingerprint=(
+                    fingerprint if (fragment_rows or legacy_preambles) else None
+                ),
                 fragment_ids=selection.fragment_ids,
                 allocations=selection.allocations,
                 supplemental_prices=selection.supplemental_prices,
+                legacy_preamble_ids=selection.legacy_preamble_ids,
+                configured_risk_budget_usdt=(
+                    Decimal(str(evidence["configured_risk_budget_usdt"]))
+                    if evidence.get("configured_risk_budget_usdt") is not None
+                    else None
+                ),
+                effective_risk_budget_usdt=(
+                    Decimal(str(evidence["effective_risk_budget_usdt"]))
+                    if evidence.get("effective_risk_budget_usdt") is not None
+                    else None
+                ),
+                planned_entry_leg_count=(
+                    int(evidence["planned_entry_leg_count"])
+                    if evidence.get("planned_entry_leg_count") is not None
+                    else None
+                ),
             )
         assembly = EntryStrategyAssembly(
             entry_preamble_id=None,
@@ -646,21 +744,6 @@ def assemble_adjacent_entry_strategy(
                 )
                 if int(consumed.rowcount or 0) != 1:
                     raise RuntimeError("entry fragment was not consumed exactly once")
-                if row.fragment_kind == "risk_multiplier":
-                    session.execute(
-                        update(EntryPreamble)
-                        .where(
-                            EntryPreamble.raw_message_id == int(row.raw_message_id),
-                            EntryPreamble.evidence_version_id
-                            == int(row.evidence_version_id),
-                            EntryPreamble.status == "pending",
-                        )
-                        .values(
-                            status="consumed",
-                            consumed_at=assembled_at,
-                            updated_at=assembled_at,
-                        )
-                    )
                 session.add(
                     EntryAssemblyFragment(
                         entry_strategy_assembly_id=int(assembly.id),
@@ -668,6 +751,21 @@ def assemble_adjacent_entry_strategy(
                         created_at=assembled_at,
                     )
                 )
+            for preamble in legacy_preambles:
+                consumed = session.execute(
+                    update(EntryPreamble)
+                    .where(
+                        EntryPreamble.id == int(preamble.id),
+                        EntryPreamble.status == "pending",
+                    )
+                    .values(
+                        status="consumed",
+                        consumed_at=assembled_at,
+                        updated_at=assembled_at,
+                    )
+                )
+                if int(consumed.rowcount or 0) != 1:
+                    raise RuntimeError("legacy entry preamble was not consumed exactly once")
             session.commit()
             session.refresh(assembly)
             return _v2_result_from_assembly(assembly, mode=mode)
@@ -683,6 +781,84 @@ def assemble_adjacent_entry_strategy(
             if existing is None or existing.entry_preamble_id is not None:
                 raise
             return _v2_result_from_assembly(existing, mode=mode)
+
+
+def finalize_adjacent_entry_assembly_draft(
+    session_factory: sessionmaker,
+    *,
+    assembly_id: int,
+    order_draft: Mapping[str, object],
+) -> str:
+    """Attach the exact bounded order economics once, before any exchange write."""
+
+    bounded_legs = []
+    for leg in list(order_draft.get("order_legs") or []):
+        if not isinstance(leg, Mapping):
+            continue
+        bounded_legs.append(
+            {
+                key: leg.get(key)
+                for key in (
+                    "price",
+                    "order_type",
+                    "allocation_pct",
+                    "risk_budget_usdt",
+                    "quantity",
+                    "quantity_unit",
+                    "estimated_stop_loss_usdt",
+                    "client_order_id",
+                )
+            }
+        )
+    if not 1 <= len(bounded_legs) <= 5:
+        raise ValueError("entry assembly draft must contain one to five legs")
+    draft_snapshot = {
+        "strategy_instance_id": order_draft.get("strategy_instance_id"),
+        "instrument_id": order_draft.get("instrument_id"),
+        "stop_loss": order_draft.get("stop_loss"),
+        "take_profit_legs": order_draft.get("take_profit_legs") or [],
+        "risk_budget_usdt": order_draft.get("risk_budget_usdt"),
+        "order_legs": bounded_legs,
+    }
+    with session_factory() as session:
+        assembly = session.get(EntryStrategyAssembly, int(assembly_id))
+        if assembly is None or assembly.entry_preamble_id is not None:
+            raise LookupError("v2 entry assembly not found")
+        original_evidence_json = assembly.evidence_json or "{}"
+        original_fingerprint = str(assembly.fingerprint)
+        evidence = json.loads(original_evidence_json)
+        existing = evidence.get("order_draft_snapshot")
+        if existing is not None:
+            if existing != draft_snapshot:
+                raise RuntimeError("entry_assembly_draft_conflict")
+            return str(assembly.fingerprint)
+        evidence["order_draft_snapshot"] = draft_snapshot
+        evidence["final_entry_leg_count"] = len(bounded_legs)
+        evidence_json = json.dumps(
+            evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        fingerprint = hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()
+        result = session.execute(
+            update(EntryStrategyAssembly)
+            .where(
+                EntryStrategyAssembly.id == int(assembly_id),
+                EntryStrategyAssembly.entry_preamble_id.is_(None),
+                EntryStrategyAssembly.evidence_json == original_evidence_json,
+                EntryStrategyAssembly.fingerprint == original_fingerprint,
+            )
+            .values(evidence_json=evidence_json, fingerprint=fingerprint)
+        )
+        session.commit()
+        if int(result.rowcount or 0) == 1:
+            return fingerprint
+    with session_factory() as session:
+        assembly = session.get(EntryStrategyAssembly, int(assembly_id))
+        if assembly is None or assembly.entry_preamble_id is not None:
+            raise LookupError("v2 entry assembly not found")
+        evidence = json.loads(assembly.evidence_json or "{}")
+        if evidence.get("order_draft_snapshot") != draft_snapshot:
+            raise RuntimeError("entry_assembly_draft_conflict")
+        return str(assembly.fingerprint)
 
 
 def assemble_entry_strategy(

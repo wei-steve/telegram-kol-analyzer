@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 import sys
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any
 
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
@@ -25,6 +25,7 @@ class DeepcoinOrderDraftError(ValueError):
 
 
 MAX_FLOAT_DECIMAL = Decimal(str(sys.float_info.max))
+MAX_ENTRY_LEGS = 5
 
 
 def build_deepcoin_order_draft(
@@ -151,6 +152,16 @@ def build_deepcoin_order_draft(
                     error_message="entry price produces non-positive price after tick normalization",
                 )
             ]
+        elif hybrid_market_price is not None:
+            _, limit_price = _range_entry_leg_prices(
+                position_side=position_side,
+                low=entry_low,
+                high=entry_high,
+                first_limit_offset=Decimal("0"),
+                second_limit_offset=second_limit_offset,
+                contract_spec=contract_spec,
+            )
+            planned_prices = [hybrid_market_price, limit_price]
         else:
             planned_prices = list(
                 _range_entry_leg_prices(
@@ -165,6 +176,10 @@ def build_deepcoin_order_draft(
         for price in supplemental_prices:
             if price not in planned_prices:
                 planned_prices.append(price)
+        if len(planned_prices) > MAX_ENTRY_LEGS:
+            raise DeepcoinOrderDraftError(
+                f"entry plan exceeds maximum of {MAX_ENTRY_LEGS} legs"
+            )
         if explicit_entry_allocations:
             if len(explicit_entry_allocations) != len(planned_prices):
                 raise DeepcoinOrderDraftError(
@@ -180,7 +195,11 @@ def build_deepcoin_order_draft(
             start=1,
         ):
             allocation_pct = float(allocation_fraction * Decimal("100"))
-            leg_order_type = order_type if index == 1 else "limit"
+            leg_order_type = (
+                "market"
+                if index == 1 and hybrid_market_price is not None
+                else order_type if index == 1 else "limit"
+            )
             order_legs.append(
                 _order_leg(
                     side=open_side,
@@ -361,10 +380,11 @@ def build_deepcoin_order_draft(
             ),
         ]
     order_legs = _coalesce_equivalent_entry_legs(order_legs)
-    estimated_aggregate_risk = math.fsum(
-        float(leg.get("estimated_stop_loss_usdt") or 0) for leg in order_legs
+    estimated_aggregate_risk = sum(
+        Decimal(str(leg.get("estimated_stop_loss_usdt") or 0))
+        for leg in order_legs
     )
-    if custom_entry_plan and estimated_aggregate_risk > risk_budget + 1e-6:
+    if custom_entry_plan and estimated_aggregate_risk > Decimal(str(risk_budget)):
         raise DeepcoinOrderDraftError("aggregate entry risk exceeds risk_budget_usdt")
     blocking_reason_codes = _blocking_reason_codes(
         stop_loss=stop_loss,
@@ -600,11 +620,18 @@ def _estimate_leg_quantity(
 ) -> float | None:
     if stop_loss is None:
         return None
-    price_risk = abs(entry_price - stop_loss)
+    price_risk = abs(Decimal(str(entry_price)) - Decimal(str(stop_loss)))
     if price_risk <= 0:
         raise DeepcoinOrderDraftError("stop_loss must differ from entry price")
-    leg_risk = risk_budget * allocation_pct / 100
-    return round(leg_risk / price_risk, 6)
+    leg_risk = (
+        Decimal(str(risk_budget))
+        * Decimal(str(allocation_pct))
+        / Decimal("100")
+    )
+    quantity = (leg_risk / price_risk).quantize(
+        Decimal("0.000001"), rounding=ROUND_DOWN
+    )
+    return float(quantity)
 
 
 def _range_entry_allocations(
@@ -792,17 +819,19 @@ def _estimated_stop_loss_usdt(
 ) -> float | None:
     if stop_loss is None or quantity in (None, ""):
         return None
-    price_risk = abs(float(entry_price) - float(stop_loss))
+    price_risk = abs(Decimal(str(entry_price)) - Decimal(str(stop_loss)))
     if price_risk <= 0:
         return None
-    quantity_float = float(quantity)
+    quantity_decimal = Decimal(str(quantity))
     if quantity_unit == "contracts":
         if contract_spec is None:
             return None
-        loss = price_risk * quantity_float * contract_spec.contract_value
+        loss = price_risk * quantity_decimal * Decimal(
+            str(contract_spec.contract_value)
+        )
     else:
-        loss = price_risk * quantity_float
-    return float(f"{loss:.6g}")
+        loss = price_risk * quantity_decimal
+    return float(loss)
 
 
 def _take_profit_legs(
@@ -864,8 +893,12 @@ def _quantity_notes(
 
 
 def _round_down_to_step(value: float, step: float) -> float:
-    rounded = math.floor((value / step) + 1e-12) * step
-    return float(f"{rounded:.12g}")
+    value_decimal = Decimal(str(value))
+    step_decimal = Decimal(str(step))
+    if step_decimal <= 0:
+        raise DeepcoinOrderDraftError("quantity or price step must be positive")
+    steps = (value_decimal / step_decimal).to_integral_value(rounding=ROUND_DOWN)
+    return float(steps * step_decimal)
 
 
 def _normalize_price(price: float, contract_spec: DeepcoinContractSpec | None) -> float:

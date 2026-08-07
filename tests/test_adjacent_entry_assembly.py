@@ -102,7 +102,7 @@ def test_selects_following_half_and_supplemental_entry():
                 message_id=4155,
                 fragment_id=4,
                 fragment_kind="supplemental_entry",
-                payload={"prices": ["63400"]},
+                payload={"entry_price": "63400"},
             ),
         ]
     )
@@ -139,6 +139,24 @@ def test_hard_boundary_stops_following_selection():
     assert decision.fragment_ids == ()
     assert decision.risk_multiplier == Decimal("1")
     assert decision.boundary_evidence == (21,)
+
+
+def test_fragment_on_following_complete_entry_message_belongs_after_boundary():
+    decision = _select(
+        [
+            _fact(
+                raw_id=21,
+                message_id=9903,
+                fragment_id=50,
+                fragment_kind="risk_multiplier",
+                payload={"risk_multiplier": "0.5"},
+            ),
+            _fact(raw_id=21, message_id=9903, kind="complete_entry"),
+        ]
+    )
+
+    assert decision.fragment_ids == ()
+    assert decision.risk_multiplier == Decimal("1")
 
 
 def test_conflicting_explicit_multipliers_block():

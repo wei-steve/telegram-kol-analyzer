@@ -907,6 +907,39 @@ def test_live_adjacent_admission_defers_before_exchange_or_trade_signal(tmp_path
         assert session.query(TradeSignal).count() == 0
 
 
+def test_v2_shadow_proposal_preserves_legacy_blocking_decision():
+    from telegram_kol_research.auto_trade_execution import (
+        _overlay_v2_shadow_proposal,
+    )
+    from telegram_kol_research.entry_strategy_assembly import EntryAssemblyResult
+
+    legacy = EntryAssemblyResult(
+        status="blocked",
+        reason_code="entry_preamble_ambiguous",
+        mode="live",
+        proposed_risk_multiplier=Decimal("1"),
+        effective_risk_multiplier=Decimal("1"),
+    )
+    proposal = EntryAssemblyResult(
+        status="proposed",
+        reason_code=None,
+        mode="shadow",
+        proposed_risk_multiplier=Decimal("0.5"),
+        effective_risk_multiplier=Decimal("1"),
+        fragment_ids=(11,),
+    )
+
+    merged = _overlay_v2_shadow_proposal(
+        legacy_assembly=legacy,
+        v2_proposal=proposal,
+    )
+
+    assert merged.status == "blocked"
+    assert merged.reason_code == "entry_preamble_ambiguous"
+    assert merged.proposed_risk_multiplier == Decimal("0.5")
+    assert merged.effective_risk_multiplier == Decimal("1")
+
+
 def test_shadow_entry_preamble_reports_half_but_executes_configured_risk(tmp_path):
     session_factory = create_session_factory(tmp_path / "half-risk-shadow.db")
     strategy_raw_id = _persist_candidate(
@@ -1008,7 +1041,7 @@ def test_live_v2_fragment_applies_half_budget_and_supplemental_leg_once(tmp_path
                     symbol="BTC",
                     side="short",
                     fragment_kind="supplemental_entry",
-                    payload_json='{"prices":["63400"]}',
+                    payload_json='{"entry_price":"63400"}',
                     evidence_version_id=evidence.id,
                     recognition_generation="v2-g",
                     source_relationship="unresolved",
@@ -1045,12 +1078,19 @@ def test_live_v2_fragment_applies_half_budget_and_supplemental_leg_once(tmp_path
     assert evidence_payload["effective_risk_budget_usdt"] == 10.0
     with session_factory() as session:
         binding_payload = json.loads(session.query(ExecutionBinding).one().payload_json)
+        assembly_evidence = json.loads(
+            session.query(EntryStrategyAssembly).one().evidence_json
+        )
     draft = binding_payload["draft"]
     assert [leg["price"] for leg in draft["order_legs"]] == [63810.0, 64110.0, 63400.0]
     assert sum(
         Decimal(str(leg["estimated_stop_loss_usdt"]))
         for leg in draft["order_legs"]
     ) <= Decimal("10")
+    assert assembly_evidence["configured_risk_budget_usdt"] == "20.0"
+    assert assembly_evidence["effective_risk_budget_usdt"] == "10.00"
+    assert assembly_evidence["final_entry_leg_count"] == 3
+    assert len(assembly_evidence["order_draft_snapshot"]["order_legs"]) == 3
 
 
 def test_invalid_persisted_entry_preamble_multiplier_blocks_before_trade_signal(tmp_path):

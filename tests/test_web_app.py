@@ -4751,7 +4751,7 @@ def test_recovery_execution_queue_api_returns_payload_preview_only(tmp_path):
     assert response.json()["items"][0]["payload_preview"]["contract"] == "BTC-USDT"
     assert response.json()["items"][0]["deepcoin_order_draft"]["instrument_id"] == "BTC-USDT-SWAP"
     assert response.json()["items"][0]["deepcoin_order_draft"]["blocking_reason_codes"] == ["contract_size_unverified"]
-    assert response.json()["items"][0]["deepcoin_order_draft"]["order_legs"][0]["quantity"] == 0.072464
+    assert response.json()["items"][0]["deepcoin_order_draft"]["order_legs"][0]["quantity"] == 0.072463
     assert response.json()["items"][0]["contract_spec_status"] == {
         "code": "missing",
         "label": "缺少规格校验",

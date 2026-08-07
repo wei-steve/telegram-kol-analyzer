@@ -731,7 +731,7 @@ def test_build_range_coalesces_equivalent_normalized_entry_legs(monkeypatch):
             "client_order_id": "TK649760E806ACF61",
             "quantity": 82.0,
             "quantity_unit": "contracts",
-            "base_asset_estimate": 0.083334,
+            "base_asset_estimate": 0.083332,
             "estimated_stop_loss_usdt": 98.4,
             "merged_from_leg_indices": [1, 2],
         }
@@ -998,6 +998,35 @@ def test_two_points_each_half_uses_full_configured_budget():
         Decimal(str(leg["estimated_stop_loss_usdt"]))
         for leg in draft["order_legs"]
     ) <= Decimal("20")
+
+
+def test_custom_adjacent_plan_preserves_hybrid_market_first_leg():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(
+            entry_range="68000-68200",
+            current_price=68190,
+            market_leg_threshold=20,
+            supplemental_entry_prices=["67900"],
+        ),
+        contract_spec=_btc_contract_spec(),
+    )
+
+    assert [leg["order_type"] for leg in draft["order_legs"]] == [
+        "market",
+        "limit",
+        "limit",
+    ]
+    assert draft["order_legs"][0]["price"] == 68190.0
+
+
+def test_adjacent_entry_plan_rejects_more_than_five_final_legs():
+    with pytest.raises(DeepcoinOrderDraftError, match="maximum of 5 legs"):
+        build_deepcoin_order_draft(
+            _payload_preview(
+                supplemental_entry_prices=["67900", "67800", "67700", "67600"],
+            ),
+            contract_spec=_btc_contract_spec(),
+        )
 def test_build_deepcoin_order_draft_rejects_mismatched_contract_spec():
     try:
         build_deepcoin_order_draft(
