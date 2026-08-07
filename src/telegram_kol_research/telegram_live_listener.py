@@ -33,6 +33,10 @@ from telegram_kol_research.models import (
 )
 from telegram_kol_research.raw_ingest import normalize_message_payload, persist_normalized_messages
 from telegram_kol_research.raw_ingest import repair_history_checkpoints
+from telegram_kol_research.runtime_incident_adapters import (
+    capture_notification_failure,
+    capture_runtime_incident_best_effort,
+)
 from telegram_kol_research.recognition_experiments import run_mimo_direct_for_message
 from telegram_kol_research.recognition_decisions import update_recognition_execution_outcome
 from telegram_kol_research.recognition_decisions import (
@@ -437,7 +441,16 @@ def _schedule_authoritative_notification(
                 automation_status=str(payload.get("automation", {}).get("status") or "unknown"),
                 automation_reason=payload.get("automation", {}).get("reason"),
                 notification_status="failed",
-                notification_error=str(exc),
+                notification_error=type(exc).__name__,
+            )
+            await asyncio.to_thread(
+                capture_runtime_incident_best_effort,
+                capture_notification_failure,
+                session_factory,
+                source_kind="authoritative_notification",
+                source_record_id=f"raw_message_{int(raw_message_id)}",
+                error_type=type(exc).__name__,
+                occurred_at=utc_now(),
             )
         else:
             await asyncio.to_thread(

@@ -355,6 +355,7 @@ groups:
         ai_recognition_config_path=None,
         authoritative_processor=None,
         system_operator_bot_config=None,
+        notification_bot_config=None,
     ):
         captured["client"] = client
         captured["target_titles"] = set(target_titles)
@@ -362,6 +363,7 @@ groups:
         captured["ai_recognition_config_path"] = ai_recognition_config_path
         captured["authoritative_processor"] = authoritative_processor
         captured["system_operator_bot_config"] = system_operator_bot_config
+        captured["notification_bot_config"] = notification_bot_config
 
     fake_client = object()
     fake_alert_config = StrategyAlertConfig(
@@ -393,6 +395,17 @@ groups:
         "telegram_kol_research.cli.load_strategy_alert_config",
         lambda: fake_alert_config,
     )
+    operator_config = object()
+    notification_config = object()
+    monkeypatch.setattr(
+        "telegram_kol_research.cli.load_system_operator_bot_config",
+        lambda: operator_config,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.cli.load_notification_bot_config",
+        lambda: notification_config,
+    )
     monkeypatch.setattr(
         "telegram_kol_research.cli.run_live_listener",
         fake_runner,
@@ -414,7 +427,8 @@ groups:
     assert captured["strategy_alert_config"] is fake_alert_config
     assert captured["ai_recognition_config_path"].name == "ai_recognition.yaml"
     assert callable(captured["authoritative_processor"])
-    assert captured["system_operator_bot_config"] is not None
+    assert captured["system_operator_bot_config"] is operator_config
+    assert captured["notification_bot_config"] is notification_config
     assert captured["lock_entered"] is True
     assert captured["lock_exited"] is True
 

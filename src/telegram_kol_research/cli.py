@@ -196,6 +196,7 @@ from telegram_kol_research.strategy_alerts import (
 )
 from telegram_kol_research.system_operator_bot import (
     load_notification_bot_config,
+    load_system_operator_bot_config,
     send_ai_recognition_conflict_review,
     system_operator_bot_enabled,
 )
@@ -4843,7 +4844,8 @@ def alerts(
             client = create_telegram_client(auth_config)
             session_factory = create_session_factory(database_path)
             broker = LiveUpdateBroker()
-            system_operator_bot_config = load_notification_bot_config()
+            system_operator_bot_config = load_system_operator_bot_config()
+            notification_bot_config = load_notification_bot_config()
 
             def authoritative_processor(raw_message_id: int):
                 return process_authoritative_message(
@@ -4874,6 +4876,7 @@ def alerts(
                         ai_recognition_config_path=ai_recognition_config_path,
                         authoritative_processor=authoritative_processor,
                         system_operator_bot_config=system_operator_bot_config,
+                        notification_bot_config=notification_bot_config,
                     )
                 )
             finally:

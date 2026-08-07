@@ -8,7 +8,10 @@ from telegram_kol_research.live_updates import LiveUpdateBroker
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.message_recognition import MessageRecognitionResult
 from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
-from telegram_kol_research.telegram_live_listener import persist_live_message_event
+from telegram_kol_research.telegram_live_listener import (
+    _schedule_authoritative_notification,
+    persist_live_message_event,
+)
 from telegram_kol_research.telegram_live_listener import run_live_listener
 
 
@@ -16,6 +19,45 @@ class _FakeSender:
     def __init__(self, first_name: str, last_name: str = "") -> None:
         self.first_name = first_name
         self.last_name = last_name
+
+
+def test_authoritative_notification_failure_captures_independent_incident(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "notification-failure.db")
+    captures = []
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.capture_runtime_incident_best_effort",
+        lambda *args, **kwargs: captures.append(kwargs),
+        raising=False,
+    )
+    outcome_updates = []
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.update_recognition_execution_outcome",
+        lambda *args, **kwargs: outcome_updates.append(kwargs),
+    )
+
+    async def scenario():
+        async def failing_sender(**kwargs):
+            raise TimeoutError("secret provider response")
+
+        _schedule_authoritative_notification(
+            session_factory=session_factory,
+            raw_message_id=41,
+            sender=failing_sender,
+            config=object(),
+            payload={"automation": {"status": "failed", "reason": "context_exhausted"}},
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    assert len(captures) == 1
+    assert captures[0]["source_kind"] == "authoritative_notification"
+    assert captures[0]["source_record_id"] == "raw_message_41"
+    assert captures[0]["error_type"] == "TimeoutError"
+    assert outcome_updates[-1]["notification_error"] == "TimeoutError"
 
 
 class _FakeMessage:

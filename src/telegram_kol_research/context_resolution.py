@@ -520,6 +520,19 @@ def resolve_contextual_strategy(
                 allowed_thread_ids=allowed_thread_ids,
                 allowed_message_ids=allowed_message_ids,
             )
+        exhausted = (
+            session.query(ContextResolutionAttempt)
+            .filter(
+                ContextResolutionAttempt.raw_message_id == int(raw_message_id),
+                ContextResolutionAttempt.context_fingerprint == context_fingerprint,
+                ContextResolutionAttempt.status == "exhausted",
+            )
+            .one_or_none()
+        )
+        if exhausted is not None:
+            raise ContextResolutionError(
+                str(exhausted.error_class or "context_contract_invalid")
+            )
     provider = _select_provider(ai_recognition_config)
     for attempt_number in (1, 2):
         failure: ContextResolutionError | None = None

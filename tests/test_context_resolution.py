@@ -231,6 +231,7 @@ def test_resolver_exhausts_repeated_closed_contract_error(tmp_path, monkeypatch)
         lambda *args, **kwargs: captures.append(kwargs),
         raising=False,
     )
+    calls = 0
     invalid = _valid_payload(
         decision="manage_thread",
         target_thread_ids=[12, 13],
@@ -238,6 +239,11 @@ def test_resolver_exhausts_repeated_closed_contract_error(tmp_path, monkeypatch)
         risk_reducing_fanout_allowed=True,
         supporting_message_ids=[3465],
     )
+
+    def invalid_caller(**kwargs):
+        nonlocal calls
+        calls += 1
+        return invalid
 
     with pytest.raises(ContextResolutionError) as raised:
         resolve_contextual_strategy(
@@ -249,7 +255,7 @@ def test_resolver_exhausts_repeated_closed_contract_error(tmp_path, monkeypatch)
             candidates=[{"thread_id": 12}, {"thread_id": 13}],
             first_pass_payload={},
             exchange_state={},
-            model_caller=lambda **kwargs: invalid,
+            model_caller=invalid_caller,
         )
 
     assert raised.value.code == "multi_target_action_not_allowed"
@@ -260,6 +266,22 @@ def test_resolver_exhausts_repeated_closed_contract_error(tmp_path, monkeypatch)
     assert attempt.error_class == "multi_target_action_not_allowed"
     assert len(captures) == 1
     assert captures[0]["status"] == "exhausted"
+
+    with pytest.raises(ContextResolutionError) as replayed:
+        resolve_contextual_strategy(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(),
+            evidence={},
+            context_window={"current": {"message_id": 3465}, "messages": []},
+            candidates=[{"thread_id": 12}, {"thread_id": 13}],
+            first_pass_payload={},
+            exchange_state={},
+            model_caller=invalid_caller,
+        )
+    assert replayed.value.code == "multi_target_action_not_allowed"
+    assert calls == 2
+    assert len(captures) == 1
 
 
 def test_resolver_rejects_supporting_message_outside_context_and_persists_failure(
