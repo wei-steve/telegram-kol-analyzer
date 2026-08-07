@@ -428,16 +428,17 @@ def _resolved_mimo_result(
             confidence=decision.confidence,
         )
         return replace(mimo, payload=payload, status="非策略")
-    target_lifecycles = {
-        candidate.thread_id: candidate.lifecycle_id for candidate in candidates
+    candidates_by_thread = {
+        candidate.thread_id: candidate for candidate in candidates
     }
-    lifecycle_ids = [
-        target_lifecycles[thread_id]
+    selected_candidates = [
+        candidates_by_thread[thread_id]
         for thread_id in decision.target_thread_ids
-        if thread_id in target_lifecycles
+        if thread_id in candidates_by_thread
     ]
-    if len(lifecycle_ids) != len(decision.target_thread_ids):
+    if len(selected_candidates) != len(decision.target_thread_ids):
         raise ContextResolutionError("resolved_lifecycle_missing")
+    lifecycle_ids = [candidate.lifecycle_id for candidate in selected_candidates]
     if decision.decision == "revise_thread":
         context_payload["replacement_strategy"] = dict(
             original_strategy if isinstance(original_strategy, dict) else {}
@@ -463,8 +464,12 @@ def _resolved_mimo_result(
     }
     if len(lifecycle_ids) > 1:
         lifecycle_event["targets"] = [
-            {"target_lifecycle_id": lifecycle_id}
-            for lifecycle_id in lifecycle_ids
+            {
+                "target_lifecycle_id": candidate.lifecycle_id,
+                "symbol": candidate.symbol,
+                "side": candidate.side,
+            }
+            for candidate in selected_candidates
         ]
     if decision.management_action is not None:
         lifecycle_event["management_action"] = decision.management_action

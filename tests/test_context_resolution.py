@@ -83,6 +83,38 @@ def test_risk_reducing_cancel_can_fan_out_to_known_threads():
     assert decision.target_thread_ids == (12, 13)
 
 
+def test_exact_multi_target_partial_take_profit_preserves_target_order():
+    decision = parse_context_resolution_decision(
+        _valid_payload(
+            decision="manage_thread",
+            target_thread_ids=[13, 12],
+            management_action="partial_take_profit",
+            risk_reducing_fanout_allowed=True,
+        ),
+        allowed_thread_ids={12, 13},
+        allowed_message_ids={1460, 1462},
+    )
+
+    assert decision.target_thread_ids == (13, 12)
+
+
+@pytest.mark.parametrize("management_action", ["move_stop_to_protect", "risk_update"])
+def test_multi_target_management_fanout_refuses_non_partial_actions(management_action):
+    with pytest.raises(ContextResolutionError) as raised:
+        parse_context_resolution_decision(
+            _valid_payload(
+                decision="manage_thread",
+                target_thread_ids=[12, 13],
+                management_action=management_action,
+                risk_reducing_fanout_allowed=True,
+            ),
+            allowed_thread_ids={12, 13},
+            allowed_message_ids={1460, 1462},
+        )
+
+    assert raised.value.code == "multi_target_action_not_allowed"
+
+
 def test_resolver_retries_malformed_json_once_and_persists_safe_attempt(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
@@ -154,7 +186,7 @@ def test_resolver_retries_closed_contract_error_once_then_completes(tmp_path):
         _valid_payload(
             decision="manage_thread",
             target_thread_ids=[12, 13],
-            management_action="partial_take_profit",
+            management_action="move_stop_to_protect",
             risk_reducing_fanout_allowed=True,
             supporting_message_ids=[1465],
         ),
@@ -202,8 +234,9 @@ def test_resolver_exhausts_repeated_closed_contract_error(tmp_path, monkeypatch)
     invalid = _valid_payload(
         decision="manage_thread",
         target_thread_ids=[12, 13],
-        management_action="partial_take_profit",
+        management_action="move_stop_to_protect",
         risk_reducing_fanout_allowed=True,
+        supporting_message_ids=[3465],
     )
 
     with pytest.raises(ContextResolutionError) as raised:

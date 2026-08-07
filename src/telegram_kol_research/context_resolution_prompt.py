@@ -16,8 +16,9 @@ CONTEXT_RESOLUTION_SYSTEM_PROMPT = """
 - 不得发明 thread_id 或 message_id。
 - 不得把相邻消息自动当作同一策略。
 - 不能唯一确定目标时必须输出 unresolved。
-- revise/manage 以及任何可能增加风险的动作只能选择一个目标。
-- 只有明确的降风险 cancel/exit 动作才可多目标，并且 risk_reducing_fanout_allowed 必须为 true。
+- revise、止损调整、风险调整以及任何可能增加风险的动作只能选择一个目标。
+- 只有明确的降风险 cancel/exit，或当前消息明确点名每个独立目标且全部仅执行 partial_take_profit 时才可多目标；risk_reducing_fanout_allowed 必须为 true。
+- 出现加仓、补仓、反手或其他增加风险的混合语义时，不得对 partial_take_profit 做多目标展开。
 
 只输出一个 JSON 对象：
 {

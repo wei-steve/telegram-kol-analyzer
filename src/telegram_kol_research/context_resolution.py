@@ -77,7 +77,6 @@ REANALYSIS_TRIGGERS = frozenset(
 TARGET_REQUIRED_DECISIONS = frozenset(
     {"revise_thread", "manage_thread", "cancel_thread", "exit_thread"}
 )
-MULTI_TARGET_DECISIONS = frozenset({"cancel_thread", "exit_thread"})
 ALLOWED_ACTIONS_BY_DECISION = {
     "new_thread": frozenset({None}),
     "revise_thread": frozenset({None, "replace_entry"}),
@@ -158,6 +157,13 @@ class ContextResolutionDecision:
         }
 
 
+def _fanout_allowed(decision: str, management_action: str | None) -> bool:
+    return decision in {"cancel_thread", "exit_thread"} or (
+        decision == "manage_thread"
+        and management_action == "partial_take_profit"
+    )
+
+
 def _int_tuple(value: Any, *, field: str) -> tuple[int, ...]:
     if not isinstance(value, list):
         raise ContextResolutionError("context_contract_invalid")
@@ -207,12 +213,6 @@ def parse_context_resolution_decision(
     fanout = payload.get("risk_reducing_fanout_allowed")
     if not isinstance(fanout, bool):
         raise ContextResolutionError("context_contract_invalid")
-    if len(target_thread_ids) > 1 and (
-        decision not in MULTI_TARGET_DECISIONS or not fanout
-    ):
-        raise ContextResolutionError("multi_target_action_not_allowed")
-    if fanout and decision not in MULTI_TARGET_DECISIONS:
-        raise ContextResolutionError("fanout_not_allowed")
     management_action_value = payload.get("management_action")
     management_action = (
         None if management_action_value is None else str(management_action_value)
@@ -221,6 +221,12 @@ def parse_context_resolution_decision(
         raise ContextResolutionError("unknown_management_action")
     if management_action not in ALLOWED_ACTIONS_BY_DECISION[decision]:
         raise ContextResolutionError("management_action_incompatible")
+    if len(target_thread_ids) > 1 and (
+        not _fanout_allowed(decision, management_action) or not fanout
+    ):
+        raise ContextResolutionError("multi_target_action_not_allowed")
+    if fanout and not _fanout_allowed(decision, management_action):
+        raise ContextResolutionError("fanout_not_allowed")
     try:
         confidence = float(payload.get("confidence"))
     except (TypeError, ValueError) as exc:

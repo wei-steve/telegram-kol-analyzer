@@ -27,6 +27,20 @@ def test_unspecified_partial_defaults_to_half() -> None:
     assert directive.fanout_allowed is True
 
 
+def test_partial_profit_mixed_with_add_position_is_not_fanout_safe() -> None:
+    directive = resolve_management_directive(
+        text="BTC ETH空单止盈一部分并加仓",
+        lifecycle_event={
+            "event_type": "position_update",
+            "management_action": "partial_take_profit",
+        },
+    )
+
+    assert directive.risk_reducing is False
+    assert directive.fanout_allowed is False
+    assert directive.reason_code == "risk_increasing_fanout_forbidden"
+
+
 def test_miya_partial_with_explicit_stop_preserves_all_components():
     contract = build_management_instruction_contract(
         text="BTC多单目前浮盈1100点，止盈50%，剩余仓位止损位移动至62700，做无风险持仓",

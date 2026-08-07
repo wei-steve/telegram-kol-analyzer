@@ -1,4 +1,5 @@
 from telegram_kol_research.context_resolution_prompt import (
+    CONTEXT_RESOLUTION_SYSTEM_PROMPT,
     build_context_resolution_request,
 )
 from telegram_kol_research.strategy_thread_candidates import StrategyThreadCandidate
@@ -38,3 +39,9 @@ def test_context_request_includes_bounded_candidate_risk_summary():
     assert saved["pending_entry_leg_ids"] == [431]
     assert saved["uncertain_entry_leg_ids"] == []
     assert "payload_json" not in saved["binding_summary"]
+
+
+def test_context_prompt_limits_management_fanout_to_explicit_partial_profit():
+    assert "partial_take_profit" in CONTEXT_RESOLUTION_SYSTEM_PROMPT
+    assert "明确点名" in CONTEXT_RESOLUTION_SYSTEM_PROMPT
+    assert "增加风险" in CONTEXT_RESOLUTION_SYSTEM_PROMPT

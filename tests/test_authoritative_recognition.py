@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -89,6 +90,59 @@ def _context_exit_decision(
         reanalysis_triggers=(),
         reason="63100没站稳，求稳就找机会出局",
     )
+
+
+def test_resolved_multi_target_partial_profit_preserves_exact_target_metadata():
+    first = _context_candidate(
+        thread_id=12,
+        lifecycle_id=22,
+        root_message_id=3463,
+        risk_state="current_risk",
+    )
+    second = replace(
+        first,
+        thread_id=13,
+        lifecycle_id=23,
+        root_message_id=3464,
+        symbol="ETH",
+        live_verified_pos_ids=("pos-23",),
+    )
+    mimo = MimoAuthoritativeResult(
+        raw_message_id=99,
+        payload={
+            "recognition_result": "是策略",
+            "strategy": {},
+            "lifecycle_event": {"event_type": "position_update"},
+        },
+        input_kind="text",
+        model="mimo-v2.5",
+        status="是策略",
+    )
+    decision = ContextResolutionDecision(
+        decision="manage_thread",
+        target_thread_ids=(12, 13),
+        management_action="partial_take_profit",
+        confidence=0.96,
+        supporting_message_ids=(3463, 3464, 3465),
+        opposing_message_ids=(),
+        conflict_types=(),
+        risk_reducing_fanout_allowed=True,
+        reanalysis_triggers=(),
+        reason="explicit BTC and ETH partial profit",
+    )
+
+    result = _resolved_mimo_result(
+        mimo,
+        decision,
+        (first, second),
+        current_message_id=3465,
+        exact_risk_reduction_authorized=True,
+    )
+
+    assert result.payload["lifecycle_event"]["targets"] == [
+        {"target_lifecycle_id": 22, "symbol": "BTC", "side": "long"},
+        {"target_lifecycle_id": 23, "symbol": "ETH", "side": "long"},
+    ]
 
 
 def test_dabiaoke_4168_projects_exact_exit_despite_ghost_lifecycle(tmp_path):
