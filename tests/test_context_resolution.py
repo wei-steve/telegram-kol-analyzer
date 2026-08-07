@@ -172,6 +172,7 @@ def test_resolver_retries_malformed_json_once_and_persists_safe_attempt(tmp_path
     assert attempt.status == "completed"
     assert attempt.attempts == 2
     assert json.loads(attempt.decision_json)["decision"] == "revise_thread"
+    assert attempt.rejected_response_diagnostic_json is None
     assert "secret" not in attempt.request_summary_json
 
 
@@ -216,6 +217,109 @@ def test_resolver_retries_closed_contract_error_once_then_completes(tmp_path):
         attempt = session.query(ContextResolutionAttempt).one()
     assert attempt.status == "completed"
     assert attempt.attempts == 2
+
+
+def test_target_not_allowed_retry_adds_correction_and_keeps_bounded_diagnostic(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "target-correction.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=88, message_id=1465, text="回顾已有策略")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    responses = [
+        _valid_payload(
+            decision="hold",
+            target_thread_ids=[12],
+            management_action=None,
+            supporting_message_ids=[1465],
+        ),
+        _valid_payload(
+            decision="hold",
+            target_thread_ids=[],
+            management_action=None,
+            supporting_message_ids=[1465],
+        ),
+    ]
+    calls = []
+
+    def model_caller(**kwargs):
+        calls.append(kwargs["system_prompt"])
+        return responses.pop(0)
+
+    decision = resolve_contextual_strategy(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        evidence={},
+        context_window={"current": {"message_id": 1465}, "messages": []},
+        candidates=[{"thread_id": 12}],
+        first_pass_payload={},
+        exchange_state={},
+        model_caller=model_caller,
+    )
+
+    assert decision.decision == "hold"
+    assert decision.target_thread_ids == ()
+    assert len(calls) == 2
+    assert "上一次响应违反 target_not_allowed" not in calls[0]
+    assert "上一次响应违反 target_not_allowed" in calls[1]
+    assert "不要修改 decision 来绕过校验" in calls[1]
+    with session_factory() as session:
+        attempt = session.query(ContextResolutionAttempt).one()
+    assert json.loads(attempt.rejected_response_diagnostic_json) == {
+        "decision": "hold",
+        "error_class": "target_not_allowed",
+        "target_thread_count": 1,
+    }
+    assert "12" not in attempt.rejected_response_diagnostic_json
+    assert attempt.status == "completed"
+    assert attempt.attempts == 2
+
+
+def test_target_not_allowed_retry_remains_exhausted_after_two_invalid_responses(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "target-exhausted.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=88, message_id=1465, text="回顾已有策略")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    calls = []
+    invalid = _valid_payload(
+        decision="hold",
+        target_thread_ids=[12],
+        management_action=None,
+        supporting_message_ids=[1465],
+    )
+
+    def model_caller(**kwargs):
+        calls.append(kwargs["system_prompt"])
+        return invalid
+
+    with pytest.raises(ContextResolutionError) as raised:
+        resolve_contextual_strategy(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(),
+            evidence={},
+            context_window={"current": {"message_id": 1465}, "messages": []},
+            candidates=[{"thread_id": 12}],
+            first_pass_payload={},
+            exchange_state={},
+            model_caller=model_caller,
+        )
+
+    assert raised.value.code == "target_not_allowed"
+    assert len(calls) == 2
+    assert "上一次响应违反 target_not_allowed" in calls[1]
+    with session_factory() as session:
+        attempt = session.query(ContextResolutionAttempt).one()
+    assert attempt.status == "exhausted"
+    assert attempt.attempts == 2
+    assert attempt.error_class == "target_not_allowed"
 
 
 def test_resolver_exhausts_repeated_closed_contract_error(tmp_path, monkeypatch):

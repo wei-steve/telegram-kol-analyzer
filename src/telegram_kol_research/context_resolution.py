@@ -114,6 +114,12 @@ CONTEXT_RESOLUTION_ERROR_CODES = frozenset(
         "resolved_lifecycle_missing",
     }
 )
+_TARGET_NOT_ALLOWED_CORRECTION = """
+纠错：上一次响应违反 target_not_allowed。
+如果 decision 是 new_thread、hold 或 unresolved，target_thread_ids 必须为 []。
+只有 revise_thread、manage_thread、cancel_thread、exit_thread 可以携带候选目标。
+不要修改 decision 来绕过校验；请保持原本语义并修正字段组合。
+""".strip()
 
 
 class ContextResolutionError(ValueError):
@@ -276,6 +282,24 @@ def _canonical_json(value: Any) -> str:
     )
 
 
+def _rejected_response_diagnostic(
+    payload: Mapping[str, Any],
+    *,
+    error_class: str,
+) -> str:
+    decision = str(payload.get("decision") or "")
+    targets = payload.get("target_thread_ids")
+    return _canonical_json(
+        {
+            "decision": decision if decision in DECISIONS else None,
+            "error_class": error_class,
+            "target_thread_count": (
+                len(targets) if isinstance(targets, list) else None
+            ),
+        }
+    )
+
+
 def _collect_ids(value: Any, key_names: set[str]) -> set[int]:
     found: set[int] = set()
     if isinstance(value, Mapping):
@@ -381,6 +405,7 @@ def _upsert_attempt(
     status: str,
     error_class: str | None,
     attempts: int,
+    rejected_response_diagnostic_json: str | None = None,
 ) -> int:
     from telegram_kol_research.context_resolution_worker import (
         build_context_state_fingerprint,
@@ -416,6 +441,9 @@ def _upsert_attempt(
                 ),
                 request_summary_json=_canonical_json(request_payload),
                 decision_json=None,
+                rejected_response_diagnostic_json=(
+                    rejected_response_diagnostic_json
+                ),
                 status=status,
                 error_class=error_class,
                 reanalysis_triggers_json="[]",
@@ -433,6 +461,10 @@ def _upsert_attempt(
             row.error_class = error_class
             row.attempts = int(attempts)
             row.updated_at = now
+            if rejected_response_diagnostic_json is not None:
+                row.rejected_response_diagnostic_json = (
+                    rejected_response_diagnostic_json
+                )
         if decision is not None:
             row.decision_json = _canonical_json(decision.to_dict())
             row.reanalysis_triggers_json = _canonical_json(
@@ -454,7 +486,7 @@ def resolve_contextual_strategy(
     exchange_state: Any,
     model_caller: Callable[..., Any] = _default_model_caller,
 ) -> ContextResolutionDecision:
-    """Call DeepSeek once, retrying only one malformed JSON response."""
+    """Call DeepSeek at most twice, preserving strict contract validation."""
 
     with session_factory() as session:
         raw_message = session.get(RawMessage, int(raw_message_id))
@@ -534,12 +566,20 @@ def resolve_contextual_strategy(
                 str(exhausted.error_class or "context_contract_invalid")
             )
     provider = _select_provider(ai_recognition_config)
+    prior_error_code: str | None = None
     for attempt_number in (1, 2):
         failure: ContextResolutionError | None = None
+        decoded: Mapping[str, Any] | None = None
         try:
             raw_result = model_caller(
                 provider=provider,
-                system_prompt=CONTEXT_RESOLUTION_SYSTEM_PROMPT,
+                system_prompt=(
+                    CONTEXT_RESOLUTION_SYSTEM_PROMPT
+                    if prior_error_code != "target_not_allowed"
+                    else CONTEXT_RESOLUTION_SYSTEM_PROMPT
+                    + "\n\n"
+                    + _TARGET_NOT_ALLOWED_CORRECTION
+                ),
                 request_payload=request_payload,
             )
         except Exception as exc:
@@ -573,8 +613,17 @@ def resolve_contextual_strategy(
                 status="exhausted" if terminal else "retry_pending",
                 error_class=failure.code,
                 attempts=attempt_number,
+                rejected_response_diagnostic_json=(
+                    _rejected_response_diagnostic(
+                        decoded,
+                        error_class=failure.code,
+                    )
+                    if decoded is not None
+                    else None
+                ),
             )
             if not terminal:
+                prior_error_code = failure.code
                 continue
             capture_runtime_incident_best_effort(
                 capture_context_worker_state,
