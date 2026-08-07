@@ -174,3 +174,15 @@ def test_phase_7_is_deferred_and_phase_8r_requires_no_action_authority():
     assert "terminal_high_risk_management_without_instruction_v1" in runbook
     assert "verified_replacement_role_gap_v1" in runbook
     assert "position_compliance_rules_status: dormant_non_deployable" in status
+
+
+@pytest.mark.architecture
+def test_runtime_notification_watermark_runbook_requires_safe_activation_and_rollback():
+    runbook = (
+        Path(__file__).parents[1]
+        / "docs"
+        / "runtime-incident-agent-runbook.md"
+    ).read_text(encoding="utf-8")
+
+    assert "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_AFTER_ID" in runbook
+    assert "restore the narrow selector before removing the watermark" in runbook

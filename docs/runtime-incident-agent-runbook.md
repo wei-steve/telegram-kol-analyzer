@@ -115,6 +115,12 @@ Phase 2 uses two independent, dormant-by-default settings:
   exact incident-type delivery allowlist. When absent, legacy global delivery
   behavior is preserved. When present but empty, no runtime incident is
   claimed for Telegram delivery.
+- `TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_AFTER_ID`: optional exclusive
+  runtime-incident ID watermark for Telegram delivery. When absent, legacy
+  oldest-first eligibility is preserved. A valid non-negative integer allows
+  only rows whose `runtime_incidents.id` is greater than the watermark. A
+  present malformed, negative, or SQLite-overflow value fails closed by using
+  the maximum SQLite integer, so no existing row is claimable.
 - `TELEGRAM_KOL_RUNTIME_AGENT_TYPES`: optional comma-separated exact
   incident-type diagnosis allowlist. When absent, legacy Agent behavior is
   preserved. When present but empty, the Agent remains supervised but claims
@@ -131,6 +137,16 @@ accept an idempotency key. A crash after Telegram accepts a report but before
 the local `delivered` commit may repeat it after lease expiry. The fixed
 `事件ID` is the operator deduplication marker; committed successes are never
 reclaimed.
+
+The watermark must first be deployed dormant with the setting absent and the
+existing narrow Telegram type selector unchanged. For a later separately
+approved activation, stop in a proven safe window, record the current maximum
+`runtime_incidents.id`, set that value as the watermark, add only the approved
+new incident type to the selector, restart, and prove that no row at or below
+the watermark was claimed. Rollback must restore the narrow selector before removing the watermark;
+otherwise removing the cutoff while the selector is still widened makes the
+historical backlog immediately eligible. Never bulk-mark historical rows as
+delivered or not-needed to manufacture a clean activation state.
 
 ### Phase 3 read-only Agent sidecar
 
