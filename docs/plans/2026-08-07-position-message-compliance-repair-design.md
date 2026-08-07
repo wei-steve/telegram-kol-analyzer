@@ -116,9 +116,12 @@ message:
 - no target outside the explicit message symbols and sides;
 - no risk-increasing clause.
 
-Validation is all-or-nothing. If one explicit target is ambiguous or unsafe,
-create no executable work for any target and record a bounded refusal. This
-prevents partial interpretation of a single cross-symbol instruction.
+This paragraph is superseded by
+`docs/plans/2026-08-07-multi-target-isolation-agent-notification-design.md`.
+Validation and execution are target-isolated: an ambiguous or unsafe target is
+refused and audited without preventing unrelated, valid targets from creating
+and completing executable work. Only targets that resolve to the same exact
+position ownership are placed in one collision group and frozen together.
 
 Once validation succeeds, reuse the existing multi-instruction orchestration
 to create one `SignalCandidate` and one `MessageInstructionItem` per lifecycle
@@ -255,7 +258,7 @@ business state.
 - reproduce the bounded evidence from message 3465 with BTC-short and
   ETH-short exact targets;
 - assert two target-specific instruction items are persisted;
-- assert one ambiguous target refuses all work;
+- assert one ambiguous target is refused while unrelated valid targets continue;
 - reject mixed reduce-then-increase fanout;
 - prove a repeated message/target pair is idempotent;
 - prove positions created after the message are excluded.
@@ -321,4 +324,3 @@ old management message.
   workers;
 - freeze every unknown exchange outcome and reconcile it read-only rather than
   using rollback as a retry mechanism.
-
