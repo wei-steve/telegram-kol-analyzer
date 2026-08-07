@@ -107,6 +107,10 @@ def management_decision_fingerprint(
     )
 
 
+def management_parameter_fingerprint(decision: Mapping[str, Any]) -> str:
+    return _sha256(_canonical_json(_decision_parameters(decision)))
+
+
 def derive_envelope_status(states: Collection[str]) -> str:
     normalized = tuple(str(state) for state in states)
     if any(state in ATTENTION_STATES for state in normalized):
@@ -196,7 +200,7 @@ def project_management_targets_in_session(
 
     parameters = _decision_parameters(decision)
     parameters_json = _canonical_json(parameters)
-    parameter_fingerprint = _sha256(parameters_json)
+    parameter_fingerprint = management_parameter_fingerprint(decision)
     envelope = _get_or_create_envelope(
         session,
         raw_message_id=raw_message_id,

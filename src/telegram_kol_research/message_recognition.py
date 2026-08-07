@@ -30,6 +30,7 @@ from telegram_kol_research.models import (
     MediaAsset,
     MessageInstructionItem,
     MessageRecognition,
+    ManagementMessageTarget,
     RawMessage,
     SignalCandidate,
     StrategyLifecycle,
@@ -56,6 +57,7 @@ from telegram_kol_research.management_scope import (
 )
 from telegram_kol_research.management_message_targets import (
     management_decision_fingerprint,
+    management_parameter_fingerprint,
     project_management_targets_in_session,
 )
 from telegram_kol_research.strategy_management_contracts import (
@@ -1080,6 +1082,7 @@ def _apply_lifecycle_event_decision(
     authoritative_generation: str | None = None,
     applied_candidate_ids: set[int] | None = None,
     current_message_text: str | None = None,
+    multi_target_management_config: MultiTargetManagementConfig | None = None,
 ) -> bool:
     instruction_text = (
         raw_message.text or ""
@@ -1090,13 +1093,31 @@ def _apply_lifecycle_event_decision(
     if target_decisions is None:
         return False
     if len(target_decisions) != 1 or target_decisions[0] is not decision:
-        if not _validate_explicit_management_targets_in_session(
-            session,
-            raw_message=raw_message,
-            target_decisions=target_decisions,
-            instruction_text=instruction_text,
+        if _multi_target_action_is_live(
+            decision,
+            multi_target_management_config,
         ):
-            return False
+            admissions = _admit_explicit_management_targets_in_session(
+                session,
+                raw_message=raw_message,
+                target_decisions=target_decisions,
+                instruction_text=instruction_text,
+            )
+            target_decisions = [
+                admission.decision
+                for admission in admissions
+                if admission.accepted
+            ]
+        else:
+            if _effective_multi_target_action(decision) != "partial_take_profit":
+                return False
+            if not _validate_explicit_management_targets_in_session(
+                session,
+                raw_message=raw_message,
+                target_decisions=target_decisions,
+                instruction_text=instruction_text,
+            ):
+                return False
         applied = False
         for target_decision in target_decisions:
             applied = _apply_lifecycle_event_decision(
@@ -1107,6 +1128,7 @@ def _apply_lifecycle_event_decision(
                 authoritative_generation=authoritative_generation,
                 applied_candidate_ids=applied_candidate_ids,
                 current_message_text=instruction_text,
+                multi_target_management_config=multi_target_management_config,
             ) or applied
         return applied
 
@@ -1908,6 +1930,158 @@ def _validate_explicit_management_targets_in_session(
     return True
 
 
+@dataclass(frozen=True, slots=True)
+class TargetAdmission:
+    decision: dict[str, Any]
+    accepted: bool
+    reason_code: str | None
+    collision_group: str | None
+
+
+def _effective_multi_target_action(decision: Mapping[str, Any]) -> str:
+    action = str(decision.get("management_action") or "").strip().lower()
+    if action:
+        return multi_target_action_policy(action).action
+    return {
+        "cancel_entry": "cancel_pending_entry",
+        "exit_position": "exit_full",
+        "exit_full": "exit_full",
+        "full_exit": "exit_full",
+        "close_position": "exit_full",
+    }.get(str(decision.get("event_type") or "").strip().lower(), "")
+
+
+def _multi_target_action_is_live(
+    decision: Mapping[str, Any],
+    config: MultiTargetManagementConfig | None,
+) -> bool:
+    return config is not None and config.action_is_live(
+        _effective_multi_target_action(decision)
+    )
+
+
+def _admit_explicit_management_targets_in_session(
+    session,
+    *,
+    raw_message: RawMessage,
+    target_decisions: list[dict[str, Any]],
+    instruction_text: str,
+) -> list[TargetAdmission]:
+    admissions: list[TargetAdmission] = []
+    for target_decision in target_decisions:
+        try:
+            with session.begin_nested():
+                admission = _admit_one_explicit_management_target_in_session(
+                    session,
+                    raw_message=raw_message,
+                    target_decision=target_decision,
+                    instruction_text=instruction_text,
+                )
+                _persist_target_admission_in_session(
+                    session,
+                    raw_message_id=raw_message.id,
+                    target_decision=target_decision,
+                    admission=admission,
+                )
+            admissions.append(admission)
+        except (ManagementScopeError, ValueError) as exc:
+            reason_code = str(exc).strip() or "target_validation_failed"
+            admission = TargetAdmission(
+                decision=target_decision,
+                accepted=False,
+                reason_code=reason_code[:128],
+                collision_group=None,
+            )
+            with session.begin_nested():
+                _persist_target_admission_in_session(
+                    session,
+                    raw_message_id=raw_message.id,
+                    target_decision=target_decision,
+                    admission=admission,
+                )
+            admissions.append(admission)
+    return admissions
+
+
+def _admit_one_explicit_management_target_in_session(
+    session,
+    *,
+    raw_message: RawMessage,
+    target_decision: dict[str, Any],
+    instruction_text: str,
+) -> TargetAdmission:
+    action = _effective_multi_target_action(target_decision)
+    policy = multi_target_action_policy(action)
+    if not policy.risk_reducing or not policy.fanout_allowed:
+        raise ValueError("multi_target_action_not_allowed")
+    directive = resolve_management_directive(
+        text=instruction_text,
+        lifecycle_event=target_decision,
+    )
+    target_id = _int_or_none(target_decision.get("target_lifecycle_id"))
+    if target_id is None:
+        raise ValueError("target_lifecycle_id_missing")
+    if not directive.risk_reducing:
+        raise ValueError(directive.reason_code)
+    if policy.requires_fraction and directive.fraction is None:
+        raise ValueError("management_fraction_required")
+    resolved = resolve_management_scope_in_session(
+        session,
+        raw_message=raw_message,
+        directive=directive,
+        explicit_target_lifecycle_id=target_id,
+        reply_target_lifecycle_id=None,
+    )
+    if len(resolved) != 1:
+        raise ValueError("target_not_unique")
+    target = resolved[0]
+    if target.scope_source != "explicit":
+        raise ValueError("target_not_verified")
+    if (
+        target.lifecycle_id != target_id
+        or str(target_decision.get("symbol") or "").upper() != target.symbol
+        or str(target_decision.get("side") or "").lower() != target.side
+    ):
+        raise ValueError("target_identity_mismatch")
+    return TargetAdmission(
+        decision=target_decision,
+        accepted=True,
+        reason_code=None,
+        collision_group=None,
+    )
+
+
+def _persist_target_admission_in_session(
+    session,
+    *,
+    raw_message_id: int,
+    target_decision: Mapping[str, Any],
+    admission: TargetAdmission,
+) -> None:
+    target_id = _int_or_none(target_decision.get("target_lifecycle_id"))
+    if target_id is None:
+        return
+    row = (
+        session.query(ManagementMessageTarget)
+        .filter(
+            ManagementMessageTarget.raw_message_id == int(raw_message_id),
+            ManagementMessageTarget.target_lifecycle_id == target_id,
+            ManagementMessageTarget.normalized_action
+            == _effective_multi_target_action(target_decision),
+            ManagementMessageTarget.parameter_fingerprint
+            == management_parameter_fingerprint(target_decision),
+        )
+        .one_or_none()
+    )
+    if row is None:
+        raise ValueError("target_projection_missing")
+    row.admission_state = "admitted" if admission.accepted else "refused"
+    row.closed_reason_code = admission.reason_code
+    row.admitted_at = utc_now() if admission.accepted else None
+    row.updated_at = utc_now()
+    session.flush()
+
+
 def _apply_low_confidence_group_exit_if_matched(
     session,
     raw_message: RawMessage,
@@ -1971,6 +2145,7 @@ def _apply_deterministic_management_scope_if_matched(
     authoritative_generation: str | None,
     applied_candidate_ids: set[int] | None,
     current_message_text: str | None = None,
+    multi_target_management_config: MultiTargetManagementConfig | None = None,
 ) -> bool:
     """Fan out only deterministic risk reductions to verified live positions."""
 
@@ -1996,13 +2171,31 @@ def _apply_deterministic_management_scope_if_matched(
     if expanded_targets is None:
         return False
     if len(expanded_targets) != 1 or expanded_targets[0] is not decision:
-        if not _validate_explicit_management_targets_in_session(
-            session,
-            raw_message=raw_message,
-            target_decisions=expanded_targets,
-            instruction_text=instruction_text,
+        if _multi_target_action_is_live(
+            decision,
+            multi_target_management_config,
         ):
-            return False
+            admissions = _admit_explicit_management_targets_in_session(
+                session,
+                raw_message=raw_message,
+                target_decisions=expanded_targets,
+                instruction_text=instruction_text,
+            )
+            expanded_targets = [
+                admission.decision
+                for admission in admissions
+                if admission.accepted
+            ]
+        else:
+            if _effective_multi_target_action(decision) != "partial_take_profit":
+                return False
+            if not _validate_explicit_management_targets_in_session(
+                session,
+                raw_message=raw_message,
+                target_decisions=expanded_targets,
+                instruction_text=instruction_text,
+            ):
+                return False
         applied = False
         for target_decision in expanded_targets:
             applied = _apply_deterministic_management_scope_if_matched(
@@ -2013,6 +2206,7 @@ def _apply_deterministic_management_scope_if_matched(
                 authoritative_generation=authoritative_generation,
                 applied_candidate_ids=applied_candidate_ids,
                 current_message_text=instruction_text,
+                multi_target_management_config=multi_target_management_config,
             ) or applied
         return applied
 
@@ -2460,6 +2654,11 @@ def apply_authoritative_mimo_payload(
 ) -> MessageRecognitionResult:
     """Persist only the authoritative MiMo interpretation."""
 
+    active_multi_target_management_config = (
+        multi_target_management_config
+        if multi_target_management_config is not None
+        else load_multi_target_management_config()
+    )
     with session_factory() as session:
         raw_message = session.get(RawMessage, raw_message_id)
         if raw_message is None:
@@ -2510,6 +2709,13 @@ def apply_authoritative_mimo_payload(
             raw_message.text,
             payload,
         )
+        _project_multi_target_management_shadow_in_session(
+            session,
+            raw_message_id=raw_message_id,
+            lifecycle_event=lifecycle_event,
+            authoritative_generation=authoritative_generation,
+            config=active_multi_target_management_config,
+        )
         event_type = str(lifecycle_event.get("event_type") or "none")
         lifecycle_applied = _apply_low_confidence_group_exit_if_matched(
             session,
@@ -2537,6 +2743,9 @@ def apply_authoritative_mimo_payload(
                         authoritative_generation=authoritative_generation,
                         applied_candidate_ids=accepted_candidate_ids,
                         current_message_text=current_message_text,
+                        multi_target_management_config=(
+                            active_multi_target_management_config
+                        ),
                     )
                 )
             if not lifecycle_applied and not management_event:
@@ -2548,6 +2757,9 @@ def apply_authoritative_mimo_payload(
                     authoritative_generation=authoritative_generation,
                     applied_candidate_ids=accepted_candidate_ids,
                     current_message_text=current_message_text,
+                    multi_target_management_config=(
+                        active_multi_target_management_config
+                    ),
                 )
 
         lifecycle_event.pop("_exact_context_risk_reduction_authorized", None)
@@ -2627,11 +2839,7 @@ def apply_authoritative_mimo_payload(
             raw_message_id=raw_message_id,
             lifecycle_event=lifecycle_event,
             authoritative_generation=authoritative_generation,
-            config=(
-                multi_target_management_config
-                if multi_target_management_config is not None
-                else load_multi_target_management_config()
-            ),
+            config=active_multi_target_management_config,
         )
         session.commit()
         return result
@@ -2655,12 +2863,16 @@ def _project_multi_target_management_shadow_in_session(
     ):
         return
     try:
+        projected_decision = dict(lifecycle_event)
+        projected_decision["management_action"] = (
+            _effective_multi_target_action(lifecycle_event)
+        )
         project_management_targets_in_session(
             session,
             raw_message_id=raw_message_id,
-            decision=lifecycle_event,
+            decision=projected_decision,
             decision_fingerprint=management_decision_fingerprint(
-                lifecycle_event,
+                projected_decision,
                 authoritative_generation=authoritative_generation,
             ),
             projection_mode="shadow" if config.shadow_only else "live",
