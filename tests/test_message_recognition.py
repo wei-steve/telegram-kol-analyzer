@@ -70,6 +70,58 @@ def _mock_deepseek_lifecycle_event(monkeypatch, payload, *, seen_requests=None):
     monkeypatch.setattr("telegram_kol_research.message_recognition.httpx.Client", FakeClient)
 
 
+def _add_exact_live_lifecycle(
+    session,
+    *,
+    chat_id: int,
+    message_id: int,
+    symbol: str,
+    side: str,
+    verified_entry: bool = True,
+):
+    strategy_id = f"deepcoin:{chat_id}:{message_id}:{symbol}:{side}"
+    binding = ExecutionBinding(
+        strategy_instance_id=strategy_id,
+        kol_id=f"group:{chat_id}",
+        chat_id=chat_id,
+        message_id=message_id,
+        symbol=symbol,
+        side=side,
+        venue="deepcoin",
+        pos_id=f"pos-{symbol.lower()}",
+        status="active",
+    )
+    session.add(binding)
+    session.flush()
+    lifecycle = StrategyLifecycle(
+        chat_id=chat_id,
+        message_id=message_id,
+        symbol=symbol,
+        side=side,
+        lifecycle_status="entered",
+        signal_at=datetime(2026, 7, 20, 12, tzinfo=UTC),
+        entered_at=datetime(2026, 7, 20, 12, 1, tzinfo=UTC),
+        execution_binding_id=binding.id,
+    )
+    session.add(lifecycle)
+    if verified_entry:
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                strategy_instance_id=strategy_id,
+                leg_index=1,
+                purpose="entry",
+                order_kind="market",
+                order_id=f"order-{symbol.lower()}",
+                pos_id=f"pos-{symbol.lower()}",
+                status="active",
+                attribution_status="verified",
+            )
+        )
+    session.flush()
+    return lifecycle
+
+
 def test_chat_completions_url_does_not_duplicate_v1_path():
     assert (
         _chat_completions_url("https://api.xiaomimimo.com/v1")
@@ -663,23 +715,11 @@ def test_authoritative_multi_target_partial_take_profit_persists_one_candidate_p
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
-        btc = StrategyLifecycle(
-            chat_id=88,
-            message_id=3365,
-            symbol="BTC",
-            side="short",
-            lifecycle_status="entered",
-            signal_at=datetime(2026, 7, 21, 12, 30, tzinfo=UTC),
-            entered_at=datetime(2026, 7, 21, 12, 32, tzinfo=UTC),
+        btc = _add_exact_live_lifecycle(
+            session, chat_id=88, message_id=3365, symbol="BTC", side="short"
         )
-        eth = StrategyLifecycle(
-            chat_id=88,
-            message_id=3359,
-            symbol="ETH",
-            side="short",
-            lifecycle_status="entered",
-            signal_at=datetime(2026, 7, 20, 19, 19, tzinfo=UTC),
-            entered_at=datetime(2026, 7, 20, 19, 20, tzinfo=UTC),
+        eth = _add_exact_live_lifecycle(
+            session, chat_id=88, message_id=3359, symbol="ETH", side="short"
         )
         raw_message = RawMessage(
             chat_id=88,
@@ -693,10 +733,7 @@ def test_authoritative_multi_target_partial_take_profit_persists_one_candidate_p
         btc_id = btc.id
         eth_id = eth.id
 
-    apply_authoritative_mimo_payload(
-        session_factory,
-        raw_message_id=raw_message_id,
-        payload={
+    payload = {
             "recognition_result": "非策略",
             "lifecycle_event": {
                 "event_type": "position_update",
@@ -709,10 +746,15 @@ def test_authoritative_multi_target_partial_take_profit_persists_one_candidate_p
                     {"target_lifecycle_id": eth_id, "symbol": "ETH", "side": "short"},
                 ],
             },
-        },
-        model="mimo-v2.5",
-        authoritative_generation="multi-target-3366",
-    )
+        }
+    for _ in range(2):
+        apply_authoritative_mimo_payload(
+            session_factory,
+            raw_message_id=raw_message_id,
+            payload=payload,
+            model="mimo-v2.5",
+            authoritative_generation="multi-target-3366",
+        )
 
     with session_factory() as session:
         candidates = (
@@ -736,6 +778,57 @@ def test_authoritative_multi_target_partial_take_profit_persists_one_candidate_p
         (eth_id, "ETH", "short", 0.5),
     }
     assert [item.instruction_kind for item in items] == ["management", "management"]
+
+
+def test_authoritative_multi_target_persistence_is_all_or_nothing(tmp_path):
+    session_factory = create_session_factory(tmp_path / "multi-target-atomic.db")
+    with session_factory() as session:
+        btc = _add_exact_live_lifecycle(
+            session, chat_id=88, message_id=3463, symbol="BTC", side="short"
+        )
+        eth = _add_exact_live_lifecycle(
+            session,
+            chat_id=88,
+            message_id=3464,
+            symbol="ETH",
+            side="short",
+            verified_entry=False,
+        )
+        raw = RawMessage(
+            chat_id=88,
+            message_id=3465,
+            posted_at=datetime(2026, 7, 21, 18, 5, tzinfo=UTC),
+            text="BTC ETH空单可以止盈一部分",
+        )
+        session.add(raw)
+        session.flush()
+        raw_id, btc_id, eth_id = raw.id, btc.id, eth.id
+        session.commit()
+
+    result = apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_id,
+        payload={
+            "recognition_result": "非策略",
+            "lifecycle_event": {
+                "event_type": "position_update",
+                "management_action": "partial_take_profit",
+                "management_fraction": 0.5,
+                "confidence": 0.95,
+                "targets": [
+                    {"target_lifecycle_id": btc_id, "symbol": "BTC", "side": "short"},
+                    {"target_lifecycle_id": eth_id, "symbol": "ETH", "side": "short"},
+                ],
+            },
+        },
+        model="mimo-v2.5",
+        authoritative_generation="multi-target-3465",
+    )
+
+    assert result.status == "识别失败"
+    with session_factory() as session:
+        assert session.query(SignalCandidate).filter_by(raw_message_id=raw_id).count() == 0
+        assert session.query(MessageInstructionItem).filter_by(raw_message_id=raw_id).count() == 0
 
 
 def test_authoritative_unscoped_break_even_does_not_guess_same_group_positions(

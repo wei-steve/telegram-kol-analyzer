@@ -1078,6 +1078,13 @@ def _apply_lifecycle_event_decision(
     if target_decisions is None:
         return False
     if len(target_decisions) != 1 or target_decisions[0] is not decision:
+        if not _validate_explicit_management_targets_in_session(
+            session,
+            raw_message=raw_message,
+            target_decisions=target_decisions,
+            instruction_text=instruction_text,
+        ):
+            return False
         applied = False
         for target_decision in target_decisions:
             applied = _apply_lifecycle_event_decision(
@@ -1821,6 +1828,62 @@ def _expand_lifecycle_event_targets(
     return targets
 
 
+def _validate_explicit_management_targets_in_session(
+    session,
+    *,
+    raw_message: RawMessage,
+    target_decisions: list[dict[str, Any]],
+    instruction_text: str,
+) -> bool:
+    """Validate the complete explicit target set before creating any work."""
+
+    if len(target_decisions) < 2:
+        return False
+    for target_decision in target_decisions:
+        if (
+            str(target_decision.get("event_type") or "") != "position_update"
+            or str(target_decision.get("management_action") or "")
+            != "partial_take_profit"
+        ):
+            return False
+        try:
+            directive = resolve_management_directive(
+                text=instruction_text,
+                lifecycle_event=target_decision,
+            )
+            target_id = _int_or_none(
+                target_decision.get("target_lifecycle_id")
+            )
+            if (
+                target_id is None
+                or directive.intent != "partial_take_profit"
+                or not directive.risk_reducing
+                or not directive.fanout_allowed
+            ):
+                return False
+            resolved = resolve_management_scope_in_session(
+                session,
+                raw_message=raw_message,
+                directive=directive,
+                explicit_target_lifecycle_id=target_id,
+                reply_target_lifecycle_id=None,
+            )
+        except (ManagementScopeError, ValueError):
+            return False
+        if len(resolved) != 1 or resolved[0].scope_source != "explicit":
+            return False
+        target = resolved[0]
+        if (
+            target.lifecycle_id != target_id
+            or str(target_decision.get("symbol") or "").upper()
+            != target.symbol
+            or str(target_decision.get("side") or "").lower()
+            != target.side
+        ):
+            return False
+    return True
+
+
 def _apply_low_confidence_group_exit_if_matched(
     session,
     raw_message: RawMessage,
@@ -1909,6 +1972,13 @@ def _apply_deterministic_management_scope_if_matched(
     if expanded_targets is None:
         return False
     if len(expanded_targets) != 1 or expanded_targets[0] is not decision:
+        if not _validate_explicit_management_targets_in_session(
+            session,
+            raw_message=raw_message,
+            target_decisions=expanded_targets,
+            instruction_text=instruction_text,
+        ):
+            return False
         applied = False
         for target_decision in expanded_targets:
             applied = _apply_deterministic_management_scope_if_matched(

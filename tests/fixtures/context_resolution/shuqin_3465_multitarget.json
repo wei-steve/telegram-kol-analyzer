@@ -1,0 +1,21 @@
+{
+  "message_text": "BTC ETH空单可以止盈一部分",
+  "targets": [
+    {
+      "symbol": "BTC",
+      "side": "short",
+      "same_chat": true,
+      "active_lifecycle": true,
+      "verified_entry_leg_count": 1,
+      "position_created_before_message": true
+    },
+    {
+      "symbol": "ETH",
+      "side": "short",
+      "same_chat": true,
+      "active_lifecycle": true,
+      "verified_entry_leg_count": 1,
+      "position_created_before_message": true
+    }
+  ]
+}
