@@ -1,5 +1,6 @@
 ﻿import json
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 
@@ -19,7 +20,7 @@ from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.message_instruction_items import create_message_instruction_items_in_session
-from telegram_kol_research.models import EntryPreamble, EntryStrategyAssembly, ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, MediaAsset, MessageEvidenceExtractionClaim, MessageEvidenceVersion, MessageInstructionItem, PositionProtectionLeg, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal, TriggerProtectionIntent, TriggerTakeProfitConvergence
+from telegram_kol_research.models import EntryPreamble, EntryStrategyAssembly, EntryStrategyFragment, ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, MediaAsset, MessageEvidenceExtractionClaim, MessageEvidenceVersion, MessageInstructionItem, PositionProtectionLeg, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal, TriggerProtectionIntent, TriggerTakeProfitConvergence
 from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
 from telegram_kol_research.recovery_live_submit import _trigger_protection_lock_key
 from telegram_kol_research.recovery_live_submit import _trigger_protection_request_fingerprint
@@ -944,6 +945,112 @@ def test_shadow_entry_preamble_reports_half_but_executes_configured_risk(tmp_pat
     with session_factory() as session:
         assert session.query(RecoveryDecisionRecord).one().max_loss_usdt == 20.0
         assert session.get(EntryPreamble, preamble_id).status == "pending"
+
+
+def test_live_v2_fragment_applies_half_budget_and_supplemental_leg_once(tmp_path):
+    session_factory = create_session_factory(tmp_path / "v2-risk-live.db")
+    strategy_raw_id = _persist_candidate(
+        session_factory,
+        text="BTC short 63900-64200 SL 64900 TP 62800",
+        entry_text="63900-64200",
+        stop_loss_text="64900",
+        take_profit_text="62800",
+        symbol="BTC",
+        side="short",
+    )
+    with session_factory() as session:
+        strategy = session.get(RawMessage, strategy_raw_id)
+        context = RawMessage(
+            chat_id=strategy.chat_id,
+            message_id=strategy.message_id + 1,
+            posted_at=strategy.posted_at + timedelta(seconds=1),
+            text="50%仓位，补仓63400",
+        )
+        session.add(context)
+        session.flush()
+        evidence = MessageEvidenceVersion(
+            raw_message_id=context.id,
+            version=1,
+            input_fingerprint="v2-context",
+            model="mimo",
+            prompt_versions_json="{}",
+            extraction_status="completed",
+            confidence=1,
+            text_evidence_json="{}",
+            image_evidence_json="{}",
+            normalized_evidence_json="{}",
+        )
+        session.add(evidence)
+        session.flush()
+        session.add_all(
+            [
+                EntryStrategyFragment(
+                    raw_message_id=context.id,
+                    chat_id=context.chat_id,
+                    message_id=context.message_id,
+                    symbol="BTC",
+                    side="short",
+                    fragment_kind="risk_multiplier",
+                    payload_json='{"risk_multiplier":"0.5"}',
+                    evidence_version_id=evidence.id,
+                    recognition_generation="v2-g",
+                    source_relationship="unresolved",
+                    status="pending",
+                    reason="50%",
+                    fingerprint="a" * 64,
+                    created_at=context.posted_at,
+                    updated_at=context.posted_at,
+                ),
+                EntryStrategyFragment(
+                    raw_message_id=context.id,
+                    chat_id=context.chat_id,
+                    message_id=context.message_id,
+                    symbol="BTC",
+                    side="short",
+                    fragment_kind="supplemental_entry",
+                    payload_json='{"prices":["63400"]}',
+                    evidence_version_id=evidence.id,
+                    recognition_generation="v2-g",
+                    source_relationship="unresolved",
+                    status="pending",
+                    reason="补仓",
+                    fingerprint="b" * 64,
+                    created_at=context.posted_at,
+                    updated_at=context.posted_at,
+                ),
+            ]
+        )
+        session.commit()
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC"],
+            "entry_message_assembly_v2_mode": "live",
+        },
+    )
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=strategy_raw_id,
+        group_config=_group_config(),
+        deepcoin_client=_FakeDeepcoinClient(),
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 8, 5, 12, 2, tzinfo=UTC),
+    )
+
+    evidence_payload = result["entry_preamble_assembly"]
+    assert evidence_payload["strategy_risk_multiplier"] == "0.5"
+    assert evidence_payload["effective_risk_budget_usdt"] == 10.0
+    with session_factory() as session:
+        binding_payload = json.loads(session.query(ExecutionBinding).one().payload_json)
+    draft = binding_payload["draft"]
+    assert [leg["price"] for leg in draft["order_legs"]] == [63810.0, 64110.0, 63400.0]
+    assert sum(
+        Decimal(str(leg["estimated_stop_loss_usdt"]))
+        for leg in draft["order_legs"]
+    ) <= Decimal("10")
 
 
 def test_invalid_persisted_entry_preamble_multiplier_blocks_before_trade_signal(tmp_path):

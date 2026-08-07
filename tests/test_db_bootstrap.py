@@ -1176,3 +1176,51 @@ def test_database_bootstrap_backfills_web_performance_indexes(tmp_path):
     assert "ix_strategy_lifecycles_chat_status_signal" in lifecycle_indexes
     assert "ix_strategy_lifecycles_chat_status_entered" in lifecycle_indexes
     assert "ix_strategy_lifecycles_chat_status_exited" in lifecycle_indexes
+
+
+def test_database_bootstrap_makes_legacy_assembly_preamble_nullable(tmp_path):
+    database_path = tmp_path / "legacy-assembly.db"
+    conn = sqlite3.connect(database_path)
+    conn.execute(
+        """
+        CREATE TABLE entry_strategy_assemblies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_preamble_id INTEGER NOT NULL UNIQUE,
+            strategy_raw_message_id INTEGER NOT NULL,
+            signal_candidate_id INTEGER NOT NULL UNIQUE,
+            strategy_instance_id VARCHAR(255) NOT NULL UNIQUE,
+            risk_multiplier VARCHAR(32) NOT NULL,
+            evidence_json TEXT NOT NULL,
+            fingerprint VARCHAR(64) NOT NULL UNIQUE,
+            created_at DATETIME NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO entry_strategy_assemblies (
+            entry_preamble_id, strategy_raw_message_id, signal_candidate_id,
+            strategy_instance_id, risk_multiplier, evidence_json, fingerprint,
+            created_at
+        ) VALUES (1, 2, 3, 'legacy', '0.5', '{}', ?, '2026-08-08 00:00:00')
+        """,
+        ("f" * 64,),
+    )
+    conn.commit()
+    conn.close()
+
+    create_session_factory(database_path)
+
+    conn = sqlite3.connect(database_path)
+    columns = {
+        row[1]: row for row in conn.execute(
+            "PRAGMA table_info(entry_strategy_assemblies)"
+        ).fetchall()
+    }
+    rows = conn.execute(
+        "SELECT entry_preamble_id, strategy_instance_id FROM entry_strategy_assemblies"
+    ).fetchall()
+    conn.close()
+
+    assert columns["entry_preamble_id"][3] == 0
+    assert rows == [(1, "legacy")]

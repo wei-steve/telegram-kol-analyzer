@@ -8,8 +8,10 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.entry_preambles import persist_entry_preamble_in_session
 from telegram_kol_research.message_evidence import EntryPreambleEvidence
 from telegram_kol_research.models import (
+    EntryAssemblyFragment,
     EntryPreamble,
     EntryStrategyAssembly,
+    EntryStrategyFragment,
     MessageEvidenceVersion,
     MessageEvidenceExtractionClaim,
     RawMessage,
@@ -535,3 +537,137 @@ def test_live_assembly_fingerprint_is_unique_across_chats_with_same_message_ids(
     ]
 
     assert len({result.assembly_fingerprint for result in results}) == 2
+
+
+def test_v2_live_assembly_atomically_consumes_multiple_fragments(tmp_path):
+    from telegram_kol_research.entry_strategy_assembly import (
+        assemble_adjacent_entry_strategy,
+    )
+
+    session_factory = create_session_factory(tmp_path / "v2-multi.db")
+    with session_factory() as session:
+        before = RawMessage(chat_id=100, message_id=1000, posted_at=NOW, text="half")
+        strategy = RawMessage(
+            chat_id=100,
+            message_id=1001,
+            posted_at=NOW + timedelta(seconds=1),
+            text="BTC short 63900-64200 SL 64900",
+        )
+        after = RawMessage(
+            chat_id=100,
+            message_id=1002,
+            posted_at=NOW + timedelta(seconds=2),
+            text="supplement 63400",
+        )
+        session.add_all([before, strategy, after])
+        session.flush()
+        evidence_before = MessageEvidenceVersion(
+            raw_message_id=before.id,
+            version=1,
+            input_fingerprint="before",
+            model="mimo",
+            prompt_versions_json="{}",
+            extraction_status="completed",
+            confidence=1,
+            text_evidence_json="{}",
+            image_evidence_json="{}",
+            normalized_evidence_json="{}",
+        )
+        evidence_after = MessageEvidenceVersion(
+            raw_message_id=after.id,
+            version=1,
+            input_fingerprint="after",
+            model="mimo",
+            prompt_versions_json="{}",
+            extraction_status="completed",
+            confidence=1,
+            text_evidence_json="{}",
+            image_evidence_json="{}",
+            normalized_evidence_json="{}",
+        )
+        session.add_all([evidence_before, evidence_after])
+        session.flush()
+        risk = EntryStrategyFragment(
+            raw_message_id=before.id,
+            chat_id=100,
+            message_id=1000,
+            symbol="BTC",
+            side="short",
+            fragment_kind="risk_multiplier",
+            payload_json='{"risk_multiplier":"0.5"}',
+            evidence_version_id=evidence_before.id,
+            recognition_generation="g-before",
+            source_relationship="unresolved",
+            status="pending",
+            reason="half",
+            fingerprint="1" * 64,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        legacy_preamble = EntryPreamble(
+            raw_message_id=before.id,
+            chat_id=100,
+            message_id=1000,
+            symbol="BTC",
+            side="short",
+            risk_multiplier="0.5",
+            evidence_version_id=evidence_before.id,
+            recognition_generation="g-before",
+            fingerprint="3" * 64,
+            status="pending",
+            reason="half",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        supplemental = EntryStrategyFragment(
+            raw_message_id=after.id,
+            chat_id=100,
+            message_id=1002,
+            symbol="BTC",
+            side="short",
+            fragment_kind="supplemental_entry",
+            payload_json='{"prices":["63400"]}',
+            evidence_version_id=evidence_after.id,
+            recognition_generation="g-after",
+            source_relationship="unresolved",
+            status="pending",
+            reason="supplement",
+            fingerprint="2" * 64,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        candidate = SignalCandidate(
+            raw_message_id=strategy.id,
+            symbol="BTC",
+            side="short",
+            event_type="entry_signal",
+            parse_source="mimo_authoritative",
+            confidence=1,
+        )
+        session.add_all([risk, supplemental, legacy_preamble, candidate])
+        session.flush()
+        ids = strategy.id, candidate.id, risk.id, supplemental.id, legacy_preamble.id
+        session.commit()
+
+    kwargs = dict(
+        strategy_raw_message_id=ids[0],
+        signal_candidate_id=ids[1],
+        strategy_instance_id="deepcoin:100:1001:BTC:short",
+        mode="live",
+        assembled_at=NOW + timedelta(seconds=3),
+    )
+    first = assemble_adjacent_entry_strategy(session_factory, **kwargs)
+    repeated = assemble_adjacent_entry_strategy(session_factory, **kwargs)
+
+    assert first.fragment_ids == (ids[2], ids[3])
+    assert first.effective_risk_multiplier == Decimal("0.5")
+    assert first.supplemental_prices == (Decimal("63400"),)
+    assert repeated.assembly_id == first.assembly_id
+    with session_factory() as session:
+        assert session.query(EntryStrategyAssembly).count() == 1
+        assert session.query(EntryAssemblyFragment).count() == 2
+        assert {
+            session.get(EntryStrategyFragment, ids[2]).status,
+            session.get(EntryStrategyFragment, ids[3]).status,
+        } == {"consumed"}
+        assert session.get(EntryPreamble, ids[4]).status == "consumed"

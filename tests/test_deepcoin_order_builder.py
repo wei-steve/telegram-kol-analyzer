@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 import pytest
 
 import telegram_kol_research.deepcoin_order_builder as deepcoin_order_builder
@@ -944,6 +946,58 @@ def test_build_deepcoin_order_draft_blocks_when_contract_quantity_is_below_minim
     assert draft["order_legs"][0]["base_asset_estimate"] == 0.083333
 
 
+def test_adjacent_entry_allocations_and_supplemental_price_share_one_risk_cap():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(
+            open_side="sell",
+            position_side="short",
+            entry_range="63900-64200",
+            stop_loss="64900",
+            risk_budget_usdt=10.0,
+            supplemental_entry_prices=["63400"],
+            entry_allocations=["0.4", "0.3", "0.3"],
+        ),
+        contract_spec=DeepcoinContractSpec(
+            instrument_id="BTC-USDT-SWAP",
+            contract_value=0.001,
+            quantity_step=1,
+            min_quantity=1,
+            price_tick=0.1,
+        ),
+    )
+
+    assert [leg["price"] for leg in draft["order_legs"]] == [63900.0, 64200.0, 63400.0]
+    assert [leg["risk_budget_usdt"] for leg in draft["order_legs"]] == [4.0, 3.0, 3.0]
+    assert sum(
+        Decimal(str(leg["estimated_stop_loss_usdt"]))
+        for leg in draft["order_legs"]
+    ) <= Decimal("10")
+
+
+def test_two_points_each_half_uses_full_configured_budget():
+    draft = build_deepcoin_order_draft(
+        _payload_preview(
+            open_side="sell",
+            position_side="short",
+            entry_range="63900-64200",
+            stop_loss="64900",
+            risk_budget_usdt=20.0,
+            entry_allocations=["0.5", "0.5"],
+        ),
+        contract_spec=DeepcoinContractSpec(
+            instrument_id="BTC-USDT-SWAP",
+            contract_value=0.001,
+            quantity_step=1,
+            min_quantity=1,
+            price_tick=0.1,
+        ),
+    )
+
+    assert [leg["risk_budget_usdt"] for leg in draft["order_legs"]] == [10.0, 10.0]
+    assert sum(
+        Decimal(str(leg["estimated_stop_loss_usdt"]))
+        for leg in draft["order_legs"]
+    ) <= Decimal("20")
 def test_build_deepcoin_order_draft_rejects_mismatched_contract_spec():
     try:
         build_deepcoin_order_draft(

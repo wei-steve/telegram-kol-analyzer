@@ -21,7 +21,10 @@ from telegram_kol_research.deepcoin_order_builder import build_deepcoin_order_dr
 from telegram_kol_research.execution_events import ExecutionEventRecord
 from telegram_kol_research.execution_events import record_execution_event
 from telegram_kol_research.execution_bindings import build_strategy_instance_id
-from telegram_kol_research.entry_strategy_assembly import assemble_entry_strategy
+from telegram_kol_research.entry_strategy_assembly import (
+    assemble_adjacent_entry_strategy,
+    assemble_entry_strategy,
+)
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -589,14 +592,56 @@ def _auto_process_single_message_trade_signal(
         symbol=symbol,
         side=side,
     )
-    assembly = assemble_entry_strategy(
-        session_factory,
-        strategy_raw_message_id=int(raw_message.id),
-        signal_candidate_id=int(candidate.id),
-        strategy_instance_id=strategy_instance_id,
-        mode=settings.entry_preamble_mode,
-        assembled_at=now,
-    )
+    if settings.entry_message_assembly_v2_mode == "live":
+        assembly = assemble_adjacent_entry_strategy(
+            session_factory,
+            strategy_raw_message_id=int(raw_message.id),
+            signal_candidate_id=int(candidate.id),
+            strategy_instance_id=strategy_instance_id,
+            mode="live",
+            assembled_at=now,
+        )
+    else:
+        legacy_assembly = assemble_entry_strategy(
+            session_factory,
+            strategy_raw_message_id=int(raw_message.id),
+            signal_candidate_id=int(candidate.id),
+            strategy_instance_id=strategy_instance_id,
+            mode=settings.entry_preamble_mode,
+            assembled_at=now,
+        )
+        if settings.entry_message_assembly_v2_mode == "shadow":
+            v2_proposal = assemble_adjacent_entry_strategy(
+                session_factory,
+                strategy_raw_message_id=int(raw_message.id),
+                signal_candidate_id=int(candidate.id),
+                strategy_instance_id=strategy_instance_id,
+                mode="shadow",
+                assembled_at=now,
+            )
+            assembly = (
+                v2_proposal
+                if v2_proposal.fragment_ids
+                else legacy_assembly
+            )
+            if v2_proposal.fragment_ids:
+                assembly = type(v2_proposal)(
+                    status=v2_proposal.status,
+                    reason_code=v2_proposal.reason_code,
+                    mode=v2_proposal.mode,
+                    proposed_risk_multiplier=v2_proposal.proposed_risk_multiplier,
+                    effective_risk_multiplier=legacy_assembly.effective_risk_multiplier,
+                    preamble_id=legacy_assembly.preamble_id,
+                    preamble_message_id=legacy_assembly.preamble_message_id,
+                    strategy_message_id=v2_proposal.strategy_message_id,
+                    assembly_id=legacy_assembly.assembly_id,
+                    assembly_fingerprint=v2_proposal.assembly_fingerprint,
+                    fragment_ids=v2_proposal.fragment_ids,
+                    allocations=v2_proposal.allocations,
+                    supplemental_prices=v2_proposal.supplemental_prices,
+                )
+        else:
+            assembly = legacy_assembly
     if assembly.status == "unresolved":
         return {"status": "deferred", "reason": assembly.reason_code}
     if assembly.status == "blocked":
@@ -620,11 +665,17 @@ def _auto_process_single_message_trade_signal(
         "status": assembly.status,
         "configured_risk_budget_usdt": float(configured_risk),
         "risk_multiplier": str(assembly.proposed_risk_multiplier),
+        "strategy_risk_multiplier": str(assembly.proposed_risk_multiplier),
         "applied_risk_multiplier": str(multiplier),
         "effective_risk_budget_usdt": float(effective_risk),
         "preamble_message_id": assembly.preamble_message_id,
         "strategy_message_id": int(raw_message.message_id),
         "assembly_fingerprint": assembly.assembly_fingerprint,
+        "fragment_ids": list(assembly.fragment_ids),
+        "entry_allocations": [str(value) for value in assembly.allocations],
+        "supplemental_entry_prices": [
+            str(value) for value in assembly.supplemental_prices
+        ],
     }
 
     signal = RecoverySignal(
@@ -642,6 +693,16 @@ def _auto_process_single_message_trade_signal(
         trading_mode="auto_trade",
         max_loss_usdt=float(effective_risk),
         entry_preamble_assembly=assembly_evidence,
+        entry_allocations=(
+            tuple(str(value) for value in assembly.allocations)
+            if settings.entry_message_assembly_v2_mode == "live"
+            else ()
+        ),
+        supplemental_entry_prices=(
+            tuple(str(value) for value in assembly.supplemental_prices)
+            if settings.entry_message_assembly_v2_mode == "live"
+            else ()
+        ),
         symbol_whitelist=[str(item).upper() for item in runtime_config["symbol_whitelist"]],
     )
     decision = RecoveryDecision(
@@ -677,7 +738,20 @@ def _auto_process_single_message_trade_signal(
     )
     auto_draft = None
     execution_plan = None
-    if entry_execution_type == "market":
+    if signal.entry_allocations or signal.supplemental_entry_prices:
+        auto_draft = _build_auto_adjacent_deepcoin_draft(
+            signal=signal,
+            runtime_kol_id=str(runtime_config["kol_id"]),
+            entry_execution_type=entry_execution_type,
+            reference_price=reference_price,
+            stop_loss_text=candidate.stop_loss_text,
+            take_profit_text=candidate.take_profit_text,
+            take_profit_allocations=settings.take_profit_allocations,
+            entry_thresholds=entry_thresholds,
+            contract_spec_provider=contract_spec_provider,
+        )
+        execution_plan = "adjacent_multi_fragment_entry"
+    elif entry_execution_type == "market":
         auto_draft = _build_auto_market_deepcoin_draft(
             signal=signal,
             runtime_kol_id=str(runtime_config["kol_id"]),
@@ -1089,6 +1163,65 @@ def market_price_is_near_entry_edge(
     return (
         abs(Decimal(str(current_price)) - Decimal(str(anchor)))
         <= max_distance
+    )
+
+
+def _build_auto_adjacent_deepcoin_draft(
+    *,
+    signal: RecoverySignal,
+    runtime_kol_id: str,
+    entry_execution_type: str,
+    reference_price: float | None,
+    stop_loss_text: str | None,
+    take_profit_text: str | None,
+    take_profit_allocations: list[float],
+    entry_thresholds: SymbolEntryThresholds,
+    contract_spec_provider: DeepcoinContractSpecProvider | None,
+) -> dict[str, Any]:
+    contract = f"{signal.symbol}-USDT"
+    instrument_id = _to_deepcoin_swap_instrument(signal.symbol)
+    contract_spec = (
+        contract_spec_provider.get_contract_spec(instrument_id)
+        if contract_spec_provider is not None
+        else None
+    )
+    if signal.entry_range is None:
+        raise ValueError("adjacent entry range is unavailable")
+    entry_range = signal.entry_range
+    if entry_execution_type == "market" and reference_price is not None:
+        entry_range = (reference_price, reference_price)
+    return build_deepcoin_order_draft(
+        {
+            "venue": "deepcoin",
+            "contract": contract,
+            "order_type": entry_execution_type,
+            "open_side": "buy" if signal.side == "long" else "sell",
+            "position_side": signal.side,
+            "margin_mode": "cross",
+            "position_mode": "split",
+            "entry_range": f"{entry_range[0]}-{entry_range[1]}",
+            "entry_allocations": list(signal.entry_allocations),
+            "supplemental_entry_prices": list(signal.supplemental_entry_prices),
+            "stop_loss": stop_loss_text,
+            "take_profit": take_profit_text,
+            "take_profit_allocations": take_profit_allocations,
+            "current_price": reference_price,
+            **entry_thresholds.to_dict(),
+            "risk_budget_usdt": signal.max_loss_usdt,
+            "strategy_instance_id": build_strategy_instance_id(
+                venue="deepcoin",
+                chat_id=signal.chat_id,
+                message_id=signal.message_id,
+                symbol=signal.symbol,
+                side=signal.side,
+            ),
+            "source": {
+                "kol_id": runtime_kol_id,
+                "chat_id": signal.chat_id,
+                "message_id": signal.message_id,
+            },
+        },
+        contract_spec=contract_spec,
     )
 
 

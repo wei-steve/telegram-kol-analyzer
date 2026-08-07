@@ -305,8 +305,8 @@ class EntryStrategyAssembly(Base):
     __tablename__ = "entry_strategy_assemblies"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    entry_preamble_id: Mapped[int] = mapped_column(
-        ForeignKey("entry_preambles.id"), nullable=False, unique=True
+    entry_preamble_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("entry_preambles.id"), nullable=True, unique=True
     )
     strategy_raw_message_id: Mapped[int] = mapped_column(
         ForeignKey("raw_messages.id"), nullable=False, index=True

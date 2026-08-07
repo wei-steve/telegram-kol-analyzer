@@ -133,7 +133,82 @@ def build_deepcoin_order_draft(
         if order_type == "limit" and not single_entry_price
         else None
     )
-    if order_type == "market" or single_entry_price:
+    supplemental_prices = _parse_supplemental_entry_prices(
+        payload_preview.get("supplemental_entry_prices"),
+        symbol=symbol,
+        contract_spec=contract_spec,
+    )
+    explicit_entry_allocations = _parse_entry_allocations(
+        payload_preview.get("entry_allocations")
+    )
+    custom_entry_plan = bool(supplemental_prices or explicit_entry_allocations)
+    if custom_entry_plan:
+        if single_entry_price:
+            planned_prices = [
+                _normalize_final_entry_price(
+                    entry_low,
+                    contract_spec,
+                    error_message="entry price produces non-positive price after tick normalization",
+                )
+            ]
+        else:
+            planned_prices = list(
+                _range_entry_leg_prices(
+                    position_side=position_side,
+                    low=entry_low,
+                    high=entry_high,
+                    first_limit_offset=first_limit_offset,
+                    second_limit_offset=second_limit_offset,
+                    contract_spec=contract_spec,
+                )
+            )
+        for price in supplemental_prices:
+            if price not in planned_prices:
+                planned_prices.append(price)
+        if explicit_entry_allocations:
+            if len(explicit_entry_allocations) != len(planned_prices):
+                raise DeepcoinOrderDraftError(
+                    "entry_allocations must match the final entry leg count"
+                )
+            allocation_fractions = explicit_entry_allocations
+        else:
+            equal = Decimal("1") / Decimal(len(planned_prices))
+            allocation_fractions = tuple(equal for _ in planned_prices)
+        order_legs = []
+        for index, (price, allocation_fraction) in enumerate(
+            zip(planned_prices, allocation_fractions, strict=True),
+            start=1,
+        ):
+            allocation_pct = float(allocation_fraction * Decimal("100"))
+            leg_order_type = order_type if index == 1 else "limit"
+            order_legs.append(
+                _order_leg(
+                    side=open_side,
+                    position_side=position_side,
+                    order_type=leg_order_type,
+                    price=price,
+                    client_order_id=build_client_order_id(
+                        strategy_instance_id=strategy_instance_id,
+                        leg_index=index,
+                        kol_code=source_kol_code,
+                        message_id=source_message_id,
+                    ),
+                    allocation_pct=allocation_pct,
+                    risk_budget_usdt=_leg_risk_budget(
+                        risk_budget=risk_budget,
+                        allocation_pct=allocation_pct,
+                    ),
+                    quantity=_estimate_leg_quantity(
+                        risk_budget=risk_budget,
+                        allocation_pct=allocation_pct,
+                        entry_price=price,
+                        stop_loss=normalized_stop_loss,
+                    ),
+                    stop_loss=normalized_stop_loss,
+                    contract_spec=contract_spec,
+                )
+            )
+    elif order_type == "market" or single_entry_price:
         reference_price = _normalize_final_entry_price(
             (entry_low + entry_high) / 2,
             contract_spec,
@@ -286,6 +361,11 @@ def build_deepcoin_order_draft(
             ),
         ]
     order_legs = _coalesce_equivalent_entry_legs(order_legs)
+    estimated_aggregate_risk = math.fsum(
+        float(leg.get("estimated_stop_loss_usdt") or 0) for leg in order_legs
+    )
+    if custom_entry_plan and estimated_aggregate_risk > risk_budget + 1e-6:
+        raise DeepcoinOrderDraftError("aggregate entry risk exceeds risk_budget_usdt")
     blocking_reason_codes = _blocking_reason_codes(
         stop_loss=stop_loss,
         contract_spec=contract_spec,
@@ -395,6 +475,53 @@ def _parse_take_profit_prices(value: Any, *, symbol: str | None = None) -> list[
     if value in (None, ""):
         return []
     return extract_normalized_prices(value, symbol=symbol)
+
+
+def _parse_supplemental_entry_prices(
+    value: Any,
+    *,
+    symbol: str | None,
+    contract_spec: DeepcoinContractSpec | None,
+) -> list[float]:
+    if value in (None, "", []):
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise DeepcoinOrderDraftError("supplemental_entry_prices must be a list")
+    prices: list[float] = []
+    for item in value:
+        parsed = extract_normalized_prices(item, symbol=symbol)
+        if len(parsed) != 1 or float(parsed[0]) <= 0:
+            raise DeepcoinOrderDraftError(
+                "supplemental_entry_prices must contain positive prices"
+            )
+        normalized = _normalize_final_entry_price(
+            float(parsed[0]),
+            contract_spec,
+            error_message="supplemental entry price is invalid after normalization",
+        )
+        if normalized not in prices:
+            prices.append(normalized)
+    return prices
+
+
+def _parse_entry_allocations(value: Any) -> tuple[Decimal, ...]:
+    if value in (None, "", []):
+        return ()
+    if not isinstance(value, (list, tuple)) or not value or len(value) > 8:
+        raise DeepcoinOrderDraftError("entry_allocations must be a bounded list")
+    parsed: list[Decimal] = []
+    for item in value:
+        allocation = _parse_nonnegative_decimal(
+            item, field_name="entry_allocations"
+        )
+        if allocation <= 0 or allocation > 1:
+            raise DeepcoinOrderDraftError(
+                "entry_allocations must contain fractions in (0, 1]"
+            )
+        parsed.append(allocation)
+    if sum(parsed) != Decimal("1"):
+        raise DeepcoinOrderDraftError("entry_allocations must sum to 1")
+    return tuple(parsed)
 
 
 def _range_entry_leg_prices(

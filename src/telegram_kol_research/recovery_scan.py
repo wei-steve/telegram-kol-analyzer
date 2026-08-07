@@ -37,6 +37,8 @@ class RecoverySignal:
     max_loss_usdt: float = 20.0
     symbol_whitelist: list[str] = field(default_factory=lambda: ["BTC", "ETH"])
     entry_preamble_assembly: dict[str, object] | None = None
+    entry_allocations: tuple[str, ...] = ()
+    supplemental_entry_prices: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)

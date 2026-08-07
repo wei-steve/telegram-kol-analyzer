@@ -629,6 +629,7 @@ def init_db(engine: Engine) -> None:
 
     _configure_sqlite(engine)
     Base.metadata.create_all(engine)
+    _make_sqlite_entry_assembly_preamble_nullable(engine)
     _backfill_sqlite_columns(engine)
     _backfill_sqlite_expiry_review_state(engine)
     _backfill_sqlite_indexes(engine)
@@ -641,6 +642,72 @@ def _configure_sqlite(engine: Engine) -> None:
     with engine.begin() as connection:
         connection.execute(text("PRAGMA journal_mode=WAL"))
         connection.execute(text("PRAGMA busy_timeout=30000"))
+
+
+def _make_sqlite_entry_assembly_preamble_nullable(engine: Engine) -> None:
+    """Rebuild the small immutable ledger when upgrading its legacy NOT NULL key."""
+
+    if engine.dialect.name != "sqlite":
+        return
+    raw_connection = engine.raw_connection()
+    try:
+        cursor = raw_connection.cursor()
+        columns = cursor.execute(
+            "PRAGMA table_info(entry_strategy_assemblies)"
+        ).fetchall()
+        preamble_column = next(
+            (row for row in columns if row[1] == "entry_preamble_id"), None
+        )
+        if preamble_column is None or int(preamble_column[3]) == 0:
+            return
+        foreign_keys_enabled = int(cursor.execute("PRAGMA foreign_keys").fetchone()[0])
+        if foreign_keys_enabled:
+            cursor.execute("PRAGMA foreign_keys=OFF")
+        cursor.execute(
+            """
+            CREATE TABLE entry_strategy_assemblies_nullable (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_preamble_id INTEGER UNIQUE,
+                strategy_raw_message_id INTEGER NOT NULL,
+                signal_candidate_id INTEGER NOT NULL UNIQUE,
+                strategy_instance_id VARCHAR(255) NOT NULL UNIQUE,
+                risk_multiplier VARCHAR(32) NOT NULL,
+                evidence_json TEXT NOT NULL,
+                fingerprint VARCHAR(64) NOT NULL UNIQUE,
+                created_at DATETIME NOT NULL,
+                FOREIGN KEY(entry_preamble_id) REFERENCES entry_preambles(id),
+                FOREIGN KEY(strategy_raw_message_id) REFERENCES raw_messages(id),
+                FOREIGN KEY(signal_candidate_id) REFERENCES signal_candidates(id)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            INSERT INTO entry_strategy_assemblies_nullable (
+                id, entry_preamble_id, strategy_raw_message_id,
+                signal_candidate_id, strategy_instance_id, risk_multiplier,
+                evidence_json, fingerprint, created_at
+            )
+            SELECT id, entry_preamble_id, strategy_raw_message_id,
+                   signal_candidate_id, strategy_instance_id, risk_multiplier,
+                   evidence_json, fingerprint, created_at
+            FROM entry_strategy_assemblies
+            """
+        )
+        cursor.execute("DROP TABLE entry_strategy_assemblies")
+        cursor.execute(
+            "ALTER TABLE entry_strategy_assemblies_nullable "
+            "RENAME TO entry_strategy_assemblies"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS ix_entry_strategy_assemblies_strategy_raw_message_id "
+            "ON entry_strategy_assemblies (strategy_raw_message_id)"
+        )
+        raw_connection.commit()
+        if foreign_keys_enabled:
+            cursor.execute("PRAGMA foreign_keys=ON")
+    finally:
+        raw_connection.close()
 
 
 def _backfill_sqlite_columns(engine: Engine) -> None:
