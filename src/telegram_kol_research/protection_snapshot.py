@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
@@ -33,6 +34,7 @@ def build_position_protection_audit(
     take_profit_orders: Iterable[object],
     pending_trigger_orders: Iterable[dict[str, Any]],
     freeze_reasons: Iterable[object] = (),
+    protection_revisions: Iterable[object] = (),
     open_positions: Iterable[dict[str, Any]] | None = None,
     account_ownership: AccountProtectionOwnership | None = None,
 ) -> dict[str, Any]:
@@ -129,9 +131,14 @@ def build_position_protection_audit(
             pos_id in conflict.pos_ids
             for conflict in account_ownership.conflicts
         )
+    active_freeze_reasons = _active_freeze_reasons(
+        pos_id=pos_id,
+        freeze_reasons=freeze_reasons,
+        protection_revisions=protection_revisions,
+    )
     reasons = {
         _text(_field(reason, "reason") or _field(reason, "incident_type") or reason)
-        for reason in freeze_reasons
+        for reason in active_freeze_reasons
         if _text(_field(reason, "reason") or _field(reason, "incident_type") or reason)
     }
     if primary["verification_status"] == "none":
@@ -193,6 +200,53 @@ def build_position_protection_audit(
         "freeze_reasons": sorted(reasons),
         "protected": protected,
     }
+
+
+_TRANSIENT_REPLACEMENT_FREEZE_REASONS = frozenset(
+    {"backup_stop_blocked", "protection_missing"}
+)
+
+
+def _active_freeze_reasons(*, pos_id, freeze_reasons, protection_revisions):
+    reasons = list(freeze_reasons)
+    complete_revisions = []
+    for revision in protection_revisions:
+        if (
+            _text(_field(revision, "pos_id")) != pos_id
+            or _text(_field(revision, "status")) != "active"
+        ):
+            continue
+        payload = _json_value(_field(revision, "protection_json"))
+        if not {"primary_stop", "backup_stop", "take_profit"}.issubset(
+            set(payload.get("roles") or [])
+        ):
+            continue
+        created_at = _field(revision, "created_at")
+        if isinstance(created_at, datetime):
+            complete_revisions.append(created_at)
+    if not complete_revisions:
+        return reasons
+    newest = max(_utc_naive(value) for value in complete_revisions)
+    active = []
+    for reason in reasons:
+        reason_code = _text(
+            _field(reason, "reason") or _field(reason, "incident_type") or reason
+        )
+        created_at = _field(reason, "created_at")
+        recovered = (
+            reason_code in _TRANSIENT_REPLACEMENT_FREEZE_REASONS
+            and isinstance(created_at, datetime)
+            and _utc_naive(created_at) < newest
+        )
+        if not recovered:
+            active.append(reason)
+    return active
+
+
+def _utc_naive(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
 
 
 def _primary_stop_summary(position, pending, scope, rows):

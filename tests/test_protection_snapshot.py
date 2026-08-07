@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import PendingTpslSnapshotObservation
 from telegram_kol_research.protection_snapshot import (
@@ -307,6 +309,44 @@ def test_position_audit_prefers_verified_composite_backup_and_ignores_cancelled_
     assert audit["readback_complete"] is True
     assert audit["automation_safe"] is True
     assert audit["protected"] is True
+
+
+def test_verified_newer_replacement_supersedes_transient_freeze_reasons():
+    position = {"posId": "pos-1", "instId": "BTC-USDT-SWAP", "posSide": "long", "pos": "6"}
+    ledger = [
+        {"id": 1, "pos_id": "pos-1", "purpose": "stop_loss", "order_id": "primary-new", "trigger_price": "64100", "size_text": "6", "status": "verified"},
+        {"id": 2, "pos_id": "pos-1", "purpose": "backup_stop", "order_id": "backup-new", "trigger_price": "63900", "size_text": "6", "status": "verified"},
+    ]
+    pending = [
+        {"ordId": "primary-new", "triggerOrderType": "TPSL", "instId": "BTC-USDT-SWAP", "posId": "pos-1", "posSide": "long", "sz": "6", "slTriggerPx": "64100"},
+        {"ordId": "backup-new", "triggerOrderType": "TPSL", "instId": "BTC-USDT-SWAP", "posId": "pos-1", "posSide": "long", "sz": "6", "slTriggerPx": "63900"},
+    ]
+    freezes = [
+        {"pos_id": "pos-1", "incident_type": "backup_stop_blocked", "created_at": datetime(2026, 8, 1, tzinfo=UTC)},
+        {"pos_id": "pos-1", "incident_type": "protection_missing", "created_at": datetime(2026, 8, 1, tzinfo=UTC)},
+    ]
+    complete_revision = {
+        "pos_id": "pos-1", "status": "active",
+        "created_at": datetime(2026, 8, 2, tzinfo=UTC),
+        "protection_json": '{"roles":["primary_stop","backup_stop","take_profit"]}',
+    }
+
+    recovered = build_position_protection_audit(
+        position=position, protection_ledger=ledger, backup_stops=[],
+        take_profit_orders=[], pending_trigger_orders=pending,
+        freeze_reasons=freezes, protection_revisions=[complete_revision],
+    )
+    incomplete = build_position_protection_audit(
+        position=position, protection_ledger=ledger, backup_stops=[],
+        take_profit_orders=[], pending_trigger_orders=pending,
+        freeze_reasons=freezes,
+        protection_revisions=[{**complete_revision, "protection_json": '{"roles":["primary_stop"]}'}],
+    )
+
+    assert recovered["protected"] is True
+    assert "backup_stop_blocked" not in recovered["freeze_reasons"]
+    assert "protection_missing" not in recovered["freeze_reasons"]
+    assert "backup_stop_blocked" in incomplete["freeze_reasons"]
 
 
 def test_position_audit_flags_terminal_local_order_that_is_still_pending():

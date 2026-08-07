@@ -295,8 +295,11 @@ def capture_protection_state(
     severity: str,
     reason_code: str | None,
     occurred_at: datetime,
+    current_health_status: str | None = None,
     recorder: Callable[..., Any] | None = None,
 ):
+    if str(current_health_status or "").lower() == "resolved_by_verified_replacement":
+        return None
     normalized_severity = str(severity).lower()
     if normalized_severity not in {"high", "critical"}:
         return None

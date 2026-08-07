@@ -431,6 +431,20 @@ def test_only_severe_protection_incidents_are_captured(tmp_path):
     assert high.incident_type == "severe_protection_incident"
 
 
+def test_recovered_protection_source_does_not_realert(tmp_path):
+    captured = capture_protection_state(
+        create_session_factory(tmp_path / "recovered-protection.db"),
+        config=_enabled("severe_protection_incident"),
+        source_record_id="41",
+        severity="critical",
+        reason_code="protection_missing",
+        occurred_at=NOW,
+        current_health_status="resolved_by_verified_replacement",
+    )
+
+    assert captured is None
+
+
 def test_provider_and_notification_failures_store_only_bounded_error_type(tmp_path):
     session_factory = create_session_factory(tmp_path / "failures.db")
 
