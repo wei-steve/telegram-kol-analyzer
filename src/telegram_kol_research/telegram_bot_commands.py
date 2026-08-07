@@ -46,6 +46,13 @@ EXPIRY_EXPIRE_KEEP_COMMAND = "expiry_expire_keep"
 EXPIRY_REFRESH_COMMAND = "expiry_refresh"
 EXPIRY_REVIEW_CONTINUE_HOURS = 3
 EXPIRY_REFRESH_ELIGIBLE_LIFECYCLE_STATUSES = frozenset({"pending_entry", "entered"})
+EXPIRY_PARTIAL_ENTRY_LEG_STATUSES = frozenset(
+    {"partially_filled", "partial_filled", "partial"}
+)
+EXPIRY_PENDING_ENTRY_LEG_STATUSES = frozenset({"open", "pending", "submitted"})
+EXPIRY_UNCERTAIN_ATTRIBUTION_STATUSES = frozenset(
+    {"attribution_conflict", "evidence_unavailable"}
+)
 EXPIRY_LEG_STATUS_LABELS = {
     "active": "已入场",
     "partially_filled": "部分成交",
@@ -302,7 +309,9 @@ def refresh_expiry_review_status(
         return ExpiryReviewRefreshResult(
             answer_text=f"策略 #{lifecycle_id} 状态更新失败。",
             status_text="更新失败，Deepcoin 客户端不可用；未改变策略或挂单状态。",
-            keep_actions=True,
+            keep_actions=_expiry_failure_keep_actions(
+                session_factory, lifecycle_id=lifecycle_id
+            ),
         )
 
     try:
@@ -320,7 +329,9 @@ def refresh_expiry_review_status(
         return ExpiryReviewRefreshResult(
             answer_text=f"策略 #{lifecycle_id} 状态更新失败。",
             status_text="更新失败，未改变策略或挂单状态。请稍后重试。",
-            keep_actions=True,
+            keep_actions=_expiry_failure_keep_actions(
+                session_factory, lifecycle_id=lifecycle_id
+            ),
         )
 
     with session_factory() as session:
@@ -346,7 +357,11 @@ def refresh_expiry_review_status(
             and (
                 binding is None
                 or binding.last_exchange_status
-                == "position_attribution_evidence_unavailable"
+                in {
+                    "position_attribution_evidence_unavailable",
+                    "position_attribution_conflict",
+                }
+                or any(_expiry_leg_requires_review(leg) for leg in legs)
                 or binding_has_unresolved_entry_leg(session, binding)
             )
         )
@@ -379,6 +394,20 @@ def _load_expiry_refresh_binding(session, lifecycle: StrategyLifecycle) -> Execu
     )
 
 
+def _expiry_failure_keep_actions(
+    session_factory: sessionmaker,
+    *,
+    lifecycle_id: int,
+) -> bool:
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        return bool(
+            lifecycle is None
+            or lifecycle.lifecycle_status
+            in EXPIRY_REFRESH_ELIGIBLE_LIFECYCLE_STATUSES
+        )
+
+
 def _format_expiry_refresh_status(
     *,
     lifecycle: StrategyLifecycle,
@@ -390,11 +419,17 @@ def _format_expiry_refresh_status(
         lifecycle_status, lifecycle_status or "未知"
     )
     entered = sum(1 for leg in legs if _expiry_leg_is_entered(leg))
+    partial = sum(1 for leg in legs if _expiry_leg_is_partial(leg))
     pending = sum(1 for leg in legs if _expiry_leg_is_pending(leg))
+    uncertain = sum(1 for leg in legs if _expiry_leg_is_uncertain(leg))
     cancelled = sum(1 for leg in legs if _expiry_leg_label(leg) == "已取消")
     progress_parts = [f"{entered}/{len(legs)} 条腿已入场"]
+    if partial:
+        progress_parts.append(f"{partial}/{len(legs)} 条腿部分成交")
     if pending:
         progress_parts.append(f"{pending}/{len(legs)} 条腿挂单中")
+    if uncertain:
+        progress_parts.append(f"{uncertain}/{len(legs)} 条腿状态待确认")
     if cancelled:
         progress_parts.append(f"{cancelled}/{len(legs)} 条腿已取消")
     if not legs:
@@ -423,21 +458,53 @@ def _format_expiry_refresh_status(
 
 
 def _expiry_leg_is_entered(leg: ExecutionOrderLeg) -> bool:
-    return bool(leg.pos_id and str(leg.attribution_status or "") == "verified")
+    return bool(
+        leg.pos_id
+        and str(leg.attribution_status or "") == "verified"
+        and not _expiry_leg_is_partial(leg)
+    )
+
+
+def _expiry_leg_is_partial(leg: ExecutionOrderLeg) -> bool:
+    return str(leg.status or "").lower() in EXPIRY_PARTIAL_ENTRY_LEG_STATUSES
 
 
 def _expiry_leg_is_pending(leg: ExecutionOrderLeg) -> bool:
-    return not _expiry_leg_is_entered(leg) and str(leg.status or "").lower() in {
-        "open",
-        "pending",
-        "submitted",
-        "partially_filled",
-        "partial_filled",
-        "partial",
-    }
+    return (
+        not _expiry_leg_is_entered(leg)
+        and not _expiry_leg_is_partial(leg)
+        and not _expiry_leg_is_uncertain(leg)
+        and str(leg.status or "").lower() in EXPIRY_PENDING_ENTRY_LEG_STATUSES
+    )
+
+
+def _expiry_leg_is_uncertain(leg: ExecutionOrderLeg) -> bool:
+    attribution_status = str(leg.attribution_status or "").lower()
+    status = str(leg.status or "").lower()
+    return bool(
+        attribution_status in EXPIRY_UNCERTAIN_ATTRIBUTION_STATUSES
+        or status == "unknown"
+        or (
+            leg.pos_id
+            and status == "active"
+            and attribution_status != "verified"
+        )
+    )
+
+
+def _expiry_leg_requires_review(leg: ExecutionOrderLeg) -> bool:
+    return bool(
+        _expiry_leg_is_partial(leg)
+        or _expiry_leg_is_pending(leg)
+        or _expiry_leg_is_uncertain(leg)
+    )
 
 
 def _expiry_leg_label(leg: ExecutionOrderLeg) -> str:
+    if _expiry_leg_is_partial(leg):
+        return "部分成交"
+    if _expiry_leg_is_uncertain(leg):
+        return "归属待确认"
     if _expiry_leg_is_entered(leg):
         return "已入场"
     status = str(leg.status or "unknown").lower()
