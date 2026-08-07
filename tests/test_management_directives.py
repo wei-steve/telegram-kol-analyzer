@@ -39,7 +39,7 @@ def test_closed_multi_target_policy_rejects_unsafe_actions(action):
     assert policy.fanout_allowed is False
 
 
-def test_cancel_entry_directive_is_safe_for_independent_targets():
+def test_cancel_entry_directive_requires_explicit_targets_for_fanout():
     directive = resolve_management_directive(
         text="BTC ETH 挂单全部取消",
         lifecycle_event={
@@ -50,7 +50,7 @@ def test_cancel_entry_directive_is_safe_for_independent_targets():
 
     assert directive.intent == "cancel_entry"
     assert directive.risk_reducing is True
-    assert directive.fanout_allowed is True
+    assert directive.fanout_allowed is False
 
 
 def test_structured_partial_exit_uses_its_bounded_fraction():
@@ -349,7 +349,7 @@ def test_cancel_pending_orders_wording_is_a_cancel_entry_directive() -> None:
 
     assert directive.intent == "cancel_entry"
     assert directive.cancel_deferred_entries is True
-    assert directive.fanout_allowed is True
+    assert directive.fanout_allowed is False
     assert directive.strategy_thread_id == 42
 
 

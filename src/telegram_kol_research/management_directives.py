@@ -158,7 +158,6 @@ def resolve_management_directive(
     has_protection = has_break_even or current_message_stop is not None
 
     if any(term in combined for term in _CANCEL_ENTRY_TERMS) or event_type == "cancel_entry":
-        policy = multi_target_action_policy("cancel_pending_entry")
         return ManagementDirective(
             intent="cancel_entry",
             fraction=None,
@@ -166,7 +165,7 @@ def resolve_management_directive(
             side=side,
             stop_loss=stop_loss,
             risk_reducing=True,
-            fanout_allowed=policy.fanout_allowed,
+            fanout_allowed=False,
             cancel_deferred_entries=True,
             reason_code="explicit_cancel_entry",
             strategy_thread_id=strategy_thread_id,

@@ -1868,7 +1868,6 @@ def _validate_explicit_management_targets_in_session(
             if (
                 target_id is None
                 or not directive.risk_reducing
-                or not directive.fanout_allowed
                 or (
                     policy.requires_fraction
                     and directive.fraction is None
