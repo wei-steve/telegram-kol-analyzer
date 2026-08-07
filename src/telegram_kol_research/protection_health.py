@@ -4,15 +4,363 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from telegram_kol_research.models import PositionBackupStopOrder
+from telegram_kol_research.models import PositionProtectionHealthObservation
 from telegram_kol_research.models import PositionProtectionIncident
 from telegram_kol_research.models import PositionProtectionLedger
 from telegram_kol_research.models import PositionProtectionRevision
+from telegram_kol_research.models import PositionTakeProfitOrder
+from telegram_kol_research.protection_snapshot import build_position_protection_audit
+
+
+CURRENT_PROTECTION_HEALTH_CLASSIFICATIONS = frozenset(
+    {
+        "healthy_current_evidence",
+        "recovery_required",
+        "evidence_insufficient",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentPositionProtectionHealth:
+    venue: str
+    execution_binding_id: int
+    execution_order_leg_id: int
+    pos_id: str
+    classification: str
+    reason_codes: tuple[str, ...]
+    evidence_fingerprint: str
+    exchange_snapshot_fingerprint: str
+    source_incident_ids: tuple[int, ...]
+    primary_order_id: str | None = None
+    backup_order_id: str | None = None
+    take_profit_order_ids: tuple[str, ...] = ()
+
+
+def classify_current_position_protection_health(
+    session: Session,
+    *,
+    venue: str,
+    execution_binding_id: int,
+    execution_order_leg_id: int,
+    pos_id: str,
+    position: dict[str, Any] | None,
+    open_positions: list[dict[str, Any]],
+    pending_trigger_orders: list[dict[str, Any]],
+    pending_tpsl_observations: list[dict[str, Any]],
+    snapshot_errors: dict[str, Any],
+    account_ownership: Any,
+    exchange_snapshot_fingerprint: str,
+    source_incident_ids: tuple[int, ...] = (),
+) -> CurrentPositionProtectionHealth:
+    """Classify one exact position from a single coherent exchange snapshot."""
+
+    normalized_venue = str(venue or "deepcoin").lower()
+    clean_pos_id = str(pos_id or "").strip()
+    scope = {
+        "venue": normalized_venue,
+        "execution_binding_id": int(execution_binding_id),
+        "execution_order_leg_id": int(execution_order_leg_id),
+        "raw_pos_id": clean_pos_id,
+        "pos_id_ref": _hash_ref("position", clean_pos_id),
+        "exchange_snapshot_fingerprint": str(exchange_snapshot_fingerprint),
+    }
+    if snapshot_errors:
+        return _health_result(
+            scope=scope,
+            classification="evidence_insufficient",
+            reason_codes=("exchange_snapshot_error",),
+            source_incident_ids=source_incident_ids,
+        )
+    if position is None or not clean_pos_id:
+        return _health_result(
+            scope=scope,
+            classification="evidence_insufficient",
+            reason_codes=("target_live_position_unavailable",),
+            source_incident_ids=source_incident_ids,
+        )
+    if _text(position, "posId", "pos_id", "id") != clean_pos_id:
+        return _health_result(
+            scope=scope,
+            classification="evidence_insufficient",
+            reason_codes=("target_position_identity_conflict",),
+            source_incident_ids=source_incident_ids,
+        )
+    instrument_id = _text(position, "instId", "inst_id").upper()
+    complete = any(
+        str(row.get("instrument_id") or "").upper() == instrument_id
+        and row.get("complete") is True
+        for row in pending_tpsl_observations
+        if isinstance(row, dict)
+    )
+    if not instrument_id or not complete:
+        return _health_result(
+            scope=scope,
+            classification="evidence_insufficient",
+            reason_codes=("target_protection_snapshot_incomplete",),
+            source_incident_ids=source_incident_ids,
+        )
+
+    ledger_rows = (
+        session.query(PositionProtectionLedger)
+        .filter(
+            PositionProtectionLedger.venue == normalized_venue,
+            PositionProtectionLedger.execution_binding_id
+            == int(execution_binding_id),
+            PositionProtectionLedger.execution_order_leg_id
+            == int(execution_order_leg_id),
+            PositionProtectionLedger.pos_id == clean_pos_id,
+        )
+        .all()
+    )
+    backup_rows = (
+        session.query(PositionBackupStopOrder)
+        .filter(
+            PositionBackupStopOrder.venue == normalized_venue,
+            PositionBackupStopOrder.execution_binding_id
+            == int(execution_binding_id),
+            PositionBackupStopOrder.execution_order_leg_id
+            == int(execution_order_leg_id),
+            PositionBackupStopOrder.pos_id == clean_pos_id,
+        )
+        .all()
+    )
+    active_backups = [
+        row
+        for row in backup_rows
+        if str(row.status or "").lower() == "active"
+        and str(row.order_id or "").strip()
+    ]
+    if len(active_backups) != 1:
+        return _health_result(
+            scope=scope,
+            classification="recovery_required",
+            reason_codes=("verified_backup_stop_missing",),
+            source_incident_ids=source_incident_ids,
+        )
+    backup_order_id = str(active_backups[0].order_id)
+    primary_ledger_rows = [
+        row
+        for row in ledger_rows
+        if not (
+            str(row.purpose or "").lower() == "stop_loss"
+            and str(row.order_id or "") == backup_order_id
+        )
+    ]
+    take_profit_rows = (
+        session.query(PositionTakeProfitOrder)
+        .filter(
+            PositionTakeProfitOrder.venue == normalized_venue,
+            PositionTakeProfitOrder.execution_binding_id
+            == int(execution_binding_id),
+            PositionTakeProfitOrder.execution_order_leg_id
+            == int(execution_order_leg_id),
+            PositionTakeProfitOrder.pos_id == clean_pos_id,
+        )
+        .all()
+    )
+    revisions = (
+        session.query(PositionProtectionRevision)
+        .filter(
+            PositionProtectionRevision.venue == normalized_venue,
+            PositionProtectionRevision.execution_binding_id
+            == int(execution_binding_id),
+            PositionProtectionRevision.execution_order_leg_id
+            == int(execution_order_leg_id),
+            PositionProtectionRevision.pos_id == clean_pos_id,
+        )
+        .all()
+    )
+    audit = build_position_protection_audit(
+        position=position,
+        protection_ledger=primary_ledger_rows,
+        backup_stops=backup_rows,
+        take_profit_orders=take_profit_rows,
+        pending_trigger_orders=pending_trigger_orders,
+        freeze_reasons=(),
+        protection_revisions=revisions,
+        open_positions=open_positions,
+        account_ownership=account_ownership,
+    )
+    primary_order_id = str(audit["primary_stop"].get("order_id") or "")
+    selected_backup_id = str(audit["backup_stop"].get("order_id") or "")
+    take_profit_order_ids = tuple(
+        sorted(
+            str(row.get("order_id") or "")
+            for row in audit.get("take_profits", [])
+            if str(row.get("order_id") or "")
+        )
+    )
+    selected_order_ids = {
+        primary_order_id,
+        selected_backup_id,
+        *take_profit_order_ids,
+    }
+    selected_order_ids.discard("")
+    owners_are_exact = bool(selected_order_ids) and all(
+        (owner := account_ownership.owner_for_order(order_id)) is not None
+        and owner.pos_id == clean_pos_id
+        for order_id in selected_order_ids
+    )
+    position_side = _text(position, "posSide", "pos_side", "side").lower()
+    current_ledger_by_order = {
+        str(row.order_id): row
+        for row in ledger_rows
+        if str(row.status or "").lower() in {"verified", "protected"}
+        and str(row.order_id or "").strip()
+    }
+    local_rows_match = bool(position_side) and all(
+        (row := current_ledger_by_order.get(order_id)) is not None
+        and str(row.instrument_id or "").upper() == instrument_id
+        and str(row.side or "").lower() == position_side
+        for order_id in selected_order_ids
+    )
+    backup_row_matches = bool(
+        str(active_backups[0].instrument_id or "").upper() == instrument_id
+        and str(active_backups[0].side or "").lower() == position_side
+    )
+    reasons = set(str(reason) for reason in audit.get("freeze_reasons", []))
+    if int(audit.get("verified_take_profit_count") or 0) < 1:
+        reasons.add("verified_take_profit_missing")
+    if not owners_are_exact:
+        reasons.add("protection_ownership_conflict")
+    if not local_rows_match or not backup_row_matches:
+        reasons.add("protection_scope_mismatch")
+    if not primary_order_id:
+        reasons.add("verified_primary_stop_missing")
+    if selected_backup_id != backup_order_id:
+        reasons.add("verified_backup_stop_missing")
+    if primary_order_id and primary_order_id == selected_backup_id:
+        reasons.add("protection_role_identity_conflict")
+    healthy = bool(
+        audit.get("protected") is True
+        and int(audit.get("verified_take_profit_count") or 0) >= 1
+        and primary_order_id
+        and selected_backup_id == backup_order_id
+        and primary_order_id != selected_backup_id
+        and owners_are_exact
+        and local_rows_match
+        and backup_row_matches
+    )
+    return _health_result(
+        scope=scope,
+        classification=(
+            "healthy_current_evidence" if healthy else "recovery_required"
+        ),
+        reason_codes=() if healthy else tuple(sorted(reasons)),
+        source_incident_ids=source_incident_ids,
+        primary_order_id=primary_order_id or None,
+        backup_order_id=selected_backup_id or None,
+        take_profit_order_ids=take_profit_order_ids,
+    )
+
+
+def record_position_protection_health_observation(
+    session: Session,
+    *,
+    result: CurrentPositionProtectionHealth,
+    observed_at: datetime,
+) -> PositionProtectionHealthObservation:
+    """Append one bounded observation without changing its source evidence."""
+
+    summary = {
+        "reason_codes": list(result.reason_codes),
+        "primary_order_ref": _hash_ref("order", result.primary_order_id),
+        "backup_order_ref": _hash_ref("order", result.backup_order_id),
+        "take_profit_order_refs": [
+            _hash_ref("order", order_id)
+            for order_id in result.take_profit_order_ids
+        ],
+    }
+    row = PositionProtectionHealthObservation(
+        venue=result.venue,
+        execution_binding_id=result.execution_binding_id,
+        execution_order_leg_id=result.execution_order_leg_id,
+        pos_id=result.pos_id,
+        classification=result.classification,
+        evidence_fingerprint=result.evidence_fingerprint,
+        exchange_snapshot_fingerprint=result.exchange_snapshot_fingerprint,
+        source_incident_ids_json=json.dumps(
+            list(result.source_incident_ids), separators=(",", ":")
+        ),
+        summary_json=json.dumps(summary, sort_keys=True, separators=(",", ":")),
+        observed_at=observed_at,
+        created_at=observed_at,
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def _health_result(
+    *,
+    scope: dict[str, Any],
+    classification: str,
+    reason_codes: tuple[str, ...],
+    source_incident_ids: tuple[int, ...],
+    primary_order_id: str | None = None,
+    backup_order_id: str | None = None,
+    take_profit_order_ids: tuple[str, ...] = (),
+) -> CurrentPositionProtectionHealth:
+    if classification not in CURRENT_PROTECTION_HEALTH_CLASSIFICATIONS:
+        raise ValueError("current protection health classification is invalid")
+    normalized_incident_ids = tuple(
+        sorted({int(value) for value in source_incident_ids})
+    )[:100]
+    fingerprint_payload = {
+        "venue": scope["venue"],
+        "execution_binding_id": scope["execution_binding_id"],
+        "execution_order_leg_id": scope["execution_order_leg_id"],
+        "pos_id_ref": scope["pos_id_ref"],
+        "exchange_snapshot_fingerprint": scope[
+            "exchange_snapshot_fingerprint"
+        ],
+        "classification": classification,
+        "reason_codes": list(reason_codes),
+        "source_incident_ids": list(normalized_incident_ids),
+        "primary_order_ref": _hash_ref("order", primary_order_id),
+        "backup_order_ref": _hash_ref("order", backup_order_id),
+        "take_profit_order_refs": [
+            _hash_ref("order", order_id) for order_id in take_profit_order_ids
+        ],
+    }
+    return CurrentPositionProtectionHealth(
+        venue=str(scope["venue"]),
+        execution_binding_id=int(scope["execution_binding_id"]),
+        execution_order_leg_id=int(scope["execution_order_leg_id"]),
+        pos_id=str(scope.get("raw_pos_id") or ""),
+        classification=classification,
+        reason_codes=tuple(reason_codes),
+        evidence_fingerprint=hashlib.sha256(
+            json.dumps(
+                fingerprint_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        exchange_snapshot_fingerprint=str(
+            scope["exchange_snapshot_fingerprint"]
+        ),
+        source_incident_ids=normalized_incident_ids,
+        primary_order_id=primary_order_id,
+        backup_order_id=backup_order_id,
+        take_profit_order_ids=tuple(take_profit_order_ids),
+    )
+
+
+def _hash_ref(kind: str, value: object) -> str | None:
+    clean = str(value or "").strip()
+    if not clean:
+        return None
+    digest = hashlib.sha256(clean.encode("utf-8")).hexdigest()[:16]
+    return f"{kind}:{digest}"
 
 
 def current_protection_incident_health_status(

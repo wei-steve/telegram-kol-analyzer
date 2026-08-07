@@ -10,20 +10,16 @@ from typing import Any
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
-    PositionBackupStopOrder,
     PositionProtectionIncident,
     PositionProtectionLedger,
     PositionProtectionRevision,
-    PositionTakeProfitOrder,
 )
 from telegram_kol_research.protection_ledger import (
     load_account_protection_ownership,
 )
 from telegram_kol_research.protection_health import (
+    classify_current_position_protection_health,
     current_protection_incident_health_status,
-)
-from telegram_kol_research.protection_snapshot import (
-    build_position_protection_audit,
 )
 
 
@@ -93,6 +89,19 @@ def audit_protection_incident_convergence(
             for row in live_positions.values()
         )
     )
+    exchange_snapshot_fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "positions": positions,
+                "pending_trigger_orders": pending,
+                "pending_tpsl_observations": pending_observations,
+                "errors": snapshot_errors,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
 
     counts: Counter[str] = Counter()
     buckets: dict[str, list[dict[str, str]]] = {
@@ -104,7 +113,7 @@ def audit_protection_incident_convergence(
             session,
             live_pos_ids=live_pos_ids,
         )
-        current_scope_cache: dict[tuple[str, int, int, str], bool] = {}
+        current_scope_cache: dict[tuple[str, int, int, str], str] = {}
         incidents = (
             session.query(PositionProtectionIncident)
             .order_by(PositionProtectionIncident.created_at, PositionProtectionIncident.id)
@@ -123,6 +132,7 @@ def audit_protection_incident_convergence(
                 complete_instruments=complete_instruments,
                 account_ownership=account_ownership,
                 current_scope_cache=current_scope_cache,
+                exchange_snapshot_fingerprint=exchange_snapshot_fingerprint,
             )
             incident_total += 1
             counts[classification] += 1
@@ -175,7 +185,8 @@ def _classify_incident(
     positions: list[dict[str, Any]],
     complete_instruments: set[str],
     account_ownership: Any,
-    current_scope_cache: dict[tuple[str, int, int, str], bool],
+    current_scope_cache: dict[tuple[str, int, int, str], str],
+    exchange_snapshot_fingerprint: str,
 ) -> str:
     if not exchange_complete or not str(incident.pos_id or "").strip():
         return "evidence_insufficient"
@@ -189,16 +200,18 @@ def _classify_incident(
                 pending=pending,
                 pending_observations=pending_observations,
             )
-        ) or _current_protection_visible_on_exchange(
+        ) or _current_health_classification(
             session,
             incident=incident,
             position=live_positions[str(incident.pos_id)],
             positions=positions,
             pending=pending,
-            complete_instruments=complete_instruments,
+            pending_observations=pending_observations,
+            snapshot_errors={},
             account_ownership=account_ownership,
+            exchange_snapshot_fingerprint=exchange_snapshot_fingerprint,
             cache=current_scope_cache,
-        ):
+        ) == "healthy_current_evidence":
             return "resolved_by_current_exchange_evidence"
         return "current_risk"
 
@@ -216,18 +229,20 @@ def _classify_incident(
     return "evidence_insufficient"
 
 
-def _current_protection_visible_on_exchange(
+def _current_health_classification(
     session,
     *,
     incident: PositionProtectionIncident,
     position: dict[str, Any],
     positions: list[dict[str, Any]],
     pending: list[dict[str, Any]],
-    complete_instruments: set[str],
+    pending_observations: list[dict[str, Any]],
+    snapshot_errors: dict[str, Any],
     account_ownership: Any,
-    cache: dict[tuple[str, int, int, str], bool],
-) -> bool:
-    """Prove exact current protection without rewriting historical evidence."""
+    exchange_snapshot_fingerprint: str,
+    cache: dict[tuple[str, int, int, str], str],
+) -> str:
+    """Reuse one exact current-health decision for all incidents in a scope."""
 
     venue = str(incident.venue or "deepcoin").lower()
     binding_id = int(incident.execution_binding_id)
@@ -236,126 +251,23 @@ def _current_protection_visible_on_exchange(
     scope = (venue, binding_id, leg_id, pos_id)
     if scope in cache:
         return cache[scope]
-
-    instrument_id = _text(position, "instId", "inst_id").upper()
-    if not instrument_id or instrument_id not in complete_instruments:
-        cache[scope] = False
-        return False
-
-    ledger_rows = (
-        session.query(PositionProtectionLedger)
-        .filter(
-            PositionProtectionLedger.venue == venue,
-            PositionProtectionLedger.execution_binding_id == binding_id,
-            PositionProtectionLedger.execution_order_leg_id == leg_id,
-            PositionProtectionLedger.pos_id == pos_id,
-        )
-        .all()
-    )
-    backup_rows = (
-        session.query(PositionBackupStopOrder)
-        .filter(
-            PositionBackupStopOrder.venue == venue,
-            PositionBackupStopOrder.execution_binding_id == binding_id,
-            PositionBackupStopOrder.execution_order_leg_id == leg_id,
-            PositionBackupStopOrder.pos_id == pos_id,
-        )
-        .all()
-    )
-    active_backups = [
-        row
-        for row in backup_rows
-        if str(row.status or "").lower() == "active"
-        and str(row.order_id or "").strip()
-    ]
-    if len(active_backups) != 1:
-        cache[scope] = False
-        return False
-    backup_order_id = str(active_backups[0].order_id)
-    primary_ledger_rows = [
-        row
-        for row in ledger_rows
-        if not (
-            str(row.purpose or "").lower() == "stop_loss"
-            and str(row.order_id or "") == backup_order_id
-        )
-    ]
-    take_profit_rows = (
-        session.query(PositionTakeProfitOrder)
-        .filter(
-            PositionTakeProfitOrder.venue == venue,
-            PositionTakeProfitOrder.execution_binding_id == binding_id,
-            PositionTakeProfitOrder.execution_order_leg_id == leg_id,
-            PositionTakeProfitOrder.pos_id == pos_id,
-        )
-        .all()
-    )
-    revisions = (
-        session.query(PositionProtectionRevision)
-        .filter(
-            PositionProtectionRevision.venue == venue,
-            PositionProtectionRevision.execution_binding_id == binding_id,
-            PositionProtectionRevision.execution_order_leg_id == leg_id,
-            PositionProtectionRevision.pos_id == pos_id,
-        )
-        .all()
-    )
-    audit = build_position_protection_audit(
+    result = classify_current_position_protection_health(
+        session,
+        venue=venue,
+        execution_binding_id=binding_id,
+        execution_order_leg_id=leg_id,
+        pos_id=pos_id,
         position=position,
-        protection_ledger=primary_ledger_rows,
-        backup_stops=backup_rows,
-        take_profit_orders=take_profit_rows,
-        pending_trigger_orders=pending,
-        freeze_reasons=(),
-        protection_revisions=revisions,
         open_positions=positions,
+        pending_trigger_orders=pending,
+        pending_tpsl_observations=pending_observations,
+        snapshot_errors=snapshot_errors,
         account_ownership=account_ownership,
+        exchange_snapshot_fingerprint=exchange_snapshot_fingerprint,
+        source_incident_ids=(int(incident.id),),
     )
-    primary_order_id = str(audit["primary_stop"].get("order_id") or "")
-    selected_backup_id = str(audit["backup_stop"].get("order_id") or "")
-    selected_order_ids = {
-        primary_order_id,
-        selected_backup_id,
-        *(
-            str(row.get("order_id") or "")
-            for row in audit.get("take_profits", [])
-        ),
-    }
-    selected_order_ids.discard("")
-    owners_are_exact = bool(selected_order_ids) and all(
-        (owner := account_ownership.owner_for_order(order_id)) is not None
-        and owner.pos_id == pos_id
-        for order_id in selected_order_ids
-    )
-    position_side = _text(position, "posSide", "pos_side", "side").lower()
-    current_ledger_by_order = {
-        str(row.order_id): row
-        for row in ledger_rows
-        if str(row.status or "").lower() in {"verified", "protected"}
-        and str(row.order_id or "").strip()
-    }
-    local_rows_match = bool(position_side) and all(
-        (row := current_ledger_by_order.get(order_id)) is not None
-        and str(row.instrument_id or "").upper() == instrument_id
-        and str(row.side or "").lower() == position_side
-        for order_id in selected_order_ids
-    )
-    backup_row_matches = bool(
-        str(active_backups[0].instrument_id or "").upper() == instrument_id
-        and str(active_backups[0].side or "").lower() == position_side
-    )
-    result = bool(
-        audit.get("protected") is True
-        and int(audit.get("verified_take_profit_count") or 0) >= 1
-        and primary_order_id
-        and selected_backup_id == backup_order_id
-        and primary_order_id != selected_backup_id
-        and owners_are_exact
-        and local_rows_match
-        and backup_row_matches
-    )
-    cache[scope] = result
-    return result
+    cache[scope] = str(result.classification)
+    return cache[scope]
 
 
 def _replacement_visible_on_exchange(

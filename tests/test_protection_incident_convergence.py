@@ -302,6 +302,37 @@ def test_legacy_current_exchange_evidence_without_pending_pos_id_resolves(
     assert "legacy-tp" not in rendered
 
 
+def test_incident_audit_reuses_shared_current_health_classifier(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        _incident(session, suffix="z", pos_id="pos-legacy-current")
+        session.commit()
+    calls = []
+
+    def fake_classifier(session, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(classification="healthy_current_evidence")
+
+    monkeypatch.setattr(
+        "telegram_kol_research.protection_incident_convergence."
+        "classify_current_position_protection_health",
+        fake_classifier,
+    )
+
+    result = audit_protection_incident_convergence(
+        session_factory,
+        snapshot=_legacy_current_snapshot(),
+        limit=100,
+    )
+
+    assert result["counts"]["resolved_by_current_exchange_evidence"] == 1
+    assert len(calls) == 1
+    assert calls[0]["pos_id"] == "pos-legacy-current"
+
+
 def test_current_evidence_rejects_wrong_local_instrument(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
