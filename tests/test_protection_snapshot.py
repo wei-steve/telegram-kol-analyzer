@@ -314,21 +314,24 @@ def test_position_audit_prefers_verified_composite_backup_and_ignores_cancelled_
 def test_verified_newer_replacement_supersedes_transient_freeze_reasons():
     position = {"posId": "pos-1", "instId": "BTC-USDT-SWAP", "posSide": "long", "pos": "6"}
     ledger = [
-        {"id": 1, "pos_id": "pos-1", "purpose": "stop_loss", "order_id": "primary-new", "trigger_price": "64100", "size_text": "6", "status": "verified"},
-        {"id": 2, "pos_id": "pos-1", "purpose": "backup_stop", "order_id": "backup-new", "trigger_price": "63900", "size_text": "6", "status": "verified"},
+        {"id": 1, "execution_binding_id": 7, "execution_order_leg_id": 8, "pos_id": "pos-1", "purpose": "stop_loss", "order_id": "primary-new", "trigger_price": "64100", "size_text": "6", "status": "verified"},
+        {"id": 2, "execution_binding_id": 7, "execution_order_leg_id": 8, "pos_id": "pos-1", "purpose": "backup_stop", "order_id": "backup-new", "trigger_price": "63900", "size_text": "6", "status": "verified"},
+        {"id": 3, "execution_binding_id": 7, "execution_order_leg_id": 8, "pos_id": "pos-1", "purpose": "take_profit", "order_id": "tp-new", "trigger_price": "66000", "size_text": "6", "status": "verified"},
     ]
     pending = [
         {"ordId": "primary-new", "triggerOrderType": "TPSL", "instId": "BTC-USDT-SWAP", "posId": "pos-1", "posSide": "long", "sz": "6", "slTriggerPx": "64100"},
         {"ordId": "backup-new", "triggerOrderType": "TPSL", "instId": "BTC-USDT-SWAP", "posId": "pos-1", "posSide": "long", "sz": "6", "slTriggerPx": "63900"},
+        {"ordId": "tp-new", "triggerOrderType": "TPSL", "instId": "BTC-USDT-SWAP", "posId": "pos-1", "posSide": "long", "sz": "6", "tpTriggerPx": "66000"},
     ]
     freezes = [
-        {"pos_id": "pos-1", "incident_type": "backup_stop_blocked", "created_at": datetime(2026, 8, 1, tzinfo=UTC)},
-        {"pos_id": "pos-1", "incident_type": "protection_missing", "created_at": datetime(2026, 8, 1, tzinfo=UTC)},
+        {"execution_binding_id": 7, "execution_order_leg_id": 8, "pos_id": "pos-1", "incident_type": "backup_stop_blocked", "created_at": datetime(2026, 8, 1, tzinfo=UTC)},
+        {"execution_binding_id": 7, "execution_order_leg_id": 8, "pos_id": "pos-1", "incident_type": "protection_missing", "created_at": datetime(2026, 8, 1, tzinfo=UTC)},
     ]
     complete_revision = {
+        "execution_binding_id": 7, "execution_order_leg_id": 8,
         "pos_id": "pos-1", "status": "active",
         "created_at": datetime(2026, 8, 2, tzinfo=UTC),
-        "protection_json": '{"roles":["primary_stop","backup_stop","take_profit"]}',
+        "protection_json": '{"roles":["primary_stop","backup_stop","take_profit"],"order_ids":["primary-new","backup-new","tp-new"],"replacements":[{"role":"primary_stop","order_id":"primary-new","trigger_price":"64100","size_text":"6"},{"role":"backup_stop","order_id":"backup-new","trigger_price":"63900","size_text":"6"},{"role":"take_profit","order_id":"tp-new","trigger_price":"66000","size_text":"6"}]}',
     }
 
     recovered = build_position_protection_audit(
@@ -340,13 +343,18 @@ def test_verified_newer_replacement_supersedes_transient_freeze_reasons():
         position=position, protection_ledger=ledger, backup_stops=[],
         take_profit_orders=[], pending_trigger_orders=pending,
         freeze_reasons=freezes,
-        protection_revisions=[{**complete_revision, "protection_json": '{"roles":["primary_stop"]}'}],
+        protection_revisions=[{
+            **complete_revision,
+            "protection_json": '{"roles":["primary_stop","backup_stop","take_profit"],"order_ids":["primary-new","backup-new"],"replacements":[{"role":"primary_stop","order_id":"primary-new","trigger_price":"64100","size_text":"6"},{"role":"backup_stop","order_id":"backup-new","trigger_price":"63900","size_text":"6"}]}',
+        }],
     )
 
     assert recovered["protected"] is True
     assert "backup_stop_blocked" not in recovered["freeze_reasons"]
     assert "protection_missing" not in recovered["freeze_reasons"]
     assert "backup_stop_blocked" in incomplete["freeze_reasons"]
+    assert incomplete["protected"] is False
+    assert incomplete["automation_safe"] is False
 
 
 def test_position_audit_flags_terminal_local_order_that_is_still_pending():

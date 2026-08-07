@@ -12,6 +12,119 @@ from sqlalchemy.orm import Session
 from telegram_kol_research.models import PositionBackupStopOrder
 from telegram_kol_research.models import PositionProtectionIncident
 from telegram_kol_research.models import PositionProtectionLedger
+from telegram_kol_research.models import PositionProtectionRevision
+
+
+def current_protection_incident_health_status(
+    session: Session,
+    *,
+    incident: PositionProtectionIncident,
+) -> str:
+    """Resolve an old incident only from a newer, exact, complete projection."""
+
+    revision = (
+        session.query(PositionProtectionRevision)
+        .filter(
+            PositionProtectionRevision.venue == str(incident.venue).lower(),
+            PositionProtectionRevision.execution_binding_id
+            == int(incident.execution_binding_id),
+            PositionProtectionRevision.execution_order_leg_id
+            == int(incident.execution_order_leg_id),
+            PositionProtectionRevision.pos_id == str(incident.pos_id),
+            PositionProtectionRevision.status == "active",
+            PositionProtectionRevision.created_at > incident.created_at,
+        )
+        .order_by(PositionProtectionRevision.created_at.desc())
+        .first()
+    )
+    if revision is None:
+        return "current_risk"
+    try:
+        payload = json.loads(revision.protection_json)
+    except (TypeError, ValueError):
+        return "current_risk"
+    replacements = payload.get("replacements") or []
+    if not isinstance(replacements, list) or not replacements:
+        return "current_risk"
+    roles = {
+        str(item.get("role") or "")
+        for item in replacements
+        if isinstance(item, dict)
+    }
+    order_ids = [
+        str(item.get("order_id") or "")
+        for item in replacements
+        if isinstance(item, dict)
+    ]
+    declared_roles = {str(value) for value in payload.get("roles", [])}
+    declared_order_ids = {
+        str(value) for value in payload.get("order_ids", []) if value
+    }
+    if (
+        not {"primary_stop", "backup_stop", "take_profit"}.issubset(roles)
+        or declared_roles != roles
+        or not all(order_ids)
+        or len(order_ids) != len(set(order_ids))
+        or declared_order_ids != set(order_ids)
+    ):
+        return "current_risk"
+
+    ledgers = (
+        session.query(PositionProtectionLedger)
+        .filter(
+            PositionProtectionLedger.venue == str(incident.venue).lower(),
+            PositionProtectionLedger.execution_binding_id
+            == int(incident.execution_binding_id),
+            PositionProtectionLedger.execution_order_leg_id
+            == int(incident.execution_order_leg_id),
+            PositionProtectionLedger.pos_id == str(incident.pos_id),
+            PositionProtectionLedger.status == "verified",
+            PositionProtectionLedger.order_id.in_(sorted(set(order_ids))),
+        )
+        .all()
+    )
+    role_to_purpose = {
+        "primary_stop": "stop_loss",
+        "backup_stop": "backup_stop",
+        "take_profit": "take_profit",
+    }
+    expected = {
+        (
+            str(item.get("order_id")),
+            role_to_purpose.get(str(item.get("role")), ""),
+            str(item.get("trigger_price") or ""),
+            str(item.get("size_text") or ""),
+        )
+        for item in replacements
+        if isinstance(item, dict)
+    }
+    actual = {
+        (
+            row.order_id,
+            row.purpose,
+            str(row.trigger_price or ""),
+            str(row.size_text or ""),
+        )
+        for row in ledgers
+    }
+    if len(ledgers) != len(replacements) or actual != expected:
+        return "current_risk"
+
+    backup = (
+        session.query(PositionBackupStopOrder.id)
+        .filter(
+            PositionBackupStopOrder.venue == str(incident.venue).lower(),
+            PositionBackupStopOrder.execution_binding_id
+            == int(incident.execution_binding_id),
+            PositionBackupStopOrder.execution_order_leg_id
+            == int(incident.execution_order_leg_id),
+            PositionBackupStopOrder.pos_id == str(incident.pos_id),
+            PositionBackupStopOrder.status == "active",
+            PositionBackupStopOrder.order_id.in_(sorted(set(order_ids))),
+        )
+        .first()
+    )
+    return "resolved_by_verified_replacement" if backup else "current_risk"
 
 
 def reconcile_position_protection_health(

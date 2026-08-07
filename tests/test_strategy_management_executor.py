@@ -1231,10 +1231,7 @@ def test_break_even_by_market_executes_mixed_close_and_protection_legs(
         (call["closePosId"], call["sz"], call["ordType"])
         for call in client.close_calls
     ] == [("pos-1", "2", "market")]
-    assert [call["ordId"] for call in client.cancel_calls] == [
-        "tp-2",
-        "sl-2",
-    ]
+    assert [call["ordId"] for call in client.cancel_calls] == ["sl-2"]
     assert {call["posId"] for call in client.set_calls} == {"pos-2"}
     stop_payloads = [
         call for call in client.set_calls if call.get("slTriggerPx") not in (None, "")
@@ -1269,8 +1266,8 @@ def test_break_even_by_market_all_allowed_replaces_each_positions_protection(
 
     assert result["status"] == "succeeded"
     assert client.close_calls == []
-    assert len(client.cancel_calls) == 5
-    assert len(client.set_calls) == 5
+    assert len(client.cancel_calls) == 2
+    assert len(client.set_calls) == 2
     stop_by_pos = {
         call["posId"]: call["slTriggerPx"]
         for call in client.set_calls
@@ -1472,12 +1469,7 @@ def test_break_even_by_market_rejected_protection_restores_only_that_leg(
     client = _ProtectionClient(
         session_factory,
         rows_by_pos,
-        set_outcomes=[
-            {"code": "0", "data": {"ordId": "new-tp"}},
-            DeepcoinDefiniteRejection("invalid stop"),
-            {"code": "0", "data": {"ordId": "restore-tp"}},
-            {"code": "0", "data": {"ordId": "restore-sl"}},
-        ],
+        set_outcomes=[DeepcoinDefiniteRejection("invalid stop")],
     )
 
     result = execute_management_batch(
@@ -1492,11 +1484,7 @@ def test_break_even_by_market_rejected_protection_restores_only_that_leg(
         leg.pos_id: leg.status
         for leg in load_management_batch(session_factory, batch.id).legs
     } == {"pos-1": "submitted", "pos-2": "restored"}
-    assert [call["ordId"] for call in client.cancel_calls] == [
-        "tp-2",
-        "sl-2",
-        "new-tp",
-    ]
+    assert client.cancel_calls == []
     with session_factory() as session:
         rows = (
             session.query(PositionProtectionLedger)
@@ -1505,10 +1493,8 @@ def test_break_even_by_market_rejected_protection_restores_only_that_leg(
             .order_by(PositionProtectionLedger.order_id)
             .all()
         )
-        assert [row.order_id for row in rows] == ["restore-sl", "restore-tp"]
-        assert {row.evidence_source for row in rows} == {
-            "management_tpsl_restore"
-        }
+        assert [row.order_id for row in rows] == ["sl-2", "tp-2"]
+        assert {row.evidence_source for row in rows} == {"test_exact_owner"}
 
 
 def test_break_even_by_market_unknown_protection_write_never_compensates(
@@ -1538,7 +1524,7 @@ def test_break_even_by_market_unknown_protection_write_never_compensates(
         leg.pos_id: leg.status
         for leg in load_management_batch(session_factory, batch.id).legs
     } == {"pos-1": "submitted", "pos-2": "recovery_required"}
-    assert [call["ordId"] for call in client.cancel_calls] == ["tp-2", "sl-2"]
+    assert client.cancel_calls == []
     assert len(client.set_calls) == 1
 
 
@@ -3435,28 +3421,28 @@ def test_explicit_stop_replaces_every_position_and_preserves_each_take_profit(tm
     assert result["status"] == "succeeded"
     assert [leg["status"] for leg in result["legs"]] == ["succeeded", "succeeded"]
     assert [call["ordId"] for call in client.cancel_calls] == [
-        "tp-1a",
-        "tp-1b",
         "sl-1",
-        "tp-2",
         "sl-2",
     ]
     assert [
         (call["posId"], call.get("tpTriggerPx"), call.get("slTriggerPx"))
         for call in client.set_calls
     ] == [
-        ("pos-1", "63000", None),
-        ("pos-1", "62000", None),
         ("pos-1", None, "65000"),
-        ("pos-2", "62500", None),
         ("pos-2", None, "65000"),
     ]
-    assert client.set_calls[0]["tpTriggerPxType"] == "mark"
-    assert client.set_calls[1]["tpOrdPx"] == "61990"
-    assert client.set_calls[0]["sz"] == "1"
-    assert "sz" not in client.set_calls[2]
-    assert client.set_calls[3]["sz"] == "4"
-    assert "sz" not in client.set_calls[4]
+    assert all("sz" not in call for call in client.set_calls)
+    assert not any(
+        order_id in {"tp-1a", "tp-1b", "tp-2"}
+        for action, order_id in client.call_log
+        if action in {"set_position_sltp", "cancel_position_sltp"}
+    )
+    for pos_id, old_stop_id in (("pos-1", "sl-1"), ("pos-2", "sl-2")):
+        set_index = client.call_log.index(("set_position_sltp", pos_id))
+        cancel_index = client.call_log.index(
+            ("cancel_position_sltp", old_stop_id)
+        )
+        assert set_index < cancel_index
     assert all(call["instType"] == "SWAP" for call in client.cancel_calls)
     with session_factory() as session:
         lifecycle = session.get(StrategyLifecycle, batch.target_lifecycle_id)
@@ -3485,11 +3471,11 @@ def test_protection_batch_records_replacement_orders_in_ledger(tmp_path):
         (row.pos_id, row.order_id, row.purpose, row.trigger_price, row.size_text)
         for row in rows
     ] == [
-        ("pos-1", "new-1", "take_profit", "63000", "1"),
-        ("pos-1", "new-2", "take_profit", "62000", "1"),
-        ("pos-1", "new-3", "stop_loss", "65000", "0"),
-        ("pos-2", "new-4", "take_profit", "62500", "4"),
-        ("pos-2", "new-5", "stop_loss", "65000", "0"),
+        ("pos-1", "new-1", "stop_loss", "65000", "0"),
+        ("pos-1", "tp-1a", "take_profit", "63000", "1"),
+        ("pos-1", "tp-1b", "take_profit", "62000", "1"),
+        ("pos-2", "new-2", "stop_loss", "65000", "0"),
+        ("pos-2", "tp-2", "take_profit", "62500", "4"),
     ]
     assert {row.execution_binding_id for row in rows} == {batch.execution_binding_id}
     assert {row.evidence_source for row in rows} == {"management_tpsl_replacement"}
@@ -3548,10 +3534,7 @@ def test_protection_preflight_accepts_ledger_confirmed_unscoped_rows(tmp_path):
 
     assert result["status"] == "succeeded"
     assert [call["ordId"] for call in client.cancel_calls] == [
-        "tp-1a",
-        "tp-1b",
         "sl-1",
-        "tp-2",
         "sl-2",
     ]
 
@@ -3940,9 +3923,8 @@ def test_partial_then_break_even_waits_for_close_confirmation_before_protection(
     assert [
         (row["posId"], row["tpTriggerPx"], row["sz"])
         for row in take_profits
-    ] == [
-        ("pos-2", "62500", "2"),
-    ]
+    ] == [("pos-2", "62500", "2")]
+    assert any(call["ordId"] == "tp-2" for call in client.cancel_calls)
 
 
 def test_close_preflight_falls_back_from_inline_price_to_exact_ledger(tmp_path):
@@ -4289,9 +4271,7 @@ def test_partial_then_break_even_replaces_protection_after_exchange_resizes_old_
     assert protection_result["status"] == "succeeded"
     assert [row["ordId"] for row in client.cancel_calls] == [
         "tp-1a",
-        "tp-1b",
         "sl-1",
-        "tp-2",
         "sl-2",
     ]
     assert [
@@ -4299,7 +4279,6 @@ def test_partial_then_break_even_replaces_protection_after_exchange_resizes_old_
         for row in client.set_calls
         if row["posId"] == "pos-1"
     ] == [
-        ("pos-1", "62000", None, "1"),
         ("pos-1", None, "64000", None),
     ]
     assert [
@@ -4307,7 +4286,6 @@ def test_partial_then_break_even_replaces_protection_after_exchange_resizes_old_
         for row in client.set_calls
         if row["posId"] == "pos-2"
     ] == [
-        ("pos-2", "62500", None, "2"),
         ("pos-2", None, "64500", None),
     ]
 
@@ -5014,12 +4992,8 @@ def test_replacement_failure_restores_complete_position_and_stops_later_legs(tmp
         session_factory,
         rows_by_pos,
         set_outcomes=[
-            {"code": "0", "data": {"ordId": "new-1a"}},
-            {"code": "0", "data": {"ordId": "new-1b"}},
             {"code": "0", "data": {"ordId": "new-sl1"}},
             DeepcoinDefiniteRejection("replacement rejected"),
-            {"code": "0", "data": {"ordId": "restore-tp2"}},
-            {"code": "0", "data": {"ordId": "restore-sl2"}},
         ],
     )
 
@@ -5031,13 +5005,8 @@ def test_replacement_failure_restores_complete_position_and_stops_later_legs(tmp
     assert [leg["status"] for leg in result["legs"]] == ["succeeded", "restored"]
     assert [call["posId"] for call in client.set_calls] == [
         "pos-1",
-        "pos-1",
-        "pos-1",
-        "pos-2",
-        "pos-2",
         "pos-2",
     ]
-    assert client.set_calls[-1]["slTriggerPx"] == "65700"
     with session_factory() as session:
         old_rows = session.query(PositionProtectionLedger).filter(
             PositionProtectionLedger.order_id.in_(
@@ -5049,18 +5018,16 @@ def test_replacement_failure_restores_complete_position_and_stops_later_legs(tmp
                 {"restore-tp2", "restore-sl2"}
             )
         ).all()
-    assert {row.status for row in old_rows} == {"cancelled"}
-    assert {row.order_id for row in restored} == {
-        "restore-tp2",
-        "restore-sl2",
+    assert {row.order_id for row in old_rows if row.status == "verified"} == {
+        "tp-1a",
+        "tp-1b",
+        "tp-2",
+        "sl-2",
     }
-    assert {row.status for row in restored} == {"verified"}
-    assert {row.evidence_source for row in restored} == {
-        "management_tpsl_restore"
-    }
+    assert restored == []
 
 
-def test_restore_failure_marks_recovery_required_and_continues_independent_legs(
+def test_replacement_rejections_keep_old_protection_for_each_independent_leg(
     tmp_path,
 ):
     from telegram_kol_research.strategy_management_executor import execute_management_batch
@@ -5080,18 +5047,12 @@ def test_restore_failure_marks_recovery_required_and_continues_independent_legs(
         session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
     )
 
-    assert result["status"] == "recovery_required"
+    assert result["status"] == "partial_failed"
     assert [leg["status"] for leg in result["legs"]] == [
-        "recovery_required",
-        "succeeded",
+        "restored",
+        "restored",
     ]
-    assert [call["ordId"] for call in client.cancel_calls] == [
-        "tp-1a",
-        "tp-1b",
-        "sl-1",
-        "tp-2",
-        "sl-2",
-    ]
+    assert client.cancel_calls == []
 
 
 @pytest.mark.parametrize(
@@ -5124,14 +5085,8 @@ def test_unknown_protection_replacement_never_cancels_or_restores(outcome, tmp_p
     ]
     # The uncertain leg is never restored or retried, while the independent
     # sibling still completes from its own durable state.
-    assert [call["ordId"] for call in client.cancel_calls] == [
-        "tp-1a",
-        "tp-1b",
-        "sl-1",
-        "tp-2",
-        "sl-2",
-    ]
-    assert len(client.set_calls) == 3
+    assert [call["ordId"] for call in client.cancel_calls] == ["sl-2"]
+    assert len(client.set_calls) == 2
 
 
 @pytest.mark.parametrize(
@@ -5398,8 +5353,8 @@ def test_live_automated_stop_adjustment_delegates_to_exact_batch(tmp_path):
     )
 
     assert result["status"] == "succeeded"
-    assert len(client.cancel_calls) == 5
-    assert len(client.set_calls) == 5
+    assert len(client.cancel_calls) == 2
+    assert len(client.set_calls) == 2
 
 
 def test_explicit_stop_on_triggered_market_side_blocks_before_any_write(tmp_path):
@@ -6317,6 +6272,95 @@ def test_composite_protection_creates_and_owns_both_stops_before_cancelling_old(
             session.query(PositionBackupStopOrder).count(),
             session.query(PositionProtectionRevision).count(),
         ) == counts
+
+
+def test_verified_replacement_replay_heals_corrupt_and_duplicate_projections(
+    tmp_path,
+):
+    from telegram_kol_research.protection_replacement_persistence import (
+        VerifiedProtectionReplacement,
+        persist_verified_protection_replacement,
+    )
+
+    session_factory = create_session_factory(tmp_path / "protection-replay.db")
+    batch_id, component_id = _prepare_composite_protection_component(session_factory)
+    result = _execute_composite_protection(
+        session_factory, batch_id, component_id, _CompositeProtectionClient()
+    )
+    assert result.status == "confirmed"
+
+    with session_factory() as session:
+        revision = session.query(PositionProtectionRevision).filter_by(
+            pos_id="pos-composite", status="active"
+        ).one()
+        payload = json.loads(revision.protection_json)
+        primary = session.query(PositionProtectionLeg).filter_by(
+            pos_id="pos-composite", role="primary_stop", status="verified"
+        ).one()
+        primary.planned_trigger_price = "1"
+        session.add(
+            PositionProtectionLeg(
+                venue=primary.venue,
+                execution_binding_id=primary.execution_binding_id,
+                execution_order_leg_id=primary.execution_order_leg_id,
+                role=primary.role,
+                leg_index=primary.leg_index + 100,
+                planned_trigger_price=primary.planned_trigger_price,
+                planned_size=primary.planned_size,
+                pos_id=primary.pos_id,
+                exchange_order_id=primary.exchange_order_id,
+                status="verified",
+            )
+        )
+        ledger = session.query(PositionProtectionLedger).filter_by(
+            order_id="stop-new-primary"
+        ).one()
+        ledger.purpose = "take_profit"
+        replacements = tuple(
+            VerifiedProtectionReplacement(
+                role=item["role"],
+                order_id=item["order_id"],
+                trigger_price=item["trigger_price"],
+                size_text=item["size_text"],
+            )
+            for item in payload["replacements"]
+        )
+        persist_verified_protection_replacement(
+            session,
+            venue=revision.venue,
+            execution_binding_id=revision.execution_binding_id,
+            execution_order_leg_id=revision.execution_order_leg_id,
+            strategy_instance_id=revision.strategy_instance_id,
+            pos_id=revision.pos_id,
+            instrument_id="BTC-USDT-SWAP",
+            side="long",
+            source=revision.source,
+            replacement_identity=payload["replacement_identity"],
+            replacements=replacements,
+            seen_at=NOW,
+        )
+        session.commit()
+
+    with session_factory() as session:
+        roles = session.query(PositionProtectionLeg).filter_by(
+            pos_id="pos-composite", status="verified"
+        ).all()
+        assert len(roles) == 3
+        assert {
+            (
+                row.role,
+                row.exchange_order_id,
+                row.planned_trigger_price,
+                row.planned_size,
+            )
+            for row in roles
+        } == {
+            (item.role, item.order_id, item.trigger_price, item.size_text)
+            for item in replacements
+        }
+        assert session.query(PositionProtectionLedger).filter_by(
+            order_id="stop-new-primary"
+        ).one().purpose == "stop_loss"
 
 
 def test_composite_protection_readback_failure_retains_old_stops(tmp_path):

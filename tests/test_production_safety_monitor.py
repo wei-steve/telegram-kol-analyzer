@@ -45,6 +45,8 @@ from telegram_kol_research.models import (
     ExecutionOrderLeg,
     PositionBackupStopOrder,
     PositionProtectionIncident,
+    PositionProtectionLedger,
+    PositionProtectionRevision,
     RawMessage,
     RuntimeIncident,
     StrategyManagementBatch,
@@ -2175,6 +2177,149 @@ def test_monitor_adapts_each_durable_severe_protection_incident_once(tmp_path):
             source.delivery_status,
             source.updated_at,
         ) == source_snapshot
+
+
+def test_monitor_skips_incident_resolved_by_newer_exact_verified_replacement(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "resolved-protection.db")
+    incident_at = datetime(2026, 7, 16, 0, 20)
+    replacement_at = datetime(2026, 7, 16, 0, 25)
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:1:2:BTC:long",
+            kol_id="kol",
+            chat_id=1,
+            message_id=2,
+            symbol="BTC",
+            side="long",
+            status="open",
+        )
+        session.add(binding)
+        session.flush()
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            leg_index=0,
+            purpose="entry",
+            order_kind="market",
+            pos_id="pos-1",
+            status="active",
+        )
+        session.add(leg)
+        session.flush()
+        session.add(
+            PositionProtectionIncident(
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                pos_id="pos-1",
+                incident_type="stop_trigger_failed",
+                fingerprint="e" * 64,
+                evidence_json="{}",
+                delivery_status="pending",
+                created_at=incident_at,
+                updated_at=incident_at,
+            )
+        )
+        replacements = (
+            ("primary-2", "stop_loss", "63200"),
+            ("backup-2", "backup_stop", "63000"),
+            ("tp-2", "take_profit", "65000"),
+        )
+        for order_id, purpose, trigger_price in replacements:
+            session.add(
+                PositionProtectionLedger(
+                    execution_binding_id=binding.id,
+                    execution_order_leg_id=leg.id,
+                    strategy_instance_id=binding.strategy_instance_id,
+                    pos_id="pos-1",
+                    instrument_id="BTC-USDT-SWAP",
+                    side="long",
+                    order_id=order_id,
+                    purpose=purpose,
+                    trigger_price=trigger_price,
+                    size_text="1",
+                    status="verified",
+                    evidence_source="management_tpsl_readback",
+                    evidence_json="{}",
+                    created_at=replacement_at,
+                    updated_at=replacement_at,
+                )
+            )
+        session.add(
+            PositionBackupStopOrder(
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                pos_id="pos-1",
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                trigger_price="63000",
+                order_id="backup-2",
+                client_order_id="backup-client-2",
+                status="active",
+                request_json="{}",
+                created_at=replacement_at,
+                updated_at=replacement_at,
+            )
+        )
+        session.add(
+            PositionProtectionRevision(
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                pos_id="pos-1",
+                source="management_tpsl_readback",
+                status="active",
+                protection_json=json.dumps(
+                    {
+                        "roles": [
+                            "primary_stop",
+                            "backup_stop",
+                            "take_profit",
+                        ],
+                        "order_ids": ["primary-2", "backup-2", "tp-2"],
+                        "replacements": [
+                            {
+                                "role": "primary_stop",
+                                "order_id": "primary-2",
+                                "trigger_price": "63200",
+                                "size_text": "1",
+                            },
+                            {
+                                "role": "backup_stop",
+                                "order_id": "backup-2",
+                                "trigger_price": "63000",
+                                "size_text": "1",
+                            },
+                            {
+                                "role": "take_profit",
+                                "order_id": "tp-2",
+                                "trigger_price": "65000",
+                                "size_text": "1",
+                            },
+                        ],
+                    }
+                ),
+                created_at=replacement_at,
+                updated_at=replacement_at,
+            )
+        )
+        session.commit()
+
+    run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=tmp_path / "state.json",
+        adapters=_RecordingAdapters(),
+        notify=False,
+        runtime_incident_session_factory=session_factory,
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"severe_protection_incident"})
+        ),
+        now=datetime(2026, 7, 16, 0, 30, tzinfo=UTC),
+    )
+
+    with session_factory() as session:
+        assert session.query(RuntimeIncident).count() == 0
 
 
 def test_monitor_captures_tp_unknown_and_protection_deadline_once(tmp_path):

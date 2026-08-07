@@ -1817,6 +1817,8 @@ def _expand_lifecycle_event_targets(
     for raw_target in raw_targets:
         if not isinstance(raw_target, dict):
             return None
+        if set(raw_target) - {"target_lifecycle_id", "symbol", "side"}:
+            return None
         target_id = _int_or_none(raw_target.get("target_lifecycle_id"))
         if target_id is None or target_id in seen_ids:
             return None

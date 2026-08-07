@@ -135,6 +135,7 @@ def build_position_protection_audit(
         pos_id=pos_id,
         freeze_reasons=freeze_reasons,
         protection_revisions=protection_revisions,
+        current_ledger_rows=current_ledger_rows,
     )
     reasons = {
         _text(_field(reason, "reason") or _field(reason, "incident_type") or reason)
@@ -165,6 +166,7 @@ def build_position_protection_audit(
         and all(item["verification_status"] == "verified" for item in take_profits)
         and not manual_order_ids
         and not ownership_conflict
+        and not reasons
     )
     matching_strategies = sorted(
         {
@@ -207,19 +209,87 @@ _TRANSIENT_REPLACEMENT_FREEZE_REASONS = frozenset(
 )
 
 
-def _active_freeze_reasons(*, pos_id, freeze_reasons, protection_revisions):
+def _active_freeze_reasons(
+    *, pos_id, freeze_reasons, protection_revisions, current_ledger_rows
+):
     reasons = list(freeze_reasons)
+    binding_ids = {
+        int(value)
+        for row in current_ledger_rows
+        if (value := _field(row, "execution_binding_id")) is not None
+    }
+    leg_ids = {
+        int(value)
+        for row in current_ledger_rows
+        if (value := _field(row, "execution_order_leg_id")) is not None
+    }
+    role_to_purpose = {
+        "primary_stop": "stop_loss",
+        "backup_stop": "backup_stop",
+        "take_profit": "take_profit",
+    }
+    current_ledger_evidence = {
+        (
+            _text(_field(row, "purpose")),
+            value,
+            _text(_field(row, "trigger_price")),
+            _text(_field(row, "size_text")),
+        )
+        for row in current_ledger_rows
+        if (value := _text(_field(row, "order_id")))
+    }
+    if len(binding_ids) != 1 or len(leg_ids) != 1 or not current_ledger_evidence:
+        return reasons
+    exact_binding_id = next(iter(binding_ids))
+    exact_leg_id = next(iter(leg_ids))
     complete_revisions = []
     for revision in protection_revisions:
         if (
             _text(_field(revision, "pos_id")) != pos_id
             or _text(_field(revision, "status")) != "active"
+            or _field(revision, "execution_binding_id") != exact_binding_id
+            or _field(revision, "execution_order_leg_id") != exact_leg_id
         ):
             continue
         payload = _json_value(_field(revision, "protection_json"))
-        if not {"primary_stop", "backup_stop", "take_profit"}.issubset(
-            set(payload.get("roles") or [])
+        replacements = payload.get("replacements") or []
+        if not isinstance(replacements, list) or not replacements:
+            continue
+        replacement_roles = {
+            _text(item.get("role"))
+            for item in replacements
+            if isinstance(item, dict)
+        }
+        replacement_order_ids = [
+            _text(item.get("order_id"))
+            for item in replacements
+            if isinstance(item, dict)
+        ]
+        declared_roles = {_text(value) for value in payload.get("roles") or []}
+        declared_order_ids = {
+            _text(value) for value in payload.get("order_ids") or [] if _text(value)
+        }
+        if (
+            not {"primary_stop", "backup_stop", "take_profit"}.issubset(
+                replacement_roles
+            )
+            or declared_roles != replacement_roles
+            or not all(replacement_order_ids)
+            or len(replacement_order_ids) != len(set(replacement_order_ids))
+            or declared_order_ids != set(replacement_order_ids)
         ):
+            continue
+        replacement_evidence = {
+            (
+                role_to_purpose.get(_text(item.get("role")), ""),
+                _text(item.get("order_id")),
+                _text(item.get("trigger_price")),
+                _text(item.get("size_text")),
+            )
+            for item in replacements
+            if isinstance(item, dict)
+        }
+        if not replacement_evidence.issubset(current_ledger_evidence):
             continue
         created_at = _field(revision, "created_at")
         if isinstance(created_at, datetime):
@@ -235,6 +305,8 @@ def _active_freeze_reasons(*, pos_id, freeze_reasons, protection_revisions):
         created_at = _field(reason, "created_at")
         recovered = (
             reason_code in _TRANSIENT_REPLACEMENT_FREEZE_REASONS
+            and _field(reason, "execution_binding_id") == exact_binding_id
+            and _field(reason, "execution_order_leg_id") == exact_leg_id
             and isinstance(created_at, datetime)
             and _utc_naive(created_at) < newest
         )

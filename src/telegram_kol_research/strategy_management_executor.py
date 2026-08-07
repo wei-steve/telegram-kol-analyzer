@@ -778,6 +778,15 @@ def _execute_break_even_by_market_batch(
             leg=execution_leg,
             old_rows=old_rows,
         )
+        replacement_rows, retained_rows = _partition_replacement_rows(
+            old_rows=old_rows, new_rows=new_rows
+        )
+        retained_order_ids = {str(item["order_id"]) for item in retained_rows}
+        old_replaced_order_ids = [
+            str(item["order_id"])
+            for item in old_rows
+            if str(item["order_id"]) not in retained_order_ids
+        ]
         if not transition_leg(
             session_factory,
             leg.id,
@@ -785,52 +794,13 @@ def _execute_break_even_by_market_batch(
             new_status="reserved",
             transitioned_at=executed_at,
             request={
-                "cancel_order_ids": old_order_ids,
-                "expected_replacement_count": len(new_rows),
+                "cancel_order_ids": old_replaced_order_ids,
+                "expected_replacement_count": len(replacement_rows),
             },
         ):
             raise ManagementBatchExecutionError(
                 f"management_protection_leg_reservation_conflict:{leg.id}"
             )
-        try:
-            for order_id in old_order_ids:
-                _require_remediation_live_gate(session_factory, batch=batch)
-                cancel_exact_position_sltp(
-                    session_factory=session_factory,
-                    deepcoin_client=deepcoin_client,
-                    pos_id=str(leg.pos_id),
-                    order_id=str(order_id),
-                    instrument_id=inst_id,
-                    idempotency_key=(
-                        f"management:{batch.id}:{leg.id}:cancel:{order_id}"
-                    ),
-                    live_execution_gate=lambda: exact_position_write_gate(
-                        session_factory, pos_id=str(leg.pos_id)
-                    ),
-                    now_provider=lambda: executed_at,
-                )
-                _mark_management_tpsl_ledger_cancelled(
-                    session_factory,
-                    batch=batch,
-                    leg=leg,
-                    order_id=str(order_id),
-                    seen_at=executed_at,
-                )
-        except Exception as exc:
-            transition_leg(
-                session_factory,
-                leg.id,
-                expected_statuses={"reserved"},
-                new_status="recovery_required",
-                transitioned_at=executed_at,
-                last_error={
-                    "stage": "cancel_old_protection",
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                },
-            )
-            continue
-
         common = _protection_payload_common(
             binding=binding,
             position={"posId": str(leg.pos_id)},
@@ -839,7 +809,7 @@ def _execute_break_even_by_market_batch(
         created_order_ids: list[str] = []
         responses: list[dict[str, Any]] = []
         replacement_error: Exception | None = None
-        for protection_row in new_rows:
+        for protection_row in replacement_rows:
             try:
                 _require_remediation_live_gate(session_factory, batch=batch)
                 payload = _protection_row_payload(
@@ -859,6 +829,7 @@ def _execute_break_even_by_market_batch(
                     ),
                     now_provider=lambda: executed_at,
                     require_readback=True,
+                    ledger_purpose=str(protection_row["purpose"]),
                 )
                 order_id = _extract_order_id(response)
                 if not order_id:
@@ -867,28 +838,45 @@ def _execute_break_even_by_market_batch(
                     )
                 created_order_ids.append(order_id)
                 responses.append(response)
-                _record_management_tpsl_ledger_rows(
-                    session_factory,
-                    batch=batch,
-                    binding=binding,
-                    leg=leg,
-                    inst_id=inst_id,
-                    rows=[protection_row],
-                    order_ids=[order_id],
-                    seen_at=executed_at,
-                )
             except Exception as exc:
                 replacement_error = exc
                 break
         if replacement_error is None:
+            try:
+                _cancel_old_protection_after_replacement(
+                    session_factory=session_factory,
+                    batch=batch,
+                    leg=leg,
+                    deepcoin_client=deepcoin_client,
+                    inst_id=inst_id,
+                    old_order_ids=old_replaced_order_ids,
+                    executed_at=executed_at,
+                )
+            except Exception as exc:
+                transition_leg(
+                    session_factory,
+                    leg.id,
+                    expected_statuses={"reserved"},
+                    new_status="recovery_required",
+                    transitioned_at=executed_at,
+                    response={"rows": responses},
+                    last_error={
+                        "stage": "cancel_old_protection_after_replacement",
+                        "type": type(exc).__name__,
+                    },
+                )
+                continue
             _record_management_tpsl_ledger_rows(
                 session_factory,
                 batch=batch,
                 binding=binding,
                 leg=leg,
                 inst_id=inst_id,
-                rows=new_rows,
-                order_ids=created_order_ids,
+                rows=[*replacement_rows, *retained_rows],
+                order_ids=[
+                    *created_order_ids,
+                    *(str(item["order_id"]) for item in retained_rows),
+                ],
                 seen_at=executed_at,
             )
             transition_leg(
@@ -947,49 +935,9 @@ def _execute_break_even_by_market_batch(
                     order_id=order_id,
                     seen_at=executed_at,
                 )
-            for protection_row in old_rows:
-                _require_remediation_live_gate(session_factory, batch=batch)
-                payload = _protection_row_payload(
-                    common=common, row=protection_row
-                )
-                response = submit_exact_position_sltp(
-                    session_factory=session_factory,
-                    deepcoin_client=deepcoin_client,
-                    pos_id=str(leg.pos_id),
-                    payload=payload,
-                    idempotency_key=(
-                        f"management:{batch.id}:{leg.id}:restore:"
-                        f"{protection_row['purpose']}:{len(restore_responses)}"
-                    ),
-                    live_execution_gate=lambda: exact_position_write_gate(
-                        session_factory, pos_id=str(leg.pos_id)
-                    ),
-                    now_provider=lambda: executed_at,
-                    require_readback=True,
-                )
-                if not _extract_order_id(response):
-                    raise ManagementBatchExecutionError(
-                        "protection_restore_missing_order_id"
-                    )
-                restore_responses.append(response)
         except Exception as exc:
             restoration_error = exc
         if restoration_error is None:
-            restored_order_ids = [
-                str(_extract_order_id(response))
-                for response in restore_responses
-            ]
-            _record_management_tpsl_ledger_rows(
-                session_factory,
-                batch=batch,
-                binding=binding,
-                leg=leg,
-                inst_id=inst_id,
-                rows=old_rows,
-                order_ids=restored_order_ids,
-                seen_at=executed_at,
-                evidence_source="management_tpsl_restore",
-            )
             leg_status = "restored"
         else:
             leg_status = "recovery_required"
@@ -1779,6 +1727,15 @@ def _execute_protection_batch(
             if batch.effective_action == "partial_then_break_even"
             else {"planned"}
         )
+        replacement_rows, retained_rows = _partition_replacement_rows(
+            old_rows=old_rows, new_rows=new_rows
+        )
+        retained_order_ids = {str(item["order_id"]) for item in retained_rows}
+        old_replaced_order_ids = [
+            str(item["order_id"])
+            for item in old_rows
+            if str(item["order_id"]) not in retained_order_ids
+        ]
         if not transition_leg(
             session_factory,
             leg.id,
@@ -1786,62 +1743,18 @@ def _execute_protection_batch(
             new_status="reserved",
             transitioned_at=executed_at,
             request={
-                "cancel_order_ids": [row["order_id"] for row in old_rows],
-                "expected_replacement_count": len(new_rows),
+                "cancel_order_ids": old_replaced_order_ids,
+                "expected_replacement_count": len(replacement_rows),
             },
         ):
             raise ManagementBatchExecutionError(
                 f"management_protection_leg_reservation_conflict:{leg.id}"
             )
 
-        if not skip_old_cancel:
-            try:
-                for row in old_rows:
-                    _require_remediation_live_gate(
-                        session_factory, batch=batch
-                    )
-                    cancel_exact_position_sltp(
-                        session_factory=session_factory,
-                        deepcoin_client=deepcoin_client,
-                        pos_id=str(leg.pos_id),
-                        order_id=str(row["order_id"]),
-                        instrument_id=inst_id,
-                        idempotency_key=(
-                            f"management:{batch.id}:{leg.id}:cancel:"
-                            f"{row['order_id']}"
-                        ),
-                        live_execution_gate=lambda: exact_position_write_gate(
-                            session_factory, pos_id=str(leg.pos_id)
-                        ),
-                        now_provider=lambda: executed_at,
-                    )
-                    _mark_management_tpsl_ledger_cancelled(
-                        session_factory,
-                        batch=batch,
-                        leg=leg,
-                        order_id=str(row["order_id"]),
-                        seen_at=executed_at,
-                    )
-            except Exception as exc:
-                transition_leg(
-                    session_factory,
-                    leg.id,
-                    expected_statuses={"reserved"},
-                    new_status="recovery_required",
-                    transitioned_at=executed_at,
-                    last_error={
-                        "stage": "cancel_old_protection",
-                        "type": type(exc).__name__,
-                        "message": str(exc),
-                    },
-                )
-                failed_status = "recovery_required"
-                continue
-
         created_order_ids: list[str] = []
         replacement_responses: list[dict[str, Any]] = []
         replacement_error: Exception | None = None
-        for row in new_rows:
+        for row in replacement_rows:
             payload = _protection_row_payload(common=common, row=row)
             try:
                 _require_remediation_live_gate(session_factory, batch=batch)
@@ -1859,6 +1772,7 @@ def _execute_protection_batch(
                     ),
                     now_provider=lambda: executed_at,
                     require_readback=True,
+                    ledger_purpose=str(row["purpose"]),
                 )
                 order_id = _extract_order_id(response)
                 if not order_id:
@@ -1867,28 +1781,47 @@ def _execute_protection_batch(
                     )
                 created_order_ids.append(order_id)
                 replacement_responses.append(response)
-                _record_management_tpsl_ledger_rows(
-                    session_factory,
-                    batch=batch,
-                    binding=binding,
-                    leg=leg,
-                    inst_id=inst_id,
-                    rows=[row],
-                    order_ids=[order_id],
-                    seen_at=executed_at,
-                )
             except Exception as exc:
                 replacement_error = exc
                 break
         if replacement_error is None:
+            if not skip_old_cancel:
+                try:
+                    _cancel_old_protection_after_replacement(
+                        session_factory=session_factory,
+                        batch=batch,
+                        leg=leg,
+                        deepcoin_client=deepcoin_client,
+                        inst_id=inst_id,
+                        old_order_ids=old_replaced_order_ids,
+                        executed_at=executed_at,
+                    )
+                except Exception as exc:
+                    transition_leg(
+                        session_factory,
+                        leg.id,
+                        expected_statuses={"reserved"},
+                        new_status="recovery_required",
+                        transitioned_at=executed_at,
+                        response={"rows": replacement_responses},
+                        last_error={
+                            "stage": "cancel_old_protection_after_replacement",
+                            "type": type(exc).__name__,
+                        },
+                    )
+                    failed_status = "recovery_required"
+                    continue
             _record_management_tpsl_ledger_rows(
                 session_factory,
                 batch=batch,
                 binding=binding,
                 leg=leg,
                 inst_id=inst_id,
-                rows=new_rows,
-                order_ids=created_order_ids,
+                rows=[*replacement_rows, *retained_rows],
+                order_ids=[
+                    *created_order_ids,
+                    *(str(item["order_id"]) for item in retained_rows),
+                ],
                 seen_at=executed_at,
             )
             transition_leg(
@@ -1946,50 +1879,11 @@ def _execute_protection_batch(
                     seen_at=executed_at,
                 )
             restore_responses = []
-            for row in old_rows:
-                _require_remediation_live_gate(session_factory, batch=batch)
-                payload = _protection_row_payload(common=common, row=row)
-                response = submit_exact_position_sltp(
-                    session_factory=session_factory,
-                    deepcoin_client=deepcoin_client,
-                    pos_id=str(leg.pos_id),
-                    payload=payload,
-                    idempotency_key=(
-                        f"management:{batch.id}:{leg.id}:restore:"
-                        f"{row['purpose']}:{len(restore_responses)}"
-                    ),
-                    live_execution_gate=lambda: exact_position_write_gate(
-                        session_factory, pos_id=str(leg.pos_id)
-                    ),
-                    now_provider=lambda: executed_at,
-                    require_readback=True,
-                )
-                if not _extract_order_id(response):
-                    raise ManagementBatchExecutionError(
-                        "protection_restore_missing_order_id"
-                    )
-                restore_responses.append(response)
         except Exception as exc:
             restoration_error = exc
             restore_responses = []
 
         if restoration_error is None:
-            restored_order_ids = [
-                order_id
-                for response in restore_responses
-                if (order_id := _extract_order_id(response))
-            ]
-            _record_management_tpsl_ledger_rows(
-                session_factory,
-                batch=batch,
-                binding=binding,
-                leg=leg,
-                inst_id=inst_id,
-                rows=old_rows,
-                order_ids=restored_order_ids,
-                seen_at=executed_at,
-                evidence_source="management_tpsl_restore",
-            )
             leg_status = "restored"
             if failed_status is None:
                 failed_status = "partial_failed"
@@ -3260,6 +3154,30 @@ def _adjusted_protection_rows(
     return adjusted
 
 
+def _partition_replacement_rows(*, old_rows, new_rows):
+    """Retain only exact unchanged TPs; every other row must be replaced."""
+
+    old_by_order_id = {
+        str(row.get("order_id")): row
+        for row in old_rows
+        if str(row.get("order_id") or "")
+    }
+    retained = []
+    replacement = []
+    for row in new_rows:
+        old = old_by_order_id.get(str(row.get("order_id") or ""))
+        unchanged_take_profit = (
+            row.get("purpose") == "take_profit"
+            and old is not None
+            and old.get("purpose") == "take_profit"
+            and str(old.get("trigger_price") or "")
+            == str(row.get("trigger_price") or "")
+            and str(old.get("size") or "") == str(row.get("size") or "")
+        )
+        (retained if unchanged_take_profit else replacement).append(row)
+    return replacement, retained
+
+
 def _planned_stop_price(*, batch: ManagementBatchRecord, leg: Any) -> str:
     planned_tpsl = leg.planned_tpsl or {}
     explicit = planned_tpsl.get("stop_loss_text")
@@ -3513,6 +3431,41 @@ def _record_management_tpsl_ledger_rows(
                 protection_json={"order_ids": [str(value) for value in order_ids], "rows": rows, "management_batch_id": batch.id},
             )
         session.commit()
+
+
+def _cancel_old_protection_after_replacement(
+    *,
+    session_factory: sessionmaker,
+    batch: ManagementBatchRecord,
+    leg: Any,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    inst_id: str,
+    old_order_ids: list[str],
+    executed_at: datetime,
+) -> None:
+    """Cancel old protection only after every replacement has verified read-back."""
+
+    for order_id in old_order_ids:
+        _require_remediation_live_gate(session_factory, batch=batch)
+        cancel_exact_position_sltp(
+            session_factory=session_factory,
+            deepcoin_client=deepcoin_client,
+            pos_id=str(leg.pos_id),
+            order_id=str(order_id),
+            instrument_id=inst_id,
+            idempotency_key=f"management:{batch.id}:{leg.id}:cancel:{order_id}",
+            live_execution_gate=lambda: exact_position_write_gate(
+                session_factory, pos_id=str(leg.pos_id)
+            ),
+            now_provider=lambda: executed_at,
+        )
+        _mark_management_tpsl_ledger_cancelled(
+            session_factory,
+            batch=batch,
+            leg=leg,
+            order_id=str(order_id),
+            seen_at=executed_at,
+        )
 
 
 def _mark_management_tpsl_ledger_cancelled(

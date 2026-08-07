@@ -37,6 +37,9 @@ from telegram_kol_research.runtime_incident_adapters import (
     capture_protection_state,
     capture_runtime_incident_best_effort,
 )
+from telegram_kol_research.protection_health import (
+    current_protection_incident_health_status,
+)
 from telegram_kol_research.system_operator_bot import (
     load_system_operator_bot_config,
     send_system_operator_bot_message,
@@ -1360,6 +1363,9 @@ def capture_uncaptured_runtime_incident_sources(
                         int(source.id),
                         str(source.incident_type),
                         source.created_at,
+                        current_protection_incident_health_status(
+                            session, incident=source
+                        ),
                         bool(
                             session.query(PositionBackupStopOrder.id)
                             .filter(
@@ -1374,7 +1380,13 @@ def capture_uncaptured_runtime_incident_sources(
                     )
                     for source in sources
                 ]
-            for source_id, incident_type, created_at, exact_backup_verified in projected_sources:
+            for (
+                source_id,
+                incident_type,
+                created_at,
+                current_health_status,
+                exact_backup_verified,
+            ) in projected_sources:
                 classification = classify_protection_incident(
                     incident_type,
                     exact_backup_verified=exact_backup_verified,
@@ -1391,6 +1403,7 @@ def capture_uncaptured_runtime_incident_sources(
                     severity="high" if classification == "critical" else "medium",
                     reason_code=incident_type,
                     occurred_at=occurred_at,
+                    current_health_status=current_health_status,
                 )
                 captured += int(row is not None)
             now = datetime.now(UTC)

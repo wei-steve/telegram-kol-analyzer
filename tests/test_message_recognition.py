@@ -831,6 +831,36 @@ def test_authoritative_multi_target_persistence_is_all_or_nothing(tmp_path):
         assert session.query(MessageInstructionItem).filter_by(raw_message_id=raw_id).count() == 0
 
 
+def test_multi_target_rejects_target_level_policy_overrides_before_persistence(tmp_path):
+    session_factory = create_session_factory(tmp_path / "multi-target-override.db")
+    with session_factory() as session:
+        btc = _add_exact_live_lifecycle(session, chat_id=88, message_id=3463, symbol="BTC", side="short")
+        eth = _add_exact_live_lifecycle(session, chat_id=88, message_id=3464, symbol="ETH", side="short")
+        raw = RawMessage(chat_id=88, message_id=3465, text="BTC ETH空单可以止盈一部分")
+        session.add(raw)
+        session.flush()
+        raw_id, btc_id, eth_id = raw.id, btc.id, eth.id
+        session.commit()
+
+    result = apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_id,
+        payload={"recognition_result": "非策略", "lifecycle_event": {
+            "event_type": "position_update", "management_action": "partial_take_profit",
+            "confidence": 0.95, "targets": [
+                {"target_lifecycle_id": btc_id, "symbol": "BTC", "side": "short"},
+                {"target_lifecycle_id": eth_id, "symbol": "ETH", "side": "short", "confidence": 0.1},
+            ],
+        }},
+        model="mimo-v2.5",
+        authoritative_generation="hostile-target-override",
+    )
+
+    assert result.status == "识别失败"
+    with session_factory() as session:
+        assert session.query(SignalCandidate).filter_by(raw_message_id=raw_id).count() == 0
+
+
 def test_authoritative_unscoped_break_even_does_not_guess_same_group_positions(
     tmp_path,
 ):
