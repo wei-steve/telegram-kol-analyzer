@@ -15,7 +15,10 @@ from telegram_kol_research.execution_events import list_execution_events
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionBackupStopOrder,
+    PositionProtectionLeg,
     PositionProtectionLedger,
+    PositionProtectionRevision,
     RawMessage,
     RecognitionDecision,
     StrategyLifecycle,
@@ -6280,6 +6283,40 @@ def test_composite_protection_creates_and_owns_both_stops_before_cancelling_old(
         ).all()
         assert {row.purpose for row in new_rows} == {"stop_loss", "backup_stop"}
         assert all(row.status == "verified" for row in new_rows)
+        role_rows = session.query(PositionProtectionLeg).filter(
+            PositionProtectionLeg.pos_id == "pos-composite",
+            PositionProtectionLeg.status == "verified",
+        ).all()
+        assert {row.role for row in role_rows} == {
+            "primary_stop", "backup_stop", "take_profit"
+        }
+        backup = session.query(PositionBackupStopOrder).filter_by(
+            pos_id="pos-composite", status="active"
+        ).one()
+        assert backup.order_id == "stop-new-backup"
+        assert backup.trigger_price == "63872"
+        revision = session.query(PositionProtectionRevision).filter_by(
+            pos_id="pos-composite", status="active"
+        ).one()
+        assert set(json.loads(revision.protection_json)["roles"]) == {
+            "primary_stop", "backup_stop", "take_profit"
+        }
+        counts = (
+            session.query(PositionProtectionLeg).count(),
+            session.query(PositionBackupStopOrder).count(),
+            session.query(PositionProtectionRevision).count(),
+        )
+
+    repeated = _execute_composite_protection(
+        session_factory, batch_id, component_id, client
+    )
+    assert repeated.status == "confirmed"
+    with session_factory() as session:
+        assert (
+            session.query(PositionProtectionLeg).count(),
+            session.query(PositionBackupStopOrder).count(),
+            session.query(PositionProtectionRevision).count(),
+        ) == counts
 
 
 def test_composite_protection_readback_failure_retains_old_stops(tmp_path):

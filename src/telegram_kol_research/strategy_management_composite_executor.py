@@ -51,6 +51,10 @@ from telegram_kol_research.strategy_management_market_policy import (
     plan_composite_stop_replacement,
 )
 from telegram_kol_research.protection_ledger import retained_take_profit_total
+from telegram_kol_research.protection_replacement_persistence import (
+    VerifiedProtectionReplacement,
+    persist_verified_protection_replacement,
+)
 from telegram_kol_research.strategy_records import (
     CompositeManagementCompletionError,
     validate_composite_management_completion,
@@ -1100,11 +1104,51 @@ def execute_protection_replacement_component(
                 for row in final_rows
                 if row.order_id in created_order_ids and row.status == "verified"
             }
+            retained_take_profits = tuple(
+                VerifiedProtectionReplacement(
+                    role="take_profit",
+                    order_id=str(row.order_id),
+                    trigger_price=str(row.trigger_price or ""),
+                    size_text=row.size_text,
+                )
+                for row in final_rows
+                if row.purpose == "take_profit" and row.status == "verified"
+            )
         if verified_new != {
             created_order_ids[0]: "stop_loss",
             created_order_ids[1]: "backup_stop",
         }:
             raise ValueError("replacement_stop_ownership_incomplete")
+        with session_factory() as session:
+            persist_verified_protection_replacement(
+                session,
+                venue="deepcoin",
+                execution_binding_id=batch.execution_binding_id,
+                execution_order_leg_id=leg.execution_order_leg_id,
+                strategy_instance_id=batch.strategy_instance_id,
+                pos_id=leg.pos_id,
+                instrument_id=desired["instrument_id"],
+                side=contract.side,
+                source="composite_management_replacement",
+                replacement_identity=f"component:{component.id}",
+                replacements=(
+                    VerifiedProtectionReplacement(
+                        role="primary_stop",
+                        order_id=created_order_ids[0],
+                        trigger_price=decision.primary_stop,
+                        size_text=desired["target_remaining_size"],
+                    ),
+                    VerifiedProtectionReplacement(
+                        role="backup_stop",
+                        order_id=created_order_ids[1],
+                        trigger_price=decision.backup_stop,
+                        size_text=desired["target_remaining_size"],
+                    ),
+                    *retained_take_profits,
+                ),
+                seen_at=now_provider(),
+            )
+            session.commit()
     except Exception as exc:
         _transition(
             session_factory, component.id, "submitting", "operator_required",

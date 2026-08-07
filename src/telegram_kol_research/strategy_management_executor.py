@@ -29,6 +29,7 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    PositionBackupStopOrder,
     PositionProtectionLedger,
     PositionProtectionLeg,
     RawMessage,
@@ -54,6 +55,10 @@ from telegram_kol_research.protection_attribution import (
     snapshot_protection_rows,
 )
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
+from telegram_kol_research.protection_replacement_persistence import (
+    VerifiedProtectionReplacement,
+    persist_verified_protection_replacement,
+)
 from telegram_kol_research.position_protection_legs import (
     bind_filled_position,
     bind_verified_exchange_order,
@@ -3061,6 +3066,25 @@ def _preflight_exact_protection_rows(
                 "protection_preflight_rows_ambiguous_or_drifted"
             )
         seen_ids.update(str(order_id) for order_id in current_ids)
+        role_by_order_id = {
+            str(row.order_id): str(row.purpose)
+            for row in ledger_rows_by_pos_id.get(str(leg.pos_id), [])
+            if str(row.purpose) == "backup_stop"
+        }
+        with session_factory() as session:
+            role_by_order_id.update(
+                {
+                    str(row.order_id): "backup_stop"
+                    for row in session.query(PositionBackupStopOrder).filter(
+                        PositionBackupStopOrder.pos_id == str(leg.pos_id),
+                        PositionBackupStopOrder.status == "active",
+                        PositionBackupStopOrder.order_id.is_not(None),
+                    )
+                }
+            )
+        for row in current_rows:
+            if role_by_order_id.get(str(row.get("order_id"))) == "backup_stop":
+                row["purpose"] = "backup_stop"
         current_rows_by_pos_id[str(leg.pos_id)] = current_rows
     return current_rows_by_pos_id
 
@@ -3193,7 +3217,7 @@ def _ledger_matches_pending_row(ledger: Any, row: dict[str, Any]) -> bool:
 def _pending_row_trigger_price(row: dict[str, Any], purpose: str) -> Decimal | None:
     keys = (
         ("slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")
-        if purpose in {"stop_loss", "sl", "loss"}
+        if purpose in {"stop_loss", "backup_stop", "sl", "loss"}
         else ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")
     )
     for key in keys:
@@ -3219,7 +3243,7 @@ def _adjusted_protection_rows(
     found_stop = False
     for old in old_rows:
         row = dict(old)
-        if row.get("purpose") == "stop_loss":
+        if row.get("purpose") in {"stop_loss", "backup_stop"}:
             row["trigger_price"] = str(stop_price)
             found_stop = True
             adjusted.append(row)
@@ -3417,7 +3441,9 @@ def _record_management_tpsl_ledger_rows(
     evidence_source: str = "management_tpsl_replacement",
 ) -> None:
     with session_factory() as session:
+        replacements: list[VerifiedProtectionReplacement] = []
         for row, order_id in zip(rows, order_ids, strict=False):
+            purpose = str(row.get("purpose") or "")
             upsert_protection_ledger_row(
                 session,
                 venue=binding.venue,
@@ -3428,7 +3454,7 @@ def _record_management_tpsl_ledger_rows(
                 instrument_id=inst_id,
                 side=binding.side,
                 order_id=str(order_id),
-                purpose=str(row.get("purpose") or ""),
+                purpose=purpose,
                 trigger_price=_ledger_trigger_price(row),
                 size_text=str(row.get("size")) if row.get("size") is not None else None,
                 status="verified",
@@ -3440,16 +3466,52 @@ def _record_management_tpsl_ledger_rows(
                 },
                 seen_at=seen_at,
             )
-        record_replacing_protection_revision(
-            session,
-            venue=binding.venue,
-            execution_binding_id=batch.execution_binding_id,
-            execution_order_leg_id=int(leg.execution_order_leg_id),
-            strategy_instance_id=batch.strategy_instance_id,
-            pos_id=str(leg.pos_id),
-            source=evidence_source,
-            protection_json={"order_ids": [str(value) for value in order_ids], "rows": rows, "management_batch_id": batch.id},
-        )
+            role = {
+                "stop_loss": "primary_stop",
+                "backup_stop": "backup_stop",
+                "take_profit": "take_profit",
+            }.get(purpose)
+            trigger_price = _ledger_trigger_price(row)
+            if role is not None and trigger_price is not None:
+                replacements.append(
+                    VerifiedProtectionReplacement(
+                        role=role,
+                        order_id=str(order_id),
+                        trigger_price=trigger_price,
+                        size_text=(
+                            str(row.get("size"))
+                            if row.get("size") is not None
+                            else None
+                        ),
+                    )
+                )
+        replacement_roles = {row.role for row in replacements}
+        if {"primary_stop", "backup_stop"}.issubset(replacement_roles):
+            persist_verified_protection_replacement(
+                session,
+                venue=binding.venue,
+                execution_binding_id=batch.execution_binding_id,
+                execution_order_leg_id=int(leg.execution_order_leg_id),
+                strategy_instance_id=batch.strategy_instance_id,
+                pos_id=str(leg.pos_id),
+                instrument_id=inst_id,
+                side=binding.side,
+                source=evidence_source,
+                replacement_identity=f"management:{batch.id}:{leg.id}",
+                replacements=tuple(replacements),
+                seen_at=seen_at,
+            )
+        else:
+            record_replacing_protection_revision(
+                session,
+                venue=binding.venue,
+                execution_binding_id=batch.execution_binding_id,
+                execution_order_leg_id=int(leg.execution_order_leg_id),
+                strategy_instance_id=batch.strategy_instance_id,
+                pos_id=str(leg.pos_id),
+                source=evidence_source,
+                protection_json={"order_ids": [str(value) for value in order_ids], "rows": rows, "management_batch_id": batch.id},
+            )
         session.commit()
 
 
@@ -3484,7 +3546,7 @@ def _mark_management_tpsl_ledger_cancelled(
 
 def _ledger_trigger_price(row: dict[str, Any]) -> str | None:
     purpose = row.get("purpose")
-    if purpose in {"take_profit", "stop_loss"}:
+    if purpose in {"take_profit", "stop_loss", "backup_stop"}:
         value = row.get("trigger_price")
         return None if value is None else str(value)
     if purpose == "combined":
@@ -3508,7 +3570,7 @@ def _protection_row_payload(
             raise ManagementBatchExecutionError("invalid_partial_protection_size")
         payload["sz"] = str(size)
     purpose = row.get("purpose")
-    if purpose in {"take_profit", "stop_loss"}:
+    if purpose in {"take_profit", "stop_loss", "backup_stop"}:
         prefix = "tp" if purpose == "take_profit" else "sl"
         payload[f"{prefix}TriggerPx"] = str(row["trigger_price"])
         payload[f"{prefix}TriggerPxType"] = str(row.get("trigger_type") or "last")
