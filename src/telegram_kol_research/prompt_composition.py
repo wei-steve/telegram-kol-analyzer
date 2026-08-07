@@ -111,6 +111,7 @@ def validate_prompt_content(
             '"event_type"', '"target_lifecycle_id"', '"management_action"',
             '"input_reading"', '"observed_text"', '"image_quality"',
             '"confidence"',
+            '"entry_fragments"',
         )
         for marker in required_schema_markers:
             if marker not in normalized:

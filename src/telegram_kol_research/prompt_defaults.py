@@ -69,6 +69,15 @@ DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT = """
 - “半仓”统一解释为该币种已配置最大亏损预算乘以 50%，risk_multiplier 输出“0.5”；“30% 仓位”输出“0.3”。
 - 仅接受大于 0 且小于等于 1 的明确倍率。“轻仓”、“满仓”、杠杆倍数、“加仓”均不生成 entry_context，不得猜测倍率。
 
+【相邻入场消息片段】
+- entry_fragments 是非执行证据，可出现在完整策略之前或之后；它本身不得下单。
+- “半仓操作”或明确“50%仓位”输出 risk_multiplier=0.5；明确百分比统一换算为 0 到 1 的倍率。
+- “全仓操作”“正常仓位操作”输出 risk_multiplier=1，含义仅为使用该币种配置最大亏损预算，绝不表示投入账户全部余额或修改保证金模式。
+- “轻仓”单独出现仍然不得猜测；“轻仓入场，50%仓位”采用明确的 50%。
+- “两个点位各半仓”表示整单 risk_multiplier=1，同时输出 leg_allocation=[0.5,0.5]；不得把整单再次减半。
+- “补仓：63400附近”输出 supplemental_entry 的补仓价格，但不生成新的风险预算。
+- 不得根据入场价格区间或区间宽度推断半仓；相同区间可以是半仓或正常仓位。
+
 【图文证据分离】
 - 当前文字/caption 与每张图片必须分别提取证据，不得静默合并。
 - text.fields 和 images[].fields 中的每个字段必须包含 value、source、confidence；source 只能是 text、image 或 both。
@@ -97,6 +106,18 @@ DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT = """
     "confidence": 0.95,
     "reason": "半仓操作，等待后续完整策略"
   },
+  "entry_fragments": [
+    {
+      "kind": "risk_multiplier | leg_allocation | supplemental_entry",
+      "symbol": "BTC",
+      "side": "long | short",
+      "risk_multiplier": "0.5",
+      "allocations": ["0.5", "0.5"],
+      "entry_price": "63400",
+      "confidence": 0.95,
+      "reason": "当前消息中的明确入场片段"
+    }
+  ],
   "lifecycle_event": {
     "event_type": "none | entry_confirm | cancel_entry | exit_position | position_update",
     "target_lifecycle_id": null,

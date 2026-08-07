@@ -41,6 +41,8 @@ def test_default_trading_templates_have_strict_boundaries():
     assert "只输出 target_lifecycle_id，不要输出 targets" in DEFAULT_LIFECYCLE_EVENT_PROMPT
     assert "非空 targets" in DEFAULT_LIFECYCLE_EVENT_PROMPT
     assert "reply_context" in DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
+    assert '"entry_fragments"' in DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
+    assert "配置最大亏损预算" in DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
 
     assert "图片模糊" in DEFAULT_MIMO_VISION_PROMPT
     assert "交易所截图" in DEFAULT_MIMO_VISION_PROMPT

@@ -28,6 +28,12 @@ def test_shared_prompt_requires_source_separated_multimodal_evidence():
     assert '"image_type"' in prompt
     assert '"conflicts"' in prompt
     assert "不得静默合并" in prompt
+    assert '"entry_fragments"' in prompt
+    assert "全仓操作" in prompt
+    assert "正常仓位操作" in prompt
+    assert "两个点位各半仓" in prompt
+    assert "补仓价格" in prompt
+    assert "区间" in prompt and "推断半仓" in prompt
 from telegram_kol_research.prompt_registry import PromptSeed, seed_prompt_definition
 
 

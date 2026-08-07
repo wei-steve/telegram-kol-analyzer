@@ -6,6 +6,7 @@ import pytest
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.message_evidence import (
     load_current_message_evidence,
+    normalize_entry_strategy_fragments,
     normalize_mimo_evidence,
     save_message_evidence_version,
 )
@@ -87,6 +88,115 @@ def test_malformed_entry_preamble_is_omitted_without_failing_recognition(entry_c
     assert extraction_status == "completed"
     assert "entry_context" not in normalized
     assert normalized["entry_context_rejection_reason"] == "entry_context_invalid"
+
+
+def test_normalize_entry_fragments_separates_total_risk_and_leg_allocation():
+    fragments = normalize_entry_strategy_fragments(
+        [
+            {
+                "kind": "risk_multiplier",
+                "symbol": "btc",
+                "side": "LONG",
+                "risk_multiplier": "1.00",
+                "confidence": 0.95,
+                "reason": "正常仓位操作",
+            },
+            {
+                "kind": "leg_allocation",
+                "symbol": "BTC",
+                "side": "long",
+                "allocations": ["0.50", "0.5"],
+                "confidence": 0.94,
+                "reason": "两个点位各半仓",
+            },
+        ]
+    )
+
+    assert [fragment.to_dict() for fragment in fragments] == [
+        {
+            "kind": "risk_multiplier",
+            "symbol": "BTC",
+            "side": "long",
+            "risk_multiplier": "1",
+            "confidence": 0.95,
+            "reason": "正常仓位操作",
+        },
+        {
+            "kind": "leg_allocation",
+            "symbol": "BTC",
+            "side": "long",
+            "allocations": ["0.5", "0.5"],
+            "confidence": 0.94,
+            "reason": "两个点位各半仓",
+        },
+    ]
+
+
+def test_normalize_entry_fragments_accepts_numeric_sizing_and_supplemental_price():
+    fragments = normalize_entry_strategy_fragments(
+        [
+            {
+                "kind": "risk_multiplier",
+                "symbol": "BTC",
+                "side": "long",
+                "risk_multiplier": "0.50",
+                "confidence": 0.98,
+                "reason": "轻仓入场，明确50%仓位",
+            },
+            {
+                "kind": "supplemental_entry",
+                "symbol": "BTC",
+                "side": "long",
+                "entry_price": "63400.0",
+                "confidence": 0.92,
+                "reason": "补仓63400附近",
+            },
+        ]
+    )
+
+    assert fragments[0].to_dict()["risk_multiplier"] == "0.5"
+    assert fragments[1].to_dict()["entry_price"] == "63400"
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        {"kind": "risk_multiplier", "symbol": "BTC", "side": "long", "risk_multiplier": True, "confidence": 0.9, "reason": "x"},
+        {"kind": "risk_multiplier", "symbol": "BTC", "side": "long", "risk_multiplier": "0", "confidence": 0.9, "reason": "x"},
+        {"kind": "risk_multiplier", "symbol": "BTC", "side": "long", "risk_multiplier": "1.1", "confidence": 0.9, "reason": "x"},
+        {"kind": "leg_allocation", "symbol": "BTC", "side": "long", "allocations": ["0.5", "0.4"], "confidence": 0.9, "reason": "x"},
+        {"kind": "supplemental_entry", "symbol": "BTC", "side": "long", "entry_price": "附近", "confidence": 0.9, "reason": "x"},
+        {"kind": "supplemental_entry", "symbol": "BTC", "side": "flat", "entry_price": "63400", "confidence": 0.9, "reason": "x"},
+    ],
+)
+def test_normalize_entry_fragments_rejects_unsafe_values(fragment):
+    assert normalize_entry_strategy_fragments([fragment]) == ()
+
+
+def test_normalize_mimo_evidence_keeps_valid_entry_fragments_and_rejects_bad_items():
+    *_, normalized = normalize_mimo_evidence(
+        {
+            "recognition_result": "非策略",
+            "confidence": 0.9,
+            "entry_fragments": [
+                {
+                    "kind": "risk_multiplier",
+                    "symbol": "BTC",
+                    "side": "short",
+                    "risk_multiplier": "0.5",
+                    "confidence": 0.95,
+                    "reason": "半仓操作",
+                },
+                {"kind": "supplemental_entry", "symbol": "", "side": "short"},
+            ],
+        },
+        input_kind="text",
+        error_message=None,
+    )
+
+    assert len(normalized["entry_fragments"]) == 1
+    assert normalized["entry_fragments"][0]["risk_multiplier"] == "0.5"
+    assert normalized["entry_fragments_rejected_count"] == 1
 
 
 def _message(session_factory) -> RawMessage:

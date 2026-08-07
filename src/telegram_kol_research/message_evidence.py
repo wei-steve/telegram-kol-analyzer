@@ -92,6 +92,111 @@ def normalize_entry_preamble_evidence(value: Any) -> EntryPreambleEvidence | Non
     )
 
 
+@dataclass(frozen=True, slots=True)
+class EntryStrategyFragmentEvidence:
+    kind: str
+    symbol: str
+    side: str
+    payload: dict[str, Any]
+    confidence: float
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "symbol": self.symbol,
+            "side": self.side,
+            **self.payload,
+            "confidence": self.confidence,
+            "reason": self.reason,
+        }
+
+
+def _canonical_positive_decimal(value: Any, *, maximum: Decimal | None = None) -> str | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        decimal = Decimal(str(value).strip())
+    except (InvalidOperation, AttributeError, TypeError, ValueError):
+        return None
+    if not decimal.is_finite() or decimal <= 0:
+        return None
+    if maximum is not None and decimal > maximum:
+        return None
+    normalized = format(decimal.normalize(), "f")
+    return normalized.rstrip("0").rstrip(".") if "." in normalized else normalized
+
+
+def normalize_entry_strategy_fragments(
+    value: Any,
+) -> tuple[EntryStrategyFragmentEvidence, ...]:
+    """Return only bounded, explicit, non-executable entry fragments."""
+
+    if not isinstance(value, list):
+        return ()
+    normalized: list[EntryStrategyFragmentEvidence] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        kind = str(item.get("kind") or "").strip()
+        symbol = str(item.get("symbol") or "").strip().upper()
+        side = str(item.get("side") or "").strip().lower()
+        reason = str(item.get("reason") or "").strip()
+        raw_confidence = item.get("confidence")
+        if (
+            not symbol
+            or side not in {"long", "short"}
+            or not reason
+            or isinstance(raw_confidence, bool)
+        ):
+            continue
+        try:
+            confidence = float(raw_confidence)
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= confidence <= 1:
+            continue
+        payload: dict[str, Any]
+        if kind == "risk_multiplier":
+            multiplier = _canonical_positive_decimal(
+                item.get("risk_multiplier"), maximum=Decimal("1")
+            )
+            if multiplier is None:
+                continue
+            payload = {"risk_multiplier": multiplier}
+        elif kind == "leg_allocation":
+            raw_allocations = item.get("allocations")
+            if not isinstance(raw_allocations, list) or not 1 <= len(raw_allocations) <= 5:
+                continue
+            allocations = [
+                _canonical_positive_decimal(part, maximum=Decimal("1"))
+                for part in raw_allocations
+            ]
+            if any(part is None for part in allocations):
+                continue
+            if sum(Decimal(str(part)) for part in allocations) != Decimal("1"):
+                continue
+            payload = {"allocations": allocations}
+        elif kind == "supplemental_entry":
+            entry_price = _canonical_positive_decimal(item.get("entry_price"))
+            if entry_price is None:
+                continue
+            payload = {"entry_price": entry_price}
+        else:
+            continue
+        normalized.append(
+            EntryStrategyFragmentEvidence(
+                kind=kind,
+                symbol=symbol,
+                side=side,
+                payload=payload,
+                confidence=confidence,
+                reason=reason,
+            )
+        )
+    return tuple(normalized)
+
+
 def claim_message_evidence_extraction(
     session_factory: sessionmaker,
     *,
@@ -335,6 +440,16 @@ def normalize_mimo_evidence(
             ] = "entry_context_invalid"
         else:
             normalized_evidence["entry_context"] = entry_context.to_dict()
+    if "entry_fragments" in payload:
+        raw_fragments = payload.get("entry_fragments")
+        entry_fragments = normalize_entry_strategy_fragments(raw_fragments)
+        normalized_evidence["entry_fragments"] = [
+            fragment.to_dict() for fragment in entry_fragments
+        ]
+        if isinstance(raw_fragments, list) and len(entry_fragments) != len(raw_fragments):
+            normalized_evidence["entry_fragments_rejected_count"] = (
+                len(raw_fragments) - len(entry_fragments)
+            )
     return (
         extraction_status,
         confidence,
