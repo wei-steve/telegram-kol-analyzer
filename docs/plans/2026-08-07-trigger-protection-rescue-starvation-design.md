@@ -25,19 +25,16 @@ leg ownership, one exact live split position, unchanged size, no close,
 management, or position mutation in flight, no current exchange stop or opaque
 take profit, saved parent request stop, and liquidation-safe price.
 
-Permit a failed `manual_review` intent to re-enter only this stop-only rescue
-lane when its immutable `protection_adoption_refused` audit proves a deferred
-candidate (`predates_fill`, ambiguous, not-unique, or explicitly deferred).
-The query may discover such rows, but the full preflight remains authoritative
-and blocks every ineligible row.  Persist the actual refusal reason and bounded
-evidence on future retries so the terminal state is diagnosable.
+Keep failed `manual_review` intents quarantined.  Reopening them in the periodic
+worker would repeatedly rediscover closed historical positions and could starve
+newer due work at the bounded query limit.  Persist the actual refusal reason
+and bounded evidence on future retries so a terminal state remains diagnosable.
 
-For the current position, deploy the fix only in a proven quiet window.  The
-already-due intent will then be planned and executed by the existing durable,
-idempotent rescue path.  Verify the 66160 primary stop by exact exchange
-readback, then allow the existing backup-stop and staged-take-profit workers to
-converge the remaining roles.  Stop and request separate authority if any
-snapshot, position size, ownership, liquidation, or order identity changes.
+For the current position, deploy the fix only in a proven quiet window if it is
+still live.  Before deployment it closed through its normal management path,
+so no protection write is permitted or needed.  Its terminal intent remains
+immutable evidence; the ordering fix applies to future due intents before they
+can exhaust into manual review.
 
 ## Alternatives rejected
 
@@ -61,8 +58,8 @@ safe after there are no `ready`, `reserved`, `submit_unknown`, or
 ## Verification
 
 Tests must reproduce the pre-fix starvation order, prove rescue runs before a
-retry can defer the intent, prove only evidence-backed terminal manual-review
-intents are reconsidered, and prove unrelated manual-review rows stay blocked.
+retry can defer the intent, prove terminal manual-review intents remain
+quarantined, and prove refusal diagnostics are persisted.
 Production verification requires exact current-position readback, primary,
 backup, and take-profit role ownership, zero pending repair actions, unchanged
 position economics, healthy services, and a no-notify monitor diagnostic.

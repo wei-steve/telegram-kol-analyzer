@@ -34,20 +34,18 @@
 
 **Step 3:** Commit the minimal ordering fix.
 
-### Task 3: Recover evidence-backed exhausted intents
+### Task 3: Preserve refusal diagnostics without reopening exhausted intents
 
 **Files:**
 - Modify: `tests/test_trigger_protection_stop_rescue.py`
 - Modify: `tests/test_strategy_management_planner.py`
-- Modify: `src/telegram_kol_research/trigger_protection_rescue_worker.py`
-- Modify: `src/telegram_kol_research/strategy_management_planner.py`
 - Modify: `src/telegram_kol_research/execution_bindings.py`
 
-**Step 1:** Add RED tests proving a failed `manual_review` intent with a `trigger_protection_candidate_predates_fill` refusal is discovered and passes deferred-evidence eligibility, while a generic manual-review intent remains blocked.
+**Step 1:** Add a RED test proving the exact refusal reason and bounded evidence are persisted on a saved intent.
 
 **Step 2:** Persist refusal reason and bounded evidence when scheduling future retries.
 
-**Step 3:** Allow the worker to discover terminal manual-review rows, and extend `_rescue_intent_is_deferred_or_ambiguous` to recognize `predates_fill`; leave `_prepare_trigger_protection_stop_rescue` as the final authority.
+**Step 3:** Prove all terminal manual-review rows remain excluded from the bounded periodic worker, including rows with `predates_fill` evidence.
 
 **Step 4:** Run focused tests and expect GREEN.
 
@@ -77,8 +75,8 @@
 
 **Step 2:** Deploy through `/usr/local/bin/telegram-kol-update` and verify the deployed SHA, four services, and HTTP monitor status.
 
-**Step 3:** Allow one natural reconciliation tick.  Require one durable rescue for intent 105 and exact exchange readback of the 66160 stop.  If the result is unknown or blocked, do not retry automatically.
+**Step 3:** Revalidate the target.  If it remains live, require one durable rescue and exact exchange readback of the 66160 stop.  If it has closed, require zero rescue rows and zero exchange writes.
 
-**Step 4:** Verify the existing workers add one distinct backup stop and the staged 63250 take profit, all exact-owned by binding 264 / leg 469 / the unchanged position.  Require the strict repair dry-run to return no action or conflict.
+**Step 4:** For a live target, verify primary, backup, and take-profit convergence.  For a closed target, require the strict repair dry-run to return no action or conflict and classify its incident as historical terminal.
 
 **Step 5:** Run the independent no-notify monitor diagnostic and server-focused tests.  Record exact bounded evidence in the status file, commit, and push the documentation checkpoint without redeploying it.

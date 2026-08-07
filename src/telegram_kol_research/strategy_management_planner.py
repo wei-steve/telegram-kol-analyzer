@@ -2483,10 +2483,8 @@ def _binding_has_exact_pos_id(binding_pos_id: object, target_pos_id: str) -> boo
 
 def _rescue_intent_is_deferred_or_ambiguous(session, intent) -> bool:
     disposition = str(intent.recovery_disposition or "").strip()
-    if disposition in {"retry", "exact_backup"}:
-        return True
-    if disposition and disposition != "manual_review":
-        return False
+    if disposition:
+        return disposition in {"retry", "exact_backup"}
     if intent.recovery_state in {"pending", "retrying"}:
         return True
     if intent.recovery_state != "failed":
@@ -2498,10 +2496,7 @@ def _rescue_intent_is_deferred_or_ambiguous(session, intent) -> bool:
         .all()
     )
     return any(
-        any(
-            token in str(evidence or "").lower()
-            for token in ("ambiguous", "not_unique", "deferred", "predates_fill")
-        )
+        any(token in str(evidence or "").lower() for token in ("ambiguous", "not_unique", "deferred"))
         for (evidence,) in audits
     )
 

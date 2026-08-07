@@ -470,7 +470,7 @@ def test_rescue_worker_excludes_manual_review_without_deferred_evidence(tmp_path
     assert result.shadow_ready == 0
 
 
-def test_rescue_worker_reconsiders_manual_review_with_predates_fill_evidence(
+def test_rescue_worker_keeps_predates_fill_manual_review_quarantined(
     tmp_path,
 ):
     from telegram_kol_research.trigger_protection_rescue_worker import (
@@ -514,9 +514,9 @@ def test_rescue_worker_reconsiders_manual_review_with_predates_fill_evidence(
         processed_at=NOW,
     )
 
-    assert result.discovered == 1
-    assert result.evaluated == 1
-    assert result.shadow_ready == 1
+    assert result.discovered == 0
+    assert result.evaluated == 0
+    assert result.shadow_ready == 0
 
 
 def test_init_db_adds_rescue_error_json_to_prior_sqlite_schema(tmp_path):
