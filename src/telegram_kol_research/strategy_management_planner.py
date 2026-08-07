@@ -51,9 +51,15 @@ from telegram_kol_research.protection_attribution import (
     snapshot_protection_rows,
 )
 from telegram_kol_research.protection_ledger import (
+    load_account_protection_ownership,
     list_verified_account_ledger_rows,
     list_verified_ledger_rows_for_positions,
 )
+from telegram_kol_research.protection_health import (
+    classify_current_position_protection_health,
+    record_position_protection_health_observation,
+)
+from telegram_kol_research.remediation_snapshot import remediation_snapshot_payload
 from telegram_kol_research.position_authority_lock import position_authority_lock
 from telegram_kol_research.position_management_capabilities import (
     evaluate_position_management_capabilities,
@@ -102,6 +108,7 @@ RETRYABLE_PREFLIGHT_BLOCK_REASONS = frozenset(
         "target_position_snapshot_unavailable",
         "target_protection_evidence_unavailable",
         "target_protection_snapshot_incomplete",
+        "protection_current_evidence_insufficient",
         "protection_missing_cancellable_order_id",
     }
 )
@@ -124,18 +131,23 @@ class ManagementPlanningStateChanged(RuntimeError):
 def _protection_incident_requires_recovery(session, *, entry_legs) -> bool:
     """Freeze management only for an exact leg/position with an open incident."""
 
+    return bool(
+        _protection_incidents_for_entry_legs(session, entry_legs=entry_legs)
+    )
+
+
+def _protection_incidents_for_entry_legs(session, *, entry_legs) -> tuple:
+    """Load immutable incident history for the exact managed leg/position scopes."""
+
     pairs = {
         (int(leg.id), str(leg.pos_id))
         for leg in entry_legs
         if getattr(leg, "id", None) is not None and str(getattr(leg, "pos_id", "") or "")
     }
     if not pairs:
-        return False
+        return ()
     rows = (
-        session.query(
-            PositionProtectionIncident.execution_order_leg_id,
-            PositionProtectionIncident.pos_id,
-        )
+        session.query(PositionProtectionIncident)
         .filter(PositionProtectionIncident.incident_type.in_((
             "stop_trigger_failed",
             "protection_missing",
@@ -143,9 +155,14 @@ def _protection_incident_requires_recovery(session, *, entry_legs) -> bool:
             "backup_exchange_outcome_unknown",
             "protection_position_conflict",
         )))
+        .order_by(PositionProtectionIncident.id)
         .all()
     )
-    return any((int(leg_id), str(pos_id)) in pairs for leg_id, pos_id in rows)
+    return tuple(
+        row
+        for row in rows
+        if (int(row.execution_order_leg_id), str(row.pos_id)) in pairs
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -541,26 +558,13 @@ def _plan_strategy_management_batch_locked(
         )
     target_entry_legs = entry_leg_plan.target_legs
     with session_factory() as session:
-        protection_recovery_bypass = _protection_incident_requires_recovery(
+        protection_incidents = _protection_incidents_for_entry_legs(
             session, entry_legs=target_entry_legs
         )
+    protection_recovery_bypass = bool(protection_incidents)
     protection_recovery_for_risk_reduction = (
         protection_recovery_bypass and intent == "partial_then_break_even"
     )
-    if (
-        protection_recovery_bypass
-        and intent not in {"full_exit", "move_stop_to_break_even"}
-        and not protection_recovery_for_risk_reduction
-    ):
-        return _persist_blocked(
-            session_factory,
-            identity=identity,
-            raw_message_id=raw_message_id,
-            intent=intent,
-            reason_code="protection_recovery_required",
-            planned_at=now,
-            execution_mode=execution_mode,
-        )
     target_legs_by_pos_id = _leg_by_pos_id(target_entry_legs)
 
     instrument_id = f"{str(lifecycle.symbol).upper()}-USDT-SWAP"
@@ -640,6 +644,111 @@ def _plan_strategy_management_batch_locked(
             planned_at=now,
             execution_mode=execution_mode,
         )
+
+    protection_health_by_pos_id: dict[str, dict[str, Any]] = {}
+    if (
+        protection_recovery_bypass
+        and intent not in {"full_exit", "move_stop_to_break_even"}
+        and not protection_recovery_for_risk_reduction
+    ):
+        snapshot_fingerprint = management_target_fingerprint(
+            remediation_snapshot_payload(reconciliation_snapshot)
+        )
+        raw_positions_by_pos_id = {
+            str(row.get("posId") or row.get("pos_id") or row.get("id") or ""):
+            dict(row)
+            for row in live_positions
+            if str(
+                row.get("posId") or row.get("pos_id") or row.get("id") or ""
+            )
+        }
+        health_results = []
+        with session_factory() as session:
+            account_ownership = load_account_protection_ownership(
+                session,
+                live_pos_ids=raw_positions_by_pos_id,
+            )
+            for position in economics:
+                pos_id = str(position["pos_id"])
+                target_leg = target_legs_by_pos_id[pos_id]
+                incident_ids = tuple(
+                    sorted(
+                        int(incident.id)
+                        for incident in protection_incidents
+                        if int(incident.execution_order_leg_id) == int(target_leg.id)
+                        and str(incident.pos_id) == pos_id
+                    )
+                )
+                if not incident_ids:
+                    continue
+                health = classify_current_position_protection_health(
+                    session,
+                    venue="deepcoin",
+                    execution_binding_id=int(binding.id),
+                    execution_order_leg_id=int(target_leg.id),
+                    pos_id=pos_id,
+                    position=raw_positions_by_pos_id.get(pos_id),
+                    open_positions=[dict(row) for row in live_positions],
+                    pending_trigger_orders=list(
+                        reconciliation_snapshot.pending_trigger_orders
+                    ),
+                    pending_tpsl_observations=list(
+                        reconciliation_snapshot.pending_tpsl_observations
+                    ),
+                    snapshot_errors=dict(reconciliation_snapshot.errors),
+                    account_ownership=account_ownership,
+                    exchange_snapshot_fingerprint=snapshot_fingerprint,
+                    source_incident_ids=incident_ids,
+                )
+                observation = record_position_protection_health_observation(
+                    session,
+                    result=health,
+                    observed_at=now,
+                )
+                health_results.append(health)
+                protection_health_by_pos_id[pos_id] = {
+                    "observation_id": int(observation.id),
+                    "classification": health.classification,
+                    "evidence_fingerprint": health.evidence_fingerprint,
+                    "exchange_snapshot_fingerprint": (
+                        health.exchange_snapshot_fingerprint
+                    ),
+                    "source_incident_ids": list(health.source_incident_ids),
+                    "reason_codes": list(health.reason_codes),
+                    "primary_order_id": health.primary_order_id,
+                    "backup_order_id": health.backup_order_id,
+                    "take_profit_order_ids": list(
+                        health.take_profit_order_ids
+                    ),
+                }
+            session.commit()
+        unhealthy = [
+            result
+            for result in health_results
+            if result.classification != "healthy_current_evidence"
+        ]
+        incident_scopes = {
+            (int(incident.execution_order_leg_id), str(incident.pos_id))
+            for incident in protection_incidents
+        }
+        if unhealthy or len(health_results) != len(incident_scopes):
+            reason_code = (
+                "protection_current_evidence_insufficient"
+                if any(
+                    result.classification == "evidence_insufficient"
+                    for result in unhealthy
+                )
+                else "protection_recovery_required"
+            )
+            return _persist_blocked(
+                session_factory,
+                identity=identity,
+                raw_message_id=raw_message_id,
+                intent=intent,
+                reason_code=reason_code,
+                planned_at=now,
+                execution_mode=execution_mode,
+            )
 
     partial_round_before = partial_policy_state.round_before
     if intent in PARTIAL_INTENTS:
@@ -1139,6 +1248,8 @@ def _plan_strategy_management_batch_locked(
         "protection": protection_by_pos_id,
         "management_capabilities": management_capabilities,
     }
+    if protection_health_by_pos_id:
+        target_snapshot["protection_health"] = protection_health_by_pos_id
     if protection_recovery_for_risk_reduction:
         target_snapshot["protection_recovery"] = {
             "version": 1,

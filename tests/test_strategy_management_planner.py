@@ -14,8 +14,11 @@ from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionBackupStopOrder,
+    PositionProtectionHealthObservation,
     PositionProtectionIncident,
     PositionMutationIntent,
+    PositionTakeProfitOrder,
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
@@ -431,6 +434,101 @@ def _persist_open_protection_incident(session_factory, *, binding_id, pos_id="po
             )
         )
         session.commit()
+
+
+def _persist_complete_current_protection(
+    session_factory,
+    *,
+    binding_id,
+    pos_id="pos-b",
+    side="long",
+    size="6",
+):
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        leg = (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=binding_id, pos_id=pos_id)
+            .one()
+        )
+        for order_id, purpose, trigger_price, size_text in (
+            ("healthy-primary", "stop_loss", "64100", size),
+            ("healthy-backup", "stop_loss", "63971.8", None),
+            ("healthy-tp", "take_profit", "67000", size),
+        ):
+            upsert_protection_ledger_row(
+                session,
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=leg.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                pos_id=pos_id,
+                instrument_id="BTC-USDT-SWAP",
+                side=side,
+                order_id=order_id,
+                purpose=purpose,
+                trigger_price=trigger_price,
+                size_text=size_text,
+                status="verified",
+                evidence_source="readback",
+                evidence={},
+                seen_at=PLANNED_AT,
+            )
+        session.add(
+            PositionBackupStopOrder(
+                execution_binding_id=binding_id,
+                execution_order_leg_id=leg.id,
+                pos_id=pos_id,
+                instrument_id="BTC-USDT-SWAP",
+                side=side,
+                trigger_price="63971.8",
+                order_id="healthy-backup",
+                client_order_id="healthy-backup-client",
+                status="active",
+                request_json='{"slTriggerPx":"63971.8"}',
+            )
+        )
+        session.add(
+            PositionTakeProfitOrder(
+                execution_binding_id=binding_id,
+                execution_order_leg_id=leg.id,
+                pos_id=pos_id,
+                order_id="healthy-tp",
+                trigger_price="67000",
+                size_text=size,
+                status="active",
+            )
+        )
+        session.commit()
+
+
+def _complete_current_tpsl(*, side="long", size="6"):
+    return [
+        {
+            "ordId": "healthy-primary",
+            "triggerOrderType": "TPSL",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": side,
+            "sz": size,
+            "slTriggerPx": "64100",
+        },
+        {
+            "ordId": "healthy-backup",
+            "triggerOrderType": "TPSL",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": side,
+            "sz": "0",
+            "slTriggerPx": "63971.8",
+        },
+        {
+            "ordId": "healthy-tp",
+            "triggerOrderType": "TPSL",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": side,
+            "sz": size,
+            "tpTriggerPx": "67000",
+        },
+    ]
 
 
 def _persist_partial_filled_range_management_target(session_factory, *, both_pending=False):
@@ -1151,6 +1249,56 @@ def test_open_protection_incident_still_blocks_non_full_exit(
 
     assert result.status == "blocked"
     assert result.reason_code == "protection_recovery_required"
+
+
+def test_historical_protection_incident_allows_partial_take_profit_from_complete_current_evidence(
+    monkeypatch,
+    tmp_path,
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="partial_take_profit",
+        management_fraction=0.5,
+        side="long",
+    )
+    _persist_open_protection_incident(session_factory, binding_id=binding_id)
+    _persist_complete_current_protection(
+        session_factory,
+        binding_id=binding_id,
+        side="long",
+        size="6",
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    client = _ReadOnlyDeepcoin(
+        [_position("pos-b", size="6", avg_px="64289.7", side="long")],
+        tpsl_orders=_complete_current_tpsl(side="long", size="6"),
+    )
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert result.reason_code is None
+    assert result.batch.legs[0].planned_close_size == "3"
+    health = result.batch.target_snapshot["protection_health"]["pos-b"]
+    assert health["classification"] == "healthy_current_evidence"
+    assert health["exchange_snapshot_fingerprint"]
+    assert health["evidence_fingerprint"]
+    assert health["primary_order_id"] == "healthy-primary"
+    assert health["backup_order_id"] == "healthy-backup"
+    assert health["take_profit_order_ids"] == ["healthy-tp"]
+    with session_factory() as session:
+        observations = session.query(PositionProtectionHealthObservation).all()
+        assert len(observations) == 1
+        assert observations[0].classification == "healthy_current_evidence"
+    assert client.write_calls == []
 
 
 def test_break_even_plans_one_market_managed_leg_per_exact_position_without_ticker(
