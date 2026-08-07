@@ -35,6 +35,7 @@ from telegram_kol_research.time_utils import utc_naive_to_local
 
 logger = logging.getLogger(__name__)
 RUNTIME_INCIDENT_MESSAGE_MAX_CHARS = 1200
+AI_AGENT_NOTIFICATION_PREFIX = "AI agent通知：（"
 TERMINAL_ENTRY_CLEANUP_NOTIFICATION_MAX_ATTEMPTS = 5
 TERMINAL_ENTRY_CLEANUP_NOTIFICATION_LEASE_SECONDS = 120
 
@@ -147,6 +148,18 @@ async def probe_system_operator_bot_evidence(
     }
 
 
+def wrap_ai_agent_notification(content: str, *, limit: int = 3500) -> str:
+    """Apply the single operator-visible AI Agent notification boundary."""
+
+    bounded_limit = max(1, int(limit))
+    safe_lines = [
+        _safe_runtime_incident_value(line, limit=bounded_limit)
+        for line in str(content or "-").splitlines()
+    ]
+    bounded = _truncate_text("\n".join(safe_lines), limit=bounded_limit)
+    return f"{AI_AGENT_NOTIFICATION_PREFIX}{bounded}）"
+
+
 def format_runtime_incident_notification(incident) -> str:
     """Render one bounded deterministic report without AI interpretation."""
 
@@ -168,7 +181,7 @@ def format_runtime_incident_notification(incident) -> str:
         "impact": "影响",
     }
     lines = [
-        "【运行异常】",
+        "运行异常",
         f"事件ID: {int(incident.id)}",
         f"类型: {_safe_runtime_incident_value(incident.incident_type, limit=64)}",
         f"严重程度: {_safe_runtime_incident_value(incident.severity, limit=16)}",
@@ -191,8 +204,14 @@ def format_runtime_incident_notification(incident) -> str:
             "处理: 已记录，正常交易流程未等待本通知。",
         )
     )
-    rendered = "\n".join(lines)
-    return rendered[:RUNTIME_INCIDENT_MESSAGE_MAX_CHARS]
+    return wrap_ai_agent_notification(
+        "\n".join(lines),
+        limit=(
+            RUNTIME_INCIDENT_MESSAGE_MAX_CHARS
+            - len(AI_AGENT_NOTIFICATION_PREFIX)
+            - 1
+        ),
+    )
 
 
 def format_runtime_incident_diagnosis_notification(incident) -> str:
@@ -280,7 +299,7 @@ def format_runtime_incident_diagnosis_notification(incident) -> str:
     else:
         missing_text = "-"
     lines = [
-        "【运行异常 AI 诊断】",
+        "运行异常 AI 诊断",
         f"事件ID: {int(incident.id)}",
         f"类型: {_safe_runtime_incident_value(incident.incident_type, limit=64)}",
         (
@@ -314,7 +333,14 @@ def format_runtime_incident_diagnosis_notification(incident) -> str:
         f"自动操作: {action_result}",
         "边界: 未参与策略识别或上下文策略解析。",
     ]
-    return "\n".join(lines)[:RUNTIME_INCIDENT_MESSAGE_MAX_CHARS]
+    return wrap_ai_agent_notification(
+        "\n".join(lines),
+        limit=(
+            RUNTIME_INCIDENT_MESSAGE_MAX_CHARS
+            - len(AI_AGENT_NOTIFICATION_PREFIX)
+            - 1
+        ),
+    )
 
 
 def _safe_runtime_incident_value(value: Any, *, limit: int) -> str:
@@ -712,6 +738,19 @@ def _split_telegram_notification_text(text: str, *, max_chars: int) -> list[str]
     """Split display text deterministically on lines within Telegram's limit."""
 
     limit = max(1, min(int(max_chars), 4095))
+    if text.startswith(AI_AGENT_NOTIFICATION_PREFIX) and text.endswith("）"):
+        inner = text[len(AI_AGENT_NOTIFICATION_PREFIX) : -1]
+        inner_limit = max(
+            1,
+            limit - len(AI_AGENT_NOTIFICATION_PREFIX) - 1,
+        )
+        return [
+            f"{AI_AGENT_NOTIFICATION_PREFIX}{chunk}）"
+            for chunk in _split_telegram_notification_text(
+                inner,
+                max_chars=inner_limit,
+            )
+        ]
     if len(text) <= limit:
         return [text]
     chunks: list[str] = []
@@ -741,6 +780,11 @@ def format_message_instruction_summary(payload: dict[str, Any]) -> str:
         (item for item in items if isinstance(item, dict)),
         key=lambda item: (_summary_sequence(item), _summary_item_id(item)),
     )
+    targets = payload.get("targets") if isinstance(payload.get("targets"), list) else []
+    ordered_targets = sorted(
+        (target for target in targets if isinstance(target, dict)),
+        key=lambda target: int(target.get("target_ordinal") or 0),
+    )
     lines = [
         "【同消息策略指令结果】",
         (
@@ -750,6 +794,25 @@ def format_message_instruction_summary(payload: dict[str, Any]) -> str:
     ]
     if payload.get("notification_id"):
         lines.append(f"通知ID: {payload['notification_id']}")
+    if ordered_targets:
+        lines.append("目标结果:")
+        for target in ordered_targets[:100]:
+            admission_state = _safe_management_text(
+                target.get("admission_state"), limit=32
+            )
+            execution_state = _safe_management_text(
+                target.get("execution_state"), limit=32
+            )
+            outcome = (
+                "refused" if admission_state == "refused" else execution_state
+            )
+            lines.append(
+                "- "
+                f"{_safe_management_text(target.get('symbol'), limit=32)} "
+                f"{_safe_management_text(target.get('side'), limit=16)}: {outcome} / "
+                "原因: "
+                f"{_safe_management_text(target.get('reason_code'), limit=128)}"
+            )
     management_failed = False
     entry_attempted = False
     for item in ordered_items[:100]:
@@ -772,7 +835,7 @@ def format_message_instruction_summary(payload: dict[str, Any]) -> str:
         lines.append("未持久化可展示的指令结果。")
     elif management_failed and entry_attempted:
         lines.append("仓位管理异常；后续开仓已继续尝试。")
-    return "\n".join(lines)
+    return wrap_ai_agent_notification("\n".join(lines))
 
 
 def split_message_instruction_summary(
@@ -1860,6 +1923,19 @@ async def deliver_message_instruction_summary_notification(
             delivered=False,
             completed_at=completed_at,
             error=str(exc),
+        )
+        from telegram_kol_research.runtime_incident_adapters import (
+            capture_notification_failure,
+            capture_runtime_incident_best_effort,
+        )
+
+        capture_runtime_incident_best_effort(
+            capture_notification_failure,
+            session_factory,
+            source_kind="message_instruction_summary",
+            source_record_id=str(raw_message_id),
+            error_type=type(exc).__name__,
+            occurred_at=completed_at,
         )
         logger.exception(
             "message instruction summary delivery failed for raw_message_id=%s",

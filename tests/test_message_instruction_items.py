@@ -782,6 +782,63 @@ def test_terminal_message_summary_is_claimed_exactly_once(tmp_path):
     )
 
 
+def test_grouped_summary_payload_keeps_refused_target_without_instruction(tmp_path):
+    session_factory = create_session_factory(tmp_path / "grouped-target-summary.db")
+    raw_id, rows = _persist_targeted_management_items(session_factory)
+    with session_factory() as session:
+        confirmed_target = session.get(ManagementMessageTarget, rows[0][0])
+        confirmed_item = session.get(MessageInstructionItem, rows[0][1])
+        refused_target = session.get(ManagementMessageTarget, rows[1][0])
+        refused_item = session.get(MessageInstructionItem, rows[1][1])
+        confirmed_target.execution_state = "confirmed"
+        confirmed_item.status = "succeeded"
+        confirmed_item.result_json = '{"status":"confirmed"}'
+        refused_target.admission_state = "refused"
+        refused_target.execution_state = "not_started"
+        refused_target.closed_reason_code = "target_not_verified"
+        refused_target.message_instruction_item_id = None
+        refused_item.retired_at = NOW
+        stale_envelope = ManagementMessageEnvelope(
+            raw_message_id=raw_id,
+            decision_fingerprint="e" * 64,
+            normalized_action="exit_full",
+            shared_parameters_json="{}",
+            projection_mode="shadow",
+        )
+        session.add(stale_envelope)
+        session.flush()
+        session.add(
+            ManagementMessageTarget(
+                envelope_id=stale_envelope.id,
+                raw_message_id=raw_id,
+                target_lifecycle_id=refused_target.target_lifecycle_id,
+                target_ordinal=0,
+                symbol="STALE",
+                side="short",
+                normalized_action="exit_full",
+                parameters_json="{}",
+                parameter_fingerprint="q" * 64,
+                collision_group_fingerprint="z" * 64,
+                admission_state="refused",
+                execution_state="not_started",
+                closed_reason_code="stale_projection",
+            )
+        )
+        session.commit()
+
+    payload = claim_message_instruction_summary(
+        session_factory,
+        raw_message_id=raw_id,
+        claimed_at=NOW,
+    )
+
+    assert payload is not None
+    assert [target["symbol"] for target in payload["targets"]] == ["BTC", "ETH"]
+    assert payload["targets"][0]["execution_state"] == "confirmed"
+    assert payload["targets"][1]["admission_state"] == "refused"
+    assert payload["targets"][1]["reason_code"] == "target_not_verified"
+
+
 def test_expired_summary_delivery_claim_can_be_recovered(tmp_path):
     session_factory = create_session_factory(tmp_path / "summary-lease.db")
     raw_id, _, _, _ = _persist_dual_instruction_message(session_factory)

@@ -627,6 +627,33 @@ def claim_message_instruction_summary(
         if claimed.rowcount != len(claimable_item_ids):
             session.rollback()
             return None
+        linked_envelope_ids = {
+            int(envelope_id)
+            for (envelope_id,) in session.query(
+                ManagementMessageTarget.envelope_id
+            )
+            .filter(
+                ManagementMessageTarget.message_instruction_item_id.in_(
+                    [int(item.id) for item in items]
+                )
+            )
+            .distinct()
+            .all()
+        }
+        target_rows = []
+        if len(linked_envelope_ids) == 1:
+            target_rows = (
+                session.query(ManagementMessageTarget)
+                .filter(
+                    ManagementMessageTarget.envelope_id
+                    == next(iter(linked_envelope_ids))
+                )
+                .order_by(
+                    ManagementMessageTarget.target_ordinal,
+                    ManagementMessageTarget.id,
+                )
+                .all()
+            )
         payload = {
             "raw_message_id": raw_message.id,
             "chat_id": raw_message.chat_id,
@@ -636,6 +663,10 @@ def claim_message_instruction_summary(
             "notification_claim_token": claim_token,
             "notification_item_ids": claimable_item_ids,
             "items": [_public_item_result(item) for item in items],
+            "targets": [
+                _public_target_result(target)
+                for target in target_rows
+            ],
         }
         session.commit()
         return payload
@@ -711,6 +742,18 @@ def _public_item_result(item: MessageInstructionItem) -> dict:
     else:
         summary["reason"] = item.status
     return summary
+
+
+def _public_target_result(target: ManagementMessageTarget) -> dict:
+    return {
+        "target_id": int(target.id),
+        "target_ordinal": int(target.target_ordinal),
+        "symbol": target.symbol,
+        "side": target.side,
+        "admission_state": target.admission_state,
+        "execution_state": target.execution_state,
+        "reason_code": target.closed_reason_code,
+    }
 
 
 def _payload_reason(payload, *, fallback: str) -> str:

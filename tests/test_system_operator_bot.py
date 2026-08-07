@@ -31,7 +31,12 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.message_instruction_items import (
     create_message_instruction_items_in_session,
 )
-from telegram_kol_research.models import RawMessage, RuntimeIncident, SignalCandidate
+from telegram_kol_research.models import (
+    MessageInstructionItem,
+    RawMessage,
+    RuntimeIncident,
+    SignalCandidate,
+)
 from telegram_kol_research.runtime_incidents import record_runtime_incident
 from telegram_kol_research.system_operator_bot import (
     SystemOperatorBotConfig,
@@ -123,7 +128,7 @@ def _record_runtime_incident(session_factory, **overrides):
     return record_runtime_incident(session_factory, **values)
 
 
-def test_runtime_incident_notification_has_fixed_bounded_redacted_labels(tmp_path):
+def test_ai_agent_title_runtime_incident_has_fixed_bounded_redacted_labels(tmp_path):
     session_factory = create_session_factory(tmp_path / "runtime-format.db")
     incident = _record_runtime_incident(session_factory)
     with session_factory() as session:
@@ -138,7 +143,8 @@ def test_runtime_incident_notification_has_fixed_bounded_redacted_labels(tmp_pat
         session.refresh(row)
         rendered = operator_bot_module.format_runtime_incident_notification(row)
 
-    assert rendered.startswith("【运行异常】")
+    assert rendered.startswith("AI agent通知：（")
+    assert rendered.endswith("）")
     assert f"事件ID: {incident.id}" in rendered
     assert "类型: context_worker_exhausted" in rendered
     assert "严重程度: high" in rendered
@@ -149,7 +155,7 @@ def test_runtime_incident_notification_has_fixed_bounded_redacted_labels(tmp_pat
     assert 0 < len(rendered) <= operator_bot_module.RUNTIME_INCIDENT_MESSAGE_MAX_CHARS
 
 
-def test_runtime_incident_diagnosis_notification_labels_hypothesis_and_no_action(
+def test_ai_agent_title_diagnosis_labels_hypothesis_and_no_action(
     tmp_path,
 ):
     session_factory = create_session_factory(tmp_path / "runtime-diagnosis.db")
@@ -175,6 +181,8 @@ def test_runtime_incident_diagnosis_notification_labels_hypothesis_and_no_action
         )
 
     assert "AI诊断假设: Provider retry exhaustion." in rendered
+    assert rendered.startswith("AI agent通知：（")
+    assert rendered.endswith("）")
     assert "置信度: medium" in rendered
     assert "Codex交接: 需要" in rendered
     assert "自动操作: 未执行" in rendered
@@ -352,7 +360,7 @@ def test_runtime_incident_delivery_uses_diagnosis_report_for_diagnosed_row(
     )
 
     assert delivered == 1
-    assert delivered_text[0].startswith("【运行异常 AI 诊断】")
+    assert delivered_text[0].startswith("AI agent通知：（")
     assert "AI诊断假设: Provider retry exhaustion." in delivered_text[0]
 
 
@@ -845,18 +853,60 @@ def test_message_instruction_summary_sanitizes_persisted_reason_and_splits():
         ],
     }
 
-    chunks = operator_bot_module.split_message_instruction_summary(payload)
+    chunks = operator_bot_module.split_message_instruction_summary(
+        payload,
+        max_chars=500,
+    )
 
     assert "[redacted]" in "\n".join(chunks)
     assert "secret-value" not in "\n".join(chunks)
     assert len(chunks) > 1
     assert all(0 < len(chunk) < 4096 for chunk in chunks)
+    assert all(chunk.startswith("AI agent通知：（") for chunk in chunks)
+    assert all(chunk.endswith("）") for chunk in chunks)
 
 
-def test_message_instruction_summary_delivery_retries_failed_claim_once(
+def test_grouped_target_summary_lists_confirmed_and_refused_targets():
+    text = operator_bot_module.format_message_instruction_summary(
+        {
+            "message_id": 3366,
+            "chat_id": -10088,
+            "targets": [
+                {
+                    "target_ordinal": 0,
+                    "symbol": "BTC",
+                    "side": "short",
+                    "admission_state": "admitted",
+                    "execution_state": "confirmed",
+                    "reason_code": None,
+                },
+                {
+                    "target_ordinal": 1,
+                    "symbol": "ETH",
+                    "side": "short",
+                    "admission_state": "refused",
+                    "execution_state": "not_started",
+                    "reason_code": "target_not_verified",
+                },
+            ],
+            "items": [],
+        }
+    )
+
+    assert text.startswith("AI agent通知：（")
+    assert "BTC short: confirmed" in text
+    assert "ETH short: refused" in text
+    assert "target_not_verified" in text
+
+
+def test_message_instruction_summary_notification_failure_retries_claim_once(
     tmp_path,
     monkeypatch,
 ):
+    monkeypatch.setenv(
+        "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES",
+        "notification_delivery_failure",
+    )
     session_factory = create_session_factory(tmp_path / "summary-delivery.db")
     with session_factory() as session:
         raw = RawMessage(chat_id=88, message_id=901, text="ETH long")
@@ -877,7 +927,7 @@ def test_message_instruction_summary_delivery_retries_failed_claim_once(
         )[0]
         item.status = "succeeded"
         item.result_json = '{"status":"completed"}'
-        raw_id = raw.id
+        raw_id, item_id = raw.id, item.id
         session.commit()
 
     attempts = 0
@@ -922,6 +972,10 @@ def test_message_instruction_summary_delivery_retries_failed_claim_once(
 
     assert (first, second, third) == (False, True, False)
     assert attempts == 2
+    with session_factory() as session:
+        assert session.get(MessageInstructionItem, item_id).status == "succeeded"
+        incident = session.query(RuntimeIncident).one()
+        assert incident.incident_type == "notification_delivery_failure"
 
 
 def test_pending_summary_scan_skips_ineligible_prefix(tmp_path, monkeypatch):
