@@ -262,7 +262,9 @@ def test_monitor_capture_token_fails_closed_when_invalid(value):
     assert config.monitor_capture_token is None
 
 
-@pytest.mark.parametrize("status", ["unresolved", "hold", "pending_reanalysis"])
+@pytest.mark.parametrize(
+    "status", ["unresolved", "hold", "pending_reanalysis", "retry_pending"]
+)
 def test_contextual_business_outcomes_never_create_runtime_incidents(
     tmp_path,
     status,

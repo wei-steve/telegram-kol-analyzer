@@ -143,6 +143,92 @@ def test_resolver_retries_malformed_json_once_and_persists_safe_attempt(tmp_path
     assert "secret" not in attempt.request_summary_json
 
 
+def test_resolver_retries_closed_contract_error_once_then_completes(tmp_path):
+    session_factory = create_session_factory(tmp_path / "contract-retry.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=88, message_id=1465, text="BTC空单止盈一部分")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    responses = [
+        _valid_payload(
+            decision="manage_thread",
+            target_thread_ids=[12, 13],
+            management_action="partial_take_profit",
+            risk_reducing_fanout_allowed=True,
+            supporting_message_ids=[1465],
+        ),
+        _valid_payload(
+            decision="manage_thread",
+            target_thread_ids=[12],
+            management_action="partial_take_profit",
+            supporting_message_ids=[1465],
+        ),
+    ]
+
+    decision = resolve_contextual_strategy(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        evidence={},
+        context_window={"current": {"message_id": 1465}, "messages": []},
+        candidates=[{"thread_id": 12}, {"thread_id": 13}],
+        first_pass_payload={},
+        exchange_state={},
+        model_caller=lambda **kwargs: responses.pop(0),
+    )
+
+    assert decision.target_thread_ids == (12,)
+    assert responses == []
+    with session_factory() as session:
+        attempt = session.query(ContextResolutionAttempt).one()
+    assert attempt.status == "completed"
+    assert attempt.attempts == 2
+
+
+def test_resolver_exhausts_repeated_closed_contract_error(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "contract-exhausted.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=88, message_id=3465, text="Btc eth空单可以止盈一部分")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    captures = []
+    monkeypatch.setattr(
+        "telegram_kol_research.context_resolution.capture_runtime_incident_best_effort",
+        lambda *args, **kwargs: captures.append(kwargs),
+        raising=False,
+    )
+    invalid = _valid_payload(
+        decision="manage_thread",
+        target_thread_ids=[12, 13],
+        management_action="partial_take_profit",
+        risk_reducing_fanout_allowed=True,
+    )
+
+    with pytest.raises(ContextResolutionError) as raised:
+        resolve_contextual_strategy(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(),
+            evidence={},
+            context_window={"current": {"message_id": 3465}, "messages": []},
+            candidates=[{"thread_id": 12}, {"thread_id": 13}],
+            first_pass_payload={},
+            exchange_state={},
+            model_caller=lambda **kwargs: invalid,
+        )
+
+    assert raised.value.code == "multi_target_action_not_allowed"
+    with session_factory() as session:
+        attempt = session.query(ContextResolutionAttempt).one()
+    assert attempt.status == "exhausted"
+    assert attempt.attempts == 2
+    assert attempt.error_class == "multi_target_action_not_allowed"
+    assert len(captures) == 1
+    assert captures[0]["status"] == "exhausted"
+
+
 def test_resolver_rejects_supporting_message_outside_context_and_persists_failure(
     tmp_path,
 ):
@@ -180,8 +266,9 @@ def test_resolver_rejects_supporting_message_outside_context_and_persists_failur
 
     with session_factory() as session:
         attempt = session.query(ContextResolutionAttempt).one()
-    assert attempt.status == "failed"
-    assert attempt.error_class == "contract_error"
+    assert attempt.status == "exhausted"
+    assert attempt.attempts == 2
+    assert attempt.error_class == "message_evidence_outside_context"
 
 
 def test_completed_context_fingerprint_is_reused_without_recalling_model(tmp_path):

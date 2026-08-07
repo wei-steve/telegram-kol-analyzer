@@ -437,7 +437,7 @@ def _resolved_mimo_result(
         if thread_id in target_lifecycles
     ]
     if len(lifecycle_ids) != len(decision.target_thread_ids):
-        raise ContextResolutionError("resolved thread has no current lifecycle")
+        raise ContextResolutionError("resolved_lifecycle_missing")
     if decision.decision == "revise_thread":
         context_payload["replacement_strategy"] = dict(
             original_strategy if isinstance(original_strategy, dict) else {}

@@ -160,7 +160,7 @@ def capture_context_worker_state(
     error_type: str | None,
     recorder: Callable[..., Any] | None = None,
 ):
-    """Capture only retry exhaustion, never a contextual business outcome."""
+    """Capture only committed resolver/worker exhaustion, never an intermediate outcome."""
 
     if str(status).lower() != "exhausted":
         return None

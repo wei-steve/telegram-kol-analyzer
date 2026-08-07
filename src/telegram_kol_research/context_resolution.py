@@ -26,6 +26,10 @@ from telegram_kol_research.models import (
     RawMessage,
     utc_now,
 )
+from telegram_kol_research.runtime_incident_adapters import (
+    capture_context_worker_state,
+    capture_runtime_incident_best_effort,
+)
 
 
 DECISIONS = frozenset(
@@ -93,8 +97,37 @@ ALLOWED_ACTIONS_BY_DECISION = {
 }
 
 
+CONTEXT_RESOLUTION_ERROR_CODES = frozenset(
+    {
+        "context_contract_invalid",
+        "unknown_decision",
+        "target_outside_candidate_set",
+        "target_required",
+        "target_not_allowed",
+        "multi_target_action_not_allowed",
+        "fanout_not_allowed",
+        "unknown_management_action",
+        "management_action_incompatible",
+        "confidence_invalid",
+        "message_evidence_outside_context",
+        "network_error",
+        "malformed_json",
+        "resolved_lifecycle_missing",
+    }
+)
+
+
 class ContextResolutionError(ValueError):
-    """Raised when the second resolver cannot produce a safe decision."""
+    """Raised with a closed, persistence-safe context failure code."""
+
+    def __init__(self, code: str):
+        normalized = (
+            code
+            if code in CONTEXT_RESOLUTION_ERROR_CODES
+            else "context_contract_invalid"
+        )
+        self.code = normalized
+        super().__init__(normalized)
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,24 +160,24 @@ class ContextResolutionDecision:
 
 def _int_tuple(value: Any, *, field: str) -> tuple[int, ...]:
     if not isinstance(value, list):
-        raise ContextResolutionError(f"{field} must be a list")
+        raise ContextResolutionError("context_contract_invalid")
     try:
         result = tuple(int(item) for item in value)
     except (TypeError, ValueError) as exc:
-        raise ContextResolutionError(f"{field} must contain integers") from exc
+        raise ContextResolutionError("context_contract_invalid") from exc
     if len(result) != len(set(result)):
-        raise ContextResolutionError(f"{field} contains duplicates")
+        raise ContextResolutionError("context_contract_invalid")
     return result
 
 
 def _closed_tuple(value: Any, *, field: str, allowed: frozenset[str]) -> tuple[str, ...]:
     if not isinstance(value, list):
-        raise ContextResolutionError(f"{field} must be a list")
+        raise ContextResolutionError("context_contract_invalid")
     result = tuple(str(item) for item in value)
     if any(item not in allowed for item in result):
-        raise ContextResolutionError(f"{field} contains an unknown value")
+        raise ContextResolutionError("context_contract_invalid")
     if len(result) != len(set(result)):
-        raise ContextResolutionError(f"{field} contains duplicates")
+        raise ContextResolutionError("context_contract_invalid")
     return result
 
 
@@ -157,43 +190,43 @@ def parse_context_resolution_decision(
     """Validate the model response against supplied IDs and closed values."""
 
     if not isinstance(payload, Mapping):
-        raise ContextResolutionError("decision payload must be an object")
+        raise ContextResolutionError("context_contract_invalid")
     decision = str(payload.get("decision") or "")
     if decision not in DECISIONS:
-        raise ContextResolutionError("unknown decision")
+        raise ContextResolutionError("unknown_decision")
     target_thread_ids = _int_tuple(
         payload.get("target_thread_ids"),
         field="target_thread_ids",
     )
     if any(thread_id not in allowed_thread_ids for thread_id in target_thread_ids):
-        raise ContextResolutionError("invented target thread id")
+        raise ContextResolutionError("target_outside_candidate_set")
     if decision in TARGET_REQUIRED_DECISIONS and not target_thread_ids:
-        raise ContextResolutionError("target thread is required")
+        raise ContextResolutionError("target_required")
     if decision not in TARGET_REQUIRED_DECISIONS and target_thread_ids:
-        raise ContextResolutionError("decision must not select a target thread")
+        raise ContextResolutionError("target_not_allowed")
     fanout = payload.get("risk_reducing_fanout_allowed")
     if not isinstance(fanout, bool):
-        raise ContextResolutionError("risk_reducing_fanout_allowed must be boolean")
+        raise ContextResolutionError("context_contract_invalid")
     if len(target_thread_ids) > 1 and (
         decision not in MULTI_TARGET_DECISIONS or not fanout
     ):
-        raise ContextResolutionError("multiple targets are not safe for this decision")
+        raise ContextResolutionError("multi_target_action_not_allowed")
     if fanout and decision not in MULTI_TARGET_DECISIONS:
-        raise ContextResolutionError("fanout is only valid for cancel or exit")
+        raise ContextResolutionError("fanout_not_allowed")
     management_action_value = payload.get("management_action")
     management_action = (
         None if management_action_value is None else str(management_action_value)
     )
     if management_action is not None and management_action not in MANAGEMENT_ACTIONS:
-        raise ContextResolutionError("unknown management action")
+        raise ContextResolutionError("unknown_management_action")
     if management_action not in ALLOWED_ACTIONS_BY_DECISION[decision]:
-        raise ContextResolutionError("management action is incompatible with decision")
+        raise ContextResolutionError("management_action_incompatible")
     try:
         confidence = float(payload.get("confidence"))
     except (TypeError, ValueError) as exc:
-        raise ContextResolutionError("confidence must be numeric") from exc
+        raise ContextResolutionError("confidence_invalid") from exc
     if not 0.0 <= confidence <= 1.0:
-        raise ContextResolutionError("confidence outside [0, 1]")
+        raise ContextResolutionError("confidence_invalid")
     supporting = _int_tuple(
         payload.get("supporting_message_ids"),
         field="supporting_message_ids",
@@ -203,7 +236,7 @@ def parse_context_resolution_decision(
         field="opposing_message_ids",
     )
     if any(item not in allowed_message_ids for item in supporting + opposing):
-        raise ContextResolutionError("message evidence is outside supplied context")
+        raise ContextResolutionError("message_evidence_outside_context")
     conflicts = _closed_tuple(
         payload.get("conflict_types"),
         field="conflict_types",
@@ -342,7 +375,7 @@ def _upsert_attempt(
     status: str,
     error_class: str | None,
     attempts: int,
-) -> None:
+) -> int:
     from telegram_kol_research.context_resolution_worker import (
         build_context_state_fingerprint,
     )
@@ -400,6 +433,7 @@ def _upsert_attempt(
                 list(decision.reanalysis_triggers)
             )
         session.commit()
+        return int(row.id)
 
 
 def resolve_contextual_strategy(
@@ -481,9 +515,8 @@ def resolve_contextual_strategy(
                 allowed_message_ids=allowed_message_ids,
             )
     provider = _select_provider(ai_recognition_config)
-    attempts = 0
     for attempt_number in (1, 2):
-        attempts = attempt_number
+        failure: ContextResolutionError | None = None
         try:
             raw_result = model_caller(
                 provider=provider,
@@ -491,7 +524,26 @@ def resolve_contextual_strategy(
                 request_payload=request_payload,
             )
         except Exception as exc:
-            _upsert_attempt(
+            failure = ContextResolutionError("network_error")
+            failure.__cause__ = exc
+        else:
+            try:
+                decoded = _decode_model_payload(raw_result)
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                failure = ContextResolutionError("malformed_json")
+                failure.__cause__ = exc
+            else:
+                try:
+                    decision = parse_context_resolution_decision(
+                        decoded,
+                        allowed_thread_ids=allowed_thread_ids,
+                        allowed_message_ids=allowed_message_ids,
+                    )
+                except ContextResolutionError as exc:
+                    failure = exc
+        if failure is not None:
+            terminal = attempt_number == 2
+            attempt_id = _upsert_attempt(
                 session_factory,
                 raw_message_id=raw_message_id,
                 evidence_version_id=evidence_version_id,
@@ -499,49 +551,22 @@ def resolve_contextual_strategy(
                 model=provider.model,
                 request_payload=request_payload,
                 decision=None,
-                status="failed",
-                error_class="network_error",
-                attempts=attempts,
+                status="exhausted" if terminal else "retry_pending",
+                error_class=failure.code,
+                attempts=attempt_number,
             )
-            raise ContextResolutionError("context model call failed") from exc
-        try:
-            decoded = _decode_model_payload(raw_result)
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            if attempt_number == 1:
+            if not terminal:
                 continue
-            _upsert_attempt(
+            capture_runtime_incident_best_effort(
+                capture_context_worker_state,
                 session_factory,
+                attempt_id=attempt_id,
                 raw_message_id=raw_message_id,
-                evidence_version_id=evidence_version_id,
-                context_fingerprint=context_fingerprint,
-                model=provider.model,
-                request_payload=request_payload,
-                decision=None,
-                status="failed",
-                error_class="malformed_json",
-                attempts=attempts,
+                status="exhausted",
+                occurred_at=utc_now(),
+                error_type=failure.code,
             )
-            raise ContextResolutionError("context model returned malformed JSON") from exc
-        try:
-            decision = parse_context_resolution_decision(
-                decoded,
-                allowed_thread_ids=allowed_thread_ids,
-                allowed_message_ids=allowed_message_ids,
-            )
-        except ContextResolutionError:
-            _upsert_attempt(
-                session_factory,
-                raw_message_id=raw_message_id,
-                evidence_version_id=evidence_version_id,
-                context_fingerprint=context_fingerprint,
-                model=provider.model,
-                request_payload=request_payload,
-                decision=None,
-                status="failed",
-                error_class="contract_error",
-                attempts=attempts,
-            )
-            raise
+            raise failure
         _upsert_attempt(
             session_factory,
             raw_message_id=raw_message_id,
@@ -552,7 +577,7 @@ def resolve_contextual_strategy(
             decision=decision,
             status="completed",
             error_class=None,
-            attempts=attempts,
+            attempts=attempt_number,
         )
         return decision
     raise AssertionError("unreachable")
