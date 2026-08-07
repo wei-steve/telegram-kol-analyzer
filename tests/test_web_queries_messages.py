@@ -106,6 +106,35 @@ def test_load_group_messages_projects_bounded_entry_preamble_assembly(tmp_path):
     assert "secret" not in row["entry_preamble_assembly"]
 
 
+def test_load_group_messages_projects_v2_entry_assembly_without_raw_evidence(tmp_path):
+    session_factory = create_session_factory(tmp_path / "entry-v2.db")
+    with session_factory() as session:
+        session.add(RawMessage(chat_id=9, message_id=9902, text="BTC strategy"))
+        session.add(
+            ExecutionBinding(
+                strategy_instance_id="entry-v2-ui", kol_id="chen", chat_id=9,
+                message_id=9902, symbol="BTCUSDT", side="long", venue="deepcoin",
+                payload_json=json.dumps({"draft": {"entry_preamble_assembly": {
+                    "mode": "live", "status": "assembled",
+                    "configured_risk_budget_usdt": 20, "risk_multiplier": "0.5",
+                    "effective_risk_budget_usdt": 10, "strategy_message_id": 9902,
+                    "fragment_ids": [11, 12], "entry_allocations": [0.5, 0.5],
+                    "supplemental_entry_prices": [63400], "api_key": "secret",
+                }}}),
+            )
+        )
+        session.commit()
+
+    assembly = load_group_messages(session_factory, chat_id=9, limit=10)[0][
+        "entry_preamble_assembly"
+    ]
+
+    assert assembly["risk_calculation"] == "配置20U × 50% = 实际风险预算10U"
+    assert assembly["allocation_summary"] == "整单100%；两档各50%"
+    assert assembly["supplemental_summary"] == "补仓价 63400"
+    assert "secret" not in str(assembly)
+
+
 def test_load_group_messages_projects_safe_context_resolution_observability(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:

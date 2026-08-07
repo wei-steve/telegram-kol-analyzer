@@ -31,6 +31,10 @@ from telegram_kol_research.message_instruction_items import (
     finish_message_instruction_summary_delivery,
 )
 from telegram_kol_research.time_utils import utc_naive_to_local
+from telegram_kol_research.reporting import (
+    format_entry_assembly_summary,
+    format_entry_revision_summary,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -48,6 +52,32 @@ class SystemOperatorBotConfig:
 
 
 NotificationBotConfig = SystemOperatorBotConfig
+
+
+def format_entry_revision_operator_notification(
+    *,
+    assembly_evidence: object,
+    revision_evidence: object,
+) -> str | None:
+    """Render only bounded shared projections for an entry revision handoff."""
+
+    assembly = format_entry_assembly_summary(assembly_evidence)
+    revision = format_entry_revision_summary(revision_evidence)
+    if assembly is None or revision is None:
+        return None
+    lines = [
+        "入场组装/修订状态",
+        str(assembly.get("state_label") or "历史入场仓位组装"),
+        str(assembly["risk_calculation"]),
+        str(revision["label"]),
+    ]
+    if revision.get("remaining_headroom"):
+        lines.append(str(revision["remaining_headroom"]))
+    if revision.get("reason_code"):
+        lines.append(f"原因代码: {revision['reason_code']}")
+    if revision.get("orders_changed") is True:
+        lines.append("订单已变更: 是（已读回确认）")
+    return "\n".join(lines)[:RUNTIME_INCIDENT_MESSAGE_MAX_CHARS]
 
 
 def load_system_operator_bot_config(

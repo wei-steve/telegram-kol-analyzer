@@ -14,9 +14,31 @@ from telegram_kol_research.strategy_alerts import (
     StrategyAlertConfig,
     build_strategy_alert_prompt,
     format_strategy_alert_message,
+    format_structured_strategy_alert_message,
     parse_alert_decision,
     process_strategy_alert_for_record,
 )
+
+
+def test_structured_alert_reports_entry_revision_truthfully_without_secrets():
+    event = __import__(
+        "telegram_kol_research.strategy_alerts", fromlist=["StrategyAlertEvent"]
+    ).StrategyAlertEvent(
+        alert_type="entry", strategy_kind="entry", is_strategy=True,
+        confidence=0.9, reason_short="", symbol="BTCUSDT", side="long",
+        order_type="limit", management_action=None, entry_price="64000",
+        take_profit="65000", stop_loss="63000", posted_at=None,
+        original_text="BTC long",
+    )
+    rendered = format_structured_strategy_alert_message(
+        chat_title="test", event=event, message_id=9902,
+        entry_assembly={"state_label": "相邻仓位/补仓方案已组装", "risk_calculation": "配置20U × 50% = 实际风险预算10U"},
+        entry_revision={"label": "等待执行入场修订", "orders_changed": False, "reason_code": "planned", "raw": "secret"},
+    )
+    assert "配置20U × 50% = 实际风险预算10U" in rendered
+    assert "等待执行入场修订" in rendered
+    assert "订单已变更" not in rendered
+    assert "secret" not in rendered
 
 
 def _record(*, text: str | None = "Trader A\nBTC long now") -> NormalizedMessageRecord:

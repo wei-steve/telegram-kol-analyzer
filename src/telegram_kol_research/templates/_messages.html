@@ -330,9 +330,19 @@
               {% endif %}
               {% if message.entry_preamble_assembly %}
                 <div class="message-entry-preamble-assembly" role="status">
+                  {% if message.entry_preamble_assembly.state_label %}<span>{{ message.entry_preamble_assembly.state_label }}</span>{% endif %}
                   <strong>{{ message.entry_preamble_assembly.risk_calculation }}</strong>
                   {% if message.entry_preamble_assembly.proposed_risk_calculation %}<small>{{ message.entry_preamble_assembly.proposed_risk_calculation }}</small>{% endif %}
-                  <small>{{ message.entry_preamble_assembly.message_pair }} · 模式 {{ message.entry_preamble_assembly.mode }}</small>
+                  {% if message.entry_preamble_assembly.allocation_summary %}<small>{{ message.entry_preamble_assembly.allocation_summary }}</small>{% endif %}
+                  {% if message.entry_preamble_assembly.supplemental_summary %}<small>{{ message.entry_preamble_assembly.supplemental_summary }}</small>{% endif %}
+                  <small>{{ message.entry_preamble_assembly.message_pair or message.entry_preamble_assembly.source_summary }} · 模式 {{ message.entry_preamble_assembly.mode }}</small>
+                </div>
+              {% endif %}
+              {% if message.entry_revision %}
+                <div class="message-entry-revision" role="status">
+                  <strong>{{ message.entry_revision.label }}</strong>
+                  {% if message.entry_revision.remaining_headroom %}<small>{{ message.entry_revision.remaining_headroom }}</small>{% endif %}
+                  {% if message.entry_revision.reason_code %}<small>原因代码 {{ message.entry_revision.reason_code }}</small>{% endif %}
                 </div>
               {% endif %}
               {% if semantic_review %}

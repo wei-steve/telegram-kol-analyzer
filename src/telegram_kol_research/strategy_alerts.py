@@ -211,6 +211,8 @@ def format_structured_strategy_alert_message(
     chat_title: str,
     event: StrategyAlertEvent,
     message_id: int,
+    entry_assembly: dict[str, object] | None = None,
+    entry_revision: dict[str, object] | None = None,
 ) -> str:
     """Format a unified human-readable Telegram alert message."""
 
@@ -244,6 +246,19 @@ def format_structured_strategy_alert_message(
     ]
     if management_action_text != "-":
         lines.append(f"管理动作: {management_action_text}")
+    if entry_assembly:
+        state_label = str(entry_assembly.get("state_label") or "")[:48]
+        risk_calculation = str(entry_assembly.get("risk_calculation") or "")[:96]
+        if state_label:
+            lines.append(f"入场组装: {state_label}")
+        if risk_calculation:
+            lines.append(f"风险预算: {risk_calculation}")
+    if entry_revision:
+        revision_label = str(entry_revision.get("label") or "")[:48]
+        if revision_label:
+            lines.append(f"入场修订: {revision_label}")
+        if entry_revision.get("orders_changed") is True:
+            lines.append("订单已变更: 是（已读回确认）")
     lines.extend(
         [
             f"置信度: {confidence_text}",

@@ -15,6 +15,7 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
     ExecutionEvent,
+    EntryRevisionReplacement,
     MediaAsset,
     MessageRecognition,
     MessageEvidenceVersion,
@@ -28,12 +29,16 @@ from telegram_kol_research.models import (
     StrategyMessageLink,
     StrategyThread,
     StrategyManagementBatch,
+    StrategyRevisionBatch,
     TriggerProtectionIntent,
     TriggerProtectionStopRescue,
     utc_now,
 )
 from telegram_kol_research.time_utils import normalize_to_utc_naive, utc_naive_to_local
-from telegram_kol_research.reporting import format_entry_preamble_assembly_summary
+from telegram_kol_research.reporting import (
+    format_entry_assembly_summary,
+    format_entry_revision_summary,
+)
 
 STRATEGY_TIME_DISPLAY_FIELDS = (
     "posted_at",
@@ -67,7 +72,22 @@ def _serialize_entry_preamble_binding(
     )
     if evidence is None:
         evidence = payload.get("entry_preamble_assembly")
-    return format_entry_preamble_assembly_summary(evidence)
+    return format_entry_assembly_summary(evidence)
+
+
+def _serialize_entry_revision_batch(
+    batch: StrategyRevisionBatch,
+    *,
+    replacement_count: int,
+) -> dict[str, object] | None:
+    return format_entry_revision_summary(
+        {
+            "status": batch.status,
+            "reason_code": batch.reason_code,
+            "replacement_count": replacement_count,
+            "market_snapshot": _safe_json_dict(batch.market_snapshot_json),
+        }
+    )
 
 
 def load_home_event_rows(
@@ -517,6 +537,29 @@ def _serialize_raw_messages(
             (int(binding.chat_id), int(binding.message_id)), []
         ).append(binding)
 
+    binding_ids = [int(row.id) for row in binding_rows]
+    revision_rows = (
+        session.query(StrategyRevisionBatch)
+        .filter(StrategyRevisionBatch.execution_binding_id.in_(binding_ids))
+        .order_by(StrategyRevisionBatch.execution_binding_id.asc(), StrategyRevisionBatch.id.desc())
+        .all()
+        if binding_ids
+        else []
+    )
+    latest_revision_by_binding_id: dict[int, StrategyRevisionBatch] = {}
+    for batch in revision_rows:
+        latest_revision_by_binding_id.setdefault(int(batch.execution_binding_id), batch)
+    revision_ids = [int(row.id) for row in latest_revision_by_binding_id.values()]
+    replacement_counts = dict(
+        session.query(
+            EntryRevisionReplacement.revision_batch_id,
+            func.count(EntryRevisionReplacement.id),
+        )
+        .filter(EntryRevisionReplacement.revision_batch_id.in_(revision_ids))
+        .group_by(EntryRevisionReplacement.revision_batch_id)
+        .all()
+    ) if revision_ids else {}
+
     all_experiments = (
         session.query(RecognitionExperiment)
         .filter(RecognitionExperiment.raw_message_id.in_(raw_message_ids))
@@ -627,6 +670,19 @@ def _serialize_raw_messages(
             if len(matching_bindings) == 1
             else None
         )
+        latest_revision = (
+            latest_revision_by_binding_id.get(int(matching_bindings[0].id))
+            if len(matching_bindings) == 1
+            else None
+        )
+        entry_revision = (
+            _serialize_entry_revision_batch(
+                latest_revision,
+                replacement_count=int(replacement_counts.get(int(latest_revision.id), 0)),
+            )
+            if latest_revision is not None
+            else None
+        )
         rows.append(
             {
                 "raw_message_id": raw_message.id,
@@ -656,6 +712,7 @@ def _serialize_raw_messages(
                     management_batch_by_msg_id.get(raw_message.id),
                 ),
                 "entry_preamble_assembly": entry_preamble_assembly,
+                "entry_revision": entry_revision,
                 "decision_card": _build_message_decision_card(
                     decision=decision,
                     semantic_review=semantic_review,

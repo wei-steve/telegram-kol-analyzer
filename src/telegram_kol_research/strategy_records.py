@@ -20,12 +20,16 @@ from telegram_kol_research.position_attribution import (
     PositionAttributionError,
     require_verified_position_ownership,
 )
-from telegram_kol_research.reporting import format_entry_preamble_assembly_summary
+from telegram_kol_research.reporting import (
+    format_entry_assembly_summary,
+    format_entry_revision_summary,
+)
 from telegram_kol_research.models import (
     ContextResolutionAttempt,
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    EntryRevisionReplacement,
     MediaAsset,
     MessageRecognition,
     MessageEvidenceVersion,
@@ -46,6 +50,7 @@ from telegram_kol_research.models import (
     StrategyBreakEvenConvergenceLeg,
     StrategyManagementBatch,
     StrategyManagementLeg,
+    StrategyRevisionBatch,
     StrategyMessageLink,
     StrategyThread,
     TriggerProtectionIntent,
@@ -500,6 +505,27 @@ def load_strategy_record_detail(
             .all()
             if binding_id is not None
             else []
+        )
+        entry_revision_batch = (
+            session.query(StrategyRevisionBatch)
+            .filter(
+                StrategyRevisionBatch.execution_binding_id == binding_id,
+                StrategyRevisionBatch.revision_kind == "entry_sizing",
+            )
+            .order_by(StrategyRevisionBatch.id.desc())
+            .first()
+            if binding_id is not None
+            else None
+        )
+        entry_revision_replacement_count = (
+            session.query(func.count(EntryRevisionReplacement.id))
+            .filter(
+                EntryRevisionReplacement.revision_batch_id
+                == int(entry_revision_batch.id)
+            )
+            .scalar()
+            if entry_revision_batch is not None
+            else 0
         )
         event_predicates = []
         if binding_id is not None:
@@ -1186,6 +1212,20 @@ def load_strategy_record_detail(
         "timeline": timeline,
         "execution": {
             "binding": _binding_detail(binding) if binding is not None else None,
+            "entry_revision": (
+                format_entry_revision_summary(
+                    {
+                        "status": entry_revision_batch.status,
+                        "reason_code": entry_revision_batch.reason_code,
+                        "replacement_count": entry_revision_replacement_count,
+                        "market_snapshot": _safe_json_value(
+                            entry_revision_batch.market_snapshot_json
+                        ),
+                    }
+                )
+                if entry_revision_batch is not None
+                else None
+            ),
             "order_legs": [_order_leg_detail(row) for row in order_legs],
             "position_ids": _verified_active_entry_leg_position_ids(order_legs),
             "position_ids_authoritative": any(
@@ -1973,7 +2013,7 @@ def _binding_detail(row: ExecutionBinding) -> dict[str, object]:
         "status": row.status,
         "last_exchange_status": row.last_exchange_status,
         "payload": payload,
-        "entry_preamble_assembly": format_entry_preamble_assembly_summary(
+        "entry_preamble_assembly": format_entry_assembly_summary(
             assembly_evidence
         ),
     }

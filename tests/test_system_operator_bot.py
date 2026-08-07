@@ -24,6 +24,27 @@ def test_composite_completion_notification_is_bounded_and_blocks_recovering_stat
     assert "保留止盈总量: 5" in rendered
     assert len(rendered) <= 1200
 
+
+def test_entry_revision_operator_notification_never_claims_planned_orders_changed():
+    from telegram_kol_research.system_operator_bot import (
+        format_entry_revision_operator_notification,
+    )
+
+    rendered = format_entry_revision_operator_notification(
+        assembly_evidence={
+            "mode": "live", "status": "assembled",
+            "configured_risk_budget_usdt": 20, "risk_multiplier": "0.5",
+            "effective_risk_budget_usdt": 10, "strategy_message_id": 9902,
+        },
+        revision_evidence={
+            "status": "planned", "reason_code": "planned",
+            "replacement_count": 2, "api_response": "secret",
+        },
+    )
+    assert "等待执行入场修订" in rendered
+    assert "订单已变更" not in rendered
+    assert "secret" not in rendered
+
 import telegram_kol_research.telegram_bot_commands as bot_commands_module
 import telegram_kol_research.system_operator_bot as operator_bot_module
 from telegram_kol_research.config import RuntimeIncidentConfig
