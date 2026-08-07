@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import mimetypes
 import re
 from datetime import timedelta
@@ -18,6 +19,10 @@ from telegram_kol_research.ai_recognition_config import (
     AiProviderConfig,
     AiRecognitionConfig,
     load_ai_recognition_config,
+)
+from telegram_kol_research.config import (
+    MultiTargetManagementConfig,
+    load_multi_target_management_config,
 )
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -49,6 +54,10 @@ from telegram_kol_research.management_scope import (
     ManagementScopeError,
     resolve_management_scope_in_session,
 )
+from telegram_kol_research.management_message_targets import (
+    management_decision_fingerprint,
+    project_management_targets_in_session,
+)
 from telegram_kol_research.strategy_management_contracts import (
     management_contract_fingerprint,
     serialize_management_contract,
@@ -72,6 +81,8 @@ BLOCKED_SYMBOLS = {
     "HTTP",
     "HTTPS",
 }
+
+logger = logging.getLogger(__name__)
 
 EXIT_SYMBOL_ALIASES = {
     "BTCUSDT": "BTC",
@@ -2445,6 +2456,7 @@ def apply_authoritative_mimo_payload(
     error_message: str | None = None,
     authoritative_generation: str | None = None,
     _exact_context_risk_reduction_authorized: bool = False,
+    multi_target_management_config: MultiTargetManagementConfig | None = None,
 ) -> MessageRecognitionResult:
     """Persist only the authoritative MiMo interpretation."""
 
@@ -2610,8 +2622,56 @@ def apply_authoritative_mimo_payload(
             raw_message_id=raw_message_id,
             accepted_candidate_ids=accepted_candidate_ids,
         )
+        _project_multi_target_management_shadow_in_session(
+            session,
+            raw_message_id=raw_message_id,
+            lifecycle_event=lifecycle_event,
+            authoritative_generation=authoritative_generation,
+            config=(
+                multi_target_management_config
+                if multi_target_management_config is not None
+                else load_multi_target_management_config()
+            ),
+        )
         session.commit()
         return result
+
+
+def _project_multi_target_management_shadow_in_session(
+    session,
+    *,
+    raw_message_id: int,
+    lifecycle_event: Mapping[str, Any],
+    authoritative_generation: str | None,
+    config: MultiTargetManagementConfig,
+) -> None:
+    """Record an additive projection without changing authoritative work."""
+
+    targets = lifecycle_event.get("targets")
+    if (
+        not config.projection_enabled
+        or not isinstance(targets, list)
+        or len(targets) < 2
+    ):
+        return
+    try:
+        project_management_targets_in_session(
+            session,
+            raw_message_id=raw_message_id,
+            decision=lifecycle_event,
+            decision_fingerprint=management_decision_fingerprint(
+                lifecycle_event,
+                authoritative_generation=authoritative_generation,
+            ),
+            projection_mode="shadow" if config.shadow_only else "live",
+        )
+    except Exception as exc:
+        logger.warning(
+            "Multi-target shadow projection failed open: raw_message_id=%s "
+            "error=%s",
+            int(raw_message_id),
+            type(exc).__name__,
+        )
 
 
 def _format_ai_strategy_summary(strategy: dict[str, Any]) -> str | None:

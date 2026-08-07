@@ -87,6 +87,26 @@ def target_idempotency_fingerprint(
     return _sha256(stable)
 
 
+def management_decision_fingerprint(
+    decision: Mapping[str, Any],
+    *,
+    authoritative_generation: str | None,
+) -> str:
+    public_decision = {
+        str(key): value
+        for key, value in decision.items()
+        if not str(key).startswith("_")
+    }
+    return _sha256(
+        _canonical_json(
+            {
+                "authoritative_generation": authoritative_generation,
+                "decision": public_decision,
+            }
+        )
+    )
+
+
 def derive_envelope_status(states: Collection[str]) -> str:
     normalized = tuple(str(state) for state in states)
     if any(state in ATTENTION_STATES for state in normalized):

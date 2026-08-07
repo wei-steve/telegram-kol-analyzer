@@ -1,6 +1,39 @@
 import pytest
 
+from telegram_kol_research import config as config_module
 from telegram_kol_research.config import load_runtime_incident_config
+
+
+def test_multi_target_projection_defaults_dormant():
+    assert hasattr(config_module, "load_multi_target_management_config")
+    config = config_module.load_multi_target_management_config(
+        environ={},
+        env_file_paths=[],
+    )
+
+    assert config.projection_enabled is False
+    assert config.shadow_only is True
+    assert config.live_actions == frozenset()
+
+
+def test_multi_target_live_actions_are_closed_and_normalized():
+    assert hasattr(config_module, "load_multi_target_management_config")
+    config = config_module.load_multi_target_management_config(
+        environ={
+            "TELEGRAM_KOL_MULTI_TARGET_PROJECTION_ENABLED": "true",
+            "TELEGRAM_KOL_MULTI_TARGET_SHADOW_ONLY": "false",
+            "TELEGRAM_KOL_MULTI_TARGET_LIVE_ACTIONS": (
+                " partial_take_profit,EXIT_FULL,add_position "
+            ),
+        },
+        env_file_paths=[],
+    )
+
+    assert config.projection_enabled is True
+    assert config.shadow_only is False
+    assert config.live_actions == frozenset(
+        {"partial_take_profit", "exit_full"}
+    )
 
 
 def test_phase5_shadow_playbooks_are_dormant_and_exact_allowlisted():

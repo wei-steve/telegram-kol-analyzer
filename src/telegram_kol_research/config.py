@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from telegram_kol_research.llm_chat import _load_env_file_values
+from telegram_kol_research.management_directives import (
+    MULTI_TARGET_ACTION_NAMES,
+)
 
 
 READ_ONLY_CAPTURE_PROFILE = frozenset(
@@ -101,6 +104,56 @@ class RuntimeScannerConfig:
     shadow_only: bool = True
     rules: frozenset[str] = frozenset()
     interval_seconds: float = 60.0
+
+
+@dataclass(frozen=True, slots=True)
+class MultiTargetManagementConfig:
+    """Dormant-by-default projection and live-action policy."""
+
+    projection_enabled: bool = False
+    shadow_only: bool = True
+    live_actions: frozenset[str] = frozenset()
+
+    def action_is_live(self, action: str) -> bool:
+        return (
+            self.projection_enabled
+            and not self.shadow_only
+            and str(action).strip().lower() in self.live_actions
+        )
+
+
+def load_multi_target_management_config(
+    environ: dict[str, str] | None = None,
+    env_file_paths: list[str | os.PathLike[str]] | None = None,
+) -> MultiTargetManagementConfig:
+    paths = (
+        [".env", "config/telegram.env"]
+        if env_file_paths is None
+        else env_file_paths
+    )
+    env = dict(_load_env_file_values(paths) if paths else {})
+    env.update(os.environ if environ is None else environ)
+    requested_actions = {
+        item.strip().lower()
+        for item in env.get(
+            "TELEGRAM_KOL_MULTI_TARGET_LIVE_ACTIONS", ""
+        ).split(",")
+        if item.strip()
+    }
+    return MultiTargetManagementConfig(
+        projection_enabled=_enabled_flag(
+            env.get("TELEGRAM_KOL_MULTI_TARGET_PROJECTION_ENABLED")
+        ),
+        shadow_only=not (
+            str(
+                env.get("TELEGRAM_KOL_MULTI_TARGET_SHADOW_ONLY", "true")
+            ).strip().lower()
+            in {"0", "false", "no", "off"}
+        ),
+        live_actions=frozenset(
+            requested_actions.intersection(MULTI_TARGET_ACTION_NAMES)
+        ),
+    )
 
 
 def load_runtime_scanner_config(

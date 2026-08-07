@@ -39,6 +39,7 @@ _MULTI_TARGET_ACTIONS = {
         "cancel_pending_entry", True, True
     ),
 }
+MULTI_TARGET_ACTION_NAMES = frozenset(_MULTI_TARGET_ACTIONS)
 _MULTI_TARGET_ACTION_ALIASES = {
     "full_exit": "exit_full",
     "close_position": "exit_full",

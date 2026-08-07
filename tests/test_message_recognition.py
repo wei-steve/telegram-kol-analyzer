@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from telegram_kol_research import message_recognition as message_recognition_module
+from telegram_kol_research import config as config_module
 from telegram_kol_research.ai_recognition_config import AiProviderConfig, AiRecognitionConfig
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.message_recognition import (
@@ -31,6 +32,8 @@ from telegram_kol_research.models import (
     ExecutionOrderLeg,
     MediaAsset,
     MessageInstructionItem,
+    ManagementMessageEnvelope,
+    ManagementMessageTarget,
     MessageRecognition,
     RawMessage,
     SignalCandidate,
@@ -779,6 +782,78 @@ def test_authoritative_multi_target_partial_take_profit_persists_one_candidate_p
         (eth_id, "ETH", "short", 0.5),
     }
     assert [item.instruction_kind for item in items] == ["management", "management"]
+
+
+def test_authoritative_shadow_projection_records_targets_without_changing_work(
+    tmp_path,
+):
+    assert hasattr(config_module, "MultiTargetManagementConfig")
+    session_factory = create_session_factory(tmp_path / "multi-target-shadow.db")
+    with session_factory() as session:
+        btc = _add_exact_live_lifecycle(
+            session, chat_id=88, message_id=3390, symbol="BTC", side="short"
+        )
+        eth = _add_exact_live_lifecycle(
+            session, chat_id=88, message_id=3391, symbol="ETH", side="short"
+        )
+        raw = RawMessage(
+            chat_id=88,
+            message_id=3392,
+            posted_at=datetime(2026, 7, 21, 18, 5, tzinfo=UTC),
+            text="BTC ETH空单可以止盈一部分",
+        )
+        session.add(raw)
+        session.flush()
+        raw_id, btc_id, eth_id = raw.id, btc.id, eth.id
+        session.commit()
+
+    result = apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_id,
+        payload={
+            "recognition_result": "非策略",
+            "lifecycle_event": {
+                "event_type": "position_update",
+                "management_action": "partial_take_profit",
+                "management_fraction": 0.5,
+                "confidence": 0.95,
+                "targets": [
+                    {
+                        "target_lifecycle_id": btc_id,
+                        "symbol": "BTC",
+                        "side": "short",
+                    },
+                    {
+                        "target_lifecycle_id": eth_id,
+                        "symbol": "ETH",
+                        "side": "short",
+                    },
+                ],
+            },
+        },
+        model="mimo-v2.5",
+        authoritative_generation="multi-target-shadow-v1",
+        multi_target_management_config=config_module.MultiTargetManagementConfig(
+            projection_enabled=True,
+            shadow_only=True,
+        ),
+    )
+
+    assert result.status == "非策略"
+    with session_factory() as session:
+        assert session.query(ManagementMessageEnvelope).count() == 1
+        targets = (
+            session.query(ManagementMessageTarget)
+            .order_by(ManagementMessageTarget.target_ordinal)
+            .all()
+        )
+        assert [target.target_lifecycle_id for target in targets] == [
+            btc_id,
+            eth_id,
+        ]
+        assert {target.admission_state for target in targets} == {"identified"}
+        assert session.query(SignalCandidate).count() == 2
+        assert session.query(MessageInstructionItem).count() == 2
 
 
 @pytest.mark.parametrize("management_action", ["exit_full", None])
