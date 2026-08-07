@@ -23,6 +23,7 @@ READ_ONLY_CAPTURE_PROFILE = frozenset(
         "notification_delivery_failure",
     }
 )
+_SQLITE_MAX_INTEGER = 2**63 - 1
 
 RUNTIME_SCANNER_RULE_IDS = frozenset(
     {
@@ -55,6 +56,7 @@ class RuntimeIncidentConfig:
     capture_types: frozenset[str] = frozenset()
     telegram_notifications_enabled: bool = False
     telegram_notification_types: frozenset[str] | None = None
+    telegram_notification_after_incident_id: int | None = None
     notification_lease_seconds: float = 120.0
     agent_enabled: bool = False
     agent_incident_types: frozenset[str] | None = None
@@ -125,6 +127,19 @@ def load_runtime_scanner_config(
 
 def _enabled_flag(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _notification_after_incident_id(env: dict[str, str]) -> int | None:
+    key = "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_AFTER_ID"
+    if key not in env:
+        return None
+    try:
+        value = int(env[key])
+    except (TypeError, ValueError):
+        return _SQLITE_MAX_INTEGER
+    if not 0 <= value <= _SQLITE_MAX_INTEGER:
+        return _SQLITE_MAX_INTEGER
+    return value
 
 
 def load_runtime_incident_config(
@@ -258,6 +273,9 @@ def load_runtime_incident_config(
             env.get("TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_ENABLED")
         ),
         telegram_notification_types=telegram_notification_types,
+        telegram_notification_after_incident_id=(
+            _notification_after_incident_id(env)
+        ),
         notification_lease_seconds=max(5.0, min(lease_seconds, 3600.0)),
         agent_enabled=_enabled_flag(
             env.get("TELEGRAM_KOL_RUNTIME_AGENT_ENABLED")

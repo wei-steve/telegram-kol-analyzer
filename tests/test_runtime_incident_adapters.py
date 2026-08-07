@@ -91,6 +91,38 @@ def test_notification_type_allowlist_preserves_legacy_and_supports_capture_only(
     assert capture_only.notifies("management_partial_failed") is False
 
 
+def test_notification_watermark_is_absent_by_default_and_accepts_valid_ids():
+    absent = load_runtime_incident_config(environ={}, env_file_paths=[])
+    zero = load_runtime_incident_config(
+        environ={
+            "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_AFTER_ID": "0",
+        },
+        env_file_paths=[],
+    )
+    configured = load_runtime_incident_config(
+        environ={
+            "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_AFTER_ID": "256",
+        },
+        env_file_paths=[],
+    )
+
+    assert absent.telegram_notification_after_incident_id is None
+    assert zero.telegram_notification_after_incident_id == 0
+    assert configured.telegram_notification_after_incident_id == 256
+
+
+@pytest.mark.parametrize("value", ["", "abc", "-1", str(2**63)])
+def test_notification_watermark_fails_closed_when_invalid(value):
+    config = load_runtime_incident_config(
+        environ={
+            "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_AFTER_ID": value,
+        },
+        env_file_paths=[],
+    )
+
+    assert config.telegram_notification_after_incident_id == 2**63 - 1
+
+
 @pytest.mark.parametrize(
     ("incident_type", "adapter", "source_projection"),
     [
