@@ -31,6 +31,7 @@ from telegram_kol_research.production_safety_monitor import read_abnormal_execut
 from telegram_kol_research.production_safety_monitor import read_loopback_settings
 from telegram_kol_research.production_safety_monitor import read_composite_management_invariants
 from telegram_kol_research.production_safety_monitor import read_entry_preamble_invariants
+from telegram_kol_research.production_safety_monitor import read_adjacent_entry_invariants
 from telegram_kol_research.production_safety_monitor import run_daily_management_audit
 from telegram_kol_research.production_safety_monitor import run_production_safety_monitor
 from telegram_kol_research.production_safety_monitor import save_monitor_state
@@ -374,6 +375,48 @@ def test_entry_preamble_monitor_reader_detects_faults_without_writes(tmp_path):
         "stale_entry_preamble_unresolved",
         "entry_preamble_ambiguous",
         "live_entry_preamble_binding_evidence_missing",
+    }
+    assert database.read_bytes() == before
+
+
+def test_adjacent_entry_monitor_detects_all_v2_faults_without_writes(tmp_path):
+    database = tmp_path / "adjacent-entry-monitor.db"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE entry_strategy_fragments (id INTEGER PRIMARY KEY, status TEXT, created_at TEXT);
+        CREATE TABLE entry_assembly_fragments (id INTEGER PRIMARY KEY, entry_strategy_fragment_id INTEGER);
+        CREATE TABLE entry_strategy_assemblies (id INTEGER PRIMARY KEY, strategy_instance_id TEXT, fingerprint TEXT, evidence_json TEXT);
+        CREATE TABLE execution_bindings (id INTEGER PRIMARY KEY, strategy_instance_id TEXT, payload_json TEXT);
+        CREATE TABLE strategy_revision_batches (id INTEGER PRIMARY KEY, revision_kind TEXT, status TEXT, market_snapshot_json TEXT);
+        CREATE TABLE strategy_revision_legs (id INTEGER PRIMARY KEY, revision_batch_id INTEGER, action TEXT, status TEXT);
+        CREATE TABLE entry_revision_replacements (id INTEGER PRIMARY KEY, revision_batch_id INTEGER, status TEXT);
+        INSERT INTO entry_strategy_fragments VALUES
+          (1, 'pending', '2026-08-08 00:00:00'),
+          (2, 'consumed', '2026-08-08 00:00:00');
+        INSERT INTO entry_strategy_assemblies VALUES
+          (1, 'strategy-1', 'fp-1', '{"mode":"live","estimated_risk_usdt":"11","effective_risk_budget_usdt":"10"}');
+        INSERT INTO execution_bindings VALUES (1, 'strategy-1', '{"draft":{}}');
+        INSERT INTO strategy_revision_batches VALUES
+          (1, 'entry_sizing', 'rebuilding', '{"position":{"pos_id":"p1"},"verified_stop":null}');
+        INSERT INTO strategy_revision_legs VALUES (1, 1, 'cancel', 'submitted');
+        INSERT INTO entry_revision_replacements VALUES (1, 1, 'submitted');
+        """
+    )
+    connection.commit()
+    before = database.read_bytes()
+
+    codes = read_adjacent_entry_invariants(
+        database, now=datetime(2026, 8, 8, 1, 0, tzinfo=UTC)
+    )
+
+    assert set(codes) == {
+        "stale_adjacent_entry_admission",
+        "consumed_entry_fragment_missing_assembly",
+        "live_entry_assembly_binding_evidence_missing",
+        "entry_revision_risk_budget_exceeded",
+        "entry_revision_replacement_before_old_terminal",
+        "live_entry_revision_protection_unverified",
     }
     assert database.read_bytes() == before
 

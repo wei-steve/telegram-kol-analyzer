@@ -115,6 +115,12 @@ _FIXED_REASON_CODES = frozenset(
         "live_position_retained_tp_oversized",
         "composite_position_without_verified_stop",
         "stalled_composite_component",
+        "stale_adjacent_entry_admission",
+        "consumed_entry_fragment_missing_assembly",
+        "live_entry_assembly_binding_evidence_missing",
+        "entry_revision_risk_budget_exceeded",
+        "entry_revision_replacement_before_old_terminal",
+        "live_entry_revision_protection_unverified",
     }
 )
 _LOW_REPEAT_REASON_CODES = frozenset({"audit_abnormal"})
@@ -423,7 +429,12 @@ class ProductionSafetyAdapters:
         )
 
     def read_entry_preamble_invariants(self, *, now: datetime) -> tuple[str, ...]:
-        return read_entry_preamble_invariants(self.database_path, now=now)
+        return tuple(
+            sorted(
+                set(read_entry_preamble_invariants(self.database_path, now=now))
+                | set(read_adjacent_entry_invariants(self.database_path, now=now))
+            )
+        )
 
     def run_management_audit(self) -> Mapping[str, Any]:
         completed = _run_bounded_command(
@@ -696,6 +707,116 @@ def read_entry_preamble_invariants(
             ) != str(fingerprint):
                 reasons.add("live_entry_preamble_binding_evidence_missing")
                 break
+    return tuple(sorted(reasons))
+
+
+def read_adjacent_entry_invariants(
+    database_path: str | Path,
+    *,
+    now: datetime,
+    stale_after: timedelta = timedelta(minutes=15),
+    connect=sqlite3.connect,
+) -> tuple[str, ...]:
+    """Read bounded v2 assembly/revision invariants through a query-only handle."""
+
+    checked_at = _require_aware_datetime(now).astimezone(UTC).replace(tzinfo=None)
+    stale_before = checked_at - stale_after
+    required = {
+        "entry_strategy_fragments", "entry_assembly_fragments",
+        "entry_strategy_assemblies", "execution_bindings",
+        "strategy_revision_batches", "strategy_revision_legs",
+        "entry_revision_replacements",
+    }
+    reasons: set[str] = set()
+    uri = f"file:{database_path}?mode=ro"
+    with connect(uri, uri=True) as connection:
+        connection.execute("PRAGMA query_only = ON")
+        available = {
+            row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if not required.issubset(available):
+            return ()
+        if connection.execute(
+            "SELECT 1 FROM entry_strategy_fragments "
+            "WHERE status = 'pending' AND created_at < ? LIMIT 1",
+            (stale_before.isoformat(sep=" "),),
+        ).fetchone():
+            reasons.add("stale_adjacent_entry_admission")
+        if connection.execute(
+            "SELECT 1 FROM entry_strategy_fragments AS f "
+            "LEFT JOIN entry_assembly_fragments AS link "
+            "ON link.entry_strategy_fragment_id = f.id "
+            "WHERE f.status = 'consumed' AND link.id IS NULL LIMIT 1"
+        ).fetchone():
+            reasons.add("consumed_entry_fragment_missing_assembly")
+
+        bindings = {
+            str(row[0]): row[1]
+            for row in connection.execute(
+                "SELECT strategy_instance_id, payload_json FROM execution_bindings"
+            ).fetchall()
+        }
+        for strategy_instance_id, fingerprint, evidence_json in connection.execute(
+            "SELECT strategy_instance_id, fingerprint, evidence_json "
+            "FROM entry_strategy_assemblies ORDER BY id DESC LIMIT 500"
+        ).fetchall():
+            try:
+                evidence = json.loads(evidence_json or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                evidence = {}
+            if not isinstance(evidence, dict):
+                evidence = {}
+            try:
+                estimated = Decimal(str(evidence.get("estimated_risk_usdt")))
+                effective = Decimal(str(evidence.get("effective_risk_budget_usdt")))
+                if estimated > effective:
+                    reasons.add("entry_revision_risk_budget_exceeded")
+            except (InvalidOperation, TypeError, ValueError):
+                pass
+            if evidence.get("mode") != "live":
+                continue
+            try:
+                payload = json.loads(bindings.get(str(strategy_instance_id)) or "{}")
+                draft = payload.get("draft") if isinstance(payload, dict) else None
+                bound = draft.get("entry_preamble_assembly") if isinstance(draft, dict) else None
+                if bound is None and isinstance(payload, dict):
+                    bound = payload.get("entry_preamble_assembly")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                bound = None
+            if not isinstance(bound, dict) or str(
+                bound.get("assembly_fingerprint") or ""
+            ) != str(fingerprint):
+                reasons.add("live_entry_assembly_binding_evidence_missing")
+
+        submitted_batches = {
+            int(row[0]) for row in connection.execute(
+                "SELECT DISTINCT revision_batch_id FROM entry_revision_replacements "
+                "WHERE status IN ('submitted','verified')"
+            ).fetchall()
+        }
+        for batch_id in submitted_batches:
+            if connection.execute(
+                "SELECT 1 FROM strategy_revision_legs WHERE revision_batch_id = ? "
+                "AND action = 'cancel' AND status NOT IN "
+                "('cancelled','filled','rejected','expired','skipped','verified') LIMIT 1",
+                (batch_id,),
+            ).fetchone():
+                reasons.add("entry_revision_replacement_before_old_terminal")
+        for status, snapshot_json in connection.execute(
+            "SELECT status, market_snapshot_json FROM strategy_revision_batches "
+            "WHERE revision_kind = 'entry_sizing' "
+            "AND status IN ('rebuilding','reconciling','succeeded')"
+        ).fetchall():
+            del status
+            try:
+                snapshot = json.loads(snapshot_json or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                snapshot = {}
+            if isinstance(snapshot, dict) and snapshot.get("position") is not None \
+                    and snapshot.get("verified_stop") is None:
+                reasons.add("live_entry_revision_protection_unverified")
     return tuple(sorted(reasons))
 
 
