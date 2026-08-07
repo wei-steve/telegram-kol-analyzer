@@ -664,7 +664,7 @@ def assemble_adjacent_entry_strategy(
             evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
         fingerprint = hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()
-        if mode == "shadow" or not (fragment_rows or legacy_preambles):
+        if mode == "shadow":
             return EntryAssemblyResult(
                 status="proposed" if (fragment_rows or legacy_preambles) else "none",
                 reason_code=None,
@@ -812,12 +812,22 @@ def finalize_adjacent_entry_assembly_draft(
         )
     if not 1 <= len(bounded_legs) <= 5:
         raise ValueError("entry assembly draft must contain one to five legs")
+    raw_contract_spec = order_draft.get("contract_spec")
+    contract_spec = (
+        {
+            key: raw_contract_spec.get(key)
+            for key in ("contract_value", "quantity_step", "min_quantity")
+        }
+        if isinstance(raw_contract_spec, Mapping)
+        else None
+    )
     draft_snapshot = {
         "strategy_instance_id": order_draft.get("strategy_instance_id"),
         "instrument_id": order_draft.get("instrument_id"),
         "stop_loss": order_draft.get("stop_loss"),
         "take_profit_legs": order_draft.get("take_profit_legs") or [],
         "risk_budget_usdt": order_draft.get("risk_budget_usdt"),
+        "contract_spec": contract_spec,
         "order_legs": bounded_legs,
     }
     with session_factory() as session:

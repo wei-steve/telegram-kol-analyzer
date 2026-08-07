@@ -633,6 +633,24 @@ class StrategyRevisionBatch(Base):
             "strategy_thread_id",
             "status",
         ),
+        Index(
+            "uq_strategy_revision_batches_entry_assembly",
+            "revision_kind",
+            "target_assembly_fingerprint",
+            unique=True,
+            sqlite_where=text(
+                "revision_kind = 'entry_sizing' "
+                "AND target_assembly_fingerprint IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_strategy_revision_batches_active_entry_binding",
+            "execution_binding_id",
+            unique=True,
+            sqlite_where=text(
+                "revision_kind = 'entry_sizing' AND status NOT IN ('succeeded', 'blocked')"
+            ),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -661,6 +679,7 @@ class StrategyRevisionBatch(Base):
         String(64), nullable=True, index=True
     )
     target_snapshot_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    market_snapshot_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default="planned", index=True
     )
@@ -722,6 +741,49 @@ class StrategyRevisionLeg(Base):
     )
     pos_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     response_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+
+
+class EntryRevisionReplacement(Base):
+    """Durable reservation/read-back for one sizing-revision replacement leg."""
+
+    __tablename__ = "entry_revision_replacements"
+    __table_args__ = (
+        UniqueConstraint(
+            "revision_batch_id",
+            "leg_index",
+            name="uq_entry_revision_replacements_batch_leg",
+        ),
+        Index(
+            "ix_entry_revision_replacements_batch_status",
+            "revision_batch_id",
+            "status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    revision_batch_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_revision_batches.id"), nullable=False, index=True
+    )
+    execution_order_leg_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("execution_order_legs.id"), nullable=True, index=True
+    )
+    leg_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    desired_json: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="planned", index=True
+    )
+    order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    client_order_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    request_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    response_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    readback_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=utc_now, nullable=False

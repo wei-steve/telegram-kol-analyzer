@@ -17,6 +17,7 @@ from telegram_kol_research.models import TradingSetting
 
 
 TRADING_SETTINGS_KEY = "global"
+ENTRY_REVISION_ACTIVATION_KEY = "entry_revision_v2_activation"
 MAX_FLOAT_DECIMAL = Decimal(str(sys.float_info.max))
 
 ENTRY_THRESHOLD_KEYS = (
@@ -230,6 +231,9 @@ def save_trading_settings(
                 persisted_payload = parsed_persisted
         merged_payload = {**persisted_payload, **payload}
         settings = trading_settings_from_payload(merged_payload)
+        prior_revision_mode = str(
+            persisted_payload.get("entry_revision_v2_mode") or "disabled"
+        )
         stored_payload = settings.to_dict()
         if "entry_preamble_live_chat_ids" in persisted_payload:
             stored_payload["entry_preamble_live_chat_ids"] = persisted_payload[
@@ -242,6 +246,19 @@ def save_trading_settings(
         else:
             row.value_json = value_json
         row.updated_at = updated_at or datetime.now(UTC)
+        if settings.entry_revision_v2_mode != prior_revision_mode:
+            activation = (
+                session.query(TradingSetting)
+                .filter(TradingSetting.key == ENTRY_REVISION_ACTIVATION_KEY)
+                .one_or_none()
+            )
+            if activation is None:
+                activation = TradingSetting(key=ENTRY_REVISION_ACTIVATION_KEY)
+                session.add(activation)
+            activation.value_json = json.dumps(
+                {"mode": settings.entry_revision_v2_mode}, sort_keys=True
+            )
+            activation.updated_at = updated_at or datetime.now(UTC)
         session.commit()
     return settings
 

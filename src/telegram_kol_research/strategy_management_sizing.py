@@ -10,6 +10,24 @@ class ManagementSizingError(ValueError):
     """Raised when a close cannot be represented safely for every position."""
 
 
+def entry_revision_risk_reduction_delta(
+    *,
+    current_size: object,
+    target_size: object,
+    quantity_step: object,
+    min_quantity: object,
+) -> str:
+    """Route an entry-revision reduction through the exact management delta rule."""
+
+    return target_remaining_close_delta(
+        trusted_start_size=current_size,
+        target_remaining_size=target_size,
+        current_size=current_size,
+        quantity_step=quantity_step,
+        min_quantity=min_quantity,
+    )
+
+
 def target_remaining_close_delta(
     *,
     trusted_start_size: object,

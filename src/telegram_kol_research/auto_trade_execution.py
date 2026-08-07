@@ -51,9 +51,9 @@ from telegram_kol_research.recovery_decisions import apply_recovery_review_decis
 from telegram_kol_research.recovery_decisions import persist_recovery_evaluations
 from telegram_kol_research.recovery_live_submit import process_trade_signal_live
 from telegram_kol_research.recovery_live_submit import (
+    enqueue_recovery_trade_signal,
     submit_strategy_revision_replacement_live,
 )
-from telegram_kol_research.recovery_live_submit import submit_recovery_order_live
 from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
 from telegram_kol_research.recovery_scan import RecoveryDecision
 from telegram_kol_research.recovery_scan import RecoveryEvaluation
@@ -763,6 +763,15 @@ def _auto_process_single_message_trade_signal(
         execution_plan = "range_hybrid_market_half_limit_half"
     if auto_draft is not None:
         if (
+            not isinstance(auto_draft.get("contract_spec"), dict)
+            and contract_spec_provider is not None
+        ):
+            auto_spec = contract_spec_provider.get_contract_spec(
+                str(auto_draft.get("instrument_id") or "")
+            )
+            if auto_spec is not None:
+                auto_draft = {**auto_draft, "contract_spec": auto_spec.to_dict()}
+        if (
             settings.entry_message_assembly_v2_mode == "live"
             and assembly.assembly_id is not None
         ):
@@ -837,15 +846,49 @@ def _auto_process_single_message_trade_signal(
             processed_at=now,
         )
     else:
-        submit_result = submit_recovery_order_live(
+        trade_signal = enqueue_recovery_trade_signal(
             session_factory,
             chat_id=signal.chat_id,
             message_id=signal.message_id,
             symbol=symbol,
             side=side,
+            contract_spec_provider=contract_spec_provider,
+            enqueued_at=now,
+        )
+        recovery_draft = (
+            trade_signal.payload.get("deepcoin_order_draft")
+            if isinstance(trade_signal.payload, dict)
+            else None
+        )
+        if (
+            isinstance(recovery_draft, dict)
+            and not isinstance(recovery_draft.get("contract_spec"), dict)
+            and contract_spec_provider is not None
+        ):
+            recovery_spec = contract_spec_provider.get_contract_spec(
+                str(recovery_draft.get("instrument_id") or "")
+            )
+            if recovery_spec is not None:
+                recovery_draft = {
+                    **recovery_draft,
+                    "contract_spec": recovery_spec.to_dict(),
+                }
+        if (
+            settings.entry_message_assembly_v2_mode == "live"
+            and assembly.assembly_id is not None
+            and isinstance(recovery_draft, dict)
+        ):
+            finalize_adjacent_entry_assembly_draft(
+                session_factory,
+                assembly_id=int(assembly.assembly_id),
+                order_draft=recovery_draft,
+            )
+        submit_result = process_trade_signal_live(
+            session_factory,
+            signal_id=trade_signal.id,
             deepcoin_client=deepcoin_client,
             contract_spec_provider=contract_spec_provider,
-            submitted_at=now,
+            processed_at=now,
             max_order_legs=1 if entry_execution_type == "market" else None,
         )
     return {

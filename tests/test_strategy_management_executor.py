@@ -6,6 +6,30 @@ from types import SimpleNamespace
 
 import pytest
 
+
+def test_entry_revision_reduction_delegates_to_management_path_only():
+    from telegram_kol_research.strategy_management_executor import (
+        execute_entry_revision_risk_reduction_via_management,
+    )
+
+    calls = []
+    result = execute_entry_revision_risk_reduction_via_management(
+        batch_id=7,
+        execution_binding_id=9,
+        pos_id="pos-1",
+        current_quantity="0.012",
+        target_quantity="0.010",
+        reduce_quantity="0.002",
+        verified_stop={"order_id": "sl-1", "status": "verified"},
+        management_executor=lambda **kwargs: (
+            calls.append(kwargs) or {"status": "succeeded"}
+        ),
+    )
+
+    assert result == {"status": "succeeded"}
+    assert calls[0]["source"] == "entry_revision"
+    assert calls[0]["target_remaining_quantity"] == "0.010"
+
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_client import (
     DeepcoinDefiniteRejection,

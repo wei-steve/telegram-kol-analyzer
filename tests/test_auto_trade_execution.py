@@ -1683,6 +1683,7 @@ def test_auto_process_message_trade_signal_submits_live_order_with_protection(tm
             "auto_trade_enabled": True,
             "default_max_loss_usdt": 20,
             "allowed_symbols": ["BTC", "ETH"],
+            "entry_message_assembly_v2_mode": "live",
             "symbol_entry_thresholds": {
                 "BTC": {
                     "market_leg_threshold": "50",
@@ -1708,6 +1709,13 @@ def test_auto_process_message_trade_signal_submits_live_order_with_protection(tm
     assert fake_client.orders == []
     assert len(fake_client.trigger_orders) == 2
     assert fake_client.trigger_orders[0]["orderType"] == "limit"
+    with session_factory() as session:
+        assembly_evidence = json.loads(
+            session.query(EntryStrategyAssembly).one().evidence_json
+        )
+    assert assembly_evidence["order_draft_snapshot"]["contract_spec"][
+        "quantity_step"
+    ] == 1.0
     assert [order["triggerPrice"] for order in fake_client.trigger_orders] == [
         "68290.0",
         "68080.0",

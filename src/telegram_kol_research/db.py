@@ -143,6 +143,9 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         "target_snapshot_json": (
             "ALTER TABLE strategy_revision_batches ADD COLUMN target_snapshot_json TEXT"
         ),
+        "market_snapshot_json": (
+            "ALTER TABLE strategy_revision_batches ADD COLUMN market_snapshot_json TEXT"
+        ),
         "advance_claim_token": (
             "ALTER TABLE strategy_revision_batches "
             "ADD COLUMN advance_claim_token VARCHAR(64)"
@@ -470,6 +473,20 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
 }
 
 SQLITE_COMPAT_INDEXES: dict[str, str] = {
+    "uq_strategy_revision_batches_entry_assembly": (
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "uq_strategy_revision_batches_entry_assembly "
+        "ON strategy_revision_batches (revision_kind, target_assembly_fingerprint) "
+        "WHERE revision_kind = 'entry_sizing' "
+        "AND target_assembly_fingerprint IS NOT NULL"
+    ),
+    "uq_strategy_revision_batches_active_entry_binding": (
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "uq_strategy_revision_batches_active_entry_binding "
+        "ON strategy_revision_batches (execution_binding_id) "
+        "WHERE revision_kind = 'entry_sizing' "
+        "AND status NOT IN ('succeeded', 'blocked')"
+    ),
     MANAGEMENT_COMPONENT_IDEMPOTENCY_INDEX_NAME: (
         "CREATE UNIQUE INDEX IF NOT EXISTS "
         "uq_strategy_management_components_idempotency "

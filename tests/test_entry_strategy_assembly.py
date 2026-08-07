@@ -673,6 +673,59 @@ def test_v2_live_assembly_atomically_consumes_multiple_fragments(tmp_path):
         assert session.get(EntryPreamble, ids[4]).status == "consumed"
 
 
+def test_v2_live_persists_baseline_assembly_without_adjacent_fragments(tmp_path):
+    from telegram_kol_research.entry_strategy_assembly import (
+        assemble_adjacent_entry_strategy,
+    )
+
+    session_factory = create_session_factory(tmp_path / "v2-baseline.db")
+    with session_factory() as session:
+        strategy = RawMessage(
+            chat_id=100,
+            message_id=1001,
+            posted_at=NOW,
+            text="BTC short 63900-64200 SL 64900",
+        )
+        session.add(strategy)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=strategy.id,
+            symbol="BTC",
+            side="short",
+            event_type="entry_signal",
+            parse_source="mimo_authoritative",
+            confidence=1,
+        )
+        session.add(candidate)
+        session.flush()
+        ids = int(strategy.id), int(candidate.id)
+        session.commit()
+
+    result = assemble_adjacent_entry_strategy(
+        session_factory,
+        strategy_raw_message_id=ids[0],
+        signal_candidate_id=ids[1],
+        strategy_instance_id="deepcoin:100:1001:BTC:short",
+        mode="live",
+        assembled_at=NOW + timedelta(seconds=1),
+        configured_risk_budget_usdt=Decimal("20"),
+        strategy_snapshot={
+            "entry_prices": ["63900", "64200"],
+            "stop_loss": "64900",
+            "take_profit": "62800",
+            "entry_execution_type": "limit",
+        },
+    )
+
+    assert result.status == "assembled"
+    assert result.assembly_id is not None
+    assert result.fragment_ids == ()
+    assert result.effective_risk_multiplier == Decimal("1")
+    assert result.effective_risk_budget_usdt == Decimal("20")
+    with session_factory() as session:
+        assert session.query(EntryStrategyAssembly).count() == 1
+
+
 def test_v2_live_adapts_pending_legacy_preamble(tmp_path):
     from telegram_kol_research.entry_strategy_assembly import (
         assemble_adjacent_entry_strategy,

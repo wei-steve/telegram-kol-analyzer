@@ -12,6 +12,15 @@ def _sizing():
     return strategy_management_sizing
 
 
+def test_entry_revision_risk_reduction_uses_exact_management_delta():
+    assert _sizing().entry_revision_risk_reduction_delta(
+        current_size="0.012",
+        target_size="0.010",
+        quantity_step="0.001",
+        min_quantity="0.001",
+    ) == "0.002"
+
+
 @pytest.mark.parametrize(
     ("round_before", "fraction", "expected"),
     [

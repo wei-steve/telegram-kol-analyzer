@@ -118,6 +118,123 @@ class DeferredEntryIdentityDriftError(DeferredEntryCancellationError):
     """Exact deferred-entry DB identity changed after batch planning."""
 
 
+def execute_entry_revision_risk_reduction_via_management(
+    *,
+    batch_id: int,
+    execution_binding_id: int,
+    pos_id: str,
+    current_quantity: str,
+    target_quantity: str,
+    reduce_quantity: str,
+    verified_stop: dict[str, Any],
+    management_executor,
+) -> dict[str, Any]:
+    """Delegate a frozen revision reduction to the existing management boundary."""
+
+    if (
+        not pos_id
+        or not isinstance(verified_stop, dict)
+        or str(verified_stop.get("status") or "").lower() != "verified"
+    ):
+        raise ManagementBatchExecutionError(
+            "entry_revision_verified_protection_required"
+        )
+    return management_executor(
+        source="entry_revision",
+        entry_revision_batch_id=int(batch_id),
+        execution_binding_id=int(execution_binding_id),
+        pos_id=str(pos_id),
+        current_quantity=str(current_quantity),
+        target_remaining_quantity=str(target_quantity),
+        exact_close_quantity=str(reduce_quantity),
+        verified_stop=dict(verified_stop),
+    )
+
+
+@serialized_position_authority_mutation
+def execute_entry_revision_risk_reduction_live(
+    session_factory: sessionmaker,
+    *,
+    deepcoin_client,
+    source: str,
+    entry_revision_batch_id: int,
+    execution_binding_id: int,
+    pos_id: str,
+    current_quantity: str,
+    target_remaining_quantity: str,
+    exact_close_quantity: str,
+    verified_stop: dict[str, Any],
+    executed_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Use the existing exact-position mutation gateway for revision reduction."""
+
+    if source != "entry_revision" or not pos_id:
+        raise ManagementBatchExecutionError("entry_revision_reduction_identity_invalid")
+    current = Decimal(str(current_quantity))
+    target = Decimal(str(target_remaining_quantity))
+    reduction = Decimal(str(exact_close_quantity))
+    if current <= 0 or target < 0 or reduction <= 0 or current - reduction != target:
+        raise ManagementBatchExecutionError("entry_revision_reduction_size_invalid")
+    if str(verified_stop.get("status") or "").lower() != "verified":
+        raise ManagementBatchExecutionError(
+            "entry_revision_verified_protection_required"
+        )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, int(execution_binding_id))
+        owned_legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(
+                ExecutionOrderLeg.execution_binding_id == int(execution_binding_id),
+                ExecutionOrderLeg.pos_id == str(pos_id),
+                ExecutionOrderLeg.purpose == "entry",
+                ExecutionOrderLeg.attribution_status == "verified",
+            )
+            .all()
+        )
+        if binding is None or len(owned_legs) != 1:
+            raise ManagementBatchExecutionError(
+                "entry_revision_reduction_owner_not_unique"
+            )
+        instrument_id = normalize_deepcoin_swap_instrument(str(binding.symbol))
+    client_order_id = (
+        "ERD"
+        + hashlib.sha256(
+            f"{entry_revision_batch_id}:{owned_legs[0].id}:{pos_id}".encode()
+        ).hexdigest()[:17]
+    ).upper()
+    now = executed_at or datetime.now(UTC)
+    response = close_exact_position(
+        session_factory=session_factory,
+        deepcoin_client=deepcoin_client,
+        pos_id=str(pos_id),
+        instrument_id=instrument_id,
+        size=str(exact_close_quantity),
+        client_order_id=client_order_id,
+        idempotency_key=(
+            f"entry-revision:{int(entry_revision_batch_id)}:reduce:{client_order_id}"
+        ),
+        live_execution_gate=lambda: exact_position_write_gate(
+            session_factory, pos_id=str(pos_id)
+        ),
+        now_provider=lambda: now,
+    )
+    for _ in range(3):
+        matches = [
+            row
+            for row in deepcoin_client.list_positions(inst_id=instrument_id)
+            if str(row.get("posId") or "") == str(pos_id)
+        ]
+        if len(matches) == 1:
+            live_size = matches[0].get("pos") or matches[0].get("size")
+            try:
+                converged = Decimal(str(live_size)) == target
+            except (InvalidOperation, TypeError, ValueError):
+                converged = False
+            if converged:
+                return {"status": "succeeded", "response": dict(response)}
+    return {"status": "submitted", "response": dict(response)}
+
+
 @dataclass(frozen=True, slots=True)
 class _DeferredExchangeMatch:
     entry: ExecutionOrderLeg

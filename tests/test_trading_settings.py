@@ -1,4 +1,5 @@
 from decimal import Decimal
+from datetime import UTC, datetime, timedelta
 import json
 
 import pytest
@@ -13,6 +14,7 @@ from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.trading_settings import TradingSettings
 from telegram_kol_research.trading_settings import trading_settings_from_payload
+from telegram_kol_research.trading_settings import ENTRY_REVISION_ACTIVATION_KEY
 from telegram_kol_research.models import TradingSetting
 
 
@@ -46,6 +48,30 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     assert settings.entry_message_assembly_v2_mode == "disabled"
     assert settings.entry_revision_v2_mode == "disabled"
     assert not hasattr(settings, "entry_preamble_live_chat_ids")
+
+
+def test_entry_revision_activation_generation_changes_only_with_mode(tmp_path):
+    session_factory = create_session_factory(tmp_path / "revision-activation.db")
+    activated_at = datetime(2026, 8, 8, 12, tzinfo=UTC)
+    save_trading_settings(
+        session_factory,
+        {"entry_revision_v2_mode": "shadow"},
+        updated_at=activated_at,
+    )
+    save_trading_settings(
+        session_factory,
+        {"default_max_loss_usdt": 30},
+        updated_at=activated_at + timedelta(hours=1),
+    )
+
+    with session_factory() as session:
+        activation = (
+            session.query(TradingSetting)
+            .filter_by(key=ENTRY_REVISION_ACTIVATION_KEY)
+            .one()
+        )
+        assert json.loads(activation.value_json) == {"mode": "shadow"}
+        assert activation.updated_at == activated_at.replace(tzinfo=None)
 
 
 def test_entry_preamble_rollout_settings_ignore_legacy_allowlist(tmp_path):

@@ -210,6 +210,9 @@ from telegram_kol_research.context_resolution_worker import (
     run_context_resolution_once,
     schedule_context_reanalysis,
 )
+from telegram_kol_research.entry_revision_executor import (
+    run_entry_revision_worker_once,
+)
 from telegram_kol_research.trade_signals import list_pending_trade_signals
 from telegram_kol_research.web_queries import (
     load_database_freshness,
@@ -3311,6 +3314,18 @@ def _schedule_context_resolution_for_app(app: FastAPI, **event: Any) -> int:
 def _run_context_resolution_worker_for_app(app: FastAPI) -> dict[str, Any]:
     settings = load_trading_settings(app.state.session_factory)
     if not settings.context_resolution_enabled or not settings.live_management_execution_enabled:
+        if settings.entry_revision_v2_mode != "disabled":
+            revision_result = run_entry_revision_worker_once(
+                app.state.session_factory,
+                deepcoin_client=app.state.deepcoin_client_factory(),
+                contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+                management_executor=app.state.entry_revision_risk_reduction_executor,
+            )
+            return {
+                "status": "completed",
+                "context_resolution": {"status": "disabled"},
+                "entry_revision": revision_result,
+            }
         return {"status": "disabled"}
 
     def reanalyze(raw_message_id: int, _fingerprint: str) -> dict[str, Any]:
@@ -3366,7 +3381,7 @@ def _run_context_resolution_worker_for_app(app: FastAPI) -> dict[str, Any]:
             )
         )
 
-    return run_context_resolution_once(
+    context_result = run_context_resolution_once(
         app.state.session_factory,
         context_fingerprint_factory=lambda raw_message_id: (
             build_context_state_fingerprint(
@@ -3378,6 +3393,19 @@ def _run_context_resolution_worker_for_app(app: FastAPI) -> dict[str, Any]:
         notify_final_failure=notify_final_failure,
         is_eligible=is_eligible,
     )
+    if settings.entry_revision_v2_mode == "disabled":
+        return context_result
+    revision_result = run_entry_revision_worker_once(
+        app.state.session_factory,
+        deepcoin_client=app.state.deepcoin_client_factory(),
+        contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+        management_executor=app.state.entry_revision_risk_reduction_executor,
+    )
+    return {
+        "status": "completed",
+        "context_resolution": context_result,
+        "entry_revision": revision_result,
+    }
 
 
 def create_web_app(
@@ -3407,6 +3435,7 @@ def create_web_app(
     semantic_review_runner=None,
     semantic_review_restart_delay_seconds: float = 1.0,
     strategy_management_worker_runner=None,
+    entry_revision_risk_reduction_executor=None,
     strategy_management_worker_interval_seconds: float = 5.0,
     strategy_management_worker_startup_delay_seconds: float = 5.0,
     strategy_management_worker_max_batches: int = 10,
@@ -3908,6 +3937,9 @@ def create_web_app(
     app.state.semantic_review_task = None
     app.state.strategy_management_worker_runner = (
         strategy_management_worker_runner or run_strategy_management_worker_loop
+    )
+    app.state.entry_revision_risk_reduction_executor = (
+        entry_revision_risk_reduction_executor
     )
     app.state.strategy_management_worker_interval_seconds = max(
         0.01, float(strategy_management_worker_interval_seconds)
