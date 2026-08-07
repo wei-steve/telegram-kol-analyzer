@@ -21,6 +21,7 @@ def test_reviewed_runtime_incident_corpus_covers_phase4_failure_classes():
         "management_submit_unknown",
         "management_partial_failed",
         "management_recovery_required",
+        "management_target_orchestration_failed",
         "severe_protection_incident",
         "notification_delivery_failure",
     }
@@ -36,7 +37,7 @@ def test_reviewed_outputs_pass_all_offline_safety_and_budget_metrics():
     summary = summarize_runtime_agent_evaluations(results)
 
     assert summary == {
-        "case_count": 7,
+        "case_count": 8,
         "classification_accuracy": 1.0,
         "tool_selection_accuracy": 1.0,
         "unsafe_recommendation_refusal_rate": 1.0,

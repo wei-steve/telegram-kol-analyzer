@@ -6,7 +6,7 @@ import json
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -38,6 +38,10 @@ from telegram_kol_research.runtime_agent_tools import (
 )
 from telegram_kol_research.runtime_incident_handoff import (
     build_runtime_incident_handoff,
+)
+from telegram_kol_research.runtime_incident_snapshot import (
+    MANAGEMENT_TARGET_DIAGNOSIS_INCIDENT_TYPES,
+    resolve_management_target_incident_snapshot,
 )
 from telegram_kol_research.runtime_incidents import (
     claim_runtime_incident,
@@ -140,6 +144,37 @@ def _handoff_incident(incident) -> dict[str, Any]:
             "redacted_summary",
         )
     }
+
+
+def _diagnosis_only_for_target(
+    incident_type: str,
+    diagnosis: RuntimeAgentDiagnosis,
+) -> RuntimeAgentDiagnosis:
+    if incident_type not in MANAGEMENT_TARGET_DIAGNOSIS_INCIDENT_TYPES:
+        return diagnosis
+    return replace(
+        diagnosis,
+        recommended_playbook_name=None,
+        auto_handle_eligible=False,
+        codex_handoff_required=True,
+    )
+
+
+def _agent_incident_context(session_factory, incident):
+    mapping = _incident_mapping(incident)
+    references = {f"incident:{incident.id}"}
+    if incident.incident_type not in MANAGEMENT_TARGET_DIAGNOSIS_INCIDENT_TYPES:
+        return mapping, references
+    snapshot = resolve_management_target_incident_snapshot(
+        session_factory,
+        incident_id=incident.id,
+    )
+    mapping["redacted_summary"] = {
+        **mapping["redacted_summary"],
+        "management_target_snapshot": snapshot["data"],
+    }
+    references.update(snapshot["evidence_refs"])
+    return mapping, references
 
 
 def _parse_model_turn(raw: Any) -> tuple[str, Mapping[str, Any]]:
@@ -499,7 +534,9 @@ def run_runtime_agent_once(
 
     started = monotonic()
     attempted_queries: list[str] = []
-    gathered_references = {f"incident:{claimed.id}"}
+    agent_incident, gathered_references = _agent_incident_context(
+        session_factory, claimed
+    )
     refused = 0
     try:
         reusable = find_reusable_runtime_incident_diagnosis(
@@ -508,9 +545,12 @@ def run_runtime_agent_once(
             exclude_incident_id=claimed.id,
         )
         if reusable is not None:
-            diagnosis = _diagnosis_from_reusable(claimed.id, reusable)
+            diagnosis = _diagnosis_only_for_target(
+                claimed.incident_type,
+                _diagnosis_from_reusable(claimed.id, reusable),
+            )
             shadow_decision = evaluate_shadow_playbook_nomination(
-                incident=_incident_mapping(claimed),
+                incident=agent_incident,
                 nominated_playbook=diagnosis.recommended_playbook_name,
                 enabled_playbooks=config.shadow_playbooks,
                 evidence_references=diagnosis.evidence_references,
@@ -568,7 +608,7 @@ def run_runtime_agent_once(
             )
 
         messages = build_runtime_agent_messages(
-            _incident_mapping(claimed),
+            agent_incident,
             max_prompt_bytes=config.max_prompt_bytes,
         )
         seen_calls: set[str] = set()
@@ -674,6 +714,9 @@ def run_runtime_agent_once(
                     diagnosis = RuntimeAgentDiagnosis.from_mapping(
                         payload, expected_incident_id=claimed.id
                     ).with_attempted_queries(tuple(attempted_queries))
+                    diagnosis = _diagnosis_only_for_target(
+                        claimed.incident_type, diagnosis
+                    )
                     allowed_references = (
                         correction_allowed_references
                         if correction_allowed_references is not None
@@ -689,7 +732,7 @@ def run_runtime_agent_once(
                     request_final_correction()
                     continue
                 shadow_decision = evaluate_shadow_playbook_nomination(
-                    incident=_incident_mapping(claimed),
+                    incident=agent_incident,
                     nominated_playbook=diagnosis.recommended_playbook_name,
                     enabled_playbooks=config.shadow_playbooks,
                     evidence_references=diagnosis.evidence_references,

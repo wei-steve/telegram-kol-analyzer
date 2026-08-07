@@ -9,6 +9,9 @@ from typing import Any
 from telegram_kol_research.runtime_agent_playbooks import (
     get_runtime_agent_playbook,
 )
+from telegram_kol_research.runtime_incident_snapshot import (
+    MANAGEMENT_TARGET_DIAGNOSIS_INCIDENT_TYPES,
+)
 
 
 RUNTIME_AGENT_SHADOW_POLICY_VERSION = "runtime-shadow-policy-v1"
@@ -113,6 +116,17 @@ def evaluate_shadow_playbook_nomination(
             idempotency_key=None,
             verification_query=None,
         )
+    if str(incident.get("incident_type") or "") in (
+        MANAGEMENT_TARGET_DIAGNOSIS_INCIDENT_TYPES
+    ):
+        return ShadowPlaybookDecision(
+            nominated_playbook=nominated_playbook,
+            playbook_version=None,
+            accepted=False,
+            refusal_reasons=("management_target_diagnosis_only",),
+            idempotency_key=None,
+            verification_query=None,
+        )
     playbook = get_runtime_agent_playbook(nominated_playbook)
     if playbook is None:
         return ShadowPlaybookDecision(
@@ -166,6 +180,17 @@ def evaluate_execution_playbook_nomination(
             playbook_version=None,
             accepted=False,
             refusal_reasons=("no_nomination",),
+            idempotency_key=None,
+            verification_query=None,
+        )
+    if str(incident.get("incident_type") or "") in (
+        MANAGEMENT_TARGET_DIAGNOSIS_INCIDENT_TYPES
+    ):
+        return ExecutionPlaybookDecision(
+            nominated_playbook=nominated_playbook,
+            playbook_version=None,
+            accepted=False,
+            refusal_reasons=("management_target_diagnosis_only",),
             idempotency_key=None,
             verification_query=None,
         )

@@ -4,8 +4,17 @@ from datetime import UTC, datetime, timedelta
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
+    ExecutionBinding,
+    ExecutionOrderLeg,
+    ManagementMessageEnvelope,
+    ManagementMessageTarget,
+    MessageInstructionItem,
+    PositionAttributionAudit,
+    RawMessage,
     RuntimeAgentRecoveryAttempt,
     RuntimeIncident,
+    SignalCandidate,
+    StrategyLifecycle,
 )
 from telegram_kol_research.runtime_agent_tools import RuntimeAgentToolRegistry
 from telegram_kol_research.runtime_agent_contracts import (
@@ -18,6 +27,9 @@ from telegram_kol_research.runtime_agent_worker import (
     run_runtime_agent_once,
 )
 from telegram_kol_research.runtime_incidents import record_runtime_incident
+from telegram_kol_research.runtime_incident_snapshot import (
+    resolve_management_target_incident_snapshot,
+)
 
 
 NOW = datetime(2026, 7, 28, 9, 0, tzinfo=UTC)
@@ -83,6 +95,180 @@ def _registry(call_count):
             )
         }
     )
+
+
+def _record_management_target_incident(session_factory):
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=100,
+            message_id=9001,
+            text="raw secret provider output must never enter snapshot",
+        )
+        lifecycle = StrategyLifecycle(
+            chat_id=100,
+            message_id=8001,
+            symbol="BTC",
+            side="short",
+            signal_at=NOW,
+            lifecycle_status="entered",
+        )
+        session.add_all([raw, lifecycle])
+        session.flush()
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:100:8001:BTC:short",
+            kol_id="group:100",
+            chat_id=100,
+            message_id=8001,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            status="active",
+            last_exchange_status="open",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle.execution_binding_id = binding.id
+        candidate = SignalCandidate(
+            raw_message_id=raw.id,
+            symbol="BTC",
+            side="short",
+            event_type="position_update",
+            target_lifecycle_id=lifecycle.id,
+            management_action="partial_take_profit",
+            confidence=1.0,
+        )
+        session.add(candidate)
+        session.flush()
+        item = MessageInstructionItem(
+            raw_message_id=raw.id,
+            signal_candidate_id=candidate.id,
+            sequence=0,
+            instruction_kind="position_update",
+            strategy_instance_id=binding.strategy_instance_id,
+            idempotency_key="i" * 64,
+            status="failed",
+            execution_deadline_at=NOW + timedelta(minutes=1),
+        )
+        envelope = ManagementMessageEnvelope(
+            raw_message_id=raw.id,
+            decision_fingerprint="d" * 64,
+            normalized_action="partial_take_profit",
+            shared_parameters_json="{}",
+            projection_mode="shadow",
+        )
+        session.add_all([item, envelope])
+        session.flush()
+        target = ManagementMessageTarget(
+            envelope_id=envelope.id,
+            raw_message_id=raw.id,
+            target_lifecycle_id=lifecycle.id,
+            target_ordinal=0,
+            symbol="BTC",
+            side="short",
+            normalized_action="partial_take_profit",
+            parameters_json="{}",
+            parameter_fingerprint="p" * 64,
+            collision_group_fingerprint="c" * 64,
+            admission_state="admitted",
+            execution_state="failed",
+            closed_reason_code="worker_failed",
+            signal_candidate_id=candidate.id,
+            message_instruction_item_id=item.id,
+        )
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            leg_index=0,
+            purpose="entry",
+            order_kind="market",
+            venue="deepcoin",
+            attribution_status="verified",
+            status="active",
+        )
+        session.add_all([target, leg])
+        session.flush()
+        audit = PositionAttributionAudit(
+            execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id,
+            venue="deepcoin",
+            pos_id="pos-sensitive-id",
+            event_type="ownership_verified",
+            new_state="verified",
+            fingerprint="a" * 64,
+            evidence_json='{"provider_output":"must-not-leak"}',
+        )
+        session.add(audit)
+        session.commit()
+        target_id = target.id
+
+    incident = record_runtime_incident(
+        session_factory,
+        source_kind="management_message_target",
+        source_record_id=str(target_id),
+        incident_type="management_target_orchestration_failed",
+        severity="high",
+        fingerprint="t" * 64,
+        redacted_summary='{"reason_code":"worker_failed"}',
+        occurred_at=NOW + timedelta(minutes=2),
+        feature_policy_version="runtime-incident-phase-8r-v1",
+        prompt_version="runtime-agent-prompt-v7",
+        tool_policy_version="runtime-agent-tools-v2",
+    )
+    return incident
+
+
+def test_management_target_snapshot_contains_only_stable_bounded_evidence(tmp_path):
+    session_factory = create_session_factory(tmp_path / "target-snapshot.db")
+    incident = _record_management_target_incident(session_factory)
+
+    snapshot = resolve_management_target_incident_snapshot(
+        session_factory, incident_id=incident.id
+    )
+
+    assert snapshot["data"]["incident_id"] == incident.id
+    assert snapshot["data"]["target"]["execution_state"] == "failed"
+    assert snapshot["data"]["lifecycle"]["status"] == "entered"
+    assert snapshot["data"]["binding"]["status"] == "active"
+    assert snapshot["data"]["instruction_item"]["status"] == "failed"
+    assert snapshot["data"]["exchange_legs"][0]["status"] == "active"
+    assert snapshot["data"]["attribution_audits"][0]["new_state"] == "verified"
+    assert set(snapshot["evidence_refs"]) >= {
+        f"incident:{incident.id}",
+        f"management-target:{snapshot['data']['target']['id']}",
+        f"lifecycle:{snapshot['data']['lifecycle']['id']}",
+        f"binding:{snapshot['data']['binding']['id']}",
+        f"instruction-item:{snapshot['data']['instruction_item']['id']}",
+    }
+    rendered = str(snapshot).lower()
+    assert "raw secret" not in rendered
+    assert "provider_output" not in rendered
+    assert "must-not-leak" not in rendered
+    assert "pos-sensitive-id" not in rendered
+
+
+def test_management_target_provider_failure_keeps_notification_pending(tmp_path):
+    session_factory = create_session_factory(tmp_path / "target-provider.db")
+    incident = _record_management_target_incident(session_factory)
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(
+            enabled=True,
+            incident_types=frozenset({incident.incident_type}),
+            max_agent_attempts=2,
+        ),
+        tools=_registry([]),
+        model_turn=lambda **kwargs: (_ for _ in ()).throw(
+            RuntimeError("provider unavailable")
+        ),
+        now=NOW + timedelta(minutes=3),
+    )
+
+    assert result.status == "retry_pending"
+    with session_factory() as session:
+        stored = session.get(RuntimeIncident, incident.id)
+        assert stored.notification_status == "pending"
+        assert stored.recovery_status == "not_requested"
 
 
 def test_worker_is_dormant_by_default_and_does_not_claim_or_call_model(tmp_path):

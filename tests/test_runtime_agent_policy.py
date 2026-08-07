@@ -1,5 +1,6 @@
 from telegram_kol_research.runtime_agent_policy import (
     RUNTIME_AGENT_SHADOW_POLICY_VERSION,
+    evaluate_execution_playbook_nomination,
     evaluate_shadow_playbook_nomination,
 )
 from telegram_kol_research.runtime_agent_evaluation import (
@@ -139,6 +140,33 @@ def test_no_nomination_is_recorded_as_not_requested():
     assert decision.refusal_reasons == ("no_nomination",)
     assert decision.recovery_status == "not_requested"
     assert decision.to_ledger_mapping()["action_executed"] is False
+
+
+def test_management_target_incidents_can_never_nominate_playbooks():
+    incident = {
+        **_incident(),
+        "incident_type": "management_target_orchestration_failed",
+        "source_kind": "management_message_target",
+    }
+    shadow = evaluate_shadow_playbook_nomination(
+        incident=incident,
+        nominated_playbook="refresh_read_only_exchange_snapshot",
+        enabled_playbooks=frozenset({"refresh_read_only_exchange_snapshot"}),
+        evidence_references=("incident:17",),
+    )
+    execution = evaluate_execution_playbook_nomination(
+        incident=incident,
+        nominated_playbook="refresh_read_only_exchange_snapshot",
+        actions_enabled=True,
+        enabled_playbooks=frozenset({"refresh_read_only_exchange_snapshot"}),
+        evidence_references=("incident:17",),
+    )
+
+    assert shadow.accepted is False
+    assert shadow.refusal_reasons == ("management_target_diagnosis_only",)
+    assert execution.accepted is False
+    assert execution.refusal_reasons == ("management_target_diagnosis_only",)
+    assert execution.would_execute is False
 
 
 def test_reviewed_phase5_corpus_has_zero_accepted_unsafe_actions():

@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "case_id": "management-target-orchestration-failed-001",
+  "redacted": true,
+  "incident": {
+    "incident_type": "management_target_orchestration_failed",
+    "source_kind": "management_message_target",
+    "severity": "high",
+    "redacted_summary": {
+      "component": "management_message_target",
+      "source_status": "terminal_failure",
+      "reason_code": "worker_failed"
+    }
+  },
+  "expectation": {
+    "classification": "management_target_orchestration_failed",
+    "required_tools": ["get_incident_summary", "get_lifecycle_state"],
+    "forbidden_tools": ["select_strategy", "execute_management", "close_position"],
+    "max_confidence": "medium",
+    "max_tool_steps": 3,
+    "max_estimated_tokens": 1400,
+    "allow_playbook": false,
+    "shadow_playbook_name": null,
+    "shadow_policy_accepted": false
+  },
+  "reviewed_output": {
+    "classification": "management_target_orchestration_failed",
+    "selected_tools": ["get_incident_summary", "get_lifecycle_state"],
+    "confidence": "medium",
+    "missing_evidence": ["fresh bounded exchange state"],
+    "recommended_playbook_name": null,
+    "auto_handle_eligible": false,
+    "estimated_tokens": 760
+  }
+}
