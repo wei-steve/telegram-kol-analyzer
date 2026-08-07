@@ -443,7 +443,10 @@ def test_reanalysis_reuses_saved_mimo_evidence_without_model_call(
 
     save_trading_settings(
         session_factory,
-        {"entry_preamble_mode": "shadow"},
+        {
+            "entry_preamble_mode": "shadow",
+            "entry_message_assembly_v2_mode": "shadow",
+        },
     )
     with session_factory() as session:
         raw = RawMessage(chat_id=101, message_id=1462, text="更新上面的计划")
@@ -476,6 +479,16 @@ def test_reanalysis_reuses_saved_mimo_evidence_without_model_call(
                 "confidence": 0.95,
                 "reason": "半仓操作",
             },
+            "entry_fragments": [
+                {
+                    "kind": "risk_multiplier",
+                    "symbol": "BTC",
+                    "side": "short",
+                    "risk_multiplier": "0.5",
+                    "confidence": 0.95,
+                    "reason": "半仓操作",
+                }
+            ],
         },
     )
     monkeypatch.setattr(
@@ -503,6 +516,11 @@ def test_reanalysis_reuses_saved_mimo_evidence_without_model_call(
         preamble = session.query(EntryPreamble).one()
         assert preamble.message_id == 1462
         assert preamble.risk_multiplier == "0.5"
+        from telegram_kol_research.models import EntryStrategyFragment
+
+        fragment = session.query(EntryStrategyFragment).one()
+        assert fragment.message_id == 1462
+        assert fragment.fragment_kind == "risk_multiplier"
 
 
 def test_context_resolution_triggers_are_closed_and_auditable():

@@ -24,6 +24,9 @@ from telegram_kol_research.contextual_message_window import (
 from telegram_kol_research.entry_preambles import (
     persist_authoritative_entry_preamble,
 )
+from telegram_kol_research.entry_strategy_fragments import (
+    persist_authoritative_entry_fragments,
+)
 from telegram_kol_research.message_recognition import (
     MessageRecognitionResult,
     apply_authoritative_mimo_payload,
@@ -359,6 +362,12 @@ def _load_current_mimo_evidence_result(
     rejection_reason = normalized.get("entry_context_rejection_reason")
     if rejection_reason:
         payload["entry_context_rejection_reason"] = str(rejection_reason)
+    entry_fragments = normalized.get("entry_fragments")
+    if isinstance(entry_fragments, list):
+        payload["entry_fragments"] = entry_fragments
+    rejected_count = normalized.get("entry_fragments_rejected_count")
+    if isinstance(rejected_count, int) and rejected_count > 0:
+        payload["entry_fragments_rejected_count"] = rejected_count
     status = str(payload.get("recognition_result") or "")
     if status not in {"是策略", "非策略"}:
         lifecycle = payload["lifecycle_event"]
@@ -749,6 +758,15 @@ def assess_message_authoritatively(
                 recognition_generation=str(saved.comparison_claim_token),
                 payload=mimo.payload,
                 mode=settings.entry_preamble_mode,
+                now=utc_now(),
+            )
+            persist_authoritative_entry_fragments(
+                session_factory,
+                raw_message_id=int(raw_message_id),
+                evidence_version_id=int(evidence_row.id),
+                recognition_generation=str(saved.comparison_claim_token),
+                payload=mimo.payload,
+                mode=settings.entry_message_assembly_v2_mode,
                 now=utc_now(),
             )
     return AuthoritativeAssessment(
