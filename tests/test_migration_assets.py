@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from telegram_kol_research.models import PositionProtectionHealthObservation
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -47,3 +49,13 @@ def test_mac_bootstrap_checks_prerequisites_without_installing_or_network_calls(
     assert "curl " not in script
     assert "brew install" not in script
     assert 'run "uv" "sync"' not in script
+
+
+def test_protection_health_observation_model_keeps_bounded_evidence_fields():
+    table = PositionProtectionHealthObservation.__table__
+
+    assert table.c.evidence_fingerprint.type.length == 64
+    assert table.c.exchange_snapshot_fingerprint.type.length == 64
+    assert str(table.c.source_incident_ids_json.type) == "TEXT"
+    assert str(table.c.summary_json.type) == "TEXT"
+    assert table.c.observed_at.nullable is False

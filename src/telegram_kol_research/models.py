@@ -1935,6 +1935,66 @@ class PositionProtectionIncident(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class PositionProtectionHealthObservation(Base):
+    """Append-only classification of one exact position's current protection."""
+
+    __tablename__ = "position_protection_health_observations"
+    __table_args__ = (
+        Index(
+            "ix_position_protection_health_scope_observed",
+            "venue",
+            "execution_binding_id",
+            "execution_order_leg_id",
+            "pos_id",
+            "observed_at",
+        ),
+        Index(
+            "ix_position_protection_health_evidence",
+            "evidence_fingerprint",
+        ),
+        CheckConstraint(
+            "classification IN ('healthy_current_evidence', "
+            "'recovery_required', 'evidence_insufficient')",
+            name="ck_position_protection_health_classification",
+        ),
+        CheckConstraint(
+            "length(source_incident_ids_json) <= 2048",
+            name="ck_position_protection_health_incidents_bounded",
+        ),
+        CheckConstraint(
+            "length(summary_json) <= 4096",
+            name="ck_position_protection_health_summary_bounded",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    venue: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="deepcoin", server_default="deepcoin"
+    )
+    execution_binding_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=False, index=True
+    )
+    execution_order_leg_id: Mapped[int] = mapped_column(
+        ForeignKey("execution_order_legs.id"), nullable=False, index=True
+    )
+    pos_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    classification: Mapped[str] = mapped_column(String(32), nullable=False)
+    evidence_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    exchange_snapshot_fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False
+    )
+    source_incident_ids_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default="[]"
+    )
+    summary_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}", server_default="{}"
+    )
+    observed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+
+
 class PositionMutationIntent(Base):
     """Durable idempotency and outcome record for one exact position write."""
 

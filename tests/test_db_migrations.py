@@ -17,10 +17,68 @@ def test_context_resolution_schema_is_created(tmp_path):
     assert inspector.has_table("runtime_incidents")
     assert inspector.has_table("runtime_incident_observations")
     assert inspector.has_table("runtime_agent_recovery_attempts")
+    assert inspector.has_table("position_protection_health_observations")
     assert "strategy_thread_id" in {
         column["name"]
         for column in inspector.get_columns("strategy_lifecycles")
     }
+
+
+def test_position_protection_health_observation_schema_is_append_only_shape(tmp_path):
+    session_factory = create_session_factory(tmp_path / "protection-health.db")
+    inspector = inspect(session_factory.kw["bind"])
+
+    columns = {
+        column["name"]
+        for column in inspector.get_columns(
+            "position_protection_health_observations"
+        )
+    }
+    assert {
+        "venue",
+        "execution_binding_id",
+        "execution_order_leg_id",
+        "pos_id",
+        "classification",
+        "evidence_fingerprint",
+        "exchange_snapshot_fingerprint",
+        "source_incident_ids_json",
+        "summary_json",
+        "observed_at",
+    } <= columns
+    indexes = {
+        index["name"]
+        for index in inspector.get_indexes(
+            "position_protection_health_observations"
+        )
+    }
+    assert {
+        "ix_position_protection_health_scope_observed",
+        "ix_position_protection_health_evidence",
+    } <= indexes
+
+
+def test_position_protection_health_table_is_added_without_rewriting_legacy_rows(
+    tmp_path,
+):
+    database_path = tmp_path / "legacy-protection-health.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE sources "
+            "(id INTEGER PRIMARY KEY, display_name VARCHAR(255) NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO sources (id, display_name) VALUES (91, 'Legacy Source')"
+        )
+
+    session_factory = create_session_factory(database_path)
+    inspector = inspect(session_factory.kw["bind"])
+
+    assert inspector.has_table("position_protection_health_observations")
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT id, display_name FROM sources WHERE id = 91"
+        ).fetchone() == (91, "Legacy Source")
 
 
 def test_old_lifecycle_table_has_compatible_thread_column_migration():
