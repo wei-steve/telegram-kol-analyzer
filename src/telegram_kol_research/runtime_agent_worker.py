@@ -534,11 +534,12 @@ def run_runtime_agent_once(
 
     started = monotonic()
     attempted_queries: list[str] = []
-    agent_incident, gathered_references = _agent_incident_context(
-        session_factory, claimed
-    )
+    gathered_references = {f"incident:{claimed.id}"}
     refused = 0
     try:
+        agent_incident, gathered_references = _agent_incident_context(
+            session_factory, claimed
+        )
         reusable = find_reusable_runtime_incident_diagnosis(
             session_factory,
             fingerprint=claimed.fingerprint,

@@ -271,6 +271,42 @@ def test_management_target_provider_failure_keeps_notification_pending(tmp_path)
         assert stored.recovery_status == "not_requested"
 
 
+def test_missing_management_target_snapshot_retries_without_losing_claim(tmp_path):
+    session_factory = create_session_factory(tmp_path / "missing-target.db")
+    incident = record_runtime_incident(
+        session_factory,
+        source_kind="management_message_target",
+        source_record_id="404",
+        incident_type="management_target_drift",
+        severity="high",
+        fingerprint="m" * 64,
+        redacted_summary='{"reason_code":"target_missing"}',
+        occurred_at=NOW + timedelta(minutes=2),
+        feature_policy_version="runtime-incident-phase-8r-v1",
+        prompt_version="runtime-agent-prompt-v7",
+        tool_policy_version="runtime-agent-tools-v2",
+    )
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(
+            enabled=True,
+            incident_types=frozenset({incident.incident_type}),
+            max_agent_attempts=2,
+        ),
+        tools=_registry([]),
+        model_turn=lambda **kwargs: _final(incident.id),
+        now=NOW + timedelta(minutes=3),
+    )
+
+    assert result.status == "retry_pending"
+    with session_factory() as session:
+        stored = session.get(RuntimeIncident, incident.id)
+        assert stored.status == "retry_pending"
+        assert stored.claim_token is None
+        assert stored.notification_status == "pending"
+
+
 def test_worker_is_dormant_by_default_and_does_not_claim_or_call_model(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     incident = _record(session_factory)
