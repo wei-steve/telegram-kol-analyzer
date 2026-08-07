@@ -186,3 +186,16 @@ def test_runtime_notification_watermark_runbook_requires_safe_activation_and_rol
 
     assert "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_AFTER_ID" in runbook
     assert "restore the narrow selector before removing the watermark" in runbook
+
+
+@pytest.mark.architecture
+def test_context_target_contract_runbook_preserves_future_only_safe_boundary():
+    runbook = (
+        Path(__file__).parents[1]
+        / "docs"
+        / "runtime-incident-agent-runbook.md"
+    ).read_text(encoding="utf-8")
+
+    assert "context-resolution-v2" in runbook
+    assert "never replay raw message 9758" in runbook
+    assert "do not normalize invalid target lists" in runbook

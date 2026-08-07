@@ -148,6 +148,27 @@ otherwise removing the cutoff while the selector is still widened makes the
 historical backlog immediately eligible. Never bulk-mark historical rows as
 delivered or not-needed to manufacture a clean activation state.
 
+### Context resolution target-contract repair
+
+`context-resolution-v2` makes the provider prompt match the existing strict
+parser: `new_thread`, `hold`, and `unresolved` must use an empty target list,
+while revise, manage, cancel, and exit decisions must use only supplied
+candidate thread IDs. Mentioning an existing strategy does not by itself make
+commentary executable.
+
+The resolver remains limited to two provider calls. After a first
+`target_not_allowed` response, only the second call receives a deterministic
+target-cardinality correction. The parser remains authoritative: do not normalize invalid target lists,
+do not clear IDs on the model's behalf, and continue to fail closed if the
+second response is invalid. The durable rejected-response diagnostic contains
+only the closed decision, closed error code, and target count; it never stores
+target IDs or the raw provider response.
+
+Deployment and verification apply only to future natural messages. Historical
+evidence remains immutable: never replay raw message 9758, never reclassify it,
+and never allow this repair to create a management batch, mutation intent,
+execution event, notification, or exchange write for it.
+
 ### Phase 3 read-only Agent sidecar
 
 Phase 3 adds a separately supervised worker and keeps it dormant by default:
