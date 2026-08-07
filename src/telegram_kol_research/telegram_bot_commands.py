@@ -29,6 +29,7 @@ MAX_TELEGRAM_MESSAGE_CHARS = 3900
 EXPIRY_CONTINUE_COMMAND = "expiry_continue"
 EXPIRY_EXPIRE_CANCEL_COMMAND = "expiry_expire_cancel"
 EXPIRY_EXPIRE_KEEP_COMMAND = "expiry_expire_keep"
+EXPIRY_REFRESH_COMMAND = "expiry_refresh"
 EXPIRY_REVIEW_CONTINUE_HOURS = 3
 logger = logging.getLogger(__name__)
 
@@ -136,7 +137,8 @@ async def run_system_operator_bot_command_loop(
                         )
                         deepcoin_client = (
                             deepcoin_client_factory()
-                            if deepcoin_client_factory and callback_data.startswith("expiry_expire_cancel:")
+                            if deepcoin_client_factory
+                            and _expiry_callback_needs_deepcoin_client(callback_data)
                             else None
                         )
                         response_text = process_system_operator_callback_data(
@@ -203,6 +205,14 @@ def process_system_operator_callback_data(
         now=now,
         deepcoin_client=deepcoin_client,
     )
+
+
+def _expiry_callback_needs_deepcoin_client(callback_data: str) -> bool:
+    action, separator, _ = callback_data.partition(":")
+    return separator == ":" and action in {
+        EXPIRY_EXPIRE_CANCEL_COMMAND,
+        EXPIRY_REFRESH_COMMAND,
+    }
 
 
 def process_system_operator_command(

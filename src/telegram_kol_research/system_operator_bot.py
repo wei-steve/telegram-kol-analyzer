@@ -1774,8 +1774,8 @@ def build_pending_entry_expiry_review_reply_markup(payload: dict[str, Any]) -> d
                     "callback_data": f"expiry_expire_cancel:{lifecycle_id}",
                 },
                 {
-                    "text": "\u8fc7\u671f\u4f46\u4fdd\u7559\u6302\u5355",
-                    "callback_data": f"expiry_expire_keep:{lifecycle_id}",
+                    "text": "\u66f4\u65b0\u72b6\u6001",
+                    "callback_data": f"expiry_refresh:{lifecycle_id}",
                 },
             ],
         ]

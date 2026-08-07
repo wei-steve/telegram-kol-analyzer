@@ -2119,12 +2119,28 @@ def test_build_pending_entry_expiry_review_reply_markup_uses_lifecycle_id_callba
                     "callback_data": "expiry_expire_cancel:354",
                 },
                 {
-                    "text": "\u8fc7\u671f\u4f46\u4fdd\u7559\u6302\u5355",
-                    "callback_data": "expiry_expire_keep:354",
+                    "text": "\u66f4\u65b0\u72b6\u6001",
+                    "callback_data": "expiry_refresh:354",
                 },
             ],
         ]
     }
+
+
+@pytest.mark.parametrize(
+    ("callback_data", "expected"),
+    [
+        ("expiry_refresh:354", True),
+        ("expiry_expire_cancel:354", True),
+        ("expiry_continue:354", False),
+        ("expiry_expire_keep:354", False),
+    ],
+)
+def test_expiry_callback_deepcoin_client_requirement(callback_data, expected):
+    assert (
+        bot_commands_module._expiry_callback_needs_deepcoin_client(callback_data)
+        is expected
+    )
 
 
 def test_process_expiry_continue_keeps_pending_and_suppresses_repeat_review(tmp_path):
