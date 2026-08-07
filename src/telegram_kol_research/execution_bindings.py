@@ -69,6 +69,10 @@ _MANAGEMENT_POSITION_RESERVATION_STATUSES = frozenset(
 )
 
 
+class DeepcoinReconciliationSnapshotUnavailable(RuntimeError):
+    """A read-only refresh could not obtain a complete exchange snapshot."""
+
+
 @dataclass(slots=True)
 class ExecutionBindingRecord:
     kol_id: str
@@ -369,6 +373,32 @@ def reconcile_deepcoin_execution_bindings(
         reconcile_strategy_management_batches(
             session_factory, snapshot=snapshot, reconciled_at=now
         )
+        return result
+
+
+def reconcile_deepcoin_execution_bindings_read_only(
+    session_factory: sessionmaker,
+    *,
+    client: DeepcoinReadOnlyClient,
+    recovered_at: datetime | None = None,
+) -> ExecutionReconciliationResult:
+    """Refresh local binding state without invoking exchange mutation workers."""
+
+    now = recovered_at or datetime.now(UTC)
+    with position_authority_lock():
+        snapshot = load_deepcoin_execution_reconciliation_snapshot(
+            session_factory,
+            client=client,
+        )
+        result = _apply_reconcile_snapshot(
+            session_factory,
+            snapshot=snapshot,
+            recovered_at=now,
+        )
+        if snapshot.errors:
+            raise DeepcoinReconciliationSnapshotUnavailable(
+                "Deepcoin reconciliation snapshot is incomplete"
+            )
         return result
 
 

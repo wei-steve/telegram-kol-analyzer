@@ -4,7 +4,7 @@
 
 **Goal:** Replace “过期但保留挂单” with a safe live “更新状态” action that refreshes per-leg Deepcoin state, edits the original Telegram message, and removes the buttons when no unresolved entry leg remains.
 
-**Architecture:** Reuse `reconcile_deepcoin_execution_bindings` as the only authority for exchange state and attribution. A Telegram-facing result reads the selected lifecycle, binding, and entry legs after reconciliation, formats one replaceable status section, and decides whether the keyboard remains by combining lifecycle eligibility with the existing unresolved-entry-leg predicate. Keep the legacy `expiry_expire_keep` handler for already-sent messages.
+**Architecture:** Reuse the existing Deepcoin snapshot reader and local `_apply_reconcile_snapshot` authority through a dedicated exchange-read-only reconciliation entry point that skips protection rescue and every other exchange mutation worker. A Telegram-facing result reads the selected lifecycle, binding, and entry legs after reconciliation, formats one replaceable status section, and decides whether the keyboard remains by combining lifecycle eligibility with the existing unresolved-entry-leg predicate. Keep the legacy `expiry_expire_keep` handler for already-sent messages.
 
 **Tech Stack:** Python 3.12, SQLAlchemy, httpx, pytest, Telegram Bot API, existing Deepcoin reconciliation modules.
 
@@ -125,7 +125,7 @@ class ExpiryReviewRefreshResult:
 Implement `refresh_expiry_review_status(...)` to:
 
 1. Resolve the lifecycle identifier with `_parse_operator_lifecycle_identifier`.
-2. Require a Deepcoin client and call `reconcile_deepcoin_execution_bindings(session_factory, client=..., recovered_at=event_at)`.
+2. Require a Deepcoin client and call `reconcile_deepcoin_execution_bindings_read_only(session_factory, client=..., recovered_at=event_at)`; this reads exchange state and updates local reconciliation records but never invokes exchange mutation workers.
 3. Reload the lifecycle after reconciliation.
 4. Resolve its exact binding by `execution_binding_id`, then by the existing stable source keys only if needed.
 5. Load `purpose == "entry"` legs ordered by `leg_index`.

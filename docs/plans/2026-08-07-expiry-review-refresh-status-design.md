@@ -31,10 +31,11 @@ Telegram callback，再编辑原消息；消息正文保留原有策略上下文
 ## 权威数据与对账
 
 点击按钮时通过系统操作机器人现有的 `deepcoin_client_factory` 创建客户端，
-复用 `reconcile_deepcoin_execution_bindings` 的完整权威对账流程。该流程综合当前
-仓位、普通挂单、触发挂单、订单历史和成交记录，并按现有执行腿归属规则更新
-`ExecutionBinding`、`ExecutionOrderLeg` 和相应生命周期。按钮自身不新增第二套
-订单匹配或状态推导规则。
+复用现有 Deepcoin 快照读取和执行绑定对账核心，新增明确的只读交易所入口。
+该入口综合当前仓位、普通挂单、触发挂单、订单历史和成交记录，并按现有执行腿
+归属规则更新本地 `ExecutionBinding`、`ExecutionOrderLeg` 和相应生命周期；它
+不得调用保护单救援、补单或其他可能写入交易所的后台工作器。按钮自身不新增
+第二套订单匹配或状态推导规则。
 
 对账完成后，只查询回调中 lifecycle 对应的执行绑定与 entry legs，并生成该
 策略的展示摘要。虽然权威对账会保持整个账户的本地状态一致，Telegram 消息

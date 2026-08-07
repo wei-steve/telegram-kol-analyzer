@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import pytest
 from sqlalchemy.exc import IntegrityError
 
+import telegram_kol_research.execution_bindings as execution_bindings_module
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.execution_bindings import (
     ExecutionBindingRecord,
@@ -72,6 +73,37 @@ def _binding(**overrides):
     }
     values.update(overrides)
     return ExecutionBindingRecord(**values)
+
+
+def test_read_only_reconcile_surfaces_incomplete_snapshot_after_local_apply(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    snapshot = execution_bindings_module._ReconcileSnapshot(
+        errors={"positions": "Authorization: secret-value"}
+    )
+    applied = []
+    monkeypatch.setattr(
+        execution_bindings_module,
+        "load_deepcoin_execution_reconciliation_snapshot",
+        lambda *args, **kwargs: snapshot,
+    )
+    monkeypatch.setattr(
+        execution_bindings_module,
+        "_apply_reconcile_snapshot",
+        lambda *args, **kwargs: applied.append(kwargs["snapshot"]),
+    )
+
+    with pytest.raises(
+        execution_bindings_module.DeepcoinReconciliationSnapshotUnavailable
+    ):
+        execution_bindings_module.reconcile_deepcoin_execution_bindings_read_only(
+            session_factory,
+            client=object(),
+            recovered_at=datetime(2026, 8, 7, 6, 30),
+        )
+
+    assert applied == [snapshot]
 
 
 def _add_entry_leg(

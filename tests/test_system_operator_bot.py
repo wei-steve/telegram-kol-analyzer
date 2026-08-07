@@ -2210,7 +2210,7 @@ def test_refresh_expiry_review_status_reports_active_and_pending_legs(
 
     monkeypatch.setattr(
         bot_commands_module,
-        "reconcile_deepcoin_execution_bindings",
+        "reconcile_deepcoin_execution_bindings_read_only",
         fake_reconcile,
         raising=False,
     )
@@ -2289,7 +2289,9 @@ def test_refresh_expiry_review_status_all_entered_removes_actions(tmp_path, monk
         ],
     )
     monkeypatch.setattr(
-        bot_commands_module, "reconcile_deepcoin_execution_bindings", lambda *a, **k: None
+        bot_commands_module,
+        "reconcile_deepcoin_execution_bindings_read_only",
+        lambda *a, **k: None,
     )
 
     result = bot_commands_module.refresh_expiry_review_status(
@@ -2316,7 +2318,9 @@ def test_refresh_expiry_review_status_entered_and_cancelled_removes_actions(
         ],
     )
     monkeypatch.setattr(
-        bot_commands_module, "reconcile_deepcoin_execution_bindings", lambda *a, **k: None
+        bot_commands_module,
+        "reconcile_deepcoin_execution_bindings_read_only",
+        lambda *a, **k: None,
     )
 
     result = bot_commands_module.refresh_expiry_review_status(
@@ -2340,7 +2344,9 @@ def test_refresh_expiry_review_status_group_cancelled_lifecycle_removes_actions(
         leg_specs=[{"status": "pending"}],
     )
     monkeypatch.setattr(
-        bot_commands_module, "reconcile_deepcoin_execution_bindings", lambda *a, **k: None
+        bot_commands_module,
+        "reconcile_deepcoin_execution_bindings_read_only",
+        lambda *a, **k: None,
     )
 
     result = bot_commands_module.refresh_expiry_review_status(
@@ -2372,7 +2378,9 @@ def test_refresh_expiry_review_status_missing_binding_keeps_actions_conservative
         session.commit()
         lifecycle_id = lifecycle.id
     monkeypatch.setattr(
-        bot_commands_module, "reconcile_deepcoin_execution_bindings", lambda *a, **k: None
+        bot_commands_module,
+        "reconcile_deepcoin_execution_bindings_read_only",
+        lambda *a, **k: None,
     )
 
     result = bot_commands_module.refresh_expiry_review_status(
@@ -2384,6 +2392,104 @@ def test_refresh_expiry_review_status_missing_binding_keeps_actions_conservative
 
     assert result.keep_actions is True
     assert "入场进度：状态待确认" in result.status_text
+
+
+def test_replace_expiry_refresh_status_keeps_only_latest_section():
+    original = (
+        "【待入场策略超时复核】\n内部ID: 789\n\n"
+        "【最新策略状态】\n策略状态：待入场\n更新时间：旧"
+    )
+
+    refreshed = bot_commands_module._replace_expiry_refresh_status(
+        original,
+        "策略状态：已入场\n更新时间：新",
+    )
+
+    assert refreshed.count("【最新策略状态】") == 1
+    assert "更新时间：旧" not in refreshed
+    assert "更新时间：新" in refreshed
+
+
+@pytest.mark.parametrize("keep_actions", [True, False])
+def test_refresh_callback_response_preserves_or_removes_actions(keep_actions):
+    class FakeResponse:
+        def __init__(self):
+            self.request = httpx.Request("POST", "https://example.test")
+
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        def __init__(self):
+            self.posts = []
+
+        async def post(self, url, json):
+            self.posts.append((url, json))
+            return FakeResponse()
+
+    client = FakeClient()
+    result = bot_commands_module.ExpiryReviewRefreshResult(
+        answer_text="策略 #789 状态已更新。",
+        status_text="策略状态：已入场",
+        keep_actions=keep_actions,
+    )
+
+    asyncio.run(
+        bot_commands_module._finish_expiry_refresh_callback_response(
+            client,
+            "https://api.telegram.org/bot-token",
+            callback_query_id="callback-1",
+            chat_id="123",
+            message_id=456,
+            lifecycle_id=789,
+            result=result,
+            original_message_text="【待入场策略超时复核】\n内部ID: 789",
+        )
+    )
+
+    edit_payload = client.posts[-1][1]
+    assert edit_payload["text"].count("【最新策略状态】") == 1
+    if keep_actions:
+        assert edit_payload["reply_markup"] == (
+            build_pending_entry_expiry_review_reply_markup({"lifecycle_id": 789})
+        )
+    else:
+        assert edit_payload["reply_markup"] == {"inline_keyboard": []}
+
+
+def test_refresh_expiry_review_status_failure_keeps_actions(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=100,
+            message_id=4002,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 8, 7, 0, 0, tzinfo=UTC),
+            management_action="expiry_review_requested",
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    def fail_reconcile(*args, **kwargs):
+        raise RuntimeError("Authorization: secret-value")
+
+    monkeypatch.setattr(
+        bot_commands_module, "reconcile_deepcoin_execution_bindings_read_only", fail_reconcile
+    )
+
+    result = bot_commands_module.refresh_expiry_review_status(
+        session_factory,
+        str(lifecycle_id),
+        deepcoin_client=object(),
+        now=datetime(2026, 8, 7, 6, 30, tzinfo=UTC),
+    )
+
+    assert result.keep_actions is True
+    assert "更新失败，未改变策略或挂单状态" in result.status_text
+    assert "secret-value" not in result.status_text
 
 
 def test_process_expiry_continue_keeps_pending_and_suppresses_repeat_review(tmp_path):

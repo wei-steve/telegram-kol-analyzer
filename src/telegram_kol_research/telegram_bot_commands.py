@@ -15,7 +15,10 @@ from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.strategy_alerts import StrategyAlertConfig
-from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
+from telegram_kol_research.system_operator_bot import (
+    SystemOperatorBotConfig,
+    build_pending_entry_expiry_review_reply_markup,
+)
 from telegram_kol_research.web_queries import list_holding_strategies, list_pending_strategies
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -25,7 +28,7 @@ from telegram_kol_research.models import (
 )
 from telegram_kol_research.execution_bindings import (
     binding_has_unresolved_entry_leg,
-    reconcile_deepcoin_execution_bindings,
+    reconcile_deepcoin_execution_bindings_read_only,
 )
 from telegram_kol_research.deepcoin_execution_actions import (
     cancel_pending_entry_legs,
@@ -184,12 +187,26 @@ async def run_system_operator_bot_command_loop(
                             and _expiry_callback_needs_deepcoin_client(callback_data)
                             else None
                         )
-                        response_text = process_system_operator_callback_data(
+                        callback_response = process_system_operator_callback_data(
                             session_factory,
                             callback_data,
                             deepcoin_client=deepcoin_client,
                         )
-                        if response_text:
+                        if isinstance(
+                            callback_response, ExpiryReviewRefreshResult
+                        ):
+                            _, _, identifier = callback_data.partition(":")
+                            await _finish_expiry_refresh_callback_response(
+                                client,
+                                base_url,
+                                callback_query_id=str(callback.get("id") or ""),
+                                chat_id=chat_id,
+                                message_id=int(message.get("message_id") or 0),
+                                lifecycle_id=int(identifier),
+                                result=callback_response,
+                                original_message_text=str(message.get("text") or ""),
+                            )
+                        elif callback_response:
                             await _finish_system_operator_callback_response(
                                 client,
                                 base_url,
@@ -197,7 +214,7 @@ async def run_system_operator_bot_command_loop(
                                 chat_id=chat_id,
                                 message_id=int(message.get("message_id") or 0),
                                 callback_data=callback_data,
-                                response_text=response_text,
+                                response_text=callback_response,
                                 operator_name=_callback_operator_name(callback),
                                 original_message_text=str(message.get("text") or ""),
                             )
@@ -237,10 +254,17 @@ def process_system_operator_callback_data(
     *,
     now: datetime | None = None,
     deepcoin_client=None,
-) -> str | None:
+) -> str | ExpiryReviewRefreshResult | None:
     action, sep, identifier = callback_data.partition(":")
     if sep != ":":
         return None
+    if action == EXPIRY_REFRESH_COMMAND:
+        return refresh_expiry_review_status(
+            session_factory,
+            identifier,
+            now=now,
+            deepcoin_client=deepcoin_client,
+        )
     return _process_expiry_action(
         session_factory,
         action,
@@ -281,11 +305,23 @@ def refresh_expiry_review_status(
             keep_actions=True,
         )
 
-    reconcile_deepcoin_execution_bindings(
-        session_factory,
-        client=deepcoin_client,
-        recovered_at=event_at,
-    )
+    try:
+        reconcile_deepcoin_execution_bindings_read_only(
+            session_factory,
+            client=deepcoin_client,
+            recovered_at=event_at,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Expiry review status refresh failed lifecycle_id=%s error_type=%s",
+            lifecycle_id,
+            type(exc).__name__,
+        )
+        return ExpiryReviewRefreshResult(
+            answer_text=f"策略 #{lifecycle_id} 状态更新失败。",
+            status_text="更新失败，未改变策略或挂单状态。请稍后重试。",
+            keep_actions=True,
+        )
 
     with session_factory() as session:
         lifecycle = session.get(StrategyLifecycle, lifecycle_id)
@@ -447,6 +483,12 @@ def _process_expiry_action(
     now: datetime | None = None,
     deepcoin_client=None,
 ) -> str | None:
+    if command not in {
+        EXPIRY_CONTINUE_COMMAND,
+        EXPIRY_EXPIRE_CANCEL_COMMAND,
+        EXPIRY_EXPIRE_KEEP_COMMAND,
+    }:
+        return None
     lifecycle_id = _parse_operator_lifecycle_identifier(session_factory, identifier)
     if lifecycle_id is None:
         return "未找到对应策略，请使用内部ID或策略代码，例如 /expiry_continue #3251。"
@@ -970,6 +1012,48 @@ async def _finish_system_operator_callback_response(
     )
 
 
+async def _finish_expiry_refresh_callback_response(
+    client: httpx.AsyncClient,
+    base_url: str,
+    *,
+    callback_query_id: str,
+    chat_id: str,
+    message_id: int,
+    lifecycle_id: int,
+    result: ExpiryReviewRefreshResult,
+    original_message_text: str,
+) -> None:
+    try:
+        await _answer_callback_query(
+            client,
+            base_url,
+            callback_query_id=callback_query_id,
+            text=result.answer_text,
+        )
+    except httpx.HTTPStatusError:
+        logger.warning(
+            "System operator bot refresh callback answer failed; editing message anyway"
+        )
+    reply_markup = (
+        build_pending_entry_expiry_review_reply_markup(
+            {"lifecycle_id": lifecycle_id}
+        )
+        if result.keep_actions
+        else {"inline_keyboard": []}
+    )
+    await _edit_message_text(
+        client,
+        base_url,
+        chat_id=chat_id,
+        message_id=message_id,
+        text=_replace_expiry_refresh_status(
+            original_message_text,
+            result.status_text,
+        ),
+        reply_markup=reply_markup,
+    )
+
+
 async def _edit_message_text(
     client: httpx.AsyncClient,
     base_url: str,
@@ -977,19 +1061,33 @@ async def _edit_message_text(
     chat_id: str,
     message_id: int,
     text: str,
+    reply_markup: dict[str, Any] | None = None,
 ) -> None:
     if not message_id:
         return
+    payload: dict[str, Any] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     response = await client.post(
         f"{base_url}/editMessageText",
-        json={
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text": text,
-            "disable_web_page_preview": True,
-        },
+        json=payload,
     )
     response.raise_for_status()
+
+
+def _replace_expiry_refresh_status(original_text: str, status_text: str) -> str:
+    heading = "【最新策略状态】"
+    base = str(original_text or "").split(heading, 1)[0].rstrip()
+    suffix = f"{heading}\n{status_text.strip()}"
+    max_base_chars = MAX_TELEGRAM_MESSAGE_CHARS - len(suffix) - 2
+    if len(base) > max_base_chars:
+        base = base[: max(0, max_base_chars - 4)].rstrip() + "\n..."
+    return f"{base}\n\n{suffix}".strip()
 
 
 def _format_callback_resolution_text(
