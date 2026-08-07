@@ -129,6 +129,20 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         ),
     },
     "strategy_revision_batches": {
+        "revision_kind": (
+            "ALTER TABLE strategy_revision_batches ADD COLUMN revision_kind "
+            "VARCHAR(32) NOT NULL DEFAULT 'replacement'"
+        ),
+        "target_assembly_id": (
+            "ALTER TABLE strategy_revision_batches ADD COLUMN target_assembly_id INTEGER"
+        ),
+        "target_assembly_fingerprint": (
+            "ALTER TABLE strategy_revision_batches "
+            "ADD COLUMN target_assembly_fingerprint VARCHAR(64)"
+        ),
+        "target_snapshot_json": (
+            "ALTER TABLE strategy_revision_batches ADD COLUMN target_snapshot_json TEXT"
+        ),
         "advance_claim_token": (
             "ALTER TABLE strategy_revision_batches "
             "ADD COLUMN advance_claim_token VARCHAR(64)"

@@ -651,6 +651,16 @@ class StrategyRevisionBatch(Base):
     execution_binding_id: Mapped[int] = mapped_column(
         ForeignKey("execution_bindings.id"), nullable=False, index=True
     )
+    revision_kind: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="replacement", server_default="replacement"
+    )
+    target_assembly_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("entry_strategy_assemblies.id"), nullable=True, index=True
+    )
+    target_assembly_fingerprint: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    target_snapshot_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default="planned", index=True
     )
