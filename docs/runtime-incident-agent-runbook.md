@@ -148,6 +148,31 @@ otherwise removing the cutoff while the selector is still widened makes the
 historical backlog immediately eligible. Never bulk-mark historical rows as
 delivered or not-needed to manufacture a clean activation state.
 
+### Historical protection incident convergence
+
+`audit-protection-incidents` is read-only. It may classify a legacy or
+transient incident as `resolved_by_current_exchange_evidence` without creating
+a synthetic replacement revision, but only from one stable database snapshot
+and one complete current exchange snapshot.
+
+The exact current-evidence path requires the incident's live `posId`, binding,
+and execution leg; a complete pending-TPSL observation for the target
+instrument; conflict-free account-wide order ownership; one visible active
+specialized backup stop; a separate visible primary stop after excluding that
+exact backup ID from legacy `stop_loss` rows; at least one visible verified
+take profit; matching persisted instrument, side, price, and size; and no
+unowned native TPSL order that can affect the position. Deepcoin pending TPSL
+rows may omit `posId`; a globally unique order ID plus the canonical protection
+ledger supplies ownership. Symbol, side, price, size, or time similarity never
+does.
+
+Missing pagination evidence, exchange errors, wrong local scope, duplicate
+primary/backup identity, missing roles, mismatched readback, or ownership
+conflicts fail closed as `evidence_insufficient` or `current_risk`. The audit
+does not update incidents, revisions, ledgers, claims, or notifications and
+does not call a Deepcoin mutation method. Historical source rows remain
+immutable even when their returned classification converges.
+
 ### Context resolution target-contract repair
 
 `context-resolution-v2` makes the provider prompt match the existing strict

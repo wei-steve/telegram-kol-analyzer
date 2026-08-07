@@ -237,6 +237,26 @@ def _legacy_current_snapshot(*, pending_orders=None, observations=None):
     )
 
 
+def _source_rows(session_factory):
+    models = (
+        ExecutionBinding,
+        ExecutionOrderLeg,
+        PositionProtectionIncident,
+        PositionProtectionLedger,
+        PositionProtectionRevision,
+        PositionBackupStopOrder,
+        PositionTakeProfitOrder,
+    )
+    with session_factory() as session:
+        return {
+            model.__tablename__: [
+                tuple(getattr(row, column.name) for column in model.__table__.columns)
+                for row in session.query(model).order_by(model.id).all()
+            ]
+            for model in models
+        }
+
+
 def test_legacy_current_exchange_evidence_without_pending_pos_id_resolves(
     tmp_path,
 ):
@@ -415,6 +435,32 @@ def test_current_evidence_rejects_unowned_order_for_exact_position(tmp_path):
 
     assert result["counts"]["resolved_by_current_exchange_evidence"] == 0
     assert result["counts"]["current_risk"] == 1
+
+
+def test_current_evidence_audit_preserves_every_source_row(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding, leg, incident = _incident(
+            session, suffix="h", pos_id="pos-legacy-current"
+        )
+        _legacy_current_protection(
+            session,
+            binding=binding,
+            leg=leg,
+            incident=incident,
+            pos_id="pos-legacy-current",
+        )
+        session.commit()
+    before = _source_rows(session_factory)
+
+    result = audit_protection_incident_convergence(
+        session_factory,
+        snapshot=_legacy_current_snapshot(),
+        limit=100,
+    )
+
+    assert result["counts"]["resolved_by_current_exchange_evidence"] == 1
+    assert _source_rows(session_factory) == before
 
 
 def test_audit_classifies_live_before_history_and_redacts_output(tmp_path):
