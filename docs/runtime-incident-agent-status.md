@@ -7,9 +7,9 @@ used to advance or reinterpret the rollout.
 project: runtime-incident-agent
 design_version: 2
 design_authority_status: original_runtime_agent_incomplete_extended_by_message_operation_design
-current_phase: 8R.5
-phase_name: deterministic-message-operation-contract-projection
-phase_status: in_progress
+current_phase: 8R.6A
+phase_name: message-operation-outcome-supervisor
+phase_status: planned
 position_compliance_rules_status: dormant_non_deployable
 position_compliance_rollout_status: multi_target_live_new_natural_messages_only
 multi_target_projection_status: live_partial_take_profit_future_natural_messages_only
@@ -23,8 +23,8 @@ position_protection_live_repair_status: exact_backup_repaired_exchange_healthy
 position_protection_audit_convergence_status: deployed_current_evidence_healthy
 position_protection_rescue_starvation_status: deployed_future_due_intents_fixed
 context_target_contract_repair_status: deployed_future_natural_observation_pending
-last_completed_phase: "8R.4"
-last_completed_commit: 6f7359a
+last_completed_phase: "8R.5"
+last_completed_commit: 2d0cc6e
 production_commit: 2d0cc6ed7475d7ba41c384d93c99ba3a32b716a9
 local_tests:
   - "terminal-prebinding-monitor-repair: the production-shaped regression failed with live_entry_preamble_binding_evidence_missing before implementation; 360 monitor, CLI, Runtime Agent architecture, and message-operation projection tests pass after the exact read-only classifier and fail-closed matrix. Independent review findings for missing schema guards, strategy/source identity, result evidence, and candidate corroboration were fixed under TDD; final review found no Critical or Important findings"
@@ -228,9 +228,10 @@ server_verification:
   phase_8r_5_canary_blocker: "The required independent no-notify post-deployment diagnostic was fail-closed with healthy=false, monitor_error=null, notification_status=suppressed, and reason live_entry_preamble_binding_evidence_missing. This invariant appeared after the pre-existing natural strategy message raw 9955, which had already ended automation_status partial_failed before deployment; Phase 8R.5 does not import or mutate that path. The monitor timer was restored active, but the message-operation supervisor remains disabled with all three activation keys absent, watermark not recorded, no shadow cycle executed, zero contract/item rows, no model call, no historical replay, no Telegram send, and no exchange/business mutation. Resume only after a fresh healthy independent diagnostic and a new zero-in-flight gate, then record the current maximum raw ID and run the future-only one-shot canary."
   phase_8r_5_blocker_root_cause: "Read-only tracing reproduced the invariant against exactly assembly 3 from raw 9955. Its SOL-short entry candidate 1643 created the additive entry assembly, then instruction item 438 terminated failed with RecoveryLiveSubmitError signal_enqueue_blocked:missing_ready_confirmation,contract_size_unverified. No TradeSignal, ExecutionBinding, ExecutionEvent, management batch, or exchange submission was created. Production global trading settings allow BTC, ETH, and SOL, while the reviewed static Deepcoin contract-spec file contains only BTC and ETH, so SOL sizing correctly failed closed before enqueue. The independent monitor scans every recent assembly and currently treats this terminal pre-binding safety refusal as live_entry_preamble_binding_evidence_missing because assembly 3 has no binding; the reason therefore remains indefinitely even though there is no live order or position from raw 9955. Resolving the blocker requires an approved behavior design: the narrow non-trading option is to classify only exact terminal pre-binding no-submit evidence as non-live while preserving the failed instruction, then address SOL contract-spec/allowed-symbol consistency separately before any SOL auto-trading change. No code, configuration, historical row, service, notification, or exchange state was changed during this investigation."
   phase_8r_5_monitor_repair_deployment: "The approved terminal pre-binding monitor repair was independently reviewed through commit 2d0cc6e with no open Critical or Important finding. Three initial identity/schema findings and one candidate/result corroboration finding were reproduced with failing tests and fixed fail-closed. Before deployment, two quiet passes retained latest raw/decision 9962 as non-strategy/skipped/completed with zero current evidence, recognition, context, management, component, position-mutation, recent execution, Runtime Agent, notification, or recovery work; both contract tables were zero. Two database-stable, exchange-complete read-only protection audits had identical counts: current_risk=0, evidence_insufficient=1, historical_terminal=236, resolved_by_current_exchange_evidence=3. The standard helper deployed 2d0cc6e with all message-operation supervisor keys absent. Main, Runtime Agent, scanner, and monitor timer are active, HTTP docs is 200, both contract tables remain empty, and the disabled CLI returns status disabled. Server focused verification exited successfully with 360 tests passing. The independent expected-HEAD pin is 2d0cc6e; its no-notify diagnostic returned healthy=true, monitor_error=null, notification_status=disabled, and reason_codes=[], after which the timer was re-enabled. No historical row, trading setting, SOL contract spec, Agent policy, notification policy, order, position, or exchange state was changed."
+  phase_8r_5_shadow_canary: "A second future-only gate retained latest raw/decision 9962 as non-strategy/skipped/completed through two quiet passes with every active evidence, recognition, context, management, component, position-mutation, recovery, Runtime Agent, and notification count at zero; no recent raw message or execution event appeared. Two database-stable and exchange-complete protection audits had identical counts at current_risk=0, evidence_insufficient=1, historical_terminal=236, and resolved_by_current_exchange_evidence=3. The root-owned mode-0600 policy was atomically backed up and configured manual-only with enabled=true, shadow_only=true, after_raw_message_id=9962, and batch_limit=50; the main service was not restarted. Exactly one --shadow --once cycle returned status shadow, messages_scanned=0, contracts_created=0, errors=0, model_calls=0, and last_scanned_raw_message_id=9962. Both contract tables remained empty, so no row exists at or below the watermark. The zero-row code path executed only its bounded SELECT and never entered projection persistence. Authoritative recognition, context, instruction, strategy, management, execution, protection-incident, RuntimeIncident, notification/Agent, and recovery row counts were unchanged. A deliberately overbroad whole-database logical hash also observed 30 new passive pending-TPSL snapshots and normal reconciliation timestamp refreshes from the continuously running production service; these independent telemetry changes were not attributed to the zero-row canary and no normal component was paused. Two complete exchange semantic snapshots were identical at one position, zero open orders, five trigger orders, and hash a0fadf36d194279d5e4c235ae2ade994a6fa73ac7bc6810a5e7952d09941f1b8. The enabled=false override returned status disabled with zero contract/item rows, after which the reviewed manual shadow configuration remained installed. No supervisor timer, service, or process exists; main, Runtime Agent, scanner, monitor timer, and HTTP remained healthy. Action authority is false and both playbook allowlists remain empty."
   multi_target_partial_tp_live_activation: "After explicit operator instruction that new functionality must be used, the reviewed multi-target projection was activated for future natural messages only. Two consecutive pre-change database gates retained latest raw/decision 9854 terminal as non-strategy/completed/skipped with zero evidence, context, management, component, position-mutation, rescue, Runtime Agent, notification, recovery, recent execution, or recent message work in flight; management_message_envelopes and management_message_targets were both zero. Two read-only protection audits were database-stable and exchange-complete with identical classifications: current_risk=0, evidence_insufficient=1, historical_terminal=234, resolved_by_current_exchange_evidence=2. Root-owned mode-0600 policy files were backed up and atomically changed, then only the main service received a bounded restart. Projection is enabled, shadow_only is false, and the sole live action is partial_take_profit. Capture now includes all six multi-target/envelope failures and deterministic Telegram notification includes those same six types; the existing incident watermark remains 272. The Runtime Agent selector remains exactly management_partial_failed, action authority is false, and shadow/action playbook allowlists are empty. Post-activation HTTP is 200; main, Runtime Agent, scanner, and monitor timer are active; RuntimeIncident max ID stayed 280, target/envelope rows stayed zero, claims stayed zero, and no recent raw message or execution event appeared. This proves no historical replay or activation-time exchange mutation. Per-target admission and execution remain isolated: a refused or failed target records its own outcome and does not suppress eligible sibling targets."
   operator_shuqin_manual_close_after_activation: "During the post-activation observation, the operator reported manually closing Shuqin's position. The resulting normal manual-bound-position-close path persisted mutation intent 350 as confirmed and close reservation 36 as confirmed. This occurred after the activation gate and is not attributed to multi-target rollout. A subsequent read-only audit remained database-stable and exchange-complete with current_risk=0, evidence_insufficient=1, historical_terminal=236, and resolved_by_current_exchange_evidence=1. RuntimeIncident max ID remained 280, target/envelope rows remained zero, and runtime/notification claims remained zero. No automated follow-up action was taken."
-  remaining: "Phase 8R.5 code and the exact read-only terminal pre-binding monitor repair are reviewed and deployed dormant at 2d0cc6e. The independent diagnostic is healthy, the supervisor remains disabled with its activation keys absent, and both contract tables remain empty. Next, prove a second fresh zero-in-flight gate, record the then-current maximum raw-message ID, and run exactly one future-only --shadow --once canary. Keep SOL contract-spec and allowed-symbol consistency separate; do not implement outcome supervision, Stage 1 notification, broad Agent eligibility, or business mutation while 8R.5 remains in progress."
+  remaining: "Phase 8R.5 is complete at deployed code commit 2d0cc6e after its reviewed future-only zero-model shadow canary and rollback proof. Phase 8R.6A outcome supervision is planned but not started. It must be implemented dormant in a separate turn before any Stage 1 notification work. Keep SOL contract-spec and allowed-symbol consistency separate; do not grant broad Agent eligibility or business mutation authority."
 enabled_flags:
   - "capture:READ_ONLY_CAPTURE_PROFILE-plus-six-multi-target-types"
   - "telegram:deterministic-runtime-incident-reports"
@@ -238,6 +239,7 @@ enabled_flags:
   - "runtime-agent:read-only-diagnosis"
   - "monitor:independent-system-operator-alerting"
   - "runtime-scanner:cancel-outcome-stale-unknown-v1-shadow-only"
+  - "message-operation-supervisor:manual-shadow-only-after-raw-9962"
 known_issues:
   - "The production web process has pre-existing synchronous maintenance windows that can delay loopback HTTP dispatch for tens of seconds. The isolated monitor capture client is bounded to 45 seconds and remains fail-open; this does not block the listener or trading process."
   - "The pre-existing production safety baseline remains `audit_abnormal` (32 blocked, 1 partial_failed, 5 recovery_required in the latest bounded audit); Phase 5 did not alter those historical rows."
@@ -261,9 +263,12 @@ phase_8r_roadmap_control:
 message_operation_extension:
   design_commit: 98b7884
   implementation_plan_commit: 879f489
-  status: approved_next_phase_8r_5
+  status: phase_8r_5_completed_next_phase_8r_6a_planned
   original_runtime_agent_complete: false
   next_phase_after_8r_4: 8R.5
+  task_8r_5_commit: 2d0cc6e
+  task_8r_5_status: completed_future_only_shadow_canary
+  next_phase_after_8r_5: 8R.6A
 next_session_prompt: "请执行自定义ai agent的下一步实施"
 ```
 
@@ -584,7 +589,7 @@ Phase 5 is not complete until:
 - Status: in progress
 - Roadmap-control Task 0: completed locally with 10 focused tests passing;
   documentation and test changes only, so no production restart was required
-- Current task: `8R.5 deterministic-message-operation-contract-projection`
+- Current task: `8R.6A message-operation-outcome-supervisor` (planned)
 - Approved scope: deterministic proactive discovery, bounded read-only
   diagnosis, Telegram notification, Codex handoff, and read-only verification
 - Prohibited scope: order, position, protection, strategy, recognition,
@@ -608,13 +613,11 @@ Phase 5 is not complete until:
   gap inventory is recorded; two additive contract tables exist and remain
   empty; idempotent helpers, closed categories, CAS transitions, and dormant
   architecture boundaries passed local and server verification.
-- Task 8R.5: reviewed deterministic zero-model projection and the exact
-  terminal pre-binding monitor repair are deployed dormant at `2d0cc6e`;
-  activation keys remain absent, both additive tables remain empty, and the
-  independent no-notify diagnostic is healthy with no reason codes.
-- Next action: prove a second fresh zero-in-flight gate, record the then-current
-  maximum raw-message ID, and run exactly one future-only `--shadow --once`
-  canary. Keep SOL contract-spec and allowed-symbol consistency as a separate
-  trading-affecting decision. Do not start outcome
-  supervision, Stage 1 notification, broad Agent eligibility, or business
-  mutation while this phase remains in progress.
+- Task 8R.5: completed at deployed code commit `2d0cc6e`. The future-only
+  watermark is raw 9962; exactly one manual shadow cycle scanned zero newer
+  messages, made zero model calls, reported zero errors, and created zero
+  contract/item rows. The disabled override returned status disabled, and no
+  supervisor service or timer exists.
+- Next action: implement only Phase 8R.6A outcome evaluation and unified
+  incident creation as a new dormant stage. Do not start Stage 1 notification,
+  broad Agent eligibility, or business mutation in that turn.
