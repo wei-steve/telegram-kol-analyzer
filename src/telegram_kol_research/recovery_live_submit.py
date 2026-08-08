@@ -6,6 +6,7 @@ import math
 import time
 import hashlib
 import json
+from collections.abc import Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from threading import RLock
@@ -24,6 +25,7 @@ from telegram_kol_research.execution_bindings import upsert_execution_binding
 from telegram_kol_research.execution_bindings import upsert_execution_order_leg
 from telegram_kol_research.execution_events import ExecutionEventRecord
 from telegram_kol_research.execution_events import record_execution_event
+from telegram_kol_research.models import EntryStrategyAssembly
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
@@ -69,6 +71,82 @@ from telegram_kol_research.take_profit_plan import build_take_profit_plan
 
 class RecoveryLiveSubmitError(RuntimeError):
     """Raised when a live recovery order cannot be submitted safely."""
+
+
+def _require_synchronized_finalized_entry_assembly(
+    session_factory: sessionmaker,
+    *,
+    trade_signal: TradeSignalRecord,
+) -> None:
+    """Fail closed when a V2 entry signal is stale at the execution boundary."""
+
+    strategy_instance_id = trade_signal.strategy_instance_id
+    if not strategy_instance_id:
+        return
+    with session_factory() as session:
+        assembly = (
+            session.query(EntryStrategyAssembly)
+            .filter(
+                EntryStrategyAssembly.strategy_instance_id
+                == strategy_instance_id,
+                EntryStrategyAssembly.entry_preamble_id.is_(None),
+            )
+            .one_or_none()
+        )
+        if assembly is None:
+            return
+        assembly_id = int(assembly.id)
+        assembly_fingerprint = str(assembly.fingerprint)
+        try:
+            assembly_evidence = json.loads(assembly.evidence_json or "{}")
+        except (TypeError, ValueError):
+            assembly_evidence = None
+
+    payload = trade_signal.payload
+    top_evidence = (
+        payload.get("entry_preamble_assembly")
+        if isinstance(payload, Mapping)
+        else None
+    )
+    draft = (
+        payload.get("deepcoin_order_draft")
+        if isinstance(payload, Mapping)
+        else None
+    )
+    nested_evidence = (
+        draft.get("entry_preamble_assembly")
+        if isinstance(draft, Mapping)
+        else None
+    )
+    snapshot = (
+        assembly_evidence.get("order_draft_snapshot")
+        if isinstance(assembly_evidence, Mapping)
+        else None
+    )
+    final_leg_count = (
+        assembly_evidence.get("final_entry_leg_count")
+        if isinstance(assembly_evidence, Mapping)
+        else None
+    )
+    snapshot_legs = (
+        snapshot.get("order_legs") if isinstance(snapshot, Mapping) else None
+    )
+    evidence_copies = (top_evidence, nested_evidence)
+    if (
+        not isinstance(snapshot, Mapping)
+        or type(final_leg_count) is not int
+        or final_leg_count <= 0
+        or not isinstance(snapshot_legs, list)
+        or len(snapshot_legs) != final_leg_count
+        or any(not isinstance(evidence, Mapping) for evidence in evidence_copies)
+        or any(
+            evidence.get("assembly_id") != assembly_id
+            or evidence.get("strategy_instance_id") != strategy_instance_id
+            or evidence.get("assembly_fingerprint") != assembly_fingerprint
+            for evidence in evidence_copies
+        )
+    ):
+        raise RecoveryLiveSubmitError("entry_assembly_signal_not_synchronized")
 
 
 @contextmanager
@@ -374,6 +452,10 @@ def process_trade_signal_live(
         raise RecoveryLiveSubmitError(f"trade_signal_not_pending:{trade_signal.status}")
     try:
         if trade_signal.action == "open_position":
+            _require_synchronized_finalized_entry_assembly(
+                session_factory,
+                trade_signal=trade_signal,
+            )
             result = _submit_recovery_signal_direct(
                 session_factory,
                 trade_signal=trade_signal,

@@ -685,6 +685,16 @@ def _auto_process_single_message_trade_signal(
             str(value) for value in assembly.supplemental_prices
         ],
     }
+    if (
+        settings.entry_message_assembly_v2_mode == "live"
+        and assembly.assembly_id is not None
+    ):
+        assembly_evidence.update(
+            {
+                "assembly_id": int(assembly.assembly_id),
+                "strategy_instance_id": strategy_instance_id,
+            }
+        )
 
     signal = RecoverySignal(
         kol_id=str(runtime_config["kol_id"]),
@@ -881,48 +891,31 @@ def _auto_process_single_message_trade_signal(
             and assembly.assembly_id is not None
             and isinstance(recovery_draft, dict)
         ):
-            recovery_assembly_evidence = {
-                **assembly_evidence,
-                "assembly_id": int(assembly.assembly_id),
-                "strategy_instance_id": str(
-                    trade_signal.strategy_instance_id or ""
-                ),
-            }
-            recovery_draft["entry_preamble_assembly"] = recovery_assembly_evidence
-            recovery_payload = {
-                **trade_signal.payload,
-                "deepcoin_order_draft": recovery_draft,
-                "entry_preamble_assembly": recovery_assembly_evidence,
-            }
-            trade_signal = enqueue_trade_signal(
-                session_factory,
-                venue=trade_signal.venue,
-                source_type=trade_signal.source_type,
-                kol_id=trade_signal.kol_id,
-                chat_id=trade_signal.chat_id,
-                message_id=trade_signal.message_id,
-                symbol=trade_signal.symbol,
-                side=trade_signal.side,
-                action=trade_signal.action,
-                payload=recovery_payload,
-                strategy_instance_id=trade_signal.strategy_instance_id,
-                enqueued_at=now,
-            )
             finalized = finalize_adjacent_entry_assembly_draft(
                 session_factory,
                 assembly_id=int(assembly.assembly_id),
                 order_draft=recovery_draft,
             )
             final_evidence = {
-                **recovery_assembly_evidence,
+                **assembly_evidence,
+                "assembly_id": finalized.assembly_id,
+                "strategy_instance_id": finalized.strategy_instance_id,
                 "assembly_fingerprint": finalized.final_fingerprint,
             }
+            queued_evidence = recovery_draft.get("entry_preamble_assembly")
+            expected_fingerprint = finalized.original_fingerprint
+            if (
+                isinstance(queued_evidence, dict)
+                and queued_evidence.get("assembly_fingerprint")
+                == finalized.final_fingerprint
+            ):
+                expected_fingerprint = finalized.final_fingerprint
             trade_signal = synchronize_pending_entry_assembly_evidence(
                 session_factory,
                 signal_id=trade_signal.id,
                 strategy_instance_id=finalized.strategy_instance_id,
                 expected_payload=trade_signal.payload,
-                expected_fingerprint=finalized.original_fingerprint,
+                expected_fingerprint=expected_fingerprint,
                 finalized_evidence=final_evidence,
                 synchronized_at=now,
             )

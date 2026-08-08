@@ -7,7 +7,14 @@ import pytest
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
-from telegram_kol_research.models import ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, RawMessage, SignalCandidate
+from telegram_kol_research.models import (
+    EntryStrategyAssembly,
+    ExecutionBinding,
+    ExecutionEvent,
+    ExecutionOrderLeg,
+    RawMessage,
+    SignalCandidate,
+)
 from telegram_kol_research.models import SourceMessageDeletionExit, StrategyLifecycle, TradeSignal, TriggerTakeProfitConvergence
 from telegram_kol_research.models import TriggerProtectionIntent
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
@@ -846,6 +853,166 @@ def test_process_next_trade_signal_live_consumes_pending_signal(tmp_path):
     with session_factory() as session:
         assert session.query(ExecutionBinding).count() == 1
         assert session.query(TradeSignal).filter_by(id=signal.id).one().status == "submitted"
+
+
+@pytest.mark.parametrize("assembly_is_finalized", [True, False])
+def test_process_next_rejects_unsynchronized_or_unfinalized_v2_entry_signal(
+    tmp_path,
+    assembly_is_finalized,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    assembly_fingerprint = ("b" if assembly_is_finalized else "a") * 64
+    assembly_evidence = (
+        {
+            "order_draft_snapshot": {"order_legs": [{"price": 68000}]},
+            "final_entry_leg_count": 1,
+        }
+        if assembly_is_finalized
+        else {}
+    )
+    with session_factory() as session:
+        raw = session.query(RawMessage).filter_by(chat_id=100, message_id=55).one()
+        candidate = session.query(SignalCandidate).filter_by(
+            raw_message_id=raw.id
+        ).one()
+        assembly = EntryStrategyAssembly(
+            strategy_raw_message_id=raw.id,
+            signal_candidate_id=candidate.id,
+            strategy_instance_id=str(signal.strategy_instance_id),
+            risk_multiplier="1",
+            evidence_json=json.dumps(assembly_evidence, sort_keys=True),
+            fingerprint=assembly_fingerprint,
+        )
+        session.add(assembly)
+        session.flush()
+        row = session.get(TradeSignal, signal.id)
+        payload = json.loads(row.payload_json)
+        stale_evidence = {
+            "assembly_id": assembly.id,
+            "strategy_instance_id": signal.strategy_instance_id,
+            "assembly_fingerprint": "a" * 64,
+        }
+        payload["deepcoin_order_draft"][
+            "entry_preamble_assembly"
+        ] = stale_evidence
+        if not assembly_is_finalized:
+            payload["entry_preamble_assembly"] = dict(stale_evidence)
+        row.payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        session.commit()
+    client = _FakeDeepcoinClient()
+
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="^entry_assembly_signal_not_synchronized$",
+    ):
+        process_next_trade_signal_live(
+            session_factory,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+
+    assert client.payloads == []
+    assert client.trigger_payloads == []
+    with session_factory() as session:
+        assert session.get(TradeSignal, signal.id).status == "failed"
+        assert session.query(ExecutionBinding).count() == 0
+        assert session.query(TriggerProtectionIntent).count() == 0
+
+
+def test_process_next_reloads_v2_assembly_after_loading_pending_signal(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.recovery_live_submit as live_submit_module
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    with session_factory() as session:
+        raw = session.query(RawMessage).filter_by(chat_id=100, message_id=55).one()
+        candidate = session.query(SignalCandidate).filter_by(
+            raw_message_id=raw.id
+        ).one()
+        assembly = EntryStrategyAssembly(
+            strategy_raw_message_id=raw.id,
+            signal_candidate_id=candidate.id,
+            strategy_instance_id=str(signal.strategy_instance_id),
+            risk_multiplier="1",
+            evidence_json=json.dumps(
+                {
+                    "order_draft_snapshot": {
+                        "order_legs": [{"price": 68000}]
+                    },
+                    "final_entry_leg_count": 1,
+                },
+                sort_keys=True,
+            ),
+            fingerprint="a" * 64,
+        )
+        session.add(assembly)
+        session.flush()
+        assembly_id = assembly.id
+        row = session.get(TradeSignal, signal.id)
+        payload = json.loads(row.payload_json)
+        evidence = {
+            "assembly_id": assembly_id,
+            "strategy_instance_id": signal.strategy_instance_id,
+            "assembly_fingerprint": "a" * 64,
+        }
+        payload["entry_preamble_assembly"] = dict(evidence)
+        payload["deepcoin_order_draft"][
+            "entry_preamble_assembly"
+        ] = dict(evidence)
+        row.payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        session.commit()
+
+    real_load = live_submit_module.load_trade_signal
+
+    def load_then_finalize_concurrently(factory, signal_id):
+        loaded = real_load(factory, signal_id)
+        with factory() as session:
+            assembly = session.get(EntryStrategyAssembly, assembly_id)
+            assembly.fingerprint = "b" * 64
+            session.commit()
+        return loaded
+
+    monkeypatch.setattr(
+        live_submit_module,
+        "load_trade_signal",
+        load_then_finalize_concurrently,
+    )
+    client = _FakeDeepcoinClient()
+
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="^entry_assembly_signal_not_synchronized$",
+    ):
+        process_next_trade_signal_live(
+            session_factory,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+
+    assert client.payloads == []
+    assert client.trigger_payloads == []
 
 
 def test_legacy_management_audit_is_bounded_redacted_and_read_only(tmp_path):

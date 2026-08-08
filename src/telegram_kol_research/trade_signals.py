@@ -92,11 +92,6 @@ def synchronize_pending_entry_assembly_evidence(
             "entry_assembly_signal_payload_invalid"
         ) from None
 
-    top_evidence = updated_payload.get("entry_preamble_assembly")
-    if not isinstance(top_evidence, dict):
-        raise TradeSignalFingerprintSyncError(
-            "entry_assembly_signal_evidence_invalid"
-        )
     draft = updated_payload.get("deepcoin_order_draft")
     if not isinstance(draft, dict):
         raise TradeSignalFingerprintSyncError("entry_assembly_signal_draft_invalid")
@@ -105,43 +100,8 @@ def synchronize_pending_entry_assembly_evidence(
         expected_fingerprint,
         error_code="entry_assembly_signal_fingerprint_mismatch",
     )
-    evidence_copies = [top_evidence]
+    top_evidence = updated_payload.get("entry_preamble_assembly")
     nested_evidence = draft.get("entry_preamble_assembly")
-    if nested_evidence is not None:
-        if not isinstance(nested_evidence, dict):
-            raise TradeSignalFingerprintSyncError(
-                "entry_assembly_signal_evidence_invalid"
-            )
-        evidence_copies.append(nested_evidence)
-    if any(
-        _normalized_assembly_fingerprint(
-            evidence.get("assembly_fingerprint"),
-            error_code="entry_assembly_signal_fingerprint_mismatch",
-        )
-        != normalized_expected_fingerprint
-        for evidence in evidence_copies
-    ):
-        raise TradeSignalFingerprintSyncError(
-            "entry_assembly_signal_fingerprint_mismatch"
-        )
-
-    assembly_id = top_evidence.get("assembly_id")
-    evidence_strategy_id = top_evidence.get("strategy_instance_id")
-    if (
-        not _is_positive_assembly_id(assembly_id)
-        or not isinstance(evidence_strategy_id, str)
-        or evidence_strategy_id != strategy_instance_id
-        or any(
-            not _is_positive_assembly_id(evidence.get("assembly_id"))
-            or evidence.get("assembly_id") != assembly_id
-            or not isinstance(evidence.get("strategy_instance_id"), str)
-            or evidence.get("strategy_instance_id") != evidence_strategy_id
-            for evidence in evidence_copies[1:]
-        )
-    ):
-        raise TradeSignalFingerprintSyncError(
-            "entry_assembly_signal_identity_mismatch"
-        )
 
     try:
         final_evidence = json.loads(
@@ -161,7 +121,6 @@ def synchronize_pending_entry_assembly_evidence(
     )
     if (
         not _is_positive_assembly_id(final_evidence.get("assembly_id"))
-        or final_evidence.get("assembly_id") != assembly_id
         or not isinstance(final_evidence.get("strategy_instance_id"), str)
         or final_evidence.get("strategy_instance_id") != strategy_instance_id
     ):
@@ -169,6 +128,38 @@ def synchronize_pending_entry_assembly_evidence(
             "entry_assembly_signal_identity_mismatch"
         )
     final_evidence["assembly_fingerprint"] = final_fingerprint
+    assembly_id = final_evidence["assembly_id"]
+
+    evidence_copies = [
+        evidence
+        for evidence in (top_evidence, nested_evidence)
+        if evidence is not None
+    ]
+    if any(not isinstance(evidence, dict) for evidence in evidence_copies):
+        raise TradeSignalFingerprintSyncError(
+            "entry_assembly_signal_evidence_invalid"
+        )
+    if any(
+        _normalized_assembly_fingerprint(
+            evidence.get("assembly_fingerprint"),
+            error_code="entry_assembly_signal_fingerprint_mismatch",
+        )
+        != normalized_expected_fingerprint
+        for evidence in evidence_copies
+    ):
+        raise TradeSignalFingerprintSyncError(
+            "entry_assembly_signal_fingerprint_mismatch"
+        )
+    if any(
+        not _is_positive_assembly_id(evidence.get("assembly_id"))
+        or evidence.get("assembly_id") != assembly_id
+        or not isinstance(evidence.get("strategy_instance_id"), str)
+        or evidence.get("strategy_instance_id") != strategy_instance_id
+        for evidence in evidence_copies
+    ):
+        raise TradeSignalFingerprintSyncError(
+            "entry_assembly_signal_identity_mismatch"
+        )
 
     updated_payload["entry_preamble_assembly"] = final_evidence
     draft["entry_preamble_assembly"] = json.loads(

@@ -91,6 +91,32 @@ def test_synchronize_pending_entry_assembly_evidence_updates_both_copies(tmp_pat
         assert row.updated_at == NOW.replace(tzinfo=None)
 
 
+@pytest.mark.parametrize("missing_copy", ["top", "nested", "both"])
+def test_synchronize_pending_entry_assembly_evidence_adds_missing_copies(
+    tmp_path,
+    missing_copy,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    payload = _payload()
+    if missing_copy in {"top", "both"}:
+        payload.pop("entry_preamble_assembly")
+    if missing_copy in {"nested", "both"}:
+        payload["deepcoin_order_draft"].pop("entry_preamble_assembly")
+    signal = _enqueue(session_factory, payload=payload)
+
+    updated = _synchronize(session_factory, signal)
+
+    assert updated.payload["entry_preamble_assembly"] == {
+        "assembly_id": 2,
+        "strategy_instance_id": "strategy-1",
+        "assembly_fingerprint": FINAL_FINGERPRINT,
+    }
+    assert (
+        updated.payload["deepcoin_order_draft"]["entry_preamble_assembly"]
+        == updated.payload["entry_preamble_assembly"]
+    )
+
+
 @pytest.mark.parametrize(
     ("case", "expected_error"),
     [

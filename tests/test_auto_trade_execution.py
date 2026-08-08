@@ -1831,15 +1831,30 @@ def test_recovery_trigger_fingerprint_sync_failure_blocks_exchange_submission(
     client = _FakeDeepcoinClient()
     import telegram_kol_research.auto_trade_execution as auto_module
 
-    def fail_sync(*args, **kwargs):
-        raise TradeSignalFingerprintSyncError("entry_assembly_signal_cas_failed")
+    import telegram_kol_research.trade_signals as trade_signals_module
+
+    real_sync = trade_signals_module.synchronize_pending_entry_assembly_evidence
+    sync_calls = []
+    unsafe_refresh_calls = []
+
+    def fail_first_sync(*args, **kwargs):
+        sync_calls.append(kwargs["signal_id"])
+        if len(sync_calls) == 1:
+            raise TradeSignalFingerprintSyncError(
+                "entry_assembly_signal_cas_failed"
+            )
+        return real_sync(*args, **kwargs)
+
+    def record_unsafe_refresh(*args, **kwargs):
+        unsafe_refresh_calls.append(kwargs)
+        return trade_signals_module.enqueue_trade_signal(*args, **kwargs)
 
     monkeypatch.setattr(
         auto_module,
         "synchronize_pending_entry_assembly_evidence",
-        fail_sync,
-        raising=False,
+        fail_first_sync,
     )
+    monkeypatch.setattr(auto_module, "enqueue_trade_signal", record_unsafe_refresh)
 
     with pytest.raises(
         TradeSignalFingerprintSyncError,
@@ -1858,6 +1873,21 @@ def test_recovery_trigger_fingerprint_sync_failure_blocks_exchange_submission(
     assert client.trigger_orders == []
     with session_factory() as session:
         assert session.query(TradeSignal).one().status == "pending"
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 8, 8, 8, 2, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    assert len(sync_calls) == 2
+    assert unsafe_refresh_calls == []
+    assert client.orders == []
+    assert len(client.trigger_orders) == 2
 
 
 def test_trigger_limit_entry_persists_tpsl_intent_before_parent_submission(tmp_path):
