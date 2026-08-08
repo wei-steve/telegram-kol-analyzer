@@ -37,6 +37,9 @@ from telegram_kol_research.entry_assembly_fingerprint_repair import (
     canonical_fingerprint,
     derive_pre_finalization_fingerprint,
 )
+from telegram_kol_research.entry_strategy_assembly import (
+    build_bounded_entry_order_draft_snapshot,
+)
 from telegram_kol_research.runtime_incident_adapters import (
     capture_management_state,
     capture_monitor_state,
@@ -63,25 +66,6 @@ _GIT_HEAD = re.compile(r"[0-9a-f]{40}\Z")
 _SAFE_TIMESTAMP = re.compile(r"[0-9T:+.-]{1,40}\Z")
 _SHA256_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_RECONCILIATION_JSON_BYTES = 1_000_000
-_RECONCILIATION_DRAFT_KEYS = (
-    "strategy_instance_id",
-    "instrument_id",
-    "stop_loss",
-    "take_profit_legs",
-    "risk_budget_usdt",
-    "contract_spec",
-    "order_legs",
-)
-_RECONCILIATION_LEG_KEYS = (
-    "price",
-    "order_type",
-    "allocation_pct",
-    "risk_budget_usdt",
-    "quantity",
-    "quantity_unit",
-    "estimated_stop_loss_usdt",
-    "client_order_id",
-)
 _RECONCILIATION_EVENT_COLUMNS = frozenset(
     {
         "id",
@@ -762,26 +746,6 @@ def _read_reconciliation_json(raw: object) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _bounded_reconciliation_draft(
-    draft: Mapping[str, Any],
-) -> dict[str, Any] | None:
-    legs = draft.get("order_legs")
-    if not isinstance(legs, list) or not all(
-        isinstance(leg, Mapping) for leg in legs
-    ):
-        return None
-    bounded = {
-        key: draft.get(key)
-        for key in _RECONCILIATION_DRAFT_KEYS
-        if key != "order_legs"
-    }
-    bounded["order_legs"] = [
-        {key: leg.get(key) for key in _RECONCILIATION_LEG_KEYS}
-        for leg in legs
-    ]
-    return bounded
-
-
 def _reconciliation_stale_evidence_matches(
     evidence: object,
     *,
@@ -851,15 +815,26 @@ def _has_exact_entry_fingerprint_reconciliation(
         if isinstance(final_evidence, Mapping)
         else None
     )
-    snapshot_legs = snapshot.get("order_legs") if isinstance(snapshot, Mapping) else None
+    try:
+        canonical_snapshot = (
+            build_bounded_entry_order_draft_snapshot(snapshot)
+            if isinstance(snapshot, Mapping)
+            else None
+        )
+    except (TypeError, ValueError):
+        canonical_snapshot = None
+    snapshot_legs = (
+        canonical_snapshot.get("order_legs")
+        if isinstance(canonical_snapshot, Mapping)
+        else None
+    )
     if (
         not strategy_id
         or not _SHA256_FINGERPRINT.fullmatch(final_fp)
         or final_evidence is None
-        or not isinstance(snapshot, Mapping)
+        or canonical_snapshot is None
+        or canonical_snapshot != snapshot
         or not isinstance(snapshot_legs, list)
-        or not 1 <= len(snapshot_legs) <= 5
-        or not all(isinstance(leg, Mapping) for leg in snapshot_legs)
         or isinstance(final_leg_count, bool)
         or not isinstance(final_leg_count, int)
         or final_leg_count != len(snapshot_legs)
@@ -876,6 +851,14 @@ def _has_exact_entry_fingerprint_reconciliation(
         return False
 
     binding_draft = binding_payload.get("draft")
+    try:
+        binding_snapshot = (
+            build_bounded_entry_order_draft_snapshot(binding_draft)
+            if isinstance(binding_draft, Mapping)
+            else None
+        )
+    except (TypeError, ValueError):
+        binding_snapshot = None
     if (
         str(binding_identity.get("strategy_instance_id") or "") != strategy_id
         or str(binding_identity.get("venue") or "").lower() != "deepcoin"
@@ -886,9 +869,7 @@ def _has_exact_entry_fingerprint_reconciliation(
         != str(binding_identity.get("symbol") or "").upper()
         or str(final_evidence.get("side") or "").lower()
         != str(binding_identity.get("side") or "").lower()
-        or not isinstance(binding_draft, Mapping)
-        or _bounded_reconciliation_draft(binding_draft)
-        != _bounded_reconciliation_draft(snapshot)
+        or binding_snapshot != canonical_snapshot
     ):
         return False
 
@@ -940,6 +921,14 @@ def _has_exact_entry_fingerprint_reconciliation(
         if isinstance(signal_draft, Mapping)
         else None
     )
+    try:
+        signal_snapshot = (
+            build_bounded_entry_order_draft_snapshot(signal_draft)
+            if isinstance(signal_draft, Mapping)
+            else None
+        )
+    except (TypeError, ValueError):
+        signal_snapshot = None
     if (
         not _reconciliation_stale_evidence_matches(
             signal_top,
@@ -953,9 +942,7 @@ def _has_exact_entry_fingerprint_reconciliation(
             strategy_instance_id=strategy_id,
             old_fingerprint=old_fp,
         )
-        or not isinstance(signal_draft, Mapping)
-        or _bounded_reconciliation_draft(signal_draft)
-        != _bounded_reconciliation_draft(snapshot)
+        or signal_snapshot != canonical_snapshot
     ):
         return False
 

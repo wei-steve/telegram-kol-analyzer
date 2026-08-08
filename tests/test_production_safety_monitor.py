@@ -395,8 +395,60 @@ def _seed_reconciled_entry_preamble_monitor(database, *, second_mismatch=False):
         "strategy_message_id": 55,
         "symbol": "BTC",
         "side": "long",
-        "order_draft_snapshot": {"order_legs": [{"price": 64000}]},
-        "final_entry_leg_count": 1,
+        "order_draft_snapshot": {
+            "strategy_instance_id": "strategy-1",
+            "instrument_id": "BTC-USDT-SWAP",
+            "symbol": "BTC",
+            "margin_mode": "cross",
+            "position_mode": "split",
+            "stop_loss": 63000,
+            "take_profit_legs": [{"price": 66000, "allocation_pct": 100}],
+            "risk_budget_usdt": 10,
+            "contract_spec": {
+                "contract_value": 0.001,
+                "quantity_step": 1,
+                "min_quantity": 1,
+            },
+            "source": {
+                "kol_id": "group:-1001",
+                "kol_code": None,
+                "chat_id": -1001,
+                "message_id": 55,
+            },
+            "selected_entry_leg_indices": [1],
+            "selected_entry_leg_count": 1,
+            "order_legs": [
+                {
+                    "price": 64000,
+                    "order_type": "limit",
+                    "allocation_pct": 60,
+                    "risk_budget_usdt": 6,
+                    "quantity": 10,
+                    "base_asset_estimate": 0.01,
+                    "quantity_unit": "contracts",
+                    "estimated_stop_loss_usdt": 6,
+                    "client_order_id": "entry-1",
+                    "side": "buy",
+                    "position_side": "long",
+                    "take_profit_leg": None,
+                },
+                {
+                    "price": 63800,
+                    "order_type": "limit",
+                    "allocation_pct": 40,
+                    "risk_budget_usdt": 4,
+                    "quantity": 5,
+                    "base_asset_estimate": 0.005,
+                    "quantity_unit": "contracts",
+                    "estimated_stop_loss_usdt": 4,
+                    "client_order_id": "entry-2",
+                    "side": "buy",
+                    "position_side": "long",
+                    "take_profit_leg": None,
+                },
+            ],
+        },
+        "final_entry_leg_count": 2,
     }
     final_fingerprint = canonical_fingerprint(final_evidence)
     old_fingerprint = derive_pre_finalization_fingerprint(final_evidence)
@@ -639,6 +691,89 @@ def test_entry_preamble_monitor_requires_exact_durable_recovery_signal(
 @pytest.mark.parametrize(
     "mutation",
     [
+        "margin_mode",
+        "position_mode",
+        "symbol",
+        "source",
+        "leg_side",
+        "leg_position_side",
+        "leg_base_asset_estimate",
+        "leg_take_profit",
+        "selected_legs",
+        "selected_leg_count",
+    ],
+)
+def test_entry_preamble_monitor_proves_complete_canonical_draft_snapshot(
+    tmp_path, mutation
+):
+    database = tmp_path / f"entry-preamble-reconciled-complete-{mutation}.db"
+    _seed_reconciled_entry_preamble_monitor(database)
+    connection = sqlite3.connect(database)
+    evidence = json.loads(
+        connection.execute(
+            "SELECT evidence_json FROM entry_strategy_assemblies WHERE id = 2"
+        ).fetchone()[0]
+    )
+    snapshot = evidence["order_draft_snapshot"]
+    if mutation == "margin_mode":
+        snapshot["margin_mode"] = "isolated"
+    elif mutation == "position_mode":
+        snapshot["position_mode"] = "merge"
+    elif mutation == "symbol":
+        snapshot["symbol"] = "ETH"
+    elif mutation == "source":
+        snapshot["source"]["message_id"] = 56
+    elif mutation == "leg_side":
+        snapshot["order_legs"][0]["side"] = "sell"
+    elif mutation == "leg_position_side":
+        snapshot["order_legs"][0]["position_side"] = "short"
+    elif mutation == "leg_base_asset_estimate":
+        snapshot["order_legs"][0]["base_asset_estimate"] = 0.02
+    elif mutation == "leg_take_profit":
+        snapshot["order_legs"][0]["take_profit_leg"] = {
+            "price": 66000,
+            "allocation_pct": 100,
+        }
+    elif mutation == "selected_legs":
+        snapshot["selected_entry_leg_indices"] = [2]
+    else:
+        snapshot["selected_entry_leg_indices"] = [1, 2]
+        snapshot["selected_entry_leg_count"] = 2
+
+    final_fingerprint = canonical_fingerprint(evidence)
+    old_fingerprint = derive_pre_finalization_fingerprint(evidence)
+    repair_fingerprint = build_reconciliation_fingerprint(
+        assembly_id=2,
+        execution_binding_id=266,
+        trade_signal_id=398,
+        strategy_instance_id="strategy-1",
+        old_fingerprint=old_fingerprint,
+        final_fingerprint=final_fingerprint,
+    )
+    after = json.loads(
+        connection.execute("SELECT after_json FROM execution_events").fetchone()[0]
+    )
+    after["assembly_fingerprint"] = final_fingerprint
+    after["repair_fingerprint"] = repair_fingerprint
+    connection.execute(
+        "UPDATE entry_strategy_assemblies SET evidence_json = ?, fingerprint = ? WHERE id = 2",
+        (json.dumps(evidence), final_fingerprint),
+    )
+    connection.execute(
+        "UPDATE execution_events SET after_json = ?, notification_fingerprint = ?",
+        (json.dumps(after), repair_fingerprint),
+    )
+    connection.commit()
+    connection.close()
+
+    assert read_entry_preamble_invariants(
+        database, now=datetime(2026, 8, 8, tzinfo=UTC)
+    ) == ("live_entry_preamble_binding_evidence_missing",)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
         "snapshot_missing",
         "snapshot_not_mapping",
         "legs_not_list",
@@ -679,7 +814,7 @@ def test_entry_preamble_monitor_rejects_invalid_finalized_assembly_shape(
     elif mutation == "count_bool":
         evidence["final_entry_leg_count"] = True
     elif mutation == "count_mismatch":
-        evidence["final_entry_leg_count"] = 2
+        evidence["final_entry_leg_count"] = 1
     final_fingerprint = canonical_fingerprint(evidence)
     old_fingerprint = derive_pre_finalization_fingerprint(evidence)
     repair_fingerprint = build_reconciliation_fingerprint(
@@ -827,7 +962,7 @@ def test_entry_preamble_monitor_rejects_event_for_previous_final_fingerprint(tmp
             "SELECT evidence_json FROM entry_strategy_assemblies WHERE id = 2"
         ).fetchone()[0]
     )
-    evidence["final_entry_leg_count"] = 2
+    evidence["final_entry_leg_count"] = 1
     connection.execute(
         "UPDATE entry_strategy_assemblies SET evidence_json = ?, fingerprint = ? WHERE id = 2",
         (json.dumps(evidence), canonical_fingerprint(evidence)),
