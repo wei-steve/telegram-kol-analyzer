@@ -21,6 +21,8 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    RawMessage,
+    SignalCandidate,
     TradeSignal,
 )
 
@@ -105,6 +107,29 @@ def _seed_case(tmp_path):
         "deepcoin_order_draft": deepcopy(draft),
     }
     with session_factory() as session:
+        session.add(
+            RawMessage(
+                id=10,
+                chat_id=-1001,
+                message_id=55,
+                text="BTC long entry",
+                archived_target_group=True,
+                created_at=NOW,
+            )
+        )
+        session.add(
+            SignalCandidate(
+                id=20,
+                raw_message_id=10,
+                symbol="BTC",
+                side="long",
+                event_type="entry_signal",
+                parse_source="mimo_authoritative",
+                confidence=0.95,
+                review_status="pending",
+                created_at=NOW,
+            )
+        )
         session.add(
             EntryStrategyAssembly(
                 id=2,
@@ -485,6 +510,57 @@ def test_build_plan_returns_fixed_conflict_for_invalid_json(tmp_path, target, ra
 
     assert plan.action is None
     assert expected in plan.conflicts
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_conflict"),
+    [
+        ("missing_raw", "strategy_raw_message_not_found"),
+        ("missing_candidate", "signal_candidate_not_found"),
+        ("candidate_raw", "signal_candidate_raw_message_mismatch"),
+        ("raw_chat", "strategy_raw_message_source_mismatch"),
+        ("raw_message", "strategy_raw_message_source_mismatch"),
+        ("candidate_event", "signal_candidate_not_entry_strategy"),
+        ("candidate_symbol", "signal_candidate_not_entry_strategy"),
+        ("candidate_symbol_case", "signal_candidate_not_entry_strategy"),
+        ("candidate_side", "signal_candidate_not_entry_strategy"),
+        ("candidate_side_case", "signal_candidate_not_entry_strategy"),
+        ("candidate_status", "signal_candidate_not_entry_strategy"),
+    ],
+)
+def test_build_plan_proves_exact_source_lineage(tmp_path, mutation, expected_conflict):
+    _, session_factory = _seed_case(tmp_path)
+    with session_factory() as session:
+        raw = session.get(RawMessage, 10)
+        candidate = session.get(SignalCandidate, 20)
+        if mutation == "missing_raw":
+            session.delete(raw)
+        elif mutation == "missing_candidate":
+            session.delete(candidate)
+        elif mutation == "candidate_raw":
+            candidate.raw_message_id = 11
+        elif mutation == "raw_chat":
+            raw.chat_id = -1002
+        elif mutation == "raw_message":
+            raw.message_id = 56
+        elif mutation == "candidate_event":
+            candidate.event_type = "position_update"
+        elif mutation == "candidate_symbol":
+            candidate.symbol = "ETH"
+        elif mutation == "candidate_symbol_case":
+            candidate.symbol = "btc"
+        elif mutation == "candidate_side":
+            candidate.side = "short"
+        elif mutation == "candidate_side_case":
+            candidate.side = "LONG"
+        elif mutation == "candidate_status":
+            candidate.review_status = "rejected"
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.action is None
+    assert expected_conflict in plan.conflicts
 
 
 def test_apply_requires_exact_plan_fingerprint_and_is_idempotent(tmp_path):

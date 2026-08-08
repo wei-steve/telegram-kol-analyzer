@@ -18,6 +18,8 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    RawMessage,
+    SignalCandidate,
     TradeSignal,
 )
 
@@ -183,6 +185,32 @@ def _build_entry_assembly_fingerprint_repair_plan(
         final_evidence.get("signal_candidate_id"), assembly.signal_candidate_id
     ):
         conflicts.append("assembly_signal_candidate_identity_mismatch")
+    strategy_raw_message = session.get(
+        RawMessage, int(assembly.strategy_raw_message_id)
+    )
+    signal_candidate = session.get(
+        SignalCandidate, int(assembly.signal_candidate_id)
+    )
+    if strategy_raw_message is None:
+        conflicts.append("strategy_raw_message_not_found")
+    if signal_candidate is None:
+        conflicts.append("signal_candidate_not_found")
+    if signal_candidate is not None and (
+        int(signal_candidate.raw_message_id) != int(assembly.strategy_raw_message_id)
+    ):
+        conflicts.append("signal_candidate_raw_message_mismatch")
+    if strategy_raw_message is not None and not _raw_source_identity_matches(
+        strategy_raw_message,
+        evidence=final_evidence,
+        binding=binding,
+    ):
+        conflicts.append("strategy_raw_message_source_mismatch")
+    if signal_candidate is not None and not _candidate_is_entry_strategy(
+        signal_candidate,
+        evidence=final_evidence,
+        binding=binding,
+    ):
+        conflicts.append("signal_candidate_not_entry_strategy")
     snapshot_strategy = (
         str(snapshot.get("strategy_instance_id") or "")
         if isinstance(snapshot, Mapping)
@@ -401,6 +429,40 @@ def _source_identity_matches(evidence: Mapping[str, Any], binding: ExecutionBind
         and evidence.get("strategy_message_id") == int(binding.message_id)
         and str(evidence.get("symbol") or "").upper() == str(binding.symbol).upper()
         and str(evidence.get("side") or "").lower() == str(binding.side).lower()
+    )
+
+
+def _raw_source_identity_matches(
+    raw_message: RawMessage,
+    *,
+    evidence: Mapping[str, Any],
+    binding: ExecutionBinding,
+) -> bool:
+    return (
+        int(raw_message.chat_id) == evidence.get("chat_id") == int(binding.chat_id)
+        and int(raw_message.message_id)
+        == evidence.get("strategy_message_id")
+        == int(binding.message_id)
+    )
+
+
+def _candidate_is_entry_strategy(
+    candidate: SignalCandidate,
+    *,
+    evidence: Mapping[str, Any],
+    binding: ExecutionBinding,
+) -> bool:
+    return (
+        candidate.event_type == "entry_signal"
+        and candidate.review_status in {"pending", "confirmed"}
+        and candidate.target_lifecycle_id is None
+        and candidate.management_action is None
+        and str(candidate.symbol or "")
+        == str(evidence.get("symbol") or "")
+        == str(binding.symbol)
+        and str(candidate.side or "")
+        == str(evidence.get("side") or "")
+        == str(binding.side)
     )
 
 
