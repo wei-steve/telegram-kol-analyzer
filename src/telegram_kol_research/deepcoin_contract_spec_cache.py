@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from datetime import timedelta
+from datetime import timezone
 from decimal import Decimal
-from decimal import DecimalException
 from decimal import InvalidOperation
 import hashlib
 import json
@@ -41,7 +41,22 @@ class DeepcoinInstrumentCapability:
 
     instrument_id: str
     state: str
-    contract_spec: DeepcoinContractSpec
+    contract_value: Decimal
+    quantity_step: Decimal
+    min_quantity: Decimal
+    price_tick: Decimal
+
+    @property
+    def contract_spec(self) -> DeepcoinContractSpec:
+        """Convert exact exchange values to the legacy execution spec type."""
+
+        return DeepcoinContractSpec(
+            instrument_id=self.instrument_id,
+            contract_value=_finite_float(self.contract_value, field="ctVal"),
+            quantity_step=_finite_float(self.quantity_step, field="lotSz"),
+            min_quantity=_finite_float(self.min_quantity, field="minSz"),
+            price_tick=_finite_float(self.price_tick, field="tickSz"),
+        )
 
 
 @dataclass(frozen=True)
@@ -87,6 +102,22 @@ class DeepcoinContractSpecSnapshot:
                 for instrument_id, capability in self.capabilities_by_instrument_id.items()
             }
         )
+
+    def to_instrument_rows(self) -> list[dict[str, str]]:
+        """Return canonical JSON-safe rows without losing Decimal precision."""
+
+        return [
+            {
+                "instType": "SWAP",
+                "instId": capability.instrument_id,
+                "ctVal": _canonical_decimal(capability.contract_value),
+                "lotSz": _canonical_decimal(capability.quantity_step),
+                "minSz": _canonical_decimal(capability.min_quantity),
+                "tickSz": _canonical_decimal(capability.price_tick),
+                "state": capability.state,
+            }
+            for _, capability in sorted(self.capabilities_by_instrument_id.items())
+        ]
 
 
 @dataclass(frozen=True)
@@ -169,23 +200,26 @@ def validate_deepcoin_instrument_snapshot(
         instrument_id: DeepcoinInstrumentCapability(
             instrument_id=instrument_id,
             state=validated.state,
-            contract_spec=DeepcoinContractSpec(
-                instrument_id=instrument_id,
-                contract_value=_finite_float(validated.contract_value, field="ctVal"),
-                quantity_step=_finite_float(validated.quantity_step, field="lotSz"),
-                min_quantity=_finite_float(validated.min_quantity, field="minSz"),
-                price_tick=_finite_float(validated.price_tick, field="tickSz"),
-            ),
+            contract_value=validated.contract_value,
+            quantity_step=validated.quantity_step,
+            min_quantity=validated.min_quantity,
+            price_tick=validated.price_tick,
         )
         for instrument_id, validated in sorted(validated_by_id.items())
     }
+    # Exercise the legacy float conversion only after the entire response has
+    # passed structural and Decimal validation. Non-live rows are checked too,
+    # because they remain part of the platform capability snapshot.
+    for capability in capabilities.values():
+        capability.contract_spec
     digest = _snapshot_digest(validated_by_id)
+    normalized_fetched_at = fetched_at.astimezone(timezone.utc)
     return DeepcoinContractSpecSnapshot(
         schema_version=DEEPCOIN_CONTRACT_SPEC_SNAPSHOT_SCHEMA_VERSION,
         venue="deepcoin",
         source_path=source_path.strip(),
-        fetched_at=fetched_at,
-        expires_at=fetched_at + ttl,
+        fetched_at=normalized_fetched_at,
+        expires_at=normalized_fetched_at + ttl,
         source_digest_sha256=digest,
         capabilities_by_instrument_id=capabilities,
     )
@@ -226,11 +260,11 @@ def _positive_decimal(value: Any, *, field: str, row_index: int) -> Decimal:
 
 
 def _is_integral_multiple(value: Decimal, step: Decimal) -> bool:
-    try:
-        quotient = value / step
-        return quotient == quotient.to_integral_value()
-    except DecimalException:
-        return False
+    value_numerator, value_denominator = value.as_integer_ratio()
+    step_numerator, step_denominator = step.as_integer_ratio()
+    ratio_numerator = value_numerator * step_denominator
+    ratio_denominator = value_denominator * step_numerator
+    return ratio_numerator % ratio_denominator == 0
 
 
 def _snapshot_digest(instruments: Mapping[str, _ValidatedInstrument]) -> str:
@@ -256,8 +290,9 @@ def _snapshot_digest(instruments: Mapping[str, _ValidatedInstrument]) -> str:
 
 
 def _canonical_decimal(value: Decimal) -> str:
-    normalized = value.normalize()
-    rendered = format(normalized, "f")
+    # Decimal.normalize() applies the active arithmetic context and can round
+    # high-precision exchange metadata. Fixed-point formatting is exact.
+    rendered = format(value, "f")
     if "." in rendered:
         rendered = rendered.rstrip("0").rstrip(".")
     return rendered

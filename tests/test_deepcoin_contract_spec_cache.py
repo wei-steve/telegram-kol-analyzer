@@ -5,6 +5,8 @@ from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
 from decimal import Decimal
+import json
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -217,6 +219,87 @@ def test_validate_digest_is_deterministic_across_row_and_key_order():
     assert first.source_digest_sha256 == second.source_digest_sha256
 
 
+def test_validate_high_precision_incompatible_minimum_is_not_rounded_to_multiple():
+    with pytest.raises(ValueError, match="minSz.*lotSz"):
+        validate_deepcoin_instrument_snapshot(
+            [
+                _row(
+                    "BTC-USDT-SWAP",
+                    lotSz="1",
+                    minSz="10000000000000000000000000000.1",
+                )
+            ],
+            fetched_at=NOW,
+            ttl=TTL,
+        )
+
+
+def test_validate_high_precision_exact_multiple_is_accepted():
+    snapshot = validate_deepcoin_instrument_snapshot(
+        [
+            _row(
+                "BTC-USDT-SWAP",
+                lotSz="0.12345678901234567890123456789",
+                minSz="0.37037036703703703670370370367",
+            )
+        ],
+        fetched_at=NOW,
+        ttl=TTL,
+    )
+
+    capability = snapshot.capabilities_by_instrument_id["BTC-USDT-SWAP"]
+    assert capability.quantity_step == Decimal("0.12345678901234567890123456789")
+    assert capability.min_quantity == Decimal("0.37037036703703703670370370367")
+
+
+def test_validate_high_precision_values_do_not_collide_in_digest():
+    first = validate_deepcoin_instrument_snapshot(
+        [_row("BTC-USDT-SWAP", ctVal="1.00000000000000000000000000001")],
+        fetched_at=NOW,
+        ttl=TTL,
+    )
+    second = validate_deepcoin_instrument_snapshot(
+        [_row("BTC-USDT-SWAP", ctVal="1.00000000000000000000000000002")],
+        fetched_at=NOW,
+        ttl=TTL,
+    )
+
+    assert first.source_digest_sha256 != second.source_digest_sha256
+
+
+def test_snapshot_canonical_rows_round_trip_losslessly_through_json():
+    snapshot = validate_deepcoin_instrument_snapshot(
+        [
+            _row(
+                "BTC-USDT-SWAP",
+                ctVal="1.0000000000000000000000000000100",
+                lotSz="0.1234567890123456789012345678900",
+                minSz="0.3703703670370370367037037036700",
+                tickSz="0.0000000000000000000000000000100",
+                state=" SUSPEND ",
+            )
+        ],
+        fetched_at=NOW,
+        ttl=TTL,
+    )
+
+    serialized_rows = json.loads(json.dumps(snapshot.to_instrument_rows()))
+    reloaded = validate_deepcoin_instrument_snapshot(
+        serialized_rows,
+        fetched_at=snapshot.fetched_at,
+        ttl=snapshot.expires_at - snapshot.fetched_at,
+        source_path=snapshot.source_path,
+    )
+
+    capability = snapshot.capabilities_by_instrument_id["BTC-USDT-SWAP"]
+    assert capability.contract_value == Decimal("1.00000000000000000000000000001")
+    assert capability.quantity_step == Decimal("0.12345678901234567890123456789")
+    assert capability.min_quantity == Decimal("0.37037036703703703670370370367")
+    assert capability.price_tick == Decimal("0.00000000000000000000000000001")
+    assert reloaded.to_instrument_rows() == snapshot.to_instrument_rows()
+    assert reloaded.source_digest_sha256 == snapshot.source_digest_sha256
+
+
 @pytest.mark.parametrize(
     ("fetched_at", "ttl", "match"),
     [
@@ -232,6 +315,25 @@ def test_validate_rejects_invalid_snapshot_timing(fetched_at, ttl, match):
             fetched_at=fetched_at,
             ttl=ttl,
         )
+
+
+def test_validate_normalizes_fetched_at_to_utc_before_ttl_across_dst_fallback():
+    # Vancouver falls back at 02:00 on 2026-11-01. Two elapsed hours after
+    # 00:30 PDT is 01:30 PST, not 02:30 PST.
+    local_fetched_at = datetime(
+        2026, 11, 1, 0, 30, tzinfo=ZoneInfo("America/Vancouver")
+    )
+
+    snapshot = validate_deepcoin_instrument_snapshot(
+        [_row("BTC-USDT-SWAP")],
+        fetched_at=local_fetched_at,
+        ttl=timedelta(hours=2),
+    )
+
+    assert snapshot.fetched_at == datetime(2026, 11, 1, 7, 30, tzinfo=timezone.utc)
+    assert snapshot.fetched_at.tzinfo is timezone.utc
+    assert snapshot.expires_at == datetime(2026, 11, 1, 9, 30, tzinfo=timezone.utc)
+    assert snapshot.expires_at.tzinfo is timezone.utc
 
 
 def test_validate_rejects_empty_or_non_list_snapshot():
