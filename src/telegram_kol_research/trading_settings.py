@@ -77,6 +77,7 @@ class TradingSettings:
         "disabled", "shadow", "live"
     ] = "disabled"
     entry_revision_v2_mode: Literal["disabled", "shadow", "live"] = "disabled"
+    deepcoin_contract_specs_mode: Literal["static", "shadow", "live"] = "static"
     default_max_loss_usdt: float = 20.0
     daily_max_loss_usdt: float = 500.0
     max_concurrent_positions: int = 4
@@ -343,6 +344,12 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         raw.get("entry_revision_v2_mode", defaults.entry_revision_v2_mode),
         field_name="entry_revision_v2_mode",
     )
+    deepcoin_contract_specs_mode = _deepcoin_contract_specs_mode(
+        raw.get(
+            "deepcoin_contract_specs_mode",
+            defaults.deepcoin_contract_specs_mode,
+        )
+    )
     return TradingSettings(
         auto_trade_enabled=_boolean_setting(
             raw,
@@ -361,6 +368,7 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         entry_preamble_mode=entry_preamble_mode,
         entry_message_assembly_v2_mode=entry_message_assembly_v2_mode,
         entry_revision_v2_mode=entry_revision_v2_mode,
+        deepcoin_contract_specs_mode=deepcoin_contract_specs_mode,
         default_max_loss_usdt=_positive_float(
             raw.get("default_max_loss_usdt"),
             defaults.default_max_loss_usdt,
@@ -473,6 +481,21 @@ def _rollout_mode(
     normalized = value.strip().lower()
     if normalized not in {"disabled", "shadow", "live"}:
         raise ValueError(f"{field_name} must be disabled, shadow, or live")
+    return normalized
+
+
+def _deepcoin_contract_specs_mode(
+    value: Any,
+) -> Literal["static", "shadow", "live"]:
+    if not isinstance(value, str):
+        raise ValueError(
+            "deepcoin_contract_specs_mode must be static, shadow, or live"
+        )
+    normalized = value.strip().lower()
+    if normalized not in {"static", "shadow", "live"}:
+        raise ValueError(
+            "deepcoin_contract_specs_mode must be static, shadow, or live"
+        )
     return normalized
 
 

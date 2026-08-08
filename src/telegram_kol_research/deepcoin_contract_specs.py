@@ -94,6 +94,68 @@ class DeepcoinContractSpecLookup:
     contract_spec: DeepcoinContractSpec | None = None
 
 
+@dataclass(frozen=True)
+class DeepcoinContractSpecComparison:
+    """Last shadow comparison without changing execution authority."""
+
+    instrument_id: str
+    matches: bool
+    static_spec: DeepcoinContractSpec | None
+    authoritative_spec: DeepcoinContractSpec | None
+    error: str | None = None
+
+
+class RolloutDeepcoinContractSpecProvider:
+    """Select static or authoritative specs through an explicit rollout mode."""
+
+    def __init__(
+        self,
+        *,
+        static_provider: DeepcoinContractSpecProvider,
+        authoritative_provider: DeepcoinContractSpecProvider,
+        mode_loader: Callable[[], str],
+    ) -> None:
+        self.static_provider = static_provider
+        self.authoritative_provider = authoritative_provider
+        self._mode_loader = mode_loader
+        self.last_comparison: DeepcoinContractSpecComparison | None = None
+
+    @property
+    def mode(self) -> str:
+        try:
+            value = self._mode_loader()
+        except Exception:
+            return "static"
+        return value if value in {"static", "shadow", "live"} else "static"
+
+    def get_contract_spec(self, instrument_id: str) -> DeepcoinContractSpec | None:
+        mode = self.mode
+        if mode == "live":
+            return self.authoritative_provider.get_contract_spec(instrument_id)
+
+        static_spec = self.static_provider.get_contract_spec(instrument_id)
+        if mode == "shadow":
+            comparison_error = None
+            try:
+                authoritative_spec = self.authoritative_provider.get_contract_spec(
+                    instrument_id
+                )
+            except Exception as exc:
+                authoritative_spec = None
+                comparison_error = f"shadow_compare_failed:{type(exc).__name__}"
+            self.last_comparison = DeepcoinContractSpecComparison(
+                instrument_id=str(instrument_id).strip().upper(),
+                matches=(
+                    comparison_error is None
+                    and static_spec == authoritative_spec
+                ),
+                static_spec=static_spec,
+                authoritative_spec=authoritative_spec,
+                error=comparison_error,
+            )
+        return static_spec
+
+
 class RefreshableDeepcoinContractSpecProvider:
     """Cache-backed provider with coalesced, bounded refresh attempts."""
 
@@ -127,6 +189,14 @@ class RefreshableDeepcoinContractSpecProvider:
         self._last_success_expires_at: datetime | None = None
         self._last_error: str | None = None
         self._reload_locked()
+
+    @property
+    def cache_path(self) -> Path:
+        return self._cache_path
+
+    @property
+    def ttl(self) -> timedelta:
+        return self._ttl
 
     @property
     def snapshot(self) -> DeepcoinContractSpecSnapshot | None:

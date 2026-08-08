@@ -1,4 +1,5 @@
 import asyncio
+from datetime import timedelta
 from types import SimpleNamespace
 
 from typer.testing import CliRunner
@@ -7,6 +8,7 @@ from pathlib import Path
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.cli import app
 from telegram_kol_research import cli as cli_module
+from telegram_kol_research import deepcoin_contract_specs as contract_specs_module
 
 
 def test_web_command_is_available_in_help():
@@ -185,6 +187,165 @@ contracts:
         min_quantity=1,
         price_tick=0.1,
     )
+
+
+def test_web_command_composes_rollout_provider_with_process_cache_controls(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "groups.yaml"
+    spec_path = tmp_path / "deepcoin_contract_specs.yaml"
+    cache_path = tmp_path / "runtime" / "deepcoin-contract-specs.json"
+    config_path.write_text("groups: []", encoding="utf-8")
+    spec_path.write_text(
+        """
+contracts:
+  - instrument_id: BTC-USDT-SWAP
+    contract_value: 0.001
+    quantity_step: 1
+    min_quantity: 1
+    price_tick: 0.1
+""".strip(),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_create_web_app(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("telegram_kol_research.cli.create_web_app", fake_create_web_app)
+    monkeypatch.setattr(
+        "telegram_kol_research.cli._build_web_server",
+        lambda app_instance, host, port: SimpleNamespace(run=lambda: None),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.cli.load_telegram_auth_config",
+        lambda: (_ for _ in ()).throw(ValueError("missing")),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "web",
+            "--database-path",
+            str(tmp_path / "research.db"),
+            "--config-path",
+            str(config_path),
+            "--deepcoin-contract-specs-path",
+            str(spec_path),
+            "--deepcoin-contract-specs-cache-path",
+            str(cache_path),
+            "--deepcoin-contract-specs-ttl-hours",
+            "12",
+        ],
+    )
+
+    provider = captured["deepcoin_contract_spec_provider"]
+    assert result.exit_code == 0
+    assert type(provider).__name__ == "RolloutDeepcoinContractSpecProvider"
+    assert provider.authoritative_provider.cache_path == cache_path
+    assert provider.authoritative_provider.ttl == timedelta(hours=12)
+    # The persisted default is static, so the reviewed YAML remains authoritative.
+    assert provider.mode == "static"
+    assert provider.get_contract_spec("BTC-USDT-SWAP").contract_value == 0.001
+
+
+def test_web_command_rejects_non_positive_contract_spec_ttl(tmp_path):
+    result = CliRunner().invoke(
+        app,
+        ["web", "--deepcoin-contract-specs-ttl-hours", "0"],
+    )
+
+    assert result.exit_code != 0
+    assert "deepcoin-contract-specs-ttl-hours" in result.output
+
+
+def test_contract_spec_rollout_modes_preserve_authority_and_compare_in_shadow():
+    provider_class = getattr(
+        contract_specs_module,
+        "RolloutDeepcoinContractSpecProvider",
+        None,
+    )
+    assert provider_class is not None
+
+    static_spec = DeepcoinContractSpec("BTC-USDT-SWAP", 0.001, 1, 1, 0.1)
+    dynamic_spec = DeepcoinContractSpec("BTC-USDT-SWAP", 0.01, 1, 1, 0.1)
+    static_provider = SimpleNamespace(
+        get_contract_spec=lambda instrument_id: static_spec,
+    )
+
+    class AuthoritativeProvider:
+        cache_path = Path("cache.json")
+        ttl = timedelta(hours=24)
+
+        def get_contract_spec(self, instrument_id):
+            return dynamic_spec
+
+    mode = {"value": "static"}
+    provider = provider_class(
+        static_provider=static_provider,
+        authoritative_provider=AuthoritativeProvider(),
+        mode_loader=lambda: mode["value"],
+    )
+
+    assert provider.get_contract_spec("BTC-USDT-SWAP") is static_spec
+    assert provider.last_comparison is None
+
+    mode["value"] = "shadow"
+    assert provider.get_contract_spec("BTC-USDT-SWAP") is static_spec
+    assert provider.last_comparison.matches is False
+    assert provider.last_comparison.instrument_id == "BTC-USDT-SWAP"
+
+    mode["value"] = "live"
+    assert provider.get_contract_spec("BTC-USDT-SWAP") is dynamic_spec
+
+
+def test_contract_spec_rollout_live_never_falls_back_to_static():
+    provider_class = getattr(
+        contract_specs_module,
+        "RolloutDeepcoinContractSpecProvider",
+        None,
+    )
+    assert provider_class is not None
+    static_spec = DeepcoinContractSpec("SOL-USDT-SWAP", 1, 1, 1, 0.001)
+    provider = provider_class(
+        static_provider=SimpleNamespace(
+            get_contract_spec=lambda instrument_id: static_spec,
+        ),
+        authoritative_provider=SimpleNamespace(
+            get_contract_spec=lambda instrument_id: None,
+        ),
+        mode_loader=lambda: "live",
+    )
+
+    assert provider.get_contract_spec("SOL-USDT-SWAP") is None
+
+
+def test_contract_spec_shadow_comparison_failure_cannot_change_static_execution():
+    provider_class = getattr(
+        contract_specs_module,
+        "RolloutDeepcoinContractSpecProvider",
+        None,
+    )
+    assert provider_class is not None
+    static_spec = DeepcoinContractSpec("BTC-USDT-SWAP", 0.001, 1, 1, 0.1)
+
+    def fail_comparison(instrument_id):
+        raise RuntimeError("signed request details must not escape")
+
+    provider = provider_class(
+        static_provider=SimpleNamespace(
+            get_contract_spec=lambda instrument_id: static_spec,
+        ),
+        authoritative_provider=SimpleNamespace(
+            get_contract_spec=fail_comparison,
+        ),
+        mode_loader=lambda: "shadow",
+    )
+
+    assert provider.get_contract_spec("BTC-USDT-SWAP") is static_spec
+    assert provider.last_comparison.matches is False
+    assert provider.last_comparison.error == "shadow_compare_failed:RuntimeError"
 
 
 def test_web_command_does_not_create_live_client_when_session_lock_is_busy(

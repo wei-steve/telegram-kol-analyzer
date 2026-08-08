@@ -4838,6 +4838,32 @@ class _StaticContractSpecProvider:
         )
 
 
+def test_create_web_app_keeps_one_contract_spec_provider_instance_for_workers(tmp_path):
+    provider = _StaticContractSpecProvider()
+    observed = []
+
+    async def worker(**kwargs):
+        observed.append(kwargs["contract_spec_provider"])
+        return None
+
+    app = create_web_app(
+        tmp_path / "research.db",
+        deepcoin_contract_spec_provider=provider,
+        deepcoin_reconcile_runner=worker,
+        strategy_management_worker_runner=worker,
+        source_message_deletion_worker_runner=worker,
+        deepcoin_reconcile_startup_delay_seconds=0,
+        strategy_management_worker_startup_delay_seconds=0,
+    )
+
+    with TestClient(app):
+        pass
+
+    assert app.state.deepcoin_contract_spec_provider is provider
+    assert observed
+    assert all(item is provider for item in observed)
+
+
 def _persist_execution_candidate(session_factory):
     with session_factory() as session:
         raw = RawMessage(

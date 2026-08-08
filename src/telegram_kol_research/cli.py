@@ -51,7 +51,11 @@ from telegram_kol_research.message_operation_supervisor import (
     run_message_operation_outcome_shadow_once,
 )
 from telegram_kol_research.runtime_incident_scanner import build_scanner_facts, run_scanner_cycle
-from telegram_kol_research.deepcoin_contract_specs import load_deepcoin_contract_specs
+from telegram_kol_research.deepcoin_contract_specs import (
+    RefreshableDeepcoinContractSpecProvider,
+    RolloutDeepcoinContractSpecProvider,
+    load_deepcoin_contract_specs,
+)
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
 from telegram_kol_research.execution_bindings import (
     load_deepcoin_execution_reconciliation_snapshot_read_only,
@@ -5093,6 +5097,15 @@ def web(
     database_path: Path = Path("data/research.db"),
     config_path: Path = Path("config/groups.yaml"),
     deepcoin_contract_specs_path: Path = Path("config/deepcoin_contract_specs.yaml"),
+    deepcoin_contract_specs_cache_path: Path = typer.Option(
+        Path("data/deepcoin_contract_specs_cache.json"),
+        "--deepcoin-contract-specs-cache-path",
+    ),
+    deepcoin_contract_specs_ttl_hours: float = typer.Option(
+        24.0,
+        "--deepcoin-contract-specs-ttl-hours",
+        min=0.000001,
+    ),
 ) -> None:
     """Run the local web workbench."""
 
@@ -5117,9 +5130,24 @@ def web(
         for group in group_config.groups
         if group.enabled
     }
-    deepcoin_contract_spec_provider = load_deepcoin_contract_specs(
+    static_contract_spec_provider = load_deepcoin_contract_specs(
         deepcoin_contract_specs_path,
         required=False,
+    )
+    settings_session_factory = create_session_factory(database_path)
+    authoritative_contract_spec_provider = RefreshableDeepcoinContractSpecProvider(
+        cache_path=deepcoin_contract_specs_cache_path,
+        instrument_loader=lambda: (
+            build_deepcoin_client_from_env().list_swap_instruments()
+        ),
+        ttl=timedelta(hours=deepcoin_contract_specs_ttl_hours),
+    )
+    deepcoin_contract_spec_provider = RolloutDeepcoinContractSpecProvider(
+        static_provider=static_contract_spec_provider,
+        authoritative_provider=authoritative_contract_spec_provider,
+        mode_loader=lambda: load_trading_settings(
+            settings_session_factory
+        ).deepcoin_contract_specs_mode,
     )
 
     telegram_client = None

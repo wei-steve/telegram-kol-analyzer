@@ -47,7 +47,39 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     assert settings.entry_preamble_mode == "disabled"
     assert settings.entry_message_assembly_v2_mode == "disabled"
     assert settings.entry_revision_v2_mode == "disabled"
+    assert settings.deepcoin_contract_specs_mode == "static"
     assert not hasattr(settings, "entry_preamble_live_chat_ids")
+
+
+@pytest.mark.parametrize("mode", ["static", "shadow", "live"])
+def test_deepcoin_contract_specs_mode_round_trips(mode, tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+
+    saved = save_trading_settings(
+        session_factory,
+        {"deepcoin_contract_specs_mode": mode.upper()},
+    )
+
+    assert saved.deepcoin_contract_specs_mode == mode
+    assert load_trading_settings(session_factory).deepcoin_contract_specs_mode == mode
+
+
+@pytest.mark.parametrize("value", ["disabled", "unsafe", True, [], {}, 1, None])
+def test_deepcoin_contract_specs_mode_fails_closed(value):
+    with pytest.raises(ValueError, match="deepcoin_contract_specs_mode"):
+        trading_settings_from_payload({"deepcoin_contract_specs_mode": value})
+
+
+def test_contract_spec_cache_controls_are_not_web_trading_settings():
+    settings = trading_settings_from_payload(
+        {
+            "deepcoin_contract_specs_cache_path": "/tmp/untrusted.json",
+            "deepcoin_contract_specs_ttl_hours": 999,
+        }
+    )
+
+    assert not hasattr(settings, "deepcoin_contract_specs_cache_path")
+    assert not hasattr(settings, "deepcoin_contract_specs_ttl_hours")
 
 
 def test_entry_revision_activation_generation_changes_only_with_mode(tmp_path):
