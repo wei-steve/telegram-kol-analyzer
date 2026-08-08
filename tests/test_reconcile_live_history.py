@@ -121,6 +121,29 @@ def test_run_reconcile_once_persists_only_messages_newer_than_checkpoint(tmp_pat
     assert checkpoint.last_message_id == 78
 
 
+def test_history_reconcile_without_authority_persists_raw_only(tmp_path):
+    session_factory = create_session_factory(tmp_path / "authority-required.db")
+
+    stats = asyncio.run(
+        run_reconcile_once(
+            client=_FakeClient(),
+            session_factory=session_factory,
+            broker=None,
+            target_titles={"VIP BTC Room"},
+            authoritative_processor=None,
+            discover_dialogs_fn=_fake_discover_dialogs,
+            fetch_dialog_messages_fn=_fake_fetch_dialog_messages,
+        )
+    )
+
+    assert stats["inserted_messages"] == 2
+    assert stats["inserted_candidates"] == 0
+    assert stats["inserted_trade_ideas"] == 0
+    assert stats["recognition_status"] == "authoritative_processor_required"
+    with session_factory() as session:
+        assert session.query(SignalCandidate).count() == 0
+
+
 def test_reconcile_processes_each_new_message_authoritatively_exactly_once(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     processed: list[int] = []

@@ -25,9 +25,9 @@ EXPECTED_LEGACY_IMPORTERS = {
     "recognize_message_now": {
         "web_app.py",
     },
-    "recognize_records_with_ai_config": {"telegram_live_listener.py"},
+    "recognize_records_with_ai_config": set(),
     "run_mimo_direct_for_message": set(),
-    "persist_text_signal_candidates": {"telegram_live_listener.py"},
+    "persist_text_signal_candidates": set(),
 }
 
 

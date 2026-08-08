@@ -13,13 +13,11 @@ from sqlalchemy import or_
 from sqlalchemy import tuple_
 
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig, load_ai_recognition_config
-from telegram_kol_research.candidates import persist_text_signal_candidates
 from telegram_kol_research.contextual_message_window import (
     fetch_missing_reply_target,
 )
 from telegram_kol_research.message_recognition import (
     filter_records_by_inserted_message_keys,
-    recognize_records_with_ai_config,
 )
 from telegram_kol_research.media_retention import resolve_media_path
 from telegram_kol_research.models import (
@@ -900,6 +898,11 @@ async def run_reconcile_once(
     inserted_messages = 0
     inserted_candidates = 0
     inserted_trade_ideas = 0
+    recognition_status = (
+        "authoritative"
+        if authoritative_processor is not None
+        else "authoritative_processor_required"
+    )
 
     for dialog in matched_dialogs:
         checkpoint_message_id = history_checkpoints.get(int(dialog.get("id") or 0), 0)
@@ -1010,14 +1013,13 @@ async def run_reconcile_once(
                     session.query(SignalCandidate).count() - candidate_count_before,
                 )
         else:
-            candidate_stats = recognize_records_with_ai_config(
-                session_factory,
-                inserted_records,
-                fallback_recognizer=persist_text_signal_candidates,
+            logger.error(
+                "history recognition authority unavailable "
+                "reason=authoritative_processor_required"
             )
-            inserted_candidates += candidate_stats["inserted_candidates"]
-        trade_stats = persist_trade_ideas_from_candidates(session_factory)
-        inserted_trade_ideas += trade_stats["inserted_trade_ideas"]
+        if authoritative_processor is not None:
+            trade_stats = persist_trade_ideas_from_candidates(session_factory)
+            inserted_trade_ideas += trade_stats["inserted_trade_ideas"]
         dialog_title = str(dialog.get("title") or "")
         if (
             strategy_alert_config is not None
@@ -1044,6 +1046,7 @@ async def run_reconcile_once(
         "inserted_trade_ideas": inserted_trade_ideas,
         "recovered_messages": recovered_messages,
         "expired_recovery_messages": expired_recovery_messages,
+        "recognition_status": recognition_status,
     }
 
 
