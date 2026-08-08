@@ -1883,6 +1883,167 @@ def test_legacy_reconciliation_validates_recreation_pending_reconciliation(
     assert read_entry_preamble_invariants(database_path, now=NOW) == expected
 
 
+@pytest.mark.parametrize("before", [{}, {"stop_loss": "63000"}])
+def test_legacy_reconciliation_accepts_recreation_with_writer_price_snapshot(
+    tmp_path, before
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        recreated = session.query(ExecutionOrderLeg).filter_by(leg_index=1).one()
+        recreated.order_id = binding.order_id = "new-order-1"
+        recreated.client_order_id = binding.client_order_id = "new-client-1"
+        recreated.status = "open"
+        binding.last_exchange_status = "trigger_entry_recreated"
+        _add_legacy_action_event(
+            session,
+            action="recreate_trigger_entry",
+            order_id="new-order-1",
+            related_order_id="order-1",
+            before=before,
+            after={"stop_loss": "63100", "take_profit": "66000"},
+            request={
+                "instId": "BTC-USDT-SWAP",
+                "clOrdId": "new-client-1",
+                "slTriggerPx": "63100",
+            },
+            response={"code": "0", "data": {"ordId": "new-order-1"}},
+        )
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == ()
+
+
+def test_legacy_reconciliation_rejects_forged_recreation_take_profit(tmp_path):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        recreated = session.query(ExecutionOrderLeg).filter_by(leg_index=1).one()
+        recreated.order_id = binding.order_id = "new-order-1"
+        recreated.client_order_id = binding.client_order_id = "new-client-1"
+        recreated.status = "open"
+        binding.last_exchange_status = "trigger_entry_recreated"
+        _add_legacy_action_event(
+            session,
+            action="recreate_trigger_entry",
+            order_id="new-order-1",
+            related_order_id="order-1",
+            before={"take_profit": "66000"},
+            after={"take_profit": "65000"},
+            request={
+                "instId": "BTC-USDT-SWAP",
+                "clOrdId": "new-client-1",
+            },
+            response={"code": "0", "data": {"ordId": "new-order-1"}},
+        )
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == (
+        "live_entry_preamble_binding_evidence_missing",
+    )
+
+
+def test_legacy_reconciliation_rejects_recreation_request_with_deferred_tp(
+    tmp_path,
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        recreated = session.query(ExecutionOrderLeg).filter_by(leg_index=1).one()
+        recreated.order_id = binding.order_id = "new-order-1"
+        recreated.client_order_id = binding.client_order_id = "new-client-1"
+        recreated.status = "open"
+        binding.last_exchange_status = "trigger_entry_recreated"
+        _add_legacy_action_event(
+            session,
+            action="recreate_trigger_entry",
+            order_id="new-order-1",
+            related_order_id="order-1",
+            before={},
+            after={"take_profit": "66000"},
+            request={
+                "instId": "BTC-USDT-SWAP",
+                "clOrdId": "new-client-1",
+                "tpTriggerPx": "66000",
+            },
+            response={"code": "0", "data": {"ordId": "new-order-1"}},
+        )
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == (
+        "live_entry_preamble_binding_evidence_missing",
+    )
+
+
+@pytest.mark.parametrize("forged_price", [{"x": 1}, [63100], True, -1, "bad"])
+def test_legacy_reconciliation_rejects_non_scalar_recreation_price(
+    tmp_path, forged_price
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        recreated = session.query(ExecutionOrderLeg).filter_by(leg_index=1).one()
+        recreated.order_id = binding.order_id = "new-order-1"
+        recreated.client_order_id = binding.client_order_id = "new-client-1"
+        recreated.status = "open"
+        binding.last_exchange_status = "trigger_entry_recreated"
+        _add_legacy_action_event(
+            session,
+            action="recreate_trigger_entry",
+            order_id="new-order-1",
+            related_order_id="order-1",
+            before={},
+            after={"stop_loss": forged_price},
+            request={
+                "instId": "BTC-USDT-SWAP",
+                "clOrdId": "new-client-1",
+                "slTriggerPx": forged_price,
+            },
+            response={"code": "0", "data": {"ordId": "new-order-1"}},
+        )
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == (
+        "live_entry_preamble_binding_evidence_missing",
+    )
+
+
 def test_legacy_reconciliation_accepts_all_pending_legs_operator_cancelled(
     tmp_path,
 ):
@@ -1922,6 +2083,53 @@ def test_legacy_reconciliation_accepts_all_pending_legs_operator_cancelled(
         session.commit()
 
     assert read_entry_preamble_invariants(database_path, now=NOW) == ()
+
+
+@pytest.mark.parametrize("mutation", [None, "missing_event", "wrong_identity"])
+def test_legacy_reconciliation_validates_all_absent_entry_recovery(
+    tmp_path, mutation
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        binding.order_id = None
+        binding.client_order_id = None
+        binding.last_exchange_status = "pending_entry_leg_cancelled"
+        legs = session.query(ExecutionOrderLeg).order_by(
+            ExecutionOrderLeg.leg_index
+        ).all()
+        for index, leg in enumerate(legs):
+            leg.status = "cancelled"
+            leg.terminal_reason = "pending_entry_order_absent_confirmed"
+            if mutation == "missing_event" and index == 1:
+                continue
+            _add_legacy_action_event(
+                session,
+                action="cancel_entry_absent_confirmed",
+                order_id=(
+                    "forged-order"
+                    if mutation == "wrong_identity" and index == 0
+                    else leg.order_id
+                ),
+                client_order_id=leg.client_order_id,
+            )
+        session.commit()
+
+    expected = (
+        ()
+        if mutation is None
+        else ("live_entry_preamble_binding_evidence_missing",)
+    )
+    assert read_entry_preamble_invariants(database_path, now=NOW) == expected
 
 
 @pytest.mark.parametrize("order_alias", ["algoId", "orderId", "order_id"])

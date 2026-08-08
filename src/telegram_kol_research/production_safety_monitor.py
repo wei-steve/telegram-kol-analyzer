@@ -1292,6 +1292,7 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
           AND action IN (
               'adjust_position_tpsl', 'set_position_tpsl',
               'cancel_trigger_entry', 'cancel_regular_entry',
+              'cancel_entry_absent_confirmed',
               'recreate_trigger_entry'
           )
         ORDER BY id ASC
@@ -1333,6 +1334,9 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
         legs=legs,
         initial_submission_identity=binding_order_identity,
         events=transition_events,
+        durable_take_profit_prices={
+            str(row["price"]) for row in binding_draft["take_profit_legs"]
+        },
     )
     if not lifecycle_is_lawful and not event_transition_is_lawful:
         return False

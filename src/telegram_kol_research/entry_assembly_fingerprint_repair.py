@@ -6,6 +6,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
 from sqlalchemy import text
@@ -1196,6 +1197,7 @@ _LEGACY_BINDING_EVENT_ACTIONS = frozenset(
         "set_position_tpsl",
         "cancel_trigger_entry",
         "cancel_regular_entry",
+        "cancel_entry_absent_confirmed",
         "recreate_trigger_entry",
     }
 )
@@ -1207,6 +1209,7 @@ def _legacy_current_identity_lineage_is_exact(
     legs: list[Any],
     initial_submission_identity: Mapping[str, Any],
     events: list[Mapping[str, Any]],
+    durable_take_profit_prices: set[str],
 ) -> bool:
     expected_order_ids = str(
         initial_submission_identity.get("order_id") or ""
@@ -1241,14 +1244,16 @@ def _legacy_current_identity_lineage_is_exact(
             or not _legacy_transition_event_core_is_exact(
                 event, binding=binding, action="recreate_trigger_entry"
             )
-            or not _legacy_recreation_price_snapshot_is_exact(event.get("before"))
+            or not _legacy_recreation_price_snapshot_is_exact(
+                event.get("before"), allow_empty=True
+            )
             or not _legacy_recreation_price_snapshot_is_exact(event.get("after"))
             or request.get("instId") != instrument_id
             or not str(request.get("clOrdId") or "").strip()
-            or (
-                event["after"].get("stop_loss") is not None
-                and str(request.get("slTriggerPx"))
-                != str(event["after"]["stop_loss"])
+            or not _legacy_recreation_after_matches_request(
+                event["after"],
+                request,
+                durable_take_profit_prices=durable_take_profit_prices,
             )
             or _legacy_success_response_order_id(response) != next_order_id
         ):
@@ -1293,6 +1298,7 @@ def legacy_event_backed_transition_is_lawful(
     legs: list[Any],
     initial_submission_identity: Mapping[str, Any],
     events: list[Mapping[str, Any]],
+    durable_take_profit_prices: set[str],
 ) -> bool:
     transition_events = [
         row
@@ -1306,6 +1312,7 @@ def legacy_event_backed_transition_is_lawful(
         legs=legs,
         initial_submission_identity=initial_submission_identity,
         events=transition_events,
+        durable_take_profit_prices=durable_take_profit_prices,
     ):
         return False
     last_status = binding.get("last_exchange_status")
@@ -1341,7 +1348,7 @@ def legacy_event_backed_transition_is_lawful(
     ):
         return True
     if last_status == "pending_entry_leg_cancelled":
-        return _legacy_all_pending_operator_cancel_is_exact(
+        return _legacy_all_pending_cancel_is_exact(
             binding, legs=legs, events=transition_events
         )
     if last_status == "position_tpsl_adjusted":
@@ -1375,6 +1382,7 @@ def legacy_event_backed_transition_is_lawful(
                 for row in transition_events
                 if row.get("action") == "recreate_trigger_entry"
             ],
+            durable_take_profit_prices=durable_take_profit_prices,
         )
     return False
 
@@ -1512,7 +1520,7 @@ def _legacy_full_cancel_transition_is_exact(
     return True
 
 
-def _legacy_all_pending_operator_cancel_is_exact(
+def _legacy_all_pending_cancel_is_exact(
     binding: Mapping[str, Any],
     *,
     legs: list[Any],
@@ -1527,17 +1535,22 @@ def _legacy_all_pending_operator_cancel_is_exact(
         or not legs
         or any(
             str(_leg_value(row, "status") or "").lower() != "cancelled"
-            or _leg_value(row, "terminal_reason")
-            != "operator_cancelled_unfilled_entry_leg"
             or _leg_value(row, "pos_id") is not None
             for row in legs
         )
     ):
         return False
+    reasons = {_leg_value(row, "terminal_reason") for row in legs}
+    if reasons == {"operator_cancelled_unfilled_entry_leg"}:
+        allowed_actions = {"cancel_trigger_entry", "cancel_regular_entry"}
+    elif reasons == {"pending_entry_order_absent_confirmed"}:
+        allowed_actions = {"cancel_entry_absent_confirmed"}
+    else:
+        return False
     cancel_events = [
         event
         for event in events
-        if event.get("action") in {"cancel_trigger_entry", "cancel_regular_entry"}
+        if event.get("action") in allowed_actions
     ]
     event_by_order_id = {event.get("order_id"): event for event in cancel_events}
     if len(cancel_events) != len(legs) or len(event_by_order_id) != len(legs):
@@ -1545,14 +1558,47 @@ def _legacy_all_pending_operator_cancel_is_exact(
     instrument_id = f"{str(binding.get('symbol') or '').upper()}-USDT-SWAP"
     return all(
         (event := event_by_order_id.get(_leg_value(row, "order_id"))) is not None
-        and _legacy_cancel_event_matches_identity(
-            event,
-            binding=binding,
-            order_id=_leg_value(row, "order_id"),
-            client_order_id=_leg_value(row, "client_order_id"),
-            instrument_id=instrument_id,
+        and (
+            _legacy_absent_cancel_event_matches_identity(
+                event,
+                binding=binding,
+                order_id=_leg_value(row, "order_id"),
+                client_order_id=_leg_value(row, "client_order_id"),
+            )
+            if event.get("action") == "cancel_entry_absent_confirmed"
+            else _legacy_cancel_event_matches_identity(
+                event,
+                binding=binding,
+                order_id=_leg_value(row, "order_id"),
+                client_order_id=_leg_value(row, "client_order_id"),
+                instrument_id=instrument_id,
+            )
         )
         for row in legs
+    )
+
+
+def _legacy_absent_cancel_event_matches_identity(
+    event: Mapping[str, Any],
+    *,
+    binding: Mapping[str, Any],
+    order_id: Any,
+    client_order_id: Any,
+) -> bool:
+    return bool(
+        event.get("action") == "cancel_entry_absent_confirmed"
+        and event.get("status") == "submitted"
+        and event.get("venue") == "deepcoin"
+        and event.get("strategy_instance_id")
+        == binding.get("strategy_instance_id")
+        and event.get("order_id") == order_id
+        and event.get("client_order_id") == client_order_id
+        and event.get("pos_id") is None
+        and event.get("related_order_id") is None
+        and event.get("before") is None
+        and event.get("after") is None
+        and event.get("request") is None
+        and event.get("response") is None
     )
 
 
@@ -1663,6 +1709,7 @@ def _legacy_trigger_recreation_is_exact(
     legs: list[Any],
     initial_submission_identity: Mapping[str, Any],
     events: list[Mapping[str, Any]],
+    durable_take_profit_prices: set[str],
 ) -> bool:
     if not events:
         return False
@@ -1673,7 +1720,9 @@ def _legacy_trigger_recreation_is_exact(
         or not _legacy_transition_event_core_is_exact(
             event, binding=binding, action="recreate_trigger_entry"
         )
-        or not _legacy_recreation_price_snapshot_is_exact(event.get("before"))
+        or not _legacy_recreation_price_snapshot_is_exact(
+            event.get("before"), allow_empty=True
+        )
         or not _legacy_recreation_price_snapshot_is_exact(event.get("after"))
     ):
         return False
@@ -1722,7 +1771,7 @@ def _legacy_trigger_recreation_is_exact(
                 action="recreate_trigger_entry",
             )
             or not _legacy_recreation_price_snapshot_is_exact(
-                recreation_event.get("before")
+                recreation_event.get("before"), allow_empty=True
             )
             or not _legacy_recreation_price_snapshot_is_exact(
                 recreation_event.get("after")
@@ -1732,10 +1781,10 @@ def _legacy_trigger_recreation_is_exact(
             or not str(next_order_id or "").strip()
             or not str(next_client_id or "").strip()
             or request.get("instId") != instrument_id
-            or (
-                recreation_event["after"].get("stop_loss") is not None
-                and str(request.get("slTriggerPx"))
-                != str(recreation_event["after"]["stop_loss"])
+            or not _legacy_recreation_after_matches_request(
+                recreation_event["after"],
+                request,
+                durable_take_profit_prices=durable_take_profit_prices,
             )
             or _legacy_success_response_order_id(response) != next_order_id
         ):
@@ -1802,12 +1851,46 @@ def _nested_mapping_values(value: Any, key: str) -> list[Any]:
     return []
 
 
-def _legacy_recreation_price_snapshot_is_exact(value: Any) -> bool:
+def _legacy_recreation_price_snapshot_is_exact(
+    value: Any, *, allow_empty: bool = False
+) -> bool:
     return bool(
         isinstance(value, Mapping)
-        and value
+        and (allow_empty or value)
         and set(value).issubset({"stop_loss", "take_profit"})
-        and all(item not in (None, "", 0, "0") for item in value.values())
+        and all(_legacy_positive_price(item) for item in value.values())
+    )
+
+
+def _legacy_positive_price(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return False
+    try:
+        price = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    return price.is_finite() and price > 0
+
+
+def _legacy_recreation_after_matches_request(
+    after: Mapping[str, Any],
+    request: Mapping[str, Any],
+    *,
+    durable_take_profit_prices: set[str],
+) -> bool:
+    return bool(
+        not any(
+            request.get(key) not in (None, "")
+            for key in ("tpTriggerPx", "tpTriggerPxType", "tpOrdPx")
+        )
+        and (
+            after.get("stop_loss") is None
+            or str(request.get("slTriggerPx")) == str(after["stop_loss"])
+        )
+        and (
+            after.get("take_profit") is None
+            or str(after["take_profit"]) in durable_take_profit_prices
+        )
     )
 
 
