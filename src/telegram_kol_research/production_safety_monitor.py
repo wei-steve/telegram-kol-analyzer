@@ -77,6 +77,11 @@ _GIT_HEAD = re.compile(r"[0-9a-f]{40}\Z")
 _SAFE_TIMESTAMP = re.compile(r"[0-9T:+.-]{1,40}\Z")
 _SHA256_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_RECONCILIATION_JSON_BYTES = 1_000_000
+_TERMINAL_PREBINDING_ERROR_TYPE = "RecoveryLiveSubmitError"
+_TERMINAL_PREBINDING_ERROR_PREFIX = "signal_enqueue_blocked:"
+_TERMINAL_PREBINDING_REASONS = frozenset(
+    {"missing_ready_confirmation", "contract_size_unverified"}
+)
 _RECONCILIATION_EVENT_COLUMNS = frozenset(
     {
         "id",
@@ -765,6 +770,139 @@ def _read_reconciliation_json(raw: object) -> dict[str, Any] | None:
     except (UnicodeError, TypeError, ValueError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _has_exact_terminal_prebinding_refusal(
+    connection: sqlite3.Connection,
+    *,
+    available_tables: set[str],
+    signal_candidate_id: object,
+    strategy_raw_message_id: object,
+    strategy_instance_id: object,
+) -> bool:
+    """Recognize one closed-set refusal that ended before any live artifact."""
+
+    required_tables = {
+        "message_instruction_items",
+        "trade_signals",
+        "execution_bindings",
+        "execution_events",
+        "raw_messages",
+    }
+    if not required_tables.issubset(available_tables):
+        return False
+    if (
+        type(signal_candidate_id) is not int
+        or signal_candidate_id <= 0
+        or type(strategy_raw_message_id) is not int
+        or strategy_raw_message_id <= 0
+        or not isinstance(strategy_instance_id, str)
+        or not strategy_instance_id
+        or len(strategy_instance_id) > 255
+    ):
+        return False
+
+    required_columns = {
+        "message_instruction_items": {
+            "raw_message_id",
+            "signal_candidate_id",
+            "instruction_kind",
+            "status",
+            "error_json",
+            "retired_at",
+        },
+        "raw_messages": {"id", "chat_id", "message_id"},
+        "trade_signals": {"strategy_instance_id", "chat_id", "message_id"},
+        "execution_bindings": {"strategy_instance_id"},
+        "execution_events": {
+            "strategy_instance_id",
+            "chat_id",
+            "message_id",
+            "source_message_id",
+        },
+    }
+    for table, expected in required_columns.items():
+        actual = {
+            str(row[1])
+            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if not expected.issubset(actual):
+            return False
+
+    instruction_rows = connection.execute(
+        """
+        SELECT raw_message_id, instruction_kind, status, error_json, retired_at
+        FROM message_instruction_items
+        WHERE signal_candidate_id = ?
+        ORDER BY id
+        LIMIT 2
+        """,
+        (signal_candidate_id,),
+    ).fetchall()
+    if len(instruction_rows) != 1:
+        return False
+    raw_message_id, instruction_kind, status, error_json, retired_at = (
+        instruction_rows[0]
+    )
+    if (
+        raw_message_id != strategy_raw_message_id
+        or instruction_kind != "entry"
+        or status != "failed"
+        or retired_at is not None
+    ):
+        return False
+    error = _read_reconciliation_json(error_json)
+    if error is None or set(error) != {"type", "message"}:
+        return False
+    message = error.get("message")
+    if (
+        error.get("type") != _TERMINAL_PREBINDING_ERROR_TYPE
+        or not isinstance(message, str)
+        or not message.startswith(_TERMINAL_PREBINDING_ERROR_PREFIX)
+    ):
+        return False
+    reasons = message.removeprefix(_TERMINAL_PREBINDING_ERROR_PREFIX).split(",")
+    if (
+        len(reasons) != 2
+        or len(set(reasons)) != 2
+        or frozenset(reasons) != _TERMINAL_PREBINDING_REASONS
+    ):
+        return False
+
+    source = connection.execute(
+        "SELECT chat_id, message_id FROM raw_messages WHERE id = ? LIMIT 2",
+        (strategy_raw_message_id,),
+    ).fetchall()
+    if len(source) != 1:
+        return False
+    chat_id, message_id = source[0]
+    if chat_id is None or message_id is None:
+        return False
+    if connection.execute(
+        """
+        SELECT 1 FROM trade_signals
+        WHERE strategy_instance_id = ? OR (chat_id = ? AND message_id = ?)
+        LIMIT 1
+        """,
+        (strategy_instance_id, chat_id, message_id),
+    ).fetchone():
+        return False
+    if connection.execute(
+        "SELECT 1 FROM execution_bindings WHERE strategy_instance_id = ? LIMIT 1",
+        (strategy_instance_id,),
+    ).fetchone():
+        return False
+    if connection.execute(
+        """
+        SELECT 1 FROM execution_events
+        WHERE strategy_instance_id = ?
+           OR (chat_id = ? AND (message_id = ? OR source_message_id = ?))
+        LIMIT 1
+        """,
+        (strategy_instance_id, chat_id, message_id, message_id),
+    ).fetchone():
+        return False
+    return True
 
 
 def _reconciliation_stale_evidence_matches(
@@ -1478,6 +1616,16 @@ def read_entry_preamble_invariants(
         assembly_evidence_column = (
             "a.evidence_json" if "evidence_json" in assembly_columns else "NULL"
         )
+        assembly_candidate_column = (
+            "a.signal_candidate_id"
+            if "signal_candidate_id" in assembly_columns
+            else "NULL"
+        )
+        assembly_raw_message_column = (
+            "a.strategy_raw_message_id"
+            if "strategy_raw_message_id" in assembly_columns
+            else "NULL"
+        )
         binding_columns = {
             str(row[1])
             for row in connection.execute(
@@ -1506,7 +1654,8 @@ def read_entry_preamble_invariants(
         evidence_rows = connection.execute(
             f"""
             SELECT a.id, a.strategy_instance_id, a.fingerprint,
-                   {assembly_evidence_column}, b.id, b.payload_json,
+                   {assembly_evidence_column}, {assembly_candidate_column},
+                   {assembly_raw_message_column}, b.id, b.payload_json,
                    b.strategy_instance_id,
                    {binding_identity_select}
             FROM entry_strategy_assemblies AS a
@@ -1520,6 +1669,8 @@ def read_entry_preamble_invariants(
             strategy_instance_id,
             fingerprint,
             assembly_evidence_json,
+            signal_candidate_id,
+            strategy_raw_message_id,
             binding_id,
             payload_json,
             binding_strategy_instance_id,
@@ -1581,7 +1732,19 @@ def read_entry_preamble_invariants(
                     stale_evidence=evidence,
                 )
             )
-            if not matches and not reconciled:
+            terminal_prebinding_refusal = (
+                binding_id is None
+                and not matches
+                and not reconciled
+                and _has_exact_terminal_prebinding_refusal(
+                    connection,
+                    available_tables=available,
+                    signal_candidate_id=signal_candidate_id,
+                    strategy_raw_message_id=strategy_raw_message_id,
+                    strategy_instance_id=strategy_instance_id,
+                )
+            )
+            if not matches and not reconciled and not terminal_prebinding_refusal:
                 reasons.add("live_entry_preamble_binding_evidence_missing")
                 break
     return tuple(sorted(reasons))
