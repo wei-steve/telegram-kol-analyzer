@@ -23,6 +23,7 @@ class LLMProxyConfig:
     api_key: str
     model: str
     timeout_seconds: float
+    egress_socket_path: str | None = None
 
 
 class RuntimeAgentLLMConfigError(ValueError):
@@ -31,6 +32,9 @@ class RuntimeAgentLLMConfigError(ValueError):
 
 _RUNTIME_AGENT_LLM_CONFIG_ERROR = (
     "dedicated Runtime Agent provider configuration is invalid"
+)
+_RUNTIME_AGENT_MODEL_EGRESS_SOCKET = (
+    "/run/telegram-kol-agent-model-egress.sock"
 )
 
 
@@ -133,6 +137,10 @@ def load_runtime_agent_llm_config(
         "TELEGRAM_KOL_RUNTIME_AGENT_LLM_API_KEY", ""
     ).strip()
     model = env.get("TELEGRAM_KOL_RUNTIME_AGENT_LLM_MODEL", "").strip()
+    egress_socket_path = env.get(
+        "TELEGRAM_KOL_RUNTIME_AGENT_MODEL_EGRESS_SOCKET",
+        _RUNTIME_AGENT_MODEL_EGRESS_SOCKET,
+    ).strip()
     try:
         timeout_seconds = float(
             env.get(
@@ -152,6 +160,7 @@ def load_runtime_agent_llm_config(
         or parsed_url.fragment
         or not api_key
         or model != "mimo-v2.5"
+        or egress_socket_path != _RUNTIME_AGENT_MODEL_EGRESS_SOCKET
         or not math.isfinite(timeout_seconds)
     ):
         raise RuntimeAgentLLMConfigError(_RUNTIME_AGENT_LLM_CONFIG_ERROR)
@@ -160,6 +169,20 @@ def load_runtime_agent_llm_config(
         api_key=api_key,
         model=model,
         timeout_seconds=max(5.0, min(timeout_seconds, 120.0)),
+        egress_socket_path=egress_socket_path,
+    )
+
+
+def _build_runtime_agent_http_client(
+    config: LLMProxyConfig,
+    *,
+    timeout_seconds: float,
+) -> httpx.Client:
+    if config.egress_socket_path != _RUNTIME_AGENT_MODEL_EGRESS_SOCKET:
+        raise RuntimeAgentLLMConfigError(_RUNTIME_AGENT_LLM_CONFIG_ERROR)
+    return httpx.Client(
+        timeout=timeout_seconds,
+        transport=httpx.HTTPTransport(uds=config.egress_socket_path),
     )
 
 
@@ -368,8 +391,9 @@ def request_structured_chat_turn(
             }
         )
     created_client = client is None
-    active_client = client or httpx.Client(
-        timeout=timeout_seconds or config.timeout_seconds
+    active_client = client or _build_runtime_agent_http_client(
+        config,
+        timeout_seconds=timeout_seconds or config.timeout_seconds,
     )
     try:
         response = active_client.post(

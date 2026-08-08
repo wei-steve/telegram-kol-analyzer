@@ -15,6 +15,12 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 UNIT_NAME="telegram-kol-runtime-agent.service"
 UNIT_SOURCE="$PRODUCTION_ROOT/deploy/systemd/$UNIT_NAME"
 UNIT_DEST="/etc/systemd/system/$UNIT_NAME"
+EGRESS_SOCKET_NAME="telegram-kol-agent-model-egress.socket"
+EGRESS_SERVICE_NAME="telegram-kol-agent-model-egress.service"
+EGRESS_SOCKET_SOURCE="$PRODUCTION_ROOT/deploy/systemd/$EGRESS_SOCKET_NAME"
+EGRESS_SERVICE_SOURCE="$PRODUCTION_ROOT/deploy/systemd/$EGRESS_SERVICE_NAME"
+EGRESS_SOCKET_DEST="/etc/systemd/system/$EGRESS_SOCKET_NAME"
+EGRESS_SERVICE_DEST="/etc/systemd/system/$EGRESS_SERVICE_NAME"
 PREPARE_HELPER_SOURCE="$PROJECT_ROOT/deploy/systemd/telegram-kol-runtime-agent-prepare-db-acl"
 PREPARE_HELPER_TARGET="/usr/local/libexec/telegram-kol-runtime-agent-prepare-db-acl"
 ENV_FILE="$PRODUCTION_ROOT/config/runtime_incident_agent.env"
@@ -30,9 +36,14 @@ if [[ "$PROJECT_ROOT" != "$PRODUCTION_ROOT" ]]; then
   echo "Run this installer only from $PRODUCTION_ROOT." >&2
   exit 1
 fi
-if [[ ! -f "$UNIT_SOURCE" || ! -f "$PREPARE_HELPER_SOURCE" \
+if [[ ! -f "$UNIT_SOURCE" || ! -f "$EGRESS_SOCKET_SOURCE" \
+  || ! -f "$EGRESS_SERVICE_SOURCE" || ! -f "$PREPARE_HELPER_SOURCE" \
   || ! -x "$PRODUCTION_ROOT/.venv/bin/telegram-kol-research" ]]; then
   echo "Reviewed sidecar unit or installed CLI is missing." >&2
+  exit 1
+fi
+if [[ ! -x /usr/lib/systemd/systemd-socket-proxyd ]]; then
+  echo "Fixed systemd socket relay is unavailable." >&2
   exit 1
 fi
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -66,6 +77,23 @@ case "$active_status" in
     exit 1
     ;;
 esac
+
+for egress_unit in "$EGRESS_SOCKET_NAME" "$EGRESS_SERVICE_NAME"; do
+  egress_status=0
+  systemctl is-active --quiet "$egress_unit" || egress_status=$?
+  case "$egress_status" in
+    3|4)
+      ;;
+    0)
+      echo "Stop $egress_unit before installing or upgrading." >&2
+      exit 1
+      ;;
+    *)
+      echo "Unable to prove $egress_unit is inactive." >&2
+      exit 1
+      ;;
+  esac
+done
 
 enabled_status=0
 systemctl is-enabled --quiet "$UNIT_NAME" || enabled_status=$?
@@ -155,6 +183,8 @@ if [[ -f "$MONITOR_STATE_PATH" ]]; then
 fi
 
 install -o root -g root -m 0644 "$UNIT_SOURCE" "$UNIT_DEST"
+install -o root -g root -m 0644 "$EGRESS_SOCKET_SOURCE" "$EGRESS_SOCKET_DEST"
+install -o root -g root -m 0644 "$EGRESS_SERVICE_SOURCE" "$EGRESS_SERVICE_DEST"
 install -d -o root -g root -m 0755 "$(dirname "$PREPARE_HELPER_TARGET")"
 install -o root -g root -m 0755 "$PREPARE_HELPER_SOURCE" "$PREPARE_HELPER_TARGET"
 install -d -o "$AGENT_USER" -g "$AGENT_GROUP" -m 0700 "$PRIVATE_WORKSPACE"

@@ -636,8 +636,9 @@ lifecycle and the new audit ledger; production fact reads made by the broker
 are query-only.
 
 Deploy 8R.7 with Agent eligibility and tool registration unchanged. Stop and
-disable only the Runtime Agent sidecar before its installer, then restore the
-existing sidecar policy after the main-service safe-window gate. Run isolated
+disable the Runtime Agent sidecar and stop its fixed model-egress socket/relay
+before the installer, then restore the existing sidecar policy after the
+main-service safe-window gate. Run isolated
 read and mutation-refusal canaries with temporary data; do not send Telegram,
 call a live exchange mutation, replay a historical message, or make a
 message-operation incident eligible. Completion additionally requires a
@@ -647,6 +648,18 @@ identity. Until those controls are proven, keep 8R.7 `in_progress` and do not
 begin 8R.8. Immediate rollback is to stop the Runtime Agent sidecar; normal
 intake, execution, reconciliation, Stage 1 delivery, scanner, and monitor stay
 independent.
+
+The Phase 8R.7 completion egress boundary denies every direct IP destination
+from the Agent cgroup except loopback. The dedicated Runtime Agent LLM client
+connects through `/run/telegram-kol-agent-model-egress.sock`; a root-owned
+systemd socket relay has one immutable upstream,
+`api.xiaomimimo.com:443`. The Agent therefore cannot directly reach Deepcoin,
+Telegram, MiMo, or another public host. Loopback remains available only for the
+existing fixed evidence projections. The already deployed Deepcoin projection
+is the approved equivalent of a trade-disabled credential: only the trusted
+main service owns the exchange credential and the loopback endpoint exposes
+one bounded positions/open-orders fingerprint through fixed read methods,
+rejects forwarding headers, and exposes no mutation parameters or methods.
 
 The operator approved a controlled Phase 8R.3 completion canary on 2026-08-08
 so that a rare natural multi-target failure cannot block later read-only Agent

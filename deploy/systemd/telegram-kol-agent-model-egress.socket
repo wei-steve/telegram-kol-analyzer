@@ -1,0 +1,10 @@
+[Unit]
+Description=Runtime Agent fixed MiMo model egress socket
+
+[Socket]
+ListenStream=/run/telegram-kol-agent-model-egress.sock
+SocketUser=telegram-kol-agent
+SocketGroup=telegram-kol-agent
+SocketMode=0600
+RemoveOnStop=true
+

@@ -203,6 +203,10 @@ def test_runtime_agent_environment_example_has_placeholders_not_secrets():
     ) in example
     assert "TELEGRAM_KOL_RUNTIME_AGENT_LLM_API_KEY=" in example
     assert "TELEGRAM_KOL_RUNTIME_AGENT_LLM_MODEL=mimo-v2.5" in example
+    assert (
+        "TELEGRAM_KOL_RUNTIME_AGENT_MODEL_EGRESS_SOCKET="
+        "/run/telegram-kol-agent-model-egress.sock"
+    ) in example
     assert "sk-" not in example
 
 

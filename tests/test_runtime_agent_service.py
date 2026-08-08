@@ -25,6 +25,13 @@ def test_runtime_agent_sidecar_unit_is_separate_and_dormant_until_enabled():
     assert "CapabilityBoundingSet=" in text
     assert "PrivateDevices=true" in text
     assert "ProtectSystem=strict" in text
+    assert "IPAddressDeny=any" in text
+    assert "IPAddressAllow=localhost" in text
+    assert "Requires=telegram-kol-agent-model-egress.socket" in text
+    assert (
+        "Environment=TELEGRAM_KOL_RUNTIME_AGENT_MODEL_EGRESS_SOCKET="
+        "/run/telegram-kol-agent-model-egress.sock"
+    ) in text
     assert "ReadWritePaths=/opt/telegram-kol-analyzer/data" in text
     assert "ReadOnlyPaths=/opt/telegram-kol-analyzer/data\n" not in text
     assert "InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session" in text
@@ -44,6 +51,8 @@ def test_runtime_agent_sidecar_unit_is_separate_and_dormant_until_enabled():
     assert "systemctl enable --now" not in installer
     assert 'PREPARE_HELPER_SOURCE="$PROJECT_ROOT/deploy/systemd/telegram-kol-runtime-agent-prepare-db-acl"' in installer
     assert 'install -o root -g root -m 0755 "$PREPARE_HELPER_SOURCE" "$PREPARE_HELPER_TARGET"' in installer
+    assert "telegram-kol-agent-model-egress.socket" in installer
+    assert "telegram-kol-agent-model-egress.service" in installer
     assert "useradd --system" in installer
     assert "setfacl -m" in installer
     assert "runuser -u \"$AGENT_USER\" -- test -w" in installer
@@ -78,6 +87,29 @@ def test_runtime_agent_sidecar_unit_is_separate_and_dormant_until_enabled():
     assert "pass_fds=(fd,)" in prepare_helper
     assert "os.fchmod(fd, metadata.st_mode & ~0o077)" in prepare_helper
     assert '"--sanitize-non-db"' in prepare_helper
+
+    socket_unit = (
+        Path(__file__).parents[1]
+        / "deploy"
+        / "systemd"
+        / "telegram-kol-agent-model-egress.socket"
+    ).read_text(encoding="utf-8")
+    relay_unit = (
+        Path(__file__).parents[1]
+        / "deploy"
+        / "systemd"
+        / "telegram-kol-agent-model-egress.service"
+    ).read_text(encoding="utf-8")
+    assert "ListenStream=/run/telegram-kol-agent-model-egress.sock" in socket_unit
+    assert "SocketUser=telegram-kol-agent" in socket_unit
+    assert "SocketMode=0600" in socket_unit
+    assert (
+        "ExecStart=/usr/lib/systemd/systemd-socket-proxyd "
+        "api.xiaomimimo.com:443"
+    ) in relay_unit
+    assert "DynamicUser=yes" in relay_unit
+    assert "api.deepcoin.com" not in relay_unit
+    assert "api.telegram.org" not in relay_unit
 
 
 def test_runtime_agent_acl_helper_never_opens_sqlite_symlinks(tmp_path):

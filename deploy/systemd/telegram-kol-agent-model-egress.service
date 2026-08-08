@@ -1,0 +1,34 @@
+[Unit]
+Description=Runtime Agent fixed MiMo model egress relay
+After=network-online.target
+Wants=network-online.target
+Requires=telegram-kol-agent-model-egress.socket
+
+[Service]
+Type=exec
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd api.xiaomimimo.com:443
+DynamicUser=yes
+AmbientCapabilities=
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @privileged

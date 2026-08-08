@@ -2,6 +2,8 @@
 Description=Telegram KOL read-only runtime incident agent sidecar
 After=network-online.target telegram-kol.service
 Wants=network-online.target
+Requires=telegram-kol-agent-model-egress.socket
+After=telegram-kol-agent-model-egress.socket
 ConditionPathExists=/opt/telegram-kol-analyzer/config/runtime_incident_agent.env
 
 [Service]
@@ -12,6 +14,7 @@ SupplementaryGroups=systemd-journal
 UMask=0077
 WorkingDirectory=/opt/telegram-kol-analyzer
 Environment=PYTHONUNBUFFERED=1
+Environment=TELEGRAM_KOL_RUNTIME_AGENT_MODEL_EGRESS_SOCKET=/run/telegram-kol-agent-model-egress.sock
 EnvironmentFile=-/opt/telegram-kol-analyzer/config/runtime_incident_agent.env
 ExecStartPre=+/usr/local/libexec/telegram-kol-runtime-agent-prepare-db-acl
 ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research runtime-incident-agent-worker --database-path /opt/telegram-kol-analyzer/data/research.db --poll-seconds 5
@@ -37,6 +40,8 @@ ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectProc=invisible
 ProtectSystem=strict
+IPAddressDeny=any
+IPAddressAllow=localhost
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true
 RestrictRealtime=true

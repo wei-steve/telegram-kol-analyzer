@@ -1,5 +1,6 @@
 import httpx
 import pytest
+import telegram_kol_research.llm_chat as llm_chat_module
 
 from telegram_kol_research.llm_chat import (
     LLMProxyConfig,
@@ -56,7 +57,45 @@ def test_runtime_agent_llm_config_is_isolated():
         api_key="agent-key",
         model="mimo-v2.5",
         timeout_seconds=120.0,
+        egress_socket_path="/run/telegram-kol-agent-model-egress.sock",
     )
+
+
+def test_runtime_agent_http_client_uses_only_reviewed_unix_egress_socket():
+    client = llm_chat_module._build_runtime_agent_http_client(
+        LLMProxyConfig(
+            base_url="https://api.xiaomimimo.com",
+            api_key="agent-key",
+            model="mimo-v2.5",
+            timeout_seconds=30,
+            egress_socket_path="/run/telegram-kol-agent-model-egress.sock",
+        ),
+        timeout_seconds=12,
+    )
+    try:
+        assert client._transport._pool._uds == (
+            "/run/telegram-kol-agent-model-egress.sock"
+        )
+        assert client.timeout.connect == 12
+    finally:
+        client.close()
+
+
+def test_runtime_agent_llm_config_rejects_unreviewed_egress_socket():
+    with pytest.raises(RuntimeAgentLLMConfigError):
+        load_runtime_agent_llm_config(
+            environ={
+                "TELEGRAM_KOL_RUNTIME_AGENT_LLM_BASE_URL": (
+                    "https://api.xiaomimimo.com/v1"
+                ),
+                "TELEGRAM_KOL_RUNTIME_AGENT_LLM_API_KEY": "agent-key",
+                "TELEGRAM_KOL_RUNTIME_AGENT_LLM_MODEL": "mimo-v2.5",
+                "TELEGRAM_KOL_RUNTIME_AGENT_MODEL_EGRESS_SOCKET": (
+                    "/tmp/unreviewed.sock"
+                ),
+            },
+            env_file_paths=[],
+        )
 
 
 def test_runtime_agent_llm_config_never_falls_back_to_shared_key():
