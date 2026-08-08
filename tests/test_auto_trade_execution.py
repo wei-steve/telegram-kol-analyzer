@@ -1731,6 +1731,135 @@ def test_auto_process_message_trade_signal_submits_live_order_with_protection(tm
     assert binding.position_mode == "split"
 
 
+def test_recovery_trigger_synchronizes_finalized_fingerprint_before_exchange_submission(
+    tmp_path,
+):
+    session_factory = create_session_factory(
+        tmp_path / "recovery-trigger-fingerprint.db"
+    )
+    raw_message_id = _persist_candidate(session_factory)
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC"],
+            "entry_message_assembly_v2_mode": "live",
+            "symbol_entry_thresholds": {
+                "BTC": {
+                    "market_leg_threshold": "50",
+                    "first_limit_offset": "90",
+                    "second_limit_offset": "80",
+                }
+            },
+        },
+    )
+
+    class _FingerprintInspectingClient(_FakeDeepcoinClient):
+        def __init__(self):
+            super().__init__()
+            self.inspected_first_submission = False
+
+        def trigger_order(self, order_payload):
+            if not self.inspected_first_submission:
+                with session_factory() as session:
+                    assembly = session.query(EntryStrategyAssembly).one()
+                    signal_payload = json.loads(
+                        session.query(TradeSignal).one().payload_json
+                    )
+                assert assembly.fingerprint == signal_payload[
+                    "entry_preamble_assembly"
+                ]["assembly_fingerprint"]
+                assert assembly.fingerprint == signal_payload[
+                    "deepcoin_order_draft"
+                ]["entry_preamble_assembly"]["assembly_fingerprint"]
+                self.inspected_first_submission = True
+            return super().trigger_order(order_payload)
+
+    client = _FingerprintInspectingClient()
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 8, 8, 8, 1, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    assert client.inspected_first_submission is True
+    with session_factory() as session:
+        assembly = session.query(EntryStrategyAssembly).one()
+        binding_payload = json.loads(
+            session.query(ExecutionBinding).one().payload_json
+        )
+    assert assembly.fingerprint == binding_payload["draft"][
+        "entry_preamble_assembly"
+    ]["assembly_fingerprint"]
+    assert result["entry_preamble_assembly"]["assembly_fingerprint"] == (
+        assembly.fingerprint
+    )
+
+
+def test_recovery_trigger_fingerprint_sync_failure_blocks_exchange_submission(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research.trade_signals import (
+        TradeSignalFingerprintSyncError,
+    )
+
+    session_factory = create_session_factory(
+        tmp_path / "recovery-trigger-fingerprint-sync-failure.db"
+    )
+    raw_message_id = _persist_candidate(session_factory)
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC"],
+            "entry_message_assembly_v2_mode": "live",
+            "symbol_entry_thresholds": {
+                "BTC": {
+                    "market_leg_threshold": "50",
+                    "first_limit_offset": "90",
+                    "second_limit_offset": "80",
+                }
+            },
+        },
+    )
+    client = _FakeDeepcoinClient()
+    import telegram_kol_research.auto_trade_execution as auto_module
+
+    def fail_sync(*args, **kwargs):
+        raise TradeSignalFingerprintSyncError("entry_assembly_signal_cas_failed")
+
+    monkeypatch.setattr(
+        auto_module,
+        "synchronize_pending_entry_assembly_evidence",
+        fail_sync,
+        raising=False,
+    )
+
+    with pytest.raises(
+        TradeSignalFingerprintSyncError,
+        match="entry_assembly_signal_cas_failed",
+    ):
+        auto_process_message_trade_signal(
+            session_factory,
+            raw_message_id=raw_message_id,
+            group_config=_group_config(),
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            processed_at=datetime(2026, 8, 8, 8, 1, tzinfo=UTC),
+        )
+
+    assert client.orders == []
+    assert client.trigger_orders == []
+    with session_factory() as session:
+        assert session.query(TradeSignal).one().status == "pending"
+
+
 def test_trigger_limit_entry_persists_tpsl_intent_before_parent_submission(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_message_id = _persist_candidate(session_factory)
