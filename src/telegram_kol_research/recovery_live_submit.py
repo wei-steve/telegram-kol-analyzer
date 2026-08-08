@@ -18,6 +18,10 @@ from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
 from telegram_kol_research.deepcoin_order_builder import _coalesce_equivalent_entry_legs
+from telegram_kol_research.entry_strategy_assembly import (
+    build_bounded_entry_order_draft_snapshot,
+    canonical_entry_assembly_fingerprint,
+)
 from telegram_kol_research.deepcoin_execution_actions import execute_deepcoin_management_signal
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord
 from telegram_kol_research.execution_bindings import ExecutionOrderLegRecord
@@ -56,6 +60,7 @@ from telegram_kol_research.trade_signals import MANAGEMENT_TRADE_SIGNAL_ACTIONS
 from telegram_kol_research.trade_signals import canonical_management_batch_id
 from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trade_signals import list_pending_trade_signals
+from telegram_kol_research.trade_signals import load_or_create_trade_signal
 from telegram_kol_research.trade_signals import load_trade_signal
 from telegram_kol_research.trade_signals import mark_trade_signal_failed
 from telegram_kol_research.trade_signals import mark_trade_signal_submitted
@@ -80,28 +85,6 @@ def _require_synchronized_finalized_entry_assembly(
 ) -> None:
     """Fail closed when a V2 entry signal is stale at the execution boundary."""
 
-    strategy_instance_id = trade_signal.strategy_instance_id
-    if not strategy_instance_id:
-        return
-    with session_factory() as session:
-        assembly = (
-            session.query(EntryStrategyAssembly)
-            .filter(
-                EntryStrategyAssembly.strategy_instance_id
-                == strategy_instance_id,
-                EntryStrategyAssembly.entry_preamble_id.is_(None),
-            )
-            .one_or_none()
-        )
-        if assembly is None:
-            return
-        assembly_id = int(assembly.id)
-        assembly_fingerprint = str(assembly.fingerprint)
-        try:
-            assembly_evidence = json.loads(assembly.evidence_json or "{}")
-        except (TypeError, ValueError):
-            assembly_evidence = None
-
     payload = trade_signal.payload
     top_evidence = (
         payload.get("entry_preamble_assembly")
@@ -118,6 +101,44 @@ def _require_synchronized_finalized_entry_assembly(
         if isinstance(draft, Mapping)
         else None
     )
+    declares_v2 = any(
+        isinstance(evidence, Mapping)
+        and (
+            "assembly_id" in evidence
+            or "strategy_instance_id" in evidence
+        )
+        for evidence in (top_evidence, nested_evidence)
+    )
+    if not declares_v2:
+        return
+    strategy_instance_id = trade_signal.strategy_instance_id
+    if (
+        not strategy_instance_id
+        or not isinstance(top_evidence, Mapping)
+        or not isinstance(nested_evidence, Mapping)
+        or not isinstance(draft, Mapping)
+    ):
+        raise RecoveryLiveSubmitError("entry_assembly_signal_not_synchronized")
+    with session_factory() as session:
+        assembly = (
+            session.query(EntryStrategyAssembly)
+            .filter(
+                EntryStrategyAssembly.strategy_instance_id
+                == strategy_instance_id,
+                EntryStrategyAssembly.entry_preamble_id.is_(None),
+            )
+            .one_or_none()
+        )
+        if assembly is None:
+            raise RecoveryLiveSubmitError(
+                "entry_assembly_signal_not_synchronized"
+            )
+        assembly_id = int(assembly.id)
+        assembly_fingerprint = str(assembly.fingerprint)
+        try:
+            assembly_evidence = json.loads(assembly.evidence_json or "{}")
+        except (TypeError, ValueError):
+            assembly_evidence = None
     snapshot = (
         assembly_evidence.get("order_draft_snapshot")
         if isinstance(assembly_evidence, Mapping)
@@ -131,6 +152,14 @@ def _require_synchronized_finalized_entry_assembly(
     snapshot_legs = (
         snapshot.get("order_legs") if isinstance(snapshot, Mapping) else None
     )
+    try:
+        current_snapshot = build_bounded_entry_order_draft_snapshot(draft)
+        canonical_fingerprint = canonical_entry_assembly_fingerprint(
+            assembly_evidence
+        )
+    except (TypeError, ValueError):
+        current_snapshot = None
+        canonical_fingerprint = None
     evidence_copies = (top_evidence, nested_evidence)
     if (
         not isinstance(snapshot, Mapping)
@@ -138,6 +167,8 @@ def _require_synchronized_finalized_entry_assembly(
         or final_leg_count <= 0
         or not isinstance(snapshot_legs, list)
         or len(snapshot_legs) != final_leg_count
+        or current_snapshot != snapshot
+        or canonical_fingerprint != assembly_fingerprint
         or any(not isinstance(evidence, Mapping) for evidence in evidence_copies)
         or any(
             evidence.get("assembly_id") != assembly_id
@@ -408,7 +439,7 @@ def enqueue_recovery_trade_signal(
     if not isinstance(draft, dict):
         raise RecoveryLiveSubmitError("missing_deepcoin_order_draft")
     source = draft.get("source") if isinstance(draft.get("source"), dict) else {}
-    return enqueue_trade_signal(
+    return load_or_create_trade_signal(
         session_factory,
         venue="deepcoin",
         source_type="recovery",

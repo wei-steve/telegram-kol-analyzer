@@ -792,35 +792,34 @@ def assemble_adjacent_entry_strategy(
             return _v2_result_from_assembly(existing, mode=mode)
 
 
-def finalize_adjacent_entry_assembly_draft(
-    session_factory: sessionmaker,
-    *,
-    assembly_id: int,
+def build_bounded_entry_order_draft_snapshot(
     order_draft: Mapping[str, object],
-) -> FinalizedEntryAssemblyDraft:
-    """Attach the exact bounded order economics once, before any exchange write."""
+) -> dict[str, object]:
+    """Return the one canonical bounded snapshot used for entry finalization."""
 
-    bounded_legs = []
-    for leg in list(order_draft.get("order_legs") or []):
-        if not isinstance(leg, Mapping):
-            continue
-        bounded_legs.append(
-            {
-                key: leg.get(key)
-                for key in (
-                    "price",
-                    "order_type",
-                    "allocation_pct",
-                    "risk_budget_usdt",
-                    "quantity",
-                    "quantity_unit",
-                    "estimated_stop_loss_usdt",
-                    "client_order_id",
-                )
-            }
-        )
-    if not 1 <= len(bounded_legs) <= 5:
-        raise ValueError("entry assembly draft must contain one to five legs")
+    raw_legs = order_draft.get("order_legs")
+    if (
+        not isinstance(raw_legs, list)
+        or not 1 <= len(raw_legs) <= 5
+        or any(not isinstance(leg, Mapping) for leg in raw_legs)
+    ):
+        raise ValueError("entry assembly draft must contain one to five valid legs")
+    bounded_legs = [
+        {
+            key: leg.get(key)
+            for key in (
+                "price",
+                "order_type",
+                "allocation_pct",
+                "risk_budget_usdt",
+                "quantity",
+                "quantity_unit",
+                "estimated_stop_loss_usdt",
+                "client_order_id",
+            )
+        }
+        for leg in raw_legs
+    ]
     raw_contract_spec = order_draft.get("contract_spec")
     contract_spec = (
         {
@@ -830,7 +829,7 @@ def finalize_adjacent_entry_assembly_draft(
         if isinstance(raw_contract_spec, Mapping)
         else None
     )
-    draft_snapshot = {
+    return {
         "strategy_instance_id": order_draft.get("strategy_instance_id"),
         "instrument_id": order_draft.get("instrument_id"),
         "stop_loss": order_draft.get("stop_loss"),
@@ -839,6 +838,29 @@ def finalize_adjacent_entry_assembly_draft(
         "contract_spec": contract_spec,
         "order_legs": bounded_legs,
     }
+
+
+def canonical_entry_assembly_fingerprint(evidence: Mapping[str, object]) -> str:
+    """Hash entry assembly evidence with the persisted canonical encoding."""
+
+    evidence_json = json.dumps(
+        evidence,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()
+
+
+def finalize_adjacent_entry_assembly_draft(
+    session_factory: sessionmaker,
+    *,
+    assembly_id: int,
+    order_draft: Mapping[str, object],
+) -> FinalizedEntryAssemblyDraft:
+    """Attach the exact bounded order economics once, before any exchange write."""
+
+    draft_snapshot = build_bounded_entry_order_draft_snapshot(order_draft)
     with session_factory() as session:
         assembly = session.get(EntryStrategyAssembly, int(assembly_id))
         if assembly is None or assembly.entry_preamble_id is not None:
@@ -876,11 +898,11 @@ def finalize_adjacent_entry_assembly_draft(
                 ),
             )
         evidence["order_draft_snapshot"] = draft_snapshot
-        evidence["final_entry_leg_count"] = len(bounded_legs)
+        evidence["final_entry_leg_count"] = len(draft_snapshot["order_legs"])
         evidence_json = json.dumps(
             evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
-        fingerprint = hashlib.sha256(evidence_json.encode("utf-8")).hexdigest()
+        fingerprint = canonical_entry_assembly_fingerprint(evidence)
         result = session.execute(
             update(EntryStrategyAssembly)
             .where(

@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.execution_bindings import build_strategy_instance_id
@@ -56,6 +57,10 @@ class TradeSignalRecord:
 
 class TradeSignalFingerprintSyncError(RuntimeError):
     """The pending signal could not be synchronized without ambiguity."""
+
+
+class TradeSignalReuseError(RuntimeError):
+    """An immutable queued signal conflicts with the requested identity."""
 
 
 def _normalized_assembly_fingerprint(value: Any, *, error_code: str) -> str:
@@ -327,6 +332,90 @@ def enqueue_trade_signal(
         row.updated_at = now
         session.commit()
         return _row_to_record(row)
+
+
+def load_or_create_trade_signal(
+    session_factory: sessionmaker,
+    *,
+    venue: str,
+    source_type: str,
+    kol_id: str,
+    chat_id: int,
+    message_id: int,
+    symbol: str,
+    side: str,
+    action: str,
+    payload: dict[str, Any],
+    strategy_instance_id: str | None = None,
+    enqueued_at: datetime | None = None,
+) -> TradeSignalRecord:
+    """Create once, then reuse the durable signal without rewriting history."""
+
+    normalized_venue = venue.lower()
+    normalized_source_type = source_type.lower()
+    normalized_symbol = symbol.upper()
+    normalized_side = side.lower()
+    normalized_action = action.lower()
+    signal_uid = build_trade_signal_uid(
+        venue=normalized_venue,
+        source_type=normalized_source_type,
+        chat_id=chat_id,
+        message_id=message_id,
+        symbol=normalized_symbol,
+        side=normalized_side,
+        action=normalized_action,
+    )
+    resolved_strategy_instance_id = strategy_instance_id or build_strategy_instance_id(
+        venue=normalized_venue,
+        chat_id=chat_id,
+        message_id=message_id,
+        symbol=normalized_symbol,
+        side=normalized_side,
+    )
+    payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    now = enqueued_at or datetime.now(UTC)
+
+    def validate_existing(row: TradeSignal) -> TradeSignalRecord:
+        if row.strategy_instance_id != resolved_strategy_instance_id:
+            raise TradeSignalReuseError("trade_signal_reuse_identity_mismatch")
+        return _row_to_record(row)
+
+    with session_factory() as session:
+        existing = (
+            session.query(TradeSignal)
+            .filter(TradeSignal.signal_uid == signal_uid)
+            .one_or_none()
+        )
+        if existing is not None:
+            return validate_existing(existing)
+        row = TradeSignal(
+            signal_uid=signal_uid,
+            strategy_instance_id=resolved_strategy_instance_id,
+            venue=normalized_venue,
+            source_type=normalized_source_type,
+            kol_id=kol_id,
+            chat_id=chat_id,
+            message_id=message_id,
+            symbol=normalized_symbol,
+            side=normalized_side,
+            action=normalized_action,
+            payload_json=payload_json,
+            updated_at=now,
+        )
+        session.add(row)
+        try:
+            session.commit()
+            return _row_to_record(row)
+        except IntegrityError:
+            session.rollback()
+            existing = (
+                session.query(TradeSignal)
+                .filter(TradeSignal.signal_uid == signal_uid)
+                .one_or_none()
+            )
+            if existing is None:
+                raise
+            return validate_existing(existing)
 
 
 def load_trade_signal(
