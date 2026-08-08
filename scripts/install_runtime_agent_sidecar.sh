@@ -102,17 +102,8 @@ setfacl -x "d:u:$AGENT_USER" "$DATA_DIRECTORY" 2>/dev/null || true
 setfacl -m "d:g::---,d:o::---" "$DATA_DIRECTORY"
 setfacl -m "u:$AGENT_USER:-wx" "$DATA_DIRECTORY"
 chmod +t "$DATA_DIRECTORY"
-setfacl -m "u:$AGENT_USER:rw-" "$DATABASE_PATH"
-for sqlite_sidecar in \
-  "$DATABASE_PATH-wal" \
-  "$DATABASE_PATH-shm" \
-  "$DATABASE_PATH-journal"
-do
-  if [[ -e "$sqlite_sidecar" ]]; then
-    setfacl -m "u:$AGENT_USER:rw-" "$sqlite_sidecar"
-  fi
-done
-"$PREPARE_HELPER_SOURCE" --sanitize-non-db
+/usr/bin/python3 "$PREPARE_HELPER_SOURCE"
+/usr/bin/python3 "$PREPARE_HELPER_SOURCE" --sanitize-non-db
 for denied_directory in backups deepcoin_field_probe session_backups; do
   denied_path="$DATA_DIRECTORY/$denied_directory"
   if [[ -e "$denied_path" ]] && runuser -u "$AGENT_USER" -- test -x "$denied_path"; then
