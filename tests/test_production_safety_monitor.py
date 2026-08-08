@@ -433,7 +433,17 @@ def _seed_reconciled_entry_preamble_monitor(database, *, second_mismatch=False):
         CREATE TABLE raw_messages (id INTEGER PRIMARY KEY, chat_id INTEGER, message_id INTEGER, posted_at TEXT);
         CREATE TABLE signal_candidates (id INTEGER PRIMARY KEY, raw_message_id INTEGER, event_type TEXT, management_action TEXT);
         CREATE TABLE entry_strategy_assemblies (id INTEGER PRIMARY KEY, strategy_instance_id TEXT, fingerprint TEXT, evidence_json TEXT);
-        CREATE TABLE execution_bindings (id INTEGER PRIMARY KEY, strategy_instance_id TEXT, payload_json TEXT);
+        CREATE TABLE execution_bindings (
+          id INTEGER PRIMARY KEY, strategy_instance_id TEXT, kol_id TEXT,
+          chat_id INTEGER, message_id INTEGER, symbol TEXT, side TEXT,
+          venue TEXT, payload_json TEXT
+        );
+        CREATE TABLE trade_signals (
+          id INTEGER PRIMARY KEY, strategy_instance_id TEXT, kol_id TEXT,
+          chat_id INTEGER, message_id INTEGER, symbol TEXT, side TEXT,
+          venue TEXT, source_type TEXT, action TEXT, status TEXT,
+          processed_at TEXT, payload_json TEXT
+        );
         CREATE TABLE execution_events (
           id INTEGER PRIMARY KEY, execution_binding_id INTEGER, trade_signal_id INTEGER,
           strategy_instance_id TEXT, venue TEXT, action TEXT, status TEXT,
@@ -453,9 +463,19 @@ def _seed_reconciled_entry_preamble_monitor(database, *, second_mismatch=False):
         "INSERT INTO entry_strategy_assemblies VALUES (2, 'strategy-1', ?, ?)",
         (final_fingerprint, json.dumps(final_evidence, sort_keys=True)),
     )
+    snapshot = final_evidence["order_draft_snapshot"]
+    binding_draft = {**snapshot, "entry_preamble_assembly": stale}
+    signal_draft = {**snapshot, "entry_preamble_assembly": stale}
     connection.execute(
-        "INSERT INTO execution_bindings VALUES (266, 'strategy-1', ?)",
-        (json.dumps({"draft": {"entry_preamble_assembly": stale}}, sort_keys=True),),
+        "INSERT INTO execution_bindings VALUES (266, 'strategy-1', 'group:-1001', -1001, 55, 'BTC', 'long', 'deepcoin', ?)",
+        (json.dumps({"draft": binding_draft}, sort_keys=True),),
+    )
+    connection.execute(
+        "INSERT INTO trade_signals VALUES (398, 'strategy-1', 'group:-1001', -1001, 55, 'BTC', 'long', 'deepcoin', 'recovery', 'open_position', 'submitted', '2026-08-08 00:00:00', ?)",
+        (json.dumps({
+            "entry_preamble_assembly": stale,
+            "deepcoin_order_draft": signal_draft,
+        }, sort_keys=True),),
     )
     connection.execute(
         """INSERT INTO execution_events (
@@ -480,8 +500,8 @@ def _seed_reconciled_entry_preamble_monitor(database, *, second_mismatch=False):
             (other_final, json.dumps(other_evidence, sort_keys=True)),
         )
         connection.execute(
-            "INSERT INTO execution_bindings VALUES (267, 'strategy-2', ?)",
-            (json.dumps({"draft": {"entry_preamble_assembly": {
+            "INSERT INTO execution_bindings VALUES (267, 'strategy-2', 'group:-1001', -1001, 55, 'BTC', 'long', 'deepcoin', ?)",
+            (json.dumps({"draft": {**other_evidence["order_draft_snapshot"], "entry_preamble_assembly": {
                 "assembly_id": 3,
                 "strategy_instance_id": "strategy-2",
                 "assembly_fingerprint": other_old,
@@ -500,6 +520,195 @@ def test_entry_preamble_monitor_accepts_exact_reconciliation_without_writes(tmp_
         database, now=datetime(2026, 8, 8, tzinfo=UTC)
     ) == ()
     assert database.read_bytes() == before
+
+
+def test_entry_preamble_monitor_rejects_consistent_forged_alternate_signal_id(tmp_path):
+    database = tmp_path / "entry-preamble-reconciled-forged-signal.db"
+    _seed_reconciled_entry_preamble_monitor(database)
+    connection = sqlite3.connect(database)
+    assembly_fingerprint = connection.execute(
+        "SELECT fingerprint FROM entry_strategy_assemblies WHERE id = 2"
+    ).fetchone()[0]
+    evidence = json.loads(
+        connection.execute(
+            "SELECT evidence_json FROM entry_strategy_assemblies WHERE id = 2"
+        ).fetchone()[0]
+    )
+    old_fingerprint = derive_pre_finalization_fingerprint(evidence)
+    forged_repair = build_reconciliation_fingerprint(
+        assembly_id=2,
+        execution_binding_id=266,
+        trade_signal_id=399,
+        strategy_instance_id="strategy-1",
+        old_fingerprint=old_fingerprint,
+        final_fingerprint=assembly_fingerprint,
+    )
+    before = json.loads(
+        connection.execute("SELECT before_json FROM execution_events").fetchone()[0]
+    )
+    after = json.loads(
+        connection.execute("SELECT after_json FROM execution_events").fetchone()[0]
+    )
+    before["trade_signal_id"] = 399
+    after["trade_signal_id"] = 399
+    after["repair_fingerprint"] = forged_repair
+    connection.execute(
+        "UPDATE execution_events SET trade_signal_id = 399, before_json = ?, after_json = ?, notification_fingerprint = ?",
+        (json.dumps(before), json.dumps(after), forged_repair),
+    )
+    connection.commit()
+    connection.close()
+
+    assert read_entry_preamble_invariants(
+        database, now=datetime(2026, 8, 8, tzinfo=UTC)
+    ) == ("live_entry_preamble_binding_evidence_missing",)
+
+
+def test_entry_preamble_monitor_treats_partial_event_schema_as_strict(tmp_path):
+    database = tmp_path / "entry-preamble-reconciled-partial-event-schema.db"
+    _seed_reconciled_entry_preamble_monitor(database)
+    connection = sqlite3.connect(database)
+    columns = [
+        row[1]
+        for row in connection.execute("PRAGMA table_info(execution_events)").fetchall()
+        if row[1] != "id"
+    ]
+    selected = ", ".join(columns)
+    connection.execute("ALTER TABLE execution_events RENAME TO old_execution_events")
+    connection.execute(
+        f"CREATE TABLE execution_events AS SELECT {selected} FROM old_execution_events"
+    )
+    connection.execute("DROP TABLE old_execution_events")
+    connection.commit()
+    connection.close()
+
+    assert read_entry_preamble_invariants(
+        database, now=datetime(2026, 8, 8, tzinfo=UTC)
+    ) == ("live_entry_preamble_binding_evidence_missing",)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["signal_top", "signal_nested", "signal_draft", "binding_draft", "duplicate_signal"],
+)
+def test_entry_preamble_monitor_requires_exact_durable_recovery_signal(
+    tmp_path, mutation
+):
+    database = tmp_path / f"entry-preamble-reconciled-durable-{mutation}.db"
+    _seed_reconciled_entry_preamble_monitor(database)
+    connection = sqlite3.connect(database)
+    if mutation == "duplicate_signal":
+        connection.execute(
+            "INSERT INTO trade_signals SELECT 399, strategy_instance_id, kol_id, chat_id, message_id, symbol, side, venue, source_type, action, status, processed_at, payload_json FROM trade_signals WHERE id = 398"
+        )
+    elif mutation == "binding_draft":
+        raw = connection.execute(
+            "SELECT payload_json FROM execution_bindings WHERE id = 266"
+        ).fetchone()[0]
+        payload = json.loads(raw)
+        payload["draft"]["order_legs"][0]["price"] = 1
+        connection.execute(
+            "UPDATE execution_bindings SET payload_json = ? WHERE id = 266",
+            (json.dumps(payload),),
+        )
+    else:
+        raw = connection.execute(
+            "SELECT payload_json FROM trade_signals WHERE id = 398"
+        ).fetchone()[0]
+        payload = json.loads(raw)
+        if mutation == "signal_top":
+            payload["entry_preamble_assembly"]["assembly_fingerprint"] = "f" * 64
+        elif mutation == "signal_nested":
+            payload["deepcoin_order_draft"]["entry_preamble_assembly"][
+                "assembly_fingerprint"
+            ] = "f" * 64
+        else:
+            payload["deepcoin_order_draft"]["order_legs"][0]["price"] = 1
+        connection.execute(
+            "UPDATE trade_signals SET payload_json = ? WHERE id = 398",
+            (json.dumps(payload),),
+        )
+    connection.commit()
+    connection.close()
+
+    assert read_entry_preamble_invariants(
+        database, now=datetime(2026, 8, 8, tzinfo=UTC)
+    ) == ("live_entry_preamble_binding_evidence_missing",)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "snapshot_missing",
+        "snapshot_not_mapping",
+        "legs_not_list",
+        "legs_empty",
+        "legs_too_many",
+        "count_missing",
+        "count_bool",
+        "count_mismatch",
+    ],
+)
+def test_entry_preamble_monitor_rejects_invalid_finalized_assembly_shape(
+    tmp_path, mutation
+):
+    database = tmp_path / f"entry-preamble-reconciled-shape-{mutation}.db"
+    _seed_reconciled_entry_preamble_monitor(database)
+    connection = sqlite3.connect(database)
+    evidence = json.loads(
+        connection.execute(
+            "SELECT evidence_json FROM entry_strategy_assemblies WHERE id = 2"
+        ).fetchone()[0]
+    )
+    if mutation == "snapshot_missing":
+        evidence.pop("order_draft_snapshot")
+    elif mutation == "snapshot_not_mapping":
+        evidence["order_draft_snapshot"] = []
+    elif mutation == "legs_not_list":
+        evidence["order_draft_snapshot"]["order_legs"] = {}
+    elif mutation == "legs_empty":
+        evidence["order_draft_snapshot"]["order_legs"] = []
+        evidence["final_entry_leg_count"] = 0
+    elif mutation == "legs_too_many":
+        evidence["order_draft_snapshot"]["order_legs"] = [
+            {"price": 64000 + index} for index in range(6)
+        ]
+        evidence["final_entry_leg_count"] = 6
+    elif mutation == "count_missing":
+        evidence.pop("final_entry_leg_count")
+    elif mutation == "count_bool":
+        evidence["final_entry_leg_count"] = True
+    elif mutation == "count_mismatch":
+        evidence["final_entry_leg_count"] = 2
+    final_fingerprint = canonical_fingerprint(evidence)
+    old_fingerprint = derive_pre_finalization_fingerprint(evidence)
+    repair_fingerprint = build_reconciliation_fingerprint(
+        assembly_id=2,
+        execution_binding_id=266,
+        trade_signal_id=398,
+        strategy_instance_id="strategy-1",
+        old_fingerprint=old_fingerprint,
+        final_fingerprint=final_fingerprint,
+    )
+    after = json.loads(
+        connection.execute("SELECT after_json FROM execution_events").fetchone()[0]
+    )
+    after["assembly_fingerprint"] = final_fingerprint
+    after["repair_fingerprint"] = repair_fingerprint
+    connection.execute(
+        "UPDATE entry_strategy_assemblies SET evidence_json = ?, fingerprint = ? WHERE id = 2",
+        (json.dumps(evidence), final_fingerprint),
+    )
+    connection.execute(
+        "UPDATE execution_events SET after_json = ?, notification_fingerprint = ?",
+        (json.dumps(after), repair_fingerprint),
+    )
+    connection.commit()
+    connection.close()
+
+    assert read_entry_preamble_invariants(
+        database, now=datetime(2026, 8, 8, tzinfo=UTC)
+    ) == ("live_entry_preamble_binding_evidence_missing",)
 
 
 @pytest.mark.parametrize(

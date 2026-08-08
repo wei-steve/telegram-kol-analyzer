@@ -63,8 +63,28 @@ _GIT_HEAD = re.compile(r"[0-9a-f]{40}\Z")
 _SAFE_TIMESTAMP = re.compile(r"[0-9T:+.-]{1,40}\Z")
 _SHA256_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_RECONCILIATION_JSON_BYTES = 1_000_000
+_RECONCILIATION_DRAFT_KEYS = (
+    "strategy_instance_id",
+    "instrument_id",
+    "stop_loss",
+    "take_profit_legs",
+    "risk_budget_usdt",
+    "contract_spec",
+    "order_legs",
+)
+_RECONCILIATION_LEG_KEYS = (
+    "price",
+    "order_type",
+    "allocation_pct",
+    "risk_budget_usdt",
+    "quantity",
+    "quantity_unit",
+    "estimated_stop_loss_usdt",
+    "client_order_id",
+)
 _RECONCILIATION_EVENT_COLUMNS = frozenset(
     {
+        "id",
         "execution_binding_id",
         "trade_signal_id",
         "strategy_instance_id",
@@ -96,6 +116,36 @@ _RECONCILIATION_EVENT_COLUMNS = frozenset(
         "notification_claim_token",
         "notification_claimed_at",
         "notified_at",
+    }
+)
+_RECONCILIATION_BINDING_COLUMNS = frozenset(
+    {
+        "id",
+        "strategy_instance_id",
+        "kol_id",
+        "chat_id",
+        "message_id",
+        "symbol",
+        "side",
+        "venue",
+        "payload_json",
+    }
+)
+_RECONCILIATION_SIGNAL_COLUMNS = frozenset(
+    {
+        "id",
+        "strategy_instance_id",
+        "kol_id",
+        "chat_id",
+        "message_id",
+        "symbol",
+        "side",
+        "venue",
+        "source_type",
+        "action",
+        "status",
+        "processed_at",
+        "payload_json",
     }
 )
 _ADAPTER_NAMES = frozenset(
@@ -712,6 +762,42 @@ def _read_reconciliation_json(raw: object) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _bounded_reconciliation_draft(
+    draft: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    legs = draft.get("order_legs")
+    if not isinstance(legs, list) or not all(
+        isinstance(leg, Mapping) for leg in legs
+    ):
+        return None
+    bounded = {
+        key: draft.get(key)
+        for key in _RECONCILIATION_DRAFT_KEYS
+        if key != "order_legs"
+    }
+    bounded["order_legs"] = [
+        {key: leg.get(key) for key in _RECONCILIATION_LEG_KEYS}
+        for leg in legs
+    ]
+    return bounded
+
+
+def _reconciliation_stale_evidence_matches(
+    evidence: object,
+    *,
+    assembly_id: int,
+    strategy_instance_id: str,
+    old_fingerprint: str,
+) -> bool:
+    return (
+        isinstance(evidence, Mapping)
+        and evidence.get("assembly_id") == assembly_id
+        and str(evidence.get("strategy_instance_id") or "")
+        == strategy_instance_id
+        and str(evidence.get("assembly_fingerprint") or "") == old_fingerprint
+    )
+
+
 def _has_exact_entry_fingerprint_reconciliation(
     connection: sqlite3.Connection,
     *,
@@ -721,15 +807,29 @@ def _has_exact_entry_fingerprint_reconciliation(
     final_fingerprint: object,
     assembly_evidence_json: object,
     execution_binding_id: object,
+    binding_identity: Mapping[str, Any],
+    binding_payload: Mapping[str, Any],
     stale_evidence: Mapping[str, Any],
 ) -> bool:
-    if "execution_events" not in available_tables:
+    if not {"execution_events", "trade_signals"}.issubset(available_tables):
         return False
     event_columns = {
         str(row[1])
         for row in connection.execute("PRAGMA table_info(execution_events)").fetchall()
     }
-    if not _RECONCILIATION_EVENT_COLUMNS.issubset(event_columns):
+    binding_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(execution_bindings)").fetchall()
+    }
+    signal_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(trade_signals)").fetchall()
+    }
+    if (
+        not _RECONCILIATION_EVENT_COLUMNS.issubset(event_columns)
+        or not _RECONCILIATION_BINDING_COLUMNS.issubset(binding_columns)
+        or not _RECONCILIATION_SIGNAL_COLUMNS.issubset(signal_columns)
+    ):
         return False
     if (
         isinstance(assembly_id, bool)
@@ -741,10 +841,28 @@ def _has_exact_entry_fingerprint_reconciliation(
     strategy_id = str(strategy_instance_id or "")
     final_fp = str(final_fingerprint or "")
     final_evidence = _read_reconciliation_json(assembly_evidence_json)
+    snapshot = (
+        final_evidence.get("order_draft_snapshot")
+        if isinstance(final_evidence, Mapping)
+        else None
+    )
+    final_leg_count = (
+        final_evidence.get("final_entry_leg_count")
+        if isinstance(final_evidence, Mapping)
+        else None
+    )
+    snapshot_legs = snapshot.get("order_legs") if isinstance(snapshot, Mapping) else None
     if (
         not strategy_id
         or not _SHA256_FINGERPRINT.fullmatch(final_fp)
         or final_evidence is None
+        or not isinstance(snapshot, Mapping)
+        or not isinstance(snapshot_legs, list)
+        or not 1 <= len(snapshot_legs) <= 5
+        or not all(isinstance(leg, Mapping) for leg in snapshot_legs)
+        or isinstance(final_leg_count, bool)
+        or not isinstance(final_leg_count, int)
+        or final_leg_count != len(snapshot_legs)
         or canonical_fingerprint(final_evidence) != final_fp
         or stale_evidence.get("assembly_id") != assembly_id
         or str(stale_evidence.get("strategy_instance_id") or "") != strategy_id
@@ -755,6 +873,90 @@ def _has_exact_entry_fingerprint_reconciliation(
     except (TypeError, ValueError):
         return False
     if str(stale_evidence.get("assembly_fingerprint") or "") != old_fp:
+        return False
+
+    binding_draft = binding_payload.get("draft")
+    if (
+        str(binding_identity.get("strategy_instance_id") or "") != strategy_id
+        or str(binding_identity.get("venue") or "").lower() != "deepcoin"
+        or final_evidence.get("chat_id") != binding_identity.get("chat_id")
+        or final_evidence.get("strategy_message_id")
+        != binding_identity.get("message_id")
+        or str(final_evidence.get("symbol") or "").upper()
+        != str(binding_identity.get("symbol") or "").upper()
+        or str(final_evidence.get("side") or "").lower()
+        != str(binding_identity.get("side") or "").lower()
+        or not isinstance(binding_draft, Mapping)
+        or _bounded_reconciliation_draft(binding_draft)
+        != _bounded_reconciliation_draft(snapshot)
+    ):
+        return False
+
+    signal_rows = connection.execute(
+        """
+        SELECT id, payload_json
+        FROM trade_signals
+        WHERE strategy_instance_id = ?
+          AND chat_id = ?
+          AND message_id = ?
+          AND symbol = ?
+          AND side = ?
+          AND kol_id = ?
+          AND venue = 'deepcoin'
+          AND source_type = 'recovery'
+          AND action = 'open_position'
+          AND status = 'submitted'
+          AND processed_at IS NOT NULL
+        ORDER BY id ASC
+        LIMIT 2
+        """,
+        (
+            strategy_id,
+            binding_identity.get("chat_id"),
+            binding_identity.get("message_id"),
+            binding_identity.get("symbol"),
+            binding_identity.get("side"),
+            binding_identity.get("kol_id"),
+        ),
+    ).fetchall()
+    if len(signal_rows) != 1:
+        return False
+    trade_signal_id, signal_payload_json = signal_rows[0]
+    if isinstance(trade_signal_id, bool) or not isinstance(trade_signal_id, int):
+        return False
+    signal_payload = _read_reconciliation_json(signal_payload_json)
+    signal_top = (
+        signal_payload.get("entry_preamble_assembly")
+        if isinstance(signal_payload, Mapping)
+        else None
+    )
+    signal_draft = (
+        signal_payload.get("deepcoin_order_draft")
+        if isinstance(signal_payload, Mapping)
+        else None
+    )
+    signal_nested = (
+        signal_draft.get("entry_preamble_assembly")
+        if isinstance(signal_draft, Mapping)
+        else None
+    )
+    if (
+        not _reconciliation_stale_evidence_matches(
+            signal_top,
+            assembly_id=assembly_id,
+            strategy_instance_id=strategy_id,
+            old_fingerprint=old_fp,
+        )
+        or not _reconciliation_stale_evidence_matches(
+            signal_nested,
+            assembly_id=assembly_id,
+            strategy_instance_id=strategy_id,
+            old_fingerprint=old_fp,
+        )
+        or not isinstance(signal_draft, Mapping)
+        or _bounded_reconciliation_draft(signal_draft)
+        != _bounded_reconciliation_draft(snapshot)
+    ):
         return False
 
     rows = connection.execute(
@@ -778,8 +980,7 @@ def _has_exact_entry_fingerprint_reconciliation(
     if len(rows) != 1:
         return False
     row = rows[0]
-    trade_signal_id = row[0]
-    if isinstance(trade_signal_id, bool) or not isinstance(trade_signal_id, int):
+    if row[0] != trade_signal_id:
         return False
     repair_fp = build_reconciliation_fingerprint(
         assembly_id=assembly_id,
@@ -889,10 +1090,30 @@ def read_entry_preamble_invariants(
         assembly_evidence_column = (
             "a.evidence_json" if "evidence_json" in assembly_columns else "NULL"
         )
+        binding_columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(execution_bindings)"
+            ).fetchall()
+        }
+        binding_identity_columns = (
+            "kol_id",
+            "chat_id",
+            "message_id",
+            "symbol",
+            "side",
+            "venue",
+        )
+        binding_identity_select = ", ".join(
+            f"b.{column}" if column in binding_columns else "NULL"
+            for column in binding_identity_columns
+        )
         evidence_rows = connection.execute(
             f"""
             SELECT a.id, a.strategy_instance_id, a.fingerprint,
-                   {assembly_evidence_column}, b.id, b.payload_json
+                   {assembly_evidence_column}, b.id, b.payload_json,
+                   b.strategy_instance_id,
+                   {binding_identity_select}
             FROM entry_strategy_assemblies AS a
             LEFT JOIN execution_bindings AS b
               ON b.strategy_instance_id = a.strategy_instance_id
@@ -906,6 +1127,13 @@ def read_entry_preamble_invariants(
             assembly_evidence_json,
             binding_id,
             payload_json,
+            binding_strategy_instance_id,
+            binding_kol_id,
+            binding_chat_id,
+            binding_message_id,
+            binding_symbol,
+            binding_side,
+            binding_venue,
         ) in evidence_rows:
             payload = _read_reconciliation_json(payload_json)
             draft = payload.get("draft") if isinstance(payload, dict) else None
@@ -931,6 +1159,16 @@ def read_entry_preamble_invariants(
                     final_fingerprint=fingerprint,
                     assembly_evidence_json=assembly_evidence_json,
                     execution_binding_id=binding_id,
+                    binding_identity={
+                        "strategy_instance_id": binding_strategy_instance_id,
+                        "kol_id": binding_kol_id,
+                        "chat_id": binding_chat_id,
+                        "message_id": binding_message_id,
+                        "symbol": binding_symbol,
+                        "side": binding_side,
+                        "venue": binding_venue,
+                    },
+                    binding_payload=payload,
                     stale_evidence=evidence,
                 )
             )
