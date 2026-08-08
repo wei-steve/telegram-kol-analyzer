@@ -528,6 +528,13 @@ does not install a timer or long-running supervisor unit. Immediate rollback
 is to set the enabled flag false; because no normal service imports the
 projector, rollback requires no listener, trading, Agent, or scanner shutdown.
 The two additive tables may remain for audit and idempotent retry evidence.
+For a later separately reviewed one-shot cycle, advance the configured
+watermark only to the prior cycle's returned `last_scanned_raw_message_id`;
+this prevents ordinary chat (which correctly has no contract) from occupying
+the same bounded batch forever. The cycle scans raw-message IDs contiguously
+and stops before a missing or nonterminal recognition decision, so an
+out-of-order completion cannot be skipped. Both `completed` and exhausted
+`failed` comparison states are terminal for this inspection cursor.
 
 The operator approved a controlled Phase 8R.3 completion canary on 2026-08-08
 so that a rare natural multi-target failure cannot block later read-only Agent

@@ -3370,7 +3370,7 @@ def message_operation_supervisor(
     """Run one future-only Phase 8R.5 deterministic shadow projection cycle."""
 
     config = load_message_operation_supervisor_config(
-        environ=dict(os.environ), env_file_paths=[]
+        environ=dict(os.environ)
     )
     if not config.enabled:
         typer.echo('{"status":"disabled"}')

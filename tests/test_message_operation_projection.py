@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 import json
 
 import pytest
 from typer.testing import CliRunner
 
-from telegram_kol_research import authoritative_recognition, llm_chat
+from telegram_kol_research import (
+    authoritative_recognition,
+    llm_chat,
+    message_operation_contracts,
+)
 from telegram_kol_research.cli import app
 from telegram_kol_research.config import load_message_operation_supervisor_config
 from telegram_kol_research.db import create_session_factory
@@ -16,6 +21,7 @@ from telegram_kol_research.message_operation_contracts import (
     run_message_operation_shadow_once,
 )
 from telegram_kol_research.models import (
+    ContextResolutionAttempt,
     ManagementMessageEnvelope,
     ManagementMessageTarget,
     MessageInstructionItem,
@@ -274,10 +280,44 @@ def test_unresolved_executable_projection_never_invents_target(tmp_path):
     raw_message_id = _message(
         session_factory,
         message_id=103,
-        event_type="position_update",
-        actions=("partial_take_profit",),
-        resolution_status="unresolved",
+        event_type="none",
+        status="非策略",
     )
+    with session_factory() as session:
+        decision = session.query(RecognitionDecision).filter_by(
+            raw_message_id=raw_message_id
+        ).one()
+        decision.authoritative_payload_json = json.dumps(
+            {
+                "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+                "_context_resolution": {
+                    "decision": "unresolved",
+                    "target_thread_ids": [],
+                    "management_action": None,
+                    "confidence": 0.4,
+                },
+            }
+        )
+        session.add(
+            ContextResolutionAttempt(
+                raw_message_id=raw_message_id,
+                context_fingerprint="sha256:unresolved",
+                model="fixture",
+                prompt_versions_json="{}",
+                request_summary_json="{}",
+                decision_json=json.dumps(
+                    {
+                        "decision": "unresolved",
+                        "target_thread_ids": [],
+                        "management_action": None,
+                        "confidence": 0.4,
+                    }
+                ),
+                status="completed",
+                reanalysis_triggers_json="[]",
+            )
+        )
+        session.commit()
 
     projection = project_message_operation_contract(
         session_factory,
@@ -291,6 +331,78 @@ def test_unresolved_executable_projection_never_invents_target(tmp_path):
     assert projection.items[0].authoritative_instruction_id.startswith(
         "recognition_decision:"
     )
+    assert any(
+        reference.startswith("context_resolution_attempt:")
+        for reference in projection.items[0].evidence_references
+    )
+
+
+def test_projection_scopes_targets_to_latest_envelope(tmp_path):
+    session_factory = create_session_factory(tmp_path / "latest-envelope.db")
+    raw_message_id = _message(
+        session_factory,
+        message_id=116,
+        event_type="position_update",
+        actions=("partial_take_profit",),
+    )
+    with session_factory() as session:
+        candidate = session.query(SignalCandidate).filter_by(
+            raw_message_id=raw_message_id
+        ).one()
+        item = session.query(MessageInstructionItem).filter_by(
+            raw_message_id=raw_message_id
+        ).one()
+        lifecycles = []
+        for index, symbol in enumerate(("OLD", "NEW")):
+            lifecycle = StrategyLifecycle(
+                chat_id=77,
+                message_id=200 + index,
+                symbol=symbol,
+                side="long",
+                lifecycle_status="entered",
+                signal_at=NOW,
+            )
+            session.add(lifecycle)
+            session.flush()
+            lifecycles.append(lifecycle)
+            envelope = ManagementMessageEnvelope(
+                raw_message_id=raw_message_id,
+                decision_fingerprint=str(index + 1) * 64,
+                normalized_action="partial_take_profit",
+                shared_parameters_json="{}",
+                projection_mode="live",
+            )
+            session.add(envelope)
+            session.flush()
+            session.add(
+                ManagementMessageTarget(
+                    envelope_id=envelope.id,
+                    raw_message_id=raw_message_id,
+                    target_lifecycle_id=lifecycle.id,
+                    target_ordinal=0,
+                    symbol=symbol,
+                    side="long",
+                    normalized_action="partial_take_profit",
+                    parameters_json="{}",
+                    parameter_fingerprint=str(index + 3) * 64,
+                    collision_group_fingerprint=str(index + 5) * 64,
+                    admission_state="admitted",
+                    execution_state="pending",
+                    signal_candidate_id=candidate.id,
+                    message_instruction_item_id=item.id,
+                )
+            )
+        latest_lifecycle_id = lifecycles[1].id
+        session.commit()
+
+    projection = project_message_operation_contract(
+        session_factory, raw_message_id=raw_message_id
+    )
+
+    assert projection is not None
+    assert [row.target_lifecycle_id for row in projection.items] == [
+        latest_lifecycle_id
+    ]
 
 
 def test_ordinary_chat_has_no_contract_projection(tmp_path):
@@ -299,6 +411,21 @@ def test_ordinary_chat_has_no_contract_projection(tmp_path):
         session_factory,
         message_id=104,
         event_type="none",
+        status="非策略",
+    )
+
+    assert project_message_operation_contract(
+        session_factory,
+        raw_message_id=raw_message_id,
+    ) is None
+
+
+def test_non_strategy_decision_does_not_project_stale_executable_payload(tmp_path):
+    session_factory = create_session_factory(tmp_path / "non-strategy.db")
+    raw_message_id = _message(
+        session_factory,
+        message_id=114,
+        event_type="exit_position",
         status="非策略",
     )
 
@@ -336,6 +463,30 @@ def test_projection_preserves_duplicate_and_superseded_dispositions(tmp_path):
     assert superseded is not None
     assert duplicate.items[0].source_disposition == "duplicate"
     assert superseded.items[0].source_disposition == "superseded"
+
+    duplicate_contract = persist_message_operation_projection(
+        session_factory, duplicate
+    )
+    superseded_contract = persist_message_operation_projection(
+        session_factory, superseded
+    )
+    with session_factory() as session:
+        assert (
+            session.get(MessageOperationContract, duplicate_contract.id).status
+            == "duplicate"
+        )
+        assert (
+            session.get(MessageOperationContract, superseded_contract.id).status
+            == "superseded"
+        )
+        statuses = {
+            row.contract_id: row.status
+            for row in session.query(MessageOperationItem).all()
+        }
+        assert statuses == {
+            duplicate_contract.id: "duplicate",
+            superseded_contract.id: "superseded",
+        }
 
 
 def test_projection_does_not_reach_any_provider_entry_point(tmp_path, monkeypatch):
@@ -394,6 +545,31 @@ def test_projection_persistence_is_idempotent_and_bounded(tmp_path):
         assert session.query(RuntimeIncident).count() == 0
 
 
+def test_projection_persistence_is_atomic_on_invalid_item_set(tmp_path):
+    session_factory = create_session_factory(tmp_path / "atomic.db")
+    raw_message_id = _message(
+        session_factory,
+        message_id=117,
+        event_type="position_update",
+        actions=("partial_take_profit", "stop_loss"),
+    )
+    projection = project_message_operation_contract(
+        session_factory, raw_message_id=raw_message_id
+    )
+    assert projection is not None
+    invalid = replace(
+        projection,
+        items=(projection.items[0], replace(projection.items[1], sequence=1)),
+    )
+
+    with pytest.raises(ValueError):
+        persist_message_operation_projection(session_factory, invalid)
+
+    with session_factory() as session:
+        assert session.query(MessageOperationContract).count() == 0
+        assert session.query(MessageOperationItem).count() == 0
+
+
 def test_shadow_cycle_scans_only_terminal_rows_above_watermark(tmp_path):
     session_factory = create_session_factory(tmp_path / "cycle.db")
     below = _message(
@@ -432,15 +608,143 @@ def test_shadow_cycle_scans_only_terminal_rows_above_watermark(tmp_path):
     assert result == {
         "contracts_created": 1,
         "errors": 0,
-        "messages_scanned": 2,
+        "existing_skipped": 0,
+        "last_scanned_raw_message_id": executable,
+        "messages_scanned": 3,
         "model_calls": 0,
         "ordinary_skipped": 1,
+        "pending_blocked": 1,
     }
     with session_factory() as session:
         contract = session.query(MessageOperationContract).one()
         assert contract.raw_message_id == executable
         assert contract.raw_message_id != ordinary
         assert session.query(RuntimeIncident).count() == 0
+
+
+def test_shadow_cursor_stops_before_lower_nonterminal_decision(tmp_path):
+    session_factory = create_session_factory(tmp_path / "out-of-order.db")
+    pending = _message(
+        session_factory,
+        message_id=121,
+        event_type="position_update",
+        actions=("stop_loss",),
+        comparison_status="execution_running",
+    )
+    completed = _message(
+        session_factory,
+        message_id=122,
+        event_type="exit_position",
+        actions=("full_exit",),
+    )
+
+    blocked = run_message_operation_shadow_once(
+        session_factory,
+        after_raw_message_id=pending - 1,
+        limit=20,
+        now=NOW,
+    )
+
+    assert blocked["pending_blocked"] == 1
+    assert blocked["last_scanned_raw_message_id"] == pending - 1
+    with session_factory() as session:
+        assert session.query(MessageOperationContract).count() == 0
+        decision = session.query(RecognitionDecision).filter_by(
+            raw_message_id=pending
+        ).one()
+        decision.comparison_status = "completed"
+        session.commit()
+
+    resumed = run_message_operation_shadow_once(
+        session_factory,
+        after_raw_message_id=blocked["last_scanned_raw_message_id"],
+        limit=20,
+        now=NOW,
+    )
+
+    assert resumed["pending_blocked"] == 0
+    assert resumed["last_scanned_raw_message_id"] == completed
+    with session_factory() as session:
+        assert {
+            row.raw_message_id
+            for row in session.query(MessageOperationContract).all()
+        } == {pending, completed}
+
+
+def test_shadow_cycle_includes_terminal_failed_comparison(tmp_path):
+    session_factory = create_session_factory(tmp_path / "terminal-failed.db")
+    failed = _message(
+        session_factory,
+        message_id=123,
+        event_type="position_update",
+        actions=("partial_take_profit",),
+        comparison_status="failed",
+    )
+
+    result = run_message_operation_shadow_once(
+        session_factory,
+        after_raw_message_id=failed - 1,
+        limit=20,
+        now=NOW,
+    )
+
+    assert result["errors"] == 0
+    assert result["contracts_created"] == 1
+    assert result["last_scanned_raw_message_id"] == failed
+    with session_factory() as session:
+        assert session.query(MessageOperationContract).one().raw_message_id == failed
+
+
+def test_shadow_cycle_stops_at_error_without_advancing_past_it(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "cycle-error.db")
+    first = _message(
+        session_factory,
+        message_id=118,
+        event_type="none",
+        status="非策略",
+    )
+    failed = _message(
+        session_factory,
+        message_id=119,
+        event_type="position_update",
+        actions=("stop_loss",),
+    )
+    later = _message(
+        session_factory,
+        message_id=120,
+        event_type="exit_position",
+        actions=("full_exit",),
+    )
+    original = message_operation_contracts.project_message_operation_contract
+
+    def fail_middle(session_factory, *, raw_message_id):
+        if raw_message_id == failed:
+            raise RuntimeError("bounded fixture failure")
+        return original(session_factory, raw_message_id=raw_message_id)
+
+    monkeypatch.setattr(
+        message_operation_contracts,
+        "project_message_operation_contract",
+        fail_middle,
+    )
+
+    result = run_message_operation_shadow_once(
+        session_factory,
+        after_raw_message_id=first - 1,
+        limit=20,
+        now=NOW,
+    )
+
+    assert result["errors"] == 1
+    assert result["last_scanned_raw_message_id"] == first
+    assert result["messages_scanned"] == 2
+    with session_factory() as session:
+        assert session.query(MessageOperationContract).count() == 0
+        assert session.query(MessageOperationContract).filter_by(
+            raw_message_id=later
+        ).count() == 0
 
 
 def test_supervisor_config_is_disabled_and_fail_closed_by_default():
@@ -555,3 +859,42 @@ def test_shadow_cli_requires_enablement_explicit_shadow_once_and_existing_db(
     assert payload["status"] == "shadow"
     assert payload["contracts_created"] == 1
     assert payload["model_calls"] == 0
+
+
+def test_shadow_cli_loads_reviewed_project_config_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    database = tmp_path / "config-enabled.db"
+    session_factory = create_session_factory(database)
+    raw_message_id = _message(
+        session_factory,
+        message_id=115,
+        event_type="position_update",
+        actions=("stop_loss",),
+    )
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "runtime_incident_agent.env").write_text(
+        "\n".join(
+            (
+                "TELEGRAM_KOL_MESSAGE_OPERATION_SUPERVISOR_ENABLED=true",
+                "TELEGRAM_KOL_MESSAGE_OPERATION_SUPERVISOR_SHADOW_ONLY=true",
+                "TELEGRAM_KOL_MESSAGE_OPERATION_SUPERVISOR_AFTER_RAW_MESSAGE_ID="
+                f"{raw_message_id - 1}",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "message-operation-supervisor",
+            "--database-path",
+            str(database),
+            "--shadow",
+            "--once",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["contracts_created"] == 1

@@ -8,11 +8,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import exists, select, update
+from sqlalchemy import select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
+    ContextResolutionAttempt,
     MessageOperationContract,
     MessageOperationItem,
     ManagementMessageEnvelope,
@@ -108,6 +109,9 @@ _EXIT_ACTIONS = frozenset(
 _ADD_ENTRY_ACTIONS = frozenset({"add_entry", "add_position"})
 _EXECUTABLE_EVENT_TYPES = frozenset(
     {"entry_signal", "add_entry", "position_update", "exit_position", "cancel_entry"}
+)
+_NON_EXECUTABLE_AUTHORITATIVE_STATUSES = frozenset(
+    {"非策略", "non_strategy", "not_strategy"}
 )
 
 
@@ -268,7 +272,7 @@ def project_message_operation_contract(
         targets = (
             session.execute(
                 select(ManagementMessageTarget)
-                .where(ManagementMessageTarget.raw_message_id == raw_message_id)
+                .where(ManagementMessageTarget.envelope_id == envelope.id)
                 .order_by(
                     ManagementMessageTarget.target_ordinal,
                     ManagementMessageTarget.id,
@@ -289,10 +293,25 @@ def project_message_operation_contract(
         ).scalars().all()
         candidate_by_id = {row.id: row for row in candidates}
         item_by_id = {row.id: row for row in instruction_rows}
+        context_attempt = session.execute(
+            select(ContextResolutionAttempt)
+            .where(ContextResolutionAttempt.raw_message_id == raw_message_id)
+            .order_by(ContextResolutionAttempt.id.desc())
+        ).scalars().first()
 
         decision_payload = _bounded_decision_payload(decision)
+        context_resolution = decision_payload.get("_context_resolution")
+        context_resolution = (
+            context_resolution if isinstance(context_resolution, dict) else {}
+        )
+        context_attempt_payload = _bounded_json_object(
+            context_attempt.decision_json if context_attempt is not None else None
+        )
         resolution_status = str(
-            decision_payload.get("resolution_status") or ""
+            context_resolution.get("decision") or ""
+        ).strip().lower()
+        attempt_resolution_status = str(
+            context_attempt_payload.get("decision") or ""
         ).strip().lower()
         decision_event = decision_payload.get("lifecycle_event")
         decision_event = decision_event if isinstance(decision_event, dict) else {}
@@ -302,14 +321,20 @@ def project_message_operation_contract(
             or decision_payload.get("management_action")
             or ""
         ).strip().lower()
-        unresolved = resolution_status in {"hold", "unresolved", "refused"}
+        unresolved = (
+            context_attempt is not None
+            and str(context_attempt.status).strip().lower() == "completed"
+            and resolution_status in {"hold", "unresolved"}
+            and attempt_resolution_status == resolution_status
+        )
 
         projected_items: list[MessageOperationItemProjection] = []
-        if unresolved and event_type in _EXECUTABLE_EVENT_TYPES:
+        if unresolved:
             projected_items.append(
                 _recognition_item_projection(
                     decision=decision,
                     raw_message_id=raw_message_id,
+                    context_attempt_id=context_attempt.id,
                 )
             )
         elif targets:
@@ -393,7 +418,12 @@ def project_message_operation_contract(
                         target_lifecycle_id=candidate.target_lifecycle_id,
                     )
                 )
-        elif event_type in _EXECUTABLE_EVENT_TYPES:
+        elif (
+            event_type in _EXECUTABLE_EVENT_TYPES
+            and decision is not None
+            and str(decision.authoritative_status).strip().lower()
+            not in _NON_EXECUTABLE_AUTHORITATIVE_STATUSES
+        ):
             intent = _action_to_intent(
                 decision_action,
                 event_type=event_type,
@@ -452,29 +482,135 @@ def persist_message_operation_projection(
 ) -> MessageOperationContract:
     """Persist one deterministic projection into the dormant additive ledger."""
 
-    contract = create_message_operation_contract(
-        session_factory,
-        raw_message_id=projection.raw_message_id,
-        intent_kind=projection.intent_kind,
-        expected_terminal_kind=projection.expected_terminal_kind,
-        deadline_at=projection.deadline_at,
-        evidence_refs=projection.evidence_references,
-        now=now,
-    )
-    for item in projection.items:
-        append_message_operation_item(
-            session_factory,
-            contract_id=contract.id,
-            sequence=item.sequence,
-            instruction_key=item.instruction_key,
-            instruction_kind=item.intent_kind,
-            authoritative_instruction_id=item.authoritative_instruction_id,
-            expected_descendant_kind=item.expected_descendant_kind,
-            expected_terminal_kind=item.expected_terminal_kind,
-            evidence_refs=item.evidence_references,
-            now=now,
+    if not projection.items:
+        raise MessageOperationContractBoundsError("projection must contain items")
+    sequences = [item.sequence for item in projection.items]
+    instruction_keys = [item.instruction_key for item in projection.items]
+    if len(sequences) != len(set(sequences)):
+        raise MessageOperationContractBoundsError(
+            "projection item sequences must be unique"
         )
-    return contract
+    if len(instruction_keys) != len(set(instruction_keys)):
+        raise MessageOperationContractBoundsError("projection item keys must be unique")
+
+    intent_kind = _closed_value("intent_kind", projection.intent_kind, INTENT_KINDS)
+    expected_terminal_kind = _closed_value(
+        "expected_terminal_kind", projection.expected_terminal_kind, TERMINAL_KINDS
+    )
+    if not isinstance(projection.deadline_at, datetime):
+        raise MessageOperationContractBoundsError("deadline_at must be a datetime")
+    timestamp = now or utc_now()
+    contract_status = _projection_contract_status(projection.items)
+    contract_values = {
+        "raw_message_id": projection.raw_message_id,
+        "intent_kind": intent_kind,
+        "expected_terminal_kind": expected_terminal_kind,
+        "status": contract_status,
+        "deadline_at": projection.deadline_at,
+        "evidence_refs_json": _evidence_refs_json(projection.evidence_references),
+        "agent_requested": False,
+        "policy_version": POLICY_VERSION,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    }
+
+    with session_factory() as session:
+        if session.get(RawMessage, projection.raw_message_id) is None:
+            raise MessageOperationContractBoundsError(
+                "raw_message_id does not identify an authoritative message"
+            )
+        statement = sqlite_insert(MessageOperationContract).values(**contract_values)
+        session.execute(
+            statement.on_conflict_do_nothing(
+                index_elements=["raw_message_id", "policy_version"]
+            )
+        )
+        contract = session.execute(
+            select(MessageOperationContract).where(
+                MessageOperationContract.raw_message_id == projection.raw_message_id,
+                MessageOperationContract.policy_version == POLICY_VERSION,
+            )
+        ).scalar_one()
+        contract_fields = (
+            "intent_kind",
+            "expected_terminal_kind",
+            "status",
+            "evidence_refs_json",
+        )
+        if (
+            any(
+                getattr(contract, field) != contract_values[field]
+                for field in contract_fields
+            )
+            or contract.deadline_at != projection.deadline_at.replace(tzinfo=None)
+        ):
+            raise MessageOperationContractBoundsError(
+                "existing contract conflicts with authoritative projection"
+            )
+
+        for item in projection.items:
+            item_status = _projection_item_status(item.source_disposition)
+            item_values = {
+                "contract_id": contract.id,
+                "sequence": item.sequence,
+                "instruction_key": _bounded_text(
+                    "instruction_key", item.instruction_key, maximum=128
+                ),
+                "instruction_kind": _closed_value(
+                    "instruction_kind", item.intent_kind, INSTRUCTION_KINDS
+                ),
+                "authoritative_instruction_id": _bounded_text(
+                    "authoritative_instruction_id",
+                    item.authoritative_instruction_id,
+                    maximum=255,
+                ),
+                "expected_descendant_kind": _closed_value(
+                    "expected_descendant_kind",
+                    item.expected_descendant_kind,
+                    DESCENDANT_KINDS,
+                ),
+                "expected_terminal_kind": _closed_value(
+                    "expected_terminal_kind",
+                    item.expected_terminal_kind,
+                    TERMINAL_KINDS,
+                ),
+                "status": item_status,
+                "evidence_refs_json": _evidence_refs_json(
+                    item.evidence_references
+                ),
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            }
+            item_statement = sqlite_insert(MessageOperationItem).values(**item_values)
+            session.execute(
+                item_statement.on_conflict_do_nothing(
+                    index_elements=["contract_id", "instruction_key"]
+                )
+            )
+            stored_item = session.execute(
+                select(MessageOperationItem).where(
+                    MessageOperationItem.contract_id == contract.id,
+                    MessageOperationItem.instruction_key == item.instruction_key,
+                )
+            ).scalar_one()
+            comparable = (
+                "sequence",
+                "instruction_kind",
+                "authoritative_instruction_id",
+                "expected_descendant_kind",
+                "expected_terminal_kind",
+                "status",
+                "evidence_refs_json",
+            )
+            if any(
+                getattr(stored_item, field) != item_values[field]
+                for field in comparable
+            ):
+                raise MessageOperationContractBoundsError(
+                    "existing item conflicts with authoritative projection"
+                )
+        session.commit()
+        return _detach(session, contract)
 
 
 def run_message_operation_shadow_once(
@@ -493,51 +629,78 @@ def run_message_operation_shadow_once(
     if not 1 <= limit <= 100:
         raise MessageOperationContractBoundsError("limit must be between 1 and 100")
     with session_factory() as session:
-        raw_message_ids = session.execute(
-            select(RecognitionDecision.raw_message_id)
-            .where(
-                RecognitionDecision.raw_message_id > after_raw_message_id,
-                RecognitionDecision.comparison_status == "completed",
-                ~exists().where(
-                    MessageOperationContract.raw_message_id
-                    == RecognitionDecision.raw_message_id,
-                    MessageOperationContract.policy_version == POLICY_VERSION,
-                ),
+        rows = session.execute(
+            select(
+                RawMessage.id,
+                RecognitionDecision.comparison_status,
+                MessageOperationContract.id,
             )
-            .order_by(RecognitionDecision.raw_message_id)
+            .outerjoin(
+                RecognitionDecision,
+                RecognitionDecision.raw_message_id == RawMessage.id,
+            )
+            .outerjoin(
+                MessageOperationContract,
+                (MessageOperationContract.raw_message_id == RawMessage.id)
+                & (MessageOperationContract.policy_version == POLICY_VERSION),
+            )
+            .where(
+                RawMessage.id > after_raw_message_id,
+            )
+            .order_by(RawMessage.id)
             .limit(limit)
-        ).scalars().all()
+        ).all()
 
     result = {
         "contracts_created": 0,
         "errors": 0,
-        "messages_scanned": len(raw_message_ids),
+        "existing_skipped": 0,
+        "last_scanned_raw_message_id": after_raw_message_id,
+        "messages_scanned": 0,
         "model_calls": 0,
         "ordinary_skipped": 0,
+        "pending_blocked": 0,
     }
-    for raw_message_id in raw_message_ids:
+    for raw_message_id, comparison_status, contract_id in rows:
+        result["messages_scanned"] += 1
+        if comparison_status not in {"completed", "failed"}:
+            result["pending_blocked"] = 1
+            break
+        if contract_id is not None:
+            result["existing_skipped"] += 1
+            result["last_scanned_raw_message_id"] = raw_message_id
+            continue
         try:
             projection = project_message_operation_contract(
                 session_factory, raw_message_id=raw_message_id
             )
             if projection is None:
                 result["ordinary_skipped"] += 1
+                result["last_scanned_raw_message_id"] = raw_message_id
                 continue
             persist_message_operation_projection(
                 session_factory, projection, now=now
             )
             result["contracts_created"] += 1
             result["model_calls"] += projection.model_calls
+            result["last_scanned_raw_message_id"] = raw_message_id
         except Exception:
             result["errors"] += 1
+            break
     return result
 
 
 def _bounded_decision_payload(decision: RecognitionDecision | None) -> dict:
     if decision is None:
         return {}
+    return _bounded_json_object(decision.authoritative_payload_json)
+
+
+def _bounded_json_object(value: str | None) -> dict:
+    if not isinstance(value, str) or len(value) > 65536:
+        return {}
     try:
-        payload = json.loads(decision.authoritative_payload_json)
+        payload = json.loads(value)
     except (TypeError, ValueError):
         return {}
     return payload if isinstance(payload, dict) else {}
@@ -558,7 +721,10 @@ def _source_disposition(item: MessageInstructionItem | None) -> str:
 
 
 def _recognition_item_projection(
-    *, decision: RecognitionDecision | None, raw_message_id: int
+    *,
+    decision: RecognitionDecision | None,
+    raw_message_id: int,
+    context_attempt_id: int,
 ) -> MessageOperationItemProjection:
     decision_id = decision.id if decision is not None else raw_message_id
     return MessageOperationItemProjection(
@@ -568,9 +734,31 @@ def _recognition_item_projection(
         authoritative_instruction_id=f"recognition_decision:{decision_id}",
         expected_descendant_kind="context_resolution_attempt",
         expected_terminal_kind="verified_management",
-        evidence_references=(f"recognition_decision:{decision_id}",),
+        evidence_references=(
+            f"recognition_decision:{decision_id}",
+            f"context_resolution_attempt:{context_attempt_id}",
+        ),
         target_lifecycle_id=None,
     )
+
+
+def _projection_item_status(source_disposition: str) -> str:
+    if source_disposition == "active":
+        return "observing"
+    if source_disposition in {"duplicate", "superseded"}:
+        return source_disposition
+    raise MessageOperationContractBoundsError("unsupported source disposition")
+
+
+def _projection_contract_status(
+    items: Sequence[MessageOperationItemProjection],
+) -> str:
+    statuses = {_projection_item_status(item.source_disposition) for item in items}
+    if "observing" in statuses:
+        return "observing"
+    if "superseded" in statuses:
+        return "superseded"
+    return "duplicate"
 
 
 def _item_projection(
