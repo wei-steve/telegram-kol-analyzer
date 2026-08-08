@@ -17,6 +17,7 @@ from telegram_kol_research.entry_assembly_fingerprint_repair import (
     build_entry_assembly_fingerprint_repair_plan,
     canonical_fingerprint,
     derive_pre_finalization_fingerprint,
+    _json_object,
 )
 from telegram_kol_research.models import (
     EntryStrategyAssembly,
@@ -29,6 +30,9 @@ from telegram_kol_research.models import (
 )
 from telegram_kol_research.production_safety_monitor import (
     read_entry_preamble_invariants,
+)
+from telegram_kol_research.recovery_live_submit import (
+    build_deepcoin_trigger_order_payload,
 )
 
 
@@ -252,16 +256,65 @@ def _convert_to_production_legacy_finalized_case(session_factory) -> None:
         signal = session.get(TradeSignal, 398)
         evidence = json.loads(assembly.evidence_json)
         binding_payload = json.loads(binding.payload_json)
-        full_draft = binding_payload["draft"]
-        full_draft.pop("selected_entry_leg_indices")
-        full_draft.pop("selected_entry_leg_count")
+        original_draft = binding_payload["draft"]
+        full_draft = {
+            "blocking_reason_codes": [],
+            "contract_spec": {
+                **original_draft["contract_spec"],
+                "instrument_id": "BTC-USDT-SWAP",
+                "price_tick": 0.1,
+            },
+            "dry_run_only": False,
+            "entry_preamble_assembly": None,
+            "executable": True,
+            "instrument_id": original_draft["instrument_id"],
+            "margin_mode": original_draft["margin_mode"],
+            "notes": [],
+            "order_legs": [
+                {
+                    key: leg[key]
+                    for key in (
+                        "allocation_pct",
+                        "base_asset_estimate",
+                        "client_order_id",
+                        "estimated_stop_loss_usdt",
+                        "order_type",
+                        "position_side",
+                        "price",
+                        "quantity",
+                        "quantity_unit",
+                        "risk_budget_usdt",
+                        "side",
+                    )
+                }
+                for leg in original_draft["order_legs"]
+            ],
+            "position_mode": original_draft["position_mode"],
+            "risk_budget_usdt": original_draft["risk_budget_usdt"],
+            "source": deepcopy(original_draft["source"]),
+            "stop_loss": original_draft["stop_loss"],
+            "strategy_instance_id": original_draft["strategy_instance_id"],
+            "symbol": original_draft["symbol"],
+            "take_profit_legs": [
+                {
+                    "allocation_pct": 100,
+                    "index": 1,
+                    "order_type": "limit",
+                    "price": 66000,
+                }
+            ],
+            "venue": "deepcoin",
+        }
         legacy_snapshot = {
             "strategy_instance_id": full_draft["strategy_instance_id"],
             "instrument_id": full_draft["instrument_id"],
             "stop_loss": full_draft["stop_loss"],
             "take_profit_legs": deepcopy(full_draft["take_profit_legs"]),
             "risk_budget_usdt": full_draft["risk_budget_usdt"],
-            "contract_spec": deepcopy(full_draft["contract_spec"]),
+            "contract_spec": {
+                key: full_draft["contract_spec"][key]
+                for key in ("contract_value", "quantity_step", "min_quantity")
+            },
             "order_legs": [
                 {
                     key: leg[key]
@@ -298,6 +351,11 @@ def _convert_to_production_legacy_finalized_case(session_factory) -> None:
         assembly.fingerprint = final_fingerprint
         for leg in session.query(ExecutionOrderLeg).all():
             leg.status = "pending"
+            leg.request_json = _canonical_json(
+                build_deepcoin_trigger_order_payload(
+                    full_draft, full_draft["order_legs"][leg.leg_index - 1]
+                )
+            )
         session.commit()
 
 
@@ -382,7 +440,192 @@ def test_build_plan_accepts_exact_production_legacy_finalized_snapshot(tmp_path)
     assert plan.action is not None
     assert plan.action.policy_version == LEGACY_FINALIZED_RECONCILIATION_POLICY
     assert plan.action.trade_signal_id == 398
+    with session_factory() as session:
+        requests = [
+            json.loads(row.request_json)
+            for row in session.query(ExecutionOrderLeg)
+            .order_by(ExecutionOrderLeg.leg_index)
+            .all()
+        ]
+    assert len(requests) == 2
+    assert all(len(request) == 16 for request in requests)
     assert database_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "full_draft_extra",
+        "full_draft_missing",
+        "contract_extra",
+        "source_extra",
+        "leg_extra",
+        "take_profit_extra",
+        "wrong_boolean_type",
+        "normalized_missing_take_profit",
+    ],
+)
+def test_legacy_policy_rejects_any_schema_tolerance(tmp_path, mutation):
+    _, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    with session_factory() as session:
+        assembly = session.get(EntryStrategyAssembly, 2)
+        binding = session.get(ExecutionBinding, 266)
+        signal = session.get(TradeSignal, 398)
+        binding_payload = json.loads(binding.payload_json)
+        signal_payload = json.loads(signal.payload_json)
+        binding_draft = binding_payload["draft"]
+        signal_draft = signal_payload["deepcoin_order_draft"]
+        if mutation == "full_draft_extra":
+            binding_draft["unexpected"] = signal_draft["unexpected"] = True
+        elif mutation == "full_draft_missing":
+            binding_draft.pop("blocking_reason_codes")
+            signal_draft.pop("blocking_reason_codes")
+        elif mutation == "contract_extra":
+            binding_draft["contract_spec"]["unexpected"] = True
+            signal_draft["contract_spec"]["unexpected"] = True
+        elif mutation == "source_extra":
+            binding_draft["source"]["unexpected"] = True
+            signal_draft["source"]["unexpected"] = True
+        elif mutation == "leg_extra":
+            binding_draft["order_legs"][0]["unexpected"] = True
+            signal_draft["order_legs"][0]["unexpected"] = True
+        elif mutation == "take_profit_extra":
+            evidence = json.loads(assembly.evidence_json)
+            evidence["order_draft_snapshot"]["take_profit_legs"][0][
+                "unexpected"
+            ] = True
+            assembly.evidence_json = _canonical_json(evidence)
+            assembly.fingerprint = canonical_fingerprint(evidence)
+            binding_draft["take_profit_legs"][0]["unexpected"] = True
+            signal_draft["take_profit_legs"][0]["unexpected"] = True
+            old_fp = derive_pre_finalization_fingerprint(evidence)
+            binding_draft["entry_preamble_assembly"]["assembly_fingerprint"] = old_fp
+            signal_draft["entry_preamble_assembly"]["assembly_fingerprint"] = old_fp
+        elif mutation == "wrong_boolean_type":
+            binding_draft["executable"] = signal_draft["executable"] = 1
+        else:
+            evidence = json.loads(assembly.evidence_json)
+            evidence["order_draft_snapshot"]["take_profit_legs"] = []
+            assembly.evidence_json = _canonical_json(evidence)
+            assembly.fingerprint = canonical_fingerprint(evidence)
+            binding_draft.pop("take_profit_legs")
+            signal_draft.pop("take_profit_legs")
+            old_fp = derive_pre_finalization_fingerprint(evidence)
+            binding_draft["entry_preamble_assembly"]["assembly_fingerprint"] = old_fp
+            signal_draft["entry_preamble_assembly"]["assembly_fingerprint"] = old_fp
+        binding.payload_json = _canonical_json(binding_payload)
+        signal.payload_json = _canonical_json(signal_payload)
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.action is None
+    assert set(plan.conflicts) & {
+        "assembly_finalization_fields_missing",
+        "assembly_legacy_snapshot_binding_mismatch",
+    }
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"value":1,"value":1}',
+        '{"value":NaN}',
+        '{"value":Infinity}',
+        '{"value":-Infinity}',
+    ],
+)
+def test_repair_json_parser_rejects_duplicate_keys_and_nonfinite_values(raw):
+    assert _json_object(raw) is None
+
+
+@pytest.mark.parametrize(
+    "document",
+    ["assembly", "binding", "signal", "request", "event"],
+)
+def test_duplicate_json_key_blocks_plan_and_apply(tmp_path, document):
+    _, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    original_plan = _plan(session_factory)
+    assert original_plan.action is not None
+    if document == "event":
+        apply_entry_assembly_fingerprint_repair_plan(
+            session_factory,
+            assembly_id=2,
+            execution_binding_id=266,
+            expected_plan_fingerprint=original_plan.fingerprint,
+            applied_at=NOW,
+        )
+    with session_factory() as session:
+        if document == "assembly":
+            row = session.get(EntryStrategyAssembly, 2)
+            row.evidence_json = row.evidence_json[:-1] + ',"chat_id":-1001}'
+        elif document == "binding":
+            row = session.get(ExecutionBinding, 266)
+            value = json.loads(row.payload_json)["draft"]
+            row.payload_json = (
+                row.payload_json[:-1]
+                + ',"draft":'
+                + _canonical_json(value)
+                + "}"
+            )
+        elif document == "signal":
+            row = session.get(TradeSignal, 398)
+            value = json.loads(row.payload_json)["deepcoin_order_draft"]
+            row.payload_json = (
+                row.payload_json[:-1]
+                + ',"deepcoin_order_draft":'
+                + _canonical_json(value)
+                + "}"
+            )
+        elif document == "request":
+            row = session.query(ExecutionOrderLeg).filter_by(leg_index=1).one()
+            row.request_json = row.request_json[:-1] + ',"side":"buy"}'
+        else:
+            row = session.query(ExecutionEvent).one()
+            row.before_json = row.before_json[:-1] + ',"assembly_id":2}'
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.action is None
+    with pytest.raises(RuntimeError, match="repair_plan_not_actionable"):
+        apply_entry_assembly_fingerprint_repair_plan(
+            session_factory,
+            assembly_id=2,
+            execution_binding_id=266,
+            expected_plan_fingerprint=original_plan.fingerprint,
+            applied_at=NOW,
+        )
+    with session_factory() as session:
+        expected_events = 1 if document == "event" else 0
+        assert session.query(ExecutionEvent).count() == expected_events
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_nonfinite_binding_payload_blocks_plan_and_apply(tmp_path, constant):
+    _, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        binding.payload_json = (
+            binding.payload_json[:-1] + f',"ignored":{constant}' + "}"
+        )
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.action is None
+    assert "binding_payload_invalid" in plan.conflicts
+    with pytest.raises(RuntimeError, match="repair_plan_not_actionable"):
+        apply_entry_assembly_fingerprint_repair_plan(
+            session_factory,
+            assembly_id=2,
+            execution_binding_id=266,
+            expected_plan_fingerprint=plan.fingerprint,
+            applied_at=NOW,
+        )
 
 
 @pytest.mark.parametrize(
@@ -467,7 +710,14 @@ def test_monitor_accepts_legacy_reconciliation_only_after_exact_event(tmp_path):
 
 @pytest.mark.parametrize(
     "mutation",
-    ["signal_top", "request", "leg_status", "source_lineage", "event_policy"],
+    [
+        "signal_top",
+        "request",
+        "leg_status",
+        "source_lineage",
+        "event_policy",
+        "legacy_schema_extra",
+    ],
 )
 def test_monitor_rejects_legacy_event_when_durable_proof_drifts(
     tmp_path, mutation
@@ -501,6 +751,15 @@ def test_monitor_rejects_legacy_event_when_durable_proof_drifts(
             )
         elif mutation == "source_lineage":
             session.get(RawMessage, 10).message_id = 56
+        elif mutation == "legacy_schema_extra":
+            binding = session.get(ExecutionBinding, 266)
+            signal = session.get(TradeSignal, 398)
+            binding_payload = json.loads(binding.payload_json)
+            signal_payload = json.loads(signal.payload_json)
+            binding_payload["draft"]["unexpected"] = True
+            signal_payload["deepcoin_order_draft"]["unexpected"] = True
+            binding.payload_json = _canonical_json(binding_payload)
+            signal.payload_json = _canonical_json(signal_payload)
         else:
             event_row = session.query(ExecutionEvent).one()
             after = json.loads(event_row.after_json)

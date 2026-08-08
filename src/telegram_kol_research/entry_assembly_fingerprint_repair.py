@@ -55,6 +55,60 @@ _LEGACY_LEG_KEYS = frozenset(
         "client_order_id",
     }
 )
+_LEGACY_FULL_DRAFT_KEYS = frozenset(
+    {
+        "blocking_reason_codes",
+        "contract_spec",
+        "dry_run_only",
+        "entry_preamble_assembly",
+        "executable",
+        "instrument_id",
+        "margin_mode",
+        "notes",
+        "order_legs",
+        "position_mode",
+        "risk_budget_usdt",
+        "source",
+        "stop_loss",
+        "strategy_instance_id",
+        "symbol",
+        "take_profit_legs",
+        "venue",
+    }
+)
+_LEGACY_FULL_CONTRACT_KEYS = frozenset(
+    {
+        "contract_value",
+        "instrument_id",
+        "min_quantity",
+        "price_tick",
+        "quantity_step",
+    }
+)
+_LEGACY_FULL_SOURCE_KEYS = frozenset(
+    {"chat_id", "kol_code", "kol_id", "message_id"}
+)
+_LEGACY_FULL_LEG_KEYS = frozenset(
+    {
+        "allocation_pct",
+        "base_asset_estimate",
+        "client_order_id",
+        "estimated_stop_loss_usdt",
+        "order_type",
+        "position_side",
+        "price",
+        "quantity",
+        "quantity_unit",
+        "risk_budget_usdt",
+        "side",
+    }
+)
+_LEGACY_TAKE_PROFIT_KEYS = frozenset(
+    {"allocation_pct", "index", "order_type", "price"}
+)
+_STALE_EVIDENCE_KEYS = frozenset(
+    {"assembly_id", "strategy_instance_id", "assembly_fingerprint"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -493,17 +547,35 @@ def _json_object(raw: str | None) -> dict[str, Any] | None:
     try:
         if len(raw.encode("utf-8")) > _MAX_JSON_BYTES:
             return None
-        value = json.loads(raw)
+        value = json.loads(
+            raw,
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_json_constant,
+        )
         encoded = json.dumps(
             value,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
+            allow_nan=False,
         )
         encoded.encode("utf-8")
     except (TypeError, ValueError, UnicodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"invalid JSON constant: {value}")
 
 
 def _bounded_snapshot(draft: Any) -> dict[str, object] | None:
@@ -529,6 +601,7 @@ def _legacy_snapshot(snapshot: Any) -> dict[str, object] | None:
         )
         or not isinstance(contract_spec, Mapping)
         or set(contract_spec) != {"contract_value", "quantity_step", "min_quantity"}
+        or not _legacy_snapshot_values_are_valid(snapshot)
     ):
         return None
     return json.loads(json.dumps(dict(snapshot), ensure_ascii=False))
@@ -537,10 +610,10 @@ def _legacy_snapshot(snapshot: Any) -> dict[str, object] | None:
 def legacy_finalized_snapshot_from_full_draft(
     draft: Any,
 ) -> dict[str, object] | None:
-    if not isinstance(draft, Mapping):
+    if not _legacy_full_draft_is_exact(draft):
         return None
-    legs = draft.get("order_legs")
-    contract_spec = draft.get("contract_spec")
+    legs = draft["order_legs"]
+    contract_spec = draft["contract_spec"]
     if (
         not isinstance(legs, list)
         or not 1 <= len(legs) <= 5
@@ -549,20 +622,154 @@ def legacy_finalized_snapshot_from_full_draft(
     ):
         return None
     projected = {
-        "strategy_instance_id": draft.get("strategy_instance_id"),
-        "instrument_id": draft.get("instrument_id"),
-        "stop_loss": draft.get("stop_loss"),
-        "take_profit_legs": draft.get("take_profit_legs") or [],
-        "risk_budget_usdt": draft.get("risk_budget_usdt"),
+        "strategy_instance_id": draft["strategy_instance_id"],
+        "instrument_id": draft["instrument_id"],
+        "stop_loss": draft["stop_loss"],
+        "take_profit_legs": draft["take_profit_legs"],
+        "risk_budget_usdt": draft["risk_budget_usdt"],
         "contract_spec": {
-            key: contract_spec.get(key)
+            key: contract_spec[key]
             for key in ("contract_value", "quantity_step", "min_quantity")
         },
         "order_legs": [
-            {key: leg.get(key) for key in _LEGACY_LEG_KEYS} for leg in legs
+            {key: leg[key] for key in _LEGACY_LEG_KEYS} for leg in legs
         ],
     }
     return _legacy_snapshot(projected)
+
+
+def _legacy_snapshot_values_are_valid(snapshot: Mapping[str, Any]) -> bool:
+    contract = snapshot["contract_spec"]
+    legs = snapshot["order_legs"]
+    take_profit_legs = snapshot["take_profit_legs"]
+    return (
+        _nonempty_string(snapshot["strategy_instance_id"])
+        and _nonempty_string(snapshot["instrument_id"])
+        and _positive_number(snapshot["stop_loss"])
+        and _positive_number(snapshot["risk_budget_usdt"])
+        and all(_positive_number(contract[key]) for key in contract)
+        and isinstance(take_profit_legs, list)
+        and 1 <= len(take_profit_legs) <= 5
+        and all(_legacy_take_profit_is_exact(row) for row in take_profit_legs)
+        and all(_legacy_snapshot_leg_values_are_valid(row) for row in legs)
+    )
+
+
+def _legacy_full_draft_is_exact(draft: Any) -> bool:
+    if not isinstance(draft, Mapping) or set(draft) != _LEGACY_FULL_DRAFT_KEYS:
+        return False
+    contract = draft["contract_spec"]
+    source = draft["source"]
+    legs = draft["order_legs"]
+    take_profit_legs = draft["take_profit_legs"]
+    stale = draft["entry_preamble_assembly"]
+    return (
+        isinstance(contract, Mapping)
+        and set(contract) == _LEGACY_FULL_CONTRACT_KEYS
+        and isinstance(source, Mapping)
+        and set(source) == _LEGACY_FULL_SOURCE_KEYS
+        and isinstance(stale, Mapping)
+        and set(stale) == _STALE_EVIDENCE_KEYS
+        and isinstance(legs, list)
+        and 1 <= len(legs) <= 5
+        and all(
+            isinstance(leg, Mapping)
+            and set(leg) == _LEGACY_FULL_LEG_KEYS
+            and _legacy_full_leg_values_are_valid(leg)
+            for leg in legs
+        )
+        and isinstance(take_profit_legs, list)
+        and 1 <= len(take_profit_legs) <= 5
+        and all(_legacy_take_profit_is_exact(row) for row in take_profit_legs)
+        and isinstance(draft["blocking_reason_codes"], list)
+        and all(isinstance(value, str) for value in draft["blocking_reason_codes"])
+        and type(draft["dry_run_only"]) is bool
+        and type(draft["executable"]) is bool
+        and draft["dry_run_only"] is False
+        and draft["executable"] is True
+        and isinstance(draft["notes"], list)
+        and all(isinstance(value, str) for value in draft["notes"])
+        and _nonempty_string(draft["instrument_id"])
+        and contract["instrument_id"] == draft["instrument_id"]
+        and all(
+            _positive_number(contract[key])
+            for key in (
+                "contract_value",
+                "min_quantity",
+                "price_tick",
+                "quantity_step",
+            )
+        )
+        and draft["margin_mode"] in {"cross", "isolated"}
+        and draft["position_mode"] in {"split", "merge"}
+        and _positive_number(draft["risk_budget_usdt"])
+        and _positive_number(draft["stop_loss"])
+        and _nonempty_string(draft["strategy_instance_id"])
+        and _nonempty_string(draft["symbol"])
+        and draft["venue"] == "deepcoin"
+        and _nonempty_string(source["kol_id"])
+        and _nonempty_string(source["kol_code"])
+        and isinstance(source["chat_id"], int)
+        and not isinstance(source["chat_id"], bool)
+        and isinstance(source["message_id"], int)
+        and not isinstance(source["message_id"], bool)
+        and source["message_id"] > 0
+    )
+
+
+def _legacy_full_leg_values_are_valid(leg: Mapping[str, Any]) -> bool:
+    return (
+        _positive_number(leg["allocation_pct"])
+        and _positive_number(leg["base_asset_estimate"])
+        and _nonempty_string(leg["client_order_id"])
+        and _positive_number(leg["estimated_stop_loss_usdt"])
+        and leg["order_type"] == "limit"
+        and leg["position_side"] in {"long", "short"}
+        and _positive_number(leg["price"])
+        and _positive_number(leg["quantity"])
+        and _nonempty_string(leg["quantity_unit"])
+        and _positive_number(leg["risk_budget_usdt"])
+        and leg["side"] in {"buy", "sell"}
+    )
+
+
+def _legacy_snapshot_leg_values_are_valid(leg: Mapping[str, Any]) -> bool:
+    return (
+        _positive_number(leg["price"])
+        and leg["order_type"] == "limit"
+        and _positive_number(leg["allocation_pct"])
+        and _positive_number(leg["risk_budget_usdt"])
+        and _positive_number(leg["quantity"])
+        and _nonempty_string(leg["quantity_unit"])
+        and _positive_number(leg["estimated_stop_loss_usdt"])
+        and _nonempty_string(leg["client_order_id"])
+    )
+
+
+def _legacy_take_profit_is_exact(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value) == _LEGACY_TAKE_PROFIT_KEYS
+        and _positive_number(value["allocation_pct"])
+        and isinstance(value["index"], int)
+        and not isinstance(value["index"], bool)
+        and value["index"] > 0
+        and value["order_type"] == "limit"
+        and _positive_number(value["price"])
+    )
+
+
+def _positive_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and value > 0
+        and value not in {float("inf"), float("-inf")}
+    )
+
+
+def _nonempty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip()) and value == value.strip()
 
 
 def _positive_int_equals(value: Any, expected: int) -> bool:
