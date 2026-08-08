@@ -13,6 +13,9 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from telegram_kol_research.entry_strategy_assembly import (
+    build_bounded_entry_order_draft_snapshot,
+)
 from telegram_kol_research.models import (
     EntryStrategyAssembly,
     ExecutionBinding,
@@ -27,25 +30,6 @@ from telegram_kol_research.models import (
 RECONCILIATION_ACTION = "entry_assembly_fingerprint_reconciled"
 RECONCILIATION_POLICY = "entry-assembly-fingerprint-reconciliation-v1"
 _MAX_JSON_BYTES = 1_000_000
-_DRAFT_KEYS = (
-    "strategy_instance_id",
-    "instrument_id",
-    "stop_loss",
-    "take_profit_legs",
-    "risk_budget_usdt",
-    "contract_spec",
-    "order_legs",
-)
-_LEG_KEYS = (
-    "price",
-    "order_type",
-    "allocation_pct",
-    "risk_budget_usdt",
-    "quantity",
-    "quantity_unit",
-    "estimated_stop_loss_usdt",
-    "client_order_id",
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,9 +141,12 @@ def _build_entry_assembly_fingerprint_repair_plan(
         return _plan(None, conflicts)
 
     snapshot = final_evidence.get("order_draft_snapshot")
+    canonical_snapshot = _bounded_snapshot(snapshot)
     final_leg_count = final_evidence.get("final_entry_leg_count")
     if (
         not isinstance(snapshot, Mapping)
+        or canonical_snapshot is None
+        or canonical_snapshot != snapshot
         or not isinstance(snapshot.get("order_legs"), list)
         or not all(isinstance(leg, Mapping) for leg in snapshot["order_legs"])
         or isinstance(final_leg_count, bool)
@@ -239,9 +226,7 @@ def _build_entry_assembly_fingerprint_repair_plan(
         old_fingerprint=old_fingerprint,
     ):
         conflicts.append("binding_old_fingerprint_not_derivable")
-    if not isinstance(binding_draft, Mapping) or not isinstance(snapshot, Mapping) or (
-        _bounded_draft(binding_draft) != _bounded_draft(snapshot)
-    ):
+    if canonical_snapshot is None or _bounded_snapshot(binding_draft) != canonical_snapshot:
         conflicts.append("binding_draft_identity_mismatch")
 
     trade_signal = _load_exact_trade_signal(session, assembly, binding)
@@ -393,17 +378,13 @@ def _json_object(raw: str | None) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _bounded_draft(draft: Mapping[str, Any]) -> dict[str, Any] | None:
-    bounded = {key: draft.get(key) for key in _DRAFT_KEYS if key != "order_legs"}
-    raw_legs = draft.get("order_legs")
-    if not isinstance(raw_legs, list) or not all(
-        isinstance(leg, Mapping) for leg in raw_legs
-    ):
+def _bounded_snapshot(draft: Any) -> dict[str, object] | None:
+    if not isinstance(draft, Mapping):
         return None
-    bounded["order_legs"] = [
-        {key: leg.get(key) for key in _LEG_KEYS} for leg in raw_legs
-    ]
-    return bounded
+    try:
+        return build_bounded_entry_order_draft_snapshot(draft)
+    except (TypeError, ValueError):
+        return None
 
 
 def _positive_int_equals(value: Any, expected: int) -> bool:
@@ -514,8 +495,7 @@ def _signal_has_stale_evidence(
             strategy_instance_id=strategy_instance_id,
             old_fingerprint=old_fingerprint,
         )
-        and isinstance(draft, Mapping)
-        and _bounded_draft(draft) == _bounded_draft(snapshot)
+        and _bounded_snapshot(draft) == _bounded_snapshot(snapshot)
     )
 
 
@@ -542,9 +522,21 @@ def _execution_legs_match(
     symbol: str,
     side: str,
 ) -> bool:
-    expected_legs = snapshot.get("order_legs")
+    all_expected_legs = snapshot.get("order_legs")
+    selected_indices = snapshot.get("selected_entry_leg_indices")
     instrument = str(snapshot.get("instrument_id") or "").upper()
-    if not isinstance(expected_legs, list) or len(legs) != len(expected_legs):
+    if not isinstance(all_expected_legs, list) or not isinstance(selected_indices, list):
+        return False
+    if any(
+        isinstance(index, bool)
+        or not isinstance(index, int)
+        or index < 1
+        or index > len(all_expected_legs)
+        for index in selected_indices
+    ):
+        return False
+    expected_legs = [all_expected_legs[index - 1] for index in selected_indices]
+    if len(legs) != len(expected_legs):
         return False
     if instrument != f"{symbol.upper()}-USDT-SWAP":
         return False
@@ -554,6 +546,7 @@ def _execution_legs_match(
             return False
         request_price = request.get("price", request.get("triggerPrice"))
         draft_order_type = str(expected.get("order_type") or "").lower()
+        draft_side = str(expected.get("side") or "").lower()
         expected_order_kind = {
             "limit": "trigger_limit",
             "market": "market",
@@ -575,6 +568,9 @@ def _execution_legs_match(
             or str(request.get("instId") or "").upper() != instrument
             or str(request.get("posSide") or request.get("side") or "").lower()
             != side.lower()
+            or str(request.get("side") or "").lower() != draft_side
+            or str(request.get("tdMode") or "").lower()
+            != str(snapshot.get("margin_mode") or "").lower()
             or str(request.get("orderType") or "").lower()
             != expected_request_order_type
             or not _same_number(request_price, expected.get("price"))

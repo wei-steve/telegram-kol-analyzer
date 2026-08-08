@@ -53,6 +53,9 @@ def _final_evidence() -> dict[str, object]:
         "order_draft_snapshot": {
             "strategy_instance_id": STRATEGY_ID,
             "instrument_id": "BTC-USDT-SWAP",
+            "symbol": "BTC",
+            "margin_mode": "cross",
+            "position_mode": "split",
             "stop_loss": 63000,
             "take_profit_legs": [{"price": 66000, "allocation_pct": 100}],
             "risk_budget_usdt": 10,
@@ -61,6 +64,14 @@ def _final_evidence() -> dict[str, object]:
                 "quantity_step": 1,
                 "min_quantity": 1,
             },
+            "source": {
+                "kol_id": "group:-1001",
+                "kol_code": "group-a",
+                "chat_id": -1001,
+                "message_id": 55,
+            },
+            "selected_entry_leg_indices": [1, 2],
+            "selected_entry_leg_count": 2,
             "order_legs": [
                 {
                     "price": 64000,
@@ -68,9 +79,13 @@ def _final_evidence() -> dict[str, object]:
                     "allocation_pct": 60,
                     "risk_budget_usdt": 6,
                     "quantity": 10,
+                    "base_asset_estimate": 0.01,
                     "quantity_unit": "contracts",
                     "estimated_stop_loss_usdt": 6,
                     "client_order_id": "entry-1",
+                    "side": "buy",
+                    "position_side": "long",
+                    "take_profit_leg": {"price": 66000, "allocation_pct": 60},
                 },
                 {
                     "price": 63800,
@@ -78,9 +93,13 @@ def _final_evidence() -> dict[str, object]:
                     "allocation_pct": 40,
                     "risk_budget_usdt": 4,
                     "quantity": 5,
+                    "base_asset_estimate": 0.005,
                     "quantity_unit": "contracts",
                     "estimated_stop_loss_usdt": 4,
                     "client_order_id": "entry-2",
+                    "side": "buy",
+                    "position_side": "long",
+                    "take_profit_leg": {"price": 66000, "allocation_pct": 40},
                 },
             ],
         },
@@ -195,6 +214,8 @@ def _seed_case(tmp_path):
                         {
                             "instId": "BTC-USDT-SWAP",
                             "posSide": "long",
+                            "side": "buy",
+                            "tdMode": "cross",
                             "price": str(leg["price"]),
                             "orderType": leg["order_type"],
                             "sz": str(leg["quantity"]),
@@ -484,6 +505,173 @@ def test_build_plan_enforces_exact_submitted_v2_identity(
 
     assert plan.action is None
     assert expected_conflict in plan.conflicts
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "margin_mode",
+        "position_mode",
+        "symbol",
+        "source_kol_id",
+        "source_kol_code",
+        "source_chat_id",
+        "source_message_id",
+        "leg_side",
+        "leg_position_side",
+        "leg_base_asset_estimate",
+        "leg_take_profit_leg",
+        "selected_entry_leg_indices",
+        "selected_entry_leg_count",
+        "request_side",
+        "request_margin_mode",
+    ],
+)
+def test_build_plan_proves_complete_finalized_and_execution_snapshot(
+    tmp_path, mutation
+):
+    _, session_factory = _seed_case(tmp_path)
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        payload = json.loads(binding.payload_json)
+        draft = payload["draft"]
+        if mutation == "margin_mode":
+            draft["margin_mode"] = "isolated"
+        elif mutation == "position_mode":
+            draft["position_mode"] = "merge"
+        elif mutation == "symbol":
+            draft["symbol"] = "ETH"
+        elif mutation.startswith("source_"):
+            field = mutation.removeprefix("source_")
+            draft["source"][field] = {
+                "kol_id": "other",
+                "kol_code": "other",
+                "chat_id": -1002,
+                "message_id": 56,
+            }[field]
+        elif mutation == "leg_side":
+            draft["order_legs"][0]["side"] = "sell"
+        elif mutation == "leg_position_side":
+            draft["order_legs"][0]["position_side"] = "short"
+        elif mutation == "leg_base_asset_estimate":
+            draft["order_legs"][0]["base_asset_estimate"] = 0.02
+        elif mutation == "leg_take_profit_leg":
+            draft["order_legs"][0]["take_profit_leg"]["price"] = 67000
+        elif mutation == "selected_entry_leg_indices":
+            draft["selected_entry_leg_indices"] = [2, 1]
+        elif mutation == "selected_entry_leg_count":
+            draft["selected_entry_leg_count"] = 1
+        elif mutation.startswith("request_"):
+            leg = session.query(ExecutionOrderLeg).filter_by(leg_index=1).one()
+            request = json.loads(leg.request_json)
+            if mutation == "request_side":
+                request["side"] = "sell"
+            else:
+                request["tdMode"] = "isolated"
+            leg.request_json = _canonical_json(request)
+        if not mutation.startswith("request_"):
+            binding.payload_json = _canonical_json(payload)
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.action is None
+    assert (
+        "binding_draft_identity_mismatch" in plan.conflicts
+        or "execution_leg_identity_mismatch" in plan.conflicts
+    )
+
+
+def test_build_plan_maps_durable_legs_through_selected_entry_indices(tmp_path):
+    _, session_factory = _seed_case(tmp_path)
+    with session_factory() as session:
+        assembly = session.get(EntryStrategyAssembly, 2)
+        evidence = json.loads(assembly.evidence_json)
+        evidence["order_draft_snapshot"]["selected_entry_leg_indices"] = [2]
+        evidence["order_draft_snapshot"]["selected_entry_leg_count"] = 1
+        assembly.evidence_json = _canonical_json(evidence)
+        assembly.fingerprint = canonical_fingerprint(evidence)
+        binding = session.get(ExecutionBinding, 266)
+        binding_payload = json.loads(binding.payload_json)
+        binding_payload["draft"]["selected_entry_leg_indices"] = [2]
+        binding_payload["draft"]["selected_entry_leg_count"] = 1
+        binding.payload_json = _canonical_json(binding_payload)
+        signal = session.get(TradeSignal, 398)
+        signal_payload = json.loads(signal.payload_json)
+        signal_payload["deepcoin_order_draft"]["selected_entry_leg_indices"] = [2]
+        signal_payload["deepcoin_order_draft"]["selected_entry_leg_count"] = 1
+        signal.payload_json = _canonical_json(signal_payload)
+        legs = session.query(ExecutionOrderLeg).order_by(ExecutionOrderLeg.leg_index).all()
+        session.delete(legs[1])
+        legs[0].client_order_id = "entry-2"
+        request = json.loads(legs[0].request_json)
+        request.update({"price": "63800", "sz": "5", "clOrdId": "entry-2"})
+        legs[0].request_json = _canonical_json(request)
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.conflicts == ()
+    assert plan.action is not None
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "margin_mode",
+        "position_mode",
+        "symbol",
+        "source_kol_id",
+        "source_kol_code",
+        "source_chat_id",
+        "source_message_id",
+        "leg_side",
+        "leg_position_side",
+        "leg_base_asset_estimate",
+        "leg_take_profit_leg",
+        "selected_entry_leg_indices",
+        "selected_entry_leg_count",
+    ],
+)
+def test_build_plan_proves_complete_submitted_signal_snapshot(tmp_path, mutation):
+    _, session_factory = _seed_case(tmp_path)
+    with session_factory() as session:
+        signal = session.get(TradeSignal, 398)
+        payload = json.loads(signal.payload_json)
+        draft = payload["deepcoin_order_draft"]
+        if mutation == "margin_mode":
+            draft["margin_mode"] = "isolated"
+        elif mutation == "position_mode":
+            draft["position_mode"] = "merge"
+        elif mutation == "symbol":
+            draft["symbol"] = "ETH"
+        elif mutation.startswith("source_"):
+            field = mutation.removeprefix("source_")
+            draft["source"][field] = {
+                "kol_id": "other",
+                "kol_code": "other",
+                "chat_id": -1002,
+                "message_id": 56,
+            }[field]
+        elif mutation == "leg_side":
+            draft["order_legs"][0]["side"] = "sell"
+        elif mutation == "leg_position_side":
+            draft["order_legs"][0]["position_side"] = "short"
+        elif mutation == "leg_base_asset_estimate":
+            draft["order_legs"][0]["base_asset_estimate"] = 0.02
+        elif mutation == "leg_take_profit_leg":
+            draft["order_legs"][0]["take_profit_leg"]["price"] = 67000
+        elif mutation == "selected_entry_leg_indices":
+            draft["selected_entry_leg_indices"] = [2, 1]
+        elif mutation == "selected_entry_leg_count":
+            draft["selected_entry_leg_count"] = 1
+        signal.payload_json = _canonical_json(payload)
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.action is None
+    assert "trade_signal_evidence_mismatch" in plan.conflicts
 
 
 @pytest.mark.parametrize(
