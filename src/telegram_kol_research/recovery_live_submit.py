@@ -109,36 +109,38 @@ def _require_synchronized_finalized_entry_assembly(
         )
         for evidence in (top_evidence, nested_evidence)
     )
-    if not declares_v2:
-        return
     strategy_instance_id = trade_signal.strategy_instance_id
+    assembly = None
+    if strategy_instance_id:
+        with session_factory() as session:
+            assembly = (
+                session.query(EntryStrategyAssembly)
+                .filter(
+                    EntryStrategyAssembly.strategy_instance_id
+                    == strategy_instance_id,
+                    EntryStrategyAssembly.entry_preamble_id.is_(None),
+                )
+                .one_or_none()
+            )
+            if assembly is not None:
+                assembly_id = int(assembly.id)
+                assembly_fingerprint = str(assembly.fingerprint)
+                try:
+                    assembly_evidence = json.loads(
+                        assembly.evidence_json or "{}"
+                    )
+                except (TypeError, ValueError):
+                    assembly_evidence = None
+    if assembly is None and not declares_v2:
+        return
     if (
-        not strategy_instance_id
+        assembly is None
+        or not strategy_instance_id
         or not isinstance(top_evidence, Mapping)
         or not isinstance(nested_evidence, Mapping)
         or not isinstance(draft, Mapping)
     ):
         raise RecoveryLiveSubmitError("entry_assembly_signal_not_synchronized")
-    with session_factory() as session:
-        assembly = (
-            session.query(EntryStrategyAssembly)
-            .filter(
-                EntryStrategyAssembly.strategy_instance_id
-                == strategy_instance_id,
-                EntryStrategyAssembly.entry_preamble_id.is_(None),
-            )
-            .one_or_none()
-        )
-        if assembly is None:
-            raise RecoveryLiveSubmitError(
-                "entry_assembly_signal_not_synchronized"
-            )
-        assembly_id = int(assembly.id)
-        assembly_fingerprint = str(assembly.fingerprint)
-        try:
-            assembly_evidence = json.loads(assembly.evidence_json or "{}")
-        except (TypeError, ValueError):
-            assembly_evidence = None
     snapshot = (
         assembly_evidence.get("order_draft_snapshot")
         if isinstance(assembly_evidence, Mapping)
@@ -160,6 +162,18 @@ def _require_synchronized_finalized_entry_assembly(
     except (TypeError, ValueError):
         current_snapshot = None
         canonical_fingerprint = None
+    current_legs = (
+        current_snapshot.get("order_legs")
+        if isinstance(current_snapshot, Mapping)
+        else None
+    )
+    side_is_consistent = isinstance(current_legs, list) and all(
+        isinstance(leg, Mapping)
+        and leg.get("position_side") == trade_signal.side
+        and leg.get("side")
+        == ("buy" if trade_signal.side == "long" else "sell")
+        for leg in current_legs
+    )
     evidence_copies = (top_evidence, nested_evidence)
     if (
         not isinstance(snapshot, Mapping)
@@ -169,6 +183,7 @@ def _require_synchronized_finalized_entry_assembly(
         or len(snapshot_legs) != final_leg_count
         or current_snapshot != snapshot
         or canonical_fingerprint != assembly_fingerprint
+        or not side_is_consistent
         or any(not isinstance(evidence, Mapping) for evidence in evidence_copies)
         or any(
             evidence.get("assembly_id") != assembly_id

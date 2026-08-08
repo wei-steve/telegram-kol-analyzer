@@ -788,14 +788,33 @@ def test_v2_order_draft_snapshot_is_immutable(tmp_path):
     draft = {
         "strategy_instance_id": "deepcoin:-1002337721508:9902:BTC:short",
         "instrument_id": "BTC-USDT-SWAP",
+        "margin_mode": "cross",
+        "position_mode": "split",
+        "stop_loss": 64900,
+        "take_profit_legs": [],
         "risk_budget_usdt": 10,
+        "contract_spec": {
+            "contract_value": 0.001,
+            "quantity_step": 1,
+            "min_quantity": 1,
+        },
+        "source": {
+            "kol_id": "alice",
+            "chat_id": -1002337721508,
+            "message_id": 9902,
+        },
         "order_legs": [
             {
                 "price": 64200,
                 "order_type": "limit",
+                "side": "sell",
+                "position_side": "short",
                 "allocation_pct": 100,
                 "risk_budget_usdt": 10,
-                "quantity": 0.01,
+                "quantity": 10,
+                "quantity_unit": "contracts",
+                "estimated_stop_loss_usdt": 7,
+                "client_order_id": "test-leg-1",
             }
         ],
     }

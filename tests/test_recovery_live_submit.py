@@ -132,6 +132,40 @@ class _FakeDeepcoinClient:
         return 68100.0
 
 
+class _RecordingAllDeepcoinCalls(_FakeDeepcoinClient):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def place_order(self, order_payload):
+        self.calls.append("place_order")
+        return super().place_order(order_payload)
+
+    def trigger_order(self, order_payload):
+        self.calls.append("trigger_order")
+        return super().trigger_order(order_payload)
+
+    def set_position_sltp(self, protection_payload):
+        self.calls.append("set_position_sltp")
+        return super().set_position_sltp(protection_payload)
+
+    def replace_order_sltp(self, protection_payload):
+        self.calls.append("replace_order_sltp")
+        return super().replace_order_sltp(protection_payload)
+
+    def cancel_order(self, cancel_payload):
+        self.calls.append("cancel_order")
+        return super().cancel_order(cancel_payload)
+
+    def list_positions(self, *, inst_id=None):
+        self.calls.append("list_positions")
+        return super().list_positions(inst_id=inst_id)
+
+    def list_trigger_orders_pending(self, *, inst_id):
+        self.calls.append("list_trigger_orders_pending")
+        return super().list_trigger_orders_pending(inst_id=inst_id)
+
+
 class _ProtectionFailingDeepcoinClient(_FakeDeepcoinClient):
     def __init__(self):
         super().__init__()
@@ -958,6 +992,11 @@ def test_process_next_rejects_declared_v2_evidence_without_matching_assembly(
         ("risk_budget_usdt", 999.0),
         ("stop_loss", 67499.0),
         ("malformed_leg", "invalid"),
+        ("margin_mode", "isolated"),
+        ("position_mode", "merge"),
+        ("side", "sell"),
+        ("position_side", "short"),
+        ("take_profit_leg", {"price": 99999.0, "allocation_pct": 100}),
     ],
 )
 def test_process_next_rejects_finalized_v2_order_economics_drift(
@@ -982,7 +1021,7 @@ def test_process_next_rejects_finalized_v2_order_economics_drift(
         row = session.get(TradeSignal, signal.id)
         payload = json.loads(row.payload_json)
         draft = payload["deepcoin_order_draft"]
-        if drift_field == "stop_loss":
+        if drift_field in {"stop_loss", "margin_mode", "position_mode"}:
             draft[drift_field] = drift_value
         elif drift_field == "malformed_leg":
             draft["order_legs"][0] = drift_value
@@ -990,7 +1029,7 @@ def test_process_next_rejects_finalized_v2_order_economics_drift(
             draft["order_legs"][0][drift_field] = drift_value
         row.payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         session.commit()
-    client = _FakeDeepcoinClient()
+    client = _RecordingAllDeepcoinCalls()
 
     with pytest.raises(
         RecoveryLiveSubmitError,
@@ -1002,8 +1041,87 @@ def test_process_next_rejects_finalized_v2_order_economics_drift(
             contract_spec_provider=_StaticContractSpecProvider(),
         )
 
-    assert client.payloads == []
-    assert client.trigger_payloads == []
+    assert client.calls == []
+
+
+def test_process_next_validates_malformed_second_leg_before_first_exchange_call(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    assert len(signal.payload["deepcoin_order_draft"]["order_legs"]) == 2
+    finalized = _finalize_v2_assembly_for_signal(session_factory, signal)
+    _persist_finalized_signal_evidence(session_factory, signal, finalized)
+    with session_factory() as session:
+        row = session.get(TradeSignal, signal.id)
+        payload = json.loads(row.payload_json)
+        payload["deepcoin_order_draft"]["order_legs"][1] = "invalid"
+        row.payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        session.commit()
+    client = _RecordingAllDeepcoinCalls()
+
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="^entry_assembly_signal_not_synchronized$",
+    ):
+        process_next_trade_signal_live(
+            session_factory,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("evidence_state", ["missing", "malformed"])
+def test_process_next_rejects_v2_row_without_two_valid_evidence_copies(
+    tmp_path,
+    evidence_state,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    _finalize_v2_assembly_for_signal(session_factory, signal)
+    with session_factory() as session:
+        row = session.get(TradeSignal, signal.id)
+        payload = json.loads(row.payload_json)
+        payload.pop("entry_preamble_assembly", None)
+        payload["deepcoin_order_draft"].pop("entry_preamble_assembly", None)
+        if evidence_state == "malformed":
+            payload["entry_preamble_assembly"] = "invalid"
+            payload["deepcoin_order_draft"]["entry_preamble_assembly"] = []
+        row.payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        session.commit()
+    client = _RecordingAllDeepcoinCalls()
+
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="^entry_assembly_signal_not_synchronized$",
+    ):
+        process_next_trade_signal_live(
+            session_factory,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+
+    assert client.calls == []
 
 
 def test_process_next_rejects_noncanonical_current_assembly_fingerprint(tmp_path):

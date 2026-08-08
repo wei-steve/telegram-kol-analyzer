@@ -797,6 +797,32 @@ def build_bounded_entry_order_draft_snapshot(
 ) -> dict[str, object]:
     """Return the one canonical bounded snapshot used for entry finalization."""
 
+    strategy_instance_id = order_draft.get("strategy_instance_id")
+    instrument_id = order_draft.get("instrument_id")
+    margin_mode = order_draft.get("margin_mode")
+    position_mode = order_draft.get("position_mode")
+    if not isinstance(strategy_instance_id, str) or not strategy_instance_id:
+        raise ValueError("entry assembly draft strategy identity is invalid")
+    if not isinstance(instrument_id, str) or not instrument_id:
+        raise ValueError("entry assembly draft instrument is invalid")
+    if margin_mode not in {"cross", "isolated"}:
+        raise ValueError("entry assembly draft margin mode is invalid")
+    if position_mode not in {"split", "merge"}:
+        raise ValueError("entry assembly draft position mode is invalid")
+    if not _is_positive_draft_number(order_draft.get("stop_loss")):
+        raise ValueError("entry assembly draft stop loss is invalid")
+    if not _is_positive_draft_number(order_draft.get("risk_budget_usdt")):
+        raise ValueError("entry assembly draft risk budget is invalid")
+
+    take_profit_legs = order_draft.get("take_profit_legs")
+    if not isinstance(take_profit_legs, list) or any(
+        not isinstance(leg, Mapping)
+        or not _is_positive_draft_number(leg.get("price"))
+        or not _is_positive_draft_number(leg.get("allocation_pct"))
+        for leg in take_profit_legs
+    ):
+        raise ValueError("entry assembly draft take profit legs are invalid")
+
     raw_legs = order_draft.get("order_legs")
     if (
         not isinstance(raw_legs, list)
@@ -804,6 +830,36 @@ def build_bounded_entry_order_draft_snapshot(
         or any(not isinstance(leg, Mapping) for leg in raw_legs)
     ):
         raise ValueError("entry assembly draft must contain one to five valid legs")
+    for leg in raw_legs:
+        side = leg.get("side")
+        position_side = leg.get("position_side")
+        take_profit_leg = leg.get("take_profit_leg")
+        if (
+            side not in {"buy", "sell"}
+            or position_side not in {"long", "short"}
+            or (position_side == "long" and side != "buy")
+            or (position_side == "short" and side != "sell")
+            or leg.get("order_type") not in {"market", "limit"}
+            or not _is_positive_draft_number(leg.get("price"))
+            or not _is_positive_draft_number(leg.get("quantity"))
+            or not _is_positive_draft_number(leg.get("allocation_pct"))
+            or not _is_positive_draft_number(leg.get("risk_budget_usdt"))
+            or not isinstance(leg.get("quantity_unit"), str)
+            or not leg.get("quantity_unit")
+            or not isinstance(leg.get("client_order_id"), str)
+            or not leg.get("client_order_id")
+            or (
+                leg.get("estimated_stop_loss_usdt") is not None
+                and not _is_positive_draft_number(
+                    leg.get("estimated_stop_loss_usdt")
+                )
+            )
+            or (
+                take_profit_leg is not None
+                and not isinstance(take_profit_leg, Mapping)
+            )
+        ):
+            raise ValueError("entry assembly draft order leg is invalid")
     bounded_legs = [
         {
             key: leg.get(key)
@@ -813,14 +869,26 @@ def build_bounded_entry_order_draft_snapshot(
                 "allocation_pct",
                 "risk_budget_usdt",
                 "quantity",
+                "base_asset_estimate",
                 "quantity_unit",
                 "estimated_stop_loss_usdt",
                 "client_order_id",
+                "side",
+                "position_side",
+                "take_profit_leg",
             )
         }
         for leg in raw_legs
     ]
     raw_contract_spec = order_draft.get("contract_spec")
+    if raw_contract_spec is not None and (
+        not isinstance(raw_contract_spec, Mapping)
+        or any(
+            not _is_positive_draft_number(raw_contract_spec.get(key))
+            for key in ("contract_value", "quantity_step", "min_quantity")
+        )
+    ):
+        raise ValueError("entry assembly draft contract spec is invalid")
     contract_spec = (
         {
             key: raw_contract_spec.get(key)
@@ -829,15 +897,35 @@ def build_bounded_entry_order_draft_snapshot(
         if isinstance(raw_contract_spec, Mapping)
         else None
     )
+    raw_source = order_draft.get("source")
+    source = (
+        {
+            key: raw_source.get(key)
+            for key in ("kol_id", "kol_code", "chat_id", "message_id")
+        }
+        if isinstance(raw_source, Mapping)
+        else None
+    )
     return {
-        "strategy_instance_id": order_draft.get("strategy_instance_id"),
-        "instrument_id": order_draft.get("instrument_id"),
+        "strategy_instance_id": strategy_instance_id,
+        "instrument_id": instrument_id,
+        "symbol": order_draft.get("symbol"),
+        "margin_mode": margin_mode,
+        "position_mode": position_mode,
         "stop_loss": order_draft.get("stop_loss"),
-        "take_profit_legs": order_draft.get("take_profit_legs") or [],
+        "take_profit_legs": take_profit_legs,
         "risk_budget_usdt": order_draft.get("risk_budget_usdt"),
         "contract_spec": contract_spec,
+        "source": source,
         "order_legs": bounded_legs,
     }
+
+
+def _is_positive_draft_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, int | float | Decimal):
+        return False
+    decimal_value = Decimal(str(value))
+    return decimal_value.is_finite() and decimal_value > 0
 
 
 def canonical_entry_assembly_fingerprint(evidence: Mapping[str, object]) -> str:
