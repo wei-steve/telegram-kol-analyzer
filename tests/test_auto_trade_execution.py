@@ -1801,6 +1801,142 @@ def test_recovery_trigger_synchronizes_finalized_fingerprint_before_exchange_sub
     )
 
 
+def test_partial_v2_entry_submission_is_quarantined_and_never_reenqueued(
+    tmp_path,
+):
+    from telegram_kol_research.recovery_live_submit import process_trade_signal_live
+    from telegram_kol_research.trade_signals import load_or_create_trade_signal
+
+    session_factory = create_session_factory(tmp_path / "partial-v2-entry.db")
+    raw_message_id = _persist_candidate(session_factory)
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC"],
+            "entry_message_assembly_v2_mode": "live",
+            "symbol_entry_thresholds": {
+                "BTC": {
+                    "market_leg_threshold": "50",
+                    "first_limit_offset": "90",
+                    "second_limit_offset": "80",
+                }
+            },
+        },
+    )
+
+    class _SecondLegUnknownClient(_FakeDeepcoinClient):
+        def trigger_order(self, order_payload):
+            self.trigger_orders.append(order_payload)
+            if len(self.trigger_orders) >= 2:
+                raise DeepcoinRequestOutcomeUnknown("second leg outcome unknown")
+            return {"code": "0", "data": {"ordId": "trigger-1"}}
+
+    client = _SecondLegUnknownClient()
+    with pytest.raises(DeepcoinRequestOutcomeUnknown):
+        auto_process_message_trade_signal(
+            session_factory,
+            raw_message_id=raw_message_id,
+            group_config=_group_config(),
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            processed_at=datetime(2026, 8, 8, 8, 1, tzinfo=UTC),
+        )
+    with session_factory() as session:
+        signal = session.query(TradeSignal).one()
+        original_payload_json = signal.payload_json
+        assert signal.status == "partial_submission_failed"
+        assert signal.last_error == "second leg outcome unknown"
+
+    with pytest.raises(LookupError, match="recovery execution item not found"):
+        auto_process_message_trade_signal(
+            session_factory,
+            raw_message_id=raw_message_id,
+            group_config=_group_config(),
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            processed_at=datetime(2026, 8, 8, 8, 2, tzinfo=UTC),
+        )
+
+    reused = load_or_create_trade_signal(
+        session_factory,
+        venue="deepcoin",
+        source_type="recovery",
+        kol_id="changed",
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        action="open_position",
+        payload={"unsafe_retry_payload": True},
+        strategy_instance_id="deepcoin:100:55:BTC:long",
+    )
+    assert reused.status == "partial_submission_failed"
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="^trade_signal_claim_failed:partial_submission_failed$",
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=reused.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+
+    assert len(client.trigger_orders) == 2
+    with session_factory() as session:
+        signal = session.query(TradeSignal).one()
+        assert signal.status == "partial_submission_failed"
+        assert signal.last_error == "second leg outcome unknown"
+        assert signal.payload_json == original_payload_json
+
+
+def test_auto_market_draft_uses_immutable_signal_enqueue(tmp_path, monkeypatch):
+    import telegram_kol_research.auto_trade_execution as auto_module
+    from telegram_kol_research.trade_signals import load_or_create_trade_signal
+
+    session_factory = create_session_factory(tmp_path / "auto-market-immutable.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="BTC long market SL 67500 TP 69000/70000",
+        entry_text="market",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC"],
+            "entry_message_assembly_v2_mode": "live",
+        },
+    )
+    immutable_enqueue_calls = []
+
+    def record_immutable_enqueue(*args, **kwargs):
+        immutable_enqueue_calls.append(kwargs)
+        return load_or_create_trade_signal(*args, **kwargs)
+
+    monkeypatch.setattr(
+        auto_module,
+        "load_or_create_trade_signal",
+        record_immutable_enqueue,
+        raising=False,
+    )
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=_FakeDeepcoinClient(),
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 8, 8, 8, 1, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    assert len(immutable_enqueue_calls) == 1
+
+
 def test_recovery_trigger_fingerprint_sync_failure_blocks_exchange_submission(
     tmp_path, monkeypatch
 ):

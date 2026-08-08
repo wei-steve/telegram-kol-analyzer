@@ -1080,6 +1080,38 @@ def test_v2_submission_uses_durable_selected_legs_not_external_maximum(tmp_path)
     assert len(client.trigger_payloads) == 2
 
 
+def test_legacy_shadow_metadata_does_not_override_maximum_order_legs(tmp_path):
+    session_factory = create_session_factory(tmp_path / "legacy-shadow.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    with session_factory() as session:
+        row = session.get(TradeSignal, signal.id)
+        payload = json.loads(row.payload_json)
+        payload["entry_preamble_assembly"] = {"mode": "shadow"}
+        row.payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        session.commit()
+    client = _FakeDeepcoinClient()
+
+    result = process_trade_signal_live(
+        session_factory,
+        signal_id=signal.id,
+        deepcoin_client=client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        max_order_legs=1,
+    )
+
+    assert result["order_count"] == 1
+    assert len(client.trigger_payloads) == 1
+
+
 def test_process_next_rejects_declared_v2_evidence_without_matching_assembly(
     tmp_path,
 ):
@@ -1301,8 +1333,18 @@ def test_process_next_rejects_noncanonical_current_assembly_fingerprint(tmp_path
     assert client.trigger_payloads == []
 
 
-@pytest.mark.parametrize("status", ["pending", "submitted"])
-def test_enqueue_recovery_reuses_finalized_signal_without_rewriting_payload(
+@pytest.mark.parametrize(
+    "status",
+    [
+        "pending",
+        "processing",
+        "submitted",
+        "failed",
+        "partial_submission_failed",
+        "unknown_exchange_outcome",
+    ],
+)
+def test_enqueue_recovery_reuses_any_finalized_signal_without_rewriting_payload(
     tmp_path,
     status,
 ):

@@ -61,7 +61,7 @@ from telegram_kol_research.recovery_scan import RecoverySignal
 from telegram_kol_research.recovery_scan import _parse_entry_range
 from telegram_kol_research.recovery_scan import _resolve_runtime_config
 from telegram_kol_research.recovery_scan import _resolve_signal_max_loss_usdt
-from telegram_kol_research.trade_signals import enqueue_trade_signal
+from telegram_kol_research.trade_signals import load_or_create_trade_signal
 from telegram_kol_research.trade_signals import (
     synchronize_pending_entry_assembly_evidence,
 )
@@ -836,7 +836,7 @@ def _auto_process_single_message_trade_signal(
     )
     if auto_draft is not None:
         auto_draft["entry_preamble_assembly"] = assembly_evidence
-        trade_signal = enqueue_trade_signal(
+        trade_signal = load_or_create_trade_signal(
             session_factory,
             venue="deepcoin",
             source_type="recovery",

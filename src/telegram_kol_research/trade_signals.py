@@ -620,6 +620,7 @@ def mark_trade_signal_failed(
     error: str,
     failed_at: datetime | None = None,
     expected_status: str | None = None,
+    terminal_status: str = "failed",
 ) -> None:
     now = failed_at or datetime.now(UTC)
     with session_factory() as session:
@@ -631,7 +632,7 @@ def mark_trade_signal_failed(
                     TradeSignal.status == expected_status,
                 )
                 .values(
-                    status="failed",
+                    status=terminal_status,
                     last_error=error,
                     attempts=TradeSignal.attempts + 1,
                     updated_at=now,
@@ -647,7 +648,7 @@ def mark_trade_signal_failed(
         if row is None:
             raise LookupError("trade signal not found")
         if expected_status is None:
-            row.status = "failed"
+            row.status = terminal_status
             row.last_error = error
             row.attempts = int(row.attempts or 0) + 1
             row.updated_at = now

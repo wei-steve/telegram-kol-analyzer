@@ -84,7 +84,7 @@ def _require_synchronized_finalized_entry_assembly(
     session_factory: sessionmaker,
     *,
     trade_signal: TradeSignalRecord,
-) -> None:
+) -> bool:
     """Fail closed when a V2 entry signal is stale at the execution boundary."""
 
     payload = trade_signal.payload
@@ -134,7 +134,7 @@ def _require_synchronized_finalized_entry_assembly(
                 except (TypeError, ValueError):
                     assembly_evidence = None
     if assembly is None and not declares_v2:
-        return
+        return False
     if (
         assembly is None
         or not strategy_instance_id
@@ -195,6 +195,7 @@ def _require_synchronized_finalized_entry_assembly(
         )
     ):
         raise RecoveryLiveSubmitError("entry_assembly_signal_not_synchronized")
+    return True
 
 
 @contextmanager
@@ -530,8 +531,9 @@ def process_trade_signal_live(
     except TradeSignalClaimError as exc:
         raise RecoveryLiveSubmitError(str(exc)) from exc
     try:
+        verified_v2_assembly = False
         if trade_signal.action == "open_position":
-            _require_synchronized_finalized_entry_assembly(
+            verified_v2_assembly = _require_synchronized_finalized_entry_assembly(
                 session_factory,
                 trade_signal=trade_signal,
             )
@@ -542,6 +544,7 @@ def process_trade_signal_live(
                 contract_spec_provider=contract_spec_provider,
                 submitted_at=processed_at,
                 max_order_legs=max_order_legs,
+                verified_v2_assembly=verified_v2_assembly,
             )
         else:
             if (
@@ -565,6 +568,11 @@ def process_trade_signal_live(
             error=str(exc),
             failed_at=processed_at,
             expected_status="processing",
+            terminal_status=(
+                "partial_submission_failed"
+                if verified_v2_assembly
+                else "failed"
+            ),
         )
         raise
     mark_trade_signal_submitted(
@@ -635,6 +643,7 @@ def _submit_recovery_signal_direct(
     submitted_at: datetime | None = None,
     max_order_legs: int | None = None,
     validated_draft: dict[str, Any] | None = None,
+    verified_v2_assembly: bool = False,
 ) -> dict[str, Any]:
     if validated_draft is None:
         gate = validate_recovery_live_submit_gate(
@@ -674,16 +683,7 @@ def _submit_recovery_signal_direct(
     side_key = trade_signal.side.lower()
     warnings = _protection_warnings(draft)
 
-    assembly_evidence = (
-        trade_signal.payload.get("entry_preamble_assembly")
-        if isinstance(trade_signal.payload, dict)
-        else None
-    )
-    nested_evidence = draft.get("entry_preamble_assembly")
-    is_v2_submission = isinstance(assembly_evidence, dict) or isinstance(
-        nested_evidence, dict
-    )
-    if is_v2_submission:
+    if verified_v2_assembly:
         selected_indices = draft.get("selected_entry_leg_indices")
         if not isinstance(selected_indices, list):
             raise RecoveryLiveSubmitError("invalid_selected_entry_leg_indices")
