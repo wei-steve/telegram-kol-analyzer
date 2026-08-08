@@ -2256,10 +2256,10 @@ def _legacy_nested_evidence_shape_is_exact(evidence: Any) -> bool:
         and type(message_id) is int
         and message_id > 0
         and evidence["applied_risk_multiplier"] == "1"
-        and type(evidence["configured_risk_budget_usdt"]) is int
-        and evidence["configured_risk_budget_usdt"] == 20
-        and type(evidence["effective_risk_budget_usdt"]) is int
-        and evidence["effective_risk_budget_usdt"] == 20
+        and type(evidence["configured_risk_budget_usdt"]) is float
+        and evidence["configured_risk_budget_usdt"] == 20.0
+        and type(evidence["effective_risk_budget_usdt"]) is float
+        and evidence["effective_risk_budget_usdt"] == 20.0
         and evidence["entry_allocations"] == []
         and evidence["fragment_ids"] == []
         and evidence["legacy_preamble_ids"] == []

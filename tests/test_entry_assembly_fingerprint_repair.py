@@ -352,8 +352,8 @@ def _convert_to_production_legacy_finalized_case(session_factory) -> None:
         stale = {
             "applied_risk_multiplier": "1",
             "assembly_fingerprint": old_fingerprint,
-            "configured_risk_budget_usdt": 20,
-            "effective_risk_budget_usdt": 20,
+            "configured_risk_budget_usdt": 20.0,
+            "effective_risk_budget_usdt": 20.0,
             "entry_allocations": [],
             "fragment_ids": [],
             "legacy_preamble_ids": [],
@@ -752,6 +752,41 @@ def test_legacy_policy_rejects_nested_evidence_schema_drift(tmp_path, mutation):
                 nested["unexpected"] = True
             else:
                 nested.pop("fragment_ids")
+        binding.payload_json = _canonical_json(binding_payload)
+        signal.payload_json = _canonical_json(signal_payload)
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.action is None
+    assert plan.conflicts
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        (field, invalid_value)
+        for field in (
+            "configured_risk_budget_usdt",
+            "effective_risk_budget_usdt",
+        )
+        for invalid_value in (20, True, "20.0", 21.0)
+    ],
+)
+def test_legacy_policy_rejects_nested_budget_type_or_value_drift(
+    tmp_path, field, invalid_value
+):
+    _, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        signal = session.get(TradeSignal, 398)
+        binding_payload = json.loads(binding.payload_json)
+        signal_payload = json.loads(signal.payload_json)
+        binding_payload["draft"]["entry_preamble_assembly"][field] = invalid_value
+        signal_payload["deepcoin_order_draft"]["entry_preamble_assembly"][
+            field
+        ] = invalid_value
         binding.payload_json = _canonical_json(binding_payload)
         signal.payload_json = _canonical_json(signal_payload)
         session.commit()
