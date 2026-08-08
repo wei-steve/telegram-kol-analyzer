@@ -55,6 +55,7 @@ def test_runtime_agent_sidecar_unit_is_separate_and_dormant_until_enabled():
     assert 'chmod +t "$DATA_DIRECTORY"' in installer
     assert 'find "$DATA_DIRECTORY" -maxdepth 1 -type f -print0' in installer
     assert 'setfacl -m "u:$AGENT_USER:---" "$data_file"' in installer
+    assert 'chmod go-rwx "$data_file"' in installer
     assert "Agent identity can access non-allowlisted production data" in installer
     assert "Agent identity cannot create SQLite sidecar files" in installer
 

@@ -620,7 +620,8 @@ writable only because SQLite must be able to recreate absent WAL/SHM files
 after a clean close or reboot. DAC grants the Agent write-plus-traverse but not
 directory enumeration, the directory is sticky, and the installer removes
 legacy Agent grants by applying an explicit deny ACL to every non-database
-top-level file, denies group/other access on future inherited file ACLs, and
+top-level file and removing its group/other mode access, denies group/other
+access on future inherited file ACLs, and
 refuses deployment if any such file remains readable or writable. Known Telegram session paths are
 also inaccessible in the service mount namespace. A root-owned pre-start
 helper opens only single-link regular database/WAL/SHM/journal files with

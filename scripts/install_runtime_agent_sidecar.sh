@@ -118,6 +118,7 @@ while IFS= read -r -d '' data_file; do
       continue
       ;;
   esac
+  chmod go-rwx "$data_file"
   setfacl -m "u:$AGENT_USER:---" "$data_file"
   if runuser -u "$AGENT_USER" -- test -r "$data_file" \
     || runuser -u "$AGENT_USER" -- test -w "$data_file"; then
