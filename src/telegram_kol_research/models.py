@@ -3106,7 +3106,8 @@ class RuntimeAgentInvestigationAudit(Base):
             name="ck_runtime_agent_investigation_reference_bounded",
         ),
         CheckConstraint(
-            "result_bytes BETWEEN 0 AND 32768 AND duration_ms >= 0",
+            "result_bytes BETWEEN 0 AND 32768 "
+            "AND duration_ms BETWEEN 0 AND 86400000",
             name="ck_runtime_agent_investigation_measures_bounded",
         ),
         CheckConstraint(

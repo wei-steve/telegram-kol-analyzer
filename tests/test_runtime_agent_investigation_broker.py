@@ -126,6 +126,35 @@ def test_broker_refuses_unbounded_time_ids_and_sensitive_provider_output():
     ]
 
 
+def test_sensitive_invalid_kind_and_evidence_reference_are_never_audited_verbatim():
+    audit_rows = []
+    broker = InvestigationBroker(
+        providers={
+            "message_evidence": lambda request: {
+                "data": {"status": "failed"},
+                "evidence_refs": ["api-key:must-not-persist"],
+            }
+        },
+        incident_exists=lambda incident_id: True,
+        audit_recorder=audit_rows.append,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(InvestigationDenied, match="evidence_kind_denied"):
+        broker.execute(
+            InvestigationRequest(incident_id=17, evidence_kind="api_key=secret")
+        )
+    with pytest.raises(InvestigationDenied, match="sensitive_result"):
+        broker.execute(
+            InvestigationRequest(incident_id=17, evidence_kind="message_evidence")
+        )
+
+    assert audit_rows[0].evidence_kind == "invalid"
+    assert audit_rows[0].evidence_reference is None
+    assert audit_rows[1].evidence_reference is None
+    assert "must-not-persist" not in repr(audit_rows)
+
+
 def test_sqlite_evidence_store_is_uri_read_only_and_query_only(tmp_path):
     database = tmp_path / "facts.db"
     connection = sqlite3.connect(database)

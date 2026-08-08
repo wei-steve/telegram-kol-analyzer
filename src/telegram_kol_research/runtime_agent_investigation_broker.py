@@ -117,6 +117,15 @@ def _contains_sensitive_material(value: Any, *, depth: int = 0) -> bool:
     return value is not None and not isinstance(value, (bool, int, float))
 
 
+def _audited_evidence_kind(value: Any) -> str:
+    normalized = str(value)
+    return (
+        normalized
+        if normalized in BROAD_READ_ONLY_EVIDENCE_KINDS
+        else "invalid"
+    )
+
+
 class InvestigationBroker:
     """Validate one closed evidence request, execute it, and audit the result."""
 
@@ -197,10 +206,20 @@ class InvestigationBroker:
                 or any(
                     not isinstance(reference, str)
                     or not 1 <= len(reference) <= 255
+                    or _SENSITIVE_MARKER.search(reference)
                     for reference in references
                 )
             ):
-                raise InvestigationDenied("result_contract_invalid")
+                raise InvestigationDenied(
+                    "sensitive_result"
+                    if isinstance(references, (list, tuple))
+                    and any(
+                        isinstance(reference, str)
+                        and _SENSITIVE_MARKER.search(reference)
+                        for reference in references
+                    )
+                    else "result_contract_invalid"
+                )
             if _contains_sensitive_material(raw["data"]):
                 raise InvestigationDenied("sensitive_result")
             payload = {
@@ -224,7 +243,7 @@ class InvestigationBroker:
                         and not isinstance(request.incident_id, bool)
                         else 0
                     ),
-                    evidence_kind=str(request.evidence_kind)[:64],
+                    evidence_kind=_audited_evidence_kind(request.evidence_kind),
                     arguments_fingerprint=fingerprint,
                     result_status="denied",
                     evidence_reference=None,
@@ -244,7 +263,7 @@ class InvestigationBroker:
                         and not isinstance(request.incident_id, bool)
                         else 0
                     ),
-                    evidence_kind=str(request.evidence_kind)[:64],
+                    evidence_kind=_audited_evidence_kind(request.evidence_kind),
                     arguments_fingerprint=fingerprint,
                     result_status="error",
                     evidence_reference=None,
@@ -288,7 +307,7 @@ def build_sqlalchemy_audit_recorder(session_factory):
                 else None
             ),
             result_bytes=max(0, min(int(value.result_bytes), 32_768)),
-            duration_ms=max(0, int(value.duration_ms)),
+            duration_ms=max(0, min(int(value.duration_ms), 86_400_000)),
             denial_code=(
                 str(value.denial_code)[:64]
                 if value.denial_code is not None
