@@ -36,6 +36,7 @@ from telegram_kol_research.entry_assembly_fingerprint_repair import (
     build_reconciliation_fingerprint,
     canonical_fingerprint,
     derive_pre_finalization_fingerprint,
+    entry_order_snapshot_matches_durable_identity,
 )
 from telegram_kol_research.entry_strategy_assembly import (
     build_bounded_entry_order_draft_snapshot,
@@ -112,6 +113,8 @@ _RECONCILIATION_BINDING_COLUMNS = frozenset(
         "symbol",
         "side",
         "venue",
+        "margin_mode",
+        "position_mode",
         "payload_json",
     }
 )
@@ -828,12 +831,35 @@ def _has_exact_entry_fingerprint_reconciliation(
         if isinstance(canonical_snapshot, Mapping)
         else None
     )
+    binding_chat_id = binding_identity.get("chat_id")
+    binding_message_id = binding_identity.get("message_id")
+    durable_identity_matches = (
+        isinstance(canonical_snapshot, Mapping)
+        and isinstance(binding_chat_id, int)
+        and not isinstance(binding_chat_id, bool)
+        and isinstance(binding_message_id, int)
+        and not isinstance(binding_message_id, bool)
+        and entry_order_snapshot_matches_durable_identity(
+            canonical_snapshot,
+            strategy_instance_id=str(
+                binding_identity.get("strategy_instance_id") or ""
+            ),
+            symbol=str(binding_identity.get("symbol") or ""),
+            side=str(binding_identity.get("side") or ""),
+            kol_id=str(binding_identity.get("kol_id") or ""),
+            chat_id=binding_chat_id,
+            message_id=binding_message_id,
+            margin_mode=str(binding_identity.get("margin_mode") or ""),
+            position_mode=str(binding_identity.get("position_mode") or ""),
+        )
+    )
     if (
         not strategy_id
         or not _SHA256_FINGERPRINT.fullmatch(final_fp)
         or final_evidence is None
         or canonical_snapshot is None
         or canonical_snapshot != snapshot
+        or not durable_identity_matches
         or not isinstance(snapshot_legs, list)
         or isinstance(final_leg_count, bool)
         or not isinstance(final_leg_count, int)
@@ -1090,6 +1116,8 @@ def read_entry_preamble_invariants(
             "symbol",
             "side",
             "venue",
+            "margin_mode",
+            "position_mode",
         )
         binding_identity_select = ", ".join(
             f"b.{column}" if column in binding_columns else "NULL"
@@ -1121,6 +1149,8 @@ def read_entry_preamble_invariants(
             binding_symbol,
             binding_side,
             binding_venue,
+            binding_margin_mode,
+            binding_position_mode,
         ) in evidence_rows:
             payload = _read_reconciliation_json(payload_json)
             draft = payload.get("draft") if isinstance(payload, dict) else None
@@ -1154,6 +1184,8 @@ def read_entry_preamble_invariants(
                         "symbol": binding_symbol,
                         "side": binding_side,
                         "venue": binding_venue,
+                        "margin_mode": binding_margin_mode,
+                        "position_mode": binding_position_mode,
                     },
                     binding_payload=payload,
                     stale_evidence=evidence,
