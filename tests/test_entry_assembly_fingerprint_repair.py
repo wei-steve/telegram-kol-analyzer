@@ -131,6 +131,7 @@ def _seed_case(tmp_path):
                 action="open_position",
                 status="submitted",
                 payload_json=_canonical_json(signal_payload),
+                processed_at=NOW,
                 created_at=NOW,
                 updated_at=NOW,
             )
@@ -158,7 +159,7 @@ def _seed_case(tmp_path):
                     strategy_instance_id=STRATEGY_ID,
                     leg_index=index,
                     purpose="entry",
-                    order_kind="limit",
+                    order_kind="trigger_limit",
                     order_id=f"order-{index}",
                     client_order_id=leg["client_order_id"],
                     venue="deepcoin",
@@ -270,6 +271,133 @@ def test_build_plan_rejects_unproven_or_conflicting_state(
     assert expected_conflict in plan.conflicts
 
 
+@pytest.mark.parametrize(
+    ("mutation", "expected_conflict"),
+    [
+        ("legacy_assembly", "assembly_not_v2"),
+        ("empty_strategy", "assembly_strategy_identity_invalid"),
+        ("snapshot_strategy", "assembly_snapshot_strategy_mismatch"),
+        ("binding_evidence_assembly", "binding_old_fingerprint_not_derivable"),
+        ("binding_evidence_strategy", "binding_old_fingerprint_not_derivable"),
+        ("binding_venue", "binding_venue_mismatch"),
+        ("signal_strategy", "trade_signal_identity_missing"),
+        ("signal_kol", "trade_signal_identity_missing"),
+        ("signal_venue", "trade_signal_identity_missing"),
+        ("signal_source", "trade_signal_identity_missing"),
+        ("signal_action", "trade_signal_identity_missing"),
+        ("signal_status", "trade_signal_identity_missing"),
+        ("signal_unprocessed", "trade_signal_identity_missing"),
+        ("signal_evidence_assembly", "trade_signal_evidence_mismatch"),
+        ("signal_evidence_strategy", "trade_signal_evidence_mismatch"),
+        ("leg_strategy", "execution_leg_identity_mismatch"),
+        ("leg_venue", "execution_leg_identity_mismatch"),
+        ("leg_status", "execution_leg_identity_mismatch"),
+        ("leg_order_id", "execution_leg_identity_mismatch"),
+        ("leg_kind", "execution_leg_identity_mismatch"),
+        ("request_order_type", "execution_leg_identity_mismatch"),
+    ],
+)
+def test_build_plan_enforces_exact_submitted_v2_identity(
+    tmp_path, mutation, expected_conflict
+):
+    _, session_factory = _seed_case(tmp_path)
+    with session_factory() as session:
+        assembly = session.get(EntryStrategyAssembly, 2)
+        binding = session.get(ExecutionBinding, 266)
+        signal = session.get(TradeSignal, 398)
+        leg = session.query(ExecutionOrderLeg).filter_by(leg_index=1).one()
+        if mutation == "legacy_assembly":
+            assembly.entry_preamble_id = 999
+        elif mutation == "empty_strategy":
+            assembly.strategy_instance_id = ""
+        elif mutation == "snapshot_strategy":
+            evidence = json.loads(assembly.evidence_json)
+            evidence["order_draft_snapshot"]["strategy_instance_id"] = "other"
+            assembly.evidence_json = _canonical_json(evidence)
+            assembly.fingerprint = canonical_fingerprint(evidence)
+        elif mutation.startswith("binding_evidence_"):
+            payload = json.loads(binding.payload_json)
+            evidence = payload["draft"]["entry_preamble_assembly"]
+            if mutation.endswith("assembly"):
+                evidence["assembly_id"] = 3
+            else:
+                evidence["strategy_instance_id"] = "other"
+            binding.payload_json = _canonical_json(payload)
+        elif mutation == "binding_venue":
+            binding.venue = "other"
+        elif mutation == "signal_strategy":
+            signal.strategy_instance_id = "other"
+        elif mutation == "signal_kol":
+            signal.kol_id = "other"
+        elif mutation == "signal_venue":
+            signal.venue = "other"
+        elif mutation == "signal_source":
+            signal.source_type = "manual"
+        elif mutation == "signal_action":
+            signal.action = "close_position"
+        elif mutation == "signal_status":
+            signal.status = "pending"
+        elif mutation == "signal_unprocessed":
+            signal.processed_at = None
+        elif mutation.startswith("signal_evidence_"):
+            payload = json.loads(signal.payload_json)
+            for evidence in (
+                payload["entry_preamble_assembly"],
+                payload["deepcoin_order_draft"]["entry_preamble_assembly"],
+            ):
+                if mutation.endswith("assembly"):
+                    evidence["assembly_id"] = 3
+                else:
+                    evidence["strategy_instance_id"] = "other"
+            signal.payload_json = _canonical_json(payload)
+        elif mutation == "leg_strategy":
+            leg.strategy_instance_id = "other"
+        elif mutation == "leg_venue":
+            leg.venue = "other"
+        elif mutation == "leg_status":
+            leg.status = "submitting"
+        elif mutation == "leg_order_id":
+            leg.order_id = None
+        elif mutation == "leg_kind":
+            leg.order_kind = "market"
+        elif mutation == "request_order_type":
+            request = json.loads(leg.request_json)
+            request["orderType"] = "market"
+            leg.request_json = _canonical_json(request)
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.action is None
+    assert expected_conflict in plan.conflicts
+
+
+@pytest.mark.parametrize(
+    ("target", "raw"),
+    [
+        ("assembly", '{"bad":"\\ud800"}'),
+        ("binding", '{"bad":"\\ud800"}'),
+        ("assembly", "{malformed"),
+        ("binding", "{malformed"),
+    ],
+)
+def test_build_plan_returns_fixed_conflict_for_invalid_json(tmp_path, target, raw):
+    _, session_factory = _seed_case(tmp_path)
+    with session_factory() as session:
+        if target == "assembly":
+            session.get(EntryStrategyAssembly, 2).evidence_json = raw
+            expected = "assembly_evidence_invalid"
+        else:
+            session.get(ExecutionBinding, 266).payload_json = raw
+            expected = "binding_payload_invalid"
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.action is None
+    assert expected in plan.conflicts
+
+
 def test_apply_requires_exact_plan_fingerprint_and_is_idempotent(tmp_path):
     _, session_factory = _seed_case(tmp_path)
     plan = _plan(session_factory)
@@ -326,8 +454,9 @@ def test_apply_requires_exact_plan_fingerprint_and_is_idempotent(tmp_path):
             "trade_signal_id": 398,
             "strategy_instance_id": STRATEGY_ID,
             "assembly_fingerprint": plan.action.old_fingerprint,
-            "policy": "entry-assembly-fingerprint-reconciliation-v1",
+            "policy_version": "entry-assembly-fingerprint-reconciliation-v1",
         }
+        assert event.reason == "pre_finalization_payload_preserved"
         assert json.loads(event.after_json)["assembly_fingerprint"] == (
             plan.action.final_fingerprint
         )
@@ -350,7 +479,7 @@ def test_apply_rejects_existing_reconciliation_with_extra_evidence(tmp_path):
     _, session_factory = _seed_case(tmp_path)
     plan = _plan(session_factory)
     common = {
-        "policy": "entry-assembly-fingerprint-reconciliation-v1",
+        "policy_version": "entry-assembly-fingerprint-reconciliation-v1",
         "assembly_id": 2,
         "execution_binding_id": 266,
         "trade_signal_id": 398,
@@ -365,7 +494,7 @@ def test_apply_rejects_existing_reconciliation_with_extra_evidence(tmp_path):
                 venue="deepcoin",
                 action=RECONCILIATION_ACTION,
                 status="resolved",
-                reason="entry-assembly-fingerprint-reconciliation-v1",
+                reason="pre_finalization_payload_preserved",
                 notification_fingerprint=plan.action.repair_fingerprint,
                 before_json=_canonical_json(
                     {**common, "assembly_fingerprint": plan.action.old_fingerprint}
@@ -415,3 +544,50 @@ def test_apply_rejects_unique_fingerprint_collision(tmp_path):
             expected_plan_fingerprint=plan.fingerprint,
             applied_at=NOW,
         )
+
+
+def test_apply_rebuilds_proof_inside_the_single_write_transaction(tmp_path):
+    _, base_factory = _seed_case(tmp_path)
+    plan = _plan(base_factory)
+
+    class CountingSessionFactory:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self):
+            self.calls += 1
+            return base_factory()
+
+    counting_factory = CountingSessionFactory()
+    event_id = apply_entry_assembly_fingerprint_repair_plan(
+        counting_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+
+    assert event_id > 0
+    assert counting_factory.calls == 1
+
+
+def test_apply_refuses_state_drift_since_operator_plan(tmp_path):
+    _, session_factory = _seed_case(tmp_path)
+    plan = _plan(session_factory)
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        payload = json.loads(binding.payload_json)
+        payload["draft"]["order_legs"][0]["price"] = 1
+        binding.payload_json = _canonical_json(payload)
+        session.commit()
+
+    with pytest.raises(RuntimeError, match="repair_plan_not_actionable"):
+        apply_entry_assembly_fingerprint_repair_plan(
+            session_factory,
+            assembly_id=2,
+            execution_binding_id=266,
+            expected_plan_fingerprint=plan.fingerprint,
+            applied_at=NOW,
+        )
+    with session_factory() as session:
+        assert session.query(ExecutionEvent).count() == 0
