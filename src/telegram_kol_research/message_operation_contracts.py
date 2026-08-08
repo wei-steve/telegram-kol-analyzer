@@ -5,16 +5,22 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import exists, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
     MessageOperationContract,
     MessageOperationItem,
+    ManagementMessageEnvelope,
+    ManagementMessageTarget,
+    MessageInstructionItem,
     RawMessage,
+    RecognitionDecision,
+    SignalCandidate,
     utc_now,
 )
 
@@ -70,6 +76,64 @@ _TERMINAL_CONTRACT_STATUSES = CONTRACT_STATUSES - {"observing"}
 _EVIDENCE_REFERENCE_PATTERN = re.compile(
     r"[a-z][a-z0-9_-]{1,31}:[A-Za-z0-9._-]{1,128}"
 )
+_DEADLINE_SECONDS = {
+    "new_entry": 600,
+    "add_entry": 600,
+    "take_profit": 180,
+    "stop_loss": 60,
+    "cancel": 60,
+    "exit": 60,
+    "manage": 300,
+    "unresolved_executable": 60,
+    "other_management": 300,
+}
+_TAKE_PROFIT_ACTIONS = frozenset(
+    {"partial_take_profit", "take_profit", "reduce_position", "close_half"}
+)
+_STOP_LOSS_ACTIONS = frozenset(
+    {
+        "stop_loss",
+        "move_stop_to_break_even",
+        "move_stop_to_protect",
+        "break_even",
+        "modify_stop",
+    }
+)
+_CANCEL_ACTIONS = frozenset(
+    {"cancel", "cancel_entry", "cancel_order", "cancel_pending_entry"}
+)
+_EXIT_ACTIONS = frozenset(
+    {"exit", "exit_position", "full_exit", "full_close", "close_position"}
+)
+_ADD_ENTRY_ACTIONS = frozenset({"add_entry", "add_position"})
+_EXECUTABLE_EVENT_TYPES = frozenset(
+    {"entry_signal", "add_entry", "position_update", "exit_position", "cancel_entry"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class MessageOperationItemProjection:
+    sequence: int
+    intent_kind: str
+    instruction_key: str
+    authoritative_instruction_id: str
+    expected_descendant_kind: str
+    expected_terminal_kind: str
+    evidence_references: tuple[str, ...]
+    target_lifecycle_id: int | None = None
+    source_disposition: str = "active"
+
+
+@dataclass(frozen=True, slots=True)
+class MessageOperationProjection:
+    raw_message_id: int
+    executable_intent: bool
+    intent_kind: str
+    expected_terminal_kind: str
+    deadline_at: datetime
+    items: tuple[MessageOperationItemProjection, ...]
+    evidence_references: tuple[str, ...]
+    model_calls: int = 0
 
 
 class MessageOperationContractBoundsError(ValueError):
@@ -121,6 +185,7 @@ def create_message_operation_contract(
     expected_terminal_kind: str,
     deadline_at: datetime,
     policy_version: str = POLICY_VERSION,
+    evidence_refs: Sequence[str] | None = None,
     now: datetime | None = None,
 ) -> MessageOperationContract:
     """Idempotently persist a dormant contract without touching message processing."""
@@ -135,13 +200,14 @@ def create_message_operation_contract(
     if not isinstance(deadline_at, datetime):
         raise MessageOperationContractBoundsError("deadline_at must be a datetime")
     timestamp = now or utc_now()
+    refs_json = _evidence_refs_json(evidence_refs)
     values = {
         "raw_message_id": raw_message_id,
         "intent_kind": intent_kind,
         "expected_terminal_kind": expected_terminal_kind,
         "status": "observing",
         "deadline_at": deadline_at,
-        "evidence_refs_json": "[]",
+        "evidence_refs_json": refs_json,
         "agent_requested": False,
         "policy_version": policy_version,
         "created_at": timestamp,
@@ -168,11 +234,407 @@ def create_message_operation_contract(
             row.intent_kind != intent_kind
             or row.expected_terminal_kind != expected_terminal_kind
             or row.deadline_at != deadline_at.replace(tzinfo=None)
+            or row.evidence_refs_json != refs_json
         ):
             raise MessageOperationContractBoundsError(
                 "existing contract conflicts with authoritative expectation"
             )
         return _detach(session, row)
+
+
+def project_message_operation_contract(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+) -> MessageOperationProjection | None:
+    """Project expectations from existing durable facts without model calls."""
+
+    with session_factory() as session:
+        raw = session.get(RawMessage, raw_message_id)
+        if raw is None:
+            raise MessageOperationContractBoundsError(
+                "raw_message_id does not identify an authoritative message"
+            )
+        decision = session.execute(
+            select(RecognitionDecision).where(
+                RecognitionDecision.raw_message_id == raw_message_id
+            )
+        ).scalar_one_or_none()
+        envelope = session.execute(
+            select(ManagementMessageEnvelope)
+            .where(ManagementMessageEnvelope.raw_message_id == raw_message_id)
+            .order_by(ManagementMessageEnvelope.id.desc())
+        ).scalars().first()
+        targets = (
+            session.execute(
+                select(ManagementMessageTarget)
+                .where(ManagementMessageTarget.raw_message_id == raw_message_id)
+                .order_by(
+                    ManagementMessageTarget.target_ordinal,
+                    ManagementMessageTarget.id,
+                )
+            ).scalars().all()
+            if envelope is not None
+            else []
+        )
+        instruction_rows = session.execute(
+            select(MessageInstructionItem)
+            .where(MessageInstructionItem.raw_message_id == raw_message_id)
+            .order_by(MessageInstructionItem.sequence, MessageInstructionItem.id)
+        ).scalars().all()
+        candidates = session.execute(
+            select(SignalCandidate)
+            .where(SignalCandidate.raw_message_id == raw_message_id)
+            .order_by(SignalCandidate.id)
+        ).scalars().all()
+        candidate_by_id = {row.id: row for row in candidates}
+        item_by_id = {row.id: row for row in instruction_rows}
+
+        decision_payload = _bounded_decision_payload(decision)
+        resolution_status = str(
+            decision_payload.get("resolution_status") or ""
+        ).strip().lower()
+        decision_event = decision_payload.get("lifecycle_event")
+        decision_event = decision_event if isinstance(decision_event, dict) else {}
+        event_type = str(decision_event.get("event_type") or "").strip().lower()
+        decision_action = str(
+            decision_event.get("management_action")
+            or decision_payload.get("management_action")
+            or ""
+        ).strip().lower()
+        unresolved = resolution_status in {"hold", "unresolved", "refused"}
+
+        projected_items: list[MessageOperationItemProjection] = []
+        if unresolved and event_type in _EXECUTABLE_EVENT_TYPES:
+            projected_items.append(
+                _recognition_item_projection(
+                    decision=decision,
+                    raw_message_id=raw_message_id,
+                )
+            )
+        elif targets:
+            for sequence, target in enumerate(targets, start=1):
+                source_item = item_by_id.get(target.message_instruction_item_id)
+                intent = _action_to_intent(
+                    target.normalized_action,
+                    event_type="position_update",
+                    instruction_kind="management",
+                )
+                projected_items.append(
+                    _item_projection(
+                        sequence=sequence,
+                        intent_kind=intent,
+                        instruction_key=f"management_target:{target.id}",
+                        authoritative_instruction_id=f"management_target:{target.id}",
+                        evidence_references=tuple(
+                            reference
+                            for reference in (
+                                f"management_target:{target.id}",
+                                f"message_instruction:{source_item.id}"
+                                if source_item is not None
+                                else None,
+                            )
+                            if reference is not None
+                        ),
+                        target_lifecycle_id=target.target_lifecycle_id,
+                        source_disposition=_source_disposition(source_item),
+                    )
+                )
+        elif instruction_rows:
+            for sequence, item in enumerate(instruction_rows, start=1):
+                candidate = candidate_by_id.get(item.signal_candidate_id)
+                intent = _action_to_intent(
+                    candidate.management_action if candidate is not None else None,
+                    event_type=candidate.event_type if candidate is not None else event_type,
+                    instruction_kind=item.instruction_kind,
+                )
+                projected_items.append(
+                    _item_projection(
+                        sequence=sequence,
+                        intent_kind=intent,
+                        instruction_key=f"message_instruction:{item.id}",
+                        authoritative_instruction_id=f"message_instruction:{item.id}",
+                        evidence_references=tuple(
+                            reference
+                            for reference in (
+                                f"message_instruction:{item.id}",
+                                f"signal_candidate:{candidate.id}"
+                                if candidate is not None
+                                else None,
+                            )
+                            if reference is not None
+                        ),
+                        target_lifecycle_id=(
+                            candidate.target_lifecycle_id
+                            if candidate is not None
+                            else None
+                        ),
+                        source_disposition=_source_disposition(item),
+                    )
+                )
+        elif candidates:
+            for sequence, candidate in enumerate(candidates, start=1):
+                intent = _action_to_intent(
+                    candidate.management_action,
+                    event_type=candidate.event_type,
+                    instruction_kind=(
+                        "entry"
+                        if candidate.event_type in {"entry_signal", "add_entry"}
+                        else "management"
+                    ),
+                )
+                projected_items.append(
+                    _item_projection(
+                        sequence=sequence,
+                        intent_kind=intent,
+                        instruction_key=f"signal_candidate:{candidate.id}",
+                        authoritative_instruction_id=f"signal_candidate:{candidate.id}",
+                        evidence_references=(f"signal_candidate:{candidate.id}",),
+                        target_lifecycle_id=candidate.target_lifecycle_id,
+                    )
+                )
+        elif event_type in _EXECUTABLE_EVENT_TYPES:
+            intent = _action_to_intent(
+                decision_action,
+                event_type=event_type,
+                instruction_kind=(
+                    "entry" if event_type in {"entry_signal", "add_entry"}
+                    else "management"
+                ),
+            )
+            projected_items.append(
+                _item_projection(
+                    sequence=1,
+                    intent_kind=intent,
+                    instruction_key=f"recognition_decision:{decision.id}",
+                    authoritative_instruction_id=f"recognition_decision:{decision.id}",
+                    evidence_references=(f"recognition_decision:{decision.id}",),
+                )
+            )
+
+        if not projected_items:
+            return None
+
+        item_tuple = tuple(projected_items)
+        intent_kinds = {item.intent_kind for item in item_tuple}
+        contract_intent = (
+            next(iter(intent_kinds)) if len(intent_kinds) == 1 else "manage"
+        )
+        expected_terminal = (
+            item_tuple[0].expected_terminal_kind
+            if len({item.expected_terminal_kind for item in item_tuple}) == 1
+            else "verified_management"
+        )
+        base_time = _aware_utc(raw.posted_at or raw.created_at)
+        deadline_seconds = min(_DEADLINE_SECONDS[item.intent_kind] for item in item_tuple)
+        evidence = [f"raw_message:{raw_message_id}"]
+        if decision is not None:
+            evidence.append(f"recognition_decision:{decision.id}")
+        if envelope is not None:
+            evidence.append(f"management_envelope:{envelope.id}")
+        return MessageOperationProjection(
+            raw_message_id=raw_message_id,
+            executable_intent=True,
+            intent_kind=contract_intent,
+            expected_terminal_kind=expected_terminal,
+            deadline_at=base_time + timedelta(seconds=deadline_seconds),
+            items=item_tuple,
+            evidence_references=tuple(evidence),
+            model_calls=0,
+        )
+
+
+def persist_message_operation_projection(
+    session_factory: sessionmaker,
+    projection: MessageOperationProjection,
+    *,
+    now: datetime | None = None,
+) -> MessageOperationContract:
+    """Persist one deterministic projection into the dormant additive ledger."""
+
+    contract = create_message_operation_contract(
+        session_factory,
+        raw_message_id=projection.raw_message_id,
+        intent_kind=projection.intent_kind,
+        expected_terminal_kind=projection.expected_terminal_kind,
+        deadline_at=projection.deadline_at,
+        evidence_refs=projection.evidence_references,
+        now=now,
+    )
+    for item in projection.items:
+        append_message_operation_item(
+            session_factory,
+            contract_id=contract.id,
+            sequence=item.sequence,
+            instruction_key=item.instruction_key,
+            instruction_kind=item.intent_kind,
+            authoritative_instruction_id=item.authoritative_instruction_id,
+            expected_descendant_kind=item.expected_descendant_kind,
+            expected_terminal_kind=item.expected_terminal_kind,
+            evidence_refs=item.evidence_references,
+            now=now,
+        )
+    return contract
+
+
+def run_message_operation_shadow_once(
+    session_factory: sessionmaker,
+    *,
+    after_raw_message_id: int,
+    limit: int,
+    now: datetime | None = None,
+) -> dict[str, int]:
+    """Project a bounded future-only batch without incidents or notifications."""
+
+    if not 0 <= after_raw_message_id <= 2**63 - 1:
+        raise MessageOperationContractBoundsError(
+            "after_raw_message_id must be a non-negative SQLite identifier"
+        )
+    if not 1 <= limit <= 100:
+        raise MessageOperationContractBoundsError("limit must be between 1 and 100")
+    with session_factory() as session:
+        raw_message_ids = session.execute(
+            select(RecognitionDecision.raw_message_id)
+            .where(
+                RecognitionDecision.raw_message_id > after_raw_message_id,
+                RecognitionDecision.comparison_status == "completed",
+                ~exists().where(
+                    MessageOperationContract.raw_message_id
+                    == RecognitionDecision.raw_message_id,
+                    MessageOperationContract.policy_version == POLICY_VERSION,
+                ),
+            )
+            .order_by(RecognitionDecision.raw_message_id)
+            .limit(limit)
+        ).scalars().all()
+
+    result = {
+        "contracts_created": 0,
+        "errors": 0,
+        "messages_scanned": len(raw_message_ids),
+        "model_calls": 0,
+        "ordinary_skipped": 0,
+    }
+    for raw_message_id in raw_message_ids:
+        try:
+            projection = project_message_operation_contract(
+                session_factory, raw_message_id=raw_message_id
+            )
+            if projection is None:
+                result["ordinary_skipped"] += 1
+                continue
+            persist_message_operation_projection(
+                session_factory, projection, now=now
+            )
+            result["contracts_created"] += 1
+            result["model_calls"] += projection.model_calls
+        except Exception:
+            result["errors"] += 1
+    return result
+
+
+def _bounded_decision_payload(decision: RecognitionDecision | None) -> dict:
+    if decision is None:
+        return {}
+    try:
+        payload = json.loads(decision.authoritative_payload_json)
+    except (TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _aware_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _source_disposition(item: MessageInstructionItem | None) -> str:
+    if item is None:
+        return "active"
+    if item.retired_at is not None:
+        return "superseded"
+    if str(item.status).strip().lower() == "duplicate":
+        return "duplicate"
+    return "active"
+
+
+def _recognition_item_projection(
+    *, decision: RecognitionDecision | None, raw_message_id: int
+) -> MessageOperationItemProjection:
+    decision_id = decision.id if decision is not None else raw_message_id
+    return MessageOperationItemProjection(
+        sequence=1,
+        intent_kind="unresolved_executable",
+        instruction_key=f"recognition_decision:{decision_id}",
+        authoritative_instruction_id=f"recognition_decision:{decision_id}",
+        expected_descendant_kind="context_resolution_attempt",
+        expected_terminal_kind="verified_management",
+        evidence_references=(f"recognition_decision:{decision_id}",),
+        target_lifecycle_id=None,
+    )
+
+
+def _item_projection(
+    *,
+    sequence: int,
+    intent_kind: str,
+    instruction_key: str,
+    authoritative_instruction_id: str,
+    evidence_references: tuple[str, ...],
+    target_lifecycle_id: int | None = None,
+    source_disposition: str = "active",
+) -> MessageOperationItemProjection:
+    descendant, terminal = _expectation_for_intent(intent_kind)
+    return MessageOperationItemProjection(
+        sequence=sequence,
+        intent_kind=intent_kind,
+        instruction_key=instruction_key,
+        authoritative_instruction_id=authoritative_instruction_id,
+        expected_descendant_kind=descendant,
+        expected_terminal_kind=terminal,
+        evidence_references=evidence_references,
+        target_lifecycle_id=target_lifecycle_id,
+        source_disposition=source_disposition,
+    )
+
+
+def _expectation_for_intent(intent_kind: str) -> tuple[str, str]:
+    return {
+        "new_entry": ("execution_binding", "verified_entry"),
+        "add_entry": ("execution_binding", "verified_entry"),
+        "take_profit": ("position_mutation_intent", "verified_execution"),
+        "stop_loss": ("protection_revision", "verified_protection"),
+        "cancel": ("position_mutation_intent", "verified_cancel"),
+        "exit": ("position_mutation_intent", "verified_exit"),
+        "manage": ("management_item", "verified_management"),
+        "unresolved_executable": (
+            "context_resolution_attempt",
+            "verified_management",
+        ),
+        "other_management": ("management_item", "verified_management"),
+    }[intent_kind]
+
+
+def _action_to_intent(
+    action: str | None,
+    *,
+    event_type: str | None,
+    instruction_kind: str | None,
+) -> str:
+    normalized_action = str(action or "").strip().lower()
+    normalized_event = str(event_type or "").strip().lower()
+    if normalized_action in _TAKE_PROFIT_ACTIONS:
+        return "take_profit"
+    if normalized_action in _STOP_LOSS_ACTIONS:
+        return "stop_loss"
+    if normalized_action in _CANCEL_ACTIONS or normalized_event == "cancel_entry":
+        return "cancel"
+    if normalized_action in _EXIT_ACTIONS or normalized_event == "exit_position":
+        return "exit"
+    if normalized_action in _ADD_ENTRY_ACTIONS or normalized_event == "add_entry":
+        return "add_entry"
+    if normalized_event == "entry_signal" or instruction_kind == "entry":
+        return "new_entry"
+    return "other_management"
 
 
 def get_message_operation_contract(

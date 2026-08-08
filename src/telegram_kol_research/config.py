@@ -119,6 +119,16 @@ class RuntimeScannerConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class MessageOperationSupervisorConfig:
+    """Fail-closed Phase 8R.5 shadow projection settings."""
+
+    enabled: bool = False
+    shadow_only: bool = True
+    after_raw_message_id: int = _SQLITE_MAX_INTEGER
+    batch_limit: int = 50
+
+
+@dataclass(frozen=True, slots=True)
 class MultiTargetManagementConfig:
     """Dormant-by-default projection and live-action policy."""
 
@@ -193,6 +203,51 @@ def load_runtime_scanner_config(
         ),
         rules=frozenset(requested.intersection(RUNTIME_SCANNER_DEPLOYABLE_RULE_IDS)),
         interval_seconds=max(10.0, min(interval, 3600.0)),
+    )
+
+
+def load_message_operation_supervisor_config(
+    environ: dict[str, str] | None = None,
+    env_file_paths: list[str | os.PathLike[str]] | None = None,
+) -> MessageOperationSupervisorConfig:
+    paths = (
+        ["config/runtime_incident_agent.env"]
+        if env_file_paths is None
+        else env_file_paths
+    )
+    env = dict(_load_env_file_values(paths) if paths else {})
+    env.update(os.environ if environ is None else environ)
+    try:
+        after_raw_message_id = int(
+            env[
+                "TELEGRAM_KOL_MESSAGE_OPERATION_SUPERVISOR_AFTER_RAW_MESSAGE_ID"
+            ]
+        )
+    except (KeyError, TypeError, ValueError):
+        after_raw_message_id = _SQLITE_MAX_INTEGER
+    if not 0 <= after_raw_message_id <= _SQLITE_MAX_INTEGER:
+        after_raw_message_id = _SQLITE_MAX_INTEGER
+    try:
+        batch_limit = int(
+            env.get("TELEGRAM_KOL_MESSAGE_OPERATION_SUPERVISOR_BATCH_LIMIT", "50")
+        )
+    except (TypeError, ValueError):
+        batch_limit = 50
+    return MessageOperationSupervisorConfig(
+        enabled=_enabled_flag(
+            env.get("TELEGRAM_KOL_MESSAGE_OPERATION_SUPERVISOR_ENABLED")
+        ),
+        shadow_only=not (
+            str(
+                env.get(
+                    "TELEGRAM_KOL_MESSAGE_OPERATION_SUPERVISOR_SHADOW_ONLY",
+                    "true",
+                )
+            ).strip().lower()
+            in {"0", "false", "no", "off"}
+        ),
+        after_raw_message_id=after_raw_message_id,
+        batch_limit=max(1, min(batch_limit, 100)),
     )
 
 

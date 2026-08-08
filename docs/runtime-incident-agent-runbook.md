@@ -494,6 +494,41 @@ settings:
 - `TELEGRAM_KOL_RUNTIME_SCANNER_INTERVAL_SECONDS` is bounded to 10–3600
   seconds and defaults to 60.
 
+Task 8R.5 adds a deterministic message-operation projector with no provider,
+notification, incident, Agent, planner, or exchange dependency. It is not
+imported by the web service, listener, recognition, contextual resolution,
+management, execution, protection, or reconciliation paths. Its only caller is
+the explicit CLI command `message-operation-supervisor --shadow --once`.
+
+The Phase 8R.5 settings are:
+
+- `TELEGRAM_KOL_MESSAGE_OPERATION_SUPERVISOR_ENABLED` defaults to false;
+- `TELEGRAM_KOL_MESSAGE_OPERATION_SUPERVISOR_SHADOW_ONLY` defaults to true and
+  the CLI refuses false;
+- `TELEGRAM_KOL_MESSAGE_OPERATION_SUPERVISOR_AFTER_RAW_MESSAGE_ID` is a
+  required future-only watermark when enabled; absent, malformed, negative, or
+  overflowing values fail closed at the maximum SQLite integer;
+- `TELEGRAM_KOL_MESSAGE_OPERATION_SUPERVISOR_BATCH_LIMIT` is bounded to 1–100
+  and defaults to 50.
+
+The CLI also refuses an enabled invocation unless both `--shadow` and `--once`
+are explicit and the production database already exists. It reads only
+terminal authoritative recognition rows above the watermark and writes only
+idempotent rows in `message_operation_contracts` and
+`message_operation_items`. Ordinary chat creates no contract. A successful
+projection reports `model_calls: 0`; any nonzero value, RuntimeIncident,
+notification/Agent claim, business-row change, or exchange request fails the
+canary.
+
+Deploy Phase 8R.5 with the supervisor disabled. After post-deployment
+continuity checks, record the current maximum `raw_messages.id`, configure that
+exact watermark with enabled=true and shadow-only=true, and run one bounded
+CLI cycle manually. Never replay or backfill a historical message. This phase
+does not install a timer or long-running supervisor unit. Immediate rollback
+is to set the enabled flag false; because no normal service imports the
+projector, rollback requires no listener, trading, Agent, or scanner shutdown.
+The two additive tables may remain for audit and idempotent retry evidence.
+
 The operator approved a controlled Phase 8R.3 completion canary on 2026-08-08
 so that a rare natural multi-target failure cannot block later read-only Agent
 work indefinitely. This alternative changes only the verification method; it

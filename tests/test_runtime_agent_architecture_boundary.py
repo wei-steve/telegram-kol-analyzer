@@ -124,7 +124,7 @@ def test_runtime_agent_modules_do_not_import_business_resolution_or_write_paths(
 
 
 @pytest.mark.architecture
-def test_message_operation_contract_helpers_remain_dormant():
+def test_message_operation_contract_helpers_have_only_shadow_cli_caller():
     source_root = Path(__file__).parents[1] / "src" / "telegram_kol_research"
     callers = []
     for path in source_root.glob("*.py"):
@@ -144,7 +144,7 @@ def test_message_operation_contract_helpers_remain_dormant():
                 callers.append(path.name)
                 break
 
-    assert callers == []
+    assert callers == ["cli.py"]
 
 
 @pytest.mark.architecture
@@ -194,7 +194,7 @@ def test_phase_7_is_deferred_and_phase_8r_requires_no_action_authority():
         "phase_name: deterministic-message-operation-contract-projection"
         in status
     )
-    assert "phase_status: planned" in status
+    assert "phase_status: in_progress" in status
     assert 'last_completed_phase: "8R.4"' in status
     assert "task_8r_4_status: completed_dormant_production_verified" in status
     assert "original_runtime_agent_complete: false" in status

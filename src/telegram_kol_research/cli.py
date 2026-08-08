@@ -40,7 +40,13 @@ from telegram_kol_research.db import (
     create_existing_session_factory,
     create_session_factory,
 )
-from telegram_kol_research.config import load_runtime_scanner_config
+from telegram_kol_research.config import (
+    load_message_operation_supervisor_config,
+    load_runtime_scanner_config,
+)
+from telegram_kol_research.message_operation_contracts import (
+    run_message_operation_shadow_once,
+)
 from telegram_kol_research.runtime_incident_scanner import build_scanner_facts, run_scanner_cycle
 from telegram_kol_research.deepcoin_contract_specs import load_deepcoin_contract_specs
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
@@ -3353,6 +3359,46 @@ def runtime_incident_scanner(
             time.sleep(config.interval_seconds)
     except KeyboardInterrupt:
         return
+
+
+@app.command("message-operation-supervisor")
+def message_operation_supervisor(
+    database_path: Path = typer.Option(Path("data/research.db"), "--database-path"),
+    shadow: bool = typer.Option(False, "--shadow"),
+    once: bool = typer.Option(False, "--once"),
+) -> None:
+    """Run one future-only Phase 8R.5 deterministic shadow projection cycle."""
+
+    config = load_message_operation_supervisor_config(
+        environ=dict(os.environ), env_file_paths=[]
+    )
+    if not config.enabled:
+        typer.echo('{"status":"disabled"}')
+        return
+    if not config.shadow_only or not shadow:
+        raise typer.BadParameter(
+            "message operation supervisor must remain explicitly shadow-only"
+        )
+    if not once:
+        raise typer.BadParameter(
+            "Phase 8R.5 permits only an explicitly bounded --once cycle"
+        )
+    if not database_path.is_file():
+        raise typer.BadParameter("supervisor database must already exist")
+    session_factory = create_existing_session_factory(database_path)
+    result = run_message_operation_shadow_once(
+        session_factory,
+        after_raw_message_id=config.after_raw_message_id,
+        limit=config.batch_limit,
+        now=datetime.now(UTC),
+    )
+    typer.echo(
+        json.dumps(
+            {"status": "shadow", **result},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
 
 
 @app.command("runtime-incident-handoff")
