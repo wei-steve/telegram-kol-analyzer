@@ -23,6 +23,7 @@ RUNTIME_AGENT_MODULES = (
     "runtime_incident_rules.py",
     "runtime_incident_snapshot.py",
     "message_operation_contracts.py",
+    "message_operation_supervisor.py",
 )
 FORBIDDEN_SYMBOL_FRAGMENTS = (
     "recognize",
@@ -36,7 +37,7 @@ FORBIDDEN_SYMBOL_FRAGMENTS = (
 ALLOWED_PACKAGE_IMPORTS_BY_MODULE = {
     "runtime_incidents.py": frozenset({"models", "runtime_agent_playbooks"}),
     "runtime_incident_adapters.py": frozenset(
-        {"config", "models", "runtime_incidents"}
+        {"config", "message_operation_types", "models", "runtime_incidents"}
     ),
     "runtime_agent_contracts.py": frozenset(),
     "runtime_agent_tools.py": frozenset({"runtime_agent_contracts"}),
@@ -78,7 +79,12 @@ ALLOWED_PACKAGE_IMPORTS_BY_MODULE = {
     ),
     "runtime_incident_rules.py": frozenset({"runtime_incident_scanner"}),
     "runtime_incident_snapshot.py": frozenset({"models"}),
-    "message_operation_contracts.py": frozenset({"models"}),
+    "message_operation_contracts.py": frozenset(
+        {"message_operation_types", "models"}
+    ),
+    "message_operation_supervisor.py": frozenset(
+        {"message_operation_types", "models"}
+    ),
 }
 
 
@@ -191,7 +197,7 @@ def test_phase_7_is_deferred_and_phase_8r_requires_no_action_authority():
     assert "phase_7_disposition: deferred_non_blocking" in status
     assert "current_phase: 8R.6A" in status
     assert "phase_name: message-operation-outcome-supervisor" in status
-    assert "phase_status: planned" in status
+    assert "phase_status: in_progress" in status
     assert 'last_completed_phase: "8R.5"' in status
     assert "task_8r_4_status: completed_dormant_production_verified" in status
     assert "task_8r_5_status: completed_future_only_shadow_canary" in status

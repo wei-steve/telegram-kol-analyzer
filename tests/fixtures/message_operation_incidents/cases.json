@@ -1,0 +1,82 @@
+[
+  {
+    "name": "contextual_exhaustion",
+    "deadline_offset_seconds": 60,
+    "evidence": {"items": [{"instruction_key": "recognition_decision:1", "expected_descendant_kind": "context_resolution_attempt", "expected_terminal_kind": "verified_management", "state": "context_exhausted", "evidence_refs": ["context_resolution_attempt:1"]}]},
+    "expected_status": "violated",
+    "expected_violation_code": "context_exhausted",
+    "should_create_incident": true
+  },
+  {
+    "name": "unresolved_actionable_intent",
+    "deadline_offset_seconds": 60,
+    "evidence": {"items": [{"instruction_key": "recognition_decision:2", "expected_descendant_kind": "context_resolution_attempt", "expected_terminal_kind": "verified_management", "state": "unresolved", "evidence_refs": ["context_resolution_attempt:2"]}]},
+    "expected_status": "violated",
+    "expected_violation_code": "context_unresolved",
+    "should_create_incident": true
+  },
+  {
+    "name": "missing_management_descendant",
+    "deadline_offset_seconds": -1,
+    "evidence": {"items": [{"instruction_key": "message_instruction:3", "expected_descendant_kind": "management_item", "expected_terminal_kind": "verified_management", "state": "missing", "evidence_refs": ["message_instruction:3"]}]},
+    "expected_status": "violated",
+    "expected_violation_code": "missing_management_descendant",
+    "should_create_incident": true
+  },
+  {
+    "name": "target_refusal",
+    "deadline_offset_seconds": 60,
+    "evidence": {"items": [{"instruction_key": "management_target:4", "expected_descendant_kind": "management_target", "expected_terminal_kind": "verified_management", "state": "safety_refusal", "evidence_refs": ["management_target:4"]}]},
+    "expected_status": "violated",
+    "expected_violation_code": "action_refused",
+    "should_create_incident": true
+  },
+  {
+    "name": "partial_result",
+    "deadline_offset_seconds": 60,
+    "evidence": {"items": [{"instruction_key": "message_instruction:5", "expected_descendant_kind": "management_item", "expected_terminal_kind": "verified_execution", "state": "partial", "evidence_refs": ["message_instruction:5"]}]},
+    "expected_status": "violated",
+    "expected_violation_code": "partial_operation",
+    "should_create_incident": true
+  },
+  {
+    "name": "unknown_result",
+    "deadline_offset_seconds": 60,
+    "evidence": {"items": [{"instruction_key": "message_instruction:6", "expected_descendant_kind": "management_item", "expected_terminal_kind": "verified_execution", "state": "unknown", "evidence_refs": ["message_instruction:6"]}]},
+    "expected_status": "violated",
+    "expected_violation_code": "unknown_operation_result",
+    "should_create_incident": true
+  },
+  {
+    "name": "false_local_success",
+    "deadline_offset_seconds": -1,
+    "evidence": {"items": [{"instruction_key": "message_instruction:7", "expected_descendant_kind": "execution_binding", "expected_terminal_kind": "verified_entry", "state": "local_success", "exchange_required": true, "exchange_verified": false, "evidence_refs": ["message_instruction:7"]}]},
+    "expected_status": "violated",
+    "expected_violation_code": "local_success_unverified",
+    "should_create_incident": true
+  },
+  {
+    "name": "exchange_mismatch",
+    "deadline_offset_seconds": 60,
+    "evidence": {"items": [{"instruction_key": "message_instruction:8", "expected_descendant_kind": "execution_event", "expected_terminal_kind": "verified_execution", "state": "exchange_mismatch", "evidence_refs": ["execution_event:8"]}]},
+    "expected_status": "violated",
+    "expected_violation_code": "exchange_readback_mismatch",
+    "should_create_incident": true
+  },
+  {
+    "name": "restart_skip",
+    "deadline_offset_seconds": 60,
+    "evidence": {"items": [{"instruction_key": "message_instruction:9", "expected_descendant_kind": "management_item", "expected_terminal_kind": "verified_management", "state": "restart_skip", "evidence_refs": ["message_instruction:9"]}]},
+    "expected_status": "violated",
+    "expected_violation_code": "restart_or_lease_skip",
+    "should_create_incident": true
+  },
+  {
+    "name": "later_reconciliation_disproves_success",
+    "deadline_offset_seconds": 60,
+    "evidence": {"items": [{"instruction_key": "message_instruction:10", "expected_descendant_kind": "execution_event", "expected_terminal_kind": "verified_execution", "state": "reconciliation_disproved", "evidence_refs": ["execution_event:10"]}]},
+    "expected_status": "violated",
+    "expected_violation_code": "reconciliation_disproved_success",
+    "should_create_incident": true
+  }
+]

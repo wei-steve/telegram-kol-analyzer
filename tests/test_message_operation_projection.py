@@ -859,6 +859,9 @@ def test_shadow_cli_requires_enablement_explicit_shadow_once_and_existing_db(
     assert payload["status"] == "shadow"
     assert payload["contracts_created"] == 1
     assert payload["model_calls"] == 0
+    assert payload["outcome_evaluated"] == 1
+    assert payload["outcome_incidents_created"] == 0
+    assert payload["outcome_model_calls"] == 0
 
 
 def test_shadow_cli_loads_reviewed_project_config_file(tmp_path, monkeypatch):

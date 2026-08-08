@@ -1,0 +1,1115 @@
+"""Deterministic, shadow-first evaluation of message-operation outcomes."""
+
+from __future__ import annotations
+
+import re
+import json
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+
+from sqlalchemy import or_, select, update
+from sqlalchemy.orm import sessionmaker
+
+from telegram_kol_research.message_operation_types import (
+    MESSAGE_OPERATION_VIOLATIONS,
+)
+from telegram_kol_research.models import (
+    ContextResolutionAttempt,
+    ExecutionBinding,
+    ExecutionEvent,
+    ManagementMessageTarget,
+    MessageInstructionItem,
+    MessageOperationContract,
+    MessageOperationItem,
+    PositionMutationIntent,
+    PositionProtectionRevision,
+    RawMessage,
+    RecognitionDecision,
+    SignalCandidate,
+    StrategyManagementBatch,
+    StrategyManagementLeg,
+)
+
+
+OUTCOME_STATES = frozenset(
+    {
+        "observing",
+        "missing",
+        "verified",
+        "recognition_failed",
+        "hold",
+        "unresolved",
+        "context_exhausted",
+        "safety_refusal",
+        "action_refused",
+        "partial",
+        "unknown",
+        "local_success",
+        "exchange_mismatch",
+        "restart_skip",
+        "reconciliation_disproved",
+        "duplicate_verified",
+        "superseded_verified",
+    }
+)
+EVALUATION_STATUSES = frozenset(
+    {
+        "observing",
+        "verified",
+        "violated",
+        "duplicate_verified",
+        "superseded_verified",
+    }
+)
+_REFERENCE = re.compile(r"[a-z][a-z0-9_-]{1,31}:[A-Za-z0-9._-]{1,128}\Z")
+_MANAGEMENT_DESCENDANTS = frozenset(
+    {"management_envelope", "management_target", "management_item"}
+)
+_IMMEDIATE_VIOLATIONS = {
+    "recognition_failed": "recognition_failed",
+    "hold": "context_unresolved",
+    "unresolved": "context_unresolved",
+    "context_exhausted": "context_exhausted",
+    "safety_refusal": "action_refused",
+    "action_refused": "action_refused",
+    "partial": "partial_operation",
+    "unknown": "unknown_operation_result",
+    "exchange_mismatch": "exchange_readback_mismatch",
+    "restart_skip": "restart_or_lease_skip",
+    "reconciliation_disproved": "reconciliation_disproved_success",
+}
+
+
+class MessageOperationEvaluationError(ValueError):
+    """Raised when unbounded or unknown outcome evidence is presented."""
+
+
+def _bounded_text(name: str, value: object, maximum: int) -> str:
+    if not isinstance(value, str) or not value or len(value) > maximum:
+        raise MessageOperationEvaluationError(f"invalid {name}")
+    return value
+
+
+def _aware_utc(value: datetime) -> datetime:
+    if not isinstance(value, datetime):
+        raise MessageOperationEvaluationError("deadline must be a datetime")
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _evidence_refs(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise MessageOperationEvaluationError("invalid evidence references")
+    refs = tuple(value)
+    if (
+        len(refs) > 32
+        or not all(isinstance(ref, str) and _REFERENCE.fullmatch(ref) for ref in refs)
+        or len(set(refs)) != len(refs)
+    ):
+        raise MessageOperationEvaluationError("invalid evidence references")
+    return refs
+
+
+@dataclass(frozen=True, slots=True)
+class ItemOutcomeEvidence:
+    instruction_key: str
+    expected_descendant_kind: str
+    expected_terminal_kind: str
+    state: str
+    observed_terminal_kind: str | None = None
+    exchange_required: bool = False
+    exchange_verified: bool = False
+    evidence_refs: tuple[str, ...] = ()
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> "ItemOutcomeEvidence":
+        if not isinstance(value, Mapping):
+            raise MessageOperationEvaluationError("item evidence must be a mapping")
+        allowed = {
+            "instruction_key",
+            "expected_descendant_kind",
+            "expected_terminal_kind",
+            "state",
+            "observed_terminal_kind",
+            "exchange_required",
+            "exchange_verified",
+            "evidence_refs",
+        }
+        if set(value) - allowed:
+            raise MessageOperationEvaluationError("unsupported item evidence field")
+        state = _bounded_text("state", value.get("state"), 64)
+        if state not in OUTCOME_STATES:
+            raise MessageOperationEvaluationError("unsupported outcome state")
+        observed = value.get("observed_terminal_kind")
+        if observed is not None:
+            observed = _bounded_text("observed_terminal_kind", observed, 64)
+        exchange_required = value.get("exchange_required", False)
+        exchange_verified = value.get("exchange_verified", False)
+        if type(exchange_required) is not bool or type(exchange_verified) is not bool:
+            raise MessageOperationEvaluationError("exchange evidence flags must be boolean")
+        return cls(
+            instruction_key=_bounded_text(
+                "instruction_key", value.get("instruction_key"), 128
+            ),
+            expected_descendant_kind=_bounded_text(
+                "expected_descendant_kind",
+                value.get("expected_descendant_kind"),
+                64,
+            ),
+            expected_terminal_kind=_bounded_text(
+                "expected_terminal_kind", value.get("expected_terminal_kind"), 64
+            ),
+            state=state,
+            observed_terminal_kind=observed,
+            exchange_required=exchange_required,
+            exchange_verified=exchange_verified,
+            evidence_refs=_evidence_refs(value.get("evidence_refs")),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "instruction_key": self.instruction_key,
+            "expected_descendant_kind": self.expected_descendant_kind,
+            "expected_terminal_kind": self.expected_terminal_kind,
+            "state": self.state,
+            "observed_terminal_kind": self.observed_terminal_kind,
+            "exchange_required": self.exchange_required,
+            "exchange_verified": self.exchange_verified,
+            "evidence_refs": list(self.evidence_refs),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ContractOutcomeEvidence:
+    items: tuple[ItemOutcomeEvidence, ...]
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> "ContractOutcomeEvidence":
+        if not isinstance(value, Mapping) or set(value) != {"items"}:
+            raise MessageOperationEvaluationError(
+                "contract evidence must contain exactly items"
+            )
+        raw_items = value["items"]
+        if (
+            not isinstance(raw_items, Sequence)
+            or isinstance(raw_items, (str, bytes))
+            or len(raw_items) > 32
+        ):
+            raise MessageOperationEvaluationError("invalid contract evidence items")
+        items = tuple(ItemOutcomeEvidence.from_mapping(item) for item in raw_items)
+        keys = [item.instruction_key for item in items]
+        if len(keys) != len(set(keys)):
+            raise MessageOperationEvaluationError("duplicate instruction evidence")
+        return cls(items=items)
+
+    def to_mappings(self) -> tuple[dict[str, object], ...]:
+        return tuple(item.to_mapping() for item in self.items)
+
+
+@dataclass(frozen=True, slots=True)
+class MessageOperationEvaluation:
+    status: str
+    violation_code: str | None
+    should_create_incident: bool
+    evidence_refs: tuple[str, ...]
+    item_states: tuple[str, ...]
+
+
+def _item_violation(
+    item: ItemOutcomeEvidence,
+    *,
+    deadline_elapsed: bool,
+) -> str | None:
+    immediate = _IMMEDIATE_VIOLATIONS.get(item.state)
+    if immediate is not None:
+        return immediate
+    if item.state == "verified":
+        if item.observed_terminal_kind != item.expected_terminal_kind:
+            return "exchange_readback_mismatch"
+        if item.exchange_required and not item.exchange_verified:
+            return "local_success_unverified" if deadline_elapsed else None
+        return None
+    if item.state == "local_success":
+        if item.exchange_required and item.exchange_verified:
+            return None
+        return "local_success_unverified" if deadline_elapsed else None
+    if item.state == "missing" and deadline_elapsed:
+        return (
+            "missing_management_descendant"
+            if item.expected_descendant_kind in _MANAGEMENT_DESCENDANTS
+            else "no_operation_created"
+        )
+    if item.state == "observing" and deadline_elapsed:
+        return "operation_timeout"
+    return None
+
+
+def evaluate_message_operation_contract(
+    *,
+    contract: object,
+    evidence: ContractOutcomeEvidence,
+    observed_at: datetime,
+) -> MessageOperationEvaluation:
+    """Return one closed, fail-closed outcome without performing any write."""
+
+    observed = _aware_utc(observed_at)
+    deadline = _aware_utc(getattr(contract, "deadline_at", None))
+    deadline_elapsed = observed >= deadline
+    refs = tuple(
+        dict.fromkeys(ref for item in evidence.items for ref in item.evidence_refs)
+    )
+    states = tuple(item.state for item in evidence.items)
+
+    for item in evidence.items:
+        violation = _item_violation(item, deadline_elapsed=deadline_elapsed)
+        if violation is not None:
+            if violation not in MESSAGE_OPERATION_VIOLATIONS:
+                raise MessageOperationEvaluationError("unknown violation code")
+            return MessageOperationEvaluation(
+                status="violated",
+                violation_code=violation,
+                should_create_incident=True,
+                evidence_refs=refs,
+                item_states=states,
+            )
+
+    if not evidence.items:
+        status = "violated" if deadline_elapsed else "observing"
+        violation = "no_operation_created" if deadline_elapsed else None
+    elif all(item.state == "duplicate_verified" for item in evidence.items):
+        status, violation = "duplicate_verified", None
+    elif all(item.state == "superseded_verified" for item in evidence.items):
+        status, violation = "superseded_verified", None
+    elif all(
+        item.state in {"verified", "duplicate_verified", "superseded_verified"}
+        or (
+            item.state == "local_success"
+            and (not item.exchange_required or item.exchange_verified)
+        )
+        for item in evidence.items
+    ):
+        status, violation = "verified", None
+    else:
+        status, violation = "observing", None
+    if status not in EVALUATION_STATUSES:
+        raise MessageOperationEvaluationError("unknown evaluation status")
+    return MessageOperationEvaluation(
+        status=status,
+        violation_code=violation,
+        should_create_incident=status == "violated",
+        evidence_refs=refs,
+        item_states=states,
+    )
+
+
+def _bounded_json_object(value: object) -> dict[str, object]:
+    if not isinstance(value, str) or len(value.encode("utf-8")) > 65_536:
+        return {}
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _stored_refs(value: object) -> tuple[str, ...]:
+    if not isinstance(value, str) or len(value) > 4096:
+        return ()
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ()
+    try:
+        return _evidence_refs(decoded)
+    except MessageOperationEvaluationError:
+        return ()
+
+
+def _cap_collected_refs(*groups: Sequence[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(ref for group in groups for ref in group))[:32]
+
+
+def _instruction_state(item: MessageInstructionItem) -> tuple[str, str | None]:
+    status = str(item.status or "").strip().lower()
+    error = _bounded_json_object(item.error_json)
+    error_type = str(error.get("type") or "")
+    error_message = str(error.get("message") or "")
+    if (
+        status == "failed"
+        and error_type == "RecoveryLiveSubmitError"
+        and error_message.startswith("signal_enqueue_blocked:")
+    ):
+        return "safety_refusal", "verified_refusal"
+    if status in {"failed", "partial_failed"}:
+        return "partial", None
+    if status in {"unknown", "submit_unknown", "recovery_required"}:
+        return "unknown", None
+    if status in {"succeeded", "completed", "confirmed"}:
+        return "local_success", None
+    if status == "duplicate":
+        return "duplicate_verified", None
+    return "observing", None
+
+
+def _target_state(target: ManagementMessageTarget) -> tuple[str, str | None]:
+    admission = str(target.admission_state or "").strip().lower()
+    execution = str(target.execution_state or "").strip().lower()
+    if admission == "refused":
+        return "safety_refusal", "verified_refusal"
+    if execution == "confirmed":
+        return "local_success", None
+    if execution == "failed":
+        return "partial", None
+    if execution in {"submit_unknown", "recovery_required"}:
+        return "unknown", None
+    return "observing", None
+
+
+def _explicit_durable_failure_state(*values: object) -> str | None:
+    normalized = " ".join(str(value or "").strip().lower() for value in values)
+    if "reconciliation_disproved" in normalized:
+        return "reconciliation_disproved"
+    if "exchange_readback_mismatch" in normalized or "readback_mismatch" in normalized:
+        return "exchange_mismatch"
+    if "restart_or_lease_skip" in normalized or (
+        "skip" in normalized and ("restart" in normalized or "lease" in normalized)
+    ):
+        return "restart_skip"
+    return None
+
+
+def _expected_exchange_actions(instruction_kind: str) -> frozenset[str]:
+    return {
+        "new_entry": frozenset(
+            {
+                "entry",
+                "entry_signal",
+                "open",
+                "open_position",
+                "submit_entry",
+                "create_trigger_entry",
+                "create_limit_entry",
+                "open_market_position",
+                "recreate_trigger_entry",
+            }
+        ),
+        "add_entry": frozenset(
+            {
+                "add_entry",
+                "add_position",
+                "create_trigger_entry",
+                "create_limit_entry",
+                "open_market_position",
+                "recreate_trigger_entry",
+            }
+        ),
+        "take_profit": frozenset(
+            {
+                "partial_take_profit",
+                "take_profit",
+                "reduce_position",
+                "close_half",
+                "close_position",
+                "close_bound_position_market",
+                "strategy_management_close_submit",
+            }
+        ),
+        "stop_loss": frozenset(
+            {
+                "stop_loss",
+                "move_stop_to_break_even",
+                "move_stop_to_protect",
+                "break_even",
+                "modify_stop",
+                "protection",
+                "set_position_sltp",
+                "set_position_tpsl",
+                "adjust_position_tpsl",
+                "create_backup_stop",
+                "strategy_management_protection_restore",
+                "trigger_protection_stop_rescue",
+                "migrate_native_tpsl_backup_stop",
+            }
+        ),
+        "cancel": frozenset(
+            {
+                "cancel",
+                "cancel_entry",
+                "cancel_order",
+                "cancel_pending_entry",
+                "cancel_trigger_order",
+                "cancel_trigger_entry",
+                "cancel_regular_entry",
+                "cancel_entry_absent_confirmed",
+                "cancel_revision_entry_leg",
+                "reply_cancel_after_entry",
+                "strategy_management_cancel_deferred_trigger_entry",
+                "strategy_management_cancel_deferred_regular_entry",
+            }
+        ),
+        "exit": frozenset(
+            {
+                "exit",
+                "exit_position",
+                "full_exit",
+                "full_close",
+                "close_position",
+                "close_bound_position_market",
+                "strategy_management_close_submit",
+            }
+        ),
+        "manage": frozenset({"manage"}),
+        "other_management": frozenset({"other_management"}),
+        "unresolved_executable": frozenset(),
+    }[instruction_kind]
+
+
+def _event_matches_source_message(event: ExecutionEvent, raw: RawMessage) -> bool:
+    return bool(
+        event.source_message_id == raw.id
+        or (
+            event.source_message_id == raw.message_id
+            and event.chat_id == raw.chat_id
+        )
+        or (event.chat_id == raw.chat_id and event.message_id == raw.message_id)
+    )
+
+
+def _exchange_outcome(
+    session,
+    *,
+    raw: RawMessage,
+    row: MessageOperationItem,
+    strategy_instance_ids: set[str],
+    base_state: str,
+    allow_raw_scope: bool,
+    allow_item_success: bool,
+    retrospective: bool,
+) -> tuple[str, str | None, tuple[str, ...]]:
+    """Return only independently corroborated durable exchange outcomes."""
+
+    source_time = raw.posted_at or raw.created_at
+    expected_actions = _expected_exchange_actions(row.instruction_kind)
+
+    binding_filters = []
+    if strategy_instance_ids:
+        binding_filters.append(
+            ExecutionBinding.strategy_instance_id.in_(tuple(strategy_instance_ids))
+        )
+    elif allow_raw_scope:
+        binding_filters.append(
+            (ExecutionBinding.chat_id == raw.chat_id)
+            & (ExecutionBinding.message_id == raw.message_id)
+        )
+    bindings = (
+        session.execute(
+            select(ExecutionBinding)
+            .where(or_(*binding_filters))
+            .order_by(ExecutionBinding.updated_at.desc(), ExecutionBinding.id.desc())
+            .limit(32)
+        ).scalars().all()
+        if binding_filters
+        else []
+    )
+    binding_ids = {int(binding.id) for binding in bindings}
+    refs = [f"execution_binding:{binding.id}" for binding in bindings]
+
+    def outcome_refs(*decisive: str) -> tuple[str, ...]:
+        return _cap_collected_refs(decisive, refs)
+
+    event_filters = []
+    if strategy_instance_ids:
+        event_filters.append(
+            ExecutionEvent.strategy_instance_id.in_(tuple(strategy_instance_ids))
+        )
+    elif allow_raw_scope:
+        event_filters.extend(
+            (
+                ExecutionEvent.source_message_id == raw.id,
+                (ExecutionEvent.chat_id == raw.chat_id)
+                & (ExecutionEvent.message_id == raw.message_id),
+            )
+        )
+    if binding_ids:
+        event_filters.append(ExecutionEvent.execution_binding_id.in_(binding_ids))
+    events = (
+        session.execute(
+            select(ExecutionEvent)
+            .where(or_(*event_filters))
+            .where(ExecutionEvent.created_at >= source_time)
+            .order_by(ExecutionEvent.created_at.desc(), ExecutionEvent.id.desc())
+            .limit(64)
+        ).scalars().all()
+        if event_filters
+        else []
+    )
+    refs.extend(f"execution_event:{event.id}" for event in events)
+    for event in events:
+        failure = _explicit_durable_failure_state(
+            event.action, event.status, event.reason
+        )
+        failure_is_exact = _event_matches_source_message(event, raw)
+        if failure is not None and failure_is_exact:
+            return failure, None, outcome_refs(f"execution_event:{event.id}")
+    for binding in bindings:
+        failure = _explicit_durable_failure_state(
+            binding.status, binding.last_exchange_status
+        )
+        if failure is not None and row.instruction_kind == "new_entry":
+            return failure, None, outcome_refs(f"execution_binding:{binding.id}")
+        if (
+            row.instruction_kind == "new_entry"
+            and str(binding.last_exchange_status or "").strip().lower()
+            in {
+                "position_attribution_conflict",
+                "position_ownership_unassigned",
+            }
+        ):
+            return "exchange_mismatch", None, outcome_refs(
+                f"execution_binding:{binding.id}"
+            )
+
+    verified_event_statuses = {"confirmed", "filled", "verified"}
+    verified_event = next(
+        (
+            event
+            for event in events
+            if str(event.status or "").strip().lower() in verified_event_statuses
+            and str(event.action or "").strip().lower() in expected_actions
+            and _event_matches_source_message(event, raw)
+        ),
+        None,
+    )
+    if verified_event is not None and allow_item_success:
+        return (
+            "verified",
+            row.expected_terminal_kind,
+            outcome_refs(f"execution_event:{verified_event.id}"),
+        )
+    verified_binding = next(
+        (
+            binding
+            for binding in bindings
+            if row.instruction_kind == "new_entry"
+            and str(binding.status or "").strip().lower() == "active"
+            and str(binding.last_exchange_status or "").strip().lower()
+            in {"position_ownership_verified", "manual_bound_live_position"}
+        ),
+        None,
+    )
+    if verified_binding is not None and allow_item_success:
+        return (
+            "verified",
+            row.expected_terminal_kind,
+            outcome_refs(f"execution_binding:{verified_binding.id}"),
+        )
+
+    batch_filters = [StrategyManagementBatch.raw_message_id == raw.id]
+    if strategy_instance_ids:
+        batch_filters.append(
+            StrategyManagementBatch.strategy_instance_id.in_(
+                tuple(strategy_instance_ids)
+            )
+        )
+    batches = session.execute(
+        select(StrategyManagementBatch)
+        .where(*batch_filters)
+        .order_by(StrategyManagementBatch.id.desc())
+        .limit(32)
+    ).scalars().all()
+    refs.extend(f"strategy_management_batch:{batch.id}" for batch in batches)
+    batch_ids = {int(batch.id) for batch in batches}
+    legs = (
+        session.execute(
+            select(StrategyManagementLeg)
+            .where(StrategyManagementLeg.management_batch_id.in_(batch_ids))
+            .order_by(StrategyManagementLeg.id)
+            .limit(32)
+        ).scalars().all()
+        if batch_ids
+        else []
+    )
+    refs.extend(f"strategy_management_leg:{leg.id}" for leg in legs)
+    leg_ids = {int(leg.execution_order_leg_id) for leg in legs}
+
+    if leg_ids:
+        mutations = session.execute(
+            select(PositionMutationIntent)
+            .where(PositionMutationIntent.execution_order_leg_id.in_(leg_ids))
+            .where(PositionMutationIntent.created_at >= source_time)
+            .order_by(PositionMutationIntent.created_at.desc(), PositionMutationIntent.id.desc())
+            .limit(32)
+        ).scalars().all()
+        refs.extend(f"position_mutation_intent:{item.id}" for item in mutations)
+        for mutation in mutations:
+            failure = _explicit_durable_failure_state(
+                mutation.status, mutation.error_json
+            )
+            if (
+                failure is not None
+                and not retrospective
+                and str(mutation.operation or "").strip().lower()
+                in expected_actions
+            ):
+                return failure, None, outcome_refs(
+                    f"position_mutation_intent:{mutation.id}"
+                )
+        verified_mutation = next(
+            (
+                mutation
+                for mutation in mutations
+                if str(mutation.status or "").strip().lower() == "confirmed"
+                and mutation.confirmed_at is not None
+                and str(mutation.operation or "").strip().lower()
+                in expected_actions
+            ),
+            None,
+        )
+        if verified_mutation is not None and allow_item_success:
+            return (
+                "verified",
+                row.expected_terminal_kind,
+                outcome_refs(f"position_mutation_intent:{verified_mutation.id}"),
+            )
+
+    if leg_ids and row.instruction_kind == "stop_loss":
+        revisions = session.execute(
+            select(PositionProtectionRevision)
+            .where(PositionProtectionRevision.execution_order_leg_id.in_(leg_ids))
+            .where(PositionProtectionRevision.created_at >= source_time)
+            .order_by(
+                PositionProtectionRevision.created_at.desc(),
+                PositionProtectionRevision.id.desc(),
+            )
+            .limit(32)
+        ).scalars().all()
+        refs.extend(f"protection_revision:{revision.id}" for revision in revisions)
+        active_revision = next(
+            (
+                revision
+                for revision in revisions
+                if str(revision.status or "").strip().lower() == "active"
+            ),
+            None,
+        )
+        if active_revision is not None and allow_item_success:
+            return (
+                "verified",
+                row.expected_terminal_kind,
+                outcome_refs(f"protection_revision:{active_revision.id}"),
+            )
+    return base_state, None, outcome_refs()
+
+
+def _recognition_state(
+    decision: RecognitionDecision | None,
+    context: ContextResolutionAttempt | None,
+) -> tuple[str, str | None]:
+    if decision is None:
+        return "missing", None
+    authoritative = str(decision.authoritative_status or "").strip().lower()
+    if authoritative in {"recognition-failed", "recognition_failed", "failed"}:
+        return "recognition_failed", None
+    if context is None:
+        return "missing", None
+    status = str(context.status or "").strip().lower()
+    if status in {"exhausted", "failed"}:
+        return "context_exhausted", None
+    payload = _bounded_json_object(context.decision_json)
+    resolution = str(payload.get("decision") or "").strip().lower()
+    if resolution in {"hold", "unresolved"}:
+        return resolution, None
+    return "observing", None
+
+
+def _operation_row_strategy_ids(
+    session,
+    *,
+    row: MessageOperationItem,
+    raw_message_id: int,
+    candidates_by_id: Mapping[int, SignalCandidate],
+) -> frozenset[str]:
+    instruction: MessageInstructionItem | None = None
+    prefix, _, raw_id = row.instruction_key.partition(":")
+    try:
+        identity = int(raw_id)
+    except (TypeError, ValueError):
+        identity = 0
+    if prefix == "message_instruction":
+        instruction = session.get(MessageInstructionItem, identity)
+    elif prefix == "management_target":
+        target = session.get(ManagementMessageTarget, identity)
+        if target is not None and target.message_instruction_item_id is not None:
+            instruction = session.get(
+                MessageInstructionItem, target.message_instruction_item_id
+            )
+    elif prefix == "signal_candidate":
+        candidate = candidates_by_id.get(identity)
+        if candidate is not None:
+            instruction = session.execute(
+                select(MessageInstructionItem)
+                .where(
+                    MessageInstructionItem.raw_message_id == raw_message_id,
+                    MessageInstructionItem.signal_candidate_id == candidate.id,
+                )
+                .order_by(MessageInstructionItem.id.desc())
+            ).scalars().first()
+    if (
+        instruction is None
+        or instruction.raw_message_id != raw_message_id
+        or not instruction.strategy_instance_id
+    ):
+        return frozenset()
+    return frozenset({instruction.strategy_instance_id})
+
+
+def collect_message_operation_evidence(
+    session_factory: sessionmaker,
+    *,
+    contract_id: int,
+) -> ContractOutcomeEvidence:
+    """Collect only bounded durable evidence for one additive contract."""
+
+    if type(contract_id) is not int or contract_id < 1:
+        raise MessageOperationEvaluationError("contract_id must be positive")
+    with session_factory() as session:
+        contract = session.get(MessageOperationContract, contract_id)
+        if contract is None:
+            raise MessageOperationEvaluationError("contract not found")
+        raw = session.get(RawMessage, contract.raw_message_id)
+        if raw is None:
+            raise MessageOperationEvaluationError("contract raw message not found")
+        rows = session.execute(
+            select(MessageOperationItem)
+            .where(MessageOperationItem.contract_id == contract_id)
+            .order_by(MessageOperationItem.sequence, MessageOperationItem.id)
+        ).scalars().all()
+        if len(rows) > 32:
+            raise MessageOperationEvaluationError("contract item evidence is unbounded")
+        decision = session.execute(
+            select(RecognitionDecision).where(
+                RecognitionDecision.raw_message_id == contract.raw_message_id
+            )
+        ).scalar_one_or_none()
+        context = session.execute(
+            select(ContextResolutionAttempt)
+            .where(ContextResolutionAttempt.raw_message_id == contract.raw_message_id)
+            .order_by(ContextResolutionAttempt.id.desc())
+        ).scalars().first()
+        candidates = session.execute(
+            select(SignalCandidate)
+            .where(SignalCandidate.raw_message_id == contract.raw_message_id)
+            .order_by(SignalCandidate.id)
+            .limit(32)
+        ).scalars().all()
+        candidates_by_id = {int(candidate.id): candidate for candidate in candidates}
+        strategy_ids_by_key = {
+            row.instruction_key: _operation_row_strategy_ids(
+                session,
+                row=row,
+                raw_message_id=contract.raw_message_id,
+                candidates_by_id=candidates_by_id,
+            )
+            for row in rows
+        }
+        scope_counts: dict[tuple[str, frozenset[str]], int] = {}
+        for row in rows:
+            scope = (row.instruction_kind, strategy_ids_by_key[row.instruction_key])
+            scope_counts[scope] = scope_counts.get(scope, 0) + 1
+        evidence_items: list[ItemOutcomeEvidence] = []
+        for row in rows:
+            state = "missing"
+            observed_terminal: str | None = None
+            refs = list(_stored_refs(row.evidence_refs_json))
+            exchange_refs: tuple[str, ...] = ()
+            strategy_instance_ids = set(strategy_ids_by_key[row.instruction_key])
+            if row.instruction_key.startswith("management_target:"):
+                try:
+                    target_id = int(row.instruction_key.split(":", 1)[1])
+                except (TypeError, ValueError):
+                    target_id = 0
+                target = session.get(ManagementMessageTarget, target_id)
+                if target is not None and target.raw_message_id == contract.raw_message_id:
+                    state, observed_terminal = _target_state(target)
+                    refs.append(f"management_target:{target.id}")
+                    instruction = (
+                        session.get(
+                            MessageInstructionItem,
+                            target.message_instruction_item_id,
+                        )
+                        if target.message_instruction_item_id is not None
+                        else None
+                    )
+                    if instruction is not None and instruction.strategy_instance_id:
+                        strategy_instance_ids.add(instruction.strategy_instance_id)
+            elif row.instruction_key.startswith("message_instruction:"):
+                try:
+                    item_id = int(row.instruction_key.split(":", 1)[1])
+                except (TypeError, ValueError):
+                    item_id = 0
+                instruction = session.get(MessageInstructionItem, item_id)
+                if (
+                    instruction is not None
+                    and instruction.raw_message_id == contract.raw_message_id
+                ):
+                    state, observed_terminal = _instruction_state(instruction)
+                    refs.append(f"message_instruction:{instruction.id}")
+                    if instruction.strategy_instance_id:
+                        strategy_instance_ids.add(instruction.strategy_instance_id)
+                    candidate = candidates_by_id.get(instruction.signal_candidate_id)
+                    if candidate is not None:
+                        refs.append(f"signal_candidate:{candidate.id}")
+            elif row.instruction_key.startswith("signal_candidate:"):
+                try:
+                    candidate_id = int(row.instruction_key.split(":", 1)[1])
+                except (TypeError, ValueError):
+                    candidate_id = 0
+                candidate = candidates_by_id.get(candidate_id)
+                if candidate is not None:
+                    refs.append(f"signal_candidate:{candidate.id}")
+                    state = "observing"
+                    instruction = session.execute(
+                        select(MessageInstructionItem)
+                        .where(
+                            MessageInstructionItem.raw_message_id
+                            == contract.raw_message_id,
+                            MessageInstructionItem.signal_candidate_id == candidate.id,
+                        )
+                        .order_by(MessageInstructionItem.id.desc())
+                    ).scalars().first()
+                    if instruction is not None:
+                        state, observed_terminal = _instruction_state(instruction)
+                        refs.append(f"message_instruction:{instruction.id}")
+                        if instruction.strategy_instance_id:
+                            strategy_instance_ids.add(
+                                instruction.strategy_instance_id
+                            )
+            elif row.instruction_key.startswith("recognition_decision:"):
+                state, observed_terminal = _recognition_state(decision, context)
+                if decision is not None:
+                    refs.append(f"recognition_decision:{decision.id}")
+                if context is not None:
+                    refs.append(f"context_resolution_attempt:{context.id}")
+            if row.expected_descendant_kind != "context_resolution_attempt" and state not in {
+                "recognition_failed",
+                "hold",
+                "unresolved",
+                "context_exhausted",
+                "safety_refusal",
+                "action_refused",
+                "partial",
+                "unknown",
+                "duplicate_verified",
+                "superseded_verified",
+            }:
+                state, exchange_terminal, exchange_refs = _exchange_outcome(
+                    session,
+                    raw=raw,
+                    row=row,
+                    strategy_instance_ids=strategy_instance_ids,
+                    base_state=state,
+                    allow_raw_scope=len(rows) == 1,
+                    allow_item_success=(
+                        scope_counts[
+                            (
+                                row.instruction_kind,
+                                strategy_ids_by_key[row.instruction_key],
+                            )
+                        ]
+                        == 1
+                    ),
+                    retrospective=contract.status == "verified",
+                )
+                if exchange_terminal is not None:
+                    observed_terminal = exchange_terminal
+            if state == "verified" and observed_terminal is None:
+                observed_terminal = row.expected_terminal_kind
+            exchange_required = row.expected_terminal_kind in {
+                "verified_entry",
+                "verified_execution",
+                "verified_cancel",
+                "verified_exit",
+                "verified_protection",
+            }
+            exchange_verified = state == "verified"
+            evidence_items.append(
+                ItemOutcomeEvidence(
+                    instruction_key=row.instruction_key,
+                    expected_descendant_kind=row.expected_descendant_kind,
+                    expected_terminal_kind=row.expected_terminal_kind,
+                    state=state,
+                    observed_terminal_kind=observed_terminal,
+                    exchange_required=exchange_required,
+                    exchange_verified=exchange_verified,
+                    evidence_refs=_cap_collected_refs(exchange_refs, refs),
+                )
+            )
+        return ContractOutcomeEvidence(items=tuple(evidence_items))
+
+
+def _item_storage_status(
+    item: ItemOutcomeEvidence,
+    *,
+    deadline_elapsed: bool,
+) -> str:
+    if item.state == "duplicate_verified":
+        return "duplicate"
+    if item.state == "superseded_verified":
+        return "superseded"
+    if _item_violation(item, deadline_elapsed=deadline_elapsed) is not None:
+        return "violated"
+    if item.state == "verified" or (
+        item.state == "local_success"
+        and (not item.exchange_required or item.exchange_verified)
+    ):
+        return "verified"
+    return "observing"
+
+
+def _apply_shadow_evaluation(
+    session_factory: sessionmaker,
+    *,
+    contract_id: int,
+    evidence: ContractOutcomeEvidence,
+    evaluation: MessageOperationEvaluation,
+    observed_at: datetime,
+) -> None:
+    storage_status = {
+        "observing": "observing",
+        "verified": "verified",
+        "violated": "violated",
+        "duplicate_verified": "duplicate",
+        "superseded_verified": "superseded",
+    }[evaluation.status]
+    with session_factory() as session:
+        contract = session.get(MessageOperationContract, contract_id)
+        if contract is None or contract.status not in {"observing", "verified"}:
+            return
+        prior_status = contract.status
+        if prior_status == "verified" and evaluation.violation_code not in {
+            "exchange_readback_mismatch",
+            "reconciliation_disproved_success",
+        }:
+            contract.updated_at = observed_at
+            session.commit()
+            return
+        rows = session.execute(
+            select(MessageOperationItem)
+            .where(MessageOperationItem.contract_id == contract_id)
+            .order_by(MessageOperationItem.sequence, MessageOperationItem.id)
+        ).scalars().all()
+        if [row.instruction_key for row in rows] != [
+            item.instruction_key for item in evidence.items
+        ]:
+            raise MessageOperationEvaluationError("contract evidence changed")
+        deadline_elapsed = _aware_utc(observed_at) >= _aware_utc(contract.deadline_at)
+        for row, item in zip(rows, evidence.items, strict=True):
+            row.status = _item_storage_status(item, deadline_elapsed=deadline_elapsed)
+            row.observed_terminal_kind = (
+                "verified_refusal"
+                if item.state in {"safety_refusal", "action_refused"}
+                else item.observed_terminal_kind
+            )
+            row.evidence_refs_json = json.dumps(
+                item.evidence_refs,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+            row.updated_at = observed_at
+        result = session.execute(
+            update(MessageOperationContract)
+            .where(
+                MessageOperationContract.id == contract_id,
+                MessageOperationContract.status == prior_status,
+            )
+            .values(
+                status=storage_status,
+                violation_code=evaluation.violation_code,
+                evidence_refs_json=json.dumps(
+                    evaluation.evidence_refs,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ),
+                runtime_incident_id=None,
+                agent_requested=False,
+                updated_at=observed_at,
+            )
+        )
+        if result.rowcount != 1:
+            session.rollback()
+            return
+        session.commit()
+
+
+def run_message_operation_outcome_shadow_once(
+    session_factory: sessionmaker,
+    *,
+    limit: int,
+    observed_at: datetime,
+) -> dict[str, int]:
+    """Evaluate one bounded batch and persist observation state only."""
+
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise MessageOperationEvaluationError("limit must be between 1 and 100")
+    with session_factory() as session:
+        contract_ids = session.execute(
+            select(MessageOperationContract.id)
+            .where(MessageOperationContract.status.in_(("observing", "verified")))
+            .order_by(
+                MessageOperationContract.status == "verified",
+                MessageOperationContract.updated_at,
+                MessageOperationContract.deadline_at,
+                MessageOperationContract.id,
+            )
+            .limit(limit)
+        ).scalars().all()
+    result = {
+        "errors": 0,
+        "evaluated": 0,
+        "observing": 0,
+        "verified": 0,
+        "violated": 0,
+        "duplicate_verified": 0,
+        "superseded_verified": 0,
+        "incidents_created": 0,
+        "model_calls": 0,
+        "rechecked_verified": 0,
+    }
+    for contract_id in contract_ids:
+        try:
+            with session_factory() as session:
+                contract = session.get(MessageOperationContract, contract_id)
+                if contract is None or contract.status not in {"observing", "verified"}:
+                    continue
+                prior_status = contract.status
+                session.expunge(contract)
+            evidence = collect_message_operation_evidence(
+                session_factory, contract_id=contract_id
+            )
+            evaluation = evaluate_message_operation_contract(
+                contract=contract,
+                evidence=evidence,
+                observed_at=observed_at,
+            )
+            _apply_shadow_evaluation(
+                session_factory,
+                contract_id=contract_id,
+                evidence=evidence,
+                evaluation=evaluation,
+                observed_at=observed_at,
+            )
+            result["evaluated"] += 1
+            if prior_status == "verified":
+                result["rechecked_verified"] += 1
+            effective_status = evaluation.status
+            if prior_status == "verified" and evaluation.violation_code not in {
+                "exchange_readback_mismatch",
+                "reconciliation_disproved_success",
+            }:
+                effective_status = "verified"
+            result[effective_status] += 1
+        except Exception:
+            result["errors"] += 1
+    return result

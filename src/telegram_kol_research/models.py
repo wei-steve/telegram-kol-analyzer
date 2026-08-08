@@ -2912,6 +2912,37 @@ class MessageOperationItem(Base):
     )
 
 
+class RuntimeIncidentAffectedMessage(Base):
+    """Additive source-message membership for a coalesced runtime incident."""
+
+    __tablename__ = "runtime_incident_affected_messages"
+    __table_args__ = (
+        UniqueConstraint(
+            "runtime_incident_id",
+            "raw_message_id",
+            name="uq_runtime_incident_affected_message",
+        ),
+        Index(
+            "ix_runtime_incident_affected_messages_contract",
+            "message_operation_contract_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    runtime_incident_id: Mapped[int] = mapped_column(
+        ForeignKey("runtime_incidents.id"), nullable=False, index=True
+    )
+    raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False, index=True
+    )
+    message_operation_contract_id: Mapped[int] = mapped_column(
+        ForeignKey("message_operation_contracts.id"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+
 class RuntimeIncidentObservation(Base):
     """Additive shadow record for one stable invariant object/rule pair."""
 

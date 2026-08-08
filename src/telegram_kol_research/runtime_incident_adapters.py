@@ -15,13 +15,23 @@ from telegram_kol_research.config import (
     RuntimeIncidentConfig,
     load_runtime_incident_config,
 )
-from telegram_kol_research.models import ManagementMessageTarget, utc_now
+from telegram_kol_research.message_operation_types import (
+    MESSAGE_OPERATION_VIOLATIONS,
+)
+from telegram_kol_research.models import (
+    ManagementMessageTarget,
+    MessageOperationContract,
+    utc_now,
+)
 from telegram_kol_research.runtime_incidents import record_runtime_incident
 
 
 logger = logging.getLogger(__name__)
 
 _SAFE_LABEL = re.compile(r"[^A-Za-z0-9._-]+")
+_STABLE_EVIDENCE_REF = re.compile(
+    r"[a-z][a-z0-9_-]{1,31}:[A-Za-z0-9._-]{1,128}\Z"
+)
 _SENSITIVE_MARKERS = (
     "authorization",
     "bearer",
@@ -129,6 +139,9 @@ def _capture(
     severity: str,
     redacted_summary: str,
     occurred_at: datetime,
+    evidence_refs_json: str | None = None,
+    affected_raw_message_id: int | None = None,
+    message_operation_contract_id: int | None = None,
     recorder: Callable[..., Any] | None = None,
 ):
     if not config.captures(incident_type):
@@ -137,23 +150,34 @@ def _capture(
     source_record_id = _safe_label(source_record_id, limit=255)
     incident_type = _safe_label(incident_type, limit=64)
     try:
-        return (recorder or record_runtime_incident)(
-            session_factory,
-            source_kind=source_kind,
-            source_record_id=source_record_id,
-            incident_type=incident_type,
-            severity=severity,
-            fingerprint=_fingerprint(
+        capture_kwargs = {
+            "source_kind": source_kind,
+            "source_record_id": source_record_id,
+            "incident_type": incident_type,
+            "severity": severity,
+            "fingerprint": _fingerprint(
                 incident_type=incident_type,
                 source_kind=source_kind,
                 source_record_id=source_record_id,
                 summary=redacted_summary,
             ),
-            redacted_summary=redacted_summary,
-            occurred_at=occurred_at,
-            feature_policy_version=config.feature_policy_version,
-            prompt_version=config.prompt_version,
-            tool_policy_version=config.tool_policy_version,
+            "redacted_summary": redacted_summary,
+            "occurred_at": occurred_at,
+            "feature_policy_version": config.feature_policy_version,
+            "prompt_version": config.prompt_version,
+            "tool_policy_version": config.tool_policy_version,
+        }
+        if evidence_refs_json is not None:
+            capture_kwargs["evidence_refs_json"] = evidence_refs_json
+        if affected_raw_message_id is not None:
+            capture_kwargs["affected_raw_message_id"] = affected_raw_message_id
+        if message_operation_contract_id is not None:
+            capture_kwargs["message_operation_contract_id"] = (
+                message_operation_contract_id
+            )
+        return (recorder or record_runtime_incident)(
+            session_factory,
+            **capture_kwargs,
         )
     except Exception as exc:
         logger.warning(
@@ -163,6 +187,85 @@ def _capture(
             type(exc).__name__,
         )
         return None
+
+
+def capture_message_operation_failure(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    contract_id: int,
+    raw_message_id: int,
+    violation_code: str,
+    evidence_refs: tuple[str, ...] | list[str],
+    occurred_at: datetime,
+    shadow_only: bool,
+):
+    """Reuse the incident ledger for one contract violation after shadow review."""
+
+    if shadow_only:
+        return None
+    if (
+        type(contract_id) is not int
+        or contract_id < 1
+        or type(raw_message_id) is not int
+        or raw_message_id < 1
+        or violation_code not in MESSAGE_OPERATION_VIOLATIONS
+    ):
+        raise ValueError("invalid message operation failure identity")
+    if not isinstance(evidence_refs, (tuple, list)):
+        raise ValueError("invalid message operation evidence references")
+    normalized_refs = tuple(
+        dict.fromkeys(
+            (
+                f"message_operation_contract:{contract_id}",
+                f"raw_message:{raw_message_id}",
+                *evidence_refs,
+            )
+        )
+    )
+    if (
+        len(normalized_refs) > 32
+        or not all(
+            isinstance(reference, str)
+            and _STABLE_EVIDENCE_REF.fullmatch(reference)
+            for reference in normalized_refs
+        )
+    ):
+        raise ValueError("invalid message operation evidence references")
+    evidence_refs_json = json.dumps(
+        normalized_refs,
+        ensure_ascii=True,
+        sort_keys=False,
+        separators=(",", ":"),
+    )
+    with session_factory() as session:
+        contract = session.get(MessageOperationContract, contract_id)
+        if contract is None or contract.raw_message_id != raw_message_id:
+            raise ValueError("message operation contract identity mismatch")
+        if (
+            contract.status != "violated"
+            or contract.violation_code != violation_code
+        ):
+            raise ValueError("message operation terminal violation mismatch")
+    incident = _capture(
+        session_factory,
+        config=config,
+        source_kind="message_operation_violation",
+        source_record_id=violation_code,
+        incident_type="message_operation_failure",
+        severity="high",
+        redacted_summary=_summary(
+            component="message_operation_supervisor",
+            source_status="violated",
+            reason_code=violation_code,
+            operation="coalesced_message_operation",
+        ),
+        occurred_at=occurred_at,
+        evidence_refs_json=evidence_refs_json,
+        affected_raw_message_id=raw_message_id,
+        message_operation_contract_id=contract_id,
+    )
+    return incident
 
 
 def capture_context_worker_state(

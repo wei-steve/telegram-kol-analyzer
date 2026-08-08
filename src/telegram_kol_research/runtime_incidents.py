@@ -7,11 +7,15 @@ import re
 from collections.abc import Sequence
 from datetime import datetime
 
-from sqlalchemy import and_, case, or_, update
+from sqlalchemy import and_, case, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import sessionmaker
 
-from telegram_kol_research.models import RuntimeIncident
+from telegram_kol_research.models import (
+    MessageOperationContract,
+    RuntimeIncident,
+    RuntimeIncidentAffectedMessage,
+)
 from telegram_kol_research.runtime_agent_playbooks import (
     get_runtime_agent_playbook,
 )
@@ -524,6 +528,8 @@ def record_runtime_incident(
     generation: int = 1,
     diagnosis_json: str | None = None,
     evidence_refs_json: str | None = None,
+    affected_raw_message_id: int | None = None,
+    message_operation_contract_id: int | None = None,
 ) -> RuntimeIncident:
     """Insert or atomically coalesce one occurrence of a fingerprint generation."""
 
@@ -584,6 +590,19 @@ def record_runtime_incident(
         "created_at": occurred_at,
         "updated_at": occurred_at,
     }
+    atomic_link_requested = (
+        affected_raw_message_id is not None
+        or message_operation_contract_id is not None
+    )
+    if atomic_link_requested and (
+        type(affected_raw_message_id) is not int
+        or affected_raw_message_id < 1
+        or type(message_operation_contract_id) is not int
+        or message_operation_contract_id < 1
+        or values["incident_type"] != "message_operation_failure"
+    ):
+        raise ValueError("invalid atomic message-operation incident link")
+
     with session_factory() as session:
         existing_severity_rank = case(
             *(
@@ -631,6 +650,50 @@ def record_runtime_incident(
             },
         ).returning(RuntimeIncident.id)
         incident_id = session.execute(statement).scalar_one()
+        if atomic_link_requested:
+            contract = session.get(
+                MessageOperationContract, message_operation_contract_id
+            )
+            if (
+                contract is None
+                or contract.raw_message_id != affected_raw_message_id
+                or contract.status != "violated"
+                or contract.violation_code != values["source_record_id"]
+                or contract.runtime_incident_id not in (None, incident_id)
+            ):
+                raise RuntimeIncidentBoundsError(
+                    "atomic message-operation incident identity conflict"
+                )
+            relation_statement = sqlite_insert(
+                RuntimeIncidentAffectedMessage
+            ).values(
+                runtime_incident_id=incident_id,
+                raw_message_id=affected_raw_message_id,
+                message_operation_contract_id=message_operation_contract_id,
+                created_at=occurred_at,
+            )
+            session.execute(
+                relation_statement.on_conflict_do_nothing(
+                    index_elements=["runtime_incident_id", "raw_message_id"]
+                )
+            )
+            relation = session.execute(
+                select(RuntimeIncidentAffectedMessage).where(
+                    RuntimeIncidentAffectedMessage.runtime_incident_id
+                    == incident_id,
+                    RuntimeIncidentAffectedMessage.raw_message_id
+                    == affected_raw_message_id,
+                )
+            ).scalar_one()
+            if (
+                relation.message_operation_contract_id
+                != message_operation_contract_id
+            ):
+                raise RuntimeIncidentBoundsError(
+                    "affected message contract identity conflict"
+                )
+            contract.runtime_incident_id = incident_id
+            contract.updated_at = occurred_at
         session.commit()
         return _detach(session, session.get(RuntimeIncident, incident_id))
 

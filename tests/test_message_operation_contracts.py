@@ -146,13 +146,25 @@ def test_contract_transition_is_compare_and_set_and_closed_enum(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_message = _raw_message(session_factory)
     contract = _create_contract(session_factory, raw_message_id=raw_message.id)
+    other_raw = _raw_message(session_factory, message_id=43)
+    other = _create_contract(session_factory, raw_message_id=other_raw.id)
+
+    with pytest.raises(MessageOperationContractBoundsError, match="violation_code"):
+        transition_message_operation_contract(
+            session_factory,
+            contract_id=other.id,
+            expected_status="observing",
+            new_status="violated",
+            violation_code="invented_violation",
+            now=NOW,
+        )
 
     assert transition_message_operation_contract(
         session_factory,
         contract_id=contract.id,
         expected_status="observing",
         new_status="violated",
-        violation_code="missing_verified_descendant",
+        violation_code="missing_management_descendant",
         evidence_refs=["raw_message:42"],
         now=NOW,
     )
@@ -166,7 +178,7 @@ def test_contract_transition_is_compare_and_set_and_closed_enum(tmp_path):
     updated = get_message_operation_contract(session_factory, contract.id)
     assert updated is not None
     assert updated.status == "violated"
-    assert updated.violation_code == "missing_verified_descendant"
+    assert updated.violation_code == "missing_management_descendant"
 
     with pytest.raises(MessageOperationContractBoundsError, match="status"):
         transition_message_operation_contract(

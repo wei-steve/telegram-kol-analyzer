@@ -9,7 +9,7 @@ design_version: 2
 design_authority_status: original_runtime_agent_incomplete_extended_by_message_operation_design
 current_phase: 8R.6A
 phase_name: message-operation-outcome-supervisor
-phase_status: planned
+phase_status: in_progress
 position_compliance_rules_status: dormant_non_deployable
 position_compliance_rollout_status: multi_target_live_new_natural_messages_only
 multi_target_projection_status: live_partial_take_profit_future_natural_messages_only
@@ -27,6 +27,7 @@ last_completed_phase: "8R.5"
 last_completed_commit: 2d0cc6e
 production_commit: 2d0cc6ed7475d7ba41c384d93c99ba3a32b716a9
 local_tests:
+  - "phase-8r.6a-outcome-supervisor: 404 focused and adjacent regressions pass. Deterministic outcome evaluation reads exact durable instruction, candidate, target, execution-binding, exchange-event, reconciled management-batch/leg, mutation-intent, and protection-revision evidence; confirmed local target state alone fails closed, verified contracts rotate through exact-source retrospective reconciliation checks, violation-level incidents coalesce through one ledger row with an additive affected-message relation in the same transaction, and the production CLI remains explicitly shadow-only with zero incident, notification, Agent claim, or model-call authority. Independent review found no remaining Critical or Important issue."
   - "terminal-prebinding-monitor-repair: the production-shaped regression failed with live_entry_preamble_binding_evidence_missing before implementation; 360 monitor, CLI, Runtime Agent architecture, and message-operation projection tests pass after the exact read-only classifier and fail-closed matrix. Independent review findings for missing schema guards, strategy/source identity, result evidence, and candidate corroboration were fixed under TDD; final review found no Critical or Important findings"
   - "phase-8r.5-projection: 27 focused projection tests and 292 combined contract, CLI, architecture, recognition, context, migration, and instruction regressions passed; the successful path performs zero model calls, persistence is atomic, the cursor is contiguous across nonterminal gaps, terminal failed decisions are included, and final review found no Critical or Important findings"
   - "phase-8r.4-focused-and-adjacent: the initial missing-module test failed before implementation; 77 schema, bootstrap, migration, runtime-ledger, and architecture tests passed after enforcing authoritative parents and closed item categories, and 329 broader recognition, context, instruction-item, and management regressions passed"
@@ -263,12 +264,15 @@ phase_8r_roadmap_control:
 message_operation_extension:
   design_commit: 98b7884
   implementation_plan_commit: 879f489
-  status: phase_8r_5_completed_next_phase_8r_6a_planned
+  status: phase_8r_6a_reviewed_locally_pending_dormant_deployment
   original_runtime_agent_complete: false
   next_phase_after_8r_4: 8R.5
   task_8r_5_commit: 2d0cc6e
   task_8r_5_status: completed_future_only_shadow_canary
   next_phase_after_8r_5: 8R.6A
+  task_8r_6a_status: in_progress_reviewed_local_implementation
+  allowed_symbol_contract_spec_status: unresolved_separate_trading_scope
+  allowed_symbol_contract_spec_requirement: "Every globally allowed virtual-asset symbol must have a current, independently validated Deepcoin instrument specification before auto-trading can admit it. The present reviewed static file contains BTC and ETH only; SOL and any other allowlisted symbol without a verified specification remain fail-closed. Future support must use authoritative instrument discovery or a reviewed generated cache plus an allowlist/spec consistency gate, without weakening sizing or submission safety."
 next_session_prompt: "请执行自定义ai agent的下一步实施"
 ```
 
@@ -589,7 +593,9 @@ Phase 5 is not complete until:
 - Status: in progress
 - Roadmap-control Task 0: completed locally with 10 focused tests passing;
   documentation and test changes only, so no production restart was required
-- Current task: `8R.6A message-operation-outcome-supervisor` (planned)
+- Current task: `8R.6A message-operation-outcome-supervisor` (in progress;
+  local implementation and independent re-review complete, dormant production
+  verification pending)
 - Approved scope: deterministic proactive discovery, bounded read-only
   diagnosis, Telegram notification, Codex handoff, and read-only verification
 - Prohibited scope: order, position, protection, strategy, recognition,
@@ -618,6 +624,7 @@ Phase 5 is not complete until:
   messages, made zero model calls, reported zero errors, and created zero
   contract/item rows. The disabled override returned status disabled, and no
   supervisor service or timer exists.
-- Next action: implement only Phase 8R.6A outcome evaluation and unified
-  incident creation as a new dormant stage. Do not start Stage 1 notification,
-  broad Agent eligibility, or business mutation in that turn.
+- Next action: deploy only the dormant Phase 8R.6A outcome evaluator in a
+  proven quiet window and run one bounded
+  shadow parity cycle. Do not start Stage 1 notification, broad Agent
+  eligibility, contract-spec expansion, or business mutation in that turn.

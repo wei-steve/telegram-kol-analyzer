@@ -47,6 +47,9 @@ from telegram_kol_research.config import (
 from telegram_kol_research.message_operation_contracts import (
     run_message_operation_shadow_once,
 )
+from telegram_kol_research.message_operation_supervisor import (
+    run_message_operation_outcome_shadow_once,
+)
 from telegram_kol_research.runtime_incident_scanner import build_scanner_facts, run_scanner_cycle
 from telegram_kol_research.deepcoin_contract_specs import load_deepcoin_contract_specs
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
@@ -3386,15 +3389,24 @@ def message_operation_supervisor(
     if not database_path.is_file():
         raise typer.BadParameter("supervisor database must already exist")
     session_factory = create_existing_session_factory(database_path)
+    observed_at = datetime.now(UTC)
     result = run_message_operation_shadow_once(
         session_factory,
         after_raw_message_id=config.after_raw_message_id,
         limit=config.batch_limit,
-        now=datetime.now(UTC),
+        now=observed_at,
     )
+    outcomes = run_message_operation_outcome_shadow_once(
+        session_factory,
+        limit=config.batch_limit,
+        observed_at=observed_at,
+    )
+    outcome_payload = {
+        f"outcome_{key}": value for key, value in outcomes.items()
+    }
     typer.echo(
         json.dumps(
-            {"status": "shadow", **result},
+            {"status": "shadow", **result, **outcome_payload},
             sort_keys=True,
             separators=(",", ":"),
         )

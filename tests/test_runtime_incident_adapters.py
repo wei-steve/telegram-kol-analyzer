@@ -11,7 +11,12 @@ from telegram_kol_research.config import (
     load_runtime_incident_config,
 )
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import RuntimeIncident
+from telegram_kol_research.models import (
+    MessageOperationContract,
+    RawMessage,
+    RuntimeIncident,
+    RuntimeIncidentAffectedMessage,
+)
 from telegram_kol_research.runtime_incident_adapters import (
     MANAGEMENT_ENVELOPE_INCIDENT_TYPES,
     MANAGEMENT_TARGET_INCIDENT_TYPES,
@@ -20,14 +25,240 @@ from telegram_kol_research.runtime_incident_adapters import (
     capture_runtime_incident_best_effort,
     capture_context_worker_state,
     capture_management_state,
+    capture_message_operation_failure,
     capture_monitor_state,
     capture_notification_failure,
     capture_protection_state,
     capture_provider_failure,
 )
+from telegram_kol_research.runtime_incidents import (
+    RuntimeIncidentBoundsError,
+    record_runtime_incident,
+)
 
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
+
+
+def _message_operation_contract(
+    session_factory, *, message_id: int = 9001
+) -> tuple[int, int]:
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=77,
+            message_id=message_id,
+            posted_at=NOW,
+            text="redacted operation fixture",
+        )
+        session.add(raw)
+        session.flush()
+        contract = MessageOperationContract(
+            raw_message_id=raw.id,
+            intent_kind="manage",
+            expected_terminal_kind="verified_management",
+            status="violated",
+            deadline_at=NOW,
+            violation_code="missing_management_descendant",
+            evidence_refs_json=f'["raw_message:{raw.id}"]',
+            agent_requested=False,
+            policy_version="message-operation-contract-v1",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(contract)
+        session.commit()
+        return contract.id, raw.id
+
+
+def test_message_operation_failure_reuses_incident_ledger_and_links_contract(tmp_path):
+    session_factory = create_session_factory(tmp_path / "message-operation.db")
+    contract_id, raw_message_id = _message_operation_contract(session_factory)
+    config = RuntimeIncidentConfig(
+        capture_types=frozenset({"message_operation_failure"})
+    )
+
+    first = capture_message_operation_failure(
+        session_factory,
+        config=config,
+        contract_id=contract_id,
+        raw_message_id=raw_message_id,
+        violation_code="missing_management_descendant",
+        evidence_refs=(
+            f"message_operation_contract:{contract_id}",
+            f"raw_message:{raw_message_id}",
+        ),
+        occurred_at=NOW,
+        shadow_only=False,
+    )
+    second = capture_message_operation_failure(
+        session_factory,
+        config=config,
+        contract_id=contract_id,
+        raw_message_id=raw_message_id,
+        violation_code="missing_management_descendant",
+        evidence_refs=(
+            f"message_operation_contract:{contract_id}",
+            f"raw_message:{raw_message_id}",
+        ),
+        occurred_at=NOW,
+        shadow_only=False,
+    )
+
+    assert first is not None
+    assert second.id == first.id
+    assert second.repeat_count == 2
+    assert second.incident_type == "message_operation_failure"
+    assert second.source_kind == "message_operation_violation"
+    assert f"raw_message:{raw_message_id}" in second.evidence_refs_json
+    with session_factory() as session:
+        contract = session.get(MessageOperationContract, contract_id)
+        assert contract.runtime_incident_id == first.id
+        assert contract.agent_requested is False
+        affected = session.query(RuntimeIncidentAffectedMessage).one()
+        assert affected.raw_message_id == raw_message_id
+        assert affected.message_operation_contract_id == contract_id
+
+
+def test_message_operation_shadow_never_creates_incident_or_claim(tmp_path):
+    session_factory = create_session_factory(tmp_path / "message-operation-shadow.db")
+    contract_id, raw_message_id = _message_operation_contract(session_factory)
+
+    captured = capture_message_operation_failure(
+        session_factory,
+        config=RuntimeIncidentConfig(
+            capture_types=frozenset({"message_operation_failure"})
+        ),
+        contract_id=contract_id,
+        raw_message_id=raw_message_id,
+        violation_code="context_unresolved",
+        evidence_refs=(f"raw_message:{raw_message_id}",),
+        occurred_at=NOW,
+        shadow_only=True,
+    )
+
+    assert captured is None
+    assert _rows(session_factory) == []
+    with session_factory() as session:
+        contract = session.get(MessageOperationContract, contract_id)
+        assert contract.runtime_incident_id is None
+        assert contract.agent_requested is False
+
+
+def test_message_operation_failure_requires_matching_terminal_contract(tmp_path):
+    session_factory = create_session_factory(tmp_path / "message-operation-state.db")
+    contract_id, raw_message_id = _message_operation_contract(session_factory)
+    with session_factory() as session:
+        contract = session.get(MessageOperationContract, contract_id)
+        contract.status = "observing"
+        contract.violation_code = None
+        session.commit()
+
+    with pytest.raises(ValueError, match="terminal violation mismatch"):
+        capture_message_operation_failure(
+            session_factory,
+            config=RuntimeIncidentConfig(
+                capture_types=frozenset({"message_operation_failure"})
+            ),
+            contract_id=contract_id,
+            raw_message_id=raw_message_id,
+            violation_code="missing_management_descendant",
+            evidence_refs=(),
+            occurred_at=NOW,
+            shadow_only=False,
+        )
+
+
+def test_message_operation_failure_adds_authoritative_identity_refs(tmp_path):
+    session_factory = create_session_factory(tmp_path / "message-operation-refs.db")
+    contract_id, raw_message_id = _message_operation_contract(session_factory)
+
+    incident = capture_message_operation_failure(
+        session_factory,
+        config=RuntimeIncidentConfig(
+            capture_types=frozenset({"message_operation_failure"})
+        ),
+        contract_id=contract_id,
+        raw_message_id=raw_message_id,
+        violation_code="missing_management_descendant",
+        evidence_refs=(),
+        occurred_at=NOW,
+        shadow_only=False,
+    )
+
+    assert incident is not None
+    assert f'"message_operation_contract:{contract_id}"' in incident.evidence_refs_json
+    assert f'"raw_message:{raw_message_id}"' in incident.evidence_refs_json
+
+
+def test_message_operation_failure_coalesces_violation_and_appends_messages(tmp_path):
+    session_factory = create_session_factory(tmp_path / "message-operation-group.db")
+    first_contract_id, first_raw_id = _message_operation_contract(
+        session_factory, message_id=9001
+    )
+    second_contract_id, second_raw_id = _message_operation_contract(
+        session_factory, message_id=9002
+    )
+    config = RuntimeIncidentConfig(
+        capture_types=frozenset({"message_operation_failure"})
+    )
+
+    first = capture_message_operation_failure(
+        session_factory,
+        config=config,
+        contract_id=first_contract_id,
+        raw_message_id=first_raw_id,
+        violation_code="missing_management_descendant",
+        evidence_refs=(),
+        occurred_at=NOW,
+        shadow_only=False,
+    )
+    second = capture_message_operation_failure(
+        session_factory,
+        config=config,
+        contract_id=second_contract_id,
+        raw_message_id=second_raw_id,
+        violation_code="missing_management_descendant",
+        evidence_refs=(),
+        occurred_at=NOW,
+        shadow_only=False,
+    )
+
+    assert second.id == first.id
+    with session_factory() as session:
+        affected = session.query(RuntimeIncidentAffectedMessage).order_by(
+            RuntimeIncidentAffectedMessage.raw_message_id
+        ).all()
+        assert [row.raw_message_id for row in affected] == [first_raw_id, second_raw_id]
+        assert session.query(RuntimeIncident).count() == 1
+
+
+def test_message_operation_incident_link_failure_rolls_back_every_row(tmp_path):
+    session_factory = create_session_factory(tmp_path / "message-operation-atomic.db")
+    contract_id, raw_message_id = _message_operation_contract(session_factory)
+
+    with pytest.raises(RuntimeIncidentBoundsError, match="identity conflict"):
+        record_runtime_incident(
+            session_factory,
+            source_kind="message_operation_violation",
+            source_record_id="missing_management_descendant",
+            incident_type="message_operation_failure",
+            severity="high",
+            fingerprint="f" * 64,
+            redacted_summary='{"component":"message_operation_supervisor"}',
+            occurred_at=NOW,
+            feature_policy_version="test-policy",
+            prompt_version="test-prompt",
+            tool_policy_version="test-tools",
+            evidence_refs_json="[]",
+            affected_raw_message_id=raw_message_id + 999,
+            message_operation_contract_id=contract_id,
+        )
+
+    with session_factory() as session:
+        contract = session.get(MessageOperationContract, contract_id)
+        assert contract.runtime_incident_id is None
+        assert session.query(RuntimeIncident).count() == 0
+        assert session.query(RuntimeIncidentAffectedMessage).count() == 0
 
 
 def test_read_only_capture_profile_is_closed_and_excludes_business_ambiguity():

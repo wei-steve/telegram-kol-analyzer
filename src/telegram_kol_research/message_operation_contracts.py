@@ -24,6 +24,9 @@ from telegram_kol_research.models import (
     SignalCandidate,
     utc_now,
 )
+from telegram_kol_research.message_operation_types import (
+    MESSAGE_OPERATION_VIOLATIONS,
+)
 
 
 POLICY_VERSION = "message-operation-contract-v1"
@@ -937,6 +940,10 @@ def transition_message_operation_contract(
         )
     if violation_code is not None:
         violation_code = _bounded_text("violation_code", violation_code, maximum=64)
+        if violation_code not in MESSAGE_OPERATION_VIOLATIONS:
+            raise MessageOperationContractBoundsError(
+                "unsupported violation_code"
+            )
     if new_status == "violated" and violation_code is None:
         raise MessageOperationContractBoundsError(
             "violated status requires violation_code"
