@@ -387,6 +387,73 @@ def test_entry_preamble_monitor_reader_detects_faults_without_writes(tmp_path):
     assert database.read_bytes() == before
 
 
+def _seed_terminal_prebinding_refusal(database):
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE entry_preambles (
+          id INTEGER PRIMARY KEY, raw_message_id INTEGER, chat_id INTEGER,
+          message_id INTEGER, symbol TEXT, side TEXT, status TEXT, created_at TEXT
+        );
+        CREATE TABLE raw_messages (
+          id INTEGER PRIMARY KEY, chat_id INTEGER, message_id INTEGER, posted_at TEXT
+        );
+        CREATE TABLE signal_candidates (
+          id INTEGER PRIMARY KEY, raw_message_id INTEGER,
+          event_type TEXT, management_action TEXT
+        );
+        CREATE TABLE message_instruction_items (
+          id INTEGER PRIMARY KEY, raw_message_id INTEGER,
+          signal_candidate_id INTEGER, instruction_kind TEXT,
+          status TEXT, error_json TEXT, retired_at TEXT
+        );
+        CREATE TABLE entry_strategy_assemblies (
+          id INTEGER PRIMARY KEY, entry_preamble_id INTEGER,
+          strategy_raw_message_id INTEGER, signal_candidate_id INTEGER,
+          strategy_instance_id TEXT, evidence_json TEXT, fingerprint TEXT
+        );
+        CREATE TABLE execution_bindings (
+          id INTEGER PRIMARY KEY, strategy_instance_id TEXT, payload_json TEXT
+        );
+        CREATE TABLE trade_signals (
+          id INTEGER PRIMARY KEY, strategy_instance_id TEXT,
+          chat_id INTEGER, message_id INTEGER
+        );
+        CREATE TABLE execution_events (
+          id INTEGER PRIMARY KEY, strategy_instance_id TEXT,
+          chat_id INTEGER, message_id INTEGER, source_message_id INTEGER
+        );
+        INSERT INTO raw_messages VALUES
+          (9955, -1001, 3478, '2026-08-08 00:00:00');
+        INSERT INTO signal_candidates VALUES
+          (1643, 9955, 'entry_signal', NULL);
+        INSERT INTO entry_strategy_assemblies VALUES
+          (3, NULL, 9955, 1643, 'deepcoin:-1001:3478:SOL:short', '{}',
+           'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+        INSERT INTO message_instruction_items VALUES
+          (438, 9955, 1643, 'entry', 'failed',
+           '{"type":"RecoveryLiveSubmitError","message":"signal_enqueue_blocked:missing_ready_confirmation,contract_size_unverified"}',
+           NULL);
+        """
+    )
+    connection.commit()
+    connection.close()
+
+
+def test_entry_preamble_monitor_accepts_exact_terminal_prebinding_refusal(tmp_path):
+    database = tmp_path / "terminal-prebinding-refusal.db"
+    _seed_terminal_prebinding_refusal(database)
+    before = database.read_bytes()
+
+    codes = read_entry_preamble_invariants(
+        database,
+        now=datetime(2026, 8, 8, tzinfo=UTC),
+    )
+
+    assert codes == ()
+    assert database.read_bytes() == before
+
+
 def _seed_reconciled_entry_preamble_monitor(database, *, second_mismatch=False):
     final_evidence = {
         "assembly_id": 2,
