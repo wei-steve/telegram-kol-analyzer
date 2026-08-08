@@ -113,6 +113,7 @@ def _canonical_arguments(request: InvestigationRequest) -> bytes:
                 request.incident_id
                 if isinstance(request.incident_id, int)
                 and not isinstance(request.incident_id, bool)
+                and 0 <= request.incident_id <= 2**63 - 1
                 else "<invalid>"
             ),
             "maximum_bytes": (
@@ -193,6 +194,7 @@ class InvestigationBroker:
             isinstance(request.incident_id, bool)
             or not isinstance(request.incident_id, int)
             or request.incident_id < 1
+            or request.incident_id > 2**63 - 1
         ):
             raise InvestigationDenied("incident_not_found")
         if not self._incident_exists(request.incident_id):
@@ -241,6 +243,7 @@ class InvestigationBroker:
             request.incident_id
             if isinstance(request.incident_id, int)
             and not isinstance(request.incident_id, bool)
+            and 0 <= request.incident_id <= 2**63 - 1
             else 0
         )
         audited_kind = _audited_evidence_kind(request.evidence_kind)

@@ -345,6 +345,16 @@ def test_malformed_runtime_arguments_still_leave_started_and_denied_audits():
         )
     assert [row.result_status for row in audit_rows] == ["started", "denied"]
 
+    audit_rows.clear()
+    with pytest.raises(InvestigationDenied, match="incident_not_found"):
+        broker.execute(
+            InvestigationRequest(
+                incident_id=10 ** 100_000,
+                evidence_kind="message_evidence",
+            )
+        )
+    assert [row.result_status for row in audit_rows] == ["started", "denied"]
+
 
 @pytest.mark.parametrize(
     "opaque_secret",
