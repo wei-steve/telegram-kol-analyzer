@@ -536,6 +536,46 @@ and stops before a missing or nonterminal recognition decision, so an
 out-of-order completion cannot be skipped. Both `completed` and exhausted
 `failed` comparison states are terminal for this inspection cursor.
 
+Task 8R.6B adds a separate durable Stage 1 outbox for every affected source
+message of a `message_operation_failure`. The main-service system-operator
+dispatcher materializes rows idempotently from the existing bounded
+`runtime_incident_affected_messages` relation. The unique identity is
+`(runtime_incident_id, raw_message_id, notification_kind)`, so fingerprint
+coalescing may reuse one RuntimeIncident/Agent investigation without
+suppressing any source-message alert. Stage 1 never claims the Runtime Agent,
+does not invoke a model, and does not depend on the legacy incident-type
+Telegram selector.
+
+The Phase 8R.6B settings are:
+
+- `TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_ENABLED` defaults to false;
+- `TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_AFTER_INCIDENT_ID` is a required
+  exclusive future-only RuntimeIncident watermark; absent, malformed,
+  negative, or overflowing values fail closed at the maximum SQLite integer;
+- `TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_MAX_ATTEMPTS` is bounded to 1–20 and
+  defaults to 5;
+- the existing notification lease setting controls durable stale-claim
+  recovery and retry spacing.
+
+Each outbox row stores only bounded status, claim token/time, attempt count,
+next attempt, Telegram message ID, delivered time, and error type. Formatting
+loads the exact incident, raw message, and violated contract, then includes a
+bounded redacted original message, authoritative intent, violation checkpoint,
+known impact, and the fixed notice that read-only AI investigation is in
+progress. Missing or conflicting durable identity fails the delivery closed
+and remains retryable; exception text is never persisted.
+
+Deploy 8R.6B with the flag absent/false. After the normal post-deployment
+continuity checks, stop only in a newly proven safe window, record the current
+maximum RuntimeIncident ID, set that exact value as the watermark, and then
+enable Stage 1. Prove no incident at or below the watermark materializes or is
+claimed. Immediate rollback is to clear only the Stage 1 enabled flag and
+restart the main service in a safe window. Existing outbox rows and affected
+message relations remain as audit evidence; do not delete, rewrite, or
+bulk-complete them. Agent eligibility, legacy notification selectors, the
+message-operation supervisor mode, and every business-mutation authority stay
+unchanged.
+
 The operator approved a controlled Phase 8R.3 completion canary on 2026-08-08
 so that a rare natural multi-target failure cannot block later read-only Agent
 work indefinitely. This alternative changes only the verification method; it

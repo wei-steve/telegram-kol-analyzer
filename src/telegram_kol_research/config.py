@@ -78,6 +78,9 @@ class RuntimeIncidentConfig:
     telegram_notification_types: frozenset[str] | None = None
     telegram_notification_after_incident_id: int | None = None
     notification_lease_seconds: float = 120.0
+    message_operation_stage1_enabled: bool = False
+    message_operation_stage1_after_incident_id: int = _SQLITE_MAX_INTEGER
+    message_operation_stage1_max_attempts: int = 5
     agent_enabled: bool = False
     agent_incident_types: frozenset[str] | None = None
     agent_max_tool_steps: int = 4
@@ -268,6 +271,17 @@ def _notification_after_incident_id(env: dict[str, str]) -> int | None:
     return value
 
 
+def _message_operation_stage1_after_incident_id(env: dict[str, str]) -> int:
+    key = "TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_AFTER_INCIDENT_ID"
+    try:
+        value = int(env[key])
+    except (KeyError, TypeError, ValueError):
+        return _SQLITE_MAX_INTEGER
+    if not 0 <= value <= _SQLITE_MAX_INTEGER:
+        return _SQLITE_MAX_INTEGER
+    return value
+
+
 def load_runtime_incident_config(
     environ: dict[str, str] | None = None,
     env_file_paths: list[str | os.PathLike[str]] | None = None,
@@ -347,6 +361,14 @@ def load_runtime_incident_config(
     except (TypeError, ValueError):
         lease_seconds = 120.0
     try:
+        message_operation_stage1_max_attempts = int(
+            env.get(
+                "TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_MAX_ATTEMPTS", "5"
+            )
+        )
+    except (TypeError, ValueError):
+        message_operation_stage1_max_attempts = 5
+    try:
         agent_tool_steps = int(
             env.get("TELEGRAM_KOL_RUNTIME_AGENT_MAX_TOOL_STEPS", "4")
         )
@@ -403,6 +425,15 @@ def load_runtime_incident_config(
             _notification_after_incident_id(env)
         ),
         notification_lease_seconds=max(5.0, min(lease_seconds, 3600.0)),
+        message_operation_stage1_enabled=_enabled_flag(
+            env.get("TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_ENABLED")
+        ),
+        message_operation_stage1_after_incident_id=(
+            _message_operation_stage1_after_incident_id(env)
+        ),
+        message_operation_stage1_max_attempts=max(
+            1, min(message_operation_stage1_max_attempts, 20)
+        ),
         agent_enabled=_enabled_flag(
             env.get("TELEGRAM_KOL_RUNTIME_AGENT_ENABLED")
         ),

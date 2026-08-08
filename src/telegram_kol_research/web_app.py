@@ -3587,6 +3587,8 @@ def create_web_app(
                 if (
                     app.state.runtime_incident_config
                     .telegram_notifications_enabled
+                    or app.state.runtime_incident_config
+                    .message_operation_stage1_enabled
                 ):
                     app.state.runtime_incident_notification_task = (
                         asyncio.create_task(

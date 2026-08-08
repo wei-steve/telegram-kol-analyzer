@@ -8,7 +8,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import exists, or_, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.message_operation_types import (
@@ -22,6 +23,7 @@ from telegram_kol_research.models import (
     MessageInstructionItem,
     MessageOperationContract,
     MessageOperationItem,
+    MessageOperationStage1Notification,
     PositionMutationIntent,
     PositionProtectionRevision,
     RawMessage,
@@ -29,6 +31,8 @@ from telegram_kol_research.models import (
     SignalCandidate,
     StrategyManagementBatch,
     StrategyManagementLeg,
+    RuntimeIncident,
+    RuntimeIncidentAffectedMessage,
 )
 
 
@@ -83,6 +87,76 @@ _IMMEDIATE_VIOLATIONS = {
 
 class MessageOperationEvaluationError(ValueError):
     """Raised when unbounded or unknown outcome evidence is presented."""
+
+
+def materialize_message_operation_stage1_outbox(
+    session_factory: sessionmaker,
+    *,
+    after_incident_id: int,
+    created_at: datetime,
+    limit: int = 100,
+) -> int:
+    """Idempotently materialize one Stage 1 row per affected source message."""
+
+    if type(after_incident_id) is not int or after_incident_id < 0:
+        raise MessageOperationEvaluationError("invalid Stage 1 incident watermark")
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise MessageOperationEvaluationError("Stage 1 limit must be between 1 and 100")
+    now = _aware_utc(created_at)
+    with session_factory() as session:
+        affected = session.execute(
+            select(RuntimeIncidentAffectedMessage)
+            .join(
+                RuntimeIncident,
+                RuntimeIncident.id
+                == RuntimeIncidentAffectedMessage.runtime_incident_id,
+            )
+            .where(
+                RuntimeIncident.id > after_incident_id,
+                RuntimeIncident.incident_type == "message_operation_failure",
+                ~exists(
+                    select(MessageOperationStage1Notification.id).where(
+                        MessageOperationStage1Notification.runtime_incident_id
+                        == RuntimeIncidentAffectedMessage.runtime_incident_id,
+                        MessageOperationStage1Notification.raw_message_id
+                        == RuntimeIncidentAffectedMessage.raw_message_id,
+                        MessageOperationStage1Notification.notification_kind
+                        == "message_operation_stage1",
+                    )
+                ),
+            )
+            .order_by(
+                RuntimeIncidentAffectedMessage.runtime_incident_id,
+                RuntimeIncidentAffectedMessage.raw_message_id,
+            )
+            .limit(limit)
+        ).scalars().all()
+        created = 0
+        for relation in affected:
+            statement = sqlite_insert(MessageOperationStage1Notification).values(
+                runtime_incident_id=relation.runtime_incident_id,
+                raw_message_id=relation.raw_message_id,
+                message_operation_contract_id=(
+                    relation.message_operation_contract_id
+                ),
+                notification_kind="message_operation_stage1",
+                status="pending",
+                attempt_count=0,
+                created_at=now,
+                updated_at=now,
+            )
+            result = session.execute(
+                statement.on_conflict_do_nothing(
+                    index_elements=[
+                        "runtime_incident_id",
+                        "raw_message_id",
+                        "notification_kind",
+                    ]
+                )
+            )
+            created += max(0, int(result.rowcount or 0))
+        session.commit()
+        return created
 
 
 def _bounded_text(name: str, value: object, maximum: int) -> str:

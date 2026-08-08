@@ -322,6 +322,95 @@ def test_collector_classifies_exact_safety_refusal_without_incident(tmp_path):
         assert session.query(RuntimeIncident).count() == 0
 
 
+def test_stage1_outbox_materializes_once_per_affected_message_above_watermark(
+    tmp_path,
+):
+    from telegram_kol_research.config import RuntimeIncidentConfig
+    from telegram_kol_research.message_operation_supervisor import (
+        materialize_message_operation_stage1_outbox,
+    )
+    from telegram_kol_research.models import (
+        MessageOperationStage1Notification,
+        RuntimeIncidentAffectedMessage,
+    )
+    from telegram_kol_research.runtime_incident_adapters import (
+        capture_message_operation_failure,
+    )
+
+    session_factory = create_session_factory(tmp_path / "stage1-outbox.db")
+    contract_ids = [
+        _seed_contract(
+            session_factory,
+            deadline_at=NOW - timedelta(seconds=1),
+            message_id=message_id,
+        )
+        for message_id in (9201, 9202, 9203)
+    ]
+    config = RuntimeIncidentConfig(
+        capture_types=frozenset({"message_operation_failure"})
+    )
+    incidents = []
+    raw_ids = []
+    for contract_id in contract_ids:
+        with session_factory() as session:
+            contract = session.get(MessageOperationContract, contract_id)
+            contract.status = "violated"
+            contract.violation_code = "no_operation_created"
+            raw_ids.append(contract.raw_message_id)
+            session.commit()
+        incidents.append(
+            capture_message_operation_failure(
+                session_factory,
+                config=config,
+                contract_id=contract_id,
+                raw_message_id=raw_ids[-1],
+                violation_code="no_operation_created",
+                evidence_refs=(),
+                occurred_at=NOW,
+                shadow_only=False,
+            )
+        )
+
+    assert incidents[0].id == incidents[1].id
+    created = materialize_message_operation_stage1_outbox(
+        session_factory,
+        after_incident_id=incidents[0].id - 1,
+        created_at=NOW,
+        limit=2,
+    )
+    repeated = materialize_message_operation_stage1_outbox(
+        session_factory,
+        after_incident_id=incidents[0].id - 1,
+        created_at=NOW,
+        limit=2,
+    )
+    exhausted = materialize_message_operation_stage1_outbox(
+        session_factory,
+        after_incident_id=incidents[0].id - 1,
+        created_at=NOW,
+        limit=2,
+    )
+
+    assert (created, repeated, exhausted) == (2, 1, 0)
+    with session_factory() as session:
+        rows = session.query(MessageOperationStage1Notification).order_by(
+            MessageOperationStage1Notification.raw_message_id
+        ).all()
+        assert [row.raw_message_id for row in rows] == sorted(raw_ids)
+        assert all(row.runtime_incident_id == incidents[0].id for row in rows)
+        assert all(row.status == "pending" for row in rows)
+        assert session.query(RuntimeIncidentAffectedMessage).count() == 3
+        assert session.query(RuntimeIncident).count() == 1
+        assert session.get(RuntimeIncident, incidents[0].id).agent_attempt_count == 0
+
+    assert materialize_message_operation_stage1_outbox(
+        session_factory,
+        after_incident_id=incidents[0].id,
+        created_at=NOW,
+        limit=20,
+    ) == 0
+
+
 def test_collector_verifies_confirmed_management_target(tmp_path):
     session_factory = create_session_factory(tmp_path / "confirmed-target.db")
     contract_id = _seed_contract(

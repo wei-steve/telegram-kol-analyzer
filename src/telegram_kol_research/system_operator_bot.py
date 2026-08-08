@@ -42,6 +42,7 @@ RUNTIME_INCIDENT_MESSAGE_MAX_CHARS = 1200
 AI_AGENT_NOTIFICATION_PREFIX = "AI agent通知：（"
 TERMINAL_ENTRY_CLEANUP_NOTIFICATION_MAX_ATTEMPTS = 5
 TERMINAL_ENTRY_CLEANUP_NOTIFICATION_LEASE_SECONDS = 120
+MESSAGE_OPERATION_STAGE1_MAX_ATTEMPTS = 5
 
 
 @dataclass(slots=True)
@@ -242,6 +243,274 @@ def format_runtime_incident_notification(incident) -> str:
             - 1
         ),
     )
+
+
+def format_message_operation_stage1_notification(
+    *,
+    notification,
+    incident,
+    raw_message,
+    contract,
+) -> str:
+    """Render one immediate bounded alert without an AI hypothesis."""
+
+    try:
+        summary = json.loads(incident.redacted_summary or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        summary = {}
+    if not isinstance(summary, dict):
+        summary = {}
+    source_time = raw_message.posted_at or raw_message.created_at
+    source_text = _safe_runtime_incident_value(
+        raw_message.text or "-", limit=320
+    )
+    impact = _safe_runtime_incident_value(
+        summary.get("impact") or "请求的操作尚未获得可验证结果",
+        limit=180,
+    )
+    lines = [
+        "消息操作异常（第1阶段）",
+        f"事件ID: {int(incident.id)}",
+        f"源消息ID: {int(notification.raw_message_id)}",
+        f"源时间: {source_time.isoformat() if source_time else '-'}",
+        f"原消息: {source_text}",
+        (
+            "可执行意图: "
+            f"{_safe_runtime_incident_value(contract.intent_kind, limit=32)}"
+        ),
+        (
+            "失败检查点: "
+            f"{_safe_runtime_incident_value(contract.violation_code, limit=64)}"
+        ),
+        f"已知影响: {impact}",
+        "状态: 只读AI调查进行中",
+        "自动操作: 未执行",
+    ]
+    return wrap_ai_agent_notification(
+        "\n".join(lines),
+        limit=(
+            RUNTIME_INCIDENT_MESSAGE_MAX_CHARS
+            - len(AI_AGENT_NOTIFICATION_PREFIX)
+            - 1
+        ),
+    )
+
+
+def _message_operation_stage1_claimable(
+    *, now: datetime, lease_seconds: float, max_attempts: int
+):
+    from telegram_kol_research.models import MessageOperationStage1Notification
+
+    stale_before = now - timedelta(seconds=max(5.0, float(lease_seconds)))
+    return and_(
+        MessageOperationStage1Notification.attempt_count < int(max_attempts),
+        or_(
+            MessageOperationStage1Notification.status == "pending",
+            and_(
+                MessageOperationStage1Notification.status == "failed",
+                or_(
+                    MessageOperationStage1Notification.next_attempt_at.is_(None),
+                    MessageOperationStage1Notification.next_attempt_at <= now,
+                ),
+            ),
+            and_(
+                MessageOperationStage1Notification.status == "delivering",
+                or_(
+                    MessageOperationStage1Notification.claimed_at.is_(None),
+                    MessageOperationStage1Notification.claimed_at <= stale_before,
+                ),
+            ),
+        ),
+    )
+
+
+def claim_next_message_operation_stage1_notification(
+    session_factory,
+    *,
+    claimed_at: datetime | None = None,
+    lease_seconds: float = 120.0,
+    max_attempts: int = MESSAGE_OPERATION_STAGE1_MAX_ATTEMPTS,
+    after_incident_id: int = 0,
+):
+    """CAS one pending, retryable, or stale per-message Stage 1 delivery."""
+
+    from telegram_kol_research.models import MessageOperationStage1Notification
+
+    now = claimed_at or datetime.now(UTC)
+    claimable = and_(
+        _message_operation_stage1_claimable(
+            now=now, lease_seconds=lease_seconds, max_attempts=max_attempts
+        ),
+        MessageOperationStage1Notification.runtime_incident_id
+        > int(after_incident_id),
+    )
+    with session_factory() as session:
+        row_id = session.execute(
+            select(MessageOperationStage1Notification.id)
+            .where(claimable)
+            .order_by(
+                MessageOperationStage1Notification.next_attempt_at,
+                MessageOperationStage1Notification.id,
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+    if row_id is None:
+        return None
+    token = uuid.uuid4().hex
+    with session_factory() as session:
+        result = session.execute(
+            update(MessageOperationStage1Notification)
+            .where(
+                MessageOperationStage1Notification.id == row_id,
+                claimable,
+            )
+            .values(
+                status="delivering",
+                claim_token=token,
+                claimed_at=now,
+                attempt_count=(
+                    MessageOperationStage1Notification.attempt_count + 1
+                ),
+                next_attempt_at=None,
+                error_code=None,
+                updated_at=now,
+            )
+        )
+        session.commit()
+        if result.rowcount != 1:
+            return None
+        row = session.get(MessageOperationStage1Notification, row_id)
+        session.expunge(row)
+        return {"notification": row, "claim_token": token}
+
+
+async def deliver_message_operation_stage1_notifications(
+    session_factory,
+    *,
+    config: SystemOperatorBotConfig,
+    after_incident_id: int,
+    limit: int = 20,
+    claimed_at: datetime | None = None,
+    lease_seconds: float = 120.0,
+    max_attempts: int = MESSAGE_OPERATION_STAGE1_MAX_ATTEMPTS,
+) -> int:
+    """Materialize and deliver Stage 1 independently from Agent diagnosis."""
+
+    from telegram_kol_research.message_operation_supervisor import (
+        materialize_message_operation_stage1_outbox,
+    )
+    from telegram_kol_research.models import (
+        MessageOperationContract,
+        MessageOperationStage1Notification,
+        RawMessage,
+        RuntimeIncident,
+    )
+
+    operation_now = claimed_at or datetime.now(UTC)
+    materialize_message_operation_stage1_outbox(
+        session_factory,
+        after_incident_id=after_incident_id,
+        created_at=operation_now,
+        limit=max(1, min(int(limit), 100)),
+    )
+    delivered = 0
+    for _ in range(max(1, min(int(limit), 100))):
+        claim = claim_next_message_operation_stage1_notification(
+            session_factory,
+            claimed_at=operation_now,
+            lease_seconds=lease_seconds,
+            max_attempts=max_attempts,
+            after_incident_id=after_incident_id,
+        )
+        if claim is None:
+            break
+        notification = claim["notification"]
+        token = claim["claim_token"]
+        with session_factory() as session:
+            incident = session.get(RuntimeIncident, notification.runtime_incident_id)
+            raw = session.get(RawMessage, notification.raw_message_id)
+            contract = session.get(
+                MessageOperationContract,
+                notification.message_operation_contract_id,
+            )
+            valid = bool(
+                incident is not None
+                and incident.incident_type == "message_operation_failure"
+                and raw is not None
+                and contract is not None
+                and contract.raw_message_id == raw.id
+                and contract.runtime_incident_id == incident.id
+                and contract.status == "violated"
+            )
+            if valid:
+                session.expunge(incident)
+                session.expunge(raw)
+                session.expunge(contract)
+        try:
+            if not valid:
+                raise ValueError("stage1_evidence_incomplete")
+            message_id = await send_system_operator_bot_message(
+                config=config,
+                text=format_message_operation_stage1_notification(
+                    notification=notification,
+                    incident=incident,
+                    raw_message=raw,
+                    contract=contract,
+                ),
+            )
+        except Exception as exc:
+            retry_at = operation_now + timedelta(
+                seconds=max(5.0, float(lease_seconds))
+            )
+            with session_factory() as session:
+                row = session.get(
+                    MessageOperationStage1Notification, notification.id
+                )
+                exhausted = bool(
+                    row is not None and row.attempt_count >= int(max_attempts)
+                )
+                session.execute(
+                    update(MessageOperationStage1Notification)
+                    .where(
+                        MessageOperationStage1Notification.id == notification.id,
+                        MessageOperationStage1Notification.status == "delivering",
+                        MessageOperationStage1Notification.claim_token == token,
+                    )
+                    .values(
+                        status="exhausted" if exhausted else "failed",
+                        claim_token=None,
+                        claimed_at=None,
+                        next_attempt_at=None if exhausted else retry_at,
+                        error_code=type(exc).__name__[:128],
+                        updated_at=operation_now,
+                    )
+                )
+                session.commit()
+            break
+        with session_factory() as session:
+            result = session.execute(
+                update(MessageOperationStage1Notification)
+                .where(
+                    MessageOperationStage1Notification.id == notification.id,
+                    MessageOperationStage1Notification.status == "delivering",
+                    MessageOperationStage1Notification.claim_token == token,
+                )
+                .values(
+                    status="delivered",
+                    claim_token=None,
+                    claimed_at=None,
+                    next_attempt_at=None,
+                    telegram_message_id=(
+                        str(message_id)[:255] if message_id is not None else None
+                    ),
+                    delivered_at=operation_now,
+                    error_code=None,
+                    updated_at=operation_now,
+                )
+            )
+            session.commit()
+            delivered += int(result.rowcount == 1)
+    return delivered
 
 
 def format_runtime_incident_diagnosis_notification(incident) -> str:
@@ -1727,13 +1996,33 @@ async def deliver_runtime_incident_notifications(
     )
 
     feature_config = runtime_config or load_runtime_incident_config()
+    delivered = 0
+    if feature_config.message_operation_stage1_enabled:
+        try:
+            delivered += await deliver_message_operation_stage1_notifications(
+                session_factory,
+                config=config,
+                after_incident_id=(
+                    feature_config.message_operation_stage1_after_incident_id
+                ),
+                limit=limit,
+                claimed_at=claimed_at,
+                lease_seconds=feature_config.notification_lease_seconds,
+                max_attempts=(
+                    feature_config.message_operation_stage1_max_attempts
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Message-operation Stage 1 delivery failed open: error=%s",
+                type(exc).__name__,
+            )
     if not feature_config.telegram_notifications_enabled:
-        return 0
+        return delivered
     notification_types = feature_config.telegram_notification_types
     if notification_types == frozenset():
-        return 0
+        return delivered
     operation_now = claimed_at or datetime.now(UTC)
-    delivered = 0
     for _ in range(max(1, min(int(limit), 100))):
         claim = claim_next_runtime_incident_notification(
             session_factory,

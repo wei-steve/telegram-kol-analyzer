@@ -404,6 +404,330 @@ def test_runtime_incident_delivery_is_disabled_without_claiming(tmp_path):
         assert row.notification_claim_token is None
 
 
+def _seed_message_operation_stage1(session_factory, *, text="reduce by 50%"):
+    from telegram_kol_research.message_operation_supervisor import (
+        materialize_message_operation_stage1_outbox,
+    )
+    from telegram_kol_research.models import MessageOperationContract
+
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=77,
+            message_id=9301,
+            posted_at=NOW,
+            text=text,
+        )
+        session.add(raw)
+        session.flush()
+        contract = MessageOperationContract(
+            raw_message_id=raw.id,
+            intent_kind="take_profit",
+            expected_terminal_kind="verified_execution",
+            status="violated",
+            deadline_at=NOW,
+            violation_code="no_operation_created",
+            evidence_refs_json=f'["raw_message:{raw.id}"]',
+            agent_requested=False,
+            policy_version="message-operation-contract-v1",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(contract)
+        session.commit()
+        contract_id = contract.id
+        raw_id = raw.id
+    incident = record_runtime_incident(
+        session_factory,
+        source_kind="message_operation_violation",
+        source_record_id="no_operation_created",
+        incident_type="message_operation_failure",
+        severity="high",
+        fingerprint="f" * 64,
+        redacted_summary=json.dumps(
+            {
+                "component": "message_operation_supervisor",
+                "source_status": "violated",
+                "reason_code": "no_operation_created",
+                "impact": "requested operation not verified",
+            },
+            sort_keys=True,
+        ),
+        occurred_at=NOW,
+        feature_policy_version="message-operation-contract-v1",
+        prompt_version="none",
+        tool_policy_version="none",
+        affected_raw_message_id=raw_id,
+        message_operation_contract_id=contract_id,
+    )
+    assert materialize_message_operation_stage1_outbox(
+        session_factory,
+        after_incident_id=incident.id - 1,
+        created_at=NOW,
+        limit=20,
+    ) == 1
+    return incident, raw_id
+
+
+def test_message_operation_stage1_claim_recovers_stale_lease_and_counts_attempts(
+    tmp_path,
+):
+    from telegram_kol_research.models import MessageOperationStage1Notification
+
+    session_factory = create_session_factory(tmp_path / "stage1-claim.db")
+    _seed_message_operation_stage1(session_factory)
+
+    first = operator_bot_module.claim_next_message_operation_stage1_notification(
+        session_factory, claimed_at=NOW, lease_seconds=30
+    )
+    before = operator_bot_module.claim_next_message_operation_stage1_notification(
+        session_factory, claimed_at=NOW + timedelta(seconds=29), lease_seconds=30
+    )
+    after = operator_bot_module.claim_next_message_operation_stage1_notification(
+        session_factory, claimed_at=NOW + timedelta(seconds=31), lease_seconds=30
+    )
+
+    assert first is not None
+    assert before is None
+    assert after is not None
+    assert after["claim_token"] != first["claim_token"]
+    with session_factory() as session:
+        row = session.query(MessageOperationStage1Notification).one()
+        assert row.attempt_count == 2
+        assert row.status == "delivering"
+
+
+def test_message_operation_stage1_claim_has_one_concurrent_winner(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    session_factory = create_session_factory(tmp_path / "stage1-concurrent.db")
+    _seed_message_operation_stage1(session_factory)
+    barrier = __import__("threading").Barrier(2)
+
+    def claim():
+        barrier.wait()
+        return operator_bot_module.claim_next_message_operation_stage1_notification(
+            session_factory,
+            claimed_at=NOW,
+            lease_seconds=30,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        claims = list(pool.map(lambda _item: claim(), range(2)))
+
+    assert sum(item is not None for item in claims) == 1
+
+
+def test_message_operation_stage1_delivery_is_bounded_redacted_and_durable(
+    tmp_path,
+    monkeypatch,
+):
+    from telegram_kol_research.models import MessageOperationStage1Notification
+
+    session_factory = create_session_factory(tmp_path / "stage1-delivery.db")
+    incident, raw_id = _seed_message_operation_stage1(
+        session_factory,
+        text="Authorization: bearer never-show-this " + ("x" * 4000),
+    )
+    deliveries = []
+
+    async def capture(**kwargs):
+        deliveries.append(kwargs["text"])
+        return 7788
+
+    monkeypatch.setattr(
+        operator_bot_module, "send_system_operator_bot_message", capture
+    )
+    delivered = asyncio.run(
+        operator_bot_module.deliver_message_operation_stage1_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            after_incident_id=incident.id - 1,
+            claimed_at=NOW,
+        )
+    )
+
+    assert delivered == 1
+    assert len(deliveries) == 1
+    assert deliveries[0].startswith("AI agent通知：（")
+    assert f"事件ID: {incident.id}" in deliveries[0]
+    assert f"源消息ID: {raw_id}" in deliveries[0]
+    assert "take_profit" in deliveries[0]
+    assert "no_operation_created" in deliveries[0]
+    assert "只读AI调查进行中" in deliveries[0]
+    assert "never-show-this" not in deliveries[0]
+    assert len(deliveries[0]) <= operator_bot_module.RUNTIME_INCIDENT_MESSAGE_MAX_CHARS
+    with session_factory() as session:
+        row = session.query(MessageOperationStage1Notification).one()
+        assert row.status == "delivered"
+        assert row.telegram_message_id == "7788"
+        assert row.delivered_at.replace(tzinfo=UTC) == NOW
+        assert row.claim_token is None
+
+
+def test_message_operation_stage1_failure_persists_bounded_error_and_retry(
+    tmp_path,
+    monkeypatch,
+):
+    from telegram_kol_research.models import MessageOperationStage1Notification
+
+    session_factory = create_session_factory(tmp_path / "stage1-failure.db")
+    incident, _ = _seed_message_operation_stage1(session_factory)
+
+    async def fail(**_kwargs):
+        raise httpx.ConnectError("secret transport detail")
+
+    monkeypatch.setattr(operator_bot_module, "send_system_operator_bot_message", fail)
+    delivered = asyncio.run(
+        operator_bot_module.deliver_message_operation_stage1_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            after_incident_id=incident.id - 1,
+            claimed_at=NOW,
+            lease_seconds=30,
+        )
+    )
+
+    assert delivered == 0
+    with session_factory() as session:
+        row = session.query(MessageOperationStage1Notification).one()
+        assert row.status == "failed"
+        assert row.error_code == "ConnectError"
+        assert row.next_attempt_at.replace(tzinfo=UTC) > NOW
+        assert "secret" not in (row.error_code or "")
+        assert row.claim_token is None
+
+
+def test_message_operation_stage1_exhaustion_is_terminal_and_not_reclaimed(
+    tmp_path,
+    monkeypatch,
+):
+    from telegram_kol_research.models import MessageOperationStage1Notification
+
+    session_factory = create_session_factory(tmp_path / "stage1-exhausted.db")
+    incident, _ = _seed_message_operation_stage1(session_factory)
+
+    async def fail(**_kwargs):
+        raise httpx.ConnectError("temporary")
+
+    monkeypatch.setattr(operator_bot_module, "send_system_operator_bot_message", fail)
+    assert asyncio.run(
+        operator_bot_module.deliver_message_operation_stage1_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            after_incident_id=incident.id - 1,
+            claimed_at=NOW,
+            lease_seconds=30,
+            max_attempts=1,
+        )
+    ) == 0
+    assert operator_bot_module.claim_next_message_operation_stage1_notification(
+        session_factory,
+        claimed_at=NOW + timedelta(minutes=5),
+        lease_seconds=30,
+        max_attempts=1,
+    ) is None
+    with session_factory() as session:
+        row = session.query(MessageOperationStage1Notification).one()
+        assert row.status == "exhausted"
+        assert row.next_attempt_at is None
+
+
+def test_message_operation_stage1_config_is_dormant_and_watermark_fails_closed():
+    from telegram_kol_research.config import load_runtime_incident_config
+
+    dormant = load_runtime_incident_config(environ={}, env_file_paths=[])
+    enabled = load_runtime_incident_config(
+        environ={
+            "TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_ENABLED": "true",
+            "TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_AFTER_INCIDENT_ID": "41",
+        },
+        env_file_paths=[],
+    )
+    malformed = load_runtime_incident_config(
+        environ={
+            "TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_ENABLED": "true",
+            "TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_AFTER_INCIDENT_ID": "bad",
+        },
+        env_file_paths=[],
+    )
+
+    assert dormant.message_operation_stage1_enabled is False
+    assert dormant.message_operation_stage1_after_incident_id == 2**63 - 1
+    assert enabled.message_operation_stage1_enabled is True
+    assert enabled.message_operation_stage1_after_incident_id == 41
+    assert malformed.message_operation_stage1_after_incident_id == 2**63 - 1
+
+
+def test_main_runtime_dispatcher_delivers_stage1_without_agent_or_legacy_selector(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "stage1-main-loop.db")
+    incident, _ = _seed_message_operation_stage1(session_factory)
+    deliveries = []
+
+    async def capture(**kwargs):
+        deliveries.append(kwargs["text"])
+        return 9901
+
+    monkeypatch.setattr(
+        operator_bot_module, "send_system_operator_bot_message", capture
+    )
+    delivered = asyncio.run(
+        operator_bot_module.deliver_runtime_incident_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            runtime_config=RuntimeIncidentConfig(
+                message_operation_stage1_enabled=True,
+                message_operation_stage1_after_incident_id=incident.id - 1,
+                agent_enabled=False,
+                telegram_notifications_enabled=False,
+                telegram_notification_types=frozenset(),
+            ),
+            claimed_at=NOW,
+        )
+    )
+
+    assert delivered == 1
+    assert len(deliveries) == 1
+    assert "消息操作异常（第1阶段）" in deliveries[0]
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        assert row.agent_attempt_count == 0
+        assert row.notification_status == "pending"
+
+
+def test_stage1_watermark_excludes_preexisting_outbox_rows(tmp_path, monkeypatch):
+    from telegram_kol_research.models import MessageOperationStage1Notification
+
+    session_factory = create_session_factory(tmp_path / "stage1-watermark.db")
+    incident, _ = _seed_message_operation_stage1(session_factory)
+    deliveries = []
+
+    async def capture(**kwargs):
+        deliveries.append(kwargs["text"])
+        return 9902
+
+    monkeypatch.setattr(
+        operator_bot_module, "send_system_operator_bot_message", capture
+    )
+    delivered = asyncio.run(
+        operator_bot_module.deliver_message_operation_stage1_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            after_incident_id=incident.id,
+            claimed_at=NOW,
+        )
+    )
+
+    assert delivered == 0
+    assert deliveries == []
+    with session_factory() as session:
+        row = session.query(MessageOperationStage1Notification).one()
+        assert row.status == "pending"
+        assert row.attempt_count == 0
+
+
 def test_runtime_incident_delivery_claims_only_exact_notification_types(
     tmp_path,
     monkeypatch,

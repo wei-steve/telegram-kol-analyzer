@@ -19,6 +19,7 @@ def test_context_resolution_schema_is_created(tmp_path):
     assert inspector.has_table("runtime_agent_recovery_attempts")
     assert inspector.has_table("message_operation_contracts")
     assert inspector.has_table("message_operation_items")
+    assert inspector.has_table("message_operation_stage1_notifications")
     assert inspector.has_table("position_protection_health_observations")
     assert inspector.has_table("management_message_envelopes")
     assert inspector.has_table("management_message_targets")
@@ -26,6 +27,41 @@ def test_context_resolution_schema_is_created(tmp_path):
         column["name"]
         for column in inspector.get_columns("strategy_lifecycles")
     }
+
+
+def test_message_operation_stage1_outbox_has_additive_bounded_shape(tmp_path):
+    session_factory = create_session_factory(tmp_path / "stage1-schema.db")
+    inspector = inspect(session_factory.kw["bind"])
+
+    columns = {
+        column["name"]
+        for column in inspector.get_columns(
+            "message_operation_stage1_notifications"
+        )
+    }
+    assert {
+        "runtime_incident_id",
+        "raw_message_id",
+        "notification_kind",
+        "status",
+        "claim_token",
+        "claimed_at",
+        "attempt_count",
+        "next_attempt_at",
+        "telegram_message_id",
+        "delivered_at",
+        "error_code",
+        "created_at",
+        "updated_at",
+    } <= columns
+    indexes = {
+        index["name"]
+        for index in inspector.get_indexes(
+            "message_operation_stage1_notifications"
+        )
+    }
+    assert "uq_message_operation_stage1_identity" in indexes
+    assert "ix_message_operation_stage1_claimable" in indexes
 
 
 def test_position_protection_health_observation_schema_is_append_only_shape(tmp_path):
@@ -199,6 +235,7 @@ def test_runtime_incident_table_is_added_to_an_existing_database(tmp_path):
     assert inspector.has_table("runtime_incidents")
     assert inspector.has_table("message_operation_contracts")
     assert inspector.has_table("message_operation_items")
+    assert inspector.has_table("message_operation_stage1_notifications")
     with sqlite3.connect(database_path) as connection:
         assert connection.execute(
             "SELECT display_name FROM sources WHERE telegram_sender_id = 7"

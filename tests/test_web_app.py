@@ -582,6 +582,47 @@ def test_runtime_incident_notification_worker_stays_dormant_when_disabled(
         assert app.state.system_operator_bot_command_task is not None
 
 
+def test_message_operation_stage1_starts_dispatcher_without_legacy_notifications(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.web_app as web_module
+
+    started = threading.Event()
+
+    async def fake_runtime_incident_loop(**_kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    async def fake_system_operator_loop(**_kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        web_module,
+        "run_runtime_incident_notification_loop",
+        fake_runtime_incident_loop,
+    )
+    monkeypatch.setattr(
+        web_module,
+        "run_system_operator_bot_command_loop",
+        fake_system_operator_loop,
+    )
+    app = create_web_app(database_path=tmp_path / "research.db")
+    app.state.system_operator_bot_config = SystemOperatorBotConfig(
+        bot_token="system-token",
+        chat_id="system-chat",
+    )
+    app.state.runtime_incident_config = RuntimeIncidentConfig(
+        telegram_notifications_enabled=False,
+        message_operation_stage1_enabled=True,
+        message_operation_stage1_after_incident_id=42,
+    )
+
+    with TestClient(app):
+        assert started.wait(timeout=1)
+        assert app.state.runtime_incident_notification_task is not None
+
+
 def test_management_worker_lifespan_starts_once_and_is_cancelled(tmp_path):
     started = threading.Event()
     stopped = threading.Event()

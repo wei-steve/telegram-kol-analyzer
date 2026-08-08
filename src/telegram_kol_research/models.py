@@ -2943,6 +2943,89 @@ class RuntimeIncidentAffectedMessage(Base):
     )
 
 
+class MessageOperationStage1Notification(Base):
+    """Durable immediate alert for one affected message, independent of AI."""
+
+    __tablename__ = "message_operation_stage1_notifications"
+    __table_args__ = (
+        Index(
+            "uq_message_operation_stage1_identity",
+            "runtime_incident_id",
+            "raw_message_id",
+            "notification_kind",
+            unique=True,
+        ),
+        Index(
+            "ix_message_operation_stage1_claimable",
+            "status",
+            "next_attempt_at",
+            "claimed_at",
+        ),
+        CheckConstraint(
+            "notification_kind = 'message_operation_stage1'",
+            name="ck_message_operation_stage1_kind",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'delivering', 'failed', 'delivered', 'exhausted')",
+            name="ck_message_operation_stage1_status",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_message_operation_stage1_attempt_count",
+        ),
+        CheckConstraint(
+            "claim_token IS NULL OR length(claim_token) <= 64",
+            name="ck_message_operation_stage1_claim_token",
+        ),
+        CheckConstraint(
+            "telegram_message_id IS NULL OR length(telegram_message_id) <= 255",
+            name="ck_message_operation_stage1_telegram_id",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR length(error_code) <= 128",
+            name="ck_message_operation_stage1_error_code",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    runtime_incident_id: Mapped[int] = mapped_column(
+        ForeignKey("runtime_incidents.id"), nullable=False, index=True
+    )
+    raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False, index=True
+    )
+    message_operation_contract_id: Mapped[int] = mapped_column(
+        ForeignKey("message_operation_contracts.id"), nullable=False, index=True
+    )
+    notification_kind: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="message_operation_stage1",
+        server_default=sql_text("'message_operation_stage1'"),
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending",
+        server_default=sql_text("'pending'"),
+    )
+    claim_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sql_text("0")
+    )
+    next_attempt_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    telegram_message_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True
+    )
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    error_code: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+
 class RuntimeIncidentObservation(Base):
     """Additive shadow record for one stable invariant object/rule pair."""
 
