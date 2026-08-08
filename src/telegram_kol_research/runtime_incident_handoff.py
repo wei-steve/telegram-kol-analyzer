@@ -174,7 +174,10 @@ def build_runtime_incident_handoff(
     shadow_policy: Mapping[str, Any] | None = None,
     recovery_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if set(incident) != _ALLOWED_INCIDENT_FIELDS:
+    if set(incident) not in {
+        _ALLOWED_INCIDENT_FIELDS,
+        _ALLOWED_INCIDENT_FIELDS | {"severity"},
+    }:
         raise RuntimeIncidentHandoffError("incident handoff fields are invalid")
     if int(incident["id"]) != diagnosis.incident_id:
         raise RuntimeIncidentHandoffError("incident diagnosis does not match")
@@ -184,6 +187,7 @@ def build_runtime_incident_handoff(
         "source_kind": str(incident["source_kind"])[:64],
         "source_record_id": str(incident["source_record_id"])[:255],
         "redacted_summary": incident["redacted_summary"],
+        "severity": str(incident.get("severity") or "unknown")[:16],
     }
     _validate_redacted(compact_incident)
     bounded_queries = [str(query)[:64] for query in tuple(attempted_queries)[:16]]
@@ -365,6 +369,7 @@ def build_runtime_incident_failure_handoff(
             key: incident[key]
             for key in _ALLOWED_INCIDENT_FIELDS
         },
+        "severity": str(incident.get("severity") or "unknown")[:16],
         "outcome_kind": outcome_kind,
         "instruction_items": [
             {

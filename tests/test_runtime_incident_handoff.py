@@ -221,6 +221,7 @@ def test_durable_handoff_artifact_survives_restart_and_contains_copyable_evidenc
             "source_kind": incident.source_kind,
             "source_record_id": incident.source_record_id,
             "redacted_summary": {"error_type": "provider_timeout"},
+            "severity": "high",
         },
         diagnosis=RuntimeAgentDiagnosis.from_mapping(
             {
@@ -260,7 +261,10 @@ def test_durable_handoff_artifact_survives_restart_and_contains_copyable_evidenc
         handoff=handoff,
         created_at=datetime(2026, 7, 28, 9, 2, tzinfo=UTC),
     )
-    changed_handoff = {**handoff, "severity": "critical"}
+    changed_handoff = {
+        **handoff,
+        "incident": {**handoff["incident"], "severity": "critical"},
+    }
     changed = persist_runtime_incident_handoff(
         session_factory,
         incident_id=incident.id,

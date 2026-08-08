@@ -148,6 +148,7 @@ def _handoff_incident(incident) -> dict[str, Any]:
             "source_kind",
             "source_record_id",
             "redacted_summary",
+            "severity",
         )
     }
 
@@ -161,6 +162,7 @@ def _handoff_incident_from_mapping(incident: Mapping[str, Any]) -> dict[str, Any
             "source_kind",
             "source_record_id",
             "redacted_summary",
+            "severity",
         )
     }
 
