@@ -1,0 +1,152 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from datetime import UTC, datetime
+
+import pytest
+
+from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.models import TradeSignal
+from telegram_kol_research.trade_signals import enqueue_trade_signal
+from telegram_kol_research.trade_signals import load_trade_signal
+from telegram_kol_research.trade_signals import (
+    synchronize_pending_entry_assembly_evidence,
+)
+from telegram_kol_research.trade_signals import TradeSignalFingerprintSyncError
+
+
+NOW = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+OLD_FINGERPRINT = "a" * 64
+FINAL_FINGERPRINT = "b" * 64
+
+
+def _payload() -> dict[str, object]:
+    evidence = {
+        "assembly_id": 2,
+        "strategy_instance_id": "strategy-1",
+        "assembly_fingerprint": OLD_FINGERPRINT,
+    }
+    return {
+        "entry_preamble_assembly": deepcopy(evidence),
+        "deepcoin_order_draft": {
+            "symbol": "BTCUSDT",
+            "entry_preamble_assembly": deepcopy(evidence),
+        },
+    }
+
+
+def _enqueue(session_factory, *, payload: dict[str, object] | None = None):
+    return enqueue_trade_signal(
+        session_factory,
+        venue="deepcoin",
+        source_type="recovery",
+        kol_id="alice",
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        action="open_position",
+        payload=payload if payload is not None else _payload(),
+        strategy_instance_id="strategy-1",
+    )
+
+
+def _synchronize(session_factory, signal, **overrides):
+    arguments = {
+        "signal_id": signal.id,
+        "strategy_instance_id": "strategy-1",
+        "expected_payload": signal.payload,
+        "expected_fingerprint": OLD_FINGERPRINT,
+        "finalized_evidence": {
+            "assembly_id": 2,
+            "strategy_instance_id": "strategy-1",
+            "assembly_fingerprint": FINAL_FINGERPRINT,
+        },
+        "synchronized_at": NOW,
+    }
+    arguments.update(overrides)
+    return synchronize_pending_entry_assembly_evidence(session_factory, **arguments)
+
+
+def test_synchronize_pending_entry_assembly_evidence_updates_both_copies(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    signal = _enqueue(session_factory)
+
+    updated = _synchronize(session_factory, signal)
+
+    assert updated.status == "pending"
+    assert (
+        updated.payload["entry_preamble_assembly"]["assembly_fingerprint"]
+        == FINAL_FINGERPRINT
+    )
+    assert (
+        updated.payload["deepcoin_order_draft"]["entry_preamble_assembly"]
+        ["assembly_fingerprint"]
+        == FINAL_FINGERPRINT
+    )
+    with session_factory() as session:
+        row = session.get(TradeSignal, signal.id)
+        assert row is not None
+        assert row.updated_at == NOW.replace(tzinfo=None)
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_error"),
+    [
+        ("non_pending", "entry_assembly_signal_cas_failed"),
+        ("strategy_mismatch", "entry_assembly_signal_cas_failed"),
+        ("payload_drift", "entry_assembly_signal_cas_failed"),
+        ("absent_draft", "entry_assembly_signal_draft_invalid"),
+        ("malformed_draft", "entry_assembly_signal_draft_invalid"),
+        ("wrong_top_fingerprint", "entry_assembly_signal_fingerprint_mismatch"),
+        ("wrong_nested_fingerprint", "entry_assembly_signal_fingerprint_mismatch"),
+    ],
+)
+def test_synchronize_pending_entry_assembly_evidence_fails_without_mutation(
+    tmp_path,
+    case,
+    expected_error,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    payload = _payload()
+    if case == "absent_draft":
+        payload.pop("deepcoin_order_draft")
+    elif case == "malformed_draft":
+        payload["deepcoin_order_draft"] = "invalid"
+    elif case == "wrong_top_fingerprint":
+        payload["entry_preamble_assembly"]["assembly_fingerprint"] = "c" * 64
+    elif case == "wrong_nested_fingerprint":
+        payload["deepcoin_order_draft"]["entry_preamble_assembly"][
+            "assembly_fingerprint"
+        ] = "c" * 64
+    signal = _enqueue(session_factory, payload=payload)
+    original_payload = deepcopy(signal.payload)
+    kwargs = {}
+
+    if case == "non_pending":
+        with session_factory() as session:
+            row = session.get(TradeSignal, signal.id)
+            assert row is not None
+            row.status = "submitted"
+            session.commit()
+    elif case == "strategy_mismatch":
+        kwargs["strategy_instance_id"] = "strategy-other"
+    elif case == "payload_drift":
+        with session_factory() as session:
+            row = session.get(TradeSignal, signal.id)
+            assert row is not None
+            row.payload_json = row.payload_json.replace("BTCUSDT", "ETHUSDT")
+            session.commit()
+
+    with pytest.raises(TradeSignalFingerprintSyncError, match=expected_error):
+        _synchronize(session_factory, signal, **kwargs)
+
+    reloaded = load_trade_signal(session_factory, signal.id)
+    if case == "payload_drift":
+        assert reloaded.payload["deepcoin_order_draft"]["symbol"] == "ETHUSDT"
+        expected = deepcopy(original_payload)
+        expected["deepcoin_order_draft"]["symbol"] = "ETHUSDT"
+        assert reloaded.payload == expected
+    else:
+        assert reloaded.payload == original_payload
+

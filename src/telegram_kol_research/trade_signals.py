@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy import update
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.execution_bindings import build_strategy_instance_id
@@ -50,6 +51,128 @@ class TradeSignalRecord:
     payload: Any
     attempts: int
     last_error: str | None = None
+
+
+class TradeSignalFingerprintSyncError(RuntimeError):
+    """The pending signal could not be synchronized without ambiguity."""
+
+
+def synchronize_pending_entry_assembly_evidence(
+    session_factory: sessionmaker,
+    *,
+    signal_id: int,
+    strategy_instance_id: str,
+    expected_payload: Mapping[str, Any],
+    expected_fingerprint: str,
+    finalized_evidence: Mapping[str, Any],
+    synchronized_at: datetime,
+) -> TradeSignalRecord:
+    """Atomically replace both pending-signal copies of assembly evidence."""
+
+    try:
+        expected_payload_json = json.dumps(
+            expected_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        updated_payload = json.loads(expected_payload_json)
+    except (TypeError, ValueError):
+        raise TradeSignalFingerprintSyncError(
+            "entry_assembly_signal_payload_invalid"
+        ) from None
+
+    top_evidence = updated_payload.get("entry_preamble_assembly")
+    if not isinstance(top_evidence, dict):
+        raise TradeSignalFingerprintSyncError(
+            "entry_assembly_signal_evidence_invalid"
+        )
+    draft = updated_payload.get("deepcoin_order_draft")
+    if not isinstance(draft, dict):
+        raise TradeSignalFingerprintSyncError("entry_assembly_signal_draft_invalid")
+
+    evidence_copies = [top_evidence]
+    nested_evidence = draft.get("entry_preamble_assembly")
+    if nested_evidence is not None:
+        if not isinstance(nested_evidence, dict):
+            raise TradeSignalFingerprintSyncError(
+                "entry_assembly_signal_evidence_invalid"
+            )
+        evidence_copies.append(nested_evidence)
+    if any(
+        evidence.get("assembly_fingerprint") != expected_fingerprint
+        for evidence in evidence_copies
+    ):
+        raise TradeSignalFingerprintSyncError(
+            "entry_assembly_signal_fingerprint_mismatch"
+        )
+
+    try:
+        final_evidence = json.loads(
+            json.dumps(finalized_evidence, ensure_ascii=False, sort_keys=True)
+        )
+    except (TypeError, ValueError):
+        raise TradeSignalFingerprintSyncError(
+            "entry_assembly_signal_final_evidence_invalid"
+        ) from None
+    if not isinstance(final_evidence, dict) or not isinstance(
+        final_evidence.get("assembly_fingerprint"), str
+    ):
+        raise TradeSignalFingerprintSyncError(
+            "entry_assembly_signal_final_evidence_invalid"
+        )
+
+    updated_payload["entry_preamble_assembly"] = final_evidence
+    draft["entry_preamble_assembly"] = json.loads(
+        json.dumps(final_evidence, ensure_ascii=False, sort_keys=True)
+    )
+    updated_payload_json = json.dumps(
+        updated_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+    with session_factory() as session:
+        result = session.execute(
+            update(TradeSignal)
+            .where(
+                TradeSignal.id == int(signal_id),
+                TradeSignal.status == "pending",
+                TradeSignal.strategy_instance_id == strategy_instance_id,
+                TradeSignal.payload_json == expected_payload_json,
+            )
+            .values(
+                payload_json=updated_payload_json,
+                updated_at=synchronized_at,
+            )
+        )
+        if int(result.rowcount or 0) != 1:
+            session.rollback()
+            raise TradeSignalFingerprintSyncError(
+                "entry_assembly_signal_cas_failed"
+            )
+        session.commit()
+
+    updated = load_trade_signal(session_factory, int(signal_id))
+    top_final = updated.payload.get("entry_preamble_assembly")
+    draft_final = updated.payload.get("deepcoin_order_draft")
+    nested_final = (
+        draft_final.get("entry_preamble_assembly")
+        if isinstance(draft_final, Mapping)
+        else None
+    )
+    final_fingerprint = final_evidence["assembly_fingerprint"]
+    if (
+        updated.status != "pending"
+        or updated.strategy_instance_id != strategy_instance_id
+        or not isinstance(top_final, Mapping)
+        or not isinstance(nested_final, Mapping)
+        or top_final.get("assembly_fingerprint") != final_fingerprint
+        or nested_final.get("assembly_fingerprint") != final_fingerprint
+    ):
+        raise TradeSignalFingerprintSyncError(
+            "entry_assembly_signal_reload_validation_failed"
+        )
+    return updated
 
 
 def build_trade_signal_uid(
