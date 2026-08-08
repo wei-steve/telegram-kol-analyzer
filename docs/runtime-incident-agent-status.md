@@ -7,9 +7,9 @@ used to advance or reinterpret the rollout.
 project: runtime-incident-agent
 design_version: 2
 design_authority_status: original_runtime_agent_incomplete_extended_by_message_operation_design
-current_phase: 8R.10
-phase_name: monitor-coverage-and-silent-loss
-phase_status: in_progress
+current_phase: 8
+phase_name: cost-quality-and-continuous-improvement
+phase_status: planned
 position_compliance_rules_status: dormant_non_deployable
 position_compliance_rollout_status: multi_target_live_new_natural_messages_only
 multi_target_projection_status: live_partial_take_profit_future_natural_messages_only
@@ -23,10 +23,13 @@ position_protection_live_repair_status: exact_backup_repaired_exchange_healthy
 position_protection_audit_convergence_status: deployed_current_evidence_healthy
 position_protection_rescue_starvation_status: deployed_future_due_intents_fixed
 context_target_contract_repair_status: deployed_future_natural_observation_pending
-last_completed_phase: "8R.9"
-last_completed_commit: 8db0c27
-production_commit: 10f3b64801ed402878d8c7185bd801102f893037
+last_completed_phase: "8R.10"
+last_completed_commit: f21bac9
+production_commit: f21bac92b425ea74a0d4e76f4772d1a561c9d125
 local_tests:
+  - "phase-8r.10-server: reviewed code commit 2ad7f33 plus monitor-installer correction f21bac9 were deployed after a terminal zero-in-flight gate and two complete stable read-only exchange audits. The first deployment kept the supervisor disabled and returned an authenticated database-free coverage rollback snapshot. Server focused verification passed 336 tests. A fresh stopped-state raw watermark of 9969 was then recorded and the supervisor was enabled in shadow mode only above that ID; the Runtime Agent deployed-code identity was synchronized to f21bac9. The first and repeated coverage projections report enabled=true, scan_truncated=false, a fresh heartbeat, zero executable messages/contracts/violations/gaps/Stage1/Agent/handoffs/Stage2 rows, and oldest nonterminal age zero. Main, Agent, scanner, monitor timer, HTTP, and system Bot loop are active; the no-notify full diagnostic returned healthy=true, monitor_error=null, notification_status=disabled, and no reason codes. Action authority remains false and both playbook allowlists remain empty."
+  - "phase-8r.10-local-reviewed: bounded end-to-end ledger metrics, database-free disabled rollback, authenticated fixed-loopback 32-KiB projection, successful-cycle heartbeat, fail-closed truncation/schema/parity checks, watermark sentinel/future/DB-error rejection, natural violation-to-atomic-incident-to-Stage1 composition, projection/outcome/capture error and zero-model gates, and independent critical reason codes are implemented. Repository-wide verification passed 4510 tests with 1 skipped and 17 known deprecation warnings; focused/adjacent verification passed 711 with 1 skipped. Independent review found no remaining Critical or Important finding."
+  - "phase-8r.10-installer-review: production exposed that raw DAC writeability is not the monitor's effective systemd boundary. The corrected reviewed installer verifies all three monitor units bind the production DB read-only and reject a writable production-checkout mount, while retaining the dedicated identity's inability to read Runtime Agent policy/provider settings. The initial install-only preflight changed no unit; the corrected install completed dormant, and review found no Critical or Important finding."
   - "phase-8r.9-server: reviewed production code 10f3b64 was deployed dormant after repeated stable zero-in-flight gates retained latest raw/decision 9969, execution event 3352, and zero recent instruction, context, management, mutation, Agent claim, recovery, contract, Stage 1, or Stage 2 work. The deployed focused gate passed 189 tests; the exact temporary-database injected-receiver Stage 2 canary passed independently, and the read-only system Bot identity/chat probe returned all four evidence booleans true. A fresh stopped-state handoff watermark of 0 was recorded, then Stage 2 was enabled only above ID 0 with five attempts and Stage 1 still enabled. Production contract, Stage 1, and handoff tables remain empty, so there was no historical replay or Telegram send. Main, Agent, scanner, monitor timer, HTTP, and the root-run no-notify monitor diagnostic are healthy; Agent action authority is false and both playbook allowlists remain empty."
   - "phase-8r.9-local-reviewed: durable revisioned redacted handoffs, atomic diagnosis-plus-artifact persistence, all six terminal investigation outcomes, Stage 1 ordering, recoverable two-segment Stage 2 delivery, copyable Codex prompt plus matching JSON document, restart rebuild, full-source evidence/diagnosis digests, deterministic oversized-evidence compaction, update-on-content-change/no-update-on-unchanged behavior, and dormant fail-closed configuration are implemented. The focused and adjacent gate passes 365 tests; independent review found no remaining Critical or Important finding."
   - "phase-8r.8-server: reviewed commit 606371f was deployed after two stable zero-in-flight safe-window passes with latest raw/decision 9969, execution event 3352 unchanged, and zero nonterminal context, management, mutation, runtime claim, recovery, contract, message-operation incident, or investigation-audit rows. Server config/contract tests passed 20 and the six new production-path/race/rollover tests passed. An isolated temporary-database canary used investigate_message_evidence, persisted exactly started+allowed broker audits, produced one closed expected-safety-refusal diagnosis/Codex handoff, cleared the model's playbook request, and created zero mutation/event rows. Production then activated only message-operation Agent eligibility above fresh contract watermark 0 with exact deployed code 606371f; action authority is false, both playbook allowlists are empty, historical counts remain zero, all services and HTTP are healthy, and Agent restarts are zero."
@@ -249,7 +252,8 @@ server_verification:
   phase_8r_6a_operator_completion: "On 2026-08-09 the operator explicitly directed the rollout not to wait for a future natural executable message and accepted returning to correct later issues. Phase 8R.6A is therefore complete on the reviewed 404-test local evidence, 33-test deployed supervisor evidence, and the production zero-impact dormant canary. Natural-message parity remains unobserved and is a recorded residual verification item, not a gate for beginning the next separately dormant phase. This completion enabled no incident creation, Stage 1 notification, Agent eligibility, model call, or business mutation authority."
   phase_8r_6b_deployment_and_activation: "Reviewed commit 04b3d34 was pushed and deployed with Stage 1 absent/disabled. Server verification passed 156 focused tests; main, Runtime Agent, and runtime scanner were active and HTTP root returned 200. The additive outbox table existed with zero rows. After a second fresh gate proved zero active position mutations, RuntimeIncident/notification/Stage 1 claims, contracts, and outbox rows, the root-owned mode-0600 policy was backed up and Stage 1 was enabled for contract IDs above the stopped-state maximum of 0, with five bounded attempts. Only the main service restarted; it returned HTTP 200, all runtime services remained active, and counts stayed zero, proving no historical materialization, Telegram send, Agent claim, or trading mutation. The independent monitor expected-HEAD pin was synchronized to 04b3d34, its no-notify diagnostic returned healthy=true with no reason codes, and the timer was restored. Runtime Agent action authority and both playbook allowlists remain unchanged/empty."
   phase_8r_9_deployment_and_activation: "Reviewed production code 10f3b64 was deployed with Stage 2 absent/disabled. Server verification passed 189 focused tests and the exact temporary-database injected-receiver handoff/document canary passed separately without touching production. The read-only production system Bot probe confirmed endpoint, identity, and target-chat availability. A fresh zero-in-flight gate retained latest raw/decision 9969, execution event 3352, and zero recent instruction, context, management, mutation, Agent claim, recovery, contract, Stage 1, or handoff rows. The stopped-state maximum handoff ID was 0; root-owned policy was atomically backed up and Stage 2 was enabled only for future handoff IDs above 0 with five bounded attempts. Only the main service restarted. Production contract, Stage 1, handoff, and investigation-audit counts remain zero, so activation caused no historical claim, Telegram delivery, model call, or business mutation. Main, Runtime Agent, scanner, monitor timer, and HTTP are healthy; a root-run no-notify diagnostic returned healthy=true with no reason codes. Runtime Agent action authority remains false and both playbook allowlists remain empty."
-  remaining: "Phase 8R.10 is in progress: the bounded coverage projection, authenticated loopback endpoint, independent heartbeat/silent-loss rules, dormant web supervisor loop, and local failure-path regressions are implemented. Independent review, complete local gates, push, and safe-window dormant production verification remain. Natural 8R.6A/8R.6B behavior and all-symbol contract-spec expansion remain separate residual scopes."
+  phase_8r_10_deployment_and_activation: "Reviewed commit 2ad7f33 was deployed with the supervisor explicitly disabled after latest raw/decision 9969 remained terminal non-strategy/completed/skipped, evidence/context/management/component/mutation/Runtime-Agent/notification/Stage1/Stage2 work was zero, recent raw/execution counts were zero, and two complete stable exchange audits matched at current_risk=0, evidence_insufficient=1, historical_terminal=236, resolved_by_current_exchange_evidence=3. The authenticated disabled endpoint returned a zero, database-free clean rollback projection. Monitor installer correction f21bac9 was then pulled without a business-code restart; server focused tests passed 336 and the no-notify diagnostic was healthy. In a second stopped-state gate, max raw 9969 became the exclusive future watermark, supervisor shadow mode was enabled, and exact deployed-code identity was updated to f21bac9. The background cycle made zero model calls and created zero contracts/items/incidents/outboxes/handoffs because no newer raw existed. Coverage heartbeat is fresh and every silent-gap count is zero. Main, Agent, scanner, monitor timer, HTTP, and system Bot command loop are active; action authority is false and both playbook allowlists are empty."
+  remaining: "Original Phase 8 cost, quality, Token-budget, and continuous-regression work is now the next planned phase. Natural future-message behavioral evidence for the earlier 8R.6A/8R.6B chain and all-symbol contract-spec expansion remain recorded separate residual scopes; the active Phase 8R.10 independent coverage monitor will fail closed on any future silent gap."
 enabled_flags:
   - "capture:READ_ONLY_CAPTURE_PROFILE-plus-six-multi-target-types"
   - "telegram:deterministic-runtime-incident-reports"
@@ -257,7 +261,7 @@ enabled_flags:
   - "runtime-agent:read-only-diagnosis"
   - "monitor:independent-system-operator-alerting"
   - "runtime-scanner:cancel-outcome-stale-unknown-v1-shadow-only"
-  - "message-operation-supervisor:manual-shadow-only-after-raw-9962"
+  - "message-operation-supervisor:continuous-shadow-only-future-messages-after-raw-9969"
   - "message-operation-stage1:future-contracts-only-after-contract-id-0"
   - "message-operation-stage2:future-handoffs-only-after-handoff-id-0"
 known_issues:
@@ -283,7 +287,7 @@ phase_8r_roadmap_control:
 message_operation_extension:
   design_commit: 98b7884
   implementation_plan_commit: 879f489
-  status: phase_8r_10_in_progress
+  status: phase_8r_completed
   original_runtime_agent_complete: false
   next_phase_after_8r_4: 8R.5
   task_8r_5_commit: 2d0cc6e
@@ -304,7 +308,9 @@ message_operation_extension:
   task_8r_9_commit: 10f3b64
   task_8r_9_status: completed_future_only_production_active
   next_phase_after_8r_9: 8R.10
-  task_8r_10_status: in_progress
+  task_8r_10_commit: f21bac9
+  task_8r_10_status: completed_future_only_production_active
+  next_phase_after_8r_10: 8
   allowed_symbol_contract_spec_status: unresolved_separate_trading_scope
   allowed_symbol_contract_spec_requirement: "Every globally allowed virtual-asset symbol must have a current, independently validated Deepcoin instrument specification before auto-trading can admit it. The present reviewed static file contains BTC and ETH only; SOL and any other allowlisted symbol without a verified specification remain fail-closed. Future support must use authoritative instrument discovery or a reviewed generated cache plus an allowlist/spec consistency gate, without weakening sizing or submission safety."
 next_session_prompt: "请执行自定义ai agent的下一步实施"
@@ -624,11 +630,11 @@ Phase 5 is not complete until:
 
 ### Phase 8R — Proactive Read-Only Incident Detection
 
-- Status: in progress; Phase 8R.9 complete and Phase 8R.10 implementation under review
+- Status: completed; Phase 8R.10 is reviewed, deployed, activated future-only,
+  and independently monitored
 - Roadmap-control Task 0: completed locally with 10 focused tests passing;
   documentation and test changes only, so no production restart was required
-- Current task: `8R.10 monitor-coverage-and-silent-loss` (local implementation
-  and focused tests complete; review and production gates pending)
+- Completed task: `8R.10 monitor-coverage-and-silent-loss`
 - Approved scope: deterministic proactive discovery, bounded read-only
   diagnosis, Telegram notification, Codex handoff, and read-only verification
 - Prohibited scope: order, position, protection, strategy, recognition,
@@ -681,12 +687,14 @@ Phase 5 is not complete until:
   copyable prompt and matching JSON document only after Stage 1 reaches a
   terminal delivery state. Production is active only above handoff watermark
   0; the injected-receiver canary passed and no historical row was replayed.
-- Phase 8R.10 local implementation adds an authenticated aggregate-only
-  loopback projection, a successful-cycle heartbeat, fixed independent monitor
-  reasons for every silent gap, and a separately cancellable zero-model-call
-  supervisor loop. The dedicated monitor remains database-read-only and cannot
-  read Runtime Agent policy/provider settings. Dormant deployment, a fresh
-  future-only activation gate, and final parity evidence are still required.
-- Next action: complete only the Phase 8R.10 review, local gates, and staged
-  production verification. Do not combine it with contract-spec expansion,
+- Task 8R.10 completed at deployed commit `f21bac9`. The authenticated
+  aggregate-only loopback projection, successful-cycle heartbeat, fixed
+  independent monitor reasons, natural violation capture bridge, and
+  separately cancellable zero-model-call supervisor are active only above raw
+  watermark 9969. The dedicated monitor is database-read-only in its systemd
+  namespace and cannot read Runtime Agent policy/provider settings. Production
+  coverage parity is complete with all counts zero and a fresh heartbeat; the
+  final no-notify diagnostic is healthy.
+- Next action: begin only original `Phase 8 cost-quality-and-continuous-improvement`
+  in a new turn. Do not combine it with contract-spec expansion,
   natural-contract tuning, or any business mutation.

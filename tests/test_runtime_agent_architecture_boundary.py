@@ -230,10 +230,10 @@ def test_phase_7_is_deferred_and_phase_8r_requires_no_action_authority():
 
     assert "phase_7_explicitly_approved: false" in status
     assert "phase_7_disposition: deferred_non_blocking" in status
-    assert "current_phase: 8R.10" in status
-    assert "phase_name: monitor-coverage-and-silent-loss" in status
-    assert "phase_status: in_progress" in status
-    assert 'last_completed_phase: "8R.9"' in status
+    assert "current_phase: 8" in status
+    assert "phase_name: cost-quality-and-continuous-improvement" in status
+    assert "phase_status: planned" in status
+    assert 'last_completed_phase: "8R.10"' in status
     assert "task_8r_4_status: completed_dormant_production_verified" in status
     assert "task_8r_5_status: completed_future_only_shadow_canary" in status
     assert (
@@ -252,6 +252,7 @@ def test_phase_7_is_deferred_and_phase_8r_requires_no_action_authority():
         in status
     )
     assert "task_8r_8_status: completed_future_only_production_active" in status
+    assert "task_8r_10_status: completed_future_only_production_active" in status
     assert "original_runtime_agent_complete: false" in status
     assert "### Phase 8R proactive read-only incident detection" in runbook
     assert (
