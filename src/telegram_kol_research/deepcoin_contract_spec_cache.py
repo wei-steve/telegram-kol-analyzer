@@ -9,9 +9,13 @@ from datetime import timezone
 from decimal import Decimal
 from decimal import InvalidOperation
 import hashlib
+import hmac
 import json
 import math
+import os
+from pathlib import Path
 import re
+import tempfile
 from types import MappingProxyType
 from typing import Any
 from typing import Mapping
@@ -41,6 +45,11 @@ _MAX_NUMERIC_SIGNIFICANT_DIGITS = 64
 _MIN_NUMERIC_ADJUSTED_EXPONENT = -100
 _MAX_NUMERIC_ADJUSTED_EXPONENT = 100
 _MAX_NUMERIC_INTEGER_BITS = 512
+_MAX_CACHE_FILE_BYTES = 4 * 1024 * 1024
+_MAX_CACHE_METADATA_TEXT_LENGTH = 512
+_MAX_CACHE_INSTRUMENT_COUNT = 10_000
+_MAX_CACHE_INSTRUMENT_ID_LENGTH = 128
+_MAX_CACHE_STATE_LENGTH = 64
 _DECIMAL_TEXT_PATTERN = re.compile(
     r"^[+]?(?:(?P<integer>[0-9]+)(?:\.(?P<fraction>[0-9]*))?"
     r"|\.(?P<fraction_only>[0-9]+))(?:[eE](?P<exponent>[+-]?[0-9]+))?$"
@@ -235,6 +244,215 @@ def validate_deepcoin_instrument_snapshot(
         source_digest_sha256=digest,
         capabilities_by_instrument_id=capabilities,
     )
+
+
+def publish_deepcoin_contract_spec_snapshot(
+    cache_path: str | Path,
+    snapshot: DeepcoinContractSpecSnapshot,
+    *,
+    now: datetime,
+) -> None:
+    """Durably publish a validated snapshot without exposing partial JSON."""
+
+    if not isinstance(snapshot, DeepcoinContractSpecSnapshot):
+        raise TypeError("snapshot must be a DeepcoinContractSpecSnapshot")
+    normalized_now = _normalize_aware_datetime(now, field="now")
+    serialized_payload = _serialize_snapshot_payload(snapshot)
+    path = Path(cache_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        temporary_path = Path(temporary_name)
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as temporary_file:
+            temporary_file.write(serialized_payload)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+
+        # Re-read through the same strict parser used at startup before the
+        # candidate is allowed to replace the last known-good snapshot.
+        _load_snapshot_file(temporary_path, now=normalized_now)
+        os.replace(temporary_path, path)
+        temporary_path = None
+        _fsync_directory(path.parent)
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def load_deepcoin_contract_spec_snapshot(
+    cache_path: str | Path,
+    *,
+    now: datetime,
+) -> DeepcoinContractSpecSnapshot:
+    """Load a fresh, digest-verified snapshot or fail closed."""
+
+    normalized_now = _normalize_aware_datetime(now, field="now")
+    return _load_snapshot_file(Path(cache_path), now=normalized_now)
+
+
+def _snapshot_payload(snapshot: DeepcoinContractSpecSnapshot) -> dict[str, object]:
+    return {
+        "schema_version": snapshot.schema_version,
+        "venue": snapshot.venue,
+        "source_path": snapshot.source_path,
+        "fetched_at": _format_datetime(snapshot.fetched_at),
+        "expires_at": _format_datetime(snapshot.expires_at),
+        "source_digest_sha256": snapshot.source_digest_sha256,
+        "instruments": snapshot.to_instrument_rows(),
+    }
+
+
+def _serialize_snapshot_payload(snapshot: DeepcoinContractSpecSnapshot) -> bytes:
+    _validate_snapshot_publish_bounds(snapshot)
+    serialized = json.dumps(
+        _snapshot_payload(snapshot),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8") + b"\n"
+    if len(serialized) > _MAX_CACHE_FILE_BYTES:
+        raise ValueError("Deepcoin contract spec cache exceeds safe size limit")
+    return serialized
+
+
+def _validate_snapshot_publish_bounds(snapshot: DeepcoinContractSpecSnapshot) -> None:
+    capabilities = snapshot.capabilities_by_instrument_id
+    if len(capabilities) > _MAX_CACHE_INSTRUMENT_COUNT:
+        raise ValueError("Deepcoin contract spec cache exceeds safe instrument count")
+    for index, (instrument_id, capability) in enumerate(capabilities.items()):
+        if (
+            not isinstance(instrument_id, str)
+            or len(instrument_id) > _MAX_CACHE_INSTRUMENT_ID_LENGTH
+            or not isinstance(capability, DeepcoinInstrumentCapability)
+            or not isinstance(capability.instrument_id, str)
+            or len(capability.instrument_id) > _MAX_CACHE_INSTRUMENT_ID_LENGTH
+            or not isinstance(capability.state, str)
+            or len(capability.state) > _MAX_CACHE_STATE_LENGTH
+        ):
+            raise ValueError("Deepcoin contract spec cache metadata exceeds safe bounds")
+        for field, value in (
+            ("ctVal", capability.contract_value),
+            ("lotSz", capability.quantity_step),
+            ("minSz", capability.min_quantity),
+            ("tickSz", capability.price_tick),
+        ):
+            _positive_decimal(value, field=field, row_index=index)
+    for field, value in (
+        ("venue", snapshot.venue),
+        ("source_path", snapshot.source_path),
+        ("source_digest_sha256", snapshot.source_digest_sha256),
+    ):
+        if not isinstance(value, str) or len(value) > _MAX_CACHE_METADATA_TEXT_LENGTH:
+            raise ValueError(
+                f"Deepcoin contract spec cache {field} exceeds safe bounds"
+            )
+
+
+def _load_snapshot_file(
+    path: Path,
+    *,
+    now: datetime | None,
+) -> DeepcoinContractSpecSnapshot:
+    try:
+        with path.open("rb") as cache_file:
+            raw_payload = cache_file.read(_MAX_CACHE_FILE_BYTES + 1)
+    except OSError:
+        raise
+    if len(raw_payload) > _MAX_CACHE_FILE_BYTES:
+        raise ValueError("Deepcoin contract spec cache exceeds safe size limit")
+    try:
+        payload = json.loads(raw_payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        raise ValueError("Deepcoin contract spec cache must contain valid JSON") from None
+    if not isinstance(payload, dict):
+        raise ValueError("Deepcoin contract spec cache root must be an object")
+
+    schema_version = payload.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or schema_version != DEEPCOIN_CONTRACT_SPEC_SNAPSHOT_SCHEMA_VERSION
+    ):
+        raise ValueError("unsupported Deepcoin contract spec cache schema_version")
+    venue = _cache_text(payload, "venue")
+    if venue != "deepcoin":
+        raise ValueError("Deepcoin contract spec cache has invalid venue")
+    source_path = _cache_text(payload, "source_path")
+    fetched_at = _parse_cache_datetime(payload, "fetched_at")
+    expires_at = _parse_cache_datetime(payload, "expires_at")
+    if expires_at <= fetched_at:
+        raise ValueError("Deepcoin contract spec cache expires_at must follow fetched_at")
+    digest = _cache_text(payload, "source_digest_sha256")
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("Deepcoin contract spec cache has invalid source digest")
+    rows = payload.get("instruments")
+
+    validated = validate_deepcoin_instrument_snapshot(
+        rows,
+        fetched_at=fetched_at,
+        ttl=expires_at - fetched_at,
+        source_path=source_path,
+    )
+    if not hmac.compare_digest(validated.source_digest_sha256, digest):
+        raise ValueError("Deepcoin contract spec cache digest mismatch")
+    if now is not None:
+        if fetched_at > now:
+            raise ValueError("Deepcoin contract spec cache fetched_at is in the future")
+        if now >= expires_at:
+            raise ValueError("Deepcoin contract spec cache is stale")
+    return validated
+
+
+def _cache_text(payload: Mapping[str, Any], field: str) -> str:
+    value = payload.get(field)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, str)
+        or not value
+        or len(value) > _MAX_CACHE_METADATA_TEXT_LENGTH
+    ):
+        raise ValueError(f"Deepcoin contract spec cache has invalid {field}")
+    return value
+
+
+def _parse_cache_datetime(payload: Mapping[str, Any], field: str) -> datetime:
+    value = _cache_text(payload, field)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError(
+            f"Deepcoin contract spec cache has invalid {field}"
+        ) from None
+    return _normalize_aware_datetime(parsed, field=field)
+
+
+def _normalize_aware_datetime(value: datetime, *, field: str) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ValueError(f"{field} must be timezone-aware")
+    if value.utcoffset() is None:
+        raise ValueError(f"{field} must be timezone-aware")
+    return value.astimezone(timezone.utc)
+
+
+def _format_datetime(value: datetime) -> str:
+    return _normalize_aware_datetime(value, field="snapshot datetime").isoformat()
+
+
+def _fsync_directory(directory: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(directory, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _validate_snapshot_timing(*, fetched_at: datetime, ttl: timedelta) -> None:

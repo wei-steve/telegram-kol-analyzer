@@ -6,6 +6,8 @@ from datetime import timedelta
 from datetime import timezone
 from decimal import Decimal
 import json
+import os
+import stat
 from time import monotonic
 from zoneinfo import ZoneInfo
 
@@ -16,6 +18,12 @@ from telegram_kol_research.deepcoin_contract_spec_cache import (
 )
 from telegram_kol_research.deepcoin_contract_spec_cache import (
     DeepcoinContractSpecSnapshot,
+)
+from telegram_kol_research.deepcoin_contract_spec_cache import (
+    load_deepcoin_contract_spec_snapshot,
+)
+from telegram_kol_research.deepcoin_contract_spec_cache import (
+    publish_deepcoin_contract_spec_snapshot,
 )
 from telegram_kol_research.deepcoin_contract_spec_cache import (
     validate_deepcoin_instrument_snapshot,
@@ -445,3 +453,232 @@ def test_validate_rejects_value_that_cannot_convert_to_a_positive_finite_existin
             fetched_at=NOW,
             ttl=TTL,
         )
+
+
+def test_cache_publish_and_load_round_trip_atomically(tmp_path):
+    cache_path = tmp_path / "deepcoin_contract_specs.json"
+    snapshot = validate_deepcoin_instrument_snapshot(
+        [_row("BTC-USDT-SWAP", ctVal="0.001"), _row("SOL-USDT-SWAP")],
+        fetched_at=NOW,
+        ttl=TTL,
+    )
+
+    publish_deepcoin_contract_spec_snapshot(cache_path, snapshot, now=NOW)
+    loaded = load_deepcoin_contract_spec_snapshot(cache_path, now=NOW)
+
+    assert loaded == snapshot
+    assert cache_path.stat().st_mode & 0o777 == 0o600
+    assert list(tmp_path.glob(f".{cache_path.name}.*.tmp")) == []
+
+
+def test_cache_digest_verification_is_independent_of_json_key_and_row_order(tmp_path):
+    cache_path = tmp_path / "deepcoin_contract_specs.json"
+    snapshot = validate_deepcoin_instrument_snapshot(
+        [_row("BTC-USDT-SWAP"), _row("SOL-USDT-SWAP")],
+        fetched_at=NOW,
+        ttl=TTL,
+    )
+    publish_deepcoin_contract_spec_snapshot(cache_path, snapshot, now=NOW)
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    payload["instruments"].reverse()
+    reordered_payload = dict(reversed(list(payload.items())))
+    cache_path.write_text(json.dumps(reordered_payload, indent=3), encoding="utf-8")
+
+    loaded = load_deepcoin_contract_spec_snapshot(cache_path, now=NOW)
+
+    assert loaded.source_digest_sha256 == snapshot.source_digest_sha256
+    assert loaded.to_instrument_rows() == snapshot.to_instrument_rows()
+
+
+def test_cache_publish_fsyncs_file_before_atomic_replace(tmp_path, monkeypatch):
+    cache_path = tmp_path / "deepcoin_contract_specs.json"
+    snapshot = validate_deepcoin_instrument_snapshot(
+        [_row("BTC-USDT-SWAP")], fetched_at=NOW, ttl=TTL
+    )
+    events = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def recording_fsync(fd):
+        event = "directory_fsync" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file_fsync"
+        events.append(event)
+        return real_fsync(fd)
+
+    def recording_replace(source, destination):
+        events.append("replace")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(
+        "telegram_kol_research.deepcoin_contract_spec_cache.os.fsync",
+        recording_fsync,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.deepcoin_contract_spec_cache.os.replace",
+        recording_replace,
+    )
+
+    publish_deepcoin_contract_spec_snapshot(cache_path, snapshot, now=NOW)
+
+    assert events == ["file_fsync", "replace", "directory_fsync"]
+
+
+def test_cache_publish_failure_preserves_previous_valid_cache(tmp_path, monkeypatch):
+    cache_path = tmp_path / "deepcoin_contract_specs.json"
+    previous = validate_deepcoin_instrument_snapshot(
+        [_row("BTC-USDT-SWAP")], fetched_at=NOW, ttl=TTL
+    )
+    replacement = validate_deepcoin_instrument_snapshot(
+        [_row("SOL-USDT-SWAP")], fetched_at=NOW, ttl=TTL
+    )
+    publish_deepcoin_contract_spec_snapshot(cache_path, previous, now=NOW)
+
+    def fail_fsync(_fd):
+        raise OSError("injected fsync failure")
+
+    monkeypatch.setattr(
+        "telegram_kol_research.deepcoin_contract_spec_cache.os.fsync", fail_fsync
+    )
+
+    with pytest.raises(OSError, match="injected fsync failure"):
+        publish_deepcoin_contract_spec_snapshot(cache_path, replacement, now=NOW)
+
+    assert load_deepcoin_contract_spec_snapshot(cache_path, now=NOW) == previous
+    assert list(tmp_path.glob(f".{cache_path.name}.*.tmp")) == []
+
+
+def test_cache_publish_rejects_oversized_candidate_before_writing(tmp_path, monkeypatch):
+    cache_path = tmp_path / "deepcoin_contract_specs.json"
+    previous = validate_deepcoin_instrument_snapshot(
+        [_row("BTC-USDT-SWAP")], fetched_at=NOW, ttl=TTL
+    )
+    oversized = validate_deepcoin_instrument_snapshot(
+        [_row("BTC-USDT-SWAP"), _row("SOL-USDT-SWAP")],
+        fetched_at=NOW,
+        ttl=TTL,
+    )
+    publish_deepcoin_contract_spec_snapshot(cache_path, previous, now=NOW)
+    monkeypatch.setattr(
+        "telegram_kol_research.deepcoin_contract_spec_cache._MAX_CACHE_INSTRUMENT_COUNT",
+        1,
+    )
+
+    with pytest.raises(ValueError, match="instrument count"):
+        publish_deepcoin_contract_spec_snapshot(cache_path, oversized, now=NOW)
+
+    assert load_deepcoin_contract_spec_snapshot(cache_path, now=NOW) == previous
+    assert list(tmp_path.glob(f".{cache_path.name}.*.tmp")) == []
+
+
+def test_cache_load_rejects_corrupt_json(tmp_path):
+    cache_path = tmp_path / "deepcoin_contract_specs.json"
+    cache_path.write_text("{not-json", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="valid JSON"):
+        load_deepcoin_contract_spec_snapshot(cache_path, now=NOW)
+
+
+def test_cache_load_normalizes_json_parser_resource_failure(tmp_path, monkeypatch):
+    cache_path = tmp_path / "deepcoin_contract_specs.json"
+    cache_path.write_text("{}", encoding="utf-8")
+
+    def fail_from_nesting(_value):
+        raise RecursionError("maximum JSON nesting exceeded")
+
+    monkeypatch.setattr(
+        "telegram_kol_research.deepcoin_contract_spec_cache.json.loads",
+        fail_from_nesting,
+    )
+
+    with pytest.raises(ValueError, match="valid JSON"):
+        load_deepcoin_contract_spec_snapshot(cache_path, now=NOW)
+
+
+def test_cache_load_rejects_unsupported_schema_version(tmp_path):
+    cache_path = tmp_path / "deepcoin_contract_specs.json"
+    snapshot = validate_deepcoin_instrument_snapshot(
+        [_row("BTC-USDT-SWAP")], fetched_at=NOW, ttl=TTL
+    )
+    publish_deepcoin_contract_spec_snapshot(cache_path, snapshot, now=NOW)
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    payload["schema_version"] += 1
+    cache_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="schema_version"):
+        load_deepcoin_contract_spec_snapshot(cache_path, now=NOW)
+
+
+def test_cache_load_rejects_digest_mismatch(tmp_path):
+    cache_path = tmp_path / "deepcoin_contract_specs.json"
+    snapshot = validate_deepcoin_instrument_snapshot(
+        [_row("BTC-USDT-SWAP")], fetched_at=NOW, ttl=TTL
+    )
+    publish_deepcoin_contract_spec_snapshot(cache_path, snapshot, now=NOW)
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    payload["instruments"][0]["ctVal"] = "2"
+    cache_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="digest"):
+        load_deepcoin_contract_spec_snapshot(cache_path, now=NOW)
+
+
+def test_cache_load_rejects_future_fetched_at(tmp_path):
+    cache_path = tmp_path / "deepcoin_contract_specs.json"
+    snapshot = validate_deepcoin_instrument_snapshot(
+        [_row("BTC-USDT-SWAP")], fetched_at=NOW, ttl=TTL
+    )
+    publish_deepcoin_contract_spec_snapshot(cache_path, snapshot, now=NOW)
+
+    with pytest.raises(ValueError, match="future"):
+        load_deepcoin_contract_spec_snapshot(cache_path, now=NOW - timedelta(microseconds=1))
+
+
+def test_cache_is_stale_at_exact_expiry_boundary(tmp_path):
+    cache_path = tmp_path / "deepcoin_contract_specs.json"
+    snapshot = validate_deepcoin_instrument_snapshot(
+        [_row("BTC-USDT-SWAP")], fetched_at=NOW, ttl=TTL
+    )
+    publish_deepcoin_contract_spec_snapshot(cache_path, snapshot, now=NOW)
+
+    with pytest.raises(ValueError, match="stale"):
+        load_deepcoin_contract_spec_snapshot(cache_path, now=NOW + TTL)
+
+
+def test_cache_publish_creates_missing_parent_directory(tmp_path):
+    cache_path = tmp_path / "not-yet-created" / "nested" / "specs.json"
+    snapshot = validate_deepcoin_instrument_snapshot(
+        [_row("BTC-USDT-SWAP")], fetched_at=NOW, ttl=TTL
+    )
+
+    publish_deepcoin_contract_spec_snapshot(cache_path, snapshot, now=NOW)
+
+    assert load_deepcoin_contract_spec_snapshot(cache_path, now=NOW) == snapshot
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        validate_deepcoin_instrument_snapshot(
+            [_row("SOL-USDT-SWAP")],
+            fetched_at=NOW + timedelta(microseconds=1),
+            ttl=TTL,
+        ),
+        validate_deepcoin_instrument_snapshot(
+            [_row("SOL-USDT-SWAP")],
+            fetched_at=NOW - (TTL * 2),
+            ttl=TTL,
+        ),
+    ],
+)
+def test_cache_publish_rejects_unusable_candidate_and_preserves_previous(
+    tmp_path, replacement
+):
+    cache_path = tmp_path / "deepcoin_contract_specs.json"
+    previous = validate_deepcoin_instrument_snapshot(
+        [_row("BTC-USDT-SWAP")], fetched_at=NOW, ttl=TTL
+    )
+    publish_deepcoin_contract_spec_snapshot(cache_path, previous, now=NOW)
+
+    with pytest.raises(ValueError, match="future|stale"):
+        publish_deepcoin_contract_spec_snapshot(cache_path, replacement, now=NOW)
+
+    assert load_deepcoin_contract_spec_snapshot(cache_path, now=NOW) == previous
