@@ -8,11 +8,22 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from dataclasses import dataclass
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 from pathlib import Path
+from threading import Lock
 from typing import Any
+from typing import Callable
 from typing import Protocol
+from typing import TYPE_CHECKING
 
 import yaml
+
+if TYPE_CHECKING:
+    from telegram_kol_research.deepcoin_contract_spec_cache import (
+        DeepcoinContractSpecSnapshot,
+    )
 
 
 @dataclass(frozen=True)
@@ -62,6 +73,194 @@ class StaticDeepcoinContractSpecProvider:
 
     def get_contract_spec(self, instrument_id: str) -> DeepcoinContractSpec | None:
         return self.specs_by_instrument_id.get(instrument_id.upper())
+
+
+@dataclass(frozen=True)
+class DeepcoinContractSpecProviderMetadata:
+    """Bounded health metadata for a refreshable contract-spec provider."""
+
+    last_success_at: datetime | None
+    expires_at: datetime | None
+    last_error: str | None
+
+
+@dataclass(frozen=True)
+class DeepcoinContractSpecLookup:
+    """Explicit lookup result; absence is never overloaded as unsupported."""
+
+    instrument_id: str
+    reason: str
+    venue_state: str | None = None
+    contract_spec: DeepcoinContractSpec | None = None
+
+
+class RefreshableDeepcoinContractSpecProvider:
+    """Cache-backed provider with coalesced, bounded refresh attempts."""
+
+    def __init__(
+        self,
+        *,
+        cache_path: str | Path,
+        instrument_loader: Callable[[], list[dict[str, Any]]],
+        ttl: timedelta,
+        now_provider: Callable[[], datetime] | None = None,
+        refresh_lock_timeout_seconds: float = 5.0,
+        max_error_length: int = 256,
+    ) -> None:
+        if not isinstance(ttl, timedelta) or ttl <= timedelta(0):
+            raise ValueError("ttl must be positive")
+        if refresh_lock_timeout_seconds <= 0:
+            raise ValueError("refresh_lock_timeout_seconds must be positive")
+        if isinstance(max_error_length, bool) or max_error_length <= 0:
+            raise ValueError("max_error_length must be positive")
+        self._cache_path = Path(cache_path)
+        self._instrument_loader = instrument_loader
+        self._ttl = ttl
+        self._now_provider = now_provider or (lambda: datetime.now(timezone.utc))
+        self._refresh_lock_timeout_seconds = refresh_lock_timeout_seconds
+        self._max_error_length = max_error_length
+        self._refresh_lock = Lock()
+        self._refresh_generation = 0
+        self._last_refresh_result = False
+        self._snapshot: DeepcoinContractSpecSnapshot | None = None
+        self._last_success_at: datetime | None = None
+        self._last_success_expires_at: datetime | None = None
+        self._last_error: str | None = None
+        self.reload()
+
+    @property
+    def snapshot(self) -> DeepcoinContractSpecSnapshot | None:
+        return self._snapshot
+
+    @property
+    def metadata(self) -> DeepcoinContractSpecProviderMetadata:
+        return DeepcoinContractSpecProviderMetadata(
+            last_success_at=self._last_success_at,
+            expires_at=self._last_success_expires_at,
+            last_error=self._last_error,
+        )
+
+    def get_contract_spec(self, instrument_id: str) -> DeepcoinContractSpec | None:
+        lookup = self.lookup_contract_spec(instrument_id)
+        return lookup.contract_spec if lookup.reason == "available" else None
+
+    def lookup_contract_spec(self, instrument_id: str) -> DeepcoinContractSpecLookup:
+        normalized_id = str(instrument_id).strip().upper()
+        snapshot = self._snapshot
+        if snapshot is None:
+            return DeepcoinContractSpecLookup(
+                instrument_id=normalized_id,
+                reason="contract_spec_sync_unavailable",
+            )
+        now = _provider_now(self._now_provider)
+        if now >= snapshot.expires_at:
+            return DeepcoinContractSpecLookup(
+                instrument_id=normalized_id,
+                reason="contract_spec_stale",
+            )
+        capability = snapshot.capabilities_by_instrument_id.get(normalized_id)
+        if capability is None:
+            return DeepcoinContractSpecLookup(
+                instrument_id=normalized_id,
+                reason="venue_instrument_unsupported",
+            )
+        if capability.state != "live":
+            return DeepcoinContractSpecLookup(
+                instrument_id=normalized_id,
+                reason="venue_instrument_not_live",
+                venue_state=capability.state,
+            )
+        return DeepcoinContractSpecLookup(
+            instrument_id=normalized_id,
+            reason="available",
+            venue_state=capability.state,
+            contract_spec=capability.contract_spec,
+        )
+
+    def reload(self) -> bool:
+        """Reload an atomically published cache, clearing authority on failure."""
+
+        from telegram_kol_research.deepcoin_contract_spec_cache import (
+            load_deepcoin_contract_spec_snapshot,
+        )
+
+        try:
+            snapshot = load_deepcoin_contract_spec_snapshot(
+                self._cache_path,
+                now=_provider_now(self._now_provider),
+            )
+        except (OSError, ValueError) as exc:
+            self._snapshot = None
+            self._record_error(exc)
+            return False
+        self._accept_snapshot(snapshot)
+        return True
+
+    def refresh(self) -> bool:
+        """Refresh once; waiters share the completed in-flight attempt."""
+
+        generation = self._refresh_generation
+        acquired = self._refresh_lock.acquire(
+            timeout=self._refresh_lock_timeout_seconds
+        )
+        if not acquired:
+            self._record_error(TimeoutError("contract spec refresh lock timed out"))
+            return False
+        try:
+            if self._refresh_generation != generation:
+                return self._last_refresh_result
+            result = self._refresh_locked()
+            self._last_refresh_result = result
+            self._refresh_generation += 1
+            return result
+        finally:
+            self._refresh_lock.release()
+
+    def _refresh_locked(self) -> bool:
+        from telegram_kol_research.deepcoin_contract_spec_cache import (
+            publish_deepcoin_contract_spec_snapshot,
+            validate_deepcoin_instrument_snapshot,
+        )
+
+        now = _provider_now(self._now_provider)
+        try:
+            rows = self._instrument_loader()
+            snapshot = validate_deepcoin_instrument_snapshot(
+                rows,
+                fetched_at=now,
+                ttl=self._ttl,
+            )
+            publish_deepcoin_contract_spec_snapshot(
+                self._cache_path,
+                snapshot,
+                now=now,
+            )
+        except Exception as exc:
+            self._record_error(exc)
+            # A refresh failure cannot invalidate a still-fresh snapshot that
+            # was already fully validated and atomically published.
+            return False
+        self._accept_snapshot(snapshot)
+        return True
+
+    def _accept_snapshot(self, snapshot: DeepcoinContractSpecSnapshot) -> None:
+        self._snapshot = snapshot
+        self._last_success_at = snapshot.fetched_at
+        self._last_success_expires_at = snapshot.expires_at
+        self._last_error = None
+
+    def _record_error(self, error: Exception) -> None:
+        rendered = f"{type(error).__name__}: {error}"
+        self._last_error = rendered[: self._max_error_length]
+
+
+def _provider_now(now_provider: Callable[[], datetime]) -> datetime:
+    value = now_provider()
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ValueError("provider clock must return a timezone-aware datetime")
+    if value.utcoffset() is None:
+        raise ValueError("provider clock must return a timezone-aware datetime")
+    return value.astimezone(timezone.utc)
 
 
 def load_deepcoin_contract_specs(
