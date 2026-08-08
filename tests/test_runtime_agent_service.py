@@ -141,3 +141,39 @@ def test_runtime_agent_sanitizer_never_follows_agent_bait_symlink(tmp_path):
         os.close(directory_fd)
     assert target.read_text(encoding="utf-8") == "unchanged"
     assert target.stat().st_mode == original_mode
+
+
+def test_runtime_agent_sanitizer_handles_reviewed_directory_and_rejects_bait(tmp_path):
+    helper_path = (
+        Path(__file__).parents[1]
+        / "deploy"
+        / "systemd"
+        / "telegram-kol-runtime-agent-prepare-db-acl"
+    )
+    helper = runpy.run_path(str(helper_path))
+    sanitizer = helper["_sanitize_non_database_files"]
+    sanitizer.__globals__["DATABASE_PATH"] = str(tmp_path / "research.db")
+    sanitizer.__globals__["SQLITE_NAMES"] = frozenset(
+        {"research.db", "research.db-wal", "research.db-shm", "research.db-journal"}
+    )
+    sanitizer.__globals__["_set_agent_acl_fd"] = lambda _fd, _permission: None
+    (tmp_path / "research.db").write_bytes(b"")
+    (tmp_path / "web_cache").mkdir()
+    regular = tmp_path / "telegram.session"
+    regular.write_text("redacted-fixture", encoding="utf-8")
+    regular.chmod(0o644)
+
+    sanitizer(trusted_owner_uid=os.getuid())
+    assert regular.stat().st_mode & 0o077 == 0
+
+    target = tmp_path.parent / f"{tmp_path.name}-protected-target"
+    try:
+        target.write_text("unchanged", encoding="utf-8")
+        original_mode = target.stat().st_mode
+        (tmp_path / "bait").symlink_to(target)
+        with pytest.raises(OSError):
+            sanitizer(trusted_owner_uid=os.getuid())
+        assert target.read_text(encoding="utf-8") == "unchanged"
+        assert target.stat().st_mode == original_mode
+    finally:
+        target.unlink(missing_ok=True)
