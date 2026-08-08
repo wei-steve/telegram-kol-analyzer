@@ -866,7 +866,11 @@ def legacy_repair_immutable_identity(
     if order_identity is None:
         return None
     leg_submissions: list[dict[str, Any]] = []
-    for row in legs:
+    if not isinstance(submitted_orders, list) or len(submitted_orders) != len(legs):
+        return None
+    for row, submitted in zip(legs, submitted_orders):
+        if not isinstance(submitted, Mapping):
+            return None
         request_raw = _leg_value(row, "request_json")
         request = (
             dict(request_raw)
@@ -877,9 +881,9 @@ def legacy_repair_immutable_identity(
             return None
         leg_submissions.append(
             {
-                "client_order_id": _leg_value(row, "client_order_id"),
+                "client_order_id": submitted.get("client_order_id"),
                 "leg_index": _leg_value(row, "leg_index"),
-                "order_id": _leg_value(row, "order_id"),
+                "order_id": submitted.get("order_id"),
                 "order_kind": _leg_value(row, "order_kind"),
                 "request": request,
             }
@@ -1127,6 +1131,19 @@ def _current_binding_order_identity_is_exact(
     initial_order_id: Any,
     initial_client_order_id: Any,
 ) -> bool:
+    initial_order_ids = str(initial_order_id or "").split(",")
+    initial_client_order_ids = str(initial_client_order_id or "").split(",")
+    if (
+        len(initial_order_ids) != len(legs)
+        or len(initial_client_order_ids) != len(legs)
+        or any(
+            _leg_value(row, "order_id") != initial_order_ids[index]
+            or _leg_value(row, "client_order_id")
+            != initial_client_order_ids[index]
+            for index, row in enumerate(legs)
+        )
+    ):
+        return False
     retained_legs = [
         row
         for row in legs
@@ -1166,6 +1183,414 @@ def _is_management_deferred_cancelled_leg(row: Any) -> bool:
         and _leg_value(row, "terminal_reason")
         == "management_full_close_cancelled_unfilled_entry_leg"
         and not _leg_value(row, "pos_id")
+    )
+
+
+_LEGACY_BINDING_EVENT_ACTIONS = frozenset(
+    {
+        "adjust_position_tpsl",
+        "set_position_tpsl",
+        "cancel_trigger_entry",
+        "cancel_regular_entry",
+        "recreate_trigger_entry",
+    }
+)
+
+
+def legacy_event_backed_transition_is_lawful(
+    binding: Mapping[str, Any],
+    *,
+    legs: list[Any],
+    initial_submission_identity: Mapping[str, Any],
+    events: list[Mapping[str, Any]],
+) -> bool:
+    transition_events = [
+        row
+        for row in events
+        if row.get("action") in _LEGACY_BINDING_EVENT_ACTIONS
+    ]
+    if not transition_events:
+        return False
+    last_status = binding.get("last_exchange_status")
+    if last_status == "position_tpsl_adjusted":
+        return _legacy_tpsl_transition_is_exact(
+            binding,
+            legs=legs,
+            initial_submission_identity=initial_submission_identity,
+            event=transition_events[-1],
+        )
+    if last_status in {"cancel_trigger_entry", "cancel_regular_entry"}:
+        trailing = []
+        for row in reversed(transition_events):
+            if row.get("action") != last_status:
+                break
+            trailing.append(row)
+        return _legacy_full_cancel_transition_is_exact(
+            binding,
+            legs=legs,
+            initial_submission_identity=initial_submission_identity,
+            events=list(reversed(trailing)),
+        )
+    if last_status == "trigger_entry_recreated":
+        return _legacy_trigger_recreation_is_exact(
+            binding,
+            legs=legs,
+            initial_submission_identity=initial_submission_identity,
+            events=[
+                row
+                for row in transition_events
+                if row.get("action") == "recreate_trigger_entry"
+            ],
+        )
+    return False
+
+
+def _legacy_transition_event_core_is_exact(
+    event: Mapping[str, Any], *, binding: Mapping[str, Any], action: str
+) -> bool:
+    return (
+        event.get("action") == action
+        and event.get("status") == "submitted"
+        and event.get("venue") == "deepcoin"
+        and event.get("strategy_instance_id")
+        == binding.get("strategy_instance_id")
+        and isinstance(event.get("request"), Mapping)
+        and isinstance(event.get("response"), Mapping)
+    )
+
+
+def _legacy_tpsl_transition_is_exact(
+    binding: Mapping[str, Any],
+    *,
+    legs: list[Any],
+    initial_submission_identity: Mapping[str, Any],
+    event: Mapping[str, Any],
+) -> bool:
+    action = event.get("action")
+    ordinary_active = dict(binding)
+    ordinary_active["last_exchange_status"] = "position_ownership_verified"
+    position_ids = {
+        value.strip()
+        for value in str(binding.get("pos_id") or "").split(",")
+        if value.strip()
+    }
+    request = event.get("request")
+    response = event.get("response")
+    expected_instrument_id = f"{str(binding.get('symbol') or '').upper()}-USDT-SWAP"
+    request_rows = request.get("rows") if isinstance(request, Mapping) else None
+    response_rows = response.get("rows") if isinstance(response, Mapping) else None
+    response_order_ids = (
+        [_legacy_success_response_order_id(row) for row in response_rows]
+        if isinstance(response_rows, list)
+        else []
+    )
+    after = event.get("after")
+    return (
+        binding.get("status") == "active"
+        and action in {"adjust_position_tpsl", "set_position_tpsl"}
+        and legacy_lifecycle_state_is_lawful(
+            ordinary_active,
+            legs=legs,
+            initial_submission_identity=initial_submission_identity,
+        )
+        and _legacy_transition_event_core_is_exact(
+            event, binding=binding, action=str(action)
+        )
+        and event.get("pos_id") in position_ids
+        and bool(str(event.get("order_id") or "").strip())
+        and isinstance(request_rows, list)
+        and bool(request_rows)
+        and all(
+            isinstance(row, Mapping)
+            and row.get("instId") == expected_instrument_id
+            for row in request_rows
+        )
+        and isinstance(response_rows, list)
+        and len(response_rows) == len(request_rows)
+        and all(response_order_ids)
+        and event.get("order_id") == ",".join(response_order_ids)
+        and _legacy_tpsl_after_matches_requests(after, request_rows)
+        and (
+            action == "set_position_tpsl"
+            or isinstance(event.get("before"), Mapping)
+        )
+    )
+
+
+def _legacy_full_cancel_transition_is_exact(
+    binding: Mapping[str, Any],
+    *,
+    legs: list[Any],
+    initial_submission_identity: Mapping[str, Any],
+    events: list[Mapping[str, Any]],
+) -> bool:
+    action = str(binding.get("last_exchange_status") or "")
+    if (
+        binding.get("status") != "cancelled"
+        or binding.get("pos_id") is not None
+        or action not in {"cancel_trigger_entry", "cancel_regular_entry"}
+        or not _current_binding_order_identity_is_exact(
+            binding,
+            legs=legs,
+            initial_order_id=initial_submission_identity.get("order_id"),
+            initial_client_order_id=initial_submission_identity.get(
+                "client_order_id"
+            ),
+        )
+    ):
+        return False
+    newly_cancelled = [
+        row for row in legs if not _is_prior_top_removed_cancelled_leg(row)
+    ]
+    if len(events) != len(newly_cancelled) or not newly_cancelled:
+        return False
+    event_by_order_id = {event.get("order_id"): event for event in events}
+    if len(event_by_order_id) != len(events):
+        return False
+    instrument_id = f"{str(binding.get('symbol') or '').upper()}-USDT-SWAP"
+    for leg in newly_cancelled:
+        leg_status = str(_leg_value(leg, "status") or "").lower()
+        if (
+            _leg_value(leg, "pos_id")
+            or leg_status not in {"cancelled", "exchange_cancelled"}
+            or (
+                leg_status == "cancelled"
+                and _leg_value(leg, "terminal_reason") is not None
+            )
+            or (
+                leg_status == "exchange_cancelled"
+                and _leg_value(leg, "terminal_reason") != action
+            )
+        ):
+            return False
+        identity = (
+            _leg_value(leg, "order_id"),
+            _leg_value(leg, "client_order_id"),
+        )
+        event = event_by_order_id.get(identity[0])
+        request = event.get("request") if isinstance(event, Mapping) else None
+        response = event.get("response") if isinstance(event, Mapping) else None
+        if (
+            event is None
+            or not _legacy_transition_event_core_is_exact(
+                event, binding=binding, action=action
+            )
+            or not isinstance(event.get("before"), Mapping)
+            or event.get("after") is not None
+            or request.get("instId") != instrument_id
+            or request.get("ordId") != identity[0]
+            or (
+                event.get("client_order_id") is not None
+                and event.get("client_order_id") != identity[1]
+            )
+            or (
+                request.get("clOrdId") is not None
+                and request.get("clOrdId") != identity[1]
+            )
+            or not _nested_mapping_contains(event.get("before"), "ordId", identity[0])
+            or any(
+                value != identity[1]
+                for value in _nested_mapping_values(
+                    event.get("before"), "clOrdId"
+                )
+            )
+            or _legacy_success_response_order_id(response) != identity[0]
+            or (
+                action == "cancel_regular_entry"
+                and request.get("mrgPosition")
+                != binding.get("position_mode")
+            )
+        ):
+            return False
+    return True
+
+
+def _legacy_success_response_order_id(response: Any) -> str | None:
+    if not isinstance(response, Mapping) or str(response.get("code")) != "0":
+        return None
+    data = response.get("data")
+    payloads = [data] if isinstance(data, Mapping) else data if isinstance(data, list) else []
+    order_ids = [
+        str(payload.get("ordId"))
+        for payload in payloads
+        if isinstance(payload, Mapping) and payload.get("ordId") not in (None, "")
+    ]
+    return order_ids[0] if len(order_ids) == 1 else None
+
+
+def _legacy_tpsl_after_matches_requests(after: Any, requests: list[Any]) -> bool:
+    if (
+        not isinstance(after, Mapping)
+        or not after
+        or not set(after).issubset({"stop_loss", "take_profit"})
+    ):
+        return False
+    request_prices = {
+        "stop_loss": {
+            str(row.get("slTriggerPx"))
+            for row in requests
+            if isinstance(row, Mapping) and row.get("slTriggerPx") not in (None, "")
+        },
+        "take_profit": {
+            str(row.get("tpTriggerPx"))
+            for row in requests
+            if isinstance(row, Mapping) and row.get("tpTriggerPx") not in (None, "")
+        },
+    }
+    return all(str(value) in request_prices[key] for key, value in after.items())
+
+
+def _legacy_trigger_recreation_is_exact(
+    binding: Mapping[str, Any],
+    *,
+    legs: list[Any],
+    initial_submission_identity: Mapping[str, Any],
+    events: list[Mapping[str, Any]],
+) -> bool:
+    if not events:
+        return False
+    event = events[-1]
+    if (
+        binding.get("status") not in {"open", "active"}
+        or event.get("action") != "recreate_trigger_entry"
+        or not _legacy_transition_event_core_is_exact(
+            event, binding=binding, action="recreate_trigger_entry"
+        )
+        or not _legacy_recreation_price_snapshot_is_exact(event.get("before"))
+        or not _legacy_recreation_price_snapshot_is_exact(event.get("after"))
+    ):
+        return False
+    initial_order_ids = str(initial_submission_identity.get("order_id") or "").split(",")
+    initial_client_ids = str(
+        initial_submission_identity.get("client_order_id") or ""
+    ).split(",")
+    if len(initial_order_ids) != len(legs) or len(initial_client_ids) != len(legs):
+        return False
+    changed = [
+        (index, row)
+        for index, row in enumerate(legs)
+        if _leg_value(row, "order_id") != initial_order_ids[index]
+        or _leg_value(row, "client_order_id") != initial_client_ids[index]
+    ]
+    if len(changed) != 1:
+        return False
+    changed_index, changed_leg = changed[0]
+    current_order_id = _leg_value(changed_leg, "order_id")
+    current_client_id = _leg_value(changed_leg, "client_order_id")
+    if (
+        not str(current_order_id or "").strip()
+        or not str(current_client_id or "").strip()
+        or _leg_value(changed_leg, "order_kind") != "trigger_limit"
+        or _leg_value(changed_leg, "status") != "open"
+        or _leg_value(changed_leg, "pos_id") is not None
+        or _leg_value(changed_leg, "terminal_reason") is not None
+        or binding.get("order_id") != current_order_id
+        or binding.get("client_order_id") != current_client_id
+    ):
+        return False
+    expected_previous_order_id = initial_order_ids[changed_index]
+    expected_current_client_id = initial_client_ids[changed_index]
+    instrument_id = f"{str(binding.get('symbol') or '').upper()}-USDT-SWAP"
+    for recreation_event in events:
+        request = recreation_event.get("request")
+        response = recreation_event.get("response")
+        if not isinstance(request, Mapping) or not isinstance(response, Mapping):
+            return False
+        next_order_id = recreation_event.get("order_id")
+        next_client_id = request.get("clOrdId")
+        if (
+            not _legacy_transition_event_core_is_exact(
+                recreation_event,
+                binding=binding,
+                action="recreate_trigger_entry",
+            )
+            or not _legacy_recreation_price_snapshot_is_exact(
+                recreation_event.get("before")
+            )
+            or not _legacy_recreation_price_snapshot_is_exact(
+                recreation_event.get("after")
+            )
+            or recreation_event.get("related_order_id")
+            != expected_previous_order_id
+            or not str(next_order_id or "").strip()
+            or not str(next_client_id or "").strip()
+            or request.get("instId") != instrument_id
+            or (
+                recreation_event["after"].get("stop_loss") is not None
+                and str(request.get("slTriggerPx"))
+                != str(recreation_event["after"]["stop_loss"])
+            )
+            or _legacy_success_response_order_id(response) != next_order_id
+        ):
+            return False
+        expected_previous_order_id = str(next_order_id)
+        expected_current_client_id = str(next_client_id)
+    if (
+        expected_previous_order_id != current_order_id
+        or expected_current_client_id != current_client_id
+    ):
+        return False
+    for index, row in enumerate(legs):
+        if index == changed_index:
+            continue
+        if (
+            _leg_value(row, "order_id") != initial_order_ids[index]
+            or _leg_value(row, "client_order_id") != initial_client_ids[index]
+        ):
+            return False
+    if binding.get("status") == "open":
+        return binding.get("pos_id") is None and all(
+            not _leg_value(row, "pos_id")
+            and str(_leg_value(row, "status") or "").lower()
+            in {"open", "pending", "submitted"}
+            and _leg_value(row, "terminal_reason") is None
+            for row in legs
+        )
+    verified_position_ids = [
+        str(_leg_value(row, "pos_id"))
+        for row in legs
+        if _leg_value(row, "pos_id")
+        and _leg_value(row, "attribution_status") == "verified"
+        and str(_leg_value(row, "status") or "").lower()
+        in {"active", "partially_filled", "partial"}
+        and _leg_value(row, "terminal_reason") is None
+    ]
+    return bool(verified_position_ids) and binding.get("pos_id") == ",".join(
+        dict.fromkeys(verified_position_ids)
+    )
+
+
+def _nested_mapping_contains(value: Any, key: str, expected: Any) -> bool:
+    if isinstance(value, Mapping):
+        return value.get(key) == expected or any(
+            _nested_mapping_contains(item, key, expected)
+            for item in value.values()
+        )
+    if isinstance(value, list):
+        return any(_nested_mapping_contains(item, key, expected) for item in value)
+    return False
+
+
+def _nested_mapping_values(value: Any, key: str) -> list[Any]:
+    if isinstance(value, Mapping):
+        values = [value[key]] if key in value else []
+        for item in value.values():
+            values.extend(_nested_mapping_values(item, key))
+        return values
+    if isinstance(value, list):
+        values: list[Any] = []
+        for item in value:
+            values.extend(_nested_mapping_values(item, key))
+        return values
+    return []
+
+
+def _legacy_recreation_price_snapshot_is_exact(value: Any) -> bool:
+    return bool(
+        isinstance(value, Mapping)
+        and value
+        and set(value).issubset({"stop_loss", "take_profit"})
+        and all(item not in (None, "", 0, "0") for item in value.values())
     )
 
 
@@ -1527,6 +1952,7 @@ def legacy_finalized_execution_legs_match(
     symbol: str,
     side: str,
     submitted_orders: Any,
+    require_initial_order_identity: bool = True,
 ) -> bool:
     expected_legs = full_draft.get("order_legs")
     instrument = str(full_draft.get("instrument_id") or "").upper()
@@ -1566,15 +1992,25 @@ def legacy_finalized_execution_legs_match(
             or str(_leg_value(row, "strategy_instance_id") or "")
             != strategy_instance_id
             or str(_leg_value(row, "venue") or "").lower() != "deepcoin"
-            or not str(_leg_value(row, "order_id") or "").strip()
-            or _leg_value(row, "order_id") != submitted["order_id"]
+            or (
+                require_initial_order_identity
+                and (
+                    not str(_leg_value(row, "order_id") or "").strip()
+                    or _leg_value(row, "order_id") != submitted["order_id"]
+                )
+            )
             or expected_kind is None
             or str(_leg_value(row, "order_kind") or "").lower() != expected_kind
-            or not str(_leg_value(row, "client_order_id") or "").strip()
-            or str(_leg_value(row, "client_order_id"))
-            != str(expected.get("client_order_id") or "")
-            or _leg_value(row, "client_order_id")
-            != submitted["client_order_id"]
+            or (
+                require_initial_order_identity
+                and (
+                    not str(_leg_value(row, "client_order_id") or "").strip()
+                    or str(_leg_value(row, "client_order_id"))
+                    != str(expected.get("client_order_id") or "")
+                    or _leg_value(row, "client_order_id")
+                    != submitted["client_order_id"]
+                )
+            )
             or request != submitted["request"]
             or not _exact_request_matches_leg(
                 request, expected=expected, full_draft=full_draft

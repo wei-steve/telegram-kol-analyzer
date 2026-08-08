@@ -39,6 +39,7 @@ from telegram_kol_research.entry_assembly_fingerprint_repair import (
     derive_pre_finalization_fingerprint,
     entry_order_snapshot_matches_durable_identity,
     legacy_expected_initial_observed_state,
+    legacy_event_backed_transition_is_lawful,
     legacy_finalized_execution_legs_match,
     legacy_finalized_binding_payload_is_exact,
     legacy_finalized_signal_payload_is_exact,
@@ -1272,6 +1273,7 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
         symbol=str(binding_identity.get("symbol") or ""),
         side=str(binding_identity.get("side") or ""),
         submitted_orders=binding_payload["submitted_orders"],
+        require_initial_order_identity=False,
     ):
         return False
     binding_order_identity = legacy_initial_submission_identity(
@@ -1280,11 +1282,59 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
     )
     if binding_order_identity is None:
         return False
-    if not legacy_lifecycle_state_is_lawful(
+    transition_rows = connection.execute(
+        """
+        SELECT id, strategy_instance_id, venue, action, status,
+               order_id, client_order_id, pos_id, related_order_id,
+               before_json, after_json, request_json, response_json
+        FROM execution_events
+        WHERE execution_binding_id = ?
+          AND action IN (
+              'adjust_position_tpsl', 'set_position_tpsl',
+              'cancel_trigger_entry', 'cancel_regular_entry',
+              'recreate_trigger_entry'
+          )
+        ORDER BY id ASC
+        """,
+        (execution_binding_id,),
+    ).fetchall()
+    transition_events: list[dict[str, Any]] = []
+    for transition_row in transition_rows:
+        parsed_documents: list[dict[str, Any] | None] = []
+        for raw_document in transition_row[9:13]:
+            parsed = _read_reconciliation_json(raw_document)
+            if raw_document is not None and parsed is None:
+                return False
+            parsed_documents.append(parsed)
+        transition_events.append(
+            {
+                "id": transition_row[0],
+                "strategy_instance_id": transition_row[1],
+                "venue": transition_row[2],
+                "action": transition_row[3],
+                "status": transition_row[4],
+                "order_id": transition_row[5],
+                "client_order_id": transition_row[6],
+                "pos_id": transition_row[7],
+                "related_order_id": transition_row[8],
+                "before": parsed_documents[0],
+                "after": parsed_documents[1],
+                "request": parsed_documents[2],
+                "response": parsed_documents[3],
+            }
+        )
+    lifecycle_is_lawful = legacy_lifecycle_state_is_lawful(
         binding_identity,
         legs=legs,
         initial_submission_identity=binding_order_identity,
-    ):
+    )
+    event_transition_is_lawful = legacy_event_backed_transition_is_lawful(
+        binding_identity,
+        legs=legs,
+        initial_submission_identity=binding_order_identity,
+        events=transition_events,
+    )
+    if not lifecycle_is_lawful and not event_transition_is_lawful:
         return False
 
     rows = connection.execute(

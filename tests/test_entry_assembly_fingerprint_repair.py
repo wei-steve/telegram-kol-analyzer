@@ -436,6 +436,41 @@ def _transition_legacy_binding_lifecycle(session, state: str) -> None:
         raise AssertionError(f"unsupported lifecycle state: {state}")
 
 
+def _add_legacy_action_event(
+    session,
+    *,
+    action: str,
+    order_id: str | None = None,
+    client_order_id: str | None = None,
+    pos_id: str | None = None,
+    related_order_id: str | None = None,
+    before: dict | None = None,
+    after: dict | None = None,
+    request: dict | None = None,
+    response: dict | None = None,
+) -> None:
+    session.add(
+        ExecutionEvent(
+            execution_binding_id=266,
+            strategy_instance_id=STRATEGY_ID,
+            venue="deepcoin",
+            action=action,
+            status="submitted",
+            order_id=order_id,
+            client_order_id=client_order_id,
+            pos_id=pos_id,
+            related_order_id=related_order_id,
+            before_json=_canonical_json(before) if before is not None else None,
+            after_json=_canonical_json(after) if after is not None else None,
+            request_json=_canonical_json(request) if request is not None else None,
+            response_json=(
+                _canonical_json(response) if response is not None else None
+            ),
+            created_at=NOW,
+        )
+    )
+
+
 def _rewrite_all_draft_copies(session, mutate) -> None:
     assembly = session.get(EntryStrategyAssembly, 2)
     evidence = json.loads(assembly.evidence_json)
@@ -1194,6 +1229,503 @@ def test_legacy_reconciliation_rejects_corrupt_management_subset_close(
     assert read_entry_preamble_invariants(database_path, now=NOW) == (
         "live_entry_preamble_binding_evidence_missing",
     )
+
+
+@pytest.mark.parametrize("action", ["adjust_position_tpsl", "set_position_tpsl"])
+@pytest.mark.parametrize("with_event", [True, False])
+def test_legacy_reconciliation_requires_exact_tpsl_adjustment_event(
+    tmp_path, with_event, action
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        _transition_legacy_binding_lifecycle(session, "active")
+        binding = session.get(ExecutionBinding, 266)
+        binding.last_exchange_status = "position_tpsl_adjusted"
+        if with_event:
+            _add_legacy_action_event(
+                session,
+                action=action,
+                order_id="tpsl-1",
+                pos_id="pos-1",
+                before=(
+                    {"rows": [{"ordId": "old-tpsl"}]}
+                    if action == "adjust_position_tpsl"
+                    else None
+                ),
+                after={"stop_loss": "63100"},
+                request={
+                    "rows": [
+                        {
+                            "instId": "BTC-USDT-SWAP",
+                            "slTriggerPx": "63100",
+                        }
+                    ]
+                },
+                response={
+                    "rows": [
+                        {"code": "0", "data": {"ordId": "tpsl-1"}}
+                    ]
+                },
+            )
+        session.commit()
+
+    expected = () if with_event else ("live_entry_preamble_binding_evidence_missing",)
+    assert read_entry_preamble_invariants(database_path, now=NOW) == expected
+
+
+def test_legacy_reconciliation_rejects_tpsl_event_for_wrong_instrument(tmp_path):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        _transition_legacy_binding_lifecycle(session, "active")
+        session.get(ExecutionBinding, 266).last_exchange_status = (
+            "position_tpsl_adjusted"
+        )
+        _add_legacy_action_event(
+            session,
+            action="adjust_position_tpsl",
+            order_id="tpsl-1",
+            pos_id="pos-1",
+            before={"rows": [{"ordId": "old-tpsl"}]},
+            after={"stop_loss": "63100"},
+            request={
+                "rows": [
+                    {"instId": "ETH-USDT-SWAP", "slTriggerPx": "63100"}
+                ]
+            },
+            response={
+                "rows": [{"code": "0", "data": {"ordId": "tpsl-1"}}]
+            },
+        )
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == (
+        "live_entry_preamble_binding_evidence_missing",
+    )
+
+
+@pytest.mark.parametrize(
+    ("order_id", "response", "after"),
+    [
+        ("forged-tpsl", {"rows": [{"code": "0", "data": {"ordId": "tpsl-1"}}]}, {"stop_loss": "63100"}),
+        ("tpsl-1", {"rows": [{"code": "1", "data": {"ordId": "tpsl-1"}}]}, {"stop_loss": "63100"}),
+        ("tpsl-1", {"rows": [{"code": "0", "data": {"ordId": "tpsl-1"}}]}, {"take_profit": "99999"}),
+    ],
+)
+def test_legacy_reconciliation_rejects_forged_tpsl_event_proof(
+    tmp_path, order_id, response, after
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        _transition_legacy_binding_lifecycle(session, "active")
+        session.get(ExecutionBinding, 266).last_exchange_status = (
+            "position_tpsl_adjusted"
+        )
+        _add_legacy_action_event(
+            session,
+            action="adjust_position_tpsl",
+            order_id=order_id,
+            pos_id="pos-1",
+            before={"stop_loss": "63000"},
+            after=after,
+            request={
+                "rows": [
+                    {
+                        "instId": "BTC-USDT-SWAP",
+                        "slTriggerPx": "63100",
+                    }
+                ]
+            },
+            response=response,
+        )
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == (
+        "live_entry_preamble_binding_evidence_missing",
+    )
+
+
+@pytest.mark.parametrize("leg_status", ["cancelled", "exchange_cancelled"])
+@pytest.mark.parametrize("action", ["cancel_trigger_entry", "cancel_regular_entry"])
+def test_legacy_reconciliation_accepts_exact_full_entry_cancel_events(
+    tmp_path, action, leg_status
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        binding.status = "cancelled"
+        binding.last_exchange_status = action
+        for leg in session.query(ExecutionOrderLeg).order_by(
+            ExecutionOrderLeg.leg_index
+        ):
+            leg.status = leg_status
+            leg.terminal_reason = (
+                action if leg_status == "exchange_cancelled" else None
+            )
+            request = {"instId": "BTC-USDT-SWAP", "ordId": leg.order_id}
+            request["clOrdId"] = leg.client_order_id
+            if action == "cancel_regular_entry":
+                request["mrgPosition"] = "split"
+            _add_legacy_action_event(
+                session,
+                action=action,
+                order_id=leg.order_id,
+                client_order_id=leg.client_order_id,
+                before={
+                    "ordId": leg.order_id,
+                    "clOrdId": leg.client_order_id,
+                },
+                request=request,
+                response={"code": "0", "data": {"ordId": leg.order_id}},
+            )
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == ()
+
+
+def test_legacy_reconciliation_rejects_forged_full_entry_cancel_state(tmp_path):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        binding.status = "cancelled"
+        binding.last_exchange_status = "cancel_trigger_entry"
+        legs = session.query(ExecutionOrderLeg).order_by(
+            ExecutionOrderLeg.leg_index
+        ).all()
+        for leg in legs:
+            leg.status = "cancelled"
+        _add_legacy_action_event(
+            session,
+            action="cancel_trigger_entry",
+            order_id=legs[0].order_id,
+            client_order_id=legs[0].client_order_id,
+            before={
+                "ordId": legs[0].order_id,
+                "clOrdId": legs[0].client_order_id,
+            },
+            request={
+                "instId": "BTC-USDT-SWAP",
+                "ordId": legs[0].order_id,
+                "clOrdId": legs[0].client_order_id,
+            },
+            response={"code": "0", "data": {"ordId": legs[0].order_id}},
+        )
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == (
+        "live_entry_preamble_binding_evidence_missing",
+    )
+
+
+def test_legacy_reconciliation_accepts_order_id_only_full_cancel_events(tmp_path):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        binding.status = "cancelled"
+        binding.last_exchange_status = "cancel_trigger_entry"
+        for leg in session.query(ExecutionOrderLeg).order_by(
+            ExecutionOrderLeg.leg_index
+        ):
+            leg.status = "cancelled"
+            _add_legacy_action_event(
+                session,
+                action="cancel_trigger_entry",
+                order_id=leg.order_id,
+                before={"ordId": leg.order_id},
+                request={"instId": "BTC-USDT-SWAP", "ordId": leg.order_id},
+                response={"code": "0", "data": {"ordId": leg.order_id}},
+            )
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == ()
+
+
+@pytest.mark.parametrize("mutation", ["wrong_client", "failed_response", "wrong_response_order"])
+def test_legacy_reconciliation_rejects_forged_full_cancel_event_proof(
+    tmp_path, mutation
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        binding.status = "cancelled"
+        binding.last_exchange_status = "cancel_trigger_entry"
+        for leg in session.query(ExecutionOrderLeg).order_by(
+            ExecutionOrderLeg.leg_index
+        ):
+            leg.status = "cancelled"
+            request_client_id = (
+                "forged-client" if mutation == "wrong_client" else leg.client_order_id
+            )
+            response_code = "1" if mutation == "failed_response" else "0"
+            response_order_id = (
+                "forged-order" if mutation == "wrong_response_order" else leg.order_id
+            )
+            _add_legacy_action_event(
+                session,
+                action="cancel_trigger_entry",
+                order_id=leg.order_id,
+                client_order_id=leg.client_order_id,
+                before={
+                    "ordId": leg.order_id,
+                    "clOrdId": leg.client_order_id,
+                },
+                request={
+                    "instId": "BTC-USDT-SWAP",
+                    "ordId": leg.order_id,
+                    "clOrdId": request_client_id,
+                },
+                response={
+                    "code": response_code,
+                    "data": {"ordId": response_order_id},
+                },
+            )
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == (
+        "live_entry_preamble_binding_evidence_missing",
+    )
+
+
+@pytest.mark.parametrize("binding_status", ["open", "active"])
+def test_legacy_reconciliation_accepts_exact_trigger_entry_recreation(
+    tmp_path, binding_status
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        legs = session.query(ExecutionOrderLeg).order_by(
+            ExecutionOrderLeg.leg_index
+        ).all()
+        recreated = legs[0]
+        recreated.order_id = "new-order-1"
+        recreated.client_order_id = "new-client-1"
+        recreated.status = "open"
+        binding.order_id = "new-order-1"
+        binding.client_order_id = "new-client-1"
+        binding.status = binding_status
+        binding.last_exchange_status = "trigger_entry_recreated"
+        if binding_status == "active":
+            legs[1].status = "active"
+            legs[1].pos_id = "pos-2"
+            legs[1].attribution_status = "verified"
+            binding.pos_id = "pos-2"
+        _add_legacy_action_event(
+            session,
+            action="recreate_trigger_entry",
+            order_id="new-order-1",
+            related_order_id="order-1",
+            before={"stop_loss": "63000"},
+            after={"stop_loss": "63100"},
+            request={
+                "instId": "BTC-USDT-SWAP",
+                "clOrdId": "new-client-1",
+                "slTriggerPx": "63100",
+            },
+            response={"code": "0", "data": {"ordId": "new-order-1"}},
+        )
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == ()
+
+
+def test_legacy_reconciliation_rejects_forged_trigger_entry_recreation(tmp_path):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        leg = session.query(ExecutionOrderLeg).filter_by(leg_index=1).one()
+        leg.order_id = binding.order_id = "new-order-1"
+        leg.client_order_id = binding.client_order_id = "new-client-1"
+        leg.status = "open"
+        binding.last_exchange_status = "trigger_entry_recreated"
+        _add_legacy_action_event(
+            session,
+            action="recreate_trigger_entry",
+            order_id="new-order-1",
+            related_order_id="wrong-old-order",
+            before={"stop_loss": "63000"},
+            after={"stop_loss": "63100"},
+            request={
+                "instId": "BTC-USDT-SWAP",
+                "clOrdId": "new-client-1",
+                "slTriggerPx": "63100",
+            },
+            response={"code": "0", "data": {"ordId": "new-order-1"}},
+        )
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == (
+        "live_entry_preamble_binding_evidence_missing",
+    )
+
+
+@pytest.mark.parametrize("mutation", ["wrong_before_order", "failed_response"])
+def test_legacy_reconciliation_rejects_forged_trigger_recreation_event_proof(
+    tmp_path, mutation
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        leg = session.query(ExecutionOrderLeg).filter_by(leg_index=1).one()
+        leg.order_id = binding.order_id = "new-order-1"
+        leg.client_order_id = binding.client_order_id = "new-client-1"
+        leg.status = "open"
+        binding.last_exchange_status = "trigger_entry_recreated"
+        _add_legacy_action_event(
+            session,
+            action="recreate_trigger_entry",
+            order_id="new-order-1",
+            related_order_id="order-1",
+            before=(
+                {"rows": [{"ordId": "order-1"}]}
+                if mutation == "wrong_before_order"
+                else {"stop_loss": "63000"}
+            ),
+            after={"stop_loss": "63100"},
+            request={
+                "instId": "BTC-USDT-SWAP",
+                "clOrdId": "new-client-1",
+                "slTriggerPx": "63100",
+            },
+            response={
+                "code": "1" if mutation == "failed_response" else "0",
+                "data": {"ordId": "new-order-1"},
+            },
+        )
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == (
+        "live_entry_preamble_binding_evidence_missing",
+    )
+
+
+def test_legacy_reconciliation_accepts_chained_trigger_entry_recreation(tmp_path):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        leg = session.query(ExecutionOrderLeg).filter_by(leg_index=1).one()
+        leg.order_id = binding.order_id = "new-order-2"
+        leg.client_order_id = binding.client_order_id = "new-client-2"
+        leg.status = "open"
+        binding.last_exchange_status = "trigger_entry_recreated"
+        for old_order, new_order, new_client in (
+            ("order-1", "new-order-1", "new-client-1"),
+            ("new-order-1", "new-order-2", "new-client-2"),
+        ):
+            _add_legacy_action_event(
+                session,
+                action="recreate_trigger_entry",
+                order_id=new_order,
+                related_order_id=old_order,
+                before={"stop_loss": "63000"},
+                after={"stop_loss": "63100"},
+                request={
+                    "instId": "BTC-USDT-SWAP",
+                    "clOrdId": new_client,
+                    "slTriggerPx": "63100",
+                },
+                response={"code": "0", "data": {"ordId": new_order}},
+            )
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == ()
 
 
 def test_legacy_reconciliation_rejects_unjustified_reduced_identity_after_cancel(
