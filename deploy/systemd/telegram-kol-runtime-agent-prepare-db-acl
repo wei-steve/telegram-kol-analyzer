@@ -1,33 +1,74 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/python3
+"""Race-safe ACL restoration for the exact Runtime Agent SQLite files."""
 
-if [[ "$(id -u)" -ne 0 || "$#" -ne 0 ]]; then
-  echo "Runtime Agent database ACL preparation requires root and no arguments." >&2
-  exit 1
-fi
+from __future__ import annotations
 
-AGENT_USER="telegram-kol-agent"
-DATABASE_PATH="/opt/telegram-kol-analyzer/data/research.db"
+import errno
+import os
+import pwd
+import stat
+import subprocess
+import sys
 
-if ! id "$AGENT_USER" >/dev/null 2>&1 || [[ ! -f "$DATABASE_PATH" ]]; then
-  echo "Runtime Agent identity or production database is missing." >&2
-  exit 1
-fi
 
-# The root main service may recreate these after a clean shutdown or reboot.
-# Reapply only the exact SQLite allowlist before every Agent start/restart.
-for sqlite_file in \
-  "$DATABASE_PATH" \
-  "$DATABASE_PATH-wal" \
-  "$DATABASE_PATH-shm" \
-  "$DATABASE_PATH-journal"
-do
-  if [[ -e "$sqlite_file" ]]; then
-    setfacl -m "u:$AGENT_USER:rw-" "$sqlite_file"
-  fi
-done
+AGENT_USER = "telegram-kol-agent"
+DATABASE_PATH = "/opt/telegram-kol-analyzer/data/research.db"
+SQLITE_PATHS = (
+    DATABASE_PATH,
+    f"{DATABASE_PATH}-wal",
+    f"{DATABASE_PATH}-shm",
+    f"{DATABASE_PATH}-journal",
+)
 
-if ! runuser -u "$AGENT_USER" -- test -w "$DATABASE_PATH"; then
-  echo "Runtime Agent cannot update the reviewed SQLite ledger." >&2
-  exit 1
-fi
+
+def _open_regular_nofollow(path: str, *, optional: bool) -> int | None:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        if optional:
+            return None
+        raise
+    except OSError as exc:
+        if optional and exc.errno == errno.ENOENT:
+            return None
+        raise
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        os.close(fd)
+        raise RuntimeError("SQLite ACL target is not a single-link regular file")
+    return fd
+
+
+def main() -> int:
+    if os.geteuid() != 0 or len(sys.argv) != 1:
+        raise RuntimeError("SQLite ACL preparation requires root and no arguments")
+    agent_uid = pwd.getpwnam(AGENT_USER).pw_uid
+    for index, sqlite_path in enumerate(SQLITE_PATHS):
+        fd = _open_regular_nofollow(sqlite_path, optional=index != 0)
+        if fd is None:
+            continue
+        try:
+            metadata = os.fstat(fd)
+            if metadata.st_uid not in {0, agent_uid}:
+                raise RuntimeError("SQLite ACL target has an unexpected owner")
+            subprocess.run(
+                [
+                    "/usr/bin/setfacl",
+                    "-m",
+                    f"u:{AGENT_USER}:rw-",
+                    "--",
+                    f"/proc/self/fd/{fd}",
+                ],
+                check=True,
+                close_fds=True,
+                pass_fds=(fd,),
+                env={"PATH": "/usr/bin:/bin", "LANG": "C"},
+            )
+        finally:
+            os.close(fd)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

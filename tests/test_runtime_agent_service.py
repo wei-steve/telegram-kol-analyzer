@@ -1,4 +1,8 @@
+import os
 from pathlib import Path
+import runpy
+
+import pytest
 
 
 def test_runtime_agent_sidecar_unit_is_separate_and_dormant_until_enabled():
@@ -59,6 +63,32 @@ def test_runtime_agent_sidecar_unit_is_separate_and_dormant_until_enabled():
         / "systemd"
         / "telegram-kol-runtime-agent-prepare-db-acl"
     ).read_text(encoding="utf-8")
-    assert '"$DATABASE_PATH-wal"' in prepare_helper
-    assert '"$DATABASE_PATH-shm"' in prepare_helper
-    assert 'setfacl -m "u:$AGENT_USER:rw-" "$sqlite_file"' in prepare_helper
+    assert 'f"{DATABASE_PATH}-wal"' in prepare_helper
+    assert 'f"{DATABASE_PATH}-shm"' in prepare_helper
+    assert "os.O_NOFOLLOW" in prepare_helper
+    assert "stat.S_ISREG" in prepare_helper
+    assert "st_nlink != 1" in prepare_helper
+    assert '"/usr/bin/setfacl"' in prepare_helper
+    assert "pass_fds=(fd,)" in prepare_helper
+
+
+def test_runtime_agent_acl_helper_never_opens_sqlite_symlinks(tmp_path):
+    helper_path = (
+        Path(__file__).parents[1]
+        / "deploy"
+        / "systemd"
+        / "telegram-kol-runtime-agent-prepare-db-acl"
+    )
+    helper = runpy.run_path(str(helper_path))
+    target = tmp_path / "protected-target"
+    target.write_text("unchanged", encoding="utf-8")
+    original_mode = target.stat().st_mode
+
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        link = tmp_path / f"research.db{suffix}"
+        link.symlink_to(target)
+        with pytest.raises(OSError):
+            helper["_open_regular_nofollow"](str(link), optional=False)
+        assert target.read_text(encoding="utf-8") == "unchanged"
+        assert target.stat().st_mode == original_mode
+        os.unlink(link)
