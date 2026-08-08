@@ -385,7 +385,7 @@ def _convert_to_production_legacy_finalized_case(session_factory) -> None:
                     "response": {
                         "code": "0",
                         "data": {
-                            "clOrdId": leg.client_order_id,
+                            "clOrdId": "",
                             "ordId": leg.order_id,
                             "sCode": "0",
                             "sMsg": "",
@@ -593,6 +593,7 @@ def test_legacy_policy_rejects_any_schema_tolerance(tmp_path, mutation):
         "submitted_extra",
         "submitted_missing",
         "submitted_order_id",
+        "response_client_alias",
         "coordinated_one_leg",
     ],
 )
@@ -624,6 +625,10 @@ def test_legacy_policy_rejects_wrapper_or_submitted_order_drift(
             binding_payload["submitted_orders"][0].pop("response")
         elif mutation == "submitted_order_id":
             binding_payload["submitted_orders"][0]["order_id"] = "other-order"
+        elif mutation == "response_client_alias":
+            binding_payload["submitted_orders"][0]["response"]["data"][
+                "clOrdId"
+            ] = "other-client"
         else:
             assembly = session.get(EntryStrategyAssembly, 2)
             evidence = json.loads(assembly.evidence_json)

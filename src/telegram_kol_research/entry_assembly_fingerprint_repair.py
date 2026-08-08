@@ -887,7 +887,7 @@ def _legacy_submitted_order_is_exact(
         and isinstance(response["msg"], str)
         and isinstance(response_data, Mapping)
         and set(response_data) == _LEGACY_SUBMISSION_DATA_KEYS
-        and response_data["clOrdId"] == value["client_order_id"]
+        and response_data["clOrdId"] == ""
         and response_data["ordId"] == value["order_id"]
         and response_data["sCode"] == "0"
         and isinstance(response_data["sMsg"], str)
