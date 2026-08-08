@@ -46,6 +46,7 @@ from telegram_kol_research.entry_assembly_fingerprint_repair import (
     legacy_finalized_snapshot_from_full_draft,
     legacy_lifecycle_state_is_lawful,
     legacy_initial_submission_identity,
+    legacy_nested_evidence_matches,
 )
 from telegram_kol_research.entry_strategy_assembly import (
     build_bounded_entry_order_draft_snapshot,
@@ -1113,11 +1114,10 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
     chat_id = binding_identity.get("chat_id")
     message_id = binding_identity.get("message_id")
     if (
-        not _reconciliation_stale_evidence_matches(
+        not legacy_nested_evidence_matches(
             stale_evidence,
-            assembly_id=assembly_id,
-            strategy_instance_id=strategy_id,
             old_fingerprint=old_fp,
+            strategy_message_id=message_id,
         )
         or not isinstance(chat_id, int)
         or isinstance(chat_id, bool)
@@ -1224,11 +1224,10 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
         not legacy_finalized_signal_payload_is_exact(signal_payload)
         or signal_draft != binding_draft
         or legacy_finalized_snapshot_from_full_draft(signal_draft) != snapshot
-        or not _reconciliation_stale_evidence_matches(
+        or not legacy_nested_evidence_matches(
             signal_nested,
-            assembly_id=assembly_id,
-            strategy_instance_id=strategy_id,
             old_fingerprint=old_fp,
+            strategy_message_id=message_id,
         )
     ):
         return False

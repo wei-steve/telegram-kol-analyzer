@@ -350,9 +350,20 @@ def _convert_to_production_legacy_finalized_case(session_factory) -> None:
         final_fingerprint = canonical_fingerprint(evidence)
         old_fingerprint = derive_pre_finalization_fingerprint(evidence)
         stale = {
-            "assembly_id": 2,
-            "strategy_instance_id": STRATEGY_ID,
+            "applied_risk_multiplier": "1",
             "assembly_fingerprint": old_fingerprint,
+            "configured_risk_budget_usdt": 20,
+            "effective_risk_budget_usdt": 20,
+            "entry_allocations": [],
+            "fragment_ids": [],
+            "legacy_preamble_ids": [],
+            "mode": "live",
+            "preamble_message_id": None,
+            "risk_multiplier": "1",
+            "status": "assembled",
+            "strategy_message_id": 55,
+            "strategy_risk_multiplier": "1",
+            "supplemental_entry_prices": [],
         }
         full_draft["entry_preamble_assembly"] = deepcopy(stale)
         signal_draft = deepcopy(full_draft)
@@ -681,6 +692,74 @@ def test_legacy_policy_rejects_any_schema_tolerance(tmp_path, mutation):
         "assembly_finalization_fields_missing",
         "assembly_legacy_snapshot_binding_mismatch",
     }
+
+
+@pytest.mark.parametrize(
+    ("field", "drift"),
+    [
+        ("applied_risk_multiplier", "2"),
+        ("assembly_fingerprint", "0" * 64),
+        ("configured_risk_budget_usdt", 21),
+        ("effective_risk_budget_usdt", 21),
+        ("entry_allocations", [1]),
+        ("fragment_ids", [1]),
+        ("legacy_preamble_ids", [1]),
+        ("mode", "shadow"),
+        ("preamble_message_id", 55),
+        ("risk_multiplier", "2"),
+        ("status", "pending"),
+        ("strategy_message_id", 56),
+        ("strategy_risk_multiplier", "2"),
+        ("supplemental_entry_prices", [1]),
+    ],
+)
+def test_legacy_policy_rejects_nested_evidence_field_drift(
+    tmp_path, field, drift
+):
+    _, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        signal = session.get(TradeSignal, 398)
+        binding_payload = json.loads(binding.payload_json)
+        signal_payload = json.loads(signal.payload_json)
+        binding_payload["draft"]["entry_preamble_assembly"][field] = drift
+        signal_payload["deepcoin_order_draft"]["entry_preamble_assembly"][field] = drift
+        binding.payload_json = _canonical_json(binding_payload)
+        signal.payload_json = _canonical_json(signal_payload)
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.action is None
+    assert plan.conflicts
+
+
+@pytest.mark.parametrize("mutation", ["extra", "missing"])
+def test_legacy_policy_rejects_nested_evidence_schema_drift(tmp_path, mutation):
+    _, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        signal = session.get(TradeSignal, 398)
+        binding_payload = json.loads(binding.payload_json)
+        signal_payload = json.loads(signal.payload_json)
+        for nested in (
+            binding_payload["draft"]["entry_preamble_assembly"],
+            signal_payload["deepcoin_order_draft"]["entry_preamble_assembly"],
+        ):
+            if mutation == "extra":
+                nested["unexpected"] = True
+            else:
+                nested.pop("fragment_ids")
+        binding.payload_json = _canonical_json(binding_payload)
+        signal.payload_json = _canonical_json(signal_payload)
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.action is None
+    assert plan.conflicts
 
 
 @pytest.mark.parametrize(

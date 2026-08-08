@@ -110,6 +110,24 @@ _LEGACY_TAKE_PROFIT_KEYS = frozenset(
 _STALE_EVIDENCE_KEYS = frozenset(
     {"assembly_id", "strategy_instance_id", "assembly_fingerprint"}
 )
+_LEGACY_NESTED_EVIDENCE_KEYS = frozenset(
+    {
+        "applied_risk_multiplier",
+        "assembly_fingerprint",
+        "configured_risk_budget_usdt",
+        "effective_risk_budget_usdt",
+        "entry_allocations",
+        "fragment_ids",
+        "legacy_preamble_ids",
+        "mode",
+        "preamble_message_id",
+        "risk_multiplier",
+        "status",
+        "strategy_message_id",
+        "strategy_risk_multiplier",
+        "supplemental_entry_prices",
+    }
+)
 _LEGACY_BINDING_PAYLOAD_KEYS = frozenset({"draft", "submitted_orders"})
 _LEGACY_SIGNAL_PAYLOAD_KEYS = frozenset({"deepcoin_order_draft", "source"})
 _LEGACY_SIGNAL_SOURCE_KEYS = frozenset(
@@ -388,15 +406,26 @@ def _build_entry_assembly_fingerprint_repair_plan(
         else None
     )
     old_fingerprint = derive_pre_finalization_fingerprint(final_evidence)
-    if not _stale_evidence_matches(
-        stale_evidence,
-        assembly_id=int(assembly.id),
-        strategy_instance_id=strategy_id,
-        old_fingerprint=old_fingerprint,
-    ):
-        conflicts.append("binding_old_fingerprint_not_derivable")
     canonical_proof = canonical_snapshot == snapshot
     legacy_proof = legacy_snapshot == snapshot
+    stale_evidence_is_exact = (
+        _stale_evidence_matches(
+            stale_evidence,
+            assembly_id=int(assembly.id),
+            strategy_instance_id=strategy_id,
+            old_fingerprint=old_fingerprint,
+        )
+        if canonical_proof
+        else legacy_nested_evidence_matches(
+            stale_evidence,
+            old_fingerprint=old_fingerprint,
+            strategy_message_id=int(binding.message_id),
+        )
+        if legacy_proof
+        else False
+    )
+    if not stale_evidence_is_exact:
+        conflicts.append("binding_old_fingerprint_not_derivable")
     binding_order_identity = None
     observed_initial_state = None
     if canonical_proof:
@@ -752,7 +781,7 @@ def _legacy_full_draft_is_exact(draft: Any) -> bool:
         and isinstance(source, Mapping)
         and set(source) == _LEGACY_FULL_SOURCE_KEYS
         and isinstance(stale, Mapping)
-        and set(stale) == _STALE_EVIDENCE_KEYS
+        and _legacy_nested_evidence_shape_is_exact(stale)
         and isinstance(legs, list)
         and len(legs) == 2
         and all(
@@ -2170,11 +2199,10 @@ def _legacy_signal_has_stale_evidence(
     return (
         isinstance(binding_draft, Mapping)
         and signal_draft == binding_draft
-        and _stale_evidence_matches(
+        and legacy_nested_evidence_matches(
             nested,
-            assembly_id=assembly_id,
-            strategy_instance_id=strategy_instance_id,
             old_fingerprint=old_fingerprint,
+            strategy_message_id=int(signal.message_id),
         )
         and legacy_finalized_snapshot_from_full_draft(signal_draft) == snapshot
     )
@@ -2192,6 +2220,55 @@ def _stale_evidence_matches(
         and evidence.get("assembly_id") == assembly_id
         and str(evidence.get("strategy_instance_id") or "") == strategy_instance_id
         and str(evidence.get("assembly_fingerprint") or "") == old_fingerprint
+    )
+
+
+def legacy_nested_evidence_matches(
+    evidence: Any,
+    *,
+    old_fingerprint: str,
+    strategy_message_id: int,
+) -> bool:
+    return bool(
+        _legacy_nested_evidence_shape_is_exact(evidence)
+        and evidence["assembly_fingerprint"] == old_fingerprint
+        and evidence["strategy_message_id"] == strategy_message_id
+    )
+
+
+def _legacy_nested_evidence_shape_is_exact(evidence: Any) -> bool:
+    fingerprint = (
+        evidence.get("assembly_fingerprint")
+        if isinstance(evidence, Mapping)
+        else None
+    )
+    message_id = (
+        evidence.get("strategy_message_id")
+        if isinstance(evidence, Mapping)
+        else None
+    )
+    return bool(
+        isinstance(evidence, Mapping)
+        and set(evidence) == _LEGACY_NESTED_EVIDENCE_KEYS
+        and isinstance(fingerprint, str)
+        and len(fingerprint) == 64
+        and all(character in "0123456789abcdef" for character in fingerprint)
+        and type(message_id) is int
+        and message_id > 0
+        and evidence["applied_risk_multiplier"] == "1"
+        and type(evidence["configured_risk_budget_usdt"]) is int
+        and evidence["configured_risk_budget_usdt"] == 20
+        and type(evidence["effective_risk_budget_usdt"]) is int
+        and evidence["effective_risk_budget_usdt"] == 20
+        and evidence["entry_allocations"] == []
+        and evidence["fragment_ids"] == []
+        and evidence["legacy_preamble_ids"] == []
+        and evidence["mode"] == "live"
+        and evidence["preamble_message_id"] is None
+        and evidence["risk_multiplier"] == "1"
+        and evidence["status"] == "assembled"
+        and evidence["strategy_risk_multiplier"] == "1"
+        and evidence["supplemental_entry_prices"] == []
     )
 
 
