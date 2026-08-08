@@ -7,9 +7,9 @@ used to advance or reinterpret the rollout.
 project: runtime-incident-agent
 design_version: 2
 design_authority_status: original_runtime_agent_incomplete_extended_by_message_operation_design
-current_phase: 8R.8
-phase_name: diagnose-every-message-operation-incident
-phase_status: in_progress
+current_phase: 8R.9
+phase_name: persist-codex-handoff-and-stage2
+phase_status: planned
 position_compliance_rules_status: dormant_non_deployable
 position_compliance_rollout_status: multi_target_live_new_natural_messages_only
 multi_target_projection_status: live_partial_take_profit_future_natural_messages_only
@@ -23,10 +23,11 @@ position_protection_live_repair_status: exact_backup_repaired_exchange_healthy
 position_protection_audit_convergence_status: deployed_current_evidence_healthy
 position_protection_rescue_starvation_status: deployed_future_due_intents_fixed
 context_target_contract_repair_status: deployed_future_natural_observation_pending
-last_completed_phase: "8R.7"
-last_completed_commit: 7d09358
-production_commit: 7d09358c729b6689ee2ecd73957a324de6c05c23
+last_completed_phase: "8R.8"
+last_completed_commit: 606371f
+production_commit: 606371f24e8b941b6919623c481c10edcf7668df
 local_tests:
+  - "phase-8r.8-server: reviewed commit 606371f was deployed after two stable zero-in-flight safe-window passes with latest raw/decision 9969, execution event 3352 unchanged, and zero nonterminal context, management, mutation, runtime claim, recovery, contract, message-operation incident, or investigation-audit rows. Server config/contract tests passed 20 and the six new production-path/race/rollover tests passed. An isolated temporary-database canary used investigate_message_evidence, persisted exactly started+allowed broker audits, produced one closed expected-safety-refusal diagnosis/Codex handoff, cleared the model's playbook request, and created zero mutation/event rows. Production then activated only message-operation Agent eligibility above fresh contract watermark 0 with exact deployed code 606371f; action authority is false, both playbook allowlists are empty, historical counts remain zero, all services and HTTP are healthy, and Agent restarts are zero."
   - "phase-8r.8-local: class-level future-only message-operation eligibility, v8 expected-versus-observed diagnosis, mandatory Codex handoff, exact affected-message identity, audited broker-only tool access, deterministic no-playbook enforcement, strict policy/code/evidence/class/severity reuse, same-incident reopen, in-flight membership claim invalidation, and 32-member generation rollover are implemented. The extended local suite passes 459 tests; independent review's broader related suite passes 502 with no remaining Critical/Important finding. Production remains dormant pending safe-window deployment and canary."
   - "phase-8r.7-egress-server: reviewed commit 7d09358 passed 145 server security/runtime tests. The real Agent cgroup denied direct public IP TLS while the same cgroup reached the bounded loopback Deepcoin projection; a UDS-only transient client completed TLS/SNI/certificate validation and authenticated GET /v1/models through the immutable api.xiaomimimo.com:443 relay. After relay activation, stopping the Agent stopped both egress units and removed the socket; restart restored only the socket until demand. Main, Agent, scanner, monitor timer, HTTP listener, and no-notify diagnostic are healthy with zero active mutation/management work, zero investigation audits, zero Agent restarts, and the nine-tool registry unchanged."
   - "phase-8r.7-egress-local: 145 fixed-egress, LLM, broker, tool, worker, service, architecture, exchange, audit, and Telegram regressions pass. Independent review found no remaining Critical or Important issue after binding socket/relay lifetime to the Agent. The Agent LLM client accepts only /run/telegram-kol-agent-model-egress.sock, the relay has one immutable api.xiaomimimo.com:443 upstream, and direct public IP egress is denied while loopback evidence remains available."
@@ -245,7 +246,7 @@ server_verification:
   operator_shuqin_manual_close_after_activation: "During the post-activation observation, the operator reported manually closing Shuqin's position. The resulting normal manual-bound-position-close path persisted mutation intent 350 as confirmed and close reservation 36 as confirmed. This occurred after the activation gate and is not attributed to multi-target rollout. A subsequent read-only audit remained database-stable and exchange-complete with current_risk=0, evidence_insufficient=1, historical_terminal=236, and resolved_by_current_exchange_evidence=1. RuntimeIncident max ID remained 280, target/envelope rows remained zero, and runtime/notification claims remained zero. No automated follow-up action was taken."
   phase_8r_6a_operator_completion: "On 2026-08-09 the operator explicitly directed the rollout not to wait for a future natural executable message and accepted returning to correct later issues. Phase 8R.6A is therefore complete on the reviewed 404-test local evidence, 33-test deployed supervisor evidence, and the production zero-impact dormant canary. Natural-message parity remains unobserved and is a recorded residual verification item, not a gate for beginning the next separately dormant phase. This completion enabled no incident creation, Stage 1 notification, Agent eligibility, model call, or business mutation authority."
   phase_8r_6b_deployment_and_activation: "Reviewed commit 04b3d34 was pushed and deployed with Stage 1 absent/disabled. Server verification passed 156 focused tests; main, Runtime Agent, and runtime scanner were active and HTTP root returned 200. The additive outbox table existed with zero rows. After a second fresh gate proved zero active position mutations, RuntimeIncident/notification/Stage 1 claims, contracts, and outbox rows, the root-owned mode-0600 policy was backed up and Stage 1 was enabled for contract IDs above the stopped-state maximum of 0, with five bounded attempts. Only the main service restarted; it returned HTTP 200, all runtime services remained active, and counts stayed zero, proving no historical materialization, Telegram send, Agent claim, or trading mutation. The independent monitor expected-HEAD pin was synchronized to 04b3d34, its no-notify diagnostic returned healthy=true with no reason codes, and the timer was restored. Runtime Agent action authority and both playbook allowlists remain unchanged/empty."
-  remaining: "Phase 8R.7 is complete. The deployed fixed Deepcoin loopback projection satisfies the approved equivalent-read-only exchange boundary, and the Agent cgroup/Unix-relay canaries prove enforced network egress. Phase 8R.8 is planned but not started: make every message-operation incident eligible for bounded read-only diagnosis without changing Stage 1 delivery, strategy targeting, business mutation authority, or historical rows. Natural 8R.6A/8R.6B behavior and all-symbol contract specs remain separate residual scopes."
+  remaining: "Phase 8R.8 is complete and active only for future message-operation contracts above watermark 0. Phase 8R.9 is planned: persist the bounded Codex handoff and send a terminal Stage 2 notification for every investigation outcome without giving the Agent Telegram credentials or business mutation authority. Natural 8R.6A/8R.6B behavior and all-symbol contract specs remain separate residual scopes."
 enabled_flags:
   - "capture:READ_ONLY_CAPTURE_PROFILE-plus-six-multi-target-types"
   - "telegram:deterministic-runtime-incident-reports"
@@ -278,7 +279,7 @@ phase_8r_roadmap_control:
 message_operation_extension:
   design_commit: 98b7884
   implementation_plan_commit: 879f489
-  status: phase_8r_8_planned_phase_8r_7_complete
+  status: phase_8r_9_planned_phase_8r_8_complete
   original_runtime_agent_complete: false
   next_phase_after_8r_4: 8R.5
   task_8r_5_commit: 2d0cc6e
@@ -293,6 +294,9 @@ message_operation_extension:
   task_8r_7_commit: 7d09358
   task_8r_7_status: completed_dormant_production_verified
   next_phase_after_8r_7: 8R.8
+  task_8r_8_commit: 606371f
+  task_8r_8_status: completed_future_only_production_active
+  next_phase_after_8r_8: 8R.9
   allowed_symbol_contract_spec_status: unresolved_separate_trading_scope
   allowed_symbol_contract_spec_requirement: "Every globally allowed virtual-asset symbol must have a current, independently validated Deepcoin instrument specification before auto-trading can admit it. The present reviewed static file contains BTC and ETH only; SOL and any other allowlisted symbol without a verified specification remain fail-closed. Future support must use authoritative instrument discovery or a reviewed generated cache plus an allowlist/spec consistency gate, without weakening sizing or submission safety."
 next_session_prompt: "请执行自定义ai agent的下一步实施"
@@ -612,12 +616,11 @@ Phase 5 is not complete until:
 
 ### Phase 8R — Proactive Read-Only Incident Detection
 
-- Status: in progress; Phase 8R.7 complete and Phase 8R.8 implementation in progress
+- Status: in progress; Phase 8R.8 complete and Phase 8R.9 planned
 - Roadmap-control Task 0: completed locally with 10 focused tests passing;
   documentation and test changes only, so no production restart was required
-- Current task: `8R.8 diagnose-every-message-operation-incident` (implemented
-  locally; dormant deployment, isolated canary, and fresh-watermark activation
-  remain)
+- Current task: `8R.9 persist-codex-handoff-and-stage2` (planned; not started
+  in the Phase 8R.8 completion turn)
 - Approved scope: deterministic proactive discovery, bounded read-only
   diagnosis, Telegram notification, Codex handoff, and read-only verification
 - Prohibited scope: order, position, protection, strategy, recognition,
@@ -658,11 +661,11 @@ Phase 5 is not complete until:
   existing Agent tool registry and selector remain unchanged. A bounded
   Deepcoin loopback projection and fixed MiMo Unix relay satisfy the exchange
   and OS-egress gates; direct public egress is denied by the Agent cgroup.
-- Task 8R.8 local implementation adds a dormant class gate for every future
+- Task 8R.8 completed at deployed code commit `606371f`. It adds a class gate for every future
   `message_operation_failure`, a v8 structured diagnosis/Codex contract, all
   nine audited broker categories, deterministic no-playbook behavior, and
   strict reuse identity. No business mutation or strategy/context authority is
-  added.
-- Next action: complete independent review, deploy dormant, prove an isolated
-  safe-window canary, then activate only above the newly recorded contract
-  watermark with action flags and both playbook allowlists off/empty.
+  added. Production is active only above contract watermark 0 with exact code
+  identity; an isolated audited-broker canary passed with zero business writes.
+- Next action: begin only Phase 8R.9 in a new turn. Do not combine it with
+  contract-spec expansion, natural-contract tuning, or any business mutation.
