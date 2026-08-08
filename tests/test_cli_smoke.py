@@ -1,4 +1,5 @@
 from typer.testing import CliRunner
+from copy import deepcopy
 from datetime import UTC, datetime
 import json
 import os
@@ -16,13 +17,272 @@ from telegram_kol_research.execution_bindings import (
     list_execution_order_legs,
     upsert_execution_binding,
 )
-from telegram_kol_research.models import ExecutionBinding, StrategyLifecycle
+from telegram_kol_research.entry_assembly_fingerprint_repair import (
+    canonical_fingerprint,
+    derive_pre_finalization_fingerprint,
+)
+from telegram_kol_research.models import (
+    EntryStrategyAssembly,
+    ExecutionBinding,
+    ExecutionEvent,
+    ExecutionOrderLeg,
+    RawMessage,
+    SignalCandidate,
+    StrategyLifecycle,
+    TradeSignal,
+)
 from telegram_kol_research.production_safety_monitor import (
     MonitorExpectations,
     MonitorSnapshot,
     evaluate_monitor_snapshot,
 )
 from telegram_kol_research.trading_settings import load_trading_settings
+
+
+_ENTRY_REPAIR_NOW = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+_ENTRY_REPAIR_STRATEGY_ID = "deepcoin:-1001:55:BTC:long"
+
+
+def _canonical_json(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _seed_entry_assembly_fingerprint_cli_case(tmp_path):
+    database_path = tmp_path / "entry-repair.db"
+    session_factory = create_session_factory(database_path)
+    secret_text = "PRIVATE TELEGRAM MESSAGE MUST NOT APPEAR"
+    final_evidence = {
+        "chat_id": -1001,
+        "strategy_raw_message_id": 10,
+        "strategy_message_id": 55,
+        "signal_candidate_id": 20,
+        "symbol": "BTC",
+        "side": "long",
+        "fragment_ids": [30],
+        "legacy_preamble_ids": [],
+        "risk_multiplier": "0.5",
+        "allocations": ["1"],
+        "supplemental_prices": [],
+        "cutoff": ["2026-08-08T11:59:00+00:00", 55, 10],
+        "planned_entry_leg_count": 1,
+        "order_draft_snapshot": {
+            "strategy_instance_id": _ENTRY_REPAIR_STRATEGY_ID,
+            "instrument_id": "BTC-USDT-SWAP",
+            "stop_loss": 63000,
+            "take_profit_legs": [{"price": 66000, "allocation_pct": 100}],
+            "risk_budget_usdt": 10,
+            "contract_spec": {
+                "contract_value": 0.001,
+                "quantity_step": 1,
+                "min_quantity": 1,
+            },
+            "order_legs": [
+                {
+                    "price": 64000,
+                    "order_type": "limit",
+                    "allocation_pct": 100,
+                    "risk_budget_usdt": 10,
+                    "quantity": 10,
+                    "quantity_unit": "contracts",
+                    "estimated_stop_loss_usdt": 10,
+                    "client_order_id": "entry-1",
+                }
+            ],
+        },
+        "final_entry_leg_count": 1,
+    }
+    final_fingerprint = canonical_fingerprint(final_evidence)
+    old_fingerprint = derive_pre_finalization_fingerprint(final_evidence)
+    stale_evidence = {
+        "assembly_id": 2,
+        "strategy_instance_id": _ENTRY_REPAIR_STRATEGY_ID,
+        "assembly_fingerprint": old_fingerprint,
+    }
+    draft = deepcopy(final_evidence["order_draft_snapshot"])
+    draft["entry_preamble_assembly"] = deepcopy(stale_evidence)
+    signal_payload = {
+        "entry_preamble_assembly": deepcopy(stale_evidence),
+        "deepcoin_order_draft": deepcopy(draft),
+        "private_message": secret_text,
+    }
+    with session_factory() as session:
+        session.add(RawMessage(
+            id=10, chat_id=-1001, message_id=55, text=secret_text,
+            archived_target_group=True, created_at=_ENTRY_REPAIR_NOW,
+        ))
+        session.add(SignalCandidate(
+            id=20, raw_message_id=10, symbol="BTC", side="long",
+            event_type="entry_signal", parse_source="mimo_authoritative",
+            confidence=0.95, review_status="pending", created_at=_ENTRY_REPAIR_NOW,
+        ))
+        session.add(EntryStrategyAssembly(
+            id=2, entry_preamble_id=None, strategy_raw_message_id=10,
+            signal_candidate_id=20, strategy_instance_id=_ENTRY_REPAIR_STRATEGY_ID,
+            risk_multiplier="0.5", evidence_json=_canonical_json(final_evidence),
+            fingerprint=final_fingerprint, created_at=_ENTRY_REPAIR_NOW,
+        ))
+        session.add(TradeSignal(
+            id=398, signal_uid="repair-signal",
+            strategy_instance_id=_ENTRY_REPAIR_STRATEGY_ID,
+            source_type="recovery", venue="deepcoin", kol_id="group:-1001",
+            chat_id=-1001, message_id=55, symbol="BTC", side="long",
+            action="open_position", status="submitted",
+            payload_json=_canonical_json(signal_payload), processed_at=_ENTRY_REPAIR_NOW,
+            created_at=_ENTRY_REPAIR_NOW, updated_at=_ENTRY_REPAIR_NOW,
+        ))
+        session.add(ExecutionBinding(
+            id=266, strategy_instance_id=_ENTRY_REPAIR_STRATEGY_ID,
+            kol_id="group:-1001", chat_id=-1001, message_id=55,
+            symbol="BTC", side="long", venue="deepcoin",
+            payload_json=_canonical_json({"draft": draft, "private": secret_text}),
+            status="open", created_at=_ENTRY_REPAIR_NOW, updated_at=_ENTRY_REPAIR_NOW,
+        ))
+        leg = final_evidence["order_draft_snapshot"]["order_legs"][0]
+        session.add(ExecutionOrderLeg(
+            execution_binding_id=266, strategy_instance_id=_ENTRY_REPAIR_STRATEGY_ID,
+            leg_index=1, purpose="entry", order_kind="trigger_limit",
+            order_id="order-1", client_order_id=leg["client_order_id"],
+            venue="deepcoin", status="open",
+            request_json=_canonical_json({
+                "instId": "BTC-USDT-SWAP", "posSide": "long",
+                "price": str(leg["price"]), "orderType": leg["order_type"],
+                "sz": str(leg["quantity"]), "clOrdId": leg["client_order_id"],
+            }), created_at=_ENTRY_REPAIR_NOW, updated_at=_ENTRY_REPAIR_NOW,
+        ))
+        session.commit()
+    return database_path, session_factory, secret_text
+
+
+def _entry_repair_args(database_path, *extra):
+    return [
+        "repair-entry-assembly-fingerprint",
+        "--database-path", str(database_path),
+        "--assembly-id", "2",
+        "--execution-binding-id", "266",
+        *extra,
+    ]
+
+
+def test_entry_assembly_fingerprint_repair_help_exposes_bounded_inputs():
+    root = CliRunner().invoke(app, ["--help"])
+    command = CliRunner().invoke(
+        app, ["repair-entry-assembly-fingerprint", "--help"]
+    )
+
+    assert root.exit_code == 0
+    assert "repair-entry-assembly-fingerprint" in root.output
+    assert command.exit_code == 0
+    for option in (
+        "--database-path", "--assembly-id", "--execution-binding-id",
+        "--apply", "--expected-plan-fingerprint",
+    ):
+        assert option in command.output
+
+
+def test_entry_assembly_fingerprint_repair_dry_run_is_redacted_and_read_only(
+    tmp_path, monkeypatch
+):
+    database_path, session_factory, secret_text = (
+        _seed_entry_assembly_fingerprint_cli_case(tmp_path)
+    )
+    before = database_path.read_bytes()
+    import telegram_kol_research.cli as cli_module
+    monkeypatch.setattr(
+        cli_module, "build_deepcoin_client_from_env",
+        lambda: pytest.fail("Deepcoin client must not be constructed"),
+    )
+    monkeypatch.setattr(
+        cli_module, "create_telegram_client",
+        lambda *args, **kwargs: pytest.fail("Telegram client must not be constructed"),
+    )
+
+    result = CliRunner().invoke(app, _entry_repair_args(database_path))
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["mode"] == "dry_run"
+    assert payload["plan"]["conflicts"] == []
+    assert payload["plan"]["action"]["assembly_id"] == 2
+    assert len(payload["plan"]["fingerprint"]) == 64
+    assert secret_text not in result.output
+    assert "private_message" not in result.output
+    assert _ENTRY_REPAIR_STRATEGY_ID not in result.output
+    with session_factory() as session:
+        assert session.query(ExecutionEvent).count() == 0
+    assert database_path.read_bytes() == before
+
+
+def test_entry_assembly_fingerprint_repair_apply_requires_reviewed_fingerprint(
+    tmp_path,
+):
+    database_path, session_factory, _ = _seed_entry_assembly_fingerprint_cli_case(tmp_path)
+
+    result = CliRunner().invoke(
+        app, _entry_repair_args(database_path, "--apply")
+    )
+
+    assert result.exit_code == 2
+    assert "--expected-plan-fingerprint" in result.output + result.stderr
+    with session_factory() as session:
+        assert session.query(ExecutionEvent).count() == 0
+
+
+def test_entry_assembly_fingerprint_repair_apply_rejects_changed_fingerprint(tmp_path):
+    database_path, session_factory, _ = _seed_entry_assembly_fingerprint_cli_case(tmp_path)
+
+    result = CliRunner().invoke(
+        app,
+        _entry_repair_args(
+            database_path,
+            "--apply",
+            "--expected-plan-fingerprint", "0" * 64,
+        ),
+    )
+
+    assert result.exit_code == 2
+    assert "repair_plan_fingerprint_mismatch" in result.output + result.stderr
+    with session_factory() as session:
+        assert session.query(ExecutionEvent).count() == 0
+
+
+def test_entry_assembly_fingerprint_repair_exact_apply_appends_one_event(
+    tmp_path, monkeypatch
+):
+    database_path, session_factory, secret_text = (
+        _seed_entry_assembly_fingerprint_cli_case(tmp_path)
+    )
+    import telegram_kol_research.cli as cli_module
+    monkeypatch.setattr(
+        cli_module, "build_deepcoin_client_from_env",
+        lambda: pytest.fail("Deepcoin client must not be constructed"),
+    )
+    monkeypatch.setattr(
+        cli_module, "create_telegram_client",
+        lambda *args, **kwargs: pytest.fail("Telegram client must not be constructed"),
+    )
+    dry_run = CliRunner().invoke(app, _entry_repair_args(database_path))
+    fingerprint = json.loads(dry_run.output)["plan"]["fingerprint"]
+
+    applied = CliRunner().invoke(
+        app,
+        _entry_repair_args(
+            database_path,
+            "--apply",
+            "--expected-plan-fingerprint", fingerprint,
+        ),
+    )
+
+    assert applied.exit_code == 0, applied.output
+    outputs = [json.loads(line) for line in applied.output.splitlines()]
+    assert outputs[0]["mode"] == "apply_plan"
+    assert outputs[0]["plan"]["fingerprint"] == fingerprint
+    assert outputs[1]["mode"] == "apply"
+    assert isinstance(outputs[1]["event_id"], int)
+    assert secret_text not in applied.output
+    assert "private_message" not in applied.output
+    with session_factory() as session:
+        assert session.query(ExecutionEvent).count() == 1
+        assert session.get(ExecutionEvent, outputs[1]["event_id"]) is not None
 
 
 def test_reviewed_legacy_conditional_cancel_help_exposes_fail_closed_inputs():

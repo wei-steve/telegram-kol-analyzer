@@ -1520,3 +1520,53 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
   --data-binary @/tmp/trading-settings.rollback.json \
   http://127.0.0.1:8000/api/trading-settings
 ```
+
+## 修复相邻入场组装指纹历史不一致
+
+恢复触发入场路径已保证：在任何交易所提交之前，已持久化的
+trade signal 顶层和订单草稿内层必须同时使用组装的最终指纹。
+历史上已提交的绑定和订单快照不得改写；本命令只能为一个能够从
+最终组装证据机械推导出的旧指纹追加一条审计事件。它不得重放
+Telegram 消息、重发交易信号、调用 Deepcoin 变更接口，也不得修改已提交
+的 binding、trade signal、订单或成交记录。
+
+首先在服务器上仅执行 dry-run：
+
+```bash
+telegram-kol repair-entry-assembly-fingerprint \
+  --database-path <production-db> \
+  --assembly-id 2 \
+  --execution-binding-id 266
+```
+
+输出只包含可审核的 ID、指纹和冲突码，不包含原始消息或完整 payload。
+操作员必须确认：
+
+- `action` 非空，且 `conflicts` 为空；
+- assembly ID、execution binding ID 和 trade signal ID 与事故证据一致；
+- `old_fingerprint` 是可从最终证据严格推导的最终化前指纹；
+- `final_fingerprint` 等于当前组装指纹；
+- `repair_fingerprint` 和顶层的 plan `fingerprint` 均为 64 位且在重复
+  dry-run 中保持不变。
+
+dry-run 之后必须向用户展示这一份脱敏计划，并获得一次新的、明确的
+生产写入批准。之前对修复方案或部署的同意不等于这次 apply 批准。
+批准后重做安全窗口检查和 dry-run，只有计划未变时才能复制其精确指纹：
+
+```bash
+telegram-kol repair-entry-assembly-fingerprint \
+  --database-path <production-db> \
+  --assembly-id 2 \
+  --execution-binding-id 266 \
+  --apply \
+  --expected-plan-fingerprint <exact-fingerprint-from-approved-dry-run>
+```
+
+缺少指纹、指纹改变、不是恰好一个 action，或任何 conflict 都必须在写入前
+失败关闭。成功后记录输出的 `event_id`，重复 dry-run 并按现有生产安全
+监控命令运行一次不带 `--notify` 的诊断，确认
+`live_entry_preamble_binding_evidence_missing` 已消失且没有新异常。
+
+代码回滚时可恢复上一版服务，但已追加的审计事件不删除、不改写。
+如后续证明该证据有误，立即按新事故处理，保留原事件并通过单独评审的
+追加证据纠正；不得手工删行或直接改写生产数据。

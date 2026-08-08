@@ -57,6 +57,10 @@ from telegram_kol_research.entry_protection_ledger_repair import (
     apply_entry_protection_ledger_repair_plan,
     build_entry_protection_ledger_repair_plan,
 )
+from telegram_kol_research.entry_assembly_fingerprint_repair import (
+    apply_entry_assembly_fingerprint_repair_plan,
+    build_entry_assembly_fingerprint_repair_plan,
+)
 from telegram_kol_research.evidence_backfill import (
     plan_mimo_evidence_backfill,
     run_mimo_evidence_backfill,
@@ -3997,6 +4001,95 @@ def repair_entry_protection_ledger(
         confirmation_token=confirmation_token or "",
     )
     typer.echo(f"Applied {result.applied} entry protection ledger repair(s).")
+
+
+def _redacted_entry_assembly_fingerprint_plan(plan: Any) -> dict[str, Any]:
+    action = plan.action
+    return {
+        "action": (
+            {
+                "assembly_id": action.assembly_id,
+                "execution_binding_id": action.execution_binding_id,
+                "trade_signal_id": action.trade_signal_id,
+                "old_fingerprint": action.old_fingerprint,
+                "final_fingerprint": action.final_fingerprint,
+                "repair_fingerprint": action.repair_fingerprint,
+            }
+            if action is not None
+            else None
+        ),
+        "conflicts": list(plan.conflicts),
+        "fingerprint": plan.fingerprint,
+    }
+
+
+@app.command("repair-entry-assembly-fingerprint")
+def repair_entry_assembly_fingerprint(
+    database_path: Path = typer.Option(
+        Path("data/research.db"), "--database-path"
+    ),
+    assembly_id: int = typer.Option(..., "--assembly-id"),
+    execution_binding_id: int = typer.Option(..., "--execution-binding-id"),
+    apply: bool = typer.Option(False, "--apply"),
+    expected_plan_fingerprint: str | None = typer.Option(
+        None, "--expected-plan-fingerprint"
+    ),
+) -> None:
+    """Plan or append one bounded entry-assembly fingerprint repair event."""
+
+    resolved_path = database_path.expanduser().resolve()
+    if not resolved_path.is_file():
+        typer.echo(
+            "Refusing repair: database does not exist; no file was created.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    session_factory = create_existing_session_factory(resolved_path)
+    plan = build_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=assembly_id,
+        execution_binding_id=execution_binding_id,
+    )
+    redacted_plan = _redacted_entry_assembly_fingerprint_plan(plan)
+    typer.echo(json.dumps(
+        {
+            "mode": "apply_plan" if apply else "dry_run",
+            "plan": redacted_plan,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    ))
+    if not apply:
+        return
+    if not expected_plan_fingerprint:
+        typer.echo(
+            "Refusing apply: --expected-plan-fingerprint is required.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if plan.action is None or plan.conflicts:
+        typer.echo(
+            "Refusing apply: the current repair plan must contain exactly one "
+            "conflict-free action.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    try:
+        event_id = apply_entry_assembly_fingerprint_repair_plan(
+            session_factory,
+            assembly_id=assembly_id,
+            execution_binding_id=execution_binding_id,
+            expected_plan_fingerprint=expected_plan_fingerprint,
+            applied_at=datetime.now(UTC),
+        )
+    except (RuntimeError, ValueError) as exc:
+        typer.echo(f"Refusing apply: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(
+        {"mode": "apply", "event_id": event_id},
+        ensure_ascii=False,
+        sort_keys=True,
+    ))
 
 
 def _backup_stop_conflicts_for_target(
