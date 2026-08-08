@@ -79,7 +79,7 @@ class RuntimeIncidentConfig:
     telegram_notification_after_incident_id: int | None = None
     notification_lease_seconds: float = 120.0
     message_operation_stage1_enabled: bool = False
-    message_operation_stage1_after_incident_id: int = _SQLITE_MAX_INTEGER
+    message_operation_stage1_after_contract_id: int = _SQLITE_MAX_INTEGER
     message_operation_stage1_max_attempts: int = 5
     agent_enabled: bool = False
     agent_incident_types: frozenset[str] | None = None
@@ -271,8 +271,8 @@ def _notification_after_incident_id(env: dict[str, str]) -> int | None:
     return value
 
 
-def _message_operation_stage1_after_incident_id(env: dict[str, str]) -> int:
-    key = "TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_AFTER_INCIDENT_ID"
+def _message_operation_stage1_after_contract_id(env: dict[str, str]) -> int:
+    key = "TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_AFTER_CONTRACT_ID"
     try:
         value = int(env[key])
     except (KeyError, TypeError, ValueError):
@@ -428,8 +428,8 @@ def load_runtime_incident_config(
         message_operation_stage1_enabled=_enabled_flag(
             env.get("TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_ENABLED")
         ),
-        message_operation_stage1_after_incident_id=(
-            _message_operation_stage1_after_incident_id(env)
+        message_operation_stage1_after_contract_id=(
+            _message_operation_stage1_after_contract_id(env)
         ),
         message_operation_stage1_max_attempts=max(
             1, min(message_operation_stage1_max_attempts, 20)

@@ -92,14 +92,14 @@ class MessageOperationEvaluationError(ValueError):
 def materialize_message_operation_stage1_outbox(
     session_factory: sessionmaker,
     *,
-    after_incident_id: int,
+    after_contract_id: int,
     created_at: datetime,
     limit: int = 100,
 ) -> int:
     """Idempotently materialize one Stage 1 row per affected source message."""
 
-    if type(after_incident_id) is not int or after_incident_id < 0:
-        raise MessageOperationEvaluationError("invalid Stage 1 incident watermark")
+    if type(after_contract_id) is not int or after_contract_id < 0:
+        raise MessageOperationEvaluationError("invalid Stage 1 contract watermark")
     if type(limit) is not int or not 1 <= limit <= 100:
         raise MessageOperationEvaluationError("Stage 1 limit must be between 1 and 100")
     now = _aware_utc(created_at)
@@ -112,7 +112,8 @@ def materialize_message_operation_stage1_outbox(
                 == RuntimeIncidentAffectedMessage.runtime_incident_id,
             )
             .where(
-                RuntimeIncident.id > after_incident_id,
+                RuntimeIncidentAffectedMessage.message_operation_contract_id
+                > after_contract_id,
                 RuntimeIncident.incident_type == "message_operation_failure",
                 ~exists(
                     select(MessageOperationStage1Notification.id).where(

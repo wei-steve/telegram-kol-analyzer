@@ -374,19 +374,19 @@ def test_stage1_outbox_materializes_once_per_affected_message_above_watermark(
     assert incidents[0].id == incidents[1].id
     created = materialize_message_operation_stage1_outbox(
         session_factory,
-        after_incident_id=incidents[0].id - 1,
+        after_contract_id=0,
         created_at=NOW,
         limit=2,
     )
     repeated = materialize_message_operation_stage1_outbox(
         session_factory,
-        after_incident_id=incidents[0].id - 1,
+        after_contract_id=0,
         created_at=NOW,
         limit=2,
     )
     exhausted = materialize_message_operation_stage1_outbox(
         session_factory,
-        after_incident_id=incidents[0].id - 1,
+        after_contract_id=0,
         created_at=NOW,
         limit=2,
     )
@@ -405,10 +405,70 @@ def test_stage1_outbox_materializes_once_per_affected_message_above_watermark(
 
     assert materialize_message_operation_stage1_outbox(
         session_factory,
-        after_incident_id=incidents[0].id,
+        after_contract_id=max(contract_ids),
         created_at=NOW,
         limit=20,
     ) == 0
+
+
+def test_stage1_contract_watermark_allows_new_message_on_old_coalesced_incident(
+    tmp_path,
+):
+    from telegram_kol_research.config import RuntimeIncidentConfig
+    from telegram_kol_research.message_operation_supervisor import (
+        materialize_message_operation_stage1_outbox,
+    )
+    from telegram_kol_research.models import MessageOperationStage1Notification
+    from telegram_kol_research.runtime_incident_adapters import (
+        capture_message_operation_failure,
+    )
+
+    session_factory = create_session_factory(tmp_path / "stage1-coalesced.db")
+    config = RuntimeIncidentConfig(
+        capture_types=frozenset({"message_operation_failure"})
+    )
+
+    def violate_and_capture(message_id):
+        contract_id = _seed_contract(
+            session_factory,
+            deadline_at=NOW - timedelta(seconds=1),
+            message_id=message_id,
+        )
+        with session_factory() as session:
+            contract = session.get(MessageOperationContract, contract_id)
+            contract.status = "violated"
+            contract.violation_code = "no_operation_created"
+            raw_id = contract.raw_message_id
+            session.commit()
+        incident = capture_message_operation_failure(
+            session_factory,
+            config=config,
+            contract_id=contract_id,
+            raw_message_id=raw_id,
+            violation_code="no_operation_created",
+            evidence_refs=(),
+            occurred_at=NOW,
+            shadow_only=False,
+        )
+        return contract_id, raw_id, incident
+
+    old_contract_id, old_raw_id, old_incident = violate_and_capture(9251)
+    new_contract_id, new_raw_id, new_incident = violate_and_capture(9252)
+
+    assert new_incident.id == old_incident.id
+    assert new_contract_id > old_contract_id
+    assert materialize_message_operation_stage1_outbox(
+        session_factory,
+        after_contract_id=old_contract_id,
+        created_at=NOW,
+        limit=20,
+    ) == 1
+    with session_factory() as session:
+        row = session.query(MessageOperationStage1Notification).one()
+        assert row.runtime_incident_id == old_incident.id
+        assert row.raw_message_id == new_raw_id
+        assert row.raw_message_id != old_raw_id
+        assert row.message_operation_contract_id == new_contract_id
 
 
 def test_collector_verifies_confirmed_management_target(tmp_path):

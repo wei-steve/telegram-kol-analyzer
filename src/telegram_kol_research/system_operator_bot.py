@@ -330,7 +330,7 @@ def claim_next_message_operation_stage1_notification(
     claimed_at: datetime | None = None,
     lease_seconds: float = 120.0,
     max_attempts: int = MESSAGE_OPERATION_STAGE1_MAX_ATTEMPTS,
-    after_incident_id: int = 0,
+    after_contract_id: int = 0,
 ):
     """CAS one pending, retryable, or stale per-message Stage 1 delivery."""
 
@@ -341,8 +341,8 @@ def claim_next_message_operation_stage1_notification(
         _message_operation_stage1_claimable(
             now=now, lease_seconds=lease_seconds, max_attempts=max_attempts
         ),
-        MessageOperationStage1Notification.runtime_incident_id
-        > int(after_incident_id),
+        MessageOperationStage1Notification.message_operation_contract_id
+        > int(after_contract_id),
     )
     with session_factory() as session:
         row_id = session.execute(
@@ -388,7 +388,7 @@ async def deliver_message_operation_stage1_notifications(
     session_factory,
     *,
     config: SystemOperatorBotConfig,
-    after_incident_id: int,
+    after_contract_id: int,
     limit: int = 20,
     claimed_at: datetime | None = None,
     lease_seconds: float = 120.0,
@@ -410,7 +410,7 @@ async def deliver_message_operation_stage1_notifications(
     operation_now = claimed_at or datetime.now(UTC)
     materialize_message_operation_stage1_outbox(
         session_factory,
-        after_incident_id=after_incident_id,
+        after_contract_id=after_contract_id,
         created_at=operation_now,
         limit=max(1, min(int(limit), 100)),
     )
@@ -421,7 +421,7 @@ async def deliver_message_operation_stage1_notifications(
             claimed_at=operation_now,
             lease_seconds=lease_seconds,
             max_attempts=max_attempts,
-            after_incident_id=after_incident_id,
+            after_contract_id=after_contract_id,
         )
         if claim is None:
             break
@@ -499,6 +499,7 @@ async def deliver_message_operation_stage1_notifications(
                     source_record_id=str(notification.id),
                     error_type=type(exc).__name__,
                     occurred_at=operation_now,
+                    severity="high",
                 )
             break
         with session_factory() as session:
@@ -2016,8 +2017,8 @@ async def deliver_runtime_incident_notifications(
             delivered += await deliver_message_operation_stage1_notifications(
                 session_factory,
                 config=config,
-                after_incident_id=(
-                    feature_config.message_operation_stage1_after_incident_id
+                after_contract_id=(
+                    feature_config.message_operation_stage1_after_contract_id
                 ),
                 limit=limit,
                 claimed_at=claimed_at,

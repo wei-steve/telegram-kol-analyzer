@@ -549,8 +549,8 @@ Telegram selector.
 The Phase 8R.6B settings are:
 
 - `TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_ENABLED` defaults to false;
-- `TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_AFTER_INCIDENT_ID` is a required
-  exclusive future-only RuntimeIncident watermark; absent, malformed,
+- `TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_AFTER_CONTRACT_ID` is a required
+  exclusive future-only message-operation contract watermark; absent, malformed,
   negative, or overflowing values fail closed at the maximum SQLite integer;
 - `TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_MAX_ATTEMPTS` is bounded to 1–20 and
   defaults to 5;
@@ -567,9 +567,11 @@ and remains retryable; exception text is never persisted.
 
 Deploy 8R.6B with the flag absent/false. After the normal post-deployment
 continuity checks, stop only in a newly proven safe window, record the current
-maximum RuntimeIncident ID, set that exact value as the watermark, and then
-enable Stage 1. Prove no incident at or below the watermark materializes or is
-claimed. Immediate rollback is to clear only the Stage 1 enabled flag and
+maximum message-operation contract ID, set that exact value as the watermark, and then
+enable Stage 1. Prove no contract at or below the watermark materializes or is
+claimed. Because coalesced incidents may predate a
+new affected message, eligibility is always based on the per-message contract
+identity and never on the shared RuntimeIncident ID. Immediate rollback is to clear only the Stage 1 enabled flag and
 restart the main service in a safe window. Existing outbox rows and affected
 message relations remain as audit evidence; do not delete, rewrite, or
 bulk-complete them. Agent eligibility, legacy notification selectors, the

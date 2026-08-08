@@ -615,7 +615,7 @@ def test_message_operation_stage1_starts_dispatcher_without_legacy_notifications
     app.state.runtime_incident_config = RuntimeIncidentConfig(
         telegram_notifications_enabled=False,
         message_operation_stage1_enabled=True,
-        message_operation_stage1_after_incident_id=42,
+        message_operation_stage1_after_contract_id=42,
     )
 
     with TestClient(app):

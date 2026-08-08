@@ -554,6 +554,7 @@ def capture_notification_failure(
     source_record_id: str,
     error_type: str | None,
     occurred_at: datetime,
+    severity: str = "medium",
     recorder: Callable[..., Any] | None = None,
 ):
     return _capture(
@@ -562,7 +563,7 @@ def capture_notification_failure(
         source_kind=source_kind,
         source_record_id=source_record_id,
         incident_type="notification_delivery_failure",
-        severity="medium",
+        severity=severity,
         redacted_summary=_summary(
             component="telegram_notification",
             notification_status="failed",

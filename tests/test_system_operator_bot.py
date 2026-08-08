@@ -461,7 +461,7 @@ def _seed_message_operation_stage1(session_factory, *, text="reduce by 50%"):
     )
     assert materialize_message_operation_stage1_outbox(
         session_factory,
-        after_incident_id=incident.id - 1,
+        after_contract_id=0,
         created_at=NOW,
         limit=20,
     ) == 1
@@ -541,7 +541,7 @@ def test_message_operation_stage1_delivery_is_bounded_redacted_and_durable(
         operator_bot_module.deliver_message_operation_stage1_notifications(
             session_factory,
             config=SystemOperatorBotConfig("token", "chat"),
-            after_incident_id=incident.id - 1,
+            after_contract_id=0,
             claimed_at=NOW,
         )
     )
@@ -581,7 +581,7 @@ def test_message_operation_stage1_failure_persists_bounded_error_and_retry(
         operator_bot_module.deliver_message_operation_stage1_notifications(
             session_factory,
             config=SystemOperatorBotConfig("token", "chat"),
-            after_incident_id=incident.id - 1,
+            after_contract_id=0,
             claimed_at=NOW,
             lease_seconds=30,
             runtime_config=RuntimeIncidentConfig(
@@ -601,6 +601,7 @@ def test_message_operation_stage1_failure_persists_bounded_error_and_retry(
         notification_failure = session.query(RuntimeIncident).filter_by(
             incident_type="notification_delivery_failure"
         ).one()
+        assert notification_failure.severity == "high"
         assert notification_failure.source_kind == (
             "message_operation_stage1_notification"
         )
@@ -624,7 +625,7 @@ def test_message_operation_stage1_exhaustion_is_terminal_and_not_reclaimed(
         operator_bot_module.deliver_message_operation_stage1_notifications(
             session_factory,
             config=SystemOperatorBotConfig("token", "chat"),
-            after_incident_id=incident.id - 1,
+            after_contract_id=0,
             claimed_at=NOW,
             lease_seconds=30,
             max_attempts=1,
@@ -649,23 +650,23 @@ def test_message_operation_stage1_config_is_dormant_and_watermark_fails_closed()
     enabled = load_runtime_incident_config(
         environ={
             "TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_ENABLED": "true",
-            "TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_AFTER_INCIDENT_ID": "41",
+            "TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_AFTER_CONTRACT_ID": "41",
         },
         env_file_paths=[],
     )
     malformed = load_runtime_incident_config(
         environ={
             "TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_ENABLED": "true",
-            "TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_AFTER_INCIDENT_ID": "bad",
+            "TELEGRAM_KOL_MESSAGE_OPERATION_STAGE1_AFTER_CONTRACT_ID": "bad",
         },
         env_file_paths=[],
     )
 
     assert dormant.message_operation_stage1_enabled is False
-    assert dormant.message_operation_stage1_after_incident_id == 2**63 - 1
+    assert dormant.message_operation_stage1_after_contract_id == 2**63 - 1
     assert enabled.message_operation_stage1_enabled is True
-    assert enabled.message_operation_stage1_after_incident_id == 41
-    assert malformed.message_operation_stage1_after_incident_id == 2**63 - 1
+    assert enabled.message_operation_stage1_after_contract_id == 41
+    assert malformed.message_operation_stage1_after_contract_id == 2**63 - 1
 
 
 def test_main_runtime_dispatcher_delivers_stage1_without_agent_or_legacy_selector(
@@ -689,7 +690,7 @@ def test_main_runtime_dispatcher_delivers_stage1_without_agent_or_legacy_selecto
             config=SystemOperatorBotConfig("token", "chat"),
             runtime_config=RuntimeIncidentConfig(
                 message_operation_stage1_enabled=True,
-                message_operation_stage1_after_incident_id=incident.id - 1,
+                message_operation_stage1_after_contract_id=0,
                 agent_enabled=False,
                 telegram_notifications_enabled=False,
                 telegram_notification_types=frozenset(),
@@ -712,6 +713,9 @@ def test_stage1_watermark_excludes_preexisting_outbox_rows(tmp_path, monkeypatch
 
     session_factory = create_session_factory(tmp_path / "stage1-watermark.db")
     incident, _ = _seed_message_operation_stage1(session_factory)
+    from telegram_kol_research.models import MessageOperationContract
+    with session_factory() as session:
+        contract_id = session.query(MessageOperationContract.id).scalar()
     deliveries = []
 
     async def capture(**kwargs):
@@ -725,7 +729,7 @@ def test_stage1_watermark_excludes_preexisting_outbox_rows(tmp_path, monkeypatch
         operator_bot_module.deliver_message_operation_stage1_notifications(
             session_factory,
             config=SystemOperatorBotConfig("token", "chat"),
-            after_incident_id=incident.id,
+            after_contract_id=contract_id,
             claimed_at=NOW,
         )
     )
