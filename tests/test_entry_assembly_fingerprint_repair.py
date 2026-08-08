@@ -10,7 +10,9 @@ from sqlalchemy import event
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.entry_assembly_fingerprint_repair import (
+    LEGACY_FINALIZED_RECONCILIATION_POLICY,
     RECONCILIATION_ACTION,
+    RECONCILIATION_POLICY,
     apply_entry_assembly_fingerprint_repair_plan,
     build_entry_assembly_fingerprint_repair_plan,
     canonical_fingerprint,
@@ -24,6 +26,9 @@ from telegram_kol_research.models import (
     RawMessage,
     SignalCandidate,
     TradeSignal,
+)
+from telegram_kol_research.production_safety_monitor import (
+    read_entry_preamble_invariants,
 )
 
 
@@ -238,6 +243,64 @@ def _seed_case(tmp_path):
     return database_path, session_factory
 
 
+def _convert_to_production_legacy_finalized_case(session_factory) -> None:
+    """Match the pre-fix schema observed for assembly 2 / binding 266."""
+
+    with session_factory() as session:
+        assembly = session.get(EntryStrategyAssembly, 2)
+        binding = session.get(ExecutionBinding, 266)
+        signal = session.get(TradeSignal, 398)
+        evidence = json.loads(assembly.evidence_json)
+        binding_payload = json.loads(binding.payload_json)
+        full_draft = binding_payload["draft"]
+        full_draft.pop("selected_entry_leg_indices")
+        full_draft.pop("selected_entry_leg_count")
+        legacy_snapshot = {
+            "strategy_instance_id": full_draft["strategy_instance_id"],
+            "instrument_id": full_draft["instrument_id"],
+            "stop_loss": full_draft["stop_loss"],
+            "take_profit_legs": deepcopy(full_draft["take_profit_legs"]),
+            "risk_budget_usdt": full_draft["risk_budget_usdt"],
+            "contract_spec": deepcopy(full_draft["contract_spec"]),
+            "order_legs": [
+                {
+                    key: leg[key]
+                    for key in (
+                        "price",
+                        "order_type",
+                        "allocation_pct",
+                        "risk_budget_usdt",
+                        "quantity",
+                        "quantity_unit",
+                        "estimated_stop_loss_usdt",
+                        "client_order_id",
+                    )
+                }
+                for leg in full_draft["order_legs"]
+            ],
+        }
+        evidence["order_draft_snapshot"] = legacy_snapshot
+        evidence["final_entry_leg_count"] = len(legacy_snapshot["order_legs"])
+        final_fingerprint = canonical_fingerprint(evidence)
+        old_fingerprint = derive_pre_finalization_fingerprint(evidence)
+        stale = {
+            "assembly_id": 2,
+            "strategy_instance_id": STRATEGY_ID,
+            "assembly_fingerprint": old_fingerprint,
+        }
+        full_draft["entry_preamble_assembly"] = deepcopy(stale)
+        binding.payload_json = _canonical_json({"draft": full_draft})
+        signal_draft = deepcopy(full_draft)
+        signal.payload_json = _canonical_json(
+            {"deepcoin_order_draft": signal_draft}
+        )
+        assembly.evidence_json = _canonical_json(evidence)
+        assembly.fingerprint = final_fingerprint
+        for leg in session.query(ExecutionOrderLeg).all():
+            leg.status = "pending"
+        session.commit()
+
+
 def _plan(session_factory):
     return build_entry_assembly_fingerprint_repair_plan(
         session_factory, assembly_id=2, execution_binding_id=266
@@ -306,6 +369,148 @@ def test_build_plan_returns_one_stable_action_without_writing(tmp_path):
     assert len(first.action.repair_fingerprint) == 64
     assert len(first.fingerprint) == 64
     assert database_path.read_bytes() == before
+
+
+def test_build_plan_accepts_exact_production_legacy_finalized_snapshot(tmp_path):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    before = database_path.read_bytes()
+
+    plan = _plan(session_factory)
+
+    assert plan.conflicts == ()
+    assert plan.action is not None
+    assert plan.action.policy_version == LEGACY_FINALIZED_RECONCILIATION_POLICY
+    assert plan.action.trade_signal_id == 398
+    assert database_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_conflict"),
+    [
+        ("snapshot_field", "assembly_legacy_snapshot_binding_mismatch"),
+        ("signal_top_present", "trade_signal_evidence_mismatch"),
+        ("signal_full_draft", "trade_signal_evidence_mismatch"),
+        ("binding_old_fingerprint", "binding_old_fingerprint_not_derivable"),
+        ("missing_execution_leg", "execution_leg_identity_mismatch"),
+        ("empty_order_id", "execution_leg_identity_mismatch"),
+        ("unsubmitted_status", "execution_leg_identity_mismatch"),
+    ],
+)
+def test_legacy_finalized_proof_rejects_any_unbound_or_unsubmitted_state(
+    tmp_path, mutation, expected_conflict
+):
+    _, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    with session_factory() as session:
+        assembly = session.get(EntryStrategyAssembly, 2)
+        binding = session.get(ExecutionBinding, 266)
+        signal = session.get(TradeSignal, 398)
+        if mutation == "snapshot_field":
+            evidence = json.loads(assembly.evidence_json)
+            evidence["order_draft_snapshot"]["risk_budget_usdt"] = 11
+            assembly.evidence_json = _canonical_json(evidence)
+            assembly.fingerprint = canonical_fingerprint(evidence)
+        elif mutation == "signal_top_present":
+            payload = json.loads(signal.payload_json)
+            payload["entry_preamble_assembly"] = deepcopy(
+                payload["deepcoin_order_draft"]["entry_preamble_assembly"]
+            )
+            signal.payload_json = _canonical_json(payload)
+        elif mutation == "signal_full_draft":
+            payload = json.loads(signal.payload_json)
+            payload["deepcoin_order_draft"]["margin_mode"] = "isolated"
+            signal.payload_json = _canonical_json(payload)
+        elif mutation == "binding_old_fingerprint":
+            payload = json.loads(binding.payload_json)
+            payload["draft"]["entry_preamble_assembly"][
+                "assembly_fingerprint"
+            ] = "f" * 64
+            binding.payload_json = _canonical_json(payload)
+        elif mutation == "missing_execution_leg":
+            session.delete(
+                session.query(ExecutionOrderLeg).filter_by(leg_index=2).one()
+            )
+        else:
+            leg = session.query(ExecutionOrderLeg).filter_by(leg_index=1).one()
+            if mutation == "empty_order_id":
+                leg.order_id = ""
+            else:
+                leg.status = "planned"
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.action is None
+    assert expected_conflict in plan.conflicts
+
+
+def test_monitor_accepts_legacy_reconciliation_only_after_exact_event(tmp_path):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    assert read_entry_preamble_invariants(database_path, now=NOW) == (
+        "live_entry_preamble_binding_evidence_missing",
+    )
+    plan = _plan(session_factory)
+    assert plan.action is not None
+
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == ()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["signal_top", "request", "leg_status", "source_lineage", "event_policy"],
+)
+def test_monitor_rejects_legacy_event_when_durable_proof_drifts(
+    tmp_path, mutation
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        if mutation == "signal_top":
+            signal = session.get(TradeSignal, 398)
+            payload = json.loads(signal.payload_json)
+            payload["entry_preamble_assembly"] = deepcopy(
+                payload["deepcoin_order_draft"]["entry_preamble_assembly"]
+            )
+            signal.payload_json = _canonical_json(payload)
+        elif mutation == "request":
+            leg = session.query(ExecutionOrderLeg).filter_by(leg_index=1).one()
+            request = json.loads(leg.request_json)
+            request["side"] = "sell"
+            leg.request_json = _canonical_json(request)
+        elif mutation == "leg_status":
+            session.query(ExecutionOrderLeg).filter_by(leg_index=1).one().status = (
+                "planned"
+            )
+        elif mutation == "source_lineage":
+            session.get(RawMessage, 10).message_id = 56
+        else:
+            event_row = session.query(ExecutionEvent).one()
+            after = json.loads(event_row.after_json)
+            after["policy_version"] = RECONCILIATION_POLICY
+            event_row.after_json = _canonical_json(after)
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == (
+        "live_entry_preamble_binding_evidence_missing",
+    )
 
 
 @pytest.mark.parametrize(

@@ -31,12 +31,15 @@ from telegram_kol_research.config import (
     load_runtime_incident_config,
 )
 from telegram_kol_research.entry_assembly_fingerprint_repair import (
+    LEGACY_FINALIZED_RECONCILIATION_POLICY,
     RECONCILIATION_ACTION,
     RECONCILIATION_POLICY,
     build_reconciliation_fingerprint,
     canonical_fingerprint,
     derive_pre_finalization_fingerprint,
     entry_order_snapshot_matches_durable_identity,
+    legacy_finalized_execution_legs_match,
+    legacy_finalized_snapshot_from_full_draft,
 )
 from telegram_kol_research.entry_strategy_assembly import (
     build_bounded_entry_order_draft_snapshot,
@@ -831,6 +834,21 @@ def _has_exact_entry_fingerprint_reconciliation(
         if isinstance(canonical_snapshot, Mapping)
         else None
     )
+    if canonical_snapshot != snapshot:
+        return _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
+            connection,
+            available_tables=available_tables,
+            assembly_id=assembly_id,
+            strategy_id=strategy_id,
+            final_fp=final_fp,
+            final_evidence=final_evidence,
+            snapshot=snapshot,
+            final_leg_count=final_leg_count,
+            execution_binding_id=execution_binding_id,
+            binding_identity=binding_identity,
+            binding_payload=binding_payload,
+            stale_evidence=stale_evidence,
+        )
     binding_chat_id = binding_identity.get("chat_id")
     binding_message_id = binding_identity.get("message_id")
     durable_identity_matches = (
@@ -1028,6 +1046,270 @@ def _has_exact_entry_fingerprint_reconciliation(
         and row[8] == repair_fp
         and row[9] == 0
         and all(value is None for value in unused_values)
+    )
+
+
+def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
+    connection: sqlite3.Connection,
+    *,
+    available_tables: set[str],
+    assembly_id: int,
+    strategy_id: str,
+    final_fp: str,
+    final_evidence: Mapping[str, Any] | None,
+    snapshot: object,
+    final_leg_count: object,
+    execution_binding_id: int,
+    binding_identity: Mapping[str, Any],
+    binding_payload: Mapping[str, Any],
+    stale_evidence: Mapping[str, Any],
+) -> bool:
+    required = {
+        "execution_events",
+        "trade_signals",
+        "execution_order_legs",
+        "raw_messages",
+        "signal_candidates",
+    }
+    if not required.issubset(available_tables):
+        return False
+    if (
+        not strategy_id
+        or not _SHA256_FINGERPRINT.fullmatch(final_fp)
+        or not isinstance(final_evidence, Mapping)
+        or not isinstance(snapshot, Mapping)
+        or isinstance(final_leg_count, bool)
+        or not isinstance(final_leg_count, int)
+        or canonical_fingerprint(final_evidence) != final_fp
+    ):
+        return False
+    binding_draft = binding_payload.get("draft")
+    legacy_snapshot = legacy_finalized_snapshot_from_full_draft(binding_draft)
+    if (
+        legacy_snapshot != snapshot
+        or len(legacy_snapshot.get("order_legs", [])) != final_leg_count
+    ):
+        return False
+    try:
+        old_fp = derive_pre_finalization_fingerprint(final_evidence)
+    except (TypeError, ValueError):
+        return False
+    chat_id = binding_identity.get("chat_id")
+    message_id = binding_identity.get("message_id")
+    if (
+        not _reconciliation_stale_evidence_matches(
+            stale_evidence,
+            assembly_id=assembly_id,
+            strategy_instance_id=strategy_id,
+            old_fingerprint=old_fp,
+        )
+        or not isinstance(chat_id, int)
+        or isinstance(chat_id, bool)
+        or not isinstance(message_id, int)
+        or isinstance(message_id, bool)
+        or not entry_order_snapshot_matches_durable_identity(
+            binding_draft,
+            strategy_instance_id=strategy_id,
+            symbol=str(binding_identity.get("symbol") or ""),
+            side=str(binding_identity.get("side") or ""),
+            kol_id=str(binding_identity.get("kol_id") or ""),
+            chat_id=chat_id,
+            message_id=message_id,
+            margin_mode=str(binding_identity.get("margin_mode") or ""),
+            position_mode=str(binding_identity.get("position_mode") or ""),
+        )
+        or str(binding_identity.get("strategy_instance_id") or "") != strategy_id
+        or str(binding_identity.get("venue") or "").lower() != "deepcoin"
+        or final_evidence.get("chat_id") != chat_id
+        or final_evidence.get("strategy_message_id") != message_id
+        or str(final_evidence.get("symbol") or "").upper()
+        != str(binding_identity.get("symbol") or "").upper()
+        or str(final_evidence.get("side") or "").lower()
+        != str(binding_identity.get("side") or "").lower()
+    ):
+        return False
+
+    assembly_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(entry_strategy_assemblies)"
+        ).fetchall()
+    }
+    if not {
+        "entry_preamble_id",
+        "strategy_raw_message_id",
+        "signal_candidate_id",
+    }.issubset(assembly_columns):
+        return False
+    lineage = connection.execute(
+        """
+        SELECT a.entry_preamble_id, a.strategy_raw_message_id,
+               a.signal_candidate_id, raw.chat_id, raw.message_id,
+               candidate.raw_message_id, candidate.event_type,
+               candidate.symbol, candidate.side, candidate.target_lifecycle_id,
+               candidate.management_action
+        FROM entry_strategy_assemblies AS a
+        JOIN raw_messages AS raw ON raw.id = a.strategy_raw_message_id
+        JOIN signal_candidates AS candidate ON candidate.id = a.signal_candidate_id
+        WHERE a.id = ? AND a.strategy_instance_id = ?
+        """,
+        (assembly_id, strategy_id),
+    ).fetchone()
+    if (
+        lineage is None
+        or lineage[0] is not None
+        or final_evidence.get("strategy_raw_message_id") != lineage[1]
+        or final_evidence.get("signal_candidate_id") != lineage[2]
+        or lineage[3] != chat_id
+        or lineage[4] != message_id
+        or lineage[5] != lineage[1]
+        or lineage[6] != "entry_signal"
+        or str(lineage[7] or "") != str(binding_identity.get("symbol") or "")
+        or str(lineage[8] or "") != str(binding_identity.get("side") or "")
+        or lineage[9] is not None
+        or lineage[10] is not None
+    ):
+        return False
+
+    signal_rows = connection.execute(
+        """
+        SELECT id, payload_json FROM trade_signals
+        WHERE strategy_instance_id = ? AND chat_id = ? AND message_id = ?
+          AND symbol = ? AND side = ? AND kol_id = ? AND venue = 'deepcoin'
+          AND source_type = 'recovery' AND action = 'open_position'
+          AND status = 'submitted' AND processed_at IS NOT NULL
+        ORDER BY id ASC LIMIT 2
+        """,
+        (
+            strategy_id,
+            chat_id,
+            message_id,
+            binding_identity.get("symbol"),
+            binding_identity.get("side"),
+            binding_identity.get("kol_id"),
+        ),
+    ).fetchall()
+    if len(signal_rows) != 1:
+        return False
+    trade_signal_id, signal_payload_json = signal_rows[0]
+    signal_payload = _read_reconciliation_json(signal_payload_json)
+    signal_draft = (
+        signal_payload.get("deepcoin_order_draft")
+        if isinstance(signal_payload, Mapping)
+        else None
+    )
+    signal_nested = (
+        signal_draft.get("entry_preamble_assembly")
+        if isinstance(signal_draft, Mapping)
+        else None
+    )
+    if (
+        not isinstance(signal_payload, Mapping)
+        or "entry_preamble_assembly" in signal_payload
+        or signal_draft != binding_draft
+        or legacy_finalized_snapshot_from_full_draft(signal_draft) != snapshot
+        or not _reconciliation_stale_evidence_matches(
+            signal_nested,
+            assembly_id=assembly_id,
+            strategy_instance_id=strategy_id,
+            old_fingerprint=old_fp,
+        )
+    ):
+        return False
+
+    leg_columns = (
+        "leg_index",
+        "strategy_instance_id",
+        "venue",
+        "status",
+        "order_id",
+        "order_kind",
+        "client_order_id",
+        "request_json",
+    )
+    available_leg_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(execution_order_legs)"
+        ).fetchall()
+    }
+    if not {"execution_binding_id", "purpose", *leg_columns}.issubset(
+        available_leg_columns
+    ):
+        return False
+    leg_rows = connection.execute(
+        f"""
+        SELECT {', '.join(leg_columns)} FROM execution_order_legs
+        WHERE execution_binding_id = ? AND purpose = 'entry'
+        ORDER BY leg_index ASC, id ASC
+        """,
+        (execution_binding_id,),
+    ).fetchall()
+    legs = [dict(zip(leg_columns, row)) for row in leg_rows]
+    if not legacy_finalized_execution_legs_match(
+        legs,
+        full_draft=binding_draft,
+        final_leg_count=final_leg_count,
+        strategy_instance_id=strategy_id,
+        symbol=str(binding_identity.get("symbol") or ""),
+        side=str(binding_identity.get("side") or ""),
+    ):
+        return False
+
+    rows = connection.execute(
+        """
+        SELECT trade_signal_id, strategy_instance_id, venue, status, reason,
+               before_json, after_json, notification_status,
+               notification_fingerprint, notification_attempts,
+               kol_id, chat_id, message_id, source_message_id, symbol, side,
+               order_id, client_order_id, pos_id, related_order_id,
+               request_json, response_json, exchange_event_time,
+               notification_message_id, notification_error,
+               notification_next_attempt_at, notification_claim_token,
+               notification_claimed_at, notified_at
+        FROM execution_events
+        WHERE execution_binding_id = ? AND action = ?
+        ORDER BY id ASC LIMIT 2
+        """,
+        (execution_binding_id, RECONCILIATION_ACTION),
+    ).fetchall()
+    if len(rows) != 1:
+        return False
+    row = rows[0]
+    repair_fp = build_reconciliation_fingerprint(
+        assembly_id=assembly_id,
+        execution_binding_id=execution_binding_id,
+        trade_signal_id=trade_signal_id,
+        strategy_instance_id=strategy_id,
+        old_fingerprint=old_fp,
+        final_fingerprint=final_fp,
+        policy_version=LEGACY_FINALIZED_RECONCILIATION_POLICY,
+    )
+    common = {
+        "policy_version": LEGACY_FINALIZED_RECONCILIATION_POLICY,
+        "assembly_id": assembly_id,
+        "execution_binding_id": execution_binding_id,
+        "trade_signal_id": trade_signal_id,
+        "strategy_instance_id": strategy_id,
+    }
+    before = {**common, "assembly_fingerprint": old_fp}
+    after = {
+        **common,
+        "assembly_fingerprint": final_fp,
+        "repair_fingerprint": repair_fp,
+    }
+    return (
+        row[0] == trade_signal_id
+        and row[1] == strategy_id
+        and row[2] == "deepcoin"
+        and row[3] == "resolved"
+        and row[4] == "pre_finalization_payload_preserved"
+        and _read_reconciliation_json(row[5]) == before
+        and _read_reconciliation_json(row[6]) == after
+        and row[7] is None
+        and row[8] == repair_fp
+        and row[9] == 0
+        and all(value is None for value in row[10:])
     )
 
 

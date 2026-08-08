@@ -28,7 +28,33 @@ from telegram_kol_research.models import (
 
 RECONCILIATION_ACTION = "entry_assembly_fingerprint_reconciled"
 RECONCILIATION_POLICY = "entry-assembly-fingerprint-reconciliation-v1"
+LEGACY_FINALIZED_RECONCILIATION_POLICY = (
+    "entry-assembly-fingerprint-reconciliation-legacy-finalized-v1"
+)
 _MAX_JSON_BYTES = 1_000_000
+_LEGACY_SNAPSHOT_KEYS = frozenset(
+    {
+        "strategy_instance_id",
+        "instrument_id",
+        "stop_loss",
+        "take_profit_legs",
+        "risk_budget_usdt",
+        "contract_spec",
+        "order_legs",
+    }
+)
+_LEGACY_LEG_KEYS = frozenset(
+    {
+        "price",
+        "order_type",
+        "allocation_pct",
+        "risk_budget_usdt",
+        "quantity",
+        "quantity_unit",
+        "estimated_stop_loss_usdt",
+        "client_order_id",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +66,7 @@ class EntryAssemblyFingerprintRepairAction:
     old_fingerprint: str
     final_fingerprint: str
     repair_fingerprint: str
+    policy_version: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,10 +143,11 @@ def build_reconciliation_fingerprint(
     strategy_instance_id: str,
     old_fingerprint: str,
     final_fingerprint: str,
+    policy_version: str = RECONCILIATION_POLICY,
 ) -> str:
     return canonical_fingerprint(
         {
-            "policy_version": RECONCILIATION_POLICY,
+            "policy_version": policy_version,
             "assembly_id": int(assembly_id),
             "execution_binding_id": int(execution_binding_id),
             "trade_signal_id": trade_signal_id,
@@ -180,16 +208,19 @@ def _build_entry_assembly_fingerprint_repair_plan(
 
     snapshot = final_evidence.get("order_draft_snapshot")
     canonical_snapshot = _bounded_snapshot(snapshot)
+    legacy_snapshot = _legacy_snapshot(snapshot)
     final_leg_count = final_evidence.get("final_entry_leg_count")
+    snapshot_legs = (
+        snapshot.get("order_legs") if isinstance(snapshot, Mapping) else None
+    )
     if (
         not isinstance(snapshot, Mapping)
-        or canonical_snapshot is None
-        or canonical_snapshot != snapshot
-        or not isinstance(snapshot.get("order_legs"), list)
-        or not all(isinstance(leg, Mapping) for leg in snapshot["order_legs"])
+        or (canonical_snapshot != snapshot and legacy_snapshot != snapshot)
+        or not isinstance(snapshot_legs, list)
+        or not all(isinstance(leg, Mapping) for leg in snapshot_legs)
         or isinstance(final_leg_count, bool)
         or not isinstance(final_leg_count, int)
-        or final_leg_count != len(snapshot["order_legs"])
+        or final_leg_count != len(snapshot_legs)
         or not 1 <= final_leg_count <= 5
     ):
         conflicts.append("assembly_finalization_fields_missing")
@@ -249,9 +280,14 @@ def _build_entry_assembly_fingerprint_repair_plan(
         conflicts.append("binding_venue_mismatch")
     if not _source_identity_matches(final_evidence, binding):
         conflicts.append("binding_source_identity_mismatch")
-    if not isinstance(canonical_snapshot, Mapping) or not (
+    identity_snapshot = (
+        canonical_snapshot
+        if canonical_snapshot == snapshot
+        else binding_payload.get("draft")
+    )
+    if not isinstance(identity_snapshot, Mapping) or not (
         entry_order_snapshot_matches_durable_identity(
-            canonical_snapshot,
+            identity_snapshot,
             strategy_instance_id=strategy_id,
             symbol=str(binding.symbol),
             side=str(binding.side),
@@ -278,17 +314,38 @@ def _build_entry_assembly_fingerprint_repair_plan(
         old_fingerprint=old_fingerprint,
     ):
         conflicts.append("binding_old_fingerprint_not_derivable")
-    if canonical_snapshot is None or _bounded_snapshot(binding_draft) != canonical_snapshot:
+    canonical_proof = canonical_snapshot == snapshot
+    legacy_proof = legacy_snapshot == snapshot
+    if canonical_proof:
+        if _bounded_snapshot(binding_draft) != canonical_snapshot:
+            conflicts.append("binding_draft_identity_mismatch")
+    elif legacy_proof:
+        if (
+            legacy_finalized_snapshot_from_full_draft(binding_draft)
+            != legacy_snapshot
+        ):
+            conflicts.append("assembly_legacy_snapshot_binding_mismatch")
+    else:
         conflicts.append("binding_draft_identity_mismatch")
 
     trade_signal = _load_exact_trade_signal(session, assembly, binding)
     if trade_signal is None:
         conflicts.append("trade_signal_identity_missing")
-    elif not _signal_has_stale_evidence(
+    elif canonical_proof:
+        if not _signal_has_stale_evidence(
+            trade_signal,
+            assembly_id=int(assembly.id),
+            strategy_instance_id=strategy_id,
+            old_fingerprint=old_fingerprint,
+            snapshot=snapshot,
+        ):
+            conflicts.append("trade_signal_evidence_mismatch")
+    elif not _legacy_signal_has_stale_evidence(
         trade_signal,
         assembly_id=int(assembly.id),
         strategy_instance_id=strategy_id,
         old_fingerprint=old_fingerprint,
+        binding_draft=binding_draft,
         snapshot=snapshot,
     ):
         conflicts.append("trade_signal_evidence_mismatch")
@@ -300,18 +357,35 @@ def _build_entry_assembly_fingerprint_repair_plan(
         .order_by(ExecutionOrderLeg.leg_index.asc(), ExecutionOrderLeg.id.asc())
         .all()
     )
-    if not isinstance(snapshot, Mapping) or not _execution_legs_match(
-        legs,
-        snapshot=snapshot,
-        strategy_instance_id=strategy_id,
-        symbol=str(binding.symbol),
-        side=str(binding.side),
-    ):
+    legs_match = False
+    if isinstance(snapshot, Mapping) and canonical_proof:
+        legs_match = _execution_legs_match(
+            legs,
+            snapshot=snapshot,
+            strategy_instance_id=strategy_id,
+            symbol=str(binding.symbol),
+            side=str(binding.side),
+        )
+    elif isinstance(binding_draft, Mapping) and legacy_proof:
+        legs_match = legacy_finalized_execution_legs_match(
+            legs,
+            full_draft=binding_draft,
+            final_leg_count=final_leg_count,
+            strategy_instance_id=strategy_id,
+            symbol=str(binding.symbol),
+            side=str(binding.side),
+        )
+    if not legs_match:
         conflicts.append("execution_leg_identity_mismatch")
 
     if conflicts:
         return _plan(None, conflicts)
     trade_signal_id = int(trade_signal.id) if trade_signal is not None else None
+    policy_version = (
+        RECONCILIATION_POLICY
+        if canonical_proof
+        else LEGACY_FINALIZED_RECONCILIATION_POLICY
+    )
     repair_fingerprint = build_reconciliation_fingerprint(
         assembly_id=int(assembly.id),
         execution_binding_id=int(binding.id),
@@ -319,6 +393,7 @@ def _build_entry_assembly_fingerprint_repair_plan(
         strategy_instance_id=strategy_id,
         old_fingerprint=old_fingerprint,
         final_fingerprint=str(assembly.fingerprint),
+        policy_version=policy_version,
     )
     action = EntryAssemblyFingerprintRepairAction(
         assembly_id=int(assembly.id),
@@ -328,6 +403,7 @@ def _build_entry_assembly_fingerprint_repair_plan(
         old_fingerprint=old_fingerprint,
         final_fingerprint=str(assembly.fingerprint),
         repair_fingerprint=repair_fingerprint,
+        policy_version=policy_version,
     )
     events = (
         session.query(ExecutionEvent)
@@ -437,6 +513,56 @@ def _bounded_snapshot(draft: Any) -> dict[str, object] | None:
         return build_bounded_entry_order_draft_snapshot(draft)
     except (TypeError, ValueError):
         return None
+
+
+def _legacy_snapshot(snapshot: Any) -> dict[str, object] | None:
+    if not isinstance(snapshot, Mapping) or set(snapshot) != _LEGACY_SNAPSHOT_KEYS:
+        return None
+    legs = snapshot.get("order_legs")
+    contract_spec = snapshot.get("contract_spec")
+    if (
+        not isinstance(legs, list)
+        or not 1 <= len(legs) <= 5
+        or any(
+            not isinstance(leg, Mapping) or set(leg) != _LEGACY_LEG_KEYS
+            for leg in legs
+        )
+        or not isinstance(contract_spec, Mapping)
+        or set(contract_spec) != {"contract_value", "quantity_step", "min_quantity"}
+    ):
+        return None
+    return json.loads(json.dumps(dict(snapshot), ensure_ascii=False))
+
+
+def legacy_finalized_snapshot_from_full_draft(
+    draft: Any,
+) -> dict[str, object] | None:
+    if not isinstance(draft, Mapping):
+        return None
+    legs = draft.get("order_legs")
+    contract_spec = draft.get("contract_spec")
+    if (
+        not isinstance(legs, list)
+        or not 1 <= len(legs) <= 5
+        or any(not isinstance(leg, Mapping) for leg in legs)
+        or not isinstance(contract_spec, Mapping)
+    ):
+        return None
+    projected = {
+        "strategy_instance_id": draft.get("strategy_instance_id"),
+        "instrument_id": draft.get("instrument_id"),
+        "stop_loss": draft.get("stop_loss"),
+        "take_profit_legs": draft.get("take_profit_legs") or [],
+        "risk_budget_usdt": draft.get("risk_budget_usdt"),
+        "contract_spec": {
+            key: contract_spec.get(key)
+            for key in ("contract_value", "quantity_step", "min_quantity")
+        },
+        "order_legs": [
+            {key: leg.get(key) for key in _LEGACY_LEG_KEYS} for leg in legs
+        ],
+    }
+    return _legacy_snapshot(projected)
 
 
 def _positive_int_equals(value: Any, expected: int) -> bool:
@@ -551,6 +677,37 @@ def _signal_has_stale_evidence(
     )
 
 
+def _legacy_signal_has_stale_evidence(
+    signal: TradeSignal,
+    *,
+    assembly_id: int,
+    strategy_instance_id: str,
+    old_fingerprint: str,
+    binding_draft: Any,
+    snapshot: Mapping[str, Any],
+) -> bool:
+    payload = _json_object(signal.payload_json)
+    if payload is None or "entry_preamble_assembly" in payload:
+        return False
+    signal_draft = payload.get("deepcoin_order_draft")
+    nested = (
+        signal_draft.get("entry_preamble_assembly")
+        if isinstance(signal_draft, Mapping)
+        else None
+    )
+    return (
+        isinstance(binding_draft, Mapping)
+        and signal_draft == binding_draft
+        and _stale_evidence_matches(
+            nested,
+            assembly_id=assembly_id,
+            strategy_instance_id=strategy_instance_id,
+            old_fingerprint=old_fingerprint,
+        )
+        and legacy_finalized_snapshot_from_full_draft(signal_draft) == snapshot
+    )
+
+
 def _stale_evidence_matches(
     evidence: Any,
     *,
@@ -622,6 +779,99 @@ def _execution_legs_match(
     return True
 
 
+def legacy_finalized_execution_legs_match(
+    legs: list[Any],
+    *,
+    full_draft: Mapping[str, Any],
+    final_leg_count: Any,
+    strategy_instance_id: str,
+    symbol: str,
+    side: str,
+) -> bool:
+    expected_legs = full_draft.get("order_legs")
+    instrument = str(full_draft.get("instrument_id") or "").upper()
+    if (
+        isinstance(final_leg_count, bool)
+        or not isinstance(final_leg_count, int)
+        or not isinstance(expected_legs, list)
+        or len(expected_legs) != final_leg_count
+        or len(legs) != final_leg_count
+        or instrument != f"{symbol.upper()}-USDT-SWAP"
+    ):
+        return False
+    for index, (row, expected) in enumerate(zip(legs, expected_legs), 1):
+        request_raw = _leg_value(row, "request_json")
+        request = (
+            dict(request_raw)
+            if isinstance(request_raw, Mapping)
+            else _json_object(request_raw)
+        )
+        if not isinstance(expected, Mapping) or request is None:
+            return False
+        order_type = str(expected.get("order_type") or "").lower()
+        expected_kind = {"limit": "trigger_limit", "market": "market"}.get(
+            order_type
+        )
+        if (
+            _leg_value(row, "leg_index") != index
+            or str(_leg_value(row, "strategy_instance_id") or "")
+            != strategy_instance_id
+            or str(_leg_value(row, "venue") or "").lower() != "deepcoin"
+            or str(_leg_value(row, "status") or "").lower()
+            not in {"pending", "submitted", "open", "active"}
+            or not str(_leg_value(row, "order_id") or "").strip()
+            or expected_kind is None
+            or str(_leg_value(row, "order_kind") or "").lower() != expected_kind
+            or not str(_leg_value(row, "client_order_id") or "").strip()
+            or str(_leg_value(row, "client_order_id"))
+            != str(expected.get("client_order_id") or "")
+            or not _exact_request_matches_leg(
+                request, expected=expected, full_draft=full_draft
+            )
+        ):
+            return False
+    return str(full_draft.get("position_mode") or "") in {"split", "merge"} and (
+        str(full_draft.get("symbol") or "").upper() == symbol.upper()
+        and all(
+            str(leg.get("position_side") or "").lower() == side.lower()
+            for leg in expected_legs
+        )
+    )
+
+
+def _leg_value(row: Any, field: str) -> Any:
+    return row.get(field) if isinstance(row, Mapping) else getattr(row, field, None)
+
+
+def _exact_request_matches_leg(
+    request: Mapping[str, Any],
+    *,
+    expected: Mapping[str, Any],
+    full_draft: Mapping[str, Any],
+) -> bool:
+    try:
+        from telegram_kol_research.recovery_live_submit import (
+            RecoveryLiveSubmitError,
+            build_deepcoin_market_order_payload,
+            build_deepcoin_trigger_order_payload,
+        )
+
+        order_type = str(expected.get("order_type") or "").lower()
+        if order_type == "market":
+            expected_request = build_deepcoin_market_order_payload(
+                dict(full_draft), dict(expected)
+            )
+        elif order_type == "limit":
+            expected_request = build_deepcoin_trigger_order_payload(
+                dict(full_draft), dict(expected)
+            )
+        else:
+            return False
+    except (KeyError, TypeError, ValueError, RecoveryLiveSubmitError):
+        return False
+    return dict(request) == expected_request
+
+
 def _request_matches_selected_leg(
     request: Mapping[str, Any],
     *,
@@ -664,7 +914,7 @@ def _request_matches_selected_leg(
 
 def _event_documents(action: EntryAssemblyFingerprintRepairAction):
     common = {
-        "policy_version": RECONCILIATION_POLICY,
+        "policy_version": action.policy_version,
         "assembly_id": action.assembly_id,
         "execution_binding_id": action.execution_binding_id,
         "trade_signal_id": action.trade_signal_id,
