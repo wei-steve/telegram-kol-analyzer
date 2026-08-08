@@ -358,6 +358,14 @@ version numbers are omitted from the operator message and the version number
 does not participate in an `audit_abnormal` fingerprint. A normal code deployment
 therefore cannot retrigger an unchanged historical audit notification.
 
+If the monitor reports `authoritative_processor_required`, raw Telegram intake
+may remain running when its health checks are otherwise normal, but automatic
+message interpretation has stopped. Do not enable a legacy recognizer. Inspect
+the production application construction and deployed commit, repair the
+authoritative processor wiring, and redeploy only in a proven safe window.
+Never automatically replay messages older than the observed gap; preserve them
+as raw evidence for an explicit, separately reviewed recovery decision.
+
 The management audit reports informational keep-holding history separately as
 `counts.informational_noop`. It also reports completed fail-closed history as
 `counts.terminal_blocked` when the batch has `completed_at` and no leg retains

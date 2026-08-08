@@ -1990,6 +1990,52 @@ class _RecordingAdapters:
         return self.audit
 
 
+def test_authoritative_processor_required_journal_signal_is_critical(tmp_path):
+    class AuthorityMissingAdapters(_RecordingAdapters):
+        def read_journal_summary(self, *, since):
+            self.calls.append(("journal", since))
+            return {
+                "generic_error_count": 0,
+                "reason_codes": ("authoritative_processor_required",),
+            }
+
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=tmp_path / "state.json",
+        adapters=AuthorityMissingAdapters(),
+        now=datetime(2026, 8, 8, 1, 0, tzinfo=UTC),
+        notify=False,
+    )
+    presentation = monitor_module.build_monitor_alert_presentation(outcome.result)
+
+    assert outcome.result.reason_codes == ("authoritative_processor_required",)
+    assert presentation.severity == "critical"
+    assert "原始消息仍可继续接收" in presentation.impact
+    assert "自动解读已停止" in presentation.impact
+    assert "不要启用旧识别器" in presentation.operator_action
+    assert "123" not in monitor_module.format_monitor_alert(
+        outcome.result,
+        checked_at="2026-08-08T01:00:00+00:00",
+    )
+
+
+def test_malformed_journal_summary_fails_closed(tmp_path):
+    class MalformedJournalAdapters(_RecordingAdapters):
+        def read_journal_summary(self, *, since):
+            return {"unexpected": "raw journal detail"}
+
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=tmp_path / "state.json",
+        adapters=MalformedJournalAdapters(),
+        now=datetime(2026, 8, 8, 1, 0, tzinfo=UTC),
+        notify=False,
+    )
+
+    assert outcome.result.reason_codes == ("malformed_snapshot",)
+    assert "raw journal detail" not in repr(outcome.result)
+
+
 def test_monitor_orchestration_reads_all_bounded_lightweight_sources(tmp_path):
     adapters = _RecordingAdapters()
     state_path = tmp_path / "state.json"
@@ -3702,7 +3748,11 @@ def test_subprocess_adapters_use_fixed_argv_timeouts_and_output_caps(monkeypatch
         calls.append((argv, kwargs))
         output = {
             "git": REVIEWED_HEAD + "\n",
-            "journalctl": "first\nsecond\n",
+            "journalctl": (
+                "recognition authority unavailable raw_message_id=123 "
+                "reason=authoritative_processor_required\n"
+                "unrelated error\n"
+            ),
             sys.executable: json.dumps(_healthy_audit()),
         }[argv[0]]
         return SimpleNamespace(returncode=0, output=output)
@@ -3723,6 +3773,12 @@ def test_subprocess_adapters_use_fixed_argv_timeouts_and_output_caps(monkeypatch
     assert adapters.count_journal_errors(
         since=datetime(2026, 7, 16, 0, 0, tzinfo=UTC)
     ) == 2
+    assert adapters.read_journal_summary(
+        since=datetime(2026, 7, 16, 0, 0, tzinfo=UTC)
+    ) == {
+        "generic_error_count": 1,
+        "reason_codes": ("authoritative_processor_required",),
+    }
     assert adapters.run_management_audit() == _healthy_audit()
     assert calls == [
         (
@@ -3734,6 +3790,21 @@ def test_subprocess_adapters_use_fixed_argv_timeouts_and_output_caps(monkeypatch
                 "HEAD",
             ),
             {"timeout_seconds": 5, "cwd": Path("/opt/telegram-kol-analyzer")},
+        ),
+        (
+            (
+                "journalctl",
+                "--unit",
+                "telegram-kol.service",
+                "--priority",
+                "err",
+                "--since",
+                "2026-07-16T00:00:00+00:00",
+                "--no-pager",
+                "--output",
+                "cat",
+            ),
+            {"timeout_seconds": 10, "max_output_bytes": 262_144},
         ),
         (
             (

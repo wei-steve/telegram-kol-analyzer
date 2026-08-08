@@ -97,6 +97,7 @@ _RECOVERY_EVENT_STATUSES = frozenset({"recovery_required"})
 _FIXED_REASON_CODES = frozenset(
     {
         "adapter_failure",
+        "authoritative_processor_required",
         "audit_abnormal",
         "audit_incomplete",
         "auto_trade_enabled_drift",
@@ -210,6 +211,7 @@ def send_monitor_incident_capture(
         raise ValueError("monitor incident capture count is invalid")
     return min(captured, 102)
 _FINGERPRINT_DETAIL_KEYS_BY_REASON = {
+    "authoritative_processor_required": (),
     "service_inactive": ("service_state",),
     "auto_trade_enabled_drift": (
         "auto_trade_enabled",
@@ -301,6 +303,7 @@ class MonitorSnapshot:
     journal_error_count: int
     abnormal_events: Sequence[Mapping[str, Any]]
     audit: Mapping[str, Any] | None
+    journal_reason_codes: Sequence[str] = ()
     composite_invariant_codes: Sequence[str] = ()
     entry_preamble_invariant_codes: Sequence[str] = ()
     adapter_failures: Sequence[str] = ()
@@ -397,6 +400,25 @@ class ProductionSafetyAdapters:
         return read_loopback_settings(self.settings_url)
 
     def count_journal_errors(self, *, since: datetime) -> int:
+        return len(self._read_bounded_journal_lines(since=since))
+
+    def read_journal_summary(self, *, since: datetime) -> Mapping[str, Any]:
+        lines = self._read_bounded_journal_lines(since=since)
+        authority_marker = "reason=authoritative_processor_required"
+        authority_missing = any(authority_marker in line for line in lines)
+        generic_error_count = sum(
+            1 for line in lines if authority_marker not in line
+        )
+        return {
+            "generic_error_count": generic_error_count,
+            "reason_codes": (
+                ("authoritative_processor_required",)
+                if authority_missing
+                else ()
+            ),
+        }
+
+    def _read_bounded_journal_lines(self, *, since: datetime) -> tuple[str, ...]:
         completed = _run_bounded_command(
             (
                 "journalctl",
@@ -415,10 +437,11 @@ class ProductionSafetyAdapters:
         )
         if completed.returncode != 0:
             raise RuntimeError("journal_unavailable")
-        return min(
-            _MAX_JOURNAL_ERRORS,
-            sum(1 for line in completed.output.splitlines() if line.strip()),
-        )
+        return tuple(
+            line
+            for line in completed.output.splitlines()
+            if line.strip()
+        )[:_MAX_JOURNAL_ERRORS]
 
     def read_abnormal_events(
         self, *, since: datetime, limit: int
@@ -1197,12 +1220,34 @@ def run_production_safety_monitor(
     service_state = _read_adapter(adapters.read_service_state, "service", failures, "unknown")
     head = _read_adapter(adapters.read_git_head, "head", failures, "0" * 40)
     settings = _read_adapter(adapters.read_settings, "settings", failures, {})
-    journal_error_count = _read_adapter(
-        lambda: adapters.count_journal_errors(since=since),
-        "journal",
-        failures,
-        0,
-    )
+    journal_summary_reader = getattr(adapters, "read_journal_summary", None)
+    if callable(journal_summary_reader):
+        journal_summary = _read_adapter(
+            lambda: journal_summary_reader(since=since),
+            "journal",
+            failures,
+            None,
+        )
+        if journal_summary is None and "journal" in failures:
+            journal_error_count = 0
+            journal_reason_codes = ()
+        elif (
+            isinstance(journal_summary, Mapping)
+            and set(journal_summary) == {"generic_error_count", "reason_codes"}
+        ):
+            journal_error_count = journal_summary["generic_error_count"]
+            journal_reason_codes = journal_summary["reason_codes"]
+        else:
+            journal_error_count = None
+            journal_reason_codes = None
+    else:
+        journal_error_count = _read_adapter(
+            lambda: adapters.count_journal_errors(since=since),
+            "journal",
+            failures,
+            0,
+        )
+        journal_reason_codes = ()
     abnormal_events = _read_adapter(
         lambda: adapters.read_abnormal_events(
             since=since,
@@ -1260,6 +1305,7 @@ def run_production_safety_monitor(
             journal_error_count=journal_error_count,
             abnormal_events=abnormal_events,
             audit=audit,
+            journal_reason_codes=journal_reason_codes,
             composite_invariant_codes=composite_invariant_codes,
             entry_preamble_invariant_codes=entry_preamble_invariant_codes,
             adapter_failures=tuple(failures),
@@ -2136,6 +2182,14 @@ def evaluate_monitor_snapshot(
         reasons.add("journal_errors")
         details["journal_error_count"] = journal_error_count
 
+    journal_reason_codes = _safe_journal_reason_codes(
+        snapshot.journal_reason_codes
+    )
+    if journal_reason_codes is None:
+        reasons.add("malformed_snapshot")
+    else:
+        reasons.update(journal_reason_codes)
+
     adapter_failures = _safe_adapter_failures(snapshot.adapter_failures)
     if adapter_failures is None:
         reasons.add("malformed_snapshot")
@@ -2608,6 +2662,11 @@ def format_monitor_recovery(*, checked_at: datetime | str) -> str:
 
 
 _ALERT_RULES: Mapping[str, tuple[str, str, str]] = {
+    "authoritative_processor_required": (
+        "critical",
+        "权威消息识别未连接",
+        "权威处理器未连接，系统已停止自动解读新消息。",
+    ),
     "service_inactive": (
         "critical",
         "自动交易服务未正常运行",
@@ -2696,6 +2755,7 @@ _ALERT_RULES: Mapping[str, tuple[str, str, str]] = {
     ),
 }
 _ALERT_REASON_PRIORITY = (
+    "authoritative_processor_required",
     "event_unknown_status",
     "duplicate_composite_close_submission",
     "composite_position_without_verified_stop",
@@ -2758,9 +2818,17 @@ def build_monitor_alert_presentation(result: MonitorResult) -> MonitorAlertPrese
     additional_batch_count = max(0, (total or 0) - len(batch_ids))
 
     if severity == "critical":
-        if {"event_unknown_status", "event_recovery_status", "duplicate_manual_close"}.intersection(
-            known_reasons
-        ) or audit_submit_unknown:
+        if "authoritative_processor_required" in known_reasons:
+            impact = "原始消息仍可继续接收，但自动解读已停止，不会生成新的交易指令。"
+            operator_action = (
+                "不要启用旧识别器；请检查生产构造和当前提交，"
+                "在安全时窗修复权威处理器连接。"
+            )
+        elif {
+            "event_unknown_status",
+            "event_recovery_status",
+            "duplicate_manual_close",
+        }.intersection(known_reasons) or audit_submit_unknown:
             impact = "对应订单或仓位的最终状态尚未确认，重复操作可能扩大风险。"
             operator_action = "不要重复下单或平仓，请先由开发者核对交易所订单和当前仓位。"
         elif {"adapter_failure", "audit_incomplete", "malformed_snapshot"}.intersection(
@@ -2915,6 +2983,20 @@ def _safe_count(value: object) -> int | None:
     if type(value) is not int or not 0 <= value <= MAX_SAFE_COUNT:
         return None
     return value
+
+
+def _safe_journal_reason_codes(value: object) -> tuple[str, ...] | None:
+    if not isinstance(value, Sequence) or isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        return None
+    allowed = {"authoritative_processor_required"}
+    reasons: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or item not in allowed:
+            return None
+        reasons.add(item)
+    return tuple(sorted(reasons))
 
 
 def _safe_adapter_failures(value: object) -> tuple[str, ...] | None:
