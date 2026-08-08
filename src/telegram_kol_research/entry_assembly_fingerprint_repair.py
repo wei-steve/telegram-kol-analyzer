@@ -650,11 +650,25 @@ def _request_matches_selected_leg(
     if order_type == "market":
         return (
             str(request.get("ordType") or "").lower() == "market"
-            and all(request.get(key) in (None, "") for key in ("price", "triggerPrice", "px"))
+            and all(
+                request.get(key) in (None, "")
+                for key in (
+                    "orderType",
+                    "price",
+                    "triggerPrice",
+                    "orderPrice",
+                    "px",
+                    "triggerPxType",
+                    "productGroup",
+                    "isCrossMargin",
+                )
+            )
         )
     if order_type == "limit":
         return (
             str(request.get("orderType") or "").lower() == "limit"
+            and request.get("ordType") in (None, "")
+            and request.get("px") in (None, "")
             and _same_number(request.get("price"), expected.get("price"))
             and _same_number(request.get("triggerPrice"), expected.get("price"))
         )

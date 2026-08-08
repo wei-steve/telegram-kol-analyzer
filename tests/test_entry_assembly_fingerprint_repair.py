@@ -817,8 +817,12 @@ def test_build_plan_accepts_production_shaped_market_request(tmp_path):
     [
         "limit_trigger_price",
         "limit_position_mode_missing",
+        "limit_market_ord_type",
+        "limit_market_px",
         "market_price_present",
         "market_wrong_order_key",
+        "market_trigger_order_type",
+        "market_order_price",
     ],
 )
 def test_build_plan_rejects_request_schema_drift(tmp_path, mutation):
@@ -833,11 +837,19 @@ def test_build_plan_rejects_request_schema_drift(tmp_path, mutation):
             request["triggerPrice"] = "63999"
         elif mutation == "limit_position_mode_missing":
             request.pop("mrgPosition")
+        elif mutation == "limit_market_ord_type":
+            request["ordType"] = "market"
+        elif mutation == "limit_market_px":
+            request["px"] = "64000"
         elif mutation == "market_price_present":
             request["price"] = "64000"
-        else:
+        elif mutation == "market_wrong_order_key":
             request.pop("ordType")
             request["orderType"] = "market"
+        elif mutation == "market_trigger_order_type":
+            request["orderType"] = "limit"
+        else:
+            request["orderPrice"] = "64000"
         leg.request_json = _canonical_json(request)
         session.commit()
 
