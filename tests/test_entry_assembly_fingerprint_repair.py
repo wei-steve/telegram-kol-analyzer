@@ -265,9 +265,9 @@ def _convert_to_production_legacy_finalized_case(session_factory) -> None:
                 "instrument_id": "BTC-USDT-SWAP",
                 "price_tick": 0.1,
             },
-            "dry_run_only": False,
+            "dry_run_only": True,
             "entry_preamble_assembly": None,
-            "executable": True,
+            "executable": False,
             "instrument_id": original_draft["instrument_id"],
             "margin_mode": original_draft["margin_mode"],
             "notes": [],
@@ -298,11 +298,23 @@ def _convert_to_production_legacy_finalized_case(session_factory) -> None:
             "symbol": original_draft["symbol"],
             "take_profit_legs": [
                 {
-                    "allocation_pct": 100,
+                    "allocation_pct": 40,
                     "index": 1,
-                    "order_type": "limit",
+                    "order_type": "market_on_trigger",
                     "price": 66000,
-                }
+                },
+                {
+                    "allocation_pct": 30,
+                    "index": 2,
+                    "order_type": "market_on_trigger",
+                    "price": 67000,
+                },
+                {
+                    "allocation_pct": 30,
+                    "index": 3,
+                    "order_type": "market_on_trigger",
+                    "price": 68000,
+                },
             ],
             "venue": "deepcoin",
         }
@@ -575,6 +587,10 @@ def test_build_plan_accepts_exact_production_legacy_finalized_snapshot(tmp_path)
         "leg_extra",
         "take_profit_extra",
         "wrong_boolean_type",
+        "reversed_boolean_values",
+        "take_profit_limit",
+        "take_profit_mixed",
+        "take_profit_count",
         "normalized_missing_take_profit",
     ],
 )
@@ -617,6 +633,33 @@ def test_legacy_policy_rejects_any_schema_tolerance(tmp_path, mutation):
             signal_draft["entry_preamble_assembly"]["assembly_fingerprint"] = old_fp
         elif mutation == "wrong_boolean_type":
             binding_draft["executable"] = signal_draft["executable"] = 1
+        elif mutation == "reversed_boolean_values":
+            binding_draft["dry_run_only"] = signal_draft["dry_run_only"] = False
+            binding_draft["executable"] = signal_draft["executable"] = True
+        elif mutation in {"take_profit_limit", "take_profit_mixed"}:
+            evidence = json.loads(assembly.evidence_json)
+            indexes = range(3) if mutation == "take_profit_limit" else [1]
+            for index in indexes:
+                evidence["order_draft_snapshot"]["take_profit_legs"][index][
+                    "order_type"
+                ] = "limit"
+                binding_draft["take_profit_legs"][index]["order_type"] = "limit"
+                signal_draft["take_profit_legs"][index]["order_type"] = "limit"
+            assembly.evidence_json = _canonical_json(evidence)
+            assembly.fingerprint = canonical_fingerprint(evidence)
+            old_fp = derive_pre_finalization_fingerprint(evidence)
+            binding_draft["entry_preamble_assembly"]["assembly_fingerprint"] = old_fp
+            signal_draft["entry_preamble_assembly"]["assembly_fingerprint"] = old_fp
+        elif mutation == "take_profit_count":
+            evidence = json.loads(assembly.evidence_json)
+            evidence["order_draft_snapshot"]["take_profit_legs"].pop()
+            binding_draft["take_profit_legs"].pop()
+            signal_draft["take_profit_legs"].pop()
+            assembly.evidence_json = _canonical_json(evidence)
+            assembly.fingerprint = canonical_fingerprint(evidence)
+            old_fp = derive_pre_finalization_fingerprint(evidence)
+            binding_draft["entry_preamble_assembly"]["assembly_fingerprint"] = old_fp
+            signal_draft["entry_preamble_assembly"]["assembly_fingerprint"] = old_fp
         else:
             evidence = json.loads(assembly.evidence_json)
             evidence["order_draft_snapshot"]["take_profit_legs"] = []

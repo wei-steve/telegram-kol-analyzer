@@ -732,7 +732,7 @@ def _legacy_snapshot_values_are_valid(snapshot: Mapping[str, Any]) -> bool:
         and _positive_number(snapshot["risk_budget_usdt"])
         and all(_positive_number(contract[key]) for key in contract)
         and isinstance(take_profit_legs, list)
-        and 1 <= len(take_profit_legs) <= 5
+        and len(take_profit_legs) == 3
         and all(_legacy_take_profit_is_exact(row) for row in take_profit_legs)
         and all(_legacy_snapshot_leg_values_are_valid(row) for row in legs)
     )
@@ -762,14 +762,14 @@ def _legacy_full_draft_is_exact(draft: Any) -> bool:
             for leg in legs
         )
         and isinstance(take_profit_legs, list)
-        and 1 <= len(take_profit_legs) <= 5
+        and len(take_profit_legs) == 3
         and all(_legacy_take_profit_is_exact(row) for row in take_profit_legs)
         and isinstance(draft["blocking_reason_codes"], list)
         and all(isinstance(value, str) for value in draft["blocking_reason_codes"])
         and type(draft["dry_run_only"]) is bool
         and type(draft["executable"]) is bool
-        and draft["dry_run_only"] is False
-        and draft["executable"] is True
+        and draft["dry_run_only"] is True
+        and draft["executable"] is False
         and isinstance(draft["notes"], list)
         and all(isinstance(value, str) for value in draft["notes"])
         and _nonempty_string(draft["instrument_id"])
@@ -2019,7 +2019,7 @@ def _legacy_take_profit_is_exact(value: Any) -> bool:
         and isinstance(value["index"], int)
         and not isinstance(value["index"], bool)
         and value["index"] > 0
-        and value["order_type"] == "limit"
+        and value["order_type"] == "market_on_trigger"
         and _positive_number(value["price"])
     )
 
