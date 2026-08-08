@@ -70,6 +70,45 @@ def derive_pre_finalization_fingerprint(
     return canonical_fingerprint(evidence)
 
 
+def entry_order_snapshot_matches_durable_identity(
+    snapshot: Mapping[str, Any],
+    *,
+    strategy_instance_id: str,
+    symbol: str,
+    side: str,
+    kol_id: str,
+    chat_id: int,
+    message_id: int,
+    margin_mode: str,
+    position_mode: str,
+) -> bool:
+    """Bind a canonical entry snapshot to identities stored outside its JSON."""
+
+    source = snapshot.get("source")
+    legs = snapshot.get("order_legs")
+    expected_order_side = {"long": "buy", "short": "sell"}.get(side)
+    return (
+        bool(strategy_instance_id)
+        and snapshot.get("strategy_instance_id") == strategy_instance_id
+        and snapshot.get("symbol") == symbol
+        and snapshot.get("instrument_id") == f"{symbol}-USDT-SWAP"
+        and snapshot.get("margin_mode") == margin_mode
+        and snapshot.get("position_mode") == position_mode
+        and isinstance(source, Mapping)
+        and source.get("kol_id") == kol_id
+        and source.get("chat_id") == chat_id
+        and source.get("message_id") == message_id
+        and expected_order_side is not None
+        and isinstance(legs, list)
+        and all(
+            isinstance(leg, Mapping)
+            and leg.get("position_side") == side
+            and leg.get("side") == expected_order_side
+            for leg in legs
+        )
+    )
+
+
 def build_reconciliation_fingerprint(
     *,
     assembly_id: int,
@@ -211,6 +250,20 @@ def _build_entry_assembly_fingerprint_repair_plan(
         conflicts.append("binding_venue_mismatch")
     if not _source_identity_matches(final_evidence, binding):
         conflicts.append("binding_source_identity_mismatch")
+    if not isinstance(canonical_snapshot, Mapping) or not (
+        entry_order_snapshot_matches_durable_identity(
+            canonical_snapshot,
+            strategy_instance_id=strategy_id,
+            symbol=str(binding.symbol),
+            side=str(binding.side),
+            kol_id=str(binding.kol_id),
+            chat_id=int(binding.chat_id),
+            message_id=int(binding.message_id),
+            margin_mode=str(binding.margin_mode),
+            position_mode=str(binding.position_mode),
+        )
+    ):
+        conflicts.append("assembly_snapshot_durable_identity_mismatch")
 
     binding_draft = binding_payload.get("draft")
     stale_evidence = (
@@ -544,15 +597,9 @@ def _execution_legs_match(
         request = _json_object(row.request_json)
         if not isinstance(expected, Mapping) or request is None:
             return False
-        request_price = request.get("price", request.get("triggerPrice"))
         draft_order_type = str(expected.get("order_type") or "").lower()
-        draft_side = str(expected.get("side") or "").lower()
         expected_order_kind = {
             "limit": "trigger_limit",
-            "market": "market",
-        }.get(draft_order_type)
-        expected_request_order_type = {
-            "limit": "limit",
             "market": "market",
         }.get(draft_order_type)
         if (
@@ -565,21 +612,53 @@ def _execution_legs_match(
             or str(row.order_kind or "").lower() != expected_order_kind
             or str(row.client_order_id or "") != str(expected.get("client_order_id") or "")
             or not str(row.client_order_id or "").strip()
-            or str(request.get("instId") or "").upper() != instrument
-            or str(request.get("posSide") or request.get("side") or "").lower()
-            != side.lower()
-            or str(request.get("side") or "").lower() != draft_side
-            or str(request.get("tdMode") or "").lower()
-            != str(snapshot.get("margin_mode") or "").lower()
-            or str(request.get("orderType") or "").lower()
-            != expected_request_order_type
-            or not _same_number(request_price, expected.get("price"))
-            or not _same_number(request.get("sz"), expected.get("quantity"))
-            or str(request.get("clOrdId") or "")
-            != str(expected.get("client_order_id") or "")
+            or not _request_matches_selected_leg(
+                request,
+                expected=expected,
+                snapshot=snapshot,
+                instrument=instrument,
+            )
         ):
             return False
     return True
+
+
+def _request_matches_selected_leg(
+    request: Mapping[str, Any],
+    *,
+    expected: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    instrument: str,
+) -> bool:
+    order_type = str(expected.get("order_type") or "").lower()
+    common_matches = (
+        str(request.get("instId") or "").upper() == instrument
+        and str(request.get("side") or "").lower()
+        == str(expected.get("side") or "").lower()
+        and str(request.get("posSide") or "").lower()
+        == str(expected.get("position_side") or "").lower()
+        and str(request.get("tdMode") or "").lower()
+        == str(snapshot.get("margin_mode") or "").lower()
+        and str(request.get("mrgPosition") or "").lower()
+        == str(snapshot.get("position_mode") or "").lower()
+        and _same_number(request.get("sz"), expected.get("quantity"))
+        and str(request.get("clOrdId") or "")
+        == str(expected.get("client_order_id") or "")
+    )
+    if not common_matches:
+        return False
+    if order_type == "market":
+        return (
+            str(request.get("ordType") or "").lower() == "market"
+            and all(request.get(key) in (None, "") for key in ("price", "triggerPrice", "px"))
+        )
+    if order_type == "limit":
+        return (
+            str(request.get("orderType") or "").lower() == "limit"
+            and _same_number(request.get("price"), expected.get("price"))
+            and _same_number(request.get("triggerPrice"), expected.get("price"))
+        )
+    return False
 
 
 def _same_number(left: Any, right: Any) -> bool:

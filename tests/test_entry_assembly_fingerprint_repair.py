@@ -216,7 +216,9 @@ def _seed_case(tmp_path):
                             "posSide": "long",
                             "side": "buy",
                             "tdMode": "cross",
+                            "mrgPosition": "split",
                             "price": str(leg["price"]),
+                            "triggerPrice": str(leg["price"]),
                             "orderType": leg["order_type"],
                             "sz": str(leg["quantity"]),
                             "clOrdId": leg["client_order_id"],
@@ -234,6 +236,47 @@ def _plan(session_factory):
     return build_entry_assembly_fingerprint_repair_plan(
         session_factory, assembly_id=2, execution_binding_id=266
     )
+
+
+def _rewrite_all_draft_copies(session, mutate) -> None:
+    assembly = session.get(EntryStrategyAssembly, 2)
+    evidence = json.loads(assembly.evidence_json)
+    mutate(evidence["order_draft_snapshot"])
+    assembly.evidence_json = _canonical_json(evidence)
+    assembly.fingerprint = canonical_fingerprint(evidence)
+    binding = session.get(ExecutionBinding, 266)
+    binding_payload = json.loads(binding.payload_json)
+    mutate(binding_payload["draft"])
+    binding.payload_json = _canonical_json(binding_payload)
+    signal = session.get(TradeSignal, 398)
+    signal_payload = json.loads(signal.payload_json)
+    mutate(signal_payload["deepcoin_order_draft"])
+    signal.payload_json = _canonical_json(signal_payload)
+
+
+def _convert_first_selected_leg_to_market(session) -> ExecutionOrderLeg:
+    def mutate(draft):
+        draft["selected_entry_leg_indices"] = [1]
+        draft["selected_entry_leg_count"] = 1
+        draft["order_legs"][0]["order_type"] = "market"
+
+    _rewrite_all_draft_copies(session, mutate)
+    legs = session.query(ExecutionOrderLeg).order_by(ExecutionOrderLeg.leg_index).all()
+    session.delete(legs[1])
+    legs[0].order_kind = "market"
+    legs[0].request_json = _canonical_json(
+        {
+            "instId": "BTC-USDT-SWAP",
+            "tdMode": "cross",
+            "side": "buy",
+            "posSide": "long",
+            "ordType": "market",
+            "sz": "10",
+            "clOrdId": "entry-1",
+            "mrgPosition": "split",
+        }
+    )
+    return legs[0]
 
 
 def test_build_plan_returns_one_stable_action_without_writing(tmp_path):
@@ -605,7 +648,14 @@ def test_build_plan_maps_durable_legs_through_selected_entry_indices(tmp_path):
         session.delete(legs[1])
         legs[0].client_order_id = "entry-2"
         request = json.loads(legs[0].request_json)
-        request.update({"price": "63800", "sz": "5", "clOrdId": "entry-2"})
+        request.update(
+            {
+                "price": "63800",
+                "triggerPrice": "63800",
+                "sz": "5",
+                "clOrdId": "entry-2",
+            }
+        )
         legs[0].request_json = _canonical_json(request)
         session.commit()
 
@@ -672,6 +722,129 @@ def test_build_plan_proves_complete_submitted_signal_snapshot(tmp_path, mutation
 
     assert plan.action is None
     assert "trade_signal_evidence_mismatch" in plan.conflicts
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "strategy",
+        "symbol",
+        "instrument",
+        "source_kol_id",
+        "source_chat_id",
+        "source_message_id",
+    ],
+)
+def test_build_plan_binds_coordinated_snapshots_to_durable_identity(
+    tmp_path, mutation
+):
+    _, session_factory = _seed_case(tmp_path)
+
+    def mutate(draft):
+        if mutation == "strategy":
+            draft["strategy_instance_id"] = "other-strategy"
+        elif mutation == "symbol":
+            draft["symbol"] = "ETH"
+            draft["instrument_id"] = "ETH-USDT-SWAP"
+        elif mutation == "instrument":
+            draft["instrument_id"] = "ETH-USDT-SWAP"
+        elif mutation.startswith("source_"):
+            field = mutation.removeprefix("source_")
+            draft["source"][field] = {
+                "kol_id": "other",
+                "chat_id": -1002,
+                "message_id": 56,
+            }[field]
+
+    with session_factory() as session:
+        _rewrite_all_draft_copies(session, mutate)
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.action is None
+    assert "assembly_snapshot_durable_identity_mismatch" in plan.conflicts
+
+
+@pytest.mark.parametrize("mutation", ["direction", "margin_mode", "position_mode"])
+def test_build_plan_rejects_coordinated_request_identity_mutation(tmp_path, mutation):
+    _, session_factory = _seed_case(tmp_path)
+
+    def mutate(draft):
+        if mutation == "direction":
+            for leg in draft["order_legs"]:
+                leg["side"] = "sell"
+                leg["position_side"] = "short"
+        elif mutation == "margin_mode":
+            draft["margin_mode"] = "isolated"
+        else:
+            draft["position_mode"] = "merge"
+
+    with session_factory() as session:
+        _rewrite_all_draft_copies(session, mutate)
+        for leg in session.query(ExecutionOrderLeg).all():
+            request = json.loads(leg.request_json)
+            if mutation == "direction":
+                request["side"] = "sell"
+                request["posSide"] = "short"
+            elif mutation == "margin_mode":
+                request["tdMode"] = "isolated"
+            else:
+                request["mrgPosition"] = "merge"
+            leg.request_json = _canonical_json(request)
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.action is None
+    assert "assembly_snapshot_durable_identity_mismatch" in plan.conflicts
+
+
+def test_build_plan_accepts_production_shaped_market_request(tmp_path):
+    _, session_factory = _seed_case(tmp_path)
+    with session_factory() as session:
+        _convert_first_selected_leg_to_market(session)
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.conflicts == ()
+    assert plan.action is not None
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "limit_trigger_price",
+        "limit_position_mode_missing",
+        "market_price_present",
+        "market_wrong_order_key",
+    ],
+)
+def test_build_plan_rejects_request_schema_drift(tmp_path, mutation):
+    _, session_factory = _seed_case(tmp_path)
+    with session_factory() as session:
+        if mutation.startswith("market_"):
+            leg = _convert_first_selected_leg_to_market(session)
+        else:
+            leg = session.query(ExecutionOrderLeg).filter_by(leg_index=1).one()
+        request = json.loads(leg.request_json)
+        if mutation == "limit_trigger_price":
+            request["triggerPrice"] = "63999"
+        elif mutation == "limit_position_mode_missing":
+            request.pop("mrgPosition")
+        elif mutation == "market_price_present":
+            request["price"] = "64000"
+        else:
+            request.pop("ordType")
+            request["orderType"] = "market"
+        leg.request_json = _canonical_json(request)
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.action is None
+    assert "execution_leg_identity_mismatch" in plan.conflicts
 
 
 @pytest.mark.parametrize(
