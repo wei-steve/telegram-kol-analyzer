@@ -101,4 +101,3 @@ def test_decide_reports_sync_unavailable_without_a_valid_snapshot():
     assert decision.reason == "contract_spec_sync_unavailable"
     assert decision.tradable is False
     assert decision.contract_spec is None
-

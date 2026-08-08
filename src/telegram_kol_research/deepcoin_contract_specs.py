@@ -126,7 +126,7 @@ class RefreshableDeepcoinContractSpecProvider:
         self._last_success_at: datetime | None = None
         self._last_success_expires_at: datetime | None = None
         self._last_error: str | None = None
-        self.reload()
+        self._reload_locked()
 
     @property
     def snapshot(self) -> DeepcoinContractSpecSnapshot | None:
@@ -153,6 +153,11 @@ class RefreshableDeepcoinContractSpecProvider:
                 reason="contract_spec_sync_unavailable",
             )
         now = _provider_now(self._now_provider)
+        if now < snapshot.fetched_at:
+            return DeepcoinContractSpecLookup(
+                instrument_id=normalized_id,
+                reason="contract_spec_invalid",
+            )
         if now >= snapshot.expires_at:
             return DeepcoinContractSpecLookup(
                 instrument_id=normalized_id,
@@ -180,6 +185,23 @@ class RefreshableDeepcoinContractSpecProvider:
     def reload(self) -> bool:
         """Reload an atomically published cache, clearing authority on failure."""
 
+        acquired = self._refresh_lock.acquire(
+            timeout=self._refresh_lock_timeout_seconds
+        )
+        if not acquired:
+            self._record_error(
+                TimeoutError("contract spec reload lock timed out"),
+                operation="cache_reload",
+            )
+            return False
+        try:
+            return self._reload_locked()
+        finally:
+            self._refresh_lock.release()
+
+    def _reload_locked(self) -> bool:
+        """Reload while holding the provider's sole mutation lock."""
+
         from telegram_kol_research.deepcoin_contract_spec_cache import (
             load_deepcoin_contract_spec_snapshot,
         )
@@ -191,7 +213,7 @@ class RefreshableDeepcoinContractSpecProvider:
             )
         except (OSError, ValueError) as exc:
             self._snapshot = None
-            self._record_error(exc)
+            self._record_error(exc, operation="cache_reload")
             return False
         self._accept_snapshot(snapshot)
         return True
@@ -204,7 +226,10 @@ class RefreshableDeepcoinContractSpecProvider:
             timeout=self._refresh_lock_timeout_seconds
         )
         if not acquired:
-            self._record_error(TimeoutError("contract spec refresh lock timed out"))
+            self._record_error(
+                TimeoutError("contract spec refresh lock timed out"),
+                operation="refresh_lock",
+            )
             return False
         try:
             if self._refresh_generation != generation:
@@ -222,8 +247,8 @@ class RefreshableDeepcoinContractSpecProvider:
             validate_deepcoin_instrument_snapshot,
         )
 
-        now = _provider_now(self._now_provider)
         try:
+            now = _provider_now(self._now_provider)
             rows = self._instrument_loader()
             snapshot = validate_deepcoin_instrument_snapshot(
                 rows,
@@ -236,7 +261,7 @@ class RefreshableDeepcoinContractSpecProvider:
                 now=now,
             )
         except Exception as exc:
-            self._record_error(exc)
+            self._record_error(exc, operation="refresh")
             # A refresh failure cannot invalidate a still-fresh snapshot that
             # was already fully validated and atomically published.
             return False
@@ -249,8 +274,11 @@ class RefreshableDeepcoinContractSpecProvider:
         self._last_success_expires_at = snapshot.expires_at
         self._last_error = None
 
-    def _record_error(self, error: Exception) -> None:
-        rendered = f"{type(error).__name__}: {error}"
+    def _record_error(self, error: Exception, *, operation: str) -> None:
+        # Exception messages from HTTP clients can contain signed URLs,
+        # headers, or response bodies. Health metadata needs only a bounded
+        # category; detailed diagnostics belong in access-controlled logs.
+        rendered = f"{operation}_failed:{type(error).__name__}"
         self._last_error = rendered[: self._max_error_length]
 
 

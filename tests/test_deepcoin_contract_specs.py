@@ -4,6 +4,7 @@ from datetime import timezone
 from pathlib import Path
 from threading import Event
 from threading import Thread
+from time import sleep
 
 import pytest
 
@@ -236,4 +237,94 @@ def test_refreshable_provider_refresh_failure_keeps_fresh_snapshot_and_bounds_er
 
     assert provider.get_contract_spec("BTC-USDT-SWAP") is not None
     assert provider.metadata.last_success_at == NOW
-    assert len(provider.metadata.last_error or "") == 64
+    assert len(provider.metadata.last_error or "") <= 64
+
+
+def test_refreshable_provider_fails_closed_if_clock_moves_before_snapshot(tmp_path):
+    current_time = [NOW]
+    provider = RefreshableDeepcoinContractSpecProvider(
+        cache_path=tmp_path / "specs.json",
+        instrument_loader=lambda: [_row("BTC-USDT-SWAP")],
+        ttl=timedelta(hours=24),
+        now_provider=lambda: current_time[0],
+    )
+    assert provider.refresh() is True
+
+    current_time[0] = NOW - timedelta(microseconds=1)
+
+    lookup = provider.lookup_contract_spec("BTC-USDT-SWAP")
+    assert lookup.reason == "contract_spec_invalid"
+    assert provider.get_contract_spec("BTC-USDT-SWAP") is None
+
+
+def test_refreshable_provider_serializes_reload_with_refresh_to_prevent_old_restore(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research import deepcoin_contract_spec_cache as cache_module
+
+    cache_path = tmp_path / "specs.json"
+    rows = [[_row("BTC-USDT-SWAP")]]
+    provider = RefreshableDeepcoinContractSpecProvider(
+        cache_path=cache_path,
+        instrument_loader=lambda: rows[0],
+        ttl=timedelta(hours=24),
+        now_provider=lambda: NOW,
+    )
+    assert provider.refresh() is True
+    old_snapshot = provider.snapshot
+    rows[0] = [_row("SOL-USDT-SWAP")]
+    reload_entered = Event()
+    release_reload = Event()
+    refresh_loader_entered = Event()
+    real_loader = provider._instrument_loader
+
+    def delayed_cache_load(*_args, **_kwargs):
+        reload_entered.set()
+        assert release_reload.wait(timeout=1)
+        return old_snapshot
+
+    def observed_instrument_load():
+        refresh_loader_entered.set()
+        return real_loader()
+
+    monkeypatch.setattr(
+        cache_module,
+        "load_deepcoin_contract_spec_snapshot",
+        delayed_cache_load,
+    )
+    provider._instrument_loader = observed_instrument_load
+    reload_thread = Thread(target=provider.reload)
+    refresh_thread = Thread(target=provider.refresh)
+
+    reload_thread.start()
+    assert reload_entered.wait(timeout=1)
+    refresh_thread.start()
+    sleep(0.02)
+
+    assert refresh_loader_entered.is_set() is False
+    release_reload.set()
+    reload_thread.join(timeout=1)
+    refresh_thread.join(timeout=1)
+
+    assert provider.get_contract_spec("BTC-USDT-SWAP") is None
+    assert provider.get_contract_spec("SOL-USDT-SWAP") is not None
+
+
+def test_refreshable_provider_redacts_exception_text_from_health_metadata(tmp_path):
+    secret = "DC-ACCESS-KEY=super-secret-value"
+
+    def fail():
+        raise RuntimeError(f"request failed with {secret}")
+
+    provider = RefreshableDeepcoinContractSpecProvider(
+        cache_path=tmp_path / "specs.json",
+        instrument_loader=fail,
+        ttl=timedelta(hours=24),
+        now_provider=lambda: NOW,
+    )
+
+    assert provider.refresh() is False
+
+    assert provider.metadata.last_error is not None
+    assert "super-secret-value" not in provider.metadata.last_error
+    assert "request failed" not in provider.metadata.last_error
