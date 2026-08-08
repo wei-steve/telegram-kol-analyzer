@@ -64,7 +64,6 @@ from telegram_kol_research.trade_signals import MANUAL_MANAGEMENT_SOURCE_TYPES
 from telegram_kol_research.trade_signals import MANAGEMENT_TRADE_SIGNAL_ACTIONS
 from telegram_kol_research.trade_signals import canonical_management_batch_id
 from telegram_kol_research.trade_signals import claim_pending_trade_signal
-from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trade_signals import list_pending_trade_signals
 from telegram_kol_research.trade_signals import load_or_create_trade_signal
 from telegram_kol_research.trade_signals import load_trade_signal
@@ -122,12 +121,10 @@ def _report_entry_submission_progress(func):
         try:
             return func(*args, **kwargs)
         except Exception as exc:
-            if kwargs.get("verified_v2_assembly"):
-                raise EntrySubmissionProgressError(
-                    exc,
-                    progress=progress,
-                ) from exc
-            raise
+            raise EntrySubmissionProgressError(
+                exc,
+                progress=progress,
+            ) from exc
 
     return wrapped
 
@@ -451,7 +448,7 @@ def submit_strategy_revision_replacement_live(
         }
     validated_draft = dict(draft)
     validated_draft["_entry_leg_index_offset"] = max_leg_index
-    trade_signal = enqueue_trade_signal(
+    trade_signal = load_or_create_trade_signal(
         session_factory,
         venue="deepcoin",
         source_type="strategy_revision",
@@ -469,6 +466,15 @@ def submit_strategy_revision_replacement_live(
         enqueued_at=now,
     )
     try:
+        trade_signal = claim_pending_trade_signal(
+            session_factory,
+            signal_id=trade_signal.id,
+            claimed_at=now,
+        )
+    except TradeSignalClaimError as exc:
+        raise RecoveryLiveSubmitError(str(exc)) from exc
+    submission_progress = EntrySubmissionProgress()
+    try:
         result = _submit_recovery_signal_direct(
             session_factory,
             trade_signal=trade_signal,
@@ -476,20 +482,33 @@ def submit_strategy_revision_replacement_live(
             contract_spec_provider=contract_spec_provider,
             submitted_at=now,
             validated_draft=validated_draft,
+            submission_progress=submission_progress,
         )
     except Exception as exc:
+        failure = exc
+        if isinstance(exc, EntrySubmissionProgressError):
+            failure = exc.cause
+            submission_progress = exc.progress
         mark_trade_signal_failed(
             session_factory,
             signal_id=trade_signal.id,
-            error=str(exc),
+            error=str(failure),
             failed_at=now,
+            expected_status="processing",
+            terminal_status=_entry_submission_failure_status(
+                failure,
+                progress=submission_progress,
+            ),
         )
+        if failure is not exc:
+            raise failure from exc
         raise
     mark_trade_signal_submitted(
         session_factory,
         signal_id=trade_signal.id,
         result=result,
         processed_at=now,
+        expected_status="processing",
     )
     return {"status": "submitted", **result}
 

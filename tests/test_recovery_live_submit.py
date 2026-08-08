@@ -20,6 +20,7 @@ from telegram_kol_research.models import (
     ExecutionOrderLeg,
     RawMessage,
     SignalCandidate,
+    StrategyRevisionBatch,
 )
 from telegram_kol_research.models import SourceMessageDeletionExit, StrategyLifecycle, TradeSignal, TriggerTakeProfitConvergence
 from telegram_kol_research.models import TriggerProtectionIntent
@@ -35,6 +36,7 @@ from telegram_kol_research.recovery_live_submit import enqueue_recovery_trade_si
 from telegram_kol_research.recovery_live_submit import process_next_trade_signal_live
 from telegram_kol_research.recovery_live_submit import process_trade_signal_live
 from telegram_kol_research.recovery_live_submit import submit_recovery_order_live
+from telegram_kol_research.recovery_live_submit import submit_strategy_revision_replacement_live
 from telegram_kol_research.recovery_live_submit import _load_matching_position_ids
 from telegram_kol_research.deepcoin_execution_actions import _exact_exchange_order_id
 from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
@@ -45,6 +47,7 @@ from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trade_signals import canonical_management_batch_id
 from telegram_kol_research.source_message_deletion import record_source_message_deleted
+from telegram_kol_research.strategy_threads import create_strategy_thread_for_lifecycle
 
 
 class _StaticContractSpecProvider:
@@ -512,6 +515,67 @@ def _persist_ready_market_item(session_factory):
         persist_ready_confirmation=True,
         confirmed_at=datetime(2026, 6, 30, 8, 2, tzinfo=UTC),
     )
+
+
+def _persist_reserved_revision_batch(session_factory):
+    _persist_ready_item(session_factory)
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    draft = signal.payload["deepcoin_order_draft"]
+    with session_factory() as session:
+        session.delete(session.get(TradeSignal, signal.id))
+        raw = session.query(RawMessage).filter_by(chat_id=100, message_id=55).one()
+        binding = ExecutionBinding(
+            strategy_instance_id=draft["strategy_instance_id"],
+            kol_id="alice",
+            chat_id=100,
+            message_id=55,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            status="open",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=100,
+            message_id=55,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 8, 8, 8, tzinfo=UTC),
+            execution_binding_id=binding.id,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+        raw_id = raw.id
+        binding_id = binding.id
+    thread = create_strategy_thread_for_lifecycle(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+    )
+    with session_factory() as session:
+        batch = StrategyRevisionBatch(
+            idempotency_fingerprint="revision" * 8,
+            raw_message_id=raw_id,
+            strategy_thread_id=thread.id,
+            target_lifecycle_id=lifecycle_id,
+            execution_binding_id=binding_id,
+            status="submitting_replacements",
+            replacement_json="{}",
+            advance_claim_token="reserved",
+            planned_at=datetime(2026, 8, 8, 8, tzinfo=UTC),
+        )
+        session.add(batch)
+        session.commit()
+        return batch.id, draft
 
 
 def _replace_queued_order_legs(session_factory, signal_id, order_legs):
@@ -1341,6 +1405,127 @@ def test_fallback_trigger_generic_id_is_not_persisted_as_order_identity(tmp_path
         assert row.status == "unknown_exchange_outcome"
         assert session.query(ExecutionBinding).count() == 0
         assert session.query(ExecutionOrderLeg).count() == 0
+
+
+def test_revision_first_generic_write_error_is_unknown_and_never_retried(tmp_path):
+    session_factory = create_session_factory(tmp_path / "revision-unknown.db")
+    batch_id, draft = _persist_reserved_revision_batch(session_factory)
+
+    class _GenericRevisionErrorClient(_FakeDeepcoinClient):
+        def trigger_order(self, order_payload):
+            self.trigger_payloads.append(order_payload)
+            raise DeepcoinClientError("revision write transport failed")
+
+    client = _GenericRevisionErrorClient()
+    with pytest.raises(DeepcoinClientError, match="revision write transport failed"):
+        submit_strategy_revision_replacement_live(
+            session_factory,
+            batch_id=batch_id,
+            draft=draft,
+            deepcoin_client=client,
+        )
+    with session_factory() as session:
+        signal = session.query(TradeSignal).filter_by(source_type="strategy_revision").one()
+        original_payload_json = signal.payload_json
+        assert signal.status == "unknown_exchange_outcome"
+
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="^trade_signal_claim_failed:unknown_exchange_outcome$",
+    ):
+        submit_strategy_revision_replacement_live(
+            session_factory,
+            batch_id=batch_id,
+            draft={**draft, "risk_budget_usdt": 999},
+            deepcoin_client=client,
+        )
+
+    assert len(client.trigger_payloads) == 1
+    with session_factory() as session:
+        signal = session.query(TradeSignal).filter_by(source_type="strategy_revision").one()
+        assert signal.payload_json == original_payload_json
+
+
+def test_revision_confirmed_first_leg_then_error_is_partial_and_never_retried(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "revision-partial.db")
+    batch_id, draft = _persist_reserved_revision_batch(session_factory)
+
+    class _PartialRevisionClient(_FakeDeepcoinClient):
+        def trigger_order(self, order_payload):
+            self.trigger_payloads.append(order_payload)
+            if len(self.trigger_payloads) == 1:
+                return {"code": "0", "data": {"ordId": "revision-leg-1"}}
+            raise DeepcoinClientError("revision second write failed")
+
+    client = _PartialRevisionClient()
+    with pytest.raises(DeepcoinClientError, match="revision second write failed"):
+        submit_strategy_revision_replacement_live(
+            session_factory,
+            batch_id=batch_id,
+            draft=draft,
+            deepcoin_client=client,
+        )
+    with session_factory() as session:
+        signal = session.query(TradeSignal).filter_by(source_type="strategy_revision").one()
+        original_payload_json = signal.payload_json
+        assert signal.status == "partial_submission_failed"
+
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="^trade_signal_claim_failed:partial_submission_failed$",
+    ):
+        submit_strategy_revision_replacement_live(
+            session_factory,
+            batch_id=batch_id,
+            draft=draft,
+            deepcoin_client=client,
+        )
+
+    assert len(client.trigger_payloads) == 2
+    with session_factory() as session:
+        signal = session.query(TradeSignal).filter_by(source_type="strategy_revision").one()
+        assert signal.payload_json == original_payload_json
+
+
+def test_revision_definite_first_rejection_is_failed_but_never_auto_revived(tmp_path):
+    session_factory = create_session_factory(tmp_path / "revision-rejected.db")
+    batch_id, draft = _persist_reserved_revision_batch(session_factory)
+
+    class _RejectedRevisionClient(_FakeDeepcoinClient):
+        def trigger_order(self, order_payload):
+            self.trigger_payloads.append(order_payload)
+            raise DeepcoinDefiniteRejection("revision explicitly rejected")
+
+    client = _RejectedRevisionClient()
+    with pytest.raises(DeepcoinDefiniteRejection, match="revision explicitly rejected"):
+        submit_strategy_revision_replacement_live(
+            session_factory,
+            batch_id=batch_id,
+            draft=draft,
+            deepcoin_client=client,
+        )
+    with session_factory() as session:
+        signal = session.query(TradeSignal).filter_by(source_type="strategy_revision").one()
+        original_payload_json = signal.payload_json
+        assert signal.status == "failed"
+
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="^trade_signal_claim_failed:failed$",
+    ):
+        submit_strategy_revision_replacement_live(
+            session_factory,
+            batch_id=batch_id,
+            draft=draft,
+            deepcoin_client=client,
+        )
+
+    assert len(client.trigger_payloads) == 1
+    with session_factory() as session:
+        signal = session.query(TradeSignal).filter_by(source_type="strategy_revision").one()
+        assert signal.payload_json == original_payload_json
 
 
 def test_v2_submission_uses_durable_selected_legs_not_external_maximum(tmp_path):

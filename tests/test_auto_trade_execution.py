@@ -1967,12 +1967,10 @@ def test_recovery_trigger_fingerprint_sync_failure_blocks_exchange_submission(
     client = _FakeDeepcoinClient()
     import telegram_kol_research.auto_trade_execution as auto_module
 
-    import telegram_kol_research.recovery_live_submit as live_submit_module
     import telegram_kol_research.trade_signals as trade_signals_module
 
     real_sync = trade_signals_module.synchronize_pending_entry_assembly_evidence
     sync_calls = []
-    unsafe_refresh_calls = []
 
     def fail_first_sync(*args, **kwargs):
         sync_calls.append(kwargs["signal_id"])
@@ -1982,21 +1980,10 @@ def test_recovery_trigger_fingerprint_sync_failure_blocks_exchange_submission(
             )
         return real_sync(*args, **kwargs)
 
-    real_enqueue = live_submit_module.enqueue_trade_signal
-
-    def record_unsafe_refresh(*args, **kwargs):
-        unsafe_refresh_calls.append(kwargs)
-        return real_enqueue(*args, **kwargs)
-
     monkeypatch.setattr(
         auto_module,
         "synchronize_pending_entry_assembly_evidence",
         fail_first_sync,
-    )
-    monkeypatch.setattr(
-        live_submit_module,
-        "enqueue_trade_signal",
-        record_unsafe_refresh,
     )
 
     with pytest.raises(
@@ -2028,7 +2015,6 @@ def test_recovery_trigger_fingerprint_sync_failure_blocks_exchange_submission(
 
     assert result["status"] == "submitted"
     assert len(sync_calls) == 2
-    assert unsafe_refresh_calls == []
     assert client.orders == []
     assert len(client.trigger_orders) == 2
 
