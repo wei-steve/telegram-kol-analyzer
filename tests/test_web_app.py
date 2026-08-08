@@ -47,11 +47,20 @@ from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.models import TradeSignal
 from telegram_kol_research.models import StrategyManagementBatch, StrategyManagementLeg
 from telegram_kol_research.models import RuntimeIncident
-from telegram_kol_research.message_recognition import MessageRecognitionResult
+from telegram_kol_research.message_recognition import (
+    MessageRecognitionResult,
+    apply_authoritative_mimo_payload,
+)
 from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
 from telegram_kol_research.telegram_bot_commands import (
     _log_system_operator_callback_processed,
 )
+
+
+def test_web_app_does_not_install_v1_message_recognizer(tmp_path):
+    app = create_web_app(tmp_path / "research.db")
+
+    assert not hasattr(app.state, "message_recognizer")
 
 
 def test_web_auto_executor_disabled_management_skips_client_factory(tmp_path):
@@ -3881,10 +3890,23 @@ def test_message_recognition_api_updates_message_result(tmp_path):
         raw_message_id = raw_message.id
 
     def fake_authoritative_processor(message_id):
-        result = app.state.message_recognizer(
+        result = apply_authoritative_mimo_payload(
             app.state.session_factory,
             raw_message_id=message_id,
-            ai_recognition_config=AiRecognitionConfig(),
+            payload={
+                "recognition_result": "是策略",
+                "reason": "测试权威投影",
+                "strategy": {
+                    "symbol": "BTC",
+                    "side": "long",
+                    "entry": "68000-68200",
+                    "stop_loss": "67500",
+                    "take_profit": "69000",
+                },
+                "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+                "confidence": 0.95,
+            },
+            model="fixture-mimo",
         )
         return SimpleNamespace(
             recognition=result,
@@ -3932,10 +3954,11 @@ def test_message_recognition_api_runs_auto_trade_executor_after_recognition(tmp_
         raw_message_id = raw_message.id
 
     def fake_authoritative_processor(message_id):
-        result = app.state.message_recognizer(
-            app.state.session_factory,
+        result = MessageRecognitionResult(
             raw_message_id=message_id,
-            ai_recognition_config=AiRecognitionConfig(),
+            status="非策略",
+            reason="测试权威识别",
+            parse_source="mimo_authoritative",
         )
         return SimpleNamespace(
             recognition=result,
@@ -4047,7 +4070,6 @@ def test_message_recognition_api_reports_pending_without_scheduling_review(
     app = create_web_app(
         database_path=database_path,
         ai_recognition_config_path=tmp_path / "ai_recognition.yaml",
-        message_recognizer=fake_recognizer,
     )
     app.state.system_operator_bot_config = SystemOperatorBotConfig(
         bot_token="system-token",

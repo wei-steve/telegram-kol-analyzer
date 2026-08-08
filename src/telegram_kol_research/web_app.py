@@ -74,7 +74,6 @@ from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import update_group_automation_settings
 from telegram_kol_research.live_updates import LiveUpdateBroker
 from telegram_kol_research.live_position_snapshot import LivePositionSnapshotStore
-from telegram_kol_research.message_recognition import recognize_message_now
 from telegram_kol_research.models import (
     AiPromptTestRun,
     ExecutionBinding,
@@ -3430,7 +3429,6 @@ def create_web_app(
     deepcoin_reconcile_runner=None,
     deepcoin_reconcile_interval_seconds: int = 30,
     deepcoin_reconcile_startup_delay_seconds: int = 5,
-    message_recognizer=None,
     ai_recognition_config_path: str | Path | None = None,
     semantic_review_runner=None,
     semantic_review_restart_delay_seconds: float = 1.0,
@@ -3919,7 +3917,6 @@ def create_web_app(
         app,
         raw_message_id=raw_message_id,
     )
-    app.state.message_recognizer = message_recognizer or recognize_message_now
     app.state.ai_recognition_config_path = (
         Path(ai_recognition_config_path)
         if ai_recognition_config_path is not None
