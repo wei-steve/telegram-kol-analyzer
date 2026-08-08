@@ -94,6 +94,66 @@ def test_handoff_bounds_codex_prompt_for_maximum_contract_text():
     assert len(handoff["codex_prompt"]) <= 512
 
 
+def test_handoff_accepts_one_real_message_operation_instruction_item():
+    handoff = build_runtime_incident_handoff(
+        incident={
+            "id": 17,
+            "incident_type": "message_operation_failure",
+            "source_kind": "message_operation_violation",
+            "source_record_id": "no_operation_created",
+            "severity": "high",
+            "redacted_summary": {
+                "message_operation_snapshot": {
+                    "affected_message_count": 1,
+                    "truncated": False,
+                    "affected_message_ids": [91],
+                    "contracts": [
+                        {
+                            "contract_id": 4,
+                            "intent_kind": "take_profit",
+                            "expected_terminal_kind": "verified_management",
+                            "observed_status": "violated",
+                            "violation_code": "no_operation_created",
+                            "evidence_refs": ["message_operation_contract:4"],
+                            "items": [
+                                {
+                                    "instruction_kind": "take_profit",
+                                    "expected_descendant_kind": "management_item",
+                                    "expected_terminal_kind": "verified_management",
+                                    "observed_terminal_kind": None,
+                                    "status": "violated",
+                                    "evidence_refs": ["message_operation_item:8"],
+                                }
+                            ],
+                        }
+                    ],
+                    "message_evidence": [
+                        {
+                            "raw_message_id": 91,
+                            "chat_id": 700,
+                            "message_id": 8101,
+                            "reply_to_message_id": 8000,
+                            "source_status": "active",
+                        }
+                    ],
+                    "timeline": [
+                        {
+                            "contract_id": 4,
+                            "created_at": "2026-08-09T00:00:00",
+                            "updated_at": "2026-08-09T00:01:00",
+                            "status": "violated",
+                        }
+                    ],
+                }
+            },
+        },
+        diagnosis=_diagnosis(),
+        attempted_queries=("investigate_message_evidence",),
+    )
+
+    assert handoff["instruction_items"][0]["items"][0]["status"] == "violated"
+
+
 def test_handoff_rejects_sensitive_or_mismatched_incident_material():
     with pytest.raises(RuntimeIncidentHandoffError):
         build_runtime_incident_handoff(

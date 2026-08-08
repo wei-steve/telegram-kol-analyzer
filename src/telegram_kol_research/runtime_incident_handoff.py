@@ -141,7 +141,10 @@ def persist_runtime_incident_handoff(
 
 
 def _validate_redacted(value, *, depth=0) -> None:
-    if depth > 6:
+    # The closed message-operation projection reaches eight levels at an
+    # instruction item's scalar fields. Keep a small fixed ceiling above that
+    # real schema while still rejecting recursive or unbounded structures.
+    if depth > 10:
         raise RuntimeIncidentHandoffError("handoff is not bounded")
     if isinstance(value, dict):
         if len(value) > 32:
