@@ -64,6 +64,10 @@ def _normalized_assembly_fingerprint(value: Any, *, error_code: str) -> str:
     return value.lower()
 
 
+def _is_positive_assembly_id(value: Any) -> bool:
+    return type(value) is int and value > 0
+
+
 def synchronize_pending_entry_assembly_evidence(
     session_factory: sessionmaker,
     *,
@@ -124,13 +128,13 @@ def synchronize_pending_entry_assembly_evidence(
     assembly_id = top_evidence.get("assembly_id")
     evidence_strategy_id = top_evidence.get("strategy_instance_id")
     if (
-        not isinstance(assembly_id, int)
-        or isinstance(assembly_id, bool)
-        or assembly_id <= 0
+        not _is_positive_assembly_id(assembly_id)
         or not isinstance(evidence_strategy_id, str)
         or evidence_strategy_id != strategy_instance_id
         or any(
-            evidence.get("assembly_id") != assembly_id
+            not _is_positive_assembly_id(evidence.get("assembly_id"))
+            or evidence.get("assembly_id") != assembly_id
+            or not isinstance(evidence.get("strategy_instance_id"), str)
             or evidence.get("strategy_instance_id") != evidence_strategy_id
             for evidence in evidence_copies[1:]
         )
@@ -156,7 +160,9 @@ def synchronize_pending_entry_assembly_evidence(
         error_code="entry_assembly_signal_final_evidence_invalid",
     )
     if (
-        final_evidence.get("assembly_id") != assembly_id
+        not _is_positive_assembly_id(final_evidence.get("assembly_id"))
+        or final_evidence.get("assembly_id") != assembly_id
+        or not isinstance(final_evidence.get("strategy_instance_id"), str)
         or final_evidence.get("strategy_instance_id") != strategy_instance_id
     ):
         raise TradeSignalFingerprintSyncError(
@@ -196,8 +202,24 @@ def synchronize_pending_entry_assembly_evidence(
         session.commit()
 
     updated = load_trade_signal(session_factory, int(signal_id))
-    top_final = updated.payload.get("entry_preamble_assembly")
-    draft_final = updated.payload.get("deepcoin_order_draft")
+    try:
+        reloaded_payload_json = json.dumps(
+            updated.payload,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    except (TypeError, ValueError):
+        reloaded_payload_json = ""
+    top_final = (
+        updated.payload.get("entry_preamble_assembly")
+        if isinstance(updated.payload, Mapping)
+        else None
+    )
+    draft_final = (
+        updated.payload.get("deepcoin_order_draft")
+        if isinstance(updated.payload, Mapping)
+        else None
+    )
     nested_final = (
         draft_final.get("entry_preamble_assembly")
         if isinstance(draft_final, Mapping)
@@ -206,8 +228,17 @@ def synchronize_pending_entry_assembly_evidence(
     if (
         updated.status != "pending"
         or updated.strategy_instance_id != strategy_instance_id
+        or reloaded_payload_json != updated_payload_json
         or not isinstance(top_final, Mapping)
         or not isinstance(nested_final, Mapping)
+        or not _is_positive_assembly_id(top_final.get("assembly_id"))
+        or top_final.get("assembly_id") != assembly_id
+        or not _is_positive_assembly_id(nested_final.get("assembly_id"))
+        or nested_final.get("assembly_id") != assembly_id
+        or not isinstance(top_final.get("strategy_instance_id"), str)
+        or top_final.get("strategy_instance_id") != strategy_instance_id
+        or not isinstance(nested_final.get("strategy_instance_id"), str)
+        or nested_final.get("strategy_instance_id") != strategy_instance_id
         or top_final.get("assembly_fingerprint") != final_fingerprint
         or nested_final.get("assembly_fingerprint") != final_fingerprint
     ):

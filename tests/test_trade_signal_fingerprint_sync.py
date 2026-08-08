@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+import telegram_kol_research.trade_signals as trade_signals_module
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import TradeSignal
 from telegram_kol_research.trade_signals import enqueue_trade_signal
@@ -275,3 +276,95 @@ def test_synchronize_normalizes_uppercase_hex_fingerprints(tmp_path):
         ["assembly_fingerprint"]
         == FINAL_FINGERPRINT
     )
+
+
+@pytest.mark.parametrize("invalid_assembly_id", [True, 0, "2"])
+def test_synchronize_rejects_non_positive_integer_final_assembly_id(
+    tmp_path,
+    invalid_assembly_id,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    payload = _payload()
+    if invalid_assembly_id is True:
+        payload["entry_preamble_assembly"]["assembly_id"] = 1
+        payload["deepcoin_order_draft"]["entry_preamble_assembly"][
+            "assembly_id"
+        ] = 1
+    signal = _enqueue(session_factory, payload=payload)
+    original_payload = deepcopy(signal.payload)
+
+    with pytest.raises(
+        TradeSignalFingerprintSyncError,
+        match="^entry_assembly_signal_identity_mismatch$",
+    ):
+        _synchronize(
+            session_factory,
+            signal,
+            finalized_evidence={
+                "assembly_id": invalid_assembly_id,
+                "strategy_instance_id": "strategy-1",
+                "assembly_fingerprint": FINAL_FINGERPRINT,
+            },
+        )
+
+    assert load_trade_signal(session_factory, signal.id).payload == original_payload
+
+
+@pytest.mark.parametrize("invalid_assembly_id", [True, 0, "2"])
+def test_synchronize_rejects_non_positive_integer_nested_assembly_id(
+    tmp_path,
+    invalid_assembly_id,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    payload = _payload()
+    final_assembly_id = 2
+    if invalid_assembly_id is True:
+        payload["entry_preamble_assembly"]["assembly_id"] = 1
+        final_assembly_id = 1
+    payload["deepcoin_order_draft"]["entry_preamble_assembly"]["assembly_id"] = (
+        invalid_assembly_id
+    )
+    signal = _enqueue(session_factory, payload=payload)
+    original_payload = deepcopy(signal.payload)
+
+    with pytest.raises(
+        TradeSignalFingerprintSyncError,
+        match="^entry_assembly_signal_identity_mismatch$",
+    ):
+        _synchronize(
+            session_factory,
+            signal,
+            finalized_evidence={
+                "assembly_id": final_assembly_id,
+                "strategy_instance_id": "strategy-1",
+                "assembly_fingerprint": FINAL_FINGERPRINT,
+            },
+        )
+
+    assert load_trade_signal(session_factory, signal.id).payload == original_payload
+
+
+def test_synchronize_rejects_post_cas_payload_drift_retaining_fingerprints(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    signal = _enqueue(session_factory)
+    real_load = trade_signals_module.load_trade_signal
+
+    def load_with_post_cas_drift(factory, signal_id):
+        record = real_load(factory, signal_id)
+        record.payload["deepcoin_order_draft"]["symbol"] = "ETHUSDT"
+        return record
+
+    monkeypatch.setattr(
+        trade_signals_module,
+        "load_trade_signal",
+        load_with_post_cas_drift,
+    )
+
+    with pytest.raises(
+        TradeSignalFingerprintSyncError,
+        match="^entry_assembly_signal_reload_validation_failed$",
+    ):
+        _synchronize(session_factory, signal)
