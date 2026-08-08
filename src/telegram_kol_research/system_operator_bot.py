@@ -393,6 +393,7 @@ async def deliver_message_operation_stage1_notifications(
     claimed_at: datetime | None = None,
     lease_seconds: float = 120.0,
     max_attempts: int = MESSAGE_OPERATION_STAGE1_MAX_ATTEMPTS,
+    runtime_config: RuntimeIncidentConfig | None = None,
 ) -> int:
     """Materialize and deliver Stage 1 independently from Agent diagnosis."""
 
@@ -486,6 +487,19 @@ async def deliver_message_operation_stage1_notifications(
                     )
                 )
                 session.commit()
+            if runtime_config is not None:
+                from telegram_kol_research.runtime_incident_adapters import (
+                    capture_notification_failure,
+                )
+
+                capture_notification_failure(
+                    session_factory,
+                    config=runtime_config,
+                    source_kind="message_operation_stage1_notification",
+                    source_record_id=str(notification.id),
+                    error_type=type(exc).__name__,
+                    occurred_at=operation_now,
+                )
             break
         with session_factory() as session:
             result = session.execute(
@@ -2011,6 +2025,7 @@ async def deliver_runtime_incident_notifications(
                 max_attempts=(
                     feature_config.message_operation_stage1_max_attempts
                 ),
+                runtime_config=feature_config,
             )
         except Exception as exc:
             logger.warning(

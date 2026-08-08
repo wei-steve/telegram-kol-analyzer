@@ -584,6 +584,9 @@ def test_message_operation_stage1_failure_persists_bounded_error_and_retry(
             after_incident_id=incident.id - 1,
             claimed_at=NOW,
             lease_seconds=30,
+            runtime_config=RuntimeIncidentConfig(
+                capture_types=frozenset({"notification_delivery_failure"})
+            ),
         )
     )
 
@@ -595,6 +598,13 @@ def test_message_operation_stage1_failure_persists_bounded_error_and_retry(
         assert row.next_attempt_at.replace(tzinfo=UTC) > NOW
         assert "secret" not in (row.error_code or "")
         assert row.claim_token is None
+        notification_failure = session.query(RuntimeIncident).filter_by(
+            incident_type="notification_delivery_failure"
+        ).one()
+        assert notification_failure.source_kind == (
+            "message_operation_stage1_notification"
+        )
+        assert notification_failure.source_record_id == str(row.id)
 
 
 def test_message_operation_stage1_exhaustion_is_terminal_and_not_reclaimed(
