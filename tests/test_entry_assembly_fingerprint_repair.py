@@ -2132,6 +2132,84 @@ def test_legacy_reconciliation_validates_all_absent_entry_recovery(
     assert read_entry_preamble_invariants(database_path, now=NOW) == expected
 
 
+@pytest.mark.parametrize("mutation", [None, "missing_operator_event", "wrong_outcome_event"])
+def test_legacy_reconciliation_validates_mixed_pending_cancel_batch(
+    tmp_path, mutation
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        binding.order_id = None
+        binding.client_order_id = None
+        binding.last_exchange_status = "pending_entry_leg_cancelled"
+        legs = session.query(ExecutionOrderLeg).order_by(
+            ExecutionOrderLeg.leg_index
+        ).all()
+        absent, operator = legs
+        absent.status = "cancelled"
+        absent.terminal_reason = "pending_entry_order_absent_confirmed"
+        operator.status = "cancelled"
+        operator.terminal_reason = "operator_cancelled_unfilled_entry_leg"
+        if mutation == "wrong_outcome_event":
+            _add_legacy_action_event(
+                session,
+                action="cancel_trigger_entry",
+                order_id=absent.order_id,
+                client_order_id=absent.client_order_id,
+                before={
+                    "ordId": absent.order_id,
+                    "clOrdId": absent.client_order_id,
+                },
+                request={
+                    "instId": "BTC-USDT-SWAP",
+                    "ordId": absent.order_id,
+                    "clOrdId": absent.client_order_id,
+                },
+                response={"code": "0", "data": {"ordId": absent.order_id}},
+            )
+        else:
+            _add_legacy_action_event(
+                session,
+                action="cancel_entry_absent_confirmed",
+                order_id=absent.order_id,
+                client_order_id=absent.client_order_id,
+            )
+        if mutation != "missing_operator_event":
+            _add_legacy_action_event(
+                session,
+                action="cancel_trigger_entry",
+                order_id=operator.order_id,
+                client_order_id=operator.client_order_id,
+                before={
+                    "algoId": operator.order_id,
+                    "clOrdId": operator.client_order_id,
+                },
+                request={
+                    "instId": "BTC-USDT-SWAP",
+                    "ordId": operator.order_id,
+                    "clOrdId": operator.client_order_id,
+                },
+                response={"code": "0", "data": {"ordId": operator.order_id}},
+            )
+        session.commit()
+
+    expected = (
+        ()
+        if mutation is None
+        else ("live_entry_preamble_binding_evidence_missing",)
+    )
+    assert read_entry_preamble_invariants(database_path, now=NOW) == expected
+
+
 @pytest.mark.parametrize("order_alias", ["algoId", "orderId", "order_id"])
 def test_legacy_reconciliation_accepts_direct_cancel_exchange_order_alias(
     tmp_path, order_alias

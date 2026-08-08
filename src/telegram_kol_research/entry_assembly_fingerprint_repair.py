@@ -1541,12 +1541,17 @@ def _legacy_all_pending_cancel_is_exact(
     ):
         return False
     reasons = {_leg_value(row, "terminal_reason") for row in legs}
-    if reasons == {"operator_cancelled_unfilled_entry_leg"}:
-        allowed_actions = {"cancel_trigger_entry", "cancel_regular_entry"}
-    elif reasons == {"pending_entry_order_absent_confirmed"}:
-        allowed_actions = {"cancel_entry_absent_confirmed"}
-    else:
+    allowed_reasons = {
+        "operator_cancelled_unfilled_entry_leg",
+        "pending_entry_order_absent_confirmed",
+    }
+    if not reasons or not reasons.issubset(allowed_reasons):
         return False
+    allowed_actions = {
+        "cancel_trigger_entry",
+        "cancel_regular_entry",
+        "cancel_entry_absent_confirmed",
+    }
     cancel_events = [
         event
         for event in events
@@ -1565,8 +1570,11 @@ def _legacy_all_pending_cancel_is_exact(
                 order_id=_leg_value(row, "order_id"),
                 client_order_id=_leg_value(row, "client_order_id"),
             )
-            if event.get("action") == "cancel_entry_absent_confirmed"
-            else _legacy_cancel_event_matches_identity(
+            if _leg_value(row, "terminal_reason")
+            == "pending_entry_order_absent_confirmed"
+            else event.get("action")
+            in {"cancel_trigger_entry", "cancel_regular_entry"}
+            and _legacy_cancel_event_matches_identity(
                 event,
                 binding=binding,
                 order_id=_leg_value(row, "order_id"),
