@@ -8,13 +8,16 @@ import hashlib
 import json
 from collections.abc import Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import wraps
 from threading import RLock
 from typing import Any
 
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
+from telegram_kol_research.deepcoin_client import DeepcoinDefiniteRejection
 from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
 from telegram_kol_research.deepcoin_order_builder import _coalesce_equivalent_entry_legs
@@ -78,6 +81,69 @@ from telegram_kol_research.take_profit_plan import build_take_profit_plan
 
 class RecoveryLiveSubmitError(RuntimeError):
     """Raised when a live recovery order cannot be submitted safely."""
+
+
+@dataclass(slots=True)
+class EntrySubmissionProgress:
+    """Track entry exchange writes separately from pre-submit validation."""
+
+    attempted_writes: int = 0
+    confirmed_legs: int = 0
+
+    def record_attempt(self) -> None:
+        self.attempted_writes += 1
+
+    def record_confirmed_leg(self) -> None:
+        self.confirmed_legs += 1
+
+
+class EntrySubmissionProgressError(RuntimeError):
+    """Carry exact V2 entry-write progress across the submission boundary."""
+
+    def __init__(
+        self,
+        cause: Exception,
+        *,
+        progress: EntrySubmissionProgress,
+    ) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+        self.progress = progress
+
+
+def _report_entry_submission_progress(func):
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        progress = kwargs.get("submission_progress")
+        if not isinstance(progress, EntrySubmissionProgress):
+            progress = EntrySubmissionProgress()
+            kwargs["submission_progress"] = progress
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            if kwargs.get("verified_v2_assembly"):
+                raise EntrySubmissionProgressError(
+                    exc,
+                    progress=progress,
+                ) from exc
+            raise
+
+    return wrapped
+
+
+def _entry_submission_failure_status(
+    exc: Exception,
+    *,
+    verified_v2_assembly: bool,
+    progress: EntrySubmissionProgress,
+) -> str:
+    if not verified_v2_assembly or progress.attempted_writes == 0:
+        return "failed"
+    if progress.confirmed_legs > 0:
+        return "partial_submission_failed"
+    if isinstance(exc, DeepcoinDefiniteRejection):
+        return "failed"
+    return "unknown_exchange_outcome"
 
 
 def _require_synchronized_finalized_entry_assembly(
@@ -530,8 +596,9 @@ def process_trade_signal_live(
         )
     except TradeSignalClaimError as exc:
         raise RecoveryLiveSubmitError(str(exc)) from exc
+    verified_v2_assembly = False
+    submission_progress = EntrySubmissionProgress()
     try:
-        verified_v2_assembly = False
         if trade_signal.action == "open_position":
             verified_v2_assembly = _require_synchronized_finalized_entry_assembly(
                 session_factory,
@@ -545,6 +612,7 @@ def process_trade_signal_live(
                 submitted_at=processed_at,
                 max_order_legs=max_order_legs,
                 verified_v2_assembly=verified_v2_assembly,
+                submission_progress=submission_progress,
             )
         else:
             if (
@@ -562,18 +630,24 @@ def process_trade_signal_live(
                 executed_at=processed_at,
             )
     except Exception as exc:
+        failure = exc
+        if isinstance(exc, EntrySubmissionProgressError):
+            failure = exc.cause
+            submission_progress = exc.progress
         mark_trade_signal_failed(
             session_factory,
             signal_id=signal_id,
-            error=str(exc),
+            error=str(failure),
             failed_at=processed_at,
             expected_status="processing",
-            terminal_status=(
-                "partial_submission_failed"
-                if verified_v2_assembly
-                else "failed"
+            terminal_status=_entry_submission_failure_status(
+                failure,
+                verified_v2_assembly=verified_v2_assembly,
+                progress=submission_progress,
             ),
         )
+        if failure is not exc:
+            raise failure from exc
         raise
     mark_trade_signal_submitted(
         session_factory,
@@ -634,6 +708,7 @@ def _is_automatic_legacy_management_signal(
 
 
 @serialized_source_message_execution
+@_report_entry_submission_progress
 def _submit_recovery_signal_direct(
     session_factory: sessionmaker,
     *,
@@ -644,7 +719,9 @@ def _submit_recovery_signal_direct(
     max_order_legs: int | None = None,
     validated_draft: dict[str, Any] | None = None,
     verified_v2_assembly: bool = False,
+    submission_progress: EntrySubmissionProgress | None = None,
 ) -> dict[str, Any]:
+    progress = submission_progress or EntrySubmissionProgress()
     if validated_draft is None:
         gate = validate_recovery_live_submit_gate(
             session_factory,
@@ -712,6 +789,7 @@ def _submit_recovery_signal_direct(
                     trade_signal=trade_signal,
                     source=source,
                 ):
+                    progress.record_attempt()
                     response = deepcoin_client.place_order(order_payload)
             except DeepcoinClientError:
                 raise
@@ -721,6 +799,7 @@ def _submit_recovery_signal_direct(
             order_id = _extract_order_id(response)
             if not order_id:
                 raise DeepcoinClientError("Deepcoin order response missing order id")
+            progress.record_confirmed_leg()
             client_order_id = str(leg.get("client_order_id") or order_payload.get("clOrdId") or "")
             pos_id = _extract_position_id(response) or _find_open_position_id(
                 deepcoin_client,
@@ -818,8 +897,10 @@ def _submit_recovery_signal_direct(
                                 "source": source,
                             },
                             order_payload=order_payload,
+                            submission_progress=progress,
                         )
                     else:
+                        progress.record_attempt()
                         response = deepcoin_client.trigger_order(order_payload)
             except DeepcoinClientError:
                 raise
@@ -829,6 +910,7 @@ def _submit_recovery_signal_direct(
                 raise DeepcoinClientError(f"Deepcoin client failed: {exc}") from exc
 
             order_id = _normalized_trigger_order_id(response)
+            progress.record_confirmed_leg()
             pos_id = _extract_position_id(response)
             client_order_id = str(leg.get("client_order_id") or "")
             protection_payload = {
@@ -846,6 +928,7 @@ def _submit_recovery_signal_direct(
                     trade_signal=trade_signal,
                     source=source,
                 ):
+                    progress.record_attempt()
                     response = deepcoin_client.trigger_order(order_payload)
             except DeepcoinClientError:
                 raise
@@ -855,6 +938,7 @@ def _submit_recovery_signal_direct(
             order_id = _extract_order_id(response)
             if not order_id:
                 raise DeepcoinClientError("Deepcoin trigger order response missing order id")
+            progress.record_confirmed_leg()
             pos_id = _extract_position_id(response)
             client_order_id = str(leg.get("client_order_id") or "")
             protection_payload = {
@@ -1043,6 +1127,7 @@ def _submit_trigger_with_protection_intent(
     leg_index: int,
     binding_context: dict[str, Any],
     order_payload: dict[str, Any],
+    submission_progress: EntrySubmissionProgress,
 ) -> dict[str, Any]:
     """Snapshot, persist intent, submit parent, and bind its returned identity."""
 
@@ -1096,6 +1181,7 @@ def _submit_trigger_with_protection_intent(
             )
             session.commit()
         try:
+            submission_progress.record_attempt()
             response = deepcoin_client.trigger_order(order_payload)
         except DeepcoinClientError:
             raise

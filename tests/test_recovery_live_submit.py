@@ -7,6 +7,7 @@ import pytest
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
+from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.entry_strategy_assembly import (
     finalize_adjacent_entry_assembly_draft,
@@ -1038,6 +1039,101 @@ def test_processing_signal_is_not_auto_reset_or_reexecuted_after_crash(tmp_path)
     assert client.calls == []
     with session_factory() as session:
         assert session.get(TradeSignal, signal.id).status == "processing"
+
+
+def test_v2_pre_submit_gate_failure_is_ordinary_failed_with_zero_exchange_calls(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.recovery_live_submit as submitter
+
+    session_factory = create_session_factory(tmp_path / "pre-submit-failure.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    finalized = _finalize_v2_assembly_for_signal(session_factory, signal)
+    _persist_finalized_signal_evidence(session_factory, signal, finalized)
+    monkeypatch.setattr(
+        submitter,
+        "validate_recovery_live_submit_gate",
+        lambda *args, **kwargs: {
+            "would_submit": False,
+            "reason_codes": ["pre_submit_blocked"],
+        },
+    )
+    client = _RecordingAllDeepcoinCalls()
+
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="^live_submit_blocked:pre_submit_blocked$",
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+
+    assert client.calls == []
+    with session_factory() as session:
+        row = session.get(TradeSignal, signal.id)
+        assert row.status == "failed"
+        assert row.last_error == "live_submit_blocked:pre_submit_blocked"
+
+
+def test_v2_unknown_first_exchange_write_is_quarantined_without_retry(tmp_path):
+    session_factory = create_session_factory(tmp_path / "unknown-first-write.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    finalized = _finalize_v2_assembly_for_signal(session_factory, signal)
+    _persist_finalized_signal_evidence(session_factory, signal, finalized)
+
+    class _UnknownFirstWriteClient(_FakeDeepcoinClient):
+        def trigger_order(self, order_payload):
+            self.trigger_payloads.append(order_payload)
+            raise DeepcoinRequestOutcomeUnknown("first leg outcome unknown")
+
+    client = _UnknownFirstWriteClient()
+    with pytest.raises(DeepcoinRequestOutcomeUnknown):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+
+    assert len(client.trigger_payloads) == 1
+    with session_factory() as session:
+        row = session.get(TradeSignal, signal.id)
+        assert row.status == "unknown_exchange_outcome"
+        assert row.last_error == "first leg outcome unknown"
+
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="^trade_signal_claim_failed:unknown_exchange_outcome$",
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+    assert len(client.trigger_payloads) == 1
 
 
 def test_v2_submission_uses_durable_selected_legs_not_external_maximum(tmp_path):
