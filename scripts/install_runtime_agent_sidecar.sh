@@ -113,6 +113,13 @@ do
   fi
 done
 "$PREPARE_HELPER_SOURCE" --sanitize-non-db
+for denied_directory in backups deepcoin_field_probe session_backups; do
+  denied_path="$DATA_DIRECTORY/$denied_directory"
+  if [[ -e "$denied_path" ]] && runuser -u "$AGENT_USER" -- test -x "$denied_path"; then
+    echo "Agent identity can access denied production data directory." >&2
+    exit 1
+  fi
+done
 while IFS= read -r -d '' data_file; do
   case "$data_file" in
     "$DATABASE_PATH"|"$DATABASE_PATH-wal"|"$DATABASE_PATH-shm"|"$DATABASE_PATH-journal")

@@ -53,6 +53,9 @@ InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session
 InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session-journal
 InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session-wal
 InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session-shm
+InaccessiblePaths=-/opt/telegram-kol-analyzer/data/backups
+InaccessiblePaths=-/opt/telegram-kol-analyzer/data/deepcoin_field_probe
+InaccessiblePaths=-/opt/telegram-kol-analyzer/data/session_backups
 
 [Install]
 WantedBy=multi-user.target

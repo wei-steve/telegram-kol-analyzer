@@ -28,6 +28,7 @@ def test_runtime_agent_sidecar_unit_is_separate_and_dormant_until_enabled():
     assert "ReadWritePaths=/opt/telegram-kol-analyzer/data" in text
     assert "ReadOnlyPaths=/opt/telegram-kol-analyzer/data\n" not in text
     assert "InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session" in text
+    assert "InaccessiblePaths=-/opt/telegram-kol-analyzer/data/session_backups" in text
     assert "StateDirectory=telegram-kol-runtime-agent" in text
     assert "InaccessiblePaths=/opt/telegram-kol-analyzer/config/runtime_incident_agent.env" in text
     assert "UMask=0077" in text
@@ -159,12 +160,15 @@ def test_runtime_agent_sanitizer_handles_reviewed_directory_and_rejects_bait(tmp
     sanitizer.__globals__["_set_agent_acl_fd"] = lambda _fd, _permission: None
     (tmp_path / "research.db").write_bytes(b"")
     (tmp_path / "web_cache").mkdir()
+    denied_directory = tmp_path / "session_backups"
+    denied_directory.mkdir(mode=0o755)
     regular = tmp_path / "telegram.session"
     regular.write_text("redacted-fixture", encoding="utf-8")
     regular.chmod(0o644)
 
     sanitizer(trusted_owner_uid=os.getuid())
     assert regular.stat().st_mode & 0o077 == 0
+    assert denied_directory.stat().st_mode & 0o077 == 0
 
     target = tmp_path.parent / f"{tmp_path.name}-protected-target"
     try:

@@ -20,7 +20,13 @@ SQLITE_PATHS = (
     f"{DATABASE_PATH}-journal",
 )
 SQLITE_NAMES = frozenset(os.path.basename(path) for path in SQLITE_PATHS)
-REVIEWED_DATA_DIRECTORIES = frozenset({"web_cache"})
+REVIEWED_READABLE_DATA_DIRECTORIES = frozenset({"logs", "media", "web_cache"})
+DENIED_DATA_DIRECTORIES = frozenset(
+    {"backups", "deepcoin_field_probe", "session_backups"}
+)
+REVIEWED_DATA_DIRECTORIES = (
+    REVIEWED_READABLE_DATA_DIRECTORIES | DENIED_DATA_DIRECTORIES
+)
 
 
 def _open_regular_nofollow(path: str, *, optional: bool) -> int | None:
@@ -78,6 +84,7 @@ def _verify_reviewed_directory_nofollow_at(
     name: str,
     *,
     trusted_owner_uid: int,
+    deny_agent: bool,
 ) -> None:
     fd = os.open(
         name,
@@ -88,6 +95,9 @@ def _verify_reviewed_directory_nofollow_at(
         metadata = os.fstat(fd)
         if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != trusted_owner_uid:
             raise RuntimeError("reviewed production data directory is not trusted")
+        if deny_agent:
+            os.fchmod(fd, metadata.st_mode & ~0o077)
+            _set_agent_acl_fd(fd, "---")
     finally:
         os.close(fd)
 
@@ -106,6 +116,7 @@ def _sanitize_non_database_files(*, trusted_owner_uid: int = 0) -> None:
                     directory_fd,
                     name,
                     trusted_owner_uid=trusted_owner_uid,
+                    deny_agent=name in DENIED_DATA_DIRECTORIES,
                 )
                 continue
             try:

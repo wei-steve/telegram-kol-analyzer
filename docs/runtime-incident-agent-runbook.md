@@ -623,7 +623,10 @@ legacy Agent grants by applying an explicit deny ACL to every non-database
 top-level file and removing its group/other mode access, denies group/other
 access on future inherited file ACLs, and
 refuses deployment if any such file remains readable or writable. Known Telegram session paths are
-also inaccessible in the service mount namespace. A root-owned pre-start
+also inaccessible in the service mount namespace. Existing reviewed evidence
+directories (`logs`, `media`, and `web_cache`) must be root-owned real
+directories; backup, session-backup, and exchange-probe directories are
+descriptor-sanitized and mount-inaccessible to the Agent. A root-owned pre-start
 helper opens only single-link regular database/WAL/SHM/journal files with
 `O_NOFOLLOW` and reapplies the ACL through the already-open descriptor before
 every sidecar start. This covers files recreated first by the root main service
