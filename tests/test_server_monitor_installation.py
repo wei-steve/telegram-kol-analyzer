@@ -307,10 +307,11 @@ def test_installer_creates_identity_and_allowlisted_monitor_environment():
     assert "monitor_capture_token" in installer
     assert "TELEGRAM_KOL_RUNTIME_AGENT_LLM_API_KEY" not in installer
     assert "DEEP_API" not in installer
-    assert 'runuser -u "$MONITOR_USER" -- test -w "$PRODUCTION_ROOT/data/research.db"' in installer
     assert 'runuser -u "$MONITOR_USER" -- test -r "$RUNTIME_POLICY_FILE"' in installer
-    assert "must not have production database write access" in installer
     assert "must not read the Runtime Agent policy or provider settings" in installer
+    assert '"BindReadOnlyPaths=$PRODUCTION_ROOT/data/research.db"' in installer
+    assert "Monitor service must bind the production database read-only" in installer
+    assert '"^ReadWritePaths=$PRODUCTION_ROOT(/|$)"' in installer
     env_block = installer.split('env_source="$(mktemp)"', 1)[1].split(
         'install -o root -g root -m 0600 "$env_source" "$ENV_FILE"', 1
     )[0]

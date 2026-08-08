@@ -133,6 +133,25 @@ if [[ "$enable_timer" == false && "$timer_enabled_status" -eq 0 ]]; then
   exit 1
 fi
 
+for monitor_service_source in \
+  "$SERVICE_SOURCE" \
+  "$DIAGNOSTIC_SOURCE" \
+  "$TEST_NOTIFICATION_SOURCE"
+do
+  if ! grep -Fxq \
+    "BindReadOnlyPaths=$PRODUCTION_ROOT/data/research.db" \
+    "$monitor_service_source"; then
+    echo "Monitor service must bind the production database read-only." >&2
+    exit 1
+  fi
+  if grep -Eq \
+    "^ReadWritePaths=$PRODUCTION_ROOT(/|$)" \
+    "$monitor_service_source"; then
+    echo "Monitor service must not mount the production checkout writable." >&2
+    exit 1
+  fi
+done
+
 if [[ ! -f "$CREDENTIAL_FILE" ]]; then
   echo "Missing root-owned monitor credential file $CREDENTIAL_FILE." >&2
   exit 1
@@ -203,10 +222,6 @@ if ! runuser -u "$MONITOR_USER" -- test -x "$PRODUCTION_ROOT/.venv/bin/telegram-
 fi
 if ! runuser -u "$MONITOR_USER" -- test -r "$PRODUCTION_ROOT/data/research.db"; then
   echo "Monitor identity cannot read the production database." >&2
-  exit 1
-fi
-if runuser -u "$MONITOR_USER" -- test -w "$PRODUCTION_ROOT/data/research.db"; then
-  echo "Monitor identity must not have production database write access." >&2
   exit 1
 fi
 if runuser -u "$MONITOR_USER" -- test -r "$RUNTIME_POLICY_FILE"; then

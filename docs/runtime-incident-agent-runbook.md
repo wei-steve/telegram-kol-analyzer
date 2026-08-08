@@ -806,8 +806,10 @@ all prior executable rows have durable contracts.
 
 The root-owned production monitor sends the capture token over fixed loopback
 HTTP with environment proxy use disabled and a 32 KiB response limit. Its
-installer fails if the dedicated monitor identity can write the production
-database or read the Runtime Agent policy/provider file. The monitor raises a
+installer requires every monitor unit to bind the production database
+read-only, rejects a writable production-checkout mount, and fails if the
+dedicated monitor identity can read the Runtime Agent policy/provider file.
+The monitor raises a
 fixed critical reason when any of these is true:
 
 - an executable authoritative message lacks its current-policy contract;
