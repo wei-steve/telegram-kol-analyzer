@@ -18,6 +18,7 @@ from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import DeepcoinDefiniteRejection
+from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
 from telegram_kol_research.deepcoin_order_builder import _coalesce_equivalent_entry_legs
@@ -25,6 +26,7 @@ from telegram_kol_research.entry_strategy_assembly import (
     build_bounded_entry_order_draft_snapshot,
     canonical_entry_assembly_fingerprint,
 )
+from telegram_kol_research.deepcoin_execution_actions import _exact_exchange_order_id
 from telegram_kol_research.deepcoin_execution_actions import execute_deepcoin_management_signal
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord
 from telegram_kol_research.execution_bindings import ExecutionOrderLegRecord
@@ -137,13 +139,15 @@ def _entry_submission_failure_status(
     verified_v2_assembly: bool,
     progress: EntrySubmissionProgress,
 ) -> str:
-    if not verified_v2_assembly or progress.attempted_writes == 0:
+    if progress.attempted_writes == 0:
         return "failed"
-    if progress.confirmed_legs > 0:
+    if verified_v2_assembly and progress.confirmed_legs > 0:
         return "partial_submission_failed"
+    if isinstance(exc, DeepcoinRequestOutcomeUnknown):
+        return "unknown_exchange_outcome"
     if isinstance(exc, DeepcoinDefiniteRejection):
         return "failed"
-    return "unknown_exchange_outcome"
+    return "failed"
 
 
 def _require_synchronized_finalized_entry_assembly(
@@ -796,9 +800,11 @@ def _submit_recovery_signal_direct(
             except Exception as exc:  # pragma: no cover - defensive boundary
                 raise DeepcoinClientError(f"Deepcoin client failed: {exc}") from exc
 
-            order_id = _extract_order_id(response)
+            order_id = _extract_exact_entry_order_id(response)
             if not order_id:
-                raise DeepcoinClientError("Deepcoin order response missing order id")
+                raise DeepcoinRequestOutcomeUnknown(
+                    "market order response missing exact order id"
+                )
             progress.record_confirmed_leg()
             client_order_id = str(leg.get("client_order_id") or order_payload.get("clOrdId") or "")
             pos_id = _extract_position_id(response) or _find_open_position_id(
@@ -935,9 +941,11 @@ def _submit_recovery_signal_direct(
             except Exception as exc:  # pragma: no cover - defensive boundary
                 raise DeepcoinClientError(f"Deepcoin client failed: {exc}") from exc
 
-            order_id = _extract_order_id(response)
+            order_id = _extract_exact_entry_order_id(response)
             if not order_id:
-                raise DeepcoinClientError("Deepcoin trigger order response missing order id")
+                raise DeepcoinRequestOutcomeUnknown(
+                    "trigger order response missing exact order id"
+                )
             progress.record_confirmed_leg()
             pos_id = _extract_position_id(response)
             client_order_id = str(leg.get("client_order_id") or "")
@@ -2609,6 +2617,14 @@ def _extract_order_id(response: dict[str, Any]) -> str | None:
             value = payload.get(key)
             if value not in (None, ""):
                 return str(value)
+    return None
+
+
+def _extract_exact_entry_order_id(response: dict[str, Any]) -> str | None:
+    for payload in _response_payloads(response):
+        order_id = _exact_exchange_order_id(payload)
+        if order_id is not None and order_id.strip() == order_id and order_id:
+            return order_id
     return None
 
 

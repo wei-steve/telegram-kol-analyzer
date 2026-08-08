@@ -1136,6 +1136,96 @@ def test_v2_unknown_first_exchange_write_is_quarantined_without_retry(tmp_path):
     assert len(client.trigger_payloads) == 1
 
 
+def test_v2_market_generic_id_is_not_a_confirmed_exchange_order(tmp_path):
+    session_factory = create_session_factory(tmp_path / "market-generic-id.db")
+    _persist_ready_market_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=200,
+        message_id=66,
+        symbol="BTC",
+        side="short",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    finalized = _finalize_v2_assembly_for_signal(session_factory, signal)
+    _persist_finalized_signal_evidence(session_factory, signal, finalized)
+
+    class _GenericMarketIdClient(_FakeDeepcoinClient):
+        def place_order(self, order_payload):
+            self.payloads.append(order_payload)
+            return {"code": "0", "data": {"id": "generic-market-id"}}
+
+    client = _GenericMarketIdClient()
+    with pytest.raises(
+        DeepcoinRequestOutcomeUnknown,
+        match="market order response missing exact order id",
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+
+    assert len(client.payloads) == 1
+    with session_factory() as session:
+        row = session.get(TradeSignal, signal.id)
+        assert row.status == "unknown_exchange_outcome"
+        assert session.query(ExecutionBinding).count() == 0
+        assert session.query(ExecutionOrderLeg).count() == 0
+
+
+def test_fallback_trigger_generic_id_is_not_persisted_as_order_identity(tmp_path):
+    session_factory = create_session_factory(tmp_path / "fallback-generic-id.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    with session_factory() as session:
+        row = session.get(TradeSignal, signal.id)
+        payload = json.loads(row.payload_json)
+        payload["deepcoin_order_draft"]["order_legs"][0][
+            "order_type"
+        ] = "fallback_trigger"
+        payload["deepcoin_order_draft"]["order_legs"] = payload[
+            "deepcoin_order_draft"
+        ]["order_legs"][:1]
+        row.payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        session.commit()
+
+    class _GenericFallbackIdClient(_FakeDeepcoinClient):
+        def trigger_order(self, order_payload):
+            self.trigger_payloads.append(order_payload)
+            return {"code": "0", "data": {"id": "generic-trigger-id"}}
+
+    client = _GenericFallbackIdClient()
+    with pytest.raises(
+        DeepcoinRequestOutcomeUnknown,
+        match="trigger order response missing exact order id",
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            max_order_legs=1,
+        )
+
+    assert len(client.trigger_payloads) == 1
+    with session_factory() as session:
+        row = session.get(TradeSignal, signal.id)
+        assert row.status == "unknown_exchange_outcome"
+        assert session.query(ExecutionBinding).count() == 0
+        assert session.query(ExecutionOrderLeg).count() == 0
+
+
 def test_v2_submission_uses_durable_selected_legs_not_external_maximum(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _persist_ready_item(session_factory)
