@@ -66,6 +66,7 @@ def test_runtime_agent_sidecar_unit_is_separate_and_dormant_until_enabled():
     assert 'f"{DATABASE_PATH}-wal"' in prepare_helper
     assert 'f"{DATABASE_PATH}-shm"' in prepare_helper
     assert "os.O_NOFOLLOW" in prepare_helper
+    assert "os.O_NONBLOCK" in prepare_helper
     assert "stat.S_ISREG" in prepare_helper
     assert "st_nlink != 1" in prepare_helper
     assert '"/usr/bin/setfacl"' in prepare_helper
@@ -92,3 +93,25 @@ def test_runtime_agent_acl_helper_never_opens_sqlite_symlinks(tmp_path):
         assert target.read_text(encoding="utf-8") == "unchanged"
         assert target.stat().st_mode == original_mode
         os.unlink(link)
+
+
+def test_runtime_agent_acl_helper_rejects_special_files_without_blocking(tmp_path):
+    helper_path = (
+        Path(__file__).parents[1]
+        / "deploy"
+        / "systemd"
+        / "telegram-kol-runtime-agent-prepare-db-acl"
+    )
+    helper = runpy.run_path(str(helper_path))
+    for suffix in ("-wal", "-shm", "-journal"):
+        fifo = tmp_path / f"research.db{suffix}"
+        os.mkfifo(fifo)
+        with pytest.raises(RuntimeError, match="single-link regular file"):
+            helper["_open_regular_nofollow"](str(fifo), optional=False)
+        os.unlink(fifo)
+
+        directory = tmp_path / f"research.db{suffix}"
+        directory.mkdir()
+        with pytest.raises(RuntimeError, match="single-link regular file"):
+            helper["_open_regular_nofollow"](str(directory), optional=False)
+        directory.rmdir()

@@ -43,8 +43,8 @@ if [[ "$(stat -c %u "$ENV_FILE")" != "0" || "$(stat -c %a "$ENV_FILE")" != "600"
   echo "Runtime incident environment file must be root-owned mode 0600." >&2
   exit 1
 fi
-if ! command -v setfacl >/dev/null 2>&1; then
-  echo "setfacl is required for least-privilege database access." >&2
+if [[ ! -x /usr/bin/setfacl ]]; then
+  echo "/usr/bin/setfacl is required for least-privilege database access." >&2
   exit 1
 fi
 if [[ ! -d "$DATA_DIRECTORY" || ! -f "$DATABASE_PATH" ]]; then

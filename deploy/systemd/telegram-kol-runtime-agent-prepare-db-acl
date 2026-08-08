@@ -22,7 +22,7 @@ SQLITE_PATHS = (
 
 
 def _open_regular_nofollow(path: str, *, optional: bool) -> int | None:
-    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
         fd = os.open(path, flags)
     except FileNotFoundError:
