@@ -578,6 +578,57 @@ bulk-complete them. Agent eligibility, legacy notification selectors, the
 message-operation supervisor mode, and every business-mutation authority stay
 unchanged.
 
+Task 8R.7 adds an audited declarative investigation broker. It is a library
+boundary only in this phase and is not added to the Agent tool registry or any
+incident selector. The closed evidence categories are message/reply evidence,
+database projections, processing timelines, bounded journal summaries,
+deployed code/Git state, non-secret configuration/audit state, exchange
+snapshots, Telegram evidence, and prior incidents. Requests bind to one
+existing incident, at most 32 bounded object IDs, an optional reviewed query
+name (never SQL or shell text), a maximum 31-day time window, and 256-32768
+result bytes.
+
+Every allowed, denied, and provider-error request appends one bounded
+`runtime_agent_investigation_audits` row containing only the incident ID,
+evidence category, arguments fingerprint, status, first evidence reference,
+byte/duration measures, and a closed denial code. Exception text, query
+contents, credentials, raw provider payloads, and model responses are never
+persisted. Database evidence uses SQLite URI `mode=ro` plus
+`PRAGMA query_only=ON` and an authorizer that refuses DML, DDL, transaction,
+ATTACH/DETACH, and PRAGMA operations. It intentionally does not use
+`immutable=1` against the live WAL database because that would omit committed
+WAL facts.
+
+File evidence is limited to reviewed read-only roots, rejects traversal and
+credential-like paths, and exposes no create/modify/delete API. Network
+evidence authorizes HTTPS GET only, rejects forwarded/proxy headers, limits
+Deepcoin to an exact read-endpoint allowlist, and denies unapproved hosts and
+exchange mutation paths. Exchange, Telegram, and production-audit adapters
+project bounded proofs before the broker accepts their result.
+
+The sidecar remains the dedicated unprivileged `telegram-kol-agent` identity.
+Its checkout stays read-only under `ProtectSystem=strict`; the installer fails
+if that identity can write source or configuration. A mode-0700
+`/var/lib/telegram-kol-runtime-agent` state directory is its only private
+analysis workspace. The root-owned Runtime Agent environment file is
+inaccessible inside the service mount namespace after systemd loads it.
+Existing database write access remains limited to the reviewed incident/claim
+lifecycle and the new audit ledger; production fact reads made by the broker
+are query-only.
+
+Deploy 8R.7 with Agent eligibility and tool registration unchanged. Stop and
+disable only the Runtime Agent sidecar before its installer, then restore the
+existing sidecar policy after the main-service safe-window gate. Run isolated
+read and mutation-refusal canaries with temporary data; do not send Telegram,
+call a live exchange mutation, replay a historical message, or make a
+message-operation incident eligible. Completion additionally requires a
+trade-disabled Deepcoin evidence credential or an equivalent trusted
+read-only loopback projection, plus enforced egress evidence for the deployed
+identity. Until those controls are proven, keep 8R.7 `in_progress` and do not
+begin 8R.8. Immediate rollback is to stop the Runtime Agent sidecar; normal
+intake, execution, reconciliation, Stage 1 delivery, scanner, and monitor stay
+independent.
+
 The operator approved a controlled Phase 8R.3 completion canary on 2026-08-08
 so that a rare natural multi-target failure cannot block later read-only Agent
 work indefinitely. This alternative changes only the verification method; it

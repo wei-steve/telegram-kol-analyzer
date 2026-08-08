@@ -9,7 +9,7 @@ design_version: 2
 design_authority_status: original_runtime_agent_incomplete_extended_by_message_operation_design
 current_phase: 8R.7
 phase_name: broad-enforced-read-only-investigation-broker
-phase_status: planned
+phase_status: in_progress
 position_compliance_rules_status: dormant_non_deployable
 position_compliance_rollout_status: multi_target_live_new_natural_messages_only
 multi_target_projection_status: live_partial_take_profit_future_natural_messages_only
@@ -27,6 +27,7 @@ last_completed_phase: "8R.6B"
 last_completed_commit: 04b3d34
 production_commit: 04b3d3445b37f4da36ccf12a6c199e012b7ede65
 local_tests:
+  - "phase-8r.7-local-initial: the audited declarative broker has nine broad read-only evidence categories, exact incident binding, closed query names, bounded IDs/time/bytes, per-request durable audit metadata, SQLite mode=ro plus query_only/authorizer enforcement with live-WAL visibility, read-only file roots, HTTPS GET/host/proxy/Deepcoin endpoint policy, bounded exchange/Telegram/audit adapters, and a private sidecar workspace. It remains unregistered from Agent tools and selectors. Focused security/migration/architecture verification is pending final review."
   - "phase-8r.6b-server: reviewed commit 04b3d34 passed 156 focused Stage 1, supervisor, migration, and architecture tests on the server. Dormant deployment preserved HTTP 200 and all three runtime services; the additive table was empty. A separate fresh zero-in-flight gate recorded maximum contract ID 0, then enabled only future-contract Stage 1 eligibility. Post-activation contracts, outbox rows, claims, and active mutations remained zero; the independent no-notify monitor was healthy and its timer was restored."
   - "phase-8r.6b-stage1-local: 349 Stage 1 dispatcher, message-operation supervisor, schema/migration, concurrent claim/retry/exhaustion, per-contract watermark including a new message coalesced into an older incident, bounded-redaction, high-priority delivery-failure capture, Telegram-message-ID, legacy notification, Web lifecycle, runtime-ledger, Agent-worker, and architecture regressions pass. The additive outbox is dormant by default, per affected source message, independently claimable from the single coalesced RuntimeIncident/Agent investigation, and no model or business mutation path was added."
   - "phase-8r.6b-review: two Important findings were reproduced and fixed under TDD: eligibility now uses the per-message contract watermark so an old coalesced RuntimeIncident cannot suppress a new source-message alert, and Stage 1 delivery failure creates a separate high-severity notification_delivery_failure incident without persisting exception text. Independent re-review ran 363 focused/adjacent tests, passed diff-check, and found no remaining Critical or Important issue."
@@ -239,7 +240,7 @@ server_verification:
   operator_shuqin_manual_close_after_activation: "During the post-activation observation, the operator reported manually closing Shuqin's position. The resulting normal manual-bound-position-close path persisted mutation intent 350 as confirmed and close reservation 36 as confirmed. This occurred after the activation gate and is not attributed to multi-target rollout. A subsequent read-only audit remained database-stable and exchange-complete with current_risk=0, evidence_insufficient=1, historical_terminal=236, and resolved_by_current_exchange_evidence=1. RuntimeIncident max ID remained 280, target/envelope rows remained zero, and runtime/notification claims remained zero. No automated follow-up action was taken."
   phase_8r_6a_operator_completion: "On 2026-08-09 the operator explicitly directed the rollout not to wait for a future natural executable message and accepted returning to correct later issues. Phase 8R.6A is therefore complete on the reviewed 404-test local evidence, 33-test deployed supervisor evidence, and the production zero-impact dormant canary. Natural-message parity remains unobserved and is a recorded residual verification item, not a gate for beginning the next separately dormant phase. This completion enabled no incident creation, Stage 1 notification, Agent eligibility, model call, or business mutation authority."
   phase_8r_6b_deployment_and_activation: "Reviewed commit 04b3d34 was pushed and deployed with Stage 1 absent/disabled. Server verification passed 156 focused tests; main, Runtime Agent, and runtime scanner were active and HTTP root returned 200. The additive outbox table existed with zero rows. After a second fresh gate proved zero active position mutations, RuntimeIncident/notification/Stage 1 claims, contracts, and outbox rows, the root-owned mode-0600 policy was backed up and Stage 1 was enabled for contract IDs above the stopped-state maximum of 0, with five bounded attempts. Only the main service restarted; it returned HTTP 200, all runtime services remained active, and counts stayed zero, proving no historical materialization, Telegram send, Agent claim, or trading mutation. The independent monitor expected-HEAD pin was synchronized to 04b3d34, its no-notify diagnostic returned healthy=true with no reason codes, and the timer was restored. Runtime Agent action authority and both playbook allowlists remain unchanged/empty."
-  remaining: "Phase 8R.6B is complete and Phase 8R.7 is planned. The next turn may implement only the broad enforced read-only investigation broker, introduced dormant and with a tested rollback path; it must not broaden Agent business-mutation authority. Natural 8R.6A/8R.6B live-message behavior remains a residual observation. SOL and every other globally allowed symbol still require a separately approved authoritative contract-spec discovery/cache and allowlist/spec consistency gate; do not combine that trading-scope change with Phase 8R.7."
+  remaining: "Phase 8R.7 local implementation is in progress. Complete focused and adjacent regressions, independent review, push, and a fresh safe-window dormant server deployment. Server verification must install the hardened sidecar only while stopped/disabled, run isolated read/mutation-refusal canaries without changing Agent eligibility, and prove service/listener/scanner/monitor continuity. Completion also requires a trade-disabled Deepcoin evidence credential or equivalent trusted read-only loopback projection and deployed egress-enforcement evidence; the current application host policy alone is not treated as exchange-credential or OS-network proof. Do not begin 8R.8. Natural 8R.6A/8R.6B behavior and all-symbol contract specs remain separate residual scopes."
 enabled_flags:
   - "capture:READ_ONLY_CAPTURE_PROFILE-plus-six-multi-target-types"
   - "telegram:deterministic-runtime-incident-reports"
@@ -272,7 +273,7 @@ phase_8r_roadmap_control:
 message_operation_extension:
   design_commit: 98b7884
   implementation_plan_commit: 879f489
-  status: phase_8r_6b_completed_phase_8r_7_planned
+  status: phase_8r_7_in_progress_local_broker_dormant
   original_runtime_agent_complete: false
   next_phase_after_8r_4: 8R.5
   task_8r_5_commit: 2d0cc6e
@@ -284,6 +285,7 @@ message_operation_extension:
   task_8r_6b_commit: 04b3d34
   task_8r_6b_status: completed_future_only_production_active
   next_phase_after_8r_6b: 8R.7
+  task_8r_7_status: in_progress_local_review_and_server_controls_pending
   allowed_symbol_contract_spec_status: unresolved_separate_trading_scope
   allowed_symbol_contract_spec_requirement: "Every globally allowed virtual-asset symbol must have a current, independently validated Deepcoin instrument specification before auto-trading can admit it. The present reviewed static file contains BTC and ETH only; SOL and any other allowlisted symbol without a verified specification remain fail-closed. Future support must use authoritative instrument discovery or a reviewed generated cache plus an allowlist/spec consistency gate, without weakening sizing or submission safety."
 next_session_prompt: "请执行自定义ai agent的下一步实施"
@@ -606,8 +608,9 @@ Phase 5 is not complete until:
 - Status: in progress
 - Roadmap-control Task 0: completed locally with 10 focused tests passing;
   documentation and test changes only, so no production restart was required
-- Current task: `8R.7 broad-enforced-read-only-investigation-broker` (planned;
-  implementation has not started)
+- Current task: `8R.7 broad-enforced-read-only-investigation-broker` (in
+  progress; local broker implementation is dormant and server isolation gates
+  remain)
 - Approved scope: deterministic proactive discovery, bounded read-only
   diagnosis, Telegram notification, Codex handoff, and read-only verification
 - Prohibited scope: order, position, protection, strategy, recognition,
@@ -642,6 +645,11 @@ Phase 5 is not complete until:
   dispatcher is separate from the single coalesced Agent investigation; and
   all new configuration defaults fail closed/dormant. Production is activated
   only for contract IDs above watermark 0; activation created no rows or sends.
-- Next action: start only Phase 8R.7 from its approved plan, keeping the broker
-  dormant until its isolation, read-only enforcement, and rollback gates pass.
-  Do not combine contract-spec expansion or business mutation with that phase.
+- Task 8R.7 local implementation: nine closed evidence categories, query-only
+  live-WAL database reads, bounded read-only file/network adapters, and one
+  durable audit row per allowed/denied/error request are implemented. The
+  existing Agent tool registry and selector remain unchanged.
+- Next action: finish independent review and dormant server verification. Keep
+  8R.7 in progress until a trade-disabled exchange evidence credential (or
+  equivalent trusted read-only loopback) and deployed egress enforcement are
+  proven. Do not begin 8R.8, contract-spec expansion, or business mutation.

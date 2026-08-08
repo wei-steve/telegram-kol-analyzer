@@ -21,6 +21,9 @@ def test_runtime_agent_sidecar_unit_is_separate_and_dormant_until_enabled():
     assert "PrivateDevices=true" in text
     assert "ProtectSystem=strict" in text
     assert "ReadWritePaths=/opt/telegram-kol-analyzer/data" in text
+    assert "StateDirectory=telegram-kol-runtime-agent" in text
+    assert "InaccessiblePaths=/opt/telegram-kol-analyzer/config/runtime_incident_agent.env" in text
+    assert "UMask=0077" in text
     assert "WantedBy=multi-user.target" in text
 
     installer = (
@@ -34,3 +37,6 @@ def test_runtime_agent_sidecar_unit_is_separate_and_dormant_until_enabled():
     assert "useradd --system" in installer
     assert "setfacl -m" in installer
     assert "runuser -u \"$AGENT_USER\" -- test -w" in installer
+    assert "PRIVATE_WORKSPACE=\"/var/lib/telegram-kol-runtime-agent\"" in installer
+    assert "test -w \"$PRODUCTION_ROOT/src\"" in installer
+    assert "Agent identity can write reviewed source" in installer

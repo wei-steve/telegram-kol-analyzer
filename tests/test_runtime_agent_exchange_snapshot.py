@@ -5,8 +5,10 @@ import pytest
 from telegram_kol_research.runtime_agent_exchange_snapshot import (
     RuntimeAgentExchangeSnapshotError,
     RuntimeAgentExchangeSnapshotRefresh,
+    build_broker_exchange_provider,
     build_read_only_exchange_snapshot,
 )
+from telegram_kol_research.runtime_agent_investigation_broker import InvestigationRequest
 
 
 class _Client:
@@ -82,6 +84,20 @@ def test_bounded_snapshot_is_stable_and_does_not_return_exchange_ids():
     assert "position-secret-1" not in str(left)
     assert "order-secret-1" not in str(left)
     assert first.calls == ["positions", "open_orders"]
+
+
+def test_broker_exchange_provider_exposes_only_bounded_read_methods():
+    client = _Client(positions=[], orders=[])
+    client.place_order = lambda: (_ for _ in ()).throw(AssertionError("write called"))
+    provider = build_broker_exchange_provider(lambda: client)
+
+    result = provider(
+        InvestigationRequest(incident_id=17, evidence_kind="exchange_snapshot")
+    )
+
+    assert result["data"]["complete"] is True
+    assert result["evidence_refs"] == ["exchange-snapshot:17"]
+    assert client.calls == ["positions", "open_orders"]
 
 
 @pytest.mark.parametrize(

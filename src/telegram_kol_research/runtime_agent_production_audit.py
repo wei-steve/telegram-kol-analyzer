@@ -171,6 +171,20 @@ def project_bounded_production_audit(value: Any) -> dict[str, Any]:
     return _proof_payload(_project_audit(value))
 
 
+def build_broker_production_audit_provider(
+    runner: Callable[[], Mapping[str, Any]],
+):
+    """Build the broker's non-secret configuration/audit evidence category."""
+
+    def provider(request) -> dict[str, Any]:
+        return {
+            "data": project_bounded_production_audit(runner()),
+            "evidence_refs": [f"production-audit:{int(request.incident_id)}"],
+        }
+
+    return provider
+
+
 def run_bounded_production_audit_command(
     database_path: str | Path,
     *,

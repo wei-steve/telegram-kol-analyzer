@@ -11,7 +11,9 @@ from telegram_kol_research.models import RuntimeIncident
 from telegram_kol_research.runtime_agent_telegram_evidence import (
     RuntimeAgentTelegramEvidenceError,
     RuntimeAgentTelegramEvidenceRefresh,
+    build_broker_telegram_evidence_provider,
 )
+from telegram_kol_research.runtime_agent_investigation_broker import InvestigationRequest
 from telegram_kol_research.runtime_incidents import record_runtime_incident
 
 
@@ -22,6 +24,20 @@ COMPLETE_PROOF = {
     "bot_identity_available": True,
     "target_chat_available": True,
 }
+
+
+def test_broker_telegram_provider_returns_only_bounded_endpoint_proof():
+    provider = build_broker_telegram_evidence_provider(
+        lambda incident_id: {**COMPLETE_PROOF, "bot_token": "omit"}
+    )
+    result = provider(
+        InvestigationRequest(incident_id=17, evidence_kind="telegram_evidence")
+    )
+
+    assert result == {
+        "data": COMPLETE_PROOF,
+        "evidence_refs": ["telegram-evidence:17"],
+    }
 
 
 def _record_incident(

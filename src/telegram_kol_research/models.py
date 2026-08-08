@@ -3070,6 +3070,67 @@ class RuntimeIncidentObservation(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now)
 
 
+class RuntimeAgentInvestigationAudit(Base):
+    """Append-only bounded audit evidence for one broker request."""
+
+    __tablename__ = "runtime_agent_investigation_audits"
+    __table_args__ = (
+        Index(
+            "ix_runtime_agent_investigation_incident_created",
+            "runtime_incident_id",
+            "created_at",
+        ),
+        Index(
+            "ix_runtime_agent_investigation_status_created",
+            "result_status",
+            "created_at",
+        ),
+        CheckConstraint(
+            "runtime_incident_id >= 0",
+            name="ck_runtime_agent_investigation_incident_nonnegative",
+        ),
+        CheckConstraint(
+            "length(evidence_kind) BETWEEN 1 AND 64",
+            name="ck_runtime_agent_investigation_kind_bounded",
+        ),
+        CheckConstraint(
+            "length(arguments_fingerprint) = 64",
+            name="ck_runtime_agent_investigation_fingerprint",
+        ),
+        CheckConstraint(
+            "result_status IN ('allowed', 'denied', 'error')",
+            name="ck_runtime_agent_investigation_status",
+        ),
+        CheckConstraint(
+            "evidence_reference IS NULL OR length(evidence_reference) <= 255",
+            name="ck_runtime_agent_investigation_reference_bounded",
+        ),
+        CheckConstraint(
+            "result_bytes BETWEEN 0 AND 32768 AND duration_ms >= 0",
+            name="ck_runtime_agent_investigation_measures_bounded",
+        ),
+        CheckConstraint(
+            "denial_code IS NULL OR length(denial_code) <= 64",
+            name="ck_runtime_agent_investigation_denial_bounded",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    runtime_incident_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    evidence_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    arguments_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    result_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    evidence_reference: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True
+    )
+    result_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    denial_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+
 class RuntimeAgentRecoveryAttempt(Base):
     """Durable idempotency and verification record for one low-risk action."""
 

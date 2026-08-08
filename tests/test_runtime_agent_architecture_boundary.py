@@ -11,6 +11,7 @@ RUNTIME_AGENT_MODULES = (
     "runtime_incident_adapters.py",
     "runtime_agent_contracts.py",
     "runtime_agent_tools.py",
+    "runtime_agent_investigation_broker.py",
     "runtime_agent_prompt.py",
     "runtime_agent_worker.py",
     "runtime_agent_evaluation.py",
@@ -40,7 +41,10 @@ ALLOWED_PACKAGE_IMPORTS_BY_MODULE = {
         {"config", "message_operation_types", "models", "runtime_incidents"}
     ),
     "runtime_agent_contracts.py": frozenset(),
-    "runtime_agent_tools.py": frozenset({"runtime_agent_contracts"}),
+    "runtime_agent_tools.py": frozenset(
+        {"runtime_agent_contracts", "runtime_agent_investigation_broker"}
+    ),
+    "runtime_agent_investigation_broker.py": frozenset({"models"}),
     "runtime_agent_prompt.py": frozenset(
         {"runtime_agent_contracts", "runtime_agent_playbooks"}
     ),
@@ -130,6 +134,25 @@ def test_runtime_agent_modules_do_not_import_business_resolution_or_write_paths(
 
 
 @pytest.mark.architecture
+def test_investigation_broker_exposes_no_arbitrary_command_or_mutation_client():
+    source = (
+        Path(__file__).parents[1]
+        / "src"
+        / "telegram_kol_research"
+        / "runtime_agent_investigation_broker.py"
+    ).read_text(encoding="utf-8")
+
+    assert "subprocess" not in source
+    assert "os.system" not in source
+    assert "systemctl" not in source
+    assert "place_order" not in source
+    assert "cancel_order" not in source
+    assert "close_position" not in source
+    assert "?mode=ro" in source
+    assert "PRAGMA query_only=ON" in source
+
+
+@pytest.mark.architecture
 def test_message_operation_contract_helpers_have_only_shadow_cli_caller():
     source_root = Path(__file__).parents[1] / "src" / "telegram_kol_research"
     callers = []
@@ -197,7 +220,7 @@ def test_phase_7_is_deferred_and_phase_8r_requires_no_action_authority():
     assert "phase_7_disposition: deferred_non_blocking" in status
     assert "current_phase: 8R.7" in status
     assert "phase_name: broad-enforced-read-only-investigation-broker" in status
-    assert "phase_status: planned" in status
+    assert "phase_status: in_progress" in status
     assert 'last_completed_phase: "8R.6B"' in status
     assert "task_8r_4_status: completed_dormant_production_verified" in status
     assert "task_8r_5_status: completed_future_only_shadow_canary" in status
@@ -209,6 +232,11 @@ def test_phase_7_is_deferred_and_phase_8r_requires_no_action_authority():
     assert (
         "task_8r_6b_status: "
         "completed_future_only_production_active"
+        in status
+    )
+    assert (
+        "task_8r_7_status: "
+        "in_progress_local_review_and_server_controls_pending"
         in status
     )
     assert "original_runtime_agent_complete: false" in status

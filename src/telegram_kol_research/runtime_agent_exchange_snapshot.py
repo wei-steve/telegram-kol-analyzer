@@ -164,6 +164,19 @@ def incomplete_read_only_exchange_snapshot() -> dict[str, Any]:
     }
 
 
+def build_broker_exchange_provider(client_reader: Callable[[], Any]):
+    """Build the broker's exchange category from two read-only client calls."""
+
+    def provider(request) -> dict[str, Any]:
+        proof = build_read_only_exchange_snapshot(client_reader())
+        return {
+            "data": proof,
+            "evidence_refs": [f"exchange-snapshot:{int(request.incident_id)}"],
+        }
+
+    return provider
+
+
 def _validated_proof(value: Any) -> tuple[str, int, int]:
     if not isinstance(value, Mapping) or set(value) != _SNAPSHOT_FIELDS:
         raise RuntimeAgentExchangeSnapshotError(

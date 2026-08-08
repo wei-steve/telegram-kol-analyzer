@@ -10,7 +10,12 @@ from telegram_kol_research.runtime_agent_tools import (
     build_prior_attempts_summary,
     build_protection_summary,
     build_worker_history_summary,
+    build_broker_tool_provider,
 )
+from telegram_kol_research.runtime_agent_investigation_broker import (
+    InvestigationBroker,
+)
+from datetime import UTC, datetime
 
 
 def test_read_only_registry_exposes_only_closed_bounded_tools():
@@ -172,3 +177,34 @@ def test_phase4_protection_summary_exposes_counts_not_raw_order_evidence():
     unavailable = build_protection_summary({})
     assert unavailable["missing_stop_loss"] is None
     assert unavailable["missing_take_profit"] is None
+
+
+def test_broker_tool_provider_uses_closed_incident_bound_request():
+    requests = []
+    broker = InvestigationBroker(
+        providers={
+            "processing_timeline": lambda request: (
+                requests.append(request)
+                or {
+                    "data": {"events": 2},
+                    "evidence_refs": [f"timeline:{request.incident_id}"],
+                }
+            )
+        },
+        incident_exists=lambda incident_id: incident_id == 17,
+        audit_recorder=lambda record: None,
+        clock=lambda: datetime(2026, 8, 9, tzinfo=UTC),
+    )
+
+    provider = build_broker_tool_provider(
+        broker,
+        evidence_kind="processing_timeline",
+        query="message-operation-v1",
+    )
+    assert provider(incident_id=17) == {
+        "data": {"events": 2},
+        "evidence_refs": ["timeline:17"],
+    }
+    assert requests[0].incident_id == 17
+    assert requests[0].evidence_kind == "processing_timeline"
+    assert requests[0].query == "message-operation-v1"

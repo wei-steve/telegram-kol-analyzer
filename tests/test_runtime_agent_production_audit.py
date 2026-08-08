@@ -10,7 +10,9 @@ from telegram_kol_research.runtime_agent_production_audit import (
     RuntimeAgentProductionAuditRefresh,
     project_bounded_production_audit,
     run_bounded_production_audit_command,
+    build_broker_production_audit_provider,
 )
+from telegram_kol_research.runtime_agent_investigation_broker import InvestigationRequest
 
 
 def _audit(**overrides):
@@ -76,6 +78,16 @@ def test_rerun_captures_one_bounded_complete_audit_proof():
     }
     assert refresh.has_capture(9) is False
     assert refresh.consume_verification(incident_id=9) is None
+
+
+def test_broker_production_audit_provider_returns_only_projected_proof():
+    provider = build_broker_production_audit_provider(lambda: _audit(extra="ignored"))
+    result = provider(
+        InvestigationRequest(incident_id=17, evidence_kind="configuration_state")
+    )
+
+    assert result["data"] == project_bounded_production_audit(_audit())
+    assert result["evidence_refs"] == ["production-audit:17"]
 
 
 def test_historical_abnormal_counts_do_not_make_a_complete_audit_incomplete():

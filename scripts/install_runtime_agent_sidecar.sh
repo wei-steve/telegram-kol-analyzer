@@ -22,6 +22,7 @@ DATA_DIRECTORY="$PRODUCTION_ROOT/data"
 DATABASE_PATH="$DATA_DIRECTORY/research.db"
 MONITOR_STATE_DIRECTORY="/var/lib/telegram-kol-monitor"
 MONITOR_STATE_PATH="$MONITOR_STATE_DIRECTORY/state.json"
+PRIVATE_WORKSPACE="/var/lib/telegram-kol-runtime-agent"
 
 if [[ "$PROJECT_ROOT" != "$PRODUCTION_ROOT" ]]; then
   echo "Run this installer only from $PRODUCTION_ROOT." >&2
@@ -117,6 +118,14 @@ if ! runuser -u "$AGENT_USER" -- test -x "$PRODUCTION_ROOT/.venv/bin/telegram-ko
   echo "Agent identity cannot execute the installed CLI." >&2
   exit 1
 fi
+if runuser -u "$AGENT_USER" -- test -w "$PRODUCTION_ROOT/src"; then
+  echo "Agent identity can write reviewed source." >&2
+  exit 1
+fi
+if runuser -u "$AGENT_USER" -- test -w "$PRODUCTION_ROOT/config"; then
+  echo "Agent identity can write reviewed configuration." >&2
+  exit 1
+fi
 if [[ -d "$MONITOR_STATE_DIRECTORY" ]]; then
   setfacl -m "u:$AGENT_USER:--x" "$MONITOR_STATE_DIRECTORY"
 fi
@@ -125,6 +134,7 @@ if [[ -f "$MONITOR_STATE_PATH" ]]; then
 fi
 
 install -o root -g root -m 0644 "$UNIT_SOURCE" "$UNIT_DEST"
+install -d -o "$AGENT_USER" -g "$AGENT_GROUP" -m 0700 "$PRIVATE_WORKSPACE"
 systemctl daemon-reload
 
 echo "Installed $UNIT_NAME in disabled, inactive state."

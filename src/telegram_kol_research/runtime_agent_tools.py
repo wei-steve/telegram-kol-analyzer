@@ -12,6 +12,11 @@ from telegram_kol_research.runtime_agent_contracts import (
     RuntimeAgentContractError,
     validate_evidence_references,
 )
+from telegram_kol_research.runtime_agent_investigation_broker import (
+    BROAD_READ_ONLY_EVIDENCE_KINDS,
+    InvestigationBroker,
+    InvestigationRequest,
+)
 
 
 READ_ONLY_RUNTIME_AGENT_TOOL_NAMES = frozenset(
@@ -41,6 +46,29 @@ _CREDENTIAL_PATTERN = re.compile(
 
 class RuntimeAgentToolError(ValueError):
     """Raised when a tool request or result fails the read-only policy."""
+
+
+def build_broker_tool_provider(
+    broker: InvestigationBroker,
+    *,
+    evidence_kind: str,
+    query: str | None = None,
+):
+    """Adapt one reviewed broker category to the existing closed tool API."""
+
+    if evidence_kind not in BROAD_READ_ONLY_EVIDENCE_KINDS:
+        raise RuntimeAgentToolError("broker evidence kind is not allowed")
+
+    def provider(*, incident_id: int) -> Mapping[str, Any]:
+        return broker.execute(
+            InvestigationRequest(
+                incident_id=int(incident_id),
+                evidence_kind=evidence_kind,
+                query=query,
+            )
+        )
+
+    return provider
 
 
 def _safe_scalar(value: Any, *, maximum: int = 64):

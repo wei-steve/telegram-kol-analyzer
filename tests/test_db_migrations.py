@@ -17,6 +17,7 @@ def test_context_resolution_schema_is_created(tmp_path):
     assert inspector.has_table("runtime_incidents")
     assert inspector.has_table("runtime_incident_observations")
     assert inspector.has_table("runtime_agent_recovery_attempts")
+    assert inspector.has_table("runtime_agent_investigation_audits")
     assert inspector.has_table("message_operation_contracts")
     assert inspector.has_table("message_operation_items")
     assert inspector.has_table("message_operation_stage1_notifications")
@@ -27,6 +28,33 @@ def test_context_resolution_schema_is_created(tmp_path):
         column["name"]
         for column in inspector.get_columns("strategy_lifecycles")
     }
+
+
+def test_runtime_agent_investigation_audit_has_additive_bounded_shape(tmp_path):
+    session_factory = create_session_factory(tmp_path / "broker-audit-schema.db")
+    inspector = inspect(session_factory.kw["bind"])
+
+    columns = {
+        column["name"]
+        for column in inspector.get_columns("runtime_agent_investigation_audits")
+    }
+    assert {
+        "runtime_incident_id",
+        "evidence_kind",
+        "arguments_fingerprint",
+        "result_status",
+        "evidence_reference",
+        "result_bytes",
+        "duration_ms",
+        "denial_code",
+        "created_at",
+    } <= columns
+    indexes = {
+        index["name"]
+        for index in inspector.get_indexes("runtime_agent_investigation_audits")
+    }
+    assert "ix_runtime_agent_investigation_incident_created" in indexes
+    assert "ix_runtime_agent_investigation_status_created" in indexes
 
 
 def test_message_operation_stage1_outbox_has_additive_bounded_shape(tmp_path):

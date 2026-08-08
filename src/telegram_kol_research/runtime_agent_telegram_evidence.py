@@ -117,6 +117,21 @@ def project_bounded_telegram_evidence(value: Any) -> dict[str, bool]:
     return _project_proof(projected).as_endpoint_mapping()
 
 
+def build_broker_telegram_evidence_provider(
+    reader: Callable[[int], Mapping[str, Any]],
+):
+    """Build the broker's Telegram category without exposing Bot credentials."""
+
+    def provider(request) -> dict[str, Any]:
+        incident_id = int(request.incident_id)
+        return {
+            "data": project_bounded_telegram_evidence(reader(incident_id)),
+            "evidence_refs": [f"telegram-evidence:{incident_id}"],
+        }
+
+    return provider
+
+
 class RuntimeAgentTelegramEvidenceRefresh:
     """Fetch one exact Telegram endpoint proof and expose it exactly once."""
 

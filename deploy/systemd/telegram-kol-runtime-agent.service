@@ -24,6 +24,8 @@ NoNewPrivileges=true
 PrivateDevices=true
 PrivateMounts=true
 PrivateTmp=true
+StateDirectory=telegram-kol-runtime-agent
+StateDirectoryMode=0700
 ProcSubset=pid
 ProtectClock=true
 ProtectControlGroups=true
@@ -44,6 +46,8 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@mount @privileged
 ReadOnlyPaths=/opt/telegram-kol-analyzer
 ReadWritePaths=/opt/telegram-kol-analyzer/data
+ReadWritePaths=/var/lib/telegram-kol-runtime-agent
+InaccessiblePaths=/opt/telegram-kol-analyzer/config/runtime_incident_agent.env
 
 [Install]
 WantedBy=multi-user.target
