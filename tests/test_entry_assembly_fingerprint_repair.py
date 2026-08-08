@@ -412,6 +412,30 @@ def _plan(session_factory):
     )
 
 
+def _transition_legacy_binding_lifecycle(session, state: str) -> None:
+    binding = session.get(ExecutionBinding, 266)
+    legs = session.query(ExecutionOrderLeg).order_by(
+        ExecutionOrderLeg.leg_index
+    ).all()
+    if state == "active":
+        binding.status = "active"
+        binding.last_exchange_status = "position_ownership_verified"
+        binding.pos_id = "pos-1,pos-2"
+        for index, leg in enumerate(legs, 1):
+            leg.status = "active"
+            leg.pos_id = f"pos-{index}"
+            leg.attribution_status = "verified"
+    elif state == "closed":
+        binding.status = "closed"
+        binding.last_exchange_status = "entry_legs_terminal"
+        binding.pos_id = None
+        for leg in legs:
+            leg.status = "closed"
+            leg.pos_id = None
+    else:
+        raise AssertionError(f"unsupported lifecycle state: {state}")
+
+
 def _rewrite_all_draft_copies(session, mutate) -> None:
     assembly = session.get(EntryStrategyAssembly, 2)
     evidence = json.loads(assembly.evidence_json)
@@ -887,6 +911,156 @@ def test_monitor_accepts_legacy_reconciliation_only_after_exact_event(tmp_path):
     )
 
     assert read_entry_preamble_invariants(database_path, now=NOW) == ()
+
+
+def test_legacy_reconciliation_event_preserves_initial_observed_state(tmp_path):
+    _, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+
+    with session_factory() as session:
+        event = session.query(ExecutionEvent).one()
+        expected = {
+            "binding": {
+                "last_exchange_status": "entry_order_pending",
+                "pos_id": None,
+                "status": "open",
+            },
+            "entry_legs": [
+                {"leg_index": 1, "pos_id": None, "status": "pending"},
+                {"leg_index": 2, "pos_id": None, "status": "pending"},
+            ],
+        }
+        assert json.loads(event.before_json)["observed_initial_state"] == expected
+        assert json.loads(event.after_json)["observed_initial_state"] == expected
+
+
+@pytest.mark.parametrize("state", ["active", "partially_filled", "closed"])
+def test_legacy_reconciliation_survives_lawful_binding_lifecycle(
+    tmp_path, state
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    original_repair_fingerprint = plan.action.repair_fingerprint
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        if state == "partially_filled":
+            _transition_legacy_binding_lifecycle(session, "active")
+            binding = session.get(ExecutionBinding, 266)
+            binding.pos_id = "pos-1"
+            second_leg = session.query(ExecutionOrderLeg).filter_by(
+                leg_index=2
+            ).one()
+            second_leg.status = "pending"
+            second_leg.pos_id = None
+            second_leg.attribution_status = "pending"
+            session.query(ExecutionOrderLeg).filter_by(
+                leg_index=1
+            ).one().status = "partially_filled"
+        else:
+            _transition_legacy_binding_lifecycle(session, state)
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == ()
+    with session_factory() as session:
+        assert (
+            session.query(ExecutionEvent).one().notification_fingerprint
+            == original_repair_fingerprint
+        )
+
+
+def test_legacy_reconciliation_rejects_immutable_drift_after_lifecycle_change(
+    tmp_path,
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        _transition_legacy_binding_lifecycle(session, "active")
+        session.query(ExecutionOrderLeg).filter_by(leg_index=1).one().order_id = (
+            "drifted-order"
+        )
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == (
+        "live_entry_preamble_binding_evidence_missing",
+    )
+
+
+def test_legacy_reconciliation_fingerprint_binds_full_submitted_order_payload(
+    tmp_path,
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        payload = json.loads(binding.payload_json)
+        payload["submitted_orders"][0]["response"]["data"]["tag"] = "drift"
+        binding.payload_json = _canonical_json(payload)
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == (
+        "live_entry_preamble_binding_evidence_missing",
+    )
+
+
+@pytest.mark.parametrize("mutation", ["missing_binding_pos", "planned_live_leg"])
+def test_legacy_reconciliation_rejects_illegal_lifecycle_state_combination(
+    tmp_path, mutation
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        _transition_legacy_binding_lifecycle(session, "active")
+        if mutation == "missing_binding_pos":
+            session.get(ExecutionBinding, 266).pos_id = None
+        else:
+            session.query(ExecutionOrderLeg).filter_by(leg_index=1).one().status = (
+                "planned"
+            )
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == (
+        "live_entry_preamble_binding_evidence_missing",
+    )
 
 
 @pytest.mark.parametrize(

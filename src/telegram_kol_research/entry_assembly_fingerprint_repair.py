@@ -143,6 +143,7 @@ class EntryAssemblyFingerprintRepairAction:
     final_fingerprint: str
     repair_fingerprint: str
     policy_version: str
+    observed_initial_state: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,6 +396,7 @@ def _build_entry_assembly_fingerprint_repair_plan(
     canonical_proof = canonical_snapshot == snapshot
     legacy_proof = legacy_snapshot == snapshot
     binding_order_identity = None
+    observed_initial_state = None
     if canonical_proof:
         if _bounded_snapshot(binding_draft) != canonical_snapshot:
             conflicts.append("binding_draft_identity_mismatch")
@@ -467,8 +469,36 @@ def _build_entry_assembly_fingerprint_repair_plan(
             side=str(binding.side),
             submitted_orders=binding_payload.get("submitted_orders"),
         )
+        observed_initial_state = legacy_initial_observed_state(
+            {
+                "pos_id": binding.pos_id,
+                "status": binding.status,
+                "last_exchange_status": binding.last_exchange_status,
+            },
+            legs=legs,
+        )
+        if observed_initial_state is None:
+            if (
+                binding.pos_id is None
+                and binding.status == "open"
+                and binding.last_exchange_status == "entry_order_pending"
+            ):
+                conflicts.append("execution_leg_identity_mismatch")
+            else:
+                conflicts.append("binding_top_order_identity_mismatch")
     if not legs_match:
         conflicts.append("execution_leg_identity_mismatch")
+    if legacy_proof and binding_order_identity is not None:
+        binding_order_identity = legacy_repair_immutable_identity(
+            {
+                "order_id": binding.order_id,
+                "client_order_id": binding.client_order_id,
+            },
+            binding_payload=binding_payload,
+            legs=legs,
+        )
+        if binding_order_identity is None:
+            conflicts.append("execution_leg_identity_mismatch")
 
     if conflicts:
         return _plan(None, conflicts)
@@ -497,6 +527,7 @@ def _build_entry_assembly_fingerprint_repair_plan(
         final_fingerprint=str(assembly.fingerprint),
         repair_fingerprint=repair_fingerprint,
         policy_version=policy_version,
+        observed_initial_state=observed_initial_state,
     )
     events = (
         session.query(ExecutionEvent)
@@ -568,9 +599,12 @@ def _plan(
     action: EntryAssemblyFingerprintRepairAction | None, conflicts: list[str]
 ) -> EntryAssemblyFingerprintRepairPlan:
     unique_conflicts = tuple(dict.fromkeys(conflicts))
+    action_payload = asdict(action) if action is not None else None
+    if action_payload is not None and action_payload["observed_initial_state"] is None:
+        action_payload.pop("observed_initial_state")
     payload = {
         "policy_version": RECONCILIATION_POLICY,
-        "action": asdict(action) if action is not None else None,
+        "action": action_payload,
         "conflicts": list(unique_conflicts),
     }
     return EntryAssemblyFingerprintRepairPlan(
@@ -804,19 +838,137 @@ def legacy_binding_order_identity(
         or not expected_client_order_id
         or binding.get("order_id") != expected_order_id
         or binding.get("client_order_id") != expected_client_order_id
-        or binding.get("pos_id") is not None
         or any(row.get("pos_id") is not None for row in submitted_orders)
-        or binding.get("status") != "open"
-        or binding.get("last_exchange_status") != "entry_order_pending"
     ):
         return None
     return {
         "order_id": expected_order_id,
         "client_order_id": expected_client_order_id,
-        "pos_id": None,
-        "status": "open",
-        "last_exchange_status": "entry_order_pending",
     }
+
+
+def legacy_repair_immutable_identity(
+    binding: Mapping[str, Any], *, binding_payload: Mapping[str, Any], legs: list[Any]
+) -> dict[str, Any] | None:
+    submitted_orders = binding_payload.get("submitted_orders")
+    order_identity = legacy_binding_order_identity(
+        binding, submitted_orders=submitted_orders
+    )
+    if order_identity is None:
+        return None
+    leg_submissions: list[dict[str, Any]] = []
+    for row in legs:
+        request_raw = _leg_value(row, "request_json")
+        request = (
+            dict(request_raw)
+            if isinstance(request_raw, Mapping)
+            else _json_object(request_raw)
+        )
+        if request is None:
+            return None
+        leg_submissions.append(
+            {
+                "client_order_id": _leg_value(row, "client_order_id"),
+                "leg_index": _leg_value(row, "leg_index"),
+                "order_id": _leg_value(row, "order_id"),
+                "order_kind": _leg_value(row, "order_kind"),
+                "request": request,
+            }
+        )
+    return {
+        **order_identity,
+        "binding_payload_fingerprint": canonical_fingerprint(binding_payload),
+        "execution_leg_submissions_fingerprint": canonical_fingerprint(
+            {"legs": leg_submissions}
+        ),
+    }
+
+
+def legacy_initial_observed_state(
+    binding: Mapping[str, Any], *, legs: list[Any]
+) -> dict[str, Any] | None:
+    leg_states = [
+        {
+            "leg_index": _leg_value(row, "leg_index"),
+            "pos_id": _leg_value(row, "pos_id"),
+            "status": _leg_value(row, "status"),
+        }
+        for row in legs
+    ]
+    expected = legacy_expected_initial_observed_state()
+    expected_legs = expected["entry_legs"]
+    if (
+        binding.get("pos_id") is not None
+        or binding.get("status") != "open"
+        or binding.get("last_exchange_status") != "entry_order_pending"
+        or leg_states != expected_legs
+    ):
+        return None
+    return expected
+
+
+def legacy_expected_initial_observed_state() -> dict[str, Any]:
+    return {
+        "binding": {
+            "last_exchange_status": "entry_order_pending",
+            "pos_id": None,
+            "status": "open",
+        },
+        "entry_legs": [
+            {"leg_index": 1, "pos_id": None, "status": "pending"},
+            {"leg_index": 2, "pos_id": None, "status": "pending"},
+        ],
+    }
+
+
+def legacy_lifecycle_state_is_lawful(
+    binding: Mapping[str, Any], *, legs: list[Any]
+) -> bool:
+    if legacy_initial_observed_state(binding, legs=legs) is not None:
+        return True
+    status = binding.get("status")
+    last_status = binding.get("last_exchange_status")
+    binding_pos_id = binding.get("pos_id")
+    terminal_states = {
+        "cancelled",
+        "manually_cancelled",
+        "exchange_cancelled",
+        "manually_closed",
+        "closed",
+        "expired",
+        "invalidated",
+    }
+    if status == "closed" and last_status == "entry_legs_terminal":
+        return binding_pos_id is None and bool(legs) and all(
+            str(_leg_value(row, "status") or "").lower() in terminal_states
+            for row in legs
+        )
+    if status != "active" or last_status != "position_ownership_verified":
+        return False
+    pending_states = {"open", "pending", "submitted", "partially_filled", "partial"}
+    for row in legs:
+        leg_status = str(_leg_value(row, "status") or "").lower()
+        leg_pos_id = _leg_value(row, "pos_id")
+        if leg_status in terminal_states:
+            continue
+        if leg_pos_id:
+            if (
+                leg_status not in {"active", "partially_filled", "partial"}
+                or _leg_value(row, "attribution_status") != "verified"
+            ):
+                return False
+        elif leg_status not in pending_states:
+            return False
+    verified_position_ids = [
+        str(_leg_value(row, "pos_id"))
+        for row in legs
+        if _leg_value(row, "pos_id")
+        and _leg_value(row, "attribution_status") == "verified"
+        and str(_leg_value(row, "status") or "").lower() not in terminal_states
+    ]
+    return bool(verified_position_ids) and binding_pos_id == ",".join(
+        dict.fromkeys(verified_position_ids)
+    )
 
 
 def legacy_finalized_signal_payload_is_exact(payload: Any) -> bool:
@@ -1216,7 +1368,6 @@ def legacy_finalized_execution_legs_match(
             or str(_leg_value(row, "strategy_instance_id") or "")
             != strategy_instance_id
             or str(_leg_value(row, "venue") or "").lower() != "deepcoin"
-            or str(_leg_value(row, "status") or "").lower() != "pending"
             or not str(_leg_value(row, "order_id") or "").strip()
             or _leg_value(row, "order_id") != submitted["order_id"]
             or expected_kind is None
@@ -1328,6 +1479,10 @@ def _event_documents(action: EntryAssemblyFingerprintRepairAction):
         "assembly_fingerprint": action.final_fingerprint,
         "repair_fingerprint": action.repair_fingerprint,
     }
+    if action.observed_initial_state is not None:
+        observed = dict(action.observed_initial_state)
+        before["observed_initial_state"] = observed
+        after["observed_initial_state"] = observed
     return before, after
 
 

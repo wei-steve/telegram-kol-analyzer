@@ -39,10 +39,13 @@ from telegram_kol_research.entry_assembly_fingerprint_repair import (
     derive_pre_finalization_fingerprint,
     entry_order_snapshot_matches_durable_identity,
     legacy_binding_order_identity,
+    legacy_expected_initial_observed_state,
     legacy_finalized_execution_legs_match,
     legacy_finalized_binding_payload_is_exact,
     legacy_finalized_signal_payload_is_exact,
     legacy_finalized_snapshot_from_full_draft,
+    legacy_lifecycle_state_is_lawful,
+    legacy_repair_immutable_identity,
 )
 from telegram_kol_research.entry_strategy_assembly import (
     build_bounded_entry_order_draft_snapshot,
@@ -1241,6 +1244,8 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
         "strategy_instance_id",
         "venue",
         "status",
+        "pos_id",
+        "attribution_status",
         "order_id",
         "order_kind",
         "client_order_id",
@@ -1274,6 +1279,15 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
         side=str(binding_identity.get("side") or ""),
         submitted_orders=binding_payload["submitted_orders"],
     ):
+        return False
+    if not legacy_lifecycle_state_is_lawful(binding_identity, legs=legs):
+        return False
+    binding_order_identity = legacy_repair_immutable_identity(
+        binding_identity,
+        binding_payload=binding_payload,
+        legs=legs,
+    )
+    if binding_order_identity is None:
         return False
 
     rows = connection.execute(
@@ -1313,11 +1327,17 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
         "trade_signal_id": trade_signal_id,
         "strategy_instance_id": strategy_id,
     }
-    before = {**common, "assembly_fingerprint": old_fp}
+    observed_initial_state = legacy_expected_initial_observed_state()
+    before = {
+        **common,
+        "assembly_fingerprint": old_fp,
+        "observed_initial_state": observed_initial_state,
+    }
     after = {
         **common,
         "assembly_fingerprint": final_fp,
         "repair_fingerprint": repair_fp,
+        "observed_initial_state": observed_initial_state,
     }
     return (
         row[0] == trade_signal_id
