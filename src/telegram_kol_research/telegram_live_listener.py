@@ -19,7 +19,6 @@ from telegram_kol_research.contextual_message_window import (
 )
 from telegram_kol_research.message_recognition import (
     filter_records_by_inserted_message_keys,
-    recognize_message_now,
     recognize_records_with_ai_config,
 )
 from telegram_kol_research.media_retention import resolve_media_path
@@ -37,7 +36,6 @@ from telegram_kol_research.runtime_incident_adapters import (
     capture_notification_failure,
     capture_runtime_incident_best_effort,
 )
-from telegram_kol_research.recognition_experiments import run_mimo_direct_for_message
 from telegram_kol_research.recognition_decisions import update_recognition_execution_outcome
 from telegram_kol_research.recognition_decisions import (
     RecognitionDecisionRecord,
@@ -312,49 +310,14 @@ async def persist_live_message_event(
                         occurred_at=event_time,
                     )
             else:
-                recog_result = await asyncio.to_thread(
-                    recognize_message_now,
-                    session_factory,
-                    raw_message_id=raw_message.id,
-                    ai_recognition_config=live_ai_config,
+                logger.error(
+                    "recognition authority unavailable raw_message_id=%s "
+                    "reason=authoritative_processor_required",
+                    raw_message.id,
                 )
-                mimo_result = await asyncio.to_thread(
-                    run_mimo_direct_for_message,
-                    session_factory,
-                    raw_message_id=raw_message.id,
-                    ai_recognition_config=live_ai_config,
-                    media_root=media_root,
+                stats["recognition_status"] = (
+                    "authoritative_processor_required"
                 )
-                conflict_payload = _build_ai_recognition_conflict_payload(
-                    raw_message=raw_message,
-                    chat_title=chat_title,
-                    deepseek_result=recog_result,
-                    mimo_result=mimo_result,
-                )
-                if conflict_payload is not None and system_operator_bot_enabled(system_operator_bot_config):
-                    await system_operator_conflict_sender(
-                        config=system_operator_bot_config,
-                        payload=conflict_payload,
-                    )
-                    return stats
-                if auto_trade_executor is not None:
-                    await asyncio.to_thread(auto_trade_executor, raw_message.id)
-            # Legacy lifecycle hook remains for callers that have not adopted
-            # the authoritative processor. MiMo application owns this in production.
-            if authoritative_processor is None and lifecycle_monitor is not None and recog_result is not None:
-                ai_payload = recog_result.ai_payload or {}
-                strategy_kind = ai_payload.get("strategy_kind")
-                if strategy_kind == "exit":
-                    strategy = ai_payload.get("strategy") or {}
-                    symbol = str(strategy.get("symbol") or "")
-                    side = str(strategy.get("side") or "")
-                    if symbol and side:
-                        await lifecycle_monitor.on_new_exit_signal(
-                            chat_id=chat_id,
-                            symbol=symbol,
-                            side=side,
-                            message_id=message_id,
-                        )
 
     if (
         strategy_alert_config is not None
@@ -603,59 +566,6 @@ def _record_expired_authoritative_recovery_gap(
         automation_reason=reason,
         notification_status="suppressed_expired_recovery",
     )
-
-
-def _build_ai_recognition_conflict_payload(
-    *,
-    raw_message: RawMessage,
-    chat_title: str | None,
-    deepseek_result: Any | None,
-    mimo_result: Any | None,
-) -> dict[str, Any] | None:
-    deepseek = _classify_deepseek_recognition(deepseek_result)
-    mimo = _classify_mimo_recognition(mimo_result)
-    if deepseek is None or mimo is None:
-        return None
-    if deepseek["kind"] == mimo["kind"]:
-        return None
-    return {
-        "chat_title": chat_title,
-        "chat_id": raw_message.chat_id,
-        "message_id": raw_message.message_id,
-        "posted_at": raw_message.posted_at,
-        "text": raw_message.text,
-        "deepseek": deepseek,
-        "mimo": mimo,
-    }
-
-
-def _classify_deepseek_recognition(result: Any | None) -> dict[str, str] | None:
-    if result is None:
-        return None
-    status = str(getattr(result, "status", "") or "").strip()
-    reason = str(getattr(result, "reason", "") or "").strip()
-    parse_source = str(getattr(result, "parse_source", "") or "").strip()
-    ai_payload = getattr(result, "ai_payload", None) or {}
-    lifecycle_event = ai_payload.get("lifecycle_event") if isinstance(ai_payload, dict) else None
-    if status == "识别失败":
-        return None
-    kind = "non_strategy"
-    if status == "是策略" or parse_source == "lifecycle_ai":
-        kind = "strategy_related"
-    if isinstance(lifecycle_event, dict) and str(lifecycle_event.get("event_type") or "none") != "none":
-        kind = "strategy_related"
-    return {"status": status or "-", "kind": kind, "reason": reason or "-"}
-
-
-def _classify_mimo_recognition(result: Any | None) -> dict[str, str] | None:
-    if result is None or getattr(result, "error_message", None):
-        return None
-    status = str(getattr(result, "status", "") or "").strip()
-    reason = str(getattr(result, "reason", "") or "").strip()
-    if status in {"", "识别失败"}:
-        return None
-    kind = "strategy_related" if status != "非策略" else "non_strategy"
-    return {"status": status, "kind": kind, "reason": reason or "-"}
 
 
 async def run_live_listener(
