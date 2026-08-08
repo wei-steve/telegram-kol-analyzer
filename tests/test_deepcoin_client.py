@@ -613,6 +613,58 @@ def test_deepcoin_client_lists_swap_symbols_from_market_tickers():
     assert http_client.requests[-1]["request_path"] == "/deepcoin/market/tickers?instType=SWAP"
 
 
+def test_deepcoin_client_lists_swap_instruments_with_validator_fields_untouched():
+    instrument = {
+        "instType": "SWAP",
+        "instId": "SOL-USDT-SWAP",
+        "ctVal": "1",
+        "lotSz": "1",
+        "minSz": "1",
+        "tickSz": "0.001",
+        "state": "live",
+    }
+    http_client = _CapturingHttpClient({"code": "0", "data": [instrument]})
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+        timestamp_factory=lambda: "2026-08-08T00:00:00.000Z",
+    )
+
+    instruments = client.list_swap_instruments()
+
+    assert instruments == [instrument]
+    assert http_client.requests[-1]["request_path"] == (
+        "/deepcoin/market/instruments?instType=SWAP"
+    )
+
+
+def test_deepcoin_client_list_swap_instruments_rejects_non_list_data():
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=_CapturingHttpClient(
+            {"code": "0", "data": {"unexpected": []}}
+        ),
+    )
+
+    with pytest.raises(DeepcoinClientError, match="invalid list response schema"):
+        client.list_swap_instruments()
+
+
+def test_deepcoin_client_list_swap_instruments_rejects_api_error():
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=_CapturingHttpClient(
+            {"code": "50011", "msg": "instrument service unavailable", "data": []}
+        ),
+    )
+
+    with pytest.raises(
+        DeepcoinClientError,
+        match="Deepcoin API error 50011: instrument service unavailable",
+    ):
+        client.list_swap_instruments()
+
+
 def test_get_ticker_quote_returns_structured_last_price_evidence():
     http_client = _CapturingHttpClient(
         {

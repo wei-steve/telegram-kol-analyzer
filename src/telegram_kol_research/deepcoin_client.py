@@ -38,6 +38,7 @@ DEEPCOIN_SET_POSITION_SLTP_PATH = "/deepcoin/trade/set-position-sltp"
 DEEPCOIN_CANCEL_POSITION_SLTP_PATH = "/deepcoin/trade/cancel-position-sltp"
 DEEPCOIN_ACCOUNT_POSITIONS_PATH = "/deepcoin/account/positions"
 DEEPCOIN_ACCOUNT_POSITIONS_HISTORY_PATH = "/deepcoin/account/positions-history"
+DEEPCOIN_MARKET_INSTRUMENTS_PATH = "/deepcoin/market/instruments"
 DEEPCOIN_MARKET_TICKERS_PATH = "/deepcoin/market/tickers"
 
 
@@ -130,6 +131,9 @@ class DeepcoinTradingClientProtocol(Protocol):
 
     def list_swap_symbols(self) -> list[dict[str, str]]:
         """Return tradable SWAP base symbols and instrument ids."""
+
+    def list_swap_instruments(self) -> list[dict[str, Any]]:
+        """Return raw SWAP product information for contract-spec validation."""
 
 
 def load_deepcoin_credentials(
@@ -555,6 +559,12 @@ class DeepcoinRestClient:
             symbols_by_instrument.values(),
             key=lambda item: item["symbol"],
         )
+
+    def list_swap_instruments(self) -> list[dict[str, Any]]:
+        payload = self._request(
+            "GET", f"{DEEPCOIN_MARKET_INSTRUMENTS_PATH}?instType=SWAP"
+        )
+        return _require_list_data(payload, endpoint=DEEPCOIN_MARKET_INSTRUMENTS_PATH)
 
     def _request(
         self,
