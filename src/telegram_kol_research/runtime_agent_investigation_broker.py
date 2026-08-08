@@ -34,6 +34,16 @@ _SENSITIVE_MARKER = re.compile(
     r"authorization|private.?key|\.env(?:\b|$))",
     re.IGNORECASE,
 )
+_OPAQUE_CREDENTIAL_PATTERN = re.compile(
+    r"(?:\bsk-[A-Za-z0-9_-]{12,}\b|"
+    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b|"
+    r"authorization\s*:\s*bearer\s+\S+|"
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----)",
+    re.IGNORECASE,
+)
+_EVIDENCE_REFERENCE_PATTERN = re.compile(
+    r"[a-z][a-z0-9_-]{1,31}:[A-Za-z0-9._-]{1,128}"
+)
 _SQL_WRITE = re.compile(
     r"\b(?:insert|update|delete|replace|create|alter|drop|attach|detach|"
     r"vacuum|reindex|analyze|pragma|begin|commit|rollback|savepoint|release)\b",
@@ -83,15 +93,42 @@ class InvestigationAuditRecord:
 
 
 def _canonical_arguments(request: InvestigationRequest) -> bytes:
+    def bounded_string(value: Any, maximum: int) -> str:
+        return value[:maximum] if isinstance(value, str) else "<invalid>"
+
+    def bounded_time(value: Any) -> str | None:
+        return value.isoformat() if isinstance(value, datetime) else (
+            None if value is None else "<invalid>"
+        )
+
+    object_ids = (
+        [bounded_string(value, 128) for value in request.object_ids[:33]]
+        if isinstance(request.object_ids, tuple)
+        else ["<invalid>"]
+    )
     return json.dumps(
         {
-            "evidence_kind": request.evidence_kind,
-            "incident_id": request.incident_id,
-            "maximum_bytes": request.maximum_bytes,
-            "object_ids": list(request.object_ids),
-            "query": request.query,
-            "since": request.since.isoformat() if request.since else None,
-            "until": request.until.isoformat() if request.until else None,
+            "evidence_kind": bounded_string(request.evidence_kind, 64),
+            "incident_id": (
+                request.incident_id
+                if isinstance(request.incident_id, int)
+                and not isinstance(request.incident_id, bool)
+                else "<invalid>"
+            ),
+            "maximum_bytes": (
+                request.maximum_bytes
+                if isinstance(request.maximum_bytes, int)
+                and not isinstance(request.maximum_bytes, bool)
+                else "<invalid>"
+            ),
+            "object_ids": object_ids,
+            "query": (
+                bounded_string(request.query, 64)
+                if request.query is not None
+                else None
+            ),
+            "since": bounded_time(request.since),
+            "until": bounded_time(request.until),
         },
         ensure_ascii=True,
         sort_keys=True,
@@ -113,12 +150,16 @@ def _contains_sensitive_material(value: Any, *, depth: int = 0) -> bool:
             _contains_sensitive_material(item, depth=depth + 1) for item in value
         )
     if isinstance(value, str):
-        return len(value) > 2048 or bool(_SENSITIVE_MARKER.search(value))
+        return (
+            len(value) > 2048
+            or bool(_SENSITIVE_MARKER.search(value))
+            or bool(_OPAQUE_CREDENTIAL_PATTERN.search(value))
+        )
     return value is not None and not isinstance(value, (bool, int, float))
 
 
 def _audited_evidence_kind(value: Any) -> str:
-    normalized = str(value)
+    normalized = value if isinstance(value, str) else "invalid"
     return (
         normalized
         if normalized in BROAD_READ_ONLY_EVIDENCE_KINDS
@@ -158,9 +199,13 @@ class InvestigationBroker:
             raise InvestigationDenied("incident_not_found")
         if request.evidence_kind not in BROAD_READ_ONLY_EVIDENCE_KINDS:
             raise InvestigationDenied("evidence_kind_denied")
-        if not 256 <= request.maximum_bytes <= 32_768:
+        if (
+            isinstance(request.maximum_bytes, bool)
+            or not isinstance(request.maximum_bytes, int)
+            or not 256 <= request.maximum_bytes <= 32_768
+        ):
             raise InvestigationDenied("bounds_invalid")
-        if len(request.object_ids) > 32:
+        if not isinstance(request.object_ids, tuple) or len(request.object_ids) > 32:
             raise InvestigationDenied("bounds_invalid")
         if any(
             not isinstance(value, str)
@@ -179,6 +224,10 @@ class InvestigationBroker:
         if (request.since is None) != (request.until is None):
             raise InvestigationDenied("bounds_invalid")
         if request.since is not None and request.until is not None:
+            if not isinstance(request.since, datetime) or not isinstance(
+                request.until, datetime
+            ):
+                raise InvestigationDenied("bounds_invalid")
             if (
                 request.until < request.since
                 or request.until - request.since > timedelta(days=31)
@@ -188,6 +237,26 @@ class InvestigationBroker:
     def execute(self, request: InvestigationRequest) -> dict[str, Any]:
         started = time.monotonic()
         fingerprint = hashlib.sha256(_canonical_arguments(request)).hexdigest()
+        requested_incident_id = (
+            request.incident_id
+            if isinstance(request.incident_id, int)
+            and not isinstance(request.incident_id, bool)
+            else 0
+        )
+        audited_kind = _audited_evidence_kind(request.evidence_kind)
+        self._audit_recorder(
+            InvestigationAuditRecord(
+                incident_id=requested_incident_id,
+                evidence_kind=audited_kind,
+                arguments_fingerprint=fingerprint,
+                result_status="started",
+                evidence_reference=None,
+                result_bytes=0,
+                duration_ms=0,
+                denial_code=None,
+                created_at=self._clock(),
+            )
+        )
         try:
             self._validate(request)
             provider = self._providers.get(request.evidence_kind)
@@ -206,7 +275,9 @@ class InvestigationBroker:
                 or any(
                     not isinstance(reference, str)
                     or not 1 <= len(reference) <= 255
+                    or not _EVIDENCE_REFERENCE_PATTERN.fullmatch(reference)
                     or _SENSITIVE_MARKER.search(reference)
+                    or _OPAQUE_CREDENTIAL_PATTERN.search(reference)
                     for reference in references
                 )
             ):
@@ -215,7 +286,10 @@ class InvestigationBroker:
                     if isinstance(references, (list, tuple))
                     and any(
                         isinstance(reference, str)
-                        and _SENSITIVE_MARKER.search(reference)
+                        and (
+                            _SENSITIVE_MARKER.search(reference)
+                            or _OPAQUE_CREDENTIAL_PATTERN.search(reference)
+                        )
                         for reference in references
                     )
                     else "result_contract_invalid"
@@ -238,12 +312,9 @@ class InvestigationBroker:
             self._audit_recorder(
                 InvestigationAuditRecord(
                     incident_id=(
-                        request.incident_id
-                        if isinstance(request.incident_id, int)
-                        and not isinstance(request.incident_id, bool)
-                        else 0
+                        requested_incident_id
                     ),
-                    evidence_kind=_audited_evidence_kind(request.evidence_kind),
+                    evidence_kind=audited_kind,
                     arguments_fingerprint=fingerprint,
                     result_status="denied",
                     evidence_reference=None,
@@ -258,12 +329,9 @@ class InvestigationBroker:
             self._audit_recorder(
                 InvestigationAuditRecord(
                     incident_id=(
-                        request.incident_id
-                        if isinstance(request.incident_id, int)
-                        and not isinstance(request.incident_id, bool)
-                        else 0
+                        requested_incident_id
                     ),
-                    evidence_kind=_audited_evidence_kind(request.evidence_kind),
+                    evidence_kind=audited_kind,
                     arguments_fingerprint=fingerprint,
                     result_status="error",
                     evidence_reference=None,
@@ -358,7 +426,13 @@ class SqliteReadOnlyEvidenceStore:
         }
         return sqlite3.SQLITE_DENY if action in denied else sqlite3.SQLITE_OK
 
-    def select(self, statement: str, *, maximum_rows: int) -> list[dict[str, Any]]:
+    def select(
+        self,
+        statement: str,
+        *,
+        maximum_rows: int,
+        maximum_bytes: int = 8192,
+    ) -> list[dict[str, Any]]:
         normalized = statement.strip()
         if (
             not isinstance(statement, str)
@@ -368,6 +442,7 @@ class SqliteReadOnlyEvidenceStore:
             or _SQL_WRITE.search(normalized)
             or not re.match(r"^(?:select|with)\b", normalized, re.IGNORECASE)
             or not 1 <= int(maximum_rows) <= 100
+            or not 256 <= int(maximum_bytes) <= 32_768
         ):
             raise InvestigationDenied("database_write_denied")
         uri = f"file:{quote(str(self.database_path))}?mode=ro"
@@ -375,14 +450,29 @@ class SqliteReadOnlyEvidenceStore:
             connection = sqlite3.connect(uri, uri=True)
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA query_only=ON")
+            connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, int(maximum_bytes))
             connection.set_authorizer(self._authorizer)
             cursor = connection.execute(normalized)
             rows = cursor.fetchmany(int(maximum_rows) + 1)
             if len(rows) > int(maximum_rows):
                 raise InvestigationDenied("result_too_large")
-            return [dict(row) for row in rows]
+            projected = [dict(row) for row in rows]
+            try:
+                encoded = json.dumps(
+                    projected,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            except (TypeError, ValueError) as exc:
+                raise InvestigationDenied("database_query_denied") from exc
+            if len(encoded) > int(maximum_bytes):
+                raise InvestigationDenied("result_too_large")
+            return projected
         except InvestigationDenied:
             raise
+        except sqlite3.DataError as exc:
+            raise InvestigationDenied("result_too_large") from exc
         except sqlite3.Error as exc:
             raise InvestigationDenied("database_query_denied") from exc
         finally:
@@ -411,7 +501,10 @@ class ReadOnlyFileEvidenceReader:
         if _SENSITIVE_MARKER.search(target.name):
             raise InvestigationDenied("credential_path_denied")
         try:
-            payload = target.read_bytes()
+            if target.stat().st_size > self.maximum_bytes:
+                raise InvestigationDenied("result_too_large")
+            with target.open("rb") as source:
+                payload = source.read(self.maximum_bytes + 1)
         except OSError as exc:
             raise InvestigationDenied("path_unavailable") from exc
         if len(payload) > self.maximum_bytes:

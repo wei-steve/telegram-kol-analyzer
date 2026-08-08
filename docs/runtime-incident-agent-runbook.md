@@ -588,10 +588,11 @@ existing incident, at most 32 bounded object IDs, an optional reviewed query
 name (never SQL or shell text), a maximum 31-day time window, and 256-32768
 result bytes.
 
-Every allowed, denied, and provider-error request appends one bounded
-`runtime_agent_investigation_audits` row containing only the incident ID,
-evidence category, arguments fingerprint, status, first evidence reference,
-byte/duration measures, and a closed denial code. Exception text, query
+Every request first appends a bounded `started` audit row before validation or
+provider execution, then appends an `allowed`, `denied`, or `error` terminal
+row. A crash or provider hang therefore remains visible as a started request.
+Rows contain only the incident ID, evidence category, arguments fingerprint,
+status, first evidence reference, byte/duration measures, and a closed denial code. Exception text, query
 contents, credentials, raw provider payloads, and model responses are never
 persisted. Database evidence uses SQLite URI `mode=ro` plus
 `PRAGMA query_only=ON` and an authorizer that refuses DML, DDL, transaction,
@@ -599,7 +600,9 @@ ATTACH/DETACH, and PRAGMA operations. It intentionally does not use
 `immutable=1` against the live WAL database because that would omit committed
 WAL facts.
 
-File evidence is limited to reviewed read-only roots, rejects traversal and
+Opaque `sk-` credentials, JWTs, bearer values, private-key material, and
+sensitive evidence references are rejected before model output or audit
+persistence. File evidence is limited to reviewed read-only roots, rejects traversal and
 credential-like paths, and exposes no create/modify/delete API. Network
 evidence authorizes HTTPS GET only, rejects forwarded/proxy headers, limits
 Deepcoin to an exact read-endpoint allowlist, and denies unapproved hosts and
@@ -612,7 +615,9 @@ if that identity can write source or configuration. A mode-0700
 `/var/lib/telegram-kol-runtime-agent` state directory is its only private
 analysis workspace. The root-owned Runtime Agent environment file is
 inaccessible inside the service mount namespace after systemd loads it.
-Existing database write access remains limited to the reviewed incident/claim
+The production data directory has no Agent default ACL and is not mounted
+writable; only the existing SQLite database and its present WAL/SHM/journal
+files receive explicit write exceptions. Existing database write access remains limited to the reviewed incident/claim
 lifecycle and the new audit ledger; production fact reads made by the broker
 are query-only.
 

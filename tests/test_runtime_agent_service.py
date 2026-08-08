@@ -20,7 +20,10 @@ def test_runtime_agent_sidecar_unit_is_separate_and_dormant_until_enabled():
     assert "CapabilityBoundingSet=" in text
     assert "PrivateDevices=true" in text
     assert "ProtectSystem=strict" in text
-    assert "ReadWritePaths=/opt/telegram-kol-analyzer/data" in text
+    assert "ReadWritePaths=/opt/telegram-kol-analyzer/data/research.db" in text
+    assert "ReadWritePaths=-/opt/telegram-kol-analyzer/data/research.db-wal" in text
+    assert "ReadWritePaths=-/opt/telegram-kol-analyzer/data/research.db-shm" in text
+    assert "ReadWritePaths=/opt/telegram-kol-analyzer/data\n" not in text
     assert "StateDirectory=telegram-kol-runtime-agent" in text
     assert "InaccessiblePaths=/opt/telegram-kol-analyzer/config/runtime_incident_agent.env" in text
     assert "UMask=0077" in text
@@ -40,3 +43,7 @@ def test_runtime_agent_sidecar_unit_is_separate_and_dormant_until_enabled():
     assert "PRIVATE_WORKSPACE=\"/var/lib/telegram-kol-runtime-agent\"" in installer
     assert "test -w \"$PRODUCTION_ROOT/src\"" in installer
     assert "Agent identity can write reviewed source" in installer
+    assert 'setfacl -m "u:$AGENT_USER:--x" "$DATA_DIRECTORY"' in installer
+    assert 'd:u:$AGENT_USER:rwx' not in installer
+    assert 'test -w "$DATA_DIRECTORY"' in installer
+    assert "Agent identity can write the production data directory" in installer

@@ -45,13 +45,12 @@ def test_broker_allows_every_closed_read_category_and_audits_it(evidence_kind):
 
     assert result["data"]["incident_id"] == 17
     assert result["evidence_refs"] == [f"{evidence_kind}:17"]
-    assert len(audit_rows) == 1
-    assert audit_rows[0].incident_id == 17
-    assert audit_rows[0].evidence_kind == evidence_kind
-    assert audit_rows[0].result_status == "allowed"
-    assert audit_rows[0].denial_code is None
-    assert audit_rows[0].result_bytes > 0
-    assert len(audit_rows[0].arguments_fingerprint) == 64
+    assert [row.result_status for row in audit_rows] == ["started", "allowed"]
+    assert audit_rows[-1].incident_id == 17
+    assert audit_rows[-1].evidence_kind == evidence_kind
+    assert audit_rows[-1].denial_code is None
+    assert audit_rows[-1].result_bytes > 0
+    assert len(audit_rows[-1].arguments_fingerprint) == 64
 
 
 @pytest.mark.parametrize(
@@ -78,10 +77,9 @@ def test_broker_refuses_unsafe_requests_and_audits_the_denial(
     with pytest.raises(InvestigationDenied, match=denial_code):
         broker.execute(investigation_request)
 
-    assert len(audit_rows) == 1
-    assert audit_rows[0].result_status == "denied"
-    assert audit_rows[0].denial_code == denial_code
-    assert audit_rows[0].evidence_reference is None
+    assert [row.result_status for row in audit_rows] == ["started", "denied"]
+    assert audit_rows[-1].denial_code == denial_code
+    assert audit_rows[-1].evidence_reference is None
 
 
 def test_broker_refuses_unbounded_time_ids_and_sensitive_provider_output():
@@ -119,7 +117,7 @@ def test_broker_refuses_unbounded_time_ids_and_sensitive_provider_output():
         broker.execute(
             InvestigationRequest(incident_id=17, evidence_kind="message_evidence")
         )
-    assert [row.denial_code for row in audit_rows] == [
+    assert [row.denial_code for row in audit_rows if row.result_status != "started"] == [
         "bounds_invalid",
         "bounds_invalid",
         "sensitive_result",
@@ -150,8 +148,8 @@ def test_sensitive_invalid_kind_and_evidence_reference_are_never_audited_verbati
         )
 
     assert audit_rows[0].evidence_kind == "invalid"
-    assert audit_rows[0].evidence_reference is None
     assert audit_rows[1].evidence_reference is None
+    assert audit_rows[3].evidence_reference is None
     assert "must-not-persist" not in repr(audit_rows)
 
 
@@ -200,6 +198,23 @@ def test_sqlite_read_only_store_sees_committed_wal_rows_without_mutating(tmp_pat
     writer.close()
 
 
+def test_sqlite_store_denies_oversized_cell_before_materializing_result(tmp_path):
+    database = tmp_path / "large.db"
+    connection = sqlite3.connect(database)
+    connection.execute("create table facts (payload blob)")
+    connection.execute("insert into facts values (?)", (b"x" * 1_000_000,))
+    connection.commit()
+    connection.close()
+
+    store = SqliteReadOnlyEvidenceStore(database)
+    with pytest.raises(InvestigationDenied, match="result_too_large"):
+        store.select(
+            "select payload from facts",
+            maximum_rows=10,
+            maximum_bytes=1024,
+        )
+
+
 def test_file_reader_is_bounded_read_only_and_refuses_credentials(tmp_path):
     source_root = tmp_path / "source"
     scratch_root = tmp_path / "scratch"
@@ -220,6 +235,10 @@ def test_file_reader_is_bounded_read_only_and_refuses_credentials(tmp_path):
         reader.read_text(credential)
     with pytest.raises(InvestigationDenied, match="path_denied"):
         reader.read_text(tmp_path / "outside.txt")
+    oversized = source_root / "oversized.log"
+    oversized.write_bytes(b"x" * 2048)
+    with pytest.raises(InvestigationDenied, match="result_too_large"):
+        reader.read_text(oversized)
     assert not hasattr(reader, "write_text")
     assert not hasattr(reader, "delete")
 
@@ -275,7 +294,9 @@ def test_broker_persists_one_bounded_audit_row_per_request(tmp_path):
             RuntimeAgentInvestigationAudit.id
         ).all()
     assert [(row.result_status, row.denial_code) for row in rows] == [
+        ("started", None),
         ("allowed", None),
+        ("started", None),
         ("denied", "query_denied"),
     ]
     assert all(row.result_bytes <= 32_768 for row in rows)
@@ -299,7 +320,58 @@ def test_provider_exception_is_audited_without_exception_text():
             InvestigationRequest(incident_id=17, evidence_kind="journal_summary")
         )
 
-    assert len(audit_rows) == 1
-    assert audit_rows[0].result_status == "error"
-    assert audit_rows[0].denial_code == "provider_error"
-    assert "sensitive-detail" not in repr(audit_rows[0])
+    assert [row.result_status for row in audit_rows] == ["started", "error"]
+    assert audit_rows[-1].denial_code == "provider_error"
+    assert "sensitive-detail" not in repr(audit_rows[-1])
+
+
+def test_malformed_runtime_arguments_still_leave_started_and_denied_audits():
+    audit_rows = []
+    broker = InvestigationBroker(
+        providers={},
+        incident_exists=lambda incident_id: True,
+        audit_recorder=audit_rows.append,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(InvestigationDenied, match="bounds_invalid"):
+        broker.execute(
+            InvestigationRequest(
+                incident_id=17,
+                evidence_kind="message_evidence",
+                since=object(),
+                until=object(),
+            )
+        )
+    assert [row.result_status for row in audit_rows] == ["started", "denied"]
+
+
+@pytest.mark.parametrize(
+    "opaque_secret",
+    [
+        "sk-ABCDEFGHIJKLMNOPQRSTUVWX",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signaturevalue1234",
+        "authorization: bearer ABCDEFGHIJKLMNOPQRSTUVWX",
+    ],
+)
+def test_opaque_credentials_are_denied_in_data_and_evidence_refs(opaque_secret):
+    for location in ("data", "reference"):
+        audit_rows = []
+        broker = InvestigationBroker(
+            providers={
+                "message_evidence": lambda request: {
+                    "data": {"value": opaque_secret if location == "data" else "safe"},
+                    "evidence_refs": [
+                        f"incident:{opaque_secret}" if location == "reference" else "incident:17"
+                    ],
+                }
+            },
+            incident_exists=lambda incident_id: True,
+            audit_recorder=audit_rows.append,
+            clock=lambda: NOW,
+        )
+        with pytest.raises(InvestigationDenied, match="sensitive_result"):
+            broker.execute(
+                InvestigationRequest(incident_id=17, evidence_kind="message_evidence")
+            )
+        assert opaque_secret not in repr(audit_rows)

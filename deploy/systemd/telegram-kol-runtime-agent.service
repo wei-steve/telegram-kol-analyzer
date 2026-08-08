@@ -45,7 +45,11 @@ SystemCallErrorNumber=EPERM
 SystemCallFilter=@system-service
 SystemCallFilter=~@mount @privileged
 ReadOnlyPaths=/opt/telegram-kol-analyzer
-ReadWritePaths=/opt/telegram-kol-analyzer/data
+ReadOnlyPaths=/opt/telegram-kol-analyzer/data
+ReadWritePaths=/opt/telegram-kol-analyzer/data/research.db
+ReadWritePaths=-/opt/telegram-kol-analyzer/data/research.db-wal
+ReadWritePaths=-/opt/telegram-kol-analyzer/data/research.db-shm
+ReadWritePaths=-/opt/telegram-kol-analyzer/data/research.db-journal
 ReadWritePaths=/var/lib/telegram-kol-runtime-agent
 InaccessiblePaths=/opt/telegram-kol-analyzer/config/runtime_incident_agent.env
 

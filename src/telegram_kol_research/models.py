@@ -3098,7 +3098,7 @@ class RuntimeAgentInvestigationAudit(Base):
             name="ck_runtime_agent_investigation_fingerprint",
         ),
         CheckConstraint(
-            "result_status IN ('allowed', 'denied', 'error')",
+            "result_status IN ('started', 'allowed', 'denied', 'error')",
             name="ck_runtime_agent_investigation_status",
         ),
         CheckConstraint(

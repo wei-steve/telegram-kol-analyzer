@@ -95,7 +95,8 @@ if [[ "$(id -u "$AGENT_USER")" -eq 0 || "$(id -gn "$AGENT_USER")" != "$AGENT_GRO
   exit 1
 fi
 
-setfacl -m "u:$AGENT_USER:rwx" -m "d:u:$AGENT_USER:rwx" "$DATA_DIRECTORY"
+setfacl -x "d:u:$AGENT_USER" "$DATA_DIRECTORY" 2>/dev/null || true
+setfacl -m "u:$AGENT_USER:--x" "$DATA_DIRECTORY"
 setfacl -m "u:$AGENT_USER:rw-" "$DATABASE_PATH"
 for sqlite_sidecar in \
   "$DATABASE_PATH-wal" \
@@ -106,8 +107,8 @@ do
     setfacl -m "u:$AGENT_USER:rw-" "$sqlite_sidecar"
   fi
 done
-if ! runuser -u "$AGENT_USER" -- test -w "$DATA_DIRECTORY"; then
-  echo "Agent identity cannot create SQLite sidecar files." >&2
+if runuser -u "$AGENT_USER" -- test -w "$DATA_DIRECTORY"; then
+  echo "Agent identity can write the production data directory." >&2
   exit 1
 fi
 if ! runuser -u "$AGENT_USER" -- test -w "$DATABASE_PATH"; then
