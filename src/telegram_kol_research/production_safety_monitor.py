@@ -151,7 +151,16 @@ _RECONCILIATION_SIGNAL_COLUMNS = frozenset(
     }
 )
 _ADAPTER_NAMES = frozenset(
-    {"service", "head", "settings", "journal", "events", "audit", "composite"}
+    {
+        "service",
+        "head",
+        "settings",
+        "journal",
+        "events",
+        "audit",
+        "composite",
+        "coverage",
+    }
 )
 _MONITOR_CAPTURE_REASON_CODES = frozenset(
     {"adapter_failure", "audit_incomplete"}
@@ -220,6 +229,11 @@ _FIXED_REASON_CODES = frozenset(
         "adjacent_entry_invariant_scan_incomplete",
         "entry_message_assembly_v2_mode_drift",
         "entry_revision_v2_mode_drift",
+        "executable_message_missing_contract",
+        "contract_violation_missing_stage1",
+        "message_operation_incident_missing_terminal",
+        "message_operation_supervisor_stale",
+        "message_operation_coverage_incomplete",
     }
 )
 _LOW_REPEAT_REASON_CODES = frozenset({"audit_abnormal"})
@@ -403,6 +417,7 @@ class MonitorSnapshot:
     entry_preamble_invariant_codes: Sequence[str] = ()
     adapter_failures: Sequence[str] = ()
     state_invalid: bool = False
+    message_operation_coverage: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -461,6 +476,10 @@ class ProductionSafetyAdapters:
     live_position_snapshot_path: Path | None = None
     checkout_path: Path = Path(".")
     settings_url: str = "http://127.0.0.1:8000/api/trading-settings"
+    message_operation_coverage_url: str = (
+        "http://127.0.0.1:8000/api/runtime-incidents/message-operation-coverage"
+    )
+    monitor_capture_token: str | None = None
     service_name: str = "telegram-kol.service"
     audit_command: tuple[str, ...] = (
         sys.executable,
@@ -493,6 +512,12 @@ class ProductionSafetyAdapters:
 
     def read_settings(self) -> Mapping[str, Any]:
         return read_loopback_settings(self.settings_url)
+
+    def read_message_operation_coverage(self) -> Mapping[str, Any]:
+        return read_message_operation_coverage(
+            self.message_operation_coverage_url,
+            token=self.monitor_capture_token,
+        )
 
     def count_journal_errors(self, *, since: datetime) -> int:
         return len(self._read_bounded_journal_lines(since=since))
@@ -2227,6 +2252,51 @@ def read_loopback_settings(
     }
 
 
+def read_message_operation_coverage(
+    url: str,
+    *,
+    token: str | None,
+    timeout_seconds: float = 30.0,
+) -> Mapping[str, Any]:
+    """Read the authenticated loopback-only coverage projection."""
+
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "::1"}
+        or parsed.path
+        != "/api/runtime-incidents/message-operation-coverage"
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("coverage URL must use the fixed loopback endpoint")
+    if not isinstance(token, str) or not re.fullmatch(
+        r"[A-Za-z0-9_-]{32,128}", token
+    ):
+        raise ValueError("coverage token unavailable")
+    body = bytearray()
+    with httpx.stream(
+        "GET",
+        url,
+        headers={"x-monitor-capture-token": token},
+        timeout=timeout_seconds,
+        trust_env=False,
+    ) as response:
+        response.raise_for_status()
+        for chunk in response.iter_bytes():
+            body.extend(chunk)
+            if len(body) > 32_768:
+                raise ValueError("coverage response too large")
+    payload = json.loads(
+        body,
+        object_pairs_hook=_strict_json_object,
+        parse_constant=_reject_json_constant,
+    )
+    if not isinstance(payload, Mapping):
+        raise ValueError("coverage response must be an object")
+    return payload
+
+
 def run_production_safety_monitor(
     *,
     expectations: MonitorExpectations,
@@ -2327,6 +2397,19 @@ def run_production_safety_monitor(
         if callable(entry_preamble_reader)
         else ()
     )
+    coverage_reader = getattr(
+        adapters, "read_message_operation_coverage", None
+    )
+    message_operation_coverage = (
+        _read_adapter(
+            coverage_reader,
+            "coverage",
+            failures,
+            None,
+        )
+        if callable(coverage_reader)
+        else None
+    )
     window_sources_complete = not {"journal", "events"}.intersection(failures)
 
     audit = None
@@ -2356,8 +2439,10 @@ def run_production_safety_monitor(
             entry_preamble_invariant_codes=entry_preamble_invariant_codes,
             adapter_failures=tuple(failures),
             state_invalid=state_integrity_alert_pending,
+            message_operation_coverage=message_operation_coverage,
         ),
         expectations,
+        checked_at=checked_at,
     )
 
     successful_audit_date = state.last_full_audit_date
@@ -3197,6 +3282,8 @@ def _uses_low_repeat_policy(result: MonitorResult) -> bool:
 def evaluate_monitor_snapshot(
     snapshot: MonitorSnapshot,
     expectations: MonitorExpectations,
+    *,
+    checked_at: datetime | None = None,
 ) -> MonitorResult:
     """Evaluate one already-collected snapshot without I/O or raw error retention."""
 
@@ -3257,6 +3344,17 @@ def evaluate_monitor_snapshot(
     )
     if snapshot.audit is not None:
         _evaluate_audit(snapshot.audit, reasons, details)
+    if snapshot.message_operation_coverage is not None:
+        _evaluate_message_operation_coverage(
+            snapshot.message_operation_coverage,
+            checked_at=(
+                _require_aware_datetime(checked_at)
+                if checked_at is not None
+                else datetime.now(UTC)
+            ),
+            reasons=reasons,
+            details=details,
+        )
 
     reason_codes = tuple(sorted(reasons))
     return MonitorResult(
@@ -3264,6 +3362,115 @@ def evaluate_monitor_snapshot(
         reason_codes=reason_codes,
         details=details,
     )
+
+
+_MESSAGE_OPERATION_COVERAGE_COUNT_FIELDS = frozenset(
+    {
+        "executable_messages_total",
+        "contracts_created_total",
+        "contracts_verified_total",
+        "contracts_violated_total",
+        "executable_without_contract_total",
+        "violations_without_stage1_total",
+        "stage1_pending",
+        "stage1_delivered",
+        "stage1_failed",
+        "agent_pending",
+        "agent_diagnosed",
+        "agent_failed",
+        "agent_timed_out",
+        "incidents_without_terminal_stage2_total",
+        "handoffs_persisted_total",
+        "stage2_pending",
+        "stage2_delivered",
+        "stage2_failed",
+        "oldest_nonterminal_age_seconds",
+    }
+)
+_MESSAGE_OPERATION_COVERAGE_FIELDS = _MESSAGE_OPERATION_COVERAGE_COUNT_FIELDS | {
+    "schema_version",
+    "coverage_enabled",
+    "scan_truncated",
+    "supervisor_last_success_at",
+}
+_MESSAGE_OPERATION_HEARTBEAT_MAX_AGE = timedelta(minutes=5)
+_MESSAGE_OPERATION_HEARTBEAT_FUTURE_SKEW = timedelta(minutes=1)
+
+
+def _evaluate_message_operation_coverage(
+    value: object,
+    *,
+    checked_at: datetime,
+    reasons: set[str],
+    details: dict[str, Any],
+) -> None:
+    if not isinstance(value, Mapping) or set(value) != (
+        _MESSAGE_OPERATION_COVERAGE_FIELDS
+    ):
+        reasons.add("message_operation_coverage_incomplete")
+        return
+    if value.get("schema_version") != 1:
+        reasons.add("message_operation_coverage_incomplete")
+        return
+    enabled = value.get("coverage_enabled")
+    truncated = value.get("scan_truncated")
+    if type(enabled) is not bool or type(truncated) is not bool:
+        reasons.add("message_operation_coverage_incomplete")
+        return
+    counts: dict[str, int] = {}
+    for name in _MESSAGE_OPERATION_COVERAGE_COUNT_FIELDS:
+        raw = value.get(name)
+        if type(raw) is not int or not 0 <= raw <= MAX_SAFE_COUNT:
+            reasons.add("message_operation_coverage_incomplete")
+            return
+        counts[name] = raw
+    heartbeat_raw = value.get("supervisor_last_success_at")
+    heartbeat = None
+    if heartbeat_raw is not None:
+        try:
+            heartbeat = _validate_canonical_aware_datetime(heartbeat_raw)
+        except (TypeError, ValueError):
+            reasons.add("message_operation_coverage_incomplete")
+            return
+
+    if not enabled:
+        return
+    if truncated:
+        reasons.add("message_operation_coverage_incomplete")
+    if (
+        counts["contracts_created_total"]
+        + counts["executable_without_contract_total"]
+        != counts["executable_messages_total"]
+        or counts["contracts_verified_total"]
+        + counts["contracts_violated_total"]
+        > counts["contracts_created_total"]
+        or counts["stage1_pending"]
+        + counts["stage1_delivered"]
+        + counts["stage1_failed"]
+        + counts["violations_without_stage1_total"]
+        != counts["contracts_violated_total"]
+        or counts["stage2_pending"]
+        + counts["stage2_delivered"]
+        + counts["stage2_failed"]
+        > counts["handoffs_persisted_total"]
+    ):
+        reasons.add("message_operation_coverage_incomplete")
+    if counts["executable_without_contract_total"]:
+        reasons.add("executable_message_missing_contract")
+    if counts["violations_without_stage1_total"]:
+        reasons.add("contract_violation_missing_stage1")
+    if counts["incidents_without_terminal_stage2_total"]:
+        reasons.add("message_operation_incident_missing_terminal")
+    if (
+        heartbeat is None
+        or checked_at - heartbeat > _MESSAGE_OPERATION_HEARTBEAT_MAX_AGE
+        or heartbeat - checked_at > _MESSAGE_OPERATION_HEARTBEAT_FUTURE_SKEW
+    ):
+        reasons.add("message_operation_supervisor_stale")
+    details["message_operation_coverage"] = {
+        name: counts[name]
+        for name in sorted(_MESSAGE_OPERATION_COVERAGE_COUNT_FIELDS)
+    }
 
 
 _COMPOSITE_INVARIANT_CODES = frozenset(
@@ -3799,6 +4006,31 @@ _ALERT_RULES: Mapping[str, tuple[str, str, str]] = {
     "stalled_composite_component": (
         "critical", "复合仓位管理组件停滞", "有组件超过时限未取得持久化进展。",
     ),
+    "executable_message_missing_contract": (
+        "critical",
+        "可执行消息缺少监督合约",
+        "已识别的可执行消息没有建立预期操作合约。",
+    ),
+    "contract_violation_missing_stage1": (
+        "critical",
+        "操作违约未发送第一阶段通知",
+        "消息操作已确认违约，但缺少对应的即时告警记录。",
+    ),
+    "message_operation_incident_missing_terminal": (
+        "critical",
+        "AI Agent 调查缺少可见终态",
+        "消息操作事件尚未形成已送达的调查结果和 Codex 交接。",
+    ),
+    "message_operation_supervisor_stale": (
+        "critical",
+        "消息操作监督器心跳过期",
+        "消息操作监督器未在规定时间内完成检查。",
+    ),
+    "message_operation_coverage_incomplete": (
+        "critical",
+        "消息操作覆盖检查不完整",
+        "端到端覆盖投影被截断、格式错误或计数不一致。",
+    ),
 }
 _ALERT_REASON_PRIORITY = (
     "authoritative_processor_required",
@@ -3808,6 +4040,11 @@ _ALERT_REASON_PRIORITY = (
     "live_position_retained_tp_oversized",
     "completed_batch_missing_component_evidence",
     "stalled_composite_component",
+    "executable_message_missing_contract",
+    "contract_violation_missing_stage1",
+    "message_operation_incident_missing_terminal",
+    "message_operation_supervisor_stale",
+    "message_operation_coverage_incomplete",
     "duplicate_manual_close",
     "service_inactive",
     "auto_trade_enabled_drift",

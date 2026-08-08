@@ -205,6 +205,14 @@ if ! runuser -u "$MONITOR_USER" -- test -r "$PRODUCTION_ROOT/data/research.db"; 
   echo "Monitor identity cannot read the production database." >&2
   exit 1
 fi
+if runuser -u "$MONITOR_USER" -- test -w "$PRODUCTION_ROOT/data/research.db"; then
+  echo "Monitor identity must not have production database write access." >&2
+  exit 1
+fi
+if runuser -u "$MONITOR_USER" -- test -r "$RUNTIME_POLICY_FILE"; then
+  echo "Monitor identity must not read the Runtime Agent policy or provider settings." >&2
+  exit 1
+fi
 LIVE_POSITION_SNAPSHOT="$PRODUCTION_ROOT/data/web_cache/deepcoin_live_positions.json"
 if [[ -e "$LIVE_POSITION_SNAPSHOT" ]] && \
    ! runuser -u "$MONITOR_USER" -- test -r "$LIVE_POSITION_SNAPSHOT"; then

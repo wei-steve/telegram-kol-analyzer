@@ -2374,6 +2374,7 @@ def monitor_production_safety(
             database_path=database_path,
             checkout_path=checkout_path,
             settings_url=settings_url,
+            monitor_capture_token=runtime_config.monitor_capture_token,
         ),
         now=datetime.now(UTC),
         notify=notify,

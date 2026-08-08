@@ -37,6 +37,7 @@ from telegram_kol_research.production_safety_monitor import format_monitor_alert
 from telegram_kol_research.production_safety_monitor import load_monitor_state
 from telegram_kol_research.production_safety_monitor import read_abnormal_execution_events
 from telegram_kol_research.production_safety_monitor import read_loopback_settings
+from telegram_kol_research.production_safety_monitor import read_message_operation_coverage
 from telegram_kol_research.production_safety_monitor import read_composite_management_invariants
 from telegram_kol_research.production_safety_monitor import read_entry_preamble_invariants
 from telegram_kol_research.production_safety_monitor import read_adjacent_entry_invariants
@@ -247,6 +248,82 @@ def _snapshot(**overrides):
     }
     values.update(overrides)
     return MonitorSnapshot(**values)
+
+
+def _healthy_message_operation_coverage(**overrides):
+    values = {
+        "schema_version": 1,
+        "coverage_enabled": True,
+        "scan_truncated": False,
+        "executable_messages_total": 2,
+        "contracts_created_total": 2,
+        "contracts_verified_total": 1,
+        "contracts_violated_total": 1,
+        "executable_without_contract_total": 0,
+        "violations_without_stage1_total": 0,
+        "stage1_pending": 0,
+        "stage1_delivered": 1,
+        "stage1_failed": 0,
+        "agent_pending": 0,
+        "agent_diagnosed": 1,
+        "agent_failed": 0,
+        "agent_timed_out": 0,
+        "incidents_without_terminal_stage2_total": 0,
+        "handoffs_persisted_total": 1,
+        "stage2_pending": 0,
+        "stage2_delivered": 1,
+        "stage2_failed": 0,
+        "oldest_nonterminal_age_seconds": 0,
+        "supervisor_last_success_at": "2026-08-09T01:59:30+00:00",
+    }
+    values.update(overrides)
+    return values
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"executable_without_contract_total": 1}, "executable_message_missing_contract"),
+        ({"violations_without_stage1_total": 1}, "contract_violation_missing_stage1"),
+        (
+            {"incidents_without_terminal_stage2_total": 1},
+            "message_operation_incident_missing_terminal",
+        ),
+        (
+            {"supervisor_last_success_at": "2026-08-09T01:50:00+00:00"},
+            "message_operation_supervisor_stale",
+        ),
+        ({"scan_truncated": True}, "message_operation_coverage_incomplete"),
+    ],
+)
+def test_message_operation_coverage_gap_makes_monitor_unhealthy(overrides, reason):
+    result = evaluate_monitor_snapshot(
+        _snapshot(
+            message_operation_coverage=_healthy_message_operation_coverage(
+                **overrides
+            )
+        ),
+        EXPECTATIONS,
+        checked_at=datetime(2026, 8, 9, 2, 0, tzinfo=UTC),
+    )
+
+    assert result.healthy is False
+    assert reason in result.reason_codes
+
+
+def test_disabled_message_operation_coverage_is_a_clean_rollback_state():
+    result = evaluate_monitor_snapshot(
+        _snapshot(
+            message_operation_coverage=_healthy_message_operation_coverage(
+                coverage_enabled=False,
+                supervisor_last_success_at=None,
+            )
+        ),
+        EXPECTATIONS,
+        checked_at=datetime(2026, 8, 9, 2, 0, tzinfo=UTC),
+    )
+
+    assert result.healthy is True
 
 
 def _healthy_audit(**overrides):
@@ -4623,6 +4700,90 @@ def test_loopback_settings_disable_environment_proxy_trust(monkeypatch):
             {"timeout": 30.0, "trust_env": False},
         )
     ]
+
+
+def test_message_operation_coverage_reader_is_authenticated_bounded_and_no_proxy(
+    monkeypatch,
+):
+    calls = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield json.dumps(_healthy_message_operation_coverage()).encode("utf-8")
+
+    def stream(*args, **kwargs):
+        calls.append((args, kwargs))
+        return Response()
+
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setattr(monitor_module.httpx, "stream", stream)
+
+    payload = read_message_operation_coverage(
+        "http://127.0.0.1:8000/api/runtime-incidents/message-operation-coverage",
+        token="c" * 43,
+    )
+
+    assert payload == _healthy_message_operation_coverage()
+    assert calls == [
+        (
+            (
+                "GET",
+                "http://127.0.0.1:8000/api/runtime-incidents/message-operation-coverage",
+            ),
+            {
+                "headers": {"x-monitor-capture-token": "c" * 43},
+                "timeout": 30.0,
+                "trust_env": False,
+            },
+        )
+    ]
+
+    with pytest.raises(ValueError, match="fixed loopback"):
+        read_message_operation_coverage(
+            "http://example.com/api/runtime-incidents/message-operation-coverage",
+            token="c" * 43,
+        )
+    with pytest.raises(ValueError, match="token unavailable"):
+        read_message_operation_coverage(
+            "http://127.0.0.1:8000/api/runtime-incidents/message-operation-coverage",
+            token=None,
+        )
+
+
+def test_message_operation_coverage_reader_rejects_oversized_response(monkeypatch):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield b"x" * 32_769
+
+    monkeypatch.setattr(
+        monitor_module.httpx,
+        "stream",
+        lambda *args, **kwargs: Response(),
+    )
+
+    with pytest.raises(ValueError, match="too large"):
+        read_message_operation_coverage(
+            "http://127.0.0.1:8000/api/runtime-incidents/message-operation-coverage",
+            token="c" * 43,
+        )
 
 
 def test_successful_daily_audit_records_shanghai_date(tmp_path):

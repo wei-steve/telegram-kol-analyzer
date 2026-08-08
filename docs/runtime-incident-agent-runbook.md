@@ -495,10 +495,12 @@ settings:
   seconds and defaults to 60.
 
 Task 8R.5 adds a deterministic message-operation projector with no provider,
-notification, incident, Agent, planner, or exchange dependency. It is not
-imported by the web service, listener, recognition, contextual resolution,
-management, execution, protection, or reconciliation paths. Its only caller is
-the explicit CLI command `message-operation-supervisor --shadow --once`.
+notification, incident, Agent, planner, or exchange dependency. At its initial
+rollout its only caller was the explicit CLI command
+`message-operation-supervisor --shadow --once`. Phase 8R.10 later adds the same
+reviewed projector to an independent non-critical web background task; it does
+not run inline with listener, recognition, contextual resolution, management,
+execution, protection, or reconciliation work.
 
 The Phase 8R.5 settings are:
 
@@ -767,6 +769,69 @@ claim, that artifact/prompt/document IDs and hashes match, and that main,
 Agent, scanner, monitor, listener, and HTTP remain healthy. Immediate rollback
 clears the Stage 2 flag and restarts only the main service; persisted artifacts
 remain available through `runtime-incident-handoff <incident_id>`.
+
+### Phase 8R.10 coverage and silent-loss monitor
+
+Phase 8R.10 closes the end-to-end observability gap without adding model calls
+or business authority. When the existing message-operation supervisor flag is
+enabled in shadow mode, the main web process runs a bounded deterministic
+projection/outcome cycle in a separate background task. A cycle advances an
+in-memory contiguous raw-message cursor only after both projection and outcome
+collectors report zero errors. Only such a successful cycle updates
+`supervisor_last_success_at`. A failure is logged, leaves the prior cursor and
+heartbeat unchanged, and cannot interrupt or delay the message listener or a
+business worker.
+
+After each outcome cycle, the same isolated task captures only current-policy
+contracts that are durably `violated`, remain without an incident link, and
+have a raw-message ID above the activation watermark. It reuses the reviewed
+`capture_message_operation_failure` adapter, then requires both the exact
+contract link and affected-message relation to exist before the cycle may
+heartbeat. Capture failure remains retryable and independently visible; the
+CLI's original manual shadow command still creates no incident. The resulting
+relation is the existing input to per-message Stage 1, Agent eligibility, and
+Stage 2 rather than a replacement notification path.
+
+The authenticated loopback endpoint
+`/api/runtime-incidents/message-operation-coverage` exposes only the closed
+schema of aggregate counts, oldest nonterminal age, truncation state, and the
+last successful supervisor heartbeat. It reuses the root-owned monitor capture
+token, rejects remote clients, performs no write, and returns no message text,
+strategy content, provider response, exchange payload, or credential. The
+projection examines at most 1000 post-watermark source rows. If that bound is
+reached it reports `scan_truncated=true`; truncation is an explicit independent
+monitor failure, never silent omission. Advance or replace a production
+watermark only in a separately reviewed future-only safe window after proving
+all prior executable rows have durable contracts.
+
+The root-owned production monitor sends the capture token over fixed loopback
+HTTP with environment proxy use disabled and a 32 KiB response limit. Its
+installer fails if the dedicated monitor identity can write the production
+database or read the Runtime Agent policy/provider file. The monitor raises a
+fixed critical reason when any of these is true:
+
+- an executable authoritative message lacks its current-policy contract;
+- a violated contract lacks its durable Stage 1 row;
+- a message-operation incident lacks a delivered operator-visible Stage 2
+  terminal artifact;
+- the supervisor heartbeat is missing or older than five minutes (with at most
+  one minute of future clock skew); or
+- the coverage schema, counts, or bounded scan is incomplete.
+
+With `TELEGRAM_KOL_MESSAGE_OPERATION_SUPERVISOR_ENABLED=false`, the endpoint
+reports `coverage_enabled=false` and the monitor treats the absent heartbeat as
+the reviewed clean rollback state. Deployment must therefore start dormant,
+verify the endpoint and independent monitor, then enable only in a new proven
+zero-in-flight safe window. Immediate rollback disables only the supervisor
+flag and restarts the main service; Stage 1, Agent diagnosis, handoff delivery,
+scanner, independent monitor, and all business paths retain their prior state.
+Do not delete contracts, outboxes, incidents, or handoffs during rollback.
+When enabled, the configured activation watermark must be a real nonnegative
+SQLite ID, must not be the fail-closed maximum-ID sentinel, and must not exceed
+the currently observed maximum raw-message ID. Invalid or unreadable watermark
+evidence prevents the task from starting and leaves the heartbeat absent, so
+the independent monitor reports the configuration drift instead of accepting
+an empty healthy scan.
 
 The operator approved a controlled Phase 8R.3 completion canary on 2026-08-08
 so that a rare natural multi-target failure cannot block later read-only Agent

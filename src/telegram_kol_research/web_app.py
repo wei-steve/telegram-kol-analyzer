@@ -18,7 +18,7 @@ import time
 from urllib.parse import urlencode
 
 import httpx
-from sqlalchemy import func
+from sqlalchemy import func, select
 
 try:
     from fastapi import FastAPI, Request
@@ -173,8 +173,14 @@ from telegram_kol_research.strategy_alerts import (
     strategy_alerts_enabled,
 )
 from telegram_kol_research.config import (
+    MessageOperationSupervisorConfig,
     RuntimeIncidentConfig,
+    load_message_operation_supervisor_config,
     load_runtime_incident_config,
+)
+from telegram_kol_research.message_operation_supervisor import (
+    build_message_operation_coverage_snapshot,
+    run_message_operation_supervisor_cycle,
 )
 from telegram_kol_research.system_operator_bot import (
     SystemOperatorBotConfig,
@@ -3407,6 +3413,94 @@ def _run_context_resolution_worker_for_app(app: FastAPI) -> dict[str, Any]:
     }
 
 
+async def _run_message_operation_supervisor_loop(app: FastAPI) -> None:
+    """Run the deterministic supervisor outside every message critical path."""
+
+    cursor = app.state.message_operation_supervisor_config.after_raw_message_id
+    while True:
+        observed_at = app.state.now_provider()
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=UTC)
+        else:
+            observed_at = observed_at.astimezone(UTC)
+        try:
+            result = await asyncio.to_thread(
+                app.state.message_operation_supervisor_runner,
+                app.state.session_factory,
+                after_raw_message_id=cursor,
+                capture_after_raw_message_id=(
+                    app.state.message_operation_supervisor_config.after_raw_message_id
+                ),
+                limit=(
+                    app.state.message_operation_supervisor_config.batch_limit
+                ),
+                observed_at=observed_at,
+                runtime_incident_config=app.state.runtime_incident_config,
+            )
+            if not isinstance(result, dict):
+                raise RuntimeError("message operation supervisor result invalid")
+            required_counts = {
+                key: result.get(key)
+                for key in (
+                    "errors",
+                    "outcome_errors",
+                    "model_calls",
+                    "outcome_model_calls",
+                    "capture_errors",
+                )
+            }
+            if any(
+                type(value) is not int or value < 0
+                for value in required_counts.values()
+            ):
+                raise RuntimeError("message operation supervisor result invalid")
+            errors = (
+                required_counts["errors"]
+                + required_counts["outcome_errors"]
+                + required_counts["capture_errors"]
+            )
+            model_calls = (
+                required_counts["model_calls"]
+                + required_counts["outcome_model_calls"]
+            )
+            if errors or model_calls:
+                raise RuntimeError("message operation supervisor cycle failed")
+            next_cursor = result.get("last_scanned_raw_message_id")
+            if type(next_cursor) is not int or next_cursor < cursor:
+                raise RuntimeError("message operation supervisor cursor invalid")
+            cursor = next_cursor
+            app.state.message_operation_supervisor_cursor = cursor
+            app.state.message_operation_supervisor_last_success_at = observed_at
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("message operation supervisor cycle failed")
+        await asyncio.sleep(
+            app.state.message_operation_supervisor_interval_seconds
+        )
+
+
+def _message_operation_supervisor_watermark_is_valid(app: FastAPI) -> bool:
+    config = app.state.message_operation_supervisor_config
+    if not config.enabled:
+        return True
+    if (
+        not config.shadow_only
+        or type(config.after_raw_message_id) is not int
+        or not 0 <= config.after_raw_message_id < 2**63 - 1
+    ):
+        return False
+    try:
+        with app.state.session_factory() as session:
+            latest_raw_id = session.execute(
+                select(func.max(RawMessage.id))
+            ).scalar_one()
+        return config.after_raw_message_id <= int(latest_raw_id or 0)
+    except Exception:
+        logger.exception("message operation supervisor watermark validation failed")
+        return False
+
+
 def create_web_app(
     database_path: str | Path,
     media_root: str | Path | None = None,
@@ -3447,6 +3541,11 @@ def create_web_app(
     runtime_agent_telegram_evidence_runner=None,
     runtime_incident_config: RuntimeIncidentConfig | None = None,
     runtime_incident_config_loader=None,
+    message_operation_supervisor_config: (
+        MessageOperationSupervisorConfig | None
+    ) = None,
+    message_operation_supervisor_runner=None,
+    message_operation_supervisor_interval_seconds: float = 30.0,
     live_position_snapshot_path: str | Path | None = None,
     position_snapshot_now_provider=None,
     position_snapshot_refresh_seconds: float = 5.0,
@@ -3463,6 +3562,20 @@ def create_web_app(
     async def lifespan(app: FastAPI):
         try:
             app.state.web_event_loop = asyncio.get_running_loop()
+            if (
+                app.state.message_operation_supervisor_config.enabled
+                and app.state.message_operation_supervisor_config.shadow_only
+                and app.state.message_operation_supervisor_watermark_valid
+                and app.state.message_operation_supervisor_task is None
+            ):
+                app.state.message_operation_supervisor_task = asyncio.create_task(
+                    _run_message_operation_supervisor_loop(app)
+                )
+                app.state.message_operation_supervisor_task.add_done_callback(
+                    _log_background_task_result(
+                        "message_operation_supervisor_task"
+                    )
+                )
             if app.state.semantic_review_task is None:
                 app.state.semantic_review_task = asyncio.create_task(
                     _supervise_semantic_review_runner(app)
@@ -3672,6 +3785,18 @@ def create_web_app(
                 )
             yield
         finally:
+            message_operation_supervisor_task = (
+                app.state.message_operation_supervisor_task
+            )
+            if message_operation_supervisor_task is not None:
+                message_operation_supervisor_task.cancel()
+                try:
+                    await message_operation_supervisor_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.message_operation_supervisor_task = None
             position_snapshot_startup_task = (
                 app.state.position_snapshot_startup_task
             )
@@ -3867,6 +3992,27 @@ def create_web_app(
         )
     except Exception:
         app.state.runtime_incident_config = RuntimeIncidentConfig()
+    app.state.message_operation_supervisor_config = (
+        message_operation_supervisor_config
+        if message_operation_supervisor_config is not None
+        else load_message_operation_supervisor_config()
+    )
+    app.state.message_operation_supervisor_runner = (
+        message_operation_supervisor_runner
+        or run_message_operation_supervisor_cycle
+    )
+    app.state.message_operation_supervisor_interval_seconds = max(
+        1.0,
+        min(float(message_operation_supervisor_interval_seconds), 3600.0),
+    )
+    app.state.message_operation_supervisor_task = None
+    app.state.message_operation_supervisor_last_success_at = None
+    app.state.message_operation_supervisor_cursor = (
+        app.state.message_operation_supervisor_config.after_raw_message_id
+    )
+    app.state.message_operation_supervisor_watermark_valid = (
+        _message_operation_supervisor_watermark_is_valid(app)
+    )
     app.state.monitor_incident_capture_lock = threading.Lock()
     app.state.chat_requester = request_grounded_chat_answer
     app.state.prompt_test_runner = run_prompt_draft_test
@@ -4290,6 +4436,22 @@ def create_web_app(
     def api_runtime_incidents_monitor_capture_health(request: Request):
         require_monitor_capture_auth(request)
         return {"available": True, "schema_version": 1}
+
+    @app.get("/api/runtime-incidents/message-operation-coverage")
+    def api_runtime_incidents_message_operation_coverage(request: Request):
+        require_monitor_capture_auth(request)
+        config = app.state.message_operation_supervisor_config
+        enabled = bool(config.enabled and config.shadow_only)
+        return build_message_operation_coverage_snapshot(
+            app.state.session_factory,
+            after_raw_message_id=config.after_raw_message_id,
+            supervisor_last_success_at=(
+                app.state.message_operation_supervisor_last_success_at
+            ),
+            observed_at=app.state.now_provider(),
+            limit=1_000,
+            coverage_enabled=enabled,
+        )
 
     @app.post("/api/runtime-incidents/monitor-capture")
     async def api_runtime_incidents_monitor_capture(request: Request):

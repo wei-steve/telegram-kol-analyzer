@@ -12,8 +12,14 @@ from sqlalchemy import exists, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.config import RuntimeIncidentConfig
 from telegram_kol_research.message_operation_types import (
     MESSAGE_OPERATION_VIOLATIONS,
+)
+from telegram_kol_research.message_operation_contracts import (
+    POLICY_VERSION,
+    project_message_operation_contract,
+    run_message_operation_shadow_once,
 )
 from telegram_kol_research.models import (
     ContextResolutionAttempt,
@@ -33,6 +39,10 @@ from telegram_kol_research.models import (
     StrategyManagementLeg,
     RuntimeIncident,
     RuntimeIncidentAffectedMessage,
+    RuntimeIncidentHandoffArtifact,
+)
+from telegram_kol_research.runtime_incident_adapters import (
+    capture_message_operation_failure,
 )
 
 
@@ -87,6 +97,394 @@ _IMMEDIATE_VIOLATIONS = {
 
 class MessageOperationEvaluationError(ValueError):
     """Raised when unbounded or unknown outcome evidence is presented."""
+
+
+_COVERAGE_LIMIT_MAX = 1_000
+_COVERAGE_AGE_MAX_SECONDS = 1_000_000_000
+_TERMINAL_RECOGNITION_STATES = frozenset({"completed", "failed"})
+
+
+def build_message_operation_coverage_snapshot(
+    session_factory: sessionmaker,
+    *,
+    after_raw_message_id: int,
+    supervisor_last_success_at: datetime | None,
+    observed_at: datetime,
+    limit: int = _COVERAGE_LIMIT_MAX,
+    coverage_enabled: bool = True,
+) -> dict[str, object]:
+    """Build one bounded, read-only end-to-end coverage projection."""
+
+    if (
+        type(after_raw_message_id) is not int
+        or not 0 <= after_raw_message_id <= 2**63 - 1
+    ):
+        raise MessageOperationEvaluationError("invalid coverage raw-message watermark")
+    if type(limit) is not int or not 1 <= limit <= _COVERAGE_LIMIT_MAX:
+        raise MessageOperationEvaluationError("coverage limit must be between 1 and 1000")
+    if type(coverage_enabled) is not bool:
+        raise MessageOperationEvaluationError("coverage_enabled must be boolean")
+    now = _aware_utc(observed_at)
+    heartbeat = (
+        None
+        if supervisor_last_success_at is None
+        else _aware_utc(supervisor_last_success_at)
+    )
+    if not coverage_enabled:
+        return _disabled_message_operation_coverage_snapshot()
+
+    with session_factory() as session:
+        source_rows = session.execute(
+            select(
+                RawMessage.id,
+                RawMessage.posted_at,
+                RawMessage.created_at,
+                RecognitionDecision.comparison_status,
+            )
+            .outerjoin(
+                RecognitionDecision,
+                RecognitionDecision.raw_message_id == RawMessage.id,
+            )
+            .where(RawMessage.id > after_raw_message_id)
+            .order_by(RawMessage.id)
+            .limit(limit + 1)
+        ).all()
+    scan_truncated = len(source_rows) > limit
+    source_rows = source_rows[:limit]
+
+    executable_raw_ids: list[int] = []
+    missing_contract_raw_ids: list[int] = []
+    missing_contract_times: list[datetime] = []
+    terminal_raw_ids: list[int] = []
+    for raw_id, posted_at, created_at, comparison_status in source_rows:
+        if str(comparison_status or "").strip().lower() not in (
+            _TERMINAL_RECOGNITION_STATES
+        ):
+            continue
+        terminal_raw_ids.append(int(raw_id))
+        projection = project_message_operation_contract(
+            session_factory,
+            raw_message_id=int(raw_id),
+        )
+        if projection is None:
+            continue
+        executable_raw_ids.append(int(raw_id))
+        with session_factory() as session:
+            contract_exists = session.execute(
+                select(MessageOperationContract.id).where(
+                    MessageOperationContract.raw_message_id == int(raw_id),
+                    MessageOperationContract.policy_version == POLICY_VERSION,
+                )
+            ).scalar_one_or_none()
+        if contract_exists is None:
+            missing_contract_raw_ids.append(int(raw_id))
+            missing_contract_times.append(posted_at or created_at)
+
+    with session_factory() as session:
+        contracts = (
+            session.execute(
+                select(MessageOperationContract)
+                .where(
+                    MessageOperationContract.raw_message_id.in_(terminal_raw_ids),
+                    MessageOperationContract.policy_version == POLICY_VERSION,
+                )
+                .order_by(MessageOperationContract.id)
+            ).scalars().all()
+            if terminal_raw_ids
+            else []
+        )
+        contract_ids = [int(row.id) for row in contracts]
+        stage1_rows = (
+            session.execute(
+                select(MessageOperationStage1Notification).where(
+                    MessageOperationStage1Notification.message_operation_contract_id.in_(
+                        contract_ids
+                    )
+                )
+            ).scalars().all()
+            if contract_ids
+            else []
+        )
+        incident_rows = (
+            session.execute(
+                select(RuntimeIncident)
+                .join(
+                    RuntimeIncidentAffectedMessage,
+                    RuntimeIncidentAffectedMessage.runtime_incident_id
+                    == RuntimeIncident.id,
+                )
+                .where(
+                    RuntimeIncidentAffectedMessage.message_operation_contract_id.in_(
+                        contract_ids
+                    ),
+                    RuntimeIncident.incident_type == "message_operation_failure",
+                )
+                .distinct()
+                .order_by(RuntimeIncident.id)
+            ).scalars().all()
+            if contract_ids
+            else []
+        )
+        incident_ids = [int(row.id) for row in incident_rows]
+        handoff_rows = (
+            session.execute(
+                select(RuntimeIncidentHandoffArtifact)
+                .where(
+                    RuntimeIncidentHandoffArtifact.runtime_incident_id.in_(
+                        incident_ids
+                    )
+                )
+                .order_by(
+                    RuntimeIncidentHandoffArtifact.runtime_incident_id,
+                    RuntimeIncidentHandoffArtifact.diagnosis_revision,
+                    RuntimeIncidentHandoffArtifact.id,
+                )
+            ).scalars().all()
+            if incident_ids
+            else []
+        )
+
+    stage1_by_contract = {
+        int(row.message_operation_contract_id): row for row in stage1_rows
+    }
+    latest_handoff_by_incident: dict[int, RuntimeIncidentHandoffArtifact] = {}
+    for row in handoff_rows:
+        latest_handoff_by_incident[int(row.runtime_incident_id)] = row
+
+    violated_contracts = [row for row in contracts if row.status == "violated"]
+    violations_without_stage1 = sum(
+        1 for row in violated_contracts if int(row.id) not in stage1_by_contract
+    )
+    incidents_without_terminal = sum(
+        1
+        for row in incident_rows
+        if (
+            latest_handoff_by_incident.get(int(row.id)) is None
+            or latest_handoff_by_incident[int(row.id)].status != "delivered"
+        )
+    )
+
+    latest_handoffs = tuple(latest_handoff_by_incident.values())
+    failure_outcomes = {"provider_failed", "tool_failed", "evidence_incomplete"}
+    nonterminal_times: list[datetime] = list(missing_contract_times)
+    nonterminal_times.extend(
+        row.created_at for row in contracts if row.status == "observing"
+    )
+    nonterminal_times.extend(
+        row.created_at
+        for row in stage1_rows
+        if row.status not in {"delivered", "exhausted"}
+    )
+    nonterminal_times.extend(
+        row.first_occurred_at
+        for row in incident_rows
+        if (
+            latest_handoff_by_incident.get(int(row.id)) is None
+            or latest_handoff_by_incident[int(row.id)].status != "delivered"
+        )
+    )
+    nonterminal_times.extend(
+        row.created_at
+        for row in latest_handoffs
+        if row.status not in {"delivered", "exhausted"}
+    )
+    oldest_age = max(
+        (
+            max(0, int((now - _aware_utc(value)).total_seconds()))
+            for value in nonterminal_times
+            if isinstance(value, datetime)
+        ),
+        default=0,
+    )
+    oldest_age = min(oldest_age, _COVERAGE_AGE_MAX_SECONDS)
+
+    return {
+        "schema_version": 1,
+        "coverage_enabled": coverage_enabled,
+        "scan_truncated": scan_truncated,
+        "executable_messages_total": len(executable_raw_ids),
+        "contracts_created_total": len(contracts),
+        "contracts_verified_total": sum(
+            row.status in {"verified", "duplicate", "superseded"}
+            for row in contracts
+        ),
+        "contracts_violated_total": len(violated_contracts),
+        "executable_without_contract_total": len(missing_contract_raw_ids),
+        "violations_without_stage1_total": violations_without_stage1,
+        "stage1_pending": sum(
+            row.status in {"pending", "delivering"} for row in stage1_rows
+        ),
+        "stage1_delivered": sum(row.status == "delivered" for row in stage1_rows),
+        "stage1_failed": sum(
+            row.status in {"failed", "exhausted"} for row in stage1_rows
+        ),
+        "agent_pending": sum(
+            row.status in {"pending", "claimed", "retry_pending"}
+            for row in incident_rows
+        ),
+        "agent_diagnosed": sum(
+            row.outcome_kind in {"diagnosed", "reused"} for row in latest_handoffs
+        ),
+        "agent_failed": sum(
+            row.outcome_kind in failure_outcomes for row in latest_handoffs
+        ),
+        "agent_timed_out": sum(
+            row.outcome_kind == "timed_out" for row in latest_handoffs
+        ),
+        "incidents_without_terminal_stage2_total": incidents_without_terminal,
+        "handoffs_persisted_total": len(handoff_rows),
+        "stage2_pending": sum(
+            row.status in {"pending", "delivering"} for row in latest_handoffs
+        ),
+        "stage2_delivered": sum(
+            row.status == "delivered" for row in latest_handoffs
+        ),
+        "stage2_failed": sum(
+            row.status in {"failed", "exhausted"} for row in latest_handoffs
+        ),
+        "oldest_nonterminal_age_seconds": oldest_age,
+        "supervisor_last_success_at": (
+            heartbeat.isoformat() if heartbeat is not None else None
+        ),
+    }
+
+
+def _disabled_message_operation_coverage_snapshot() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "coverage_enabled": False,
+        "scan_truncated": False,
+        "executable_messages_total": 0,
+        "contracts_created_total": 0,
+        "contracts_verified_total": 0,
+        "contracts_violated_total": 0,
+        "executable_without_contract_total": 0,
+        "violations_without_stage1_total": 0,
+        "stage1_pending": 0,
+        "stage1_delivered": 0,
+        "stage1_failed": 0,
+        "agent_pending": 0,
+        "agent_diagnosed": 0,
+        "agent_failed": 0,
+        "agent_timed_out": 0,
+        "incidents_without_terminal_stage2_total": 0,
+        "handoffs_persisted_total": 0,
+        "stage2_pending": 0,
+        "stage2_delivered": 0,
+        "stage2_failed": 0,
+        "oldest_nonterminal_age_seconds": 0,
+        "supervisor_last_success_at": None,
+    }
+
+
+def run_message_operation_supervisor_cycle(
+    session_factory: sessionmaker,
+    *,
+    after_raw_message_id: int,
+    capture_after_raw_message_id: int,
+    limit: int,
+    observed_at: datetime,
+    runtime_incident_config: RuntimeIncidentConfig,
+) -> dict[str, int]:
+    """Run one bounded projection plus outcome cycle with zero model calls."""
+
+    projection = run_message_operation_shadow_once(
+        session_factory,
+        after_raw_message_id=after_raw_message_id,
+        limit=limit,
+        now=observed_at,
+    )
+    outcomes = run_message_operation_outcome_shadow_once(
+        session_factory,
+        limit=limit,
+        observed_at=observed_at,
+    )
+    captures = _capture_terminal_message_operation_violations(
+        session_factory,
+        config=runtime_incident_config,
+        after_raw_message_id=capture_after_raw_message_id,
+        limit=limit,
+        occurred_at=observed_at,
+    )
+    return {
+        **projection,
+        **{f"outcome_{key}": value for key, value in outcomes.items()},
+        **captures,
+    }
+
+
+def _capture_terminal_message_operation_violations(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    after_raw_message_id: int,
+    limit: int,
+    occurred_at: datetime,
+) -> dict[str, int]:
+    if (
+        type(after_raw_message_id) is not int
+        or not 0 <= after_raw_message_id <= 2**63 - 1
+        or type(limit) is not int
+        or not 1 <= limit <= 100
+    ):
+        raise MessageOperationEvaluationError("invalid violation capture bounds")
+    with session_factory() as session:
+        rows = session.execute(
+            select(
+                MessageOperationContract.id,
+                MessageOperationContract.raw_message_id,
+                MessageOperationContract.violation_code,
+                MessageOperationContract.evidence_refs_json,
+            )
+            .where(
+                MessageOperationContract.raw_message_id > after_raw_message_id,
+                MessageOperationContract.policy_version == POLICY_VERSION,
+                MessageOperationContract.status == "violated",
+                MessageOperationContract.runtime_incident_id.is_(None),
+            )
+            .order_by(MessageOperationContract.id)
+            .limit(limit)
+        ).all()
+    result = {"violations_captured": 0, "capture_errors": 0}
+    for contract_id, raw_message_id, violation_code, evidence_refs_json in rows:
+        try:
+            evidence_refs = json.loads(evidence_refs_json)
+            if not isinstance(evidence_refs, list):
+                raise MessageOperationEvaluationError(
+                    "invalid violation evidence references"
+                )
+            capture_message_operation_failure(
+                session_factory,
+                config=config,
+                contract_id=int(contract_id),
+                raw_message_id=int(raw_message_id),
+                violation_code=str(violation_code or ""),
+                evidence_refs=evidence_refs,
+                occurred_at=occurred_at,
+                shadow_only=False,
+            )
+            with session_factory() as session:
+                durable_link = session.execute(
+                    select(RuntimeIncidentAffectedMessage.id).where(
+                        RuntimeIncidentAffectedMessage.message_operation_contract_id
+                        == int(contract_id),
+                        RuntimeIncidentAffectedMessage.raw_message_id
+                        == int(raw_message_id),
+                    )
+                ).scalar_one_or_none()
+                contract_link = session.execute(
+                    select(MessageOperationContract.runtime_incident_id).where(
+                        MessageOperationContract.id == int(contract_id)
+                    )
+                ).scalar_one_or_none()
+            if durable_link is None or contract_link is None:
+                raise MessageOperationEvaluationError(
+                    "violation incident capture did not persist exact links"
+                )
+            result["violations_captured"] += 1
+        except Exception:
+            result["capture_errors"] += 1
+    return result
 
 
 def materialize_message_operation_stage1_outbox(

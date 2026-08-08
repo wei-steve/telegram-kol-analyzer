@@ -4,7 +4,7 @@ import re
 import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -13,7 +13,10 @@ import pytest
 import telegram_kol_research.web_app as web_app_module
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
-from telegram_kol_research.config import RuntimeIncidentConfig
+from telegram_kol_research.config import (
+    MessageOperationSupervisorConfig,
+    RuntimeIncidentConfig,
+)
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
@@ -5530,6 +5533,165 @@ def test_monitor_incident_writer_health_probe_is_persistence_free(tmp_path):
     assert response.json() == {"available": True, "schema_version": 1}
     with app.state.session_factory() as session:
         assert session.query(RuntimeIncident).count() == 0
+
+
+def test_message_operation_coverage_health_is_loopback_authenticated_and_read_only(
+    tmp_path,
+):
+    token = "m" * 43
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            monitor_capture_token=token,
+        ),
+        message_operation_supervisor_config=MessageOperationSupervisorConfig(
+            enabled=True,
+            shadow_only=True,
+            after_raw_message_id=0,
+            batch_limit=50,
+        ),
+        message_operation_supervisor_interval_seconds=3600,
+    )
+    app.state.message_operation_supervisor_last_success_at = datetime(
+        2026, 8, 9, 2, 0, tzinfo=UTC
+    )
+
+    missing = TestClient(app, client=("127.0.0.1", 50000)).get(
+        "/api/runtime-incidents/message-operation-coverage"
+    )
+    remote = TestClient(app, client=("198.51.100.8", 50000)).get(
+        "/api/runtime-incidents/message-operation-coverage",
+        headers={"x-monitor-capture-token": token},
+    )
+    accepted = TestClient(app, client=("127.0.0.1", 50000)).get(
+        "/api/runtime-incidents/message-operation-coverage",
+        headers={"x-monitor-capture-token": token},
+    )
+
+    assert missing.status_code == remote.status_code == 404
+    assert accepted.status_code == 200
+    payload = accepted.json()
+    assert payload["schema_version"] == 1
+    assert payload["coverage_enabled"] is True
+    assert payload["executable_messages_total"] == 0
+    assert payload["contracts_created_total"] == 0
+    assert payload["supervisor_last_success_at"].endswith("+00:00")
+    with app.state.session_factory() as session:
+        assert session.query(RuntimeIncident).count() == 0
+
+
+def test_message_operation_supervisor_lifecycle_records_only_successful_heartbeat(
+    tmp_path,
+):
+    calls = []
+
+    def run_cycle(session_factory, **kwargs):
+        calls.append(kwargs)
+        return {
+            "last_scanned_raw_message_id": kwargs["after_raw_message_id"] + 1,
+            "errors": 0,
+            "outcome_errors": 0,
+            "model_calls": 0,
+            "outcome_model_calls": 0,
+            "capture_errors": 0,
+        }
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        message_operation_supervisor_config=MessageOperationSupervisorConfig(
+            enabled=True,
+            shadow_only=True,
+            after_raw_message_id=0,
+            batch_limit=7,
+        ),
+        message_operation_supervisor_runner=run_cycle,
+        message_operation_supervisor_interval_seconds=3600,
+    )
+
+    with TestClient(app):
+        deadline = time.monotonic() + 2
+        while app.state.message_operation_supervisor_last_success_at is None:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert len(calls) == 1
+        assert calls[0]["after_raw_message_id"] == 0
+        assert calls[0]["capture_after_raw_message_id"] == 0
+        assert calls[0]["limit"] == 7
+        assert (
+            calls[0]["observed_at"]
+            == app.state.message_operation_supervisor_last_success_at
+        )
+        assert isinstance(calls[0]["runtime_incident_config"], RuntimeIncidentConfig)
+        assert app.state.message_operation_supervisor_cursor == 1
+        assert app.state.message_operation_supervisor_task is not None
+
+    assert app.state.message_operation_supervisor_task is None
+
+
+@pytest.mark.parametrize("model_key", ["model_calls", "outcome_model_calls"])
+def test_message_operation_supervisor_does_not_heartbeat_after_model_call(
+    tmp_path, model_key
+):
+    called = threading.Event()
+
+    def run_cycle(session_factory, **kwargs):
+        called.set()
+        result = {
+            "last_scanned_raw_message_id": kwargs["after_raw_message_id"],
+            "errors": 0,
+            "outcome_errors": 0,
+            "model_calls": 0,
+            "outcome_model_calls": 0,
+            "capture_errors": 0,
+        }
+        result[model_key] = 1
+        return result
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        message_operation_supervisor_config=MessageOperationSupervisorConfig(
+            enabled=True,
+            shadow_only=True,
+            after_raw_message_id=0,
+            batch_limit=5,
+        ),
+        message_operation_supervisor_runner=run_cycle,
+        message_operation_supervisor_interval_seconds=3600,
+    )
+
+    with TestClient(app):
+        assert called.wait(timeout=2)
+        time.sleep(0.05)
+        assert app.state.message_operation_supervisor_last_success_at is None
+        assert app.state.message_operation_supervisor_cursor == 0
+
+
+@pytest.mark.parametrize("watermark", [-1, 1, 2**63 - 1])
+def test_message_operation_supervisor_rejects_sentinel_or_future_watermark(
+    tmp_path, watermark
+):
+    called = threading.Event()
+
+    def run_cycle(session_factory, **kwargs):
+        called.set()
+        raise AssertionError("invalid watermark must not start the supervisor")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        message_operation_supervisor_config=MessageOperationSupervisorConfig(
+            enabled=True,
+            shadow_only=True,
+            after_raw_message_id=watermark,
+            batch_limit=5,
+        ),
+        message_operation_supervisor_runner=run_cycle,
+    )
+
+    with TestClient(app):
+        assert called.wait(timeout=0.1) is False
+        assert app.state.message_operation_supervisor_watermark_valid is False
+        assert app.state.message_operation_supervisor_last_success_at is None
+        assert app.state.message_operation_supervisor_task is None
 
 
 def test_monitor_incident_writer_rejects_oversized_content_length_before_body(

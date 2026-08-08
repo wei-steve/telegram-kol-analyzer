@@ -9,7 +9,7 @@ design_version: 2
 design_authority_status: original_runtime_agent_incomplete_extended_by_message_operation_design
 current_phase: 8R.10
 phase_name: monitor-coverage-and-silent-loss
-phase_status: planned
+phase_status: in_progress
 position_compliance_rules_status: dormant_non_deployable
 position_compliance_rollout_status: multi_target_live_new_natural_messages_only
 multi_target_projection_status: live_partial_take_profit_future_natural_messages_only
@@ -249,7 +249,7 @@ server_verification:
   phase_8r_6a_operator_completion: "On 2026-08-09 the operator explicitly directed the rollout not to wait for a future natural executable message and accepted returning to correct later issues. Phase 8R.6A is therefore complete on the reviewed 404-test local evidence, 33-test deployed supervisor evidence, and the production zero-impact dormant canary. Natural-message parity remains unobserved and is a recorded residual verification item, not a gate for beginning the next separately dormant phase. This completion enabled no incident creation, Stage 1 notification, Agent eligibility, model call, or business mutation authority."
   phase_8r_6b_deployment_and_activation: "Reviewed commit 04b3d34 was pushed and deployed with Stage 1 absent/disabled. Server verification passed 156 focused tests; main, Runtime Agent, and runtime scanner were active and HTTP root returned 200. The additive outbox table existed with zero rows. After a second fresh gate proved zero active position mutations, RuntimeIncident/notification/Stage 1 claims, contracts, and outbox rows, the root-owned mode-0600 policy was backed up and Stage 1 was enabled for contract IDs above the stopped-state maximum of 0, with five bounded attempts. Only the main service restarted; it returned HTTP 200, all runtime services remained active, and counts stayed zero, proving no historical materialization, Telegram send, Agent claim, or trading mutation. The independent monitor expected-HEAD pin was synchronized to 04b3d34, its no-notify diagnostic returned healthy=true with no reason codes, and the timer was restored. Runtime Agent action authority and both playbook allowlists remain unchanged/empty."
   phase_8r_9_deployment_and_activation: "Reviewed production code 10f3b64 was deployed with Stage 2 absent/disabled. Server verification passed 189 focused tests and the exact temporary-database injected-receiver handoff/document canary passed separately without touching production. The read-only production system Bot probe confirmed endpoint, identity, and target-chat availability. A fresh zero-in-flight gate retained latest raw/decision 9969, execution event 3352, and zero recent instruction, context, management, mutation, Agent claim, recovery, contract, Stage 1, or handoff rows. The stopped-state maximum handoff ID was 0; root-owned policy was atomically backed up and Stage 2 was enabled only for future handoff IDs above 0 with five bounded attempts. Only the main service restarted. Production contract, Stage 1, handoff, and investigation-audit counts remain zero, so activation caused no historical claim, Telegram delivery, model call, or business mutation. Main, Runtime Agent, scanner, monitor timer, and HTTP are healthy; a root-run no-notify diagnostic returned healthy=true with no reason codes. Runtime Agent action authority remains false and both playbook allowlists remain empty."
-  remaining: "Phase 8R.10 is planned: add independent end-to-end coverage metrics, supervisor heartbeat checks, silent-loss detection, and failure-injection verification. Natural 8R.6A/8R.6B behavior and all-symbol contract-spec expansion remain separate residual scopes."
+  remaining: "Phase 8R.10 is in progress: the bounded coverage projection, authenticated loopback endpoint, independent heartbeat/silent-loss rules, dormant web supervisor loop, and local failure-path regressions are implemented. Independent review, complete local gates, push, and safe-window dormant production verification remain. Natural 8R.6A/8R.6B behavior and all-symbol contract-spec expansion remain separate residual scopes."
 enabled_flags:
   - "capture:READ_ONLY_CAPTURE_PROFILE-plus-six-multi-target-types"
   - "telegram:deterministic-runtime-incident-reports"
@@ -283,7 +283,7 @@ phase_8r_roadmap_control:
 message_operation_extension:
   design_commit: 98b7884
   implementation_plan_commit: 879f489
-  status: phase_8r_9_in_progress_local_review_approved
+  status: phase_8r_10_in_progress
   original_runtime_agent_complete: false
   next_phase_after_8r_4: 8R.5
   task_8r_5_commit: 2d0cc6e
@@ -301,7 +301,10 @@ message_operation_extension:
   task_8r_8_commit: 606371f
   task_8r_8_status: completed_future_only_production_active
   next_phase_after_8r_8: 8R.9
-  task_8r_9_status: in_progress_dormant_deployment_pending
+  task_8r_9_commit: 10f3b64
+  task_8r_9_status: completed_future_only_production_active
+  next_phase_after_8r_9: 8R.10
+  task_8r_10_status: in_progress
   allowed_symbol_contract_spec_status: unresolved_separate_trading_scope
   allowed_symbol_contract_spec_requirement: "Every globally allowed virtual-asset symbol must have a current, independently validated Deepcoin instrument specification before auto-trading can admit it. The present reviewed static file contains BTC and ETH only; SOL and any other allowlisted symbol without a verified specification remain fail-closed. Future support must use authoritative instrument discovery or a reviewed generated cache plus an allowlist/spec consistency gate, without weakening sizing or submission safety."
 next_session_prompt: "请执行自定义ai agent的下一步实施"
@@ -621,11 +624,11 @@ Phase 5 is not complete until:
 
 ### Phase 8R — Proactive Read-Only Incident Detection
 
-- Status: in progress; Phase 8R.9 complete and Phase 8R.10 planned
+- Status: in progress; Phase 8R.9 complete and Phase 8R.10 implementation under review
 - Roadmap-control Task 0: completed locally with 10 focused tests passing;
   documentation and test changes only, so no production restart was required
-- Current task: `8R.10 monitor-coverage-and-silent-loss` (planned; not started
-  in the Phase 8R.9 completion turn)
+- Current task: `8R.10 monitor-coverage-and-silent-loss` (local implementation
+  and focused tests complete; review and production gates pending)
 - Approved scope: deterministic proactive discovery, bounded read-only
   diagnosis, Telegram notification, Codex handoff, and read-only verification
 - Prohibited scope: order, position, protection, strategy, recognition,
@@ -678,5 +681,12 @@ Phase 5 is not complete until:
   copyable prompt and matching JSON document only after Stage 1 reaches a
   terminal delivery state. Production is active only above handoff watermark
   0; the injected-receiver canary passed and no historical row was replayed.
-- Next action: begin only Phase 8R.10 in a new turn. Do not combine it with
-  contract-spec expansion, natural-contract tuning, or any business mutation.
+- Phase 8R.10 local implementation adds an authenticated aggregate-only
+  loopback projection, a successful-cycle heartbeat, fixed independent monitor
+  reasons for every silent gap, and a separately cancellable zero-model-call
+  supervisor loop. The dedicated monitor remains database-read-only and cannot
+  read Runtime Agent policy/provider settings. Dormant deployment, a fresh
+  future-only activation gate, and final parity evidence are still required.
+- Next action: complete only the Phase 8R.10 review, local gates, and staged
+  production verification. Do not combine it with contract-spec expansion,
+  natural-contract tuning, or any business mutation.

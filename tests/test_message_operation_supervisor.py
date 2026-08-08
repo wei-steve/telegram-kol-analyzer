@@ -7,12 +7,14 @@ from types import SimpleNamespace
 
 import pytest
 
+import telegram_kol_research.message_operation_supervisor as supervisor_module
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.message_operation_supervisor import (
     ContractOutcomeEvidence,
     collect_message_operation_evidence,
     evaluate_message_operation_contract,
     run_message_operation_outcome_shadow_once,
+    run_message_operation_supervisor_cycle,
 )
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -470,6 +472,187 @@ def test_stage1_contract_watermark_allows_new_message_on_old_coalesced_incident(
         assert row.raw_message_id != old_raw_id
         assert row.message_operation_contract_id == new_contract_id
 
+
+def test_coverage_snapshot_reports_every_pipeline_stage_and_silent_gap(tmp_path):
+    assert hasattr(supervisor_module, "build_message_operation_coverage_snapshot")
+    from telegram_kol_research.config import RuntimeIncidentConfig
+    from telegram_kol_research.message_operation_supervisor import (
+        materialize_message_operation_stage1_outbox,
+    )
+    from telegram_kol_research.runtime_incident_adapters import (
+        capture_message_operation_failure,
+    )
+
+    session_factory = create_session_factory(tmp_path / "coverage.db")
+    verified_id = _seed_contract(
+        session_factory,
+        deadline_at=NOW - timedelta(minutes=2),
+        message_id=9261,
+    )
+    violated_id = _seed_contract(
+        session_factory,
+        deadline_at=NOW - timedelta(minutes=2),
+        message_id=9262,
+    )
+    with session_factory() as session:
+        verified = session.get(MessageOperationContract, verified_id)
+        verified.status = "verified"
+        violated = session.get(MessageOperationContract, violated_id)
+        violated.status = "violated"
+        violated.violation_code = "no_operation_created"
+        violated_raw_id = violated.raw_message_id
+        missing_raw = RawMessage(
+            chat_id=77,
+            message_id=9263,
+            posted_at=NOW - timedelta(minutes=2),
+            text="missing contract",
+        )
+        session.add(missing_raw)
+        session.flush()
+        session.add(
+            RecognitionDecision(
+                raw_message_id=missing_raw.id,
+                input_kind="text",
+                authoritative_model="fixture",
+                authoritative_status="策略",
+                authoritative_payload_json=(
+                    '{"lifecycle_event":{"event_type":"position_update",'
+                    '"management_action":"partial_take_profit"}}'
+                ),
+                agreement_status="agreed",
+                differences_json="[]",
+                automation_status="completed",
+                prompt_versions_json="{}",
+                comparison_status="completed",
+            )
+        )
+        session.commit()
+        missing_raw_id = missing_raw.id
+
+    incident = capture_message_operation_failure(
+        session_factory,
+        config=RuntimeIncidentConfig(
+            capture_types=frozenset({"message_operation_failure"})
+        ),
+        contract_id=violated_id,
+        raw_message_id=violated_raw_id,
+        violation_code="no_operation_created",
+        evidence_refs=(),
+        occurred_at=NOW - timedelta(minutes=2),
+        shadow_only=False,
+    )
+    assert materialize_message_operation_stage1_outbox(
+        session_factory,
+        after_contract_id=0,
+        created_at=NOW - timedelta(minutes=2),
+    ) == 1
+
+    snapshot = supervisor_module.build_message_operation_coverage_snapshot(
+        session_factory,
+        after_raw_message_id=0,
+        supervisor_last_success_at=NOW - timedelta(seconds=30),
+        observed_at=NOW,
+        limit=100,
+    )
+
+    assert snapshot == {
+        "schema_version": 1,
+        "coverage_enabled": True,
+        "scan_truncated": False,
+        "executable_messages_total": 3,
+        "contracts_created_total": 2,
+        "contracts_verified_total": 1,
+        "contracts_violated_total": 1,
+        "executable_without_contract_total": 1,
+        "violations_without_stage1_total": 0,
+        "stage1_pending": 1,
+        "stage1_delivered": 0,
+        "stage1_failed": 0,
+        "agent_pending": 1,
+        "agent_diagnosed": 0,
+        "agent_failed": 0,
+        "agent_timed_out": 0,
+        "incidents_without_terminal_stage2_total": 1,
+        "handoffs_persisted_total": 0,
+        "stage2_pending": 0,
+        "stage2_delivered": 0,
+        "stage2_failed": 0,
+        "oldest_nonterminal_age_seconds": 120,
+        "supervisor_last_success_at": "2026-08-09T01:59:30+00:00",
+    }
+    assert missing_raw_id > 0
+    assert incident.id > 0
+
+
+def test_disabled_coverage_snapshot_is_database_free_clean_rollback():
+    def unavailable_session_factory():
+        raise AssertionError("disabled coverage must not read the database")
+
+    snapshot = supervisor_module.build_message_operation_coverage_snapshot(
+        unavailable_session_factory,
+        after_raw_message_id=0,
+        supervisor_last_success_at=None,
+        observed_at=NOW,
+        coverage_enabled=False,
+    )
+    assert snapshot["coverage_enabled"] is False
+    assert snapshot["scan_truncated"] is False
+    assert snapshot["supervisor_last_success_at"] is None
+    assert all(
+        value == 0
+        for key, value in snapshot.items()
+        if key.endswith("_total")
+        or key.startswith("stage1_")
+        or key.startswith("stage2_")
+        or key.startswith("agent_")
+        or key == "oldest_nonterminal_age_seconds"
+    )
+
+
+def test_live_supervisor_cycle_captures_natural_violation_for_stage1(tmp_path):
+    from telegram_kol_research.config import RuntimeIncidentConfig
+    from telegram_kol_research.message_operation_supervisor import (
+        materialize_message_operation_stage1_outbox,
+    )
+    from telegram_kol_research.models import RuntimeIncidentAffectedMessage
+
+    session_factory = create_session_factory(tmp_path / "natural-chain.db")
+    contract_id = _seed_contract(
+        session_factory,
+        deadline_at=NOW - timedelta(seconds=1),
+        message_id=9271,
+    )
+    with session_factory() as session:
+        contract = session.get(MessageOperationContract, contract_id)
+        raw_message_id = contract.raw_message_id
+
+    result = run_message_operation_supervisor_cycle(
+        session_factory,
+        after_raw_message_id=0,
+        capture_after_raw_message_id=0,
+        limit=10,
+        observed_at=NOW,
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"message_operation_failure"})
+        ),
+    )
+
+    assert result["outcome_violated"] == 1
+    assert result["violations_captured"] == 1
+    assert result["capture_errors"] == 0
+    with session_factory() as session:
+        contract = session.get(MessageOperationContract, contract_id)
+        assert contract.runtime_incident_id is not None
+        relation = session.query(RuntimeIncidentAffectedMessage).filter_by(
+            message_operation_contract_id=contract_id,
+            raw_message_id=raw_message_id,
+        ).one()
+        assert relation.runtime_incident_id == contract.runtime_incident_id
+    assert materialize_message_operation_stage1_outbox(
+        session_factory,
+        after_contract_id=0,
+        created_at=NOW,
+    ) == 1
 
 def test_collector_verifies_confirmed_management_target(tmp_path):
     session_factory = create_session_factory(tmp_path / "confirmed-target.db")
