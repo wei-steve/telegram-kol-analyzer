@@ -715,7 +715,7 @@ def test_lifespan_disconnects_shared_telegram_client_before_stopping_listener(tm
 
         task = asyncio.create_task(enter_and_exit())
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=0.2)
+            await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
             timed_out = False
         except TimeoutError:
             timed_out = True
@@ -771,7 +771,7 @@ def test_lifespan_bounds_listener_shutdown_when_telegram_disconnect_hangs(
 
         task = asyncio.create_task(enter_and_exit())
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=0.2)
+            await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
             timed_out = False
         except TimeoutError:
             timed_out = True

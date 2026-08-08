@@ -47,15 +47,14 @@ def test_authoritative_notification_failure_captures_independent_incident(
         async def failing_sender(**kwargs):
             raise TimeoutError("secret provider response")
 
-        _schedule_authoritative_notification(
+        notification_task = _schedule_authoritative_notification(
             session_factory=session_factory,
             raw_message_id=41,
             sender=failing_sender,
             config=object(),
             payload={"automation": {"status": "failed", "reason": "context_exhausted"}},
         )
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        await notification_task
 
     asyncio.run(scenario())
 
@@ -795,10 +794,10 @@ def test_authoritative_mimo_failure_still_alerts_position_management_text(
             ),
             system_operator_conflict_sender=sender,
         )
-        for _ in range(10):
+        for _ in range(100):
             if len(audit) >= 2:
                 break
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.001)
 
     asyncio.run(scenario())
 

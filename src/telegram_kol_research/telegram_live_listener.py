@@ -381,7 +381,7 @@ def _schedule_authoritative_notification(
     sender,
     config,
     payload: dict[str, Any],
-) -> None:
+) -> asyncio.Task[None]:
     update_recognition_execution_outcome(
         session_factory,
         raw_message_id=raw_message_id,
@@ -423,7 +423,7 @@ def _schedule_authoritative_notification(
                 notification_status="sent",
             )
 
-    asyncio.create_task(send_in_background())
+    return asyncio.create_task(send_in_background())
 
 
 def _handle_authoritative_failure_notification(
