@@ -33,6 +33,18 @@ _REQUIRED_FIELDS = (
     "state",
 )
 _NUMERIC_FIELDS = ("ctVal", "lotSz", "minSz", "tickSz")
+# Deepcoin contract metadata normally uses short fixed-point values. These
+# limits leave substantial headroom while bounding Decimal coefficient and
+# power-of-ten work before exact ratio or canonical string construction.
+_MAX_NUMERIC_INPUT_LENGTH = 128
+_MAX_NUMERIC_SIGNIFICANT_DIGITS = 64
+_MIN_NUMERIC_ADJUSTED_EXPONENT = -100
+_MAX_NUMERIC_ADJUSTED_EXPONENT = 100
+_MAX_NUMERIC_INTEGER_BITS = 512
+_DECIMAL_TEXT_PATTERN = re.compile(
+    r"^[+]?(?:(?P<integer>[0-9]+)(?:\.(?P<fraction>[0-9]*))?"
+    r"|\.(?P<fraction_only>[0-9]+))(?:[eE](?P<exponent>[+-]?[0-9]+))?$"
+)
 
 
 @dataclass(frozen=True)
@@ -248,15 +260,84 @@ def _required_string(row: Mapping[str, Any], field: str, *, row_index: int) -> s
 def _positive_decimal(value: Any, *, field: str, row_index: int) -> Decimal:
     if isinstance(value, bool):
         raise ValueError(f"Deepcoin instrument row {row_index} has invalid {field}")
+
+    if isinstance(value, str):
+        _validate_decimal_text_bounds(value, field=field, row_index=row_index)
+        decimal_input: str | int | float | Decimal = value
+    elif isinstance(value, int):
+        if value.bit_length() > _MAX_NUMERIC_INTEGER_BITS:
+            _raise_numeric_bounds(field=field, row_index=row_index)
+        decimal_input = value
+    elif isinstance(value, (float, Decimal)):
+        decimal_input = value
+    else:
+        raise ValueError(f"Deepcoin instrument row {row_index} has invalid {field}")
+
     try:
-        parsed = value if isinstance(value, Decimal) else Decimal(str(value))
+        parsed = (
+            decimal_input
+            if isinstance(decimal_input, Decimal)
+            else Decimal(str(decimal_input))
+        )
     except (InvalidOperation, ValueError):
         raise ValueError(
             f"Deepcoin instrument row {row_index} has invalid {field}"
         ) from None
     if not parsed.is_finite() or parsed <= 0:
         raise ValueError(f"Deepcoin instrument row {row_index} has invalid {field}")
+    if (
+        len(parsed.as_tuple().digits) > _MAX_NUMERIC_SIGNIFICANT_DIGITS
+        or parsed.adjusted() < _MIN_NUMERIC_ADJUSTED_EXPONENT
+        or parsed.adjusted() > _MAX_NUMERIC_ADJUSTED_EXPONENT
+    ):
+        _raise_numeric_bounds(field=field, row_index=row_index)
     return parsed
+
+
+def _validate_decimal_text_bounds(
+    value: str,
+    *,
+    field: str,
+    row_index: int,
+) -> None:
+    if len(value) > _MAX_NUMERIC_INPUT_LENGTH:
+        _raise_numeric_bounds(field=field, row_index=row_index)
+
+    match = _DECIMAL_TEXT_PATTERN.fullmatch(value.strip())
+    if match is None:
+        return
+
+    integer = match.group("integer") or ""
+    fraction = match.group("fraction")
+    if fraction is None:
+        fraction = match.group("fraction_only") or ""
+    coefficient = integer + fraction
+    significant = coefficient.lstrip("0")
+    if len(significant) > _MAX_NUMERIC_SIGNIFICANT_DIGITS:
+        _raise_numeric_bounds(field=field, row_index=row_index)
+
+    exponent_text = match.group("exponent")
+    explicit_exponent = int(exponent_text) if exponent_text else 0
+    first_nonzero = next(
+        (index for index, digit in enumerate(coefficient) if digit != "0"),
+        None,
+    )
+    if first_nonzero is None:
+        adjusted_exponent = explicit_exponent
+    else:
+        adjusted_exponent = explicit_exponent + len(integer) - first_nonzero - 1
+    if not (
+        _MIN_NUMERIC_ADJUSTED_EXPONENT
+        <= adjusted_exponent
+        <= _MAX_NUMERIC_ADJUSTED_EXPONENT
+    ):
+        _raise_numeric_bounds(field=field, row_index=row_index)
+
+
+def _raise_numeric_bounds(*, field: str, row_index: int) -> None:
+    raise ValueError(
+        f"Deepcoin instrument row {row_index} {field} exceeds safe numeric bounds"
+    )
 
 
 def _is_integral_multiple(value: Decimal, step: Decimal) -> bool:

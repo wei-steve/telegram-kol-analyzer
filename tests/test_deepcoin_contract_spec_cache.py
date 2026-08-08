@@ -6,6 +6,7 @@ from datetime import timedelta
 from datetime import timezone
 from decimal import Decimal
 import json
+from time import monotonic
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -265,6 +266,45 @@ def test_validate_high_precision_values_do_not_collide_in_digest():
     )
 
     assert first.source_digest_sha256 != second.source_digest_sha256
+
+
+@pytest.mark.parametrize("field", ["ctVal", "lotSz", "minSz", "tickSz"])
+@pytest.mark.parametrize("value", ["1e1000000", "1e-1000000"])
+def test_validate_rejects_extreme_numeric_exponents_promptly(field, value):
+    started_at = monotonic()
+
+    with pytest.raises(ValueError, match=rf"{field}.*safe numeric bounds"):
+        validate_deepcoin_instrument_snapshot(
+            [_row("BTC-USDT-SWAP", **{field: value})],
+            fetched_at=NOW,
+            ttl=TTL,
+        )
+
+    assert monotonic() - started_at < 1
+
+
+@pytest.mark.parametrize("field", ["ctVal", "lotSz", "minSz", "tickSz"])
+def test_validate_rejects_excessive_significant_digits(field):
+    value = "1." + ("2" * 64)
+
+    with pytest.raises(ValueError, match=rf"{field}.*safe numeric bounds"):
+        validate_deepcoin_instrument_snapshot(
+            [_row("BTC-USDT-SWAP", **{field: value})],
+            fetched_at=NOW,
+            ttl=TTL,
+        )
+
+
+@pytest.mark.parametrize("field", ["ctVal", "lotSz", "minSz", "tickSz"])
+def test_validate_rejects_oversized_numeric_input_before_decimal_work(field):
+    value = "1" * 129
+
+    with pytest.raises(ValueError, match=rf"{field}.*safe numeric bounds"):
+        validate_deepcoin_instrument_snapshot(
+            [_row("BTC-USDT-SWAP", **{field: value})],
+            fetched_at=NOW,
+            ttl=TTL,
+        )
 
 
 def test_snapshot_canonical_rows_round_trip_losslessly_through_json():
