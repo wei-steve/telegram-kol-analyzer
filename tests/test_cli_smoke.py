@@ -68,6 +68,9 @@ def _seed_entry_assembly_fingerprint_cli_case(tmp_path):
         "order_draft_snapshot": {
             "strategy_instance_id": _ENTRY_REPAIR_STRATEGY_ID,
             "instrument_id": "BTC-USDT-SWAP",
+            "symbol": "BTC",
+            "margin_mode": "cross",
+            "position_mode": "split",
             "stop_loss": 63000,
             "take_profit_legs": [{"price": 66000, "allocation_pct": 100}],
             "risk_budget_usdt": 10,
@@ -76,6 +79,14 @@ def _seed_entry_assembly_fingerprint_cli_case(tmp_path):
                 "quantity_step": 1,
                 "min_quantity": 1,
             },
+            "source": {
+                "kol_id": "group:-1001",
+                "kol_code": "group-a",
+                "chat_id": -1001,
+                "message_id": 55,
+            },
+            "selected_entry_leg_indices": [1],
+            "selected_entry_leg_count": 1,
             "order_legs": [
                 {
                     "price": 64000,
@@ -86,6 +97,10 @@ def _seed_entry_assembly_fingerprint_cli_case(tmp_path):
                     "quantity_unit": "contracts",
                     "estimated_stop_loss_usdt": 10,
                     "client_order_id": "entry-1",
+                    "base_asset_estimate": 0.01,
+                    "side": "buy",
+                    "position_side": "long",
+                    "take_profit_leg": {"price": 66000, "allocation_pct": 100},
                 }
             ],
         },
@@ -134,6 +149,7 @@ def _seed_entry_assembly_fingerprint_cli_case(tmp_path):
             id=266, strategy_instance_id=_ENTRY_REPAIR_STRATEGY_ID,
             kol_id="group:-1001", chat_id=-1001, message_id=55,
             symbol="BTC", side="long", venue="deepcoin",
+            margin_mode="cross", position_mode="split",
             payload_json=_canonical_json({"draft": draft, "private": secret_text}),
             status="open", created_at=_ENTRY_REPAIR_NOW, updated_at=_ENTRY_REPAIR_NOW,
         ))
@@ -145,7 +161,9 @@ def _seed_entry_assembly_fingerprint_cli_case(tmp_path):
             venue="deepcoin", status="open",
             request_json=_canonical_json({
                 "instId": "BTC-USDT-SWAP", "posSide": "long",
+                "side": "buy", "tdMode": "cross", "mrgPosition": "split",
                 "price": str(leg["price"]), "orderType": leg["order_type"],
+                "triggerPrice": str(leg["price"]),
                 "sz": str(leg["quantity"]), "clOrdId": leg["client_order_id"],
             }), created_at=_ENTRY_REPAIR_NOW, updated_at=_ENTRY_REPAIR_NOW,
         ))
