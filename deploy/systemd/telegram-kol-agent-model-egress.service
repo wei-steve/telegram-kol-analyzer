@@ -3,6 +3,7 @@ Description=Runtime Agent fixed MiMo model egress relay
 After=network-online.target
 Wants=network-online.target
 Requires=telegram-kol-agent-model-egress.socket
+PartOf=telegram-kol-runtime-agent.service
 
 [Service]
 Type=exec

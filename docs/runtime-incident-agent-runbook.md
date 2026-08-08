@@ -645,7 +645,10 @@ message-operation incident eligible. Completion additionally requires a
 trade-disabled Deepcoin evidence credential or an equivalent trusted
 read-only loopback projection, plus enforced egress evidence for the deployed
 identity. Until those controls are proven, keep 8R.7 `in_progress` and do not
-begin 8R.8. Immediate rollback is to stop the Runtime Agent sidecar; normal
+begin 8R.8. Immediate rollback is to stop the Runtime Agent sidecar and
+explicitly stop its model-egress socket/relay; both egress units also declare
+`PartOf=telegram-kol-runtime-agent.service` so a normal Agent stop propagates
+and removes the Unix socket. Normal
 intake, execution, reconciliation, Stage 1 delivery, scanner, and monitor stay
 independent.
 

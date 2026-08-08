@@ -103,11 +103,13 @@ def test_runtime_agent_sidecar_unit_is_separate_and_dormant_until_enabled():
     assert "ListenStream=/run/telegram-kol-agent-model-egress.sock" in socket_unit
     assert "SocketUser=telegram-kol-agent" in socket_unit
     assert "SocketMode=0600" in socket_unit
+    assert "PartOf=telegram-kol-runtime-agent.service" in socket_unit
     assert (
         "ExecStart=/usr/lib/systemd/systemd-socket-proxyd "
         "api.xiaomimimo.com:443"
     ) in relay_unit
     assert "DynamicUser=yes" in relay_unit
+    assert "PartOf=telegram-kol-runtime-agent.service" in relay_unit
     assert "api.deepcoin.com" not in relay_unit
     assert "api.telegram.org" not in relay_unit
 
