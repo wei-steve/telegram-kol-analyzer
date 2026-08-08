@@ -15,6 +15,8 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 UNIT_NAME="telegram-kol-runtime-agent.service"
 UNIT_SOURCE="$PRODUCTION_ROOT/deploy/systemd/$UNIT_NAME"
 UNIT_DEST="/etc/systemd/system/$UNIT_NAME"
+PREPARE_HELPER_SOURCE="$PROJECT_ROOT/deploy/systemd/telegram-kol-runtime-agent-prepare-db-acl"
+PREPARE_HELPER_TARGET="/usr/local/libexec/telegram-kol-runtime-agent-prepare-db-acl"
 ENV_FILE="$PRODUCTION_ROOT/config/runtime_incident_agent.env"
 AGENT_USER="telegram-kol-agent"
 AGENT_GROUP="telegram-kol-agent"
@@ -28,7 +30,8 @@ if [[ "$PROJECT_ROOT" != "$PRODUCTION_ROOT" ]]; then
   echo "Run this installer only from $PRODUCTION_ROOT." >&2
   exit 1
 fi
-if [[ ! -f "$UNIT_SOURCE" || ! -x "$PRODUCTION_ROOT/.venv/bin/telegram-kol-research" ]]; then
+if [[ ! -f "$UNIT_SOURCE" || ! -f "$PREPARE_HELPER_SOURCE" \
+  || ! -x "$PRODUCTION_ROOT/.venv/bin/telegram-kol-research" ]]; then
   echo "Reviewed sidecar unit or installed CLI is missing." >&2
   exit 1
 fi
@@ -154,6 +157,8 @@ if [[ -f "$MONITOR_STATE_PATH" ]]; then
 fi
 
 install -o root -g root -m 0644 "$UNIT_SOURCE" "$UNIT_DEST"
+install -d -o root -g root -m 0755 "$(dirname "$PREPARE_HELPER_TARGET")"
+install -o root -g root -m 0755 "$PREPARE_HELPER_SOURCE" "$PREPARE_HELPER_TARGET"
 install -d -o "$AGENT_USER" -g "$AGENT_GROUP" -m 0700 "$PRIVATE_WORKSPACE"
 systemctl daemon-reload
 

@@ -622,7 +622,10 @@ directory enumeration, the directory is sticky, and the installer removes
 legacy Agent grants by applying an explicit deny ACL to every non-database
 top-level file, denies group/other access on future inherited file ACLs, and
 refuses deployment if any such file remains readable or writable. Known Telegram session paths are
-also inaccessible in the service mount namespace. Existing database write access remains limited to the reviewed incident/claim
+also inaccessible in the service mount namespace. A root-owned pre-start
+helper reapplies Agent access only to the exact database/WAL/SHM/journal
+allowlist before every sidecar start, covering files recreated first by the
+root main service after a clean close or reboot. Existing database write access remains limited to the reviewed incident/claim
 lifecycle and the new audit ledger; production fact reads made by the broker
 are query-only.
 

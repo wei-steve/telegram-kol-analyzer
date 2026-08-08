@@ -1,6 +1,6 @@
 [Unit]
 Description=Telegram KOL read-only runtime incident agent sidecar
-After=network-online.target
+After=network-online.target telegram-kol.service
 Wants=network-online.target
 ConditionPathExists=/opt/telegram-kol-analyzer/config/runtime_incident_agent.env
 
@@ -13,6 +13,7 @@ UMask=0077
 WorkingDirectory=/opt/telegram-kol-analyzer
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=-/opt/telegram-kol-analyzer/config/runtime_incident_agent.env
+ExecStartPre=+/usr/local/libexec/telegram-kol-runtime-agent-prepare-db-acl
 ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research runtime-incident-agent-worker --database-path /opt/telegram-kol-analyzer/data/research.db --poll-seconds 5
 Restart=on-failure
 RestartSec=5
