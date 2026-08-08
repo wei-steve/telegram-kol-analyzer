@@ -9,6 +9,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -158,6 +159,7 @@ def _build_entry_assembly_fingerprint_repair_plan(
     if (
         not isinstance(snapshot, Mapping)
         or not isinstance(snapshot.get("order_legs"), list)
+        or not all(isinstance(leg, Mapping) for leg in snapshot["order_legs"])
         or isinstance(final_leg_count, bool)
         or not isinstance(final_leg_count, int)
         or final_leg_count != len(snapshot["order_legs"])
@@ -172,6 +174,15 @@ def _build_entry_assembly_fingerprint_repair_plan(
         conflicts.append("assembly_strategy_identity_invalid")
     if assembly.entry_preamble_id is not None:
         conflicts.append("assembly_not_v2")
+    if not _positive_int_equals(
+        final_evidence.get("strategy_raw_message_id"),
+        assembly.strategy_raw_message_id,
+    ):
+        conflicts.append("assembly_strategy_raw_message_identity_mismatch")
+    if not _positive_int_equals(
+        final_evidence.get("signal_candidate_id"), assembly.signal_candidate_id
+    ):
+        conflicts.append("assembly_signal_candidate_identity_mismatch")
     snapshot_strategy = (
         str(snapshot.get("strategy_instance_id") or "")
         if isinstance(snapshot, Mapping)
@@ -277,6 +288,7 @@ def apply_entry_assembly_fingerprint_repair_plan(
     """Append exactly one audited repair event after rebuilding the proof."""
 
     with session_factory() as session:
+        _acquire_repair_write_lock(session)
         plan = build_entry_assembly_fingerprint_repair_plan(
             session_factory,
             assembly_id=assembly_id,
@@ -353,15 +365,34 @@ def _json_object(raw: str | None) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _bounded_draft(draft: Mapping[str, Any]) -> dict[str, Any]:
+def _bounded_draft(draft: Mapping[str, Any]) -> dict[str, Any] | None:
     bounded = {key: draft.get(key) for key in _DRAFT_KEYS if key != "order_legs"}
     raw_legs = draft.get("order_legs")
+    if not isinstance(raw_legs, list) or not all(
+        isinstance(leg, Mapping) for leg in raw_legs
+    ):
+        return None
     bounded["order_legs"] = [
-        {key: leg.get(key) for key in _LEG_KEYS}
-        for leg in raw_legs
-        if isinstance(leg, Mapping)
-    ] if isinstance(raw_legs, list) else None
+        {key: leg.get(key) for key in _LEG_KEYS} for leg in raw_legs
+    ]
     return bounded
+
+
+def _positive_int_equals(value: Any, expected: int) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value > 0
+        and value == int(expected)
+    )
+
+
+def _acquire_repair_write_lock(session: Session) -> None:
+    """Prevent SQLite writers from changing proof rows until event commit."""
+
+    bind = session.get_bind()
+    if bind.dialect.name == "sqlite":
+        session.execute(text("BEGIN IMMEDIATE"))
 
 
 def _source_identity_matches(evidence: Mapping[str, Any], binding: ExecutionBinding) -> bool:

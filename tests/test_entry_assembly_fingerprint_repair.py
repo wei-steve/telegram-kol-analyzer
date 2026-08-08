@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import threading
 from copy import deepcopy
 from datetime import UTC, datetime
 
 import pytest
+from sqlalchemy import event
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.entry_assembly_fingerprint_repair import (
@@ -219,6 +221,44 @@ def test_build_plan_returns_one_stable_action_without_writing(tmp_path):
         ("draft_identity", "binding_draft_identity_mismatch"),
         ("leg_identity", "execution_leg_identity_mismatch"),
         ("missing_finalization", "assembly_finalization_fields_missing"),
+        ("binding_malformed_leg", "binding_draft_identity_mismatch"),
+        ("binding_leg_count", "binding_draft_identity_mismatch"),
+        ("signal_malformed_leg", "trade_signal_evidence_mismatch"),
+        ("signal_leg_count", "trade_signal_evidence_mismatch"),
+        ("snapshot_malformed_leg", "assembly_finalization_fields_missing"),
+        ("snapshot_leg_count", "assembly_finalization_fields_missing"),
+        (
+            "strategy_raw_message_id_drift",
+            "assembly_strategy_raw_message_identity_mismatch",
+        ),
+        (
+            "strategy_raw_message_id_bool",
+            "assembly_strategy_raw_message_identity_mismatch",
+        ),
+        (
+            "strategy_raw_message_id_zero",
+            "assembly_strategy_raw_message_identity_mismatch",
+        ),
+        (
+            "strategy_raw_message_id_string",
+            "assembly_strategy_raw_message_identity_mismatch",
+        ),
+        (
+            "signal_candidate_id_drift",
+            "assembly_signal_candidate_identity_mismatch",
+        ),
+        (
+            "signal_candidate_id_bool",
+            "assembly_signal_candidate_identity_mismatch",
+        ),
+        (
+            "signal_candidate_id_zero",
+            "assembly_signal_candidate_identity_mismatch",
+        ),
+        (
+            "signal_candidate_id_string",
+            "assembly_signal_candidate_identity_mismatch",
+        ),
         ("prior_event", "reconciliation_event_conflict"),
     ],
 )
@@ -247,6 +287,55 @@ def test_build_plan_rejects_unproven_or_conflicting_state(
         elif mutation == "missing_finalization":
             evidence = json.loads(assembly.evidence_json)
             evidence.pop("final_entry_leg_count")
+            assembly.evidence_json = _canonical_json(evidence)
+            assembly.fingerprint = canonical_fingerprint(evidence)
+        elif mutation == "binding_malformed_leg":
+            payload = json.loads(binding.payload_json)
+            payload["draft"]["order_legs"].append("malformed")
+            binding.payload_json = _canonical_json(payload)
+        elif mutation == "binding_leg_count":
+            payload = json.loads(binding.payload_json)
+            payload["draft"]["order_legs"].pop()
+            binding.payload_json = _canonical_json(payload)
+        elif mutation == "signal_malformed_leg":
+            signal = session.get(TradeSignal, 398)
+            payload = json.loads(signal.payload_json)
+            payload["deepcoin_order_draft"]["order_legs"].append("malformed")
+            signal.payload_json = _canonical_json(payload)
+        elif mutation == "signal_leg_count":
+            signal = session.get(TradeSignal, 398)
+            payload = json.loads(signal.payload_json)
+            payload["deepcoin_order_draft"]["order_legs"].pop()
+            signal.payload_json = _canonical_json(payload)
+        elif mutation == "snapshot_malformed_leg":
+            evidence = json.loads(assembly.evidence_json)
+            evidence["order_draft_snapshot"]["order_legs"].append("malformed")
+            evidence["final_entry_leg_count"] += 1
+            assembly.evidence_json = _canonical_json(evidence)
+            assembly.fingerprint = canonical_fingerprint(evidence)
+        elif mutation == "snapshot_leg_count":
+            evidence = json.loads(assembly.evidence_json)
+            evidence["order_draft_snapshot"]["order_legs"].pop()
+            assembly.evidence_json = _canonical_json(evidence)
+            assembly.fingerprint = canonical_fingerprint(evidence)
+        elif mutation.startswith("strategy_raw_message_id_"):
+            evidence = json.loads(assembly.evidence_json)
+            evidence["strategy_raw_message_id"] = {
+                "bool": True,
+                "zero": 0,
+                "string": "10",
+                "drift": 11,
+            }[mutation.rsplit("_", 1)[-1]]
+            assembly.evidence_json = _canonical_json(evidence)
+            assembly.fingerprint = canonical_fingerprint(evidence)
+        elif mutation.startswith("signal_candidate_id_"):
+            evidence = json.loads(assembly.evidence_json)
+            evidence["signal_candidate_id"] = {
+                "bool": True,
+                "zero": 0,
+                "string": "20",
+                "drift": 21,
+            }[mutation.rsplit("_", 1)[-1]]
             assembly.evidence_json = _canonical_json(evidence)
             assembly.fingerprint = canonical_fingerprint(evidence)
         elif mutation == "prior_event":
@@ -591,3 +680,56 @@ def test_apply_refuses_state_drift_since_operator_plan(tmp_path):
         )
     with session_factory() as session:
         assert session.query(ExecutionEvent).count() == 0
+
+
+def test_apply_sqlite_lock_prevents_concurrent_drift_between_proof_and_event(
+    tmp_path,
+):
+    _, base_factory = _seed_case(tmp_path)
+    plan = _plan(base_factory)
+    drift_attempted = threading.Event()
+    drift_committed = threading.Event()
+    drift_finished = threading.Event()
+    committed_before_event: list[bool] = []
+    workers: list[threading.Thread] = []
+
+    def drift_binding() -> None:
+        try:
+            with base_factory() as drift_session:
+                binding = drift_session.get(ExecutionBinding, 266)
+                payload = json.loads(binding.payload_json)
+                payload["draft"]["order_legs"][0]["price"] = 1
+                binding.payload_json = _canonical_json(payload)
+                drift_attempted.set()
+                drift_session.commit()
+                drift_committed.set()
+        finally:
+            drift_finished.set()
+
+    def before_flush(*_args) -> None:
+        worker = threading.Thread(target=drift_binding, daemon=True)
+        workers.append(worker)
+        worker.start()
+        assert drift_attempted.wait(2)
+        committed_before_event.append(drift_committed.wait(0.25))
+
+    class HookedSessionFactory:
+        def __call__(self):
+            session = base_factory()
+            event.listen(session, "before_flush", before_flush, once=True)
+            return session
+
+    event_id = apply_entry_assembly_fingerprint_repair_plan(
+        HookedSessionFactory(),
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+
+    assert event_id > 0
+    assert committed_before_event == [False]
+    assert drift_finished.wait(5)
+    assert drift_committed.is_set()
+    for worker in workers:
+        worker.join(timeout=1)
