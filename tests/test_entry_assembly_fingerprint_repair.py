@@ -941,6 +941,17 @@ def test_legacy_reconciliation_event_preserves_initial_observed_state(tmp_path):
         }
         assert json.loads(event.before_json)["observed_initial_state"] == expected
         assert json.loads(event.after_json)["observed_initial_state"] == expected
+        initial_identity = json.loads(event.after_json)[
+            "initial_submission_identity"
+        ]
+        assert initial_identity["order_id"] == "order-1,order-2"
+        assert initial_identity["client_order_id"] == "entry-1,entry-2"
+        assert set(initial_identity) == {
+            "binding_payload_fingerprint",
+            "client_order_id",
+            "execution_leg_submissions_fingerprint",
+            "order_id",
+        }
 
 
 @pytest.mark.parametrize("state", ["active", "partially_filled", "closed"])
@@ -982,6 +993,246 @@ def test_legacy_reconciliation_survives_lawful_binding_lifecycle(
             session.query(ExecutionEvent).one().notification_fingerprint
             == original_repair_fingerprint
         )
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "management_selected_close_confirmed",
+        "management_full_close_confirmed",
+        "management_full_close_with_deferred_cancel",
+        "pending_entry_leg_cancelled",
+    ],
+)
+def test_legacy_reconciliation_survives_lawful_management_lifecycle(
+    tmp_path, state
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        legs = session.query(ExecutionOrderLeg).order_by(
+            ExecutionOrderLeg.leg_index
+        ).all()
+        if state == "management_selected_close_confirmed":
+            _transition_legacy_binding_lifecycle(session, "active")
+            legs[0].status = "closed"
+            legs[0].terminal_reason = "management_full_close_confirmed"
+            binding.pos_id = "pos-2"
+            binding.last_exchange_status = state
+        elif state in {
+            "management_full_close_confirmed",
+            "management_full_close_with_deferred_cancel",
+        }:
+            _transition_legacy_binding_lifecycle(session, "active")
+            for leg in legs:
+                leg.status = "closed"
+                leg.terminal_reason = "management_full_close_confirmed"
+            if state == "management_full_close_with_deferred_cancel":
+                legs[1].status = "cancelled"
+                legs[1].terminal_reason = (
+                    "management_full_close_cancelled_unfilled_entry_leg"
+                )
+                legs[1].pos_id = None
+                legs[1].attribution_status = "pending"
+            binding.status = "closed"
+            binding.pos_id = None
+            binding.last_exchange_status = "management_full_close_confirmed"
+        else:
+            legs[0].status = "cancelled"
+            legs[0].terminal_reason = "operator_cancelled_unfilled_entry_leg"
+            binding.order_id = "order-2"
+            binding.client_order_id = "entry-2"
+            binding.last_exchange_status = state
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == ()
+
+
+@pytest.mark.parametrize("state", ["active", "closed"])
+def test_legacy_reconciliation_survives_cancel_then_lifecycle_transition(
+    tmp_path, state
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        legs = session.query(ExecutionOrderLeg).order_by(
+            ExecutionOrderLeg.leg_index
+        ).all()
+        legs[0].status = "cancelled"
+        legs[0].terminal_reason = "operator_cancelled_unfilled_entry_leg"
+        binding.order_id = "order-2"
+        binding.client_order_id = "entry-2"
+        if state == "active":
+            legs[1].status = "active"
+            legs[1].pos_id = "pos-2"
+            legs[1].attribution_status = "verified"
+            binding.status = "active"
+            binding.pos_id = "pos-2"
+            binding.last_exchange_status = "position_ownership_verified"
+        else:
+            legs[1].status = "expired"
+            legs[1].terminal_reason = "entry_order_expired"
+            binding.status = "closed"
+            binding.pos_id = None
+            binding.last_exchange_status = "entry_legs_terminal"
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == ()
+
+
+def test_legacy_reconciliation_rejects_unjustified_reduced_identity_after_cancel(
+    tmp_path,
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        legs = session.query(ExecutionOrderLeg).order_by(
+            ExecutionOrderLeg.leg_index
+        ).all()
+        legs[0].status = "cancelled"
+        legs[0].terminal_reason = "operator_cancelled_unfilled_entry_leg"
+        legs[1].status = "active"
+        legs[1].pos_id = "pos-2"
+        legs[1].attribution_status = "verified"
+        binding.order_id = "order-1"
+        binding.client_order_id = "entry-1"
+        binding.status = "active"
+        binding.pos_id = "pos-2"
+        binding.last_exchange_status = "position_ownership_verified"
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == (
+        "live_entry_preamble_binding_evidence_missing",
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "selected_close_wrong_pos",
+        "selected_close_cancelled_leg",
+        "selected_close_missing_managed_pos",
+        "selected_close_survivor_bad_reason",
+        "full_close_expired_legs",
+        "full_close_missing_pos",
+        "full_close_unverified_leg",
+        "cancelled_leg_still_in_top_identity",
+        "cancelled_leg_has_pos",
+        "cancelled_leg_bad_reason",
+    ],
+)
+def test_legacy_reconciliation_rejects_corrupt_management_lifecycle(
+    tmp_path, mutation
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        legs = session.query(ExecutionOrderLeg).order_by(
+            ExecutionOrderLeg.leg_index
+        ).all()
+        if mutation in {
+            "selected_close_wrong_pos",
+            "selected_close_cancelled_leg",
+            "selected_close_missing_managed_pos",
+            "selected_close_survivor_bad_reason",
+        }:
+            _transition_legacy_binding_lifecycle(session, "active")
+            legs[0].status = (
+                "cancelled"
+                if mutation == "selected_close_cancelled_leg"
+                else "closed"
+            )
+            legs[0].terminal_reason = (
+                "operator_cancelled_unfilled_entry_leg"
+                if mutation == "selected_close_cancelled_leg"
+                else "management_full_close_confirmed"
+            )
+            binding.last_exchange_status = "management_selected_close_confirmed"
+            if mutation == "selected_close_cancelled_leg":
+                binding.pos_id = "pos-2"
+            elif mutation == "selected_close_missing_managed_pos":
+                legs[0].pos_id = None
+                binding.pos_id = "pos-2"
+            elif mutation == "selected_close_survivor_bad_reason":
+                legs[1].terminal_reason = "unexpected"
+                binding.pos_id = "pos-2"
+        elif mutation in {
+            "full_close_expired_legs",
+            "full_close_missing_pos",
+            "full_close_unverified_leg",
+        }:
+            for leg in legs:
+                leg.status = (
+                    "expired"
+                    if mutation == "full_close_expired_legs"
+                    else "closed"
+                )
+                leg.terminal_reason = "management_full_close_confirmed"
+                leg.pos_id = f"pos-{leg.leg_index}"
+                leg.attribution_status = "verified"
+            if mutation == "full_close_unverified_leg":
+                legs[0].attribution_status = "pending"
+            elif mutation == "full_close_missing_pos":
+                legs[0].pos_id = None
+            binding.status = "closed"
+            binding.last_exchange_status = "management_full_close_confirmed"
+        else:
+            legs[0].status = "cancelled"
+            legs[0].terminal_reason = (
+                "unexpected"
+                if mutation == "cancelled_leg_bad_reason"
+                else "operator_cancelled_unfilled_entry_leg"
+            )
+            if mutation == "cancelled_leg_has_pos":
+                legs[0].pos_id = "pos-cancelled"
+            if mutation == "cancelled_leg_still_in_top_identity":
+                binding.order_id = "order-1"
+                binding.client_order_id = "entry-1"
+            else:
+                binding.order_id = "order-2"
+                binding.client_order_id = "entry-2"
+            binding.last_exchange_status = "pending_entry_leg_cancelled"
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == (
+        "live_entry_preamble_binding_evidence_missing",
+    )
 
 
 def test_legacy_reconciliation_rejects_immutable_drift_after_lifecycle_change(

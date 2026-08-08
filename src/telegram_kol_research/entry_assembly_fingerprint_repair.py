@@ -144,6 +144,7 @@ class EntryAssemblyFingerprintRepairAction:
     repair_fingerprint: str
     policy_version: str
     observed_initial_state: Mapping[str, Any] | None = None
+    initial_submission_identity: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -528,6 +529,9 @@ def _build_entry_assembly_fingerprint_repair_plan(
         repair_fingerprint=repair_fingerprint,
         policy_version=policy_version,
         observed_initial_state=observed_initial_state,
+        initial_submission_identity=(
+            binding_order_identity if legacy_proof else None
+        ),
     )
     events = (
         session.query(ExecutionEvent)
@@ -600,8 +604,13 @@ def _plan(
 ) -> EntryAssemblyFingerprintRepairPlan:
     unique_conflicts = tuple(dict.fromkeys(conflicts))
     action_payload = asdict(action) if action is not None else None
-    if action_payload is not None and action_payload["observed_initial_state"] is None:
-        action_payload.pop("observed_initial_state")
+    if action_payload is not None:
+        for optional_field in (
+            "observed_initial_state",
+            "initial_submission_identity",
+        ):
+            if action_payload[optional_field] is None:
+                action_payload.pop(optional_field)
     payload = {
         "policy_version": RECONCILIATION_POLICY,
         "action": action_payload,
@@ -884,6 +893,31 @@ def legacy_repair_immutable_identity(
     }
 
 
+def legacy_initial_submission_identity(
+    *, binding_payload: Mapping[str, Any], legs: list[Any]
+) -> dict[str, Any] | None:
+    submitted_orders = binding_payload.get("submitted_orders")
+    if not isinstance(submitted_orders, list):
+        return None
+    expected_binding = {
+        "order_id": ",".join(
+            str(row.get("order_id") or "")
+            for row in submitted_orders
+            if isinstance(row, Mapping)
+        ),
+        "client_order_id": ",".join(
+            str(row.get("client_order_id") or "")
+            for row in submitted_orders
+            if isinstance(row, Mapping)
+        ),
+    }
+    return legacy_repair_immutable_identity(
+        expected_binding,
+        binding_payload=binding_payload,
+        legs=legs,
+    )
+
+
 def legacy_initial_observed_state(
     binding: Mapping[str, Any], *, legs: list[Any]
 ) -> dict[str, Any] | None:
@@ -922,9 +956,23 @@ def legacy_expected_initial_observed_state() -> dict[str, Any]:
 
 
 def legacy_lifecycle_state_is_lawful(
-    binding: Mapping[str, Any], *, legs: list[Any]
+    binding: Mapping[str, Any],
+    *,
+    legs: list[Any],
+    initial_submission_identity: Mapping[str, Any],
 ) -> bool:
-    if legacy_initial_observed_state(binding, legs=legs) is not None:
+    initial_order_id = initial_submission_identity.get("order_id")
+    initial_client_order_id = initial_submission_identity.get("client_order_id")
+    current_identity_is_exact = _current_binding_order_identity_is_exact(
+        binding,
+        legs=legs,
+        initial_order_id=initial_order_id,
+        initial_client_order_id=initial_client_order_id,
+    )
+    if (
+        current_identity_is_exact
+        and legacy_initial_observed_state(binding, legs=legs) is not None
+    ):
         return True
     status = binding.get("status")
     last_status = binding.get("last_exchange_status")
@@ -939,11 +987,77 @@ def legacy_lifecycle_state_is_lawful(
         "invalidated",
     }
     if status == "closed" and last_status == "entry_legs_terminal":
-        return binding_pos_id is None and bool(legs) and all(
-            str(_leg_value(row, "status") or "").lower() in terminal_states
-            for row in legs
+        return (
+            current_identity_is_exact
+            and binding_pos_id is None
+            and bool(legs)
+            and all(
+                str(_leg_value(row, "status") or "").lower()
+                in terminal_states
+                for row in legs
+            )
         )
-    if status != "active" or last_status != "position_ownership_verified":
+    if status == "closed" and last_status == "management_full_close_confirmed":
+        managed_closed_legs = [
+            row for row in legs if _is_management_closed_leg(row)
+        ]
+        return (
+            current_identity_is_exact
+            and binding_pos_id is None
+            and bool(managed_closed_legs)
+            and all(
+                _is_management_closed_leg(row)
+                or _is_management_deferred_cancelled_leg(row)
+                for row in legs
+            )
+        )
+    if status == "open" and last_status == "pending_entry_leg_cancelled":
+        remaining_legs = [
+            row
+            for row in legs
+            if str(_leg_value(row, "status") or "").lower()
+            not in terminal_states
+        ]
+        cancelled_legs = [
+            row
+            for row in legs
+            if str(_leg_value(row, "status") or "").lower() == "cancelled"
+        ]
+        expected_order_id = ",".join(
+            str(_leg_value(row, "order_id") or "") for row in remaining_legs
+        ) or None
+        expected_client_order_id = ",".join(
+            str(_leg_value(row, "client_order_id") or "")
+            for row in remaining_legs
+        ) or None
+        allowed_cancel_reasons = {
+            "operator_cancelled_unfilled_entry_leg",
+            "pending_entry_order_absent_confirmed",
+        }
+        return (
+            binding_pos_id is None
+            and len(cancelled_legs) == 1
+            and bool(remaining_legs)
+            and binding.get("order_id") == expected_order_id
+            and binding.get("client_order_id") == expected_client_order_id
+            and all(
+                str(_leg_value(row, "status") or "").lower()
+                in {"open", "pending", "submitted"}
+                and not _leg_value(row, "pos_id")
+                and _leg_value(row, "terminal_reason") is None
+                for row in remaining_legs
+            )
+            and all(
+                not _leg_value(row, "pos_id")
+                and _leg_value(row, "terminal_reason")
+                in allowed_cancel_reasons
+                for row in cancelled_legs
+            )
+        )
+    if status != "active" or last_status not in {
+        "position_ownership_verified",
+        "management_selected_close_confirmed",
+    }:
         return False
     pending_states = {"open", "pending", "submitted", "partially_filled", "partial"}
     for row in legs:
@@ -955,9 +1069,13 @@ def legacy_lifecycle_state_is_lawful(
             if (
                 leg_status not in {"active", "partially_filled", "partial"}
                 or _leg_value(row, "attribution_status") != "verified"
+                or _leg_value(row, "terminal_reason") is not None
             ):
                 return False
-        elif leg_status not in pending_states:
+        elif (
+            leg_status not in pending_states
+            or _leg_value(row, "terminal_reason") is not None
+        ):
             return False
     verified_position_ids = [
         str(_leg_value(row, "pos_id"))
@@ -966,8 +1084,81 @@ def legacy_lifecycle_state_is_lawful(
         and _leg_value(row, "attribution_status") == "verified"
         and str(_leg_value(row, "status") or "").lower() not in terminal_states
     ]
-    return bool(verified_position_ids) and binding_pos_id == ",".join(
-        dict.fromkeys(verified_position_ids)
+    has_terminal_leg = any(
+        str(_leg_value(row, "status") or "").lower() in terminal_states
+        for row in legs
+    )
+    management_terminal_proof_is_exact = any(
+        _is_management_closed_leg(row) for row in legs
+    ) and all(
+        str(_leg_value(row, "status") or "").lower() not in terminal_states
+        or _is_management_closed_leg(row)
+        or _is_management_deferred_cancelled_leg(row)
+        for row in legs
+    )
+    return (
+        current_identity_is_exact
+        and bool(verified_position_ids)
+        and binding_pos_id == ",".join(dict.fromkeys(verified_position_ids))
+        and (
+            last_status == "position_ownership_verified"
+            or (has_terminal_leg and management_terminal_proof_is_exact)
+        )
+    )
+
+
+def _is_management_closed_leg(row: Any) -> bool:
+    return bool(
+        str(_leg_value(row, "status") or "").lower() == "closed"
+        and _leg_value(row, "terminal_reason")
+        == "management_full_close_confirmed"
+        and str(_leg_value(row, "pos_id") or "").strip()
+        and _leg_value(row, "attribution_status") == "verified"
+    )
+
+
+def _current_binding_order_identity_is_exact(
+    binding: Mapping[str, Any],
+    *,
+    legs: list[Any],
+    initial_order_id: Any,
+    initial_client_order_id: Any,
+) -> bool:
+    top_removed_reasons = {
+        "operator_cancelled_unfilled_entry_leg",
+        "pending_entry_order_absent_confirmed",
+    }
+    retained_legs = [
+        row
+        for row in legs
+        if not (
+            str(_leg_value(row, "status") or "").lower() == "cancelled"
+            and _leg_value(row, "terminal_reason") in top_removed_reasons
+            and not _leg_value(row, "pos_id")
+        )
+    ]
+    expected_order_id = ",".join(
+        str(_leg_value(row, "order_id") or "") for row in retained_legs
+    ) or None
+    expected_client_order_id = ",".join(
+        str(_leg_value(row, "client_order_id") or "")
+        for row in retained_legs
+    ) or None
+    if len(retained_legs) == len(legs):
+        expected_order_id = initial_order_id
+        expected_client_order_id = initial_client_order_id
+    return (
+        binding.get("order_id") == expected_order_id
+        and binding.get("client_order_id") == expected_client_order_id
+    )
+
+
+def _is_management_deferred_cancelled_leg(row: Any) -> bool:
+    return bool(
+        str(_leg_value(row, "status") or "").lower() == "cancelled"
+        and _leg_value(row, "terminal_reason")
+        == "management_full_close_cancelled_unfilled_entry_leg"
+        and not _leg_value(row, "pos_id")
     )
 
 
@@ -1483,6 +1674,10 @@ def _event_documents(action: EntryAssemblyFingerprintRepairAction):
         observed = dict(action.observed_initial_state)
         before["observed_initial_state"] = observed
         after["observed_initial_state"] = observed
+    if action.initial_submission_identity is not None:
+        initial_identity = dict(action.initial_submission_identity)
+        before["initial_submission_identity"] = initial_identity
+        after["initial_submission_identity"] = initial_identity
     return before, after
 
 

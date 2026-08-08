@@ -38,14 +38,13 @@ from telegram_kol_research.entry_assembly_fingerprint_repair import (
     canonical_fingerprint,
     derive_pre_finalization_fingerprint,
     entry_order_snapshot_matches_durable_identity,
-    legacy_binding_order_identity,
     legacy_expected_initial_observed_state,
     legacy_finalized_execution_legs_match,
     legacy_finalized_binding_payload_is_exact,
     legacy_finalized_signal_payload_is_exact,
     legacy_finalized_snapshot_from_full_draft,
     legacy_lifecycle_state_is_lawful,
-    legacy_repair_immutable_identity,
+    legacy_initial_submission_identity,
 )
 from telegram_kol_research.entry_strategy_assembly import (
     build_bounded_entry_order_draft_snapshot,
@@ -1100,12 +1099,6 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
     if not legacy_finalized_binding_payload_is_exact(binding_payload):
         return False
     binding_draft = binding_payload["draft"]
-    binding_order_identity = legacy_binding_order_identity(
-        binding_identity,
-        submitted_orders=binding_payload["submitted_orders"],
-    )
-    if binding_order_identity is None:
-        return False
     legacy_snapshot = legacy_finalized_snapshot_from_full_draft(binding_draft)
     if (
         legacy_snapshot != snapshot
@@ -1246,6 +1239,7 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
         "status",
         "pos_id",
         "attribution_status",
+        "terminal_reason",
         "order_id",
         "order_kind",
         "client_order_id",
@@ -1280,14 +1274,17 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
         submitted_orders=binding_payload["submitted_orders"],
     ):
         return False
-    if not legacy_lifecycle_state_is_lawful(binding_identity, legs=legs):
-        return False
-    binding_order_identity = legacy_repair_immutable_identity(
-        binding_identity,
+    binding_order_identity = legacy_initial_submission_identity(
         binding_payload=binding_payload,
         legs=legs,
     )
     if binding_order_identity is None:
+        return False
+    if not legacy_lifecycle_state_is_lawful(
+        binding_identity,
+        legs=legs,
+        initial_submission_identity=binding_order_identity,
+    ):
         return False
 
     rows = connection.execute(
@@ -1332,12 +1329,14 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
         **common,
         "assembly_fingerprint": old_fp,
         "observed_initial_state": observed_initial_state,
+        "initial_submission_identity": binding_order_identity,
     }
     after = {
         **common,
         "assembly_fingerprint": final_fp,
         "repair_fingerprint": repair_fp,
         "observed_initial_state": observed_initial_state,
+        "initial_submission_identity": binding_order_identity,
     }
     return (
         row[0] == trade_signal_id
