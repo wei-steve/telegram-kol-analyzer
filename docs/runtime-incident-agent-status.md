@@ -7,14 +7,14 @@ used to advance or reinterpret the rollout.
 project: runtime-incident-agent
 design_version: 2
 design_authority_status: original_runtime_agent_incomplete_extended_by_message_operation_design
-current_phase: 8R.3
-phase_name: proactive-invariant-scanner
-phase_status: in_progress
+current_phase: 8R.4
+phase_name: message-operation-gap-inventory-and-dormant-contract-schema
+phase_status: planned
 position_compliance_rules_status: dormant_non_deployable
 position_compliance_rollout_status: multi_target_live_new_natural_messages_only
 multi_target_projection_status: live_partial_take_profit_future_natural_messages_only
-multi_target_failure_notification_status: deterministic_telegram_active_future_incidents_only
-multi_target_agent_diagnosis_status: pending_first_natural_notification_proof
+multi_target_failure_notification_status: controlled_end_to_end_canary_proven_deterministic_telegram_active_future_incidents_only
+multi_target_agent_diagnosis_status: deferred_to_message_operation_phase_8r_8
 position_protection_role_canary_status: waiting_for_natural_update
 position_protection_historical_audit_status: completed_explicitly_incomplete
 position_protection_notification_status: future_only_active_after_id_272
@@ -23,10 +23,12 @@ position_protection_live_repair_status: exact_backup_repaired_exchange_healthy
 position_protection_audit_convergence_status: deployed_current_evidence_healthy
 position_protection_rescue_starvation_status: deployed_future_due_intents_fixed
 context_target_contract_repair_status: deployed_future_natural_observation_pending
-last_completed_phase: "8R.2"
-last_completed_commit: b3c2f14
+last_completed_phase: "8R.3"
+last_completed_commit: f5ea2d5
 production_commit: c3f195178a9d009ef166a44f448f766e0d17f756
 local_tests:
+  - "phase-8r.3-controlled-canary-local: one isolated multi-target projection admitted BTC, refused unverified ETH, captured exactly management_target_refused, rendered the unified AI Agent notification through the real dispatcher, and committed delivered through an in-memory receiver; the temporary database was automatically removed and no exchange or Telegram write occurred"
+  - "phase-8r.3-controlled-canary-focused: 11 multi-target admission, target-orchestration capture, exact notification selector, exact Agent selector, and architecture tests passed after correcting one non-existent pytest node name that had executed zero tests"
   - "phase-8r.3-natural-failure-wait-local: 35 scanner, scanner-service, observation-ledger, and Runtime Agent architecture tests passed; no runtime code changed"
   - "trigger-protection-rescue-starvation-local: the ordering and diagnostic tests failed against the prior implementation; 363 focused and adjacent protection, ownership, mutation-gateway, liveness, and CLI tests passed after the minimal fix, with 3 known Python sqlite datetime deprecation warnings"
   - "position-protection-current-evidence-local: 13 focused convergence tests passed; 94 adjacent protection tests passed with 4 pre-existing background-submission tests deselected because their fixture leaves the liveness-v2 mode disabled; 36 protection/ownership/audit architecture and CLI tests passed"
@@ -216,9 +218,10 @@ server_verification:
   multi_target_agent_local_support: "At the local-support checkpoint, code could build a bounded target/lifecycle/binding/item/exchange-leg/audit snapshot for the five exact management-target incident types. Target diagnosis is forced to no playbook, no auto-handle eligibility, and required Codex handoff. Production Telegram and Runtime Agent selectors were unchanged at that checkpoint pending the Phase 8R.3 canary review."
   phase_8r_3_scanner_observation_review: "The overdue production scanner review completed on 2026-08-08. runtime_incident_observations, scanner-created runtime incidents, incident/notification claims, and recovery claims were all zero. The position-mutation source hash was stable across two reads at 986b60ba2ad1e1d201b100493450254a3b084d738d6fe49af62ec90217d5dca5. Journals repeatedly showed exactly cancel_outcome_stale_unknown_v1, zero observations/abnormal/insufficient results, and shadow-only operation. The independent monitor expected-head pin was corrected from stale 9fb975c to deployed 71ab842 and the supervised monitor then returned healthy true, monitor_error null, notification_status not_needed, and no reason codes."
   phase_8r_3_natural_failure_wait_review: "A fresh read-only production review at 2026-08-08 22:24 CST found main, Runtime Agent, scanner, and monitor timer active at deployed commit c3f1951 with HTTP 200. The latest persisted raw message and decision were 9949/non-strategy/completed/skipped. management_message_envelopes and management_message_targets both remained zero, and no management_target_refused, management_target_orchestration_failed, management_target_visibility_exhausted, management_target_drift, management_target_collision, or unclassified_operation_failure runtime incident existed. Runtime Agent and notification active claims were zero; the sidecar remained idle; scanner cycles remained shadow-only with one rule and zero observations/abnormal/insufficient results. The latest independent monitor run returned healthy true, monitor_error null, notification_status not_needed, and no reason codes. Therefore the required first natural multi-target failure notification has not occurred and Phase 8R.3 remains in progress. No message was synthesized or replayed, and no database, configuration, service, Telegram, or exchange mutation was performed."
+  phase_8r_3_controlled_completion_canary: "After explicit operator approval to replace the indefinite natural-failure wait, local and deployed-code canaries used automatically removed temporary databases and synthetic IDs. Each projected one multi-target partial take profit with one eligible admitted sibling and one unverified refused sibling, created exactly one linked management_target_refused RuntimeIncident, allowed the existing exact-type dispatcher to claim it, rendered the unified AI agent title and incident/type fields, and committed notification_status delivered through an injected in-memory receiver with agent_attempt_count zero. The deployed-code canary's read-only system Bot probe returned endpoint_reachable, bot_identity_available, and target_chat_available true. Production management_message_envelopes, management_message_targets, and runtime_incidents counts were identical before and after; no historical message, production database row, service, configuration, Telegram sendMessage call, or exchange state was changed. Existing delivered production runtime notifications remain the real transport proof. This satisfies the operator-approved controlled Phase 8R.3 completion gate while preserving all action and business-mutation prohibitions."
   multi_target_partial_tp_live_activation: "After explicit operator instruction that new functionality must be used, the reviewed multi-target projection was activated for future natural messages only. Two consecutive pre-change database gates retained latest raw/decision 9854 terminal as non-strategy/completed/skipped with zero evidence, context, management, component, position-mutation, rescue, Runtime Agent, notification, recovery, recent execution, or recent message work in flight; management_message_envelopes and management_message_targets were both zero. Two read-only protection audits were database-stable and exchange-complete with identical classifications: current_risk=0, evidence_insufficient=1, historical_terminal=234, resolved_by_current_exchange_evidence=2. Root-owned mode-0600 policy files were backed up and atomically changed, then only the main service received a bounded restart. Projection is enabled, shadow_only is false, and the sole live action is partial_take_profit. Capture now includes all six multi-target/envelope failures and deterministic Telegram notification includes those same six types; the existing incident watermark remains 272. The Runtime Agent selector remains exactly management_partial_failed, action authority is false, and shadow/action playbook allowlists are empty. Post-activation HTTP is 200; main, Runtime Agent, scanner, and monitor timer are active; RuntimeIncident max ID stayed 280, target/envelope rows stayed zero, claims stayed zero, and no recent raw message or execution event appeared. This proves no historical replay or activation-time exchange mutation. Per-target admission and execution remain isolated: a refused or failed target records its own outcome and does not suppress eligible sibling targets."
   operator_shuqin_manual_close_after_activation: "During the post-activation observation, the operator reported manually closing Shuqin's position. The resulting normal manual-bound-position-close path persisted mutation intent 350 as confirmed and close reservation 36 as confirmed. This occurred after the activation gate and is not attributed to multi-target rollout. A subsequent read-only audit remained database-stable and exchange-complete with current_risk=0, evidence_insufficient=1, historical_terminal=236, and resolved_by_current_exchange_evidence=1. RuntimeIncident max ID remained 280, target/envelope rows remained zero, and runtime/notification claims remained zero. No automated follow-up action was taken."
-  remaining: "Phase 8R.3 stays in progress only for observation of the first future natural multi-target failure notification; the 2026-08-08 22:24 CST review still found zero envelopes, targets, and eligible target incidents. Deterministic notification is active now and uses the unified AI agent notification title. After one real target incident proves capture and delivery end to end, a later single stage may widen the read-only Runtime Agent selector to the five exact target incident types. The four new scanner compliance rules remain non-deployable and disabled; no trading or playbook authority is granted. The approved message-operation design and implementation plan begin only after this existing phase is completed."
+  remaining: "Phase 8R.3 is complete through the explicitly approved controlled canary. Runtime Agent action authority remains false, both playbook allowlists remain empty, and four scanner compliance rules remain non-deployable and disabled. The narrow legacy Agent selector is not widened as a separate subtype stage; the approved message-operation design supersedes that final eligibility boundary and begins at planned Phase 8R.4 with a gap inventory and dormant additive contract schema."
 enabled_flags:
   - "capture:READ_ONLY_CAPTURE_PROFILE-plus-six-multi-target-types"
   - "telegram:deterministic-runtime-incident-reports"
@@ -242,10 +245,12 @@ phase_8r_roadmap_control:
   task_0_status: completed
   runtime_change: none
   production_restart: not_required
+  task_8r_3_completion_commit: f5ea2d5
+  task_8r_3_completion_status: completed_controlled_canary
 message_operation_extension:
   design_commit: 98b7884
   implementation_plan_commit: 879f489
-  status: approved_waiting_for_existing_phase_8r_3
+  status: approved_current_phase_8r_4
   original_runtime_agent_complete: false
   next_phase_after_8r_3: 8R.4
 next_session_prompt: "请执行自定义ai agent的下一步实施"
@@ -568,7 +573,7 @@ Phase 5 is not complete until:
 - Status: in progress
 - Roadmap-control Task 0: completed locally with 10 focused tests passing;
   documentation and test changes only, so no production restart was required
-- Current task: `8R.3 proactive-invariant-scanner`
+- Current task: `8R.4 message-operation-gap-inventory-and-dormant-contract-schema`
 - Approved scope: deterministic proactive discovery, bounded read-only
   diagnosis, Telegram notification, Codex handoff, and read-only verification
 - Prohibited scope: order, position, protection, strategy, recognition,
@@ -583,6 +588,12 @@ Phase 5 is not complete until:
   timer is enabled, its dedicated state is readable, the one reviewed test
   notification was delivered, and the first notified run had no configuration
   error
-- Next action: complete the overdue 8R.3 server-side shadow-canary review;
-  keep new management-target selectors and all four compliance rules dormant
-  until that evidence and a fresh safe deployment window are recorded
+- Task 8R.3: completed through the explicitly approved controlled canary. The
+  local and deployed-code temporary databases each produced one exact
+  multi-target refusal incident and completed the existing dispatcher through
+  an in-memory receiver; the live Bot/chat probe passed, production counts
+  were unchanged, and no extra Telegram or exchange write occurred.
+- Next action: execute only planned 8R.4 by writing the requirement-to-code gap
+  inventory, then add the dormant additive message-operation contract schema
+  under TDD. Do not enable projection, supervision, notification, or Agent
+  eligibility in that phase.

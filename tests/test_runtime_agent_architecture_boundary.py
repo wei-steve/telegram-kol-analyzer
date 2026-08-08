@@ -163,10 +163,14 @@ def test_phase_7_is_deferred_and_phase_8r_requires_no_action_authority():
 
     assert "phase_7_explicitly_approved: false" in status
     assert "phase_7_disposition: deferred_non_blocking" in status
-    assert "current_phase: 8R.3" in status
-    assert "phase_name: proactive-invariant-scanner" in status
-    assert "phase_status: in_progress" in status
-    assert 'last_completed_phase: "8R.2"' in status
+    assert "current_phase: 8R.4" in status
+    assert (
+        "phase_name: message-operation-gap-inventory-and-dormant-contract-schema"
+        in status
+    )
+    assert "phase_status: planned" in status
+    assert 'last_completed_phase: "8R.3"' in status
+    assert "original_runtime_agent_complete: false" in status
     assert "### Phase 8R proactive read-only incident detection" in runbook
     assert (
         "Phase 8R never enables "
