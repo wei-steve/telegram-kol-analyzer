@@ -39,6 +39,8 @@ from telegram_kol_research.entry_assembly_fingerprint_repair import (
     derive_pre_finalization_fingerprint,
     entry_order_snapshot_matches_durable_identity,
     legacy_finalized_execution_legs_match,
+    legacy_finalized_binding_payload_is_exact,
+    legacy_finalized_signal_payload_is_exact,
     legacy_finalized_snapshot_from_full_draft,
 )
 from telegram_kol_research.entry_strategy_assembly import (
@@ -747,6 +749,14 @@ def _read_reconciliation_json(raw: object) -> dict[str, Any] | None:
             object_pairs_hook=_strict_json_object,
             parse_constant=_reject_json_constant,
         )
+        canonical = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        canonical.encode("utf-8")
     except (UnicodeError, TypeError, ValueError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
@@ -1083,7 +1093,9 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
         or canonical_fingerprint(final_evidence) != final_fp
     ):
         return False
-    binding_draft = binding_payload.get("draft")
+    if not legacy_finalized_binding_payload_is_exact(binding_payload):
+        return False
+    binding_draft = binding_payload["draft"]
     legacy_snapshot = legacy_finalized_snapshot_from_full_draft(binding_draft)
     if (
         legacy_snapshot != snapshot
@@ -1146,8 +1158,8 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
         SELECT a.entry_preamble_id, a.strategy_raw_message_id,
                a.signal_candidate_id, raw.chat_id, raw.message_id,
                candidate.raw_message_id, candidate.event_type,
-               candidate.symbol, candidate.side, candidate.target_lifecycle_id,
-               candidate.management_action
+               candidate.review_status, candidate.symbol, candidate.side,
+               candidate.target_lifecycle_id, candidate.management_action
         FROM entry_strategy_assemblies AS a
         JOIN raw_messages AS raw ON raw.id = a.strategy_raw_message_id
         JOIN signal_candidates AS candidate ON candidate.id = a.signal_candidate_id
@@ -1164,10 +1176,11 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
         or lineage[4] != message_id
         or lineage[5] != lineage[1]
         or lineage[6] != "entry_signal"
-        or str(lineage[7] or "") != str(binding_identity.get("symbol") or "")
-        or str(lineage[8] or "") != str(binding_identity.get("side") or "")
-        or lineage[9] is not None
+        or lineage[7] not in {"pending", "confirmed"}
+        or str(lineage[8] or "") != str(binding_identity.get("symbol") or "")
+        or str(lineage[9] or "") != str(binding_identity.get("side") or "")
         or lineage[10] is not None
+        or lineage[11] is not None
     ):
         return False
 
@@ -1204,8 +1217,7 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
         else None
     )
     if (
-        not isinstance(signal_payload, Mapping)
-        or "entry_preamble_assembly" in signal_payload
+        not legacy_finalized_signal_payload_is_exact(signal_payload)
         or signal_draft != binding_draft
         or legacy_finalized_snapshot_from_full_draft(signal_draft) != snapshot
         or not _reconciliation_stale_evidence_matches(
@@ -1253,6 +1265,7 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
         strategy_instance_id=strategy_id,
         symbol=str(binding_identity.get("symbol") or ""),
         side=str(binding_identity.get("side") or ""),
+        submitted_orders=binding_payload["submitted_orders"],
     ):
         return False
 

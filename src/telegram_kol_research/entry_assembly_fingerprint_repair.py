@@ -109,6 +109,28 @@ _LEGACY_TAKE_PROFIT_KEYS = frozenset(
 _STALE_EVIDENCE_KEYS = frozenset(
     {"assembly_id", "strategy_instance_id", "assembly_fingerprint"}
 )
+_LEGACY_BINDING_PAYLOAD_KEYS = frozenset({"draft", "submitted_orders"})
+_LEGACY_SIGNAL_PAYLOAD_KEYS = frozenset({"deepcoin_order_draft", "source"})
+_LEGACY_SIGNAL_SOURCE_KEYS = frozenset(
+    {"chat_id", "message_id", "side", "symbol"}
+)
+_LEGACY_SUBMITTED_ORDER_KEYS = frozenset(
+    {
+        "client_order_id",
+        "execution_type",
+        "leg_index",
+        "order_id",
+        "pos_id",
+        "protection_request",
+        "protection_response",
+        "request",
+        "response",
+    }
+)
+_LEGACY_SUBMISSION_RESPONSE_KEYS = frozenset({"code", "data", "msg"})
+_LEGACY_SUBMISSION_DATA_KEYS = frozenset(
+    {"clOrdId", "ordId", "sCode", "sMsg", "tag"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,9 +396,8 @@ def _build_entry_assembly_fingerprint_repair_plan(
         if _bounded_snapshot(binding_draft) != canonical_snapshot:
             conflicts.append("binding_draft_identity_mismatch")
     elif legacy_proof:
-        if (
-            legacy_finalized_snapshot_from_full_draft(binding_draft)
-            != legacy_snapshot
+        if not legacy_finalized_binding_payload_is_exact(binding_payload) or (
+            legacy_finalized_snapshot_from_full_draft(binding_draft) != legacy_snapshot
         ):
             conflicts.append("assembly_legacy_snapshot_binding_mismatch")
     else:
@@ -428,6 +449,7 @@ def _build_entry_assembly_fingerprint_repair_plan(
             strategy_instance_id=strategy_id,
             symbol=str(binding.symbol),
             side=str(binding.side),
+            submitted_orders=binding_payload.get("submitted_orders"),
         )
     if not legs_match:
         conflicts.append("execution_leg_identity_mismatch")
@@ -594,7 +616,7 @@ def _legacy_snapshot(snapshot: Any) -> dict[str, object] | None:
     contract_spec = snapshot.get("contract_spec")
     if (
         not isinstance(legs, list)
-        or not 1 <= len(legs) <= 5
+        or len(legs) != 2
         or any(
             not isinstance(leg, Mapping) or set(leg) != _LEGACY_LEG_KEYS
             for leg in legs
@@ -616,7 +638,7 @@ def legacy_finalized_snapshot_from_full_draft(
     contract_spec = draft["contract_spec"]
     if (
         not isinstance(legs, list)
-        or not 1 <= len(legs) <= 5
+        or len(legs) != 2
         or any(not isinstance(leg, Mapping) for leg in legs)
         or not isinstance(contract_spec, Mapping)
     ):
@@ -671,7 +693,7 @@ def _legacy_full_draft_is_exact(draft: Any) -> bool:
         and isinstance(stale, Mapping)
         and set(stale) == _STALE_EVIDENCE_KEYS
         and isinstance(legs, list)
-        and 1 <= len(legs) <= 5
+        and len(legs) == 2
         and all(
             isinstance(leg, Mapping)
             and set(leg) == _LEGACY_FULL_LEG_KEYS
@@ -714,6 +736,112 @@ def _legacy_full_draft_is_exact(draft: Any) -> bool:
         and isinstance(source["message_id"], int)
         and not isinstance(source["message_id"], bool)
         and source["message_id"] > 0
+    )
+
+
+def legacy_finalized_binding_payload_is_exact(payload: Any) -> bool:
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != _LEGACY_BINDING_PAYLOAD_KEYS
+    ):
+        return False
+    draft = payload["draft"]
+    submitted = payload["submitted_orders"]
+    if (
+        not _legacy_full_draft_is_exact(draft)
+        or not isinstance(submitted, list)
+        or len(submitted) != 2
+        or len(submitted) != len(draft["order_legs"])
+    ):
+        return False
+    return all(
+        _legacy_submitted_order_is_exact(
+            row,
+            draft=draft,
+            leg=draft["order_legs"][index - 1],
+            index=index,
+        )
+        for index, row in enumerate(submitted, 1)
+    )
+
+
+def legacy_finalized_signal_payload_is_exact(payload: Any) -> bool:
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != _LEGACY_SIGNAL_PAYLOAD_KEYS
+    ):
+        return False
+    draft = payload["deepcoin_order_draft"]
+    source = payload["source"]
+    return (
+        _legacy_full_draft_is_exact(draft)
+        and isinstance(source, Mapping)
+        and set(source) == _LEGACY_SIGNAL_SOURCE_KEYS
+        and isinstance(source["chat_id"], int)
+        and not isinstance(source["chat_id"], bool)
+        and isinstance(source["message_id"], int)
+        and not isinstance(source["message_id"], bool)
+        and source["message_id"] > 0
+        and source["chat_id"] == draft["source"]["chat_id"]
+        and source["message_id"] == draft["source"]["message_id"]
+        and source["side"] in {"long", "short"}
+        and source["side"] == draft["order_legs"][0]["position_side"]
+        and _nonempty_string(source["symbol"])
+        and source["symbol"] == draft["symbol"]
+    )
+
+
+def _legacy_submitted_order_is_exact(
+    value: Any,
+    *,
+    draft: Mapping[str, Any],
+    leg: Mapping[str, Any],
+    index: int,
+) -> bool:
+    if not isinstance(value, Mapping) or set(value) != _LEGACY_SUBMITTED_ORDER_KEYS:
+        return False
+    response = value["response"]
+    response_data = response.get("data") if isinstance(response, Mapping) else None
+    protection_request = value["protection_request"]
+    protection_response = value["protection_response"]
+    protection_data = (
+        protection_response.get("data")
+        if isinstance(protection_response, Mapping)
+        else None
+    )
+    request = value["request"]
+    if not isinstance(request, Mapping) or not _exact_request_matches_leg(
+        request, expected=leg, full_draft=draft
+    ):
+        return False
+    expected_protection = {
+        "slOrdPx": request["slOrdPx"],
+        "slTriggerPx": request["slTriggerPx"],
+    }
+    return (
+        isinstance(value["leg_index"], int)
+        and not isinstance(value["leg_index"], bool)
+        and value["leg_index"] == index
+        and value["execution_type"] == "trigger_limit"
+        and value["client_order_id"] == leg["client_order_id"]
+        and _nonempty_string(value["order_id"])
+        and value["pos_id"] is None
+        and protection_request == expected_protection
+        and isinstance(response, Mapping)
+        and set(response) == _LEGACY_SUBMISSION_RESPONSE_KEYS
+        and response["code"] == "0"
+        and isinstance(response["msg"], str)
+        and isinstance(response_data, Mapping)
+        and set(response_data) == _LEGACY_SUBMISSION_DATA_KEYS
+        and response_data["clOrdId"] == value["client_order_id"]
+        and response_data["ordId"] == value["order_id"]
+        and response_data["sCode"] == "0"
+        and isinstance(response_data["sMsg"], str)
+        and isinstance(response_data["tag"], str)
+        and isinstance(protection_response, Mapping)
+        and set(protection_response) == {"code", "data"}
+        and protection_response["code"] == "0"
+        and protection_data == {"attached_on_trigger_order": True}
     )
 
 
@@ -894,7 +1022,7 @@ def _legacy_signal_has_stale_evidence(
     snapshot: Mapping[str, Any],
 ) -> bool:
     payload = _json_object(signal.payload_json)
-    if payload is None or "entry_preamble_assembly" in payload:
+    if not legacy_finalized_signal_payload_is_exact(payload):
         return False
     signal_draft = payload.get("deepcoin_order_draft")
     nested = (
@@ -994,6 +1122,7 @@ def legacy_finalized_execution_legs_match(
     strategy_instance_id: str,
     symbol: str,
     side: str,
+    submitted_orders: Any,
 ) -> bool:
     expected_legs = full_draft.get("order_legs")
     instrument = str(full_draft.get("instrument_id") or "").upper()
@@ -1004,9 +1133,18 @@ def legacy_finalized_execution_legs_match(
         or len(expected_legs) != final_leg_count
         or len(legs) != final_leg_count
         or instrument != f"{symbol.upper()}-USDT-SWAP"
+        or not isinstance(submitted_orders, list)
+        or len(submitted_orders) != final_leg_count
+        or any(
+            not isinstance(row, Mapping)
+            or set(row) != _LEGACY_SUBMITTED_ORDER_KEYS
+            for row in submitted_orders
+        )
     ):
         return False
-    for index, (row, expected) in enumerate(zip(legs, expected_legs), 1):
+    for index, (row, expected, submitted) in enumerate(
+        zip(legs, expected_legs, submitted_orders), 1
+    ):
         request_raw = _leg_value(row, "request_json")
         request = (
             dict(request_raw)
@@ -1027,11 +1165,15 @@ def legacy_finalized_execution_legs_match(
             or str(_leg_value(row, "status") or "").lower()
             not in {"pending", "submitted", "open", "active"}
             or not str(_leg_value(row, "order_id") or "").strip()
+            or _leg_value(row, "order_id") != submitted["order_id"]
             or expected_kind is None
             or str(_leg_value(row, "order_kind") or "").lower() != expected_kind
             or not str(_leg_value(row, "client_order_id") or "").strip()
             or str(_leg_value(row, "client_order_id"))
             != str(expected.get("client_order_id") or "")
+            or _leg_value(row, "client_order_id")
+            != submitted["client_order_id"]
+            or request != submitted["request"]
             or not _exact_request_matches_leg(
                 request, expected=expected, full_draft=full_draft
             )
