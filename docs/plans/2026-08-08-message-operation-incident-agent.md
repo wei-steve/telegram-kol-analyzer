@@ -85,16 +85,20 @@ PYTHONPATH=src .venv/bin/python -m pytest \
 
 Expected: PASS. A failure blocks server review and is fixed within 8R.3 only.
 
-**Step 3: Perform the runbook's read-only server review**
+**Step 3: Perform the runbook's read-only server review or approved controlled canary**
 
 Verify the deployed commit, main service, scanner, Agent sidecar, monitor,
 latest recognition, in-flight work, scanner observation counts, incident
 claims, Telegram claims, and position-mutation source integrity. Do not send a
 test trading message and do not replay a historical message.
 
-Expected: evidence matches the current 8R.3 acceptance rule. If the canonical
-status still requires a future natural event, keep the phase `in_progress` and
-stop. This is not permission to waive the gate.
+Expected: evidence matches the current 8R.3 acceptance rule. When no natural
+failure exists, the separately operator-approved controlled canary may satisfy
+the gate only by meeting every condition in the runbook: isolated temporary
+databases, exact multi-target capture, in-memory dispatcher delivery, live
+read-only Bot/chat probe, unchanged production counts, no real test message,
+and focused regressions. Without either complete evidence path, keep the phase
+`in_progress` and stop.
 
 **Step 4: Update status only from proven evidence**
 

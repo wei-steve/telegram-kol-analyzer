@@ -494,6 +494,38 @@ settings:
 - `TELEGRAM_KOL_RUNTIME_SCANNER_INTERVAL_SECONDS` is bounded to 10–3600
   seconds and defaults to 60.
 
+The operator approved a controlled Phase 8R.3 completion canary on 2026-08-08
+so that a rare natural multi-target failure cannot block later read-only Agent
+work indefinitely. This alternative changes only the verification method; it
+does not widen production capture, Telegram, Agent, scanner, or action policy.
+It may replace the first-natural-failure wait only when all of these are true:
+
+1. the local and deployed-code canaries use automatically removed temporary
+   databases and synthetic IDs only;
+2. one exact multi-target partial-take-profit projection admits an eligible
+   sibling and refuses an ineligible sibling;
+3. the refusal creates exactly one `management_target_refused` runtime
+   incident linked back to the refused target;
+4. the existing dispatcher claims that exact type, renders the unified AI
+   Agent notification, and commits `delivered` through an injected in-memory
+   receiver;
+5. the real production system Bot identity and target chat pass the existing
+   read-only `getMe`/`getChat` evidence probe;
+6. previously delivered production runtime notifications continue to prove
+   the unchanged real `sendMessage` transport;
+7. production envelope, target, incident, business, and exchange state are
+   unchanged before and after the canary;
+8. no historical message is replayed, no live test trading message is sent,
+   and no additional Telegram test notification is emitted; and
+9. focused capture, dispatcher, Agent-selector, and architecture regressions
+   pass.
+
+This composition is intentionally non-writing with respect to production. The
+in-memory receiver proves capture/claim/format/commit composition without
+violating the project rule that an implementation turn sends only its final
+stop notification. Record all evidence in the canonical status before marking
+8R.3 complete.
+
 The deployable shadow projections are
 `cancel_outcome_stale_unknown_v1` and
 `active_position_missing_protection_v1`. The
