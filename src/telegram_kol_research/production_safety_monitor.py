@@ -788,6 +788,7 @@ def _has_exact_terminal_prebinding_refusal(
         "execution_bindings",
         "execution_events",
         "raw_messages",
+        "signal_candidates",
     }
     if not required_tables.issubset(available_tables):
         return False
@@ -810,10 +811,12 @@ def _has_exact_terminal_prebinding_refusal(
             "instruction_kind",
             "strategy_instance_id",
             "status",
+            "result_json",
             "error_json",
             "retired_at",
         },
         "raw_messages": {"id", "chat_id", "message_id"},
+        "signal_candidates": {"id", "raw_message_id", "event_type"},
         "trade_signals": {"strategy_instance_id", "chat_id", "message_id"},
         "execution_bindings": {"strategy_instance_id"},
         "execution_events": {
@@ -831,10 +834,31 @@ def _has_exact_terminal_prebinding_refusal(
         if not expected.issubset(actual):
             return False
 
+    candidate_rows = connection.execute(
+        """
+        SELECT id, raw_message_id, event_type
+        FROM signal_candidates
+        WHERE id = ?
+        LIMIT 2
+        """,
+        (signal_candidate_id,),
+    ).fetchall()
+    if len(candidate_rows) != 1:
+        return False
+    candidate_id, candidate_raw_message_id, candidate_event_type = candidate_rows[0]
+    if (
+        type(candidate_id) is not int
+        or candidate_id != signal_candidate_id
+        or type(candidate_raw_message_id) is not int
+        or candidate_raw_message_id != strategy_raw_message_id
+        or candidate_event_type != "entry_signal"
+    ):
+        return False
+
     instruction_rows = connection.execute(
         """
         SELECT raw_message_id, instruction_kind, strategy_instance_id,
-               status, error_json, retired_at
+               status, result_json, error_json, retired_at
         FROM message_instruction_items
         WHERE signal_candidate_id = ?
         ORDER BY id
@@ -849,6 +873,7 @@ def _has_exact_terminal_prebinding_refusal(
         instruction_kind,
         instruction_strategy_instance_id,
         status,
+        result_json,
         error_json,
         retired_at,
     ) = instruction_rows[0]
@@ -859,6 +884,7 @@ def _has_exact_terminal_prebinding_refusal(
         or instruction_kind != "entry"
         or instruction_strategy_instance_id != strategy_instance_id
         or status != "failed"
+        or result_json is not None
         or retired_at is not None
     ):
         return False

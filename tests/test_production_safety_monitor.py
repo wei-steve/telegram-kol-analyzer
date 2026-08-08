@@ -405,7 +405,8 @@ def _seed_terminal_prebinding_refusal(database):
         CREATE TABLE message_instruction_items (
           id INTEGER PRIMARY KEY, raw_message_id INTEGER,
           signal_candidate_id INTEGER, instruction_kind TEXT,
-          strategy_instance_id TEXT, status TEXT, error_json TEXT, retired_at TEXT
+          strategy_instance_id TEXT, status TEXT, result_json TEXT,
+          error_json TEXT, retired_at TEXT
         );
         CREATE TABLE entry_strategy_assemblies (
           id INTEGER PRIMARY KEY, entry_preamble_id INTEGER,
@@ -431,7 +432,7 @@ def _seed_terminal_prebinding_refusal(database):
           (3, NULL, 9955, 1643, 'deepcoin:-1001:3478:SOL:short', '{}',
            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
         INSERT INTO message_instruction_items VALUES
-          (438, 9955, 1643, 'entry', 'deepcoin:-1001:3478:SOL:short', 'failed',
+          (438, 9955, 1643, 'entry', 'deepcoin:-1001:3478:SOL:short', 'failed', NULL,
            '{"type":"RecoveryLiveSubmitError","message":"signal_enqueue_blocked:missing_ready_confirmation,contract_size_unverified"}',
            NULL);
         """
@@ -472,7 +473,7 @@ def _assert_terminal_prebinding_refusal_fails_closed(database):
         "UPDATE message_instruction_items SET retired_at = '2026-08-08 00:01:00'",
         "UPDATE message_instruction_items SET raw_message_id = 9956",
         "INSERT INTO message_instruction_items VALUES "
-        "(439, 9955, 1643, 'entry', 'deepcoin:-1001:3478:SOL:short', 'failed', "
+        "(439, 9955, 1643, 'entry', 'deepcoin:-1001:3478:SOL:short', 'failed', NULL, "
         "'{\"type\":\"RecoveryLiveSubmitError\",\"message\":\"signal_enqueue_blocked:missing_ready_confirmation,contract_size_unverified\"}', NULL)",
     ),
 )
@@ -516,6 +517,35 @@ def test_entry_preamble_monitor_instruction_strategy_identity_is_exact(
     _assert_terminal_prebinding_refusal_fails_closed(database)
 
 
+@pytest.mark.parametrize("result_json", ('{}', '{"status":"submitted"}'))
+def test_entry_preamble_monitor_failed_instruction_result_is_fail_closed(
+    tmp_path, result_json
+):
+    database = tmp_path / "terminal-prebinding-instruction-result.db"
+    _seed_terminal_prebinding_refusal(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE message_instruction_items SET result_json = ?", (result_json,)
+        )
+    _assert_terminal_prebinding_refusal_fails_closed(database)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "DELETE FROM signal_candidates",
+        "UPDATE signal_candidates SET raw_message_id = 9956",
+        "UPDATE signal_candidates SET event_type = 'management_signal'",
+    ),
+)
+def test_entry_preamble_monitor_candidate_link_is_fail_closed(tmp_path, mutation):
+    database = tmp_path / "terminal-prebinding-candidate-link.db"
+    _seed_terminal_prebinding_refusal(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(mutation)
+    _assert_terminal_prebinding_refusal_fails_closed(database)
+
+
 @pytest.mark.parametrize(
     ("column", "value"),
     (("chat_id", "bad-chat"), ("chat_id", 0), ("message_id", "bad-message"),
@@ -541,11 +571,11 @@ def test_entry_preamble_monitor_instruction_schema_without_id_is_fail_closed(tmp
             CREATE TABLE message_instruction_items (
               raw_message_id INTEGER, signal_candidate_id INTEGER,
               instruction_kind TEXT, strategy_instance_id TEXT,
-              status TEXT, error_json TEXT, retired_at TEXT
+              status TEXT, result_json TEXT, error_json TEXT, retired_at TEXT
             );
             INSERT INTO message_instruction_items
             SELECT raw_message_id, signal_candidate_id, instruction_kind,
-                   strategy_instance_id, status, error_json, retired_at
+                   strategy_instance_id, status, result_json, error_json, retired_at
             FROM old_instruction_items;
             DROP TABLE old_instruction_items;
             """
