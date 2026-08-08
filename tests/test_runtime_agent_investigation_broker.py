@@ -202,13 +202,14 @@ def test_network_policy_allows_only_reviewed_get_endpoints_without_proxying():
     )
 
     policy.authorize("GET", "https://api.deepcoin.com/deepcoin/market/instruments", headers={})
-    policy.authorize("GET", "https://api.telegram.org/botredacted/getChat", headers={})
     for method, url, headers, denial in (
         ("POST", "https://api.deepcoin.com/deepcoin/trade/order", {}, "method_denied"),
         ("GET", "https://evil.example/data", {}, "host_denied"),
         ("GET", "http://api.deepcoin.com/deepcoin/account/balances", {}, "scheme_denied"),
+        ("GET", "https://api.deepcoin.com:444/deepcoin/account/balances", {}, "port_denied"),
         ("GET", "https://api.deepcoin.com/deepcoin/trade/cancel", {}, "exchange_endpoint_denied"),
-        ("GET", "https://api.telegram.org/botredacted/getChat", {"Forwarded": "for=1.2.3.4"}, "proxy_denied"),
+        ("GET", "https://api.telegram.org/botredacted/getChat", {}, "telegram_direct_access_denied"),
+        ("GET", "https://api.telegram.org/botredacted/sendMessage", {}, "telegram_direct_access_denied"),
     ):
         with pytest.raises(InvestigationDenied, match=denial):
             policy.authorize(method, url, headers=headers)

@@ -420,9 +420,17 @@ class NetworkReadPolicy:
         parsed = urlsplit(url)
         if parsed.scheme != "https":
             raise InvestigationDenied("scheme_denied")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise InvestigationDenied("port_denied") from exc
+        if port not in (None, 443):
+            raise InvestigationDenied("port_denied")
         if parsed.username or parsed.password:
             raise InvestigationDenied("credential_url_denied")
         host = (parsed.hostname or "").lower()
+        if host == "api.telegram.org":
+            raise InvestigationDenied("telegram_direct_access_denied")
         if host not in self.allowed_hosts:
             raise InvestigationDenied("host_denied")
         if any(str(key).lower() in _PROXY_HEADERS for key in headers):
