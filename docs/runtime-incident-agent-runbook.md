@@ -708,6 +708,54 @@ one closed diagnosis, and normal main/monitor/scanner continuity. Immediate
 rollback clears only the message-operation Agent flag and restarts only the
 sidecar; Stage 1 and all business paths remain independent.
 
+### Phase 8R.9 durable handoff and Stage 2
+
+Phase 8R.9 stores every terminal message-operation investigation result in the
+additive `runtime_incident_handoff_artifacts` ledger. Diagnosis and handoff are
+committed in the same token-checked transaction. Unique incident/revision and
+incident/content-hash keys prevent unchanged polling from creating another
+notification, while changed membership, severity, evidence, or diagnosis
+creates the next revision. The document contains bounded stable incident,
+message, contract, instruction-item, original/reply identity, timeline,
+evidence, hypothesis, missing-evidence, code/test path, prohibited-action, and
+Codex-prompt fields. It stores no raw credential, arbitrary log, or provider
+response.
+
+The terminal outcome set is closed: `diagnosed`, `reused`, `provider_failed`,
+`tool_failed`, `evidence_incomplete`, and `timed_out`. A failed investigation
+stores a low-confidence failure handoff rather than silently disappearing.
+Every new revision begins as a Stage 2 outbox row. The existing main-service
+dispatcher, never the Agent sidecar, owns the system Bot token and sends both a
+bounded copyable prompt and the matching JSON document. The notification and
+document display the same incident ID, stable handoff ID, revision, and SHA-256
+content hash. Claims, bounded retries, Telegram message IDs, failure codes, and
+delivery time are durable. When Stage 2 is enabled, the legacy incident
+dispatcher excludes this incident class to prevent duplicate terminal reports;
+Stage 1 remains first and independent.
+
+Deployment is dormant by default:
+
+- `TELEGRAM_KOL_MESSAGE_OPERATION_STAGE2_ENABLED=false` is the immediate
+  rollback gate;
+- `TELEGRAM_KOL_MESSAGE_OPERATION_STAGE2_AFTER_HANDOFF_ID` is an exclusive
+  future-only watermark and fails closed at the maximum SQLite integer when
+  absent, malformed, negative, or overflowing;
+- `TELEGRAM_KOL_MESSAGE_OPERATION_STAGE2_MAX_ATTEMPTS` defaults to five and is
+  bounded to 1 through 20;
+- disabling Stage 2 does not disable intake, recognition, context resolution,
+  execution, reconciliation, Stage 1, or Agent diagnosis.
+
+Deploy the additive schema with Stage 2 disabled. In a proven zero-in-flight
+window, run a temporary-database non-business canary that produces one terminal
+handoff and sends through an injected receiver, then verify the production Bot
+identity/chat read-only. Record the current maximum handoff ID while delivery
+is stopped, set it as the exclusive watermark, and enable only future
+message-operation revisions. Confirm that production has no historical Stage 2
+claim, that artifact/prompt/document IDs and hashes match, and that main,
+Agent, scanner, monitor, listener, and HTTP remain healthy. Immediate rollback
+clears the Stage 2 flag and restarts only the main service; persisted artifacts
+remain available through `runtime-incident-handoff <incident_id>`.
+
 The operator approved a controlled Phase 8R.3 completion canary on 2026-08-08
 so that a rare natural multi-target failure cannot block later read-only Agent
 work indefinitely. This alternative changes only the verification method; it

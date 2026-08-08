@@ -191,3 +191,97 @@ def test_handoff_rebuilds_bounded_shadow_playbook_audit(tmp_path):
     )
     assert handoff["attempted_playbooks"][0]["accepted"] is False
     assert handoff["attempted_playbooks"][0]["action_executed"] is False
+
+
+def test_durable_handoff_artifact_survives_restart_and_contains_copyable_evidence(tmp_path):
+    from telegram_kol_research.models import RuntimeIncidentHandoffArtifact
+    from telegram_kol_research.runtime_incident_handoff import (
+        persist_runtime_incident_handoff,
+    )
+
+    database_path = tmp_path / "durable-handoff.db"
+    session_factory = create_session_factory(database_path)
+    incident = record_runtime_incident(
+        session_factory,
+        source_kind="worker_job",
+        source_record_id="42",
+        incident_type="worker_retry_exhausted",
+        severity="high",
+        fingerprint="a" * 64,
+        redacted_summary='{"error_type":"provider_timeout"}',
+        occurred_at=datetime(2026, 7, 28, 9, 0, tzinfo=UTC),
+        feature_policy_version="runtime-incident-phase-8r-v1",
+        prompt_version="runtime-agent-prompt-v8",
+        tool_policy_version="runtime-agent-tools-v2",
+    )
+    handoff = build_runtime_incident_handoff(
+        incident={
+            "id": incident.id,
+            "incident_type": incident.incident_type,
+            "source_kind": incident.source_kind,
+            "source_record_id": incident.source_record_id,
+            "redacted_summary": {"error_type": "provider_timeout"},
+        },
+        diagnosis=RuntimeAgentDiagnosis.from_mapping(
+            {
+                "incident_id": incident.id,
+                "diagnosis_hypothesis": "Worker retries may have been exhausted.",
+                "confidence": "low",
+                "evidence_references": [f"incident:{incident.id}"],
+                "missing_evidence": ["current provider health"],
+                "recommended_playbook_name": None,
+                "auto_handle_eligible": False,
+                "codex_handoff_required": True,
+                "remaining_risk": "The source job remains unresolved.",
+                "expected_state": "The worker reaches a terminal state.",
+                "observed_state": "The worker exhausted retries.",
+                "classification": "code_defect",
+                "affected_message_ids": [],
+                "likely_code_paths": [
+                    "src/telegram_kol_research/runtime_agent_worker.py"
+                ],
+                "likely_test_paths": ["tests/test_runtime_agent_worker.py"],
+            },
+            expected_incident_id=incident.id,
+        ),
+        attempted_queries=("investigate_worker_jobs",),
+    )
+    artifact = persist_runtime_incident_handoff(
+        session_factory,
+        incident_id=incident.id,
+        outcome_kind="diagnosed",
+        handoff=handoff,
+        created_at=datetime(2026, 7, 28, 9, 1, tzinfo=UTC),
+    )
+    unchanged = persist_runtime_incident_handoff(
+        session_factory,
+        incident_id=incident.id,
+        outcome_kind="diagnosed",
+        handoff=handoff,
+        created_at=datetime(2026, 7, 28, 9, 2, tzinfo=UTC),
+    )
+    changed_handoff = {**handoff, "severity": "critical"}
+    changed = persist_runtime_incident_handoff(
+        session_factory,
+        incident_id=incident.id,
+        outcome_kind="diagnosed",
+        handoff=changed_handoff,
+        created_at=datetime(2026, 7, 28, 9, 3, tzinfo=UTC),
+    )
+
+    restarted_factory = create_session_factory(database_path)
+    rebuilt = load_runtime_incident_handoff(
+        restarted_factory, incident_id=incident.id
+    )
+    with restarted_factory() as session:
+        stored = session.get(RuntimeIncidentHandoffArtifact, artifact.id)
+        assert stored.diagnosis_revision == 1
+        assert stored.status == "pending"
+        assert len(stored.content_fingerprint) == 64
+        assert f"incident_id={incident.id}" in stored.codex_prompt
+        assert "AGENTS.md" in stored.codex_prompt
+        assert "stable_handoff_id" in stored.evidence_document_json
+        assert session.query(RuntimeIncidentHandoffArtifact).count() == 2
+    assert unchanged.id == artifact.id
+    assert changed.diagnosis_revision == 2
+    assert rebuilt == changed_handoff

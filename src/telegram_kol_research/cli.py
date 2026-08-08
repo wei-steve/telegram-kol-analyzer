@@ -195,6 +195,7 @@ from telegram_kol_research.runtime_agent_worker import (
 from telegram_kol_research.runtime_incident_handoff import (
     RuntimeIncidentHandoffError,
     load_runtime_incident_handoff,
+    load_latest_runtime_incident_handoff_artifact,
 )
 from telegram_kol_research.runtime_incidents import get_runtime_incident
 from telegram_kol_research.raw_ingest import (
@@ -3570,6 +3571,18 @@ def runtime_incident_handoff(
         )
     except RuntimeIncidentHandoffError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    artifact = load_latest_runtime_incident_handoff_artifact(
+        session_factory, incident_id=incident_id
+    )
+    if artifact is not None:
+        handoff = {
+            **handoff,
+            "stable_handoff_id": artifact.id,
+            "diagnosis_revision": artifact.diagnosis_revision,
+            "outcome_kind": artifact.outcome_kind,
+            "content_sha256": artifact.content_fingerprint,
+            "delivery_status": artifact.status,
+        }
     typer.echo(
         json.dumps(
             handoff,

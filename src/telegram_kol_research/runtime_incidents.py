@@ -14,6 +14,7 @@ from sqlalchemy.orm import sessionmaker
 from telegram_kol_research.models import (
     MessageOperationContract,
     MessageOperationItem,
+    RawMessage,
     RuntimeIncident,
     RuntimeIncidentAffectedMessage,
 )
@@ -980,6 +981,16 @@ def get_message_operation_incident_snapshot(
             contract_refs[int(contract.id)] = (
                 loaded_refs[:32] if isinstance(loaded_refs, list) else []
             )
+        raw_ids = [int(relation.raw_message_id) for relation, _ in rows]
+        raw_rows = (
+            session.query(RawMessage)
+            .filter(RawMessage.id.in_(raw_ids))
+            .order_by(RawMessage.id)
+            .all()
+            if raw_ids
+            else []
+        )
+        raw_by_id = {int(raw.id): raw for raw in raw_rows}
     return {
         "affected_message_count": int(affected_count),
         "truncated": affected_count > 32,
@@ -995,6 +1006,28 @@ def get_message_operation_incident_snapshot(
                 "violation_code": contract.violation_code,
                 "items": items_by_contract.get(int(contract.id), []),
                 "evidence_refs": contract_refs.get(int(contract.id), []),
+            }
+            for _, contract in rows
+        ],
+        "message_evidence": [
+            {
+                "raw_message_id": int(relation.raw_message_id),
+                "chat_id": int(raw_by_id[int(relation.raw_message_id)].chat_id),
+                "message_id": int(raw_by_id[int(relation.raw_message_id)].message_id),
+                "reply_to_message_id": raw_by_id[
+                    int(relation.raw_message_id)
+                ].reply_to_message_id,
+                "source_status": raw_by_id[int(relation.raw_message_id)].source_status,
+            }
+            for relation, _ in rows
+            if int(relation.raw_message_id) in raw_by_id
+        ],
+        "timeline": [
+            {
+                "contract_id": int(contract.id),
+                "created_at": contract.created_at.isoformat(),
+                "updated_at": contract.updated_at.isoformat(),
+                "status": contract.status,
             }
             for _, contract in rows
         ],
@@ -1074,6 +1107,8 @@ def transition_runtime_incident(
     queue_notification: bool = False,
     agent_next_attempt_at: datetime | None = None,
     prompt_version: str | None = None,
+    handoff: dict[str, object] | None = None,
+    handoff_outcome: str | None = None,
 ) -> bool:
     """Apply a token-checked lifecycle transition without loading stale state."""
 
@@ -1155,6 +1190,18 @@ def transition_runtime_incident(
         result = session.execute(
             update(RuntimeIncident).where(*predicates).values(**values)
         )
+        if result.rowcount == 1 and handoff is not None:
+            from telegram_kol_research.runtime_incident_handoff import (
+                persist_runtime_incident_handoff_in_session,
+            )
+
+            persist_runtime_incident_handoff_in_session(
+                session,
+                incident_id=int(incident_id),
+                outcome_kind=str(handoff_outcome or target),
+                handoff=handoff,
+                created_at=now,
+            )
         session.commit()
         return result.rowcount == 1
 

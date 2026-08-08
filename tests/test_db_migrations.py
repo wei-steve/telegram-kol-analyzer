@@ -21,6 +21,7 @@ def test_context_resolution_schema_is_created(tmp_path):
     assert inspector.has_table("message_operation_contracts")
     assert inspector.has_table("message_operation_items")
     assert inspector.has_table("message_operation_stage1_notifications")
+    assert inspector.has_table("runtime_incident_handoff_artifacts")
     assert inspector.has_table("position_protection_health_observations")
     assert inspector.has_table("management_message_envelopes")
     assert inspector.has_table("management_message_targets")
@@ -90,6 +91,42 @@ def test_message_operation_stage1_outbox_has_additive_bounded_shape(tmp_path):
     }
     assert "uq_message_operation_stage1_identity" in indexes
     assert "ix_message_operation_stage1_claimable" in indexes
+
+
+def test_runtime_incident_handoff_artifact_has_additive_revisioned_shape(tmp_path):
+    session_factory = create_session_factory(tmp_path / "handoff-schema.db")
+    inspector = inspect(session_factory.kw["bind"])
+
+    columns = {
+        column["name"]
+        for column in inspector.get_columns("runtime_incident_handoff_artifacts")
+    }
+    assert {
+        "runtime_incident_id",
+        "diagnosis_revision",
+        "outcome_kind",
+        "content_json",
+        "codex_prompt",
+        "evidence_document_json",
+        "content_fingerprint",
+        "status",
+        "claim_token",
+        "claimed_at",
+        "attempt_count",
+        "next_attempt_at",
+        "telegram_message_id",
+        "telegram_document_message_id",
+        "delivered_at",
+        "error_code",
+        "created_at",
+        "updated_at",
+    } <= columns
+    indexes = {
+        index["name"]
+        for index in inspector.get_indexes("runtime_incident_handoff_artifacts")
+    }
+    assert "uq_runtime_incident_handoff_revision" in indexes
+    assert "ix_runtime_incident_handoff_claimable" in indexes
 
 
 def test_position_protection_health_observation_schema_is_append_only_shape(tmp_path):

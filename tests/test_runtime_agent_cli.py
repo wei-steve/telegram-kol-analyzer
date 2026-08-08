@@ -191,6 +191,54 @@ def test_runtime_agent_cli_prints_reproducible_handoff(tmp_path):
     assert "独立验证" in payload["codex_prompt"]
 
 
+def test_runtime_agent_cli_prints_stable_durable_handoff_identity(tmp_path):
+    from telegram_kol_research.runtime_incident_handoff import (
+        persist_runtime_incident_handoff,
+    )
+
+    database_path = tmp_path / "durable-cli-handoff.db"
+    session_factory = create_session_factory(database_path)
+    incident = record_runtime_incident(
+        session_factory,
+        source_kind="worker_job",
+        source_record_id="43",
+        incident_type="worker_retry_exhausted",
+        severity="high",
+        fingerprint="e" * 64,
+        redacted_summary='{"error_type":"provider_timeout"}',
+        occurred_at=datetime(2026, 7, 28, 9, 0, tzinfo=UTC),
+        feature_policy_version="runtime-incident-phase-8r-v1",
+        prompt_version="runtime-agent-prompt-v8",
+        tool_policy_version="runtime-agent-tools-v2",
+    )
+    artifact = persist_runtime_incident_handoff(
+        session_factory,
+        incident_id=incident.id,
+        outcome_kind="provider_failed",
+        handoff={
+            "incident": {"id": incident.id},
+            "codex_prompt": f"请调查 incident_id={incident.id}，读取 AGENTS.md 并独立验证。",
+        },
+        created_at=datetime(2026, 7, 28, 9, 1, tzinfo=UTC),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "runtime-incident-handoff",
+            str(incident.id),
+            "--database-path",
+            str(database_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["stable_handoff_id"] == artifact.id
+    assert payload["diagnosis_revision"] == 1
+    assert payload["content_sha256"] == artifact.content_fingerprint
+
+
 def test_runtime_agent_cli_configures_every_phase3_read_only_projection(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)

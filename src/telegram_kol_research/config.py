@@ -81,6 +81,9 @@ class RuntimeIncidentConfig:
     message_operation_stage1_enabled: bool = False
     message_operation_stage1_after_contract_id: int = _SQLITE_MAX_INTEGER
     message_operation_stage1_max_attempts: int = 5
+    message_operation_stage2_enabled: bool = False
+    message_operation_stage2_after_handoff_id: int = _SQLITE_MAX_INTEGER
+    message_operation_stage2_max_attempts: int = 5
     agent_enabled: bool = False
     agent_incident_types: frozenset[str] | None = None
     message_operation_agent_enabled: bool = False
@@ -296,6 +299,17 @@ def _message_operation_agent_after_contract_id(env: dict[str, str]) -> int:
     return value
 
 
+def _message_operation_stage2_after_handoff_id(env: dict[str, str]) -> int:
+    key = "TELEGRAM_KOL_MESSAGE_OPERATION_STAGE2_AFTER_HANDOFF_ID"
+    try:
+        value = int(env[key])
+    except (KeyError, TypeError, ValueError):
+        return _SQLITE_MAX_INTEGER
+    if not 0 <= value <= _SQLITE_MAX_INTEGER:
+        return _SQLITE_MAX_INTEGER
+    return value
+
+
 def _deployed_code_version(env: dict[str, str]) -> str:
     value = str(
         env.get("TELEGRAM_KOL_RUNTIME_AGENT_DEPLOYED_CODE_VERSION", "unknown")
@@ -390,6 +404,14 @@ def load_runtime_incident_config(
     except (TypeError, ValueError):
         message_operation_stage1_max_attempts = 5
     try:
+        message_operation_stage2_max_attempts = int(
+            env.get(
+                "TELEGRAM_KOL_MESSAGE_OPERATION_STAGE2_MAX_ATTEMPTS", "5"
+            )
+        )
+    except (TypeError, ValueError):
+        message_operation_stage2_max_attempts = 5
+    try:
         agent_tool_steps = int(
             env.get("TELEGRAM_KOL_RUNTIME_AGENT_MAX_TOOL_STEPS", "4")
         )
@@ -454,6 +476,15 @@ def load_runtime_incident_config(
         ),
         message_operation_stage1_max_attempts=max(
             1, min(message_operation_stage1_max_attempts, 20)
+        ),
+        message_operation_stage2_enabled=_enabled_flag(
+            env.get("TELEGRAM_KOL_MESSAGE_OPERATION_STAGE2_ENABLED")
+        ),
+        message_operation_stage2_after_handoff_id=(
+            _message_operation_stage2_after_handoff_id(env)
+        ),
+        message_operation_stage2_max_attempts=max(
+            1, min(message_operation_stage2_max_attempts, 20)
         ),
         agent_enabled=_enabled_flag(
             env.get("TELEGRAM_KOL_RUNTIME_AGENT_ENABLED")

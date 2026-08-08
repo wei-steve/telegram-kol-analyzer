@@ -17,6 +17,7 @@ from telegram_kol_research.models import (
     RawMessage,
     RuntimeAgentRecoveryAttempt,
     RuntimeIncident,
+    RuntimeIncidentHandoffArtifact,
     SignalCandidate,
     StrategyLifecycle,
 )
@@ -552,6 +553,11 @@ def test_worker_runs_bounded_tool_loop_and_commits_structured_diagnosis(tmp_path
         )
         assert row.notification_status == "pending"
         assert row.notified_at is None
+        artifact = session.query(RuntimeIncidentHandoffArtifact).one()
+        assert artifact.runtime_incident_id == incident.id
+        assert artifact.outcome_kind == "diagnosed"
+        assert artifact.status == "pending"
+        assert artifact.codex_prompt == result.handoff["codex_prompt"]
 
 
 def test_worker_records_shadow_policy_result_but_never_executes_playbook(tmp_path):
@@ -1299,6 +1305,99 @@ def test_worker_safely_releases_claim_for_retry_after_provider_failure(tmp_path)
         row = session.get(RuntimeIncident, incident.id)
         assert row.agent_attempt_count == 3
         assert row.agent_next_attempt_at is None
+        artifact = session.query(RuntimeIncidentHandoffArtifact).one()
+        assert artifact.outcome_kind == "provider_failed"
+        assert artifact.status == "pending"
+        assert "incident_id=" in artifact.codex_prompt
+
+
+def test_worker_queues_terminal_stage2_for_evidence_incomplete(tmp_path):
+    session_factory = create_session_factory(tmp_path / "evidence-incomplete.db")
+    incident = _record(session_factory)
+    responses = iter(({"final": {}}, {"final": {}}))
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(enabled=True, max_agent_attempts=1),
+        tools=_registry([]),
+        model_turn=lambda **_kwargs: next(responses),
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "escalated"
+    with session_factory() as session:
+        artifact = session.query(RuntimeIncidentHandoffArtifact).one()
+        assert artifact.outcome_kind == "evidence_incomplete"
+        assert artifact.status == "pending"
+
+
+def test_worker_queues_terminal_stage2_for_tool_failure(tmp_path):
+    from telegram_kol_research.runtime_agent_tools import RuntimeAgentToolError
+
+    session_factory = create_session_factory(tmp_path / "tool-failed.db")
+    incident = _record(session_factory)
+
+    def fail_tool(*, incident_id):
+        assert incident_id == incident.id
+        raise RuntimeAgentToolError("bounded read failed")
+
+    registry = RuntimeAgentToolRegistry(
+        providers={"get_incident_summary": fail_tool}
+    )
+    responses = iter(
+        (
+            {
+                "tool_call": {
+                    "id": "call-1",
+                    "name": "get_incident_summary",
+                    "arguments": {"incident_id": incident.id},
+                }
+            },
+            {"final": {}},
+            {"final": {}},
+        )
+    )
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(enabled=True, max_agent_attempts=1),
+        tools=registry,
+        model_turn=lambda **_kwargs: next(responses),
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "escalated"
+    with session_factory() as session:
+        artifact = session.query(RuntimeIncidentHandoffArtifact).one()
+        assert artifact.outcome_kind == "tool_failed"
+
+
+def test_worker_queues_terminal_stage2_for_wall_timeout(tmp_path):
+    session_factory = create_session_factory(tmp_path / "wall-timeout.db")
+    incident = _record(session_factory)
+    calls = 0
+
+    def clock():
+        nonlocal calls
+        calls += 1
+        return 0.0 if calls == 1 else 121.0
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(
+            enabled=True,
+            max_agent_attempts=1,
+            max_wall_seconds=120.0,
+        ),
+        tools=_registry([]),
+        model_turn=lambda **_kwargs: _final(incident.id),
+        now=NOW + timedelta(minutes=2),
+        monotonic=clock,
+    )
+
+    assert result.status == "escalated"
+    with session_factory() as session:
+        artifact = session.query(RuntimeIncidentHandoffArtifact).one()
+        assert artifact.outcome_kind == "timed_out"
 
 
 def test_worker_enforces_prompt_budget_again_after_tool_output(tmp_path):
@@ -1368,6 +1467,9 @@ def test_worker_escalates_before_model_if_crash_reclaim_exceeds_attempt_budget(
         row = session.get(RuntimeIncident, incident.id)
         assert row.agent_attempt_count == 4
         assert row.status == "escalated"
+        artifact = session.query(RuntimeIncidentHandoffArtifact).one()
+        assert artifact.outcome_kind == "evidence_incomplete"
+        assert artifact.status == "pending"
 
 
 def test_worker_reuses_same_fingerprint_diagnosis_without_model_call(tmp_path):
@@ -1459,6 +1561,23 @@ def test_message_operation_reuse_requires_exact_policy_code_evidence_and_class(
     assert second_result.status == "reused"
     assert model_calls == []
     assert second_result.handoff["affected_message_ids"] == [raw_1, raw_2]
+    assert second_result.handoff["instruction_items"] == [
+        {"contract_id": 1, "items": []},
+        {"contract_id": 2, "items": []},
+    ]
+    assert [
+        item["raw_message_id"]
+        for item in second_result.handoff["original_reply_evidence"]
+    ] == [raw_1, raw_2]
+    assert len(second_result.handoff["timeline"]) == 2
+    with session_factory() as session:
+        artifacts = (
+            session.query(RuntimeIncidentHandoffArtifact)
+            .order_by(RuntimeIncidentHandoffArtifact.diagnosis_revision)
+            .all()
+        )
+        assert [row.diagnosis_revision for row in artifacts] == [1, 2]
+        assert [row.outcome_kind for row in artifacts] == ["diagnosed", "reused"]
 
 
 def test_message_operation_severity_change_forces_fresh_investigation(tmp_path):

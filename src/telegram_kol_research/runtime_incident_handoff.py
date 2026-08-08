@@ -3,18 +3,26 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 from telegram_kol_research.runtime_agent_contracts import RuntimeAgentDiagnosis
 from telegram_kol_research.runtime_incidents import get_runtime_incident
+from telegram_kol_research.models import RuntimeIncidentHandoffArtifact
 
 
 _SENSITIVE_KEY_PATTERN = re.compile(
     r"(secret|token|credential|cookie|session|api.?key|password|passphrase|"
     r"authorization|private.?key)",
     re.IGNORECASE,
+)
+_SENSITIVE_VALUE_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{6,}\."),
+    re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
 )
 _ALLOWED_INCIDENT_FIELDS = frozenset(
     {"id", "incident_type", "source_kind", "source_record_id", "redacted_summary"}
@@ -23,6 +31,113 @@ _ALLOWED_INCIDENT_FIELDS = frozenset(
 
 class RuntimeIncidentHandoffError(ValueError):
     """Raised when a handoff cannot remain bounded and redacted."""
+
+
+_OUTCOME_KINDS = frozenset(
+    {
+        "diagnosed",
+        "reused",
+        "provider_failed",
+        "tool_failed",
+        "evidence_incomplete",
+        "timed_out",
+    }
+)
+
+
+def _canonical_handoff(handoff: Mapping[str, Any]) -> tuple[str, str]:
+    _validate_redacted(handoff)
+    encoded = json.dumps(
+        dict(handoff), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    if len(encoded.encode("utf-8")) > 32768:
+        raise RuntimeIncidentHandoffError("handoff exceeds byte budget")
+    return encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def persist_runtime_incident_handoff_in_session(
+    session,
+    *,
+    incident_id: int,
+    outcome_kind: str,
+    handoff: Mapping[str, Any],
+    created_at,
+) -> RuntimeIncidentHandoffArtifact:
+    """Append one changed handoff revision inside the caller transaction."""
+
+    normalized_outcome = str(outcome_kind)
+    if normalized_outcome not in _OUTCOME_KINDS:
+        raise RuntimeIncidentHandoffError("handoff outcome is invalid")
+    content_json, content_fingerprint = _canonical_handoff(handoff)
+    prompt = handoff.get("codex_prompt")
+    if not isinstance(prompt, str) or not prompt or len(prompt) > 1500:
+        raise RuntimeIncidentHandoffError("handoff prompt is invalid")
+    existing = (
+        session.query(RuntimeIncidentHandoffArtifact)
+        .filter(
+            RuntimeIncidentHandoffArtifact.runtime_incident_id == int(incident_id),
+            RuntimeIncidentHandoffArtifact.content_fingerprint == content_fingerprint,
+        )
+        .one_or_none()
+    )
+    if existing is not None:
+        return existing
+    latest_revision = (
+        session.query(RuntimeIncidentHandoffArtifact.diagnosis_revision)
+        .filter(RuntimeIncidentHandoffArtifact.runtime_incident_id == int(incident_id))
+        .order_by(RuntimeIncidentHandoffArtifact.diagnosis_revision.desc())
+        .limit(1)
+        .scalar()
+    )
+    artifact = RuntimeIncidentHandoffArtifact(
+        runtime_incident_id=int(incident_id),
+        diagnosis_revision=int(latest_revision or 0) + 1,
+        outcome_kind=normalized_outcome,
+        content_json=content_json,
+        codex_prompt=prompt,
+        evidence_document_json="{}",
+        content_fingerprint=content_fingerprint,
+        status="pending",
+        created_at=created_at,
+        updated_at=created_at,
+    )
+    session.add(artifact)
+    session.flush()
+    document = {
+        "stable_handoff_id": artifact.id,
+        "runtime_incident_id": int(incident_id),
+        "diagnosis_revision": artifact.diagnosis_revision,
+        "content_sha256": content_fingerprint,
+        "handoff": dict(handoff),
+    }
+    artifact.evidence_document_json = json.dumps(
+        document, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    if len(artifact.evidence_document_json.encode("utf-8")) > 32768:
+        raise RuntimeIncidentHandoffError("handoff document exceeds byte budget")
+    return artifact
+
+
+def persist_runtime_incident_handoff(
+    session_factory,
+    *,
+    incident_id: int,
+    outcome_kind: str,
+    handoff: Mapping[str, Any],
+    created_at,
+) -> RuntimeIncidentHandoffArtifact:
+    with session_factory() as session:
+        artifact = persist_runtime_incident_handoff_in_session(
+            session,
+            incident_id=incident_id,
+            outcome_kind=outcome_kind,
+            handoff=handoff,
+            created_at=created_at,
+        )
+        session.commit()
+        session.refresh(artifact)
+        session.expunge(artifact)
+        return artifact
 
 
 def _validate_redacted(value, *, depth=0) -> None:
@@ -45,6 +160,8 @@ def _validate_redacted(value, *, depth=0) -> None:
     elif isinstance(value, str):
         if len(value) > 512:
             raise RuntimeIncidentHandoffError("handoff is not bounded")
+        if any(pattern.search(value) for pattern in _SENSITIVE_VALUE_PATTERNS):
+            raise RuntimeIncidentHandoffError("handoff contains sensitive material")
     elif value is not None and not isinstance(value, (bool, int, float)):
         raise RuntimeIncidentHandoffError("handoff has unsupported data")
 
@@ -164,8 +281,30 @@ def build_runtime_incident_handoff(
         f"Agent 假设: {diagnosis.diagnosis_hypothesis}\n"
         f"剩余风险: {diagnosis.remaining_risk}"
     )[:512]
+    message_snapshot = compact_incident["redacted_summary"].get(
+        "message_operation_snapshot", {}
+    ) if isinstance(compact_incident["redacted_summary"], dict) else {}
+    contracts = (
+        message_snapshot.get("contracts", [])
+        if isinstance(message_snapshot, dict)
+        else []
+    )
+    instruction_items = [
+        {
+            "contract_id": contract.get("contract_id"),
+            "items": contract.get("items", []),
+        }
+        for contract in contracts[:32]
+        if isinstance(contract, dict)
+    ]
     handoff = {
         "incident": compact_incident,
+        "instruction_items": instruction_items,
+        "original_reply_evidence": message_snapshot.get(
+            "message_evidence", []
+        ) if isinstance(message_snapshot, dict) else [],
+        "timeline": message_snapshot.get("timeline", [])
+        if isinstance(message_snapshot, dict) else [],
         "evidence_references": list(diagnosis.evidence_references),
         "attempted_queries": bounded_queries,
         "attempted_playbooks": attempted_playbooks,
@@ -193,8 +332,75 @@ def build_runtime_incident_handoff(
         json.dumps(handoff, ensure_ascii=False, separators=(",", ":")).encode(
             "utf-8"
         )
-    ) > 8192:
+    ) > 32768:
         raise RuntimeIncidentHandoffError("handoff exceeds byte budget")
+    return handoff
+
+
+def build_runtime_incident_failure_handoff(
+    *,
+    incident: Mapping[str, Any],
+    outcome_kind: str,
+    attempted_queries: Sequence[str],
+) -> dict[str, Any]:
+    """Build a deterministic terminal handoff when investigation fails closed."""
+
+    if outcome_kind not in _OUTCOME_KINDS - {"diagnosed", "reused"}:
+        raise RuntimeIncidentHandoffError("handoff outcome is invalid")
+    incident_id = int(incident["id"])
+    prompt = (
+        f"请调查运行异常 incident_id={incident_id}。\n"
+        "先读取 AGENTS.md 和稳定交接ID，独立验证证据；Agent调查未能完成。\n"
+        "保留现有策略识别与上下文解析权威，禁止重试结果未知的写操作。\n"
+        "添加回归测试，并遵守服务器安全窗口与部署门槛。"
+    )[:1500]
+    summary = incident.get("redacted_summary")
+    message_snapshot = (
+        summary.get("message_operation_snapshot", {})
+        if isinstance(summary, dict)
+        else {}
+    )
+    handoff = {
+        "incident": {
+            key: incident[key]
+            for key in _ALLOWED_INCIDENT_FIELDS
+        },
+        "outcome_kind": outcome_kind,
+        "instruction_items": [
+            {
+                "contract_id": contract.get("contract_id"),
+                "items": contract.get("items", []),
+            }
+            for contract in message_snapshot.get("contracts", [])[:32]
+            if isinstance(contract, dict)
+        ] if isinstance(message_snapshot, dict) else [],
+        "original_reply_evidence": message_snapshot.get("message_evidence", [])
+        if isinstance(message_snapshot, dict) else [],
+        "expected_state": "The investigation reaches a bounded terminal diagnosis.",
+        "observed_state": f"The investigation ended as {outcome_kind}.",
+        "timeline": message_snapshot.get("timeline", [])
+        if isinstance(message_snapshot, dict) else [],
+        "evidence_references": [f"incident:{incident_id}"],
+        "attempted_queries": [str(value)[:64] for value in attempted_queries[:16]],
+        "agent_hypothesis": {
+            "text": "No trusted diagnosis was produced.",
+            "confidence": "low",
+            "missing_evidence": [outcome_kind],
+            "classification": "insufficient_evidence",
+        },
+        "likely_code_paths": [
+            "src/telegram_kol_research/runtime_agent_worker.py"
+        ],
+        "likely_test_paths": ["tests/test_runtime_agent_worker.py"],
+        "prohibited_actions": [
+            "strategy_targeting",
+            "context_resolution_replacement",
+            "unchecked_exchange_write",
+            "unknown_write_retry",
+        ],
+        "codex_prompt": prompt,
+    }
+    _canonical_handoff(handoff)
     return handoff
 
 
@@ -204,6 +410,30 @@ def load_runtime_incident_handoff(
     incident_id: int,
 ) -> dict[str, Any]:
     """Rebuild a handoff from durable diagnosis and evidence ledger fields."""
+
+    with session_factory() as session:
+        artifact = (
+            session.query(RuntimeIncidentHandoffArtifact)
+            .filter(
+                RuntimeIncidentHandoffArtifact.runtime_incident_id
+                == int(incident_id)
+            )
+            .order_by(RuntimeIncidentHandoffArtifact.diagnosis_revision.desc())
+            .first()
+        )
+        if artifact is not None:
+            try:
+                durable = json.loads(artifact.content_json)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeIncidentHandoffError(
+                    "durable runtime incident handoff is invalid"
+                ) from exc
+            if not isinstance(durable, dict):
+                raise RuntimeIncidentHandoffError(
+                    "durable runtime incident handoff is invalid"
+                )
+            _canonical_handoff(durable)
+            return durable
 
     incident = get_runtime_incident(
         session_factory,
@@ -290,3 +520,21 @@ def load_runtime_incident_handoff(
             else None
         ),
     )
+
+
+def load_latest_runtime_incident_handoff_artifact(
+    session_factory, *, incident_id: int
+) -> RuntimeIncidentHandoffArtifact | None:
+    with session_factory() as session:
+        artifact = (
+            session.query(RuntimeIncidentHandoffArtifact)
+            .filter(
+                RuntimeIncidentHandoffArtifact.runtime_incident_id
+                == int(incident_id)
+            )
+            .order_by(RuntimeIncidentHandoffArtifact.diagnosis_revision.desc())
+            .first()
+        )
+        if artifact is not None:
+            session.expunge(artifact)
+        return artifact

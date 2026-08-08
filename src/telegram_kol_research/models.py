@@ -2943,6 +2943,104 @@ class RuntimeIncidentAffectedMessage(Base):
     )
 
 
+class RuntimeIncidentHandoffArtifact(Base):
+    """Revisioned, redacted Codex handoff and Stage 2 delivery outbox."""
+
+    __tablename__ = "runtime_incident_handoff_artifacts"
+    __table_args__ = (
+        Index(
+            "uq_runtime_incident_handoff_revision",
+            "runtime_incident_id",
+            "diagnosis_revision",
+            unique=True,
+        ),
+        Index(
+            "uq_runtime_incident_handoff_content",
+            "runtime_incident_id",
+            "content_fingerprint",
+            unique=True,
+        ),
+        Index(
+            "ix_runtime_incident_handoff_claimable",
+            "status",
+            "next_attempt_at",
+            "claimed_at",
+        ),
+        CheckConstraint(
+            "diagnosis_revision >= 1 AND attempt_count >= 0",
+            name="ck_runtime_incident_handoff_positive_counters",
+        ),
+        CheckConstraint(
+            "outcome_kind IN ('diagnosed', 'reused', 'provider_failed', "
+            "'tool_failed', 'evidence_incomplete', 'timed_out')",
+            name="ck_runtime_incident_handoff_outcome",
+        ),
+        CheckConstraint(
+            "length(content_json) <= 32768 AND length(codex_prompt) <= 1500 "
+            "AND length(evidence_document_json) <= 32768",
+            name="ck_runtime_incident_handoff_payload_bounded",
+        ),
+        CheckConstraint(
+            "length(content_fingerprint) = 64",
+            name="ck_runtime_incident_handoff_fingerprint",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'delivering', 'failed', 'delivered', 'exhausted')",
+            name="ck_runtime_incident_handoff_status",
+        ),
+        CheckConstraint(
+            "claim_token IS NULL OR length(claim_token) <= 64",
+            name="ck_runtime_incident_handoff_claim_token",
+        ),
+        CheckConstraint(
+            "telegram_message_id IS NULL OR length(telegram_message_id) <= 255",
+            name="ck_runtime_incident_handoff_telegram_message",
+        ),
+        CheckConstraint(
+            "telegram_document_message_id IS NULL OR "
+            "length(telegram_document_message_id) <= 255",
+            name="ck_runtime_incident_handoff_telegram_document",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR length(error_code) <= 128",
+            name="ck_runtime_incident_handoff_error_code",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    runtime_incident_id: Mapped[int] = mapped_column(
+        ForeignKey("runtime_incidents.id"), nullable=False, index=True
+    )
+    diagnosis_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    outcome_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    content_json: Mapped[str] = mapped_column(Text, nullable=False)
+    codex_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_document_json: Mapped[str] = mapped_column(Text, nullable=False)
+    content_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending",
+        server_default=sql_text("'pending'"),
+    )
+    claim_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sql_text("0")
+    )
+    next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    telegram_message_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    telegram_document_message_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True
+    )
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    error_code: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+
 class MessageOperationStage1Notification(Base):
     """Durable immediate alert for one affected message, independent of AI."""
 

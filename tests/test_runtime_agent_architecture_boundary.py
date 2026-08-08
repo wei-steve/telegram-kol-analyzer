@@ -36,7 +36,9 @@ FORBIDDEN_SYMBOL_FRAGMENTS = (
     "close_position",
 )
 ALLOWED_PACKAGE_IMPORTS_BY_MODULE = {
-    "runtime_incidents.py": frozenset({"models", "runtime_agent_playbooks"}),
+    "runtime_incidents.py": frozenset(
+        {"models", "runtime_agent_playbooks", "runtime_incident_handoff"}
+    ),
     "runtime_incident_adapters.py": frozenset(
         {"config", "message_operation_types", "models", "runtime_incidents"}
     ),
@@ -73,7 +75,7 @@ ALLOWED_PACKAGE_IMPORTS_BY_MODULE = {
         {"runtime_agent_policy"}
     ),
     "runtime_incident_handoff.py": frozenset(
-        {"runtime_agent_contracts", "runtime_incidents"}
+        {"models", "runtime_agent_contracts", "runtime_incidents"}
     ),
     "runtime_incident_observations.py": frozenset(
         {"models", "runtime_incident_scanner"}
@@ -224,7 +226,7 @@ def test_phase_7_is_deferred_and_phase_8r_requires_no_action_authority():
     assert "phase_7_disposition: deferred_non_blocking" in status
     assert "current_phase: 8R.9" in status
     assert "phase_name: persist-codex-handoff-and-stage2" in status
-    assert "phase_status: planned" in status
+    assert "phase_status: in_progress" in status
     assert 'last_completed_phase: "8R.8"' in status
     assert "task_8r_4_status: completed_dormant_production_verified" in status
     assert "task_8r_5_status: completed_future_only_shadow_canary" in status

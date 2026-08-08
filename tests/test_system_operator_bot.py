@@ -669,6 +669,99 @@ def test_message_operation_stage1_config_is_dormant_and_watermark_fails_closed()
     assert malformed.message_operation_stage1_after_contract_id == 2**63 - 1
 
 
+def test_message_operation_stage2_config_is_dormant_and_watermark_fails_closed():
+    from telegram_kol_research.config import load_runtime_incident_config
+
+    dormant = load_runtime_incident_config(environ={}, env_file_paths=[])
+    enabled = load_runtime_incident_config(
+        environ={
+            "TELEGRAM_KOL_MESSAGE_OPERATION_STAGE2_ENABLED": "true",
+            "TELEGRAM_KOL_MESSAGE_OPERATION_STAGE2_AFTER_HANDOFF_ID": "7",
+        },
+        env_file_paths=[],
+    )
+    malformed = load_runtime_incident_config(
+        environ={
+            "TELEGRAM_KOL_MESSAGE_OPERATION_STAGE2_ENABLED": "true",
+            "TELEGRAM_KOL_MESSAGE_OPERATION_STAGE2_AFTER_HANDOFF_ID": "bad",
+        },
+        env_file_paths=[],
+    )
+
+    assert dormant.message_operation_stage2_enabled is False
+    assert dormant.message_operation_stage2_after_handoff_id == 2**63 - 1
+    assert enabled.message_operation_stage2_enabled is True
+    assert enabled.message_operation_stage2_after_handoff_id == 7
+    assert malformed.message_operation_stage2_after_handoff_id == 2**63 - 1
+
+
+def test_stage2_dispatches_copyable_prompt_and_matching_json_document(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research.models import RuntimeIncidentHandoffArtifact
+    from telegram_kol_research.runtime_incident_handoff import (
+        persist_runtime_incident_handoff,
+    )
+
+    session_factory = create_session_factory(tmp_path / "stage2-delivery.db")
+    incident, _ = _seed_message_operation_stage1(session_factory)
+    handoff = {
+        "incident": {"id": incident.id, "incident_type": "message_operation_failure"},
+        "evidence_references": [f"incident:{incident.id}"],
+        "agent_hypothesis": {"text": "local state did not converge", "confidence": "low"},
+        "codex_prompt": (
+            f"请调查 incident_id={incident.id}；读取 AGENTS.md，独立验证，"
+            "禁止未知写重试，添加回归测试并遵守服务器部署门槛。"
+        ),
+    }
+    artifact = persist_runtime_incident_handoff(
+        session_factory,
+        incident_id=incident.id,
+        outcome_kind="diagnosed",
+        handoff=handoff,
+        created_at=NOW,
+    )
+    messages = []
+    documents = []
+
+    async def capture_message(**kwargs):
+        messages.append(kwargs["text"])
+        return 8801
+
+    async def capture_document(**kwargs):
+        documents.append(kwargs)
+        return 8802
+
+    monkeypatch.setattr(
+        operator_bot_module, "send_system_operator_bot_message", capture_message
+    )
+    monkeypatch.setattr(
+        operator_bot_module, "send_system_operator_bot_document", capture_document
+    )
+    delivered = asyncio.run(
+        operator_bot_module.deliver_runtime_incident_stage2_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            after_handoff_id=0,
+            claimed_at=NOW,
+        )
+    )
+
+    assert delivered == 1
+    assert f"交接ID: {artifact.id}" in messages[0]
+    assert artifact.content_fingerprint in messages[0]
+    assert handoff["codex_prompt"] in messages[0]
+    assert documents[0]["filename"] == f"runtime-incident-handoff-{artifact.id}.json"
+    document = json.loads(documents[0]["content"])
+    assert document["stable_handoff_id"] == artifact.id
+    assert document["content_sha256"] == artifact.content_fingerprint
+    with session_factory() as session:
+        stored = session.get(RuntimeIncidentHandoffArtifact, artifact.id)
+        assert stored.status == "delivered"
+        assert stored.telegram_message_id == "8801"
+        assert stored.telegram_document_message_id == "8802"
+
+
 def test_main_runtime_dispatcher_delivers_stage1_without_agent_or_legacy_selector(
     tmp_path,
     monkeypatch,

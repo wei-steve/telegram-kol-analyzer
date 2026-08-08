@@ -39,6 +39,7 @@ from telegram_kol_research.runtime_agent_tools import (
 )
 from telegram_kol_research.runtime_incident_handoff import (
     build_runtime_incident_handoff,
+    build_runtime_incident_failure_handoff,
 )
 from telegram_kol_research.runtime_incident_snapshot import (
     MANAGEMENT_TARGET_DIAGNOSIS_INCIDENT_TYPES,
@@ -141,6 +142,19 @@ def _handoff_incident(incident) -> dict[str, Any]:
     incident_mapping = _incident_mapping(incident)
     return {
         key: incident_mapping[key]
+        for key in (
+            "id",
+            "incident_type",
+            "source_kind",
+            "source_record_id",
+            "redacted_summary",
+        )
+    }
+
+
+def _handoff_incident_from_mapping(incident: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: incident[key]
         for key in (
             "id",
             "incident_type",
@@ -514,6 +528,8 @@ def _commit_diagnosis(
     recovery_status: str | None = None,
     prompt_version: str | None = None,
     reuse_context: Mapping[str, Any] | None = None,
+    handoff: Mapping[str, Any] | None = None,
+    outcome_kind: str = "diagnosed",
 ) -> bool:
     ledger_diagnosis = diagnosis.to_ledger_mapping()
     ledger_diagnosis["shadow_playbook_policy"] = (
@@ -547,6 +563,8 @@ def _commit_diagnosis(
         recovery_status=recovery_status or shadow_decision.recovery_status,
         queue_notification=True,
         prompt_version=prompt_version,
+        handoff=dict(handoff) if handoff is not None else None,
+        handoff_outcome=outcome_kind,
     )
 
 
@@ -618,9 +636,17 @@ def _transition_retry(
     claim_token,
     now,
     config: RuntimeAgentWorkerConfig,
+    failure_outcome: str,
+    attempted_queries: tuple[str, ...],
+    agent_incident: Mapping[str, Any] | None,
 ) -> str:
     max_attempts = max(1, min(int(config.max_agent_attempts), 10))
     if int(incident.agent_attempt_count) >= max_attempts:
+        failure_handoff = build_runtime_incident_failure_handoff(
+            incident=(agent_incident or _handoff_incident(incident)),
+            outcome_kind=failure_outcome,
+            attempted_queries=attempted_queries,
+        )
         transition_runtime_incident(
             session_factory,
             incident_id=incident.id,
@@ -628,6 +654,9 @@ def _transition_retry(
             to_status="escalated",
             claim_token=claim_token,
             now=now,
+            queue_notification=True,
+            handoff=failure_handoff,
+            handoff_outcome=failure_outcome,
         )
         return "escalated"
     delay = min(
@@ -645,6 +674,34 @@ def _transition_retry(
         agent_next_attempt_at=now + timedelta(seconds=delay),
     )
     return "retry_pending"
+
+
+def _transition_terminal_failure(
+    session_factory,
+    *,
+    incident,
+    claim_token: str,
+    now: datetime,
+    outcome_kind: str,
+    attempted_queries: tuple[str, ...] = (),
+    agent_incident: Mapping[str, Any] | None = None,
+) -> bool:
+    failure_handoff = build_runtime_incident_failure_handoff(
+        incident=(agent_incident or _handoff_incident(incident)),
+        outcome_kind=outcome_kind,
+        attempted_queries=attempted_queries,
+    )
+    return transition_runtime_incident(
+        session_factory,
+        incident_id=incident.id,
+        from_status="claimed",
+        to_status="escalated",
+        claim_token=claim_token,
+        now=now,
+        queue_notification=True,
+        handoff=failure_handoff,
+        handoff_outcome=outcome_kind,
+    )
 
 
 def run_runtime_agent_once(
@@ -694,13 +751,12 @@ def run_runtime_agent_once(
         return RuntimeAgentWorkerResult(status="claim_lost", incident_id=candidate.id)
     max_agent_attempts = max(1, min(int(config.max_agent_attempts), 10))
     if int(claimed.agent_attempt_count) > max_agent_attempts:
-        transition_runtime_incident(
+        _transition_terminal_failure(
             session_factory,
-            incident_id=claimed.id,
-            from_status="claimed",
-            to_status="escalated",
+            incident=claimed,
             claim_token=claim_token,
             now=operation_now,
+            outcome_kind="evidence_incomplete",
         )
         return RuntimeAgentWorkerResult(
             status="escalated",
@@ -711,6 +767,8 @@ def run_runtime_agent_once(
     attempted_queries: list[str] = []
     gathered_references = {f"incident:{claimed.id}"}
     refused = 0
+    agent_incident: Mapping[str, Any] | None = None
+    tool_failure_seen = False
     try:
         agent_incident, gathered_references = _agent_incident_context(
             session_factory, claimed
@@ -793,7 +851,7 @@ def run_runtime_agent_once(
                 ),
             )
             handoff = build_runtime_incident_handoff(
-                incident=_handoff_incident(claimed),
+                incident=_handoff_incident_from_mapping(agent_incident),
                 diagnosis=diagnosis,
                 attempted_queries=diagnosis.attempted_queries,
                 shadow_policy=shadow_decision.to_ledger_mapping(),
@@ -815,6 +873,8 @@ def run_runtime_agent_once(
                 recovery_status=recovery_status,
                 prompt_version=reusable.prompt_version,
                 reuse_context=reuse_context,
+                handoff=handoff,
+                outcome_kind="reused",
             ):
                 return RuntimeAgentWorkerResult(
                     status="claim_lost", incident_id=claimed.id
@@ -998,7 +1058,7 @@ def run_runtime_agent_once(
                     ),
                 )
                 handoff = build_runtime_incident_handoff(
-                    incident=_handoff_incident(claimed),
+                    incident=_handoff_incident_from_mapping(agent_incident),
                     diagnosis=diagnosis,
                     attempted_queries=attempted_queries,
                     shadow_policy=shadow_decision.to_ledger_mapping(),
@@ -1019,6 +1079,8 @@ def run_runtime_agent_once(
                     recovery_policy=recovery_policy,
                     recovery_status=recovery_status,
                     reuse_context=reuse_context,
+                    handoff=handoff,
+                    outcome_kind="diagnosed",
                 ):
                     return RuntimeAgentWorkerResult(
                         status="claim_lost",
@@ -1062,13 +1124,14 @@ def run_runtime_agent_once(
                 )
                 continue
             if len(attempted_queries) >= evidence_tool_limit:
-                transition_runtime_incident(
+                _transition_terminal_failure(
                     session_factory,
-                    incident_id=claimed.id,
-                    from_status="claimed",
-                    to_status="escalated",
+                    incident=claimed,
                     claim_token=claim_token,
                     now=operation_now,
+                    outcome_kind="evidence_incomplete",
+                    attempted_queries=tuple(attempted_queries),
+                    agent_incident=agent_incident,
                 )
                 return RuntimeAgentWorkerResult(
                     status="escalated",
@@ -1084,6 +1147,7 @@ def run_runtime_agent_once(
                     expected_incident_id=claimed.id,
                 )
             except RuntimeAgentToolError as exc:
+                tool_failure_seen = True
                 refused += 1
                 _append_tool_exchange(
                     messages,
@@ -1101,13 +1165,14 @@ def run_runtime_agent_once(
                 call=call,
                 content=result.as_model_payload(),
             )
-        transition_runtime_incident(
+        _transition_terminal_failure(
             session_factory,
-            incident_id=claimed.id,
-            from_status="claimed",
-            to_status="escalated",
+            incident=claimed,
             claim_token=claim_token,
             now=operation_now,
+            outcome_kind=("tool_failed" if tool_failure_seen else "evidence_incomplete"),
+            attempted_queries=tuple(attempted_queries),
+            agent_incident=agent_incident,
         )
         return RuntimeAgentWorkerResult(
             status="escalated",
@@ -1133,13 +1198,26 @@ def run_runtime_agent_once(
             tool_steps=len(attempted_queries),
             refused_tool_calls=refused,
         )
-    except Exception:
+    except Exception as exc:
+        failure_outcome = (
+            "timed_out"
+            if isinstance(exc, TimeoutError)
+            and "wall-clock budget exhausted" in str(exc)
+            else "tool_failed"
+            if tool_failure_seen or isinstance(exc, RuntimeAgentToolError)
+            else "evidence_incomplete"
+            if isinstance(exc, (RuntimeAgentContractError, RuntimeAgentFinalResponseError))
+            else "provider_failed"
+        )
         failure_status = _transition_retry(
             session_factory,
             incident=claimed,
             claim_token=claim_token,
             now=operation_now,
             config=config,
+            failure_outcome=failure_outcome,
+            attempted_queries=tuple(attempted_queries),
+            agent_incident=agent_incident,
         )
         return RuntimeAgentWorkerResult(
             status=failure_status,
