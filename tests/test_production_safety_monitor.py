@@ -454,6 +454,124 @@ def test_entry_preamble_monitor_accepts_exact_terminal_prebinding_refusal(tmp_pa
     assert database.read_bytes() == before
 
 
+def _assert_terminal_prebinding_refusal_fails_closed(database):
+    before = database.read_bytes()
+    codes = read_entry_preamble_invariants(
+        database,
+        now=datetime(2026, 8, 8, tzinfo=UTC),
+    )
+    assert codes == ("live_entry_preamble_binding_evidence_missing",)
+    assert database.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "DELETE FROM message_instruction_items",
+        "UPDATE message_instruction_items SET instruction_kind = 'management'",
+        "UPDATE message_instruction_items SET retired_at = '2026-08-08 00:01:00'",
+        "UPDATE message_instruction_items SET raw_message_id = 9956",
+        "INSERT INTO message_instruction_items VALUES "
+        "(439, 9955, 1643, 'entry', 'failed', "
+        "'{\"type\":\"RecoveryLiveSubmitError\",\"message\":\"signal_enqueue_blocked:missing_ready_confirmation,contract_size_unverified\"}', NULL)",
+    ),
+)
+def test_entry_preamble_monitor_terminal_prebinding_shape_is_fail_closed(
+    tmp_path, mutation
+):
+    database = tmp_path / "terminal-prebinding-shape.db"
+    _seed_terminal_prebinding_refusal(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(mutation)
+    _assert_terminal_prebinding_refusal_fails_closed(database)
+
+
+@pytest.mark.parametrize(
+    "status",
+    ("pending", "executing", "unknown", "succeeded"),
+)
+def test_entry_preamble_monitor_nonterminal_or_nonsuccess_status_is_fail_closed(
+    tmp_path, status
+):
+    database = tmp_path / "terminal-prebinding-status.db"
+    _seed_terminal_prebinding_refusal(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE message_instruction_items SET status = ?", (status,)
+        )
+    _assert_terminal_prebinding_refusal_fails_closed(database)
+
+
+@pytest.mark.parametrize(
+    "error_json",
+    (
+        None,
+        "not-json",
+        "[]",
+        '{"type":"RecoveryLiveSubmitError","type":"RecoveryLiveSubmitError","message":"signal_enqueue_blocked:missing_ready_confirmation,contract_size_unverified"}',
+        '{"type":"RecoveryLiveSubmitError","message":"signal_enqueue_blocked:missing_ready_confirmation,contract_size_unverified","extra":true}',
+        '{"type":"OtherError","message":"signal_enqueue_blocked:missing_ready_confirmation,contract_size_unverified"}',
+        '{"type":"RecoveryLiveSubmitError","message":"signal_enqueue_blocked:missing_ready_confirmation"}',
+        '{"type":"RecoveryLiveSubmitError","message":"signal_enqueue_blocked:missing_ready_confirmation,missing_ready_confirmation"}',
+        '{"type":"RecoveryLiveSubmitError","message":"signal_enqueue_blocked:missing_ready_confirmation,unknown_reason"}',
+        '{"type":"RecoveryLiveSubmitError","message":"other:missing_ready_confirmation,contract_size_unverified"}',
+        '{"type":"RecoveryLiveSubmitError","message":123}',
+        '{"type":"RecoveryLiveSubmitError","message":"signal_enqueue_blocked:contract_size_unverified,missing_ready_confirmation,unknown_reason"}',
+    ),
+)
+def test_entry_preamble_monitor_terminal_prebinding_error_is_closed_set(
+    tmp_path, error_json
+):
+    database = tmp_path / "terminal-prebinding-error.db"
+    _seed_terminal_prebinding_refusal(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE message_instruction_items SET error_json = ?", (error_json,)
+        )
+    _assert_terminal_prebinding_refusal_fails_closed(database)
+
+
+def test_entry_preamble_monitor_oversized_terminal_prebinding_error_is_fail_closed(
+    tmp_path,
+):
+    database = tmp_path / "terminal-prebinding-oversized-error.db"
+    _seed_terminal_prebinding_refusal(database)
+    oversized = json.dumps(
+        {
+            "type": "RecoveryLiveSubmitError",
+            "message": "signal_enqueue_blocked:" + "x" * 1_000_000,
+        }
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE message_instruction_items SET error_json = ?", (oversized,)
+        )
+    _assert_terminal_prebinding_refusal_fails_closed(database)
+
+
+@pytest.mark.parametrize(
+    "downstream_insert",
+    (
+        "INSERT INTO trade_signals VALUES (1, 'deepcoin:-1001:3478:SOL:short', 9, 9)",
+        "INSERT INTO trade_signals VALUES (1, 'other-strategy', -1001, 3478)",
+        "INSERT INTO execution_bindings VALUES "
+        "(1, 'deepcoin:-1001:3478:SOL:short', '{}')",
+        "INSERT INTO execution_events VALUES "
+        "(1, 'deepcoin:-1001:3478:SOL:short', 9, 9, 9)",
+        "INSERT INTO execution_events VALUES (1, 'other-strategy', -1001, 3478, NULL)",
+        "INSERT INTO execution_events VALUES (1, 'other-strategy', -1001, 9, 3478)",
+    ),
+)
+def test_entry_preamble_monitor_downstream_artifact_is_fail_closed(
+    tmp_path, downstream_insert
+):
+    database = tmp_path / "terminal-prebinding-downstream.db"
+    _seed_terminal_prebinding_refusal(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(downstream_insert)
+    _assert_terminal_prebinding_refusal_fails_closed(database)
+
+
 def _seed_reconciled_entry_preamble_monitor(database, *, second_mismatch=False):
     final_evidence = {
         "assembly_id": 2,
