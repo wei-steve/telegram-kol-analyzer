@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -57,6 +58,12 @@ class TradeSignalFingerprintSyncError(RuntimeError):
     """The pending signal could not be synchronized without ambiguity."""
 
 
+def _normalized_assembly_fingerprint(value: Any, *, error_code: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
+        raise TradeSignalFingerprintSyncError(error_code)
+    return value.lower()
+
+
 def synchronize_pending_entry_assembly_evidence(
     session_factory: sessionmaker,
     *,
@@ -90,6 +97,10 @@ def synchronize_pending_entry_assembly_evidence(
     if not isinstance(draft, dict):
         raise TradeSignalFingerprintSyncError("entry_assembly_signal_draft_invalid")
 
+    normalized_expected_fingerprint = _normalized_assembly_fingerprint(
+        expected_fingerprint,
+        error_code="entry_assembly_signal_fingerprint_mismatch",
+    )
     evidence_copies = [top_evidence]
     nested_evidence = draft.get("entry_preamble_assembly")
     if nested_evidence is not None:
@@ -99,11 +110,33 @@ def synchronize_pending_entry_assembly_evidence(
             )
         evidence_copies.append(nested_evidence)
     if any(
-        evidence.get("assembly_fingerprint") != expected_fingerprint
+        _normalized_assembly_fingerprint(
+            evidence.get("assembly_fingerprint"),
+            error_code="entry_assembly_signal_fingerprint_mismatch",
+        )
+        != normalized_expected_fingerprint
         for evidence in evidence_copies
     ):
         raise TradeSignalFingerprintSyncError(
             "entry_assembly_signal_fingerprint_mismatch"
+        )
+
+    assembly_id = top_evidence.get("assembly_id")
+    evidence_strategy_id = top_evidence.get("strategy_instance_id")
+    if (
+        not isinstance(assembly_id, int)
+        or isinstance(assembly_id, bool)
+        or assembly_id <= 0
+        or not isinstance(evidence_strategy_id, str)
+        or evidence_strategy_id != strategy_instance_id
+        or any(
+            evidence.get("assembly_id") != assembly_id
+            or evidence.get("strategy_instance_id") != evidence_strategy_id
+            for evidence in evidence_copies[1:]
+        )
+    ):
+        raise TradeSignalFingerprintSyncError(
+            "entry_assembly_signal_identity_mismatch"
         )
 
     try:
@@ -114,12 +147,22 @@ def synchronize_pending_entry_assembly_evidence(
         raise TradeSignalFingerprintSyncError(
             "entry_assembly_signal_final_evidence_invalid"
         ) from None
-    if not isinstance(final_evidence, dict) or not isinstance(
-        final_evidence.get("assembly_fingerprint"), str
-    ):
+    if not isinstance(final_evidence, dict):
         raise TradeSignalFingerprintSyncError(
             "entry_assembly_signal_final_evidence_invalid"
         )
+    final_fingerprint = _normalized_assembly_fingerprint(
+        final_evidence.get("assembly_fingerprint"),
+        error_code="entry_assembly_signal_final_evidence_invalid",
+    )
+    if (
+        final_evidence.get("assembly_id") != assembly_id
+        or final_evidence.get("strategy_instance_id") != strategy_instance_id
+    ):
+        raise TradeSignalFingerprintSyncError(
+            "entry_assembly_signal_identity_mismatch"
+        )
+    final_evidence["assembly_fingerprint"] = final_fingerprint
 
     updated_payload["entry_preamble_assembly"] = final_evidence
     draft["entry_preamble_assembly"] = json.loads(
@@ -160,7 +203,6 @@ def synchronize_pending_entry_assembly_evidence(
         if isinstance(draft_final, Mapping)
         else None
     )
-    final_fingerprint = final_evidence["assembly_fingerprint"]
     if (
         updated.status != "pending"
         or updated.strategy_instance_id != strategy_instance_id

@@ -94,7 +94,7 @@ def test_synchronize_pending_entry_assembly_evidence_updates_both_copies(tmp_pat
     ("case", "expected_error"),
     [
         ("non_pending", "entry_assembly_signal_cas_failed"),
-        ("strategy_mismatch", "entry_assembly_signal_cas_failed"),
+        ("strategy_mismatch", "entry_assembly_signal_identity_mismatch"),
         ("payload_drift", "entry_assembly_signal_cas_failed"),
         ("absent_draft", "entry_assembly_signal_draft_invalid"),
         ("malformed_draft", "entry_assembly_signal_draft_invalid"),
@@ -150,3 +150,128 @@ def test_synchronize_pending_entry_assembly_evidence_fails_without_mutation(
     else:
         assert reloaded.payload == original_payload
 
+
+@pytest.mark.parametrize(
+    ("finalized_evidence", "expected_error"),
+    [
+        (
+            {
+                "assembly_id": 999,
+                "strategy_instance_id": "strategy-1",
+                "assembly_fingerprint": FINAL_FINGERPRINT,
+            },
+            "entry_assembly_signal_identity_mismatch",
+        ),
+        (
+            {
+                "assembly_id": 2,
+                "strategy_instance_id": "strategy-other",
+                "assembly_fingerprint": FINAL_FINGERPRINT,
+            },
+            "entry_assembly_signal_identity_mismatch",
+        ),
+        (
+            {
+                "assembly_id": 2,
+                "strategy_instance_id": "strategy-1",
+                "assembly_fingerprint": "",
+            },
+            "entry_assembly_signal_final_evidence_invalid",
+        ),
+        (
+            {
+                "assembly_id": 2,
+                "strategy_instance_id": "strategy-1",
+                "assembly_fingerprint": "z" * 64,
+            },
+            "entry_assembly_signal_final_evidence_invalid",
+        ),
+        (
+            {
+                "assembly_id": 2,
+                "strategy_instance_id": "strategy-1",
+                "assembly_fingerprint": "b" * 63,
+            },
+            "entry_assembly_signal_final_evidence_invalid",
+        ),
+    ],
+)
+def test_synchronize_rejects_invalid_final_identity_without_mutation(
+    tmp_path,
+    finalized_evidence,
+    expected_error,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    signal = _enqueue(session_factory)
+    original_payload = deepcopy(signal.payload)
+
+    with pytest.raises(TradeSignalFingerprintSyncError, match=f"^{expected_error}$"):
+        _synchronize(
+            session_factory,
+            signal,
+            finalized_evidence=finalized_evidence,
+        )
+
+    assert load_trade_signal(session_factory, signal.id).payload == original_payload
+
+
+@pytest.mark.parametrize(
+    ("field", "divergent_value"),
+    [
+        ("assembly_id", 999),
+        ("strategy_instance_id", "strategy-other"),
+    ],
+)
+def test_synchronize_rejects_divergent_old_identity_without_mutation(
+    tmp_path,
+    field,
+    divergent_value,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    payload = _payload()
+    payload["deepcoin_order_draft"]["entry_preamble_assembly"][field] = (
+        divergent_value
+    )
+    signal = _enqueue(session_factory, payload=payload)
+    original_payload = deepcopy(signal.payload)
+
+    with pytest.raises(
+        TradeSignalFingerprintSyncError,
+        match="^entry_assembly_signal_identity_mismatch$",
+    ):
+        _synchronize(session_factory, signal)
+
+    assert load_trade_signal(session_factory, signal.id).payload == original_payload
+
+
+def test_synchronize_normalizes_uppercase_hex_fingerprints(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    payload = _payload()
+    payload["entry_preamble_assembly"]["assembly_fingerprint"] = (
+        OLD_FINGERPRINT.upper()
+    )
+    payload["deepcoin_order_draft"]["entry_preamble_assembly"][
+        "assembly_fingerprint"
+    ] = OLD_FINGERPRINT.upper()
+    signal = _enqueue(session_factory, payload=payload)
+
+    updated = _synchronize(
+        session_factory,
+        signal,
+        expected_fingerprint=OLD_FINGERPRINT.upper(),
+        finalized_evidence={
+            "assembly_id": 2,
+            "strategy_instance_id": "strategy-1",
+            "assembly_fingerprint": FINAL_FINGERPRINT.upper(),
+        },
+    )
+
+    assert (
+        updated.payload["entry_preamble_assembly"]["assembly_fingerprint"]
+        == FINAL_FINGERPRINT
+    )
+    assert (
+        updated.payload["deepcoin_order_draft"]["entry_preamble_assembly"]
+        ["assembly_fingerprint"]
+        == FINAL_FINGERPRINT
+    )
