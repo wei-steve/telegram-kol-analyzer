@@ -227,6 +227,32 @@ def test_entry_assembly_fingerprint_repair_apply_requires_reviewed_fingerprint(
         assert session.query(ExecutionEvent).count() == 0
 
 
+def test_entry_assembly_fingerprint_repair_conflicting_dry_run_fails_redacted(
+    tmp_path,
+):
+    database_path, session_factory, secret_text = (
+        _seed_entry_assembly_fingerprint_cli_case(tmp_path)
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        binding.strategy_instance_id = "conflicting-private-strategy"
+        session.commit()
+    before = database_path.read_bytes()
+
+    result = CliRunner().invoke(app, _entry_repair_args(database_path))
+
+    assert result.exit_code == 2
+    payload = json.loads(result.output.splitlines()[0])
+    assert payload["mode"] == "dry_run"
+    assert payload["plan"]["action"] is None
+    assert "binding_strategy_mismatch" in payload["plan"]["conflicts"]
+    assert secret_text not in result.output
+    assert "conflicting-private-strategy" not in result.output
+    with session_factory() as session:
+        assert session.query(ExecutionEvent).count() == 0
+    assert database_path.read_bytes() == before
+
+
 def test_entry_assembly_fingerprint_repair_apply_rejects_changed_fingerprint(tmp_path):
     database_path, session_factory, _ = _seed_entry_assembly_fingerprint_cli_case(tmp_path)
 

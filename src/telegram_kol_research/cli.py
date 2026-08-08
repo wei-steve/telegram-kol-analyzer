@@ -4059,18 +4059,18 @@ def repair_entry_assembly_fingerprint(
         ensure_ascii=False,
         sort_keys=True,
     ))
+    if plan.action is None or plan.conflicts:
+        typer.echo(
+            "Refusing repair: the current plan must contain exactly one "
+            "conflict-free action.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
     if not apply:
         return
     if not expected_plan_fingerprint:
         typer.echo(
             "Refusing apply: --expected-plan-fingerprint is required.",
-            err=True,
-        )
-        raise typer.Exit(code=2)
-    if plan.action is None or plan.conflicts:
-        typer.echo(
-            "Refusing apply: the current repair plan must contain exactly one "
-            "conflict-free action.",
             err=True,
         )
         raise typer.Exit(code=2)
