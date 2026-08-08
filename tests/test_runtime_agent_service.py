@@ -26,6 +26,7 @@ def test_runtime_agent_sidecar_unit_is_separate_and_dormant_until_enabled():
     assert "PrivateDevices=true" in text
     assert "ProtectSystem=strict" in text
     assert "ReadWritePaths=/opt/telegram-kol-analyzer/data" in text
+    assert "ReadOnlyPaths=/opt/telegram-kol-analyzer/data\n" not in text
     assert "InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session" in text
     assert "StateDirectory=telegram-kol-runtime-agent" in text
     assert "InaccessiblePaths=/opt/telegram-kol-analyzer/config/runtime_incident_agent.env" in text
