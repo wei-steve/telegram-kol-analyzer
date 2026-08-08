@@ -96,6 +96,7 @@ if [[ "$(id -u "$AGENT_USER")" -eq 0 || "$(id -gn "$AGENT_USER")" != "$AGENT_GRO
 fi
 
 setfacl -x "d:u:$AGENT_USER" "$DATA_DIRECTORY" 2>/dev/null || true
+setfacl -m "d:g::---,d:o::---" "$DATA_DIRECTORY"
 setfacl -m "u:$AGENT_USER:-wx" "$DATA_DIRECTORY"
 chmod +t "$DATA_DIRECTORY"
 setfacl -m "u:$AGENT_USER:rw-" "$DATABASE_PATH"
@@ -114,7 +115,7 @@ while IFS= read -r -d '' data_file; do
       continue
       ;;
   esac
-  setfacl -x "u:$AGENT_USER" "$data_file" 2>/dev/null || true
+  setfacl -m "u:$AGENT_USER:---" "$data_file"
   if runuser -u "$AGENT_USER" -- test -r "$data_file" \
     || runuser -u "$AGENT_USER" -- test -w "$data_file"; then
     echo "Agent identity can access non-allowlisted production data." >&2
