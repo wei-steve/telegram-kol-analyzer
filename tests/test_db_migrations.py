@@ -17,6 +17,8 @@ def test_context_resolution_schema_is_created(tmp_path):
     assert inspector.has_table("runtime_incidents")
     assert inspector.has_table("runtime_incident_observations")
     assert inspector.has_table("runtime_agent_recovery_attempts")
+    assert inspector.has_table("message_operation_contracts")
+    assert inspector.has_table("message_operation_items")
     assert inspector.has_table("position_protection_health_observations")
     assert inspector.has_table("management_message_envelopes")
     assert inspector.has_table("management_message_targets")
@@ -195,6 +197,8 @@ def test_runtime_incident_table_is_added_to_an_existing_database(tmp_path):
     inspector = inspect(session_factory.kw["bind"])
 
     assert inspector.has_table("runtime_incidents")
+    assert inspector.has_table("message_operation_contracts")
+    assert inspector.has_table("message_operation_items")
     with sqlite3.connect(database_path) as connection:
         assert connection.execute(
             "SELECT display_name FROM sources WHERE telegram_sender_id = 7"

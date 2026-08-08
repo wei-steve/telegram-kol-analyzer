@@ -22,6 +22,7 @@ RUNTIME_AGENT_MODULES = (
     "runtime_incident_scanner.py",
     "runtime_incident_rules.py",
     "runtime_incident_snapshot.py",
+    "message_operation_contracts.py",
 )
 FORBIDDEN_SYMBOL_FRAGMENTS = (
     "recognize",
@@ -77,6 +78,7 @@ ALLOWED_PACKAGE_IMPORTS_BY_MODULE = {
     ),
     "runtime_incident_rules.py": frozenset({"runtime_incident_scanner"}),
     "runtime_incident_snapshot.py": frozenset({"models"}),
+    "message_operation_contracts.py": frozenset({"models"}),
 }
 
 
@@ -119,6 +121,30 @@ def test_runtime_agent_modules_do_not_import_business_resolution_or_write_paths(
                 imported_module.split(".", 1)[0] in allowed
                 for imported_module in package_imports
             ), f"{filename} imports non-allowlisted application module: {package_imports}"
+
+
+@pytest.mark.architecture
+def test_message_operation_contract_helpers_remain_dormant():
+    source_root = Path(__file__).parents[1] / "src" / "telegram_kol_research"
+    callers = []
+    for path in source_root.glob("*.py"):
+        if path.name == "message_operation_contracts.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import) and any(
+                alias.name.endswith("message_operation_contracts")
+                for alias in node.names
+            ):
+                callers.append(path.name)
+                break
+            if isinstance(node, ast.ImportFrom) and (
+                node.module or ""
+            ).endswith("message_operation_contracts"):
+                callers.append(path.name)
+                break
+
+    assert callers == []
 
 
 @pytest.mark.architecture
@@ -168,7 +194,7 @@ def test_phase_7_is_deferred_and_phase_8r_requires_no_action_authority():
         "phase_name: message-operation-gap-inventory-and-dormant-contract-schema"
         in status
     )
-    assert "phase_status: planned" in status
+    assert "phase_status: in_progress" in status
     assert 'last_completed_phase: "8R.3"' in status
     assert "original_runtime_agent_complete: false" in status
     assert "### Phase 8R proactive read-only incident detection" in runbook

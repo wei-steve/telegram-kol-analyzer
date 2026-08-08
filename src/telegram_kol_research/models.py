@@ -2731,6 +2731,178 @@ class RuntimeIncident(Base):
     )
 
 
+class MessageOperationContract(Base):
+    """Dormant expectation envelope for one authoritative source message."""
+
+    __tablename__ = "message_operation_contracts"
+    __table_args__ = (
+        Index(
+            "uq_message_operation_contracts_message_policy",
+            "raw_message_id",
+            "policy_version",
+            unique=True,
+        ),
+        Index(
+            "ix_message_operation_contracts_status_deadline",
+            "status",
+            "deadline_at",
+        ),
+        Index(
+            "ix_message_operation_contracts_runtime_incident",
+            "runtime_incident_id",
+        ),
+        CheckConstraint(
+            "intent_kind IN ('new_entry', 'add_entry', 'take_profit', "
+            "'stop_loss', 'cancel', 'exit', 'manage', "
+            "'unresolved_executable', 'other_management')",
+            name="ck_message_operation_contracts_intent_kind",
+        ),
+        CheckConstraint(
+            "expected_terminal_kind IN ('verified_entry', "
+            "'verified_management', 'verified_execution', 'verified_cancel', "
+            "'verified_exit', 'verified_protection', 'verified_refusal')",
+            name="ck_message_operation_contracts_expected_terminal",
+        ),
+        CheckConstraint(
+            "status IN ('observing', 'verified', 'violated', "
+            "'superseded', 'duplicate')",
+            name="ck_message_operation_contracts_status",
+        ),
+        CheckConstraint(
+            "violation_code IS NULL OR length(violation_code) BETWEEN 1 AND 64",
+            name="ck_message_operation_contracts_violation_bounded",
+        ),
+        CheckConstraint(
+            "length(evidence_refs_json) <= 4096",
+            name="ck_message_operation_contracts_evidence_bounded",
+        ),
+        CheckConstraint(
+            "length(policy_version) BETWEEN 1 AND 64",
+            name="ck_message_operation_contracts_policy_bounded",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False, index=True
+    )
+    intent_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    expected_terminal_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="observing",
+        server_default=sql_text("'observing'"),
+    )
+    deadline_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    violation_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    evidence_refs_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default=sql_text("'[]'")
+    )
+    runtime_incident_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("runtime_incidents.id"), nullable=True
+    )
+    agent_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sql_text("0")
+    )
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+
+class MessageOperationItem(Base):
+    """One bounded authoritative instruction expectation within a contract."""
+
+    __tablename__ = "message_operation_items"
+    __table_args__ = (
+        Index(
+            "uq_message_operation_items_contract_key",
+            "contract_id",
+            "instruction_key",
+            unique=True,
+        ),
+        Index(
+            "uq_message_operation_items_contract_sequence",
+            "contract_id",
+            "sequence",
+            unique=True,
+        ),
+        Index(
+            "ix_message_operation_items_contract_status",
+            "contract_id",
+            "status",
+        ),
+        CheckConstraint("sequence >= 1", name="ck_message_operation_items_sequence"),
+        CheckConstraint(
+            "length(instruction_key) BETWEEN 1 AND 128",
+            name="ck_message_operation_items_key_bounded",
+        ),
+        CheckConstraint(
+            "length(instruction_kind) BETWEEN 1 AND 32",
+            name="ck_message_operation_items_kind_bounded",
+        ),
+        CheckConstraint(
+            "length(authoritative_instruction_id) BETWEEN 1 AND 255",
+            name="ck_message_operation_items_identity_bounded",
+        ),
+        CheckConstraint(
+            "length(expected_descendant_kind) BETWEEN 1 AND 64",
+            name="ck_message_operation_items_descendant_bounded",
+        ),
+        CheckConstraint(
+            "length(expected_terminal_kind) BETWEEN 1 AND 64",
+            name="ck_message_operation_items_expected_terminal_bounded",
+        ),
+        CheckConstraint(
+            "observed_terminal_kind IS NULL OR "
+            "length(observed_terminal_kind) BETWEEN 1 AND 64",
+            name="ck_message_operation_items_observed_terminal_bounded",
+        ),
+        CheckConstraint(
+            "status IN ('observing', 'verified', 'violated', "
+            "'superseded', 'duplicate')",
+            name="ck_message_operation_items_status",
+        ),
+        CheckConstraint(
+            "length(evidence_refs_json) <= 4096",
+            name="ck_message_operation_items_evidence_bounded",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    contract_id: Mapped[int] = mapped_column(
+        ForeignKey("message_operation_contracts.id"), nullable=False, index=True
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    instruction_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    instruction_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    authoritative_instruction_id: Mapped[str] = mapped_column(
+        String(255), nullable=False
+    )
+    expected_descendant_kind: Mapped[str] = mapped_column(
+        String(64), nullable=False
+    )
+    expected_terminal_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    observed_terminal_kind: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="observing",
+        server_default=sql_text("'observing'"),
+    )
+    evidence_refs_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default=sql_text("'[]'")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+
 class RuntimeIncidentObservation(Base):
     """Additive shadow record for one stable invariant object/rule pair."""
 

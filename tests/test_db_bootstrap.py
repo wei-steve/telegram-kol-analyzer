@@ -18,6 +18,8 @@ def test_database_bootstrap_creates_tables(tmp_path):
     assert "runtime_incidents" in tables
     assert "runtime_incident_observations" in tables
     assert "runtime_agent_recovery_attempts" in tables
+    assert "message_operation_contracts" in tables
+    assert "message_operation_items" in tables
     assert "entry_preambles" in tables
     assert "entry_strategy_assemblies" in tables
     assert "entry_strategy_fragments" in tables

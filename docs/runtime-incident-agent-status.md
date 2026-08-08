@@ -9,7 +9,7 @@ design_version: 2
 design_authority_status: original_runtime_agent_incomplete_extended_by_message_operation_design
 current_phase: 8R.4
 phase_name: message-operation-gap-inventory-and-dormant-contract-schema
-phase_status: planned
+phase_status: in_progress
 position_compliance_rules_status: dormant_non_deployable
 position_compliance_rollout_status: multi_target_live_new_natural_messages_only
 multi_target_projection_status: live_partial_take_profit_future_natural_messages_only
