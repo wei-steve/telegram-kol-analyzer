@@ -208,7 +208,7 @@ def test_phase_7_is_deferred_and_phase_8r_requires_no_action_authority():
     )
     assert (
         "task_8r_6b_status: "
-        "in_progress_local_tests_passed_review_and_server_gates_pending"
+        "in_progress_reviewed_local_server_gates_pending"
         in status
     )
     assert "original_runtime_agent_complete: false" in status
