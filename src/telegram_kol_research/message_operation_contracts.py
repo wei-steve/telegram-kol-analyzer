@@ -14,6 +14,7 @@ from sqlalchemy.orm import sessionmaker
 from telegram_kol_research.models import (
     MessageOperationContract,
     MessageOperationItem,
+    RawMessage,
     utc_now,
 )
 
@@ -42,6 +43,23 @@ TERMINAL_KINDS = frozenset(
         "verified_exit",
         "verified_protection",
         "verified_refusal",
+    }
+)
+INSTRUCTION_KINDS = INTENT_KINDS
+DESCENDANT_KINDS = frozenset(
+    {
+        "signal_candidate",
+        "strategy_lifecycle",
+        "management_envelope",
+        "management_target",
+        "management_item",
+        "execution_binding",
+        "execution_order_leg",
+        "execution_event",
+        "position_mutation_intent",
+        "protection_revision",
+        "context_resolution_attempt",
+        "safety_refusal",
     }
 )
 CONTRACT_STATUSES = frozenset(
@@ -130,6 +148,10 @@ def create_message_operation_contract(
         "updated_at": timestamp,
     }
     with session_factory() as session:
+        if session.get(RawMessage, raw_message_id) is None:
+            raise MessageOperationContractBoundsError(
+                "raw_message_id does not identify an authoritative message"
+            )
         statement = sqlite_insert(MessageOperationContract).values(**values)
         statement = statement.on_conflict_do_nothing(
             index_elements=["raw_message_id", "policy_version"]
@@ -182,15 +204,17 @@ def append_message_operation_item(
     if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
         raise MessageOperationContractBoundsError("sequence must be positive")
     instruction_key = _bounded_text("instruction_key", instruction_key, maximum=128)
-    instruction_kind = _bounded_text("instruction_kind", instruction_kind, maximum=32)
+    instruction_kind = _closed_value(
+        "instruction_kind", instruction_kind, INSTRUCTION_KINDS
+    )
     authoritative_instruction_id = _bounded_text(
         "authoritative_instruction_id", authoritative_instruction_id, maximum=255
     )
-    expected_descendant_kind = _bounded_text(
-        "expected_descendant_kind", expected_descendant_kind, maximum=64
+    expected_descendant_kind = _closed_value(
+        "expected_descendant_kind", expected_descendant_kind, DESCENDANT_KINDS
     )
-    expected_terminal_kind = _bounded_text(
-        "expected_terminal_kind", expected_terminal_kind, maximum=64
+    expected_terminal_kind = _closed_value(
+        "expected_terminal_kind", expected_terminal_kind, TERMINAL_KINDS
     )
     refs_json = _evidence_refs_json(evidence_refs)
     timestamp = now or utc_now()
@@ -208,6 +232,10 @@ def append_message_operation_item(
         "updated_at": timestamp,
     }
     with session_factory() as session:
+        if session.get(MessageOperationContract, contract_id) is None:
+            raise MessageOperationContractBoundsError(
+                "contract_id does not identify a message operation contract"
+            )
         statement = sqlite_insert(MessageOperationItem).values(**values)
         statement = statement.on_conflict_do_nothing(
             index_elements=["contract_id", "instruction_key"]

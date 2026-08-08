@@ -2840,20 +2840,29 @@ class MessageOperationItem(Base):
             name="ck_message_operation_items_key_bounded",
         ),
         CheckConstraint(
-            "length(instruction_kind) BETWEEN 1 AND 32",
-            name="ck_message_operation_items_kind_bounded",
+            "instruction_kind IN ('new_entry', 'add_entry', 'take_profit', "
+            "'stop_loss', 'cancel', 'exit', 'manage', "
+            "'unresolved_executable', 'other_management')",
+            name="ck_message_operation_items_instruction_kind",
         ),
         CheckConstraint(
             "length(authoritative_instruction_id) BETWEEN 1 AND 255",
             name="ck_message_operation_items_identity_bounded",
         ),
         CheckConstraint(
-            "length(expected_descendant_kind) BETWEEN 1 AND 64",
-            name="ck_message_operation_items_descendant_bounded",
+            "expected_descendant_kind IN ('signal_candidate', "
+            "'strategy_lifecycle', 'management_envelope', "
+            "'management_target', 'management_item', 'execution_binding', "
+            "'execution_order_leg', 'execution_event', "
+            "'position_mutation_intent', 'protection_revision', "
+            "'context_resolution_attempt', 'safety_refusal')",
+            name="ck_message_operation_items_descendant_kind",
         ),
         CheckConstraint(
-            "length(expected_terminal_kind) BETWEEN 1 AND 64",
-            name="ck_message_operation_items_expected_terminal_bounded",
+            "expected_terminal_kind IN ('verified_entry', "
+            "'verified_management', 'verified_execution', 'verified_cancel', "
+            "'verified_exit', 'verified_protection', 'verified_refusal')",
+            name="ck_message_operation_items_expected_terminal",
         ),
         CheckConstraint(
             "observed_terminal_kind IS NULL OR "

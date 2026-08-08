@@ -216,3 +216,90 @@ def test_contract_helper_rejects_unbounded_or_unknown_values(tmp_path):
             raw_message_id=raw_message.id,
             policy_version="x" * 65,
         )
+
+
+def test_contract_helper_rejects_missing_authoritative_raw_message(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+
+    with pytest.raises(MessageOperationContractBoundsError, match="raw_message_id"):
+        _create_contract(session_factory, raw_message_id=999)
+
+
+def test_item_helper_rejects_missing_contract(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+
+    with pytest.raises(MessageOperationContractBoundsError, match="contract_id"):
+        append_message_operation_item(
+            session_factory,
+            contract_id=999,
+            sequence=1,
+            instruction_key="candidate:91",
+            instruction_kind="take_profit",
+            authoritative_instruction_id="signal_candidate:91",
+            expected_descendant_kind="management_item",
+            expected_terminal_kind="verified_execution",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("instruction_kind", "invented"),
+        ("expected_descendant_kind", "invented"),
+        ("expected_terminal_kind", "invented"),
+    ),
+)
+def test_item_helper_rejects_unknown_closed_categories(tmp_path, field, value):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message = _raw_message(session_factory)
+    contract = _create_contract(session_factory, raw_message_id=raw_message.id)
+    values = {
+        "contract_id": contract.id,
+        "sequence": 1,
+        "instruction_key": "candidate:91",
+        "instruction_kind": "take_profit",
+        "authoritative_instruction_id": "signal_candidate:91",
+        "expected_descendant_kind": "management_item",
+        "expected_terminal_kind": "verified_execution",
+    }
+    values[field] = value
+
+    with pytest.raises(MessageOperationContractBoundsError, match=field):
+        append_message_operation_item(session_factory, **values)
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    (
+        ("instruction_kind", "invented"),
+        ("expected_descendant_kind", "invented"),
+        ("expected_terminal_kind", "invented"),
+    ),
+)
+def test_item_schema_rejects_unknown_closed_categories(tmp_path, column, value):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message = _raw_message(session_factory)
+    contract = _create_contract(session_factory, raw_message_id=raw_message.id)
+    values = {
+        "instruction_kind": "take_profit",
+        "expected_descendant_kind": "management_item",
+        "expected_terminal_kind": "verified_execution",
+    }
+    values[column] = value
+
+    with session_factory.kw["bind"].begin() as connection:
+        with pytest.raises(IntegrityError):
+            connection.execute(
+                text(
+                    "INSERT INTO message_operation_items ("
+                    "contract_id, sequence, instruction_key, instruction_kind, "
+                    "authoritative_instruction_id, expected_descendant_kind, "
+                    "expected_terminal_kind, status, evidence_refs_json, "
+                    "created_at, updated_at) VALUES ("
+                    ":contract_id, 1, 'candidate:91', :instruction_kind, "
+                    "'signal_candidate:91', :expected_descendant_kind, "
+                    ":expected_terminal_kind, "
+                    "'observing', '[]', :now, :now)"
+                ),
+                {"contract_id": contract.id, "now": NOW, **values},
+            )
