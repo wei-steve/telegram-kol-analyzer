@@ -30,6 +30,13 @@ from telegram_kol_research.config import (
     RuntimeIncidentConfig,
     load_runtime_incident_config,
 )
+from telegram_kol_research.entry_assembly_fingerprint_repair import (
+    RECONCILIATION_ACTION,
+    RECONCILIATION_POLICY,
+    build_reconciliation_fingerprint,
+    canonical_fingerprint,
+    derive_pre_finalization_fingerprint,
+)
 from telegram_kol_research.runtime_incident_adapters import (
     capture_management_state,
     capture_monitor_state,
@@ -55,6 +62,42 @@ _SAFE_EVENT_VALUE = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
 _GIT_HEAD = re.compile(r"[0-9a-f]{40}\Z")
 _SAFE_TIMESTAMP = re.compile(r"[0-9T:+.-]{1,40}\Z")
 _SHA256_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
+_MAX_RECONCILIATION_JSON_BYTES = 1_000_000
+_RECONCILIATION_EVENT_COLUMNS = frozenset(
+    {
+        "execution_binding_id",
+        "trade_signal_id",
+        "strategy_instance_id",
+        "venue",
+        "action",
+        "status",
+        "kol_id",
+        "chat_id",
+        "message_id",
+        "source_message_id",
+        "symbol",
+        "side",
+        "order_id",
+        "client_order_id",
+        "pos_id",
+        "related_order_id",
+        "reason",
+        "before_json",
+        "after_json",
+        "request_json",
+        "response_json",
+        "exchange_event_time",
+        "notification_status",
+        "notification_fingerprint",
+        "notification_message_id",
+        "notification_error",
+        "notification_attempts",
+        "notification_next_attempt_at",
+        "notification_claim_token",
+        "notification_claimed_at",
+        "notified_at",
+    }
+)
 _ADAPTER_NAMES = frozenset(
     {"service", "head", "settings", "journal", "events", "audit", "composite"}
 )
@@ -653,6 +696,127 @@ def read_abnormal_execution_events(
     )
 
 
+def _read_reconciliation_json(raw: object) -> dict[str, Any] | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        if len(raw.encode("utf-8")) > _MAX_RECONCILIATION_JSON_BYTES:
+            return None
+        value = json.loads(
+            raw,
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _has_exact_entry_fingerprint_reconciliation(
+    connection: sqlite3.Connection,
+    *,
+    available_tables: set[str],
+    assembly_id: object,
+    strategy_instance_id: object,
+    final_fingerprint: object,
+    assembly_evidence_json: object,
+    execution_binding_id: object,
+    stale_evidence: Mapping[str, Any],
+) -> bool:
+    if "execution_events" not in available_tables:
+        return False
+    event_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(execution_events)").fetchall()
+    }
+    if not _RECONCILIATION_EVENT_COLUMNS.issubset(event_columns):
+        return False
+    if (
+        isinstance(assembly_id, bool)
+        or not isinstance(assembly_id, int)
+        or isinstance(execution_binding_id, bool)
+        or not isinstance(execution_binding_id, int)
+    ):
+        return False
+    strategy_id = str(strategy_instance_id or "")
+    final_fp = str(final_fingerprint or "")
+    final_evidence = _read_reconciliation_json(assembly_evidence_json)
+    if (
+        not strategy_id
+        or not _SHA256_FINGERPRINT.fullmatch(final_fp)
+        or final_evidence is None
+        or canonical_fingerprint(final_evidence) != final_fp
+        or stale_evidence.get("assembly_id") != assembly_id
+        or str(stale_evidence.get("strategy_instance_id") or "") != strategy_id
+    ):
+        return False
+    try:
+        old_fp = derive_pre_finalization_fingerprint(final_evidence)
+    except (TypeError, ValueError):
+        return False
+    if str(stale_evidence.get("assembly_fingerprint") or "") != old_fp:
+        return False
+
+    rows = connection.execute(
+        """
+        SELECT trade_signal_id, strategy_instance_id, venue, status, reason,
+               before_json, after_json, notification_status,
+               notification_fingerprint, notification_attempts,
+               kol_id, chat_id, message_id, source_message_id, symbol, side,
+               order_id, client_order_id, pos_id, related_order_id,
+               request_json, response_json, exchange_event_time,
+               notification_message_id, notification_error,
+               notification_next_attempt_at, notification_claim_token,
+               notification_claimed_at, notified_at
+        FROM execution_events
+        WHERE execution_binding_id = ? AND action = ?
+        ORDER BY id ASC
+        LIMIT 2
+        """,
+        (execution_binding_id, RECONCILIATION_ACTION),
+    ).fetchall()
+    if len(rows) != 1:
+        return False
+    row = rows[0]
+    trade_signal_id = row[0]
+    if isinstance(trade_signal_id, bool) or not isinstance(trade_signal_id, int):
+        return False
+    repair_fp = build_reconciliation_fingerprint(
+        assembly_id=assembly_id,
+        execution_binding_id=execution_binding_id,
+        trade_signal_id=trade_signal_id,
+        strategy_instance_id=strategy_id,
+        old_fingerprint=old_fp,
+        final_fingerprint=final_fp,
+    )
+    common = {
+        "policy_version": RECONCILIATION_POLICY,
+        "assembly_id": assembly_id,
+        "execution_binding_id": execution_binding_id,
+        "trade_signal_id": trade_signal_id,
+        "strategy_instance_id": strategy_id,
+    }
+    expected_before = {**common, "assembly_fingerprint": old_fp}
+    expected_after = {
+        **common,
+        "assembly_fingerprint": final_fp,
+        "repair_fingerprint": repair_fp,
+    }
+    unused_values = row[10:]
+    return (
+        row[1] == strategy_id
+        and row[2] == "deepcoin"
+        and row[3] == "resolved"
+        and row[4] == "pre_finalization_payload_preserved"
+        and _read_reconciliation_json(row[5]) == expected_before
+        and _read_reconciliation_json(row[6]) == expected_after
+        and row[7] is None
+        and row[8] == repair_fp
+        and row[9] == 0
+        and all(value is None for value in unused_values)
+    )
+
+
 def read_entry_preamble_invariants(
     database_path: str | Path,
     *,
@@ -716,31 +880,61 @@ def read_entry_preamble_invariants(
         ).fetchone()
         if ambiguous:
             reasons.add("entry_preamble_ambiguous")
+        assembly_columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(entry_strategy_assemblies)"
+            ).fetchall()
+        }
+        assembly_evidence_column = (
+            "a.evidence_json" if "evidence_json" in assembly_columns else "NULL"
+        )
         evidence_rows = connection.execute(
-            """
-            SELECT a.fingerprint, b.payload_json
+            f"""
+            SELECT a.id, a.strategy_instance_id, a.fingerprint,
+                   {assembly_evidence_column}, b.id, b.payload_json
             FROM entry_strategy_assemblies AS a
             LEFT JOIN execution_bindings AS b
               ON b.strategy_instance_id = a.strategy_instance_id
             ORDER BY a.id DESC LIMIT 200
             """
         ).fetchall()
-        for fingerprint, payload_json in evidence_rows:
-            try:
-                payload = json.loads(payload_json or "{}")
-                draft = payload.get("draft") if isinstance(payload, dict) else None
-                evidence = (
-                    draft.get("entry_preamble_assembly")
-                    if isinstance(draft, dict)
-                    else None
-                )
-                if evidence is None and isinstance(payload, dict):
-                    evidence = payload.get("entry_preamble_assembly")
-            except (TypeError, ValueError, json.JSONDecodeError):
-                evidence = None
-            if not isinstance(evidence, dict) or str(
+        for (
+            assembly_id,
+            strategy_instance_id,
+            fingerprint,
+            assembly_evidence_json,
+            binding_id,
+            payload_json,
+        ) in evidence_rows:
+            payload = _read_reconciliation_json(payload_json)
+            draft = payload.get("draft") if isinstance(payload, dict) else None
+            evidence = (
+                draft.get("entry_preamble_assembly")
+                if isinstance(draft, dict)
+                else None
+            )
+            if evidence is None and isinstance(payload, dict):
+                evidence = payload.get("entry_preamble_assembly")
+            matches = isinstance(evidence, dict) and str(
                 evidence.get("assembly_fingerprint") or ""
-            ) != str(fingerprint):
+            ) == str(fingerprint)
+            reconciled = (
+                not matches
+                and isinstance(payload, dict)
+                and isinstance(evidence, dict)
+                and _has_exact_entry_fingerprint_reconciliation(
+                    connection,
+                    available_tables=available,
+                    assembly_id=assembly_id,
+                    strategy_instance_id=strategy_instance_id,
+                    final_fingerprint=fingerprint,
+                    assembly_evidence_json=assembly_evidence_json,
+                    execution_binding_id=binding_id,
+                    stale_evidence=evidence,
+                )
+            )
+            if not matches and not reconciled:
                 reasons.add("live_entry_preamble_binding_evidence_missing")
                 break
     return tuple(sorted(reasons))
