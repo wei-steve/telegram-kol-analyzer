@@ -36,6 +36,9 @@ from telegram_kol_research.production_safety_monitor import (
     MonitorSnapshot,
     evaluate_monitor_snapshot,
 )
+from telegram_kol_research.recovery_live_submit import (
+    build_deepcoin_trigger_order_payload,
+)
 from telegram_kol_research.trading_settings import load_trading_settings
 
 
@@ -159,13 +162,10 @@ def _seed_entry_assembly_fingerprint_cli_case(tmp_path):
             leg_index=1, purpose="entry", order_kind="trigger_limit",
             order_id="order-1", client_order_id=leg["client_order_id"],
             venue="deepcoin", status="open",
-            request_json=_canonical_json({
-                "instId": "BTC-USDT-SWAP", "posSide": "long",
-                "side": "buy", "tdMode": "cross", "mrgPosition": "split",
-                "price": str(leg["price"]), "orderType": leg["order_type"],
-                "triggerPrice": str(leg["price"]),
-                "sz": str(leg["quantity"]), "clOrdId": leg["client_order_id"],
-            }), created_at=_ENTRY_REPAIR_NOW, updated_at=_ENTRY_REPAIR_NOW,
+            request_json=_canonical_json(
+                build_deepcoin_trigger_order_payload(draft, leg)
+            ),
+            created_at=_ENTRY_REPAIR_NOW, updated_at=_ENTRY_REPAIR_NOW,
         ))
         session.commit()
     return database_path, session_factory, secret_text
@@ -202,6 +202,17 @@ def test_entry_assembly_fingerprint_repair_dry_run_is_redacted_and_read_only(
 ):
     database_path, session_factory, secret_text = (
         _seed_entry_assembly_fingerprint_cli_case(tmp_path)
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        draft = json.loads(binding.payload_json)["draft"]
+        request = json.loads(
+            session.query(ExecutionOrderLeg).filter_by(
+                execution_binding_id=266, leg_index=1
+            ).one().request_json
+        )
+    assert request == build_deepcoin_trigger_order_payload(
+        draft, draft["order_legs"][0]
     )
     before = database_path.read_bytes()
     import telegram_kol_research.cli as cli_module
