@@ -26,7 +26,6 @@ from telegram_kol_research.entry_strategy_assembly import (
     build_bounded_entry_order_draft_snapshot,
     canonical_entry_assembly_fingerprint,
 )
-from telegram_kol_research.deepcoin_execution_actions import _exact_exchange_order_id
 from telegram_kol_research.deepcoin_execution_actions import execute_deepcoin_management_signal
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord
 from telegram_kol_research.execution_bindings import ExecutionOrderLegRecord
@@ -136,18 +135,15 @@ def _report_entry_submission_progress(func):
 def _entry_submission_failure_status(
     exc: Exception,
     *,
-    verified_v2_assembly: bool,
     progress: EntrySubmissionProgress,
 ) -> str:
     if progress.attempted_writes == 0:
         return "failed"
-    if verified_v2_assembly and progress.confirmed_legs > 0:
+    if progress.confirmed_legs > 0:
         return "partial_submission_failed"
-    if isinstance(exc, DeepcoinRequestOutcomeUnknown):
-        return "unknown_exchange_outcome"
     if isinstance(exc, DeepcoinDefiniteRejection):
         return "failed"
-    return "failed"
+    return "unknown_exchange_outcome"
 
 
 def _require_synchronized_finalized_entry_assembly(
@@ -646,7 +642,6 @@ def process_trade_signal_live(
             expected_status="processing",
             terminal_status=_entry_submission_failure_status(
                 failure,
-                verified_v2_assembly=verified_v2_assembly,
                 progress=submission_progress,
             ),
         )
@@ -800,7 +795,7 @@ def _submit_recovery_signal_direct(
             except Exception as exc:  # pragma: no cover - defensive boundary
                 raise DeepcoinClientError(f"Deepcoin client failed: {exc}") from exc
 
-            order_id = _extract_exact_entry_order_id(response)
+            order_id = _extract_exact_market_order_id(response)
             if not order_id:
                 raise DeepcoinRequestOutcomeUnknown(
                     "market order response missing exact order id"
@@ -941,7 +936,7 @@ def _submit_recovery_signal_direct(
             except Exception as exc:  # pragma: no cover - defensive boundary
                 raise DeepcoinClientError(f"Deepcoin client failed: {exc}") from exc
 
-            order_id = _extract_exact_entry_order_id(response)
+            order_id = _extract_exact_trigger_order_id(response)
             if not order_id:
                 raise DeepcoinRequestOutcomeUnknown(
                     "trigger order response missing exact order id"
@@ -1387,10 +1382,9 @@ def _optional_snapshot_text(row: dict[str, Any], *keys: str) -> str | None:
 def _normalized_trigger_order_id(response: Any) -> str:
     if not isinstance(response, dict):
         raise DeepcoinClientError("Deepcoin trigger order response missing order id")
-    for payload in _response_payloads(response):
-        order_id = payload.get("ordId")
-        if isinstance(order_id, str) and order_id and order_id == order_id.strip():
-            return order_id
+    order_id = _extract_exact_trigger_order_id(response)
+    if order_id is not None:
+        return order_id
     raise DeepcoinClientError("Deepcoin trigger order response missing order id")
 
 
@@ -2620,11 +2614,34 @@ def _extract_order_id(response: dict[str, Any]) -> str | None:
     return None
 
 
-def _extract_exact_entry_order_id(response: dict[str, Any]) -> str | None:
+def _extract_exact_market_order_id(response: dict[str, Any]) -> str | None:
+    return _extract_endpoint_entry_order_id(
+        response,
+        fields=("ordId",),
+    )
+
+
+def _extract_exact_trigger_order_id(response: dict[str, Any]) -> str | None:
+    return _extract_endpoint_entry_order_id(
+        response,
+        fields=("ordId",),
+    )
+
+
+def _extract_endpoint_entry_order_id(
+    response: dict[str, Any],
+    *,
+    fields: tuple[str, ...],
+) -> str | None:
     for payload in _response_payloads(response):
-        order_id = _exact_exchange_order_id(payload)
-        if order_id is not None and order_id.strip() == order_id and order_id:
-            return order_id
+        for field in fields:
+            order_id = payload.get(field)
+            if (
+                isinstance(order_id, str)
+                and order_id
+                and order_id.strip() == order_id
+            ):
+                return order_id
     return None
 
 

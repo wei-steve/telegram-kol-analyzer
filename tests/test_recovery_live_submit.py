@@ -7,6 +7,7 @@ import pytest
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
+from telegram_kol_research.deepcoin_client import DeepcoinDefiniteRejection
 from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.entry_strategy_assembly import (
@@ -61,6 +62,22 @@ def test_pending_entry_update_requires_an_exact_exchange_order_id():
     assert _exact_exchange_order_id({"ordId": "trigger-123", "clOrdId": "client-123"}) == "trigger-123"
     assert _exact_exchange_order_id({"clOrdId": "client-123"}) is None
     assert _exact_exchange_order_id({"id": "internal-123"}) is None
+
+
+def test_entry_order_id_extractors_accept_only_their_endpoint_fields():
+    from telegram_kol_research.recovery_live_submit import (
+        _extract_exact_market_order_id,
+        _extract_exact_trigger_order_id,
+    )
+
+    assert _extract_exact_market_order_id({"data": {"ordId": "market-1"}}) == "market-1"
+    assert _extract_exact_market_order_id({"data": {"algoId": "algo-1"}}) is None
+    assert _extract_exact_market_order_id({"data": {"orderId": "alias-1"}}) is None
+    assert _extract_exact_trigger_order_id({"data": {"ordId": "trigger-1"}}) == "trigger-1"
+    assert _extract_exact_trigger_order_id({"data": {"algoId": "algo-1"}}) is None
+    assert _extract_exact_trigger_order_id(
+        {"data": {"triggerOrderId": "trigger-1"}}
+    ) is None
 
 
 @pytest.mark.parametrize("payload", [None, [], "scalar", 42, 1.5, True])
@@ -191,7 +208,7 @@ class _ProtectionFailingDeepcoinClient(_FakeDeepcoinClient):
 class _InsufficientMoneyDeepcoinClient(_FakeDeepcoinClient):
     def place_order(self, order_payload):
         self.payloads.append(order_payload)
-        raise DeepcoinClientError("Deepcoin API error 36: InsufficientMoney")
+        raise DeepcoinDefiniteRejection("Deepcoin API error 36: InsufficientMoney")
 
 
 def test_market_entry_fails_before_submit_when_position_baseline_is_unavailable():
@@ -1136,7 +1153,104 @@ def test_v2_unknown_first_exchange_write_is_quarantined_without_retry(tmp_path):
     assert len(client.trigger_payloads) == 1
 
 
-def test_v2_market_generic_id_is_not_a_confirmed_exchange_order(tmp_path):
+def test_v2_generic_post_call_error_is_unknown_and_not_retried(tmp_path):
+    session_factory = create_session_factory(tmp_path / "generic-post-call.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    finalized = _finalize_v2_assembly_for_signal(session_factory, signal)
+    _persist_finalized_signal_evidence(session_factory, signal, finalized)
+
+    class _GenericPostCallErrorClient(_FakeDeepcoinClient):
+        def trigger_order(self, order_payload):
+            self.trigger_payloads.append(order_payload)
+            raise DeepcoinClientError("transport failed after trigger call")
+
+    client = _GenericPostCallErrorClient()
+    with pytest.raises(DeepcoinClientError, match="transport failed after trigger call"):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+
+    with session_factory() as session:
+        assert session.get(TradeSignal, signal.id).status == "unknown_exchange_outcome"
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="^trade_signal_claim_failed:unknown_exchange_outcome$",
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+    assert len(client.trigger_payloads) == 1
+
+
+def test_v2_embedded_trigger_missing_parent_identity_is_unknown_and_not_retried(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "embedded-missing-parent.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    finalized = _finalize_v2_assembly_for_signal(session_factory, signal)
+    _persist_finalized_signal_evidence(session_factory, signal, finalized)
+
+    class _MissingParentIdentityClient(_FakeDeepcoinClient):
+        def trigger_order(self, order_payload):
+            self.trigger_payloads.append(order_payload)
+            return {"code": "0", "data": {"id": "generic-parent-id"}}
+
+    client = _MissingParentIdentityClient()
+    with pytest.raises(
+        DeepcoinClientError,
+        match="Deepcoin trigger order response missing order id",
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+
+    with session_factory() as session:
+        assert session.get(TradeSignal, signal.id).status == "unknown_exchange_outcome"
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="^trade_signal_claim_failed:unknown_exchange_outcome$",
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+    assert len(client.trigger_payloads) == 1
+
+
+@pytest.mark.parametrize("ambiguous_id_field", ["id", "algoId", "triggerOrderId"])
+def test_v2_market_ambiguous_id_is_not_a_confirmed_exchange_order(
+    tmp_path,
+    ambiguous_id_field,
+):
     session_factory = create_session_factory(tmp_path / "market-generic-id.db")
     _persist_ready_market_item(session_factory)
     save_trading_settings(session_factory, {"auto_trade_enabled": True})
@@ -1154,7 +1268,10 @@ def test_v2_market_generic_id_is_not_a_confirmed_exchange_order(tmp_path):
     class _GenericMarketIdClient(_FakeDeepcoinClient):
         def place_order(self, order_payload):
             self.payloads.append(order_payload)
-            return {"code": "0", "data": {"id": "generic-market-id"}}
+            return {
+                "code": "0",
+                "data": {ambiguous_id_field: "ambiguous-market-id"},
+            }
 
     client = _GenericMarketIdClient()
     with pytest.raises(
