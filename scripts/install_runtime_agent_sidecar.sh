@@ -96,7 +96,8 @@ if [[ "$(id -u "$AGENT_USER")" -eq 0 || "$(id -gn "$AGENT_USER")" != "$AGENT_GRO
 fi
 
 setfacl -x "d:u:$AGENT_USER" "$DATA_DIRECTORY" 2>/dev/null || true
-setfacl -m "u:$AGENT_USER:--x" "$DATA_DIRECTORY"
+setfacl -m "u:$AGENT_USER:-wx" "$DATA_DIRECTORY"
+chmod +t "$DATA_DIRECTORY"
 setfacl -m "u:$AGENT_USER:rw-" "$DATABASE_PATH"
 for sqlite_sidecar in \
   "$DATABASE_PATH-wal" \
@@ -107,8 +108,25 @@ do
     setfacl -m "u:$AGENT_USER:rw-" "$sqlite_sidecar"
   fi
 done
-if runuser -u "$AGENT_USER" -- test -w "$DATA_DIRECTORY"; then
-  echo "Agent identity can write the production data directory." >&2
+while IFS= read -r -d '' data_file; do
+  case "$data_file" in
+    "$DATABASE_PATH"|"$DATABASE_PATH-wal"|"$DATABASE_PATH-shm"|"$DATABASE_PATH-journal")
+      continue
+      ;;
+  esac
+  setfacl -x "u:$AGENT_USER" "$data_file" 2>/dev/null || true
+  if runuser -u "$AGENT_USER" -- test -r "$data_file" \
+    || runuser -u "$AGENT_USER" -- test -w "$data_file"; then
+    echo "Agent identity can access non-allowlisted production data." >&2
+    exit 1
+  fi
+done < <(find "$DATA_DIRECTORY" -maxdepth 1 -type f -print0)
+if ! runuser -u "$AGENT_USER" -- test -w "$DATA_DIRECTORY"; then
+  echo "Agent identity cannot create SQLite sidecar files." >&2
+  exit 1
+fi
+if runuser -u "$AGENT_USER" -- test -r "$DATA_DIRECTORY"; then
+  echo "Agent identity can enumerate the production data directory." >&2
   exit 1
 fi
 if ! runuser -u "$AGENT_USER" -- test -w "$DATABASE_PATH"; then

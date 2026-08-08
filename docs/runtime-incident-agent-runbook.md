@@ -615,9 +615,13 @@ if that identity can write source or configuration. A mode-0700
 `/var/lib/telegram-kol-runtime-agent` state directory is its only private
 analysis workspace. The root-owned Runtime Agent environment file is
 inaccessible inside the service mount namespace after systemd loads it.
-The production data directory has no Agent default ACL and is not mounted
-writable; only the existing SQLite database and its present WAL/SHM/journal
-files receive explicit write exceptions. Existing database write access remains limited to the reviewed incident/claim
+The production data directory has no Agent default ACL. Its service mount is
+writable only because SQLite must be able to recreate absent WAL/SHM files
+after a clean close or reboot. DAC grants the Agent write-plus-traverse but not
+directory enumeration, the directory is sticky, and the installer removes
+legacy Agent ACLs from every non-database top-level file and refuses deployment
+if any such file remains readable or writable. Known Telegram session paths are
+also inaccessible in the service mount namespace. Existing database write access remains limited to the reviewed incident/claim
 lifecycle and the new audit ledger; production fact reads made by the broker
 are query-only.
 

@@ -46,12 +46,13 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@mount @privileged
 ReadOnlyPaths=/opt/telegram-kol-analyzer
 ReadOnlyPaths=/opt/telegram-kol-analyzer/data
-ReadWritePaths=/opt/telegram-kol-analyzer/data/research.db
-ReadWritePaths=-/opt/telegram-kol-analyzer/data/research.db-wal
-ReadWritePaths=-/opt/telegram-kol-analyzer/data/research.db-shm
-ReadWritePaths=-/opt/telegram-kol-analyzer/data/research.db-journal
+ReadWritePaths=/opt/telegram-kol-analyzer/data
 ReadWritePaths=/var/lib/telegram-kol-runtime-agent
 InaccessiblePaths=/opt/telegram-kol-analyzer/config/runtime_incident_agent.env
+InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session
+InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session-journal
+InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session-wal
+InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session-shm
 
 [Install]
 WantedBy=multi-user.target
