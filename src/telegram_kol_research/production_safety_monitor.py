@@ -38,6 +38,7 @@ from telegram_kol_research.entry_assembly_fingerprint_repair import (
     canonical_fingerprint,
     derive_pre_finalization_fingerprint,
     entry_order_snapshot_matches_durable_identity,
+    legacy_binding_order_identity,
     legacy_finalized_execution_legs_match,
     legacy_finalized_binding_payload_is_exact,
     legacy_finalized_signal_payload_is_exact,
@@ -1096,6 +1097,12 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
     if not legacy_finalized_binding_payload_is_exact(binding_payload):
         return False
     binding_draft = binding_payload["draft"]
+    binding_order_identity = legacy_binding_order_identity(
+        binding_identity,
+        submitted_orders=binding_payload["submitted_orders"],
+    )
+    if binding_order_identity is None:
+        return False
     legacy_snapshot = legacy_finalized_snapshot_from_full_draft(binding_draft)
     if (
         legacy_snapshot != snapshot
@@ -1297,6 +1304,7 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
         old_fingerprint=old_fp,
         final_fingerprint=final_fp,
         policy_version=LEGACY_FINALIZED_RECONCILIATION_POLICY,
+        binding_order_identity=binding_order_identity,
     )
     common = {
         "policy_version": LEGACY_FINALIZED_RECONCILIATION_POLICY,
@@ -1413,6 +1421,11 @@ def read_entry_preamble_invariants(
             "venue",
             "margin_mode",
             "position_mode",
+            "order_id",
+            "client_order_id",
+            "pos_id",
+            "status",
+            "last_exchange_status",
         )
         binding_identity_select = ", ".join(
             f"b.{column}" if column in binding_columns else "NULL"
@@ -1446,6 +1459,11 @@ def read_entry_preamble_invariants(
             binding_venue,
             binding_margin_mode,
             binding_position_mode,
+            binding_order_id,
+            binding_client_order_id,
+            binding_pos_id,
+            binding_status,
+            binding_last_exchange_status,
         ) in evidence_rows:
             payload = _read_reconciliation_json(payload_json)
             draft = payload.get("draft") if isinstance(payload, dict) else None
@@ -1481,6 +1499,11 @@ def read_entry_preamble_invariants(
                         "venue": binding_venue,
                         "margin_mode": binding_margin_mode,
                         "position_mode": binding_position_mode,
+                        "order_id": binding_order_id,
+                        "client_order_id": binding_client_order_id,
+                        "pos_id": binding_pos_id,
+                        "status": binding_status,
+                        "last_exchange_status": binding_last_exchange_status,
                     },
                     binding_payload=payload,
                     stale_evidence=evidence,

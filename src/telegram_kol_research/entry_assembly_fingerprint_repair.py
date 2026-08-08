@@ -220,18 +220,20 @@ def build_reconciliation_fingerprint(
     old_fingerprint: str,
     final_fingerprint: str,
     policy_version: str = RECONCILIATION_POLICY,
+    binding_order_identity: Mapping[str, Any] | None = None,
 ) -> str:
-    return canonical_fingerprint(
-        {
-            "policy_version": policy_version,
-            "assembly_id": int(assembly_id),
-            "execution_binding_id": int(execution_binding_id),
-            "trade_signal_id": trade_signal_id,
-            "strategy_instance_id": strategy_instance_id,
-            "old_fingerprint": old_fingerprint,
-            "final_fingerprint": final_fingerprint,
-        }
-    )
+    payload = {
+        "policy_version": policy_version,
+        "assembly_id": int(assembly_id),
+        "execution_binding_id": int(execution_binding_id),
+        "trade_signal_id": trade_signal_id,
+        "strategy_instance_id": strategy_instance_id,
+        "old_fingerprint": old_fingerprint,
+        "final_fingerprint": final_fingerprint,
+    }
+    if binding_order_identity is not None:
+        payload["binding_order_identity"] = dict(binding_order_identity)
+    return canonical_fingerprint(payload)
 
 
 def build_entry_assembly_fingerprint_repair_plan(
@@ -392,6 +394,7 @@ def _build_entry_assembly_fingerprint_repair_plan(
         conflicts.append("binding_old_fingerprint_not_derivable")
     canonical_proof = canonical_snapshot == snapshot
     legacy_proof = legacy_snapshot == snapshot
+    binding_order_identity = None
     if canonical_proof:
         if _bounded_snapshot(binding_draft) != canonical_snapshot:
             conflicts.append("binding_draft_identity_mismatch")
@@ -400,6 +403,19 @@ def _build_entry_assembly_fingerprint_repair_plan(
             legacy_finalized_snapshot_from_full_draft(binding_draft) != legacy_snapshot
         ):
             conflicts.append("assembly_legacy_snapshot_binding_mismatch")
+        else:
+            binding_order_identity = legacy_binding_order_identity(
+                {
+                    "order_id": binding.order_id,
+                    "client_order_id": binding.client_order_id,
+                    "pos_id": binding.pos_id,
+                    "status": binding.status,
+                    "last_exchange_status": binding.last_exchange_status,
+                },
+                submitted_orders=binding_payload["submitted_orders"],
+            )
+            if binding_order_identity is None:
+                conflicts.append("binding_top_order_identity_mismatch")
     else:
         conflicts.append("binding_draft_identity_mismatch")
 
@@ -470,6 +486,7 @@ def _build_entry_assembly_fingerprint_repair_plan(
         old_fingerprint=old_fingerprint,
         final_fingerprint=str(assembly.fingerprint),
         policy_version=policy_version,
+        binding_order_identity=binding_order_identity,
     )
     action = EntryAssemblyFingerprintRepairAction(
         assembly_id=int(assembly.id),
@@ -763,6 +780,43 @@ def legacy_finalized_binding_payload_is_exact(payload: Any) -> bool:
         )
         for index, row in enumerate(submitted, 1)
     )
+
+
+def legacy_binding_order_identity(
+    binding: Mapping[str, Any],
+    *,
+    submitted_orders: Any,
+) -> dict[str, Any] | None:
+    if (
+        not isinstance(submitted_orders, list)
+        or len(submitted_orders) != 2
+        or any(not isinstance(row, Mapping) for row in submitted_orders)
+    ):
+        return None
+    expected_order_id = ",".join(
+        str(row.get("order_id") or "") for row in submitted_orders
+    )
+    expected_client_order_id = ",".join(
+        str(row.get("client_order_id") or "") for row in submitted_orders
+    )
+    if (
+        not expected_order_id
+        or not expected_client_order_id
+        or binding.get("order_id") != expected_order_id
+        or binding.get("client_order_id") != expected_client_order_id
+        or binding.get("pos_id") is not None
+        or any(row.get("pos_id") is not None for row in submitted_orders)
+        or binding.get("status") != "open"
+        or binding.get("last_exchange_status") != "entry_order_pending"
+    ):
+        return None
+    return {
+        "order_id": expected_order_id,
+        "client_order_id": expected_client_order_id,
+        "pos_id": None,
+        "status": "open",
+        "last_exchange_status": "entry_order_pending",
+    }
 
 
 def legacy_finalized_signal_payload_is_exact(payload: Any) -> bool:
@@ -1162,8 +1216,7 @@ def legacy_finalized_execution_legs_match(
             or str(_leg_value(row, "strategy_instance_id") or "")
             != strategy_instance_id
             or str(_leg_value(row, "venue") or "").lower() != "deepcoin"
-            or str(_leg_value(row, "status") or "").lower()
-            not in {"pending", "submitted", "open", "active"}
+            or str(_leg_value(row, "status") or "").lower() != "pending"
             or not str(_leg_value(row, "order_id") or "").strip()
             or _leg_value(row, "order_id") != submitted["order_id"]
             or expected_kind is None

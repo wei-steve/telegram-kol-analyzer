@@ -398,6 +398,11 @@ def _convert_to_production_legacy_finalized_case(session_factory) -> None:
         binding.payload_json = _canonical_json(
             {"draft": full_draft, "submitted_orders": submitted_orders}
         )
+        binding.order_id = "order-1,order-2"
+        binding.client_order_id = "entry-1,entry-2"
+        binding.pos_id = None
+        binding.status = "open"
+        binding.last_exchange_status = "entry_order_pending"
         session.commit()
 
 
@@ -491,6 +496,13 @@ def test_build_plan_accepts_exact_production_legacy_finalized_snapshot(tmp_path)
         ]
     assert len(requests) == 2
     assert all(len(request) == 16 for request in requests)
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        assert binding.order_id == "order-1,order-2"
+        assert binding.client_order_id == "entry-1,entry-2"
+        assert binding.pos_id is None
+        assert binding.status == "open"
+        assert binding.last_exchange_status == "entry_order_pending"
     assert database_path.read_bytes() == before
 
 
@@ -645,6 +657,36 @@ def test_legacy_policy_rejects_wrapper_or_submitted_order_drift(
         "trade_signal_evidence_mismatch",
         "execution_leg_identity_mismatch",
     }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["order_id", "client_order_id", "pos_id", "status", "last_exchange_status"],
+)
+def test_legacy_policy_rejects_binding_top_order_identity_drift(
+    tmp_path, mutation
+):
+    _, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        setattr(
+            binding,
+            mutation,
+            {
+                "order_id": "other-order,order-2",
+                "client_order_id": "other-client,entry-2",
+                "pos_id": "pos-1",
+                "status": "active",
+                "last_exchange_status": "submitted",
+            }[mutation],
+        )
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.action is None
+    assert "binding_top_order_identity_mismatch" in plan.conflicts
 
 
 @pytest.mark.parametrize(
@@ -972,6 +1014,66 @@ def test_legacy_monitor_rejects_unreviewable_signal_candidate(tmp_path):
     )
     with session_factory() as session:
         session.get(SignalCandidate, 20).review_status = "rejected"
+        session.commit()
+
+    assert _plan(session_factory).action is None
+    assert read_entry_preamble_invariants(database_path, now=NOW) == (
+        "live_entry_preamble_binding_evidence_missing",
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "order_id",
+        "client_order_id",
+        "pos_id",
+        "status",
+        "last_exchange_status",
+        "coordinated_order_id",
+    ],
+)
+def test_valid_legacy_event_does_not_hide_binding_top_identity_drift(
+    tmp_path, mutation
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        if mutation == "coordinated_order_id":
+            payload = json.loads(binding.payload_json)
+            legs = session.query(ExecutionOrderLeg).order_by(
+                ExecutionOrderLeg.leg_index
+            )
+            forged = ["forged-1", "forged-2"]
+            binding.order_id = ",".join(forged)
+            for index, (leg, order_id) in enumerate(zip(legs, forged)):
+                leg.order_id = order_id
+                payload["submitted_orders"][index]["order_id"] = order_id
+                payload["submitted_orders"][index]["response"]["data"][
+                    "ordId"
+                ] = order_id
+            binding.payload_json = _canonical_json(payload)
+        else:
+            setattr(
+                binding,
+                mutation,
+                {
+                    "order_id": "other-order,order-2",
+                    "client_order_id": "other-client,entry-2",
+                    "pos_id": "pos-1",
+                    "status": "active",
+                    "last_exchange_status": "submitted",
+                }[mutation],
+            )
         session.commit()
 
     assert _plan(session_factory).action is None
