@@ -1561,10 +1561,11 @@ def test_message_operation_reuse_requires_exact_policy_code_evidence_and_class(
     assert second_result.status == "reused"
     assert model_calls == []
     assert second_result.handoff["affected_message_ids"] == [raw_1, raw_2]
-    assert second_result.handoff["instruction_items"] == [
-        {"contract_id": 1, "items": []},
-        {"contract_id": 2, "items": []},
-    ]
+    assert second_result.handoff["instruction_items"] == []
+    assert [
+        contract["contract_id"]
+        for contract in second_result.handoff["message_operation_contracts"]
+    ] == [1, 2]
     assert [
         item["raw_message_id"]
         for item in second_result.handoff["original_reply_evidence"]

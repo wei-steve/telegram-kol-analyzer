@@ -720,6 +720,11 @@ message, contract, instruction-item, original/reply identity, timeline,
 evidence, hypothesis, missing-evidence, code/test path, prohibited-action, and
 Codex-prompt fields. It stores no raw credential, arbitrary log, or provider
 response.
+Oversized but valid source evidence and diagnosis arrays are deterministically
+compacted with exact omitted counts. SHA-256 fingerprints of the complete
+bounded source evidence and complete diagnosis/policy inputs remain in the
+artifact, so a change in omitted material still creates a new revision without
+persisting that omitted material.
 
 The terminal outcome set is closed: `diagnosed`, `reused`, `provider_failed`,
 `tool_failed`, `evidence_incomplete`, and `timed_out`. A failed investigation
@@ -729,7 +734,9 @@ dispatcher, never the Agent sidecar, owns the system Bot token and sends both a
 bounded copyable prompt and the matching JSON document. The notification and
 document display the same incident ID, stable handoff ID, revision, and SHA-256
 content hash. Claims, bounded retries, Telegram message IDs, failure codes, and
-delivery time are durable. When Stage 2 is enabled, the legacy incident
+delivery time are durable. Message and document IDs are checkpointed after
+each accepted Telegram segment, so a document retry does not resend an already
+checkpointed prompt. When Stage 2 is enabled, the legacy incident
 dispatcher excludes this incident class to prevent duplicate terminal reports;
 Stage 1 remains first and independent.
 
@@ -742,6 +749,11 @@ Deployment is dormant by default:
   absent, malformed, negative, or overflowing;
 - `TELEGRAM_KOL_MESSAGE_OPERATION_STAGE2_MAX_ATTEMPTS` defaults to five and is
   bounded to 1 through 20;
+- Stage 2 is claimable only while the Stage 1 feature is enabled, at least one
+  matching Stage 1 row exists, and every affected-message Stage 1 row is
+  `delivered` or terminal `exhausted`. Pending, delivering, or retryable failed
+  Stage 1 rows block Stage 2; an exhausted Stage 1 delivery has already created
+  its independent high-severity notification-delivery incident;
 - disabling Stage 2 does not disable intake, recognition, context resolution,
   execution, reconciliation, Stage 1, or Agent diagnosis.
 

@@ -552,6 +552,19 @@ def format_runtime_incident_stage2_notification(artifact, incident) -> str:
     return wrap_ai_agent_notification("\n".join(lines), limit=3500)
 
 
+def _require_telegram_message_id(value: Any) -> str:
+    if isinstance(value, bool):
+        raise RuntimeError("Telegram did not return a durable message id")
+    normalized = str(value or "").strip()
+    if (
+        not normalized.isdigit()
+        or int(normalized) <= 0
+        or len(normalized) > 255
+    ):
+        raise RuntimeError("Telegram did not return a durable message id")
+    return normalized
+
+
 def claim_next_runtime_incident_stage2_notification(
     session_factory,
     *,
@@ -561,6 +574,7 @@ def claim_next_runtime_incident_stage2_notification(
     max_attempts: int = MESSAGE_OPERATION_STAGE2_MAX_ATTEMPTS,
 ):
     from telegram_kol_research.models import (
+        MessageOperationStage1Notification,
         RuntimeIncident,
         RuntimeIncidentHandoffArtifact,
     )
@@ -592,6 +606,21 @@ def claim_next_runtime_incident_stage2_notification(
     eligible = and_(
         artifact_eligible,
         RuntimeIncident.incident_type == "message_operation_failure",
+        exists(
+            select(MessageOperationStage1Notification.id).where(
+                MessageOperationStage1Notification.runtime_incident_id
+                == RuntimeIncidentHandoffArtifact.runtime_incident_id
+            )
+        ),
+        ~exists(
+            select(MessageOperationStage1Notification.id).where(
+                MessageOperationStage1Notification.runtime_incident_id
+                == RuntimeIncidentHandoffArtifact.runtime_incident_id,
+                MessageOperationStage1Notification.status.not_in(
+                    ("delivered", "exhausted")
+                ),
+            )
+        ),
     )
     token = uuid.uuid4().hex
     with session_factory() as session:
@@ -666,19 +695,77 @@ async def deliver_runtime_incident_stage2_notifications(
         incident = claim["incident"]
         token = claim["claim_token"]
         try:
-            message_id = await send_system_operator_bot_message(
-                config=config,
-                text=format_runtime_incident_stage2_notification(artifact, incident),
+            message_id = (
+                _require_telegram_message_id(artifact.telegram_message_id)
+                if artifact.telegram_message_id is not None
+                else None
             )
-            document_message_id = await send_system_operator_bot_document(
-                config=config,
-                filename=f"runtime-incident-handoff-{artifact.id}.json",
-                content=artifact.evidence_document_json,
-                caption=(
-                    f"incident={incident.id} handoff={artifact.id} "
-                    f"sha256={artifact.content_fingerprint}"
-                ),
+            if message_id is None:
+                message_id = _require_telegram_message_id(
+                    await send_system_operator_bot_message(
+                        config=config,
+                        text=format_runtime_incident_stage2_notification(
+                            artifact, incident
+                        ),
+                    )
+                )
+                with session_factory() as session:
+                    persisted = session.execute(
+                        update(RuntimeIncidentHandoffArtifact)
+                        .where(
+                            RuntimeIncidentHandoffArtifact.id == artifact.id,
+                            RuntimeIncidentHandoffArtifact.status == "delivering",
+                            RuntimeIncidentHandoffArtifact.claim_token == token,
+                        )
+                        .values(
+                            telegram_message_id=(
+                                str(message_id)[:255]
+                                if message_id is not None else None
+                            ),
+                            updated_at=now,
+                        )
+                    )
+                    session.commit()
+                    if persisted.rowcount != 1:
+                        raise RuntimeError("stage2 claim lost after message delivery")
+            document_message_id = (
+                _require_telegram_message_id(
+                    artifact.telegram_document_message_id
+                )
+                if artifact.telegram_document_message_id is not None
+                else None
             )
+            if document_message_id is None:
+                document_message_id = _require_telegram_message_id(
+                    await send_system_operator_bot_document(
+                        config=config,
+                        filename=f"runtime-incident-handoff-{artifact.id}.json",
+                        content=artifact.evidence_document_json,
+                        caption=(
+                            f"incident={incident.id} handoff={artifact.id} "
+                            f"sha256={artifact.content_fingerprint}"
+                        ),
+                    )
+                )
+                with session_factory() as session:
+                    persisted = session.execute(
+                        update(RuntimeIncidentHandoffArtifact)
+                        .where(
+                            RuntimeIncidentHandoffArtifact.id == artifact.id,
+                            RuntimeIncidentHandoffArtifact.status == "delivering",
+                            RuntimeIncidentHandoffArtifact.claim_token == token,
+                        )
+                        .values(
+                            telegram_document_message_id=(
+                                str(document_message_id)[:255]
+                                if document_message_id is not None else None
+                            ),
+                            updated_at=now,
+                        )
+                    )
+                    session.commit()
+                    if persisted.rowcount != 1:
+                        raise RuntimeError("stage2 claim lost after document delivery")
         except Exception as exc:
             exhausted = int(artifact.attempt_count) >= max(1, int(max_attempts))
             with session_factory() as session:
@@ -2252,7 +2339,10 @@ async def deliver_runtime_incident_notifications(
                 "Message-operation Stage 1 delivery failed open: error=%s",
                 type(exc).__name__,
             )
-    if feature_config.message_operation_stage2_enabled:
+    if (
+        feature_config.message_operation_stage1_enabled
+        and feature_config.message_operation_stage2_enabled
+    ):
         try:
             delivered += await deliver_runtime_incident_stage2_notifications(
                 session_factory,

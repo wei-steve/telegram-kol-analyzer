@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import pytest
 
 from telegram_kol_research.runtime_agent_contracts import RuntimeAgentDiagnosis
@@ -151,7 +152,240 @@ def test_handoff_accepts_one_real_message_operation_instruction_item():
         attempted_queries=("investigate_message_evidence",),
     )
 
-    assert handoff["instruction_items"][0]["items"][0]["status"] == "violated"
+    assert handoff["instruction_items"][0]["status"] == "violated"
+
+
+def test_handoff_compacts_oversized_message_evidence_and_reserves_document_space(
+    tmp_path,
+):
+    from telegram_kol_research.runtime_incident_handoff import (
+        build_runtime_incident_failure_handoff,
+        persist_runtime_incident_handoff,
+    )
+
+    contracts = [
+        {
+            "contract_id": contract_index + 1,
+            "intent_kind": "take_profit",
+            "expected_terminal_kind": "verified_management",
+            "observed_status": "violated",
+            "violation_code": "no_operation_created",
+            "evidence_refs": [
+                f"contract-evidence:{contract_index}:{ref_index}:" + ("c" * 88)
+                for ref_index in range(20)
+            ],
+            "items": [
+                {
+                    "instruction_kind": "take_profit",
+                    "expected_descendant_kind": "management_item",
+                    "expected_terminal_kind": "verified_management",
+                    "observed_terminal_kind": None,
+                    "status": "violated",
+                    "evidence_refs": [
+                        f"item-evidence:{contract_index}:{ref_index}:" + ("x" * 96)
+                        for ref_index in range(20)
+                    ],
+                }
+            ],
+        }
+        for contract_index in range(32)
+    ]
+    handoff = build_runtime_incident_handoff(
+        incident={
+            "id": 17,
+            "incident_type": "message_operation_failure",
+            "source_kind": "message_operation_violation",
+            "source_record_id": "no_operation_created",
+            "severity": "high",
+            "redacted_summary": {
+                "component": "message_operation_supervisor",
+                "message_operation_snapshot": {
+                    "affected_message_count": 1,
+                    "truncated": False,
+                    "affected_message_ids": [91],
+                    "contracts": contracts,
+                    "message_evidence": [],
+                    "timeline": [],
+                },
+            },
+        },
+        diagnosis=_diagnosis(),
+        attempted_queries=("investigate_message_evidence",),
+    )
+
+    assert "message_operation_snapshot" not in handoff["incident"]["redacted_summary"]
+    assert handoff["compaction"]["omitted_instruction_evidence_refs"] > 0
+    assert handoff["compaction"]["omitted_contract_evidence_refs"] > 0
+    assert handoff["compaction"]["omitted_contracts"] == 16
+    assert handoff["compaction"]["omitted_instruction_items"] == 16
+    assert len(json.dumps(handoff, ensure_ascii=False).encode("utf-8")) <= 24576
+    changed_contracts = json.loads(json.dumps(contracts))
+    changed_contracts[0]["evidence_refs"][1] = (
+        "contract-evidence:changed-omitted:" + ("z" * 88)
+    )
+    changed_source_handoff = build_runtime_incident_handoff(
+        incident={
+            "id": 17,
+            "incident_type": "message_operation_failure",
+            "source_kind": "message_operation_violation",
+            "source_record_id": "no_operation_created",
+            "severity": "high",
+            "redacted_summary": {
+                "component": "message_operation_supervisor",
+                "message_operation_snapshot": {"contracts": changed_contracts},
+            },
+        },
+        diagnosis=_diagnosis(),
+        attempted_queries=("investigate_message_evidence",),
+    )
+    assert (
+        changed_source_handoff["source_evidence_fingerprint"]
+        != handoff["source_evidence_fingerprint"]
+    )
+    failure_handoff = build_runtime_incident_failure_handoff(
+        incident={
+            "id": 17,
+            "incident_type": "message_operation_failure",
+            "source_kind": "message_operation_violation",
+            "source_record_id": "no_operation_created",
+            "severity": "high",
+            "redacted_summary": {
+                "message_operation_snapshot": {"contracts": contracts}
+            },
+        },
+        outcome_kind="evidence_incomplete",
+        attempted_queries=("investigate_message_evidence",),
+    )
+    assert failure_handoff["compaction"]["omitted_contracts"] == 16
+    assert len(
+        json.dumps(failure_handoff, ensure_ascii=False).encode("utf-8")
+    ) <= 24576
+
+    session_factory = create_session_factory(tmp_path / "oversized-handoff.db")
+    incident = record_runtime_incident(
+        session_factory,
+        source_kind="message_operation_violation",
+        source_record_id="no_operation_created",
+        incident_type="message_operation_failure",
+        severity="high",
+        fingerprint="b" * 64,
+        redacted_summary='{"component":"message_operation_supervisor"}',
+        occurred_at=datetime(2026, 7, 28, 9, 0, tzinfo=UTC),
+        feature_policy_version="runtime-incident-phase-8r-v1",
+        prompt_version="runtime-agent-prompt-v8",
+        tool_policy_version="runtime-agent-tools-v2",
+    )
+    artifact = persist_runtime_incident_handoff(
+        session_factory,
+        incident_id=incident.id,
+        outcome_kind="evidence_incomplete",
+        handoff={
+            **handoff,
+            "incident": {**handoff["incident"], "id": incident.id},
+        },
+        created_at=datetime(2026, 7, 28, 9, 1, tzinfo=UTC),
+    )
+    changed_artifact = persist_runtime_incident_handoff(
+        session_factory,
+        incident_id=incident.id,
+        outcome_kind="evidence_incomplete",
+        handoff={
+            **changed_source_handoff,
+            "incident": {
+                **changed_source_handoff["incident"],
+                "id": incident.id,
+            },
+        },
+        created_at=datetime(2026, 7, 28, 9, 2, tzinfo=UTC),
+    )
+    assert len(artifact.evidence_document_json.encode("utf-8")) <= 32768
+    assert changed_artifact.diagnosis_revision == 2
+
+
+def test_omitted_diagnosis_change_creates_a_new_handoff_revision(tmp_path):
+    from telegram_kol_research.runtime_incident_handoff import (
+        persist_runtime_incident_handoff,
+    )
+
+    session_factory = create_session_factory(tmp_path / "diagnosis-digest.db")
+    incident = record_runtime_incident(
+        session_factory,
+        source_kind="worker_job",
+        source_record_id="44",
+        incident_type="worker_retry_exhausted",
+        severity="high",
+        fingerprint="c" * 64,
+        redacted_summary='{"error_type":"provider_timeout"}',
+        occurred_at=datetime(2026, 7, 28, 9, 0, tzinfo=UTC),
+        feature_policy_version="runtime-incident-phase-8r-v1",
+        prompt_version="runtime-agent-prompt-v8",
+        tool_policy_version="runtime-agent-tools-v2",
+    )
+
+    def diagnosis(last_missing: str):
+        return RuntimeAgentDiagnosis.from_mapping(
+            {
+                "incident_id": incident.id,
+                "diagnosis_hypothesis": "Worker retries may have been exhausted.",
+                "confidence": "low",
+                "evidence_references": [f"incident:{incident.id}"],
+                "missing_evidence": [
+                    *[f"missing-{index}" for index in range(8)],
+                    last_missing,
+                ],
+                "recommended_playbook_name": None,
+                "auto_handle_eligible": False,
+                "codex_handoff_required": True,
+                "remaining_risk": "The source job remains unresolved.",
+                "expected_state": "The worker reaches a terminal state.",
+                "observed_state": "The worker exhausted retries.",
+                "classification": "code_defect",
+                "affected_message_ids": [],
+                "likely_code_paths": [],
+                "likely_test_paths": [],
+            },
+            expected_incident_id=incident.id,
+        )
+
+    common_incident = {
+        "id": incident.id,
+        "incident_type": incident.incident_type,
+        "source_kind": incident.source_kind,
+        "source_record_id": incident.source_record_id,
+        "redacted_summary": {"error_type": "provider_timeout"},
+        "severity": "high",
+    }
+    first_handoff = build_runtime_incident_handoff(
+        incident=common_incident,
+        diagnosis=diagnosis("omitted-a"),
+        attempted_queries=(),
+    )
+    second_handoff = build_runtime_incident_handoff(
+        incident=common_incident,
+        diagnosis=diagnosis("omitted-b"),
+        attempted_queries=(),
+    )
+    assert first_handoff["agent_hypothesis"] == second_handoff["agent_hypothesis"]
+    assert (
+        first_handoff["source_diagnosis_fingerprint"]
+        != second_handoff["source_diagnosis_fingerprint"]
+    )
+    first = persist_runtime_incident_handoff(
+        session_factory,
+        incident_id=incident.id,
+        outcome_kind="diagnosed",
+        handoff=first_handoff,
+        created_at=datetime(2026, 7, 28, 9, 1, tzinfo=UTC),
+    )
+    second = persist_runtime_incident_handoff(
+        session_factory,
+        incident_id=incident.id,
+        outcome_kind="diagnosed",
+        handoff=second_handoff,
+        created_at=datetime(2026, 7, 28, 9, 2, tzinfo=UTC),
+    )
+    assert first.diagnosis_revision == 1
+    assert second.diagnosis_revision == 2
 
 
 def test_handoff_rejects_sensitive_or_mismatched_incident_material():

@@ -27,6 +27,8 @@ _SENSITIVE_VALUE_PATTERNS = (
 _ALLOWED_INCIDENT_FIELDS = frozenset(
     {"id", "incident_type", "source_kind", "source_record_id", "redacted_summary"}
 )
+_MAX_HANDOFF_CONTENT_BYTES = 24_576
+_MAX_HANDOFF_DOCUMENT_BYTES = 32_768
 
 
 class RuntimeIncidentHandoffError(ValueError):
@@ -50,7 +52,7 @@ def _canonical_handoff(handoff: Mapping[str, Any]) -> tuple[str, str]:
     encoded = json.dumps(
         dict(handoff), ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
-    if len(encoded.encode("utf-8")) > 32768:
+    if len(encoded.encode("utf-8")) > _MAX_HANDOFF_CONTENT_BYTES:
         raise RuntimeIncidentHandoffError("handoff exceeds byte budget")
     return encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -68,6 +70,12 @@ def persist_runtime_incident_handoff_in_session(
     normalized_outcome = str(outcome_kind)
     if normalized_outcome not in _OUTCOME_KINDS:
         raise RuntimeIncidentHandoffError("handoff outcome is invalid")
+    handoff_incident = handoff.get("incident")
+    if (
+        not isinstance(handoff_incident, Mapping)
+        or handoff_incident.get("id") != int(incident_id)
+    ):
+        raise RuntimeIncidentHandoffError("handoff incident identity is invalid")
     content_json, content_fingerprint = _canonical_handoff(handoff)
     prompt = handoff.get("codex_prompt")
     if not isinstance(prompt, str) or not prompt or len(prompt) > 1500:
@@ -113,7 +121,10 @@ def persist_runtime_incident_handoff_in_session(
     artifact.evidence_document_json = json.dumps(
         document, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
-    if len(artifact.evidence_document_json.encode("utf-8")) > 32768:
+    if (
+        len(artifact.evidence_document_json.encode("utf-8"))
+        > _MAX_HANDOFF_DOCUMENT_BYTES
+    ):
         raise RuntimeIncidentHandoffError("handoff document exceeds byte budget")
     return artifact
 
@@ -169,6 +180,165 @@ def _validate_redacted(value, *, depth=0) -> None:
         raise RuntimeIncidentHandoffError("handoff has unsupported data")
 
 
+def _compact_message_operation_snapshot(summary: Any) -> dict[str, Any]:
+    if not isinstance(summary, Mapping):
+        return {
+            "redacted_summary": summary,
+            "source_evidence_fingerprint": hashlib.sha256(b"{}").hexdigest(),
+            "contracts": [],
+            "instruction_items": [],
+            "message_evidence": [],
+            "timeline": [],
+            "compaction": {
+                "omitted_contracts": 0,
+                "omitted_instruction_items": 0,
+                "omitted_contract_evidence_refs": 0,
+                "omitted_instruction_evidence_refs": 0,
+            },
+        }
+    snapshot = summary.get("message_operation_snapshot")
+    base_summary = {
+        str(key): value
+        for key, value in summary.items()
+        if key != "message_operation_snapshot"
+    }
+    if not isinstance(snapshot, Mapping):
+        snapshot = {}
+    try:
+        source_evidence_json = json.dumps(
+            snapshot,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeIncidentHandoffError(
+            "message evidence projection is invalid"
+        ) from exc
+    if len(source_evidence_json) > 1_048_576:
+        raise RuntimeIncidentHandoffError("message evidence projection is not bounded")
+    source_evidence_fingerprint = hashlib.sha256(source_evidence_json).hexdigest()
+    raw_contracts = snapshot.get("contracts")
+    contract_values = raw_contracts if isinstance(raw_contracts, list) else []
+    contracts: list[dict[str, Any]] = []
+    instruction_items: list[dict[str, Any]] = []
+    omitted_contract_refs = 0
+    omitted_item_refs = 0
+    total_items = 0
+    for contract_index, contract in enumerate(contract_values):
+        if not isinstance(contract, Mapping):
+            continue
+        contract_refs = contract.get("evidence_refs")
+        contract_ref_values = contract_refs if isinstance(contract_refs, list) else []
+        include_contract = contract_index < 16
+        retained_contract_refs = 1 if include_contract else 0
+        omitted_contract_refs += max(
+            0, len(contract_ref_values) - retained_contract_refs
+        )
+        if include_contract:
+            contracts.append(
+                {
+                    "contract_id": contract.get("contract_id"),
+                    "intent_kind": str(contract.get("intent_kind") or "unknown")[:32],
+                    "expected_terminal_kind": str(
+                        contract.get("expected_terminal_kind") or "unknown"
+                    )[:64],
+                    "observed_status": str(
+                        contract.get("observed_status") or "unknown"
+                    )[:32],
+                    "violation_code": (
+                        str(contract.get("violation_code"))[:64]
+                        if contract.get("violation_code") is not None
+                        else None
+                    ),
+                    "evidence_refs": [
+                        str(reference)[:160]
+                        for reference in contract_ref_values[:1]
+                    ],
+                }
+            )
+        raw_items = contract.get("items")
+        item_values = raw_items if isinstance(raw_items, list) else []
+        for item in item_values:
+            if not isinstance(item, Mapping):
+                continue
+            item_refs = item.get("evidence_refs")
+            item_ref_values = item_refs if isinstance(item_refs, list) else []
+            include_item = include_contract and total_items < 16
+            retained_item_refs = 1 if include_item else 0
+            omitted_item_refs += max(0, len(item_ref_values) - retained_item_refs)
+            if include_item:
+                instruction_items.append(
+                    {
+                        "contract_id": contract.get("contract_id"),
+                        "instruction_kind": str(
+                            item.get("instruction_kind") or "unknown"
+                        )[:32],
+                        "expected_descendant_kind": str(
+                            item.get("expected_descendant_kind") or "unknown"
+                        )[:64],
+                        "expected_terminal_kind": str(
+                            item.get("expected_terminal_kind") or "unknown"
+                        )[:64],
+                        "observed_terminal_kind": (
+                            str(item.get("observed_terminal_kind"))[:64]
+                            if item.get("observed_terminal_kind") is not None
+                            else None
+                        ),
+                        "status": str(item.get("status") or "unknown")[:32],
+                        "evidence_refs": [
+                            str(reference)[:160]
+                            for reference in item_ref_values[:1]
+                        ],
+                    }
+                )
+                total_items += 1
+    all_item_count = sum(
+        len(contract.get("items"))
+        for contract in contract_values
+        if isinstance(contract, Mapping) and isinstance(contract.get("items"), list)
+    )
+    message_evidence = snapshot.get("message_evidence")
+    timeline = snapshot.get("timeline")
+    return {
+        "redacted_summary": base_summary,
+        "source_evidence_fingerprint": source_evidence_fingerprint,
+        "contracts": contracts,
+        "instruction_items": instruction_items,
+        "message_evidence": (
+            message_evidence[:16] if isinstance(message_evidence, list) else []
+        ),
+        "timeline": timeline[:16] if isinstance(timeline, list) else [],
+        "compaction": {
+            "omitted_contracts": max(0, len(contract_values) - len(contracts)),
+            "omitted_instruction_items": max(0, all_item_count - total_items),
+            "omitted_contract_evidence_refs": omitted_contract_refs,
+            "omitted_instruction_evidence_refs": omitted_item_refs,
+            "omitted_message_evidence": max(
+                0, len(message_evidence) - 16
+            ) if isinstance(message_evidence, list) else 0,
+            "omitted_timeline_events": max(
+                0, len(timeline) - 16
+            ) if isinstance(timeline, list) else 0,
+        },
+    }
+
+
+def _bounded_source_fingerprint(value: Mapping[str, Any], *, name: str) -> str:
+    try:
+        encoded = json.dumps(
+            dict(value),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeIncidentHandoffError(f"{name} is invalid") from exc
+    if len(encoded) > 1_048_576:
+        raise RuntimeIncidentHandoffError(f"{name} is not bounded")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def build_runtime_incident_handoff(
     *,
     incident: Mapping[str, Any],
@@ -184,12 +354,26 @@ def build_runtime_incident_handoff(
         raise RuntimeIncidentHandoffError("incident handoff fields are invalid")
     if int(incident["id"]) != diagnosis.incident_id:
         raise RuntimeIncidentHandoffError("incident diagnosis does not match")
+    snapshot_projection = _compact_message_operation_snapshot(
+        incident["redacted_summary"]
+    )
+    source_diagnosis_fingerprint = _bounded_source_fingerprint(
+        {
+            "diagnosis": diagnosis.to_ledger_mapping(),
+            "attempted_queries": [str(value) for value in attempted_queries],
+            "shadow_policy": dict(shadow_policy) if shadow_policy is not None else None,
+            "recovery_policy": (
+                dict(recovery_policy) if recovery_policy is not None else None
+            ),
+        },
+        name="source diagnosis",
+    )
     compact_incident = {
         "id": diagnosis.incident_id,
         "incident_type": str(incident["incident_type"])[:64],
         "source_kind": str(incident["source_kind"])[:64],
         "source_record_id": str(incident["source_record_id"])[:255],
-        "redacted_summary": incident["redacted_summary"],
+        "redacted_summary": snapshot_projection["redacted_summary"],
         "severity": str(incident.get("severity") or "unknown")[:16],
     }
     _validate_redacted(compact_incident)
@@ -274,7 +458,7 @@ def build_runtime_incident_handoff(
                                 list,
                             )
                             else []
-                        )[:16]
+                        )[:4]
                     ],
                 }
             )
@@ -288,44 +472,31 @@ def build_runtime_incident_handoff(
         f"Agent 假设: {diagnosis.diagnosis_hypothesis}\n"
         f"剩余风险: {diagnosis.remaining_risk}"
     )[:512]
-    message_snapshot = compact_incident["redacted_summary"].get(
-        "message_operation_snapshot", {}
-    ) if isinstance(compact_incident["redacted_summary"], dict) else {}
-    contracts = (
-        message_snapshot.get("contracts", [])
-        if isinstance(message_snapshot, dict)
-        else []
-    )
-    instruction_items = [
-        {
-            "contract_id": contract.get("contract_id"),
-            "items": contract.get("items", []),
-        }
-        for contract in contracts[:32]
-        if isinstance(contract, dict)
-    ]
     handoff = {
         "incident": compact_incident,
-        "instruction_items": instruction_items,
-        "original_reply_evidence": message_snapshot.get(
-            "message_evidence", []
-        ) if isinstance(message_snapshot, dict) else [],
-        "timeline": message_snapshot.get("timeline", [])
-        if isinstance(message_snapshot, dict) else [],
-        "evidence_references": list(diagnosis.evidence_references),
+        "message_operation_contracts": snapshot_projection["contracts"],
+        "instruction_items": snapshot_projection["instruction_items"],
+        "original_reply_evidence": snapshot_projection["message_evidence"],
+        "timeline": snapshot_projection["timeline"],
+        "compaction": snapshot_projection["compaction"],
+        "source_evidence_fingerprint": snapshot_projection[
+            "source_evidence_fingerprint"
+        ],
+        "source_diagnosis_fingerprint": source_diagnosis_fingerprint,
+        "evidence_references": list(diagnosis.evidence_references)[:8],
         "attempted_queries": bounded_queries,
         "attempted_playbooks": attempted_playbooks,
         "agent_hypothesis": {
             "text": diagnosis.diagnosis_hypothesis,
             "confidence": diagnosis.confidence,
-            "missing_evidence": list(diagnosis.missing_evidence),
+            "missing_evidence": list(diagnosis.missing_evidence)[:8],
             "classification": diagnosis.classification,
         },
         "expected_state": diagnosis.expected_state,
         "observed_state": diagnosis.observed_state,
         "affected_message_ids": list(diagnosis.affected_message_ids),
-        "likely_code_paths": list(diagnosis.likely_code_paths),
-        "likely_test_paths": list(diagnosis.likely_test_paths),
+        "likely_code_paths": list(diagnosis.likely_code_paths)[:8],
+        "likely_test_paths": list(diagnosis.likely_test_paths)[:8],
         "prohibited_actions": [
             "strategy_targeting",
             "context_resolution_replacement",
@@ -334,12 +505,22 @@ def build_runtime_incident_handoff(
         ],
         "codex_prompt": prompt,
     }
+    handoff["compaction"].update(
+        {
+            "omitted_diagnosis_evidence_refs": max(
+                0, len(diagnosis.evidence_references) - 8
+            ),
+            "omitted_missing_evidence": max(0, len(diagnosis.missing_evidence) - 8),
+            "omitted_likely_code_paths": max(0, len(diagnosis.likely_code_paths) - 8),
+            "omitted_likely_test_paths": max(0, len(diagnosis.likely_test_paths) - 8),
+        }
+    )
     _validate_redacted(handoff)
     if len(
         json.dumps(handoff, ensure_ascii=False, separators=(",", ":")).encode(
             "utf-8"
         )
-    ) > 32768:
+    ) > _MAX_HANDOFF_CONTENT_BYTES:
         raise RuntimeIncidentHandoffError("handoff exceeds byte budget")
     return handoff
 
@@ -361,33 +542,38 @@ def build_runtime_incident_failure_handoff(
         "保留现有策略识别与上下文解析权威，禁止重试结果未知的写操作。\n"
         "添加回归测试，并遵守服务器安全窗口与部署门槛。"
     )[:1500]
-    summary = incident.get("redacted_summary")
-    message_snapshot = (
-        summary.get("message_operation_snapshot", {})
-        if isinstance(summary, dict)
-        else {}
+    snapshot_projection = _compact_message_operation_snapshot(
+        incident.get("redacted_summary")
+    )
+    source_diagnosis_fingerprint = _bounded_source_fingerprint(
+        {
+            "outcome_kind": outcome_kind,
+            "attempted_queries": [str(value) for value in attempted_queries],
+        },
+        name="source failure diagnosis",
     )
     handoff = {
         "incident": {
-            key: incident[key]
-            for key in _ALLOWED_INCIDENT_FIELDS
+            **{
+                key: incident[key]
+                for key in _ALLOWED_INCIDENT_FIELDS
+                if key != "redacted_summary"
+            },
+            "redacted_summary": snapshot_projection["redacted_summary"],
         },
         "severity": str(incident.get("severity") or "unknown")[:16],
         "outcome_kind": outcome_kind,
-        "instruction_items": [
-            {
-                "contract_id": contract.get("contract_id"),
-                "items": contract.get("items", []),
-            }
-            for contract in message_snapshot.get("contracts", [])[:32]
-            if isinstance(contract, dict)
-        ] if isinstance(message_snapshot, dict) else [],
-        "original_reply_evidence": message_snapshot.get("message_evidence", [])
-        if isinstance(message_snapshot, dict) else [],
+        "message_operation_contracts": snapshot_projection["contracts"],
+        "instruction_items": snapshot_projection["instruction_items"],
+        "original_reply_evidence": snapshot_projection["message_evidence"],
         "expected_state": "The investigation reaches a bounded terminal diagnosis.",
         "observed_state": f"The investigation ended as {outcome_kind}.",
-        "timeline": message_snapshot.get("timeline", [])
-        if isinstance(message_snapshot, dict) else [],
+        "timeline": snapshot_projection["timeline"],
+        "compaction": snapshot_projection["compaction"],
+        "source_evidence_fingerprint": snapshot_projection[
+            "source_evidence_fingerprint"
+        ],
+        "source_diagnosis_fingerprint": source_diagnosis_fingerprint,
         "evidence_references": [f"incident:{incident_id}"],
         "attempted_queries": [str(value)[:64] for value in attempted_queries[:16]],
         "agent_hypothesis": {

@@ -721,6 +721,12 @@ def test_stage2_dispatches_copyable_prompt_and_matching_json_document(
         handoff=handoff,
         created_at=NOW,
     )
+    with session_factory() as session:
+        from telegram_kol_research.models import MessageOperationStage1Notification
+        session.query(MessageOperationStage1Notification).update(
+            {"status": "delivered", "delivered_at": NOW}
+        )
+        session.commit()
     messages = []
     documents = []
 
@@ -760,6 +766,222 @@ def test_stage2_dispatches_copyable_prompt_and_matching_json_document(
         assert stored.status == "delivered"
         assert stored.telegram_message_id == "8801"
         assert stored.telegram_document_message_id == "8802"
+
+
+def test_stage2_retries_only_the_missing_document_after_partial_delivery(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research.runtime_incident_handoff import (
+        persist_runtime_incident_handoff,
+    )
+
+    session_factory = create_session_factory(tmp_path / "stage2-partial.db")
+    incident, _ = _seed_message_operation_stage1(session_factory)
+    persist_runtime_incident_handoff(
+        session_factory,
+        incident_id=incident.id,
+        outcome_kind="tool_failed",
+        handoff={
+            "incident": {"id": incident.id},
+            "codex_prompt": f"请调查 incident_id={incident.id}，读取 AGENTS.md。",
+        },
+        created_at=NOW,
+    )
+    with session_factory() as session:
+        from telegram_kol_research.models import MessageOperationStage1Notification
+        session.query(MessageOperationStage1Notification).update(
+            {"status": "delivered", "delivered_at": NOW}
+        )
+        session.commit()
+    messages = []
+    document_attempts = 0
+
+    async def capture_message(**kwargs):
+        messages.append(kwargs["text"])
+        return 9901
+
+    async def flaky_document(**_kwargs):
+        nonlocal document_attempts
+        document_attempts += 1
+        if document_attempts == 1:
+            raise httpx.ConnectError("temporary")
+        return 9902
+
+    monkeypatch.setattr(
+        operator_bot_module, "send_system_operator_bot_message", capture_message
+    )
+    monkeypatch.setattr(
+        operator_bot_module, "send_system_operator_bot_document", flaky_document
+    )
+
+    assert asyncio.run(
+        operator_bot_module.deliver_runtime_incident_stage2_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            after_handoff_id=0,
+            claimed_at=NOW,
+        )
+    ) == 0
+    assert asyncio.run(
+        operator_bot_module.deliver_runtime_incident_stage2_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            after_handoff_id=0,
+            claimed_at=NOW + timedelta(seconds=5),
+        )
+    ) == 1
+    assert len(messages) == 1
+    assert document_attempts == 2
+
+
+@pytest.mark.parametrize("missing_segment", ["message", "document"])
+def test_stage2_retries_when_telegram_does_not_return_a_durable_message_id(
+    tmp_path, monkeypatch, missing_segment
+):
+    from telegram_kol_research.models import (
+        MessageOperationStage1Notification,
+        RuntimeIncidentHandoffArtifact,
+    )
+    from telegram_kol_research.runtime_incident_handoff import (
+        persist_runtime_incident_handoff,
+    )
+
+    session_factory = create_session_factory(
+        tmp_path / f"stage2-missing-{missing_segment}.db"
+    )
+    incident, _ = _seed_message_operation_stage1(session_factory)
+    artifact = persist_runtime_incident_handoff(
+        session_factory,
+        incident_id=incident.id,
+        outcome_kind="diagnosed",
+        handoff={
+            "incident": {"id": incident.id},
+            "codex_prompt": f"请调查 incident_id={incident.id}，读取 AGENTS.md。",
+        },
+        created_at=NOW,
+    )
+    with session_factory() as session:
+        session.query(MessageOperationStage1Notification).update(
+            {"status": "delivered", "delivered_at": NOW}
+        )
+        session.commit()
+    document_calls = []
+
+    async def message_sender(**_kwargs):
+        return None if missing_segment == "message" else 701
+
+    async def document_sender(**kwargs):
+        document_calls.append(kwargs)
+        return None if missing_segment == "document" else 702
+
+    monkeypatch.setattr(
+        operator_bot_module, "send_system_operator_bot_message", message_sender
+    )
+    monkeypatch.setattr(
+        operator_bot_module, "send_system_operator_bot_document", document_sender
+    )
+
+    assert asyncio.run(
+        operator_bot_module.deliver_runtime_incident_stage2_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            after_handoff_id=0,
+            claimed_at=NOW,
+        )
+    ) == 0
+    with session_factory() as session:
+        stored = session.get(RuntimeIncidentHandoffArtifact, artifact.id)
+        assert stored.status == "failed"
+        assert stored.telegram_document_message_id is None
+        assert stored.telegram_message_id == (
+            "701" if missing_segment == "document" else None
+        )
+    assert len(document_calls) == (1 if missing_segment == "document" else 0)
+
+
+def test_stage2_claim_waits_for_every_stage1_row_to_finish(tmp_path):
+    from telegram_kol_research.models import MessageOperationStage1Notification
+    from telegram_kol_research.runtime_incident_handoff import (
+        persist_runtime_incident_handoff,
+    )
+
+    session_factory = create_session_factory(tmp_path / "stage2-ordering.db")
+    incident, _ = _seed_message_operation_stage1(session_factory)
+    persist_runtime_incident_handoff(
+        session_factory,
+        incident_id=incident.id,
+        outcome_kind="diagnosed",
+        handoff={
+            "incident": {"id": incident.id},
+            "codex_prompt": f"请调查 incident_id={incident.id}，读取 AGENTS.md。",
+        },
+        created_at=NOW,
+    )
+
+    assert operator_bot_module.claim_next_runtime_incident_stage2_notification(
+        session_factory, after_handoff_id=0, claimed_at=NOW
+    ) is None
+    with session_factory() as session:
+        row = session.query(MessageOperationStage1Notification).one()
+        row.status = "failed"
+        row.next_attempt_at = NOW + timedelta(seconds=5)
+        session.commit()
+    assert operator_bot_module.claim_next_runtime_incident_stage2_notification(
+        session_factory, after_handoff_id=0, claimed_at=NOW
+    ) is None
+    with session_factory() as session:
+        row = session.query(MessageOperationStage1Notification).one()
+        row.status = "exhausted"
+        row.next_attempt_at = None
+        session.commit()
+    assert operator_bot_module.claim_next_runtime_incident_stage2_notification(
+        session_factory, after_handoff_id=0, claimed_at=NOW
+    ) is not None
+
+
+def test_main_dispatcher_keeps_stage2_dormant_when_stage1_is_disabled(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research.runtime_incident_handoff import (
+        persist_runtime_incident_handoff,
+    )
+
+    session_factory = create_session_factory(tmp_path / "stage2-stage1-disabled.db")
+    incident, _ = _seed_message_operation_stage1(session_factory)
+    persist_runtime_incident_handoff(
+        session_factory,
+        incident_id=incident.id,
+        outcome_kind="diagnosed",
+        handoff={
+            "incident": {"id": incident.id},
+            "codex_prompt": f"请调查 incident_id={incident.id}，读取 AGENTS.md。",
+        },
+        created_at=NOW,
+    )
+    sends = []
+
+    async def capture(**kwargs):
+        sends.append(kwargs)
+        return 1
+
+    monkeypatch.setattr(operator_bot_module, "send_system_operator_bot_message", capture)
+    monkeypatch.setattr(operator_bot_module, "send_system_operator_bot_document", capture)
+    delivered = asyncio.run(
+        operator_bot_module.deliver_runtime_incident_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig("token", "chat"),
+            runtime_config=RuntimeIncidentConfig(
+                message_operation_stage1_enabled=False,
+                message_operation_stage2_enabled=True,
+                message_operation_stage2_after_handoff_id=0,
+                telegram_notifications_enabled=False,
+            ),
+            claimed_at=NOW,
+        )
+    )
+
+    assert delivered == 0
+    assert sends == []
 
 
 def test_main_runtime_dispatcher_delivers_stage1_without_agent_or_legacy_selector(
