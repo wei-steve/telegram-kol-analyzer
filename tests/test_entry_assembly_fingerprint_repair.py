@@ -213,15 +213,21 @@ def _seed_case(tmp_path):
                     request_json=_canonical_json(
                         {
                             "instId": "BTC-USDT-SWAP",
+                            "productGroup": "Swap",
                             "posSide": "long",
                             "side": "buy",
                             "tdMode": "cross",
                             "mrgPosition": "split",
                             "price": str(leg["price"]),
                             "triggerPrice": str(leg["price"]),
+                            "triggerPxType": "last",
+                            "isCrossMargin": "1",
                             "orderType": leg["order_type"],
                             "sz": str(leg["quantity"]),
                             "clOrdId": leg["client_order_id"],
+                            "slTriggerPx": "63000",
+                            "slTriggerPxType": "last",
+                            "slOrdPx": "-1",
                         }
                     ),
                     created_at=NOW,
@@ -850,6 +856,144 @@ def test_build_plan_rejects_request_schema_drift(tmp_path, mutation):
             request["orderType"] = "limit"
         else:
             request["orderPrice"] = "64000"
+        leg.request_json = _canonical_json(request)
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.action is None
+    assert "execution_leg_identity_mismatch" in plan.conflicts
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "instId",
+        "productGroup",
+        "sz",
+        "side",
+        "posSide",
+        "price",
+        "isCrossMargin",
+        "orderType",
+        "triggerPrice",
+        "triggerPxType",
+        "mrgPosition",
+        "tdMode",
+        "clOrdId",
+        "slTriggerPx",
+        "slTriggerPxType",
+        "slOrdPx",
+    ],
+)
+@pytest.mark.parametrize("mutation", ["missing", "drift"])
+def test_build_plan_rejects_trigger_request_endpoint_field_mismatch(
+    tmp_path, key, mutation
+):
+    _, session_factory = _seed_case(tmp_path)
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).filter_by(leg_index=1).one()
+        request = json.loads(leg.request_json)
+        if mutation == "missing":
+            request.pop(key)
+        else:
+            request[key] = f"{request[key]}-drift"
+        leg.request_json = _canonical_json(request)
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.action is None
+    assert "execution_leg_identity_mismatch" in plan.conflicts
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "instId",
+        "tdMode",
+        "side",
+        "posSide",
+        "ordType",
+        "sz",
+        "clOrdId",
+        "mrgPosition",
+    ],
+)
+@pytest.mark.parametrize("mutation", ["missing", "drift"])
+def test_build_plan_rejects_market_request_endpoint_field_mismatch(
+    tmp_path, key, mutation
+):
+    _, session_factory = _seed_case(tmp_path)
+    with session_factory() as session:
+        leg = _convert_first_selected_leg_to_market(session)
+        request = json.loads(leg.request_json)
+        if mutation == "missing":
+            request.pop(key)
+        else:
+            request[key] = f"{request[key]}-drift"
+        leg.request_json = _canonical_json(request)
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.action is None
+    assert "execution_leg_identity_mismatch" in plan.conflicts
+
+
+@pytest.mark.parametrize(
+    ("order_type", "key", "value"),
+    [
+        ("limit", "ordType", None),
+        ("limit", "px", ""),
+        ("market", "orderType", None),
+        ("market", "triggerPrice", ""),
+        ("market", "productGroup", None),
+        ("market", "slTriggerPx", ""),
+    ],
+)
+def test_build_plan_rejects_foreign_request_keys_even_when_empty(
+    tmp_path, order_type, key, value
+):
+    _, session_factory = _seed_case(tmp_path)
+    with session_factory() as session:
+        leg = (
+            _convert_first_selected_leg_to_market(session)
+            if order_type == "market"
+            else session.query(ExecutionOrderLeg).filter_by(leg_index=1).one()
+        )
+        request = json.loads(leg.request_json)
+        request[key] = value
+        leg.request_json = _canonical_json(request)
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.action is None
+    assert "execution_leg_identity_mismatch" in plan.conflicts
+
+
+def test_build_plan_allows_documented_persistence_only_request_metadata(tmp_path):
+    _, session_factory = _seed_case(tmp_path)
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).filter_by(leg_index=1).one()
+        request = json.loads(leg.request_json)
+        request["merged_from_leg_indices"] = [1, 2]
+        leg.request_json = _canonical_json(request)
+        session.commit()
+
+    plan = _plan(session_factory)
+
+    assert plan.conflicts == ()
+    assert plan.action is not None
+
+
+def test_build_plan_rejects_invalid_persistence_only_request_metadata(tmp_path):
+    _, session_factory = _seed_case(tmp_path)
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).filter_by(leg_index=1).one()
+        request = json.loads(leg.request_json)
+        request["merged_from_leg_indices"] = None
         leg.request_json = _canonical_json(request)
         session.commit()
 

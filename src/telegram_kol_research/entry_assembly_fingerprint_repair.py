@@ -6,7 +6,6 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
 from sqlalchemy import text
@@ -631,59 +630,36 @@ def _request_matches_selected_leg(
     instrument: str,
 ) -> bool:
     order_type = str(expected.get("order_type") or "").lower()
-    common_matches = (
-        str(request.get("instId") or "").upper() == instrument
-        and str(request.get("side") or "").lower()
-        == str(expected.get("side") or "").lower()
-        and str(request.get("posSide") or "").lower()
-        == str(expected.get("position_side") or "").lower()
-        and str(request.get("tdMode") or "").lower()
-        == str(snapshot.get("margin_mode") or "").lower()
-        and str(request.get("mrgPosition") or "").lower()
-        == str(snapshot.get("position_mode") or "").lower()
-        and _same_number(request.get("sz"), expected.get("quantity"))
-        and str(request.get("clOrdId") or "")
-        == str(expected.get("client_order_id") or "")
-    )
-    if not common_matches:
-        return False
-    if order_type == "market":
-        return (
-            str(request.get("ordType") or "").lower() == "market"
-            and all(
-                request.get(key) in (None, "")
-                for key in (
-                    "orderType",
-                    "price",
-                    "triggerPrice",
-                    "orderPrice",
-                    "px",
-                    "triggerPxType",
-                    "productGroup",
-                    "isCrossMargin",
-                )
-            )
-        )
-    if order_type == "limit":
-        return (
-            str(request.get("orderType") or "").lower() == "limit"
-            and request.get("ordType") in (None, "")
-            and request.get("px") in (None, "")
-            and _same_number(request.get("price"), expected.get("price"))
-            and _same_number(request.get("triggerPrice"), expected.get("price"))
-        )
-    return False
-
-
-def _same_number(left: Any, right: Any) -> bool:
-    if isinstance(left, bool) or isinstance(right, bool):
+    if str(snapshot.get("instrument_id") or "").upper() != instrument:
         return False
     try:
-        left_number = Decimal(str(left))
-        right_number = Decimal(str(right))
-    except (InvalidOperation, ValueError):
+        from telegram_kol_research.recovery_live_submit import (
+            RecoveryLiveSubmitError,
+            build_deepcoin_market_order_payload,
+            build_deepcoin_trigger_order_payload,
+        )
+
+        draft = dict(snapshot)
+        leg = dict(expected)
+        if order_type == "market":
+            expected_request = build_deepcoin_market_order_payload(draft, leg)
+        elif order_type == "limit":
+            expected_request = build_deepcoin_trigger_order_payload(draft, leg)
+        else:
+            return False
+    except (KeyError, TypeError, ValueError, RecoveryLiveSubmitError):
         return False
-    return left_number.is_finite() and right_number.is_finite() and left_number == right_number
+
+    persistence_only_keys = {"merged_from_leg_indices"}
+    if set(request) - set(expected_request) - persistence_only_keys:
+        return False
+    if set(expected_request) - set(request):
+        return False
+    if any(request[key] != value for key, value in expected_request.items()):
+        return False
+    return "merged_from_leg_indices" not in request or isinstance(
+        request["merged_from_leg_indices"], list
+    )
 
 
 def _event_documents(action: EntryAssemblyFingerprintRepairAction):
