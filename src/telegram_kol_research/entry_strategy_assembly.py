@@ -830,6 +830,24 @@ def build_bounded_entry_order_draft_snapshot(
         or any(not isinstance(leg, Mapping) for leg in raw_legs)
     ):
         raise ValueError("entry assembly draft must contain one to five valid legs")
+    selected_entry_leg_indices = order_draft.get("selected_entry_leg_indices")
+    selected_entry_leg_count = order_draft.get("selected_entry_leg_count")
+    if (
+        not isinstance(selected_entry_leg_indices, list)
+        or not selected_entry_leg_indices
+        or any(
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 1
+            or index > len(raw_legs)
+            for index in selected_entry_leg_indices
+        )
+        or len(set(selected_entry_leg_indices)) != len(selected_entry_leg_indices)
+        or isinstance(selected_entry_leg_count, bool)
+        or not isinstance(selected_entry_leg_count, int)
+        or selected_entry_leg_count != len(selected_entry_leg_indices)
+    ):
+        raise ValueError("entry assembly draft selected entry legs are invalid")
     for leg in raw_legs:
         side = leg.get("side")
         position_side = leg.get("position_side")
@@ -917,6 +935,8 @@ def build_bounded_entry_order_draft_snapshot(
         "risk_budget_usdt": order_draft.get("risk_budget_usdt"),
         "contract_spec": contract_spec,
         "source": source,
+        "selected_entry_leg_indices": selected_entry_leg_indices,
+        "selected_entry_leg_count": selected_entry_leg_count,
         "order_legs": bounded_legs,
     }
 

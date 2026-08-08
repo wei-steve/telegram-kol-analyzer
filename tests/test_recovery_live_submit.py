@@ -1,7 +1,7 @@
 import json
 import hashlib
 from datetime import UTC, datetime
-from threading import Event, Thread
+from threading import Barrier, Event, Thread
 
 import pytest
 
@@ -333,6 +333,19 @@ def _persist_ready_item(session_factory):
 
 
 def _finalize_v2_assembly_for_signal(session_factory, signal):
+    with session_factory() as session:
+        row = session.get(TradeSignal, signal.id)
+        payload = json.loads(row.payload_json)
+        draft = payload["deepcoin_order_draft"]
+        leg_count = len(draft["order_legs"])
+        draft.setdefault(
+            "selected_entry_leg_indices",
+            list(range(1, leg_count + 1)),
+        )
+        draft.setdefault("selected_entry_leg_count", leg_count)
+        row.payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        session.commit()
+        signal.payload = payload
     with session_factory() as session:
         raw = session.query(RawMessage).filter_by(
             chat_id=signal.chat_id,
@@ -942,6 +955,129 @@ def test_process_next_trade_signal_live_consumes_pending_signal(tmp_path):
     with session_factory() as session:
         assert session.query(ExecutionBinding).count() == 1
         assert session.query(TradeSignal).filter_by(id=signal.id).one().status == "submitted"
+
+
+def test_two_workers_atomically_claim_one_finalized_entry_signal(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    finalized = _finalize_v2_assembly_for_signal(session_factory, signal)
+    _persist_finalized_signal_evidence(session_factory, signal, finalized)
+    client = _RecordingAllDeepcoinCalls()
+    start = Barrier(2)
+    results = []
+    errors = []
+
+    def worker():
+        start.wait(timeout=2)
+        try:
+            results.append(
+                process_trade_signal_live(
+                    session_factory,
+                    signal_id=signal.id,
+                    deepcoin_client=client,
+                    contract_spec_provider=_StaticContractSpecProvider(),
+                )
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    workers = [Thread(target=worker), Thread(target=worker)]
+    for thread in workers:
+        thread.start()
+    for thread in workers:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in workers)
+    assert len(results) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], RecoveryLiveSubmitError)
+    assert str(errors[0]).startswith("trade_signal_claim_failed:")
+    assert len(client.trigger_payloads) == 2
+    with session_factory() as session:
+        assert session.get(TradeSignal, signal.id).status == "submitted"
+        assert session.query(ExecutionBinding).count() == 1
+
+
+def test_processing_signal_is_not_auto_reset_or_reexecuted_after_crash(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    with session_factory() as session:
+        session.get(TradeSignal, signal.id).status = "processing"
+        session.commit()
+    client = _RecordingAllDeepcoinCalls()
+
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="^trade_signal_claim_failed:processing$",
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+
+    assert client.calls == []
+    with session_factory() as session:
+        assert session.get(TradeSignal, signal.id).status == "processing"
+
+
+def test_v2_submission_uses_durable_selected_legs_not_external_maximum(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    finalized = _finalize_v2_assembly_for_signal(session_factory, signal)
+    _persist_finalized_signal_evidence(session_factory, signal, finalized)
+    retried = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+        selected_entry_leg_indices=(1,),
+    )
+    assert retried.payload["deepcoin_order_draft"][
+        "selected_entry_leg_indices"
+    ] == [1, 2]
+    client = _FakeDeepcoinClient()
+
+    result = process_trade_signal_live(
+        session_factory,
+        signal_id=signal.id,
+        deepcoin_client=client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        max_order_legs=1,
+    )
+
+    assert result["order_count"] == 2
+    assert len(client.trigger_payloads) == 2
 
 
 def test_process_next_rejects_declared_v2_evidence_without_matching_assembly(

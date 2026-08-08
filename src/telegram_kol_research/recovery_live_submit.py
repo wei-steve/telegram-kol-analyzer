@@ -55,9 +55,11 @@ from telegram_kol_research.trigger_take_profit_convergence import (
 )
 from telegram_kol_research.recovery_live_submit_gate import validate_recovery_live_submit_gate
 from telegram_kol_research.trade_signals import TradeSignalRecord
+from telegram_kol_research.trade_signals import TradeSignalClaimError
 from telegram_kol_research.trade_signals import MANUAL_MANAGEMENT_SOURCE_TYPES
 from telegram_kol_research.trade_signals import MANAGEMENT_TRADE_SIGNAL_ACTIONS
 from telegram_kol_research.trade_signals import canonical_management_batch_id
+from telegram_kol_research.trade_signals import claim_pending_trade_signal
 from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trade_signals import list_pending_trade_signals
 from telegram_kol_research.trade_signals import load_or_create_trade_signal
@@ -434,6 +436,7 @@ def enqueue_recovery_trade_signal(
     side: str,
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
     enqueued_at: datetime | None = None,
+    selected_entry_leg_indices: list[int] | tuple[int, ...] | None = None,
 ) -> TradeSignalRecord:
     """Send one confirmed recovery strategy into the durable trade-signal queue."""
 
@@ -453,6 +456,31 @@ def enqueue_recovery_trade_signal(
     draft = gate["deepcoin_order_draft"]
     if not isinstance(draft, dict):
         raise RecoveryLiveSubmitError("missing_deepcoin_order_draft")
+    order_legs = draft.get("order_legs")
+    if not isinstance(order_legs, list) or not order_legs:
+        raise RecoveryLiveSubmitError("missing_order_legs")
+    selected_indices = list(
+        selected_entry_leg_indices
+        if selected_entry_leg_indices is not None
+        else range(1, len(order_legs) + 1)
+    )
+    if (
+        not selected_indices
+        or any(
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 1
+            or index > len(order_legs)
+            for index in selected_indices
+        )
+        or len(set(selected_indices)) != len(selected_indices)
+    ):
+        raise RecoveryLiveSubmitError("invalid_selected_entry_leg_indices")
+    draft = {
+        **draft,
+        "selected_entry_leg_indices": selected_indices,
+        "selected_entry_leg_count": len(selected_indices),
+    }
     source = draft.get("source") if isinstance(draft.get("source"), dict) else {}
     return load_or_create_trade_signal(
         session_factory,
@@ -493,9 +521,14 @@ def process_trade_signal_live(
     if not settings.auto_trade_enabled:
         raise RecoveryLiveSubmitError("auto_trade_disabled")
 
-    trade_signal = load_trade_signal(session_factory, signal_id)
-    if trade_signal.status != "pending":
-        raise RecoveryLiveSubmitError(f"trade_signal_not_pending:{trade_signal.status}")
+    try:
+        trade_signal = claim_pending_trade_signal(
+            session_factory,
+            signal_id=signal_id,
+            claimed_at=processed_at,
+        )
+    except TradeSignalClaimError as exc:
+        raise RecoveryLiveSubmitError(str(exc)) from exc
     try:
         if trade_signal.action == "open_position":
             _require_synchronized_finalized_entry_assembly(
@@ -531,6 +564,7 @@ def process_trade_signal_live(
             signal_id=signal_id,
             error=str(exc),
             failed_at=processed_at,
+            expected_status="processing",
         )
         raise
     mark_trade_signal_submitted(
@@ -538,6 +572,7 @@ def process_trade_signal_live(
         signal_id=signal_id,
         result=result,
         processed_at=processed_at,
+        expected_status="processing",
     )
     return result
 
@@ -639,7 +674,22 @@ def _submit_recovery_signal_direct(
     side_key = trade_signal.side.lower()
     warnings = _protection_warnings(draft)
 
-    selected_order_legs = order_legs[:max_order_legs] if max_order_legs else order_legs
+    assembly_evidence = (
+        trade_signal.payload.get("entry_preamble_assembly")
+        if isinstance(trade_signal.payload, dict)
+        else None
+    )
+    nested_evidence = draft.get("entry_preamble_assembly")
+    is_v2_submission = isinstance(assembly_evidence, dict) or isinstance(
+        nested_evidence, dict
+    )
+    if is_v2_submission:
+        selected_indices = draft.get("selected_entry_leg_indices")
+        if not isinstance(selected_indices, list):
+            raise RecoveryLiveSubmitError("invalid_selected_entry_leg_indices")
+        selected_order_legs = [order_legs[index - 1] for index in selected_indices]
+    else:
+        selected_order_legs = order_legs[:max_order_legs] if max_order_legs else order_legs
     submission_order_legs = _submission_order_legs(draft, selected_order_legs)
     leg_index_offset = int(draft.get("_entry_leg_index_offset") or 0)
     for index, leg in enumerate(

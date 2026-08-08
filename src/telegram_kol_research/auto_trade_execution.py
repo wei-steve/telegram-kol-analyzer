@@ -775,6 +775,15 @@ def _auto_process_single_message_trade_signal(
         )
         execution_plan = "range_hybrid_market_half_limit_half"
     if auto_draft is not None:
+        auto_order_legs = auto_draft.get("order_legs")
+        if isinstance(auto_order_legs, list) and auto_order_legs:
+            auto_draft = {
+                **auto_draft,
+                "selected_entry_leg_indices": list(
+                    range(1, len(auto_order_legs) + 1)
+                ),
+                "selected_entry_leg_count": len(auto_order_legs),
+            }
         if (
             not isinstance(auto_draft.get("contract_spec"), dict)
             and contract_spec_provider is not None
@@ -867,6 +876,9 @@ def _auto_process_single_message_trade_signal(
             side=side,
             contract_spec_provider=contract_spec_provider,
             enqueued_at=now,
+            selected_entry_leg_indices=(1,)
+            if entry_execution_type == "market"
+            else None,
         )
         recovery_draft = (
             trade_signal.payload.get("deepcoin_order_draft")

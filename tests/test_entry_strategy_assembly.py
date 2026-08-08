@@ -793,6 +793,8 @@ def test_v2_order_draft_snapshot_is_immutable(tmp_path):
         "stop_loss": 64900,
         "take_profit_legs": [],
         "risk_budget_usdt": 10,
+        "selected_entry_leg_indices": [1],
+        "selected_entry_leg_count": 1,
         "contract_spec": {
             "contract_value": 0.001,
             "quantity_step": 1,

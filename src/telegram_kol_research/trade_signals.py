@@ -63,6 +63,14 @@ class TradeSignalReuseError(RuntimeError):
     """An immutable queued signal conflicts with the requested identity."""
 
 
+class TradeSignalClaimError(RuntimeError):
+    """A durable signal could not be claimed exactly once."""
+
+
+class TradeSignalTransitionError(RuntimeError):
+    """A claimed signal changed state before its terminal transition."""
+
+
 def _normalized_assembly_fingerprint(value: Any, *, error_code: str) -> str:
     if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
         raise TradeSignalFingerprintSyncError(error_code)
@@ -447,6 +455,35 @@ def list_pending_trade_signals(
         return [_row_to_record(row) for row in rows]
 
 
+def claim_pending_trade_signal(
+    session_factory: sessionmaker,
+    *,
+    signal_id: int,
+    claimed_at: datetime | None = None,
+) -> TradeSignalRecord:
+    """Atomically claim one pending signal without automatic crash recovery."""
+
+    now = claimed_at or datetime.now(UTC)
+    with session_factory() as session:
+        result = session.execute(
+            update(TradeSignal)
+            .where(
+                TradeSignal.id == int(signal_id),
+                TradeSignal.status == "pending",
+            )
+            .values(status="processing", updated_at=now)
+        )
+        if int(result.rowcount or 0) != 1:
+            session.rollback()
+            row = session.get(TradeSignal, int(signal_id))
+            status = str(row.status) if row is not None else "missing"
+            raise TradeSignalClaimError(
+                f"trade_signal_claim_failed:{status}"
+            )
+        session.commit()
+    return load_trade_signal(session_factory, int(signal_id))
+
+
 def audit_pending_legacy_management_signals(
     session_factory: sessionmaker,
     *,
@@ -537,9 +574,34 @@ def mark_trade_signal_submitted(
     signal_id: int,
     result: dict[str, Any],
     processed_at: datetime | None = None,
+    expected_status: str | None = None,
 ) -> None:
     now = processed_at or datetime.now(UTC)
     with session_factory() as session:
+        if expected_status is not None:
+            transition = session.execute(
+                update(TradeSignal)
+                .where(
+                    TradeSignal.id == int(signal_id),
+                    TradeSignal.status == expected_status,
+                )
+                .values(
+                    status="submitted",
+                    result_json=json.dumps(
+                        result, ensure_ascii=False, sort_keys=True
+                    ),
+                    last_error=None,
+                    processed_at=now,
+                    updated_at=now,
+                )
+            )
+            if int(transition.rowcount or 0) != 1:
+                session.rollback()
+                raise TradeSignalTransitionError(
+                    "trade_signal_submit_transition_failed"
+                )
+            session.commit()
+            return
         row = session.get(TradeSignal, signal_id)
         if row is None:
             raise LookupError("trade signal not found")
@@ -557,16 +619,38 @@ def mark_trade_signal_failed(
     signal_id: int,
     error: str,
     failed_at: datetime | None = None,
+    expected_status: str | None = None,
 ) -> None:
     now = failed_at or datetime.now(UTC)
     with session_factory() as session:
+        if expected_status is not None:
+            transition = session.execute(
+                update(TradeSignal)
+                .where(
+                    TradeSignal.id == int(signal_id),
+                    TradeSignal.status == expected_status,
+                )
+                .values(
+                    status="failed",
+                    last_error=error,
+                    attempts=TradeSignal.attempts + 1,
+                    updated_at=now,
+                )
+            )
+            if int(transition.rowcount or 0) != 1:
+                session.rollback()
+                raise TradeSignalTransitionError(
+                    "trade_signal_failure_transition_failed"
+                )
+            session.expire_all()
         row = session.get(TradeSignal, signal_id)
         if row is None:
             raise LookupError("trade signal not found")
-        row.status = "failed"
-        row.last_error = error
-        row.attempts = int(row.attempts or 0) + 1
-        row.updated_at = now
+        if expected_status is None:
+            row.status = "failed"
+            row.last_error = error
+            row.attempts = int(row.attempts or 0) + 1
+            row.updated_at = now
         if row.action == "open_position":
             _mark_lifecycle_auto_trade_failed(session, row, now)
         session.commit()
