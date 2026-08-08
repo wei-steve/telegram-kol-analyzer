@@ -72,6 +72,15 @@ class EntryAssemblyResult:
     planned_entry_leg_count: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class FinalizedEntryAssemblyDraft:
+    assembly_id: int
+    strategy_instance_id: str
+    original_fingerprint: str
+    final_fingerprint: str
+    evidence: dict[str, object]
+
+
 def adapt_prior_fact_to_adjacent_entry_fact(
     fact: PriorMessageFact,
 ) -> AdjacentEntryFact:
@@ -788,7 +797,7 @@ def finalize_adjacent_entry_assembly_draft(
     *,
     assembly_id: int,
     order_draft: Mapping[str, object],
-) -> str:
+) -> FinalizedEntryAssemblyDraft:
     """Attach the exact bounded order economics once, before any exchange write."""
 
     bounded_legs = []
@@ -841,7 +850,31 @@ def finalize_adjacent_entry_assembly_draft(
         if existing is not None:
             if existing != draft_snapshot:
                 raise RuntimeError("entry_assembly_draft_conflict")
-            return str(assembly.fingerprint)
+            original_evidence = dict(evidence)
+            original_evidence.pop("order_draft_snapshot", None)
+            original_evidence.pop("final_entry_leg_count", None)
+            original_json = json.dumps(
+                original_evidence,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            return FinalizedEntryAssemblyDraft(
+                assembly_id=int(assembly.id),
+                strategy_instance_id=str(assembly.strategy_instance_id),
+                original_fingerprint=hashlib.sha256(
+                    original_json.encode("utf-8")
+                ).hexdigest(),
+                final_fingerprint=str(assembly.fingerprint),
+                evidence=json.loads(
+                    json.dumps(
+                        evidence,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                ),
+            )
         evidence["order_draft_snapshot"] = draft_snapshot
         evidence["final_entry_leg_count"] = len(bounded_legs)
         evidence_json = json.dumps(
@@ -860,7 +893,13 @@ def finalize_adjacent_entry_assembly_draft(
         )
         session.commit()
         if int(result.rowcount or 0) == 1:
-            return fingerprint
+            return FinalizedEntryAssemblyDraft(
+                assembly_id=int(assembly.id),
+                strategy_instance_id=str(assembly.strategy_instance_id),
+                original_fingerprint=original_fingerprint,
+                final_fingerprint=fingerprint,
+                evidence=json.loads(evidence_json),
+            )
     with session_factory() as session:
         assembly = session.get(EntryStrategyAssembly, int(assembly_id))
         if assembly is None or assembly.entry_preamble_id is not None:
@@ -868,7 +907,31 @@ def finalize_adjacent_entry_assembly_draft(
         evidence = json.loads(assembly.evidence_json or "{}")
         if evidence.get("order_draft_snapshot") != draft_snapshot:
             raise RuntimeError("entry_assembly_draft_conflict")
-        return str(assembly.fingerprint)
+        original_evidence = dict(evidence)
+        original_evidence.pop("order_draft_snapshot", None)
+        original_evidence.pop("final_entry_leg_count", None)
+        original_json = json.dumps(
+            original_evidence,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return FinalizedEntryAssemblyDraft(
+            assembly_id=int(assembly.id),
+            strategy_instance_id=str(assembly.strategy_instance_id),
+            original_fingerprint=hashlib.sha256(
+                original_json.encode("utf-8")
+            ).hexdigest(),
+            final_fingerprint=str(assembly.fingerprint),
+            evidence=json.loads(
+                json.dumps(
+                    evidence,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            ),
+        )
 
 
 def assemble_entry_strategy(

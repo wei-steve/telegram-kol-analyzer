@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from importlib.util import find_spec
@@ -806,7 +807,22 @@ def test_v2_order_draft_snapshot_is_immutable(tmp_path):
         session_factory, assembly_id=assembly.assembly_id, order_draft=draft
     )
 
+    assert first.assembly_id == assembly.assembly_id
+    assert first.strategy_instance_id == draft["strategy_instance_id"]
+    assert first.original_fingerprint == assembly.assembly_fingerprint
+    assert first.final_fingerprint != first.original_fingerprint
+    assert first.evidence["order_draft_snapshot"]["order_legs"][0]["price"] == 64200
     assert repeated == first
+    with session_factory() as session:
+        persisted = session.get(EntryStrategyAssembly, assembly.assembly_id)
+        assert persisted.fingerprint == first.final_fingerprint
+        assert json.loads(persisted.evidence_json) == first.evidence
+        assert persisted.evidence_json == json.dumps(
+            first.evidence,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     conflicting = {**draft, "risk_budget_usdt": 9}
     with pytest.raises(RuntimeError, match="entry_assembly_draft_conflict"):
         finalize_adjacent_entry_assembly_draft(
