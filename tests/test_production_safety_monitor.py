@@ -405,7 +405,7 @@ def _seed_terminal_prebinding_refusal(database):
         CREATE TABLE message_instruction_items (
           id INTEGER PRIMARY KEY, raw_message_id INTEGER,
           signal_candidate_id INTEGER, instruction_kind TEXT,
-          status TEXT, error_json TEXT, retired_at TEXT
+          strategy_instance_id TEXT, status TEXT, error_json TEXT, retired_at TEXT
         );
         CREATE TABLE entry_strategy_assemblies (
           id INTEGER PRIMARY KEY, entry_preamble_id INTEGER,
@@ -431,7 +431,7 @@ def _seed_terminal_prebinding_refusal(database):
           (3, NULL, 9955, 1643, 'deepcoin:-1001:3478:SOL:short', '{}',
            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
         INSERT INTO message_instruction_items VALUES
-          (438, 9955, 1643, 'entry', 'failed',
+          (438, 9955, 1643, 'entry', 'deepcoin:-1001:3478:SOL:short', 'failed',
            '{"type":"RecoveryLiveSubmitError","message":"signal_enqueue_blocked:missing_ready_confirmation,contract_size_unverified"}',
            NULL);
         """
@@ -472,7 +472,7 @@ def _assert_terminal_prebinding_refusal_fails_closed(database):
         "UPDATE message_instruction_items SET retired_at = '2026-08-08 00:01:00'",
         "UPDATE message_instruction_items SET raw_message_id = 9956",
         "INSERT INTO message_instruction_items VALUES "
-        "(439, 9955, 1643, 'entry', 'failed', "
+        "(439, 9955, 1643, 'entry', 'deepcoin:-1001:3478:SOL:short', 'failed', "
         "'{\"type\":\"RecoveryLiveSubmitError\",\"message\":\"signal_enqueue_blocked:missing_ready_confirmation,contract_size_unverified\"}', NULL)",
     ),
 )
@@ -498,6 +498,57 @@ def test_entry_preamble_monitor_nonterminal_or_nonsuccess_status_is_fail_closed(
     with sqlite3.connect(database) as connection:
         connection.execute(
             "UPDATE message_instruction_items SET status = ?", (status,)
+        )
+    _assert_terminal_prebinding_refusal_fails_closed(database)
+
+
+@pytest.mark.parametrize("item_strategy_instance_id", (None, "other-strategy"))
+def test_entry_preamble_monitor_instruction_strategy_identity_is_exact(
+    tmp_path, item_strategy_instance_id
+):
+    database = tmp_path / "terminal-prebinding-item-strategy.db"
+    _seed_terminal_prebinding_refusal(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE message_instruction_items SET strategy_instance_id = ?",
+            (item_strategy_instance_id,),
+        )
+    _assert_terminal_prebinding_refusal_fails_closed(database)
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    (("chat_id", "bad-chat"), ("chat_id", 0), ("message_id", "bad-message"),
+     ("message_id", 0)),
+)
+def test_entry_preamble_monitor_source_identity_is_fail_closed(
+    tmp_path, column, value
+):
+    database = tmp_path / "terminal-prebinding-source-identity.db"
+    _seed_terminal_prebinding_refusal(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(f"UPDATE raw_messages SET {column} = ?", (value,))
+    _assert_terminal_prebinding_refusal_fails_closed(database)
+
+
+def test_entry_preamble_monitor_instruction_schema_without_id_is_fail_closed(tmp_path):
+    database = tmp_path / "terminal-prebinding-missing-instruction-id.db"
+    _seed_terminal_prebinding_refusal(database)
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            ALTER TABLE message_instruction_items RENAME TO old_instruction_items;
+            CREATE TABLE message_instruction_items (
+              raw_message_id INTEGER, signal_candidate_id INTEGER,
+              instruction_kind TEXT, strategy_instance_id TEXT,
+              status TEXT, error_json TEXT, retired_at TEXT
+            );
+            INSERT INTO message_instruction_items
+            SELECT raw_message_id, signal_candidate_id, instruction_kind,
+                   strategy_instance_id, status, error_json, retired_at
+            FROM old_instruction_items;
+            DROP TABLE old_instruction_items;
+            """
         )
     _assert_terminal_prebinding_refusal_fails_closed(database)
 

@@ -804,9 +804,11 @@ def _has_exact_terminal_prebinding_refusal(
 
     required_columns = {
         "message_instruction_items": {
+            "id",
             "raw_message_id",
             "signal_candidate_id",
             "instruction_kind",
+            "strategy_instance_id",
             "status",
             "error_json",
             "retired_at",
@@ -831,7 +833,8 @@ def _has_exact_terminal_prebinding_refusal(
 
     instruction_rows = connection.execute(
         """
-        SELECT raw_message_id, instruction_kind, status, error_json, retired_at
+        SELECT raw_message_id, instruction_kind, strategy_instance_id,
+               status, error_json, retired_at
         FROM message_instruction_items
         WHERE signal_candidate_id = ?
         ORDER BY id
@@ -841,12 +844,20 @@ def _has_exact_terminal_prebinding_refusal(
     ).fetchall()
     if len(instruction_rows) != 1:
         return False
-    raw_message_id, instruction_kind, status, error_json, retired_at = (
-        instruction_rows[0]
-    )
+    (
+        raw_message_id,
+        instruction_kind,
+        instruction_strategy_instance_id,
+        status,
+        error_json,
+        retired_at,
+    ) = instruction_rows[0]
     if (
-        raw_message_id != strategy_raw_message_id
+        type(raw_message_id) is not int
+        or raw_message_id <= 0
+        or raw_message_id != strategy_raw_message_id
         or instruction_kind != "entry"
+        or instruction_strategy_instance_id != strategy_instance_id
         or status != "failed"
         or retired_at is not None
     ):
@@ -876,7 +887,12 @@ def _has_exact_terminal_prebinding_refusal(
     if len(source) != 1:
         return False
     chat_id, message_id = source[0]
-    if chat_id is None or message_id is None:
+    if (
+        type(chat_id) is not int
+        or chat_id == 0
+        or type(message_id) is not int
+        or message_id <= 0
+    ):
         return False
     if connection.execute(
         """
