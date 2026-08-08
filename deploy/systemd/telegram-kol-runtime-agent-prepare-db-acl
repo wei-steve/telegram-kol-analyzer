@@ -19,6 +19,7 @@ SQLITE_PATHS = (
     f"{DATABASE_PATH}-shm",
     f"{DATABASE_PATH}-journal",
 )
+SQLITE_NAMES = frozenset(os.path.basename(path) for path in SQLITE_PATHS)
 
 
 def _open_regular_nofollow(path: str, *, optional: bool) -> int | None:
@@ -40,10 +41,71 @@ def _open_regular_nofollow(path: str, *, optional: bool) -> int | None:
     return fd
 
 
+def _open_regular_nofollow_at(directory_fd: int, name: str) -> int:
+    if not name or name in {".", ".."} or "/" in name:
+        raise RuntimeError("invalid production data filename")
+    fd = os.open(
+        name,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        dir_fd=directory_fd,
+    )
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        os.close(fd)
+        raise RuntimeError("production data target is not a single-link regular file")
+    return fd
+
+
+def _set_agent_acl_fd(fd: int, permission: str) -> None:
+    subprocess.run(
+        [
+            "/usr/bin/setfacl",
+            "-m",
+            f"u:{AGENT_USER}:{permission}",
+            "--",
+            f"/proc/self/fd/{fd}",
+        ],
+        check=True,
+        close_fds=True,
+        pass_fds=(fd,),
+        env={"PATH": "/usr/bin:/bin", "LANG": "C"},
+    )
+
+
+def _sanitize_non_database_files() -> None:
+    directory_fd = os.open(
+        os.path.dirname(DATABASE_PATH),
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+    )
+    try:
+        for name in os.listdir(directory_fd):
+            if name in SQLITE_NAMES:
+                continue
+            try:
+                fd = _open_regular_nofollow_at(directory_fd, name)
+            except FileNotFoundError:
+                continue
+            try:
+                metadata = os.fstat(fd)
+                if metadata.st_uid != 0:
+                    raise RuntimeError("non-database production data is not root-owned")
+                os.fchmod(fd, metadata.st_mode & ~0o077)
+                _set_agent_acl_fd(fd, "---")
+            finally:
+                os.close(fd)
+    finally:
+        os.close(directory_fd)
+
+
 def main() -> int:
-    if os.geteuid() != 0 or len(sys.argv) != 1:
-        raise RuntimeError("SQLite ACL preparation requires root and no arguments")
+    if os.geteuid() != 0 or len(sys.argv) not in {1, 2}:
+        raise RuntimeError("SQLite ACL preparation requires root")
     agent_uid = pwd.getpwnam(AGENT_USER).pw_uid
+    if len(sys.argv) == 2:
+        if sys.argv[1] != "--sanitize-non-db":
+            raise RuntimeError("unsupported SQLite ACL preparation mode")
+        _sanitize_non_database_files()
+        return 0
     for index, sqlite_path in enumerate(SQLITE_PATHS):
         fd = _open_regular_nofollow(sqlite_path, optional=index != 0)
         if fd is None:
@@ -52,19 +114,7 @@ def main() -> int:
             metadata = os.fstat(fd)
             if metadata.st_uid not in {0, agent_uid}:
                 raise RuntimeError("SQLite ACL target has an unexpected owner")
-            subprocess.run(
-                [
-                    "/usr/bin/setfacl",
-                    "-m",
-                    f"u:{AGENT_USER}:rw-",
-                    "--",
-                    f"/proc/self/fd/{fd}",
-                ],
-                check=True,
-                close_fds=True,
-                pass_fds=(fd,),
-                env={"PATH": "/usr/bin:/bin", "LANG": "C"},
-            )
+            _set_agent_acl_fd(fd, "rw-")
         finally:
             os.close(fd)
     return 0

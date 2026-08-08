@@ -54,8 +54,7 @@ def test_runtime_agent_sidecar_unit_is_separate_and_dormant_until_enabled():
     assert 'setfacl -m "d:g::---,d:o::---" "$DATA_DIRECTORY"' in installer
     assert 'chmod +t "$DATA_DIRECTORY"' in installer
     assert 'find "$DATA_DIRECTORY" -maxdepth 1 -type f -print0' in installer
-    assert 'setfacl -m "u:$AGENT_USER:---" "$data_file"' in installer
-    assert 'chmod go-rwx "$data_file"' in installer
+    assert '"$PREPARE_HELPER_SOURCE" --sanitize-non-db' in installer
     assert "Agent identity can access non-allowlisted production data" in installer
     assert "Agent identity cannot create SQLite sidecar files" in installer
 
@@ -73,6 +72,8 @@ def test_runtime_agent_sidecar_unit_is_separate_and_dormant_until_enabled():
     assert "st_nlink != 1" in prepare_helper
     assert '"/usr/bin/setfacl"' in prepare_helper
     assert "pass_fds=(fd,)" in prepare_helper
+    assert "os.fchmod(fd, metadata.st_mode & ~0o077)" in prepare_helper
+    assert '"--sanitize-non-db"' in prepare_helper
 
 
 def test_runtime_agent_acl_helper_never_opens_sqlite_symlinks(tmp_path):
@@ -117,3 +118,26 @@ def test_runtime_agent_acl_helper_rejects_special_files_without_blocking(tmp_pat
         with pytest.raises(RuntimeError, match="single-link regular file"):
             helper["_open_regular_nofollow"](str(directory), optional=False)
         directory.rmdir()
+
+
+def test_runtime_agent_sanitizer_never_follows_agent_bait_symlink(tmp_path):
+    helper_path = (
+        Path(__file__).parents[1]
+        / "deploy"
+        / "systemd"
+        / "telegram-kol-runtime-agent-prepare-db-acl"
+    )
+    helper = runpy.run_path(str(helper_path))
+    target = tmp_path / "protected-target"
+    target.write_text("unchanged", encoding="utf-8")
+    original_mode = target.stat().st_mode
+    bait = tmp_path / "bait"
+    bait.symlink_to(target)
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(OSError):
+            helper["_open_regular_nofollow_at"](directory_fd, bait.name)
+    finally:
+        os.close(directory_fd)
+    assert target.read_text(encoding="utf-8") == "unchanged"
+    assert target.stat().st_mode == original_mode

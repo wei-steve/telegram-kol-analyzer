@@ -112,14 +112,13 @@ do
     setfacl -m "u:$AGENT_USER:rw-" "$sqlite_sidecar"
   fi
 done
+"$PREPARE_HELPER_SOURCE" --sanitize-non-db
 while IFS= read -r -d '' data_file; do
   case "$data_file" in
     "$DATABASE_PATH"|"$DATABASE_PATH-wal"|"$DATABASE_PATH-shm"|"$DATABASE_PATH-journal")
       continue
       ;;
   esac
-  chmod go-rwx "$data_file"
-  setfacl -m "u:$AGENT_USER:---" "$data_file"
   if runuser -u "$AGENT_USER" -- test -r "$data_file" \
     || runuser -u "$AGENT_USER" -- test -w "$data_file"; then
     echo "Agent identity can access non-allowlisted production data." >&2
