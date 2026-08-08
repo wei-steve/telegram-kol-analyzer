@@ -30,6 +30,7 @@ READ_ONLY_RUNTIME_AGENT_TOOL_NAMES = frozenset(
         "compare_local_exchange",
         "get_prior_attempts",
         "get_protection_summary",
+        *(f"investigate_{kind}" for kind in BROAD_READ_ONLY_EVIDENCE_KINDS),
     }
 )
 _SENSITIVE_KEY_PATTERN = re.compile(
@@ -284,7 +285,12 @@ class RuntimeAgentToolRegistry:
     def allowed_tools(self) -> frozenset[str]:
         return frozenset(self._providers)
 
-    def tool_schemas(self) -> list[dict[str, Any]]:
+    def tool_schemas(
+        self, *, allowed_tools: frozenset[str] | None = None
+    ) -> list[dict[str, Any]]:
+        selected = self.allowed_tools if allowed_tools is None else (
+            self.allowed_tools.intersection(allowed_tools)
+        )
         return [
             {
                 "type": "function",
@@ -304,7 +310,7 @@ class RuntimeAgentToolRegistry:
                     },
                 },
             }
-            for name in sorted(self._providers)
+            for name in sorted(selected)
         ]
 
     def execute(

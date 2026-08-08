@@ -19,6 +19,12 @@ DIAGNOSIS = {
     "auto_handle_eligible": False,
     "codex_handoff_required": True,
     "remaining_risk": "The failed job remains unresolved.",
+    "expected_state": "The worker reaches a durable terminal result.",
+    "observed_state": "The retry budget ended without a terminal result.",
+    "classification": "code_defect",
+    "affected_message_ids": [42],
+    "likely_code_paths": ["src/telegram_kol_research/worker.py"],
+    "likely_test_paths": ["tests/test_worker.py"],
 }
 
 
@@ -37,7 +43,38 @@ def test_closed_diagnosis_contract_round_trips_to_ledger_fields():
         "codex_handoff_required": True,
         "remaining_risk": "The failed job remains unresolved.",
         "attempted_queries": [],
+        "expected_state": "The worker reaches a durable terminal result.",
+        "observed_state": "The retry budget ended without a terminal result.",
+        "classification": "code_defect",
+        "affected_message_ids": [42],
+        "likely_code_paths": ["src/telegram_kol_research/worker.py"],
+        "likely_test_paths": ["tests/test_worker.py"],
     }
+
+
+def test_diagnosis_requires_structured_expected_observed_and_repair_scope():
+    for field in (
+        "expected_state",
+        "observed_state",
+        "classification",
+        "affected_message_ids",
+        "likely_code_paths",
+        "likely_test_paths",
+    ):
+        payload = dict(DIAGNOSIS)
+        payload.pop(field)
+        with pytest.raises(RuntimeAgentContractError):
+            RuntimeAgentDiagnosis.from_mapping(payload, expected_incident_id=17)
+
+
+def test_diagnosis_rejects_strategy_selection_and_non_handoff_output():
+    payload = {**DIAGNOSIS, "strategy_target_id": "guessed"}
+    with pytest.raises(RuntimeAgentContractError):
+        RuntimeAgentDiagnosis.from_mapping(payload, expected_incident_id=17)
+
+    payload = {**DIAGNOSIS, "codex_handoff_required": False}
+    with pytest.raises(RuntimeAgentContractError, match="handoff"):
+        RuntimeAgentDiagnosis.from_mapping(payload, expected_incident_id=17)
 
 
 @pytest.mark.parametrize(

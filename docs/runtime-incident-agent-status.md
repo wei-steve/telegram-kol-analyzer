@@ -9,7 +9,7 @@ design_version: 2
 design_authority_status: original_runtime_agent_incomplete_extended_by_message_operation_design
 current_phase: 8R.8
 phase_name: diagnose-every-message-operation-incident
-phase_status: planned
+phase_status: in_progress
 position_compliance_rules_status: dormant_non_deployable
 position_compliance_rollout_status: multi_target_live_new_natural_messages_only
 multi_target_projection_status: live_partial_take_profit_future_natural_messages_only
@@ -27,6 +27,7 @@ last_completed_phase: "8R.7"
 last_completed_commit: 7d09358
 production_commit: 7d09358c729b6689ee2ecd73957a324de6c05c23
 local_tests:
+  - "phase-8r.8-local: class-level future-only message-operation eligibility, v8 expected-versus-observed diagnosis, mandatory Codex handoff, exact affected-message identity, audited broker-only tool access, deterministic no-playbook enforcement, strict policy/code/evidence/class/severity reuse, same-incident reopen, in-flight membership claim invalidation, and 32-member generation rollover are implemented. The extended local suite passes 459 tests; independent review's broader related suite passes 502 with no remaining Critical/Important finding. Production remains dormant pending safe-window deployment and canary."
   - "phase-8r.7-egress-server: reviewed commit 7d09358 passed 145 server security/runtime tests. The real Agent cgroup denied direct public IP TLS while the same cgroup reached the bounded loopback Deepcoin projection; a UDS-only transient client completed TLS/SNI/certificate validation and authenticated GET /v1/models through the immutable api.xiaomimimo.com:443 relay. After relay activation, stopping the Agent stopped both egress units and removed the socket; restart restored only the socket until demand. Main, Agent, scanner, monitor timer, HTTP listener, and no-notify diagnostic are healthy with zero active mutation/management work, zero investigation audits, zero Agent restarts, and the nine-tool registry unchanged."
   - "phase-8r.7-egress-local: 145 fixed-egress, LLM, broker, tool, worker, service, architecture, exchange, audit, and Telegram regressions pass. Independent review found no remaining Critical or Important issue after binding socket/relay lifetime to the Agent. The Agent LLM client accepts only /run/telegram-kol-agent-model-egress.sock, the relay has one immutable api.xiaomimimo.com:443 upstream, and direct public IP egress is denied while loopback evidence remains available."
   - "phase-8r.7-server-dormant: reviewed commit 389b633 deployed in a zero-active-mutation/zero-active-management safe window. Main, Agent, HTTP listener, monitor timer, and no-notify diagnostic are healthy; Telegram intake advanced from raw 9966 to 9968. The broker remains absent from the nine-tool Agent registry, investigation audits remain zero, and no new eligibility or selector was enabled. The real Agent identity cannot enumerate production data, read session/config or traverse denied backup/probe directories, while reviewed SQLite ledger access is stable with zero sidecar restarts. An isolated Linux root-first/Agent-first, all-suffix symlink, and FIFO ACL canary passed without changing production facts."
@@ -611,11 +612,12 @@ Phase 5 is not complete until:
 
 ### Phase 8R — Proactive Read-Only Incident Detection
 
-- Status: in progress; Phase 8R.7 complete and Phase 8R.8 planned
+- Status: in progress; Phase 8R.7 complete and Phase 8R.8 implementation in progress
 - Roadmap-control Task 0: completed locally with 10 focused tests passing;
   documentation and test changes only, so no production restart was required
-- Current task: `8R.8 diagnose-every-message-operation-incident` (planned;
-  not started in the Phase 8R.7 completion turn)
+- Current task: `8R.8 diagnose-every-message-operation-incident` (implemented
+  locally; dormant deployment, isolated canary, and fresh-watermark activation
+  remain)
 - Approved scope: deterministic proactive discovery, bounded read-only
   diagnosis, Telegram notification, Codex handoff, and read-only verification
 - Prohibited scope: order, position, protection, strategy, recognition,
@@ -656,5 +658,11 @@ Phase 5 is not complete until:
   existing Agent tool registry and selector remain unchanged. A bounded
   Deepcoin loopback projection and fixed MiMo Unix relay satisfy the exchange
   and OS-egress gates; direct public egress is denied by the Agent cgroup.
-- Next action: begin only Phase 8R.8 in a new turn. Do not combine it with
-  contract-spec expansion or any business mutation.
+- Task 8R.8 local implementation adds a dormant class gate for every future
+  `message_operation_failure`, a v8 structured diagnosis/Codex contract, all
+  nine audited broker categories, deterministic no-playbook behavior, and
+  strict reuse identity. No business mutation or strategy/context authority is
+  added.
+- Next action: complete independent review, deploy dormant, prove an isolated
+  safe-window canary, then activate only above the newly recorded contract
+  watermark with action flags and both playbook allowlists off/empty.

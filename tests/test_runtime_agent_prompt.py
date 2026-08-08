@@ -7,8 +7,8 @@ from telegram_kol_research.runtime_agent_playbooks import (
 )
 
 
-def test_runtime_agent_v7_prompt_exposes_closed_low_risk_recovery_contract():
-    assert RUNTIME_AGENT_PROMPT_VERSION == "runtime-agent-prompt-v7"
+def test_runtime_agent_v8_prompt_exposes_message_operation_diagnosis_contract():
+    assert RUNTIME_AGENT_PROMPT_VERSION == "runtime-agent-prompt-v8"
     assert "final JSON object" in RUNTIME_AGENT_SYSTEM_PROMPT
     assert "at most 512 characters" in RUNTIME_AGENT_SYSTEM_PROMPT
     assert "at most 16 items" in RUNTIME_AGENT_SYSTEM_PROMPT
@@ -23,8 +23,17 @@ def test_runtime_agent_v7_prompt_exposes_closed_low_risk_recovery_contract():
         "auto_handle_eligible",
         "codex_handoff_required",
         "remaining_risk",
+        "expected_state",
+        "observed_state",
+        "classification",
+        "affected_message_ids",
+        "likely_code_paths",
+        "likely_test_paths",
     ):
         assert field in RUNTIME_AGENT_SYSTEM_PROMPT
+    assert "expected_safety_refusal" in RUNTIME_AGENT_SYSTEM_PROMPT
+    assert "message-operation" in RUNTIME_AGENT_SYSTEM_PROMPT
+    assert "cannot select a strategy" in RUNTIME_AGENT_SYSTEM_PROMPT
     assert "nominate" in RUNTIME_AGENT_SYSTEM_PROMPT
     assert "deterministic policy" in RUNTIME_AGENT_SYSTEM_PROMPT
     assert "model never executes a playbook" in RUNTIME_AGENT_SYSTEM_PROMPT

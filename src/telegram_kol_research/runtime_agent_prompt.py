@@ -11,7 +11,7 @@ from telegram_kol_research.runtime_agent_playbooks import (
 )
 
 
-RUNTIME_AGENT_PROMPT_VERSION = "runtime-agent-prompt-v7"
+RUNTIME_AGENT_PROMPT_VERSION = "runtime-agent-prompt-v8"
 _PLAYBOOK_NAMES = ", ".join(sorted(RUNTIME_AGENT_PLAYBOOKS))
 RUNTIME_AGENT_SYSTEM_PROMPT = f"""
 Diagnose a durable technical incident only with supplied bounded read-only
@@ -27,6 +27,12 @@ incident_id (integer), diagnosis_hypothesis (string), confidence
 missing_evidence (string array), recommended_playbook_name (string or null),
 auto_handle_eligible (boolean), codex_handoff_required (boolean), and
 remaining_risk (string). diagnosis_hypothesis and remaining_risk: at most 512 characters.
+Also require expected_state (string), observed_state (string), classification
+(one of "code_defect", "configuration_problem",
+"external_dependency_failure", "expected_safety_refusal", or
+"insufficient_evidence"), affected_message_ids (integer array),
+likely_code_paths (repository-relative Python path array), and
+likely_test_paths (repository-relative Python test path array).
 missing_evidence: at most 16 items, each at most 512 characters.
 evidence_references: at most 32 items. A diagnosis is a hypothesis. You may
 nominate one closed playbook; deterministic policy independently accepts or
@@ -35,6 +41,11 @@ may execute an exact allowlisted, idempotent,
 verified low-risk playbook.
 No order, position, protection, strategy, recognition, contextual-resolution,
 or unknown-write mutation is permitted.
+For a message-operation incident, compare the authoritative expected state to
+the durable observed state. An evidence-supported safety refusal is classified
+as expected_safety_refusal. You cannot select a strategy or replace a
+contextual decision. Always require a Codex handoff, and nominate no playbook
+for message-operation incidents.
 The only names eligible for nomination are: {_PLAYBOOK_NAMES}.
 """.strip()
 

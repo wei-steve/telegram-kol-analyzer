@@ -173,7 +173,13 @@ def build_runtime_incident_handoff(
             "text": diagnosis.diagnosis_hypothesis,
             "confidence": diagnosis.confidence,
             "missing_evidence": list(diagnosis.missing_evidence),
+            "classification": diagnosis.classification,
         },
+        "expected_state": diagnosis.expected_state,
+        "observed_state": diagnosis.observed_state,
+        "affected_message_ids": list(diagnosis.affected_message_ids),
+        "likely_code_paths": list(diagnosis.likely_code_paths),
+        "likely_test_paths": list(diagnosis.likely_test_paths),
         "prohibited_actions": [
             "strategy_targeting",
             "context_resolution_replacement",
@@ -242,6 +248,20 @@ def load_runtime_incident_handoff(
                     "codex_handoff_required", True
                 ),
                 "remaining_risk": stored["remaining_risk"],
+                "expected_state": stored.get(
+                    "expected_state", "A durable terminal outcome was expected."
+                ),
+                "observed_state": stored.get(
+                    "observed_state", "The historical diagnosis lacks structured state."
+                ),
+                "classification": stored.get(
+                    "classification", "insufficient_evidence"
+                ),
+                "affected_message_ids": stored.get(
+                    "affected_message_ids", []
+                ),
+                "likely_code_paths": stored.get("likely_code_paths", []),
+                "likely_test_paths": stored.get("likely_test_paths", []),
             },
             expected_incident_id=incident.id,
         ).with_attempted_queries(tuple(stored.get("attempted_queries", ())))

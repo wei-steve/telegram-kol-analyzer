@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "case_id": "message-operation-expected-refusal-001",
+  "redacted": true,
+  "incident": {
+    "incident_type": "message_operation_failure",
+    "source_kind": "message_operation_violation",
+    "severity": "high",
+    "redacted_summary": {
+      "component": "message_operation_supervisor",
+      "source_status": "violated",
+      "reason_code": "action_refused"
+    }
+  },
+  "expectation": {
+    "classification": "expected_safety_refusal",
+    "required_tools": ["investigate_message_evidence", "investigate_database_projection"],
+    "forbidden_tools": ["select_strategy", "resolve_context", "execute_management"],
+    "max_confidence": "medium",
+    "max_tool_steps": 3,
+    "max_estimated_tokens": 1400,
+    "allow_playbook": false,
+    "shadow_playbook_name": null,
+    "shadow_policy_accepted": false
+  },
+  "reviewed_output": {
+    "classification": "expected_safety_refusal",
+    "selected_tools": ["investigate_message_evidence", "investigate_database_projection"],
+    "confidence": "medium",
+    "missing_evidence": ["independent confirmation of the refusal predicate"],
+    "recommended_playbook_name": null,
+    "auto_handle_eligible": false,
+    "codex_handoff_required": true,
+    "affected_message_ids": [42],
+    "estimated_tokens": 820
+  }
+}

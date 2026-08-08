@@ -664,6 +664,50 @@ main service owns the exchange credential and the loopback endpoint exposes
 one bounded positions/open-orders fingerprint through fixed read methods,
 rejects forwarding headers, and exposes no mutation parameters or methods.
 
+### Phase 8R.8 message-operation diagnosis
+
+Phase 8R.8 registers the nine audited broker categories with the existing
+bounded tool loop and adds one independent, future-only class gate. It does not
+change Stage 1 delivery or the legacy selector for unrelated incident types.
+
+- `TELEGRAM_KOL_MESSAGE_OPERATION_AGENT_ENABLED` defaults to false and is the
+  immediate rollback flag for this incident class.
+- `TELEGRAM_KOL_MESSAGE_OPERATION_AGENT_AFTER_CONTRACT_ID` is an exclusive
+  contract watermark. Missing, malformed, negative, or overflowing values fail
+  closed at the maximum SQLite integer.
+- `TELEGRAM_KOL_RUNTIME_AGENT_DEPLOYED_CODE_VERSION` must be the exact reviewed
+  deployed commit. `unknown` permits diagnosis but disables diagnosis reuse.
+- The global Agent flag, lease, three-attempt budget, 120-second maximum wall
+  budget, prompt/output bounds, and repeated-call refusal remain authoritative.
+
+Every post-watermark `message_operation_failure` is eligible as a class,
+regardless of violation code. Ordinary capture-only incident types retain the
+existing `TELEGRAM_KOL_RUNTIME_AGENT_TYPES` selector. A verified/successful
+message-operation contract creates neither an incident nor an Agent claim.
+
+The v8 final contract requires expected and observed state, a closed technical
+classification, confidence, missing evidence, exact affected raw-message IDs,
+likely repository code/test paths, and a mandatory Codex handoff. It cannot
+contain a strategy choice or replacement contextual decision. For this class,
+the worker deterministically clears every playbook nomination and automatic
+eligibility before policy evaluation, so both shadow and execution recovery
+remain unreachable even if the model requests them.
+
+Same-fingerprint reuse is permitted only when feature-policy version, exact
+deployed code version, semantic evidence fingerprint, violation class, and
+severity match. Newly affected message IDs are appended to the reused
+diagnosis. Changed evidence or severity forces a new investigation; historical
+v7 diagnoses and an `unknown` code version are never reused for this class.
+
+Deploy with the message-operation Agent flag false and the action flag plus both
+playbook allowlists false/empty. In a new zero-in-flight safe window, record the
+maximum contract ID, set it as the exclusive watermark, set the exact deployed
+commit, and run one isolated post-watermark canary. Prove no historical claim,
+no strategy/context mutation, no business write, bounded audited broker reads,
+one closed diagnosis, and normal main/monitor/scanner continuity. Immediate
+rollback clears only the message-operation Agent flag and restarts only the
+sidecar; Stage 1 and all business paths remain independent.
+
 The operator approved a controlled Phase 8R.3 completion canary on 2026-08-08
 so that a rare natural multi-target failure cannot block later read-only Agent
 work indefinitely. This alternative changes only the verification method; it

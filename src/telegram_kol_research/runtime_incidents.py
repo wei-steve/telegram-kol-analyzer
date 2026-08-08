@@ -7,12 +7,13 @@ import re
 from collections.abc import Sequence
 from datetime import datetime
 
-from sqlalchemy import and_, case, or_, select, update
+from sqlalchemy import and_, case, exists, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
     MessageOperationContract,
+    MessageOperationItem,
     RuntimeIncident,
     RuntimeIncidentAffectedMessage,
 )
@@ -91,6 +92,13 @@ _DIAGNOSIS_FIELDS = frozenset(
         "remaining_risk",
         "recovery_playbook_policy",
         "shadow_playbook_policy",
+        "expected_state",
+        "observed_state",
+        "classification",
+        "affected_message_ids",
+        "likely_code_paths",
+        "likely_test_paths",
+        "reuse_context",
     }
 )
 _SHADOW_POLICY_FIELDS = frozenset(
@@ -604,6 +612,33 @@ def record_runtime_incident(
         raise ValueError("invalid atomic message-operation incident link")
 
     with session_factory() as session:
+        if atomic_link_requested:
+            latest = (
+                session.query(RuntimeIncident)
+                .filter(RuntimeIncident.fingerprint == values["fingerprint"])
+                .order_by(RuntimeIncident.generation.desc())
+                .first()
+            )
+            if latest is not None:
+                member_count = (
+                    session.query(RuntimeIncidentAffectedMessage)
+                    .filter(
+                        RuntimeIncidentAffectedMessage.runtime_incident_id
+                        == latest.id
+                    )
+                    .count()
+                )
+                selected_generation = int(latest.generation)
+                if (
+                    member_count >= 32
+                    or latest.feature_policy_version
+                    != values["feature_policy_version"]
+                ):
+                    selected_generation += 1
+                values["generation"] = max(
+                    int(values["generation"]), selected_generation
+                )
+                insert_values["generation"] = values["generation"]
         existing_severity_rank = case(
             *(
                 (RuntimeIncident.severity == severity_name, rank)
@@ -672,11 +707,11 @@ def record_runtime_incident(
                 message_operation_contract_id=message_operation_contract_id,
                 created_at=occurred_at,
             )
-            session.execute(
+            new_relation_id = session.execute(
                 relation_statement.on_conflict_do_nothing(
                     index_elements=["runtime_incident_id", "raw_message_id"]
-                )
-            )
+                ).returning(RuntimeIncidentAffectedMessage.id)
+            ).scalar_one_or_none()
             relation = session.execute(
                 select(RuntimeIncidentAffectedMessage).where(
                     RuntimeIncidentAffectedMessage.runtime_incident_id
@@ -694,6 +729,18 @@ def record_runtime_incident(
                 )
             contract.runtime_incident_id = incident_id
             contract.updated_at = occurred_at
+            incident_row = session.get(RuntimeIncident, incident_id)
+            if (
+                new_relation_id is not None
+                and incident_row is not None
+                and incident_row.status != "pending"
+            ):
+                incident_row.status = "pending"
+                incident_row.claim_token = None
+                incident_row.claimed_at = None
+                incident_row.claim_expires_at = None
+                incident_row.agent_attempt_count = 0
+                incident_row.agent_next_attempt_at = None
         session.commit()
         return _detach(session, session.get(RuntimeIncident, incident_id))
 
@@ -715,24 +762,58 @@ def _claimable(now: datetime):
     )
 
 
+def _agent_eligibility(
+    *,
+    incident_types: frozenset[str] | None,
+    message_operation_enabled: bool,
+    message_operation_after_contract_id: int,
+):
+    ordinary = RuntimeIncident.incident_type != "message_operation_failure"
+    if incident_types is not None:
+        ordinary = and_(
+            ordinary,
+            RuntimeIncident.incident_type.in_(tuple(sorted(incident_types))),
+        )
+    message_operation = and_(
+        RuntimeIncident.incident_type == "message_operation_failure",
+        bool(message_operation_enabled),
+        exists(
+            select(RuntimeIncidentAffectedMessage.id).where(
+                RuntimeIncidentAffectedMessage.runtime_incident_id
+                == RuntimeIncident.id,
+                RuntimeIncidentAffectedMessage.message_operation_contract_id
+                > int(message_operation_after_contract_id),
+            )
+        ),
+    )
+    return or_(ordinary, message_operation)
+
+
 def list_claimable_runtime_incidents(
     session_factory: sessionmaker,
     *,
     now: datetime,
     limit: int = 20,
     incident_types: frozenset[str] | None = None,
+    message_operation_enabled: bool = False,
+    message_operation_after_contract_id: int = 2**63 - 1,
 ) -> list[RuntimeIncident]:
     """Return a bounded oldest-first snapshot of claimable incident rows."""
 
     bounded_limit = max(1, min(int(limit), MAX_CLAIMABLE_LIMIT))
-    if incident_types == frozenset():
+    if incident_types == frozenset() and not message_operation_enabled:
         return []
     with session_factory() as session:
-        query = session.query(RuntimeIncident).filter(_claimable(now))
-        if incident_types is not None:
-            query = query.filter(
-                RuntimeIncident.incident_type.in_(tuple(sorted(incident_types)))
-            )
+        query = session.query(RuntimeIncident).filter(
+            _claimable(now),
+            _agent_eligibility(
+                incident_types=incident_types,
+                message_operation_enabled=message_operation_enabled,
+                message_operation_after_contract_id=(
+                    message_operation_after_contract_id
+                ),
+            ),
+        )
         rows = (
             query
             .order_by(
@@ -752,6 +833,11 @@ def find_reusable_runtime_incident_diagnosis(
     *,
     fingerprint: str,
     exclude_incident_id: int,
+    feature_policy_version: str | None = None,
+    deployed_code_version: str | None = None,
+    evidence_fingerprint: str | None = None,
+    violation_class: str | None = None,
+    severity: str | None = None,
 ) -> RuntimeIncident | None:
     """Return the newest completed diagnosis for the same redacted fingerprint."""
 
@@ -759,12 +845,20 @@ def find_reusable_runtime_incident_diagnosis(
         "fingerprint", fingerprint, maximum=64
     )
     with session_factory() as session:
-        row = (
+        rows = (
             session.query(RuntimeIncident)
             .filter(
                 RuntimeIncident.fingerprint == normalized_fingerprint,
-                RuntimeIncident.id != int(exclude_incident_id),
-                RuntimeIncident.status == "diagnosed",
+                or_(
+                    and_(
+                        RuntimeIncident.id != int(exclude_incident_id),
+                        RuntimeIncident.status == "diagnosed",
+                    ),
+                    and_(
+                        RuntimeIncident.id == int(exclude_incident_id),
+                        RuntimeIncident.status == "claimed",
+                    ),
+                ),
                 RuntimeIncident.diagnosis_json.is_not(None),
                 RuntimeIncident.evidence_refs_json.is_not(None),
             )
@@ -773,12 +867,33 @@ def find_reusable_runtime_incident_diagnosis(
                 RuntimeIncident.updated_at.desc(),
                 RuntimeIncident.id.desc(),
             )
-            .first()
+            .limit(20)
+            .all()
         )
-        if row is None:
-            return None
-        session.expunge(row)
-        return row
+        for row in rows:
+            if feature_policy_version is None:
+                session.expunge(row)
+                return row
+            if row.feature_policy_version != feature_policy_version:
+                continue
+            try:
+                stored = json.loads(row.diagnosis_json)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            reuse = stored.get("reuse_context") if isinstance(stored, dict) else None
+            if not isinstance(reuse, dict):
+                continue
+            if reuse != {
+                "deployed_code_version": deployed_code_version,
+                "evidence_fingerprint": evidence_fingerprint,
+                "feature_policy_version": feature_policy_version,
+                "severity": severity,
+                "violation_class": violation_class,
+            }:
+                continue
+            session.expunge(row)
+            return row
+        return None
 
 
 def get_runtime_incident(
@@ -796,6 +911,96 @@ def get_runtime_incident(
         return row
 
 
+def get_message_operation_incident_snapshot(
+    session_factory: sessionmaker, *, incident_id: int
+) -> dict[str, object]:
+    """Return bounded contract expectations for one coalesced message incident."""
+
+    with session_factory() as session:
+        affected_count = (
+            session.query(RuntimeIncidentAffectedMessage)
+            .filter(
+                RuntimeIncidentAffectedMessage.runtime_incident_id
+                == int(incident_id)
+            )
+            .count()
+        )
+        rows = (
+            session.query(RuntimeIncidentAffectedMessage, MessageOperationContract)
+            .join(
+                MessageOperationContract,
+                MessageOperationContract.id
+                == RuntimeIncidentAffectedMessage.message_operation_contract_id,
+            )
+            .filter(
+                RuntimeIncidentAffectedMessage.runtime_incident_id
+                == int(incident_id)
+            )
+            .order_by(RuntimeIncidentAffectedMessage.id)
+            .limit(32)
+            .all()
+        )
+        contract_ids = [contract.id for _, contract in rows]
+        item_rows = (
+            session.query(MessageOperationItem)
+            .filter(MessageOperationItem.contract_id.in_(contract_ids))
+            .order_by(
+                MessageOperationItem.contract_id,
+                MessageOperationItem.sequence,
+            )
+            .limit(128)
+            .all()
+            if contract_ids
+            else []
+        )
+        items_by_contract: dict[int, list[dict[str, object]]] = {}
+        for item in item_rows:
+            try:
+                item_refs = json.loads(item.evidence_refs_json)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                item_refs = []
+            items_by_contract.setdefault(int(item.contract_id), []).append(
+                {
+                    "instruction_kind": item.instruction_kind,
+                    "expected_descendant_kind": item.expected_descendant_kind,
+                    "expected_terminal_kind": item.expected_terminal_kind,
+                    "observed_terminal_kind": item.observed_terminal_kind,
+                    "status": item.status,
+                    "evidence_refs": (
+                        item_refs[:32] if isinstance(item_refs, list) else []
+                    ),
+                }
+            )
+        contract_refs: dict[int, list[str]] = {}
+        for _, contract in rows:
+            try:
+                loaded_refs = json.loads(contract.evidence_refs_json)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                loaded_refs = []
+            contract_refs[int(contract.id)] = (
+                loaded_refs[:32] if isinstance(loaded_refs, list) else []
+            )
+    return {
+        "affected_message_count": int(affected_count),
+        "truncated": affected_count > 32,
+        "affected_message_ids": [
+            int(relation.raw_message_id) for relation, _ in rows
+        ],
+        "contracts": [
+            {
+                "contract_id": int(contract.id),
+                "intent_kind": contract.intent_kind,
+                "expected_terminal_kind": contract.expected_terminal_kind,
+                "observed_status": contract.status,
+                "violation_code": contract.violation_code,
+                "items": items_by_contract.get(int(contract.id), []),
+                "evidence_refs": contract_refs.get(int(contract.id), []),
+            }
+            for _, contract in rows
+        ],
+    }
+
+
 def claim_runtime_incident(
     session_factory: sessionmaker,
     *,
@@ -805,13 +1010,15 @@ def claim_runtime_incident(
     claim_expires_at: datetime,
     prompt_version: str | None = None,
     incident_types: frozenset[str] | None = None,
+    message_operation_enabled: bool = False,
+    message_operation_after_contract_id: int = 2**63 - 1,
 ) -> RuntimeIncident | None:
     """Claim one row through a compare-and-set update."""
 
     token = _validate_required_text("claim_token", claim_token, maximum=64)
     if claim_expires_at <= claimed_at:
         raise ValueError("claim_expires_at must be after claimed_at")
-    if incident_types == frozenset():
+    if incident_types == frozenset() and not message_operation_enabled:
         return None
     with session_factory() as session:
         claim_values: dict[str, object | None] = {
@@ -830,11 +1037,14 @@ def claim_runtime_incident(
         claim_conditions = [
             RuntimeIncident.id == int(incident_id),
             _claimable(claimed_at),
+            _agent_eligibility(
+                incident_types=incident_types,
+                message_operation_enabled=message_operation_enabled,
+                message_operation_after_contract_id=(
+                    message_operation_after_contract_id
+                ),
+            ),
         ]
-        if incident_types is not None:
-            claim_conditions.append(
-                RuntimeIncident.incident_type.in_(tuple(sorted(incident_types)))
-            )
         incident_id_result = session.execute(
             update(RuntimeIncident)
             .where(*claim_conditions)

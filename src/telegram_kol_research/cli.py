@@ -153,6 +153,7 @@ from telegram_kol_research.models import (
     TradeIdea,
     RawMessage,
     RuntimeIncident,
+    RuntimeIncidentAffectedMessage,
     SignalCandidate,
 )
 from telegram_kol_research.models import SyncCheckpoint
@@ -161,10 +162,16 @@ from telegram_kol_research.reporting import load_leaderboard_rows, write_report
 from telegram_kol_research.config import load_runtime_incident_config
 from telegram_kol_research.runtime_agent_tools import (
     RuntimeAgentToolRegistry,
+    build_broker_tool_provider,
     build_local_exchange_comparison,
     build_prior_attempts_summary,
     build_protection_summary,
     build_worker_history_summary,
+)
+from telegram_kol_research.runtime_agent_investigation_broker import (
+    BROAD_READ_ONLY_EVIDENCE_KINDS,
+    InvestigationBroker,
+    build_sqlalchemy_audit_recorder,
 )
 from telegram_kol_research.runtime_agent_exchange_snapshot import (
     RuntimeAgentExchangeSnapshotRefresh,
@@ -189,6 +196,7 @@ from telegram_kol_research.runtime_incident_handoff import (
     RuntimeIncidentHandoffError,
     load_runtime_incident_handoff,
 )
+from telegram_kol_research.runtime_incidents import get_runtime_incident
 from telegram_kol_research.raw_ingest import (
     NormalizedMessageRecord,
     normalize_message_payload,
@@ -2410,6 +2418,7 @@ def _build_runtime_agent_cli_tools(
     telegram_evidence_refresh: (
         RuntimeAgentTelegramEvidenceRefresh | None
     ) = None,
+    deployed_code_version: str = "unknown",
 ) -> RuntimeAgentToolRegistry:
     def load_incident(session, incident_id: int):
         row = session.get(RuntimeIncident, incident_id)
@@ -2475,6 +2484,89 @@ def _build_runtime_agent_cli_tools(
                 ),
             }
 
+    def message_evidence(*, incident_id: int):
+        with session_factory() as session:
+            incident = load_incident(session, incident_id)
+            raw_ids = [
+                row[0]
+                for row in session.query(
+                    RuntimeIncidentAffectedMessage.raw_message_id
+                )
+                .filter(
+                    RuntimeIncidentAffectedMessage.runtime_incident_id
+                    == incident.id
+                )
+                .order_by(RuntimeIncidentAffectedMessage.id)
+                .limit(32)
+                .all()
+            ]
+            messages = (
+                session.query(RawMessage)
+                .filter(RawMessage.id.in_(raw_ids))
+                .order_by(RawMessage.id)
+                .all()
+                if raw_ids
+                else []
+            )
+            reply_keys = {
+                (row.chat_id, row.reply_to_message_id)
+                for row in messages
+                if row.reply_to_message_id is not None
+            }
+            replies = {
+                (row.chat_id, row.message_id): row
+                for row in (
+                    session.query(RawMessage)
+                    .filter(
+                        tuple_(RawMessage.chat_id, RawMessage.message_id).in_(
+                            reply_keys
+                        )
+                    )
+                    .limit(32)
+                    .all()
+                    if reply_keys
+                    else []
+                )
+            }
+            data = []
+            references = [f"incident:{incident.id}"]
+            for row in messages:
+                reply = replies.get((row.chat_id, row.reply_to_message_id))
+                data.append(
+                    {
+                        "raw_message_id": row.id,
+                        "message_id": row.message_id,
+                        "posted_at": isoformat(row.posted_at),
+                        "source_status": row.source_status,
+                        "text": str(row.text or "")[:512],
+                        "reply_to_message_id": row.reply_to_message_id,
+                        "reply_text": (
+                            str(reply.text or "")[:512]
+                            if reply is not None
+                            else None
+                        ),
+                    }
+                )
+                references.append(f"raw_message:{row.id}")
+            return {
+                "data": {
+                    "incident_id": incident.id,
+                    "messages": data,
+                },
+                "evidence_refs": references[:32],
+            }
+
+    def deployed_code(*, incident_id: int):
+        with session_factory() as session:
+            incident = load_incident(session, incident_id)
+        return {
+            "data": {
+                "incident_id": incident.id,
+                "deployed_code_version": deployed_code_version,
+                "version_verified": deployed_code_version != "unknown",
+            },
+            "evidence_refs": [f"deployment:{deployed_code_version}"],
+        }
     def lifecycle_state(*, incident_id: int):
         with session_factory() as session:
             incident = load_incident(session, incident_id)
@@ -2958,8 +3050,7 @@ def _build_runtime_agent_cli_tools(
                 ),
             }
 
-    return RuntimeAgentToolRegistry(
-        providers={
+    providers = {
             "get_incident_summary": incident_summary,
             "get_lifecycle_state": lifecycle_state,
             "get_worker_state": worker_state,
@@ -2969,7 +3060,40 @@ def _build_runtime_agent_cli_tools(
             "compare_local_exchange": compare_local_exchange,
             "get_prior_attempts": prior_attempts,
             "get_protection_summary": protection_summary,
+        }
+    broker_sources = {
+        "message_evidence": message_evidence,
+        "database_projection": lifecycle_state,
+        "processing_timeline": worker_state,
+        "journal_summary": journal_summary,
+        "deployed_code": deployed_code,
+        "configuration_state": service_audit_state,
+        "exchange_snapshot": compare_local_exchange,
+        "telegram_evidence": incident_summary,
+        "prior_incidents": prior_attempts,
+    }
+    broker = InvestigationBroker(
+        providers={
+            kind: (
+                lambda request, source=source: source(
+                    incident_id=request.incident_id
+                )
+            )
+            for kind, source in broker_sources.items()
         },
+        incident_exists=lambda incident_id: (
+            get_runtime_incident(session_factory, incident_id=incident_id)
+            is not None
+        ),
+        audit_recorder=build_sqlalchemy_audit_recorder(session_factory),
+        clock=lambda: datetime.now(UTC),
+    )
+    for evidence_kind in BROAD_READ_ONLY_EVIDENCE_KINDS:
+        providers[f"investigate_{evidence_kind}"] = build_broker_tool_provider(
+            broker, evidence_kind=evidence_kind
+        )
+    return RuntimeAgentToolRegistry(
+        providers=providers,
         max_output_bytes=max_output_bytes,
     )
 
@@ -3171,6 +3295,7 @@ def runtime_incident_agent_once(
         exchange_snapshot_refresh=exchange_snapshot_refresh,
         production_audit_refresh=production_audit_refresh,
         telegram_evidence_refresh=telegram_evidence_refresh,
+        deployed_code_version=runtime_config.agent_deployed_code_version,
     )
     action_handlers = _build_runtime_agent_action_handlers(
         tools,
@@ -3181,6 +3306,13 @@ def runtime_incident_agent_once(
     worker_config = RuntimeAgentWorkerConfig(
         enabled=runtime_config.agent_enabled,
         incident_types=runtime_config.agent_incident_types,
+        message_operation_enabled=(
+            runtime_config.message_operation_agent_enabled
+        ),
+        message_operation_after_contract_id=(
+            runtime_config.message_operation_agent_after_contract_id
+        ),
+        deployed_code_version=runtime_config.agent_deployed_code_version,
         max_tool_steps=runtime_config.agent_max_tool_steps,
         max_wall_seconds=runtime_config.agent_max_wall_seconds,
         max_prompt_bytes=runtime_config.agent_max_prompt_bytes,
@@ -3262,6 +3394,7 @@ def runtime_incident_agent_worker(
         exchange_snapshot_refresh=exchange_snapshot_refresh,
         production_audit_refresh=production_audit_refresh,
         telegram_evidence_refresh=telegram_evidence_refresh,
+        deployed_code_version=runtime_config.agent_deployed_code_version,
     )
     action_handlers = _build_runtime_agent_action_handlers(
         tools,
@@ -3272,6 +3405,13 @@ def runtime_incident_agent_worker(
     worker_config = RuntimeAgentWorkerConfig(
         enabled=True,
         incident_types=runtime_config.agent_incident_types,
+        message_operation_enabled=(
+            runtime_config.message_operation_agent_enabled
+        ),
+        message_operation_after_contract_id=(
+            runtime_config.message_operation_agent_after_contract_id
+        ),
+        deployed_code_version=runtime_config.agent_deployed_code_version,
         max_tool_steps=runtime_config.agent_max_tool_steps,
         max_wall_seconds=runtime_config.agent_max_wall_seconds,
         max_prompt_bytes=runtime_config.agent_max_prompt_bytes,

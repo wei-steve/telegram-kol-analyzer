@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import time
 import uuid
 from collections.abc import Callable, Mapping
@@ -47,6 +48,7 @@ from telegram_kol_research.runtime_incidents import (
     claim_runtime_incident,
     defer_runtime_incident_action_claim,
     find_reusable_runtime_incident_diagnosis,
+    get_message_operation_incident_snapshot,
     list_claimable_runtime_incidents,
     transition_runtime_incident,
 )
@@ -56,6 +58,9 @@ from telegram_kol_research.runtime_incidents import (
 class RuntimeAgentWorkerConfig:
     enabled: bool = False
     incident_types: frozenset[str] | None = None
+    message_operation_enabled: bool = False
+    message_operation_after_contract_id: int = 2**63 - 1
+    deployed_code_version: str = "unknown"
     max_tool_steps: int = 4
     max_wall_seconds: float = 45.0
     max_prompt_bytes: int = 16_384
@@ -150,7 +155,10 @@ def _diagnosis_only_for_target(
     incident_type: str,
     diagnosis: RuntimeAgentDiagnosis,
 ) -> RuntimeAgentDiagnosis:
-    if incident_type not in MANAGEMENT_TARGET_DIAGNOSIS_INCIDENT_TYPES:
+    if (
+        incident_type not in MANAGEMENT_TARGET_DIAGNOSIS_INCIDENT_TYPES
+        and incident_type != "message_operation_failure"
+    ):
         return diagnosis
     return replace(
         diagnosis,
@@ -163,6 +171,28 @@ def _diagnosis_only_for_target(
 def _agent_incident_context(session_factory, incident):
     mapping = _incident_mapping(incident)
     references = {f"incident:{incident.id}"}
+    if incident.incident_type == "message_operation_failure":
+        snapshot = get_message_operation_incident_snapshot(
+            session_factory, incident_id=incident.id
+        )
+        if snapshot.get("truncated") is True:
+            raise RuntimeAgentContractError(
+                "affected message evidence exceeds the bounded diagnosis contract"
+            )
+        mapping["redacted_summary"] = {
+            **mapping["redacted_summary"],
+            "message_operation_snapshot": snapshot,
+        }
+        for raw_id, contract in zip(
+            snapshot["affected_message_ids"], snapshot["contracts"], strict=True
+        ):
+            references.update(
+                {
+                    f"raw_message:{raw_id}",
+                    f"message_operation_contract:{contract['contract_id']}",
+                }
+            )
+        return mapping, references
     if incident.incident_type not in MANAGEMENT_TARGET_DIAGNOSIS_INCIDENT_TYPES:
         return mapping, references
     snapshot = resolve_management_target_incident_snapshot(
@@ -175,6 +205,115 @@ def _agent_incident_context(session_factory, incident):
     }
     references.update(snapshot["evidence_refs"])
     return mapping, references
+
+
+def _message_operation_reuse_context(
+    *, incident, agent_incident: Mapping[str, Any], deployed_code_version: str
+) -> dict[str, str] | None:
+    if (
+        incident.incident_type != "message_operation_failure"
+        or deployed_code_version == "unknown"
+    ):
+        return None
+    summary = agent_incident.get("redacted_summary")
+    snapshot = summary.get("message_operation_snapshot") if isinstance(summary, dict) else None
+    contracts = snapshot.get("contracts") if isinstance(snapshot, dict) else None
+    semantic_contracts = []
+    for contract in contracts if isinstance(contracts, list) else []:
+        if isinstance(contract, dict):
+            material_refs = [
+                reference
+                for reference in contract.get("evidence_refs", [])
+                if isinstance(reference, str)
+                and not reference.startswith(
+                    ("raw_message:", "message_operation_contract:")
+                )
+            ]
+            semantic_items = []
+            for item in contract.get("items", []):
+                if not isinstance(item, dict):
+                    continue
+                semantic_items.append(
+                    {
+                        **{
+                            key: item.get(key)
+                            for key in (
+                                "instruction_kind",
+                                "expected_descendant_kind",
+                                "expected_terminal_kind",
+                                "observed_terminal_kind",
+                                "status",
+                            )
+                        },
+                        "evidence_refs": sorted(
+                            reference
+                            for reference in item.get("evidence_refs", [])
+                            if isinstance(reference, str)
+                            and not reference.startswith(
+                                ("raw_message:", "message_operation_contract:")
+                            )
+                        ),
+                    }
+                )
+            semantic_contracts.append(
+                {
+                    **{
+                        key: contract.get(key)
+                        for key in (
+                            "intent_kind",
+                            "expected_terminal_kind",
+                            "observed_status",
+                            "violation_code",
+                        )
+                    },
+                    "evidence_refs": sorted(material_refs),
+                    "items": semantic_items,
+                }
+            )
+    semantic_evidence_classes = sorted(
+        {
+            json.dumps(
+                contract,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for contract in semantic_contracts
+        }
+    )
+    evidence_fingerprint = hashlib.sha256(
+        json.dumps(
+            semantic_evidence_classes,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "deployed_code_version": deployed_code_version,
+        "evidence_fingerprint": evidence_fingerprint,
+        "feature_policy_version": incident.feature_policy_version,
+        "severity": incident.severity,
+        "violation_class": incident.source_record_id,
+    }
+
+
+def _assert_affected_snapshot_current(
+    session_factory,
+    *,
+    incident,
+    affected_message_ids: tuple[int, ...],
+) -> None:
+    if incident.incident_type != "message_operation_failure":
+        return
+    latest = get_message_operation_incident_snapshot(
+        session_factory, incident_id=incident.id
+    )
+    if latest.get("truncated") is True or tuple(
+        latest.get("affected_message_ids", ())
+    ) != affected_message_ids:
+        raise RuntimeAgentContractError(
+            "affected message evidence changed during diagnosis"
+        )
 
 
 def _parse_model_turn(raw: Any) -> tuple[str, Mapping[str, Any]]:
@@ -305,7 +444,12 @@ def _append_tool_exchange(
     )
 
 
-def _diagnosis_from_reusable(current_id: int, reusable) -> RuntimeAgentDiagnosis:
+def _diagnosis_from_reusable(
+    current_id: int,
+    reusable,
+    *,
+    affected_message_ids: tuple[int, ...] = (),
+) -> RuntimeAgentDiagnosis:
     try:
         stored = json.loads(reusable.diagnosis_json)
         stored_references = json.loads(reusable.evidence_refs_json)
@@ -320,6 +464,14 @@ def _diagnosis_from_reusable(current_id: int, reusable) -> RuntimeAgentDiagnosis
         if reference != current_reference
     ][:31]
     references.append(current_reference)
+    merged_message_ids = list(
+        dict.fromkeys(
+            [
+                *stored.get("affected_message_ids", []),
+                *affected_message_ids,
+            ]
+        )
+    )[:32]
     return RuntimeAgentDiagnosis.from_mapping(
         {
             "incident_id": current_id,
@@ -333,6 +485,18 @@ def _diagnosis_from_reusable(current_id: int, reusable) -> RuntimeAgentDiagnosis
                 "codex_handoff_required", True
             ),
             "remaining_risk": stored["remaining_risk"],
+            "expected_state": stored.get(
+                "expected_state", "A durable terminal outcome was expected."
+            ),
+            "observed_state": stored.get(
+                "observed_state", "The historical diagnosis lacks structured state."
+            ),
+            "classification": stored.get(
+                "classification", "insufficient_evidence"
+            ),
+            "affected_message_ids": merged_message_ids,
+            "likely_code_paths": stored.get("likely_code_paths", []),
+            "likely_test_paths": stored.get("likely_test_paths", []),
         },
         expected_incident_id=current_id,
     ).with_attempted_queries(tuple(stored.get("attempted_queries", ())))
@@ -349,6 +513,7 @@ def _commit_diagnosis(
     recovery_policy: Mapping[str, Any] | None = None,
     recovery_status: str | None = None,
     prompt_version: str | None = None,
+    reuse_context: Mapping[str, Any] | None = None,
 ) -> bool:
     ledger_diagnosis = diagnosis.to_ledger_mapping()
     ledger_diagnosis["shadow_playbook_policy"] = (
@@ -356,6 +521,8 @@ def _commit_diagnosis(
     )
     if recovery_policy is not None:
         ledger_diagnosis["recovery_playbook_policy"] = dict(recovery_policy)
+    if reuse_context is not None:
+        ledger_diagnosis["reuse_context"] = dict(reuse_context)
     diagnosis_json = json.dumps(
         ledger_diagnosis,
         ensure_ascii=True,
@@ -500,6 +667,10 @@ def run_runtime_agent_once(
         now=operation_now,
         limit=1,
         incident_types=config.incident_types,
+        message_operation_enabled=config.message_operation_enabled,
+        message_operation_after_contract_id=(
+            config.message_operation_after_contract_id
+        ),
     )
     if not claimable:
         return RuntimeAgentWorkerResult(status="idle")
@@ -514,6 +685,10 @@ def run_runtime_agent_once(
         + timedelta(seconds=max(5.0, min(config.claim_lease_seconds, 3600.0))),
         prompt_version=RUNTIME_AGENT_PROMPT_VERSION,
         incident_types=config.incident_types,
+        message_operation_enabled=config.message_operation_enabled,
+        message_operation_after_contract_id=(
+            config.message_operation_after_contract_id
+        ),
     )
     if claimed is None:
         return RuntimeAgentWorkerResult(status="claim_lost", incident_id=candidate.id)
@@ -540,15 +715,53 @@ def run_runtime_agent_once(
         agent_incident, gathered_references = _agent_incident_context(
             session_factory, claimed
         )
+        reuse_context = _message_operation_reuse_context(
+            incident=claimed,
+            agent_incident=agent_incident,
+            deployed_code_version=config.deployed_code_version,
+        )
+        snapshot = agent_incident.get("redacted_summary", {}).get(
+            "message_operation_snapshot", {}
+        )
+        affected_message_ids = tuple(
+            snapshot.get("affected_message_ids", ())
+            if isinstance(snapshot, dict)
+            else ()
+        )
         reusable = find_reusable_runtime_incident_diagnosis(
             session_factory,
             fingerprint=claimed.fingerprint,
             exclude_incident_id=claimed.id,
+            feature_policy_version=(
+                reuse_context["feature_policy_version"]
+                if reuse_context is not None
+                else None
+            ),
+            deployed_code_version=(
+                reuse_context["deployed_code_version"]
+                if reuse_context is not None
+                else None
+            ),
+            evidence_fingerprint=(
+                reuse_context["evidence_fingerprint"]
+                if reuse_context is not None
+                else None
+            ),
+            violation_class=(
+                reuse_context["violation_class"]
+                if reuse_context is not None
+                else None
+            ),
+            severity=claimed.severity if reuse_context is not None else None,
         )
         if reusable is not None:
             diagnosis = _diagnosis_only_for_target(
                 claimed.incident_type,
-                _diagnosis_from_reusable(claimed.id, reusable),
+                _diagnosis_from_reusable(
+                    claimed.id,
+                    reusable,
+                    affected_message_ids=affected_message_ids,
+                ),
             )
             shadow_decision = evaluate_shadow_playbook_nomination(
                 incident=agent_incident,
@@ -586,6 +799,11 @@ def run_runtime_agent_once(
                 shadow_policy=shadow_decision.to_ledger_mapping(),
                 recovery_policy=recovery_policy,
             )
+            _assert_affected_snapshot_current(
+                session_factory,
+                incident=claimed,
+                affected_message_ids=affected_message_ids,
+            )
             if not _commit_diagnosis(
                 session_factory,
                 incident=claimed,
@@ -596,6 +814,7 @@ def run_runtime_agent_once(
                 recovery_policy=recovery_policy,
                 recovery_status=recovery_status,
                 prompt_version=reusable.prompt_version,
+                reuse_context=reuse_context,
             ):
                 return RuntimeAgentWorkerResult(
                     status="claim_lost", incident_id=claimed.id
@@ -611,6 +830,15 @@ def run_runtime_agent_once(
         messages = build_runtime_agent_messages(
             agent_incident,
             max_prompt_bytes=config.max_prompt_bytes,
+        )
+        allowed_tools = (
+            frozenset(
+                name
+                for name in tools.allowed_tools
+                if name.startswith("investigate_")
+            )
+            if claimed.incident_type == "message_operation_failure"
+            else tools.allowed_tools
         )
         seen_calls: set[str] = set()
         # Reserve a model turn for the final closed diagnosis even when the
@@ -684,7 +912,7 @@ def run_runtime_agent_once(
                 raw_turn = model_turn(
                     messages=messages,
                     tool_schemas=(
-                        tools.tool_schemas()
+                        tools.tool_schemas(allowed_tools=allowed_tools)
                         if (
                             len(attempted_queries) < evidence_tool_limit
                             and not final_correction_used
@@ -718,6 +946,14 @@ def run_runtime_agent_once(
                     diagnosis = _diagnosis_only_for_target(
                         claimed.incident_type, diagnosis
                     )
+                    if (
+                        claimed.incident_type == "message_operation_failure"
+                        and tuple(sorted(diagnosis.affected_message_ids))
+                        != tuple(sorted(affected_message_ids))
+                    ):
+                        raise RuntimeAgentContractError(
+                            "affected message identities do not match evidence"
+                        )
                     allowed_references = (
                         correction_allowed_references
                         if correction_allowed_references is not None
@@ -768,6 +1004,11 @@ def run_runtime_agent_once(
                     shadow_policy=shadow_decision.to_ledger_mapping(),
                     recovery_policy=recovery_policy,
                 )
+                _assert_affected_snapshot_current(
+                    session_factory,
+                    incident=claimed,
+                    affected_message_ids=affected_message_ids,
+                )
                 if not _commit_diagnosis(
                     session_factory,
                     incident=claimed,
@@ -777,6 +1018,7 @@ def run_runtime_agent_once(
                     shadow_decision=shadow_decision,
                     recovery_policy=recovery_policy,
                     recovery_status=recovery_status,
+                    reuse_context=reuse_context,
                 ):
                     return RuntimeAgentWorkerResult(
                         status="claim_lost",
@@ -800,7 +1042,7 @@ def run_runtime_agent_once(
                 )
             call = RuntimeAgentToolCall.from_mapping(
                 payload,
-                allowed_tools=tools.allowed_tools,
+                allowed_tools=allowed_tools,
                 expected_incident_id=claimed.id,
             )
             signature = json.dumps(

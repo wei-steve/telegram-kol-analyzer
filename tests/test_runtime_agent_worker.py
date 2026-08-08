@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import telegram_kol_research.runtime_agent_worker as runtime_agent_worker_module
+
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.config import RuntimeIncidentConfig
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
     ManagementMessageEnvelope,
     ManagementMessageTarget,
+    MessageOperationContract,
     MessageInstructionItem,
     PositionAttributionAudit,
     RawMessage,
@@ -27,6 +31,9 @@ from telegram_kol_research.runtime_agent_worker import (
     run_runtime_agent_once,
 )
 from telegram_kol_research.runtime_incidents import record_runtime_incident
+from telegram_kol_research.runtime_incident_adapters import (
+    capture_message_operation_failure,
+)
 from telegram_kol_research.runtime_incident_snapshot import (
     resolve_management_target_incident_snapshot,
 )
@@ -52,6 +59,67 @@ def _record(session_factory, *, generation=1):
     )
 
 
+def _record_message_operation(
+    session_factory,
+    *,
+    generation: int,
+    message_id: int,
+    severity: str = "high",
+    via_adapter: bool = False,
+):
+    with session_factory() as session:
+        raw = RawMessage(chat_id=700, message_id=message_id, text="manage")
+        session.add(raw)
+        session.flush()
+        contract = MessageOperationContract(
+            raw_message_id=raw.id,
+            intent_kind="manage",
+            expected_terminal_kind="verified_management",
+            status="violated",
+            deadline_at=NOW,
+            violation_code="action_refused",
+            evidence_refs_json="[]",
+            policy_version="message-operation-v1",
+        )
+        session.add(contract)
+        session.commit()
+        raw_id, contract_id = raw.id, contract.id
+    if via_adapter:
+        incident = capture_message_operation_failure(
+            session_factory,
+            config=RuntimeIncidentConfig(
+                capture_types=frozenset({"message_operation_failure"})
+            ),
+            contract_id=contract_id,
+            raw_message_id=raw_id,
+            violation_code="action_refused",
+            evidence_refs=(),
+            occurred_at=NOW + timedelta(minutes=generation),
+            shadow_only=False,
+        )
+        return incident, raw_id, contract_id
+    incident = record_runtime_incident(
+        session_factory,
+        source_kind="message_operation_violation",
+        source_record_id="action_refused",
+        incident_type="message_operation_failure",
+        severity=severity,
+        fingerprint="m" * 64,
+        generation=generation,
+        redacted_summary=(
+            '{"component":"message_operation_supervisor",'
+            '"source_status":"violated","reason_code":"action_refused"}'
+        ),
+        occurred_at=NOW + timedelta(minutes=generation),
+        feature_policy_version="runtime-incident-phase-8r-v1",
+        prompt_version="runtime-agent-prompt-v8",
+        tool_policy_version="runtime-agent-tools-v2",
+        affected_raw_message_id=raw_id,
+        message_operation_contract_id=contract_id,
+    )
+    return incident, raw_id, contract_id
+
+
 def _final(incident_id):
     return {
         "final": {
@@ -67,6 +135,12 @@ def _final(incident_id):
             "auto_handle_eligible": False,
             "codex_handoff_required": True,
             "remaining_risk": "The source job remains unresolved.",
+            "expected_state": "The message operation reaches its terminal state.",
+            "observed_state": "The durable evidence remains nonterminal.",
+            "classification": "code_defect",
+            "affected_message_ids": [],
+            "likely_code_paths": ["src/telegram_kol_research/runtime_agent_worker.py"],
+            "likely_test_paths": ["tests/test_runtime_agent_worker.py"],
         }
     }
 
@@ -471,7 +545,7 @@ def test_worker_runs_bounded_tool_loop_and_commits_structured_diagnosis(tmp_path
     with session_factory() as session:
         row = session.get(RuntimeIncident, incident.id)
         assert row.status == "diagnosed"
-        assert row.prompt_version == "runtime-agent-prompt-v7"
+        assert row.prompt_version == "runtime-agent-prompt-v8"
         assert "Provider retries may have been exhausted." in row.diagnosis_json
         assert row.evidence_refs_json == (
             f'["incident:{incident.id}","worker-job:42"]'
@@ -1255,7 +1329,7 @@ def test_worker_enforces_prompt_budget_again_after_tool_output(tmp_path):
         session_factory,
         config=RuntimeAgentWorkerConfig(
             enabled=True,
-            max_prompt_bytes=2200,
+            max_prompt_bytes=3200,
         ),
         tools=registry,
         model_turn=model_turn,
@@ -1329,3 +1403,216 @@ def test_worker_reuses_same_fingerprint_diagnosis_without_model_call(tmp_path):
         assert row.prompt_version == first.prompt_version
         assert "Known provider outage" in row.diagnosis_json
         assert f"incident:{second.id}" in row.evidence_refs_json
+
+
+def test_message_operation_reuse_requires_exact_policy_code_evidence_and_class(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "message-reuse.db")
+    first, raw_1, _ = _record_message_operation(
+        session_factory, generation=1, message_id=8101, via_adapter=True
+    )
+    first_final = _final(first.id)
+    first_final["final"].update(
+        {
+            "evidence_references": [f"incident:{first.id}"],
+            "classification": "expected_safety_refusal",
+            "affected_message_ids": [raw_1],
+            "recommended_playbook_name": "retry_business_instruction",
+            "auto_handle_eligible": True,
+        }
+    )
+    first_result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(
+            enabled=True,
+            incident_types=frozenset(),
+            message_operation_enabled=True,
+            message_operation_after_contract_id=0,
+            deployed_code_version="code-a",
+        ),
+        tools=_registry([]),
+        model_turn=lambda **kwargs: first_final,
+        now=NOW + timedelta(minutes=3),
+    )
+    assert first_result.status == "diagnosed"
+    assert first_result.handoff["attempted_playbooks"] == []
+
+    second, raw_2, _ = _record_message_operation(
+        session_factory, generation=1, message_id=8102, via_adapter=True
+    )
+    model_calls = []
+    second_result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(
+            enabled=True,
+            incident_types=frozenset(),
+            message_operation_enabled=True,
+            message_operation_after_contract_id=0,
+            deployed_code_version="code-a",
+        ),
+        tools=_registry([]),
+        model_turn=lambda **kwargs: model_calls.append(kwargs),
+        now=NOW + timedelta(minutes=4),
+    )
+
+    assert second_result.status == "reused"
+    assert model_calls == []
+    assert second_result.handoff["affected_message_ids"] == [raw_1, raw_2]
+
+
+def test_message_operation_severity_change_forces_fresh_investigation(tmp_path):
+    session_factory = create_session_factory(tmp_path / "message-severity.db")
+    first, raw_1, _ = _record_message_operation(
+        session_factory, generation=1, message_id=8201
+    )
+    first_final = _final(first.id)
+    first_final["final"].update(
+        {
+            "evidence_references": [f"incident:{first.id}"],
+            "affected_message_ids": [raw_1],
+        }
+    )
+    config = RuntimeAgentWorkerConfig(
+        enabled=True,
+        incident_types=frozenset(),
+        message_operation_enabled=True,
+        message_operation_after_contract_id=0,
+        deployed_code_version="code-a",
+    )
+    assert run_runtime_agent_once(
+        session_factory,
+        config=config,
+        tools=_registry([]),
+        model_turn=lambda **kwargs: first_final,
+        now=NOW + timedelta(minutes=3),
+    ).status == "diagnosed"
+
+    second, raw_2, _ = _record_message_operation(
+        session_factory,
+        generation=1,
+        message_id=8202,
+        severity="critical",
+    )
+    calls = []
+    second_final = _final(second.id)
+    second_final["final"].update(
+        {
+            "evidence_references": [f"incident:{second.id}"],
+            "affected_message_ids": [raw_1, raw_2],
+        }
+    )
+    result = run_runtime_agent_once(
+        session_factory,
+        config=config,
+        tools=_registry([]),
+        model_turn=lambda **kwargs: (calls.append(kwargs) or second_final),
+        now=NOW + timedelta(minutes=5),
+    )
+    assert result.status == "diagnosed"
+    assert len(calls) == 1
+
+
+def test_message_operation_worker_exposes_only_audited_broker_tools(tmp_path):
+    session_factory = create_session_factory(tmp_path / "message-tools.db")
+    incident, raw_id, _ = _record_message_operation(
+        session_factory, generation=1, message_id=8301
+    )
+    observed_schemas = []
+    final = _final(incident.id)
+    final["final"].update(
+        {
+            "evidence_references": [f"incident:{incident.id}"],
+            "affected_message_ids": [raw_id],
+        }
+    )
+    tools = RuntimeAgentToolRegistry(
+        providers={
+            "get_incident_summary": lambda incident_id: {
+                "data": {"incident_id": incident_id},
+                "evidence_refs": [f"incident:{incident_id}"],
+            },
+            "investigate_message_evidence": lambda incident_id: {
+                "data": {"incident_id": incident_id},
+                "evidence_refs": [f"incident:{incident_id}"],
+            },
+        }
+    )
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(
+            enabled=True,
+            incident_types=frozenset(),
+            message_operation_enabled=True,
+            message_operation_after_contract_id=0,
+        ),
+        tools=tools,
+        model_turn=lambda **kwargs: (
+            observed_schemas.append(kwargs["tool_schemas"]) or final
+        ),
+        now=NOW + timedelta(minutes=3),
+    )
+
+    assert result.status == "diagnosed"
+    assert {
+        schema["function"]["name"] for schema in observed_schemas[0]
+    } == {"investigate_message_evidence"}
+
+
+def test_new_affected_message_atomically_invalidates_inflight_claim(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "message-race.db")
+    incident, raw_1, _ = _record_message_operation(
+        session_factory,
+        generation=1,
+        message_id=8401,
+        via_adapter=True,
+    )
+    final = _final(incident.id)
+    final["final"].update(
+        {
+            "evidence_references": [f"incident:{incident.id}"],
+            "affected_message_ids": [raw_1],
+        }
+    )
+    original_assert = runtime_agent_worker_module._assert_affected_snapshot_current
+    inserted = []
+
+    def inject_after_check(*args, **kwargs):
+        original_assert(*args, **kwargs)
+        if not inserted:
+            added, raw_2, _ = _record_message_operation(
+                session_factory,
+                generation=1,
+                message_id=8402,
+                via_adapter=True,
+            )
+            inserted.append((added.id, raw_2))
+
+    monkeypatch.setattr(
+        runtime_agent_worker_module,
+        "_assert_affected_snapshot_current",
+        inject_after_check,
+    )
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(
+            enabled=True,
+            incident_types=frozenset(),
+            message_operation_enabled=True,
+            message_operation_after_contract_id=0,
+            deployed_code_version="code-a",
+        ),
+        tools=_registry([]),
+        model_turn=lambda **kwargs: final,
+        now=NOW + timedelta(minutes=3),
+    )
+
+    assert result.status == "claim_lost"
+    assert inserted[0][0] == incident.id
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        assert row.status == "pending"
+        assert row.claim_token is None

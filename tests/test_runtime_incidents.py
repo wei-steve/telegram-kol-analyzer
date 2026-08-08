@@ -9,7 +9,11 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import RuntimeIncident
+from telegram_kol_research.models import (
+    MessageOperationContract,
+    RawMessage,
+    RuntimeIncident,
+)
 from telegram_kol_research.runtime_incidents import (
     MAX_DIAGNOSIS_JSON_LENGTH,
     MAX_REDACTED_SUMMARY_LENGTH,
@@ -40,6 +44,134 @@ def _record(session_factory, **overrides):
     }
     values.update(overrides)
     return record_runtime_incident(session_factory, **values)
+
+
+def _message_operation_incident(
+    session_factory,
+    *,
+    violation_code: str,
+    message_id: int = 200,
+    feature_policy_version: str = "runtime-incident-phase-8r-v1",
+):
+    with session_factory() as session:
+        raw = RawMessage(chat_id=100, message_id=message_id, text="test")
+        session.add(raw)
+        session.flush()
+        contract = MessageOperationContract(
+            raw_message_id=raw.id,
+            intent_kind="manage",
+            expected_terminal_kind="verified_management",
+            status="violated",
+            deadline_at=NOW,
+            violation_code=violation_code,
+            evidence_refs_json="[]",
+            policy_version="message-operation-v1",
+        )
+        session.add(contract)
+        session.commit()
+        raw_id, contract_id = raw.id, contract.id
+    return record_runtime_incident(
+        session_factory,
+        source_kind="message_operation_violation",
+        source_record_id=violation_code,
+        incident_type="message_operation_failure",
+        severity="high",
+        fingerprint=(violation_code[0] * 64),
+        redacted_summary=(
+            '{"component":"message_operation_supervisor",'
+            f'"reason_code":"{violation_code}"}}'
+        ),
+        occurred_at=NOW,
+        feature_policy_version=feature_policy_version,
+        prompt_version="runtime-agent-prompt-v8",
+        tool_policy_version="runtime-agent-tools-v2",
+        affected_raw_message_id=raw_id,
+        message_operation_contract_id=contract_id,
+    ), contract_id
+
+
+@pytest.mark.parametrize(
+    "violation_code",
+    ["recognition_failed", "action_refused", "exchange_readback_mismatch"],
+)
+def test_every_post_watermark_message_operation_violation_is_agent_eligible(
+    tmp_path, violation_code
+):
+    session_factory = create_session_factory(tmp_path / f"{violation_code}.db")
+    incident, contract_id = _message_operation_incident(
+        session_factory, violation_code=violation_code
+    )
+
+    assert list_claimable_runtime_incidents(
+        session_factory,
+        now=NOW,
+        incident_types=frozenset(),
+        message_operation_enabled=False,
+        message_operation_after_contract_id=0,
+    ) == []
+    assert [row.id for row in list_claimable_runtime_incidents(
+        session_factory,
+        now=NOW,
+        incident_types=frozenset(),
+        message_operation_enabled=True,
+        message_operation_after_contract_id=contract_id - 1,
+    )] == [incident.id]
+    assert list_claimable_runtime_incidents(
+        session_factory,
+        now=NOW,
+        incident_types=frozenset(),
+        message_operation_enabled=True,
+        message_operation_after_contract_id=contract_id,
+    ) == []
+
+
+def test_message_operation_incident_rolls_generation_before_member_33(tmp_path):
+    session_factory = create_session_factory(tmp_path / "rollover.db")
+    incidents = []
+    contracts = []
+    for index in range(33):
+        incident, contract_id = _message_operation_incident(
+            session_factory,
+            violation_code="action_refused",
+            message_id=1000 + index,
+        )
+        incidents.append(incident)
+        contracts.append(contract_id)
+
+    assert len({row.id for row in incidents[:32]}) == 1
+    assert incidents[31].generation == 1
+    assert incidents[32].id != incidents[31].id
+    assert incidents[32].generation == 2
+    assert [row.id for row in list_claimable_runtime_incidents(
+        session_factory,
+        now=NOW,
+        incident_types=frozenset(),
+        message_operation_enabled=True,
+        message_operation_after_contract_id=contracts[31],
+    )] == [incidents[32].id]
+
+
+def test_message_operation_policy_change_rolls_generation_instead_of_reuse(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "policy-rollover.db")
+    first, _ = _message_operation_incident(
+        session_factory,
+        violation_code="action_refused",
+        message_id=2001,
+        feature_policy_version="policy-a",
+    )
+    second, _ = _message_operation_incident(
+        session_factory,
+        violation_code="action_refused",
+        message_id=2002,
+        feature_policy_version="policy-b",
+    )
+
+    assert first.id != second.id
+    assert first.generation == 1
+    assert second.generation == 2
+    assert second.feature_policy_version == "policy-b"
 
 
 def test_runtime_incident_table_has_additive_defaults_and_indexes(tmp_path):

@@ -93,6 +93,24 @@ def test_phase6_action_authority_is_dormant_bounded_and_exact_allowlisted():
     assert enabled.agent_action_circuit_threshold == 5
 
 
+def test_message_operation_agent_gate_is_dormant_and_watermarked():
+    dormant = load_runtime_incident_config(environ={}, env_file_paths=[])
+    enabled = load_runtime_incident_config(
+        environ={
+            "TELEGRAM_KOL_MESSAGE_OPERATION_AGENT_ENABLED": "true",
+            "TELEGRAM_KOL_MESSAGE_OPERATION_AGENT_AFTER_CONTRACT_ID": "27",
+            "TELEGRAM_KOL_RUNTIME_AGENT_DEPLOYED_CODE_VERSION": "abc123",
+        },
+        env_file_paths=[],
+    )
+
+    assert dormant.message_operation_agent_enabled is False
+    assert dormant.message_operation_agent_after_contract_id == 2**63 - 1
+    assert enabled.message_operation_agent_enabled is True
+    assert enabled.message_operation_agent_after_contract_id == 27
+    assert enabled.agent_deployed_code_version == "abc123"
+
+
 def test_runtime_config_uses_systemd_environment_when_secret_file_is_unreadable(
     tmp_path,
     monkeypatch,

@@ -12,6 +12,9 @@ _EVIDENCE_REFERENCE_PATTERN = re.compile(
 )
 _TOOL_CALL_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}")
 _PLAYBOOK_PATTERN = re.compile(r"[a-z][a-z0-9_-]{1,127}")
+_REPAIR_PATH_PATTERN = re.compile(
+    r"(?:src/telegram_kol_research|tests)/[A-Za-z0-9_./-]{1,220}\.py"
+)
 _DIAGNOSIS_FIELDS = frozenset(
     {
         "incident_id",
@@ -23,10 +26,25 @@ _DIAGNOSIS_FIELDS = frozenset(
         "auto_handle_eligible",
         "codex_handoff_required",
         "remaining_risk",
+        "expected_state",
+        "observed_state",
+        "classification",
+        "affected_message_ids",
+        "likely_code_paths",
+        "likely_test_paths",
     }
 )
 _TOOL_CALL_FIELDS = frozenset({"id", "name", "arguments"})
 _CONFIDENCE_VALUES = frozenset({"low", "medium", "high"})
+_CLASSIFICATION_VALUES = frozenset(
+    {
+        "code_defect",
+        "configuration_problem",
+        "external_dependency_failure",
+        "expected_safety_refusal",
+        "insufficient_evidence",
+    }
+)
 
 
 class RuntimeAgentContractError(ValueError):
@@ -52,6 +70,31 @@ def _bounded_text_list(name: str, value: Any, *, limit: int) -> tuple[str, ...]:
     return tuple(
         _bounded_text(f"{name} item", item, maximum=512) for item in value
     )
+
+
+def _affected_message_ids(value: Any) -> tuple[int, ...]:
+    if not isinstance(value, list) or len(value) > 32:
+        raise RuntimeAgentContractError("affected_message_ids must be bounded")
+    normalized = tuple(value)
+    if any(type(item) is not int or item < 1 for item in normalized):
+        raise RuntimeAgentContractError("affected_message_ids are invalid")
+    if len(set(normalized)) != len(normalized):
+        raise RuntimeAgentContractError("affected_message_ids are duplicated")
+    return normalized
+
+
+def _repair_paths(name: str, value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list) or len(value) > 16:
+        raise RuntimeAgentContractError(f"{name} must be bounded")
+    normalized = tuple(value)
+    if any(
+        not isinstance(item, str)
+        or not _REPAIR_PATH_PATTERN.fullmatch(item)
+        or ".." in item
+        for item in normalized
+    ):
+        raise RuntimeAgentContractError(f"{name} is invalid")
+    return normalized
 
 
 def validate_evidence_references(value: Any) -> tuple[str, ...]:
@@ -80,6 +123,12 @@ class RuntimeAgentDiagnosis:
     auto_handle_eligible: bool
     codex_handoff_required: bool
     remaining_risk: str
+    expected_state: str
+    observed_state: str
+    classification: str
+    affected_message_ids: tuple[int, ...]
+    likely_code_paths: tuple[str, ...]
+    likely_test_paths: tuple[str, ...]
     attempted_queries: tuple[str, ...] = ()
 
     @classmethod
@@ -108,6 +157,9 @@ class RuntimeAgentDiagnosis:
         confidence = payload["confidence"]
         if confidence not in _CONFIDENCE_VALUES:
             raise RuntimeAgentContractError("confidence is invalid")
+        classification = payload["classification"]
+        if classification not in _CLASSIFICATION_VALUES:
+            raise RuntimeAgentContractError("classification is invalid")
         playbook = payload["recommended_playbook_name"]
         if playbook is not None and (
             not isinstance(playbook, str) or not _PLAYBOOK_PATTERN.fullmatch(playbook)
@@ -119,6 +171,8 @@ class RuntimeAgentDiagnosis:
             handoff_required, bool
         ):
             raise RuntimeAgentContractError("boolean diagnosis fields are invalid")
+        if handoff_required is not True:
+            raise RuntimeAgentContractError("codex handoff is required")
         return cls(
             incident_id=incident_id,
             diagnosis_hypothesis=_bounded_text(
@@ -138,6 +192,22 @@ class RuntimeAgentDiagnosis:
             codex_handoff_required=handoff_required,
             remaining_risk=_bounded_text(
                 "remaining_risk", payload["remaining_risk"], maximum=512
+            ),
+            expected_state=_bounded_text(
+                "expected_state", payload["expected_state"], maximum=512
+            ),
+            observed_state=_bounded_text(
+                "observed_state", payload["observed_state"], maximum=512
+            ),
+            classification=classification,
+            affected_message_ids=_affected_message_ids(
+                payload["affected_message_ids"]
+            ),
+            likely_code_paths=_repair_paths(
+                "likely_code_paths", payload["likely_code_paths"]
+            ),
+            likely_test_paths=_repair_paths(
+                "likely_test_paths", payload["likely_test_paths"]
             ),
         )
 
@@ -162,6 +232,12 @@ class RuntimeAgentDiagnosis:
             "codex_handoff_required": self.codex_handoff_required,
             "remaining_risk": self.remaining_risk,
             "attempted_queries": list(self.attempted_queries),
+            "expected_state": self.expected_state,
+            "observed_state": self.observed_state,
+            "classification": self.classification,
+            "affected_message_ids": list(self.affected_message_ids),
+            "likely_code_paths": list(self.likely_code_paths),
+            "likely_test_paths": list(self.likely_test_paths),
         }
 
 

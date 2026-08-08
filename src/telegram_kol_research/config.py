@@ -83,6 +83,9 @@ class RuntimeIncidentConfig:
     message_operation_stage1_max_attempts: int = 5
     agent_enabled: bool = False
     agent_incident_types: frozenset[str] | None = None
+    message_operation_agent_enabled: bool = False
+    message_operation_agent_after_contract_id: int = _SQLITE_MAX_INTEGER
+    agent_deployed_code_version: str = "unknown"
     agent_max_tool_steps: int = 4
     agent_max_wall_seconds: float = 45.0
     agent_max_prompt_bytes: int = 16_384
@@ -94,7 +97,7 @@ class RuntimeIncidentConfig:
     agent_action_circuit_threshold: int = 3
     monitor_capture_token: str | None = None
     feature_policy_version: str = "runtime-incident-phase-6-v1"
-    prompt_version: str = "runtime-agent-prompt-v7"
+    prompt_version: str = "runtime-agent-prompt-v8"
     tool_policy_version: str = "runtime-agent-tools-v2"
 
     def captures(self, incident_type: str) -> bool:
@@ -282,6 +285,24 @@ def _message_operation_stage1_after_contract_id(env: dict[str, str]) -> int:
     return value
 
 
+def _message_operation_agent_after_contract_id(env: dict[str, str]) -> int:
+    key = "TELEGRAM_KOL_MESSAGE_OPERATION_AGENT_AFTER_CONTRACT_ID"
+    try:
+        value = int(env[key])
+    except (KeyError, TypeError, ValueError):
+        return _SQLITE_MAX_INTEGER
+    if not 0 <= value <= _SQLITE_MAX_INTEGER:
+        return _SQLITE_MAX_INTEGER
+    return value
+
+
+def _deployed_code_version(env: dict[str, str]) -> str:
+    value = str(
+        env.get("TELEGRAM_KOL_RUNTIME_AGENT_DEPLOYED_CODE_VERSION", "unknown")
+    ).strip()
+    return value if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value) else "unknown"
+
+
 def load_runtime_incident_config(
     environ: dict[str, str] | None = None,
     env_file_paths: list[str | os.PathLike[str]] | None = None,
@@ -438,6 +459,13 @@ def load_runtime_incident_config(
             env.get("TELEGRAM_KOL_RUNTIME_AGENT_ENABLED")
         ),
         agent_incident_types=agent_incident_types,
+        message_operation_agent_enabled=_enabled_flag(
+            env.get("TELEGRAM_KOL_MESSAGE_OPERATION_AGENT_ENABLED")
+        ),
+        message_operation_agent_after_contract_id=(
+            _message_operation_agent_after_contract_id(env)
+        ),
+        agent_deployed_code_version=_deployed_code_version(env),
         agent_max_tool_steps=max(1, min(agent_tool_steps, 4)),
         agent_max_wall_seconds=max(5.0, min(agent_wall_seconds, 120.0)),
         agent_max_prompt_bytes=max(4096, min(agent_prompt_bytes, 32_768)),

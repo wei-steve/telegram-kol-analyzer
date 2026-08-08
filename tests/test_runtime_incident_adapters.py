@@ -613,7 +613,7 @@ def test_runtime_incident_flags_are_dormant_by_default_and_parse_allowlist():
     assert enabled.monitor_capture_token == "m" * 43
     assert enabled.agent_max_tool_steps == 4
     assert enabled.agent_max_wall_seconds == 12.0
-    assert enabled.prompt_version == "runtime-agent-prompt-v7"
+    assert enabled.prompt_version == "runtime-agent-prompt-v8"
     assert enabled.tool_policy_version == "runtime-agent-tools-v2"
     assert RuntimeIncidentConfig(
         capture_types=frozenset({"*"})
