@@ -1098,6 +1098,104 @@ def test_legacy_reconciliation_survives_cancel_then_lifecycle_transition(
     assert read_entry_preamble_invariants(database_path, now=NOW) == ()
 
 
+def test_legacy_reconciliation_survives_cancel_then_management_full_close(
+    tmp_path,
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, 266)
+        legs = session.query(ExecutionOrderLeg).order_by(
+            ExecutionOrderLeg.leg_index
+        ).all()
+        legs[0].status = "cancelled"
+        legs[0].terminal_reason = "operator_cancelled_unfilled_entry_leg"
+        legs[1].status = "closed"
+        legs[1].terminal_reason = "management_full_close_confirmed"
+        legs[1].pos_id = "pos-2"
+        legs[1].attribution_status = "verified"
+        binding.order_id = "order-2"
+        binding.client_order_id = "entry-2"
+        binding.status = "closed"
+        binding.pos_id = None
+        binding.last_exchange_status = "management_full_close_confirmed"
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == ()
+
+
+def test_legacy_reconciliation_survives_management_subset_close(tmp_path):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        _transition_legacy_binding_lifecycle(session, "active")
+        binding = session.get(ExecutionBinding, 266)
+        legs = session.query(ExecutionOrderLeg).order_by(
+            ExecutionOrderLeg.leg_index
+        ).all()
+        legs[0].status = "closed"
+        legs[0].terminal_reason = "management_full_close_confirmed"
+        binding.pos_id = "pos-2"
+        binding.last_exchange_status = "management_subset_close_confirmed"
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == ()
+
+
+@pytest.mark.parametrize("mutation", ["no_managed_close", "wrong_survivor_pos"])
+def test_legacy_reconciliation_rejects_corrupt_management_subset_close(
+    tmp_path, mutation
+):
+    database_path, session_factory = _seed_case(tmp_path)
+    _convert_to_production_legacy_finalized_case(session_factory)
+    plan = _plan(session_factory)
+    apply_entry_assembly_fingerprint_repair_plan(
+        session_factory,
+        assembly_id=2,
+        execution_binding_id=266,
+        expected_plan_fingerprint=plan.fingerprint,
+        applied_at=NOW,
+    )
+    with session_factory() as session:
+        _transition_legacy_binding_lifecycle(session, "active")
+        binding = session.get(ExecutionBinding, 266)
+        legs = session.query(ExecutionOrderLeg).order_by(
+            ExecutionOrderLeg.leg_index
+        ).all()
+        if mutation == "no_managed_close":
+            legs[0].status = "cancelled"
+            legs[0].pos_id = None
+            legs[0].terminal_reason = "operator_cancelled_unfilled_entry_leg"
+            binding.order_id = "order-2"
+            binding.client_order_id = "entry-2"
+        else:
+            legs[0].status = "closed"
+            legs[0].terminal_reason = "management_full_close_confirmed"
+            binding.pos_id = "pos-1,pos-2"
+        binding.last_exchange_status = "management_subset_close_confirmed"
+        session.commit()
+
+    assert read_entry_preamble_invariants(database_path, now=NOW) == (
+        "live_entry_preamble_binding_evidence_missing",
+    )
+
+
 def test_legacy_reconciliation_rejects_unjustified_reduced_identity_after_cancel(
     tmp_path,
 ):

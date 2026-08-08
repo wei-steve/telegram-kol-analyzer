@@ -1008,6 +1008,7 @@ def legacy_lifecycle_state_is_lawful(
             and all(
                 _is_management_closed_leg(row)
                 or _is_management_deferred_cancelled_leg(row)
+                or _is_prior_top_removed_cancelled_leg(row)
                 for row in legs
             )
         )
@@ -1057,6 +1058,7 @@ def legacy_lifecycle_state_is_lawful(
     if status != "active" or last_status not in {
         "position_ownership_verified",
         "management_selected_close_confirmed",
+        "management_subset_close_confirmed",
     }:
         return False
     pending_states = {"open", "pending", "submitted", "partially_filled", "partial"}
@@ -1094,6 +1096,7 @@ def legacy_lifecycle_state_is_lawful(
         str(_leg_value(row, "status") or "").lower() not in terminal_states
         or _is_management_closed_leg(row)
         or _is_management_deferred_cancelled_leg(row)
+        or _is_prior_top_removed_cancelled_leg(row)
         for row in legs
     )
     return (
@@ -1124,18 +1127,10 @@ def _current_binding_order_identity_is_exact(
     initial_order_id: Any,
     initial_client_order_id: Any,
 ) -> bool:
-    top_removed_reasons = {
-        "operator_cancelled_unfilled_entry_leg",
-        "pending_entry_order_absent_confirmed",
-    }
     retained_legs = [
         row
         for row in legs
-        if not (
-            str(_leg_value(row, "status") or "").lower() == "cancelled"
-            and _leg_value(row, "terminal_reason") in top_removed_reasons
-            and not _leg_value(row, "pos_id")
-        )
+        if not _is_prior_top_removed_cancelled_leg(row)
     ]
     expected_order_id = ",".join(
         str(_leg_value(row, "order_id") or "") for row in retained_legs
@@ -1150,6 +1145,18 @@ def _current_binding_order_identity_is_exact(
     return (
         binding.get("order_id") == expected_order_id
         and binding.get("client_order_id") == expected_client_order_id
+    )
+
+
+def _is_prior_top_removed_cancelled_leg(row: Any) -> bool:
+    return bool(
+        str(_leg_value(row, "status") or "").lower() == "cancelled"
+        and _leg_value(row, "terminal_reason")
+        in {
+            "operator_cancelled_unfilled_entry_leg",
+            "pending_entry_order_absent_confirmed",
+        }
+        and not _leg_value(row, "pos_id")
     )
 
 
