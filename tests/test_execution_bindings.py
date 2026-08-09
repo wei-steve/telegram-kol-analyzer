@@ -5783,7 +5783,7 @@ def test_sync_missing_position_cleans_pending_entry_before_lifecycle_exit(tmp_pa
             self.cancelled = []
             self.trigger_history = []
 
-        def list_positions(self):
+        def list_positions(self, *, inst_id=None):
             return []
 
         def list_trigger_orders_pending(self, *, inst_id):
@@ -5894,7 +5894,7 @@ def test_missing_position_history_uncertainty_does_not_skip_pending_order_cancel
             self.history = []
             self.cancel_calls = 0
 
-        def list_positions(self):
+        def list_positions(self, *, inst_id=None):
             return []
 
         def list_trigger_orders_pending(self, *, inst_id):
@@ -6292,7 +6292,7 @@ def test_sync_repairs_terminal_lifecycle_with_pending_entry_leg_exactly_once(tmp
             self.cancel_calls = 0
             self.trigger_history = []
 
-        def list_positions(self):
+        def list_positions(self, *, inst_id=None):
             return []
 
         def list_trigger_orders_pending(self, *, inst_id):
@@ -6438,7 +6438,7 @@ def test_terminal_cleanup_query_does_not_starve_anomaly_after_clean_history(
             self.history = []
             self.cancel_calls = 0
 
-        def list_positions(self):
+        def list_positions(self, *, inst_id=None):
             return []
 
         def list_trigger_orders_pending(self, *, inst_id):

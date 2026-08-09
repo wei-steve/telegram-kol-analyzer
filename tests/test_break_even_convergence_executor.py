@@ -354,7 +354,8 @@ def test_live_convergence_cancels_deferred_entry_before_market_decision(tmp_path
     )
 
     assert result.status == "deciding_by_market"
-    assert client.calls[2] == ("cancel_trigger_order", "entry-2")
+    assert client.calls[2] == ("list_positions", "BTC-USDT-SWAP")
+    assert client.calls[3] == ("cancel_trigger_order", "entry-2")
     with session_factory() as session:
         deferred = session.query(ExecutionOrderLeg).filter_by(order_id="entry-2").one()
         assert deferred.status == "cancelled"
