@@ -1,5 +1,7 @@
 ﻿import json
 import re
+import shutil
+import subprocess
 import threading
 import time
 from datetime import UTC, datetime
@@ -4257,6 +4259,104 @@ def test_index_page_versions_static_assets_to_avoid_stale_browser_cache(tmp_path
     assert response.status_code == 200
     assert "/static/app.css?v=" in response.text
     assert "/static/app.js?v=" in response.text
+
+
+def test_trading_symbol_capability_ui_is_explicit_and_renders_errors_safely(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    html = client.get("/more-panel").text
+    js = client.get("/static/app.js").text
+    css = client.get("/static/app.css").text
+    selector_start = js.index("function initTradingSymbolSelector")
+    selector_end = js.index("\nfunction parseSymbolList", selector_start)
+    selector = js[selector_start:selector_end]
+
+    assert "data-contract-spec-status" in html
+    assert "venue_supported" in selector
+    assert "venue_state" in selector
+    assert "spec_status" in selector
+    assert "tradable" in selector
+    assert "reason_code" in selector
+    assert "fetched_at" in selector
+    assert "expires_at" in selector
+    assert "Deepcoin 不可交易" in selector
+    assert "选中仅表示全局允许，不会覆盖 Deepcoin 能力" in html
+    assert "checkbox.disabled" not in selector
+    assert ".slice(0, 240)" in js
+    assert "contractSpecStatus.textContent" in selector
+    assert "contractSpecStatus.innerHTML" not in selector
+    assert ".symbol-capability-badge" in css
+    assert ".is-tradable" in css
+    assert ".is-non-tradable" in css
+
+
+def test_trading_symbol_capability_view_recomputes_after_local_selection(tmp_path):
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is required for the capability view behavior test")
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+    helper_start = js.index("function symbolCapabilityView")
+    helper_end = js.index("\nfunction initTradingSymbolSelector", helper_start)
+    helper_source = js[helper_start:helper_end]
+    script = f"""
+{helper_source}
+const item = {{
+  venue_supported: true,
+  venue_state: 'live',
+  spec_status: 'fresh',
+  execution_mode: 'live',
+  execution_reason_code: 'global_not_allowed',
+}};
+console.log(JSON.stringify([
+  symbolCapabilityView(item, false),
+  symbolCapabilityView(item, true),
+]));
+"""
+
+    completed = subprocess.run(
+        ["node", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    unselected, selected = json.loads(completed.stdout)
+    assert unselected["tradable"] is False
+    assert unselected["reason_code"] == "global_not_allowed"
+    assert selected["tradable"] is True
+    assert selected["reason_code"] == "tradable"
+    assert selected["execution_tradable"] is True
+
+
+def test_contract_spec_status_text_bounds_hostile_error_as_literal_text(tmp_path):
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is required for the status rendering behavior test")
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+    helper_start = js.index("function boundedContractSpecStatusText")
+    helper_end = js.index("\nfunction initTradingSymbolSelector", helper_start)
+    helper_source = js[helper_start:helper_end]
+    hostile = "<img src=x onerror=alert(1)>" + ("x" * 500)
+    script = f"""
+{helper_source}
+console.log(JSON.stringify(boundedContractSpecStatusText({{
+  state: 'unavailable',
+  last_error: {json.dumps(hostile)},
+}})));
+"""
+
+    completed = subprocess.run(
+        ["node", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    rendered = json.loads(completed.stdout)
+
+    assert "<img src=x onerror=alert(1)>" in rendered
+    assert len(rendered) <= len("Deepcoin 规格状态：unavailable；") + 240
 
 
 def test_index_page_shows_actionable_session_lock_hint(tmp_path):

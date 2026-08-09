@@ -397,6 +397,8 @@
             <input type="hidden" name="symbol_entry_thresholds" value='{{ trading_settings.symbol_entry_thresholds|tojson }}' data-symbol-entry-thresholds-input />
             <label>允许交易币种搜索<input type="search" placeholder="搜索 BTC / ETH / SOL" data-symbol-search /></label>
             <div class="symbol-selector-summary" data-symbol-selector-summary>正在加载交易所币种...</div>
+            <div class="contract-spec-status" data-contract-spec-status aria-live="polite"></div>
+            <p class="symbol-capability-note">选中仅表示全局允许，不会覆盖 Deepcoin 能力。</p>
             <div class="selected-symbol-list" data-selected-symbol-list></div>
             <div class="symbol-selector-list" data-symbol-selector-list></div>
             <div class="selected-symbol-risk-list" data-selected-symbol-risk-list></div>

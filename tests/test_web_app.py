@@ -22,6 +22,12 @@ from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.deepcoin_contract_specs import (
     RefreshableDeepcoinContractSpecProvider,
 )
+from telegram_kol_research.deepcoin_contract_specs import (
+    RolloutDeepcoinContractSpecProvider,
+)
+from telegram_kol_research.deepcoin_contract_specs import (
+    StaticDeepcoinContractSpecProvider,
+)
 from telegram_kol_research.deepcoin_contract_spec_cache import (
     publish_deepcoin_contract_spec_snapshot,
     validate_deepcoin_instrument_snapshot,
@@ -1407,6 +1413,16 @@ def test_trading_settings_symbols_api_lists_deepcoin_symbols_with_selection(tmp_
                 "first_limit_offset": "90",
                 "second_limit_offset": "90",
             },
+            "venue_supported": True,
+            "venue_state": None,
+            "spec_status": "sync_unavailable",
+            "tradable": False,
+            "reason_code": "contract_spec_sync_unavailable",
+            "fetched_at": None,
+            "expires_at": None,
+            "execution_mode": "unavailable",
+            "execution_tradable": False,
+            "execution_reason_code": "contract_spec_sync_unavailable",
         },
         {
             "symbol": "ETH",
@@ -1418,6 +1434,16 @@ def test_trading_settings_symbols_api_lists_deepcoin_symbols_with_selection(tmp_
                 "first_limit_offset": "2",
                 "second_limit_offset": "2",
             },
+            "venue_supported": True,
+            "venue_state": None,
+            "spec_status": "sync_unavailable",
+            "tradable": False,
+            "reason_code": "contract_spec_sync_unavailable",
+            "fetched_at": None,
+            "expires_at": None,
+            "execution_mode": "unavailable",
+            "execution_tradable": False,
+            "execution_reason_code": "contract_spec_sync_unavailable",
         },
         {
             "symbol": "SOL",
@@ -1429,6 +1455,16 @@ def test_trading_settings_symbols_api_lists_deepcoin_symbols_with_selection(tmp_
                 "first_limit_offset": "0",
                 "second_limit_offset": "0",
             },
+            "venue_supported": True,
+            "venue_state": None,
+            "spec_status": "sync_unavailable",
+            "tradable": False,
+            "reason_code": "contract_spec_sync_unavailable",
+            "fetched_at": None,
+            "expires_at": None,
+            "execution_mode": "unavailable",
+            "execution_tradable": False,
+            "execution_reason_code": "contract_spec_sync_unavailable",
         },
     ]
 
@@ -1465,6 +1501,16 @@ def test_trading_settings_symbols_api_falls_back_to_saved_symbols(tmp_path):
                 "first_limit_offset": "90",
                 "second_limit_offset": "90",
             },
+            "venue_supported": False,
+            "venue_state": None,
+            "spec_status": "sync_unavailable",
+            "tradable": False,
+            "reason_code": "contract_spec_sync_unavailable",
+            "fetched_at": None,
+            "expires_at": None,
+            "execution_mode": "unavailable",
+            "execution_tradable": False,
+            "execution_reason_code": "contract_spec_sync_unavailable",
         },
         {
             "symbol": "ETH",
@@ -1476,6 +1522,16 @@ def test_trading_settings_symbols_api_falls_back_to_saved_symbols(tmp_path):
                 "first_limit_offset": "2",
                 "second_limit_offset": "2",
             },
+            "venue_supported": False,
+            "venue_state": None,
+            "spec_status": "sync_unavailable",
+            "tradable": False,
+            "reason_code": "contract_spec_sync_unavailable",
+            "fetched_at": None,
+            "expires_at": None,
+            "execution_mode": "unavailable",
+            "execution_tradable": False,
+            "execution_reason_code": "contract_spec_sync_unavailable",
         },
     ]
 
@@ -1490,6 +1546,310 @@ def _deepcoin_instrument_row(instrument_id: str) -> dict[str, str]:
         "tickSz": "0.001",
         "state": "live",
     }
+
+
+def test_trading_settings_symbols_api_exposes_deepcoin_capability_per_symbol(
+    tmp_path,
+):
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+    btc = _deepcoin_instrument_row("BTC-USDT-SWAP")
+    sol = {**_deepcoin_instrument_row("SOL-USDT-SWAP"), "state": "suspend"}
+    provider = RefreshableDeepcoinContractSpecProvider(
+        cache_path=tmp_path / "specs.json",
+        instrument_loader=lambda: [btc, sol],
+        ttl=timedelta(hours=24),
+        now_provider=lambda: now,
+    )
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_contract_spec_provider=provider,
+        now_provider=lambda: now,
+    )
+    save_trading_settings(
+        app.state.session_factory,
+        {"allowed_symbols": ["BTC", "SOL", "ABC"]},
+    )
+
+    response = TestClient(app).get("/api/trading-settings/symbols")
+
+    assert response.status_code == 200
+    rows = {row["symbol"]: row for row in response.json()["symbols"]}
+    capability_fields = {
+        key: rows["BTC"][key]
+        for key in (
+            "venue_supported",
+            "venue_state",
+            "spec_status",
+            "tradable",
+            "reason_code",
+            "fetched_at",
+            "expires_at",
+        )
+    }
+    assert capability_fields == {
+        "venue_supported": True,
+        "venue_state": "live",
+        "spec_status": "fresh",
+        "tradable": True,
+        "reason_code": "tradable",
+        "fetched_at": "2026-08-08T12:00:00Z",
+        "expires_at": "2026-08-09T12:00:00Z",
+    }
+    assert rows["SOL"]["selected"] is True
+    assert {key: rows["SOL"][key] for key in capability_fields} == {
+        "venue_supported": True,
+        "venue_state": "suspend",
+        "spec_status": "fresh",
+        "tradable": False,
+        "reason_code": "venue_instrument_not_live",
+        "fetched_at": "2026-08-08T12:00:00Z",
+        "expires_at": "2026-08-09T12:00:00Z",
+    }
+    assert rows["ABC"]["selected"] is True
+    assert {key: rows["ABC"][key] for key in capability_fields} == {
+        "venue_supported": False,
+        "venue_state": None,
+        "spec_status": "missing",
+        "tradable": False,
+        "reason_code": "venue_instrument_unsupported",
+        "fetched_at": "2026-08-08T12:00:00Z",
+        "expires_at": "2026-08-09T12:00:00Z",
+    }
+
+
+def test_trading_settings_symbols_api_marks_expired_specs_stale(tmp_path):
+    current_time = [datetime(2026, 8, 8, 12, 0, tzinfo=UTC)]
+    provider = RefreshableDeepcoinContractSpecProvider(
+        cache_path=tmp_path / "specs.json",
+        instrument_loader=lambda: [_deepcoin_instrument_row("BTC-USDT-SWAP")],
+        ttl=timedelta(hours=24),
+        now_provider=lambda: current_time[0],
+    )
+    assert provider.refresh() is True
+    current_time[0] += timedelta(hours=24)
+    provider._instrument_loader = lambda: (_ for _ in ()).throw(RuntimeError("offline"))
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_contract_spec_provider=provider,
+        now_provider=lambda: current_time[0],
+    )
+    save_trading_settings(app.state.session_factory, {"allowed_symbols": ["BTC"]})
+
+    row = TestClient(app).get("/api/trading-settings/symbols").json()["symbols"][0]
+
+    assert row["selected"] is True
+    assert row["venue_supported"] is True
+    assert row["venue_state"] == "live"
+    assert row["spec_status"] == "stale"
+    assert row["tradable"] is False
+    assert row["reason_code"] == "contract_spec_stale"
+
+
+def test_trading_settings_symbols_api_marks_inverted_snapshot_timing_invalid(
+    tmp_path,
+):
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+    capability = SimpleNamespace(state="live")
+    snapshot = SimpleNamespace(
+        fetched_at=now - timedelta(hours=1),
+        expires_at=now - timedelta(hours=2),
+        capabilities_by_instrument_id={"BTC-USDT-SWAP": capability},
+    )
+
+    class Provider:
+        ttl = timedelta(hours=24)
+        metadata = SimpleNamespace(
+            last_success_at=snapshot.fetched_at,
+            expires_at=snapshot.expires_at,
+            last_error=None,
+        )
+
+        def __init__(self):
+            self.snapshot = snapshot
+
+        def refresh(self):
+            return False
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_contract_spec_provider=Provider(),
+        now_provider=lambda: now,
+    )
+    save_trading_settings(app.state.session_factory, {"allowed_symbols": ["BTC"]})
+
+    row = TestClient(app).get("/api/trading-settings/symbols").json()["symbols"][0]
+
+    assert row["spec_status"] == "invalid"
+    assert row["tradable"] is False
+    assert row["reason_code"] == "contract_spec_invalid"
+
+
+@pytest.mark.parametrize(
+    ("mode", "execution_tradable", "execution_reason"),
+    [
+        ("static", True, "tradable"),
+        ("shadow", True, "tradable"),
+        ("live", False, "contract_spec_sync_unavailable"),
+    ],
+)
+def test_trading_settings_symbols_api_separates_rollout_execution_authority(
+    tmp_path,
+    mode,
+    execution_tradable,
+    execution_reason,
+):
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+    authoritative = RefreshableDeepcoinContractSpecProvider(
+        cache_path=tmp_path / "missing.json",
+        instrument_loader=lambda: (_ for _ in ()).throw(RuntimeError("offline")),
+        ttl=timedelta(hours=24),
+        now_provider=lambda: now,
+    )
+    static = StaticDeepcoinContractSpecProvider(
+        specs_by_instrument_id={
+            "BTC-USDT-SWAP": DeepcoinContractSpec(
+                instrument_id="BTC-USDT-SWAP",
+                contract_value=0.001,
+                quantity_step=1,
+                min_quantity=1,
+                price_tick=0.1,
+            )
+        }
+    )
+    provider = RolloutDeepcoinContractSpecProvider(
+        static_provider=static,
+        authoritative_provider=authoritative,
+        mode_loader=lambda: mode,
+    )
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_contract_spec_provider=provider,
+        deepcoin_client_factory=lambda: SimpleNamespace(
+            list_swap_symbols=lambda: [
+                {"symbol": "BTC", "instrument_id": "BTC-USDT-SWAP"}
+            ]
+        ),
+        now_provider=lambda: now,
+    )
+    save_trading_settings(
+        app.state.session_factory,
+        {
+            "allowed_symbols": ["BTC"],
+            "deepcoin_contract_specs_mode": mode,
+        },
+    )
+
+    row = TestClient(app).get("/api/trading-settings/symbols").json()["symbols"][0]
+
+    assert row["tradable"] is False
+    assert row["reason_code"] == "contract_spec_sync_unavailable"
+    assert row["execution_mode"] == mode
+    assert row["execution_tradable"] is execution_tradable
+    assert row["execution_reason_code"] == execution_reason
+
+
+def test_trading_settings_symbols_resolves_rollout_mode_once_from_settings(tmp_path):
+    mode_loads = []
+    static = StaticDeepcoinContractSpecProvider(specs_by_instrument_id={})
+    authoritative = SimpleNamespace(
+        ttl=timedelta(hours=24),
+        snapshot=None,
+        metadata=SimpleNamespace(
+            last_success_at=None,
+            expires_at=None,
+            last_error=None,
+        ),
+        refresh=lambda: False,
+    )
+    provider = RolloutDeepcoinContractSpecProvider(
+        static_provider=static,
+        authoritative_provider=authoritative,
+        mode_loader=lambda: mode_loads.append("called") or "static",
+    )
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_contract_spec_provider=provider,
+        deepcoin_client_factory=lambda: SimpleNamespace(
+            list_swap_symbols=lambda: [
+                {"symbol": symbol, "instrument_id": f"{symbol}-USDT-SWAP"}
+                for symbol in ("BTC", "ETH", "SOL")
+            ]
+        ),
+    )
+
+    response = TestClient(app).get("/api/trading-settings/symbols")
+
+    assert response.status_code == 200
+    assert len(response.json()["symbols"]) == 3
+    assert mode_loads == []
+
+
+def test_trading_settings_symbols_bounds_hostile_refresh_error(tmp_path):
+    hostile_error = "<img src=x onerror=alert(1)>" + ("x" * 500)
+
+    class Provider:
+        ttl = timedelta(hours=24)
+        snapshot = None
+        metadata = SimpleNamespace(
+            last_success_at=None,
+            expires_at=None,
+            last_error=hostile_error,
+        )
+
+        def refresh(self):
+            return False
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_contract_spec_provider=Provider(),
+    )
+
+    payload = TestClient(app).get("/api/trading-settings/symbols").json()
+
+    returned_error = payload["contract_specs"]["last_error"]
+    assert returned_error.startswith("<img src=x onerror=alert(1)>")
+    assert len(returned_error) == 240
+
+
+def test_trading_settings_symbols_api_distinguishes_verified_listing_absence(
+    tmp_path,
+):
+    static = StaticDeepcoinContractSpecProvider(
+        specs_by_instrument_id={
+            "BTC-USDT-SWAP": DeepcoinContractSpec(
+                instrument_id="BTC-USDT-SWAP",
+                contract_value=0.001,
+                quantity_step=1,
+                min_quantity=1,
+                price_tick=0.1,
+            )
+        }
+    )
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_contract_spec_provider=static,
+        deepcoin_client_factory=lambda: SimpleNamespace(
+            list_swap_symbols=lambda: [
+                {"symbol": "BTC", "instrument_id": "BTC-USDT-SWAP"}
+            ]
+        ),
+    )
+    save_trading_settings(
+        app.state.session_factory,
+        {"allowed_symbols": ["BTC", "ABC"]},
+    )
+
+    rows = {
+        row["symbol"]: row
+        for row in TestClient(app).get("/api/trading-settings/symbols").json()["symbols"]
+    }
+
+    assert rows["BTC"]["venue_supported"] is True
+    assert rows["BTC"]["reason_code"] == "contract_spec_sync_unavailable"
+    assert rows["ABC"]["selected"] is True
+    assert rows["ABC"]["venue_supported"] is False
+    assert rows["ABC"]["spec_status"] == "missing"
+    assert rows["ABC"]["reason_code"] == "venue_instrument_unsupported"
 
 
 def test_contract_spec_startup_refresh_is_non_blocking_and_stops_cleanly(tmp_path):

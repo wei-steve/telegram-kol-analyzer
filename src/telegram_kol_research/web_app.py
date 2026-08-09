@@ -3143,6 +3143,11 @@ def _build_trading_symbol_rows(
     selected_symbols: list[str],
     symbol_max_loss_usdt: dict[str, float],
     entry_thresholds_for_symbol: Callable[[str], SymbolEntryThresholds],
+    capability_snapshot: Any | None = None,
+    now: datetime | None = None,
+    exchange_symbols_verified: bool = True,
+    contract_spec_provider: Any | None = None,
+    execution_mode: str | None = None,
 ) -> list[dict[str, Any]]:
     selected = {str(symbol).upper() for symbol in selected_symbols}
     rows_by_symbol: dict[str, dict[str, Any]] = {}
@@ -3160,19 +3165,198 @@ def _build_trading_symbol_rows(
             "selected": symbol in selected,
             "max_loss_usdt": symbol_max_loss_usdt.get(symbol),
             "entry_thresholds": entry_thresholds_for_symbol(symbol).to_dict(),
+            **_trading_symbol_capability_fields(
+                symbol,
+                selected=symbol in selected,
+                snapshot=capability_snapshot,
+                now=now,
+                exchange_supported=exchange_symbols_verified,
+                exchange_listing_available=exchange_symbols_verified,
+                contract_spec_provider=contract_spec_provider,
+                execution_mode=execution_mode,
+            ),
         }
     for symbol in selected:
-        rows_by_symbol.setdefault(
-            symbol,
-            {
+        if symbol not in rows_by_symbol:
+            rows_by_symbol[symbol] = {
                 "symbol": symbol,
                 "instrument_id": _to_deepcoin_swap_instrument(symbol),
                 "selected": True,
                 "max_loss_usdt": symbol_max_loss_usdt.get(symbol),
                 "entry_thresholds": entry_thresholds_for_symbol(symbol).to_dict(),
-            },
-        )
+                **_trading_symbol_capability_fields(
+                    symbol,
+                    selected=True,
+                    snapshot=capability_snapshot,
+                    now=now,
+                    exchange_supported=False,
+                    exchange_listing_available=exchange_symbols_verified,
+                    contract_spec_provider=contract_spec_provider,
+                    execution_mode=execution_mode,
+                ),
+            }
     return sorted(rows_by_symbol.values(), key=lambda item: item["symbol"])
+
+
+def _trading_symbol_capability_fields(
+    symbol: str,
+    *,
+    selected: bool,
+    snapshot: Any | None,
+    now: datetime | None,
+    exchange_supported: bool,
+    exchange_listing_available: bool,
+    contract_spec_provider: Any | None,
+    execution_mode: str | None,
+) -> dict[str, Any]:
+    fetched_at = getattr(snapshot, "fetched_at", None)
+    expires_at = getattr(snapshot, "expires_at", None)
+    capabilities = getattr(snapshot, "capabilities_by_instrument_id", None)
+    capability = (
+        capabilities.get(_to_deepcoin_swap_instrument(symbol))
+        if capabilities is not None
+        else None
+    )
+    venue_supported = capability is not None or (
+        snapshot is None and exchange_supported
+    )
+    venue_state = getattr(capability, "state", None)
+    reason_code = "contract_spec_sync_unavailable"
+    spec_status = "sync_unavailable"
+    tradable = False
+
+    if snapshot is None and exchange_listing_available and not exchange_supported:
+        reason_code = "venue_instrument_unsupported"
+        spec_status = "missing"
+    elif snapshot is not None and not _valid_capability_time(fetched_at, expires_at, now):
+        reason_code = "contract_spec_invalid"
+        spec_status = "invalid"
+    elif snapshot is not None and _utc_datetime(now) >= _utc_datetime(expires_at):
+        reason_code = "contract_spec_stale"
+        spec_status = "stale"
+    elif snapshot is not None and capability is None:
+        reason_code = "venue_instrument_unsupported"
+        spec_status = "missing"
+    elif capability is not None and venue_state != "live":
+        reason_code = "venue_instrument_not_live"
+        spec_status = "fresh"
+    elif capability is not None:
+        spec_status = "fresh"
+        if selected:
+            reason_code = "tradable"
+            tradable = True
+        else:
+            reason_code = "global_not_allowed"
+
+    dynamic_fields = {
+        "venue_supported": venue_supported,
+        "venue_state": venue_state,
+        "spec_status": spec_status,
+        "tradable": tradable,
+        "reason_code": reason_code,
+        "fetched_at": _format_capability_datetime(fetched_at),
+        "expires_at": _format_capability_datetime(expires_at),
+    }
+    return {
+        **dynamic_fields,
+        **_trading_symbol_execution_fields(
+            symbol,
+            selected=selected,
+            provider=contract_spec_provider,
+            execution_mode=execution_mode,
+            dynamic_fields=dynamic_fields,
+        ),
+    }
+
+
+def _trading_symbol_execution_fields(
+    symbol: str,
+    *,
+    selected: bool,
+    provider: Any | None,
+    execution_mode: str | None,
+    dynamic_fields: dict[str, Any],
+) -> dict[str, Any]:
+    mode = execution_mode
+    if mode not in {"static", "shadow", "live"}:
+        mode = (
+            "live"
+            if callable(getattr(provider, "lookup_contract_spec", None))
+            else "static"
+            if provider is not None
+            else "unavailable"
+        )
+    if mode == "live" or mode == "unavailable":
+        return {
+            "execution_mode": mode,
+            "execution_tradable": bool(dynamic_fields["tradable"]),
+            "execution_reason_code": str(dynamic_fields["reason_code"]),
+        }
+
+    effective_provider = getattr(provider, "static_provider", provider)
+    instrument_id = _to_deepcoin_swap_instrument(symbol)
+    try:
+        contract_spec = effective_provider.get_contract_spec(instrument_id)
+    except Exception:
+        contract_spec = None
+    spec_matches = (
+        contract_spec is not None
+        and str(getattr(contract_spec, "instrument_id", "")).upper() == instrument_id
+    )
+    if not spec_matches:
+        execution_reason = "contract_spec_missing"
+    elif not selected:
+        execution_reason = "global_not_allowed"
+    else:
+        execution_reason = "tradable"
+    return {
+        "execution_mode": mode,
+        "execution_tradable": execution_reason == "tradable",
+        "execution_reason_code": execution_reason,
+    }
+
+
+def _valid_capability_time(
+    fetched_at: Any,
+    expires_at: Any,
+    now: datetime | None,
+) -> bool:
+    values = (fetched_at, expires_at, now)
+    if not all(
+        isinstance(value, datetime)
+        and value.tzinfo is not None
+        and value.utcoffset() is not None
+        for value in values
+    ):
+        return False
+    return (
+        _utc_datetime(fetched_at) < _utc_datetime(expires_at)
+        and _utc_datetime(fetched_at) <= _utc_datetime(now)
+    )
+
+
+def _utc_datetime(value: datetime | None) -> datetime:
+    if value is None or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("capability time must be timezone-aware")
+    return value.astimezone(UTC)
+
+
+def _format_capability_datetime(value: Any) -> str | None:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        return None
+    if value.utcoffset() is None:
+        return None
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _bounded_contract_spec_status(status: Any) -> dict[str, Any] | None:
+    if not isinstance(status, dict):
+        return None
+    bounded = dict(status)
+    error = bounded.get("last_error")
+    if error is not None:
+        bounded["last_error"] = str(error)[:240]
+    return bounded
 
 
 def _refreshable_contract_spec_provider(provider: Any) -> Any | None:
@@ -6240,13 +6424,20 @@ def create_web_app(
             if orchestrator is not None
             else None
         )
+        capability_provider = _refreshable_contract_spec_provider(
+            app.state.deepcoin_contract_spec_provider
+        )
+        capability_snapshot = getattr(capability_provider, "snapshot", None)
+        exchange_symbols_verified = exchange_symbols is not None
         if exchange_symbols is None:
             try:
                 deepcoin_client = app.state.deepcoin_client_factory()
                 if not hasattr(deepcoin_client, "list_swap_symbols"):
                     raise DeepcoinClientError("Deepcoin client cannot list symbols")
                 exchange_symbols = deepcoin_client.list_swap_symbols()
+                exchange_symbols_verified = True
             except Exception:
+                exchange_symbols_verified = False
                 exchange_symbols = [
                     {
                         "symbol": symbol,
@@ -6260,10 +6451,22 @@ def create_web_app(
                 selected_symbols=saved_symbols,
                 symbol_max_loss_usdt=settings.symbol_max_loss_usdt,
                 entry_thresholds_for_symbol=settings.entry_thresholds_for_symbol,
+                capability_snapshot=capability_snapshot,
+                now=app.state.now_provider(),
+                exchange_symbols_verified=exchange_symbols_verified,
+                contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+                execution_mode=(
+                    settings.deepcoin_contract_specs_mode
+                    if hasattr(
+                        app.state.deepcoin_contract_spec_provider,
+                        "authoritative_provider",
+                    )
+                    else None
+                ),
             )
         }
         if refresh_status is not None:
-            response["contract_specs"] = refresh_status
+            response["contract_specs"] = _bounded_contract_spec_status(refresh_status)
         return response
 
     @app.post("/api/trading-settings")

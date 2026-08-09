@@ -2486,6 +2486,36 @@ function restoreExchangePositionView(root) {
   setExchangePositionView(root, exchangePositionViewMode());
 }
 
+function boundedContractSpecStatusText(status) {
+  const payload = status && typeof status === 'object' ? status : {};
+  const state = String(payload.state || 'unavailable');
+  const error = String(payload.last_error || '').slice(0, 240);
+  return error
+    ? `Deepcoin 规格状态：${state}；${error}`
+    : `Deepcoin 规格状态：${state}`;
+}
+
+function symbolCapabilityView(item, selected) {
+  const venueReady = item.venue_supported === true
+    && item.venue_state === 'live'
+    && item.spec_status === 'fresh';
+  const reasonCode = venueReady
+    ? (selected ? 'tradable' : 'global_not_allowed')
+    : String(item.reason_code || 'contract_spec_sync_unavailable');
+  const executionReady = ['tradable', 'global_not_allowed'].includes(
+    String(item.execution_reason_code || ''),
+  );
+  const executionReasonCode = executionReady
+    ? (selected ? 'tradable' : 'global_not_allowed')
+    : String(item.execution_reason_code || reasonCode);
+  return {
+    tradable: selected && venueReady,
+    reason_code: reasonCode,
+    execution_tradable: selected && executionReady,
+    execution_reason_code: executionReasonCode,
+  };
+}
+
 function initTradingSymbolSelector(form) {
   const selector = form.querySelector('[data-symbol-selector]');
   if (!selector) {
@@ -2496,6 +2526,7 @@ function initTradingSymbolSelector(form) {
   const thresholdsInput = selector.querySelector('[data-symbol-entry-thresholds-input]');
   const searchInput = selector.querySelector('[data-symbol-search]');
   const summary = selector.querySelector('[data-symbol-selector-summary]');
+  const contractSpecStatus = selector.querySelector('[data-contract-spec-status]');
   const selectedList = selector.querySelector('[data-selected-symbol-list]');
   const symbolList = selector.querySelector('[data-symbol-selector-list]');
   const riskList = selector.querySelector('[data-selected-symbol-risk-list]');
@@ -2623,11 +2654,21 @@ function initTradingSymbolSelector(form) {
       return;
     }
     selectedSymbols.forEach((symbol) => {
+      const capability = state.symbols.find((item) => item.symbol === symbol);
+      const capabilityView = capability
+        ? symbolCapabilityView(capability, true)
+        : null;
       const chip = document.createElement('button');
       chip.type = 'button';
       chip.className = 'selected-symbol-chip';
       chip.textContent = symbol;
       chip.title = `移除 ${symbol}`;
+      if (capabilityView && !capabilityView.execution_tradable) {
+        chip.classList.add('is-non-tradable');
+        chip.title = `${symbol}：Deepcoin 不可交易；点击仅会从全局允许列表移除`;
+      } else if (capabilityView && !capabilityView.tradable) {
+        chip.title = `${symbol}：当前 ${capability.execution_mode} 执行可用，Deepcoin 动态能力不可用`;
+      }
       chip.addEventListener('click', () => {
         state.selected.delete(symbol);
         syncInputs();
@@ -2644,9 +2685,13 @@ function initTradingSymbolSelector(form) {
       return;
     }
     const query = state.query.trim().toUpperCase();
-    const visible = state.symbols
-      .filter((item) => !query || item.symbol.includes(query) || item.instrument_id.includes(query))
-      .slice(0, 80);
+    const matches = state.symbols
+      .filter((item) => !query || item.symbol.includes(query) || item.instrument_id.includes(query));
+    const selectedMatches = matches.filter((item) => state.selected.has(item.symbol));
+    const unselectedMatches = matches.filter((item) => !state.selected.has(item.symbol));
+    const visible = selectedMatches.concat(
+      unselectedMatches.slice(0, Math.max(0, 80 - selectedMatches.length)),
+    );
     symbolList.innerHTML = '';
     visible.forEach((item) => {
       const label = document.createElement('label');
@@ -2670,7 +2715,26 @@ function initTradingSymbolSelector(form) {
       symbol.textContent = item.symbol;
       const instrument = document.createElement('span');
       instrument.textContent = item.instrument_id;
-      label.append(checkbox, symbol, instrument);
+      const badge = document.createElement('span');
+      const capabilityView = symbolCapabilityView(
+        item,
+        state.selected.has(item.symbol),
+      );
+      badge.className = `symbol-capability-badge ${capabilityView.tradable ? 'is-tradable' : 'is-non-tradable'}`;
+      const badgeLabels = {
+        tradable: 'Deepcoin 可交易',
+        global_not_allowed: 'Deepcoin 可用·未全局允许',
+        venue_instrument_unsupported: 'Deepcoin 不支持',
+        venue_instrument_not_live: `Deepcoin 不可交易·${item.venue_state || '非 live'}`,
+        contract_spec_stale: '规格已过期·Deepcoin 不可交易',
+        contract_spec_invalid: '规格无效·Deepcoin 不可交易',
+        contract_spec_sync_unavailable: '规格同步不可用·Deepcoin 不可交易',
+      };
+      const venueLabel = badgeLabels[capabilityView.reason_code] || 'Deepcoin 不可交易';
+      badge.textContent = ['static', 'shadow'].includes(item.execution_mode)
+        ? `${item.execution_mode} 执行${capabilityView.execution_tradable ? '可交易' : '不可交易'}·${venueLabel}`
+        : venueLabel;
+      label.append(checkbox, symbol, instrument, badge);
       symbolList.appendChild(label);
     });
     if (summary) {
@@ -2696,7 +2760,22 @@ function initTradingSymbolSelector(form) {
       state.symbols = symbols.map((item) => ({
         symbol: String(item.symbol || '').toUpperCase(),
         instrument_id: String(item.instrument_id || '').toUpperCase(),
+        venue_supported: item.venue_supported === true,
+        venue_state: item.venue_state == null ? null : String(item.venue_state),
+        spec_status: String(item.spec_status || 'sync_unavailable'),
+        tradable: item.tradable === true,
+        reason_code: String(item.reason_code || 'contract_spec_sync_unavailable'),
+        fetched_at: item.fetched_at == null ? null : String(item.fetched_at),
+        expires_at: item.expires_at == null ? null : String(item.expires_at),
+        execution_mode: String(item.execution_mode || 'unavailable'),
+        execution_tradable: item.execution_tradable === true,
+        execution_reason_code: String(item.execution_reason_code || 'contract_spec_sync_unavailable'),
       })).filter((item) => item.symbol);
+      if (contractSpecStatus) {
+        const status = payload.contract_specs || {};
+        contractSpecStatus.textContent = boundedContractSpecStatusText(status);
+        contractSpecStatus.classList.toggle('is-error', Boolean(status.last_error));
+      }
       syncInputs();
       renderSymbols();
       renderSelectedSymbols();
@@ -2710,6 +2789,16 @@ function initTradingSymbolSelector(form) {
       state.symbols = Array.from(state.selected).sort().map((symbol) => ({
         symbol,
         instrument_id: `${symbol}-USDT-SWAP`,
+        venue_supported: false,
+        venue_state: null,
+        spec_status: 'sync_unavailable',
+        tradable: false,
+        reason_code: 'contract_spec_sync_unavailable',
+        fetched_at: null,
+        expires_at: null,
+        execution_mode: 'unavailable',
+        execution_tradable: false,
+        execution_reason_code: 'contract_spec_sync_unavailable',
       }));
       renderSymbols();
       renderSelectedSymbols();
