@@ -2621,6 +2621,20 @@ def test_process_trade_signal_live_cancels_all_bound_trigger_entry_legs(tmp_path
         pos_id=None,
         status="open",
     )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        lifecycle = StrategyLifecycle(
+            chat_id=binding.chat_id,
+            message_id=binding.message_id,
+            symbol=binding.symbol,
+            side=binding.side,
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 8, 8, tzinfo=UTC),
+            execution_binding_id=binding_id,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
     upsert_execution_order_leg(
         session_factory,
         ExecutionOrderLegRecord(
@@ -2709,6 +2723,20 @@ def test_pending_entry_cancel_state_less_history_requires_combined_proof(
         pos_id=None,
         status="open",
     )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        lifecycle = StrategyLifecycle(
+            chat_id=binding.chat_id,
+            message_id=binding.message_id,
+            symbol=binding.symbol,
+            side=binding.side,
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 8, 8, tzinfo=UTC),
+            execution_binding_id=binding_id,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
     for index, (order_id, client_order_id, price, size) in enumerate(
         (
             ("trigger-1", "client-1", "65510", "10"),
@@ -2774,7 +2802,14 @@ def test_pending_entry_cancel_state_less_history_requires_combined_proof(
             if failure_mode == "fill":
                 self.trade_fills.append({"ordId": cancel_payload["ordId"], "fillSz": "1"})
             if failure_mode == "live_position":
-                self.positions.append({"ordId": cancel_payload["ordId"], "pos": "1"})
+                self.positions.append(
+                    {
+                        "posId": "race-position",
+                        "instId": "ETH-USDT-SWAP",
+                        "posSide": "long",
+                        "pos": "1",
+                    }
+                )
             if failure_mode == "missing_success":
                 return {}
             return {"code": "0", "data": {"ordId": cancel_payload["ordId"]}}
@@ -2785,6 +2820,11 @@ def test_pending_entry_cancel_state_less_history_requires_combined_proof(
                 session_factory,
                 trade_signal=trade_signal,
                 deepcoin_client=Client(),
+            )
+        with session_factory() as session:
+            assert (
+                session.get(StrategyLifecycle, lifecycle_id).lifecycle_status
+                == "pending_entry"
             )
         return
 
@@ -2801,6 +2841,10 @@ def test_pending_entry_cancel_state_less_history_requires_combined_proof(
         execution_binding_id=binding_id,
     )
     assert [leg.status for leg in legs] == ["cancelled", "cancelled"]
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        assert lifecycle.lifecycle_status == "exited"
+        assert lifecycle.exit_reason == "cancelled"
 
 
 def test_process_trade_signal_live_recreates_trigger_entry_with_embedded_stop_only(tmp_path):

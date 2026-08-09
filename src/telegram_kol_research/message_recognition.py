@@ -1301,11 +1301,6 @@ def _apply_lifecycle_event_decision(
         return True
 
     if event_type == "cancel_entry" and target.lifecycle_status == "pending_entry":
-        target.lifecycle_status = "exited"
-        target.exit_reason = "cancelled"
-        target.exited_at = event_at
-        target.exit_signal_message_id = raw_message.message_id
-        target.updated_at = utc_now()
         candidate = _upsert_close_signal_candidate(
             session,
             raw_message=raw_message,
@@ -2780,17 +2775,22 @@ def _apply_instruction_compatibility_view(
         payload["strategy"] = dict(entry.strategy or {})
         payload["confidence"] = float(entry.confidence)
 
+    management_instructions = [
+        row
+        for row in instructions
+        if row.kind not in {"entry", "replace_entry"}
+    ]
+    if len(management_instructions) > 1:
+        raise AuthoritativeInstructionError(
+            "multiple_management_instructions_unsupported"
+        )
+
     lifecycle_event = (
         dict(payload["lifecycle_event"])
         if isinstance(payload.get("lifecycle_event"), dict)
         else {"event_type": "none", "confidence": 0.0}
     )
     if str(lifecycle_event.get("event_type") or "none") == "none":
-        management_instructions = [
-            row
-            for row in instructions
-            if row.kind not in {"entry", "replace_entry"}
-        ]
         if len(management_instructions) == 1:
             management = management_instructions[0]
             event_type, management_action = {
@@ -2875,33 +2875,55 @@ def apply_authoritative_mimo_payload(
             session.commit()
             return result
 
+        rollout_active = (
+            trading_settings.multi_instruction_mode in {"shadow", "live"}
+            and int(raw_message_id)
+            > trading_settings.multi_instruction_activation_after_raw_message_id
+        )
         try:
-            normalized_instructions = normalize_authoritative_instructions(payload)
-            if (
-                trading_settings.multi_instruction_mode == "live"
-                and int(raw_message_id)
-                > trading_settings.multi_instruction_activation_after_raw_message_id
-            ):
+            if rollout_active:
+                normalized_instructions = normalize_authoritative_instructions(payload)
+            else:
+                normalized_instructions = ()
+            if rollout_active and trading_settings.multi_instruction_mode == "shadow":
+                payload = dict(payload)
+                payload["_multi_instruction_shadow"] = {
+                    "declared_count": len(normalized_instructions),
+                    "instruction_kinds": [
+                        instruction.kind for instruction in normalized_instructions
+                    ],
+                    "executable_projection_count": 0,
+                }
+            if rollout_active and trading_settings.multi_instruction_mode == "live":
                 payload = _apply_instruction_compatibility_view(
                     dict(payload),
                     normalized_instructions,
                 )
         except AuthoritativeInstructionError as exc:
-            result = MessageRecognitionResult(
-                raw_message_id=raw_message_id,
-                status="识别失败",
-                reason=f"authoritative_instruction_contract_invalid:{exc}",
-                ai_payload=dict(payload),
-                parse_source="mimo_authoritative",
-            )
-            _upsert_recognition(session, result, engine=model)
-            _project_authoritative_instruction_items(
-                session,
-                raw_message_id=raw_message_id,
-                accepted_candidate_ids=accepted_candidate_ids,
-            )
-            session.commit()
-            return result
+            if trading_settings.multi_instruction_mode == "shadow":
+                payload = dict(payload)
+                payload["_multi_instruction_shadow"] = {
+                    "declared_count": None,
+                    "instruction_kinds": [],
+                    "executable_projection_count": 0,
+                    "validation_error": str(exc),
+                }
+            else:
+                result = MessageRecognitionResult(
+                    raw_message_id=raw_message_id,
+                    status="识别失败",
+                    reason=f"authoritative_instruction_contract_invalid:{exc}",
+                    ai_payload=dict(payload),
+                    parse_source="mimo_authoritative",
+                )
+                _upsert_recognition(session, result, engine=model)
+                _project_authoritative_instruction_items(
+                    session,
+                    raw_message_id=raw_message_id,
+                    accepted_candidate_ids=accepted_candidate_ids,
+                )
+                session.commit()
+                return result
         lifecycle_event = (
             dict(payload["lifecycle_event"])
             if isinstance(payload.get("lifecycle_event"), dict)
@@ -3798,16 +3820,12 @@ def _apply_bitcoin_junzhang_cancel_if_matched(session, raw_message: RawMessage, 
     )
     if lifecycle is None:
         return False
-    lifecycle.lifecycle_status = "exited"
-    lifecycle.exit_reason = "cancelled"
-    lifecycle.exited_at = raw_message.posted_at or utc_now()
-    lifecycle.exit_signal_message_id = raw_message.message_id
-    lifecycle.updated_at = utc_now()
     _upsert_close_signal_candidate(
         session,
         raw_message=raw_message,
         lifecycle=lifecycle,
         parse_source=BITCOIN_JUNZHANG_PARSE_SOURCE,
+        management_action="cancel_pending_entry",
     )
     return True
 
@@ -4158,23 +4176,36 @@ def _apply_cancel_signal_if_matched(
                 exit_message_id=raw_message.message_id,
                 reason=text,
             )
+            _upsert_close_signal_candidate(
+                session,
+                raw_message=raw_message,
+                lifecycle=lifecycle,
+                parse_source="cancel_heuristic",
+                management_action="cancel_pending_entry",
+            )
             continue
         entered_after_cancel_message = _lifecycle_entered_after_message(lifecycle, raw_message)
+        if lifecycle.lifecycle_status == "pending_entry" or entered_after_cancel_message:
+            _upsert_close_signal_candidate(
+                session,
+                raw_message=raw_message,
+                lifecycle=lifecycle,
+                parse_source="cancel_heuristic",
+                management_action="cancel_pending_entry",
+            )
+            continue
         lifecycle.lifecycle_status = "exited"
         lifecycle.exit_reason = "cancelled"
         lifecycle.exited_at = exited_at
         lifecycle.exit_signal_message_id = raw_message.message_id
-        if entered_after_cancel_message:
-            lifecycle.entered_at = None
-            lifecycle.entry_price_actual = None
         lifecycle.updated_at = utc_now()
-
-    _upsert_close_signal_candidate(
-        session,
-        raw_message=raw_message,
-        lifecycle=latest,
-        parse_source="cancel_heuristic",
-    )
+        _upsert_close_signal_candidate(
+            session,
+            raw_message=raw_message,
+            lifecycle=lifecycle,
+            parse_source="cancel_heuristic",
+            management_action="cancel_pending_entry",
+        )
     return True
 
 

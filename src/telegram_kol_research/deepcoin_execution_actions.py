@@ -1399,6 +1399,12 @@ def cancel_pending_entry_legs(
         trigger_orders=deepcoin_client.list_trigger_orders_pending(inst_id=inst_id),
         regular_orders=deepcoin_client.list_open_orders(inst_id=inst_id),
     )
+    position_reader = getattr(deepcoin_client, "list_positions", None)
+    pre_position_rows = (
+        list(position_reader(inst_id=inst_id) or [])
+        if position_reader is not None
+        else None
+    )
     history_rows, fill_rows = _read_pending_entry_terminal_evidence(
         deepcoin_client,
         inst_id=inst_id,
@@ -1464,6 +1470,13 @@ def cancel_pending_entry_legs(
         for leg in absent_legs
     ]
     if not visible_by_leg:
+        if not any(leg.has_position for leg in pending_legs):
+            _mark_pending_entry_lifecycle_cancelled(
+                session_factory,
+                binding_id=binding.id,
+                exit_message_id=trade_signal.message_id,
+                exited_at=now,
+            )
         return {
             "submitted": False,
             "status": "already_absent",
@@ -1553,7 +1566,6 @@ def cancel_pending_entry_legs(
         deepcoin_client,
         inst_id=inst_id,
     )
-    position_reader = getattr(deepcoin_client, "list_positions", None)
     post_position_rows = (
         list(position_reader(inst_id=inst_id) or [])
         if position_reader is not None
@@ -1569,6 +1581,7 @@ def cancel_pending_entry_legs(
         history_rows=post_history_rows,
         fill_rows=post_fill_rows,
         successful_cancellations=cancelled_orders,
+        pre_position_rows=pre_position_rows,
         position_rows=post_position_rows,
     )
 
@@ -1593,6 +1606,13 @@ def cancel_pending_entry_legs(
         },
         updated_at=now,
     )
+    if not any(leg.has_position for leg in pending_legs):
+        _mark_pending_entry_lifecycle_cancelled(
+            session_factory,
+            binding_id=binding.id,
+            exit_message_id=trade_signal.message_id,
+            exited_at=now,
+        )
     return {
         "submitted": True,
         "venue": "deepcoin",
@@ -2070,6 +2090,7 @@ def _require_cancelled_history_for_pending_entry_legs(
     history_rows: list[dict[str, Any]] | None,
     fill_rows: list[dict[str, Any]] | None,
     successful_cancellations: list[dict[str, Any]] | None = None,
+    pre_position_rows: list[dict[str, Any]] | None = None,
     position_rows: list[dict[str, Any]] | None = None,
 ) -> None:
     if history_rows is None or fill_rows is None:
@@ -2094,6 +2115,7 @@ def _require_cancelled_history_for_pending_entry_legs(
             leg,
             history_matches=history_matches,
             successful_cancellations=successful_cancellations,
+            pre_position_rows=pre_position_rows,
             position_rows=position_rows,
         ):
             continue
@@ -2108,11 +2130,16 @@ def _has_strict_stateless_cancel_proof(
     *,
     history_matches: list[dict[str, Any]],
     successful_cancellations: list[dict[str, Any]] | None,
+    pre_position_rows: list[dict[str, Any]] | None,
     position_rows: list[dict[str, Any]] | None,
 ) -> bool:
     """Accept state-less history only with same-invocation, exact readback proof."""
 
-    if successful_cancellations is None or position_rows is None:
+    if (
+        successful_cancellations is None
+        or pre_position_rows is None
+        or position_rows is None
+    ):
         return False
     matching_cancellations = [
         item
@@ -2135,6 +2162,12 @@ def _has_strict_stateless_cancel_proof(
     for position in position_rows:
         if _row_shares_order_identity(position, leg):
             return False
+    if _position_exposure_increased(
+        before,
+        pre_position_rows=pre_position_rows,
+        post_position_rows=position_rows,
+    ):
+        return False
     return True
 
 
@@ -2223,6 +2256,52 @@ def _row_shares_order_identity(
     )
 
 
+def _position_exposure_increased(
+    order: dict[str, Any],
+    *,
+    pre_position_rows: list[dict[str, Any]],
+    post_position_rows: list[dict[str, Any]],
+) -> bool:
+    inst_id = _first_string(order, "instId", "instrumentId", "symbol")
+    pos_side = _first_string(order, "posSide", "positionSide")
+    if not inst_id or not pos_side:
+        return True
+
+    def exposure(rows: list[dict[str, Any]]) -> tuple[set[str], Decimal] | None:
+        position_ids: set[str] = set()
+        total = Decimal("0")
+        for row in rows:
+            if (
+                str(_first_string(row, "instId", "instrumentId", "symbol") or "").upper()
+                != inst_id.upper()
+                or str(_first_string(row, "posSide", "positionSide") or "").lower()
+                != pos_side.lower()
+            ):
+                continue
+            raw_size = _first_present_value(row, ("pos", "position", "sz", "size"))
+            if raw_size in (None, ""):
+                return None
+            try:
+                size = abs(Decimal(str(raw_size)))
+            except (InvalidOperation, TypeError, ValueError):
+                return None
+            if size == 0:
+                continue
+            position_id = _first_string(row, "posId", "pos_id", "positionId")
+            if position_id:
+                position_ids.add(position_id)
+            total += size
+        return position_ids, total
+
+    before = exposure(pre_position_rows)
+    after = exposure(post_position_rows)
+    if before is None or after is None:
+        return True
+    before_ids, before_total = before
+    after_ids, after_total = after
+    return bool(after_ids - before_ids) or after_total > before_total
+
+
 def _mark_pending_entry_leg_ids_cancelled(
     session_factory: sessionmaker,
     *,
@@ -2247,6 +2326,29 @@ def _mark_pending_entry_leg_ids_cancelled(
                 leg.status = "cancelled"
                 leg.terminal_reason = terminal_reason
             leg.updated_at = updated_at
+        session.commit()
+
+
+def _mark_pending_entry_lifecycle_cancelled(
+    session_factory: sessionmaker,
+    *,
+    binding_id: int,
+    exit_message_id: int,
+    exited_at: datetime,
+) -> None:
+    """Converge lifecycle only after every exact pending leg is terminal."""
+
+    with session_factory() as session:
+        lifecycles = session.query(StrategyLifecycle).filter(
+            StrategyLifecycle.execution_binding_id == int(binding_id),
+            StrategyLifecycle.lifecycle_status == "pending_entry",
+        ).all()
+        for lifecycle in lifecycles:
+            lifecycle.lifecycle_status = "exited"
+            lifecycle.exit_reason = "cancelled"
+            lifecycle.exited_at = exited_at
+            lifecycle.exit_signal_message_id = int(exit_message_id)
+            lifecycle.updated_at = exited_at
         session.commit()
 
 

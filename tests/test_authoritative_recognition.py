@@ -1061,7 +1061,7 @@ def test_context_cancel_targets_exact_thread_before_projection(tmp_path, monkeyp
             )
             .one()
         )
-    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.lifecycle_status == "pending_entry"
     assert item.instruction_kind == "management"
     assert link.strategy_thread_id == thread.id
 

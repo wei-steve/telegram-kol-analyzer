@@ -1838,6 +1838,9 @@ def test_dabiaoke_4206_projects_cancel_and_independent_long_from_instructions(
             .order_by(MessageInstructionItem.sequence)
             .all()
         )
+        lifecycle_status = session.get(
+            StrategyLifecycle, old_lifecycle_id
+        ).lifecycle_status
 
     assert [
         (
@@ -1855,6 +1858,7 @@ def test_dabiaoke_4206_projects_cancel_and_independent_long_from_instructions(
         (0, "management"),
         (1, "entry"),
     ]
+    assert lifecycle_status == "pending_entry"
 
 
 @pytest.mark.parametrize(
@@ -1926,6 +1930,70 @@ def test_multi_instruction_rollout_is_future_only(
             == expected_candidates
         )
     assert "instructions" in (result.ai_payload or {})
+    if mode == "shadow":
+        assert result.ai_payload["_multi_instruction_shadow"] == {
+            "declared_count": 1,
+            "instruction_kinds": ["entry"],
+            "executable_projection_count": 0,
+        }
+
+
+def test_disabled_multi_instruction_mode_ignores_invalid_new_contract(tmp_path):
+    session_factory = create_session_factory(tmp_path / "disabled-invalid.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=88, message_id=8002, text="ordinary message")
+        session.add(raw)
+        session.commit()
+        raw_message_id = raw.id
+
+    result = apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload={
+            "instructions": "malformed rollout field",
+            "recognition_result": "非策略",
+            "strategy": {},
+            "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+            "confidence": 0.9,
+        },
+        model="mimo-v2.5",
+    )
+
+    assert result.status == "非策略"
+
+
+def test_shadow_multi_instruction_validation_error_is_observational(tmp_path):
+    session_factory = create_session_factory(tmp_path / "shadow-invalid.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=88, message_id=8003, text="ordinary message")
+        session.add(raw)
+        session.commit()
+        raw_message_id = raw.id
+    save_trading_settings(
+        session_factory,
+        {
+            "multi_instruction_mode": "shadow",
+            "multi_instruction_activation_after_raw_message_id": 0,
+        },
+    )
+
+    result = apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload={
+            "instructions": "malformed rollout field",
+            "recognition_result": "非策略",
+            "strategy": {},
+            "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+            "confidence": 0.9,
+        },
+        model="mimo-v2.5",
+    )
+
+    assert result.status == "非策略"
+    assert result.ai_payload["_multi_instruction_shadow"]["validation_error"] == (
+        "instructions_not_list"
+    )
 
 
 def test_authoritative_rerecognition_retires_superseded_pending_item(tmp_path):
@@ -3052,10 +3120,11 @@ def test_recognize_message_now_cancels_recent_pending_limit_order(tmp_path):
         lifecycle = session.get(StrategyLifecycle, lifecycle_id)
         candidate = session.query(SignalCandidate).one()
 
-    assert lifecycle.lifecycle_status == "exited"
-    assert lifecycle.exit_reason == "cancelled"
-    assert lifecycle.exit_signal_message_id == 376
+    assert lifecycle.lifecycle_status == "pending_entry"
+    assert lifecycle.exit_reason is None
+    assert lifecycle.exit_signal_message_id is None
     assert candidate.event_type == "close_signal"
+    assert candidate.management_action == "cancel_pending_entry"
     assert candidate.parse_source == "cancel_heuristic"
     assert candidate.symbol == "BTC"
     assert candidate.side == "short"
@@ -3226,9 +3295,9 @@ def test_ai_lifecycle_event_cancels_pending_order(tmp_path, monkeypatch):
         lifecycle = session.get(StrategyLifecycle, lifecycle_id)
         candidate = session.query(SignalCandidate).one()
 
-    assert lifecycle.lifecycle_status == "exited"
-    assert lifecycle.exit_reason == "cancelled"
-    assert lifecycle.exit_signal_message_id == 376
+    assert lifecycle.lifecycle_status == "pending_entry"
+    assert lifecycle.exit_reason is None
+    assert lifecycle.exit_signal_message_id is None
     assert candidate.parse_source == "lifecycle_ai"
 
 
@@ -3343,8 +3412,8 @@ def test_ai_lifecycle_event_cancels_replied_pending_strategy(tmp_path, monkeypat
         lifecycle = session.get(StrategyLifecycle, lifecycle_id)
         candidate = session.query(SignalCandidate).one()
 
-    assert lifecycle.lifecycle_status == "exited"
-    assert lifecycle.exit_reason == "cancelled"
+    assert lifecycle.lifecycle_status == "pending_entry"
+    assert lifecycle.exit_reason is None
     assert candidate.target_lifecycle_id == lifecycle_id
     assert candidate.event_type == "close_signal"
 
@@ -3529,6 +3598,24 @@ def test_configured_ai_falls_back_to_local_cancel_for_unentered_btc_orders(
             text="今日两次BTC策略都没有入场，取消吧",
         )
         session.add_all([first_lifecycle, second_lifecycle, later_lifecycle, raw_message])
+        session.flush()
+        for lifecycle in (first_lifecycle, second_lifecycle):
+            binding = ExecutionBinding(
+                strategy_instance_id=(
+                    f"deepcoin:88:{lifecycle.message_id}:BTC:{lifecycle.side}"
+                ),
+                kol_id="group:88",
+                chat_id=88,
+                message_id=lifecycle.message_id,
+                symbol="BTC",
+                side=lifecycle.side,
+                venue="deepcoin",
+                status="open",
+                order_id=f"order-{lifecycle.message_id}",
+            )
+            session.add(binding)
+            session.flush()
+            lifecycle.execution_binding_id = binding.id
         session.commit()
         raw_message_id = raw_message.id
         first_lifecycle_id = first_lifecycle.id
@@ -3566,20 +3653,28 @@ def test_configured_ai_falls_back_to_local_cancel_for_unentered_btc_orders(
         first_lifecycle = session.get(StrategyLifecycle, first_lifecycle_id)
         second_lifecycle = session.get(StrategyLifecycle, second_lifecycle_id)
         later_lifecycle = session.get(StrategyLifecycle, later_lifecycle_id)
-        candidate = session.query(SignalCandidate).one()
+        candidates = session.query(SignalCandidate).order_by(SignalCandidate.id).all()
 
-    assert first_lifecycle.lifecycle_status == "exited"
-    assert first_lifecycle.exit_reason == "cancelled"
+    assert first_lifecycle.lifecycle_status == "pending_entry"
+    assert first_lifecycle.exit_reason is None
     assert first_lifecycle.exit_signal_message_id == 376
-    assert second_lifecycle.lifecycle_status == "exited"
-    assert second_lifecycle.exit_reason == "cancelled"
+    assert second_lifecycle.lifecycle_status == "pending_entry"
+    assert second_lifecycle.exit_reason is None
     assert second_lifecycle.exit_signal_message_id == 376
     assert later_lifecycle.lifecycle_status == "pending_entry"
-    assert candidate.event_type == "close_signal"
-    assert candidate.parse_source == "cancel_heuristic"
+    assert {candidate.target_lifecycle_id for candidate in candidates} == {
+        first_lifecycle_id,
+        second_lifecycle_id,
+    }
+    assert {candidate.management_action for candidate in candidates} == {
+        "cancel_pending_entry"
+    }
+    assert {candidate.parse_source for candidate in candidates} == {
+        "cancel_heuristic"
+    }
 
 
-def test_unentered_cancel_reverts_lifecycle_entered_after_cancel_message(tmp_path):
+def test_unentered_cancel_does_not_rewrite_later_entry_before_exchange_proof(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
         lifecycle = StrategyLifecycle(
@@ -3617,10 +3712,10 @@ def test_unentered_cancel_reverts_lifecycle_entered_after_cancel_message(tmp_pat
         lifecycle = session.get(StrategyLifecycle, lifecycle_id)
         candidate = session.query(SignalCandidate).one()
 
-    assert lifecycle.lifecycle_status == "exited"
-    assert lifecycle.exit_reason == "cancelled"
-    assert lifecycle.exited_at == datetime(2026, 7, 8, 15, 44)
-    assert lifecycle.exit_signal_message_id == 3885
+    assert lifecycle.lifecycle_status == "entered"
+    assert lifecycle.exit_reason is None
+    assert lifecycle.exited_at is None
+    assert lifecycle.exit_signal_message_id is None
     assert candidate.event_type == "close_signal"
     assert candidate.parse_source == "cancel_heuristic"
 
@@ -3695,12 +3790,17 @@ def test_ai_cancel_event_also_runs_local_plural_cancel_fallback(tmp_path, monkey
     with session_factory() as session:
         pending_lifecycle = session.get(StrategyLifecycle, pending_lifecycle_id)
         later_entered_lifecycle = session.get(StrategyLifecycle, later_entered_lifecycle_id)
+        candidates = session.query(SignalCandidate).order_by(SignalCandidate.id).all()
 
-    assert pending_lifecycle.lifecycle_status == "exited"
-    assert pending_lifecycle.exit_reason == "cancelled"
-    assert later_entered_lifecycle.lifecycle_status == "exited"
-    assert later_entered_lifecycle.exit_reason == "cancelled"
-    assert later_entered_lifecycle.entered_at is None
+    assert pending_lifecycle.lifecycle_status == "pending_entry"
+    assert pending_lifecycle.exit_reason is None
+    assert later_entered_lifecycle.lifecycle_status == "entered"
+    assert later_entered_lifecycle.exit_reason is None
+    assert later_entered_lifecycle.entered_at is not None
+    assert {candidate.target_lifecycle_id for candidate in candidates} == {
+        pending_lifecycle_id,
+        later_entered_lifecycle_id,
+    }
 
 
 def test_local_exit_signal_closes_btc_long_all_out_message(tmp_path):

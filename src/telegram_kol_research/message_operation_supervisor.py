@@ -44,6 +44,7 @@ from telegram_kol_research.models import (
 from telegram_kol_research.runtime_incident_adapters import (
     capture_message_operation_failure,
 )
+from telegram_kol_research.trading_settings import load_trading_settings
 
 
 OUTCOME_STATES = frozenset(
@@ -179,6 +180,71 @@ def audit_multi_instruction_completeness(
             }
         )
     return tuple(violations)
+
+
+def apply_multi_instruction_completeness_violations(
+    session_factory: sessionmaker,
+    *,
+    after_raw_message_id: int,
+    limit: int,
+    observed_at: datetime,
+) -> int:
+    """Persist severe multi-instruction gaps into the supervisor contract path."""
+
+    if (
+        type(after_raw_message_id) is not int
+        or after_raw_message_id < 0
+        or type(limit) is not int
+        or not 1 <= limit <= 100
+    ):
+        raise MessageOperationEvaluationError(
+            "invalid multi-instruction completeness bounds"
+        )
+    trading_settings = load_trading_settings(session_factory)
+    if trading_settings.multi_instruction_mode != "live":
+        return 0
+    effective_watermark = max(
+        after_raw_message_id,
+        trading_settings.multi_instruction_activation_after_raw_message_id,
+    )
+    with session_factory() as session:
+        raw_ids = session.execute(
+            select(RecognitionDecision.raw_message_id)
+            .where(RecognitionDecision.raw_message_id > effective_watermark)
+            .order_by(RecognitionDecision.raw_message_id)
+            .limit(limit)
+        ).scalars().all()
+    applied = 0
+    priority = (
+        "missing_instruction_projection",
+        "unevaluated_sibling_instruction",
+        "hidden_instruction_failure",
+    )
+    for raw_id in raw_ids:
+        violations = audit_multi_instruction_completeness(
+            session_factory,
+            raw_message_id=int(raw_id),
+        )
+        if not violations:
+            continue
+        codes = {str(row["violation_code"]) for row in violations}
+        violation_code = next(code for code in priority if code in codes)
+        with session_factory() as session:
+            contract = session.execute(
+                select(MessageOperationContract)
+                .where(MessageOperationContract.raw_message_id == int(raw_id))
+                .order_by(MessageOperationContract.id.desc())
+            ).scalars().first()
+            if contract is None:
+                continue
+            if str(contract.status or "").lower() == "violated":
+                continue
+            contract.status = "violated"
+            contract.violation_code = violation_code
+            contract.updated_at = observed_at
+            session.commit()
+            applied += 1
+    return applied
 
 
 def build_message_operation_coverage_snapshot(
@@ -481,6 +547,12 @@ def run_message_operation_supervisor_cycle(
         limit=limit,
         observed_at=observed_at,
     )
+    completeness_violations = apply_multi_instruction_completeness_violations(
+        session_factory,
+        after_raw_message_id=after_raw_message_id,
+        limit=limit,
+        observed_at=observed_at,
+    )
     captures = _capture_terminal_message_operation_violations(
         session_factory,
         config=runtime_incident_config,
@@ -491,6 +563,7 @@ def run_message_operation_supervisor_cycle(
     return {
         **projection,
         **{f"outcome_{key}": value for key, value in outcomes.items()},
+        "multi_instruction_violations": completeness_violations,
         **captures,
     }
 

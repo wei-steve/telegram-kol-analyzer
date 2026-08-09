@@ -28,6 +28,7 @@ from telegram_kol_research.models import (
     RuntimeIncident,
     SignalCandidate,
 )
+from telegram_kol_research.trading_settings import save_trading_settings
 
 
 NOW = datetime(2026, 8, 9, 2, 0, tzinfo=UTC)
@@ -611,6 +612,13 @@ def test_disabled_coverage_snapshot_is_database_free_clean_rollback():
 
 def test_multi_instruction_completeness_flags_missing_and_hidden_siblings(tmp_path):
     session_factory = create_session_factory(tmp_path / "multi-completeness.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "multi_instruction_mode": "live",
+            "multi_instruction_activation_after_raw_message_id": 0,
+        },
+    )
     with session_factory() as session:
         raw = RawMessage(chat_id=77, message_id=9301, text="cancel old; enter long")
         session.add(raw)
@@ -711,6 +719,16 @@ def test_multi_instruction_completeness_flags_missing_and_hidden_siblings(tmp_pa
         "unevaluated_sibling_instruction",
         "hidden_instruction_failure",
     }
+    assert supervisor_module.apply_multi_instruction_completeness_violations(
+        session_factory,
+        after_raw_message_id=0,
+        limit=10,
+        observed_at=NOW,
+    ) == 1
+    with session_factory() as session:
+        contract = session.query(MessageOperationContract).one()
+        assert contract.status == "violated"
+        assert contract.violation_code == "unevaluated_sibling_instruction"
 
 
 def test_live_supervisor_cycle_captures_natural_violation_for_stage1(tmp_path):
