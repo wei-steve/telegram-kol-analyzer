@@ -829,3 +829,25 @@ snapshot preflight under the account lock.
 mode to `disabled` and leaves confirmed exchange orders, ledger rows, recovery
 records, and incident history intact. Never delete them to make rollback appear
 clean.
+
+## Multi-instruction recognition handoff
+
+Authoritative recognition now has a bounded per-action `instructions` contract.
+It preserves a cancellation or position-management instruction alongside an
+independent strategy in the same Telegram message and orders management before
+entry while retaining independent terminal outcomes. Context resolution may
+attach an exact target to management, but must not erase or retarget a sibling
+entry.
+
+The rollout is dormant by default. `multi_instruction_mode=shadow` retains the
+normalized comparison in recognition evidence without creating extra durable
+candidates/items. `live` is future-only and applies only above
+`multi_instruction_activation_after_raw_message_id`. Rollback sets the mode to
+`disabled`; it never deletes evidence or replays historical messages.
+
+Exact revisions use `revision_target_min_confidence=0.70` only with complete
+entry/SL/TP replacement fields and exact lifecycle-to-binding ownership. New
+entries still use `min_ai_confidence`. State-less Deepcoin cancel history is
+accepted only by the strict same-invocation combined proof documented in the
+runbook; ambiguity, fill evidence, exact live-position evidence, or an unknown
+cancel response remains fail-closed.

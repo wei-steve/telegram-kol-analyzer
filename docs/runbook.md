@@ -1709,3 +1709,48 @@ telegram-kol repair-entry-assembly-fingerprint \
 代码回滚时可恢复上一版服务，但已追加的审计事件不删除、不改写。
 如后续证明该证据有误，立即按新事故处理，保留原事件并通过单独评审的
 追加证据纠正；不得手工删行或直接改写生产数据。
+
+## 同消息多指令识别灰度发布
+
+`multi_instruction_mode` 默认是 `disabled`。三个模式只影响权威负载中
+`instructions` 列表向候选项和执行项的投影：
+
+- `disabled`：保留原有单动作兼容路径，不接纳列表中的额外动作；
+- `shadow`：把规范化列表留在识别审计负载中，但不创建额外候选项或执行项；
+- `live`：仅对 `raw_message_id` 严格大于
+  `multi_instruction_activation_after_raw_message_id` 的未来消息投影全部动作。
+
+同一消息中的取消挂单/仓位管理必须排在新策略之前，但每个执行项独立记录
+`submitted`、`skipped`、`failed` 或 `unknown`。一个动作成功不得掩盖兄弟动作
+失败；未知交易所结果不得自动重试。精确策略修订使用
+`revision_target_min_confidence`（默认 `0.70`），只有生命周期与 execution
+binding 归属完全一致且替换 entry/SL/TP 完整时才能使用；普通新开仓继续使用
+`min_ai_confidence`（默认 `0.75`）。
+
+撤销未成交触发入场时，历史记录缺少 `state` 只能在同一次调用收到明确成功
+响应、精确订单身份和经济字段一致、订单已从 pending 消失、没有成交证据、
+也没有精确活仓证据时确认终态。任一证据缺失或冲突都保持失败关闭。
+
+发布必须先完成本节上方的安全窗口查询，并保存当前最大 terminal raw message
+ID 作为未来水位线。首次只切到 `shadow`：
+
+```bash
+curl -fsS http://127.0.0.1:8000/api/trading-settings \
+  | jq --argjson watermark '<latest-terminal-raw-id>' \
+    '.multi_instruction_mode="shadow" |
+     .multi_instruction_activation_after_raw_message_id=$watermark' \
+  > /tmp/trading-settings.multi-shadow.json
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data-binary @/tmp/trading-settings.multi-shadow.json \
+  http://127.0.0.1:8000/api/trading-settings
+```
+
+只评审自然到达的未来消息；禁止把 `#4206`、`#4210`、`#4212` 或其他历史
+消息送回生产 listener。确认声明指令数、候选项数和执行项数一致，且没有
+`missing_instruction_projection`、`unevaluated_sibling_instruction` 或
+`hidden_instruction_failure` 后，重新完成安全窗口检查，再把同一完整 payload
+中的模式改为 `live`。切换本身不得产生候选项、执行项或 Deepcoin 写入。
+
+回滚只把 `multi_instruction_mode` 改为 `disabled`，保留水位线、识别负载、
+候选项、执行项、交易所事件及异常证据。不得删除审计行，也不得为验证回滚
+而重放历史消息。
