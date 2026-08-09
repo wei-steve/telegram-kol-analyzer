@@ -5,6 +5,7 @@ import importlib.util
 import json
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import text
@@ -105,19 +106,21 @@ def test_source_deletion_full_exit_preserves_original_ancestry_and_exact_pos_ids
         )
         session.commit()
         decision_id = decision.id
+        binding_id = binding.id
+    _freeze_sol_spec_on_binding(session_factory, binding_id)
     deletion = record_source_message_deleted(
         session_factory,
         chat_id=500,
         message_id=3428,
         deleted_at=PLANNED_AT,
     )
-    client = _ReadOnlyDeepcoin([_position("pos-deleted")])
+    client = _ReadOnlyDeepcoin([_sol_position("pos-deleted")])
 
     result = planner.plan_source_deletion_full_exit(
         session_factory,
         deletion_exit_id=deletion.exit_id,
         deepcoin_client=client,
-        contract_spec_provider=_ContractSpecs(),
+        contract_spec_provider=_UnavailableContractSpecs(),
         planned_at=PLANNED_AT,
     )
 
@@ -127,6 +130,9 @@ def test_source_deletion_full_exit_preserves_original_ancestry_and_exact_pos_ids
     assert result.batch.recognition_generation.startswith("source_deleted:")
     assert result.batch.intent == "full_exit"
     assert [leg.pos_id for leg in result.batch.legs] == ["pos-deleted"]
+    assert result.batch.target_snapshot["contract_spec_source"] == (
+        "frozen_binding_draft"
+    )
     assert result.batch.target_snapshot["source_deletion"] == {
         "event_id": deletion.event_id,
         "exit_id": deletion.exit_id,
@@ -157,6 +163,84 @@ class _ContractSpecs:
             min_quantity=1,
             price_tick=0.1,
         )
+
+
+class _UnavailableContractSpecs:
+    def get_contract_spec(self, instrument_id):
+        return None
+
+
+def _freeze_sol_spec_on_binding(session_factory, binding_id):
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        lifecycle = (
+            session.query(StrategyLifecycle)
+            .filter(StrategyLifecycle.execution_binding_id == binding_id)
+            .one()
+        )
+        candidate = (
+            session.query(SignalCandidate)
+            .filter(SignalCandidate.target_lifecycle_id == lifecycle.id)
+            .one_or_none()
+        )
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == binding_id)
+            .all()
+        )
+        strategy_instance_id = (
+            f"deepcoin:{binding.chat_id}:{binding.message_id}:SOL:{binding.side}"
+        )
+        binding.symbol = "SOL"
+        binding.strategy_instance_id = strategy_instance_id
+        lifecycle.symbol = "SOL"
+        if candidate is not None:
+            candidate.symbol = "SOL"
+        for leg in legs:
+            leg.strategy_instance_id = strategy_instance_id
+        binding.payload_json = json.dumps(
+            {
+                "draft": {
+                    "strategy_instance_id": strategy_instance_id,
+                    "instrument_id": "SOL-USDT-SWAP",
+                    "symbol": "SOL",
+                    "position_mode": binding.position_mode,
+                    "margin_mode": binding.margin_mode,
+                    "source": {
+                        "chat_id": binding.chat_id,
+                        "message_id": binding.message_id,
+                    },
+                    "order_legs": [
+                        {
+                            "position_side": binding.side,
+                            "client_order_id": "frozen-sol-entry",
+                        }
+                    ],
+                    "contract_spec": {
+                        "instrument_id": "SOL-USDT-SWAP",
+                        "contract_value": 0.1,
+                        "quantity_step": 1,
+                        "min_quantity": 1,
+                        "price_tick": 0.001,
+                    },
+                    "contract_spec_snapshot": {
+                        "source_digest_sha256": "a" * 64,
+                        "fetched_at": "2026-08-07T08:00:00+00:00",
+                        "expires_at": "2026-08-08T08:00:00+00:00",
+                    },
+                }
+            },
+            sort_keys=True,
+        )
+        session.commit()
+
+
+def _sol_position(pos_id="pos-b", *, size="10", side="short"):
+    return {
+        **_position(pos_id, size=size, side=side),
+        "instId": "SOL-USDT-SWAP",
+        "avgPx": "150",
+    }
 
 
 class _ReadOnlyDeepcoin:
@@ -206,6 +290,171 @@ def _position(pos_id="pos-b", *, size="10", avg_px="62000", side="short"):
         "posMode": "split",
         "cTime": "1721000000000",
     }
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected_action"),
+    [
+        ("partial_take_profit", "partial_close"),
+        ("full_exit", "full_exit"),
+        ("move_stop_to_break_even", "break_even_by_market"),
+    ],
+)
+def test_risk_reducing_management_uses_proven_frozen_spec_when_current_spec_is_stale(
+    monkeypatch, tmp_path, intent, expected_action
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / f"frozen-{intent}.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory, intent=intent
+    )
+    _freeze_sol_spec_on_binding(session_factory, binding_id)
+    tpsl_orders = []
+    if intent == "partial_take_profit":
+        with session_factory() as session:
+            binding = session.get(ExecutionBinding, binding_id)
+            leg = (
+                session.query(ExecutionOrderLeg)
+                .filter_by(execution_binding_id=binding_id)
+                .one()
+            )
+            upsert_protection_ledger_row(
+                session,
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=leg.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                pos_id="pos-b",
+                instrument_id="SOL-USDT-SWAP",
+                side="short",
+                order_id="sol-frozen-stop",
+                purpose="stop_loss",
+                trigger_price="140",
+                size_text="0",
+                status="verified",
+                evidence_source="entry_protection_response",
+                evidence={"match": "exact_written_order"},
+                seen_at=PLANNED_AT,
+            )
+            session.commit()
+        tpsl_orders = [
+            {
+                "instId": "SOL-USDT-SWAP",
+                "posSide": "short",
+                "triggerOrderType": "TPSL",
+                "slTriggerPx": "140",
+                "sz": "0",
+                "ordId": "sol-frozen-stop",
+                "cTime": "1721000000000",
+            }
+        ]
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin(
+            [_sol_position()], tpsl_orders=tpsl_orders
+        ),
+        contract_spec_provider=_UnavailableContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert result.batch.effective_action == expected_action
+    assert result.batch.target_snapshot["contract_spec_source"] == (
+        "frozen_binding_draft"
+    )
+    assert result.batch.target_snapshot["contract_spec"]["instrument_id"] == (
+        "SOL-USDT-SWAP"
+    )
+    assert result.batch.target_snapshot["contract_spec_snapshot"][
+        "source_digest_sha256"
+    ] == "a" * 64
+    assert [leg.pos_id for leg in result.batch.legs] == ["pos-b"]
+    assert Decimal(result.batch.legs[0].quantity_step) == Decimal("1")
+
+
+def test_management_refuses_when_neither_fresh_nor_proven_frozen_spec_exists(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "missing-frozen.db")
+    raw_id, _, _ = _persist_exact_management_target(
+        session_factory, intent="full_exit"
+    )
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_UnavailableContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert (result.status, result.reason_code) == (
+        "blocked",
+        "target_contract_spec_unavailable",
+    )
+
+
+@pytest.mark.parametrize("drift", ["instrument", "side"])
+def test_frozen_spec_refuses_instrument_or_side_identity_drift(
+    monkeypatch, tmp_path, drift
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / f"frozen-{drift}-drift.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory, intent="full_exit"
+    )
+    _freeze_sol_spec_on_binding(session_factory, binding_id)
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        payload = json.loads(binding.payload_json)
+        if drift == "instrument":
+            payload["draft"]["instrument_id"] = "ETH-USDT-SWAP"
+        else:
+            payload["draft"]["order_legs"][0]["position_side"] = "long"
+        binding.payload_json = json.dumps(payload, sort_keys=True)
+        session.commit()
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_sol_position()]),
+        contract_spec_provider=_UnavailableContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert (result.status, result.reason_code) == (
+        "blocked",
+        "target_contract_spec_unavailable",
+    )
+
+
+def test_frozen_spec_is_never_available_for_opening_or_increasing_risk(tmp_path):
+    from telegram_kol_research.deepcoin_execution_actions import (
+        resolve_existing_position_contract_spec,
+    )
+
+    session_factory = create_session_factory(tmp_path / "frozen-no-increase.db")
+    _, _, binding_id = _persist_exact_management_target(
+        session_factory, intent="full_exit"
+    )
+    _freeze_sol_spec_on_binding(session_factory, binding_id)
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        result = resolve_existing_position_contract_spec(
+            contract_spec_provider=_UnavailableContractSpecs(),
+            binding=binding,
+            instrument_id="SOL-USDT-SWAP",
+            side="short",
+            risk_reducing=False,
+        )
+
+    assert result is None
 
 
 def _persist_exact_management_target(

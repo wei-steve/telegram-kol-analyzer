@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -143,7 +144,7 @@ def _seed_never_executed_strategy(session_factory):
         return lifecycle.id
 
 
-def _seed_filled_strategy(session_factory):
+def _seed_filled_strategy(session_factory, *, frozen_spec=False):
     with session_factory() as session:
         raw = RawMessage(
             chat_id=20,
@@ -162,6 +163,39 @@ def _seed_filled_strategy(session_factory):
             order_id="entry-filled",
             pos_id="pos-filled",
             status="active",
+            payload_json=(
+                json.dumps(
+                    {
+                        "draft": {
+                            "strategy_instance_id": "deepcoin:20:200:BTC:short",
+                            "instrument_id": "BTC-USDT-SWAP",
+                            "symbol": "BTC",
+                            "source": {"chat_id": 20, "message_id": 200},
+                            "order_legs": [
+                                {
+                                    "position_side": "short",
+                                    "client_order_id": "entry-filled-client",
+                                }
+                            ],
+                            "contract_spec": {
+                                "instrument_id": "BTC-USDT-SWAP",
+                                "contract_value": 0.001,
+                                "quantity_step": 1,
+                                "min_quantity": 1,
+                                "price_tick": 0.1,
+                            },
+                            "contract_spec_snapshot": {
+                                "source_digest_sha256": "b" * 64,
+                                "fetched_at": "2026-08-01T00:00:00+00:00",
+                                "expires_at": "2026-08-02T00:00:00+00:00",
+                            },
+                        }
+                    },
+                    sort_keys=True,
+                )
+                if frozen_spec
+                else None
+            ),
         )
         session.add_all([raw, binding])
         session.flush()
@@ -557,6 +591,40 @@ def test_worker_plans_exact_full_exit_after_entry_cancellation_stage(tmp_path):
         deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
         assert deletion_exit.state == "closing_positions"
         assert deletion_exit.management_batch_id is not None
+
+
+def test_worker_plans_delisted_full_exit_from_proven_frozen_spec(tmp_path):
+    session_factory = create_session_factory(tmp_path / "frozen-spec-exit.db")
+    _seed_filled_strategy(session_factory, frozen_spec=True)
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=20,
+        message_id=200,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        deletion_exit.state = "closing_positions"
+        session.commit()
+
+    result = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=_PositionClient,
+        contract_spec_provider=None,
+        processed_at=NOW,
+    )
+
+    assert result.planned_exits == 1
+    assert result.recovery_required == 0
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        batch = session.get(
+            StrategyManagementBatch, deletion_exit.management_batch_id
+        )
+        assert batch.target_snapshot_json is not None
+        assert json.loads(batch.target_snapshot_json)["contract_spec_source"] == (
+            "frozen_binding_draft"
+        )
 
 
 def test_worker_blocks_full_exit_planning_when_frozen_binding_has_drifted(tmp_path):

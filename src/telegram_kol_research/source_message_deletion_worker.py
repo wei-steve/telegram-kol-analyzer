@@ -255,18 +255,6 @@ def run_source_message_deletion_worker_tick(
                     )
                 counts["waiting"] += 1
                 continue
-            if contract_spec_provider is None:
-                _transition_claimed(
-                    session_factory,
-                    exit_id=exit_id,
-                    claim_token=claim_token,
-                    new_state="recovery_required",
-                    reason="position_exit_contract_spec_missing",
-                    error="position_exit_contract_spec_missing",
-                    updated_at=now,
-                )
-                counts["recovery_required"] += 1
-                continue
             if exit_planner is None:
                 from telegram_kol_research.strategy_management_planner import (
                     plan_source_deletion_full_exit,

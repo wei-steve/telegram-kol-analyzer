@@ -18,6 +18,9 @@ from telegram_kol_research.execution_bindings import (
     load_deepcoin_execution_reconciliation_snapshot,
     reconcile_deepcoin_execution_bindings,
 )
+from telegram_kol_research.deepcoin_execution_actions import (
+    resolve_existing_position_contract_spec,
+)
 from telegram_kol_research.models import (
     BoundPositionCloseReservation,
     ExecutionBinding,
@@ -624,13 +627,16 @@ def _plan_strategy_management_batch_locked(
                 require_equivalent_live_position_economics(
                     owner, live_positions=live_positions, session=session
                 )
-        contract_spec = (
-            contract_spec_provider.get_contract_spec(instrument_id)
-            if contract_spec_provider is not None
-            else None
+        contract_spec_resolution = resolve_existing_position_contract_spec(
+            contract_spec_provider=contract_spec_provider,
+            binding=binding,
+            instrument_id=instrument_id,
+            side=str(lifecycle.side),
+            risk_reducing=True,
         )
-        if contract_spec is None:
+        if contract_spec_resolution is None:
             raise PositionAttributionError("target_contract_spec_unavailable")
+        contract_spec = contract_spec_resolution.contract_spec
     except PositionAttributionError as exc:
         return _persist_blocked(
             session_factory,
@@ -1252,9 +1258,14 @@ def _plan_strategy_management_batch_locked(
             for leg in (*entry_leg_plan.deferred_legs, *capability_deferred_legs)
         ],
         "contract_spec": contract_spec.to_dict(),
+        "contract_spec_source": contract_spec_resolution.source,
         "protection": protection_by_pos_id,
         "management_capabilities": management_capabilities,
     }
+    if contract_spec_resolution.snapshot is not None:
+        target_snapshot["contract_spec_snapshot"] = (
+            contract_spec_resolution.snapshot
+        )
     partial_protection_maintenance = bool(
         intent == "partial_take_profit"
         and effective_action_name == "partial_close"

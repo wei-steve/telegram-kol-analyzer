@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -15,6 +17,7 @@ from telegram_kol_research.deepcoin_client import (
     DeepcoinDefiniteRejection,
     DeepcoinTradingClientProtocol,
 )
+from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.deepcoin_normalization import (
     normalize_deepcoin_margin_mode as _deepcoin_margin_mode,
     normalize_deepcoin_position_mode as _deepcoin_position_mode,
@@ -69,6 +72,150 @@ from telegram_kol_research.source_message_deletion import (
 
 class DeepcoinExecutionActionError(RuntimeError):
     """Raised when a management signal cannot be executed unambiguously."""
+
+
+@dataclass(frozen=True, slots=True)
+class ManagementContractSpecResolution:
+    """Exact sizing authority for an existing-position mutation."""
+
+    contract_spec: DeepcoinContractSpec
+    source: str
+    snapshot: dict[str, str] | None = None
+
+
+def resolve_existing_position_contract_spec(
+    *,
+    contract_spec_provider,
+    binding: ExecutionBinding,
+    instrument_id: str,
+    side: str,
+    risk_reducing: bool,
+) -> ManagementContractSpecResolution | None:
+    """Prefer a fresh spec, then a proven opening spec for risk reduction only."""
+
+    expected_instrument = str(instrument_id or "").strip().upper()
+    expected_side = str(side or "").strip().lower()
+    if not expected_instrument or expected_side not in {"long", "short"}:
+        return None
+    current = None
+    if contract_spec_provider is not None:
+        try:
+            current = contract_spec_provider.get_contract_spec(expected_instrument)
+        except Exception:
+            current = None
+    if (
+        isinstance(current, DeepcoinContractSpec)
+        and current.instrument_id.upper() == expected_instrument
+    ):
+        return ManagementContractSpecResolution(current, "current")
+    if not risk_reducing:
+        return None
+    frozen = _proven_frozen_binding_contract_spec(
+        binding=binding,
+        instrument_id=expected_instrument,
+        side=expected_side,
+    )
+    return (
+        ManagementContractSpecResolution(
+            frozen[0], "frozen_binding_draft", frozen[1]
+        )
+        if frozen is not None
+        else None
+    )
+
+
+def _proven_frozen_binding_contract_spec(
+    *, binding: ExecutionBinding, instrument_id: str, side: str
+) -> tuple[DeepcoinContractSpec, dict[str, str]] | None:
+    if (
+        str(binding.venue or "").lower() != "deepcoin"
+        or str(binding.side or "").lower() != side
+        or f"{str(binding.symbol or '').upper()}-USDT-SWAP" != instrument_id
+        or not str(binding.strategy_instance_id or "").strip()
+        or not str(binding.payload_json or "").strip()
+    ):
+        return None
+    try:
+        payload = json.loads(str(binding.payload_json))
+    except (TypeError, ValueError):
+        return None
+    draft = payload.get("draft") if isinstance(payload, Mapping) else None
+    if not isinstance(draft, Mapping):
+        return None
+    source = draft.get("source")
+    order_legs = draft.get("order_legs")
+    if (
+        draft.get("strategy_instance_id") != binding.strategy_instance_id
+        or str(draft.get("instrument_id") or "").upper() != instrument_id
+        or str(draft.get("symbol") or "").upper() != str(binding.symbol).upper()
+        or not isinstance(source, Mapping)
+        or isinstance(source.get("chat_id"), bool)
+        or isinstance(source.get("message_id"), bool)
+        or source.get("chat_id") != binding.chat_id
+        or source.get("message_id") != binding.message_id
+        or not isinstance(order_legs, list)
+        or not order_legs
+        or any(
+            not isinstance(leg, Mapping)
+            or str(leg.get("position_side") or "").lower() != side
+            for leg in order_legs
+        )
+    ):
+        return None
+    snapshot = draft.get("contract_spec_snapshot")
+    if not _valid_frozen_spec_snapshot(snapshot):
+        return None
+    raw_spec = draft.get("contract_spec")
+    if not isinstance(raw_spec, Mapping):
+        return None
+    if str(raw_spec.get("instrument_id") or "").upper() != instrument_id:
+        return None
+    numbers: dict[str, Decimal] = {}
+    try:
+        for key in ("contract_value", "quantity_step", "min_quantity", "price_tick"):
+            value = raw_spec.get(key)
+            if isinstance(value, bool):
+                return None
+            number = Decimal(str(value))
+            if not number.is_finite() or number <= 0:
+                return None
+            numbers[key] = number
+        if numbers["min_quantity"] % numbers["quantity_step"] != 0:
+            return None
+        return (
+            DeepcoinContractSpec(
+                instrument_id=instrument_id,
+                contract_value=float(numbers["contract_value"]),
+                quantity_step=float(numbers["quantity_step"]),
+                min_quantity=float(numbers["min_quantity"]),
+                price_tick=float(numbers["price_tick"]),
+            ),
+            {
+                "source_digest_sha256": str(snapshot["source_digest_sha256"]),
+                "fetched_at": str(snapshot["fetched_at"]),
+                "expires_at": str(snapshot["expires_at"]),
+            },
+        )
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _valid_frozen_spec_snapshot(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    digest = value.get("source_digest_sha256")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        return False
+    try:
+        fetched_at = datetime.fromisoformat(str(value.get("fetched_at")))
+        expires_at = datetime.fromisoformat(str(value.get("expires_at")))
+    except (TypeError, ValueError):
+        return False
+    return (
+        fetched_at.tzinfo is not None
+        and expires_at.tzinfo is not None
+        and fetched_at < expires_at
+    )
 
 
 @dataclass(slots=True)
