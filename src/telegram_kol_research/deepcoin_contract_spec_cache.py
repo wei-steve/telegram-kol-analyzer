@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 from dataclasses import dataclass
 from datetime import datetime
 from datetime import timedelta
@@ -16,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import threading
 from types import MappingProxyType
 from typing import Any
 from typing import Mapping
@@ -54,6 +57,156 @@ _DECIMAL_TEXT_PATTERN = re.compile(
     r"^[+]?(?:(?P<integer>[0-9]+)(?:\.(?P<fraction>[0-9]*))?"
     r"|\.(?P<fraction_only>[0-9]+))(?:[eE](?P<exponent>[+-]?[0-9]+))?$"
 )
+
+
+class DeepcoinContractSpecRefreshOrchestrator:
+    """Run cache refreshes off-loop with bounded waits and cadence."""
+
+    def __init__(
+        self,
+        provider: Any,
+        *,
+        refresh_timeout_seconds: float,
+        minimum_interval_seconds: float = 30.0,
+        maximum_interval_seconds: float = 12 * 60 * 60,
+        now_provider: Any | None = None,
+    ) -> None:
+        if refresh_timeout_seconds <= 0:
+            raise ValueError("refresh_timeout_seconds must be positive")
+        if minimum_interval_seconds <= 0:
+            raise ValueError("minimum_interval_seconds must be positive")
+        if maximum_interval_seconds < minimum_interval_seconds:
+            raise ValueError("maximum_interval_seconds must not be below minimum")
+        ttl = getattr(provider, "ttl", None)
+        if not isinstance(ttl, timedelta) or ttl <= timedelta(0):
+            raise ValueError("refresh provider must expose a positive ttl")
+        self._provider = provider
+        self._refresh_timeout_seconds = float(refresh_timeout_seconds)
+        self._now_provider = now_provider or (lambda: datetime.now(timezone.utc))
+        self._future_lock = threading.Lock()
+        self._refresh_future: concurrent.futures.Future[bool] | None = None
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="deepcoin-contract-spec-refresh",
+        )
+        self._closed = False
+        half_ttl_seconds = ttl.total_seconds() / 2
+        self.interval_seconds = max(
+            float(minimum_interval_seconds),
+            min(half_ttl_seconds, float(maximum_interval_seconds)),
+        )
+
+    async def refresh_once(self) -> dict[str, object]:
+        """Attempt one refresh without blocking the application event loop."""
+
+        with self._future_lock:
+            if self._closed:
+                return self.status(
+                    refresh_succeeded=False,
+                    error_override="refresh_orchestrator_closed",
+                )
+            if self._refresh_future is None or self._refresh_future.done():
+                self._refresh_future = self._executor.submit(self._provider.refresh)
+            refresh_future = self._refresh_future
+        try:
+            refreshed = await asyncio.wait_for(
+                asyncio.shield(asyncio.wrap_future(refresh_future)),
+                timeout=self._refresh_timeout_seconds,
+            )
+        except TimeoutError:
+            return self.status(
+                refresh_succeeded=False,
+                error_override="refresh_timeout",
+            )
+        except Exception as exc:
+            return self.status(
+                refresh_succeeded=False,
+                error_override=f"refresh_failed:{type(exc).__name__}",
+            )
+        return self.status(refresh_succeeded=bool(refreshed))
+
+    def close(self) -> None:
+        """Prevent new work; the exchange client's bounded call may finish."""
+
+        with self._future_lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    async def run(self) -> None:
+        """Refresh immediately at startup, then at a bounded half-TTL cadence."""
+
+        while True:
+            await self.refresh_once()
+            await asyncio.sleep(self.interval_seconds)
+
+    def status(
+        self,
+        *,
+        refresh_succeeded: bool | None = None,
+        error_override: str | None = None,
+    ) -> dict[str, object]:
+        metadata = getattr(self._provider, "metadata", None)
+        snapshot = getattr(self._provider, "snapshot", None)
+        expires_at = getattr(metadata, "expires_at", None)
+        last_success_at = getattr(metadata, "last_success_at", None)
+        snapshot_fetched_at = getattr(snapshot, "fetched_at", None)
+        snapshot_expires_at = getattr(snapshot, "expires_at", None)
+        now = self._now()
+        if snapshot is None:
+            state = "unavailable"
+        elif not all(
+            isinstance(value, datetime)
+            and value.tzinfo is not None
+            and value.utcoffset() is not None
+            for value in (
+                expires_at,
+                last_success_at,
+                snapshot_fetched_at,
+                snapshot_expires_at,
+            )
+        ):
+            state = "unavailable"
+        elif (
+            self._utc(last_success_at) != self._utc(snapshot_fetched_at)
+            or self._utc(expires_at) != self._utc(snapshot_expires_at)
+            or now < self._utc(snapshot_fetched_at)
+        ):
+            state = "unavailable"
+        elif self._utc(expires_at) <= now:
+            state = "stale"
+        else:
+            state = "fresh"
+        return {
+            "state": state,
+            "refresh_succeeded": refresh_succeeded,
+            "last_success_at": self._format_datetime(last_success_at),
+            "expires_at": self._format_datetime(expires_at),
+            "last_error": error_override
+            if error_override is not None
+            else getattr(metadata, "last_error", None),
+        }
+
+    def _now(self) -> datetime:
+        value = self._now_provider()
+        if not isinstance(value, datetime):
+            raise ValueError("refresh clock must return datetime")
+        if value.tzinfo is None or value.utcoffset() is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _utc(value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @classmethod
+    def _format_datetime(cls, value: object) -> str | None:
+        if not isinstance(value, datetime):
+            return None
+        return cls._utc(value).isoformat().replace("+00:00", "Z")
 
 
 @dataclass(frozen=True)

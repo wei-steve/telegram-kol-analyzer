@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Callable
@@ -54,6 +54,9 @@ from telegram_kol_research.ai_recognition_config import (
     save_ai_recognition_config,
 )
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
+from telegram_kol_research.deepcoin_contract_spec_cache import (
+    DeepcoinContractSpecRefreshOrchestrator,
+)
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
 from telegram_kol_research.deepcoin_execution_actions import DeepcoinExecutionActionError
@@ -3172,6 +3175,37 @@ def _build_trading_symbol_rows(
     return sorted(rows_by_symbol.values(), key=lambda item: item["symbol"])
 
 
+def _refreshable_contract_spec_provider(provider: Any) -> Any | None:
+    """Find the authoritative refresh target without changing rollout authority."""
+
+    candidate = provider
+    seen: set[int] = set()
+    while candidate is not None and id(candidate) not in seen:
+        seen.add(id(candidate))
+        if (
+            callable(getattr(candidate, "refresh", None))
+            and isinstance(getattr(candidate, "ttl", None), timedelta)
+        ):
+            return candidate
+        candidate = getattr(candidate, "authoritative_provider", None)
+    return None
+
+
+def _contract_spec_exchange_symbols(provider: Any) -> list[dict[str, str]] | None:
+    snapshot = getattr(provider, "snapshot", None)
+    capabilities = getattr(snapshot, "capabilities_by_instrument_id", None)
+    if capabilities is None:
+        return None
+    return [
+        {
+            "symbol": instrument_id.removesuffix("-USDT-SWAP"),
+            "instrument_id": instrument_id,
+        }
+        for instrument_id in sorted(capabilities)
+        if instrument_id.endswith("-USDT-SWAP")
+    ]
+
+
 def _float_or_none(value: Any) -> float | None:
     try:
         return float(value)
@@ -3519,6 +3553,7 @@ def create_web_app(
     recovery_runner=None,
     recovery_market_data_factory=None,
     deepcoin_contract_spec_provider: DeepcoinContractSpecProvider | None = None,
+    contract_spec_refresh_timeout_seconds: float = 20.0,
     deepcoin_client_factory=None,
     deepcoin_reconcile_runner=None,
     deepcoin_reconcile_interval_seconds: int = 30,
@@ -3562,6 +3597,16 @@ def create_web_app(
     async def lifespan(app: FastAPI):
         try:
             app.state.web_event_loop = asyncio.get_running_loop()
+            if (
+                app.state.contract_spec_refresh_orchestrator is not None
+                and app.state.contract_spec_refresh_task is None
+            ):
+                app.state.contract_spec_refresh_task = asyncio.create_task(
+                    app.state.contract_spec_refresh_orchestrator.run()
+                )
+                app.state.contract_spec_refresh_task.add_done_callback(
+                    _log_background_task_result("contract_spec_refresh_task")
+                )
             if (
                 app.state.message_operation_supervisor_config.enabled
                 and app.state.message_operation_supervisor_config.shadow_only
@@ -3785,6 +3830,17 @@ def create_web_app(
                 )
             yield
         finally:
+            contract_spec_refresh_task = app.state.contract_spec_refresh_task
+            if contract_spec_refresh_task is not None:
+                contract_spec_refresh_task.cancel()
+                try:
+                    await contract_spec_refresh_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.contract_spec_refresh_task = None
+                app.state.contract_spec_refresh_orchestrator.close()
             message_operation_supervisor_task = (
                 app.state.message_operation_supervisor_task
             )
@@ -4036,6 +4092,19 @@ def create_web_app(
         recovery_market_data_factory or GateMarketDataProvider
     )
     app.state.deepcoin_contract_spec_provider = deepcoin_contract_spec_provider
+    refreshable_contract_spec_provider = _refreshable_contract_spec_provider(
+        deepcoin_contract_spec_provider
+    )
+    app.state.contract_spec_refresh_orchestrator = (
+        DeepcoinContractSpecRefreshOrchestrator(
+            refreshable_contract_spec_provider,
+            refresh_timeout_seconds=contract_spec_refresh_timeout_seconds,
+            now_provider=app.state.now_provider,
+        )
+        if refreshable_contract_spec_provider is not None
+        else None
+    )
+    app.state.contract_spec_refresh_task = None
     app.state.deepcoin_client_factory = (
         deepcoin_client_factory or build_deepcoin_client_from_env
     )
@@ -6155,23 +6224,37 @@ def create_web_app(
         return load_trading_settings(app.state.session_factory).to_dict()
 
     @app.get("/api/trading-settings/symbols")
-    def list_trading_setting_symbols():
+    async def list_trading_setting_symbols():
+        refresh_status = None
+        orchestrator = app.state.contract_spec_refresh_orchestrator
+        if orchestrator is not None:
+            refresh_status = await orchestrator.refresh_once()
         settings = load_trading_settings(app.state.session_factory)
         saved_symbols = [str(symbol).upper() for symbol in settings.allowed_symbols]
-        try:
-            deepcoin_client = app.state.deepcoin_client_factory()
-            if not hasattr(deepcoin_client, "list_swap_symbols"):
-                raise DeepcoinClientError("Deepcoin client cannot list symbols")
-            exchange_symbols = deepcoin_client.list_swap_symbols()
-        except Exception:
-            exchange_symbols = [
-                {
-                    "symbol": symbol,
-                    "instrument_id": _to_deepcoin_swap_instrument(symbol),
-                }
-                for symbol in saved_symbols
-            ]
-        return {
+        exchange_symbols = (
+            _contract_spec_exchange_symbols(
+                _refreshable_contract_spec_provider(
+                    app.state.deepcoin_contract_spec_provider
+                )
+            )
+            if orchestrator is not None
+            else None
+        )
+        if exchange_symbols is None:
+            try:
+                deepcoin_client = app.state.deepcoin_client_factory()
+                if not hasattr(deepcoin_client, "list_swap_symbols"):
+                    raise DeepcoinClientError("Deepcoin client cannot list symbols")
+                exchange_symbols = deepcoin_client.list_swap_symbols()
+            except Exception:
+                exchange_symbols = [
+                    {
+                        "symbol": symbol,
+                        "instrument_id": _to_deepcoin_swap_instrument(symbol),
+                    }
+                    for symbol in saved_symbols
+                ]
+        response = {
             "symbols": _build_trading_symbol_rows(
                 exchange_symbols,
                 selected_symbols=saved_symbols,
@@ -6179,17 +6262,30 @@ def create_web_app(
                 entry_thresholds_for_symbol=settings.entry_thresholds_for_symbol,
             )
         }
+        if refresh_status is not None:
+            response["contract_specs"] = refresh_status
+        return response
 
     @app.post("/api/trading-settings")
-    def update_trading_settings(payload: dict[str, Any]):
+    async def update_trading_settings(payload: dict[str, Any]):
+        refresh_status = None
+        orchestrator = app.state.contract_spec_refresh_orchestrator
+        if orchestrator is not None:
+            # Network refresh completes before save_trading_settings opens its
+            # short database transaction. Venue support never rewrites or
+            # rejects the global allowlist.
+            refresh_status = await orchestrator.refresh_once()
         try:
-            return save_trading_settings(
+            response = save_trading_settings(
                 app.state.session_factory,
                 payload,
                 updated_at=app.state.now_provider(),
             ).to_dict()
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if refresh_status is not None:
+            response["contract_specs"] = refresh_status
+        return response
 
     @app.post("/api/messages/{raw_message_id}/recognize")
     async def recognize_message(raw_message_id: int):

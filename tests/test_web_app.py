@@ -5,6 +5,7 @@ import sqlite3
 import threading
 import time
 from datetime import UTC, datetime
+from datetime import timedelta
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -18,6 +19,13 @@ from telegram_kol_research.config import (
     RuntimeIncidentConfig,
 )
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
+from telegram_kol_research.deepcoin_contract_specs import (
+    RefreshableDeepcoinContractSpecProvider,
+)
+from telegram_kol_research.deepcoin_contract_spec_cache import (
+    publish_deepcoin_contract_spec_snapshot,
+    validate_deepcoin_instrument_snapshot,
+)
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.live_position_snapshot import LivePositionSnapshotStore
@@ -1469,6 +1477,197 @@ def test_trading_settings_symbols_api_falls_back_to_saved_symbols(tmp_path):
                 "second_limit_offset": "2",
             },
         },
+    ]
+
+
+def _deepcoin_instrument_row(instrument_id: str) -> dict[str, str]:
+    return {
+        "instType": "SWAP",
+        "instId": instrument_id,
+        "ctVal": "1",
+        "lotSz": "1",
+        "minSz": "1",
+        "tickSz": "0.001",
+        "state": "live",
+    }
+
+
+def test_contract_spec_startup_refresh_is_non_blocking_and_stops_cleanly(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class Provider:
+        ttl = timedelta(hours=24)
+        snapshot = None
+        metadata = SimpleNamespace(
+            last_success_at=None,
+            expires_at=None,
+            last_error=None,
+        )
+
+        def refresh(self):
+            entered.set()
+            release.wait(timeout=1)
+            return False
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_contract_spec_provider=Provider(),
+        contract_spec_refresh_timeout_seconds=0.02,
+    )
+
+    started_at = time.monotonic()
+    with TestClient(app):
+        assert time.monotonic() - started_at < 0.5
+        assert entered.wait(timeout=1)
+        assert app.state.contract_spec_refresh_task is not None
+        release.set()
+
+    assert app.state.contract_spec_refresh_task is None
+
+
+def test_trading_settings_symbols_attempts_refresh_and_uses_fresh_cache_offline(
+    tmp_path,
+):
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+    cache_path = tmp_path / "specs.json"
+    snapshot = validate_deepcoin_instrument_snapshot(
+        [_deepcoin_instrument_row("BTC-USDT-SWAP")],
+        fetched_at=now,
+        ttl=timedelta(hours=24),
+    )
+    publish_deepcoin_contract_spec_snapshot(cache_path, snapshot, now=now)
+    refresh_calls = []
+
+    def offline():
+        refresh_calls.append("called")
+        raise RuntimeError("offline")
+
+    provider = RefreshableDeepcoinContractSpecProvider(
+        cache_path=cache_path,
+        instrument_loader=offline,
+        ttl=timedelta(hours=24),
+        now_provider=lambda: now,
+    )
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_contract_spec_provider=provider,
+        now_provider=lambda: now,
+    )
+    client = TestClient(app)
+
+    response = client.get("/api/trading-settings/symbols")
+
+    assert response.status_code == 200
+    assert refresh_calls == ["called"]
+    assert response.json()["contract_specs"]["state"] == "fresh"
+    assert response.json()["contract_specs"]["refresh_succeeded"] is False
+    assert response.json()["symbols"][0]["symbol"] == "BTC"
+
+
+def test_trading_settings_save_keeps_unsupported_global_symbol(tmp_path):
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+    provider = RefreshableDeepcoinContractSpecProvider(
+        cache_path=tmp_path / "specs.json",
+        instrument_loader=lambda: [_deepcoin_instrument_row("BTC-USDT-SWAP")],
+        ttl=timedelta(hours=24),
+        now_provider=lambda: now,
+    )
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_contract_spec_provider=provider,
+        now_provider=lambda: now,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/trading-settings",
+        json={"allowed_symbols": ["BTC", "ABC"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["allowed_symbols"] == ["BTC", "ABC"]
+    assert response.json()["contract_specs"]["state"] == "fresh"
+    assert client.get("/api/trading-settings").json()["allowed_symbols"] == [
+        "BTC",
+        "ABC",
+    ]
+
+
+def test_trading_settings_save_reports_fail_closed_without_cache_but_persists(
+    tmp_path,
+):
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+    provider = RefreshableDeepcoinContractSpecProvider(
+        cache_path=tmp_path / "missing.json",
+        instrument_loader=lambda: (_ for _ in ()).throw(RuntimeError("offline")),
+        ttl=timedelta(hours=24),
+        now_provider=lambda: now,
+    )
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_contract_spec_provider=provider,
+        now_provider=lambda: now,
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/trading-settings",
+        json={"allowed_symbols": ["ABC"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["allowed_symbols"] == ["ABC"]
+    assert response.json()["contract_specs"]["state"] == "unavailable"
+    assert response.json()["contract_specs"]["refresh_succeeded"] is False
+    assert client.get("/api/trading-settings").json()["allowed_symbols"] == ["ABC"]
+
+
+def test_trading_settings_symbols_reports_expired_cache_without_mutating_settings(
+    tmp_path,
+):
+    current_time = [datetime(2026, 8, 8, 12, 0, tzinfo=UTC)]
+    responses = [
+        [_deepcoin_instrument_row("BTC-USDT-SWAP")],
+        RuntimeError("offline"),
+    ]
+
+    def load_instruments():
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    provider = RefreshableDeepcoinContractSpecProvider(
+        cache_path=tmp_path / "specs.json",
+        instrument_loader=load_instruments,
+        ttl=timedelta(hours=24),
+        now_provider=lambda: current_time[0],
+    )
+    assert provider.refresh() is True
+    current_time[0] += timedelta(hours=24)
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_contract_spec_provider=provider,
+        now_provider=lambda: current_time[0],
+    )
+    save_trading_settings(
+        app.state.session_factory,
+        {"allowed_symbols": ["BTC"]},
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/trading-settings",
+        json={"allowed_symbols": ["BTC", "ABC"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["contract_specs"]["state"] == "stale"
+    assert response.json()["contract_specs"]["refresh_succeeded"] is False
+    assert client.get("/api/trading-settings").json()["allowed_symbols"] == [
+        "BTC",
+        "ABC",
     ]
 
 

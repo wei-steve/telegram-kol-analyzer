@@ -20,6 +20,9 @@ from telegram_kol_research.deepcoin_contract_spec_cache import (
     DeepcoinContractSpecSnapshot,
 )
 from telegram_kol_research.deepcoin_contract_spec_cache import (
+    DeepcoinContractSpecRefreshOrchestrator,
+)
+from telegram_kol_research.deepcoin_contract_spec_cache import (
     load_deepcoin_contract_spec_snapshot,
 )
 from telegram_kol_research.deepcoin_contract_spec_cache import (
@@ -47,6 +50,103 @@ def _row(instrument_id: str, **overrides: object) -> dict[str, object]:
     }
     row.update(overrides)
     return row
+
+
+def test_refresh_orchestrator_uses_bounded_half_ttl_schedule():
+    class Provider:
+        ttl = timedelta(seconds=20)
+
+        def refresh(self):
+            return True
+
+    orchestrator = DeepcoinContractSpecRefreshOrchestrator(
+        Provider(),
+        refresh_timeout_seconds=1,
+        minimum_interval_seconds=2,
+        maximum_interval_seconds=8,
+    )
+
+    assert orchestrator.interval_seconds == 8
+
+
+def test_refresh_orchestrator_reports_timeout_without_blocking_event_loop():
+    import asyncio
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    class Provider:
+        ttl = timedelta(seconds=20)
+        snapshot = None
+        metadata = type(
+            "Metadata",
+            (),
+            {"last_success_at": None, "expires_at": None, "last_error": None},
+        )()
+
+        def refresh(self):
+            calls.append("called")
+            entered.set()
+            release.wait(timeout=1)
+            return True
+
+    orchestrator = DeepcoinContractSpecRefreshOrchestrator(
+        Provider(),
+        refresh_timeout_seconds=0.01,
+        minimum_interval_seconds=1,
+        maximum_interval_seconds=60,
+        now_provider=lambda: NOW,
+    )
+
+    async def exercise():
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_soon(heartbeat.set)
+        result = await orchestrator.refresh_once()
+        assert heartbeat.is_set()
+        second_result = await orchestrator.refresh_once()
+        release.set()
+        return result, second_result
+
+    result, second_result = asyncio.run(exercise())
+
+    assert entered.is_set()
+    assert calls == ["called"]
+    assert result["state"] == "unavailable"
+    assert result["refresh_succeeded"] is False
+    assert result["last_error"] == "refresh_timeout"
+    assert second_result["last_error"] == "refresh_timeout"
+
+
+def test_refresh_orchestrator_never_reports_fresh_with_incoherent_metadata():
+    class Provider:
+        ttl = timedelta(hours=24)
+        snapshot = type(
+            "Snapshot",
+            (),
+            {"fetched_at": NOW, "expires_at": NOW + timedelta(hours=24)},
+        )()
+        metadata = type(
+            "Metadata",
+            (),
+            {
+                "last_success_at": NOW,
+                "expires_at": "malformed",
+                "last_error": None,
+            },
+        )()
+
+        def refresh(self):
+            return False
+
+    orchestrator = DeepcoinContractSpecRefreshOrchestrator(
+        Provider(),
+        refresh_timeout_seconds=1,
+        now_provider=lambda: NOW,
+    )
+
+    assert orchestrator.status()["state"] == "unavailable"
 
 
 def test_validate_builds_immutable_complete_snapshot_with_exact_specs():
