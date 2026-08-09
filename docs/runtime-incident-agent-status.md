@@ -6,10 +6,10 @@ used to advance or reinterpret the rollout.
 ```yaml
 project: runtime-incident-agent
 design_version: 2
-design_authority_status: original_runtime_agent_incomplete_extended_by_message_operation_design
+design_authority_status: original_runtime_agent_complete_extended_by_message_operation_design
 current_phase: 8
 phase_name: cost-quality-and-continuous-improvement
-phase_status: in_progress
+phase_status: completed
 position_compliance_rules_status: dormant_non_deployable
 position_compliance_rollout_status: multi_target_live_new_natural_messages_only
 multi_target_projection_status: live_partial_take_profit_future_natural_messages_only
@@ -23,11 +23,11 @@ position_protection_live_repair_status: exact_backup_repaired_exchange_healthy
 position_protection_audit_convergence_status: deployed_current_evidence_healthy
 position_protection_rescue_starvation_status: deployed_future_due_intents_fixed
 context_target_contract_repair_status: deployed_future_natural_observation_pending
-last_completed_phase: "8R.10"
-last_completed_commit: f21bac9
-production_commit: c1770eb8b23be262cd38398a98cabf928039cf28
+last_completed_phase: "8"
+last_completed_commit: 47e917d
+production_commit: 47e917dfd950990750371428a9c7e545446cd4c6
 local_tests:
-  - "phase-8-local-in-progress: reviewed commit 9a59d9a adds conservative model-usage reservations, exact provider settlements, per-incident and UTC-daily token budgets, immediate no-call budget escalation, bounded aggregate quality metrics, immutable diagnosis reviews, confirmed-only redacted fixture generation, and a prompt/tool/policy/playbook plus corpus regression manifest on top of the separately modified multi-instruction/dynamic-contract-spec HEAD 482701a. The budget gate defaults disabled and preserves the legacy provider request while disabled. Independent review found and closed three Important issues covering dormant provider payloads, terminal outcome/latency semantics, and pre-export sensitive-data rejection; final review found no remaining Critical or Important issue and 134 focused tests pass. The repository-wide run reached 4731 passed and 1 skipped but exposed five failures in deferred-entry cancellation/manual-close cleanup paths introduced by the other session and untouched by Phase 8. Phase 8 remains in_progress pending that external regression gate and server dormant verification; no deployment, service restart, provider call, notification, or production change has occurred."
+  - "phase-8-complete: reviewed implementation commit 9a59d9a adds conservative model-usage reservations, exact provider settlements, per-incident and UTC-daily token budgets, immediate no-call budget escalation, bounded aggregate quality metrics, immutable diagnosis reviews, confirmed-only redacted fixture generation, and a prompt/tool/policy/playbook plus corpus regression manifest. Four stale terminal-cleanup test doubles and one exact call-order assertion were aligned with the already-reviewed position-read safety contract in 47e917d without weakening business assertions. Independent review found no remaining Critical or Important issue. The complete local suite passes 4738 tests with 1 skipped, the focused Phase 8 suite passes 134, and the adjacent cleanup suite passes 280."
   - "phase-8r.10-server: reviewed code commit 2ad7f33 plus monitor-installer correction f21bac9 were deployed after a terminal zero-in-flight gate and two complete stable read-only exchange audits. The first deployment kept the supervisor disabled and returned an authenticated database-free coverage rollback snapshot. Server focused verification passed 336 tests. A fresh stopped-state raw watermark of 9969 was then recorded and the supervisor was enabled in shadow mode only above that ID; the Runtime Agent deployed-code identity was synchronized to f21bac9. The first and repeated coverage projections report enabled=true, scan_truncated=false, a fresh heartbeat, zero executable messages/contracts/violations/gaps/Stage1/Agent/handoffs/Stage2 rows, and oldest nonterminal age zero. Main, Agent, scanner, monitor timer, HTTP, and system Bot loop are active; the no-notify full diagnostic returned healthy=true, monitor_error=null, notification_status=disabled, and no reason codes. Action authority remains false and both playbook allowlists remain empty."
   - "phase-8r.10-local-reviewed: bounded end-to-end ledger metrics, database-free disabled rollback, authenticated fixed-loopback 32-KiB projection, successful-cycle heartbeat, fail-closed truncation/schema/parity checks, watermark sentinel/future/DB-error rejection, natural violation-to-atomic-incident-to-Stage1 composition, projection/outcome/capture error and zero-model gates, and independent critical reason codes are implemented. Repository-wide verification passed 4510 tests with 1 skipped and 17 known deprecation warnings; focused/adjacent verification passed 711 with 1 skipped. Independent review found no remaining Critical or Important finding."
   - "phase-8r.10-installer-review: production exposed that raw DAC writeability is not the monitor's effective systemd boundary. The corrected reviewed installer verifies all three monitor units bind the production DB read-only and reject a writable production-checkout mount, while retaining the dedicated identity's inability to read Runtime Agent policy/provider settings. The initial install-only preflight changed no unit; the corrected install completed dormant, and review found no Critical or Important finding."
@@ -129,20 +129,20 @@ local_tests:
   - "full-suite before final review fixes: 2611 passed, 1 skipped; every subsequently changed path passed the focused suites"
   - "phase-3-post-canary-focused: 127 passed"
 server_verification:
-  phase_8_deployment: "deferred_before_pull_or_restart because the required repository-wide gate exposed five failures in deferred-entry cancellation/manual-close cleanup code from the preceding multi-instruction rollout. Reviewed implementation commit 9a59d9a and status checkpoint e7a51ae are pushed. Read-only production verification confirms deployed c1770eb, main/Runtime Agent/scanner/monitor timer active, and HTTP docs 200. Phase 8 code and its dormant budget schema/config have not been deployed or enabled."
-  status: phase-8r.3-scanner-review-complete-multi-target-partial-tp-live
-  deployed_commit: 71ab842a17f2dc33c4d458235c6906fd8debe781
+  phase_8_deployment: "completed at production commit 47e917d on 2026-08-10 CST. The pre-deployment gate found zero current exchange risk, two identical complete stable exchange snapshots, zero context/management/mutation/Agent/notification claims, and seven unchanged old pending instruction rows dated 2026-07-22 through 2026-08-06. First deployment kept the budget flag false, created the two additive ledgers with zero rows, passed 134 deployed focused tests, preserved main/Agent/scanner continuity and HTTP 200, and returned a healthy no-notify monitor diagnostic. A separate stopped-sidecar policy change then enabled limits 65536 per incident, 500000 per UTC day, and 4096 maximum completion tokens only after re-proving zero active Agent claims and zero usage rows. Post-activation the Agent is active and idle, action authority is false, both playbook allowlists are empty, usage remains zero until the first eligible provider call, the monitor diagnostic is healthy with no reason codes, and a fresh exchange audit remains complete, stable, and current-risk zero. The root-owned pre-activation policy backup is retained for immediate flag rollback."
+  status: phase-8-complete-budget-active
+  deployed_commit: 47e917dfd950990750371428a9c7e545446cd4c6
   service: active-http-200
-  bounded_restarts: "service restarted without SIGKILL; raw message 8309 crossed the restart with a live pre-restart evidence lease, logged one already-in-progress recovery error, then completed through normal lease expiry recovery"
+  bounded_restarts: "Phase 8 deployment restarted the main service only after a zero-current-risk gate; the separate budget policy change stopped and restarted only the idle Runtime Agent sidecar after zero active claims and zero usage reservations were re-proven."
   listener: monitoring-31-enabled-groups-and-continuing
-  recognition: "latest raw message 8360 completed as non-strategy; diagnosis-sidecar activation did not restart or alter the main recognition service"
+  recognition: "pre-deployment latest raw message 10069 completed as non-strategy/completed/skipped; Phase 8 and the separate sidecar budget activation did not alter recognition authority"
   contextual_resolution_inflight: 0
   position_mutation_inflight: 0
-  management_latest: "succeeded; six old partial_failed/recovery_required rows were historical, with no active claim or mutation"
-  production_safety: "current diagnostic completed with monitor_error null and only the unchanged audit_abnormal baseline"
+  management_latest: "no active management batch or position mutation at either Phase 8 deployment gate"
+  production_safety: "post-budget diagnostic completed healthy=true, monitor_error=null, notification_status=disabled, and no reason codes; current exchange risk is zero"
   sidecar: installed-enabled-active
   agent_flag: enabled
-  production_incident_row: "the production ledger has 3 incidents: 2 diagnosed and 1 escalated; none is claimable or actively claimed"
+  production_incident_row: "the production ledger has 286 pending historical/capture rows, 2 diagnosed rows, and 1 escalated row; no incident is actively claimed and no message-operation incident is pending"
   phase_4_offline_gate: "7 reviewed cases; all six metrics at 1.0"
   phase_4_readonly_tools: "all nine bounded tools executed against incident 1; only projection keys and evidence counts were inspected"
   incident_agent_behavior: "the enabled sidecar is idle because no incident is claimable. On a future incident it may run bounded diagnosis tools and write only the incident diagnosis/notification ledger; empty shadow/action allowlists and disabled action authority prevent playbook or business mutation"
@@ -255,7 +255,7 @@ server_verification:
   phase_8r_6b_deployment_and_activation: "Reviewed commit 04b3d34 was pushed and deployed with Stage 1 absent/disabled. Server verification passed 156 focused tests; main, Runtime Agent, and runtime scanner were active and HTTP root returned 200. The additive outbox table existed with zero rows. After a second fresh gate proved zero active position mutations, RuntimeIncident/notification/Stage 1 claims, contracts, and outbox rows, the root-owned mode-0600 policy was backed up and Stage 1 was enabled for contract IDs above the stopped-state maximum of 0, with five bounded attempts. Only the main service restarted; it returned HTTP 200, all runtime services remained active, and counts stayed zero, proving no historical materialization, Telegram send, Agent claim, or trading mutation. The independent monitor expected-HEAD pin was synchronized to 04b3d34, its no-notify diagnostic returned healthy=true with no reason codes, and the timer was restored. Runtime Agent action authority and both playbook allowlists remain unchanged/empty."
   phase_8r_9_deployment_and_activation: "Reviewed production code 10f3b64 was deployed with Stage 2 absent/disabled. Server verification passed 189 focused tests and the exact temporary-database injected-receiver handoff/document canary passed separately without touching production. The read-only production system Bot probe confirmed endpoint, identity, and target-chat availability. A fresh zero-in-flight gate retained latest raw/decision 9969, execution event 3352, and zero recent instruction, context, management, mutation, Agent claim, recovery, contract, Stage 1, or handoff rows. The stopped-state maximum handoff ID was 0; root-owned policy was atomically backed up and Stage 2 was enabled only for future handoff IDs above 0 with five bounded attempts. Only the main service restarted. Production contract, Stage 1, handoff, and investigation-audit counts remain zero, so activation caused no historical claim, Telegram delivery, model call, or business mutation. Main, Runtime Agent, scanner, monitor timer, and HTTP are healthy; a root-run no-notify diagnostic returned healthy=true with no reason codes. Runtime Agent action authority remains false and both playbook allowlists remain empty."
   phase_8r_10_deployment_and_activation: "Reviewed commit 2ad7f33 was deployed with the supervisor explicitly disabled after latest raw/decision 9969 remained terminal non-strategy/completed/skipped, evidence/context/management/component/mutation/Runtime-Agent/notification/Stage1/Stage2 work was zero, recent raw/execution counts were zero, and two complete stable exchange audits matched at current_risk=0, evidence_insufficient=1, historical_terminal=236, resolved_by_current_exchange_evidence=3. The authenticated disabled endpoint returned a zero, database-free clean rollback projection. Monitor installer correction f21bac9 was then pulled without a business-code restart; server focused tests passed 336 and the no-notify diagnostic was healthy. In a second stopped-state gate, max raw 9969 became the exclusive future watermark, supervisor shadow mode was enabled, and exact deployed-code identity was updated to f21bac9. The background cycle made zero model calls and created zero contracts/items/incidents/outboxes/handoffs because no newer raw existed. Coverage heartbeat is fresh and every silent-gap count is zero. Main, Agent, scanner, monitor timer, HTTP, and system Bot command loop are active; action authority is false and both playbook allowlists are empty."
-  remaining: "Original Phase 8 cost, quality, Token-budget, and continuous-regression work is now the next planned phase. Natural future-message behavioral evidence for the earlier 8R.6A/8R.6B chain and all-symbol contract-spec expansion remain recorded separate residual scopes; the active Phase 8R.10 independent coverage monitor will fail closed on any future silent gap."
+  remaining: "The approved Runtime Incident Agent rollout is complete. Natural future-message behavioral evidence for the earlier 8R.6A/8R.6B chain, first real provider-usage settlement under the Phase 8 budget, and all-symbol contract-spec expansion remain recorded separate residual observations/scopes; the active Phase 8R.10 independent coverage monitor will fail closed on any future silent gap."
 enabled_flags:
   - "capture:READ_ONLY_CAPTURE_PROFILE-plus-six-multi-target-types"
   - "telegram:deterministic-runtime-incident-reports"
@@ -290,7 +290,7 @@ message_operation_extension:
   design_commit: 98b7884
   implementation_plan_commit: 879f489
   status: phase_8r_completed
-  original_runtime_agent_complete: false
+  original_runtime_agent_complete: true
   next_phase_after_8r_4: 8R.5
   task_8r_5_commit: 2d0cc6e
   task_8r_5_status: completed_future_only_shadow_canary
@@ -703,6 +703,7 @@ Phase 5 is not complete until:
   namespace and cannot read Runtime Agent policy/provider settings. Production
   coverage parity is complete with all counts zero and a fresh heartbeat; the
   final no-notify diagnostic is healthy.
-- Next action: begin only original `Phase 8 cost-quality-and-continuous-improvement`
-  in a new turn. Do not combine it with contract-spec expansion,
-  natural-contract tuning, or any business mutation.
+- Next action: operate the completed Runtime Incident Agent under its existing
+  monitors and review the first natural budget settlement. Contract-spec
+  expansion, natural-contract tuning, and any business mutation remain separate
+  explicitly approved scopes.
