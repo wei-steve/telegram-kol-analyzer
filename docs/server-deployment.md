@@ -80,8 +80,10 @@ cd /opt/telegram-kol-analyzer
   --cache-path data/deepcoin_contract_specs_cache.json
 ```
 
-Status reports `fresh`, `missing`, `stale`, `invalid`, or `unreadable`. Only an
-explicit refresh may create/replace the cache:
+Status reports `fresh`, `missing`, `stale`, `invalid`, or `unreadable`. Cache
+creation/replacement occurs only through the validated refresh mechanism. The
+Web process invokes it at startup, at a bounded half-TTL cadence, and before
+symbol-settings reads/saves; operators can also invoke it explicitly:
 
 ```bash
 .venv/bin/telegram-kol-research deepcoin-contract-specs refresh \
@@ -97,15 +99,19 @@ only until its original expiry.
 The deploy, refresh, shadow, and live steps are separate gates. A dormant
 deployment does not authorize mode promotion. Shadow requires a proven safe
 window and reviewed comparisons; live requires separate explicit operator
-approval. The practical per-symbol rule is `global allowlist ∩ Deepcoin live
-USDT perpetual ∩ fresh valid spec`. Therefore a globally saved symbol that
-Deepcoin does not support remains saved and visible but is not traded.
+approval. In `live`, the practical per-symbol rule is `global allowlist ∩
+Deepcoin live USDT perpetual ∩ fresh valid spec`. Therefore a globally saved
+symbol that Deepcoin does not support remains saved and visible but is not
+traded in live mode. Static/shadow retain YAML execution authority during the
+rollout; their dynamic capability status is observational.
 
-Rollback dynamic authority by preserving the complete current settings payload,
-changing only `deepcoin_contract_specs_mode` to `static`, POSTing it to
-`/api/trading-settings`, and reading it back. Do not delete the cache or modify
-historical orders/bindings. See `docs/runbook.md` for the exact commands and
-reason-code meanings.
+Rollback dynamic authority by fetching the complete current settings payload
+immediately before rollback, changing only `deepcoin_contract_specs_mode` to
+`static`, POSTing it to `/api/trading-settings`, and reading it back. Never POST
+an old pre-activation snapshot because doing so can overwrite unrelated settings
+changed in the meantime. Do not delete the cache or modify historical
+orders/bindings. See `docs/runbook.md` for the exact commands and reason-code
+meanings.
 
 ## Update Flow
 

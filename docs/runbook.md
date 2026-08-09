@@ -594,7 +594,8 @@ Percentage and contract-size rules for live management:
 
 ## Deepcoin dynamic contract specifications
 
-Deepcoin new-entry eligibility is always this intersection:
+In `live` contract-spec mode, Deepcoin new-entry eligibility is this
+intersection:
 
 ```text
 global allowed_symbols
@@ -603,11 +604,14 @@ global allowed_symbols
 ```
 
 The global list is venue-independent. Saving `ABC` globally is valid even if
-Deepcoin does not support `ABC-USDT-SWAP`; it remains saved and visible but is
-not traded on Deepcoin. A later validated Deepcoin listing can make it eligible
-without a code change. Conversely, a suspended/delisted instrument immediately
-stops new entries. Existing-position risk reduction uses its separately proven
-frozen specification and is not blocked solely by a later listing change.
+Deepcoin does not support `ABC-USDT-SWAP`; it remains saved and visible. In
+`live` mode it is not traded on Deepcoin. A later validated Deepcoin listing can
+make it eligible without a code change. Conversely, a suspended/delisted
+instrument immediately stops live-mode new entries. Static and shadow are
+deliberate rollout stages: their reviewed YAML remains execution authority, so
+dynamic capability is observation rather than an enforcement gate until live
+promotion. Existing-position risk reduction uses its separately proven frozen
+specification and is not blocked solely by a later listing change.
 
 The authoritative source is Deepcoin's public product-information request
 `GET https://api.deepcoin.com/deepcoin/market/instruments?instType=SWAP`
@@ -658,18 +662,26 @@ directory. Its bounded JSON state means:
 - `invalid`: JSON, schema, timing, digest, or instrument validation failed.
 - `unreadable`: the file exists but the process cannot read it.
 
-`refresh` is the only operator command that fetches and publishes. Success
-prints only the SHA-256 digest, UTC timestamps, counts, cache path, and state;
-it never prints raw product rows, credentials, signed headers, or exception
-bodies. Failure prints a small categorical result and exits nonzero. If
-`cache_preserved=true`, the prior fresh validated cache remains authoritative
-for its remaining TTL; a failed refresh never extends that TTL.
+`refresh` is the explicit operator command that fetches and publishes. The Web
+process also uses the same safe refresh mechanism at startup, at a bounded
+half-TTL cadence, and before symbol-settings reads/saves. Those automatic
+refreshes run even in static/shadow for observation, but do not change execution
+authority. Explicit refresh success prints only the SHA-256 digest, UTC
+timestamps, counts, cache path, and state; it never prints raw product rows,
+credentials, signed headers, or exception bodies. Failure prints a small
+categorical result and exits nonzero. If `cache_preserved=true`, the prior fresh
+validated cache remains authoritative for its remaining TTL; a failed refresh
+never extends that TTL.
 
-The Web symbol endpoint exposes per-symbol decision reasons:
+The Web symbol endpoint exposes dynamic per-symbol `reason_code` values:
 `tradable`, `global_not_allowed`, `venue_instrument_unsupported`,
 `venue_instrument_not_live`, `contract_spec_stale`, `contract_spec_invalid`, or
-`contract_spec_sync_unavailable`. Only `tradable` can admit a new Deepcoin
-entry. Unsupported global symbols remain saved but are not traded.
+`contract_spec_sync_unavailable`. It separately exposes
+`execution_reason_code` and `execution_tradable` for the current rollout mode.
+In static/shadow, dynamic `reason_code` is observational and the static YAML may
+still produce `execution_reason_code=tradable`; in live, the fields converge and
+only dynamic `tradable` can admit a new Deepcoin entry. Unsupported global
+symbols remain saved; they are not traded once live dynamic authority is active.
 
 ### Static, shadow, live, and rollback
 
@@ -699,15 +711,18 @@ Repeat the same full-payload procedure with `"live"`. In live mode, only a
 fresh authoritative cached specification may authorize a future new entry;
 there is no static fallback, no allowlist expansion, and no historical replay.
 
-Rollback is a settings-only authority change: set the mode back to `static`
-using the previously saved complete payload (or alter only that field in a
-fresh GET), POST it, read it back, and confirm `static`. Do not delete the cache,
-edit the YAML, replay a Telegram message, or modify an existing binding as part
-of rollback:
+Rollback is a settings-only authority change. The pre-activation payload is an
+audit/diff artifact, not a safe write payload: other settings may have changed
+since it was captured. Fetch current settings immediately, alter only the mode
+to `static`, POST the full current payload, read it back, and confirm `static`.
+Do not delete the cache, edit the YAML, replay a Telegram message, or modify an
+existing binding as part of rollback:
 
 ```bash
+curl -fsS http://127.0.0.1:8000/api/trading-settings \
+  > /tmp/trading-settings.contract-specs.current.json
 jq '.deepcoin_contract_specs_mode="static"' \
-  /tmp/trading-settings.contract-specs.before.json \
+  /tmp/trading-settings.contract-specs.current.json \
   > /tmp/trading-settings.contract-specs.rollback.json
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data-binary @/tmp/trading-settings.contract-specs.rollback.json \
