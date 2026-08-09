@@ -84,6 +84,7 @@ class TradingSettings:
     max_market_entry_deviation_pct: float = 0.15
     nearby_entry_market_deviation_pct: float = 0.15
     min_ai_confidence: float = 0.75
+    revision_target_min_confidence: float = 0.70
     allowed_symbols: list[str] = field(default_factory=lambda: ["BTC", "ETH"])
     symbol_max_loss_usdt: dict[str, float] = field(default_factory=dict)
     symbol_entry_thresholds: dict[str, dict[str, str]] = field(
@@ -392,6 +393,16 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         min_ai_confidence=max(
             0.0,
             min(1.0, _positive_float(raw.get("min_ai_confidence"), defaults.min_ai_confidence)),
+        ),
+        revision_target_min_confidence=max(
+            0.0,
+            min(
+                1.0,
+                _positive_float(
+                    raw.get("revision_target_min_confidence"),
+                    defaults.revision_target_min_confidence,
+                ),
+            ),
         ),
         allowed_symbols=allowed_symbols,
         symbol_max_loss_usdt=symbol_max_loss_usdt,

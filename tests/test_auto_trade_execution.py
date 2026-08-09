@@ -2599,7 +2599,7 @@ def test_auto_process_zero_fixed_market_threshold_keeps_two_limit_legs(tmp_path)
     ]
 
 
-def test_strategy_revision_uses_binding_symbol_fixed_offsets_for_both_drafts(
+def test_dabiaoke_4210_exact_revision_uses_dedicated_confidence_threshold(
     tmp_path,
     monkeypatch,
 ):
@@ -2651,7 +2651,7 @@ def test_strategy_revision_uses_binding_symbol_fixed_offsets_for_both_drafts(
                 take_profit_text="1650",
                 recognition_generation="revision-generation",
                 parse_source="mimo_authoritative",
-                confidence=0.99,
+                confidence=0.72,
             )
         )
         session.commit()
@@ -3376,6 +3376,29 @@ def test_auto_process_message_trade_signal_blocks_low_confidence(tmp_path):
     save_trading_settings(
         session_factory,
         {"auto_trade_enabled": True, "min_ai_confidence": 0.75},
+    )
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=_FakeDeepcoinClient(),
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+
+    assert result == {"status": "skipped", "reason": "confidence_below_minimum"}
+
+
+def test_ordinary_new_entry_at_revision_confidence_remains_blocked(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _persist_candidate(session_factory, confidence=0.72)
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "min_ai_confidence": 0.75,
+            "revision_target_min_confidence": 0.70,
+        },
     )
 
     result = auto_process_message_trade_signal(

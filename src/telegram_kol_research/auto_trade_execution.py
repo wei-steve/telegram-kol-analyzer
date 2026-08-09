@@ -1136,7 +1136,10 @@ def _auto_process_management_signal(
         and (not symbol or symbol not in allowed_symbols)
     ):
         return {"status": "skipped", "reason": "symbol_not_allowed", "symbol": symbol}
-    if candidate.confidence < settings.min_ai_confidence:
+    if (
+        candidate.event_type != "strategy_revision"
+        and candidate.confidence < settings.min_ai_confidence
+    ):
         return {"status": "skipped", "reason": "confidence_below_minimum"}
     if has_media and not settings.allow_vision_auto_trade:
         return {"status": "skipped", "reason": "vision_auto_trade_disabled"}
@@ -1167,6 +1170,35 @@ def _auto_process_management_signal(
             return {
                 "status": "blocked",
                 "reason": "revision_binding_missing",
+            }
+        if lifecycle is None or not (
+            int(binding.chat_id) == int(lifecycle.chat_id)
+            and int(binding.message_id) == int(lifecycle.message_id)
+            and str(binding.symbol or "").upper()
+            == str(lifecycle.symbol or "").upper()
+            and str(binding.side or "").lower()
+            == str(lifecycle.side or "").lower()
+        ):
+            return {
+                "status": "blocked",
+                "reason": "revision_binding_ownership_mismatch",
+            }
+        if not all(
+            str(value or "").strip()
+            for value in (
+                candidate.entry_text,
+                candidate.stop_loss_text,
+                candidate.take_profit_text,
+            )
+        ):
+            return {
+                "status": "blocked",
+                "reason": "revision_replacement_incomplete",
+            }
+        if candidate.confidence < settings.revision_target_min_confidence:
+            return {
+                "status": "skipped",
+                "reason": "revision_confidence_below_minimum",
             }
         binding_symbol = str(binding.symbol or "").upper()
         if not binding_symbol or binding_symbol not in allowed_symbols:

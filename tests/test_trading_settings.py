@@ -39,6 +39,7 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     )
     assert settings.entry_range_order_style == "eager"
     assert settings.nearby_entry_market_deviation_pct == 0.15
+    assert settings.revision_target_min_confidence == 0.70
     assert settings.take_profit_allocations == [40.0, 30.0, 30.0]
     assert settings.allow_vision_auto_trade is True
     assert settings.context_resolution_enabled is False
@@ -49,6 +50,22 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     assert settings.entry_revision_v2_mode == "disabled"
     assert settings.deepcoin_contract_specs_mode == "static"
     assert not hasattr(settings, "entry_preamble_live_chat_ids")
+
+
+def test_revision_target_min_confidence_round_trips_independently(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+
+    saved = save_trading_settings(
+        session_factory,
+        {
+            "min_ai_confidence": 0.81,
+            "revision_target_min_confidence": 0.71,
+        },
+    )
+
+    assert saved.min_ai_confidence == 0.81
+    assert saved.revision_target_min_confidence == 0.71
+    assert load_trading_settings(session_factory).revision_target_min_confidence == 0.71
 
 
 @pytest.mark.parametrize("mode", ["static", "shadow", "live"])
