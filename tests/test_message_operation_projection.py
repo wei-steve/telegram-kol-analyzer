@@ -837,6 +837,10 @@ def test_shadow_cli_requires_enablement_explicit_shadow_once_and_existing_db(
         "TELEGRAM_KOL_MESSAGE_OPERATION_SUPERVISOR_AFTER_RAW_MESSAGE_ID",
         str(raw_message_id - 1),
     )
+    monkeypatch.setenv(
+        "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES",
+        "message_operation_failure",
+    )
 
     refused = CliRunner().invoke(
         app,
@@ -883,6 +887,8 @@ def test_shadow_cli_loads_reviewed_project_config_file(tmp_path, monkeypatch):
                 "TELEGRAM_KOL_MESSAGE_OPERATION_SUPERVISOR_SHADOW_ONLY=true",
                 "TELEGRAM_KOL_MESSAGE_OPERATION_SUPERVISOR_AFTER_RAW_MESSAGE_ID="
                 f"{raw_message_id - 1}",
+                "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES="
+                "message_operation_failure",
             )
         ),
         encoding="utf-8",
@@ -901,3 +907,47 @@ def test_shadow_cli_loads_reviewed_project_config_file(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert json.loads(result.stdout)["contracts_created"] == 1
+
+
+def test_shadow_cli_invalid_capture_policy_refuses_before_projection(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "invalid-capture-policy.db"
+    session_factory = create_session_factory(database)
+    raw_message_id = _message(
+        session_factory,
+        message_id=117,
+        event_type="position_update",
+        actions=("partial_take_profit",),
+    )
+    monkeypatch.setenv(
+        "TELEGRAM_KOL_MESSAGE_OPERATION_SUPERVISOR_ENABLED", "true"
+    )
+    monkeypatch.setenv(
+        "TELEGRAM_KOL_MESSAGE_OPERATION_SUPERVISOR_SHADOW_ONLY", "true"
+    )
+    monkeypatch.setenv(
+        "TELEGRAM_KOL_MESSAGE_OPERATION_SUPERVISOR_AFTER_RAW_MESSAGE_ID",
+        str(raw_message_id - 1),
+    )
+    monkeypatch.setenv(
+        "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES",
+        "monitor_adapter_failure",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "message-operation-supervisor",
+            "--database-path",
+            str(database),
+            "--shadow",
+            "--once",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "capture policy invalid" in result.stderr
+    with session_factory() as session:
+        assert session.query(MessageOperationContract).count() == 0
+        assert session.query(MessageOperationItem).count() == 0

@@ -43,12 +43,10 @@ from telegram_kol_research.db import (
 from telegram_kol_research.config import (
     load_message_operation_supervisor_config,
     load_runtime_scanner_config,
-)
-from telegram_kol_research.message_operation_contracts import (
-    run_message_operation_shadow_once,
+    message_operation_supervisor_policy_status,
 )
 from telegram_kol_research.message_operation_supervisor import (
-    run_message_operation_outcome_shadow_once,
+    run_message_operation_supervisor_cycle,
 )
 from telegram_kol_research.runtime_incident_scanner import build_scanner_facts, run_scanner_cycle
 from telegram_kol_research.deepcoin_contract_specs import (
@@ -3670,6 +3668,18 @@ def message_operation_supervisor(
         raise typer.BadParameter(
             "message operation supervisor must remain explicitly shadow-only"
         )
+    runtime_incident_config = load_runtime_incident_config(
+        environ=dict(os.environ)
+    )
+    if (
+        message_operation_supervisor_policy_status(
+            config, runtime_incident_config
+        )
+        != "valid"
+    ):
+        raise typer.BadParameter(
+            "message operation supervisor capture policy invalid"
+        )
     if not once:
         raise typer.BadParameter(
             "Phase 8R.5 permits only an explicitly bounded --once cycle"
@@ -3678,23 +3688,17 @@ def message_operation_supervisor(
         raise typer.BadParameter("supervisor database must already exist")
     session_factory = create_existing_session_factory(database_path)
     observed_at = datetime.now(UTC)
-    result = run_message_operation_shadow_once(
+    result = run_message_operation_supervisor_cycle(
         session_factory,
         after_raw_message_id=config.after_raw_message_id,
-        limit=config.batch_limit,
-        now=observed_at,
-    )
-    outcomes = run_message_operation_outcome_shadow_once(
-        session_factory,
+        capture_after_raw_message_id=config.after_raw_message_id,
         limit=config.batch_limit,
         observed_at=observed_at,
+        runtime_incident_config=runtime_incident_config,
     )
-    outcome_payload = {
-        f"outcome_{key}": value for key, value in outcomes.items()
-    }
     typer.echo(
         json.dumps(
-            {"status": "shadow", **result, **outcome_payload},
+            {"status": "shadow", **result},
             sort_keys=True,
             separators=(",", ":"),
         )
