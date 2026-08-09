@@ -592,6 +592,130 @@ Percentage and contract-size rules for live management:
   updates use the separate `Deepcoin 已接受保护单更新` label.
 - Never replay old Telegram management messages to repair a missed action.
 
+## Deepcoin dynamic contract specifications
+
+Deepcoin new-entry eligibility is always this intersection:
+
+```text
+global allowed_symbols
+∩ Deepcoin live *-USDT-SWAP instruments
+∩ fresh, fully validated contract specifications
+```
+
+The global list is venue-independent. Saving `ABC` globally is valid even if
+Deepcoin does not support `ABC-USDT-SWAP`; it remains saved and visible but is
+not traded on Deepcoin. A later validated Deepcoin listing can make it eligible
+without a code change. Conversely, a suspended/delisted instrument immediately
+stops new entries. Existing-position risk reduction uses its separately proven
+frozen specification and is not blocked solely by a later listing change.
+
+The authoritative source is Deepcoin's public product-information request
+`GET https://api.deepcoin.com/deepcoin/market/instruments?instType=SWAP`
+([official documentation](https://www.deepcoin.com/docs/zh/DeepCoinMarket/getBaseInfo)).
+The candidate snapshot must contain valid `instType`, `instId`, `ctVal`,
+`lotSz`, `minSz`, `tickSz`, and `state` values for every accepted row. The
+application accepts only exact USDT perpetual IDs and only `state=live` for new
+entries; malformed, duplicate, ambiguous, non-positive, or incompatible values
+reject the whole refresh.
+
+The process defaults are:
+
+```text
+cache: data/deepcoin_contract_specs_cache.json
+TTL: 24 hours
+mode: static
+```
+
+The cache is generated data. Never hand-edit it. A refresh writes a restrictive
+same-directory temporary file, reloads and validates it, then atomically
+replaces the cache. Failed fetching, validation, writing, or reloading returns
+nonzero and does not replace a valid cache. The static YAML at
+`config/deepcoin_contract_specs.yaml` is reviewed bootstrap/comparison data; it
+is not an unlimited fallback that may authorize a missing or stale symbol in
+live mode.
+
+### Read-only status and explicit refresh
+
+Run from the checkout with the same explicit path and TTL passed to the Web
+process:
+
+```bash
+.venv/bin/telegram-kol-research deepcoin-contract-specs status \
+  --cache-path data/deepcoin_contract_specs_cache.json
+
+.venv/bin/telegram-kol-research deepcoin-contract-specs refresh \
+  --cache-path data/deepcoin_contract_specs_cache.json \
+  --ttl-hours 24
+```
+
+`status` performs no network request and does not create the cache or its parent
+directory. Its bounded JSON state means:
+
+- `fresh`: digest, timestamps, and counts passed complete validation and have
+  not expired.
+- `missing`: the configured cache file does not exist.
+- `stale`: the file validated but its expiry boundary has been reached.
+- `invalid`: JSON, schema, timing, digest, or instrument validation failed.
+- `unreadable`: the file exists but the process cannot read it.
+
+`refresh` is the only operator command that fetches and publishes. Success
+prints only the SHA-256 digest, UTC timestamps, counts, cache path, and state;
+it never prints raw product rows, credentials, signed headers, or exception
+bodies. Failure prints a small categorical result and exits nonzero. If
+`cache_preserved=true`, the prior fresh validated cache remains authoritative
+for its remaining TTL; a failed refresh never extends that TTL.
+
+The Web symbol endpoint exposes per-symbol decision reasons:
+`tradable`, `global_not_allowed`, `venue_instrument_unsupported`,
+`venue_instrument_not_live`, `contract_spec_stale`, `contract_spec_invalid`, or
+`contract_spec_sync_unavailable`. Only `tradable` can admit a new Deepcoin
+entry. Unsupported global symbols remain saved but are not traded.
+
+### Static, shadow, live, and rollback
+
+Keep `deepcoin_contract_specs_mode=static` for dormant deployment. In `static`,
+the reviewed YAML stays authoritative. After an explicit successful server
+refresh and a proven safe window, change only the mode to `shadow`; shadow
+refreshes and compares the authoritative cache while execution still uses the
+static YAML. Review at least two fresh independent observations, all BTC/ETH
+differences, all globally allowed symbols, and zero unknown states before
+requesting separate approval for live.
+
+Preserve the full settings payload when changing the mode:
+
+```bash
+curl -fsS http://127.0.0.1:8000/api/trading-settings \
+  > /tmp/trading-settings.contract-specs.before.json
+jq '.deepcoin_contract_specs_mode="shadow"' \
+  /tmp/trading-settings.contract-specs.before.json \
+  > /tmp/trading-settings.contract-specs.shadow.json
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data-binary @/tmp/trading-settings.contract-specs.shadow.json \
+  http://127.0.0.1:8000/api/trading-settings
+```
+
+`live` requires a separate explicit approval after reviewed shadow evidence.
+Repeat the same full-payload procedure with `"live"`. In live mode, only a
+fresh authoritative cached specification may authorize a future new entry;
+there is no static fallback, no allowlist expansion, and no historical replay.
+
+Rollback is a settings-only authority change: set the mode back to `static`
+using the previously saved complete payload (or alter only that field in a
+fresh GET), POST it, read it back, and confirm `static`. Do not delete the cache,
+edit the YAML, replay a Telegram message, or modify an existing binding as part
+of rollback:
+
+```bash
+jq '.deepcoin_contract_specs_mode="static"' \
+  /tmp/trading-settings.contract-specs.before.json \
+  > /tmp/trading-settings.contract-specs.rollback.json
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data-binary @/tmp/trading-settings.contract-specs.rollback.json \
+  http://127.0.0.1:8000/api/trading-settings
+curl -fsS http://127.0.0.1:8000/api/trading-settings \
+  | jq -e '.deepcoin_contract_specs_mode == "static"'
+```
+
 ## Entry preamble sizing context
 
 `entry_preamble_mode` defaults to `disabled`. In this mode an earlier message

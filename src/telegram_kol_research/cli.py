@@ -56,6 +56,9 @@ from telegram_kol_research.deepcoin_contract_specs import (
     RolloutDeepcoinContractSpecProvider,
     load_deepcoin_contract_specs,
 )
+from telegram_kol_research.deepcoin_contract_spec_cache import (
+    load_deepcoin_contract_spec_snapshot,
+)
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
 from telegram_kol_research.execution_bindings import (
     load_deepcoin_execution_reconciliation_snapshot_read_only,
@@ -266,6 +269,145 @@ from telegram_kol_research.tpsl_ledger_backfill import (
 from telegram_kol_research.web_app import create_web_app
 
 app = typer.Typer(help="Telegram KOL win-rate research CLI.")
+deepcoin_contract_specs_app = typer.Typer(
+    help="Inspect or explicitly refresh Deepcoin contract specifications."
+)
+app.add_typer(deepcoin_contract_specs_app, name="deepcoin-contract-specs")
+
+_DEEPCOIN_CONTRACT_SPEC_CACHE_PATH = Path(
+    "data/deepcoin_contract_specs_cache.json"
+)
+_DEEPCOIN_CONTRACT_SPEC_CLI_TEXT_LIMIT = 512
+
+
+def _bounded_contract_spec_cli_text(value: object) -> str:
+    rendered = str(value)
+    if len(rendered) <= _DEEPCOIN_CONTRACT_SPEC_CLI_TEXT_LIMIT:
+        return rendered
+    return rendered[: _DEEPCOIN_CONTRACT_SPEC_CLI_TEXT_LIMIT - 3] + "..."
+
+
+def _format_contract_spec_cli_datetime(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _echo_contract_spec_summary(payload: dict[str, object]) -> None:
+    typer.echo(
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+
+
+def _fresh_contract_spec_summary(
+    *, cache_path: Path, snapshot: object
+) -> dict[str, object]:
+    capabilities = snapshot.capabilities_by_instrument_id
+    return {
+        "cache_path": _bounded_contract_spec_cli_text(cache_path),
+        "digest_sha256": snapshot.source_digest_sha256,
+        "expires_at": _format_contract_spec_cli_datetime(snapshot.expires_at),
+        "fetched_at": _format_contract_spec_cli_datetime(snapshot.fetched_at),
+        "instrument_count": len(capabilities),
+        "live_instrument_count": sum(
+            capability.state == "live" for capability in capabilities.values()
+        ),
+        "state": "fresh",
+    }
+
+
+@deepcoin_contract_specs_app.command("status")
+def deepcoin_contract_specs_status(
+    cache_path: Path = typer.Option(
+        _DEEPCOIN_CONTRACT_SPEC_CACHE_PATH,
+        "--cache-path",
+        help="Validated dynamic contract-spec cache to inspect read-only.",
+    ),
+) -> None:
+    """Report validated cache health without network access or file creation."""
+
+    now = datetime.now(UTC)
+    try:
+        snapshot = load_deepcoin_contract_spec_snapshot(cache_path, now=now)
+    except FileNotFoundError:
+        summary = {
+            "cache_path": _bounded_contract_spec_cli_text(cache_path),
+            "state": "missing",
+        }
+    except ValueError as exc:
+        state = (
+            "stale"
+            if str(exc) == "Deepcoin contract spec cache is stale"
+            else "invalid"
+        )
+        summary = {
+            "cache_path": _bounded_contract_spec_cli_text(cache_path),
+            "state": state,
+        }
+    except OSError:
+        summary = {
+            "cache_path": _bounded_contract_spec_cli_text(cache_path),
+            "state": "unreadable",
+        }
+    else:
+        summary = _fresh_contract_spec_summary(
+            cache_path=cache_path,
+            snapshot=snapshot,
+        )
+    _echo_contract_spec_summary(summary)
+
+
+@deepcoin_contract_specs_app.command("refresh")
+def deepcoin_contract_specs_refresh(
+    cache_path: Path = typer.Option(
+        _DEEPCOIN_CONTRACT_SPEC_CACHE_PATH,
+        "--cache-path",
+        help="Validated dynamic contract-spec cache to publish atomically.",
+    ),
+    ttl_hours: float = typer.Option(
+        24.0,
+        "--ttl-hours",
+        min=0.000001,
+        help="Positive cache lifetime in hours.",
+    ),
+) -> None:
+    """Fetch, validate, and atomically publish one explicit snapshot."""
+
+    provider = RefreshableDeepcoinContractSpecProvider(
+        cache_path=cache_path,
+        instrument_loader=lambda: (
+            build_deepcoin_client_from_env().list_swap_instruments()
+        ),
+        ttl=timedelta(hours=ttl_hours),
+    )
+    previous_snapshot = provider.snapshot
+    refreshed = provider.refresh()
+    snapshot = provider.snapshot
+    if not refreshed or snapshot is None:
+        cache_preserved = bool(
+            previous_snapshot is not None
+            and snapshot is not None
+            and previous_snapshot.source_digest_sha256
+            == snapshot.source_digest_sha256
+        )
+        _echo_contract_spec_summary(
+            {
+                "cache_preserved": cache_preserved,
+                "refresh_succeeded": False,
+                "state": "refresh_failed",
+            }
+        )
+        raise typer.Exit(code=1)
+
+    summary = _fresh_contract_spec_summary(
+        cache_path=cache_path,
+        snapshot=snapshot,
+    )
+    summary["refresh_succeeded"] = True
+    _echo_contract_spec_summary(summary)
 
 
 class SyncMode(str, Enum):

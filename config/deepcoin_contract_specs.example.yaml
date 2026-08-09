@@ -1,5 +1,17 @@
-# Copy to config/deepcoin_contract_specs.yaml only after verifying each value
-# against Deepcoin's current contract specifications.
+# Bootstrap/emergency comparison data only. Copy to
+# config/deepcoin_contract_specs.yaml only after independently verifying every
+# value against Deepcoin's current contract specifications.
+#
+# This file is authoritative only while deepcoin_contract_specs_mode=static.
+# It is intentionally not an unlimited fallback for shadow/live operation and
+# should not be expanded manually to mirror every Deepcoin market. Shadow keeps
+# this file authoritative while comparing the validated dynamic cache; live
+# admits new entries only from a fresh validated cache. A missing, invalid, or
+# stale cache fails closed in live mode.
+#
+# The global allowlist is venue-independent: a symbol may remain saved there
+# even when Deepcoin has no live USDT perpetual for it. Such a symbol is not
+# traded on Deepcoin.
 contracts:
   - instrument_id: "BTC-USDT-SWAP"
     contract_value: 0.001
