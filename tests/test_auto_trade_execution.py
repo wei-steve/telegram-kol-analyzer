@@ -1,6 +1,7 @@
 ﻿import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +18,7 @@ from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord, ExecutionOrderLegRecord, upsert_execution_binding, upsert_execution_order_leg
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
+from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecLookup
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.message_instruction_items import create_message_instruction_items_in_session
@@ -45,6 +47,40 @@ class _StaticContractSpecProvider:
             min_quantity=1,
             price_tick=0.1,
         )
+
+
+class _CapabilityContractSpecProvider:
+    def __init__(self, reason):
+        self.reason = reason
+        self.snapshot = SimpleNamespace(
+            source_digest_sha256="a" * 64,
+            fetched_at=datetime(2026, 8, 8, 8, 0, tzinfo=UTC),
+            expires_at=datetime(2026, 8, 9, 8, 0, tzinfo=UTC),
+        )
+
+    def lookup_contract_spec(self, instrument_id):
+        spec = None
+        state = None
+        if self.reason == "available":
+            state = "live"
+            spec = DeepcoinContractSpec(
+                instrument_id=instrument_id,
+                contract_value=0.1,
+                quantity_step=1,
+                min_quantity=1,
+                price_tick=0.001,
+            )
+        elif self.reason == "venue_instrument_not_live":
+            state = "suspend"
+        return DeepcoinContractSpecLookup(
+            instrument_id=instrument_id,
+            reason=self.reason,
+            venue_state=state,
+            contract_spec=spec,
+        )
+
+    def get_contract_spec(self, instrument_id):
+        return self.lookup_contract_spec(instrument_id).contract_spec
 
 
 def test_auto_trade_blocks_deleted_source_before_any_exchange_call(tmp_path):
@@ -1729,6 +1765,130 @@ def test_auto_process_message_trade_signal_submits_live_order_with_protection(tm
     assert binding.strategy_instance_id == "deepcoin:100:55:BTC:long"
     assert binding.margin_mode == "cross"
     assert binding.position_mode == "split"
+
+
+@pytest.mark.parametrize(
+    "capability_reason",
+    [
+        "venue_instrument_unsupported",
+        "venue_instrument_not_live",
+        "contract_spec_missing",
+        "contract_spec_invalid",
+        "contract_spec_stale",
+        "contract_spec_sync_unavailable",
+    ],
+)
+def test_auto_entry_capability_rejection_precedes_every_durable_or_exchange_write(
+    tmp_path, capability_reason
+):
+    session_factory = create_session_factory(tmp_path / f"{capability_reason}.db")
+    raw_message_id = _persist_candidate(session_factory)
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    client = _FakeDeepcoinClient()
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=client,
+        contract_spec_provider=_CapabilityContractSpecProvider(capability_reason),
+        processed_at=datetime(2026, 8, 8, 9, 0, tzinfo=UTC),
+    )
+
+    assert result["status"] in {"skipped", "blocked"}
+    assert result["reason"] == capability_reason
+    assert client.orders == []
+    assert client.trigger_orders == []
+    assert client.protections == []
+    with session_factory() as session:
+        assert session.query(TradeSignal).count() == 0
+        assert session.query(ExecutionBinding).count() == 0
+
+
+def test_auto_entry_global_allowlist_precedes_venue_capability(tmp_path):
+    session_factory = create_session_factory(tmp_path / "global-first.db")
+    raw_message_id = _persist_candidate(session_factory)
+    save_trading_settings(
+        session_factory,
+        {"auto_trade_enabled": True, "allowed_symbols": ["ETH"]},
+    )
+    provider = _CapabilityContractSpecProvider("contract_spec_sync_unavailable")
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=_FakeDeepcoinClient(),
+        contract_spec_provider=provider,
+        processed_at=datetime(2026, 8, 8, 9, 0, tzinfo=UTC),
+    )
+
+    assert result["reason"] == "symbol_not_allowed"
+
+
+def test_auto_entry_embeds_exact_dynamic_sol_spec_and_snapshot_digest(tmp_path):
+    session_factory = create_session_factory(tmp_path / "dynamic-sol.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        symbol="SOL",
+        text="SOL long 150-152 SL 145 TP 160/170",
+        entry_text="150-152",
+        stop_loss_text="145",
+        take_profit_text="160 / 170",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "allowed_symbols": ["BTC", "ETH", "SOL"],
+        },
+    )
+    group_config = GroupConfig(
+        groups=[
+            TargetGroupConfig(
+                chat_title="Auto Group",
+                chat_id=100,
+                enabled=True,
+                trading_mode="auto_trade",
+                max_loss_usdt=20.0,
+                symbol_whitelist=["BTC", "ETH", "SOL"],
+            )
+        ]
+    )
+    client = _FakeDeepcoinClient()
+    client.ticker_prices["SOL-USDT-SWAP"] = 151.0
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=group_config,
+        deepcoin_client=client,
+        contract_spec_provider=_CapabilityContractSpecProvider("available"),
+        processed_at=datetime(2026, 8, 8, 9, 0, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    with session_factory() as session:
+        binding_payload = json.loads(session.query(ExecutionBinding).one().payload_json)
+    draft = binding_payload["draft"]
+    assert draft["contract_spec"] == {
+        "instrument_id": "SOL-USDT-SWAP",
+        "contract_value": 0.1,
+        "quantity_step": 1.0,
+        "min_quantity": 1.0,
+        "price_tick": 0.001,
+    }
+    assert draft["contract_spec_snapshot"] == {
+        "source_digest_sha256": "a" * 64,
+        "fetched_at": "2026-08-08T08:00:00+00:00",
+        "expires_at": "2026-08-09T08:00:00+00:00",
+    }
 
 
 def test_recovery_trigger_synchronizes_finalized_fingerprint_before_exchange_submission(

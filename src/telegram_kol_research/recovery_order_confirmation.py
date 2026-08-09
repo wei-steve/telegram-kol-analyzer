@@ -2,15 +2,178 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
 from telegram_kol_research.recovery_execution_queue import list_recovery_execution_previews
 from telegram_kol_research.recovery_order_confirmations import (
     upsert_ready_recovery_order_confirmation,
 )
+from telegram_kol_research.trading_settings import load_trading_settings
+
+
+@dataclass(frozen=True)
+class DeepcoinEntryCapabilityGateResult:
+    """One pinned new-entry capability decision used through persistence."""
+
+    symbol: str
+    instrument_id: str
+    allowed: bool
+    reason: str
+    contract_spec: DeepcoinContractSpec | None
+    contract_spec_snapshot: dict[str, str] | None
+
+
+@dataclass(frozen=True)
+class _PinnedContractSpecProvider:
+    instrument_id: str
+    contract_spec: DeepcoinContractSpec
+
+    def get_contract_spec(self, instrument_id: str) -> DeepcoinContractSpec | None:
+        if str(instrument_id).strip().upper() != self.instrument_id:
+            return None
+        return self.contract_spec
+
+
+def evaluate_deepcoin_entry_capability(
+    session_factory: sessionmaker,
+    *,
+    symbol: str,
+    contract_spec_provider: DeepcoinContractSpecProvider | None,
+) -> DeepcoinEntryCapabilityGateResult:
+    """Apply global allowlist first, then pin the venue/spec decision."""
+
+    symbol_key = str(symbol).strip().upper()
+    instrument_id = f"{symbol_key}-USDT-SWAP"
+    settings = load_trading_settings(session_factory)
+    allowed_symbols = {
+        str(item).strip().upper() for item in settings.allowed_symbols
+    }
+    if not symbol_key or symbol_key not in allowed_symbols:
+        return DeepcoinEntryCapabilityGateResult(
+            symbol=symbol_key,
+            instrument_id=instrument_id,
+            allowed=False,
+            reason="symbol_not_allowed",
+            contract_spec=None,
+            contract_spec_snapshot=None,
+        )
+
+    lookup_provider: Any = contract_spec_provider
+    mode = getattr(contract_spec_provider, "mode", None)
+    if mode == "live":
+        lookup_provider = getattr(
+            contract_spec_provider,
+            "authoritative_provider",
+            contract_spec_provider,
+        )
+    lookup = getattr(lookup_provider, "lookup_contract_spec", None)
+    if callable(lookup):
+        try:
+            lookup_result = lookup(instrument_id)
+        except Exception:
+            return _blocked_capability(
+                symbol_key, instrument_id, "contract_spec_sync_unavailable"
+            )
+        reason = str(getattr(lookup_result, "reason", "") or "")
+        if reason != "available":
+            return _blocked_capability(
+                symbol_key,
+                instrument_id,
+                reason or "contract_spec_invalid",
+            )
+        contract_spec = getattr(lookup_result, "contract_spec", None)
+        snapshot = getattr(lookup_provider, "snapshot", None)
+    else:
+        try:
+            contract_spec = (
+                contract_spec_provider.get_contract_spec(instrument_id)
+                if contract_spec_provider is not None
+                else None
+            )
+        except Exception:
+            return _blocked_capability(
+                symbol_key, instrument_id, "contract_spec_sync_unavailable"
+            )
+        snapshot = None
+    if not isinstance(contract_spec, DeepcoinContractSpec):
+        return _blocked_capability(
+            symbol_key, instrument_id, "contract_spec_missing"
+        )
+    if contract_spec.instrument_id.upper() != instrument_id:
+        return _blocked_capability(
+            symbol_key, instrument_id, "contract_spec_invalid"
+        )
+    return DeepcoinEntryCapabilityGateResult(
+        symbol=symbol_key,
+        instrument_id=instrument_id,
+        allowed=True,
+        reason="tradable",
+        contract_spec=contract_spec,
+        contract_spec_snapshot=_snapshot_evidence(snapshot),
+    )
+
+
+def pinned_contract_spec_provider(
+    decision: DeepcoinEntryCapabilityGateResult,
+) -> DeepcoinContractSpecProvider:
+    if not decision.allowed or decision.contract_spec is None:
+        raise ValueError(decision.reason)
+    return _PinnedContractSpecProvider(
+        instrument_id=decision.instrument_id,
+        contract_spec=decision.contract_spec,
+    )
+
+
+def attach_contract_spec_evidence(
+    draft: dict[str, Any],
+    decision: DeepcoinEntryCapabilityGateResult,
+) -> dict[str, Any]:
+    if not decision.allowed or decision.contract_spec is None:
+        raise ValueError(decision.reason)
+    accepted = {**draft, "contract_spec": decision.contract_spec.to_dict()}
+    if decision.contract_spec_snapshot is not None:
+        accepted["contract_spec_snapshot"] = dict(
+            decision.contract_spec_snapshot
+        )
+    return accepted
+
+
+def _blocked_capability(
+    symbol: str, instrument_id: str, reason: str
+) -> DeepcoinEntryCapabilityGateResult:
+    return DeepcoinEntryCapabilityGateResult(
+        symbol=symbol,
+        instrument_id=instrument_id,
+        allowed=False,
+        reason=reason,
+        contract_spec=None,
+        contract_spec_snapshot=None,
+    )
+
+
+def _snapshot_evidence(snapshot: Any) -> dict[str, str] | None:
+    if snapshot is None:
+        return None
+    digest = getattr(snapshot, "source_digest_sha256", None)
+    fetched_at = getattr(snapshot, "fetched_at", None)
+    expires_at = getattr(snapshot, "expires_at", None)
+    if (
+        not isinstance(digest, str)
+        or not isinstance(fetched_at, datetime)
+        or not isinstance(expires_at, datetime)
+    ):
+        return None
+    return {
+        "source_digest_sha256": digest,
+        "fetched_at": fetched_at.isoformat(),
+        "expires_at": expires_at.isoformat(),
+    }
 
 
 def confirm_recovery_order_dry_run(
@@ -26,15 +189,41 @@ def confirm_recovery_order_dry_run(
 ) -> dict[str, object]:
     """Re-check a recovery execution preview without placing a live order."""
 
+    capability = evaluate_deepcoin_entry_capability(
+        session_factory,
+        symbol=symbol,
+        contract_spec_provider=contract_spec_provider,
+    )
+    if not capability.allowed:
+        return {
+            "ready_for_live_order": False,
+            "dry_run_only": True,
+            "reason_codes": [capability.reason],
+            "contract_spec_status": {"code": "missing"},
+            "payload_preview": None,
+            "deepcoin_order_draft": {
+                "instrument_id": capability.instrument_id,
+                "blocking_reason_codes": [capability.reason],
+            },
+            "source": {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "symbol": capability.symbol,
+                "side": side.lower(),
+            },
+            "ready_confirmation": None,
+        }
     preview = _find_execution_preview(
         session_factory,
         chat_id=chat_id,
         message_id=message_id,
         symbol=symbol,
         side=side,
-        contract_spec_provider=contract_spec_provider,
+        contract_spec_provider=pinned_contract_spec_provider(capability),
     )
-    draft = preview["deepcoin_order_draft"]
+    draft = attach_contract_spec_evidence(
+        preview["deepcoin_order_draft"], capability
+    )
     reason_codes = _final_reason_codes(draft)
     result = {
         "ready_for_live_order": not reason_codes,

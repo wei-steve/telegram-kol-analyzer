@@ -1,9 +1,11 @@
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
+from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecLookup
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord
 from telegram_kol_research.execution_bindings import upsert_execution_binding
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
@@ -23,6 +25,38 @@ class _StaticContractSpecProvider:
             min_quantity=1,
             price_tick=0.1,
         )
+
+
+class _CapabilityContractSpecProvider:
+    def __init__(self, reason):
+        self.reason = reason
+        self.snapshot = SimpleNamespace(
+            source_digest_sha256="b" * 64,
+            fetched_at=datetime(2026, 8, 8, 8, 0, tzinfo=UTC),
+            expires_at=datetime(2026, 8, 9, 8, 0, tzinfo=UTC),
+        )
+
+    def lookup_contract_spec(self, instrument_id):
+        spec = None
+        state = "suspend" if self.reason == "venue_instrument_not_live" else None
+        if self.reason == "available":
+            state = "live"
+            spec = DeepcoinContractSpec(
+                instrument_id=instrument_id,
+                contract_value=0.001,
+                quantity_step=1,
+                min_quantity=1,
+                price_tick=0.001,
+            )
+        return DeepcoinContractSpecLookup(
+            instrument_id=instrument_id,
+            reason=self.reason,
+            venue_state=state,
+            contract_spec=spec,
+        )
+
+    def get_contract_spec(self, instrument_id):
+        return self.lookup_contract_spec(instrument_id).contract_spec
 
 
 def _persist_approved_recovery(session_factory):
@@ -101,8 +135,68 @@ def test_confirm_recovery_order_dry_run_blocks_without_contract_spec(tmp_path):
     )
 
     assert result["ready_for_live_order"] is False
-    assert result["reason_codes"] == ["contract_size_unverified"]
+    assert result["reason_codes"] == ["contract_spec_missing"]
     assert result["contract_spec_status"]["code"] == "missing"
+
+
+@pytest.mark.parametrize(
+    "capability_reason",
+    [
+        "venue_instrument_unsupported",
+        "venue_instrument_not_live",
+        "contract_spec_missing",
+        "contract_spec_invalid",
+        "contract_spec_stale",
+        "contract_spec_sync_unavailable",
+    ],
+)
+def test_confirm_recovery_order_rejects_exact_capability_reason_without_writes(
+    tmp_path, capability_reason
+):
+    session_factory = create_session_factory(tmp_path / f"{capability_reason}.db")
+    _persist_approved_recovery(session_factory)
+
+    result = confirm_recovery_order_dry_run(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_CapabilityContractSpecProvider(capability_reason),
+        persist_ready_confirmation=True,
+        confirmed_at=datetime(2026, 8, 8, 9, 0, tzinfo=UTC),
+    )
+
+    assert result["ready_for_live_order"] is False
+    assert result["reason_codes"] == [capability_reason]
+    with session_factory() as session:
+        from telegram_kol_research.models import ExecutionBinding, TradeSignal
+        from telegram_kol_research.models import RecoveryOrderConfirmation
+
+        assert session.query(TradeSignal).count() == 0
+        assert session.query(ExecutionBinding).count() == 0
+        assert session.query(RecoveryOrderConfirmation).count() == 0
+
+
+def test_confirm_recovery_order_embeds_exact_validated_snapshot(tmp_path):
+    session_factory = create_session_factory(tmp_path / "dynamic-spec.db")
+    _persist_approved_recovery(session_factory)
+
+    result = confirm_recovery_order_dry_run(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_CapabilityContractSpecProvider("available"),
+    )
+
+    assert result["ready_for_live_order"] is True
+    assert result["deepcoin_order_draft"]["contract_spec_snapshot"] == {
+        "source_digest_sha256": "b" * 64,
+        "fetched_at": "2026-08-08T08:00:00+00:00",
+        "expires_at": "2026-08-09T08:00:00+00:00",
+    }
 
 
 def test_confirm_recovery_order_dry_run_raises_when_item_is_not_in_execution_queue(tmp_path):

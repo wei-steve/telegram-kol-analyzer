@@ -58,6 +58,10 @@ from telegram_kol_research.trigger_take_profit_convergence import (
     create_or_get_trigger_take_profit_convergence,
 )
 from telegram_kol_research.recovery_live_submit_gate import validate_recovery_live_submit_gate
+from telegram_kol_research.recovery_order_confirmation import (
+    attach_contract_spec_evidence,
+    evaluate_deepcoin_entry_capability,
+)
 from telegram_kol_research.trade_signals import TradeSignalRecord
 from telegram_kol_research.trade_signals import TradeSignalClaimError
 from telegram_kol_research.trade_signals import MANUAL_MANAGEMENT_SOURCE_TYPES
@@ -446,7 +450,14 @@ def submit_strategy_revision_replacement_live(
             "side": binding.side,
             "strategy_instance_id": binding.strategy_instance_id,
         }
-    validated_draft = dict(draft)
+    capability = evaluate_deepcoin_entry_capability(
+        session_factory,
+        symbol=str(binding_context["symbol"]),
+        contract_spec_provider=contract_spec_provider,
+    )
+    if not capability.allowed:
+        raise RecoveryLiveSubmitError(capability.reason)
+    validated_draft = attach_contract_spec_evidence(dict(draft), capability)
     validated_draft["_entry_leg_index_offset"] = max_leg_index
     trade_signal = load_or_create_trade_signal(
         session_factory,
@@ -725,6 +736,25 @@ def _is_automatic_legacy_management_signal(
     )
 
 
+def _require_current_contract_spec_matches_queued(
+    *,
+    current_draft: dict[str, Any],
+    queued_draft: dict[str, Any],
+) -> None:
+    """Reject a queued entry if its pinned sizing authority has drifted."""
+
+    current_spec = current_draft.get("contract_spec")
+    queued_spec = queued_draft.get("contract_spec")
+    if not isinstance(current_spec, dict) or queued_spec != current_spec:
+        raise RecoveryLiveSubmitError("queued_contract_spec_mismatch")
+    current_snapshot = current_draft.get("contract_spec_snapshot")
+    if current_snapshot is not None and (
+        not isinstance(current_snapshot, dict)
+        or queued_draft.get("contract_spec_snapshot") != current_snapshot
+    ):
+        raise RecoveryLiveSubmitError("queued_contract_spec_snapshot_mismatch")
+
+
 @serialized_source_message_execution
 @_report_entry_submission_progress
 def _submit_recovery_signal_direct(
@@ -765,6 +795,10 @@ def _submit_recovery_signal_direct(
         else None
     )
     if isinstance(queued_draft, dict):
+        _require_current_contract_spec_matches_queued(
+            current_draft=draft,
+            queued_draft=queued_draft,
+        )
         draft = queued_draft
     order_legs = draft.get("order_legs")
     if not isinstance(order_legs, list) or not order_legs:

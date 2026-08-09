@@ -11,6 +11,7 @@ from telegram_kol_research.recovery_order_confirmation import confirm_recovery_o
 from telegram_kol_research.recovery_scan import RecoveryDecision
 from telegram_kol_research.recovery_scan import RecoveryEvaluation
 from telegram_kol_research.recovery_scan import RecoverySignal
+from telegram_kol_research.trading_settings import save_trading_settings
 
 
 class _StaticContractSpecProvider:
@@ -171,6 +172,24 @@ def test_recovery_live_submit_gate_blocks_when_order_draft_is_no_longer_ready(tm
     )
 
     assert result["would_submit"] is False
-    assert "contract_size_unverified" in result["reason_codes"]
+    assert "contract_spec_missing" in result["reason_codes"]
     assert result["checks"]["ready_confirmation"] is True
     assert result["checks"]["order_draft_ready"] is False
+
+
+def test_recovery_gate_checks_global_allowlist_before_contract_spec(tmp_path):
+    session_factory = create_session_factory(tmp_path / "global-first.db")
+    _persist_approved_recovery(session_factory)
+    save_trading_settings(session_factory, {"allowed_symbols": ["ETH"]})
+
+    result = validate_recovery_live_submit_gate(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=None,
+    )
+
+    assert result["would_submit"] is False
+    assert result["reason_codes"] == ["symbol_not_allowed"]

@@ -12,6 +12,17 @@ from telegram_kol_research.recovery_order_confirmations import (
 )
 
 
+_ENTRY_CAPABILITY_REASONS = {
+    "symbol_not_allowed",
+    "venue_instrument_unsupported",
+    "venue_instrument_not_live",
+    "contract_spec_missing",
+    "contract_spec_invalid",
+    "contract_spec_stale",
+    "contract_spec_sync_unavailable",
+}
+
+
 def validate_recovery_live_submit_gate(
     session_factory: sessionmaker,
     *,
@@ -62,7 +73,16 @@ def validate_recovery_live_submit_gate(
         )
         checks["execution_queue_item"] = True
         checks["order_draft_ready"] = bool(confirmation_result["ready_for_live_order"])
-        reason_codes.extend(str(code) for code in confirmation_result["reason_codes"])
+        confirmation_reasons = [
+            str(code) for code in confirmation_result["reason_codes"]
+        ]
+        capability_reasons = [
+            code for code in confirmation_reasons if code in _ENTRY_CAPABILITY_REASONS
+        ]
+        if capability_reasons:
+            reason_codes = capability_reasons
+        else:
+            reason_codes.extend(confirmation_reasons)
     except LookupError:
         reason_codes.append("execution_queue_item_not_found")
 

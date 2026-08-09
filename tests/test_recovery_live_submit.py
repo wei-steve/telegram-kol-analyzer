@@ -2,6 +2,7 @@ import json
 import hashlib
 from datetime import UTC, datetime
 from threading import Barrier, Event, Thread
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,6 +11,7 @@ from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import DeepcoinDefiniteRejection
 from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
+from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecLookup
 from telegram_kol_research.entry_strategy_assembly import (
     finalize_adjacent_entry_assembly_draft,
 )
@@ -59,6 +61,23 @@ class _StaticContractSpecProvider:
             min_quantity=1,
             price_tick=0.1,
         )
+
+
+class _StaleCapabilityProvider:
+    snapshot = SimpleNamespace(
+        source_digest_sha256="c" * 64,
+        fetched_at=datetime(2026, 8, 7, 8, 0, tzinfo=UTC),
+        expires_at=datetime(2026, 8, 8, 8, 0, tzinfo=UTC),
+    )
+
+    def lookup_contract_spec(self, instrument_id):
+        return DeepcoinContractSpecLookup(
+            instrument_id=instrument_id,
+            reason="contract_spec_stale",
+        )
+
+    def get_contract_spec(self, instrument_id):
+        return None
 
 
 def test_pending_entry_update_requires_an_exact_exchange_order_id():
@@ -351,6 +370,39 @@ def _persist_ready_item(session_factory):
         persist_ready_confirmation=True,
         confirmed_at=datetime(2026, 6, 12, 20, 0, tzinfo=UTC),
     )
+
+
+def test_live_submit_revalidates_capability_before_exchange_or_binding_write(tmp_path):
+    session_factory = create_session_factory(tmp_path / "stale-before-submit.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(
+        session_factory,
+        {"auto_trade_enabled": True, "allowed_symbols": ["BTC", "ETH"]},
+    )
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    client = _FakeDeepcoinClient()
+
+    with pytest.raises(RecoveryLiveSubmitError, match="contract_spec_stale"):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaleCapabilityProvider(),
+            processed_at=datetime(2026, 8, 8, 9, 0, tzinfo=UTC),
+        )
+
+    assert client.payloads == []
+    assert client.trigger_payloads == []
+    assert client.protection_payloads == []
+    with session_factory() as session:
+        assert session.query(ExecutionBinding).count() == 0
 
 
 def _finalize_v2_assembly_for_signal(session_factory, signal):
@@ -1423,6 +1475,7 @@ def test_revision_first_generic_write_error_is_unknown_and_never_retried(tmp_pat
             batch_id=batch_id,
             draft=draft,
             deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
         )
     with session_factory() as session:
         signal = session.query(TradeSignal).filter_by(source_type="strategy_revision").one()
@@ -1438,6 +1491,7 @@ def test_revision_first_generic_write_error_is_unknown_and_never_retried(tmp_pat
             batch_id=batch_id,
             draft={**draft, "risk_budget_usdt": 999},
             deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
         )
 
     assert len(client.trigger_payloads) == 1
@@ -1466,6 +1520,7 @@ def test_revision_confirmed_first_leg_then_error_is_partial_and_never_retried(
             batch_id=batch_id,
             draft=draft,
             deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
         )
     with session_factory() as session:
         signal = session.query(TradeSignal).filter_by(source_type="strategy_revision").one()
@@ -1481,6 +1536,7 @@ def test_revision_confirmed_first_leg_then_error_is_partial_and_never_retried(
             batch_id=batch_id,
             draft=draft,
             deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
         )
 
     assert len(client.trigger_payloads) == 2
@@ -1505,6 +1561,7 @@ def test_revision_definite_first_rejection_is_failed_but_never_auto_revived(tmp_
             batch_id=batch_id,
             draft=draft,
             deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
         )
     with session_factory() as session:
         signal = session.query(TradeSignal).filter_by(source_type="strategy_revision").one()
@@ -1520,6 +1577,7 @@ def test_revision_definite_first_rejection_is_failed_but_never_auto_revived(tmp_
             batch_id=batch_id,
             draft=draft,
             deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
         )
 
     assert len(client.trigger_payloads) == 1

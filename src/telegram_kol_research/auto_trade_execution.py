@@ -55,6 +55,11 @@ from telegram_kol_research.recovery_live_submit import (
     submit_strategy_revision_replacement_live,
 )
 from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
+from telegram_kol_research.recovery_order_confirmation import (
+    attach_contract_spec_evidence,
+    evaluate_deepcoin_entry_capability,
+    pinned_contract_spec_provider,
+)
 from telegram_kol_research.recovery_scan import RecoveryDecision
 from telegram_kol_research.recovery_scan import RecoveryEvaluation
 from telegram_kol_research.recovery_scan import RecoverySignal
@@ -475,6 +480,22 @@ def _auto_process_single_message_trade_signal(
             processed_at=now,
             extra={"symbol": symbol},
         )
+    capability = evaluate_deepcoin_entry_capability(
+        session_factory,
+        symbol=symbol,
+        contract_spec_provider=contract_spec_provider,
+    )
+    if not capability.allowed:
+        return _record_entry_auto_trade_skip(
+            session_factory,
+            raw_message=raw_message,
+            candidate=candidate,
+            reason=capability.reason,
+            runtime_kol_id=str(runtime_config.get("kol_id") or ""),
+            processed_at=now,
+            extra={"symbol": symbol, "instrument_id": capability.instrument_id},
+        )
+    validated_contract_spec_provider = pinned_contract_spec_provider(capability)
     entry_thresholds = settings.entry_thresholds_for_symbol(symbol)
     if candidate.confidence < settings.min_ai_confidence:
         return _record_entry_auto_trade_skip(
@@ -742,7 +763,7 @@ def _auto_process_single_message_trade_signal(
             take_profit_text=candidate.take_profit_text,
             take_profit_allocations=settings.take_profit_allocations,
             entry_thresholds=entry_thresholds,
-            contract_spec_provider=contract_spec_provider,
+            contract_spec_provider=validated_contract_spec_provider,
         )
         execution_plan = "adjacent_multi_fragment_entry"
     elif entry_execution_type == "market":
@@ -753,7 +774,7 @@ def _auto_process_single_message_trade_signal(
             stop_loss_text=candidate.stop_loss_text,
             take_profit_text=candidate.take_profit_text,
             take_profit_allocations=settings.take_profit_allocations,
-            contract_spec_provider=contract_spec_provider,
+            contract_spec_provider=validated_contract_spec_provider,
         )
         execution_plan = "single_entry_market"
     elif entry_execution_type == "limit" and market_price_is_near_entry_edge(
@@ -771,10 +792,11 @@ def _auto_process_single_message_trade_signal(
             take_profit_text=candidate.take_profit_text,
             take_profit_allocations=settings.take_profit_allocations,
             entry_thresholds=entry_thresholds,
-            contract_spec_provider=contract_spec_provider,
+            contract_spec_provider=validated_contract_spec_provider,
         )
         execution_plan = "range_hybrid_market_half_limit_half"
     if auto_draft is not None:
+        auto_draft = attach_contract_spec_evidence(auto_draft, capability)
         auto_order_legs = auto_draft.get("order_legs")
         if isinstance(auto_order_legs, list) and auto_order_legs:
             auto_draft = {
