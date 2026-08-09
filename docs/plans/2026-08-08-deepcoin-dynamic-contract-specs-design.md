@@ -50,7 +50,7 @@ Decimal，且 `minSz` 必须可按 `lotSz` 表示。重复合约、冲突数据�
 
 ## 缓存模型
 
-默认运行时缓存路径为 `data/web_cache/deepcoin_contract_specs.json`。缓存是
+默认运行时缓存路径为 `data/deepcoin_contract_specs_cache.json`。缓存是
 非敏感的交易所元数据，但仍要遵循现有数据目录权限和部署边界。
 
 快照包含：

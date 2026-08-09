@@ -93,7 +93,7 @@ def resolve_existing_position_contract_spec(
     side: str,
     risk_reducing: bool,
 ) -> ManagementContractSpecResolution | None:
-    """Prefer a fresh spec, then a proven opening spec for risk reduction only."""
+    """Prefer a proven opening spec for risk reduction, then a current spec."""
 
     expected_instrument = str(instrument_id or "").strip().upper()
     expected_side = str(side or "").strip().lower()
