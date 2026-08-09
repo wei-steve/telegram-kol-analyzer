@@ -249,6 +249,11 @@ def test_phase_7_is_deferred_and_phase_8r_requires_no_action_authority():
         "deployed_commit: 47e917dfd950990750371428a9c7e545446cd4c6"
         in status
     )
+    assert "all-symbol contract-spec expansion remain" not in status
+    assert (
+        "allowed_symbol_contract_spec_live_activation: "
+        '"After separate explicit operator approval' in status
+    )
     assert "task_8r_4_status: completed_dormant_production_verified" in status
     assert "task_8r_5_status: completed_future_only_shadow_canary" in status
     assert (
