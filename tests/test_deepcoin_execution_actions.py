@@ -11,6 +11,7 @@ from telegram_kol_research.deepcoin_execution_actions import DeepcoinExecutionAc
 from telegram_kol_research.deepcoin_execution_actions import adjust_position_tpsl
 from telegram_kol_research.deepcoin_execution_actions import close_bound_position_market
 from telegram_kol_research.deepcoin_execution_actions import cancel_revision_entry_leg
+from telegram_kol_research.deepcoin_execution_actions import cancel_pending_entry_legs
 from telegram_kol_research.deepcoin_execution_actions import execute_deepcoin_management_signal
 from telegram_kol_research.deepcoin_execution_actions import partial_close_and_move_stop_to_entry
 from telegram_kol_research.deepcoin_execution_actions import _management_action_matches_batch
@@ -2690,6 +2691,116 @@ def test_process_trade_signal_live_cancels_all_bound_trigger_entry_legs(tmp_path
         (1, "trigger-1", "cancelled"),
         (2, "trigger-2", "cancelled"),
     ]
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [None, "missing_success", "mismatched_economics", "fill", "live_position"],
+)
+def test_pending_entry_cancel_state_less_history_requires_combined_proof(
+    tmp_path,
+    failure_mode,
+):
+    session_factory = create_session_factory(tmp_path / "cancel-readback.db")
+    binding_id = _binding(
+        session_factory,
+        order_id="trigger-1,trigger-2",
+        client_order_id="client-1,client-2",
+        pos_id=None,
+        status="open",
+    )
+    for index, (order_id, client_order_id, price, size) in enumerate(
+        (
+            ("trigger-1", "client-1", "65510", "10"),
+            ("trigger-2", "client-2", "66110", "11"),
+        ),
+        start=1,
+    ):
+        upsert_execution_order_leg(
+            session_factory,
+            ExecutionOrderLegRecord(
+                execution_binding_id=binding_id,
+                strategy_instance_id="deepcoin:100:55:ETH:long",
+                leg_index=index,
+                purpose="entry",
+                order_kind="trigger_limit",
+                order_id=order_id,
+                client_order_id=client_order_id,
+                status="open",
+            ),
+        )
+    trade_signal = _signal(
+        session_factory,
+        action="cancel_entry",
+        payload={"binding_id": binding_id},
+    )
+
+    class Client(_FakeDeepcoinClient):
+        def __init__(self):
+            super().__init__()
+            self.positions = []
+            self.trigger_pending = [
+                {
+                    "ordId": "trigger-1",
+                    "clOrdId": "client-1",
+                    "instId": "ETH-USDT-SWAP",
+                    "side": "buy",
+                    "posSide": "long",
+                    "triggerPrice": "65510",
+                    "sz": "10",
+                },
+                {
+                    "ordId": "trigger-2",
+                    "clOrdId": "client-2",
+                    "instId": "ETH-USDT-SWAP",
+                    "side": "buy",
+                    "posSide": "long",
+                    "triggerPrice": "66110",
+                    "sz": "11",
+                },
+            ]
+
+        def cancel_trigger_order(self, cancel_payload):
+            matching = next(
+                row
+                for row in self.trigger_pending
+                if row["ordId"] == cancel_payload["ordId"]
+            )
+            self.trigger_pending.remove(matching)
+            history = dict(matching)
+            if failure_mode == "mismatched_economics":
+                history["triggerPrice"] = "1"
+            self.trigger_history.append(history)
+            if failure_mode == "fill":
+                self.trade_fills.append({"ordId": cancel_payload["ordId"], "fillSz": "1"})
+            if failure_mode == "live_position":
+                self.positions.append({"ordId": cancel_payload["ordId"], "pos": "1"})
+            if failure_mode == "missing_success":
+                return {}
+            return {"code": "0", "data": {"ordId": cancel_payload["ordId"]}}
+
+    if failure_mode is not None:
+        with pytest.raises(DeepcoinExecutionActionError):
+            cancel_pending_entry_legs(
+                session_factory,
+                trade_signal=trade_signal,
+                deepcoin_client=Client(),
+            )
+        return
+
+    result = cancel_pending_entry_legs(
+        session_factory,
+        trade_signal=trade_signal,
+        deepcoin_client=Client(),
+    )
+
+    assert result["submitted"] is True
+    assert len(result["cancelled_orders"]) == 2
+    legs = list_execution_order_legs(
+        session_factory,
+        execution_binding_id=binding_id,
+    )
+    assert [leg.status for leg in legs] == ["cancelled", "cancelled"]
 
 
 def test_process_trade_signal_live_recreates_trigger_entry_with_embedded_stop_only(tmp_path):

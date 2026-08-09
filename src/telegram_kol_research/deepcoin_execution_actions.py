@@ -1514,6 +1514,7 @@ def cancel_pending_entry_legs(
                 "order_id": order_id,
                 "client_order_id": client_order_id,
                 "cancel_type": cancel_type,
+                "before": dict(order),
                 "request": cancel_payload,
                 "response": response,
             }
@@ -1552,6 +1553,12 @@ def cancel_pending_entry_legs(
         deepcoin_client,
         inst_id=inst_id,
     )
+    position_reader = getattr(deepcoin_client, "list_positions", None)
+    post_position_rows = (
+        list(position_reader(inst_id=inst_id) or [])
+        if position_reader is not None
+        else None
+    )
     cancelled_legs = [
         leg
         for leg in pending_legs
@@ -1561,6 +1568,8 @@ def cancel_pending_entry_legs(
         [leg for leg in cancelled_legs if not leg.has_position],
         history_rows=post_history_rows,
         fill_rows=post_fill_rows,
+        successful_cancellations=cancelled_orders,
+        position_rows=post_position_rows,
     )
 
     for cancelled_order in cancelled_orders:
@@ -2060,6 +2069,8 @@ def _require_cancelled_history_for_pending_entry_legs(
     *,
     history_rows: list[dict[str, Any]] | None,
     fill_rows: list[dict[str, Any]] | None,
+    successful_cancellations: list[dict[str, Any]] | None = None,
+    position_rows: list[dict[str, Any]] | None = None,
 ) -> None:
     if history_rows is None or fill_rows is None:
         raise DeepcoinExecutionActionError(
@@ -2072,14 +2083,144 @@ def _require_cancelled_history_for_pending_entry_legs(
     )
     cancelled_states = {"cancelled", "canceled", "cancel", "expired", "rejected"}
     for leg in legs:
+        history_matches = _rows_matching_pending_entry_leg(history_rows, leg)
         states = {
             str(_first_string(row, "state", "status", "orderStatus") or "").lower()
-            for row in _rows_matching_pending_entry_leg(history_rows, leg)
+            for row in history_matches
         }
+        if states & cancelled_states:
+            continue
+        if _has_strict_stateless_cancel_proof(
+            leg,
+            history_matches=history_matches,
+            successful_cancellations=successful_cancellations,
+            position_rows=position_rows,
+        ):
+            continue
         if not states & cancelled_states:
             raise DeepcoinExecutionActionError(
                 "pending_entry_cancel_not_terminally_confirmed"
             )
+
+
+def _has_strict_stateless_cancel_proof(
+    leg: _PendingEntryLeg,
+    *,
+    history_matches: list[dict[str, Any]],
+    successful_cancellations: list[dict[str, Any]] | None,
+    position_rows: list[dict[str, Any]] | None,
+) -> bool:
+    """Accept state-less history only with same-invocation, exact readback proof."""
+
+    if successful_cancellations is None or position_rows is None:
+        return False
+    matching_cancellations = [
+        item
+        for item in successful_cancellations
+        if int(item.get("leg_id") or 0) == leg.id
+    ]
+    if len(matching_cancellations) != 1 or len(history_matches) != 1:
+        return False
+    cancellation = matching_cancellations[0]
+    if not _cancel_response_is_definite_success(
+        cancellation.get("response"),
+        order_id=leg.order_id,
+        client_order_id=leg.client_order_id,
+    ):
+        return False
+    before = cancellation.get("before")
+    history = history_matches[0]
+    if not isinstance(before, dict) or not _order_economics_match(before, history):
+        return False
+    for position in position_rows:
+        if _row_shares_order_identity(position, leg):
+            return False
+    return True
+
+
+def _cancel_response_is_definite_success(
+    response: Any,
+    *,
+    order_id: str | None,
+    client_order_id: str | None,
+) -> bool:
+    if not isinstance(response, dict) or "code" not in response:
+        return False
+    if str(response.get("code")) not in {"0", ""}:
+        return False
+    data = response.get("data")
+    rows = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+    for row in rows:
+        if str(row.get("sCode", "0")) not in {"0", ""}:
+            return False
+        response_order_id = _order_id_from_payload(row)
+        response_client_id = _first_string(
+            row, "clOrdId", "clientOrderId", "client_order_id"
+        )
+        if response_order_id and order_id and response_order_id != order_id:
+            return False
+        if (
+            response_client_id
+            and client_order_id
+            and response_client_id != client_order_id
+        ):
+            return False
+    return True
+
+
+def _order_economics_match(
+    before: dict[str, Any],
+    history: dict[str, Any],
+) -> bool:
+    field_groups = (
+        (False, ("instId", "instrumentId", "symbol")),
+        (False, ("side",)),
+        (False, ("posSide", "positionSide")),
+        (True, ("triggerPrice", "triggerPx")),
+        (True, ("price", "px", "orderPx")),
+        (True, ("sz", "size", "orderSz", "qty")),
+    )
+    compared = 0
+    for numeric, names in field_groups:
+        before_value = _first_present_value(before, names)
+        if before_value in (None, ""):
+            continue
+        history_value = _first_present_value(history, names)
+        if history_value in (None, ""):
+            return False
+        compared += 1
+        if numeric:
+            try:
+                if Decimal(str(before_value)) != Decimal(str(history_value)):
+                    return False
+            except (InvalidOperation, TypeError, ValueError):
+                return False
+        elif str(before_value).strip().lower() != str(history_value).strip().lower():
+            return False
+    return compared >= 4
+
+
+def _first_present_value(row: dict[str, Any], names: tuple[str, ...]) -> Any:
+    for name in names:
+        if row.get(name) not in (None, ""):
+            return row.get(name)
+    return None
+
+
+def _row_shares_order_identity(
+    row: dict[str, Any],
+    leg: _PendingEntryLeg,
+) -> bool:
+    return bool(
+        (leg.order_id and _order_id_from_payload(row) == leg.order_id)
+        or (
+            leg.client_order_id
+            and _first_string(
+                row, "clOrdId", "clientOrderId", "client_order_id"
+            )
+            == leg.client_order_id
+        )
+    )
 
 
 def _mark_pending_entry_leg_ids_cancelled(
