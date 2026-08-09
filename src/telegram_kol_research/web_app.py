@@ -180,6 +180,7 @@ from telegram_kol_research.config import (
     RuntimeIncidentConfig,
     load_message_operation_supervisor_config,
     load_runtime_incident_config,
+    message_operation_supervisor_policy_status,
 )
 from telegram_kol_research.message_operation_supervisor import (
     build_message_operation_coverage_snapshot,
@@ -3794,6 +3795,7 @@ def create_web_app(
             if (
                 app.state.message_operation_supervisor_config.enabled
                 and app.state.message_operation_supervisor_config.shadow_only
+                and app.state.message_operation_supervisor_policy_status == "valid"
                 and app.state.message_operation_supervisor_watermark_valid
                 and app.state.message_operation_supervisor_task is None
             ):
@@ -4236,6 +4238,12 @@ def create_web_app(
         message_operation_supervisor_config
         if message_operation_supervisor_config is not None
         else load_message_operation_supervisor_config()
+    )
+    app.state.message_operation_supervisor_policy_status = (
+        message_operation_supervisor_policy_status(
+            app.state.message_operation_supervisor_config,
+            app.state.runtime_incident_config,
+        )
     )
     app.state.message_operation_supervisor_runner = (
         message_operation_supervisor_runner
@@ -4694,8 +4702,13 @@ def create_web_app(
     def api_runtime_incidents_message_operation_coverage(request: Request):
         require_monitor_capture_auth(request)
         config = app.state.message_operation_supervisor_config
-        enabled = bool(config.enabled and config.shadow_only)
-        return build_message_operation_coverage_snapshot(
+        policy_status = app.state.message_operation_supervisor_policy_status
+        enabled = bool(
+            config.enabled
+            and config.shadow_only
+            and policy_status == "valid"
+        )
+        snapshot = build_message_operation_coverage_snapshot(
             app.state.session_factory,
             after_raw_message_id=config.after_raw_message_id,
             supervisor_last_success_at=(
@@ -4705,6 +4718,8 @@ def create_web_app(
             limit=1_000,
             coverage_enabled=enabled,
         )
+        snapshot["supervisor_policy_status"] = policy_status
+        return snapshot
 
     @app.post("/api/runtime-incidents/monitor-capture")
     async def api_runtime_incidents_monitor_capture(request: Request):

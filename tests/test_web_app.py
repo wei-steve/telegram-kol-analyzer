@@ -6127,6 +6127,7 @@ def test_message_operation_coverage_health_is_loopback_authenticated_and_read_on
     app = create_web_app(
         database_path=tmp_path / "research.db",
         runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"message_operation_failure"}),
             monitor_capture_token=token,
         ),
         message_operation_supervisor_config=MessageOperationSupervisorConfig(
@@ -6183,6 +6184,9 @@ def test_message_operation_supervisor_lifecycle_records_only_successful_heartbea
 
     app = create_web_app(
         database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"message_operation_failure"})
+        ),
         message_operation_supervisor_config=MessageOperationSupervisorConfig(
             enabled=True,
             shadow_only=True,
@@ -6234,6 +6238,9 @@ def test_message_operation_supervisor_does_not_heartbeat_after_model_call(
 
     app = create_web_app(
         database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"message_operation_failure"})
+        ),
         message_operation_supervisor_config=MessageOperationSupervisorConfig(
             enabled=True,
             shadow_only=True,
@@ -6263,6 +6270,9 @@ def test_message_operation_supervisor_rejects_sentinel_or_future_watermark(
 
     app = create_web_app(
         database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"message_operation_failure"})
+        ),
         message_operation_supervisor_config=MessageOperationSupervisorConfig(
             enabled=True,
             shadow_only=True,

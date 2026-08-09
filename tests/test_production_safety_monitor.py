@@ -254,6 +254,7 @@ def _healthy_message_operation_coverage(**overrides):
     values = {
         "schema_version": 1,
         "coverage_enabled": True,
+        "supervisor_policy_status": "valid",
         "scan_truncated": False,
         "executable_messages_total": 2,
         "contracts_created_total": 2,
@@ -316,6 +317,7 @@ def test_disabled_message_operation_coverage_is_a_clean_rollback_state():
         _snapshot(
             message_operation_coverage=_healthy_message_operation_coverage(
                 coverage_enabled=False,
+                supervisor_policy_status="disabled",
                 supervisor_last_success_at=None,
             )
         ),
@@ -324,6 +326,25 @@ def test_disabled_message_operation_coverage_is_a_clean_rollback_state():
     )
 
     assert result.healthy is True
+
+
+def test_invalid_message_operation_supervisor_policy_is_explicitly_unhealthy():
+    result = evaluate_monitor_snapshot(
+        _snapshot(
+            message_operation_coverage=_healthy_message_operation_coverage(
+                coverage_enabled=False,
+                supervisor_policy_status=(
+                    "invalid_missing_message_operation_failure_capture"
+                ),
+                supervisor_last_success_at=None,
+            )
+        ),
+        EXPECTATIONS,
+        checked_at=datetime(2026, 8, 9, 2, 0, tzinfo=UTC),
+    )
+
+    assert result.healthy is False
+    assert "message_operation_supervisor_policy_invalid" in result.reason_codes
 
 
 def _healthy_audit(**overrides):

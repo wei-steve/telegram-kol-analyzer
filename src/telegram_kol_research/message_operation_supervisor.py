@@ -388,6 +388,11 @@ def run_message_operation_supervisor_cycle(
 ) -> dict[str, int]:
     """Run one bounded projection plus outcome cycle with zero model calls."""
 
+    if not runtime_incident_config.captures("message_operation_failure"):
+        raise MessageOperationEvaluationError(
+            "message operation supervisor capture policy invalid"
+        )
+
     projection = run_message_operation_shadow_once(
         session_factory,
         after_raw_message_id=after_raw_message_id,

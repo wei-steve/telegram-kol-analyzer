@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from telegram_kol_research.config import (
+    MESSAGE_OPERATION_SUPERVISOR_POLICY_STATUSES,
     RuntimeIncidentConfig,
     load_runtime_incident_config,
 )
@@ -233,6 +234,7 @@ _FIXED_REASON_CODES = frozenset(
         "contract_violation_missing_stage1",
         "message_operation_incident_missing_terminal",
         "message_operation_supervisor_stale",
+        "message_operation_supervisor_policy_invalid",
         "message_operation_coverage_incomplete",
     }
 )
@@ -3391,6 +3393,7 @@ _MESSAGE_OPERATION_COVERAGE_FIELDS = _MESSAGE_OPERATION_COVERAGE_COUNT_FIELDS | 
     "schema_version",
     "coverage_enabled",
     "scan_truncated",
+    "supervisor_policy_status",
     "supervisor_last_success_at",
 }
 _MESSAGE_OPERATION_HEARTBEAT_MAX_AGE = timedelta(minutes=5)
@@ -3417,6 +3420,10 @@ def _evaluate_message_operation_coverage(
     if type(enabled) is not bool or type(truncated) is not bool:
         reasons.add("message_operation_coverage_incomplete")
         return
+    policy_status = value.get("supervisor_policy_status")
+    if policy_status not in MESSAGE_OPERATION_SUPERVISOR_POLICY_STATUSES:
+        reasons.add("message_operation_coverage_incomplete")
+        return
     counts: dict[str, int] = {}
     for name in _MESSAGE_OPERATION_COVERAGE_COUNT_FIELDS:
         raw = value.get(name)
@@ -3433,7 +3440,16 @@ def _evaluate_message_operation_coverage(
             reasons.add("message_operation_coverage_incomplete")
             return
 
+    if policy_status.startswith("invalid_"):
+        reasons.add("message_operation_supervisor_policy_invalid")
     if not enabled:
+        if policy_status not in {"disabled"} and not policy_status.startswith(
+            "invalid_"
+        ):
+            reasons.add("message_operation_coverage_incomplete")
+        return
+    if policy_status != "valid":
+        reasons.add("message_operation_coverage_incomplete")
         return
     if truncated:
         reasons.add("message_operation_coverage_incomplete")
@@ -4026,6 +4042,11 @@ _ALERT_RULES: Mapping[str, tuple[str, str, str]] = {
         "消息操作监督器心跳过期",
         "消息操作监督器未在规定时间内完成检查。",
     ),
+    "message_operation_supervisor_policy_invalid": (
+        "critical",
+        "消息操作监督器策略无效",
+        "监督器已启用，但运行时事件捕获策略缺少必需类型。",
+    ),
     "message_operation_coverage_incomplete": (
         "critical",
         "消息操作覆盖检查不完整",
@@ -4044,6 +4065,7 @@ _ALERT_REASON_PRIORITY = (
     "contract_violation_missing_stage1",
     "message_operation_incident_missing_terminal",
     "message_operation_supervisor_stale",
+    "message_operation_supervisor_policy_invalid",
     "message_operation_coverage_incomplete",
     "duplicate_manual_close",
     "service_inactive",

@@ -137,6 +137,28 @@ class MessageOperationSupervisorConfig:
     batch_limit: int = 50
 
 
+MESSAGE_OPERATION_SUPERVISOR_POLICY_STATUSES = frozenset(
+    {
+        "disabled",
+        "valid",
+        "invalid_missing_message_operation_failure_capture",
+    }
+)
+
+
+def message_operation_supervisor_policy_status(
+    supervisor_config: MessageOperationSupervisorConfig,
+    runtime_incident_config: RuntimeIncidentConfig,
+) -> str:
+    """Return the bounded startup policy state for the shadow supervisor."""
+
+    if not supervisor_config.enabled:
+        return "disabled"
+    if not runtime_incident_config.captures("message_operation_failure"):
+        return "invalid_missing_message_operation_failure_capture"
+    return "valid"
+
+
 @dataclass(frozen=True, slots=True)
 class MultiTargetManagementConfig:
     """Dormant-by-default projection and live-action policy."""
