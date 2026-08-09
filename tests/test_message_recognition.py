@@ -1745,6 +1745,110 @@ def test_dual_candidate_recognition_preserves_entry_and_management_items(tmp_pat
     ]
 
 
+def test_dabiaoke_4206_projects_cancel_and_independent_long_from_instructions(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "dabiaoke-4206.db")
+    with session_factory() as session:
+        old_lifecycle = StrategyLifecycle(
+            chat_id=-1003048800035,
+            message_id=4205,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 8, 8, 5, 35, tzinfo=UTC),
+            entry_range_low=65600,
+            entry_range_high=66200,
+            stop_loss=66700,
+            take_profit="64900/64200/63500",
+        )
+        raw_message = RawMessage(
+            chat_id=-1003048800035,
+            message_id=4206,
+            posted_at=datetime(2026, 8, 9, 0, 48, tzinfo=UTC),
+            text=(
+                "撤，不挂了，没挂到\nBTC\n方向：多\n建仓：64700-63800\n"
+                "止损：63400\n止盈：65400-66100-66800"
+            ),
+        )
+        session.add_all([old_lifecycle, raw_message])
+        session.commit()
+        raw_message_id = raw_message.id
+        old_lifecycle_id = old_lifecycle.id
+
+    result = apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload={
+            "instructions": [
+                {
+                    "kind": "cancel_pending_entry",
+                    "confidence": 0.95,
+                    "reason": "撤销未成交旧空单",
+                    "target": {"lifecycle_id": old_lifecycle_id},
+                },
+                {
+                    "kind": "entry",
+                    "confidence": 0.95,
+                    "reason": "独立的新多单",
+                    "strategy": {
+                        "symbol": "BTC",
+                        "side": "long",
+                        "entry": "64700-63800",
+                        "stop_loss": "63400",
+                        "take_profit": "65400-66100-66800",
+                    },
+                },
+            ],
+            "recognition_result": "非策略",
+            "reason": "消息级兼容视图只保留管理动作",
+            "strategy": {},
+            "lifecycle_event": {
+                "event_type": "cancel_entry",
+                "target_lifecycle_id": old_lifecycle_id,
+                "management_action": "cancel_pending_entry",
+                "confidence": 0.95,
+                "reason": "撤销未成交旧空单",
+            },
+            "confidence": 0.95,
+        },
+        model="mimo-v2.5",
+        authoritative_generation="dabiaoke-4206",
+    )
+
+    assert result.status == "是策略"
+    with session_factory() as session:
+        candidates = (
+            session.query(SignalCandidate)
+            .filter_by(raw_message_id=raw_message_id)
+            .order_by(SignalCandidate.id)
+            .all()
+        )
+        items = (
+            session.query(MessageInstructionItem)
+            .filter_by(raw_message_id=raw_message_id)
+            .order_by(MessageInstructionItem.sequence)
+            .all()
+        )
+
+    assert [
+        (
+            row.event_type,
+            row.management_action,
+            row.target_lifecycle_id,
+            row.side,
+        )
+        for row in candidates
+    ] == [
+        ("close_signal", "cancel_pending_entry", old_lifecycle_id, "short"),
+        ("entry_signal", None, None, "long"),
+    ]
+    assert [(item.sequence, item.instruction_kind) for item in items] == [
+        (0, "management"),
+        (1, "entry"),
+    ]
+
+
 def test_authoritative_rerecognition_retires_superseded_pending_item(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:

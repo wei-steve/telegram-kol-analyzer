@@ -20,6 +20,11 @@ from telegram_kol_research.ai_recognition_config import (
     AiRecognitionConfig,
     load_ai_recognition_config,
 )
+from telegram_kol_research.authoritative_instructions import (
+    AuthoritativeInstruction,
+    AuthoritativeInstructionError,
+    normalize_authoritative_instructions,
+)
 from telegram_kol_research.config import (
     MultiTargetManagementConfig,
     load_multi_target_management_config,
@@ -1305,6 +1310,10 @@ def _apply_lifecycle_event_decision(
             raw_message=raw_message,
             lifecycle=target,
             parse_source=parse_source,
+            management_action="cancel_pending_entry",
+            management_fraction=None,
+            recognition_generation=authoritative_generation,
+            confidence=confidence,
         )
         _remember_applied_candidate(session, candidate, applied_candidate_ids)
         return True
@@ -2755,6 +2764,61 @@ def infer_deepseek_auxiliary(
         return payload
 
 
+def _apply_instruction_compatibility_view(
+    payload: dict[str, Any],
+    instructions: tuple[AuthoritativeInstruction, ...],
+) -> dict[str, Any]:
+    """Project per-action instructions onto the existing message-level API."""
+
+    entry_instructions = [row for row in instructions if row.kind == "entry"]
+    if len(entry_instructions) > 1:
+        raise AuthoritativeInstructionError("multiple_entry_instructions_unsupported")
+    if entry_instructions:
+        entry = entry_instructions[0]
+        payload["recognition_result"] = "是策略"
+        payload["strategy"] = dict(entry.strategy or {})
+        payload["confidence"] = float(entry.confidence)
+
+    lifecycle_event = (
+        dict(payload["lifecycle_event"])
+        if isinstance(payload.get("lifecycle_event"), dict)
+        else {"event_type": "none", "confidence": 0.0}
+    )
+    if str(lifecycle_event.get("event_type") or "none") == "none":
+        management_instructions = [
+            row
+            for row in instructions
+            if row.kind not in {"entry", "replace_entry"}
+        ]
+        if len(management_instructions) == 1:
+            management = management_instructions[0]
+            event_type, management_action = {
+                "cancel_pending_entry": ("cancel_entry", "cancel_pending_entry"),
+                "full_exit": ("exit_position", "exit_full"),
+                "partial_exit": ("exit_position", "exit_partial"),
+                "partial_take_profit": (
+                    "position_update",
+                    "partial_take_profit",
+                ),
+                "move_stop_to_protect": (
+                    "position_update",
+                    "move_stop_to_protect",
+                ),
+                "hold_update": ("position_update", "hold_update"),
+                "risk_update": ("position_update", "risk_update"),
+            }[management.kind]
+            lifecycle_event = {
+                "event_type": event_type,
+                "management_action": management_action,
+                "target_lifecycle_id": management.target_lifecycle_id,
+                "confidence": float(management.confidence),
+                "reason": management.reason,
+                **(management.parameters or {}),
+            }
+    payload["lifecycle_event"] = lifecycle_event
+    return payload
+
+
 def apply_authoritative_mimo_payload(
     session_factory: sessionmaker,
     *,
@@ -2809,6 +2873,28 @@ def apply_authoritative_mimo_payload(
             session.commit()
             return result
 
+        try:
+            normalized_instructions = normalize_authoritative_instructions(payload)
+            payload = _apply_instruction_compatibility_view(
+                dict(payload),
+                normalized_instructions,
+            )
+        except AuthoritativeInstructionError as exc:
+            result = MessageRecognitionResult(
+                raw_message_id=raw_message_id,
+                status="识别失败",
+                reason=f"authoritative_instruction_contract_invalid:{exc}",
+                ai_payload=dict(payload),
+                parse_source="mimo_authoritative",
+            )
+            _upsert_recognition(session, result, engine=model)
+            _project_authoritative_instruction_items(
+                session,
+                raw_message_id=raw_message_id,
+                accepted_candidate_ids=accepted_candidate_ids,
+            )
+            session.commit()
+            return result
         lifecycle_event = (
             dict(payload["lifecycle_event"])
             if isinstance(payload.get("lifecycle_event"), dict)
