@@ -62,6 +62,8 @@ DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT = """
 - 缺少关键字段、无法唯一关联、内容矛盾或不可读时，输出非策略、none、识别失败或低置信度，禁止猜测。
 - 一条出局消息不是新开仓，recognition_result 可以是“非策略”，但 lifecycle_event.event_type 必须是 exit_position。
 - 持仓管理不是新开仓，但不得遗漏 position_update。
+- 取消挂单/仓位管理和新开仓可以同时存在。若同一条消息明确包含多个独立动作，必须在 instructions 中逐项输出，不能因为其中一个动作是生命周期事件而删除完整的新开仓。
+- instructions 中每个独立动作只能表达一个 kind，并分别给出 confidence、reason、strategy 或 target；管理动作在前，新开仓在后。
 
 【新开仓前置仓位指令】
 - 当当前消息有明确标的、方向和“半仓操作”或明确百分比仓位，但还没有完整入场/止损/止盈策略时，可输出 entry_context。
@@ -87,6 +89,16 @@ DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT = """
 
 只输出一个 JSON 对象，不要输出解释文字：
 {
+  "instructions": [
+    {
+      "kind": "entry | cancel_pending_entry | replace_entry | full_exit | partial_exit | partial_take_profit | move_stop_to_protect | hold_update | risk_update",
+      "confidence": 0.0,
+      "reason": "当前消息中该独立动作的判断依据",
+      "strategy": null,
+      "target": {"lifecycle_id": null, "thread_id": null},
+      "parameters": {}
+    }
+  ],
   "recognition_result": "是策略 | 非策略 | 识别失败",
   "reason": "当前消息的核心判断依据",
   "strategy": {

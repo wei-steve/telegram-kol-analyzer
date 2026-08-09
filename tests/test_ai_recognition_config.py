@@ -24,6 +24,8 @@ from telegram_kol_research.prompt_registry import get_prompt_detail
 
 
 def test_default_trading_templates_have_strict_boundaries():
+    assert '"instructions"' in DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
+    assert "取消挂单/仓位管理和新开仓可以同时存在" in DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
     assert '"recognition_result"' in DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
     assert '"lifecycle_event"' in DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
     assert "58900-59300" in DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
@@ -174,6 +176,8 @@ def test_authoritative_mimo_prompt_inherits_all_text_experience_and_image_rules(
     assert "recognition_result" in prompt
     assert "exit_position" in prompt
     assert "两个维度相互独立" in prompt
+    assert '"instructions"' in prompt
+    assert "每个独立动作" in prompt
 
 
 def test_load_ai_recognition_config_uses_defaults_when_file_is_missing(tmp_path):

@@ -189,6 +189,8 @@ MIMO_AUTHORITATIVE_OUTPUT_INSTRUCTIONS = """
 你必须同时完成“新开仓识别”和“已有策略生命周期事件识别”。这两个维度相互独立：
 - 一条“出局/平仓/止盈/止损离场”消息不是新开仓，recognition_result 可以是“非策略”，同时 lifecycle_event.event_type 必须是 exit_position。
 - 持仓管理消息不得因为“不是新开仓”而遗漏生命周期事件。
+- 取消挂单/仓位管理和新开仓可以同时存在。必须把每个独立动作分别放入 instructions；不得因为识别到取消或管理动作而清空同消息中的完整新策略。
+- instructions 内管理动作在前、新开仓在后，每个独立动作分别输出 confidence、reason、strategy 或 target。
 
 图片与图文要求：
 - 直接读取图片中可见的文字、表格、交易所截图、标注、箭头、标签和图表点位。
@@ -198,6 +200,16 @@ MIMO_AUTHORITATIVE_OUTPUT_INSTRUCTIONS = """
 
 只输出一个 JSON 对象：
 {
+  "instructions": [
+    {
+      "kind": "entry | cancel_pending_entry | replace_entry | full_exit | partial_exit | partial_take_profit | move_stop_to_protect | hold_update | risk_update",
+      "confidence": 0.0,
+      "reason": "当前消息中该独立动作的判断依据",
+      "strategy": null,
+      "target": {"lifecycle_id": null, "thread_id": null},
+      "parameters": {}
+    }
+  ],
   "recognition_result": "是策略 | 非策略 | 识别失败",
   "reason": "当前消息的核心判断依据",
   "strategy": {
