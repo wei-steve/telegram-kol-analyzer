@@ -448,6 +448,11 @@ def _resolved_mimo_result(
     if len(selected_candidates) != len(decision.target_thread_ids):
         raise ContextResolutionError("resolved_lifecycle_missing")
     lifecycle_ids = [candidate.lifecycle_id for candidate in selected_candidates]
+    payload["instructions"] = _resolved_instruction_payloads(
+        payload.get("instructions"),
+        decision=decision,
+        selected_candidates=selected_candidates,
+    )
     if decision.decision == "revise_thread":
         context_payload["replacement_strategy"] = dict(
             original_strategy if isinstance(original_strategy, dict) else {}
@@ -492,6 +497,62 @@ def _resolved_mimo_result(
         confidence=decision.confidence,
     )
     return replace(mimo, payload=payload, status="非策略")
+
+
+def _resolved_instruction_payloads(
+    value: Any,
+    *,
+    decision: ContextResolutionDecision,
+    selected_candidates: Sequence[StrategyThreadCandidate],
+) -> list[dict[str, Any]]:
+    """Attach exact targets only to the management instruction being resolved."""
+
+    if not isinstance(value, list):
+        return []
+    rows = [dict(row) for row in value if isinstance(row, Mapping)]
+    expected_kind = {
+        "revise_thread": "replace_entry",
+        "cancel_thread": "cancel_pending_entry",
+        "exit_thread": (
+            "partial_exit"
+            if decision.management_action == "exit_partial"
+            else "full_exit"
+        ),
+        "manage_thread": decision.management_action,
+    }.get(decision.decision)
+    if expected_kind is None:
+        return rows
+    aliases = {
+        "exit_full": "full_exit",
+        "exit_partial": "partial_exit",
+        "cancel_entry": "cancel_pending_entry",
+    }
+    matches = [
+        row
+        for row in rows
+        if aliases.get(str(row.get("kind") or ""), str(row.get("kind") or ""))
+        == aliases.get(str(expected_kind), str(expected_kind))
+    ]
+    if len(matches) != 1:
+        return rows
+    target_row = matches[0]
+    if len(selected_candidates) == 1:
+        candidate = selected_candidates[0]
+        target_row["target"] = {
+            "lifecycle_id": int(candidate.lifecycle_id),
+            "thread_id": int(candidate.thread_id),
+        }
+    else:
+        target_row["targets"] = [
+            {
+                "lifecycle_id": int(candidate.lifecycle_id),
+                "thread_id": int(candidate.thread_id),
+                "symbol": candidate.symbol,
+                "side": candidate.side,
+            }
+            for candidate in selected_candidates
+        ]
+    return rows
 
 
 def _authorizes_exact_context_risk_reduction(

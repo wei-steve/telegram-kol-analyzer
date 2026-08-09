@@ -151,6 +151,145 @@ def test_resolved_multi_target_partial_profit_preserves_exact_target_metadata():
     ]
 
 
+def test_context_cancel_targets_management_instruction_without_erasing_entry():
+    candidate = replace(
+        _context_candidate(
+            thread_id=134,
+            lifecycle_id=764,
+            root_message_id=4205,
+            risk_state="current_risk",
+        ),
+        status="pending_entry",
+        side="short",
+        pending_entry_leg_ids=(472, 473),
+        live_verified_pos_ids=(),
+    )
+    mimo = MimoAuthoritativeResult(
+        raw_message_id=9979,
+        payload={
+            "instructions": [
+                {
+                    "kind": "cancel_pending_entry",
+                    "confidence": 0.95,
+                    "reason": "撤，不挂了，没挂到",
+                },
+                {
+                    "kind": "entry",
+                    "confidence": 0.95,
+                    "strategy": {
+                        "symbol": "BTC",
+                        "side": "long",
+                        "entry": "64700-63800",
+                        "stop_loss": "63400",
+                        "take_profit": "65400-66100-66800",
+                    },
+                },
+            ],
+            "recognition_result": "是策略",
+            "strategy": {
+                "symbol": "BTC",
+                "side": "long",
+                "entry": "64700-63800",
+                "stop_loss": "63400",
+                "take_profit": "65400-66100-66800",
+            },
+            "lifecycle_event": {
+                "event_type": "cancel_entry",
+                "confidence": 0.95,
+            },
+            "confidence": 0.95,
+        },
+        input_kind="text",
+        model="mimo-v2.5",
+        status="是策略",
+    )
+    decision = ContextResolutionDecision(
+        decision="cancel_thread",
+        target_thread_ids=(134,),
+        management_action="cancel_pending_entry",
+        confidence=0.95,
+        supporting_message_ids=(4205, 4206),
+        opposing_message_ids=(),
+        conflict_types=("entry_or_revision",),
+        risk_reducing_fanout_allowed=False,
+        reanalysis_triggers=(),
+        reason="cancel old short before independent long",
+    )
+
+    resolved = _resolved_mimo_result(
+        mimo,
+        decision,
+        (candidate,),
+        current_message_id=4206,
+    )
+
+    assert resolved.payload["instructions"] == [
+        {
+            "kind": "cancel_pending_entry",
+            "confidence": 0.95,
+            "reason": "撤，不挂了，没挂到",
+            "target": {"lifecycle_id": 764, "thread_id": 134},
+        },
+        {
+            "kind": "entry",
+            "confidence": 0.95,
+            "strategy": {
+                "symbol": "BTC",
+                "side": "long",
+                "entry": "64700-63800",
+                "stop_loss": "63400",
+                "take_profit": "65400-66100-66800",
+            },
+        },
+    ]
+
+
+def test_conditional_reverse_without_complete_entry_is_not_synthesized():
+    mimo = MimoAuthoritativeResult(
+        raw_message_id=10007,
+        payload={
+            "instructions": [
+                {
+                    "kind": "hold_update",
+                    "confidence": 0.7,
+                    "reason": "64500不破就走，条件尚未满足",
+                }
+            ],
+            "recognition_result": "非策略",
+            "strategy": {},
+            "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+            "confidence": 0.7,
+        },
+        input_kind="text",
+        model="mimo-v2.5",
+        status="非策略",
+    )
+    decision = ContextResolutionDecision(
+        decision="hold",
+        target_thread_ids=(),
+        management_action=None,
+        confidence=0.7,
+        supporting_message_ids=(4212,),
+        opposing_message_ids=(),
+        conflict_types=(),
+        risk_reducing_fanout_allowed=False,
+        reanalysis_triggers=(),
+        reason="conditional intent only",
+    )
+
+    resolved = _resolved_mimo_result(
+        mimo,
+        decision,
+        (),
+        current_message_id=4212,
+    )
+
+    assert [row["kind"] for row in resolved.payload["instructions"]] == [
+        "hold_update"
+    ]
+    assert all(row["kind"] != "entry" for row in resolved.payload["instructions"])
+
+
 def test_dabiaoke_4168_projects_exact_exit_despite_ghost_lifecycle(tmp_path):
     session_factory = create_session_factory(tmp_path / "dabiaoke-4168.db")
     with session_factory() as session:
