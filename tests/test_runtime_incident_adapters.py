@@ -596,6 +596,10 @@ def test_runtime_incident_flags_are_dormant_by_default_and_parse_allowlist():
             "TELEGRAM_KOL_RUNTIME_AGENT_ENABLED": "true",
             "TELEGRAM_KOL_RUNTIME_AGENT_MAX_TOOL_STEPS": "99",
             "TELEGRAM_KOL_RUNTIME_AGENT_MAX_WALL_SECONDS": "12",
+            "TELEGRAM_KOL_RUNTIME_AGENT_TOKEN_BUDGET_ENABLED": "true",
+            "TELEGRAM_KOL_RUNTIME_AGENT_PER_INCIDENT_TOKEN_LIMIT": "70000",
+            "TELEGRAM_KOL_RUNTIME_AGENT_DAILY_TOKEN_LIMIT": "900000",
+            "TELEGRAM_KOL_RUNTIME_AGENT_MAX_COMPLETION_TOKENS": "2048",
             "TELEGRAM_KOL_RUNTIME_MONITOR_CAPTURE_TOKEN": "m" * 43,
         },
         env_file_paths=[],
@@ -604,6 +608,7 @@ def test_runtime_incident_flags_are_dormant_by_default_and_parse_allowlist():
     assert default.capture_types == frozenset()
     assert default.telegram_notifications_enabled is False
     assert default.agent_enabled is False
+    assert default.agent_token_budget_enabled is False
     assert enabled.capture_types == frozenset(
         {"context_worker_exhausted", "monitor_audit_incomplete"}
     )
@@ -613,6 +618,10 @@ def test_runtime_incident_flags_are_dormant_by_default_and_parse_allowlist():
     assert enabled.monitor_capture_token == "m" * 43
     assert enabled.agent_max_tool_steps == 4
     assert enabled.agent_max_wall_seconds == 12.0
+    assert enabled.agent_token_budget_enabled is True
+    assert enabled.agent_per_incident_token_limit == 70_000
+    assert enabled.agent_daily_token_limit == 900_000
+    assert enabled.agent_max_completion_tokens == 2048
     assert enabled.prompt_version == "runtime-agent-prompt-v8"
     assert enabled.tool_policy_version == "runtime-agent-tools-v2"
     assert RuntimeIncidentConfig(

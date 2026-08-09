@@ -33,6 +33,12 @@ from telegram_kol_research.runtime_agent_policy import (
     evaluate_execution_playbook_nomination,
     evaluate_shadow_playbook_nomination,
 )
+from telegram_kol_research.runtime_agent_metrics import (
+    RuntimeAgentBudgetExceeded,
+    fail_model_token_reservation,
+    reserve_model_tokens,
+    settle_model_tokens,
+)
 from telegram_kol_research.runtime_agent_tools import (
     RuntimeAgentToolError,
     RuntimeAgentToolRegistry,
@@ -76,6 +82,10 @@ class RuntimeAgentWorkerConfig:
     action_playbooks: frozenset[str] = frozenset()
     action_circuit_threshold: int = 3
     action_reservation_lease_seconds: float = 120.0
+    token_budget_enabled: bool = False
+    per_incident_token_limit: int = 65_536
+    daily_token_limit: int = 500_000
+    max_completion_tokens: int = 4096
 
 
 @dataclass(frozen=True, slots=True)
@@ -970,25 +980,102 @@ def run_runtime_agent_once(
                 maximum=config.max_wall_seconds,
                 monotonic=monotonic,
             )
+            reservation = None
+            usage_settled = False
+            if config.token_budget_enabled:
+                prompt_bytes = len(
+                    json.dumps(
+                        messages,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+                reservation = reserve_model_tokens(
+                    session_factory,
+                    incident_id=claimed.id,
+                    incident_fingerprint=claimed.fingerprint,
+                    call_key=(
+                        f"incident-{claimed.id}-attempt-"
+                        f"{claimed.agent_attempt_count}-turn-{turn_index}"
+                    ),
+                    reserved_tokens=(
+                        prompt_bytes
+                        + max(64, min(int(config.max_completion_tokens), 32768))
+                    ),
+                    per_incident_limit=max(1, int(config.per_incident_token_limit)),
+                    daily_limit=max(1, int(config.daily_token_limit)),
+                    now=(operation_now if now is not None else datetime.now(UTC)),
+                )
+
+            def record_usage(*, prompt_tokens: int, completion_tokens: int, total_tokens: int) -> None:
+                nonlocal usage_settled
+                if reservation is None:
+                    return
+                settle_model_tokens(
+                    session_factory,
+                    reservation_id=reservation.id,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                    now=(operation_now if now is not None else datetime.now(UTC)),
+                )
+                usage_settled = True
+
+            model_kwargs = {
+                "messages": messages,
+                "tool_schemas": (
+                    tools.tool_schemas(allowed_tools=allowed_tools)
+                    if (
+                        len(attempted_queries) < evidence_tool_limit
+                        and not final_correction_used
+                    )
+                    else []
+                ),
+                "timeout_seconds": min(
+                    config.model_timeout_seconds,
+                    remaining_wall,
+                ),
+            }
+            if config.token_budget_enabled:
+                model_kwargs.update(
+                    {
+                        "max_completion_tokens": max(
+                            64, min(int(config.max_completion_tokens), 32768)
+                        ),
+                        "usage_callback": record_usage,
+                    }
+                )
             try:
                 raw_turn = model_turn(
-                    messages=messages,
-                    tool_schemas=(
-                        tools.tool_schemas(allowed_tools=allowed_tools)
-                        if (
-                            len(attempted_queries) < evidence_tool_limit
-                            and not final_correction_used
-                        )
-                        else []
-                    ),
-                    timeout_seconds=min(
-                        config.model_timeout_seconds,
-                        remaining_wall,
-                    ),
+                    **model_kwargs,
                 )
             except RuntimeAgentFinalResponseError:
+                if reservation is not None and not usage_settled:
+                    fail_model_token_reservation(
+                        session_factory,
+                        reservation_id=reservation.id,
+                        now=(operation_now if now is not None else datetime.now(UTC)),
+                    )
                 request_final_correction()
                 continue
+            except Exception:
+                if reservation is not None and not usage_settled:
+                    fail_model_token_reservation(
+                        session_factory,
+                        reservation_id=reservation.id,
+                        now=(operation_now if now is not None else datetime.now(UTC)),
+                    )
+                raise
+            if reservation is not None and not usage_settled:
+                fail_model_token_reservation(
+                    session_factory,
+                    reservation_id=reservation.id,
+                    now=(operation_now if now is not None else datetime.now(UTC)),
+                )
+                raise RuntimeAgentContractError(
+                    "provider token usage is missing"
+                )
             _remaining_wall_budget(
                 started=started,
                 maximum=config.max_wall_seconds,
@@ -1173,6 +1260,22 @@ def run_runtime_agent_once(
             claim_token=claim_token,
             now=operation_now,
             outcome_kind=("tool_failed" if tool_failure_seen else "evidence_incomplete"),
+            attempted_queries=tuple(attempted_queries),
+            agent_incident=agent_incident,
+        )
+        return RuntimeAgentWorkerResult(
+            status="escalated",
+            incident_id=claimed.id,
+            tool_steps=len(attempted_queries),
+            refused_tool_calls=refused,
+        )
+    except RuntimeAgentBudgetExceeded:
+        _transition_terminal_failure(
+            session_factory,
+            incident=claimed,
+            claim_token=claim_token,
+            now=operation_now,
+            outcome_kind="evidence_incomplete",
             attempted_queries=tuple(attempted_queries),
             agent_incident=agent_incident,
         )

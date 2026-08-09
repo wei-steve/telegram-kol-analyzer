@@ -40,6 +40,7 @@ from telegram_kol_research.reporting import (
     format_entry_assembly_summary,
     format_entry_revision_summary,
 )
+from telegram_kol_research.runtime_agent_metrics import get_runtime_agent_metrics
 
 STRATEGY_TIME_DISPLAY_FIELDS = (
     "posted_at",
@@ -51,6 +52,23 @@ STRATEGY_TIME_DISPLAY_FIELDS = (
     "latest_event_at",
 )
 MAX_MEDIA_ASSETS_PER_MESSAGE = 3
+
+
+def load_runtime_agent_metrics(
+    session_factory,
+    *,
+    since: datetime,
+    until: datetime,
+    max_incidents: int = 1000,
+) -> dict[str, object]:
+    """Return the bounded aggregate-only Runtime Agent quality projection."""
+
+    return get_runtime_agent_metrics(
+        session_factory,
+        since=since,
+        until=until,
+        max_incidents=max_incidents,
+    )
 
 
 def _safe_json_dict(value: str | None) -> dict[str, object]:

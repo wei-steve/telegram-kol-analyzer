@@ -30,6 +30,14 @@ _SENSITIVE_PATTERN = re.compile(
 )
 
 
+def assert_runtime_agent_fixture_redacted(payload: Mapping[str, Any]) -> None:
+    """Reject a fixture candidate before it can be returned or persisted."""
+
+    encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+    if _SENSITIVE_PATTERN.search(encoded):
+        raise RuntimeAgentEvaluationError("runtime agent fixture is not redacted")
+
+
 class RuntimeAgentEvaluationError(ValueError):
     """Raised when a corpus case violates the offline evaluation contract."""
 
@@ -105,9 +113,10 @@ def _load_case(path: Path) -> RuntimeAgentEvaluationCase:
     incident_type = str(incident.get("incident_type") or "")
     if incident_type in _NORMAL_CONTEXT_OUTCOMES:
         raise RuntimeAgentEvaluationError("normal contextual outcome is not an incident")
-    encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True)
-    if _SENSITIVE_PATTERN.search(encoded):
-        raise RuntimeAgentEvaluationError(f"corpus is not redacted: {path.name}")
+    try:
+        assert_runtime_agent_fixture_redacted(payload)
+    except RuntimeAgentEvaluationError as exc:
+        raise RuntimeAgentEvaluationError(f"corpus is not redacted: {path.name}") from exc
     return RuntimeAgentEvaluationCase(
         case_id=str(payload["case_id"]),
         incident_type=incident_type,

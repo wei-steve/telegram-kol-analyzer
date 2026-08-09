@@ -1,0 +1,11 @@
+{
+  "corpus_case_count": 9,
+  "corpus_sha256": "f52235a7c3b12af451ec22cdf3c4f86e51f3fa181704b926c565a5621da54df3",
+  "schema_version": 1,
+  "source_files": {
+    "src/telegram_kol_research/runtime_agent_playbooks.py": "062f92cd549734d61e6a249c258ebbdb0202c0edeca9dc979d32d94e04b5da64",
+    "src/telegram_kol_research/runtime_agent_policy.py": "d17ab55cda4a73b98d16dbfb5f4e28644b69343a4839f368e9d66e8e398d27b3",
+    "src/telegram_kol_research/runtime_agent_prompt.py": "13d31175510c76dbdfafba553624e62b5729fdc4cd386ef0287162ebb37531e6",
+    "src/telegram_kol_research/runtime_agent_tools.py": "4c4fc71f135520b5ae4d2efe3ea860e9adff66d428c39f895ca171b49a84549f"
+  }
+}

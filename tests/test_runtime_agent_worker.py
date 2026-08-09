@@ -16,6 +16,7 @@ from telegram_kol_research.models import (
     PositionAttributionAudit,
     RawMessage,
     RuntimeAgentRecoveryAttempt,
+    RuntimeAgentModelUsage,
     RuntimeIncident,
     RuntimeIncidentHandoffArtifact,
     SignalCandidate,
@@ -1309,6 +1310,93 @@ def test_worker_safely_releases_claim_for_retry_after_provider_failure(tmp_path)
         assert artifact.outcome_kind == "provider_failed"
         assert artifact.status == "pending"
         assert "incident_id=" in artifact.codex_prompt
+
+
+def test_worker_reserves_and_settles_provider_usage_before_success(tmp_path):
+    session_factory = create_session_factory(tmp_path / "usage.db")
+    incident = _record(session_factory)
+
+    def model_turn(**kwargs):
+        kwargs["usage_callback"](
+            prompt_tokens=120,
+            completion_tokens=80,
+            total_tokens=200,
+        )
+        final = _final(incident.id)
+        final["final"]["evidence_references"] = [f"incident:{incident.id}"]
+        return final
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(
+            enabled=True,
+            token_budget_enabled=True,
+            per_incident_token_limit=20_000,
+            daily_token_limit=100_000,
+            max_completion_tokens=512,
+        ),
+        tools=_registry([]),
+        model_turn=model_turn,
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "diagnosed"
+    with session_factory() as session:
+        usage = session.query(RuntimeAgentModelUsage).one()
+        assert usage.status == "completed"
+        assert usage.total_tokens == 200
+        assert usage.reserved_tokens >= 512
+
+
+def test_worker_escalates_without_model_call_when_token_budget_is_full(tmp_path):
+    session_factory = create_session_factory(tmp_path / "budget.db")
+    incident = _record(session_factory)
+    calls = []
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(
+            enabled=True,
+            token_budget_enabled=True,
+            per_incident_token_limit=1,
+            daily_token_limit=1,
+            max_completion_tokens=512,
+        ),
+        tools=_registry([]),
+        model_turn=lambda **kwargs: calls.append(kwargs),
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "escalated"
+    assert calls == []
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        assert row.status == "escalated"
+        assert session.query(RuntimeAgentModelUsage).count() == 0
+
+
+def test_worker_budget_flag_off_preserves_legacy_provider_arguments(tmp_path):
+    session_factory = create_session_factory(tmp_path / "budget-off.db")
+    incident = _record(session_factory)
+    observed = []
+
+    def model_turn(**kwargs):
+        observed.append(kwargs)
+        final = _final(incident.id)
+        final["final"]["evidence_references"] = [f"incident:{incident.id}"]
+        return final
+
+    result = run_runtime_agent_once(
+        session_factory,
+        config=RuntimeAgentWorkerConfig(enabled=True, token_budget_enabled=False),
+        tools=_registry([]),
+        model_turn=model_turn,
+        now=NOW + timedelta(minutes=2),
+    )
+
+    assert result.status == "diagnosed"
+    assert "max_completion_tokens" not in observed[0]
+    assert "usage_callback" not in observed[0]
 
 
 def test_worker_queues_terminal_stage2_for_evidence_incomplete(tmp_path):

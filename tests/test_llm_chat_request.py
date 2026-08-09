@@ -255,6 +255,7 @@ def test_request_structured_chat_turn_normalizes_one_tool_call():
         payload = request.read().decode("utf-8")
         assert '"tool_choice":"auto"' in payload
         assert '"parallel_tool_calls":false' in payload
+        assert '"max_tokens"' not in payload
         assert '"name":"get_incident_summary"' in payload
         return httpx.Response(
             200,
@@ -310,6 +311,8 @@ def test_request_structured_chat_turn_normalizes_one_tool_call():
 
 
 def test_request_structured_chat_turn_normalizes_closed_final_json():
+    usages = []
+
     def handler(request: httpx.Request) -> httpx.Response:
         payload = request.read().decode("utf-8")
         assert '"response_format":{"type":"json_object"}' in payload
@@ -319,6 +322,11 @@ def test_request_structured_chat_turn_normalizes_closed_final_json():
             200,
             request=request,
             json={
+                "usage": {
+                    "prompt_tokens": 120,
+                    "completion_tokens": 30,
+                    "total_tokens": 150,
+                },
                 "choices": [
                     {
                         "message": {
@@ -341,10 +349,15 @@ def test_request_structured_chat_turn_normalizes_closed_final_json():
         ),
         messages=[{"role": "system", "content": "Read-only diagnosis."}],
         tool_schemas=[],
+        max_completion_tokens=512,
+        usage_callback=lambda **value: usages.append(value),
         client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
 
     assert turn == {"final": {"incident_id": 17, "confidence": "low"}}
+    assert usages == [
+        {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150}
+    ]
 
 
 @pytest.mark.parametrize("content", ["not-json", "[]", None])

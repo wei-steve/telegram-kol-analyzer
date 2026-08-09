@@ -364,6 +364,8 @@ def request_structured_chat_turn(
     tool_schemas: list[dict[str, Any]],
     timeout_seconds: float | None = None,
     client: httpx.Client | None = None,
+    max_completion_tokens: int | None = None,
+    usage_callback=None,
 ) -> dict[str, Any]:
     """Return one normalized tool call or final JSON object from the proxy."""
 
@@ -374,6 +376,8 @@ def request_structured_chat_turn(
         "model": config.model,
         "messages": messages,
     }
+    if max_completion_tokens is not None:
+        payload["max_tokens"] = max(64, min(int(max_completion_tokens), 32768))
     if tool_schemas:
         payload.update(
             {
@@ -407,6 +411,21 @@ def request_structured_chat_turn(
     finally:
         if created_client:
             active_client.close()
+
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if isinstance(usage, dict) and usage_callback is not None:
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        total_tokens = usage.get("total_tokens")
+        if all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in (prompt_tokens, completion_tokens, total_tokens)
+        ) and prompt_tokens + completion_tokens == total_tokens:
+            usage_callback(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+            )
 
     choices = data.get("choices") if isinstance(data, dict) else None
     if not isinstance(choices, list) or len(choices) != 1:

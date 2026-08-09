@@ -971,6 +971,54 @@ Immediate Phase 8R rollback is layered and independent:
 6. confirm action authority is false and both playbook allowlists are empty;
 7. run the independent monitor and verify message continuity.
 
+### Phase 8 cost, quality, and continuous improvement
+
+Phase 8 adds two additive ledgers: `runtime_agent_model_usage` stores a
+conservative reservation before every budgeted provider call and its exact
+provider-reported settlement; `runtime_agent_diagnosis_reviews` stores an
+immutable Codex/operator verdict bound to the SHA-256 fingerprint of the exact
+diagnosis. Neither table grants a tool, playbook, trading, Telegram, strategy,
+context-resolution, or source-row mutation capability.
+
+The budget gate is dormant unless
+`TELEGRAM_KOL_RUNTIME_AGENT_TOKEN_BUDGET_ENABLED=true`. Its bounded settings
+are `TELEGRAM_KOL_RUNTIME_AGENT_PER_INCIDENT_TOKEN_LIMIT`,
+`TELEGRAM_KOL_RUNTIME_AGENT_DAILY_TOKEN_LIMIT`, and
+`TELEGRAM_KOL_RUNTIME_AGENT_MAX_COMPLETION_TOKENS`. Every call atomically
+reserves the current bounded transcript byte count plus the maximum completion
+tokens before contacting MiMo. Reservations count against both the incident
+generation and the UTC calendar day even when a provider call fails or omits
+usage, so an unknown cost can never be treated as zero. A successful response
+must report non-negative prompt, completion, and total tokens with exact
+arithmetic and within the reservation. Budget exhaustion produces the bounded
+failure handoff and escalates immediately without another provider call.
+
+`get_runtime_agent_metrics` and the Web query wrapper return only aggregate,
+31-day/1000-incident-bounded counts: diagnosis outcomes, escalations,
+verified recoveries, verification mismatches, latency, tool steps, exact and
+reserved token usage, and confirmed-diagnosis accuracy. A scan that would
+truncate fails closed. It exposes no message text, provider response, evidence
+payload, credential, strategy identity, order ID, or position ID.
+
+A diagnosis review is accepted only when its fingerprint matches the currently
+persisted diagnosis. Only a `confirmed` review can generate a redacted corpus
+candidate, and generation returns an in-memory bounded schema-v1 fixture; it
+does not write the repository or production source rows. The candidate must be
+human-reviewed before being added to `tests/fixtures/runtime_incidents/`.
+`tests/fixtures/runtime_agent_regression_manifest.json` pins the complete
+reviewed corpus and the Runtime Agent prompt, tool, policy, and playbook source
+files. Any change to those inputs must deliberately refresh the manifest and
+pass the full offline corpus gate before deployment.
+
+First deployment keeps the budget flag false. After the normal safe-window and
+post-deployment continuity gates, the budget may be enabled in a separate
+policy change only after recording current UTC usage as zero for the new
+ledger, proving the Agent has no active claim, and retaining action authority
+false with both playbook allowlists empty. Immediate rollback clears only the
+budget flag and restarts the sidecar; existing usage and review rows remain
+audit evidence. Metrics and review helpers remain read-only/additive and do not
+affect the listener or any business worker.
+
 ## Rollback
 
 1. Disable the newest phase feature flag.

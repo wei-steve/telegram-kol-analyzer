@@ -19,6 +19,7 @@ RUNTIME_AGENT_MODULES = (
     "runtime_agent_playbooks.py",
     "runtime_agent_policy.py",
     "runtime_agent_executor.py",
+    "runtime_agent_metrics.py",
     "runtime_incident_observations.py",
     "runtime_incident_scanner.py",
     "runtime_incident_rules.py",
@@ -55,6 +56,7 @@ ALLOWED_PACKAGE_IMPORTS_BY_MODULE = {
             "llm_chat",
             "runtime_agent_contracts",
             "runtime_agent_executor",
+            "runtime_agent_metrics",
             "runtime_agent_playbooks",
             "runtime_agent_policy",
             "runtime_agent_tools",
@@ -73,6 +75,9 @@ ALLOWED_PACKAGE_IMPORTS_BY_MODULE = {
     ),
     "runtime_agent_evaluation.py": frozenset(
         {"runtime_agent_policy"}
+    ),
+    "runtime_agent_metrics.py": frozenset(
+        {"models", "runtime_agent_evaluation", "runtime_agent_policy"}
     ),
     "runtime_incident_handoff.py": frozenset(
         {"models", "runtime_agent_contracts", "runtime_incidents"}
@@ -95,6 +100,7 @@ ALLOWED_PACKAGE_IMPORTS_BY_MODULE = {
             "message_operation_types",
             "models",
             "runtime_incident_adapters",
+            "trading_settings",
         }
     ),
 }
@@ -181,7 +187,7 @@ def test_message_operation_contract_helpers_have_only_shadow_cli_caller():
                 callers.append(path.name)
                 break
 
-    assert callers == ["cli.py", "message_operation_supervisor.py"]
+    assert callers == ["message_operation_supervisor.py"]
 
 
 @pytest.mark.architecture
@@ -232,7 +238,7 @@ def test_phase_7_is_deferred_and_phase_8r_requires_no_action_authority():
     assert "phase_7_disposition: deferred_non_blocking" in status
     assert "current_phase: 8" in status
     assert "phase_name: cost-quality-and-continuous-improvement" in status
-    assert "phase_status: planned" in status
+    assert "phase_status: in_progress" in status
     assert 'last_completed_phase: "8R.10"' in status
     assert "task_8r_4_status: completed_dormant_production_verified" in status
     assert "task_8r_5_status: completed_future_only_shadow_canary" in status

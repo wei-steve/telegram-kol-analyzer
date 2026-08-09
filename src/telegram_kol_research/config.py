@@ -94,6 +94,10 @@ class RuntimeIncidentConfig:
     agent_max_prompt_bytes: int = 16_384
     agent_max_tool_output_bytes: int = 8192
     agent_claim_lease_seconds: float = 120.0
+    agent_token_budget_enabled: bool = False
+    agent_per_incident_token_limit: int = 65_536
+    agent_daily_token_limit: int = 500_000
+    agent_max_completion_tokens: int = 4096
     agent_shadow_playbooks: frozenset[str] = frozenset()
     agent_actions_enabled: bool = False
     agent_action_playbooks: frozenset[str] = frozenset()
@@ -471,6 +475,24 @@ def load_runtime_incident_config(
         )
     except (TypeError, ValueError):
         agent_action_circuit_threshold = 3
+    try:
+        agent_per_incident_token_limit = int(
+            env.get("TELEGRAM_KOL_RUNTIME_AGENT_PER_INCIDENT_TOKEN_LIMIT", "65536")
+        )
+    except (TypeError, ValueError):
+        agent_per_incident_token_limit = 65_536
+    try:
+        agent_daily_token_limit = int(
+            env.get("TELEGRAM_KOL_RUNTIME_AGENT_DAILY_TOKEN_LIMIT", "500000")
+        )
+    except (TypeError, ValueError):
+        agent_daily_token_limit = 500_000
+    try:
+        agent_max_completion_tokens = int(
+            env.get("TELEGRAM_KOL_RUNTIME_AGENT_MAX_COMPLETION_TOKENS", "4096")
+        )
+    except (TypeError, ValueError):
+        agent_max_completion_tokens = 4096
     raw_monitor_capture_token = env.get(
         "TELEGRAM_KOL_RUNTIME_MONITOR_CAPTURE_TOKEN"
     )
@@ -527,6 +549,18 @@ def load_runtime_incident_config(
         ),
         agent_claim_lease_seconds=max(
             5.0, min(agent_claim_lease_seconds, 3600.0)
+        ),
+        agent_token_budget_enabled=_enabled_flag(
+            env.get("TELEGRAM_KOL_RUNTIME_AGENT_TOKEN_BUDGET_ENABLED")
+        ),
+        agent_per_incident_token_limit=max(
+            4096, min(agent_per_incident_token_limit, 1_000_000)
+        ),
+        agent_daily_token_limit=max(
+            4096, min(agent_daily_token_limit, 10_000_000)
+        ),
+        agent_max_completion_tokens=max(
+            64, min(agent_max_completion_tokens, 32_768)
         ),
         agent_shadow_playbooks=agent_shadow_playbooks,
         agent_actions_enabled=_enabled_flag(

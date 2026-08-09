@@ -3230,6 +3230,57 @@ class RuntimeAgentInvestigationAudit(Base):
     )
 
 
+class RuntimeAgentModelUsage(Base):
+    """Conservative durable reservation and settled provider token usage."""
+
+    __tablename__ = "runtime_agent_model_usage"
+    __table_args__ = (
+        UniqueConstraint("call_key", name="uq_runtime_agent_model_usage_call"),
+        Index("ix_runtime_agent_model_usage_incident", "runtime_incident_id", "created_at"),
+        Index("ix_runtime_agent_model_usage_day", "budget_date", "created_at"),
+        CheckConstraint("status IN ('reserved', 'completed', 'failed')", name="ck_runtime_agent_model_usage_status"),
+        CheckConstraint("reserved_tokens BETWEEN 1 AND 1000000", name="ck_runtime_agent_model_usage_reserved"),
+        CheckConstraint("prompt_tokens IS NULL OR prompt_tokens >= 0", name="ck_runtime_agent_model_usage_prompt"),
+        CheckConstraint("completion_tokens IS NULL OR completion_tokens >= 0", name="ck_runtime_agent_model_usage_completion"),
+        CheckConstraint("total_tokens IS NULL OR total_tokens >= 0", name="ck_runtime_agent_model_usage_total"),
+        CheckConstraint("length(incident_fingerprint) = 64", name="ck_runtime_agent_model_usage_fingerprint"),
+        CheckConstraint("length(call_key) BETWEEN 1 AND 128", name="ck_runtime_agent_model_usage_call_key"),
+        CheckConstraint("length(budget_date) = 10", name="ck_runtime_agent_model_usage_date"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    runtime_incident_id: Mapped[int] = mapped_column(ForeignKey("runtime_incidents.id"), nullable=False)
+    incident_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    call_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    budget_date: Mapped[str] = mapped_column(String(10), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    reserved_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    prompt_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    completion_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    total_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class RuntimeAgentDiagnosisReview(Base):
+    """Operator/Codex review label for one immutable diagnosis fingerprint."""
+
+    __tablename__ = "runtime_agent_diagnosis_reviews"
+    __table_args__ = (
+        UniqueConstraint("runtime_incident_id", "diagnosis_fingerprint", name="uq_runtime_agent_diagnosis_review"),
+        CheckConstraint("verdict IN ('confirmed', 'partial', 'rejected')", name="ck_runtime_agent_diagnosis_review_verdict"),
+        CheckConstraint("length(diagnosis_fingerprint) = 64", name="ck_runtime_agent_diagnosis_review_fingerprint"),
+        CheckConstraint("fixture_case_id IS NULL OR length(fixture_case_id) BETWEEN 1 AND 128", name="ck_runtime_agent_diagnosis_review_fixture"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    runtime_incident_id: Mapped[int] = mapped_column(ForeignKey("runtime_incidents.id"), nullable=False)
+    diagnosis_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    verdict: Mapped[str] = mapped_column(String(16), nullable=False)
+    fixture_case_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    reviewed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now)
+
+
 class RuntimeAgentRecoveryAttempt(Base):
     """Durable idempotency and verification record for one low-risk action."""
 

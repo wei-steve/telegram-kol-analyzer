@@ -3470,6 +3470,10 @@ def runtime_incident_agent_once(
         action_circuit_threshold=(
             runtime_config.agent_action_circuit_threshold
         ),
+        token_budget_enabled=runtime_config.agent_token_budget_enabled,
+        per_incident_token_limit=runtime_config.agent_per_incident_token_limit,
+        daily_token_limit=runtime_config.agent_daily_token_limit,
+        max_completion_tokens=runtime_config.agent_max_completion_tokens,
     )
     if runtime_config.agent_enabled:
         llm_config = load_runtime_agent_llm_config()
@@ -3480,6 +3484,8 @@ def runtime_incident_agent_once(
                 messages=kwargs["messages"],
                 tool_schemas=kwargs["tool_schemas"],
                 timeout_seconds=kwargs["timeout_seconds"],
+                max_completion_tokens=kwargs.get("max_completion_tokens"),
+                usage_callback=kwargs.get("usage_callback"),
             )
 
     else:
@@ -3569,6 +3575,10 @@ def runtime_incident_agent_worker(
         action_circuit_threshold=(
             runtime_config.agent_action_circuit_threshold
         ),
+        token_budget_enabled=runtime_config.agent_token_budget_enabled,
+        per_incident_token_limit=runtime_config.agent_per_incident_token_limit,
+        daily_token_limit=runtime_config.agent_daily_token_limit,
+        max_completion_tokens=runtime_config.agent_max_completion_tokens,
     )
     llm_config = load_runtime_agent_llm_config()
 
@@ -3583,6 +3593,8 @@ def runtime_incident_agent_worker(
                 messages=kwargs["messages"],
                 tool_schemas=kwargs["tool_schemas"],
                 timeout_seconds=kwargs["timeout_seconds"],
+                max_completion_tokens=kwargs.get("max_completion_tokens"),
+                usage_callback=kwargs.get("usage_callback"),
             ),
         )
 
