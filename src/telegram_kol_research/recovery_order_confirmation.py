@@ -74,6 +74,7 @@ def evaluate_deepcoin_entry_capability(
         )
     lookup = getattr(lookup_provider, "lookup_contract_spec", None)
     if callable(lookup):
+        snapshot_before_lookup = getattr(lookup_provider, "snapshot", None)
         try:
             lookup_result = lookup(instrument_id)
         except Exception:
@@ -88,7 +89,15 @@ def evaluate_deepcoin_entry_capability(
                 reason or "contract_spec_invalid",
             )
         contract_spec = getattr(lookup_result, "contract_spec", None)
-        snapshot = getattr(lookup_provider, "snapshot", None)
+        snapshot_after_lookup = getattr(lookup_provider, "snapshot", None)
+        if (
+            snapshot_before_lookup is None
+            or snapshot_after_lookup is not snapshot_before_lookup
+        ):
+            return _blocked_capability(
+                symbol_key, instrument_id, "contract_spec_invalid"
+            )
+        snapshot = snapshot_before_lookup
     else:
         try:
             contract_spec = (
@@ -109,13 +118,18 @@ def evaluate_deepcoin_entry_capability(
         return _blocked_capability(
             symbol_key, instrument_id, "contract_spec_invalid"
         )
+    snapshot_evidence = _snapshot_evidence(snapshot)
+    if callable(lookup) and snapshot_evidence is None:
+        return _blocked_capability(
+            symbol_key, instrument_id, "contract_spec_invalid"
+        )
     return DeepcoinEntryCapabilityGateResult(
         symbol=symbol_key,
         instrument_id=instrument_id,
         allowed=True,
         reason="tradable",
         contract_spec=contract_spec,
-        contract_spec_snapshot=_snapshot_evidence(snapshot),
+        contract_spec_snapshot=snapshot_evidence,
     )
 
 
@@ -165,8 +179,15 @@ def _snapshot_evidence(snapshot: Any) -> dict[str, str] | None:
     expires_at = getattr(snapshot, "expires_at", None)
     if (
         not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest.lower())
         or not isinstance(fetched_at, datetime)
         or not isinstance(expires_at, datetime)
+        or fetched_at.tzinfo is None
+        or fetched_at.utcoffset() is None
+        or expires_at.tzinfo is None
+        or expires_at.utcoffset() is None
+        or expires_at <= fetched_at
     ):
         return None
     return {

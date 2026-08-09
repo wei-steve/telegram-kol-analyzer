@@ -59,6 +59,17 @@ class _CapabilityContractSpecProvider:
         return self.lookup_contract_spec(instrument_id).contract_spec
 
 
+class _SnapshotChangesDuringLookupProvider(_CapabilityContractSpecProvider):
+    def lookup_contract_spec(self, instrument_id):
+        result = super().lookup_contract_spec(instrument_id)
+        self.snapshot = SimpleNamespace(
+            source_digest_sha256="c" * 64,
+            fetched_at=datetime(2026, 8, 8, 8, 30, tzinfo=UTC),
+            expires_at=datetime(2026, 8, 9, 8, 30, tzinfo=UTC),
+        )
+        return result
+
+
 def _persist_approved_recovery(session_factory):
     persist_recovery_evaluations(
         session_factory,
@@ -197,6 +208,23 @@ def test_confirm_recovery_order_embeds_exact_validated_snapshot(tmp_path):
         "fetched_at": "2026-08-08T08:00:00+00:00",
         "expires_at": "2026-08-09T08:00:00+00:00",
     }
+
+
+def test_confirm_recovery_order_rejects_non_atomic_spec_and_snapshot(tmp_path):
+    session_factory = create_session_factory(tmp_path / "snapshot-race.db")
+    _persist_approved_recovery(session_factory)
+
+    result = confirm_recovery_order_dry_run(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_SnapshotChangesDuringLookupProvider("available"),
+    )
+
+    assert result["ready_for_live_order"] is False
+    assert result["reason_codes"] == ["contract_spec_invalid"]
 
 
 def test_confirm_recovery_order_dry_run_raises_when_item_is_not_in_execution_queue(tmp_path):

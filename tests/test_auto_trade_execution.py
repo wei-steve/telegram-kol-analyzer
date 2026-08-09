@@ -83,6 +83,18 @@ class _CapabilityContractSpecProvider:
         return self.lookup_contract_spec(instrument_id).contract_spec
 
 
+class _ChangingCapabilityContractSpecProvider(_CapabilityContractSpecProvider):
+    def __init__(self):
+        super().__init__("available")
+        self.lookup_calls = 0
+
+    def lookup_contract_spec(self, instrument_id):
+        self.lookup_calls += 1
+        if self.lookup_calls > 1:
+            self.reason = "contract_spec_stale"
+        return super().lookup_contract_spec(instrument_id)
+
+
 def test_auto_trade_blocks_deleted_source_before_any_exchange_call(tmp_path):
     session_factory = create_session_factory(tmp_path / "deleted-source.db")
     with session_factory() as session:
@@ -1889,6 +1901,34 @@ def test_auto_entry_embeds_exact_dynamic_sol_spec_and_snapshot_digest(tmp_path):
         "fetched_at": "2026-08-08T08:00:00+00:00",
         "expires_at": "2026-08-09T08:00:00+00:00",
     }
+
+
+def test_auto_entry_rechecks_capability_before_trade_signal_enqueue(tmp_path):
+    session_factory = create_session_factory(tmp_path / "stale-before-enqueue.db")
+    raw_message_id = _persist_candidate(session_factory)
+    save_trading_settings(
+        session_factory,
+        {"auto_trade_enabled": True, "allowed_symbols": ["BTC", "ETH"]},
+    )
+    client = _FakeDeepcoinClient()
+    provider = _ChangingCapabilityContractSpecProvider()
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=client,
+        contract_spec_provider=provider,
+        processed_at=datetime(2026, 8, 8, 9, 0, tzinfo=UTC),
+    )
+
+    assert result["status"] in {"skipped", "blocked"}
+    assert result["reason"] == "contract_spec_stale"
+    assert client.orders == []
+    assert client.trigger_orders == []
+    with session_factory() as session:
+        assert session.query(TradeSignal).count() == 0
+        assert session.query(ExecutionBinding).count() == 0
 
 
 def test_recovery_trigger_synchronizes_finalized_fingerprint_before_exchange_submission(

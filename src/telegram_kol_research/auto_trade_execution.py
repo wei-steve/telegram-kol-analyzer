@@ -846,7 +846,7 @@ def _auto_process_single_message_trade_signal(
         note="auto_trade_live_signal",
         reviewed_at=now,
     )
-    confirm_recovery_order_dry_run(
+    confirmation = confirm_recovery_order_dry_run(
         session_factory,
         chat_id=signal.chat_id,
         message_id=signal.message_id,
@@ -856,6 +856,22 @@ def _auto_process_single_message_trade_signal(
         persist_ready_confirmation=True,
         confirmed_at=now,
     )
+    if not confirmation["ready_for_live_order"]:
+        reason_codes = confirmation.get("reason_codes")
+        reason = (
+            str(reason_codes[0])
+            if isinstance(reason_codes, list) and reason_codes
+            else "order_draft_not_ready"
+        )
+        return _record_entry_auto_trade_skip(
+            session_factory,
+            raw_message=raw_message,
+            candidate=candidate,
+            reason=reason,
+            runtime_kol_id=str(runtime_config.get("kol_id") or ""),
+            processed_at=now,
+            extra={"symbol": symbol, "instrument_id": capability.instrument_id},
+        )
     if auto_draft is not None:
         auto_draft["entry_preamble_assembly"] = assembly_evidence
         trade_signal = load_or_create_trade_signal(
