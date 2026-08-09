@@ -87,6 +87,7 @@ from telegram_kol_research.prompt_registry import (
     PromptInvocationRecord,
     record_prompt_invocation,
 )
+from telegram_kol_research.trading_settings import load_trading_settings
 
 
 BLOCKED_SYMBOLS = {
@@ -2832,6 +2833,7 @@ def apply_authoritative_mimo_payload(
 ) -> MessageRecognitionResult:
     """Persist only the authoritative MiMo interpretation."""
 
+    trading_settings = load_trading_settings(session_factory)
     active_multi_target_management_config = (
         multi_target_management_config
         if multi_target_management_config is not None
@@ -2875,10 +2877,15 @@ def apply_authoritative_mimo_payload(
 
         try:
             normalized_instructions = normalize_authoritative_instructions(payload)
-            payload = _apply_instruction_compatibility_view(
-                dict(payload),
-                normalized_instructions,
-            )
+            if (
+                trading_settings.multi_instruction_mode == "live"
+                and int(raw_message_id)
+                > trading_settings.multi_instruction_activation_after_raw_message_id
+            ):
+                payload = _apply_instruction_compatibility_view(
+                    dict(payload),
+                    normalized_instructions,
+                )
         except AuthoritativeInstructionError as exc:
             result = MessageRecognitionResult(
                 raw_message_id=raw_message_id,

@@ -77,6 +77,8 @@ class TradingSettings:
         "disabled", "shadow", "live"
     ] = "disabled"
     entry_revision_v2_mode: Literal["disabled", "shadow", "live"] = "disabled"
+    multi_instruction_mode: Literal["disabled", "shadow", "live"] = "disabled"
+    multi_instruction_activation_after_raw_message_id: int = 0
     deepcoin_contract_specs_mode: Literal["static", "shadow", "live"] = "static"
     default_max_loss_usdt: float = 20.0
     daily_max_loss_usdt: float = 500.0
@@ -345,6 +347,17 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         raw.get("entry_revision_v2_mode", defaults.entry_revision_v2_mode),
         field_name="entry_revision_v2_mode",
     )
+    multi_instruction_mode = _rollout_mode(
+        raw.get("multi_instruction_mode", defaults.multi_instruction_mode),
+        field_name="multi_instruction_mode",
+    )
+    multi_instruction_activation_after_raw_message_id = _nonnegative_int_setting(
+        raw.get(
+            "multi_instruction_activation_after_raw_message_id",
+            defaults.multi_instruction_activation_after_raw_message_id,
+        ),
+        field_name="multi_instruction_activation_after_raw_message_id",
+    )
     deepcoin_contract_specs_mode = _deepcoin_contract_specs_mode(
         raw.get(
             "deepcoin_contract_specs_mode",
@@ -369,6 +382,10 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         entry_preamble_mode=entry_preamble_mode,
         entry_message_assembly_v2_mode=entry_message_assembly_v2_mode,
         entry_revision_v2_mode=entry_revision_v2_mode,
+        multi_instruction_mode=multi_instruction_mode,
+        multi_instruction_activation_after_raw_message_id=(
+            multi_instruction_activation_after_raw_message_id
+        ),
         deepcoin_contract_specs_mode=deepcoin_contract_specs_mode,
         default_max_loss_usdt=_positive_float(
             raw.get("default_max_loss_usdt"),
@@ -531,6 +548,12 @@ def _boolean_setting(
     value = payload[field_name]
     if not isinstance(value, bool):
         raise ValueError(f"{field_name} must be a boolean")
+    return value
+
+
+def _nonnegative_int_setting(value: Any, *, field_name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{field_name} must be a nonnegative integer")
     return value
 
 

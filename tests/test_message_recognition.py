@@ -25,6 +25,7 @@ from telegram_kol_research.message_recognition import (
 from telegram_kol_research.message_instruction_items import (
     create_message_instruction_items_in_session,
 )
+from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.models import (
     AiPromptInvocation,
     ExecutionBinding,
@@ -1749,6 +1750,13 @@ def test_dabiaoke_4206_projects_cancel_and_independent_long_from_instructions(
     tmp_path,
 ):
     session_factory = create_session_factory(tmp_path / "dabiaoke-4206.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "multi_instruction_mode": "live",
+            "multi_instruction_activation_after_raw_message_id": 0,
+        },
+    )
     with session_factory() as session:
         old_lifecycle = StrategyLifecycle(
             chat_id=-1003048800035,
@@ -1847,6 +1855,77 @@ def test_dabiaoke_4206_projects_cancel_and_independent_long_from_instructions(
         (0, "management"),
         (1, "entry"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("mode", "watermark_offset", "expected_status", "expected_candidates"),
+    [
+        ("disabled", -1, "非策略", 0),
+        ("shadow", -1, "非策略", 0),
+        ("live", 0, "非策略", 0),
+        ("live", -1, "是策略", 1),
+    ],
+)
+def test_multi_instruction_rollout_is_future_only(
+    tmp_path,
+    mode,
+    watermark_offset,
+    expected_status,
+    expected_candidates,
+):
+    session_factory = create_session_factory(tmp_path / f"{mode}-{watermark_offset}.db")
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=88,
+            message_id=8001,
+            posted_at=datetime(2026, 8, 9, 1, tzinfo=UTC),
+            text="ETH 多单 1580-1590，止损1550，止盈1650",
+        )
+        session.add(raw)
+        session.commit()
+        raw_message_id = raw.id
+    save_trading_settings(
+        session_factory,
+        {
+            "multi_instruction_mode": mode,
+            "multi_instruction_activation_after_raw_message_id": (
+                raw_message_id + watermark_offset
+            ),
+        },
+    )
+
+    result = apply_authoritative_mimo_payload(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload={
+            "instructions": [
+                {
+                    "kind": "entry",
+                    "confidence": 0.95,
+                    "strategy": {
+                        "symbol": "ETH",
+                        "side": "long",
+                        "entry": "1580-1590",
+                        "stop_loss": "1550",
+                        "take_profit": "1650",
+                    },
+                }
+            ],
+            "recognition_result": "非策略",
+            "strategy": {},
+            "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+            "confidence": 0.95,
+        },
+        model="mimo-v2.5",
+    )
+
+    assert result.status == expected_status
+    with session_factory() as session:
+        assert (
+            session.query(SignalCandidate).filter_by(raw_message_id=raw_message_id).count()
+            == expected_candidates
+        )
+    assert "instructions" in (result.ai_payload or {})
 
 
 def test_authoritative_rerecognition_retires_superseded_pending_item(tmp_path):

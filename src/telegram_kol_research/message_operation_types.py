@@ -18,5 +18,8 @@ MESSAGE_OPERATION_VIOLATIONS = frozenset(
         "exchange_readback_mismatch",
         "restart_or_lease_skip",
         "reconciliation_disproved_success",
+        "missing_instruction_projection",
+        "unevaluated_sibling_instruction",
+        "hidden_instruction_failure",
     }
 )

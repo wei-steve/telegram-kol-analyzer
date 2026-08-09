@@ -609,6 +609,110 @@ def test_disabled_coverage_snapshot_is_database_free_clean_rollback():
     )
 
 
+def test_multi_instruction_completeness_flags_missing_and_hidden_siblings(tmp_path):
+    session_factory = create_session_factory(tmp_path / "multi-completeness.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=77, message_id=9301, text="cancel old; enter long")
+        session.add(raw)
+        session.flush()
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw.id,
+                input_kind="text",
+                authoritative_model="fixture",
+                authoritative_status="策略",
+                authoritative_payload_json=json.dumps(
+                    {
+                        "instructions": [
+                            {"kind": "cancel_pending_entry"},
+                            {"kind": "entry"},
+                        ]
+                    }
+                ),
+                agreement_status="agreed",
+                differences_json="[]",
+                automation_status="completed",
+                prompt_versions_json="{}",
+                comparison_status="completed",
+            )
+        )
+        candidate = SignalCandidate(
+            raw_message_id=raw.id,
+            symbol="BTC",
+            side="short",
+            event_type="close_signal",
+            management_action="cancel_pending_entry",
+            parse_source="mimo_authoritative",
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            MessageInstructionItem(
+                raw_message_id=raw.id,
+                signal_candidate_id=candidate.id,
+                sequence=0,
+                instruction_kind="management",
+                idempotency_key="a" * 64,
+                status="failed",
+            )
+        )
+        contract = MessageOperationContract(
+            raw_message_id=raw.id,
+            intent_kind="manage",
+            expected_terminal_kind="verified_management",
+            status="verified",
+            deadline_at=NOW,
+            evidence_refs_json="[]",
+            agent_requested=False,
+            policy_version="message-operation-contract-v1",
+        )
+        session.add(contract)
+        session.commit()
+        raw_message_id = raw.id
+
+    violations = supervisor_module.audit_multi_instruction_completeness(
+        session_factory,
+        raw_message_id=raw_message_id,
+    )
+
+    assert {row["violation_code"] for row in violations} == {
+        "missing_instruction_projection",
+        "hidden_instruction_failure",
+    }
+    assert {row["severity"] for row in violations} == {"high"}
+
+    with session_factory() as session:
+        sibling = SignalCandidate(
+            raw_message_id=raw_message_id,
+            symbol="BTC",
+            side="long",
+            event_type="entry_signal",
+            parse_source="mimo_authoritative",
+        )
+        session.add(sibling)
+        session.flush()
+        session.add(
+            MessageInstructionItem(
+                raw_message_id=raw_message_id,
+                signal_candidate_id=sibling.id,
+                sequence=1,
+                instruction_kind="entry",
+                idempotency_key="b" * 64,
+                status="pending",
+            )
+        )
+        session.commit()
+
+    sibling_violations = supervisor_module.audit_multi_instruction_completeness(
+        session_factory,
+        raw_message_id=raw_message_id,
+    )
+    assert {row["violation_code"] for row in sibling_violations} == {
+        "unevaluated_sibling_instruction",
+        "hidden_instruction_failure",
+    }
+
+
 def test_live_supervisor_cycle_captures_natural_violation_for_stage1(tmp_path):
     from telegram_kol_research.config import RuntimeIncidentConfig
     from telegram_kol_research.message_operation_supervisor import (

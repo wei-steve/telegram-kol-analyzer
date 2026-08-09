@@ -104,6 +104,83 @@ _COVERAGE_AGE_MAX_SECONDS = 1_000_000_000
 _TERMINAL_RECOGNITION_STATES = frozenset({"completed", "failed"})
 
 
+def audit_multi_instruction_completeness(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+) -> tuple[dict[str, object], ...]:
+    """Detect severe projection and per-item outcome gaps without model calls."""
+
+    with session_factory() as session:
+        decision = session.execute(
+            select(RecognitionDecision).where(
+                RecognitionDecision.raw_message_id == int(raw_message_id)
+            )
+        ).scalar_one_or_none()
+        try:
+            payload = json.loads(
+                decision.authoritative_payload_json if decision is not None else "{}"
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        instructions = payload.get("instructions") if isinstance(payload, dict) else None
+        if not isinstance(instructions, list) or len(instructions) <= 1:
+            return ()
+        declared_count = len(instructions)
+        candidates = session.execute(
+            select(SignalCandidate).where(
+                SignalCandidate.raw_message_id == int(raw_message_id),
+                SignalCandidate.parse_source == "mimo_authoritative",
+            )
+        ).scalars().all()
+        items = session.execute(
+            select(MessageInstructionItem).where(
+                MessageInstructionItem.raw_message_id == int(raw_message_id),
+                MessageInstructionItem.retired_at.is_(None),
+            )
+        ).scalars().all()
+        contract = session.execute(
+            select(MessageOperationContract)
+            .where(MessageOperationContract.raw_message_id == int(raw_message_id))
+            .order_by(MessageOperationContract.id.desc())
+        ).scalars().first()
+
+    violations: list[dict[str, object]] = []
+    if len(candidates) != declared_count or len(items) != declared_count:
+        violations.append(
+            {
+                "violation_code": "missing_instruction_projection",
+                "severity": "high",
+                "declared_count": declared_count,
+                "candidate_count": len(candidates),
+                "item_count": len(items),
+            }
+        )
+    statuses = {str(item.status or "").strip().lower() for item in items}
+    terminal_statuses = {"submitted", "skipped", "failed", "unknown", "blocked"}
+    if statuses & terminal_statuses and statuses & {"pending", "executing"}:
+        violations.append(
+            {
+                "violation_code": "unevaluated_sibling_instruction",
+                "severity": "high",
+                "declared_count": declared_count,
+            }
+        )
+    if (
+        statuses & {"failed", "unknown", "blocked"}
+        and contract is not None
+        and str(contract.status or "").lower() == "verified"
+    ):
+        violations.append(
+            {
+                "violation_code": "hidden_instruction_failure",
+                "severity": "high",
+                "declared_count": declared_count,
+            }
+        )
+    return tuple(violations)
+
+
 def build_message_operation_coverage_snapshot(
     session_factory: sessionmaker,
     *,

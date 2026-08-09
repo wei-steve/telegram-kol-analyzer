@@ -40,6 +40,8 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     assert settings.entry_range_order_style == "eager"
     assert settings.nearby_entry_market_deviation_pct == 0.15
     assert settings.revision_target_min_confidence == 0.70
+    assert settings.multi_instruction_mode == "disabled"
+    assert settings.multi_instruction_activation_after_raw_message_id == 0
     assert settings.take_profit_allocations == [40.0, 30.0, 30.0]
     assert settings.allow_vision_auto_trade is True
     assert settings.context_resolution_enabled is False
@@ -66,6 +68,30 @@ def test_revision_target_min_confidence_round_trips_independently(tmp_path):
     assert saved.min_ai_confidence == 0.81
     assert saved.revision_target_min_confidence == 0.71
     assert load_trading_settings(session_factory).revision_target_min_confidence == 0.71
+
+
+@pytest.mark.parametrize("mode", ["disabled", "shadow", "live"])
+def test_multi_instruction_rollout_settings_round_trip(tmp_path, mode):
+    session_factory = create_session_factory(tmp_path / "research.db")
+
+    saved = save_trading_settings(
+        session_factory,
+        {
+            "multi_instruction_mode": mode,
+            "multi_instruction_activation_after_raw_message_id": 42,
+        },
+    )
+
+    assert saved.multi_instruction_mode == mode
+    assert saved.multi_instruction_activation_after_raw_message_id == 42
+
+
+@pytest.mark.parametrize("value", [-1, True, "42", 1.5, None])
+def test_multi_instruction_watermark_fails_closed(value):
+    with pytest.raises(ValueError, match="multi_instruction_activation"):
+        trading_settings_from_payload(
+            {"multi_instruction_activation_after_raw_message_id": value}
+        )
 
 
 @pytest.mark.parametrize("mode", ["static", "shadow", "live"])
