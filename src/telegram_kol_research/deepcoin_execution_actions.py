@@ -34,6 +34,7 @@ from telegram_kol_research.models import (
     ExecutionOrderLeg,
     PositionProtectionLedger,
     RawMessage,
+    RecoveryOrderConfirmation,
     StrategyLifecycle,
 )
 from telegram_kol_research.position_authority_lock import (
@@ -85,6 +86,7 @@ class ManagementContractSpecResolution:
 
 def resolve_existing_position_contract_spec(
     *,
+    session_factory: sessionmaker,
     contract_spec_provider,
     binding: ExecutionBinding,
     instrument_id: str,
@@ -97,6 +99,17 @@ def resolve_existing_position_contract_spec(
     expected_side = str(side or "").strip().lower()
     if not expected_instrument or expected_side not in {"long", "short"}:
         return None
+    if risk_reducing:
+        frozen = _proven_frozen_binding_contract_spec(
+            session_factory=session_factory,
+            binding=binding,
+            instrument_id=expected_instrument,
+            side=expected_side,
+        )
+        if frozen is not None:
+            return ManagementContractSpecResolution(
+                frozen[0], "frozen_binding_draft", frozen[1]
+            )
     current = None
     if contract_spec_provider is not None:
         try:
@@ -108,24 +121,15 @@ def resolve_existing_position_contract_spec(
         and current.instrument_id.upper() == expected_instrument
     ):
         return ManagementContractSpecResolution(current, "current")
-    if not risk_reducing:
-        return None
-    frozen = _proven_frozen_binding_contract_spec(
-        binding=binding,
-        instrument_id=expected_instrument,
-        side=expected_side,
-    )
-    return (
-        ManagementContractSpecResolution(
-            frozen[0], "frozen_binding_draft", frozen[1]
-        )
-        if frozen is not None
-        else None
-    )
+    return None
 
 
 def _proven_frozen_binding_contract_spec(
-    *, binding: ExecutionBinding, instrument_id: str, side: str
+    *,
+    session_factory: sessionmaker,
+    binding: ExecutionBinding,
+    instrument_id: str,
+    side: str,
 ) -> tuple[DeepcoinContractSpec, dict[str, str]] | None:
     if (
         str(binding.venue or "").lower() != "deepcoin"
@@ -169,6 +173,56 @@ def _proven_frozen_binding_contract_spec(
     if not isinstance(raw_spec, Mapping):
         return None
     if str(raw_spec.get("instrument_id") or "").upper() != instrument_id:
+        return None
+    with session_factory() as session:
+        confirmation = (
+            session.query(RecoveryOrderConfirmation)
+            .filter(
+                RecoveryOrderConfirmation.chat_id == binding.chat_id,
+                RecoveryOrderConfirmation.message_id == binding.message_id,
+                RecoveryOrderConfirmation.symbol == str(binding.symbol).upper(),
+                RecoveryOrderConfirmation.side == side,
+                RecoveryOrderConfirmation.venue == "deepcoin",
+                RecoveryOrderConfirmation.status == "ready_confirmed",
+            )
+            .one_or_none()
+        )
+        confirmation_payload_json = (
+            str(confirmation.confirmation_payload_json)
+            if confirmation is not None
+            else None
+        )
+    if confirmation_payload_json is None:
+        return None
+    try:
+        confirmation_payload = json.loads(confirmation_payload_json)
+    except (TypeError, ValueError):
+        return None
+    confirmed_draft = (
+        confirmation_payload.get("deepcoin_order_draft")
+        if isinstance(confirmation_payload, Mapping)
+        else None
+    )
+    confirmed_source = (
+        confirmation_payload.get("source")
+        if isinstance(confirmation_payload, Mapping)
+        else None
+    )
+    if (
+        not isinstance(confirmed_draft, Mapping)
+        or not isinstance(confirmed_source, Mapping)
+        or confirmed_draft.get("strategy_instance_id")
+        != binding.strategy_instance_id
+        or str(confirmed_draft.get("instrument_id") or "").upper()
+        != instrument_id
+        or confirmed_draft.get("contract_spec") != raw_spec
+        or confirmed_draft.get("contract_spec_snapshot") != snapshot
+        or confirmed_source.get("chat_id") != binding.chat_id
+        or confirmed_source.get("message_id") != binding.message_id
+        or str(confirmed_source.get("symbol") or "").upper()
+        != str(binding.symbol).upper()
+        or str(confirmed_source.get("side") or "").lower() != side
+    ):
         return None
     numbers: dict[str, Decimal] = {}
     try:

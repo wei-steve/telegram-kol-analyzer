@@ -9,6 +9,7 @@ from telegram_kol_research.models import (
     ExecutionOrderLeg,
     PositionMutationIntent,
     RawMessage,
+    RecoveryOrderConfirmation,
     RecognitionDecision,
     SignalCandidate,
     SourceMessageDeletionExit,
@@ -199,6 +200,33 @@ def _seed_filled_strategy(session_factory, *, frozen_spec=False):
         )
         session.add_all([raw, binding])
         session.flush()
+        if frozen_spec:
+            session.add(
+                RecoveryOrderConfirmation(
+                    kol_id=binding.kol_id,
+                    chat_id=binding.chat_id,
+                    message_id=binding.message_id,
+                    symbol=binding.symbol,
+                    side=binding.side,
+                    venue="deepcoin",
+                    status="ready_confirmed",
+                    confirmation_payload_json=json.dumps(
+                        {
+                            "source": {
+                                "chat_id": binding.chat_id,
+                                "message_id": binding.message_id,
+                                "symbol": binding.symbol,
+                                "side": binding.side,
+                            },
+                            "deepcoin_order_draft": json.loads(
+                                binding.payload_json
+                            )["draft"],
+                        },
+                        sort_keys=True,
+                    ),
+                    confirmed_at=NOW,
+                )
+            )
         lifecycle = StrategyLifecycle(
             chat_id=20,
             message_id=200,

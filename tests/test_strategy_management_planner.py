@@ -21,6 +21,7 @@ from telegram_kol_research.models import (
     PositionMutationIntent,
     PositionTakeProfitOrder,
     RawMessage,
+    RecoveryOrderConfirmation,
     RecognitionDecision,
     SignalCandidate,
     SourceMessageDeletionExit,
@@ -170,6 +171,17 @@ class _UnavailableContractSpecs:
         return None
 
 
+class _ChangedContractSpecs:
+    def get_contract_spec(self, instrument_id):
+        return DeepcoinContractSpec(
+            instrument_id=instrument_id,
+            contract_value=1,
+            quantity_step=5,
+            min_quantity=5,
+            price_tick=0.01,
+        )
+
+
 def _freeze_sol_spec_on_binding(session_factory, binding_id):
     with session_factory() as session:
         binding = session.get(ExecutionBinding, binding_id)
@@ -198,9 +210,7 @@ def _freeze_sol_spec_on_binding(session_factory, binding_id):
             candidate.symbol = "SOL"
         for leg in legs:
             leg.strategy_instance_id = strategy_instance_id
-        binding.payload_json = json.dumps(
-            {
-                "draft": {
+        draft = {
                     "strategy_instance_id": strategy_instance_id,
                     "instrument_id": "SOL-USDT-SWAP",
                     "symbol": "SOL",
@@ -229,8 +239,33 @@ def _freeze_sol_spec_on_binding(session_factory, binding_id):
                         "expires_at": "2026-08-08T08:00:00+00:00",
                     },
                 }
-            },
+        binding.payload_json = json.dumps(
+            {"draft": draft},
             sort_keys=True,
+        )
+        session.add(
+            RecoveryOrderConfirmation(
+                kol_id=binding.kol_id,
+                chat_id=binding.chat_id,
+                message_id=binding.message_id,
+                symbol="SOL",
+                side=binding.side,
+                venue="deepcoin",
+                status="ready_confirmed",
+                confirmation_payload_json=json.dumps(
+                    {
+                        "source": {
+                            "chat_id": binding.chat_id,
+                            "message_id": binding.message_id,
+                            "symbol": "SOL",
+                            "side": binding.side,
+                        },
+                        "deepcoin_order_draft": draft,
+                    },
+                    sort_keys=True,
+                ),
+                confirmed_at=PLANNED_AT,
+            )
         )
         session.commit()
 
@@ -399,6 +434,60 @@ def test_management_refuses_when_neither_fresh_nor_proven_frozen_spec_exists(
     )
 
 
+def test_risk_reduction_prefers_frozen_opening_spec_over_changed_current_spec(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "frozen-first.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory, intent="full_exit"
+    )
+    _freeze_sol_spec_on_binding(session_factory, binding_id)
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_sol_position()]),
+        contract_spec_provider=_ChangedContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert result.batch.target_snapshot["contract_spec_source"] == (
+        "frozen_binding_draft"
+    )
+    assert result.batch.target_snapshot["contract_spec"]["quantity_step"] == 1.0
+
+
+def test_unconfirmed_binding_payload_is_not_a_proven_frozen_spec(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "unconfirmed-frozen.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory, intent="full_exit"
+    )
+    _freeze_sol_spec_on_binding(session_factory, binding_id)
+    with session_factory() as session:
+        session.query(RecoveryOrderConfirmation).delete()
+        session.commit()
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_sol_position()]),
+        contract_spec_provider=_UnavailableContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert (result.status, result.reason_code) == (
+        "blocked",
+        "target_contract_spec_unavailable",
+    )
+
+
 @pytest.mark.parametrize("drift", ["instrument", "side"])
 def test_frozen_spec_refuses_instrument_or_side_identity_drift(
     monkeypatch, tmp_path, drift
@@ -447,6 +536,7 @@ def test_frozen_spec_is_never_available_for_opening_or_increasing_risk(tmp_path)
     with session_factory() as session:
         binding = session.get(ExecutionBinding, binding_id)
         result = resolve_existing_position_contract_spec(
+            session_factory=session_factory,
             contract_spec_provider=_UnavailableContractSpecs(),
             binding=binding,
             instrument_id="SOL-USDT-SWAP",
@@ -3796,6 +3886,46 @@ def test_final_revalidation_runs_inside_insert_transaction(monkeypatch, tmp_path
         from telegram_kol_research.models import StrategyManagementBatch
 
         assert session.query(StrategyManagementBatch).count() == 0
+
+
+def test_final_revalidation_blocks_frozen_binding_payload_drift(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "frozen-payload-drift.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory, intent="full_exit"
+    )
+    _freeze_sol_spec_on_binding(session_factory, binding_id)
+    _disable_reconciliation(monkeypatch, planner)
+    original = planner.create_management_batch_in_session
+
+    def mutate_then_create(session, *args, **kwargs):
+        with session_factory() as other_session:
+            binding = other_session.get(ExecutionBinding, binding_id)
+            payload = json.loads(binding.payload_json)
+            payload["draft"]["contract_spec"]["quantity_step"] = 2
+            binding.payload_json = json.dumps(payload, sort_keys=True)
+            other_session.commit()
+        return original(session, *args, **kwargs)
+
+    monkeypatch.setattr(
+        planner, "create_management_batch_in_session", mutate_then_create
+    )
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_sol_position()]),
+        contract_spec_provider=_UnavailableContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert (result.status, result.reason_code, result.batch) == (
+        "blocked",
+        "target_identity_changed_during_planning",
+        None,
+    )
 
 
 def test_final_revalidation_blocks_raw_chat_change_inside_insert_transaction(

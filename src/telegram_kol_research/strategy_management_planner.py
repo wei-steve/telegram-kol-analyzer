@@ -628,8 +628,9 @@ def _plan_strategy_management_batch_locked(
                     owner, live_positions=live_positions, session=session
                 )
         contract_spec_resolution = resolve_existing_position_contract_spec(
+            session_factory=session_factory,
             contract_spec_provider=contract_spec_provider,
-            binding=binding,
+            binding=current_binding,
             instrument_id=instrument_id,
             side=str(lifecycle.side),
             risk_reducing=True,
@@ -2049,6 +2050,7 @@ def _binding_state(binding: ExecutionBinding) -> tuple[Any, ...]:
         binding.pos_id,
         binding.margin_mode,
         binding.position_mode,
+        binding.payload_json,
     )
 
 
