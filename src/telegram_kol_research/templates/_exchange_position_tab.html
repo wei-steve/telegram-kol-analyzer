@@ -42,5 +42,13 @@
     <div class="exchange-view-panel" data-exchange-view-panel="grouped">
       {{ grouped_list(groups, empty_text, kind) }}
     </div>
+    {% if history_pagination %}
+      <footer class="exchange-history-browse-footer" data-history-browse-footer>
+        <span data-history-browse-status role="status" aria-live="polite">已显示 {{ history_pagination.visible_count }} / {{ history_pagination.total_count }} 条</span>
+        {% if history_pagination.has_more %}
+          <button type="button" class="secondary-button" data-history-load-more>加载更多</button>
+        {% endif %}
+      </footer>
+    {% endif %}
   {% endif %}
 </section>

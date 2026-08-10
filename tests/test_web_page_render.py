@@ -1399,6 +1399,22 @@ def test_position_history_tab_serves_continuation_from_stable_browse_snapshot(tm
     assert len(exchange.calls) == 2
 
 
+def test_position_history_tab_renders_browse_footer_and_filter_controls(tmp_path):
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=_RecordingExchangePositionsClient,
+    )
+    client = TestClient(app)
+
+    shell = client.get("/positions-panel?initial=positions")
+    fragment = client.get("/positions-panel/tabs/position-history")
+
+    assert 'data-history-position-filter' in shell.text
+    assert 'data-history-filter-preset="30d"' in shell.text
+    assert 'data-history-browse-footer' in fragment.text
+    assert 'data-history-browse-status' in fragment.text
+
+
 def test_positions_panel_tab_failure_stays_retryable(tmp_path):
     class BrokenOpenOrdersClient(_RecordingExchangePositionsClient):
         def list_open_orders(self):

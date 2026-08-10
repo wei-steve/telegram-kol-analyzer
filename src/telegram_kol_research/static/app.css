@@ -3828,6 +3828,26 @@ pre { white-space: pre-wrap; }
   .log-viewer-toolbar label { flex: 1 1 100%; }
 }
 
+.exchange-history-filter,
+.exchange-history-filter-presets,
+.exchange-history-browse-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.exchange-history-filter label {
+  color: var(--color-text-muted);
+  font-size: 0.82rem;
+}
+
+.exchange-history-browse-footer {
+  justify-content: space-between;
+  padding: 14px 0 4px;
+  color: var(--color-text-muted);
+}
+
 .ai-helper-text {
   color: #cbd5e1;
   font-size: 0.88rem;

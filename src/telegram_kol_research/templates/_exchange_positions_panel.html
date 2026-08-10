@@ -265,6 +265,17 @@
       <button type="button" class="exchange-view-button is-active" data-exchange-view-mode="list" aria-selected="true">真实列表</button>
       <button type="button" class="exchange-view-button" data-exchange-view-mode="grouped" aria-selected="false">按群组</button>
     </div>
+    <div class="exchange-history-filter" data-history-position-filter hidden>
+      <div class="exchange-history-filter-presets" role="group" aria-label="历史仓位时间范围">
+        <button type="button" class="secondary-button" data-history-filter-preset="7d">近 7 天</button>
+        <button type="button" class="secondary-button" data-history-filter-preset="30d">近 30 天</button>
+        <button type="button" class="secondary-button" data-history-filter-preset="90d">近 90 天</button>
+      </div>
+      <label>开始日期 <input type="date" data-history-filter-start></label>
+      <label>结束日期 <input type="date" data-history-filter-end></label>
+      <button type="button" class="secondary-button" data-history-filter-apply>筛选</button>
+      <button type="button" class="secondary-button" data-history-filter-clear>清除</button>
+    </div>
     <div
       class="exchange-tab-refresh-controls"
       data-exchange-tab-refresh-controls
