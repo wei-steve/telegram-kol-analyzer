@@ -3669,24 +3669,64 @@ def position_history_row_proves_full_close(
     position_identity_ids = _position_identity_ids(row)
     if position_identity_ids != {str(pos_id).strip()}:
         return False
-    if _binding_instrument_id_from_value(
-        row.get("instId") or row.get("symbol")
-    ) != instrument_id:
+    instrument_ids = {
+        _binding_instrument_id_from_value(row[key])
+        for key in ("instId", "symbol")
+        if str(row.get(key) or "").strip()
+    }
+    if instrument_ids != {_binding_instrument_id_from_value(instrument_id)}:
         return False
-    if _normalize_position_side(
-        str(row.get("posSide") or row.get("side") or "")
-    ) != position_side:
+    position_sides = {
+        _normalize_position_side(str(row[key]).strip())
+        for key in ("posSide", "side")
+        if str(row.get(key) or "").strip()
+    }
+    if position_sides != {
+        _normalize_position_side(str(position_side).strip())
+    }:
         return False
-    opened = _to_float(row.get("pos") or row.get("size"))
-    closed = _to_float(
-        row.get("closePos") or row.get("close_pos") or row.get("closedSize")
+    opened = _consistent_positive_numeric_alias_value(
+        row,
+        "pos",
+        "size",
+        "sz",
+        "positionSize",
+        "position_size",
+    )
+    closed = _consistent_positive_numeric_alias_value(
+        row,
+        "closePos",
+        "close_pos",
+        "closedSize",
     )
     return bool(
         opened is not None
-        and opened > 0
         and closed is not None
-        and abs(opened - closed) <= 1e-9
+        and abs(opened - closed) <= Decimal("1e-9")
     )
+
+
+def _consistent_positive_numeric_alias_value(
+    row: dict[str, Any],
+    *keys: str,
+) -> Decimal | None:
+    values: list[Decimal] = []
+    for key in keys:
+        if key not in row:
+            continue
+        try:
+            value = Decimal(str(row[key]).strip())
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+        if not value.is_finite() or value <= 0:
+            return None
+        values.append(value)
+    if not values:
+        return None
+    reference = values[0]
+    if any(abs(value - reference) > Decimal("1e-9") for value in values[1:]):
+        return None
+    return reference
 
 
 def _truthy_exchange_flag(value: Any) -> bool:
@@ -4205,14 +4245,21 @@ def _join_unique_ids(values: list[str]) -> str:
 
 
 def _has_nonzero_size(position: dict[str, Any]) -> bool:
-    size = position.get("pos")
-    if size in (None, ""):
-        size = position.get("size")
-    try:
-        parsed = float(size or 0)
-        return math.isfinite(parsed) and abs(parsed) > 0
-    except (TypeError, ValueError):
-        return False
+    raw_sizes = [
+        position[key]
+        for key in ("pos", "size", "sz", "positionSize", "position_size")
+        if key in position
+    ]
+    if not raw_sizes:
+        return True
+    for raw_size in raw_sizes:
+        try:
+            parsed = float(str(raw_size).strip())
+        except (TypeError, ValueError):
+            return True
+        if not math.isfinite(parsed) or abs(parsed) > 0:
+            return True
+    return False
 
 
 def _positive_position_size(position: dict[str, Any]) -> Decimal | None:

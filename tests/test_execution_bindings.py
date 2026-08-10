@@ -3250,6 +3250,56 @@ def test_full_close_predicate_rejects_conflicting_position_identity_aliases():
     )
 
 
+@pytest.mark.parametrize(
+    "size_evidence",
+    [
+        {"pos": "5", "positionSize": "1", "closePos": "5"},
+        {"pos": "5", "size": "0", "closePos": "5"},
+        {"pos": "5", "size": "NaN", "closePos": "5"},
+        {"pos": "5", "closePos": "5", "closedSize": "4"},
+    ],
+)
+def test_full_close_predicate_rejects_conflicting_or_nonfinite_size_aliases(
+    size_evidence,
+):
+    assert not execution_bindings_module.position_history_row_proves_full_close(
+        {
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-target",
+            "posSide": "short",
+            **size_evidence,
+        },
+        instrument_id="BTC-USDT-SWAP",
+        position_side="short",
+        pos_id="pos-target",
+    )
+
+
+@pytest.mark.parametrize(
+    "identity_evidence",
+    [
+        {"instId": "BTC-USDT-SWAP", "symbol": "ETH"},
+        {"posSide": "short", "side": "long"},
+    ],
+)
+def test_full_close_predicate_rejects_conflicting_instrument_or_side_aliases(
+    identity_evidence,
+):
+    assert not execution_bindings_module.position_history_row_proves_full_close(
+        {
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-target",
+            "posSide": "short",
+            "pos": "5",
+            "closePos": "5",
+            **identity_evidence,
+        },
+        instrument_id="BTC-USDT-SWAP",
+        position_side="short",
+        pos_id="pos-target",
+    )
+
+
 def test_repair_execution_order_legs_from_binding_payloads_backfills_legacy_rows(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = upsert_execution_binding(
@@ -5661,6 +5711,14 @@ def test_sync_manual_closed_positions_closes_missing_bound_position(tmp_path, bi
             "positionId": "different-position",
             "pos": "1",
         },
+        {"PositionID": "pos-live-alias", "sz": "1"},
+        {
+            "PositionID": "pos-live-alias",
+            "pos": "0",
+            "positionSize": "1",
+        },
+        {"PositionID": "pos-live-alias", "pos": "not-a-number"},
+        {"PositionID": "pos-live-alias"},
     ],
 )
 def test_sync_manual_closed_positions_keeps_supported_live_position_aliases(
