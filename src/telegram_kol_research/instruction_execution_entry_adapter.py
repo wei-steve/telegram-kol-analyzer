@@ -77,6 +77,8 @@ def project_entry_deferred_contract(
     message_instruction_item_id: int,
     reason_code: str,
     blocker_ids: tuple[int, ...],
+    deadline_at: datetime | None = None,
+    recheck_fingerprint: str | None = None,
     projected_at: datetime,
     mode: str,
 ):
@@ -88,6 +90,7 @@ def project_entry_deferred_contract(
         session_factory,
         message_instruction_item_id=int(message_instruction_item_id),
         projected_at=projected_at,
+        deadline_at=deadline_at,
     )
     if contract.intent_kind != "entry":
         raise EntryExecutionContractBlocked("non_entry_instruction_contract")
@@ -108,6 +111,8 @@ def project_entry_deferred_contract(
             {
                 "kind": "entry_admission_blockers",
                 "raw_message_ids": sorted(set(int(value) for value in blocker_ids)),
+                "deadline_at": deadline_at.isoformat() if deadline_at else None,
+                "recheck_fingerprint": recheck_fingerprint,
             }
         ],
         transitioned_at=projected_at,
@@ -140,10 +145,8 @@ def prepare_entry_submission_contract(
     if contract.state in {"verified", "failed", "expired"}:
         raise EntryExecutionContractBlocked(f"entry_contract_{contract.state}")
     if contract.state == "submitting":
-        if int(contract.trade_signal_id or 0) != int(trade_signal_id):
-            raise EntryExecutionContractBlocked("entry_contract_submitting_conflict")
-        return EntrySubmissionPreparation(
-            "submitting", int(contract.id), fingerprint
+        raise EntryExecutionContractBlocked(
+            "entry_contract_submitting_requires_reconciliation"
         )
     if contract.state == "deferred":
         contract = transition_instruction_execution_contract(
@@ -227,8 +230,19 @@ def project_entry_submission_result(
         strategy_instance_id=signal.strategy_instance_id,
     )
     verified_indices = tuple(
-        sorted(set(binding.leg_indices).intersection(expected_indices))
+        sorted(
+            index
+            for index, client_order_id in zip(
+                binding.leg_indices,
+                binding.client_order_ids,
+                strict=True,
+            )
+            if index in expected_indices
+            and client_order_id == _expected_client_order_id(signal.draft, index)
+        )
     )
+    if binding.draft_fingerprint != _draft_fingerprint(signal.draft):
+        verified_indices = ()
     absent_indices = tuple(sorted(set(int(value) for value in confirmed_absent_leg_indices)))
     exact_partition = (
         bool(expected_indices)
@@ -326,6 +340,14 @@ def _selected_leg_indices(draft: dict[str, Any]) -> tuple[int, ...]:
         if type(value) is int and 1 <= int(value) <= len(legs)
     }
     return tuple(sorted(valid))
+
+
+def _expected_client_order_id(draft: dict[str, Any], leg_index: int) -> str:
+    legs = draft.get("order_legs")
+    if not isinstance(legs, list) or not (1 <= int(leg_index) <= len(legs)):
+        return ""
+    leg = legs[int(leg_index) - 1]
+    return str(leg.get("client_order_id") or "") if isinstance(leg, dict) else ""
 
 
 def _finish(

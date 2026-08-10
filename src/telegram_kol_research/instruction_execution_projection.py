@@ -77,3 +77,16 @@ def _above_watermark(
     else:
         return False
     return int(item.id) > int(watermark)
+
+
+def instruction_execution_mode_for_item(
+    item: MessageInstructionItem,
+    settings: TradingSettings,
+) -> str:
+    """Return rollout mode only for items strictly above their future watermark."""
+
+    if settings.instruction_execution_contract_mode == "disabled":
+        return "disabled"
+    if not _above_watermark(item, settings):
+        return "disabled"
+    return settings.instruction_execution_contract_mode

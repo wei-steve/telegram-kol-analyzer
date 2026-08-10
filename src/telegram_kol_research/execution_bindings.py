@@ -137,6 +137,7 @@ class EntryBindingEvidence:
     leg_indices: tuple[int, ...]
     client_order_ids: tuple[str, ...]
     exact: bool
+    draft_fingerprint: str | None = None
 
 
 @dataclass(slots=True)
@@ -344,7 +345,7 @@ def load_entry_binding_evidence(
             strategy_instance_id
             and binding.strategy_instance_id != strategy_instance_id
         ):
-            return EntryBindingEvidence(None, (), (), False)
+            return EntryBindingEvidence(None, (), (), False, None)
         legs = (
             session.query(ExecutionOrderLeg)
             .filter(
@@ -361,11 +362,37 @@ def load_entry_binding_evidence(
             and bool(leg.client_order_id)
             and leg.status not in {"unknown", "submit_unknown"}
         ]
+        try:
+            binding_payload = json.loads(binding.payload_json or "{}")
+        except (json.JSONDecodeError, TypeError):
+            binding_payload = {}
+        binding_draft = (
+            binding_payload.get("draft")
+            if isinstance(binding_payload, dict)
+            else None
+        )
+        draft_fingerprint = None
+        if isinstance(binding_draft, dict):
+            canonical_draft = {
+                key: value
+                for key, value in binding_draft.items()
+                if key != "draft_fingerprint"
+            }
+            draft_fingerprint = hashlib.sha256(
+                json.dumps(
+                    canonical_draft,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
         return EntryBindingEvidence(
             int(binding.id),
             tuple(int(leg.leg_index) for leg in exact_legs),
             tuple(str(leg.client_order_id) for leg in exact_legs),
             len(exact_legs) == len(legs),
+            draft_fingerprint,
         )
 
 

@@ -8,6 +8,7 @@ from telegram_kol_research.models import (
     MessageEvidenceVersion,
     RawMessage,
     SignalCandidate,
+    MessageInstructionItem,
 )
 
 
@@ -682,3 +683,53 @@ def test_preamble_outside_adjacent_time_window_is_not_selected(tmp_path):
     assert decision.status == "ready"
     assert decision.selection.risk_multiplier == 1
     assert decision.selection.legacy_preamble_ids == ()
+
+
+def test_live_admission_blocks_ready_item_after_execution_deadline(tmp_path):
+    from telegram_kol_research.entry_assembly_admission import (
+        assess_entry_assembly_admission,
+    )
+
+    session_factory = create_session_factory(tmp_path / "deadline-admission.db")
+    with session_factory() as session:
+        strategy = RawMessage(
+            chat_id=100,
+            message_id=1000,
+            posted_at=NOW,
+            text="BTC long 64000 SL 63000",
+        )
+        session.add(strategy)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=strategy.id,
+            symbol="BTC",
+            side="long",
+            event_type="entry_signal",
+            recognition_generation="deadline-generation",
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            MessageInstructionItem(
+                raw_message_id=strategy.id,
+                signal_candidate_id=candidate.id,
+                sequence=0,
+                instruction_kind="entry",
+                idempotency_key="d" * 64,
+                status="executing",
+                execution_deadline_at=NOW + timedelta(seconds=1),
+            )
+        )
+        session.commit()
+        ids = strategy.id, candidate.id
+
+    decision = assess_entry_assembly_admission(
+        session_factory,
+        strategy_raw_message_id=ids[0],
+        signal_candidate_id=ids[1],
+        mode="live",
+        assessed_at=NOW + timedelta(seconds=2),
+    )
+
+    assert decision.status == "blocked"
+    assert decision.reason_code == "entry_admission_deadline_expired"

@@ -124,6 +124,11 @@ def reconcile_due_entry_admissions(
         if decision.status == "deferred":
             continue
         if decision.status == "blocked":
+            contract_snapshot = (
+                (contract.id, contract.state, contract.state_version)
+                if contract is not None
+                else None
+            )
             if _expire_attempt_and_item(
                 session_factory,
                 attempt_id=attempt_id,
@@ -132,16 +137,24 @@ def reconcile_due_entry_admissions(
                 reason="entry_admission_recheck_blocked",
             ):
                 counts["expired"] += 1
+                _expire_contract_best_effort(
+                    session_factory,
+                    contract_snapshot=contract_snapshot,
+                    now=now,
+                )
             continue
         with session_factory() as session:
             current_attempt = session.get(EntryAssemblyAttempt, attempt_id)
             if current_attempt is None or current_attempt.status != "pending":
                 continue
-            _release_adjacent_entry_visibility_delay(
+            released = _release_adjacent_entry_visibility_delay(
                 session,
                 attempt=current_attempt,
                 now=now,
             )
+            if not released:
+                session.rollback()
+                continue
             current_attempt.status = "woken"
             current_attempt.woken_at = now
             current_attempt.updated_at = now

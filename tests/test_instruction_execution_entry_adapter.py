@@ -102,6 +102,7 @@ def _persist_verified_legs(session_factory, *, signal_id, draft, leg_indices):
             order_id=":".join(f"ORDER-{index}" for index in leg_indices),
             client_order_id=":".join(f"LEG-{index}" for index in leg_indices),
             status="open",
+            payload_json=json.dumps({"draft": draft}),
         )
         session.add(binding)
         session.flush()
@@ -142,12 +143,21 @@ def test_pending_entry_can_be_projected_as_deferred(tmp_path):
         message_instruction_item_id=item_id,
         reason_code="adjacent_entry_context_pending",
         blocker_ids=(17,),
+        deadline_at=NOW,
+        recheck_fingerprint="f" * 64,
         projected_at=NOW,
         mode="shadow",
     )
 
     assert result.state == "deferred"
     assert _contract(session_factory).attempted_exchange_write is False
+    with session_factory() as session:
+        evidence = json.loads(
+            session.query(InstructionExecutionContract).one().evidence_refs_json
+        )[0]
+        assert evidence["raw_message_ids"] == [17]
+        assert evidence["deadline_at"] == NOW.isoformat()
+        assert evidence["recheck_fingerprint"] == "f" * 64
 
 
 def test_successful_one_leg_submission_becomes_verified_entry(tmp_path):
@@ -250,6 +260,62 @@ def test_ambiguous_exchange_outcome_becomes_submit_unknown(tmp_path):
             prepared_at=NOW,
             mode="shadow",
         )
+
+
+def test_existing_submitting_contract_never_reenters_writer(tmp_path):
+    session_factory = create_session_factory(tmp_path / "submitting-retry.db")
+    item_id, signal_id, draft = _persist_chain(session_factory)
+    prepare_entry_submission_contract(
+        session_factory,
+        message_instruction_item_id=item_id,
+        trade_signal_id=signal_id,
+        draft=draft,
+        prepared_at=NOW,
+        mode="shadow",
+    )
+
+    with pytest.raises(EntryExecutionContractBlocked, match="reconciliation"):
+        prepare_entry_submission_contract(
+            session_factory,
+            message_instruction_item_id=item_id,
+            trade_signal_id=signal_id,
+            draft=draft,
+            prepared_at=NOW,
+            mode="shadow",
+        )
+
+
+def test_stale_same_index_binding_with_different_client_id_stays_unknown(tmp_path):
+    session_factory = create_session_factory(tmp_path / "stale-binding.db")
+    item_id, signal_id, draft = _persist_chain(session_factory)
+    prepare_entry_submission_contract(
+        session_factory,
+        message_instruction_item_id=item_id,
+        trade_signal_id=signal_id,
+        draft=draft,
+        prepared_at=NOW,
+        mode="shadow",
+    )
+    _persist_verified_legs(
+        session_factory, signal_id=signal_id, draft=draft, leg_indices=(1,)
+    )
+    with session_factory() as session:
+        session.query(ExecutionOrderLeg).one().client_order_id = "OLD-LEG-1"
+        session.get(TradeSignal, signal_id).status = "unknown_exchange_outcome"
+        session.commit()
+
+    projection = project_entry_submission_result(
+        session_factory,
+        message_instruction_item_id=item_id,
+        trade_signal_id=signal_id,
+        attempted_writes=1,
+        confirmed_legs=0,
+        error=RuntimeError("response lost"),
+        projected_at=NOW,
+        mode="shadow",
+    )
+
+    assert projection.state == "submit_unknown"
 
 
 def test_two_verified_legs_require_exact_durable_leg_evidence(tmp_path):

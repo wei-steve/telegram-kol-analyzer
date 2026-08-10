@@ -1,5 +1,8 @@
 import json
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+
+import telegram_kol_research.entry_admission_reconciler as reconciler_module
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.entry_admission_reconciler import (
@@ -266,3 +269,52 @@ def test_historical_succeeded_defer_creates_incident_but_no_order(tmp_path):
         incident = session.query(RuntimeIncident).one()
         assert incident.incident_type == "unclassified_operation_failure"
         assert session.query(EntryAssemblyAttempt).one().status == "expired"
+
+
+def test_blocked_recheck_expires_matching_execution_contract(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "blocked-contract.db")
+    strategy_id, candidate_id, _, item_id = _persist_deferred_entry(session_factory)
+    with session_factory() as session:
+        session.add(InstructionExecutionContract(
+            message_instruction_item_id=item_id,
+            raw_message_id=strategy_id,
+            signal_candidate_id=candidate_id,
+            intent_kind="entry",
+            state="deferred",
+            state_version=1,
+        ))
+        session.commit()
+    monkeypatch.setattr(
+        reconciler_module,
+        "assess_entry_assembly_admission",
+        lambda *args, **kwargs: SimpleNamespace(status="blocked"),
+    )
+
+    result = reconcile_due_entry_admissions(
+        session_factory,
+        now=NOW + timedelta(seconds=10),
+    )
+
+    assert result.expired == 1
+    with session_factory() as session:
+        assert session.query(InstructionExecutionContract).one().state == "expired"
+
+
+def test_failed_release_cas_keeps_attempt_pending_for_next_tick(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "release-race.db")
+    _, _, blocker_id, _ = _persist_deferred_entry(session_factory)
+    _complete_blocker(session_factory, blocker_id)
+    monkeypatch.setattr(
+        reconciler_module,
+        "_release_adjacent_entry_visibility_delay",
+        lambda *args, **kwargs: False,
+    )
+
+    result = reconcile_due_entry_admissions(
+        session_factory,
+        now=NOW + timedelta(seconds=10),
+    )
+
+    assert result.released == 0
+    with session_factory() as session:
+        assert session.query(EntryAssemblyAttempt).one().status == "pending"

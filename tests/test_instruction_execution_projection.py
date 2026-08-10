@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.instruction_execution_projection import (
+    instruction_execution_mode_for_item,
     project_instruction_execution_contracts,
 )
 from telegram_kol_research.models import (
@@ -219,3 +220,18 @@ def test_projection_is_idempotent_and_does_not_retarget_or_create_candidates(
             .message_instruction_item_id
             == item_id
         )
+
+
+def test_item_mode_is_disabled_at_or_below_future_watermark(tmp_path):
+    session_factory = create_session_factory(tmp_path / "item-mode.db")
+    _, _, item_id, _ = _persist_item(session_factory, instruction_kind="entry")
+    settings = TradingSettings(
+        instruction_execution_contract_mode="live",
+        instruction_execution_entry_after_item_id=item_id,
+    )
+    with session_factory() as session:
+        item = session.get(MessageInstructionItem, item_id)
+
+        assert instruction_execution_mode_for_item(item, settings) == "disabled"
+        settings.instruction_execution_entry_after_item_id = item_id - 1
+        assert instruction_execution_mode_for_item(item, settings) == "live"

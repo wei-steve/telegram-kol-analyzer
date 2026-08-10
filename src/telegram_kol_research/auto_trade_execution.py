@@ -50,6 +50,9 @@ from telegram_kol_research.instruction_execution_outcomes import (
     InstructionOutcomeContractError,
     legacy_status_for_instruction_result,
 )
+from telegram_kol_research.instruction_execution_projection import (
+    instruction_execution_mode_for_item,
+)
 from telegram_kol_research.price_normalization import extract_normalized_prices
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import persist_recovery_evaluations
@@ -213,9 +216,7 @@ def execute_message_instruction_items(
     """Claim and execute each durable instruction independently in sequence."""
 
     now = processed_at or datetime.now(UTC)
-    enforcement_mode = load_trading_settings(
-        session_factory
-    ).instruction_execution_contract_mode
+    execution_settings = load_trading_settings(session_factory)
     while True:
         item = claim_next_message_instruction_item(
             session_factory,
@@ -224,6 +225,10 @@ def execute_message_instruction_items(
         )
         if item is None:
             break
+        enforcement_mode = instruction_execution_mode_for_item(
+            item,
+            execution_settings,
+        )
         try:
             result = _auto_process_single_message_trade_signal(
                 session_factory,
@@ -235,6 +240,7 @@ def execute_message_instruction_items(
                 instruction_kind=item.instruction_kind,
                 candidate_id=item.signal_candidate_id,
                 message_instruction_item_id=item.id,
+                execution_contract_mode=enforcement_mode,
                 revision_replacement_writer=revision_replacement_writer,
             )
         except DeepcoinRequestOutcomeUnknown as exc:
@@ -336,6 +342,7 @@ def _auto_process_single_message_trade_signal(
     instruction_kind: str | None = None,
     candidate_id: int | None = None,
     message_instruction_item_id: int | None = None,
+    execution_contract_mode: str = "disabled",
     revision_replacement_writer: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Execute exactly one selected candidate through the existing venue path."""
@@ -562,6 +569,21 @@ def _auto_process_single_message_trade_signal(
         assessed_at=now,
     )
     if admission.status == "deferred":
+        if message_instruction_item_id is not None:
+            from telegram_kol_research.instruction_execution_entry_adapter import (
+                project_entry_deferred_contract,
+            )
+
+            project_entry_deferred_contract(
+                session_factory,
+                message_instruction_item_id=message_instruction_item_id,
+                reason_code=str(admission.reason_code or "entry_deferred"),
+                blocker_ids=admission.blocking_raw_message_ids,
+                deadline_at=admission.deadline_at,
+                recheck_fingerprint=admission.recheck_fingerprint,
+                projected_at=now,
+                mode=execution_contract_mode,
+            )
         return {"status": "deferred", "reason": admission.reason_code}
     if admission.status == "blocked":
         return {"status": "blocked", "reason": admission.reason_code}
@@ -939,7 +961,7 @@ def _auto_process_single_message_trade_signal(
             contract_spec_provider=contract_spec_provider,
             processed_at=now,
             message_instruction_item_id=message_instruction_item_id,
-            execution_contract_mode=settings.instruction_execution_contract_mode,
+            execution_contract_mode=execution_contract_mode,
         )
     else:
         trade_signal = enqueue_recovery_trade_signal(
@@ -1014,7 +1036,7 @@ def _auto_process_single_message_trade_signal(
             processed_at=now,
             max_order_legs=1 if entry_execution_type == "market" else None,
             message_instruction_item_id=message_instruction_item_id,
-            execution_contract_mode=settings.instruction_execution_contract_mode,
+            execution_contract_mode=execution_contract_mode,
         )
     return {
         "status": "submitted",

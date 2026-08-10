@@ -108,7 +108,7 @@ def _release_adjacent_entry_visibility_delay(
     *,
     attempt: EntryAssemblyAttempt,
     now: datetime,
-) -> None:
+) -> bool | None:
     """Make the exact entry item immediately claimable after its final wakeup."""
 
     item = (
@@ -119,15 +119,17 @@ def _release_adjacent_entry_visibility_delay(
             MessageInstructionItem.signal_candidate_id
             == int(attempt.signal_candidate_id),
             MessageInstructionItem.instruction_kind == "entry",
-            MessageInstructionItem.status == "pending",
             MessageInstructionItem.retired_at.is_(None),
         )
         .one_or_none()
     )
-    if item is None or not _is_adjacent_entry_context_defer(item.result_json):
-        return
+    if item is None:
+        return None
+    if item.status != "pending" or not _is_adjacent_entry_context_defer(item.result_json):
+        return False
     item.visibility_next_attempt_at = None
     item.updated_at = now
+    return True
 
 
 def _load_source_facts(
@@ -483,7 +485,7 @@ def _persist_attempt(
     if item is not None and item.execution_deadline_at is None:
         item.execution_deadline_at = now + ENTRY_ADMISSION_EXECUTION_DEADLINE
     if existing is not None:
-        if existing.status in {"shadow", "pending"}:
+        if existing.status in {"shadow", "pending", "woken"}:
             existing.status = desired_status
             existing.blocking_raw_message_ids_json = blockers_json
             existing.updated_at = now
@@ -523,7 +525,7 @@ def _persist_attempt(
             .filter(EntryAssemblyAttempt.fingerprint == fingerprint)
             .one()
         )
-        if existing.status in {"shadow", "pending"}:
+        if existing.status in {"shadow", "pending", "woken"}:
             existing.status = desired_status
             existing.blocking_raw_message_ids_json = blockers_json
             existing.updated_at = now
@@ -564,6 +566,41 @@ def assess_entry_assembly_admission(
             facts=facts,
             cutoff=cutoff,
         )
+        item = (
+            session.query(MessageInstructionItem)
+            .filter(
+                MessageInstructionItem.raw_message_id == int(strategy.id),
+                MessageInstructionItem.signal_candidate_id == int(candidate.id),
+                MessageInstructionItem.instruction_kind == "entry",
+                MessageInstructionItem.retired_at.is_(None),
+            )
+            .one_or_none()
+        )
+        deadline_at = item.execution_deadline_at if item is not None else None
+        comparable_deadline = deadline_at
+        comparable_assessed_at = assessed_at
+        if comparable_deadline is not None:
+            if comparable_deadline.tzinfo is None and comparable_assessed_at.tzinfo is not None:
+                comparable_deadline = comparable_deadline.replace(
+                    tzinfo=comparable_assessed_at.tzinfo
+                )
+            elif comparable_deadline.tzinfo is not None and comparable_assessed_at.tzinfo is None:
+                comparable_assessed_at = comparable_assessed_at.replace(
+                    tzinfo=comparable_deadline.tzinfo
+                )
+        if (
+            mode == "live"
+            and comparable_deadline is not None
+            and comparable_assessed_at >= comparable_deadline
+        ):
+            return EntryAdmissionDecision(
+                "blocked",
+                "entry_admission_deadline_expired",
+                "blocked",
+                cutoff,
+                selection,
+                deadline_at=deadline_at,
+            )
         proposed_status = "deferred" if selection.status == "pending" else selection.status
         attempt = None
         blocking_ids: list[int] = []
@@ -590,7 +627,7 @@ def assess_entry_assembly_admission(
                 cutoff,
                 selection,
                 tuple(sorted(set(blocking_ids))),
-                assessed_at + ENTRY_ADMISSION_EXECUTION_DEADLINE,
+                deadline_at or assessed_at + ENTRY_ADMISSION_EXECUTION_DEADLINE,
                 attempt.fingerprint if attempt is not None else None,
             )
         if mode == "live" and selection.status == "blocked":
@@ -705,11 +742,28 @@ def claim_ready_entry_assembly_wakeups(
                     )
                 )
                 if int(result.rowcount or 0) == 1:
-                    _release_adjacent_entry_visibility_delay(
+                    released = _release_adjacent_entry_visibility_delay(
                         session,
                         attempt=attempt,
                         now=now,
                     )
+                    if released is False:
+                        session.execute(
+                            update(EntryAssemblyAttempt)
+                            .where(
+                                EntryAssemblyAttempt.id == int(attempt.id),
+                                EntryAssemblyAttempt.status == "claimed",
+                                EntryAssemblyAttempt.wake_claim_token == claim_token,
+                            )
+                            .values(
+                                status="pending",
+                                wake_claim_token=None,
+                                wake_claimed_at=None,
+                                updated_at=now,
+                            )
+                        )
+                        session.commit()
+                        break
                     session.commit()
                     claimed.append(
                         EntryAssemblyWakeClaim(
