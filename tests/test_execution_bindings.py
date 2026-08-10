@@ -3234,6 +3234,22 @@ def test_reconcile_does_not_restore_prior_authority_over_local_position_owner_co
     )
 
 
+def test_full_close_predicate_rejects_conflicting_position_identity_aliases():
+    assert not execution_bindings_module.position_history_row_proves_full_close(
+        {
+            "instId": "BTC-USDT-SWAP",
+            "PositionID": "pos-target",
+            "positionId": "pos-other",
+            "posSide": "short",
+            "pos": "5",
+            "closePos": "5",
+        },
+        instrument_id="BTC-USDT-SWAP",
+        position_side="short",
+        pos_id="pos-target",
+    )
+
+
 def test_repair_execution_order_legs_from_binding_payloads_backfills_legacy_rows(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = upsert_execution_binding(

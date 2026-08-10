@@ -3668,15 +3668,19 @@ def position_history_row_proves_full_close(
     position_side: str,
     pos_id: str,
 ) -> bool:
-    if _first_string(
-        row,
-        "posId",
-        "pos_id",
-        "PositionID",
-        "positionId",
-        "position_id",
-        "id",
-    ) != pos_id:
+    position_identity_ids = {
+        str(row[key]).strip()
+        for key in (
+            "posId",
+            "pos_id",
+            "PositionID",
+            "positionId",
+            "position_id",
+            "id",
+        )
+        if str(row.get(key) or "").strip()
+    }
+    if position_identity_ids != {str(pos_id).strip()}:
         return False
     if _binding_instrument_id_from_value(
         row.get("instId") or row.get("symbol")
