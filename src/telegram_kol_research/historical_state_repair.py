@@ -1561,10 +1561,14 @@ def _proven_take_profit_attribution_repair(
     mutation = mutations[0]
     response_object = _json_object(mutation.response_json)
     response_position_ids = _json_position_ids(mutation.response_json)
+    response_order_ids = _json_order_ids(mutation.response_json)
+    local_order_id = str(mutation.order_id or "").strip()
     if (
         _json_position_ids(mutation.request_json) != {pos_id}
         or not response_object
+        or not (response_position_ids or response_order_ids)
         or (response_position_ids and response_position_ids != {pos_id})
+        or (response_order_ids and response_order_ids != {local_order_id})
     ):
         return None, "close_mutation_payload_identity_mismatch"
 
@@ -1873,6 +1877,7 @@ def _mutation_intent_evidence(row: PositionMutationIntent) -> dict[str, Any]:
         "execution_binding_id": int(row.execution_binding_id),
         "execution_order_leg_id": int(row.execution_order_leg_id),
         "pos_id": str(row.pos_id),
+        "order_id": row.order_id,
         "status": str(row.status),
         "authority_fingerprint": str(row.authority_fingerprint),
         "request_fingerprint": str(row.request_fingerprint),
@@ -1915,6 +1920,36 @@ def _json_position_ids(value: str | None) -> set[str]:
                     "position_id",
                     "closePosId",
                     "close_pos_id",
+                }:
+                    normalized = str(child or "").strip()
+                    if normalized:
+                        found.add(normalized)
+                else:
+                    visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+
+    visit(parsed)
+    return found
+
+
+def _json_order_ids(value: str | None) -> set[str]:
+    try:
+        parsed = json.loads(str(value or "null"))
+    except (TypeError, json.JSONDecodeError):
+        return set()
+    found: set[str] = set()
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if key in {
+                    "ordId",
+                    "orderId",
+                    "order_id",
+                    "orderSysID",
+                    "OrderSysID",
                 }:
                     normalized = str(child or "").strip()
                     if normalized:

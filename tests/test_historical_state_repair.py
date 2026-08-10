@@ -846,6 +846,7 @@ def test_plan_accepts_production_shaped_confirmed_close_intent(tmp_path):
     seeded = _seed_proven_attribution_repair_candidate(session_factory)
     with session_factory() as session:
         mutation = session.get(PositionMutationIntent, seeded["mutation_id"])
+        mutation.order_id = "close-order-1"
         mutation.request_json = json.dumps(
             {
                 "instId": "BTC-USDT-SWAP",
@@ -934,6 +935,11 @@ def test_plan_accepts_supported_exact_history_position_aliases(
         ("close_mutation_wrong_leg", "confirmed_close_mutation_missing_or_ambiguous"),
         ("close_mutation_wrong_strategy", "confirmed_close_mutation_missing_or_ambiguous"),
         ("close_mutation_wrong_pos", "confirmed_close_mutation_missing_or_ambiguous"),
+        ("close_mutation_order_id", "close_mutation_payload_identity_mismatch"),
+        (
+            "close_mutation_unidentified_response",
+            "close_mutation_payload_identity_mismatch",
+        ),
         ("reservation_unconfirmed", "confirmed_close_reservation_missing_or_mismatched"),
         ("reservation_wrong_binding", "confirmed_close_reservation_missing_or_mismatched"),
         ("competing_leg", "position_owned_by_other_leg"),
@@ -998,6 +1004,17 @@ def test_plan_fails_closed_when_local_attribution_repair_proof_changes(
                 row.execution_order_leg_id = int(seeded["leg_id"]) + 999
             elif mutation == "close_mutation_wrong_strategy":
                 row.strategy_instance_id = "different-strategy"
+            elif mutation == "close_mutation_order_id":
+                row.order_id = "different-close-order"
+                row.response_json = json.dumps(
+                    {
+                        "code": "0",
+                        "data": {"ordId": "original-close-order"},
+                        "posId": seeded["pos_id"],
+                    }
+                )
+            elif mutation == "close_mutation_unidentified_response":
+                row.response_json = json.dumps({"code": "0"})
             else:
                 row.pos_id = "different-position"
         elif mutation.startswith("reservation_"):
@@ -1597,6 +1614,7 @@ def test_apply_refuses_take_profit_terms_change_after_fresh_plan(
         "authority_audit_evidence",
         "conflict_audit_evidence",
         "close_mutation_status",
+        "close_mutation_order_id",
         "close_reservation_status",
         "binding_status",
         "lifecycle_status",
@@ -1663,10 +1681,12 @@ def test_apply_refuses_every_local_cas_category_after_fresh_plan(
                 row.evidence_json = json.dumps(
                     {"candidate_leg_ids": [999], "candidate_position_ids": []}
                 )
-            elif mutation == "close_mutation_status":
-                session.get(
-                    PositionMutationIntent, seeded["mutation_id"]
-                ).status = "submitted"
+            elif mutation in {"close_mutation_status", "close_mutation_order_id"}:
+                row = session.get(PositionMutationIntent, seeded["mutation_id"])
+                if mutation == "close_mutation_status":
+                    row.status = "submitted"
+                else:
+                    row.order_id = "late-close-order"
             elif mutation == "close_reservation_status":
                 session.get(
                     BoundPositionCloseReservation,
