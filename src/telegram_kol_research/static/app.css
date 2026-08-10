@@ -1185,6 +1185,10 @@ body {
   font-size: 0.78rem;
 }
 
+.exchange-tab-refresh-status.is-error {
+  color: #fca5a5;
+}
+
 .exchange-view-button {
   min-height: 30px;
   padding: 0 10px;

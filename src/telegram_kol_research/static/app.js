@@ -26,6 +26,12 @@ const EXCHANGE_POSITION_TABS = [
   'order-history',
   'position-history',
 ];
+const EXCHANGE_POSITION_TAB_LABELS = {
+  positions: '持仓',
+  'open-orders': '当前委托',
+  'order-history': '历史委托',
+  'position-history': '历史仓位',
+};
 let strategyRecordRequestId = 0;
 let strategyRecordHasPendingChanges = false;
 let lastSuccessfulStrategyRecordAt = null;
@@ -2308,6 +2314,93 @@ function bindMobileWorkNavigation() {
   bindWorkbenchNavigation();
 }
 
+function exchangePositionTabLabel(tab) {
+  return EXCHANGE_POSITION_TAB_LABELS[tab] || '';
+}
+
+function setExchangeTabRefreshStatus(root, message = '', isError = false, tab = '') {
+  const status = root?.querySelector?.('[data-exchange-tab-refresh-status]');
+  if (!status) return;
+  status.textContent = message;
+  status.classList?.toggle('is-error', Boolean(isError));
+  if (tab) {
+    status.dataset.exchangeTabRefreshStatusTab = tab;
+  } else {
+    delete status.dataset.exchangeTabRefreshStatusTab;
+  }
+}
+
+function syncExchangeTabRefreshControls(root, tab) {
+  const controls = root?.querySelector?.('[data-exchange-tab-refresh-controls]');
+  const button = root?.querySelector?.('[data-exchange-tab-refresh]');
+  const status = root?.querySelector?.('[data-exchange-tab-refresh-status]');
+  const label = exchangePositionTabLabel(tab);
+  const supported = tab !== 'positions' && Boolean(label);
+  if (controls) controls.hidden = !supported;
+  if (!button) return;
+  const busy = root?.dataset?.exchangeTabRefreshing === tab;
+  button.disabled = !supported || busy;
+  button.textContent = busy ? '刷新中…' : `刷新${label}`;
+  if (!supported) {
+    setExchangeTabRefreshStatus(root);
+  } else if (
+    status?.dataset.exchangeTabRefreshStatusTab
+    && status.dataset.exchangeTabRefreshStatusTab !== tab
+  ) {
+    setExchangeTabRefreshStatus(root);
+  }
+}
+
+function setExchangeTabRefreshBusy(root, tab, busy) {
+  if (root?.dataset) {
+    if (busy) {
+      root.dataset.exchangeTabRefreshing = tab;
+    } else if (root.dataset.exchangeTabRefreshing === tab) {
+      delete root.dataset.exchangeTabRefreshing;
+    }
+  }
+  const activeTab = exchangePositionUiState(root).tab;
+  syncExchangeTabRefreshControls(root, activeTab);
+}
+
+function formatExchangeTabCapturedAt(value) {
+  const capturedAt = new Date(value || '');
+  if (Number.isNaN(capturedAt.getTime())) return '';
+  const hour = String(capturedAt.getUTCHours()).padStart(2, '0');
+  const minute = String(capturedAt.getUTCMinutes()).padStart(2, '0');
+  const second = String(capturedAt.getUTCSeconds()).padStart(2, '0');
+  return `${hour}:${minute}:${second} UTC`;
+}
+
+function updateExchangeTabRefreshMetadata(root, tab, fragment) {
+  const tabButton = root?.querySelector?.(
+    `[data-exchange-position-tab="${tab}"]`,
+  );
+  const label = tabButton?.dataset.exchangePositionLabel || exchangePositionTabLabel(tab);
+  const count = fragment?.dataset?.exchangeTabItemCount;
+  if (tabButton && label && count !== undefined) {
+    tabButton.textContent = `${label}(${count})`;
+  }
+  if (exchangePositionUiState(root).tab !== tab) return;
+  const capturedAt = formatExchangeTabCapturedAt(
+    fragment?.dataset?.exchangeTabCapturedAt,
+  );
+  if (capturedAt) {
+    setExchangeTabRefreshStatus(root, `更新于 ${capturedAt}`, false, tab);
+  }
+}
+
+function bindExchangeTabRetryControls(root) {
+  root?.querySelectorAll?.('[data-exchange-tab-retry]').forEach((button) => {
+    if (button.dataset.exchangeTabRetryBound === 'true') return;
+    button.dataset.exchangeTabRetryBound = 'true';
+    button.addEventListener('click', () => {
+      const tab = button.dataset.exchangeTabRetry;
+      loadExchangePositionTab(root, tab, { force: true });
+    });
+  });
+}
+
 function bindExchangePositionTabs() {
   document.querySelectorAll('[data-exchange-position-tabs]').forEach((root) => {
     const tabs = root.querySelectorAll('[data-exchange-position-tab]');
@@ -2327,6 +2420,15 @@ function bindExchangePositionTabs() {
         saveExchangePositionView(mode);
       });
     });
+    const refreshButton = root.querySelector?.('[data-exchange-tab-refresh]');
+    if (refreshButton && refreshButton.dataset.exchangeTabRefreshBound !== 'true') {
+      refreshButton.dataset.exchangeTabRefreshBound = 'true';
+      refreshButton.addEventListener('click', () => {
+        const tab = exchangePositionUiState(root).tab;
+        loadExchangePositionTab(root, tab, { force: true });
+      });
+    }
+    bindExchangeTabRetryControls(root);
     restoreExchangePositionTab(root);
     restoreExchangePositionView(root);
     const restoredTab = exchangePositionTab();
@@ -2338,7 +2440,7 @@ function bindExchangePositionTabs() {
   });
 }
 
-async function loadExchangePositionTab(root, tab) {
+async function loadExchangePositionTab(root, tab, { force = false } = {}) {
   if (!root || tab === 'positions' || !EXCHANGE_POSITION_TABS.includes(tab)) {
     return tab === 'positions';
   }
@@ -2346,7 +2448,8 @@ async function loadExchangePositionTab(root, tab) {
   const selector = `[data-exchange-position-panel="${tab}"]`;
   const panel = root.querySelector(selector);
   if (!panel) return false;
-  if (panel.dataset.exchangeTabLoaded === 'true') return true;
+  const wasLoaded = panel.dataset.exchangeTabLoaded === 'true';
+  if (wasLoaded && !force) return true;
 
   let requests = exchangePositionTabRequests.get(root);
   if (!requests) {
@@ -2355,9 +2458,12 @@ async function loadExchangePositionTab(root, tab) {
   }
   if (requests.has(tab)) return requests.get(tab);
 
-  panel.setAttribute('aria-busy', 'true');
-  const loading = panel.querySelector('[data-exchange-tab-loading]');
-  if (loading) loading.textContent = '正在加载 Deepcoin 数据...';
+  setExchangeTabRefreshBusy(root, tab, true);
+  if (!wasLoaded) {
+    panel.setAttribute('aria-busy', 'true');
+    const loading = panel.querySelector('[data-exchange-tab-loading]');
+    if (loading) loading.textContent = '正在加载 Deepcoin 数据...';
+  }
   const request = (async () => {
     try {
       const fragment = await fetchWorkbenchPartial(
@@ -2366,27 +2472,71 @@ async function loadExchangePositionTab(root, tab) {
       );
       const current = root.querySelector(selector);
       if (!current) return false;
+      if (fragment.dataset.exchangeTabLoaded !== 'true') {
+        if (wasLoaded && force) {
+          setExchangeTabRefreshStatus(
+            root,
+            '刷新失败，当前展示上次成功数据',
+            true,
+            tab,
+          );
+          return false;
+        }
+        current.replaceWith(fragment);
+        const uiState = exchangePositionUiState(root);
+        setExchangePositionTab(root, uiState.tab);
+        setExchangePositionView(root, uiState.view);
+        bindExchangeTabRetryControls(root);
+        if (uiState.tab === tab) {
+          setExchangeTabRefreshStatus(root, 'Deepcoin 数据暂不可用，请稍后重试。', true, tab);
+        }
+        return false;
+      }
       current.replaceWith(fragment);
-      setExchangePositionTab(root, exchangePositionTab());
-      setExchangePositionView(root, exchangePositionViewMode());
+      const uiState = exchangePositionUiState(root);
+      setExchangePositionTab(root, uiState.tab);
+      setExchangePositionView(root, uiState.view);
+      updateExchangeTabRefreshMetadata(root, tab, fragment);
+      bindExchangeTabRetryControls(root);
       bindBoundPositionCloseButtons();
       bindLivePositionAttributionButtons();
       return true;
-    } catch (error) {
+    } catch {
       const current = root.querySelector(selector);
+      if (wasLoaded && force) {
+        setExchangeTabRefreshStatus(
+          root,
+          '刷新失败，当前展示上次成功数据',
+          true,
+          tab,
+        );
+        return false;
+      }
       if (current) {
         current.dataset.exchangeTabLoaded = 'false';
         current.removeAttribute('aria-busy');
-        const notice = document.createElement('p');
-        notice.className = 'exchange-empty';
-        notice.dataset.exchangeTabLoading = '';
-        notice.setAttribute('role', 'alert');
-        notice.textContent = `加载失败：${error.message || '请重新点击分页重试'}`;
+        const notice = document.createElement('div');
+        notice.className = 'exchange-tab-load-error';
+        notice.setAttribute('role', 'status');
+        const message = document.createElement('p');
+        message.className = 'exchange-empty';
+        message.textContent = 'Deepcoin 数据暂不可用，请稍后重试。';
+        const retry = document.createElement('button');
+        retry.type = 'button';
+        retry.className = 'secondary-button';
+        retry.dataset.exchangeTabRetry = tab;
+        retry.textContent = '重新加载';
+        notice.append(message, retry);
         current.replaceChildren(notice);
+        bindExchangeTabRetryControls(root);
+      }
+      if (exchangePositionUiState(root).tab === tab) {
+        setExchangeTabRefreshStatus(root, 'Deepcoin 数据暂不可用，请稍后重试。', true, tab);
       }
       return false;
     } finally {
       requests.delete(tab);
+      setExchangeTabRefreshBusy(root, tab, false);
     }
   })();
   requests.set(tab, request);
@@ -2428,6 +2578,7 @@ function setExchangePositionTab(root, tab) {
       panel.dataset.exchangePositionPanel === selectedTab,
     );
   });
+  syncExchangeTabRefreshControls(root, selectedTab);
 }
 
 function exchangePositionUiState(root) {

@@ -521,11 +521,246 @@ def test_app_js_lazy_loads_exchange_position_tabs(tmp_path):
 
     js = client.get("/static/app.js").text
 
-    assert "async function loadExchangePositionTab(root, tab)" in js
+    assert "async function loadExchangePositionTab(root, tab, { force = false } = {})" in js
     assert "/positions-panel/tabs/${encodeURIComponent(tab)}" in js
     assert "panel.dataset.exchangeTabLoaded === 'true'" in js
     assert "loadExchangePositionTab(root, target)" in js
     assert "/positions-panel?initial=positions" in js
+
+
+def test_exchange_position_tab_manual_refresh_is_single_flight_and_preserves_data(
+    tmp_path,
+):
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is required for the browser-state behavior test")
+
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+    constants_start = js.index("const exchangePositionTabRequests")
+    constants_end = js.index("\nlet strategyRecordRequestId", constants_start)
+    functions_start = js.index("function exchangePositionTabLabel")
+    functions_end = js.index("\nfunction boundedContractSpecStatusText", functions_start)
+    harness = textwrap.dedent(
+        """
+        const storage = new Map([
+          [EXCHANGE_POSITION_TAB_KEY, 'open-orders'],
+          [EXCHANGE_POSITION_VIEW_KEY, 'list'],
+        ]);
+        global.window = {
+          localStorage: {
+            getItem: (key) => storage.has(key) ? storage.get(key) : null,
+            setItem: (key, value) => storage.set(key, value),
+          },
+        };
+
+        class FakeClassList {
+          constructor(initial = []) { this.values = new Set(initial); }
+          toggle(name, enabled) {
+            if (enabled) this.values.add(name);
+            else this.values.delete(name);
+          }
+          contains(name) { return this.values.has(name); }
+        }
+
+        class FakeElement {
+          constructor(dataset = {}, active = false) {
+            this.dataset = { ...dataset };
+            this.classList = new FakeClassList(active ? ['is-active'] : []);
+            this.attributes = {};
+            this.listeners = {};
+            this.textContent = '';
+            this.disabled = false;
+            this.hidden = false;
+          }
+          addEventListener(name, listener) { this.listeners[name] = listener; }
+          click() { this.listeners.click?.(); }
+          setAttribute(name, value) { this.attributes[name] = String(value); }
+          removeAttribute(name) { delete this.attributes[name]; }
+        }
+
+        class FakePanel extends FakeElement {
+          constructor(root, tab, loaded = true, count = '2', capturedAt = '') {
+            super({
+              exchangePositionPanel: tab,
+              exchangeTabLoaded: loaded ? 'true' : 'false',
+              exchangeTabItemCount: count,
+              ...(capturedAt ? { exchangeTabCapturedAt: capturedAt } : {}),
+            }, tab === 'open-orders');
+            this.root = root;
+            this.tab = tab;
+            this.loading = new FakeElement();
+            this.retryButton = null;
+          }
+          querySelector(selector) {
+            if (selector === '[data-exchange-tab-loading]') return this.loading;
+            return null;
+          }
+          querySelectorAll(selector) {
+            if (selector === '[data-exchange-tab-retry]' && this.retryButton) {
+              return [this.retryButton];
+            }
+            return [];
+          }
+          replaceWith(fragment) {
+            fragment.root = this.root;
+            fragment.tab = this.tab;
+            this.root.panels.set(this.tab, fragment);
+            this.root.currentPanel = fragment;
+          }
+          replaceChildren(child) {
+            this.children = [child];
+          }
+        }
+
+        class FakeRoot {
+          constructor() {
+            this.dataset = {};
+            this.tabs = ['positions', 'open-orders', 'order-history', 'position-history']
+              .map((tab) => {
+                const item = new FakeElement({
+                  exchangePositionTab: tab,
+                  exchangePositionLabel: ({
+                    positions: '持仓',
+                    'open-orders': '当前委托',
+                    'order-history': '历史委托',
+                    'position-history': '历史仓位',
+                  })[tab],
+                }, tab === 'open-orders');
+                item.textContent = item.dataset.exchangePositionLabel;
+                return item;
+              });
+            this.panels = new Map([
+              ['positions', new FakePanel(this, 'positions')],
+              ['open-orders', new FakePanel(this, 'open-orders')],
+              ['order-history', new FakePanel(this, 'order-history')],
+              ['position-history', new FakePanel(this, 'position-history')],
+            ]);
+            this.currentPanel = this.panels.get('open-orders');
+            this.refreshControls = new FakeElement();
+            this.refreshButton = new FakeElement();
+            this.refreshStatus = new FakeElement();
+            this.viewButtons = [new FakeElement({ exchangeViewMode: 'list' }, true)];
+          }
+          querySelectorAll(selector) {
+            if (selector === '[data-exchange-position-tab]') return this.tabs;
+            if (selector === '[data-exchange-position-panel]') return [...this.panels.values()];
+            if (selector === '[data-exchange-view-mode]') return this.viewButtons;
+            if (selector === '[data-exchange-view-panel]') return [];
+            if (selector === '[data-exchange-tab-retry]') {
+              return [...this.panels.values()]
+                .flatMap((panel) => panel.retryButton ? [panel.retryButton] : []);
+            }
+            return [];
+          }
+          querySelector(selector) {
+            const panel = selector.match(/^\\[data-exchange-position-panel="(.+)"\\]$/);
+            if (panel) return this.panels.get(panel[1]) || null;
+            const tab = selector.match(/^\\[data-exchange-position-tab="(.+)"\\]$/);
+            if (tab) return this.tabs.find((item) => item.dataset.exchangePositionTab === tab[1]) || null;
+            if (selector === '[data-exchange-position-tab].is-active') {
+              return this.tabs.find((item) => item.classList.contains('is-active')) || null;
+            }
+            if (selector === '[data-exchange-view-mode].is-active') return this.viewButtons[0];
+            if (selector === '[data-exchange-tab-refresh-controls]') return this.refreshControls;
+            if (selector === '[data-exchange-tab-refresh]') return this.refreshButton;
+            if (selector === '[data-exchange-tab-refresh-status]') return this.refreshStatus;
+            return null;
+          }
+        }
+
+        global.document = { querySelectorAll: () => [] };
+        function bindBoundPositionCloseButtons() {}
+        function bindLivePositionAttributionButtons() {}
+
+        const root = new FakeRoot();
+        setExchangePositionTab(root, 'positions');
+        if (!root.refreshControls.hidden || !root.refreshButton.disabled) {
+          throw new Error('positions tab left the manual refresh control available');
+        }
+        setExchangePositionTab(root, 'open-orders');
+        if (root.refreshControls.hidden || root.refreshButton.textContent !== '刷新当前委托') {
+          throw new Error('open-orders tab did not expose the correct refresh control');
+        }
+        let fetchCount = 0;
+        let resolveFetch;
+        var fetchWorkbenchPartial = () => {
+          fetchCount += 1;
+          return new Promise((resolve) => { resolveFetch = resolve; });
+        };
+
+        await loadExchangePositionTab(root, 'open-orders');
+        if (fetchCount !== 0) throw new Error('normal load bypassed the cache');
+
+        const first = loadExchangePositionTab(root, 'open-orders', { force: true });
+        const second = loadExchangePositionTab(root, 'open-orders', { force: true });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        if (fetchCount !== 1) throw new Error(`expected one refresh, got ${fetchCount}`);
+        if (!root.refreshButton.disabled || root.refreshButton.textContent !== '刷新中…') {
+          throw new Error('refresh button did not enter busy state');
+        }
+
+        const refreshed = new FakePanel(
+          root,
+          'open-orders',
+          true,
+          '5',
+          '2026-08-10T00:05:06+00:00',
+        );
+        resolveFetch(refreshed);
+        await Promise.all([first, second]);
+        if (root.currentPanel !== refreshed) throw new Error('fresh partial not committed');
+        if (root.refreshButton.disabled) throw new Error('refresh button stayed disabled');
+        if (root.tabs[1].textContent !== '当前委托(5)') throw new Error('count not updated');
+        if (!root.refreshStatus.textContent.includes('00:05:06 UTC')) {
+          throw new Error('capture timestamp not reported');
+        }
+
+        const beforeFailure = root.currentPanel;
+        fetchWorkbenchPartial = async () => { throw new Error('network unavailable'); };
+        await loadExchangePositionTab(root, 'open-orders', { force: true });
+        if (root.currentPanel !== beforeFailure) throw new Error('refresh failure discarded old data');
+        if (root.currentPanel.dataset.exchangeTabLoaded !== 'true') {
+          throw new Error('refresh failure made loaded panel retry-only');
+        }
+        if (root.refreshButton.disabled) throw new Error('failed refresh left button disabled');
+        if (!root.refreshStatus.textContent.includes('刷新失败，当前展示上次成功数据')) {
+          throw new Error('failed refresh did not explain preserved data');
+        }
+
+        const retryPanel = new FakePanel(root, 'order-history', false, '0');
+        const retry = new FakeElement({ exchangeTabRetry: 'order-history' });
+        retryPanel.retryButton = retry;
+        root.panels.set('order-history', retryPanel);
+        let retryFetchCount = 0;
+        fetchWorkbenchPartial = async () => {
+          retryFetchCount += 1;
+          return new FakePanel(root, 'order-history', true, '1', '2026-08-10T00:06:07+00:00');
+        };
+        bindExchangeTabRetryControls(root);
+        retry.click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        if (retryFetchCount !== 1) throw new Error('retry control did not force a reload');
+        """
+    )
+    result = subprocess.run(
+        [
+            "node",
+            "-e",
+            "\n".join(
+                (
+                    js[constants_start:constants_end],
+                    js[functions_start:functions_end],
+                    harness,
+                )
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_exchange_position_tab_persists_across_dom_replacement(tmp_path):
@@ -537,7 +772,7 @@ def test_exchange_position_tab_persists_across_dom_replacement(tmp_path):
     ).text
     constants_start = js.index("const EXCHANGE_POSITION_TAB_KEY")
     constants_end = js.index("\nlet strategyRecordRequestId", constants_start)
-    functions_start = js.index("function bindExchangePositionTabs")
+    functions_start = js.index("function exchangePositionTabLabel")
     functions_end = js.index("\nfunction exchangePositionViewMode", functions_start)
     harness = textwrap.dedent(
         """
