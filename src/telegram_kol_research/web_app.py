@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from contextlib import asynccontextmanager, nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 import asyncio
@@ -13,6 +14,7 @@ import hmac
 import json
 import logging
 import re
+import secrets
 import threading
 import time
 from urllib.parse import urlencode
@@ -1393,6 +1395,109 @@ def _load_exchange_live_snapshot(
     else:
         snapshot["_live_source"] = source_capture
     return snapshot
+
+
+@dataclass(frozen=True)
+class HistoryPositionBrowsePage:
+    """One immutable page from a short-lived history browse snapshot."""
+
+    rows: tuple[dict[str, Any], ...]
+    next_cursor: str | None
+    has_more: bool
+    total_count: int
+
+
+@dataclass(frozen=True)
+class _HistoryPositionBrowseSnapshot:
+    rows: tuple[dict[str, Any], ...]
+    filter_key: tuple[str | None, str | None]
+    expires_at: datetime
+
+
+class HistoryPositionBrowseSnapshotStore:
+    """Keep one browser's bounded, read-only history browse result stable."""
+
+    def __init__(
+        self,
+        *,
+        now_provider: Callable[[], datetime],
+        token_factory: Callable[[], str] | None = None,
+        ttl: timedelta = timedelta(minutes=5),
+        max_snapshots: int = 64,
+        max_page_size: int = 20,
+    ) -> None:
+        self._now_provider = now_provider
+        self._token_factory = token_factory or (lambda: secrets.token_urlsafe(24))
+        self._ttl = max(timedelta(seconds=1), ttl)
+        self._max_snapshots = max(1, int(max_snapshots))
+        self._max_page_size = max(1, int(max_page_size))
+        self._snapshots: dict[str, _HistoryPositionBrowseSnapshot] = {}
+        self._lock = threading.Lock()
+
+    def create(
+        self,
+        *,
+        rows: tuple[dict[str, Any], ...],
+        filter_key: tuple[str | None, str | None],
+    ) -> str:
+        now = self._utc_now()
+        with self._lock:
+            self._discard_expired(now)
+            while len(self._snapshots) >= self._max_snapshots:
+                self._snapshots.pop(next(iter(self._snapshots)))
+            token = self._token_factory()
+            if not token:
+                raise ValueError("browse token unavailable")
+            self._snapshots[token] = _HistoryPositionBrowseSnapshot(
+                rows=tuple(rows),
+                filter_key=filter_key,
+                expires_at=now + self._ttl,
+            )
+            return token
+
+    def page(
+        self,
+        *,
+        token: str,
+        cursor: str | None,
+        page_size: int,
+        filter_key: tuple[str | None, str | None],
+    ) -> HistoryPositionBrowsePage:
+        if not 1 <= page_size <= self._max_page_size:
+            raise ValueError("page size")
+        now = self._utc_now()
+        with self._lock:
+            self._discard_expired(now)
+            snapshot = self._snapshots.get(token)
+            if snapshot is None:
+                raise ValueError("browse snapshot expired")
+            if snapshot.filter_key != filter_key:
+                raise ValueError("browse snapshot filter mismatch")
+            start = 0
+            if cursor is not None:
+                for index, row in enumerate(snapshot.rows):
+                    if row.get("history_sort_id") == cursor:
+                        start = index + 1
+                        break
+                else:
+                    raise ValueError("browse snapshot cursor is unknown")
+            rows = snapshot.rows[start : start + page_size]
+            has_more = start + len(rows) < len(snapshot.rows)
+            return HistoryPositionBrowsePage(
+                rows=rows,
+                next_cursor=(str(rows[-1]["history_sort_id"]) if has_more and rows else None),
+                has_more=has_more,
+                total_count=len(snapshot.rows),
+            )
+
+    def _utc_now(self) -> datetime:
+        now = self._now_provider()
+        return now.replace(tzinfo=UTC) if now.tzinfo is None else now.astimezone(UTC)
+
+    def _discard_expired(self, now: datetime) -> None:
+        for token, snapshot in tuple(self._snapshots.items()):
+            if snapshot.expires_at <= now:
+                del self._snapshots[token]
 
 
 class _CachedLivePositionClient:
@@ -4278,6 +4383,9 @@ def create_web_app(
         title,
     )
     app.state.now_provider = now_provider or (lambda: datetime.now(UTC))
+    app.state.history_position_browse_snapshots = HistoryPositionBrowseSnapshotStore(
+        now_provider=app.state.now_provider
+    )
     app.state.reconcile_runner = reconcile_runner or run_periodic_reconcile
     app.state.recovery_runner = recovery_runner or run_recovery_dry_run
     app.state.recovery_market_data_factory = (

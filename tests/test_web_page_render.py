@@ -4,7 +4,7 @@ import shutil
 import subprocess
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -34,9 +34,93 @@ from telegram_kol_research.recovery_scan import RecoverySignal
 from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.web_app import _summarize_verified_exchange_protection_rows
 from telegram_kol_research.web_app import _load_exchange_tab_snapshot
+from telegram_kol_research.web_app import HistoryPositionBrowseSnapshotStore
 from telegram_kol_research.web_app import create_web_app
 from telegram_kol_research.web_queries import list_exited_strategies
 from telegram_kol_research.web_queries import list_verified_deepcoin_history_positions
+
+
+def test_history_position_browse_snapshot_returns_stable_cursor_pages():
+    now = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
+    store = HistoryPositionBrowseSnapshotStore(
+        now_provider=lambda: now,
+        token_factory=lambda: "browse-token",
+    )
+    rows = tuple(
+        {
+            "history_sort_id": f"pos-{index:03d}",
+            "symbol": "BTC",
+        }
+        for index in range(45)
+    )
+
+    token = store.create(rows=rows, filter_key=(None, None))
+    first = store.page(token=token, cursor=None, page_size=20, filter_key=(None, None))
+    second = store.page(
+        token=token,
+        cursor="pos-019",
+        page_size=20,
+        filter_key=(None, None),
+    )
+    last = store.page(
+        token=token,
+        cursor="pos-039",
+        page_size=20,
+        filter_key=(None, None),
+    )
+
+    assert token == "browse-token"
+    assert [row["history_sort_id"] for row in first.rows] == [
+        f"pos-{index:03d}" for index in range(20)
+    ]
+    assert first.next_cursor == "pos-019"
+    assert first.has_more is True
+    assert [row["history_sort_id"] for row in second.rows] == [
+        f"pos-{index:03d}" for index in range(20, 40)
+    ]
+    assert second.next_cursor == "pos-039"
+    assert [row["history_sort_id"] for row in last.rows] == [
+        f"pos-{index:03d}" for index in range(40, 45)
+    ]
+    assert last.next_cursor is None
+    assert last.has_more is False
+
+
+def test_history_position_browse_snapshot_rejects_expired_mismatched_or_unknown_cursor():
+    now = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
+    store = HistoryPositionBrowseSnapshotStore(
+        now_provider=lambda: now,
+        token_factory=lambda: "browse-token",
+        ttl=timedelta(seconds=30),
+    )
+    token = store.create(
+        rows=({"history_sort_id": "pos-001"},),
+        filter_key=("2026-08-01", "2026-08-10"),
+    )
+
+    with pytest.raises(ValueError, match="filter mismatch"):
+        store.page(
+            token=token,
+            cursor=None,
+            page_size=20,
+            filter_key=(None, None),
+        )
+    with pytest.raises(ValueError, match="cursor"):
+        store.page(
+            token=token,
+            cursor="unknown",
+            page_size=20,
+            filter_key=("2026-08-01", "2026-08-10"),
+        )
+
+    now += timedelta(seconds=31)
+    with pytest.raises(ValueError, match="expired"):
+        store.page(
+            token=token,
+            cursor=None,
+            page_size=20,
+            filter_key=("2026-08-01", "2026-08-10"),
+        )
 
 
 def test_trading_settings_page_keeps_legacy_range_controls_as_hidden_rollback_state(
