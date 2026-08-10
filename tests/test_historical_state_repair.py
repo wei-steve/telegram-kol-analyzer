@@ -515,6 +515,78 @@ def test_plan_reports_blank_take_profit_position_identity_as_conflict(tmp_path):
     )
 
 
+def test_plan_normalizes_local_take_profit_order_identity_before_live_probe(tmp_path):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id, _ = _seed_convergence(
+        session_factory,
+        chat_id=35,
+        message_id=305,
+        pos_id="pos-order-live",
+        status="submitted",
+        binding_status="closed",
+        with_order=True,
+    )
+    with session_factory() as session:
+        order = session.query(PositionTakeProfitOrder).filter_by(
+            trigger_take_profit_convergence_id=convergence_id
+        ).one()
+        order.order_id = " tp-pos-order-live "
+        session.commit()
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(pending=[{"ordId": "tp-pos-order-live"}]),
+        planned_at=NOW,
+    )
+
+    assert all(action.target_id != convergence_id for action in plan.actions)
+    assert any(
+        finding.target_id == convergence_id
+        and finding.reason_code == "exact_position_or_order_still_live"
+        for finding in plan.exclusions
+    )
+
+
+def test_plan_reports_blank_take_profit_order_identity_as_conflict(tmp_path):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id, _ = _seed_convergence(
+        session_factory,
+        chat_id=36,
+        message_id=306,
+        pos_id="pos-blank-order",
+        status="submitted",
+        binding_status="closed",
+        with_order=True,
+    )
+    with session_factory() as session:
+        order = session.query(PositionTakeProfitOrder).filter_by(
+            trigger_take_profit_convergence_id=convergence_id
+        ).one()
+        order.order_id = " "
+        session.commit()
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(),
+        planned_at=NOW,
+    )
+
+    assert all(action.target_id != convergence_id for action in plan.actions)
+    assert any(
+        finding.target_id == convergence_id
+        and finding.reason_code == "take_profit_state_not_repairable"
+        for finding in plan.conflicts
+    )
+
+
 def test_apply_requires_exact_gates_preserves_rows_and_is_single_use(tmp_path):
     from telegram_kol_research.historical_state_repair import (
         HistoricalStateRepairRefused,
@@ -826,6 +898,42 @@ def test_plan_fails_closed_when_exact_position_size_is_unknown(
     )
 
     assert all(action.target_id != convergence_id for action in plan.actions)
+
+
+@pytest.mark.parametrize("ambiguous_kind", ["position", "order"])
+def test_plan_refuses_unidentifiable_live_exchange_rows(tmp_path, ambiguous_kind):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id, _ = _seed_convergence(
+        session_factory,
+        chat_id=48,
+        message_id=480,
+        pos_id="pos-terminal",
+        status="submitted",
+        binding_status="closed",
+        with_order=True,
+    )
+    snapshot = (
+        _snapshot(positions=[{"instId": "BTC-USDT-SWAP", "pos": "1"}])
+        if ambiguous_kind == "position"
+        else _snapshot(pending=[{"instId": "BTC-USDT-SWAP", "sz": "1"}])
+    )
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=snapshot,
+        planned_at=NOW,
+    )
+
+    assert all(action.target_id != convergence_id for action in plan.actions)
+    assert any(
+        finding.kind == "snapshot"
+        and finding.reason_code == "exchange_snapshot_identity_incomplete"
+        for finding in plan.conflicts
+    )
 
 
 def test_plan_refuses_incomplete_exchange_snapshot(tmp_path):

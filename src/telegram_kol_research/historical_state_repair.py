@@ -117,11 +117,42 @@ def build_historical_state_repair_plan(
             )
         )
 
-    live_pos_ids = _live_position_ids(getattr(snapshot, "positions", []) or [])
-    live_order_ids = _live_order_ids(
-        list(getattr(snapshot, "open_orders", []) or [])
-        + list(getattr(snapshot, "pending_trigger_orders", []) or [])
+    position_rows = list(getattr(snapshot, "positions", []) or [])
+    order_rows = list(getattr(snapshot, "open_orders", []) or []) + list(
+        getattr(snapshot, "pending_trigger_orders", []) or []
     )
+    snapshot_identity_incomplete = bool(
+        any(
+            _position_row_is_live_or_unknown(row)
+            and not _position_identity_ids(row)
+            for row in position_rows
+        )
+        or any(not _order_identity_ids(row) for row in order_rows)
+    )
+    if snapshot_identity_incomplete:
+        conflicts.append(
+            HistoricalStateRepairFinding(
+                kind="snapshot",
+                target_id=0,
+                reason_code="exchange_snapshot_identity_incomplete",
+                evidence_json=_canonical_json(
+                    {
+                        "unidentified_live_position_count": sum(
+                            1
+                            for row in position_rows
+                            if _position_row_is_live_or_unknown(row)
+                            and not _position_identity_ids(row)
+                        ),
+                        "unidentified_order_count": sum(
+                            1 for row in order_rows if not _order_identity_ids(row)
+                        ),
+                    }
+                ),
+            )
+        )
+    snapshot_blocked = bool(snapshot_errors or snapshot_identity_incomplete)
+    live_pos_ids = _live_position_ids(position_rows)
+    live_order_ids = _live_order_ids(order_rows)
     complete_instruments = {
         str(row.get("instrument_id") or "").upper()
         for row in list(getattr(snapshot, "pending_tpsl_observations", []) or [])
@@ -299,7 +330,7 @@ def build_historical_state_repair_plan(
                 "legs": [_leg_evidence(row) for row in legs],
             }
             database_evidence.append({"source_deletion": evidence})
-            if snapshot_errors:
+            if snapshot_blocked:
                 continue
             if (
                 event is not None
@@ -484,10 +515,12 @@ def build_historical_state_repair_plan(
                     )
                 )
                 continue
-            if snapshot_errors:
+            if snapshot_blocked:
                 continue
             order_ids = {
-                str(row.order_id) for row in orders if str(row.order_id or "").strip()
+                str(row.order_id).strip()
+                for row in orders
+                if str(row.order_id or "").strip()
             }
             if pos_id in live_pos_ids or order_ids & live_order_ids:
                 exclusions.append(
@@ -1074,11 +1107,13 @@ def _terminal_convergence_identity(convergence, binding, leg) -> bool:
 
 def _take_profit_order_matches(order, convergence) -> bool:
     return bool(
-        int(order.execution_binding_id) == int(convergence.execution_binding_id)
+        str(order.order_id or "").strip()
+        and int(order.execution_binding_id) == int(convergence.execution_binding_id)
         and int(order.execution_order_leg_id) == int(
             convergence.execution_order_leg_id
         )
-        and str(order.pos_id) == str(convergence.pos_id)
+        and str(order.pos_id or "").strip()
+        == str(convergence.pos_id or "").strip()
         and str(order.venue).lower() == str(convergence.venue).lower()
         and str(order.status) == "active"
     )
@@ -1175,47 +1210,61 @@ def _normalized_order(row: Any) -> dict[str, Any]:
 def _live_position_ids(rows) -> set[str]:
     values = set()
     for row in rows:
-        if not isinstance(row, dict):
-            continue
-        pos_ids = {
-            str(row[key]).strip()
-            for key in (
-                "posId",
-                "pos_id",
-                "PositionID",
-                "positionId",
-                "position_id",
-                "id",
-            )
-            if row.get(key) not in (None, "") and str(row[key]).strip()
-        }
+        pos_ids = _position_identity_ids(row)
         if not pos_ids:
             continue
-        raw_sizes = [
-            row[key]
-            for key in ("pos", "size", "sz", "positionSize", "position_size")
-            if key in row
-        ]
-        size_is_live_or_unknown = not raw_sizes
-        for raw_size in raw_sizes:
-            try:
-                size = Decimal(str(raw_size).strip())
-            except (InvalidOperation, TypeError, ValueError):
-                size_is_live_or_unknown = True
-                break
-            if not size.is_finite() or abs(size) > 0:
-                size_is_live_or_unknown = True
-                break
-        if size_is_live_or_unknown:
+        if _position_row_is_live_or_unknown(row):
             values.update(pos_ids)
     return values
+
+
+def _position_identity_ids(row) -> set[str]:
+    if not isinstance(row, dict):
+        return set()
+    return {
+        str(row[key]).strip()
+        for key in (
+            "posId",
+            "pos_id",
+            "PositionID",
+            "positionId",
+            "position_id",
+            "id",
+        )
+        if row.get(key) not in (None, "") and str(row[key]).strip()
+    }
+
+
+def _position_row_is_live_or_unknown(row) -> bool:
+    if not isinstance(row, dict):
+        return True
+    raw_sizes = [
+        row[key]
+        for key in ("pos", "size", "sz", "positionSize", "position_size")
+        if key in row
+    ]
+    if not raw_sizes:
+        return True
+    for raw_size in raw_sizes:
+        try:
+            size = Decimal(str(raw_size).strip())
+        except (InvalidOperation, TypeError, ValueError):
+            return True
+        if not size.is_finite() or abs(size) > 0:
+            return True
+    return False
+
+
+def _order_identity_ids(row) -> set[str]:
+    if not isinstance(row, dict):
+        return set()
+    return set(_normalized_order(row)["identity_ids"])
 
 
 def _live_order_ids(rows) -> set[str]:
     values = set()
     for row in rows:
-        normalized = _normalized_order(row)
-        values.update(normalized["identity_ids"])
+        values.update(_order_identity_ids(row))
     return values
 
 

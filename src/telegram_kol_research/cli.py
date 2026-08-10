@@ -4107,6 +4107,9 @@ def repair_historical_state_convergence(
             default=str,
         )
     )
+    if not apply and plan.conflicts:
+        typer.echo("Refusing dry run: unresolved repair conflicts remain.", err=True)
+        raise typer.Exit(code=2)
     if not apply:
         return
     missing = []

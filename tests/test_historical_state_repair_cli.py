@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 from telegram_kol_research import cli
 from telegram_kol_research.historical_state_repair import (
     HistoricalStateRepairAction,
+    HistoricalStateRepairFinding,
     HistoricalStateRepairPlan,
     HistoricalStateRepairResult,
 )
@@ -74,6 +75,46 @@ def test_repair_historical_state_convergence_defaults_to_json_dry_run(
     assert payload["fingerprint"] == plan.fingerprint
     assert payload["confirmation_token"] == plan.confirmation_token
     assert applied == []
+
+
+def test_repair_historical_state_convergence_dry_run_conflict_exits_two(
+    tmp_path,
+    monkeypatch,
+):
+    plan = _plan(
+        conflicts=(
+            HistoricalStateRepairFinding(
+                kind="snapshot",
+                target_id=0,
+                reason_code="exchange_snapshot_incomplete",
+            ),
+        )
+    )
+    monkeypatch.setattr(cli, "create_existing_session_factory", lambda _path: object())
+    monkeypatch.setattr(cli, "build_deepcoin_client_from_env", lambda: object())
+    monkeypatch.setattr(
+        cli,
+        "load_deepcoin_execution_reconciliation_snapshot_read_only",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_historical_state_repair_plan",
+        lambda *_args, **_kwargs: plan,
+        raising=False,
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "repair-historical-state-convergence",
+            "--database-path",
+            str(tmp_path / "research.db"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert '"reason_code": "exchange_snapshot_incomplete"' in result.output
 
 
 def test_repair_historical_state_convergence_apply_requires_all_three_gates(

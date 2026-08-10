@@ -192,6 +192,11 @@ def reconcile_trigger_take_profit_order_history(
         if isinstance(exchange_row, dict)
         for order_id in _order_identity_ids(exchange_row)
     }
+    pending_identity_ambiguous = any(
+        not isinstance(exchange_row, dict)
+        or not _order_identity_ids(exchange_row)
+        for exchange_row in pending_orders
+    )
     history_candidates: dict[str, list[dict]] = {}
     for exchange_row in trigger_history:
         if not isinstance(exchange_row, dict):
@@ -212,6 +217,7 @@ def reconcile_trigger_take_profit_order_history(
         .all()
     )
     for row in active_rows:
+        local_order_id = str(row.order_id or "").strip()
         protection_leg = (
             session.query(PositionProtectionLeg)
             .filter_by(
@@ -268,8 +274,8 @@ def reconcile_trigger_take_profit_order_history(
                     observed_at=now,
                 )
                 continue
-        history = history_by_id.get(row.order_id)
-        if row.order_id in pending_ids or history is None:
+        history = history_by_id.get(local_order_id)
+        if pending_identity_ambiguous or local_order_id in pending_ids or history is None:
             continue
         terminal = _terminal_order_status(history)
         if terminal is None:
@@ -323,6 +329,7 @@ def reconcile_trigger_take_profit_order_history(
         if (
             position_snapshot_complete
             and pending_snapshot_complete
+            and not pending_identity_ambiguous
             and _exact_convergence_leg_is_terminal(session, convergence=convergence)
             and not _position_id_is_live(
                 positions,
@@ -338,7 +345,8 @@ def reconcile_trigger_take_profit_order_history(
                 convergence.updated_at = now
                 continue
             for row in orders:
-                if row.status != "active" or row.order_id in pending_ids:
+                local_order_id = str(row.order_id or "").strip()
+                if row.status != "active" or local_order_id in pending_ids:
                     continue
                 evidence = _load_evidence(row.evidence_json)
                 evidence["terminalization"] = {
@@ -427,18 +435,23 @@ def _take_profit_orders_match_convergence(
     convergence: TriggerTakeProfitConvergence,
 ) -> bool:
     return all(
-        str(row.venue).lower() == str(convergence.venue).lower()
+        bool(str(row.order_id or "").strip())
+        and str(row.venue).lower() == str(convergence.venue).lower()
         and int(row.execution_binding_id) == int(convergence.execution_binding_id)
         and int(row.execution_order_leg_id) == int(convergence.execution_order_leg_id)
-        and str(row.pos_id) == str(convergence.pos_id)
+        and str(row.pos_id or "").strip()
+        == str(convergence.pos_id or "").strip()
         for row in orders
     )
 
 
 def _position_id_is_live(positions: list[dict], *, pos_id: str) -> bool:
+    normalized_pos_id = str(pos_id or "").strip()
+    if not normalized_pos_id:
+        return True
     for row in positions:
         if not isinstance(row, dict):
-            continue
+            return True
         row_pos_ids = {
             str(row[key]).strip()
             for key in (
@@ -451,22 +464,32 @@ def _position_id_is_live(positions: list[dict], *, pos_id: str) -> bool:
             )
             if row.get(key) not in (None, "")
         }
-        if pos_id not in row_pos_ids:
+        if not row_pos_ids:
+            if _position_row_is_live_or_unknown(row):
+                return True
             continue
-        raw_sizes = [
-            row[key]
-            for key in ("pos", "size", "sz", "positionSize", "position_size")
-            if key in row
-        ]
-        if not raw_sizes:
+        if normalized_pos_id not in row_pos_ids:
+            continue
+        if _position_row_is_live_or_unknown(row):
             return True
-        for raw_size in raw_sizes:
-            try:
-                size = Decimal(str(raw_size).strip())
-            except (InvalidOperation, TypeError, ValueError):
-                return True
-            if not size.is_finite() or abs(size) > 0:
-                return True
+    return False
+
+
+def _position_row_is_live_or_unknown(row: dict) -> bool:
+    raw_sizes = [
+        row[key]
+        for key in ("pos", "size", "sz", "positionSize", "position_size")
+        if key in row
+    ]
+    if not raw_sizes:
+        return True
+    for raw_size in raw_sizes:
+        try:
+            size = Decimal(str(raw_size).strip())
+        except (InvalidOperation, TypeError, ValueError):
+            return True
+        if not size.is_finite() or abs(size) > 0:
+            return True
     return False
 
 

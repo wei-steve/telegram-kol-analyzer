@@ -203,7 +203,27 @@ def run_source_message_deletion_worker_tick(
             try:
                 with position_authority_lock():
                     snapshot = loader(session_factory, client=get_client())
-                    if not terminal_target_reconciliation:
+                    terminal_target_changed = bool(
+                        terminal_target_reconciliation
+                        and terminal_lifecycle_id is not None
+                        and terminal_binding_id is not None
+                        and not _deletion_target_is_already_terminal(
+                            session_factory,
+                            lifecycle_id=terminal_lifecycle_id,
+                            binding_id=terminal_binding_id,
+                        )
+                    )
+                    if terminal_target_changed:
+                        _transition_claimed(
+                            session_factory,
+                            exit_id=exit_id,
+                            claim_token=claim_token,
+                            new_state="reconciling",
+                            reason="terminal_target_state_changed",
+                            updated_at=now,
+                        )
+                        final_state = "waiting"
+                    elif not terminal_target_reconciliation:
                         if binding_reconciler is None:
                             from telegram_kol_research.execution_bindings import (
                                 reconcile_deepcoin_execution_bindings,
@@ -218,13 +238,15 @@ def run_source_message_deletion_worker_tick(
                             recovered_at=now,
                             snapshot=snapshot,
                         )
-                    final_state = finalize_source_message_deletion_exit(
-                        session_factory,
-                        deletion_exit_id=exit_id,
-                        snapshot=snapshot,
-                        finalized_at=now,
-                        expected_claim_token=claim_token,
-                    )
+                    if not terminal_target_changed:
+                        final_state = finalize_source_message_deletion_exit(
+                            session_factory,
+                            deletion_exit_id=exit_id,
+                            snapshot=snapshot,
+                            finalized_at=now,
+                            expected_claim_token=claim_token,
+                            require_terminal_target=terminal_target_reconciliation,
+                        )
             except Exception as exc:
                 _transition_claimed(
                     session_factory,
@@ -513,6 +535,7 @@ def finalize_source_message_deletion_exit(
     snapshot,
     finalized_at: datetime | None = None,
     expected_claim_token: str | None = None,
+    require_terminal_target: bool = False,
 ) -> str:
     """Commit terminal source-deletion state only after exact exchange-flat proof."""
 
@@ -561,6 +584,18 @@ def finalize_source_message_deletion_exit(
                     if deletion_exit.execution_binding_id is not None
                     else []
                 )
+                if require_terminal_target and not _deletion_rows_are_terminal(
+                    lifecycle=lifecycle,
+                    binding=binding,
+                    entry_legs=legs,
+                    binding_id=deletion_exit.execution_binding_id,
+                ):
+                    return _mark_reconciliation_waiting(
+                        session,
+                        deletion_exit=deletion_exit,
+                        reason="terminal_target_state_changed",
+                        reconciled_at=now,
+                    )
                 batch = (
                     session.get(
                         StrategyManagementBatch,
@@ -874,6 +909,13 @@ def finalize_source_message_deletion_exit(
                 live_order_rows.extend(
                     list(getattr(snapshot, "pending_trigger_orders", []) or [])
                 )
+                if any(not _row_order_ids(row) for row in live_order_rows):
+                    return _mark_reconciliation_waiting(
+                        session,
+                        deletion_exit=deletion_exit,
+                        reason="exchange_order_identity_ambiguous",
+                        reconciled_at=now,
+                    )
                 exact_order_ids = leg_order_ids | leg_client_order_ids
                 visible_order_rows = [
                     row
@@ -895,9 +937,23 @@ def finalize_source_message_deletion_exit(
                         reconciled_at=now,
                     )
 
+                snapshot_position_rows = list(
+                    getattr(snapshot, "positions", []) or []
+                )
+                if any(
+                    not _row_position_ids(row)
+                    and _position_is_not_proven_zero(row)
+                    for row in snapshot_position_rows
+                ):
+                    return _mark_reconciliation_waiting(
+                        session,
+                        deletion_exit=deletion_exit,
+                        reason="exchange_position_identity_ambiguous",
+                        reconciled_at=now,
+                    )
                 visible_position_rows = [
                     row
-                    for row in list(getattr(snapshot, "positions", []) or [])
+                    for row in snapshot_position_rows
                     if exact_pos_ids.intersection(_row_position_ids(row))
                     and _position_is_not_proven_zero(row)
                 ]
@@ -1037,28 +1093,45 @@ def _deletion_target_is_already_terminal(
             )
             .all()
         )
-        return bool(
-            lifecycle is not None
-            and binding is not None
-            and lifecycle.execution_binding_id == int(binding_id)
-            and str(lifecycle.lifecycle_status or "").lower()
-            in _TERMINAL_LIFECYCLE_STATES
-            and str(binding.status or "").lower() in _TERMINAL_BINDING_STATES
-            and entry_legs
-            and all(
-                str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
-                for leg in entry_legs
-            )
-            and any(
-                _split_ids(leg.order_id)
-                or _split_ids(leg.client_order_id)
-                or (
-                    str(leg.attribution_status or "") == "verified"
-                    and _split_ids(leg.pos_id)
-                )
-                for leg in entry_legs
-            )
+        return _deletion_rows_are_terminal(
+            lifecycle=lifecycle,
+            binding=binding,
+            entry_legs=entry_legs,
+            binding_id=binding_id,
         )
+
+
+def _deletion_rows_are_terminal(
+    *,
+    lifecycle,
+    binding,
+    entry_legs,
+    binding_id: int | None,
+) -> bool:
+    return bool(
+        binding_id is not None
+        and lifecycle is not None
+        and binding is not None
+        and lifecycle.execution_binding_id == int(binding_id)
+        and int(binding.id) == int(binding_id)
+        and str(lifecycle.lifecycle_status or "").lower()
+        in _TERMINAL_LIFECYCLE_STATES
+        and str(binding.status or "").lower() in _TERMINAL_BINDING_STATES
+        and entry_legs
+        and all(
+            str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
+            for leg in entry_legs
+        )
+        and any(
+            _split_ids(leg.order_id)
+            or _split_ids(leg.client_order_id)
+            or (
+                str(leg.attribution_status or "") == "verified"
+                and _split_ids(leg.pos_id)
+            )
+            for leg in entry_legs
+        )
+    )
 
 
 def _row_order_ids(row) -> set[str]:

@@ -685,6 +685,73 @@ def test_worker_does_not_trust_stale_terminal_reason_after_target_reactivates(tm
     assert reconciled == [binding_id]
 
 
+def test_worker_revalidates_terminal_target_after_snapshot_load(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _, lifecycle_id, binding_id, leg_id = _seed_pending_strategy(
+        session_factory,
+        chat_id=95,
+        message_id=905,
+        order_id="order-reactivated-during-snapshot",
+    )
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        lifecycle.lifecycle_status = "exited"
+        binding = session.get(ExecutionBinding, binding_id)
+        binding.status = "closed"
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        leg.status = "exchange_cancelled"
+        session.commit()
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=95,
+        message_id=905,
+        deleted_at=NOW,
+    )
+    first = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: (_ for _ in ()).throw(
+            AssertionError("terminal routing must not create a client")
+        ),
+        processed_at=NOW,
+    )
+    assert first.waiting == 1
+
+    def reactivate_while_loading(*_args, **_kwargs):
+        with session_factory() as session:
+            session.get(StrategyLifecycle, lifecycle_id).lifecycle_status = (
+                "position_open"
+            )
+            session.get(ExecutionBinding, binding_id).status = "active"
+            session.get(ExecutionOrderLeg, leg_id).status = "active"
+            session.commit()
+        return SimpleNamespace(
+            errors={},
+            positions=[],
+            open_orders=[],
+            pending_trigger_orders=[],
+        )
+
+    second = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: object(),
+        snapshot_loader=reactivate_while_loading,
+        binding_reconciler=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("changed terminal target must retry before reconciliation")
+        ),
+        processed_at=NOW,
+    )
+
+    assert second.waiting == 1
+    assert second.finalized == 0
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        assert deletion_exit.state == "reconciling"
+        assert deletion_exit.last_reason == "terminal_target_state_changed"
+        assert session.get(StrategyLifecycle, lifecycle_id).lifecycle_status == "position_open"
+        assert session.get(ExecutionBinding, binding_id).status == "active"
+        assert session.get(ExecutionOrderLeg, leg_id).status == "active"
+
+
 def test_worker_does_not_use_terminal_shortcut_without_exact_execution_identity(
     tmp_path,
 ):
@@ -1620,6 +1687,71 @@ def test_flat_finalization_waits_while_exact_entry_order_is_live(
             errors={},
             positions=[],
             open_orders=[{exchange_order_key: "order-deleted"}],
+            pending_trigger_orders=[],
+        ),
+        finalized_at=NOW,
+    )
+
+    assert status == "waiting"
+
+
+def test_flat_finalization_waits_for_unidentifiable_live_order(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _, _, _, leg_id = _seed_pending_strategy(
+        session_factory,
+        chat_id=13,
+        message_id=103,
+        order_id="known-local-order",
+    )
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=13,
+        message_id=103,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        deletion_exit.state = "reconciling"
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        leg.status = "cancelled"
+        leg.terminal_reason = "source_message_deleted_entry_cancelled"
+        session.commit()
+
+    status = finalize_source_message_deletion_exit(
+        session_factory,
+        deletion_exit_id=deletion.exit_id,
+        snapshot=SimpleNamespace(
+            errors={},
+            positions=[],
+            open_orders=[{"instId": "BTC-USDT-SWAP", "sz": "1"}],
+            pending_trigger_orders=[],
+        ),
+        finalized_at=NOW,
+    )
+
+    assert status == "waiting"
+
+
+def test_flat_finalization_waits_for_unidentifiable_live_position(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_filled_strategy(session_factory)
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=20,
+        message_id=200,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        session.get(SourceMessageDeletionExit, deletion.exit_id).state = "reconciling"
+        session.commit()
+
+    status = finalize_source_message_deletion_exit(
+        session_factory,
+        deletion_exit_id=deletion.exit_id,
+        snapshot=SimpleNamespace(
+            errors={},
+            positions=[{"instId": "BTC-USDT-SWAP", "pos": "1"}],
+            open_orders=[],
             pending_trigger_orders=[],
         ),
         finalized_at=NOW,
