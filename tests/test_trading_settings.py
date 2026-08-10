@@ -50,6 +50,9 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     assert settings.entry_preamble_mode == "disabled"
     assert settings.entry_message_assembly_v2_mode == "disabled"
     assert settings.entry_revision_v2_mode == "disabled"
+    assert settings.instruction_execution_contract_mode == "disabled"
+    assert settings.instruction_execution_entry_after_item_id == 0
+    assert settings.instruction_execution_management_after_item_id == 0
     assert settings.deepcoin_contract_specs_mode == "static"
     assert not hasattr(settings, "entry_preamble_live_chat_ids")
 
@@ -68,6 +71,56 @@ def test_revision_target_min_confidence_round_trips_independently(tmp_path):
     assert saved.min_ai_confidence == 0.81
     assert saved.revision_target_min_confidence == 0.71
     assert load_trading_settings(session_factory).revision_target_min_confidence == 0.71
+
+
+@pytest.mark.parametrize("mode", ["disabled", "shadow", "live"])
+def test_instruction_execution_rollout_settings_round_trip_without_loss(
+    tmp_path, mode
+):
+    session_factory = create_session_factory(tmp_path / "execution-settings.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "default_max_loss_usdt": 37,
+            "allowed_symbols": ["BTC", "SOL"],
+        },
+    )
+
+    saved = save_trading_settings(
+        session_factory,
+        {
+            "instruction_execution_contract_mode": mode,
+            "instruction_execution_entry_after_item_id": 101,
+            "instruction_execution_management_after_item_id": 202,
+        },
+    )
+
+    assert saved.instruction_execution_contract_mode == mode
+    assert saved.instruction_execution_entry_after_item_id == 101
+    assert saved.instruction_execution_management_after_item_id == 202
+    assert saved.default_max_loss_usdt == 37
+    assert saved.allowed_symbols == ["BTC", "SOL"]
+
+
+@pytest.mark.parametrize("value", ["unsafe", True, [], {}, 1, None])
+def test_instruction_execution_mode_fails_closed(value):
+    with pytest.raises(ValueError, match="instruction_execution_contract_mode"):
+        trading_settings_from_payload(
+            {"instruction_execution_contract_mode": value}
+        )
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "instruction_execution_entry_after_item_id",
+        "instruction_execution_management_after_item_id",
+    ],
+)
+@pytest.mark.parametrize("value", [-1, True, "42", 1.5, None])
+def test_instruction_execution_watermarks_fail_closed(field_name, value):
+    with pytest.raises(ValueError, match=field_name):
+        trading_settings_from_payload({field_name: value})
 
 
 @pytest.mark.parametrize("mode", ["disabled", "shadow", "live"])

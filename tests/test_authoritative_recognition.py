@@ -24,6 +24,7 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    InstructionExecutionContract,
     MessageInstructionItem,
     MessageEvidenceVersion,
     RawMessage,
@@ -761,6 +762,65 @@ def test_unambiguous_entry_skips_injected_context_resolver(tmp_path, monkeypatch
     assert assessment.context_resolution is None
     assert assessment.context_resolution_triggers == ()
     assert result.status == "是策略"
+
+
+def test_authoritative_apply_projects_future_shadow_contract_idempotently(tmp_path):
+    from telegram_kol_research.trading_settings import save_trading_settings
+
+    session_factory = create_session_factory(tmp_path / "shadow-contract.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "instruction_execution_contract_mode": "shadow",
+            "instruction_execution_entry_after_item_id": 0,
+        },
+    )
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=92,
+            message_id=1601,
+            text="SOL 新多单，市价进，止损 180，止盈 200",
+        )
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    mimo = MimoAuthoritativeResult(
+        raw_message_id=raw_id,
+        payload={
+            "recognition_result": "是策略",
+            "strategy": {
+                "symbol": "SOL",
+                "side": "long",
+                "entry": "市价进",
+                "stop_loss": "180",
+                "take_profit": "200",
+            },
+            "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+            "confidence": 0.95,
+        },
+        input_kind="text",
+        model="mimo-v2.5",
+        status="是策略",
+    )
+    assessment = AuthoritativeAssessment(
+        raw_message_id=raw_id,
+        mimo=mimo,
+        deepseek_payload=None,
+        agreement_status="pending",
+        differences=[],
+        authoritative_generation="shadow-generation",
+    )
+
+    apply_authoritative_assessment(session_factory, assessment)
+    apply_authoritative_assessment(session_factory, assessment)
+
+    with session_factory() as session:
+        contract = session.query(InstructionExecutionContract).one()
+        item = session.query(MessageInstructionItem).one()
+        candidate = session.query(SignalCandidate).one()
+        assert contract.message_instruction_item_id == item.id
+        assert contract.signal_candidate_id == candidate.id
+        assert contract.state == "pending"
 
 
 def test_commentary_target_contract_corrects_hold_without_business_writes(

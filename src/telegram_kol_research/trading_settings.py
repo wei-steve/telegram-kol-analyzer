@@ -79,6 +79,11 @@ class TradingSettings:
     entry_revision_v2_mode: Literal["disabled", "shadow", "live"] = "disabled"
     multi_instruction_mode: Literal["disabled", "shadow", "live"] = "disabled"
     multi_instruction_activation_after_raw_message_id: int = 0
+    instruction_execution_contract_mode: Literal[
+        "disabled", "shadow", "live"
+    ] = "disabled"
+    instruction_execution_entry_after_item_id: int = 0
+    instruction_execution_management_after_item_id: int = 0
     deepcoin_contract_specs_mode: Literal["static", "shadow", "live"] = "static"
     default_max_loss_usdt: float = 20.0
     daily_max_loss_usdt: float = 500.0
@@ -358,6 +363,27 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         ),
         field_name="multi_instruction_activation_after_raw_message_id",
     )
+    instruction_execution_contract_mode = _rollout_mode(
+        raw.get(
+            "instruction_execution_contract_mode",
+            defaults.instruction_execution_contract_mode,
+        ),
+        field_name="instruction_execution_contract_mode",
+    )
+    instruction_execution_entry_after_item_id = _nonnegative_int_setting(
+        raw.get(
+            "instruction_execution_entry_after_item_id",
+            defaults.instruction_execution_entry_after_item_id,
+        ),
+        field_name="instruction_execution_entry_after_item_id",
+    )
+    instruction_execution_management_after_item_id = _nonnegative_int_setting(
+        raw.get(
+            "instruction_execution_management_after_item_id",
+            defaults.instruction_execution_management_after_item_id,
+        ),
+        field_name="instruction_execution_management_after_item_id",
+    )
     deepcoin_contract_specs_mode = _deepcoin_contract_specs_mode(
         raw.get(
             "deepcoin_contract_specs_mode",
@@ -385,6 +411,13 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         multi_instruction_mode=multi_instruction_mode,
         multi_instruction_activation_after_raw_message_id=(
             multi_instruction_activation_after_raw_message_id
+        ),
+        instruction_execution_contract_mode=instruction_execution_contract_mode,
+        instruction_execution_entry_after_item_id=(
+            instruction_execution_entry_after_item_id
+        ),
+        instruction_execution_management_after_item_id=(
+            instruction_execution_management_after_item_id
         ),
         deepcoin_contract_specs_mode=deepcoin_contract_specs_mode,
         default_max_loss_usdt=_positive_float(

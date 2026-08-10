@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import inspect
+import logging
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
@@ -30,6 +31,9 @@ from telegram_kol_research.entry_strategy_fragments import (
 from telegram_kol_research.message_recognition import (
     MessageRecognitionResult,
     apply_authoritative_mimo_payload,
+)
+from telegram_kol_research.instruction_execution_projection import (
+    project_instruction_execution_contracts,
 )
 from telegram_kol_research.message_instruction_items import (
     create_message_instruction_items_in_session,
@@ -97,6 +101,7 @@ ENTERED_HOLDER_LANGUAGE = (
 EXACT_CONTEXT_RISK_REDUCTION_MARKER = (
     "_exact_context_risk_reduction_authorized"
 )
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -883,6 +888,19 @@ def apply_authoritative_assessment(
         _project_context_revision_instruction(
             session_factory,
             assessment=assessment,
+        )
+    try:
+        project_instruction_execution_contracts(
+            session_factory,
+            raw_message_id=assessment.raw_message_id,
+            projected_at=utc_now(),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Instruction execution shadow projection failed open: "
+            "raw_message_id=%s error=%s",
+            int(assessment.raw_message_id),
+            type(exc).__name__,
         )
     return result
 
