@@ -9,6 +9,7 @@ from telegram_kol_research.deepcoin_order_builder import (
     _coalesce_equivalent_entry_legs,
 )
 from telegram_kol_research.deepcoin_order_builder import build_deepcoin_order_draft
+from telegram_kol_research.deepcoin_order_builder import deepcoin_order_draft_fingerprint
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.recovery_live_submit import build_deepcoin_trigger_order_payload
 
@@ -42,6 +43,16 @@ def _btc_contract_spec():
         min_quantity=1,
         price_tick=0.1,
     )
+
+
+def test_order_draft_fingerprint_is_canonical_and_ignores_embedded_copy():
+    draft = build_deepcoin_order_draft(_payload_preview())
+    first = deepcoin_order_draft_fingerprint(draft)
+    reordered = dict(reversed(list(draft.items())))
+    reordered["draft_fingerprint"] = "stale"
+
+    assert deepcoin_order_draft_fingerprint(reordered) == first
+    assert len(first) == 64
 
 
 def test_build_deepcoin_order_draft_splits_long_limit_order_into_range_endpoints():

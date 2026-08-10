@@ -58,6 +58,13 @@ from telegram_kol_research.deepcoin_contract_spec_cache import (
     load_deepcoin_contract_spec_snapshot,
 )
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
+from telegram_kol_research.deepcoin_order_builder import (
+    deepcoin_order_draft_fingerprint,
+)
+from telegram_kol_research.entry_draft_revisions import (
+    EntryDraftRevisionError,
+    revise_entry_draft,
+)
 from telegram_kol_research.execution_bindings import (
     load_deepcoin_execution_reconciliation_snapshot_read_only,
     repair_execution_order_legs_from_binding_payloads,
@@ -2398,6 +2405,106 @@ def recovery_dry_run(
         return
     for action, count in sorted(result.action_counts.items()):
         typer.echo(f"{action}: {count}")
+
+
+@app.command("entry-draft-revision")
+def entry_draft_revision(
+    draft_path: Path = typer.Option(..., "--draft-path"),
+    market_price: str = typer.Option(..., "--market-price"),
+    leg_indices: list[int] = typer.Option(..., "--leg-index"),
+    operation: str = typer.Option("market_first_leg", "--operation"),
+    apply: bool = typer.Option(False, "--apply"),
+    expected_fingerprint: str | None = typer.Option(
+        None, "--expected-fingerprint"
+    ),
+    batch_id: int | None = typer.Option(None, "--batch-id"),
+    database_path: Path = typer.Option(
+        Path("data/research.db"), "--database-path"
+    ),
+    deepcoin_contract_specs_path: Path = typer.Option(
+        Path("config/deepcoin_contract_specs.yaml"),
+        "--deepcoin-contract-specs-path",
+    ),
+) -> None:
+    """Dry-run a risk-preserving entry revision; apply only by fingerprint."""
+
+    try:
+        original = json.loads(draft_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise typer.BadParameter("--draft-path must contain valid JSON") from exc
+    if not isinstance(original, dict):
+        raise typer.BadParameter("--draft-path must contain a JSON object")
+    try:
+        parsed_market_price = Decimal(market_price)
+    except InvalidOperation as exc:
+        raise typer.BadParameter("--market-price must be a decimal") from exc
+    try:
+        revised = revise_entry_draft(
+            original,
+            operation=operation,
+            market_price=parsed_market_price,
+            authorized_leg_indices=tuple(leg_indices),
+        )
+    except EntryDraftRevisionError as exc:
+        typer.echo(f"Refusing revision: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    parent_fingerprint = deepcoin_order_draft_fingerprint(original)
+    original_legs = original.get("order_legs") or []
+    revised_legs = revised.get("order_legs") or []
+    plan = {
+        "mode": "apply" if apply else "dry_run",
+        "parent_draft_fingerprint": parent_fingerprint,
+        "revision_fingerprint": revised.get("draft_fingerprint"),
+        "operation": operation,
+        "authorized_leg_indices": list(leg_indices),
+        "execution_deadline_at": original.get("execution_deadline_at")
+        or original.get("deadline_at"),
+        "risk_budget_usdt": original.get("risk_budget_usdt"),
+        "blocking_reasons": [],
+        "leg_mappings": [
+            {
+                "leg_index": index,
+                "original_client_order_id": before.get("client_order_id"),
+                "revised_client_order_id": after.get("client_order_id"),
+                "original_order_type": before.get("order_type"),
+                "revised_order_type": after.get("order_type"),
+                "original_risk_budget_usdt": before.get("risk_budget_usdt"),
+                "revised_risk_budget_usdt": after.get("risk_budget_usdt"),
+            }
+            for index, (before, after) in enumerate(
+                zip(original_legs, revised_legs, strict=True), start=1
+            )
+        ],
+    }
+    typer.echo(json.dumps(plan, ensure_ascii=False, indent=2, default=str))
+    if not apply:
+        return
+    if not expected_fingerprint or batch_id is None:
+        typer.echo(
+            "Refusing apply: --expected-fingerprint and --batch-id are required.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    from telegram_kol_research.recovery_live_submit import (
+        submit_entry_draft_revision_live,
+    )
+
+    session_factory = create_existing_session_factory(database_path)
+    result = submit_entry_draft_revision_live(
+        session_factory,
+        batch_id=batch_id,
+        original_draft=original,
+        operation=operation,
+        market_price=parsed_market_price,
+        authorized_leg_indices=tuple(leg_indices),
+        expected_parent_fingerprint=expected_fingerprint,
+        deepcoin_client=build_deepcoin_client_from_env(),
+        contract_spec_provider=load_deepcoin_contract_specs(
+            deepcoin_contract_specs_path
+        ),
+        submitted_at=datetime.now(UTC),
+    )
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 
 
 @app.command("repair-execution-order-legs")

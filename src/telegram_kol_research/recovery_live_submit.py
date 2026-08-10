@@ -38,6 +38,7 @@ from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import StrategyRevisionBatch
+from telegram_kol_research.models import StrategyRevisionLeg
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.models import TriggerProtectionIntent
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
@@ -524,6 +525,132 @@ def submit_strategy_revision_replacement_live(
     return {"status": "submitted", **result}
 
 
+def submit_entry_draft_revision_live(
+    session_factory: sessionmaker,
+    *,
+    batch_id: int,
+    original_draft: dict[str, Any],
+    operation: str,
+    market_price,
+    authorized_leg_indices: tuple[int, ...],
+    expected_parent_fingerprint: str,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    contract_spec_provider: DeepcoinContractSpecProvider | None = None,
+    submitted_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Apply an unchanged-fingerprint revision through the audited entry writer."""
+
+    from telegram_kol_research.deepcoin_order_builder import (
+        deepcoin_order_draft_fingerprint,
+    )
+    from telegram_kol_research.entry_draft_revisions import revise_entry_draft
+
+    with session_factory() as session:
+        batch = session.get(StrategyRevisionBatch, int(batch_id))
+        if batch is None:
+            raise RecoveryLiveSubmitError("revision_batch_missing")
+        binding = session.get(ExecutionBinding, int(batch.execution_binding_id))
+        try:
+            binding_payload = json.loads(binding.payload_json or "{}") if binding else {}
+        except (json.JSONDecodeError, TypeError):
+            binding_payload = {}
+        authoritative_draft = (
+            binding_payload.get("draft")
+            if isinstance(binding_payload, dict)
+            else None
+        )
+    if not isinstance(authoritative_draft, dict):
+        raise RecoveryLiveSubmitError("entry_draft_authority_missing")
+    _validate_entry_draft_revision_leg_authority(
+        session_factory,
+        batch_id=int(batch_id),
+        expected_leg_count=len(authoritative_draft.get("order_legs") or []),
+        authorized_leg_indices=authorized_leg_indices,
+    )
+    actual_fingerprint = deepcoin_order_draft_fingerprint(authoritative_draft)
+    supplied_fingerprint = deepcoin_order_draft_fingerprint(original_draft)
+    if (
+        str(expected_parent_fingerprint) != actual_fingerprint
+        or supplied_fingerprint != actual_fingerprint
+    ):
+        raise RecoveryLiveSubmitError("entry_draft_parent_fingerprint_changed")
+    revised = revise_entry_draft(
+        authoritative_draft,
+        operation=operation,
+        market_price=market_price,
+        authorized_leg_indices=authorized_leg_indices,
+    )
+    return submit_strategy_revision_replacement_live(
+        session_factory,
+        batch_id=int(batch_id),
+        draft=revised,
+        deepcoin_client=deepcoin_client,
+        contract_spec_provider=contract_spec_provider,
+        submitted_at=submitted_at,
+    )
+
+
+def _validate_entry_draft_revision_leg_authority(
+    session_factory: sessionmaker,
+    *,
+    batch_id: int,
+    expected_leg_count: int,
+    authorized_leg_indices: tuple[int, ...],
+) -> None:
+    """Require every original leg to be durably absent before replacement."""
+
+    if expected_leg_count < 1:
+        raise RecoveryLiveSubmitError("entry_draft_authority_missing")
+    with session_factory() as session:
+        batch = session.get(StrategyRevisionBatch, int(batch_id))
+        if (
+            batch is None
+            or batch.status != "submitting_replacements"
+            or not batch.advance_claim_token
+        ):
+            raise RecoveryLiveSubmitError("revision_batch_not_reserved")
+        execution_legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(
+                ExecutionOrderLeg.execution_binding_id
+                == int(batch.execution_binding_id),
+                ExecutionOrderLeg.purpose == "entry",
+            )
+            .order_by(ExecutionOrderLeg.leg_index.asc())
+            .all()
+        )
+        by_index = {int(leg.leg_index): leg for leg in execution_legs}
+        revision_by_execution_leg_id = {
+            int(row.execution_order_leg_id): row
+            for row in session.query(StrategyRevisionLeg)
+            .filter(StrategyRevisionLeg.revision_batch_id == int(batch_id))
+            .all()
+        }
+        if set(by_index) != set(range(1, int(expected_leg_count) + 1)):
+            raise RecoveryLiveSubmitError("revision_leg_authority_incomplete")
+        authorized = set(int(value) for value in authorized_leg_indices)
+        for leg_index, execution_leg in by_index.items():
+            execution_status = str(execution_leg.status or "").lower()
+            revision_leg = revision_by_execution_leg_id.get(int(execution_leg.id))
+            revision_status = str(revision_leg.status or "").lower() if revision_leg else ""
+            if revision_status in {"submit_unknown", "cancel_submitting"} or execution_status in {
+                "unknown",
+                "submit_unknown",
+                "unknown_exchange_outcome",
+            }:
+                raise RecoveryLiveSubmitError("revision_leg_outcome_unknown")
+            if leg_index not in authorized:
+                continue
+            if revision_leg is None:
+                raise RecoveryLiveSubmitError("revision_leg_authority_incomplete")
+            if revision_status not in {"cancelled", "terminal"}:
+                raise RecoveryLiveSubmitError("revision_leg_not_confirmed_absent")
+            if execution_status not in {"cancelled", "rejected", "failed", "expired"}:
+                raise RecoveryLiveSubmitError("revision_leg_not_confirmed_absent")
+            if execution_leg.pos_id or revision_leg.pos_id:
+                raise RecoveryLiveSubmitError("revision_leg_position_already_exists")
+
+
 def enqueue_recovery_trade_signal(
     session_factory: sessionmaker,
     *,
@@ -727,6 +854,7 @@ def _prepare_instruction_entry_submission(
     if message_instruction_item_id is None or execution_contract_mode == "disabled":
         return
     from telegram_kol_research.instruction_execution_entry_adapter import (
+        EntryExecutionContractBlocked,
         prepare_entry_submission_contract,
     )
 
@@ -744,6 +872,8 @@ def _prepare_instruction_entry_submission(
             prepared_at=prepared_at,
             mode=execution_contract_mode,
         )
+    except EntryExecutionContractBlocked:
+        raise
     except Exception:
         if execution_contract_mode == "live":
             raise
@@ -905,19 +1035,39 @@ def _submit_recovery_signal_direct(
     side_key = trade_signal.side.lower()
     warnings = _protection_warnings(draft)
 
-    if verified_v2_assembly:
+    revision_indices = draft.get("authorized_leg_indices")
+    if isinstance(revision_indices, list):
+        selected_indices = revision_indices
+        if (
+            not selected_indices
+            or any(
+                type(index) is not int or index < 1 or index > len(order_legs)
+                for index in selected_indices
+            )
+            or len(set(selected_indices)) != len(selected_indices)
+        ):
+            raise RecoveryLiveSubmitError("invalid_authorized_leg_indices")
+        selected_order_legs = [order_legs[index - 1] for index in selected_indices]
+    elif verified_v2_assembly:
         selected_indices = draft.get("selected_entry_leg_indices")
         if not isinstance(selected_indices, list):
             raise RecoveryLiveSubmitError("invalid_selected_entry_leg_indices")
         selected_order_legs = [order_legs[index - 1] for index in selected_indices]
     else:
         selected_order_legs = order_legs[:max_order_legs] if max_order_legs else order_legs
+        selected_indices = list(range(1, len(selected_order_legs) + 1))
     submission_order_legs = _submission_order_legs(draft, selected_order_legs)
+    submission_indices = _submission_source_leg_indices(
+        selected_indices=selected_indices,
+        submission_order_legs=submission_order_legs,
+    )
     leg_index_offset = int(draft.get("_entry_leg_index_offset") or 0)
-    for index, leg in enumerate(
+    for source_index, leg in zip(
+        submission_indices,
         submission_order_legs,
-        start=leg_index_offset + 1,
+        strict=True,
     ):
+        index = leg_index_offset + int(source_index)
         if not isinstance(leg, dict):
             raise RecoveryLiveSubmitError("invalid_order_leg")
         order_type = str(leg.get("order_type") or "").lower()
@@ -1212,6 +1362,31 @@ def _submission_order_legs(
     if not all(isinstance(leg, dict) for leg in copied_legs):
         return copied_legs
     return _coalesce_equivalent_entry_legs(copied_legs)
+
+
+def _submission_source_leg_indices(
+    *,
+    selected_indices: list[int],
+    submission_order_legs: list[Any],
+) -> list[int]:
+    """Map coalesced local leg positions back to original draft indices."""
+
+    mapped: list[int] = []
+    for position, leg in enumerate(submission_order_legs, start=1):
+        local_positions = (
+            leg.get("merged_from_leg_indices")
+            if isinstance(leg, dict)
+            else None
+        )
+        local_position = (
+            min(local_positions)
+            if isinstance(local_positions, list) and local_positions
+            else position
+        )
+        if type(local_position) is not int or not (1 <= local_position <= len(selected_indices)):
+            raise RecoveryLiveSubmitError("invalid_coalesced_entry_leg_indices")
+        mapped.append(int(selected_indices[local_position - 1]))
+    return mapped
 
 
 def _has_embedded_trigger_protection(order_payload: dict[str, Any]) -> bool:

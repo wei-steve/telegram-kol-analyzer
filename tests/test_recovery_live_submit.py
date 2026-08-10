@@ -25,6 +25,7 @@ from telegram_kol_research.models import (
     RawMessage,
     SignalCandidate,
     StrategyRevisionBatch,
+    StrategyRevisionLeg,
 )
 from telegram_kol_research.models import SourceMessageDeletionExit, StrategyLifecycle, TradeSignal, TriggerTakeProfitConvergence
 from telegram_kol_research.models import TriggerProtectionIntent
@@ -40,6 +41,7 @@ from telegram_kol_research.recovery_live_submit import enqueue_recovery_trade_si
 from telegram_kol_research.recovery_live_submit import process_next_trade_signal_live
 from telegram_kol_research.recovery_live_submit import process_trade_signal_live
 from telegram_kol_research.recovery_live_submit import submit_recovery_order_live
+from telegram_kol_research.recovery_live_submit import submit_entry_draft_revision_live
 from telegram_kol_research.recovery_live_submit import submit_strategy_revision_replacement_live
 from telegram_kol_research.recovery_live_submit import _load_matching_position_ids
 from telegram_kol_research.deepcoin_execution_actions import _exact_exchange_order_id
@@ -455,6 +457,104 @@ def test_shadow_entry_contract_observes_writer_without_changing_calls(tmp_path):
         assert contract.execution_binding_id is not None
 
 
+def test_entry_draft_revision_uses_existing_audited_writer(tmp_path, monkeypatch):
+    import telegram_kol_research.recovery_live_submit as submit_module
+    from decimal import Decimal
+    from telegram_kol_research.deepcoin_order_builder import (
+        deepcoin_order_draft_fingerprint,
+    )
+
+    session_factory = create_session_factory(tmp_path / "revision-wrapper.db")
+    batch_id, original = _persist_reserved_revision_batch(session_factory)
+    _persist_revision_leg_authority(
+        session_factory,
+        batch_id=batch_id,
+        draft=original,
+    )
+    calls = []
+    monkeypatch.setattr(
+        submit_module,
+        "submit_strategy_revision_replacement_live",
+        lambda *args, **kwargs: calls.append(kwargs) or {"status": "submitted"},
+    )
+
+    result = submit_entry_draft_revision_live(
+        session_factory,
+        batch_id=batch_id,
+        original_draft=original,
+        operation="market_first_leg",
+        market_price=Decimal("68100"),
+        authorized_leg_indices=(1,),
+        expected_parent_fingerprint=deepcoin_order_draft_fingerprint(original),
+        deepcoin_client=object(),
+    )
+
+    assert result == {"status": "submitted"}
+    assert calls[0]["batch_id"] == batch_id
+    assert len(calls[0]["draft"]["order_legs"]) == 2
+    assert calls[0]["draft"]["order_legs"][1] == original["order_legs"][1]
+
+
+def test_entry_draft_revision_rejects_file_that_differs_from_binding_authority(tmp_path):
+    from decimal import Decimal
+    from telegram_kol_research.deepcoin_order_builder import (
+        deepcoin_order_draft_fingerprint,
+    )
+
+    session_factory = create_session_factory(tmp_path / "revision-authority.db")
+    batch_id, original = _persist_reserved_revision_batch(session_factory)
+    _persist_revision_leg_authority(
+        session_factory,
+        batch_id=batch_id,
+        draft=original,
+    )
+    tampered = json.loads(json.dumps(original))
+    tampered["risk_budget_usdt"] = 999
+
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="entry_draft_parent_fingerprint_changed",
+    ):
+        submit_entry_draft_revision_live(
+            session_factory,
+            batch_id=batch_id,
+            original_draft=tampered,
+            operation="market_first_leg",
+            market_price=Decimal("68100"),
+            authorized_leg_indices=(1,),
+            expected_parent_fingerprint=deepcoin_order_draft_fingerprint(tampered),
+            deepcoin_client=object(),
+        )
+
+
+def test_entry_draft_revision_rejects_unknown_unmodified_leg(tmp_path):
+    from decimal import Decimal
+    from telegram_kol_research.deepcoin_order_builder import (
+        deepcoin_order_draft_fingerprint,
+    )
+
+    session_factory = create_session_factory(tmp_path / "revision-unknown-leg.db")
+    batch_id, original = _persist_reserved_revision_batch(session_factory)
+    _persist_revision_leg_authority(
+        session_factory,
+        batch_id=batch_id,
+        draft=original,
+        unknown_leg_index=2,
+    )
+
+    with pytest.raises(RecoveryLiveSubmitError, match="revision_leg_outcome_unknown"):
+        submit_entry_draft_revision_live(
+            session_factory,
+            batch_id=batch_id,
+            original_draft=original,
+            operation="market_first_leg",
+            market_price=Decimal("68100"),
+            authorized_leg_indices=(1,),
+            expected_parent_fingerprint=deepcoin_order_draft_fingerprint(original),
+            deepcoin_client=object(),
+        )
+
+
 def _finalize_v2_assembly_for_signal(session_factory, signal):
     with session_factory() as session:
         row = session.get(TradeSignal, signal.id)
@@ -629,7 +729,10 @@ def _persist_reserved_revision_batch(session_factory):
         side="long",
         contract_spec_provider=_StaticContractSpecProvider(),
     )
-    draft = signal.payload["deepcoin_order_draft"]
+    draft = {
+        **signal.payload["deepcoin_order_draft"],
+        "execution_deadline_at": "2099-08-10T12:00:00+00:00",
+    }
     with session_factory() as session:
         session.delete(session.get(TradeSignal, signal.id))
         raw = session.query(RawMessage).filter_by(chat_id=100, message_id=55).one()
@@ -642,6 +745,7 @@ def _persist_reserved_revision_batch(session_factory):
             side="long",
             venue="deepcoin",
             status="open",
+            payload_json=json.dumps({"draft": draft}),
         )
         session.add(binding)
         session.flush()
@@ -678,6 +782,51 @@ def _persist_reserved_revision_batch(session_factory):
         session.add(batch)
         session.commit()
         return batch.id, draft
+
+
+def _persist_revision_leg_authority(
+    session_factory,
+    *,
+    batch_id,
+    draft,
+    authorized_leg_indices=(1,),
+    unknown_leg_index=None,
+):
+    with session_factory() as session:
+        batch = session.get(StrategyRevisionBatch, batch_id)
+        for index, draft_leg in enumerate(draft["order_legs"], start=1):
+            authorized = index in set(authorized_leg_indices)
+            execution_leg = ExecutionOrderLeg(
+                execution_binding_id=batch.execution_binding_id,
+                strategy_instance_id=draft["strategy_instance_id"],
+                leg_index=index,
+                purpose="entry",
+                order_kind=str(draft_leg.get("order_type") or "limit"),
+                order_id=f"old-order-{index}",
+                client_order_id=str(draft_leg["client_order_id"]),
+                venue="deepcoin",
+                status=(
+                    "submit_unknown"
+                    if index == unknown_leg_index
+                    else "cancelled"
+                    if authorized
+                    else "open"
+                ),
+                request_json=json.dumps({"sz": draft_leg.get("quantity") or 1}),
+            )
+            session.add(execution_leg)
+            session.flush()
+            if authorized:
+                session.add(StrategyRevisionLeg(
+                    revision_batch_id=batch.id,
+                    execution_order_leg_id=execution_leg.id,
+                    action="cancel_pending",
+                    prior_status="open",
+                    status="cancelled",
+                    order_id=execution_leg.order_id,
+                    client_order_id=execution_leg.client_order_id,
+                ))
+        session.commit()
 
 
 def _replace_queued_order_legs(session_factory, signal_id, order_legs):
@@ -1548,6 +1697,30 @@ def test_revision_first_generic_write_error_is_unknown_and_never_retried(tmp_pat
     with session_factory() as session:
         signal = session.query(TradeSignal).filter_by(source_type="strategy_revision").one()
         assert signal.payload_json == original_payload_json
+
+
+def test_revision_writer_submits_only_authorized_original_leg_index(tmp_path):
+    session_factory = create_session_factory(tmp_path / "revision-selected-leg.db")
+    batch_id, draft = _persist_reserved_revision_batch(session_factory)
+    revised = {**draft, "authorized_leg_indices": [2]}
+    client = _FakeDeepcoinClient()
+
+    result = submit_strategy_revision_replacement_live(
+        session_factory,
+        batch_id=batch_id,
+        draft=revised,
+        deepcoin_client=client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+
+    assert result["order_count"] == 1
+    assert len(client.trigger_payloads) == 1
+    assert client.trigger_payloads[0]["clOrdId"] == draft["order_legs"][1][
+        "client_order_id"
+    ]
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).one()
+        assert leg.leg_index == 2
 
 
 def test_revision_confirmed_first_leg_then_error_is_partial_and_never_retried(

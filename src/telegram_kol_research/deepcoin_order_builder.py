@@ -6,6 +6,8 @@ It converts reviewed recovery previews into a conservative, auditable draft.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import sys
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
@@ -26,6 +28,26 @@ class DeepcoinOrderDraftError(ValueError):
 
 MAX_FLOAT_DECIMAL = Decimal(str(sys.float_info.max))
 MAX_ENTRY_LEGS = 5
+
+
+def deepcoin_order_draft_fingerprint(draft: dict[str, Any]) -> str:
+    """Return a canonical immutable evidence fingerprint for an entry draft."""
+
+    if not isinstance(draft, dict):
+        raise DeepcoinOrderDraftError("order draft must be a mapping")
+    normalized = {
+        key: value
+        for key, value in draft.items()
+        if key not in {"draft_fingerprint"}
+    }
+    serialized = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def build_deepcoin_order_draft(

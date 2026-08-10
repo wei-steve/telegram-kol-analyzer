@@ -50,6 +50,43 @@ def _canonical_json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def test_entry_draft_revision_cli_is_dry_run_by_default(tmp_path):
+    draft_path = tmp_path / "chen-draft.json"
+    draft_path.write_text(json.dumps({
+        "venue": "deepcoin",
+        "strategy_instance_id": "deepcoin:chen:BTC:long",
+        "instrument_id": "BTC-USDT-SWAP",
+        "symbol": "BTC",
+        "position_side": "long",
+        "stop_loss": 63000,
+        "take_profit_legs": [{"price": 66000, "allocation_pct": 100}],
+        "risk_budget_usdt": 20,
+        "execution_deadline_at": "2099-08-10T12:00:00+00:00",
+        "order_legs": [
+            {"order_type": "limit", "price": 64000, "client_order_id": "E1",
+             "allocation_pct": 50, "risk_budget_usdt": 10, "quantity": 10,
+             "side": "buy", "position_side": "long"},
+            {"order_type": "limit", "price": 63800, "client_order_id": "E2",
+             "allocation_pct": 50, "risk_budget_usdt": 10, "quantity": 12,
+             "side": "buy", "position_side": "long"},
+        ],
+    }), encoding="utf-8")
+
+    result = CliRunner().invoke(app, [
+        "entry-draft-revision",
+        "--draft-path", str(draft_path),
+        "--market-price", "63950",
+        "--leg-index", "1",
+    ])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["mode"] == "dry_run"
+    assert payload["authorized_leg_indices"] == [1]
+    assert len(payload["leg_mappings"]) == 2
+    assert payload["leg_mappings"][1]["original_client_order_id"] == "E2"
+
+
 def _seed_entry_assembly_fingerprint_cli_case(tmp_path):
     database_path = tmp_path / "entry-repair.db"
     session_factory = create_session_factory(database_path)
