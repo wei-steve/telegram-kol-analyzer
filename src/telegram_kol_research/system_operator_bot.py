@@ -26,6 +26,9 @@ from telegram_kol_research.config import (
 from telegram_kol_research.entry_admission_reconciler import (
     reconcile_due_entry_admissions,
 )
+from telegram_kol_research.instruction_execution_reconciliation import (
+    reconcile_instruction_execution_contracts,
+)
 from telegram_kol_research.llm_chat import _load_env_file_values
 from telegram_kol_research.message_instruction_items import (
     FINISH_STATUSES,
@@ -38,6 +41,7 @@ from telegram_kol_research.reporting import (
     format_entry_assembly_summary,
     format_entry_revision_summary,
 )
+from telegram_kol_research.trading_settings import load_trading_settings
 
 
 logger = logging.getLogger(__name__)
@@ -2563,6 +2567,7 @@ async def run_runtime_incident_notification_loop(
     config: SystemOperatorBotConfig,
     interval_seconds: float = 5.0,
     runtime_config: RuntimeIncidentConfig | None = None,
+    deepcoin_client_factory=None,
 ) -> None:
     """Poll the Phase 2 outbox through the dedicated system operator bot."""
 
@@ -2574,10 +2579,27 @@ async def run_runtime_incident_notification_loop(
     else:
         feature_config = runtime_config
     while True:
+        execution_client = None
         try:
+            execution_mode = str(
+                load_trading_settings(
+                    session_factory
+                ).instruction_execution_contract_mode
+            )
+            if execution_mode != "disabled":
+                if deepcoin_client_factory is None:
+                    from telegram_kol_research.deepcoin_client import (
+                        build_deepcoin_client_from_env,
+                    )
+
+                    execution_client = build_deepcoin_client_from_env()
+                else:
+                    execution_client = deepcoin_client_factory()
             run_operator_maintenance_tick(
                 session_factory,
                 now=datetime.now(UTC),
+                execution_contract_mode=execution_mode,
+                execution_reconciliation_client=execution_client,
             )
             await deliver_runtime_incident_notifications(
                 session_factory,
@@ -2588,6 +2610,10 @@ async def run_runtime_incident_notification_loop(
             raise
         except Exception:
             pass
+        finally:
+            close_client = getattr(execution_client, "close", None)
+            if callable(close_client):
+                close_client()
         await asyncio.sleep(max(0.1, float(interval_seconds)))
 
 
@@ -2596,14 +2622,29 @@ def run_operator_maintenance_tick(
     *,
     now: datetime,
     entry_admission_limit: int = 20,
+    execution_contract_mode: str = "disabled",
+    execution_reconciliation_client=None,
+    execution_reconciliation_limit: int = 20,
 ):
     """Run bounded non-exchange maintenance owned by the operator loop."""
 
-    return reconcile_due_entry_admissions(
+    entry_result = reconcile_due_entry_admissions(
         session_factory,
         now=now,
         limit=max(0, min(int(entry_admission_limit), 100)),
     )
+    if (
+        execution_contract_mode != "disabled"
+        and execution_reconciliation_client is not None
+    ):
+        reconcile_instruction_execution_contracts(
+            session_factory,
+            client=execution_reconciliation_client,
+            reconciled_at=now,
+            mode=execution_contract_mode,
+            limit=max(0, min(int(execution_reconciliation_limit), 100)),
+        )
+    return entry_result
 
 
 def build_pending_entry_expiry_review_reply_markup(payload: dict[str, Any]) -> dict[str, Any]:

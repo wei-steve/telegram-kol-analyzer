@@ -96,6 +96,78 @@ def test_operator_maintenance_tick_runs_bounded_entry_reconciler(monkeypatch):
     assert calls[0][1] == {"now": NOW, "limit": 7}
 
 
+def test_operator_maintenance_tick_runs_bounded_read_only_execution_reconciler(
+    monkeypatch,
+):
+    entry_result = SimpleNamespace(released=0, expired=0, incidents=0, skipped=0)
+    execution_calls = []
+    monkeypatch.setattr(
+        operator_bot_module,
+        "reconcile_due_entry_admissions",
+        lambda *args, **kwargs: entry_result,
+    )
+    monkeypatch.setattr(
+        operator_bot_module,
+        "reconcile_instruction_execution_contracts",
+        lambda *args, **kwargs: execution_calls.append((args, kwargs)),
+        raising=False,
+    )
+
+    result = operator_bot_module.run_operator_maintenance_tick(
+        object(),
+        now=NOW,
+        entry_admission_limit=7,
+        execution_contract_mode="shadow",
+        execution_reconciliation_client=object(),
+        execution_reconciliation_limit=9,
+    )
+
+    assert result is entry_result
+    assert execution_calls[0][1] == {
+        "client": execution_calls[0][1]["client"],
+        "reconciled_at": NOW,
+        "mode": "shadow",
+        "limit": 9,
+    }
+
+
+def test_runtime_notification_loop_wires_execution_reconciliation_only_in_mode(
+    monkeypatch,
+):
+    client = SimpleNamespace(close=lambda: None)
+    calls = []
+    monkeypatch.setattr(
+        operator_bot_module,
+        "load_trading_settings",
+        lambda session_factory: SimpleNamespace(
+            instruction_execution_contract_mode="shadow"
+        ),
+        raising=False,
+    )
+
+    def stop_after_tick(*args, **kwargs):
+        calls.append(kwargs)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        operator_bot_module,
+        "run_operator_maintenance_tick",
+        stop_after_tick,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            operator_bot_module.run_runtime_incident_notification_loop(
+                session_factory=object(),
+                config=SimpleNamespace(),
+                deepcoin_client_factory=lambda: client,
+            )
+        )
+
+    assert calls[0]["execution_contract_mode"] == "shadow"
+    assert calls[0]["execution_reconciliation_client"] is client
+
+
 def test_automatic_break_even_alert_contains_exact_non_sensitive_handoff():
     rendered = format_position_protection_incident_message({
         "incident_type": "automatic_break_even_recovery_required",
