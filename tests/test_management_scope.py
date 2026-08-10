@@ -469,6 +469,163 @@ def test_long_stop_widening_cannot_fan_out(tmp_path) -> None:
             )
 
 
+@pytest.mark.parametrize(
+    ("symbol", "side", "current_stop", "requested_stop", "limit"),
+    [
+        ("BTC", "long", 64000, 63300, 700),
+        ("BTC", "short", 64000, 64700, 700),
+        ("ETH", "long", 1900, 1879, 21),
+        ("ETH", "short", 1900, 1921, 21),
+    ],
+)
+def test_exact_verified_target_allows_bounded_stop_widening(
+    tmp_path,
+    symbol: str,
+    side: str,
+    current_stop: float,
+    requested_stop: float,
+    limit: float,
+) -> None:
+    session_factory = create_session_factory(tmp_path / f"{symbol}-{side}.db")
+    with session_factory() as session:
+        lifecycle = _persist_live_strategy(
+            session,
+            chat_id=88,
+            message_id=1,
+            symbol=symbol,
+            side=side,
+            pos_id="pos-1",
+        )
+        lifecycle.stop_loss = current_stop
+        message = RawMessage(
+            chat_id=88,
+            message_id=2,
+            text=f"{symbol} {side} stop {requested_stop}",
+        )
+        session.add(message)
+        session.flush()
+        directive = resolve_management_directive(
+            text=message.text or "",
+            lifecycle_event={
+                "event_type": "position_update",
+                "symbol": symbol,
+                "side": side,
+                "management_action": "adjust_stop_loss",
+                "stop_loss": requested_stop,
+            },
+        )
+
+        targets = resolve_management_scope_in_session(
+            session,
+            raw_message=message,
+            directive=directive,
+            explicit_target_lifecycle_id=lifecycle.id,
+            reply_target_lifecycle_id=None,
+        )
+
+    assert [target.lifecycle_id for target in targets] == [lifecycle.id]
+    assert abs(requested_stop - current_stop) == limit
+    assert targets[0].scope_source == "explicit"
+
+
+@pytest.mark.parametrize(
+    ("symbol", "side", "current_stop", "requested_stop"),
+    [
+        ("BTC", "long", 64000, 63299.9),
+        ("BTC", "short", 64000, 64700.1),
+        ("ETH", "long", 1900, 1878.9),
+        ("ETH", "short", 1900, 1921.1),
+        ("SOL", "long", 150, 149.9),
+        ("SOL", "short", 150, 150.1),
+    ],
+)
+def test_exact_target_rejects_unbounded_or_unsupported_stop_widening(
+    tmp_path,
+    symbol: str,
+    side: str,
+    current_stop: float,
+    requested_stop: float,
+) -> None:
+    session_factory = create_session_factory(tmp_path / f"{symbol}-{side}.db")
+    with session_factory() as session:
+        lifecycle = _persist_live_strategy(
+            session,
+            chat_id=88,
+            message_id=1,
+            symbol=symbol,
+            side=side,
+            pos_id="pos-1",
+        )
+        lifecycle.stop_loss = current_stop
+        message = RawMessage(
+            chat_id=88,
+            message_id=2,
+            text=f"{symbol} {side} stop {requested_stop}",
+        )
+        session.add(message)
+        session.flush()
+        directive = resolve_management_directive(
+            text=message.text or "",
+            lifecycle_event={
+                "event_type": "position_update",
+                "symbol": symbol,
+                "side": side,
+                "management_action": "adjust_stop_loss",
+                "stop_loss": requested_stop,
+            },
+        )
+
+        with pytest.raises(
+            ManagementScopeError,
+            match="stop_adjustment_direction_not_verified",
+        ):
+            resolve_management_scope_in_session(
+                session,
+                raw_message=message,
+                directive=directive,
+                explicit_target_lifecycle_id=lifecycle.id,
+                reply_target_lifecycle_id=None,
+            )
+
+
+def test_exact_unverified_target_cannot_use_bounded_stop_widening(tmp_path) -> None:
+    session_factory = create_session_factory(tmp_path / "unverified.db")
+    with session_factory() as session:
+        lifecycle = _persist_live_strategy(
+            session,
+            chat_id=88,
+            message_id=1,
+            pos_id="pos-1",
+            attribution_status="unassigned",
+        )
+        lifecycle.stop_loss = 63800
+        message = RawMessage(chat_id=88, message_id=2, text="BTC止损改到63300")
+        session.add(message)
+        session.flush()
+        directive = resolve_management_directive(
+            text=message.text or "",
+            lifecycle_event={
+                "event_type": "position_update",
+                "symbol": "BTC",
+                "side": "long",
+                "management_action": "adjust_stop_loss",
+                "stop_loss": 63300,
+            },
+        )
+
+        with pytest.raises(
+            ManagementScopeError,
+            match="stop_widening_position_ownership_not_verified",
+        ):
+            resolve_management_scope_in_session(
+                session,
+                raw_message=message,
+                directive=directive,
+                explicit_target_lifecycle_id=lifecycle.id,
+                reply_target_lifecycle_id=None,
+            )
+
+
 def test_group_stop_update_fails_closed_if_any_verified_target_would_widen(
     tmp_path,
 ) -> None:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from types import MappingProxyType
 
 from sqlalchemy.orm import Session
 
@@ -18,6 +20,14 @@ from telegram_kol_research.models import (
 
 class ManagementScopeError(RuntimeError):
     """Raised when a directive cannot be mapped to safe strategy targets."""
+
+
+EXACT_STOP_WIDENING_LIMITS = MappingProxyType(
+    {
+        "BTC": Decimal("700"),
+        "ETH": Decimal("21"),
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,11 +74,10 @@ def resolve_management_scope_in_session(
             lifecycle=lifecycle,
             directive=directive,
         )
-        if not _directive_reduces_lifecycle_risk(
+        risk_reducing = _directive_reduces_lifecycle_risk(
             lifecycle=lifecycle,
             directive=directive,
-        ):
-            raise ManagementScopeError("stop_adjustment_direction_not_verified")
+        )
         target = _verified_live_target(
             session,
             lifecycle=lifecycle,
@@ -77,6 +86,17 @@ def resolve_management_scope_in_session(
             ),
         )
         if target is None:
+            if not risk_reducing:
+                if _is_bounded_exact_stop_widening(
+                    lifecycle=lifecycle,
+                    directive=directive,
+                ):
+                    raise ManagementScopeError(
+                        "stop_widening_position_ownership_not_verified"
+                    )
+                raise ManagementScopeError(
+                    "stop_adjustment_direction_not_verified"
+                )
             return (
                 ManagementScopeTarget(
                     lifecycle_id=int(lifecycle.id),
@@ -98,6 +118,11 @@ def resolve_management_scope_in_session(
                     strategy_thread_id=lifecycle.strategy_thread_id,
                 ),
             )
+        if not risk_reducing and not _is_bounded_exact_stop_widening(
+            lifecycle=lifecycle,
+            directive=directive,
+        ):
+            raise ManagementScopeError("stop_adjustment_direction_not_verified")
         return (target,)
 
     if not directive.risk_reducing or not directive.fanout_allowed:
@@ -211,6 +236,41 @@ def _directive_reduces_lifecycle_risk(
     if str(lifecycle.side or "").lower() == "short":
         return requested_stop <= float(current_stop)
     return False
+
+
+def _is_bounded_exact_stop_widening(
+    *,
+    lifecycle: StrategyLifecycle,
+    directive: ManagementDirective,
+) -> bool:
+    if directive.intent != "adjust_stop_loss":
+        return False
+    limit = EXACT_STOP_WIDENING_LIMITS.get(
+        str(lifecycle.symbol or "").upper()
+    )
+    if limit is None or lifecycle.stop_loss is None:
+        return False
+    try:
+        requested_stop = Decimal(str(directive.stop_loss))
+        current_stop = Decimal(str(lifecycle.stop_loss))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    if (
+        not requested_stop.is_finite()
+        or not current_stop.is_finite()
+        or requested_stop <= 0
+        or current_stop <= 0
+    ):
+        return False
+    side = str(lifecycle.side or "").lower()
+    widens_risk = (
+        requested_stop < current_stop
+        if side == "long"
+        else requested_stop > current_stop
+        if side == "short"
+        else False
+    )
+    return widens_risk and abs(requested_stop - current_stop) <= limit
 
 
 def _require_source_identity(
