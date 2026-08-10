@@ -3494,29 +3494,11 @@ def _position_history_proves_full_close(
         return False
     expected_side = _normalize_position_side(str(binding.side or ""))
     for row in (rows if isinstance(rows, list) else []):
-        if not isinstance(row, dict):
-            continue
-        if _first_string(row, "posId", "pos_id", "id") != pos_id:
-            continue
-        row_instrument_id = _binding_instrument_id_from_value(
-            row.get("instId") or row.get("symbol")
-        )
-        if row_instrument_id != instrument_id:
-            continue
-        row_side = _normalize_position_side(
-            str(row.get("posSide") or row.get("side") or "")
-        )
-        if row_side != expected_side:
-            continue
-        opened = _to_float(row.get("pos") or row.get("size"))
-        closed = _to_float(
-            row.get("closePos") or row.get("close_pos") or row.get("closedSize")
-        )
-        if (
-            opened is not None
-            and opened > 0
-            and closed is not None
-            and abs(opened - closed) <= 1e-9
+        if isinstance(row, dict) and position_history_row_proves_full_close(
+            row,
+            instrument_id=instrument_id,
+            position_side=expected_side,
+            pos_id=pos_id,
         ):
             return True
     return False
@@ -3582,7 +3564,7 @@ def _binding_has_proven_take_profit_close(
             history
             for history in (position_history if isinstance(position_history, list) else [])
             if isinstance(history, dict)
-            and _position_history_row_proves_full_close(
+            and position_history_row_proves_full_close(
                 history,
                 instrument_id=instrument_id,
                 position_side=expected_position_side,
@@ -3654,7 +3636,7 @@ def _binding_has_proven_take_profit_close(
     return True
 
 
-def _position_history_row_proves_full_close(
+def position_history_row_proves_full_close(
     row: dict[str, Any],
     *,
     instrument_id: str,

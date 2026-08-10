@@ -14,12 +14,15 @@ from sqlalchemy.exc import IntegrityError
 
 from telegram_kol_research.execution_bindings import (
     load_deepcoin_execution_reconciliation_snapshot_read_only,
+    position_history_row_proves_full_close,
 )
 from telegram_kol_research.models import (
+    BoundPositionCloseReservation,
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
     PositionAttributionAudit,
+    PositionMutationIntent,
     PositionTakeProfitOrder,
     RepairConfirmationToken,
     SignalCandidate,
@@ -629,6 +632,27 @@ def build_historical_state_repair_plan(
                 "error_hash": _optional_text_hash(convergence.error_json),
                 "updated_at": convergence.updated_at,
             }
+            attribution_repair_proof = None
+            attribution_repair_failure = None
+            if (
+                convergence.status == "submitted"
+                and leg is not None
+                and str(leg.attribution_status or "")
+                in {"attribution_conflict", "evidence_unavailable"}
+            ):
+                (
+                    attribution_repair_proof,
+                    attribution_repair_failure,
+                ) = _proven_take_profit_attribution_repair(
+                    session,
+                    convergence=convergence,
+                    binding=binding,
+                    leg=leg,
+                    orders=orders,
+                    snapshot=snapshot,
+                )
+                evidence["attribution_repair_proof"] = attribution_repair_proof
+                evidence["attribution_repair_failure"] = attribution_repair_failure
             database_evidence.append({"take_profit_convergence": evidence})
             pos_id = str(convergence.pos_id or "").strip()
             if not pos_id:
@@ -669,6 +693,29 @@ def build_historical_state_repair_plan(
                         kind="take_profit_convergence",
                         target_id=int(convergence.id),
                         reason_code="pending_order_snapshot_incomplete",
+                        evidence_json=_canonical_json(evidence),
+                    )
+                )
+                continue
+            if attribution_repair_proof is not None:
+                actions.append(
+                    HistoricalStateRepairAction(
+                        kind="take_profit_attribution_repair",
+                        target_id=int(convergence.id),
+                        reason_code=(
+                            "convergence_position_terminal_prior_authority_restored"
+                        ),
+                        related_ids=tuple(int(row.id) for row in orders),
+                        evidence_json=_canonical_json(evidence),
+                    )
+                )
+                continue
+            if attribution_repair_failure is not None:
+                exclusions.append(
+                    HistoricalStateRepairFinding(
+                        kind="take_profit_convergence",
+                        target_id=int(convergence.id),
+                        reason_code="take_profit_attribution_repair_not_proven",
                         evidence_json=_canonical_json(evidence),
                     )
                 )
@@ -1242,6 +1289,192 @@ def _terminal_convergence_identity(convergence, binding, leg) -> bool:
     )
 
 
+def _proven_take_profit_attribution_repair(
+    session,
+    *,
+    convergence,
+    binding,
+    leg,
+    orders,
+    snapshot,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Return canonical proof only for one fully closed, formerly owned position."""
+
+    if binding is None or leg is None:
+        return None, "binding_or_leg_missing"
+    pos_id = str(convergence.pos_id or "").strip()
+    strategy_instance_id = str(binding.strategy_instance_id or "").strip()
+    if not pos_id or not strategy_instance_id:
+        return None, "immutable_identity_missing"
+    if not (
+        str(convergence.venue or "").lower() == "deepcoin"
+        and str(binding.venue or "").lower() == "deepcoin"
+        and str(leg.venue or "").lower() == "deepcoin"
+        and int(convergence.execution_binding_id) == int(binding.id)
+        and int(convergence.execution_order_leg_id) == int(leg.id)
+        and int(leg.execution_binding_id) == int(binding.id)
+        and str(leg.strategy_instance_id or "").strip() == strategy_instance_id
+        and _split_ids(binding.pos_id) == {pos_id}
+        and str(leg.pos_id or "").strip() == pos_id
+        and str(leg.purpose or "") == "entry"
+        and str(binding.status or "").lower() in _TERMINAL_BINDING_STATES
+        and str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
+        and str(leg.attribution_status or "")
+        in {"attribution_conflict", "evidence_unavailable"}
+        and convergence.status == "submitted"
+        and orders
+        and all(_take_profit_order_matches(row, convergence) for row in orders)
+    ):
+        return None, "strategy_or_ledger_identity_mismatch"
+
+    lifecycles = (
+        session.query(StrategyLifecycle)
+        .filter(StrategyLifecycle.execution_binding_id == int(binding.id))
+        .order_by(StrategyLifecycle.id.asc())
+        .all()
+    )
+    if len(lifecycles) != 1 or str(
+        lifecycles[0].lifecycle_status or ""
+    ).lower() not in _TERMINAL_LIFECYCLE_STATES:
+        return None, "lifecycle_not_uniquely_terminal"
+
+    audits = (
+        session.query(PositionAttributionAudit)
+        .filter(PositionAttributionAudit.execution_order_leg_id == int(leg.id))
+        .order_by(
+            PositionAttributionAudit.created_at.asc(),
+            PositionAttributionAudit.id.asc(),
+        )
+        .all()
+    )
+    authority_audits = [
+        row
+        for row in audits
+        if row.execution_binding_id == int(binding.id)
+        and str(row.venue or "").lower() == "deepcoin"
+        and str(row.pos_id or "").strip() == pos_id
+        and str(row.event_type or "") == "ownership_verified"
+        and str(row.new_state or "") == "verified"
+        and _is_policy_v2_authority_audit(row)
+    ]
+    if not authority_audits:
+        return None, "policy_v2_authority_missing"
+    latest_authority_at = max(row.created_at for row in authority_audits)
+    later_conflicts = [
+        row
+        for row in audits
+        if str(row.event_type or "") == "attribution_conflict"
+        and row.created_at >= latest_authority_at
+    ]
+    for row in later_conflicts:
+        conflict_evidence = _json_object(row.evidence_json)
+        candidate_leg_ids = conflict_evidence.get("candidate_leg_ids", [])
+        candidate_position_ids = conflict_evidence.get(
+            "candidate_position_ids", []
+        )
+        if (
+            not isinstance(candidate_leg_ids, list)
+            or not isinstance(candidate_position_ids, list)
+            or any(str(value or "").strip() for value in candidate_leg_ids)
+            or any(str(value or "").strip() for value in candidate_position_ids)
+        ):
+            return None, "later_competing_attribution_evidence"
+
+    mutations = (
+        session.query(PositionMutationIntent)
+        .filter(
+            PositionMutationIntent.venue == "deepcoin",
+            PositionMutationIntent.operation == "close_position",
+            PositionMutationIntent.execution_binding_id == int(binding.id),
+            PositionMutationIntent.execution_order_leg_id == int(leg.id),
+            PositionMutationIntent.strategy_instance_id == strategy_instance_id,
+            PositionMutationIntent.pos_id == pos_id,
+            PositionMutationIntent.status == "confirmed",
+        )
+        .order_by(PositionMutationIntent.id.asc())
+        .all()
+    )
+    if len(mutations) != 1:
+        return None, "confirmed_close_mutation_missing_or_ambiguous"
+    mutation = mutations[0]
+    if _json_position_ids(mutation.request_json) != {pos_id} or _json_position_ids(
+        mutation.response_json
+    ) != {pos_id}:
+        return None, "close_mutation_payload_identity_mismatch"
+
+    reservations = (
+        session.query(BoundPositionCloseReservation)
+        .filter(BoundPositionCloseReservation.pos_id == pos_id)
+        .order_by(BoundPositionCloseReservation.id.asc())
+        .all()
+    )
+    if not (
+        len(reservations) == 1
+        and int(reservations[0].execution_binding_id) == int(binding.id)
+        and str(reservations[0].status or "") == "confirmed"
+    ):
+        return None, "confirmed_close_reservation_missing_or_mismatched"
+    reservation = reservations[0]
+
+    competing_leg_ids = sorted(
+        int(row.id)
+        for row in session.query(ExecutionOrderLeg)
+        .filter(
+            ExecutionOrderLeg.venue == "deepcoin",
+            ExecutionOrderLeg.id != int(leg.id),
+        )
+        .all()
+        if pos_id in _split_ids(row.pos_id)
+    )
+    if competing_leg_ids:
+        return None, "position_owned_by_other_leg"
+
+    history_rows = [
+        row
+        for row in list(getattr(snapshot, "position_history", []) or [])
+        if isinstance(row, dict) and pos_id in _position_identity_ids(row)
+    ]
+    instrument_id = f"{str(binding.symbol).upper()}-USDT-SWAP"
+    if not (
+        len(history_rows) == 1
+        and _position_identity_ids(history_rows[0]) == {pos_id}
+        and position_history_row_proves_full_close(
+            history_rows[0],
+            instrument_id=instrument_id,
+            position_side=str(binding.side or ""),
+            pos_id=pos_id,
+        )
+    ):
+        return None, "exact_full_close_history_not_proven"
+
+    return (
+        {
+            "schema_version": 1,
+            "strategy_instance_id": strategy_instance_id,
+            "pos_id": pos_id,
+            "instrument_id": instrument_id,
+            "lifecycle": {
+                "id": int(lifecycles[0].id),
+                "status": str(lifecycles[0].lifecycle_status),
+                "execution_binding_id": int(
+                    lifecycles[0].execution_binding_id or 0
+                ),
+                "updated_at": lifecycles[0].updated_at,
+            },
+            "authority_audits": [_attribution_audit_evidence(row) for row in authority_audits],
+            "later_conflict_audits": [
+                _attribution_audit_evidence(row) for row in later_conflicts
+            ],
+            "close_mutation": _mutation_intent_evidence(mutation),
+            "close_reservation": _close_reservation_evidence(reservation),
+            "competing_leg_ids": competing_leg_ids,
+            "position_history": history_rows[0],
+            "position_history_hash": _fingerprint(history_rows[0]),
+        },
+        None,
+    )
+
+
 def _take_profit_order_matches(order, convergence) -> bool:
     return bool(
         str(order.order_id or "").strip()
@@ -1282,6 +1515,14 @@ def _exchange_evidence(snapshot) -> dict[str, Any]:
                     "order_ids": sorted(str(value) for value in row.get("order_ids", [])),
                 }
                 for row in getattr(snapshot, "pending_tpsl_observations", []) or []
+                if isinstance(row, dict)
+            ),
+            key=_canonical_json,
+        ),
+        "position_history": sorted(
+            (
+                dict(row)
+                for row in getattr(snapshot, "position_history", []) or []
                 if isinstance(row, dict)
             ),
             key=_canonical_json,
@@ -1425,6 +1666,94 @@ def _leg_evidence(row) -> dict[str, Any]:
         "pos_id": row.pos_id,
         "updated_at": row.updated_at,
     }
+
+
+def _attribution_audit_evidence(row: PositionAttributionAudit) -> dict[str, Any]:
+    return {
+        "id": int(row.id),
+        "execution_binding_id": (
+            int(row.execution_binding_id)
+            if row.execution_binding_id is not None
+            else None
+        ),
+        "execution_order_leg_id": (
+            int(row.execution_order_leg_id)
+            if row.execution_order_leg_id is not None
+            else None
+        ),
+        "venue": str(row.venue),
+        "pos_id": row.pos_id,
+        "event_type": str(row.event_type),
+        "prior_state": row.prior_state,
+        "new_state": str(row.new_state),
+        "fingerprint": str(row.fingerprint),
+        "evidence_hash": _optional_text_hash(row.evidence_json),
+        "created_at": row.created_at,
+    }
+
+
+def _mutation_intent_evidence(row: PositionMutationIntent) -> dict[str, Any]:
+    return {
+        "id": int(row.id),
+        "idempotency_key": str(row.idempotency_key),
+        "venue": str(row.venue),
+        "operation": str(row.operation),
+        "strategy_instance_id": str(row.strategy_instance_id),
+        "execution_binding_id": int(row.execution_binding_id),
+        "execution_order_leg_id": int(row.execution_order_leg_id),
+        "pos_id": str(row.pos_id),
+        "status": str(row.status),
+        "authority_fingerprint": str(row.authority_fingerprint),
+        "request_fingerprint": str(row.request_fingerprint),
+        "request_hash": _optional_text_hash(row.request_json),
+        "response_hash": _optional_text_hash(row.response_json),
+        "error_hash": _optional_text_hash(row.error_json),
+        "confirmed_at": row.confirmed_at,
+        "updated_at": row.updated_at,
+    }
+
+
+def _close_reservation_evidence(
+    row: BoundPositionCloseReservation,
+) -> dict[str, Any]:
+    return {
+        "id": int(row.id),
+        "pos_id": str(row.pos_id),
+        "execution_binding_id": int(row.execution_binding_id),
+        "status": str(row.status),
+        "last_error_hash": _optional_text_hash(row.last_error),
+        "updated_at": row.updated_at,
+    }
+
+
+def _json_position_ids(value: str | None) -> set[str]:
+    try:
+        parsed = json.loads(str(value or "null"))
+    except (TypeError, json.JSONDecodeError):
+        return set()
+    found: set[str] = set()
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if key in {
+                    "posId",
+                    "pos_id",
+                    "PositionID",
+                    "positionId",
+                    "position_id",
+                }:
+                    normalized = str(child or "").strip()
+                    if normalized:
+                        found.add(normalized)
+                else:
+                    visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+
+    visit(parsed)
+    return found
 
 
 def _split_ids(value: Any) -> set[str]:

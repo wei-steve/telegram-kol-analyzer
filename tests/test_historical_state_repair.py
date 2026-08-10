@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
+    BoundPositionCloseReservation,
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
     PositionAttributionAudit,
+    PositionMutationIntent,
     PositionTakeProfitOrder,
     RawMessage,
     RepairConfirmationToken,
@@ -27,11 +29,19 @@ from telegram_kol_research.source_message_deletion import record_source_message_
 NOW = datetime(2026, 8, 10, 1, 0, tzinfo=UTC)
 
 
-def _snapshot(*, positions=None, pending=None, errors=None, complete=True):
+def _snapshot(
+    *,
+    positions=None,
+    pending=None,
+    errors=None,
+    complete=True,
+    position_history=None,
+):
     return SimpleNamespace(
         positions=list(positions or []),
         open_orders=[],
         pending_trigger_orders=list(pending or []),
+        position_history=list(position_history or []),
         errors=dict(errors or {}),
         pending_tpsl_observations=[
             {
@@ -291,6 +301,171 @@ class _ReadOnlyHistoryClient:
     close_position = submit_order
 
 
+def _seed_proven_attribution_repair_candidate(
+    session_factory,
+    *,
+    pos_id: str = "pos-proven-closed",
+) -> dict[str, object]:
+    strategy_instance_id = "deepcoin:40:400:BTC:short"
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            strategy_instance_id=strategy_instance_id,
+            kol_id="group:40",
+            chat_id=40,
+            message_id=400,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            pos_id=pos_id,
+            status="closed",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=40,
+            message_id=400,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="exited",
+            exit_reason="manual",
+            signal_at=NOW - timedelta(days=2),
+            entered_at=NOW - timedelta(days=2),
+            exited_at=NOW - timedelta(days=1),
+            execution_binding_id=binding.id,
+        )
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=strategy_instance_id,
+            leg_index=1,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="entry-proven-closed",
+            pos_id=pos_id,
+            venue="deepcoin",
+            attribution_status="attribution_conflict",
+            status="manually_closed",
+        )
+        session.add_all([lifecycle, leg])
+        session.flush()
+        authority_audits = []
+        for index, evidence_type in enumerate(
+            ("trade_fill", "regular_order"), start=1
+        ):
+            audit = PositionAttributionAudit(
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                venue="deepcoin",
+                pos_id=pos_id,
+                event_type="ownership_verified",
+                prior_state="unassigned" if index == 1 else "verified",
+                new_state="verified",
+                fingerprint=str(index) * 64,
+                evidence_json=json.dumps(
+                    {
+                        "policy_version": 2,
+                        "evidence_type": "direct_order_position_id",
+                        "source": evidence_type,
+                    }
+                ),
+                created_at=NOW - timedelta(days=2, minutes=-index),
+            )
+            session.add(audit)
+            authority_audits.append(audit)
+        conflict_audit = PositionAttributionAudit(
+            execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id,
+            venue="deepcoin",
+            pos_id=pos_id,
+            event_type="attribution_conflict",
+            prior_state="evidence_unavailable",
+            new_state="attribution_conflict",
+            fingerprint="3" * 64,
+            evidence_json=json.dumps(
+                {
+                    "policy_version": 2,
+                    "candidate_leg_ids": [],
+                    "candidate_position_ids": [],
+                }
+            ),
+            created_at=NOW - timedelta(hours=12),
+        )
+        mutation = PositionMutationIntent(
+            idempotency_key="close-pos-proven-closed",
+            venue="deepcoin",
+            operation="close_position",
+            strategy_instance_id=strategy_instance_id,
+            execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id,
+            pos_id=pos_id,
+            authority_fingerprint="4" * 64,
+            request_fingerprint="5" * 64,
+            status="confirmed",
+            request_json=json.dumps({"posId": pos_id}),
+            response_json=json.dumps({"posId": pos_id, "status": "success"}),
+            reserved_at=NOW - timedelta(days=1, minutes=2),
+            submitted_at=NOW - timedelta(days=1, minutes=1),
+            confirmed_at=NOW - timedelta(days=1),
+        )
+        reservation = BoundPositionCloseReservation(
+            pos_id=pos_id,
+            execution_binding_id=binding.id,
+            status="confirmed",
+            created_at=NOW - timedelta(days=1, minutes=2),
+            updated_at=NOW - timedelta(days=1),
+        )
+        session.add_all([conflict_audit, mutation, reservation])
+        convergence = TriggerTakeProfitConvergence(
+            venue="deepcoin",
+            execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id,
+            desired_take_profits_json=json.dumps(
+                [
+                    {"price": "63000", "allocation_pct": "40"},
+                    {"price": "62000", "allocation_pct": "30"},
+                    {"price": "61000", "allocation_pct": "30"},
+                ]
+            ),
+            status="submitted",
+            pos_id=pos_id,
+            created_at=NOW - timedelta(days=2),
+            updated_at=NOW - timedelta(days=2),
+        )
+        session.add(convergence)
+        session.flush()
+        orders = []
+        for index, price in enumerate(("63000", "62000", "61000"), start=1):
+            order = PositionTakeProfitOrder(
+                venue="deepcoin",
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                trigger_take_profit_convergence_id=convergence.id,
+                pos_id=pos_id,
+                order_id=f"tp-proven-{index}",
+                trigger_price=price,
+                size_text="1",
+                status="active",
+                evidence_json=json.dumps({"mutation_intent_id": index}),
+                created_at=NOW - timedelta(days=2),
+                updated_at=NOW - timedelta(days=2),
+            )
+            session.add(order)
+            orders.append(order)
+        session.commit()
+        return {
+            "binding_id": int(binding.id),
+            "lifecycle_id": int(lifecycle.id),
+            "leg_id": int(leg.id),
+            "convergence_id": int(convergence.id),
+            "order_ids": tuple(int(row.id) for row in orders),
+            "authority_audit_ids": tuple(int(row.id) for row in authority_audits),
+            "conflict_audit_id": int(conflict_audit.id),
+            "mutation_id": int(mutation.id),
+            "reservation_id": int(reservation.id),
+            "pos_id": pos_id,
+            "strategy_instance_id": strategy_instance_id,
+        }
+
+
 def test_plan_classifies_terminal_history_and_excludes_current_live_position(tmp_path):
     from telegram_kol_research.historical_state_repair import (
         build_historical_state_repair_plan,
@@ -533,7 +708,7 @@ def test_plan_excludes_submitted_take_profit_with_unverified_identity(tmp_path):
     assert all(conflict.target_id != convergence_id for conflict in plan.conflicts)
     assert any(
         exclusion.target_id == convergence_id
-        and exclusion.reason_code == "take_profit_identity_not_terminal"
+        and exclusion.reason_code == "take_profit_attribution_repair_not_proven"
         for exclusion in plan.exclusions
     )
 
@@ -623,6 +798,334 @@ def test_historical_repair_snapshot_deduplicates_exact_history_rows(tmp_path):
 
     assert snapshot.position_history == [row]
     assert snapshot.errors == {}
+
+
+def test_plan_builds_one_proven_terminal_attribution_repair(tmp_path):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    seeded = _seed_proven_attribution_repair_candidate(session_factory)
+    snapshot = _snapshot(
+        position_history=[
+            {
+                "instId": "BTC-USDT-SWAP",
+                "posId": seeded["pos_id"],
+                "posSide": "short",
+                "pos": "5",
+                "closePos": "5",
+            }
+        ]
+    )
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=snapshot,
+        planned_at=NOW,
+    )
+
+    assert [
+        (row.kind, row.target_id, row.reason_code) for row in plan.actions
+    ] == [
+        (
+            "take_profit_attribution_repair",
+            seeded["convergence_id"],
+            "convergence_position_terminal_prior_authority_restored",
+        )
+    ]
+    assert plan.conflicts == ()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_failure"),
+    [
+        ("authority_missing", "policy_v2_authority_missing"),
+        ("authority_wrong_policy", "policy_v2_authority_missing"),
+        ("authority_wrong_leg", "policy_v2_authority_missing"),
+        ("authority_wrong_venue", "policy_v2_authority_missing"),
+        ("authority_wrong_pos", "policy_v2_authority_missing"),
+        ("later_true_conflict", "later_competing_attribution_evidence"),
+        ("close_mutation_unconfirmed", "confirmed_close_mutation_missing_or_ambiguous"),
+        ("close_mutation_wrong_leg", "confirmed_close_mutation_missing_or_ambiguous"),
+        ("close_mutation_wrong_strategy", "confirmed_close_mutation_missing_or_ambiguous"),
+        ("close_mutation_wrong_pos", "confirmed_close_mutation_missing_or_ambiguous"),
+        ("reservation_unconfirmed", "confirmed_close_reservation_missing_or_mismatched"),
+        ("reservation_wrong_binding", "confirmed_close_reservation_missing_or_mismatched"),
+        ("competing_leg", "position_owned_by_other_leg"),
+        ("lifecycle_active", "lifecycle_not_uniquely_terminal"),
+        ("binding_active", "strategy_or_ledger_identity_mismatch"),
+        ("leg_active", "strategy_or_ledger_identity_mismatch"),
+        ("order_position_mismatch", "strategy_or_ledger_identity_mismatch"),
+    ],
+)
+def test_plan_fails_closed_when_local_attribution_repair_proof_changes(
+    tmp_path,
+    mutation,
+    expected_failure,
+):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    seeded = _seed_proven_attribution_repair_candidate(session_factory)
+    with session_factory() as session:
+        if mutation.startswith("authority_"):
+            audits = (
+                session.query(PositionAttributionAudit)
+                .filter(PositionAttributionAudit.event_type == "ownership_verified")
+                .all()
+            )
+            if mutation == "authority_missing":
+                for row in audits:
+                    session.delete(row)
+            elif mutation == "authority_wrong_policy":
+                for row in audits:
+                    row.evidence_json = json.dumps({"policy_version": 1})
+            elif mutation == "authority_wrong_leg":
+                for row in audits:
+                    row.execution_order_leg_id = int(seeded["leg_id"]) + 999
+            elif mutation == "authority_wrong_venue":
+                for row in audits:
+                    row.venue = "binance"
+            elif mutation == "authority_wrong_pos":
+                for row in audits:
+                    row.pos_id = "different-position"
+        elif mutation == "later_true_conflict":
+            row = session.get(
+                PositionAttributionAudit,
+                seeded["conflict_audit_id"],
+            )
+            row.evidence_json = json.dumps(
+                {"candidate_leg_ids": [999], "candidate_position_ids": []}
+            )
+        elif mutation.startswith("close_mutation_"):
+            row = session.get(PositionMutationIntent, seeded["mutation_id"])
+            if mutation == "close_mutation_unconfirmed":
+                row.status = "submitted"
+            elif mutation == "close_mutation_wrong_leg":
+                row.execution_order_leg_id = int(seeded["leg_id"]) + 999
+            elif mutation == "close_mutation_wrong_strategy":
+                row.strategy_instance_id = "different-strategy"
+            else:
+                row.pos_id = "different-position"
+        elif mutation.startswith("reservation_"):
+            row = session.get(
+                BoundPositionCloseReservation,
+                seeded["reservation_id"],
+            )
+            if mutation == "reservation_unconfirmed":
+                row.status = "submitted"
+            else:
+                row.execution_binding_id = int(seeded["binding_id"]) + 999
+        elif mutation == "competing_leg":
+            session.add(
+                ExecutionOrderLeg(
+                    execution_binding_id=seeded["binding_id"],
+                    strategy_instance_id=seeded["strategy_instance_id"],
+                    leg_index=2,
+                    purpose="entry",
+                    order_kind="market",
+                    pos_id=f'{seeded["pos_id"]},legacy-other',
+                    venue="deepcoin",
+                    attribution_status="verified",
+                    status="manually_closed",
+                )
+            )
+        elif mutation == "lifecycle_active":
+            session.get(
+                StrategyLifecycle, seeded["lifecycle_id"]
+            ).lifecycle_status = "entered"
+        elif mutation == "binding_active":
+            session.get(ExecutionBinding, seeded["binding_id"]).status = "active"
+        elif mutation == "leg_active":
+            session.get(ExecutionOrderLeg, seeded["leg_id"]).status = "active"
+        elif mutation == "order_position_mismatch":
+            session.get(
+                PositionTakeProfitOrder, seeded["order_ids"][0]
+            ).pos_id = "different-position"
+        session.commit()
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(
+            position_history=[
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": seeded["pos_id"],
+                    "posSide": "short",
+                    "pos": "5",
+                    "closePos": "5",
+                }
+            ]
+        ),
+        planned_at=NOW,
+    )
+
+    assert not any(
+        row.kind == "take_profit_attribution_repair" for row in plan.actions
+    )
+    exclusion = next(
+        row
+        for row in plan.exclusions
+        if row.target_id == seeded["convergence_id"]
+    )
+    evidence = json.loads(exclusion.evidence_json)
+    assert evidence["attribution_repair_failure"] == expected_failure
+
+
+@pytest.mark.parametrize(
+    ("history_rows", "expected_failure"),
+    [
+        ([], "exact_full_close_history_not_proven"),
+        (
+            [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-proven-closed",
+                    "posSide": "short",
+                    "pos": "5",
+                    "closePos": "4",
+                }
+            ],
+            "exact_full_close_history_not_proven",
+        ),
+        (
+            [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "pos-proven-closed",
+                    "posSide": "short",
+                    "pos": "5",
+                    "closePos": "5",
+                }
+            ],
+            "exact_full_close_history_not_proven",
+        ),
+        (
+            [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-proven-closed",
+                    "posSide": "long",
+                    "pos": "5",
+                    "closePos": "5",
+                }
+            ],
+            "exact_full_close_history_not_proven",
+        ),
+        (
+            [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "different-position",
+                    "posSide": "short",
+                    "pos": "5",
+                    "closePos": "5",
+                }
+            ],
+            "exact_full_close_history_not_proven",
+        ),
+        (
+            [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-proven-closed",
+                    "posSide": "short",
+                    "pos": "5",
+                    "closePos": "5",
+                },
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-proven-closed",
+                    "posSide": "short",
+                    "pos": "5",
+                    "closePos": "5",
+                    "uTime": "2",
+                },
+            ],
+            "exact_full_close_history_not_proven",
+        ),
+    ],
+)
+def test_plan_fails_closed_without_one_exact_full_close_history(
+    tmp_path,
+    history_rows,
+    expected_failure,
+):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    seeded = _seed_proven_attribution_repair_candidate(session_factory)
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(position_history=history_rows),
+        planned_at=NOW,
+    )
+
+    assert not any(
+        row.kind == "take_profit_attribution_repair" for row in plan.actions
+    )
+    exclusion = next(
+        row
+        for row in plan.exclusions
+        if row.target_id == seeded["convergence_id"]
+    )
+    assert (
+        json.loads(exclusion.evidence_json)["attribution_repair_failure"]
+        == expected_failure
+    )
+
+
+@pytest.mark.parametrize("live_kind", ["position", "take_profit", "incomplete"])
+def test_plan_blocks_attribution_repair_when_current_snapshot_is_not_flat(
+    tmp_path,
+    live_kind,
+):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    seeded = _seed_proven_attribution_repair_candidate(session_factory)
+    kwargs = {
+        "position_history": [
+            {
+                "instId": "BTC-USDT-SWAP",
+                "posId": seeded["pos_id"],
+                "posSide": "short",
+                "pos": "5",
+                "closePos": "5",
+            }
+        ]
+    }
+    if live_kind == "position":
+        kwargs["positions"] = [{"posId": seeded["pos_id"], "pos": "1"}]
+    elif live_kind == "take_profit":
+        kwargs["pending"] = [{"ordId": "tp-proven-2"}]
+    else:
+        kwargs["complete"] = False
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(**kwargs),
+        planned_at=NOW,
+    )
+
+    assert not any(
+        row.kind == "take_profit_attribution_repair" for row in plan.actions
+    )
+    reasons = {
+        row.reason_code
+        for row in (*plan.exclusions, *plan.conflicts)
+        if row.target_id == seeded["convergence_id"]
+    }
+    assert reasons & {
+        "exact_position_or_order_still_live",
+        "pending_order_snapshot_incomplete",
+    }
 
 
 def test_plan_refuses_unlinked_deletion_when_source_binding_exists(tmp_path):
