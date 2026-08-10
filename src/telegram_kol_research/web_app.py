@@ -5292,6 +5292,7 @@ def create_web_app(
         *,
         browse_token: str | None = None,
         cursor: str | None = None,
+        filter_key: tuple[str | None, str | None] = (None, None),
     ) -> dict[str, Any]:
         pending_entry_signals = list_pending_strategies(
             app.state.session_factory,
@@ -5323,7 +5324,7 @@ def create_web_app(
                     token=browse_token,
                     cursor=cursor,
                     page_size=20,
-                    filter_key=(None, None),
+                    filter_key=filter_key,
                 )
             except ValueError:
                 return {
@@ -5357,16 +5358,26 @@ def create_web_app(
                 ],
             )
             if tab_name == "position-history" and not exchange_snapshot.get("error"):
-                rows = tuple(exchange_snapshot["position_history"])
+                rows = tuple(
+                    row for row in exchange_snapshot["position_history"]
+                    if (
+                        filter_key[0] is None
+                        or (row.get("exited_at") and row["exited_at"].date().isoformat() >= filter_key[0])
+                    )
+                    and (
+                        filter_key[1] is None
+                        or (row.get("exited_at") and row["exited_at"].date().isoformat() <= filter_key[1])
+                    )
+                )
                 token = app.state.history_position_browse_snapshots.create(
                     rows=rows,
-                    filter_key=(None, None),
+                    filter_key=filter_key,
                 )
                 page = app.state.history_position_browse_snapshots.page(
                     token=token,
                     cursor=None,
                     page_size=20,
-                    filter_key=(None, None),
+                    filter_key=filter_key,
                 )
                 exchange_snapshot["position_history"] = list(page.rows)
                 history_pagination = {
@@ -5929,9 +5940,20 @@ def create_web_app(
         tab_name: str,
         browse_token: str | None = None,
         cursor: str | None = None,
+        closed_after: str | None = None,
+        closed_before: str | None = None,
     ):
         if tab_name not in {"open-orders", "order-history", "position-history"}:
             raise HTTPException(status_code=404, detail="unknown exchange position tab")
+        try:
+            filter_key = (
+                datetime.fromisoformat(closed_after).date().isoformat() if closed_after else None,
+                datetime.fromisoformat(closed_before).date().isoformat() if closed_before else None,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="invalid history date filter") from exc
+        if filter_key[0] and filter_key[1] and filter_key[0] > filter_key[1]:
+            raise HTTPException(status_code=422, detail="history date range is reversed")
         return templates.TemplateResponse(
             request,
             "_exchange_position_tab.html",
@@ -5939,6 +5961,7 @@ def create_web_app(
                 tab_name,
                 browse_token=browse_token,
                 cursor=cursor,
+                filter_key=filter_key,
             ),
         )
 

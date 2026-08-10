@@ -1415,6 +1415,27 @@ def test_position_history_tab_renders_browse_footer_and_filter_controls(tmp_path
     assert 'data-history-browse-status' in fragment.text
 
 
+def test_position_history_tab_rejects_invalid_or_reversed_date_filter(tmp_path):
+    client = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            deepcoin_client_factory=_RecordingExchangePositionsClient,
+        )
+    )
+
+    invalid = client.get(
+        "/positions-panel/tabs/position-history",
+        params={"closed_after": "not-a-date"},
+    )
+    reversed_range = client.get(
+        "/positions-panel/tabs/position-history",
+        params={"closed_after": "2026-08-10", "closed_before": "2026-08-01"},
+    )
+
+    assert invalid.status_code == 422
+    assert reversed_range.status_code == 422
+
+
 def test_positions_panel_tab_failure_stays_retryable(tmp_path):
     class BrokenOpenOrdersClient(_RecordingExchangePositionsClient):
         def list_open_orders(self):
