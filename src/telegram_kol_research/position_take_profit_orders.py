@@ -416,12 +416,28 @@ def _take_profit_orders_match_convergence(
 
 
 def _position_id_is_live(positions: list[dict], *, pos_id: str) -> bool:
-    return any(
-        isinstance(row, dict)
-        and str(row.get("posId") or row.get("pos_id") or "") == pos_id
-        and abs(_decimal_or_zero(row.get("pos"))) > 0
-        for row in positions
-    )
+    for row in positions:
+        if not isinstance(row, dict) or str(
+            row.get("posId") or row.get("pos_id") or ""
+        ) != pos_id:
+            continue
+        raw_size = next(
+            (
+                row.get(key)
+                for key in ("pos", "size", "sz")
+                if row.get(key) is not None
+            ),
+            None,
+        )
+        if raw_size is None:
+            return True
+        try:
+            size = Decimal(str(raw_size))
+        except (InvalidOperation, TypeError, ValueError):
+            return True
+        if not size.is_finite() or abs(size) > 0:
+            return True
+    return False
 
 
 def _conflicting_position_mutations(

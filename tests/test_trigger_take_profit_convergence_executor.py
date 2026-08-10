@@ -1346,7 +1346,20 @@ def test_rejected_take_profit_convergence_completes_after_position_is_terminal(t
         )
 
 
-def test_rejected_take_profit_convergence_keeps_negative_short_position_live(tmp_path):
+@pytest.mark.parametrize(
+    "live_position",
+    [
+        {"posId": "pos-10", "pos": "-1"},
+        {"posId": "pos-10", "size": "-1"},
+        {"posId": "pos-10", "sz": "2"},
+        {"posId": "pos-10", "pos": "not-a-number"},
+        {"posId": "pos-10"},
+    ],
+)
+def test_rejected_take_profit_convergence_keeps_unknown_or_nonzero_position_live(
+    tmp_path,
+    live_position,
+):
     from telegram_kol_research.db import create_session_factory
     from telegram_kol_research.models import (
         ExecutionBinding,
@@ -1371,7 +1384,7 @@ def test_rejected_take_profit_convergence_keeps_negative_short_position_live(tmp
         session.flush()
         reconcile_trigger_take_profit_order_history(
             session,
-            positions=[{"posId": "pos-10", "pos": "-1"}],
+            positions=[live_position],
             pending_orders=[],
             trigger_history=[],
             observed_at=NOW,
