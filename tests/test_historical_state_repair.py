@@ -938,6 +938,7 @@ def test_plan_accepts_supported_exact_history_position_aliases(
         ("reservation_wrong_binding", "confirmed_close_reservation_missing_or_mismatched"),
         ("competing_leg", "position_owned_by_other_leg"),
         ("competing_leg_case_variant", "position_owned_by_other_leg"),
+        ("competing_leg_whitespace_venue", "position_owned_by_other_leg"),
         ("lifecycle_active", "lifecycle_not_uniquely_terminal"),
         ("binding_active", "strategy_or_ledger_identity_mismatch"),
         ("leg_active", "strategy_or_ledger_identity_mismatch"),
@@ -1008,7 +1009,11 @@ def test_plan_fails_closed_when_local_attribution_repair_proof_changes(
                 row.status = "submitted"
             else:
                 row.execution_binding_id = int(seeded["binding_id"]) + 999
-        elif mutation in {"competing_leg", "competing_leg_case_variant"}:
+        elif mutation in {
+            "competing_leg",
+            "competing_leg_case_variant",
+            "competing_leg_whitespace_venue",
+        }:
             session.add(
                 ExecutionOrderLeg(
                     execution_binding_id=seeded["binding_id"],
@@ -1020,7 +1025,11 @@ def test_plan_fails_closed_when_local_attribution_repair_proof_changes(
                     venue=(
                         "Deepcoin"
                         if mutation == "competing_leg_case_variant"
-                        else "deepcoin"
+                        else (
+                            " Deepcoin "
+                            if mutation == "competing_leg_whitespace_venue"
+                            else "deepcoin"
+                        )
                     ),
                     attribution_status="verified",
                     status="manually_closed",

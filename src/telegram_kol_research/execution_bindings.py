@@ -652,9 +652,7 @@ def _apply_reconcile_snapshot(
     ).effective_position_management_liveness_v2_mode
     active_positions = [row for row in snapshot.positions if _has_nonzero_size(row)]
     live_position_ids = {
-        pos_id
-        for row in active_positions
-        if (pos_id := _first_string(row, "posId", "pos_id", "id"))
+        pos_id for row in active_positions for pos_id in _position_identity_ids(row)
     }
     with session_factory() as session:
         bindings = (
@@ -755,7 +753,7 @@ def _apply_reconcile_snapshot(
         position_rows = [
             build_position_evidence(row)
             for row in active_positions
-            if _first_string(row, "posId", "pos_id", "id") not in reserved_pos_ids
+            if not (_position_identity_ids(row) & reserved_pos_ids)
         ]
         position_rows = [row for row in position_rows if row is not None]
         fill_rows = _snapshot_fill_evidence(
@@ -1026,12 +1024,11 @@ def _record_owned_position_observations(
         record_position_reconciliation_observation,
     )
 
-    positions_by_id = {
-        pos_id: row
-        for row in snapshot.positions
-        if _has_nonzero_size(row)
-        and (pos_id := _first_string(row, "posId", "pos_id", "id"))
-    }
+    positions_by_id = {}
+    for row in snapshot.positions:
+        position_ids = _position_identity_ids(row)
+        if _has_nonzero_size(row) and len(position_ids) == 1:
+            positions_by_id[next(iter(position_ids))] = row
     completeness_by_instrument = _pending_tpsl_snapshot_completeness(
         snapshot.pending_tpsl_observations
     )
@@ -2066,8 +2063,7 @@ def _refresh_exact_entry_leg_states(
             leg.pos_id
             and leg.attribution_status == "verified"
             and any(
-                _first_string(position, "posId", "pos_id", "id")
-                == str(leg.pos_id)
+                str(leg.pos_id) in _position_identity_ids(position)
                 and _has_nonzero_size(position)
                 for position in snapshot.positions
             )
@@ -2109,9 +2105,10 @@ def _exchange_row_matches_leg(row: dict[str, Any], leg: ExecutionOrderLeg) -> bo
 
 
 def build_position_evidence(row: dict[str, Any]) -> PositionEvidence | None:
-    pos_id = _first_string(row, "posId", "pos_id", "id")
-    if not pos_id:
+    position_ids = _position_identity_ids(row)
+    if len(position_ids) != 1:
         return None
+    pos_id = next(iter(position_ids))
     average_price = _to_float(
         row.get("avgPx") or row.get("avgPrice") or row.get("openAvgPx")
     )
@@ -2945,9 +2942,10 @@ def sync_manual_closed_deepcoin_positions(
     now = synced_at or datetime.now(UTC)
     positions = client.list_positions()
     active_pos_ids = {
-        _first_string(position, "posId", "pos_id", "id")
+        pos_id
         for position in positions
-        if _first_string(position, "posId", "pos_id", "id") and _has_nonzero_size(position)
+        if _has_nonzero_size(position)
+        for pos_id in _position_identity_ids(position)
     }
     cleanup_status_by_binding = _cleanup_terminal_lifecycle_entry_exposure(
         session_factory,
@@ -3668,18 +3666,7 @@ def position_history_row_proves_full_close(
     position_side: str,
     pos_id: str,
 ) -> bool:
-    position_identity_ids = {
-        str(row[key]).strip()
-        for key in (
-            "posId",
-            "pos_id",
-            "PositionID",
-            "positionId",
-            "position_id",
-            "id",
-        )
-        if str(row.get(key) or "").strip()
-    }
+    position_identity_ids = _position_identity_ids(row)
     if position_identity_ids != {str(pos_id).strip()}:
         return False
     if _binding_instrument_id_from_value(
@@ -4180,6 +4167,21 @@ def _first_string(payload: dict[str, Any], *keys: str) -> str | None:
         if value not in (None, ""):
             return str(value)
     return None
+
+
+def _position_identity_ids(payload: dict[str, Any]) -> set[str]:
+    return {
+        str(payload[key]).strip()
+        for key in (
+            "posId",
+            "pos_id",
+            "PositionID",
+            "positionId",
+            "position_id",
+            "id",
+        )
+        if str(payload.get(key) or "").strip()
+    }
 
 
 def _split_ids(value: str | None) -> list[str]:

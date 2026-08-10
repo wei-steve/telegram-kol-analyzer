@@ -1587,7 +1587,7 @@ def _proven_take_profit_attribution_repair(
         for row in session.query(ExecutionOrderLeg)
         .filter(ExecutionOrderLeg.id != int(leg.id))
         .all()
-        if str(row.venue or "").lower() == "deepcoin"
+        if str(row.venue or "").strip().lower() == "deepcoin"
         and pos_id in _split_ids(row.pos_id)
     )
     if competing_leg_ids:

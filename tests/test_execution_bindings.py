@@ -5652,6 +5652,68 @@ def test_sync_manual_closed_positions_closes_missing_bound_position(tmp_path, bi
     assert lifecycle.exit_reason == "manual"
 
 
+@pytest.mark.parametrize(
+    "live_position",
+    [
+        {"PositionID": "pos-live-alias", "pos": "1"},
+        {
+            "PositionID": "pos-live-alias",
+            "positionId": "different-position",
+            "pos": "1",
+        },
+    ],
+)
+def test_sync_manual_closed_positions_keeps_supported_live_position_aliases(
+    tmp_path,
+    live_position,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(pos_id="pos-live-alias", status="active"),
+    )
+    leg_id = _add_entry_leg(
+        session_factory,
+        binding_id,
+        pos_id="pos-live-alias",
+        status="active",
+        attribution_status="verified",
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 8, 10, 4, 0),
+                entered_at=datetime(2026, 8, 10, 4, 1),
+                execution_binding_id=binding_id,
+            )
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return [live_position]
+
+    result = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=FakeClient(),
+        synced_at=datetime(2026, 8, 10, 4, 2),
+    )
+
+    assert result.manually_closed == 0
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        lifecycle = session.query(StrategyLifecycle).one()
+    assert binding.status == "active"
+    assert leg.status == "active"
+    assert lifecycle.lifecycle_status == "entered"
+
+
 @pytest.mark.parametrize("evidence_case", ["proven", "ambiguous", "unproven"])
 def test_sync_missing_position_attributes_verified_take_profit_close(
     tmp_path, evidence_case
