@@ -5,6 +5,7 @@ from sqlalchemy import create_engine, inspect, text
 
 from telegram_kol_research.db import create_session_factory, init_db
 from telegram_kol_research.models import (
+    ExecutionEvent,
     RawMessage,
     SignalCandidate,
     SourceMessageDeletionExit,
@@ -16,7 +17,7 @@ from telegram_kol_research.source_message_deletion import (
 )
 
 
-def test_record_source_message_deleted_persists_bound_event_and_exit(tmp_path):
+def test_record_source_message_deleted_ignores_non_strategy_or_unlinked_raw(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
         raw = RawMessage(
@@ -39,10 +40,16 @@ def test_record_source_message_deleted_persists_bound_event_and_exit(tmp_path):
 
     assert result.binding_state == "bound"
     assert result.raw_message_id == raw_id
-    assert result.exit_state == "pending"
+    assert result.exit_state == "succeeded"
     with session_factory() as session:
-        assert session.query(TelegramSourceMessageEvent).count() == 1
-        assert session.query(SourceMessageDeletionExit).count() == 1
+        event = session.query(TelegramSourceMessageEvent).one()
+        deletion_exit = session.query(SourceMessageDeletionExit).one()
+        assert event.processing_status == "ignored"
+        assert event.reason_code == "non_strategy_or_unlinked"
+        assert event.completed_at == datetime(2026, 7, 31, 14, 35)
+        assert deletion_exit.last_reason == "non_strategy_or_unlinked"
+        assert deletion_exit.completed_at == datetime(2026, 7, 31, 14, 35)
+        assert session.query(ExecutionEvent).count() == 0
 
 
 def test_record_source_message_deleted_is_idempotent_and_fingerprint_is_stable(tmp_path):
@@ -280,7 +287,8 @@ def test_unbound_deletion_rebinds_when_target_raw_message_arrives(tmp_path):
         assert event.binding_state == "bound"
         assert event.raw_message_id == raw_id
         assert deletion_exit.raw_message_id == raw_id
-        assert deletion_exit.state == "pending"
+        assert deletion_exit.state == "succeeded"
+        assert deletion_exit.last_reason == "non_strategy_or_unlinked"
 
 
 def test_deletion_does_not_bind_non_target_raw_message(tmp_path):

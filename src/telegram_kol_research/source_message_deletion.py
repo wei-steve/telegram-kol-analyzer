@@ -25,6 +25,7 @@ from telegram_kol_research.models import (
     SourceMessageDeletionExit,
     StrategyLifecycle,
     TelegramSourceMessageEvent,
+    TradeSignal,
 )
 
 
@@ -371,6 +372,36 @@ def _bind_deletion_event_in_session(
         deletion_exit.target_fingerprint = sha256(
             json.dumps(target_identity, sort_keys=True).encode("utf-8")
         ).hexdigest()
+        has_trade_signal = (
+            session.query(TradeSignal.id)
+            .filter(
+                TradeSignal.chat_id == int(event.chat_id),
+                TradeSignal.message_id == int(event.message_id),
+            )
+            .first()
+            is not None
+        )
+        has_signal_candidate = (
+            session.query(SignalCandidate.id)
+            .filter(SignalCandidate.raw_message_id == int(raw_message.id))
+            .first()
+            is not None
+        )
+        if (
+            lifecycle is None
+            and binding is None
+            and not has_signal_candidate
+            and not has_trade_signal
+        ):
+            deletion_exit.state = "succeeded"
+            deletion_exit.last_reason = "non_strategy_or_unlinked"
+            deletion_exit.last_error = None
+            deletion_exit.claim_token = None
+            deletion_exit.claimed_at = None
+            deletion_exit.completed_at = updated_at
+            event.processing_status = "ignored"
+            event.reason_code = "non_strategy_or_unlinked"
+            event.completed_at = updated_at
     if exit_target_is_mutable and lifecycle is not None and lifecycle.lifecycle_status not in {
         "exited",
         "expired",

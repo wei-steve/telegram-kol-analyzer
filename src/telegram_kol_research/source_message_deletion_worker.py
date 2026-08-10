@@ -42,6 +42,12 @@ _ACTIVE_STATES = (
     "closing_positions",
     "reconciling",
 )
+_TERMINAL_LIFECYCLE_STATES = frozenset(
+    {"exited", "expired", "invalidated", "cancelled"}
+)
+_TERMINAL_BINDING_STATES = frozenset(
+    {"closed", "cancelled", "completed", "failed", "resolved", "superseded"}
+)
 
 
 logger = logging.getLogger(__name__)
@@ -355,6 +361,21 @@ def run_source_message_deletion_worker_tick(
                 claim_token=claim_token,
                 new_state="reconciling",
                 reason="no_execution_binding",
+                updated_at=now,
+            )
+            counts["waiting"] += 1
+            continue
+        if _deletion_target_is_already_terminal(
+            session_factory,
+            lifecycle_id=lifecycle_id,
+            binding_id=binding_id,
+        ):
+            _transition_claimed(
+                session_factory,
+                exit_id=exit_id,
+                claim_token=claim_token,
+                new_state="reconciling",
+                reason="strategy_already_terminal",
                 updated_at=now,
             )
             counts["waiting"] += 1
@@ -967,6 +988,38 @@ def _row_value(row, *names):
         if row.get(name) is not None:
             return row.get(name)
     return None
+
+
+def _deletion_target_is_already_terminal(
+    session_factory,
+    *,
+    lifecycle_id: int,
+    binding_id: int,
+) -> bool:
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, int(lifecycle_id))
+        binding = session.get(ExecutionBinding, int(binding_id))
+        entry_legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(
+                ExecutionOrderLeg.execution_binding_id == int(binding_id),
+                ExecutionOrderLeg.purpose == "entry",
+            )
+            .all()
+        )
+        return bool(
+            lifecycle is not None
+            and binding is not None
+            and lifecycle.execution_binding_id == int(binding_id)
+            and str(lifecycle.lifecycle_status or "").lower()
+            in _TERMINAL_LIFECYCLE_STATES
+            and str(binding.status or "").lower() in _TERMINAL_BINDING_STATES
+            and entry_legs
+            and all(
+                str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
+                for leg in entry_legs
+            )
+        )
 
 
 def _row_order_ids(row) -> set[str]:

@@ -548,6 +548,45 @@ def test_worker_cancels_only_exact_deleted_strategy_entry_ids(tmp_path):
         assert alert.execution_binding_id == deletion_exit.execution_binding_id
 
 
+def test_worker_routes_already_terminal_target_without_exchange_mutation(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _, lifecycle_id, binding_id, leg_id = _seed_pending_strategy(
+        session_factory,
+        chat_id=92,
+        message_id=902,
+        order_id="order-already-terminal",
+    )
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        lifecycle.lifecycle_status = "exited"
+        binding = session.get(ExecutionBinding, binding_id)
+        binding.status = "closed"
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        leg.status = "exchange_cancelled"
+        session.commit()
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=92,
+        message_id=902,
+        deleted_at=NOW,
+    )
+
+    def forbidden_exchange_client():
+        raise AssertionError("terminal routing must not create an exchange client")
+
+    result = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=forbidden_exchange_client,
+        processed_at=NOW,
+    )
+
+    assert result.waiting == 1
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        assert deletion_exit.state == "reconciling"
+        assert deletion_exit.last_reason == "strategy_already_terminal"
+
+
 def test_worker_unknown_cancel_enters_recovery_without_resubmit(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_pending_strategy(
