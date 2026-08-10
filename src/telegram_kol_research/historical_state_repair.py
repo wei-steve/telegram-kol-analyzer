@@ -603,6 +603,7 @@ def build_historical_state_repair_plan(
                         "order_id": binding.order_id,
                         "client_order_id": binding.client_order_id,
                         "pos_id": binding.pos_id,
+                        "last_exchange_status": binding.last_exchange_status,
                         "symbol": str(binding.symbol),
                         "updated_at": binding.updated_at,
                     }
@@ -1152,6 +1153,7 @@ def _apply_take_profit_action(
                 "order_id": binding.order_id,
                 "client_order_id": binding.client_order_id,
                 "pos_id": binding.pos_id,
+                "last_exchange_status": binding.last_exchange_status,
                 "symbol": str(binding.symbol),
                 "updated_at": binding.updated_at,
             }
@@ -1463,6 +1465,15 @@ def _proven_take_profit_attribution_repair(
     strategy_instance_id = str(binding.strategy_instance_id or "").strip()
     if not pos_id or not strategy_instance_id:
         return None, "immutable_identity_missing"
+    binding_pos_ids = _split_ids(binding.pos_id)
+    binding_position_identity_is_terminal = bool(
+        binding_pos_ids == {pos_id}
+        or (
+            not binding_pos_ids
+            and str(binding.last_exchange_status or "").strip().lower()
+            == "entry_legs_terminal"
+        )
+    )
     if not (
         str(convergence.venue or "").lower() == "deepcoin"
         and str(binding.venue or "").lower() == "deepcoin"
@@ -1471,7 +1482,7 @@ def _proven_take_profit_attribution_repair(
         and int(convergence.execution_order_leg_id) == int(leg.id)
         and int(leg.execution_binding_id) == int(binding.id)
         and str(leg.strategy_instance_id or "").strip() == strategy_instance_id
-        and _split_ids(binding.pos_id) == {pos_id}
+        and binding_position_identity_is_terminal
         and str(leg.pos_id or "").strip() == pos_id
         and str(leg.purpose or "") == "entry"
         and str(binding.status or "").lower() in _TERMINAL_BINDING_STATES

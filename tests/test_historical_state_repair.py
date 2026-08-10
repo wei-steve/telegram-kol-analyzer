@@ -837,6 +837,43 @@ def test_plan_builds_one_proven_terminal_attribution_repair(tmp_path):
     assert plan.conflicts == ()
 
 
+def test_plan_accepts_terminal_binding_with_canonical_cleared_position_identity(
+    tmp_path,
+):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    seeded = _seed_proven_attribution_repair_candidate(session_factory)
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, seeded["binding_id"])
+        binding.pos_id = None
+        binding.last_exchange_status = "entry_legs_terminal"
+        session.commit()
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(
+            position_history=[
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": seeded["pos_id"],
+                    "posSide": "short",
+                    "pos": "5",
+                    "closePos": "5",
+                }
+            ]
+        ),
+        planned_at=NOW,
+    )
+
+    assert [
+        (row.kind, row.target_id) for row in plan.actions
+    ] == [("take_profit_attribution_repair", seeded["convergence_id"])]
+    assert plan.conflicts == ()
+
+
 def test_plan_accepts_production_shaped_confirmed_close_intent(tmp_path):
     from telegram_kol_research.historical_state_repair import (
         build_historical_state_repair_plan,
@@ -947,6 +984,10 @@ def test_plan_accepts_supported_exact_history_position_aliases(
         ("competing_leg_whitespace_venue", "position_owned_by_other_leg"),
         ("lifecycle_active", "lifecycle_not_uniquely_terminal"),
         ("binding_active", "strategy_or_ledger_identity_mismatch"),
+        (
+            "binding_cleared_without_terminal_evidence",
+            "strategy_or_ledger_identity_mismatch",
+        ),
         ("leg_active", "strategy_or_ledger_identity_mismatch"),
         ("order_position_mismatch", "strategy_or_ledger_identity_mismatch"),
     ],
@@ -1058,6 +1099,10 @@ def test_plan_fails_closed_when_local_attribution_repair_proof_changes(
             ).lifecycle_status = "entered"
         elif mutation == "binding_active":
             session.get(ExecutionBinding, seeded["binding_id"]).status = "active"
+        elif mutation == "binding_cleared_without_terminal_evidence":
+            binding = session.get(ExecutionBinding, seeded["binding_id"])
+            binding.pos_id = None
+            binding.last_exchange_status = "position_attribution_conflict"
         elif mutation == "leg_active":
             session.get(ExecutionOrderLeg, seeded["leg_id"]).status = "active"
         elif mutation == "order_position_mismatch":
@@ -1617,6 +1662,7 @@ def test_apply_refuses_take_profit_terms_change_after_fresh_plan(
         "close_mutation_order_id",
         "close_reservation_status",
         "binding_status",
+        "binding_last_exchange_status",
         "lifecycle_status",
         "convergence_status",
         "take_profit_evidence",
@@ -1694,6 +1740,10 @@ def test_apply_refuses_every_local_cas_category_after_fresh_plan(
                 ).status = "submitted"
             elif mutation == "binding_status":
                 session.get(ExecutionBinding, seeded["binding_id"]).status = "active"
+            elif mutation == "binding_last_exchange_status":
+                session.get(
+                    ExecutionBinding, seeded["binding_id"]
+                ).last_exchange_status = "changed-after-plan"
             elif mutation == "lifecycle_status":
                 session.get(
                     StrategyLifecycle, seeded["lifecycle_id"]
