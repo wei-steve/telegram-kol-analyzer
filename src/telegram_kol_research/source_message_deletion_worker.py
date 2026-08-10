@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import json
+import logging
 from uuid import uuid4
 
 from sqlalchemy import or_, update
@@ -41,6 +42,9 @@ _ACTIVE_STATES = (
     "closing_positions",
     "reconciling",
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +107,7 @@ async def run_source_message_deletion_worker_loop(
         except asyncio.CancelledError:
             raise
         except Exception:
-            pass
+            logger.exception("source message deletion worker tick failed")
         await asyncio.sleep(max(0.1, float(interval_seconds)))
 
 
@@ -1147,7 +1151,7 @@ def _enqueue_source_deletion_notification(
             notification_fingerprint=fingerprint,
             created_at=created_at,
         )
-        .on_conflict_do_nothing(index_elements=["notification_fingerprint"])
+        .on_conflict_do_nothing()
     )
 
 

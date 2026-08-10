@@ -2424,6 +2424,7 @@ class ExecutionEvent(Base):
             "uq_execution_events_cleanup_notification_fingerprint",
             "notification_fingerprint",
             unique=True,
+            sqlite_where=sql_text("notification_fingerprint IS NOT NULL"),
         ),
     )
 

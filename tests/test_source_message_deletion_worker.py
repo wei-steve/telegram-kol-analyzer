@@ -1,4 +1,6 @@
+import asyncio
 import json
+import logging
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -24,7 +26,9 @@ from telegram_kol_research.source_message_deletion import (
     record_source_message_deleted,
 )
 from telegram_kol_research.source_message_deletion_worker import (
+    _transition_claimed,
     finalize_source_message_deletion_exit,
+    run_source_message_deletion_worker_loop,
     run_source_message_deletion_worker_if_enabled,
     run_source_message_deletion_worker_tick,
 )
@@ -32,6 +36,95 @@ from telegram_kol_research.trading_settings import save_trading_settings
 
 
 NOW = datetime(2026, 8, 2, 7, 0, tzinfo=UTC)
+
+
+def test_outcome_transition_supports_production_partial_notification_index(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_pending_strategy(
+        session_factory,
+        chat_id=91,
+        message_id=901,
+        order_id="order-partial-index",
+    )
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=91,
+        message_id=901,
+        deleted_at=NOW,
+    )
+    engine = session_factory.kw["bind"]
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "DROP INDEX uq_execution_events_cleanup_notification_fingerprint"
+        )
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX uq_execution_events_cleanup_notification_fingerprint "
+            "ON execution_events (notification_fingerprint) "
+            "WHERE notification_fingerprint IS NOT NULL"
+        )
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        deletion_exit.claim_token = "partial-index-claim"
+        deletion_exit.claimed_at = NOW
+        session.commit()
+
+    assert _transition_claimed(
+        session_factory,
+        exit_id=deletion.exit_id,
+        claim_token="partial-index-claim",
+        new_state="reconciling",
+        reason="entry_cleanup_complete",
+        updated_at=NOW,
+    )
+    with session_factory() as session:
+        assert session.get(SourceMessageDeletionExit, deletion.exit_id).state == "reconciling"
+        assert (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "source_message_deletion_outcome")
+            .count()
+            == 1
+        )
+
+
+def test_worker_loop_logs_worker_loop_exception(tmp_path, caplog):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    save_trading_settings(
+        session_factory,
+        {"telegram_source_deletion_exit_enabled": True},
+    )
+    attempts = 0
+
+    def failing_worker(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("partial-index-transition-failed")
+
+    async def run_until_first_failure():
+        task = asyncio.create_task(
+            run_source_message_deletion_worker_loop(
+                session_factory=session_factory,
+                deepcoin_client_factory=lambda: object(),
+                interval_seconds=0.1,
+                worker_runner=failing_worker,
+            )
+        )
+        while attempts == 0:
+            await asyncio.sleep(0.01)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    with caplog.at_level(
+        logging.ERROR,
+        logger="telegram_kol_research.source_message_deletion_worker",
+    ):
+        asyncio.run(run_until_first_failure())
+
+    assert attempts >= 1
+    assert "source message deletion worker tick failed" in caplog.text
+    assert "partial-index-transition-failed" in caplog.text
 
 
 def test_rollout_flag_keeps_exchange_worker_dormant_until_enabled(tmp_path):
