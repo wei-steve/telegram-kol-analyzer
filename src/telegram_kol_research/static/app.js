@@ -2487,6 +2487,7 @@ function loadMoreHistoryPositions(root) {
       const nextList = fragment.querySelector('[data-exchange-view-panel="list"] .exchange-card-list');
       if (!list || !nextList) return false;
       Array.from(nextList.children).forEach((card) => list.appendChild(card));
+      appendHistoryGroups(panel, fragment);
       panel.dataset.historyNextCursor = fragment.dataset.historyNextCursor || '';
       panel.dataset.historyHasMore = fragment.dataset.historyHasMore || 'false';
       const footer = fragment.querySelector('[data-history-browse-footer]');
@@ -2500,6 +2501,29 @@ function loadMoreHistoryPositions(root) {
       return false;
     })
     .finally(() => { delete panel.dataset.historyLoading; });
+}
+
+function appendHistoryGroups(panel, fragment) {
+  const currentGroups = panel.querySelector('[data-exchange-view-panel="grouped"] .exchange-group-list');
+  const nextGroups = fragment.querySelector('[data-exchange-view-panel="grouped"] .exchange-group-list');
+  if (!currentGroups || !nextGroups) return;
+  nextGroups.querySelectorAll('[data-exchange-group-section]').forEach((incoming) => {
+    const name = incoming.dataset.exchangeGroupName;
+    const existing = Array.from(currentGroups.querySelectorAll('[data-exchange-group-section]'))
+      .find((section) => section.dataset.exchangeGroupName === name);
+    if (!existing) {
+      currentGroups.querySelector('.exchange-empty')?.remove();
+      currentGroups.appendChild(incoming);
+      return;
+    }
+    const cards = existing.querySelector('.exchange-card-list');
+    const incomingCards = incoming.querySelector('.exchange-card-list');
+    if (!cards || !incomingCards) return;
+    cards.querySelector('.exchange-empty')?.remove();
+    Array.from(incomingCards.children).forEach((card) => cards.appendChild(card));
+    const count = existing.querySelector('.exchange-group-header span');
+    if (count) count.textContent = String(cards.querySelectorAll('[data-deepcoin-history-position]').length);
+  });
 }
 
 function bindExchangePositionTabs() {

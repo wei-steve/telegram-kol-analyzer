@@ -549,6 +549,15 @@ def test_app_js_applies_and_clears_history_position_date_filters(tmp_path):
     assert "data-history-filter-clear" in js
 
 
+def test_app_js_merges_history_continuation_into_grouped_view(tmp_path):
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+
+    assert "function appendHistoryGroups" in js
+    assert "dataset.exchangeGroupName" in js
+
+
 def test_exchange_position_tab_manual_refresh_is_single_flight_and_preserves_data(
     tmp_path,
 ):

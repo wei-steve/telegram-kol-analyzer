@@ -191,7 +191,7 @@
 {% macro grouped_list(groups, empty_text, kind) -%}
   <div class="exchange-group-list">
     {% for group in groups %}
-      <section class="exchange-group-section" data-exchange-group-section>
+      <section class="exchange-group-section" data-exchange-group-section data-exchange-group-name="{{ group['group_name'] }}">
         <header class="exchange-group-header">
           <strong>{{ group['group_name'] }}</strong>
           <span>{{ group['items']|length }}</span>
