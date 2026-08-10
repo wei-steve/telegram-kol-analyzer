@@ -548,29 +548,61 @@ Append a rollout-result section with deployed SHA, safe-window evidence summary,
 server tests, service status, and the three UI checks. Commit and push that
 documentation-only update. Do not restart for the documentation-only commit.
 
-## Rollout Status — Deployment Deferred (2026-08-10 UTC)
+## Rollout Status — Deployed (2026-08-10 UTC)
 
-The reviewed implementation through `4fb47b9` was pushed to
-`codex/deepcoin-auto-trading-v1`. Local focused Web tests, the broader relevant
-regression set, compilation, and diff checks passed; the final review reported
-no remaining P1/P2 findings.
+The reviewed implementation through `ed5fd95` was pushed to
+`codex/deepcoin-auto-trading-v1` and deployed to production. The server
+fast-forwarded from `47e917d` to `ed5fd95`, reinstalled the editable package,
+and restarted `telegram-kol.service`. The service became active at
+2026-08-10 09:04:14 CST with main PID 2504458. The imported package resolves
+from `/opt/telegram-kol-analyzer/src`, and the post-restart warning journal was
+empty.
 
-The production service and independent safety monitor were healthy, but the
-pre-restart read-only window was not safe. The database showed active
-deleted-source exit claims in `cancelling_entries`, plus current trigger
-take-profit convergence work with submitted and submit-unknown states. Recent
-lifecycle updates were also still occurring. The production service was not
-restarted and production remains on its prior commit.
+The original deployment hold was cleared after a deeper read-only audit showed
+that the apparently active database rows were stale or misclassified state,
+not current exchange actions:
 
-Before deployment, wait for these operations to reach terminal states, then
-capture two fresh stable read-only snapshots confirming zero in-flight source
-deletion, trigger-convergence, management, mutation, rescue, recognition, and
-reconciliation work; confirm the safety monitor remains healthy and the live
-exchange snapshot is complete. Only then run the standard server-update helper
-and complete the browser checks for all three manual-refresh tabs.
+- all 23 `cancelling_entries` rows had no cancellable entry leg; 21 referenced
+  missing lifecycles and the remaining two referenced terminal lifecycles;
+- all 14 trigger take-profit `submitted` rows already had `completed_at` and
+  active order evidence;
+- the sole `submit_unknown` row belonged to a mutation already recorded as a
+  definite rejection;
+- management batches, position mutations, stop rescues, context attempts,
+  evidence/runtime claims, genuinely cancellable source jobs, incomplete
+  trigger submissions, and unresolved trigger mutations were all zero;
+- the safety monitor remained healthy with no reason codes, the execution-event
+  boundary was stable across the observation interval, and the Deepcoin
+  position read succeeded with one unique live position.
 
-## Execution Handoff
+These stale states exposed two separate defects that are outside this Web-only
+rollout: the source-deletion notification insert targets a production partial
+unique index incorrectly and rolls back state convergence, while the trigger
+take-profit convergence path maps a definite rejection to `submit_unknown`.
+Neither defect was modified by this deployment.
 
-Execute task-by-task with test-first checkpoints. Local completion is not the
-terminal state: push the reviewed branch, prove a safe deployment window, deploy
-through the existing helper, and finish the authenticated production checks.
+Local Web verification completed with 167 passing tests and the independent
+review reported no remaining P1/P2 findings. On the server, 158 tests passed and
+7 skipped; two render tests failed because the production Deepcoin client
+returned real history where those tests expected an empty isolated dataset.
+The Node behavior test was skipped on the server because its optional Node test
+runtime is not installed; the same test passed locally. These environment-only
+results do not affect the authenticated production browser acceptance below.
+
+Authenticated production acceptance succeeded for all three paths:
+
+- `当前委托`: refresh changed the control to disabled `刷新中…`, preserved the
+  visible list, restored `刷新当前委托`, and advanced the captured-at status;
+- `历史委托`: the same busy/preserve/restore behavior completed and the status
+  advanced from 01:10:19 UTC to 01:10:35 UTC;
+- `历史仓位`: the same behavior completed and the status advanced from
+  01:10:59 UTC to 01:11:30 UTC.
+
+The positions path remained unchanged. No timer or focus-triggered refresh was
+introduced, and production verification performed only read operations.
+
+## Execution Complete
+
+All implementation, review, deployment, and authenticated production checks in
+this plan are complete. The separately diagnosed stale-state defects require a
+dedicated test-first change and are not part of this rollout.
