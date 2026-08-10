@@ -2705,7 +2705,7 @@ function setExchangePositionTab(root, tab) {
       panel.dataset.exchangePositionPanel === selectedTab,
     );
   });
-  const historyFilter = root.querySelector('[data-history-position-filter]');
+  const historyFilter = root.querySelector?.('[data-history-position-filter]');
   if (historyFilter) historyFilter.hidden = selectedTab !== 'position-history';
   syncExchangeTabRefreshControls(root, selectedTab);
 }
