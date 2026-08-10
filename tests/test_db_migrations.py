@@ -2,7 +2,11 @@ import sqlite3
 
 from sqlalchemy import inspect
 
-from telegram_kol_research.db import SQLITE_COMPAT_COLUMNS, create_session_factory
+from telegram_kol_research.db import (
+    SQLITE_COMPAT_COLUMNS,
+    SQLITE_COMPAT_INDEXES,
+    create_session_factory,
+)
 
 
 def test_context_resolution_schema_is_created(tmp_path):
@@ -25,10 +29,61 @@ def test_context_resolution_schema_is_created(tmp_path):
     assert inspector.has_table("position_protection_health_observations")
     assert inspector.has_table("management_message_envelopes")
     assert inspector.has_table("management_message_targets")
+    assert inspector.has_table("instruction_execution_contracts")
+    assert inspector.has_table("instruction_execution_transitions")
     assert "strategy_thread_id" in {
         column["name"]
         for column in inspector.get_columns("strategy_lifecycles")
     }
+
+
+def test_execution_contract_schema_bootstrap_is_idempotent_on_legacy_database(
+    tmp_path,
+):
+    database_path = tmp_path / "legacy-execution-contract.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE sources "
+            "(id INTEGER PRIMARY KEY, display_name VARCHAR(255) NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO sources (id, display_name) VALUES (77, 'Legacy Source')"
+        )
+
+    first_factory = create_session_factory(database_path)
+    first_inspector = inspect(first_factory.kw["bind"])
+    first_tables = set(first_inspector.get_table_names())
+    first_indexes = {
+        table: {index["name"] for index in first_inspector.get_indexes(table)}
+        for table in (
+            "instruction_execution_contracts",
+            "instruction_execution_transitions",
+        )
+    }
+    with sqlite3.connect(database_path) as connection:
+        first_source_count = connection.execute(
+            "SELECT COUNT(*) FROM sources"
+        ).fetchone()[0]
+
+    second_factory = create_session_factory(database_path)
+    second_inspector = inspect(second_factory.kw["bind"])
+
+    assert set(second_inspector.get_table_names()) == first_tables
+    assert {
+        table: {index["name"] for index in second_inspector.get_indexes(table)}
+        for table in first_indexes
+    } == first_indexes
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == (
+            first_source_count
+        )
+    assert {
+        "uq_instruction_execution_contracts_item",
+        "ix_instruction_execution_contracts_state_deadline",
+        "ix_instruction_execution_contracts_strategy_instance",
+        "uq_instruction_execution_transitions_contract_version",
+        "ix_instruction_execution_transitions_contract_created",
+    } <= set(SQLITE_COMPAT_INDEXES)
 
 
 def test_runtime_agent_investigation_audit_has_additive_bounded_shape(tmp_path):

@@ -1049,6 +1049,29 @@ class MessageInstructionItem(Base):
     )
 
 
+INSTRUCTION_EXECUTION_STATES = frozenset(
+    {
+        "pending",
+        "deferred",
+        "submitting",
+        "submit_unknown",
+        "verified",
+        "failed",
+        "expired",
+    }
+)
+INSTRUCTION_EXECUTION_TERMINAL_KINDS = frozenset(
+    {
+        "verified_entry",
+        "verified_management",
+        "verified_cancel",
+        "verified_exit",
+        "verified_refusal",
+    }
+)
+INSTRUCTION_EXECUTION_COMPLETION_SCOPES = frozenset({"full", "partial"})
+
+
 class MessageRecognition(Base):
     __tablename__ = "message_recognitions"
     __table_args__ = (
@@ -2539,6 +2562,160 @@ class TradeSignal(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class InstructionExecutionContract(Base):
+    """Current execution terminality for one authoritative instruction item."""
+
+    __tablename__ = "instruction_execution_contracts"
+    __table_args__ = (
+        Index(
+            "uq_instruction_execution_contracts_item",
+            "message_instruction_item_id",
+            unique=True,
+        ),
+        Index(
+            "ix_instruction_execution_contracts_state_deadline",
+            "state",
+            "deadline_at",
+        ),
+        Index(
+            "ix_instruction_execution_contracts_strategy_instance",
+            "strategy_instance_id",
+        ),
+        CheckConstraint(
+            "state IN ('pending', 'deferred', 'submitting', 'submit_unknown', "
+            "'verified', 'failed', 'expired')",
+            name="ck_instruction_execution_contracts_state",
+        ),
+        CheckConstraint(
+            "terminal_kind IS NULL OR terminal_kind IN "
+            "('verified_entry', 'verified_management', 'verified_cancel', "
+            "'verified_exit', 'verified_refusal')",
+            name="ck_instruction_execution_contracts_terminal_kind",
+        ),
+        CheckConstraint(
+            "completion_scope IS NULL OR completion_scope IN ('full', 'partial')",
+            name="ck_instruction_execution_contracts_completion_scope",
+        ),
+        CheckConstraint(
+            "state_version >= 0",
+            name="ck_instruction_execution_contracts_state_version",
+        ),
+        CheckConstraint(
+            "reason_code IS NULL OR length(reason_code) <= 128",
+            name="ck_instruction_execution_contracts_reason_bounded",
+        ),
+        CheckConstraint(
+            "length(evidence_refs_json) <= 4096",
+            name="ck_instruction_execution_contracts_evidence_bounded",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    message_instruction_item_id: Mapped[int] = mapped_column(
+        ForeignKey("message_instruction_items.id"), nullable=False
+    )
+    raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False, index=True
+    )
+    signal_candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("signal_candidates.id"), nullable=False, index=True
+    )
+    strategy_instance_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True
+    )
+    intent_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending", server_default=sql_text("'pending'")
+    )
+    state_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sql_text("0")
+    )
+    reason_code: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    deadline_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    trade_signal_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("trade_signals.id"), nullable=True, index=True
+    )
+    execution_binding_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=True, index=True
+    )
+    attempted_exchange_write: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sql_text("0")
+    )
+    terminal_kind: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    completion_scope: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    evidence_refs_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default=sql_text("'[]'")
+    )
+    last_progress_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    terminal_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+
+class InstructionExecutionTransition(Base):
+    """Immutable versioned audit row for an execution-contract transition."""
+
+    __tablename__ = "instruction_execution_transitions"
+    __table_args__ = (
+        Index(
+            "uq_instruction_execution_transitions_contract_version",
+            "contract_id",
+            "state_version",
+            unique=True,
+        ),
+        Index(
+            "ix_instruction_execution_transitions_contract_created",
+            "contract_id",
+            "created_at",
+        ),
+        CheckConstraint(
+            "state_version >= 1",
+            name="ck_instruction_execution_transitions_state_version",
+        ),
+        CheckConstraint(
+            "previous_state IS NULL OR previous_state IN "
+            "('pending', 'deferred', 'submitting', 'submit_unknown', "
+            "'verified', 'failed', 'expired')",
+            name="ck_instruction_execution_transitions_previous_state",
+        ),
+        CheckConstraint(
+            "next_state IN ('pending', 'deferred', 'submitting', "
+            "'submit_unknown', 'verified', 'failed', 'expired')",
+            name="ck_instruction_execution_transitions_next_state",
+        ),
+        CheckConstraint(
+            "length(reason_code) <= 128",
+            name="ck_instruction_execution_transitions_reason_bounded",
+        ),
+        CheckConstraint(
+            "length(evidence_refs_json) <= 4096",
+            name="ck_instruction_execution_transitions_evidence_bounded",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    contract_id: Mapped[int] = mapped_column(
+        ForeignKey("instruction_execution_contracts.id"), nullable=False
+    )
+    state_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    previous_state: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    next_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(128), nullable=False)
+    evidence_refs_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default=sql_text("'[]'")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
 
 
 class RecoveryDecisionRecord(Base):

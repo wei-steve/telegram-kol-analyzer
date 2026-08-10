@@ -533,6 +533,31 @@ SQLITE_COMPAT_INDEXES: dict[str, str] = {
         "ix_message_instruction_items_message_status_sequence "
         "ON message_instruction_items (raw_message_id, status, sequence)"
     ),
+    "uq_instruction_execution_contracts_item": (
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "uq_instruction_execution_contracts_item "
+        "ON instruction_execution_contracts (message_instruction_item_id)"
+    ),
+    "ix_instruction_execution_contracts_state_deadline": (
+        "CREATE INDEX IF NOT EXISTS "
+        "ix_instruction_execution_contracts_state_deadline "
+        "ON instruction_execution_contracts (state, deadline_at)"
+    ),
+    "ix_instruction_execution_contracts_strategy_instance": (
+        "CREATE INDEX IF NOT EXISTS "
+        "ix_instruction_execution_contracts_strategy_instance "
+        "ON instruction_execution_contracts (strategy_instance_id)"
+    ),
+    "uq_instruction_execution_transitions_contract_version": (
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "uq_instruction_execution_transitions_contract_version "
+        "ON instruction_execution_transitions (contract_id, state_version)"
+    ),
+    "ix_instruction_execution_transitions_contract_created": (
+        "CREATE INDEX IF NOT EXISTS "
+        "ix_instruction_execution_transitions_contract_created "
+        "ON instruction_execution_transitions (contract_id, created_at)"
+    ),
     "ix_raw_messages_chat_posted_message": (
         "CREATE INDEX IF NOT EXISTS ix_raw_messages_chat_posted_message "
         "ON raw_messages (chat_id, posted_at, message_id)"
