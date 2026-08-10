@@ -9,7 +9,7 @@ from hashlib import sha256
 import json
 from typing import Any
 
-from sqlalchemy import or_
+from sqlalchemy import and_, not_, or_
 from sqlalchemy.exc import IntegrityError
 
 from telegram_kol_research.models import (
@@ -38,7 +38,7 @@ _TERMINAL_LIFECYCLE_STATES = frozenset(
 _TERMINAL_BINDING_STATES = frozenset(
     {"closed", "cancelled", "completed", "failed", "resolved", "superseded"}
 )
-_TP_CANDIDATE_STATUSES = frozenset({"submitted", "submit_unknown", "conflicted"})
+_TP_CANDIDATE_STATUSES = frozenset({"submitted", "submit_unknown"})
 
 
 class HistoricalStateRepairRefused(RuntimeError):
@@ -239,6 +239,17 @@ def build_historical_state_repair_plan(
                             "terminal_entry_cleanup_outcome",
                         }
                     ),
+                    not_(
+                        and_(
+                            ExecutionEvent.action == "auto_trade_skipped",
+                            ExecutionEvent.status == "skipped",
+                            ExecutionEvent.reason == "symbol_not_allowed",
+                            ExecutionEvent.order_id.is_(None),
+                            ExecutionEvent.client_order_id.is_(None),
+                            ExecutionEvent.pos_id.is_(None),
+                            ExecutionEvent.response_json.is_(None),
+                        )
+                    ),
                     or_(
                         ExecutionEvent.order_id.is_not(None),
                         ExecutionEvent.client_order_id.is_not(None),
@@ -431,8 +442,15 @@ def build_historical_state_repair_plan(
             session.query(TriggerTakeProfitConvergence)
             .filter(
                 TriggerTakeProfitConvergence.venue == "deepcoin",
-                TriggerTakeProfitConvergence.status.in_(
-                    tuple(_TP_CANDIDATE_STATUSES)
+                or_(
+                    TriggerTakeProfitConvergence.status.in_(
+                        tuple(_TP_CANDIDATE_STATUSES)
+                    ),
+                    and_(
+                        TriggerTakeProfitConvergence.status == "conflicted",
+                        TriggerTakeProfitConvergence.reason_code
+                        == "convergence_submit_rejected",
+                    ),
                 )
             )
             .order_by(TriggerTakeProfitConvergence.id.asc())
@@ -799,6 +817,17 @@ def _apply_source_deletion_action(session, *, action, applied_at: datetime) -> N
                     "source_message_deletion_outcome",
                     "terminal_entry_cleanup_outcome",
                 }
+            ),
+            not_(
+                and_(
+                    ExecutionEvent.action == "auto_trade_skipped",
+                    ExecutionEvent.status == "skipped",
+                    ExecutionEvent.reason == "symbol_not_allowed",
+                    ExecutionEvent.order_id.is_(None),
+                    ExecutionEvent.client_order_id.is_(None),
+                    ExecutionEvent.pos_id.is_(None),
+                    ExecutionEvent.response_json.is_(None),
+                )
             ),
             or_(
                 ExecutionEvent.order_id.is_not(None),

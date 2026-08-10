@@ -335,6 +335,95 @@ def test_plan_refuses_terminal_strategy_with_no_exact_execution_identity(tmp_pat
     )
 
 
+def test_plan_treats_symbol_not_allowed_skip_as_no_exchange_execution(tmp_path):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    deletion_exit_id = _seed_dirty_non_strategy_deletion(session_factory)
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion_exit_id)
+        event = session.get(TelegramSourceMessageEvent, deletion_exit.source_event_id)
+        lifecycle = StrategyLifecycle(
+            chat_id=event.chat_id,
+            message_id=event.message_id,
+            symbol="ZEC",
+            side="short",
+            lifecycle_status="expired",
+            signal_at=NOW,
+        )
+        session.add(lifecycle)
+        session.flush()
+        deletion_exit.target_lifecycle_id = lifecycle.id
+        session.add_all(
+            [
+                SignalCandidate(
+                    raw_message_id=event.raw_message_id,
+                    symbol="ZEC",
+                    side="short",
+                    event_type="entry_signal",
+                    parse_source="test",
+                    confidence=1.0,
+                ),
+                ExecutionEvent(
+                    chat_id=event.chat_id,
+                    message_id=event.message_id,
+                    action="auto_trade_skipped",
+                    status="skipped",
+                    reason="symbol_not_allowed",
+                    request_json='{"symbol":"ZEC"}',
+                    created_at=NOW,
+                ),
+            ]
+        )
+        session.commit()
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(),
+        planned_at=NOW,
+    )
+
+    assert any(
+        action.target_id == deletion_exit_id
+        and action.reason_code == "strategy_terminal_without_execution"
+        for action in plan.actions
+    )
+    assert all(conflict.target_id != deletion_exit_id for conflict in plan.conflicts)
+
+
+def test_plan_leaves_unrelated_conflicted_take_profit_state_out_of_scope(tmp_path):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id, _ = _seed_convergence(
+        session_factory,
+        chat_id=37,
+        message_id=307,
+        pos_id="pos-unrelated-conflict",
+        status="conflicted",
+        binding_status="closed",
+        with_order=True,
+    )
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        convergence.reason_code = "convergence_partial_position_unexplained"
+        session.commit()
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(),
+        planned_at=NOW,
+    )
+
+    assert all(action.target_id != convergence_id for action in plan.actions)
+    assert all(conflict.target_id != convergence_id for conflict in plan.conflicts)
+    assert all(exclusion.target_id != convergence_id for exclusion in plan.exclusions)
+
+
 def test_plan_refuses_unlinked_deletion_when_source_binding_exists(tmp_path):
     from telegram_kol_research.historical_state_repair import (
         build_historical_state_repair_plan,
