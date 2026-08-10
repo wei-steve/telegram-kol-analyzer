@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
 import logging
@@ -688,6 +689,11 @@ def finalize_source_message_deletion_exit(
                         or not binding_client_order_ids.issubset(
                             leg_client_order_ids
                         )
+                        or not bool(
+                            exact_pos_ids
+                            or leg_order_ids
+                            or leg_client_order_ids
+                        )
                         or (
                             not legs
                             and bool(
@@ -1043,6 +1049,15 @@ def _deletion_target_is_already_terminal(
                 str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
                 for leg in entry_legs
             )
+            and any(
+                _split_ids(leg.order_id)
+                or _split_ids(leg.client_order_id)
+                or (
+                    str(leg.attribution_status or "") == "verified"
+                    and _split_ids(leg.pos_id)
+                )
+                for leg in entry_legs
+            )
         )
 
 
@@ -1083,11 +1098,21 @@ def _row_position_ids(row) -> set[str]:
 
 
 def _position_is_not_proven_zero(row) -> bool:
-    value = _row_value(row, "pos", "size", "sz", "positionSize", "position_size")
-    try:
-        return abs(float(value)) > 0
-    except (TypeError, ValueError):
+    raw_sizes = [
+        _row_value(row, key)
+        for key in ("pos", "size", "sz", "positionSize", "position_size")
+        if isinstance(row, dict) and key in row
+    ]
+    if not raw_sizes:
         return True
+    for value in raw_sizes:
+        try:
+            size = Decimal(str(value).strip())
+        except (InvalidOperation, TypeError, ValueError):
+            return True
+        if not size.is_finite() or abs(size) > 0:
+            return True
+    return False
 
 
 def _claim_next_job(

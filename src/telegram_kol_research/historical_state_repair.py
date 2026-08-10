@@ -285,13 +285,13 @@ def build_historical_state_repair_plan(
                 legs,
             ):
                 exact_pos_ids = {
-                    str(row.pos_id).strip() for row in legs if str(row.pos_id or "").strip()
+                    value for row in legs for value in _split_ids(row.pos_id)
                 }
                 exact_order_ids = {
-                    str(value).strip()
+                    value
                     for row in legs
-                    for value in (row.order_id, row.client_order_id)
-                    if str(value or "").strip()
+                    for identity in (row.order_id, row.client_order_id)
+                    for value in _split_ids(identity)
                 }
                 if exact_pos_ids & live_pos_ids or exact_order_ids & live_order_ids:
                     exclusions.append(
@@ -359,6 +359,11 @@ def build_historical_state_repair_plan(
             )
             evidence = {
                 "convergence_id": int(convergence.id),
+                "venue": str(convergence.venue),
+                "execution_binding_id": int(convergence.execution_binding_id),
+                "execution_order_leg_id": int(
+                    convergence.execution_order_leg_id
+                ),
                 "status": str(convergence.status),
                 "reason_code": convergence.reason_code,
                 "pos_id": str(convergence.pos_id),
@@ -447,6 +452,8 @@ def build_historical_state_repair_plan(
                 (
                     convergence.status == "conflicted"
                     and convergence.reason_code == "convergence_submit_rejected"
+                    and _error_type(convergence.error_json)
+                    == "DeepcoinDefiniteRejection"
                 )
                 or (
                     convergence.status == "submit_unknown"
@@ -768,6 +775,10 @@ def _apply_take_profit_action(
         .all()
     )
     current = {
+        "convergence_id": int(convergence.id),
+        "venue": str(convergence.venue),
+        "execution_binding_id": int(convergence.execution_binding_id),
+        "execution_order_leg_id": int(convergence.execution_order_leg_id),
         "status": str(convergence.status),
         "reason_code": convergence.reason_code,
         "pos_id": str(convergence.pos_id),
@@ -908,6 +919,7 @@ def _terminal_strategy_identity(deletion_exit, lifecycle, binding, legs) -> bool
         and _split_ids(binding.pos_id).issubset(leg_pos_ids)
         and _split_ids(binding.order_id).issubset(leg_order_ids)
         and _split_ids(binding.client_order_id).issubset(leg_client_order_ids)
+        and bool(leg_pos_ids or leg_order_ids or leg_client_order_ids)
     )
 
 
@@ -1053,15 +1065,17 @@ def _live_position_ids(rows) -> set[str]:
         ).strip()
         if not pos_id:
             continue
-        raw_size = next(
-            (row[key] for key in ("pos", "size", "sz") if key in row),
-            None,
-        )
-        try:
-            size = Decimal(str(raw_size).strip())
-            size_is_live_or_unknown = not size.is_finite() or abs(size) > 0
-        except (InvalidOperation, TypeError, ValueError):
-            size_is_live_or_unknown = True
+        raw_sizes = [row[key] for key in ("pos", "size", "sz") if key in row]
+        size_is_live_or_unknown = not raw_sizes
+        for raw_size in raw_sizes:
+            try:
+                size = Decimal(str(raw_size).strip())
+            except (InvalidOperation, TypeError, ValueError):
+                size_is_live_or_unknown = True
+                break
+            if not size.is_finite() or abs(size) > 0:
+                size_is_live_or_unknown = True
+                break
         if size_is_live_or_unknown:
             values.add(pos_id)
     return values

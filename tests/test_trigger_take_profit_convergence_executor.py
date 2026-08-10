@@ -1643,7 +1643,22 @@ def test_terminal_entry_leg_fails_closed_when_pending_snapshot_is_incomplete(tmp
     assert order.status == "active"
 
 
-def test_terminal_entry_leg_fails_closed_when_position_id_is_still_live(tmp_path):
+@pytest.mark.parametrize(
+    "live_position",
+    [
+        {"posId": "pos-10", "pos": "10"},
+        {"pos_id": "pos-10", "size": "1"},
+        {"PositionID": "pos-10", "sz": "1"},
+        {"positionId": "pos-10", "pos": "1"},
+        {"position_id": "pos-10", "pos": "1"},
+        {"id": "pos-10", "pos": "1"},
+        {"posId": "pos-10", "pos": "0", "size": "1"},
+    ],
+)
+def test_terminal_entry_leg_fails_closed_when_position_id_is_still_live(
+    tmp_path,
+    live_position,
+):
     from telegram_kol_research.db import create_session_factory
     from telegram_kol_research.models import (
         ExecutionOrderLeg,
@@ -1665,7 +1680,7 @@ def test_terminal_entry_leg_fails_closed_when_position_id_is_still_live(tmp_path
         session.commit()
         reconcile_trigger_take_profit_order_history(
             session,
-            positions=[{"posId": "pos-10", "pos": "10"}],
+            positions=[live_position],
             pending_orders=[],
             trigger_history=[],
             observed_at=NOW,

@@ -298,6 +298,79 @@ def test_plan_classifies_terminal_history_and_excludes_current_live_position(tmp
     assert len(plan.confirmation_token) == 16
 
 
+def test_plan_refuses_terminal_strategy_with_no_exact_execution_identity(tmp_path):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    deletion_exit_id = _seed_terminal_deletion_with_client_order(session_factory)
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion_exit_id)
+        binding = session.get(ExecutionBinding, deletion_exit.execution_binding_id)
+        binding.order_id = None
+        binding.client_order_id = None
+        binding.pos_id = None
+        leg = session.query(ExecutionOrderLeg).filter_by(
+            execution_binding_id=binding.id,
+            purpose="entry",
+        ).one()
+        leg.order_id = None
+        leg.client_order_id = None
+        leg.pos_id = None
+        session.commit()
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(),
+        planned_at=NOW,
+    )
+
+    assert all(action.target_id != deletion_exit_id for action in plan.actions)
+    assert any(
+        finding.target_id == deletion_exit_id
+        and finding.reason_code == "source_deletion_identity_not_terminal"
+        for finding in plan.conflicts
+    )
+
+
+def test_plan_refuses_conflicted_rejection_without_definite_exchange_evidence(
+    tmp_path,
+):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id, _ = _seed_convergence(
+        session_factory,
+        chat_id=33,
+        message_id=303,
+        pos_id="pos-unproven-rejection",
+        status="conflicted",
+        binding_status="closed",
+        with_order=False,
+    )
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        convergence.reason_code = "convergence_submit_rejected"
+        convergence.error_json = None
+        session.commit()
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(),
+        planned_at=NOW,
+    )
+
+    assert all(action.target_id != convergence_id for action in plan.actions)
+    assert any(
+        finding.target_id == convergence_id
+        and finding.reason_code == "take_profit_state_not_repairable"
+        for finding in plan.conflicts
+    )
+
+
 def test_apply_requires_exact_gates_preserves_rows_and_is_single_use(tmp_path):
     from telegram_kol_research.historical_state_repair import (
         HistoricalStateRepairRefused,
@@ -449,6 +522,66 @@ def test_apply_reloads_exchange_snapshot_and_refuses_new_live_position(tmp_path)
         assert session.query(PositionTakeProfitOrder).one().status == "active"
 
 
+def test_apply_refuses_convergence_venue_change_after_fresh_plan(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.historical_state_repair as repair_module
+    from telegram_kol_research.historical_state_repair import (
+        HistoricalStateRepairRefused,
+        apply_historical_state_repair_plan,
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id, _ = _seed_convergence(
+        session_factory,
+        chat_id=47,
+        message_id=470,
+        pos_id="pos-terminal",
+        status="submitted",
+        binding_status="closed",
+        with_order=True,
+    )
+    snapshot = _snapshot()
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=snapshot,
+        planned_at=NOW,
+    )
+    original_builder = repair_module.build_historical_state_repair_plan
+
+    def build_then_mutate(*args, **kwargs):
+        fresh_plan = original_builder(*args, **kwargs)
+        with session_factory() as session:
+            convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+            convergence.venue = "binance"
+            session.commit()
+        return fresh_plan
+
+    monkeypatch.setattr(
+        repair_module,
+        "build_historical_state_repair_plan",
+        build_then_mutate,
+    )
+
+    with pytest.raises(HistoricalStateRepairRefused, match="venue"):
+        apply_historical_state_repair_plan(
+            session_factory,
+            snapshot_loader=lambda: snapshot,
+            expected_fingerprint=plan.fingerprint,
+            expected_action_count=plan.action_count,
+            confirmation_token=plan.confirmation_token,
+            applied_at=NOW,
+        )
+
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        order = session.query(PositionTakeProfitOrder).one()
+        assert convergence.status == "submitted"
+        assert order.status == "active"
+
+
 @pytest.mark.parametrize(
     "live_position",
     [
@@ -457,6 +590,7 @@ def test_apply_reloads_exchange_snapshot_and_refuses_new_live_position(tmp_path)
         {"posId": "pos-terminal", "size": ""},
         {"posId": "pos-terminal", "sz": ""},
         {"posId": "pos-terminal", "pos": "NaN"},
+        {"posId": "pos-terminal", "pos": "0", "size": "1"},
     ],
 )
 def test_plan_fails_closed_when_exact_position_size_is_unknown(

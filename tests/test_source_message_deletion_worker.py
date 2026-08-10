@@ -685,6 +685,58 @@ def test_worker_does_not_trust_stale_terminal_reason_after_target_reactivates(tm
     assert reconciled == [binding_id]
 
 
+def test_worker_does_not_use_terminal_shortcut_without_exact_execution_identity(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _, lifecycle_id, binding_id, leg_id = _seed_pending_strategy(
+        session_factory,
+        chat_id=94,
+        message_id=904,
+        order_id="order-identity-removed",
+    )
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        lifecycle.lifecycle_status = "exited"
+        binding = session.get(ExecutionBinding, binding_id)
+        binding.status = "closed"
+        binding.order_id = None
+        binding.client_order_id = None
+        binding.pos_id = None
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        leg.status = "exchange_cancelled"
+        leg.order_id = None
+        leg.client_order_id = None
+        leg.pos_id = None
+        session.commit()
+    record_source_message_deleted(
+        session_factory,
+        chat_id=94,
+        message_id=904,
+        deleted_at=NOW,
+    )
+    cleanup_calls: list[int] = []
+
+    def record_cleanup(*_args, **_kwargs):
+        cleanup_calls.append(binding_id)
+        return SimpleNamespace(
+            status="already_absent",
+            binding_id=binding_id,
+            event_ids=(),
+            leg_ids=(),
+        )
+
+    result = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: object(),
+        cleanup_executor=record_cleanup,
+        processed_at=NOW,
+    )
+
+    assert cleanup_calls == [binding_id]
+    assert result.cancelled == 1
+
+
 def test_worker_unknown_cancel_enters_recovery_without_resubmit(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_pending_strategy(
@@ -1682,3 +1734,89 @@ def test_flat_finalization_splits_legacy_local_position_identity(tmp_path):
     )
 
     assert status == "waiting"
+
+
+@pytest.mark.parametrize(
+    "position_sizes",
+    [
+        {"pos": "NaN"},
+        {"pos": "Infinity"},
+        {"pos": "0", "size": "1"},
+    ],
+)
+def test_flat_finalization_fails_closed_for_unknown_or_conflicting_position_size(
+    tmp_path,
+    position_sizes,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_filled_strategy(session_factory)
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=20,
+        message_id=200,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        session.get(SourceMessageDeletionExit, deletion.exit_id).state = "reconciling"
+        session.commit()
+
+    status = finalize_source_message_deletion_exit(
+        session_factory,
+        deletion_exit_id=deletion.exit_id,
+        snapshot=SimpleNamespace(
+            errors={},
+            positions=[{"posId": "pos-filled", **position_sizes}],
+            open_orders=[],
+            pending_trigger_orders=[],
+        ),
+        finalized_at=NOW,
+    )
+
+    assert status == "waiting"
+
+
+def test_flat_finalization_requires_exact_identity_for_bound_strategy(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _, _, binding_id, leg_id = _seed_pending_strategy(
+        session_factory,
+        chat_id=12,
+        message_id=102,
+        order_id="identity-removed",
+    )
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=12,
+        message_id=102,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        deletion_exit.state = "reconciling"
+        binding = session.get(ExecutionBinding, binding_id)
+        binding.order_id = None
+        binding.client_order_id = None
+        binding.pos_id = None
+        binding.status = "closed"
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        leg.order_id = None
+        leg.client_order_id = None
+        leg.pos_id = None
+        leg.status = "exchange_cancelled"
+        session.commit()
+
+    status = finalize_source_message_deletion_exit(
+        session_factory,
+        deletion_exit_id=deletion.exit_id,
+        snapshot=SimpleNamespace(
+            errors={},
+            positions=[],
+            open_orders=[],
+            pending_trigger_orders=[],
+        ),
+        finalized_at=NOW,
+    )
+
+    assert status == "recovery_required"
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        assert deletion_exit.last_reason == "frozen_ledger_identity_unverified"
