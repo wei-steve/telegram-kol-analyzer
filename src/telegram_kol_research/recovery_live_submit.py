@@ -552,7 +552,7 @@ def submit_entry_draft_revision_live(
     _validate_entry_draft_revision_leg_authority(
         session_factory,
         batch_id=int(batch_id),
-        expected_leg_count=len(authoritative_draft.get("order_legs") or []),
+        authoritative_draft=authoritative_draft,
         authorized_leg_indices=authorized_leg_indices,
     )
     if str(expected_parent_fingerprint) != actual_fingerprint:
@@ -563,14 +563,72 @@ def submit_entry_draft_revision_live(
         market_price=market_price,
         authorized_leg_indices=authorized_leg_indices,
     )
-    return submit_strategy_revision_replacement_live(
+    finalized_at = submitted_at or datetime.now(UTC)
+    try:
+        result = submit_strategy_revision_replacement_live(
+            session_factory,
+            batch_id=int(batch_id),
+            draft=revised,
+            deepcoin_client=deepcoin_client,
+            contract_spec_provider=contract_spec_provider,
+            submitted_at=finalized_at,
+        )
+    except Exception:
+        _finalize_entry_draft_revision_batch(
+            session_factory,
+            batch_id=int(batch_id),
+            result=None,
+            finalized_at=finalized_at,
+        )
+        raise
+    _finalize_entry_draft_revision_batch(
         session_factory,
         batch_id=int(batch_id),
-        draft=revised,
-        deepcoin_client=deepcoin_client,
-        contract_spec_provider=contract_spec_provider,
-        submitted_at=submitted_at,
+        result=result,
+        finalized_at=finalized_at,
     )
+    return result
+
+
+def _finalize_entry_draft_revision_batch(
+    session_factory: sessionmaker,
+    *,
+    batch_id: int,
+    result: dict[str, Any] | None,
+    finalized_at: datetime,
+) -> None:
+    """Close the reservation boundary after the audited writer returns."""
+
+    response_status = str((result or {}).get("status") or "").lower()
+    with session_factory() as session:
+        batch = session.get(StrategyRevisionBatch, int(batch_id))
+        if batch is None:
+            raise RecoveryLiveSubmitError("revision_batch_missing")
+        if batch.status != "submitting_replacements":
+            raise RecoveryLiveSubmitError("revision_batch_state_changed")
+        batch.replacement_response_json = (
+            json.dumps(
+                result,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+            if result is not None
+            else None
+        )
+        batch.advance_claim_token = None
+        batch.advance_claimed_at = None
+        batch.updated_at = finalized_at
+        if response_status in {"confirmed", "succeeded"}:
+            batch.status = "succeeded"
+            batch.completed_at = finalized_at
+        elif response_status == "submitted":
+            batch.status = "reconciling"
+        else:
+            batch.status = "recovery_required"
+            batch.reason_code = "revision_replacement_submit_unknown"
+        session.commit()
 
 
 def load_entry_draft_revision_authority(
@@ -646,13 +704,23 @@ def _validate_entry_draft_revision_leg_authority(
     session_factory: sessionmaker,
     *,
     batch_id: int,
-    expected_leg_count: int,
+    authoritative_draft: dict[str, Any],
     authorized_leg_indices: tuple[int, ...],
 ) -> None:
     """Require exact known outcomes and durable absence for replaced legs."""
 
-    if expected_leg_count < 1:
+    draft_legs = authoritative_draft.get("order_legs")
+    if not isinstance(draft_legs, list) or not draft_legs:
         raise RecoveryLiveSubmitError("entry_draft_authority_missing")
+    parent_client_ids = [
+        str(leg.get("client_order_id") or "") if isinstance(leg, dict) else ""
+        for leg in draft_legs
+    ]
+    if (
+        any(not value for value in parent_client_ids)
+        or len(set(parent_client_ids)) != len(parent_client_ids)
+    ):
+        raise RecoveryLiveSubmitError("revision_leg_authority_incomplete")
     with session_factory() as session:
         batch = session.get(StrategyRevisionBatch, int(batch_id))
         if (
@@ -671,15 +739,23 @@ def _validate_entry_draft_revision_leg_authority(
             .order_by(ExecutionOrderLeg.leg_index.asc())
             .all()
         )
-        by_index = {int(leg.leg_index): leg for leg in execution_legs}
+        by_client_order_id: dict[str, list[ExecutionOrderLeg]] = {}
+        for execution_leg in execution_legs:
+            by_client_order_id.setdefault(
+                str(execution_leg.client_order_id or ""), []
+            ).append(execution_leg)
+        by_index: dict[int, ExecutionOrderLeg] = {}
+        for draft_index, client_order_id in enumerate(parent_client_ids, start=1):
+            matches = by_client_order_id.get(client_order_id, [])
+            if len(matches) != 1:
+                raise RecoveryLiveSubmitError("revision_leg_authority_incomplete")
+            by_index[draft_index] = matches[0]
         revision_by_execution_leg_id = {
             int(row.execution_order_leg_id): row
             for row in session.query(StrategyRevisionLeg)
             .filter(StrategyRevisionLeg.revision_batch_id == int(batch_id))
             .all()
         }
-        if set(by_index) != set(range(1, int(expected_leg_count) + 1)):
-            raise RecoveryLiveSubmitError("revision_leg_authority_incomplete")
         authorized = set(int(value) for value in authorized_leg_indices)
         known_execution_statuses = {
             "pending",

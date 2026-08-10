@@ -494,6 +494,11 @@ def test_entry_draft_revision_uses_existing_audited_writer(tmp_path, monkeypatch
     assert calls[0]["batch_id"] == batch_id
     assert len(calls[0]["draft"]["order_legs"]) == 2
     assert calls[0]["draft"]["order_legs"][1] == original["order_legs"][1]
+    with session_factory() as session:
+        batch = session.get(StrategyRevisionBatch, batch_id)
+        assert batch.status == "reconciling"
+        assert batch.advance_claim_token is None
+        assert json.loads(batch.replacement_response_json) == result
 
 
 def test_entry_draft_revision_rejects_file_that_differs_from_binding_authority(tmp_path):
@@ -544,6 +549,91 @@ def test_entry_draft_revision_rejects_unknown_unmodified_leg(tmp_path):
     )
 
     with pytest.raises(RecoveryLiveSubmitError, match="revision_leg_outcome_unknown"):
+        submit_entry_draft_revision_live(
+            session_factory,
+            batch_id=batch_id,
+            original_draft=original,
+            operation="market_first_leg",
+            market_price=Decimal("68100"),
+            authorized_leg_indices=(1,),
+            expected_parent_fingerprint=deepcoin_order_draft_fingerprint(original),
+            deepcoin_client=object(),
+        )
+
+
+def test_entry_draft_revision_uses_original_client_ids_after_prior_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.recovery_live_submit as submit_module
+    from decimal import Decimal
+    from telegram_kol_research.deepcoin_order_builder import (
+        deepcoin_order_draft_fingerprint,
+    )
+
+    session_factory = create_session_factory(tmp_path / "revision-lineage.db")
+    batch_id, original = _persist_reserved_revision_batch(session_factory)
+    _persist_revision_leg_authority(
+        session_factory,
+        batch_id=batch_id,
+        draft=original,
+    )
+    with session_factory() as session:
+        batch = session.get(StrategyRevisionBatch, batch_id)
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=batch.execution_binding_id,
+                strategy_instance_id=original["strategy_instance_id"],
+                leg_index=3,
+                purpose="entry",
+                order_kind="market",
+                order_id="replacement-order-1",
+                client_order_id="replacement-client-1",
+                venue="deepcoin",
+                attribution_status="unassigned",
+                status="open",
+            )
+        )
+        session.commit()
+    monkeypatch.setattr(
+        submit_module,
+        "submit_strategy_revision_replacement_live",
+        lambda *args, **kwargs: {"status": "submitted"},
+    )
+
+    result = submit_entry_draft_revision_live(
+        session_factory,
+        batch_id=batch_id,
+        original_draft=original,
+        operation="market_first_leg",
+        market_price=Decimal("68100"),
+        authorized_leg_indices=(1,),
+        expected_parent_fingerprint=deepcoin_order_draft_fingerprint(original),
+        deepcoin_client=object(),
+    )
+
+    assert result["status"] == "submitted"
+
+
+def test_entry_draft_revision_rejects_original_leg_client_id_mismatch(tmp_path):
+    from decimal import Decimal
+    from telegram_kol_research.deepcoin_order_builder import (
+        deepcoin_order_draft_fingerprint,
+    )
+
+    session_factory = create_session_factory(tmp_path / "revision-lineage-mismatch.db")
+    batch_id, original = _persist_reserved_revision_batch(session_factory)
+    _persist_revision_leg_authority(
+        session_factory,
+        batch_id=batch_id,
+        draft=original,
+    )
+    with session_factory() as session:
+        legs = session.query(ExecutionOrderLeg).order_by(ExecutionOrderLeg.leg_index).all()
+        legs[0].client_order_id = "wrong-parent-client"
+        session.commit()
+
+    with pytest.raises(RecoveryLiveSubmitError, match="revision_leg_authority_incomplete"):
         submit_entry_draft_revision_live(
             session_factory,
             batch_id=batch_id,
