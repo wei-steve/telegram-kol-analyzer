@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from sqlalchemy import update
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.execution_bindings import load_entry_binding_evidence
@@ -92,6 +93,19 @@ def project_entry_deferred_contract(
         projected_at=projected_at,
         deadline_at=deadline_at,
     )
+    if deadline_at is not None and contract.deadline_at is None:
+        with session_factory() as session:
+            session.execute(
+                update(InstructionExecutionContract)
+                .where(
+                    InstructionExecutionContract.id == int(contract.id),
+                    InstructionExecutionContract.deadline_at.is_(None),
+                )
+                .values(deadline_at=deadline_at, updated_at=projected_at)
+            )
+            session.commit()
+            contract = session.get(InstructionExecutionContract, int(contract.id))
+            session.expunge(contract)
     if contract.intent_kind != "entry":
         raise EntryExecutionContractBlocked("non_entry_instruction_contract")
     if contract.state == "deferred":
@@ -243,7 +257,24 @@ def project_entry_submission_result(
     )
     if binding.draft_fingerprint != _draft_fingerprint(signal.draft):
         verified_indices = ()
-    absent_indices = tuple(sorted(set(int(value) for value in confirmed_absent_leg_indices)))
+    durable_absent_indices = tuple(
+        sorted(
+            index
+            for index, client_order_id in zip(
+                binding.confirmed_absent_leg_indices,
+                binding.confirmed_absent_client_order_ids,
+                strict=True,
+            )
+            if index in expected_indices
+            and client_order_id == _expected_client_order_id(signal.draft, index)
+        )
+    )
+    requested_absent = set(int(value) for value in confirmed_absent_leg_indices)
+    absent_indices = tuple(
+        index
+        for index in durable_absent_indices
+        if not requested_absent or index in requested_absent
+    )
     exact_partition = (
         bool(expected_indices)
         and not set(verified_indices).intersection(absent_indices)

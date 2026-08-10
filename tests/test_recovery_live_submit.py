@@ -42,6 +42,7 @@ from telegram_kol_research.recovery_live_submit import process_next_trade_signal
 from telegram_kol_research.recovery_live_submit import process_trade_signal_live
 from telegram_kol_research.recovery_live_submit import submit_recovery_order_live
 from telegram_kol_research.recovery_live_submit import submit_entry_draft_revision_live
+from telegram_kol_research.recovery_live_submit import load_entry_draft_revision_authority
 from telegram_kol_research.recovery_live_submit import submit_strategy_revision_replacement_live
 from telegram_kol_research.recovery_live_submit import _load_matching_position_ids
 from telegram_kol_research.deepcoin_execution_actions import _exact_exchange_order_id
@@ -555,6 +556,97 @@ def test_entry_draft_revision_rejects_unknown_unmodified_leg(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    ("execution_status", "attribution_status"),
+    [
+        ("submitting", "verified"),
+        ("open", "ambiguous"),
+    ],
+)
+def test_entry_draft_revision_rejects_unverified_unmodified_leg(
+    tmp_path,
+    execution_status,
+    attribution_status,
+):
+    from decimal import Decimal
+    from telegram_kol_research.deepcoin_order_builder import (
+        deepcoin_order_draft_fingerprint,
+    )
+
+    session_factory = create_session_factory(tmp_path / "revision-unverified-leg.db")
+    batch_id, original = _persist_reserved_revision_batch(session_factory)
+    _persist_revision_leg_authority(
+        session_factory,
+        batch_id=batch_id,
+        draft=original,
+        unmodified_leg_status=execution_status,
+        unmodified_leg_attribution_status=attribution_status,
+    )
+
+    with pytest.raises(RecoveryLiveSubmitError, match="revision_leg_outcome_unknown"):
+        submit_entry_draft_revision_live(
+            session_factory,
+            batch_id=batch_id,
+            original_draft=original,
+            operation="market_first_leg",
+            market_price=Decimal("68100"),
+            authorized_leg_indices=(1,),
+            expected_parent_fingerprint=deepcoin_order_draft_fingerprint(original),
+            deepcoin_client=object(),
+        )
+
+
+def test_entry_draft_revision_loads_missing_deadline_from_exact_contract(tmp_path):
+    from telegram_kol_research.instruction_execution_contracts import (
+        load_or_create_instruction_execution_contract,
+    )
+
+    session_factory = create_session_factory(tmp_path / "revision-deadline.db")
+    batch_id, original = _persist_reserved_revision_batch(
+        session_factory,
+        include_deadline=False,
+    )
+    deadline = datetime(2099, 8, 10, 12, 0, tzinfo=UTC)
+    with session_factory() as session:
+        batch = session.get(StrategyRevisionBatch, batch_id)
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        raw = session.query(RawMessage).filter_by(chat_id=100, message_id=55).one()
+        candidate = session.query(SignalCandidate).filter_by(raw_message_id=raw.id).one()
+        item = MessageInstructionItem(
+            raw_message_id=raw.id,
+            signal_candidate_id=candidate.id,
+            sequence=0,
+            instruction_kind="entry",
+            strategy_instance_id=binding.strategy_instance_id,
+            idempotency_key="deadline" * 8,
+            execution_deadline_at=deadline,
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+    contract = load_or_create_instruction_execution_contract(
+        session_factory,
+        message_instruction_item_id=item_id,
+        projected_at=datetime(2026, 8, 10, 12, 0, tzinfo=UTC),
+        deadline_at=deadline,
+    )
+    with session_factory() as session:
+        session.get(InstructionExecutionContract, contract.id).execution_binding_id = (
+            session.get(StrategyRevisionBatch, batch_id).execution_binding_id
+        )
+        session.commit()
+
+    authoritative, persisted_fingerprint = load_entry_draft_revision_authority(
+        session_factory,
+        batch_id=batch_id,
+        supplied_draft=original,
+    )
+
+    assert authoritative["execution_deadline_at"] == deadline.isoformat()
+    assert "execution_deadline_at" not in original
+    assert persisted_fingerprint
+
+
 def _finalize_v2_assembly_for_signal(session_factory, signal):
     with session_factory() as session:
         row = session.get(TradeSignal, signal.id)
@@ -719,7 +811,7 @@ def _persist_ready_market_item(session_factory):
     )
 
 
-def _persist_reserved_revision_batch(session_factory):
+def _persist_reserved_revision_batch(session_factory, *, include_deadline=True):
     _persist_ready_item(session_factory)
     signal = enqueue_recovery_trade_signal(
         session_factory,
@@ -729,10 +821,9 @@ def _persist_reserved_revision_batch(session_factory):
         side="long",
         contract_spec_provider=_StaticContractSpecProvider(),
     )
-    draft = {
-        **signal.payload["deepcoin_order_draft"],
-        "execution_deadline_at": "2099-08-10T12:00:00+00:00",
-    }
+    draft = {**signal.payload["deepcoin_order_draft"]}
+    if include_deadline:
+        draft["execution_deadline_at"] = "2099-08-10T12:00:00+00:00"
     with session_factory() as session:
         session.delete(session.get(TradeSignal, signal.id))
         raw = session.query(RawMessage).filter_by(chat_id=100, message_id=55).one()
@@ -791,6 +882,8 @@ def _persist_revision_leg_authority(
     draft,
     authorized_leg_indices=(1,),
     unknown_leg_index=None,
+    unmodified_leg_status="open",
+    unmodified_leg_attribution_status="unassigned",
 ):
     with session_factory() as session:
         batch = session.get(StrategyRevisionBatch, batch_id)
@@ -810,7 +903,10 @@ def _persist_revision_leg_authority(
                     if index == unknown_leg_index
                     else "cancelled"
                     if authorized
-                    else "open"
+                    else unmodified_leg_status
+                ),
+                attribution_status=(
+                    "unassigned" if authorized else unmodified_leg_attribution_status
                 ),
                 request_json=json.dumps({"sz": draft_leg.get("quantity") or 1}),
             )

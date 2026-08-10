@@ -987,7 +987,10 @@ def test_live_adjacent_admission_defers_before_exchange_or_trade_signal(tmp_path
         assert session.query(TradeSignal).count() == 0
 
 
-def test_adjacent_entry_deferral_keeps_instruction_pending_for_wakeup(tmp_path):
+def test_adjacent_entry_deferral_keeps_instruction_pending_for_wakeup(
+    tmp_path,
+    monkeypatch,
+):
     session_factory = create_session_factory(tmp_path / "adjacent-item-defer.db")
     strategy_raw_id = _persist_candidate(
         session_factory,
@@ -1029,7 +1032,13 @@ def test_adjacent_entry_deferral_keeps_instruction_pending_for_wakeup(tmp_path):
             "auto_trade_enabled": True,
             "allowed_symbols": ["BTC"],
             "entry_message_assembly_v2_mode": "live",
+            "instruction_execution_contract_mode": "shadow",
         },
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.instruction_execution_entry_adapter."
+        "project_entry_deferred_contract",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("projection failed")),
     )
     client = _TickerForbiddenDeepcoinClient()
 

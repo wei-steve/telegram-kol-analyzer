@@ -6,6 +6,7 @@ import math
 import time
 import hashlib
 import json
+from copy import deepcopy
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ from telegram_kol_research.models import EntryStrategyAssembly
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
+from telegram_kol_research.models import InstructionExecutionContract
 from telegram_kol_research.models import StrategyRevisionBatch
 from telegram_kol_research.models import StrategyRevisionLeg
 from telegram_kol_research.models import StrategyLifecycle
@@ -540,39 +542,20 @@ def submit_entry_draft_revision_live(
 ) -> dict[str, Any]:
     """Apply an unchanged-fingerprint revision through the audited entry writer."""
 
-    from telegram_kol_research.deepcoin_order_builder import (
-        deepcoin_order_draft_fingerprint,
-    )
     from telegram_kol_research.entry_draft_revisions import revise_entry_draft
 
-    with session_factory() as session:
-        batch = session.get(StrategyRevisionBatch, int(batch_id))
-        if batch is None:
-            raise RecoveryLiveSubmitError("revision_batch_missing")
-        binding = session.get(ExecutionBinding, int(batch.execution_binding_id))
-        try:
-            binding_payload = json.loads(binding.payload_json or "{}") if binding else {}
-        except (json.JSONDecodeError, TypeError):
-            binding_payload = {}
-        authoritative_draft = (
-            binding_payload.get("draft")
-            if isinstance(binding_payload, dict)
-            else None
-        )
-    if not isinstance(authoritative_draft, dict):
-        raise RecoveryLiveSubmitError("entry_draft_authority_missing")
+    authoritative_draft, actual_fingerprint = load_entry_draft_revision_authority(
+        session_factory,
+        batch_id=int(batch_id),
+        supplied_draft=original_draft,
+    )
     _validate_entry_draft_revision_leg_authority(
         session_factory,
         batch_id=int(batch_id),
         expected_leg_count=len(authoritative_draft.get("order_legs") or []),
         authorized_leg_indices=authorized_leg_indices,
     )
-    actual_fingerprint = deepcoin_order_draft_fingerprint(authoritative_draft)
-    supplied_fingerprint = deepcoin_order_draft_fingerprint(original_draft)
-    if (
-        str(expected_parent_fingerprint) != actual_fingerprint
-        or supplied_fingerprint != actual_fingerprint
-    ):
+    if str(expected_parent_fingerprint) != actual_fingerprint:
         raise RecoveryLiveSubmitError("entry_draft_parent_fingerprint_changed")
     revised = revise_entry_draft(
         authoritative_draft,
@@ -590,6 +573,75 @@ def submit_entry_draft_revision_live(
     )
 
 
+def load_entry_draft_revision_authority(
+    session_factory: sessionmaker,
+    *,
+    batch_id: int,
+    supplied_draft: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Load the exact bound draft and enrich only its durable execution deadline."""
+
+    from telegram_kol_research.deepcoin_order_builder import (
+        deepcoin_order_draft_fingerprint,
+    )
+
+    with session_factory() as session:
+        batch = session.get(StrategyRevisionBatch, int(batch_id))
+        if batch is None:
+            raise RecoveryLiveSubmitError("revision_batch_missing")
+        binding = session.get(ExecutionBinding, int(batch.execution_binding_id))
+        try:
+            binding_payload = json.loads(binding.payload_json or "{}") if binding else {}
+        except (json.JSONDecodeError, TypeError):
+            binding_payload = {}
+        persisted_draft = (
+            binding_payload.get("draft")
+            if isinstance(binding_payload, dict)
+            else None
+        )
+        if not isinstance(persisted_draft, dict):
+            raise RecoveryLiveSubmitError("entry_draft_authority_missing")
+        persisted_fingerprint = deepcoin_order_draft_fingerprint(persisted_draft)
+        if supplied_draft is not None and (
+            deepcoin_order_draft_fingerprint(supplied_draft)
+            != persisted_fingerprint
+        ):
+            raise RecoveryLiveSubmitError("entry_draft_parent_fingerprint_changed")
+        authoritative_draft = deepcopy(persisted_draft)
+        if not (
+            authoritative_draft.get("execution_deadline_at")
+            or authoritative_draft.get("deadline_at")
+        ):
+            contracts = (
+                session.query(InstructionExecutionContract)
+                .filter(
+                    InstructionExecutionContract.execution_binding_id
+                    == int(batch.execution_binding_id),
+                    InstructionExecutionContract.intent_kind == "entry",
+                    InstructionExecutionContract.deadline_at.is_not(None),
+                )
+                .all()
+            )
+            deadlines = {
+                _revision_deadline_iso(row.deadline_at)
+                for row in contracts
+                if row.deadline_at is not None
+            }
+            if len(deadlines) != 1:
+                raise RecoveryLiveSubmitError(
+                    "entry_draft_deadline_authority_missing"
+                    if not deadlines
+                    else "entry_draft_deadline_authority_ambiguous"
+                )
+            authoritative_draft["execution_deadline_at"] = deadlines.pop()
+    return authoritative_draft, persisted_fingerprint
+
+
+def _revision_deadline_iso(value: datetime) -> str:
+    deadline = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return deadline.astimezone(UTC).isoformat()
+
+
 def _validate_entry_draft_revision_leg_authority(
     session_factory: sessionmaker,
     *,
@@ -597,7 +649,7 @@ def _validate_entry_draft_revision_leg_authority(
     expected_leg_count: int,
     authorized_leg_indices: tuple[int, ...],
 ) -> None:
-    """Require every original leg to be durably absent before replacement."""
+    """Require exact known outcomes and durable absence for replaced legs."""
 
     if expected_leg_count < 1:
         raise RecoveryLiveSubmitError("entry_draft_authority_missing")
@@ -629,15 +681,43 @@ def _validate_entry_draft_revision_leg_authority(
         if set(by_index) != set(range(1, int(expected_leg_count) + 1)):
             raise RecoveryLiveSubmitError("revision_leg_authority_incomplete")
         authorized = set(int(value) for value in authorized_leg_indices)
+        known_execution_statuses = {
+            "pending",
+            "submitted",
+            "open",
+            "active",
+            "partially_filled",
+            "filled",
+            "partial_closed",
+            "cancelled",
+            "rejected",
+            "failed",
+            "expired",
+        }
         for leg_index, execution_leg in by_index.items():
             execution_status = str(execution_leg.status or "").lower()
+            attribution_status = str(
+                execution_leg.attribution_status or ""
+            ).lower()
             revision_leg = revision_by_execution_leg_id.get(int(execution_leg.id))
             revision_status = str(revision_leg.status or "").lower() if revision_leg else ""
-            if revision_status in {"submit_unknown", "cancel_submitting"} or execution_status in {
-                "unknown",
-                "submit_unknown",
-                "unknown_exchange_outcome",
-            }:
+            if (
+                revision_status in {"submit_unknown", "cancel_submitting"}
+                or execution_status not in known_execution_statuses
+                or attribution_status
+                in {
+                    "ambiguous",
+                    "attribution_conflict",
+                    "evidence_unavailable",
+                    "unknown",
+                    "unverified",
+                }
+                or (execution_leg.pos_id and attribution_status != "verified")
+                or (
+                    execution_status in {"filled", "partially_filled", "partial_closed"}
+                    and not execution_leg.pos_id
+                )
+            ):
                 raise RecoveryLiveSubmitError("revision_leg_outcome_unknown")
             if leg_index not in authorized:
                 continue

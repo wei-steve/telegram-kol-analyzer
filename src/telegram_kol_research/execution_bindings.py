@@ -138,6 +138,8 @@ class EntryBindingEvidence:
     client_order_ids: tuple[str, ...]
     exact: bool
     draft_fingerprint: str | None = None
+    confirmed_absent_leg_indices: tuple[int, ...] = ()
+    confirmed_absent_client_order_ids: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -345,7 +347,7 @@ def load_entry_binding_evidence(
             strategy_instance_id
             and binding.strategy_instance_id != strategy_instance_id
         ):
-            return EntryBindingEvidence(None, (), (), False, None)
+            return EntryBindingEvidence(None, (), (), False, None, (), ())
         legs = (
             session.query(ExecutionOrderLeg)
             .filter(
@@ -355,12 +357,21 @@ def load_entry_binding_evidence(
             .order_by(ExecutionOrderLeg.leg_index.asc())
             .all()
         )
+        confirmed_absent_statuses = {"cancelled", "rejected", "failed", "expired"}
         exact_legs = [
             leg
             for leg in legs
             if bool(leg.order_id or leg.pos_id)
             and bool(leg.client_order_id)
-            and leg.status not in {"unknown", "submit_unknown"}
+            and leg.status
+            not in {"unknown", "submit_unknown", *confirmed_absent_statuses}
+        ]
+        absent_legs = [
+            leg
+            for leg in legs
+            if leg.status in confirmed_absent_statuses
+            and not leg.pos_id
+            and bool(leg.client_order_id)
         ]
         try:
             binding_payload = json.loads(binding.payload_json or "{}")
@@ -393,6 +404,8 @@ def load_entry_binding_evidence(
             tuple(str(leg.client_order_id) for leg in exact_legs),
             len(exact_legs) == len(legs),
             draft_fingerprint,
+            tuple(int(leg.leg_index) for leg in absent_legs),
+            tuple(str(leg.client_order_id) for leg in absent_legs),
         )
 
 

@@ -150,7 +150,9 @@ def test_pending_entry_can_be_projected_as_deferred(tmp_path):
     )
 
     assert result.state == "deferred"
-    assert _contract(session_factory).attempted_exchange_write is False
+    contract = _contract(session_factory)
+    assert contract.attempted_exchange_write is False
+    assert contract.deadline_at.replace(tzinfo=UTC) == NOW
     with session_factory() as session:
         evidence = json.loads(
             session.query(InstructionExecutionContract).one().evidence_refs_json
@@ -362,9 +364,26 @@ def test_confirmed_absent_second_leg_allows_verified_partial_with_fact(tmp_path)
         prepared_at=NOW,
         mode="shadow",
     )
-    _persist_verified_legs(
+    binding_id = _persist_verified_legs(
         session_factory, signal_id=signal_id, draft=draft, leg_indices=(1,)
     )
+    with session_factory() as session:
+        signal = session.get(TradeSignal, signal_id)
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=binding_id,
+                strategy_instance_id=signal.strategy_instance_id,
+                leg_index=2,
+                purpose="entry",
+                order_kind="trigger_limit",
+                order_id="ORDER-2",
+                client_order_id="LEG-2",
+                venue="deepcoin",
+                attribution_status="verified",
+                status="cancelled",
+            )
+        )
+        session.commit()
 
     projection = project_entry_submission_result(
         session_factory,
@@ -381,3 +400,32 @@ def test_confirmed_absent_second_leg_allows_verified_partial_with_fact(tmp_path)
     assert projection.completion_scope == "partial"
     assert projection.incident_facts == ("multi_leg_partial",)
     assert _contract(session_factory).completion_scope == "partial"
+
+
+def test_caller_claim_alone_cannot_confirm_an_absent_leg(tmp_path):
+    session_factory = create_session_factory(tmp_path / "untrusted-absence.db")
+    item_id, signal_id, draft = _persist_chain(session_factory, leg_count=2)
+    prepare_entry_submission_contract(
+        session_factory,
+        message_instruction_item_id=item_id,
+        trade_signal_id=signal_id,
+        draft=draft,
+        prepared_at=NOW,
+        mode="shadow",
+    )
+    _persist_verified_legs(
+        session_factory, signal_id=signal_id, draft=draft, leg_indices=(1,)
+    )
+
+    projection = project_entry_submission_result(
+        session_factory,
+        message_instruction_item_id=item_id,
+        trade_signal_id=signal_id,
+        attempted_writes=1,
+        confirmed_legs=1,
+        confirmed_absent_leg_indices=(2,),
+        projected_at=NOW,
+        mode="shadow",
+    )
+
+    assert projection.state == "submit_unknown"

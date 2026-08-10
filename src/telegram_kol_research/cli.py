@@ -2434,10 +2434,29 @@ def entry_draft_revision(
         raise typer.BadParameter("--draft-path must contain valid JSON") from exc
     if not isinstance(original, dict):
         raise typer.BadParameter("--draft-path must contain a JSON object")
+    supplied_original = original
     try:
         parsed_market_price = Decimal(market_price)
     except InvalidOperation as exc:
         raise typer.BadParameter("--market-price must be a decimal") from exc
+    if batch_id is not None:
+        from telegram_kol_research.recovery_live_submit import (
+            RecoveryLiveSubmitError,
+            load_entry_draft_revision_authority,
+        )
+
+        session_factory = create_existing_session_factory(database_path)
+        try:
+            original, parent_fingerprint = load_entry_draft_revision_authority(
+                session_factory,
+                batch_id=batch_id,
+                supplied_draft=original,
+            )
+        except RecoveryLiveSubmitError as exc:
+            typer.echo(f"Refusing revision: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
+    else:
+        parent_fingerprint = deepcoin_order_draft_fingerprint(original)
     try:
         revised = revise_entry_draft(
             original,
@@ -2448,7 +2467,6 @@ def entry_draft_revision(
     except EntryDraftRevisionError as exc:
         typer.echo(f"Refusing revision: {exc}", err=True)
         raise typer.Exit(code=2) from exc
-    parent_fingerprint = deepcoin_order_draft_fingerprint(original)
     original_legs = original.get("order_legs") or []
     revised_legs = revised.get("order_legs") or []
     plan = {
@@ -2493,7 +2511,7 @@ def entry_draft_revision(
     result = submit_entry_draft_revision_live(
         session_factory,
         batch_id=batch_id,
-        original_draft=original,
+        original_draft=supplied_original,
         operation=operation,
         market_price=parsed_market_price,
         authorized_leg_indices=tuple(leg_indices),

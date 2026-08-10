@@ -574,16 +574,20 @@ def _auto_process_single_message_trade_signal(
                 project_entry_deferred_contract,
             )
 
-            project_entry_deferred_contract(
-                session_factory,
-                message_instruction_item_id=message_instruction_item_id,
-                reason_code=str(admission.reason_code or "entry_deferred"),
-                blocker_ids=admission.blocking_raw_message_ids,
-                deadline_at=admission.deadline_at,
-                recheck_fingerprint=admission.recheck_fingerprint,
-                projected_at=now,
-                mode=execution_contract_mode,
-            )
+            try:
+                project_entry_deferred_contract(
+                    session_factory,
+                    message_instruction_item_id=message_instruction_item_id,
+                    reason_code=str(admission.reason_code or "entry_deferred"),
+                    blocker_ids=admission.blocking_raw_message_ids,
+                    deadline_at=admission.deadline_at,
+                    recheck_fingerprint=admission.recheck_fingerprint,
+                    projected_at=now,
+                    mode=execution_contract_mode,
+                )
+            except Exception:
+                if execution_contract_mode == "live":
+                    raise
         return {"status": "deferred", "reason": admission.reason_code}
     if admission.status == "blocked":
         return {"status": "blocked", "reason": admission.reason_code}
