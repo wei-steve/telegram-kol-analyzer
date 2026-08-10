@@ -23,6 +23,7 @@
   data-exchange-tab-loaded="{{ 'false' if exchange_snapshot.error else 'true' }}"
   data-exchange-tab-item-count="{{ items|length }}"
   {% if exchange_tab_captured_at %}data-exchange-tab-captured-at="{{ exchange_tab_captured_at.isoformat() }}"{% endif %}
+  {% if history_pagination %}data-history-browse-token="{{ history_pagination.token }}" data-history-visible-count="{{ history_pagination.visible_count }}" data-history-has-more="{{ 'true' if history_pagination.has_more else 'false' }}"{% if history_pagination.next_cursor %} data-history-next-cursor="{{ history_pagination.next_cursor }}"{% endif %}{% endif %}
   {% if tab_name == 'position-history' %}data-exchange-history-panel{% endif %}
 >
   {% if exchange_snapshot.error %}

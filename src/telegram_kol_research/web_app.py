@@ -5287,7 +5287,12 @@ def create_web_app(
             },
         }
 
-    def build_exchange_position_tab_context(tab_name: str) -> dict[str, Any]:
+    def build_exchange_position_tab_context(
+        tab_name: str,
+        *,
+        browse_token: str | None = None,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
         pending_entry_signals = list_pending_strategies(
             app.state.session_factory,
             chat_id=None,
@@ -5311,20 +5316,66 @@ def create_web_app(
             else []
         )
         group_label_by_chat_id = _group_label_by_chat_id(app.state.group_config)
-        exchange_snapshot = _load_exchange_tab_snapshot(
-            app.state.session_factory,
-            tab_name=tab_name,
-            deepcoin_client_factory=app.state.deepcoin_client_factory,
-            group_label_by_chat_id=group_label_by_chat_id,
-            pending_entry_signals=pending_entry_signals,
-            trading_settings=load_trading_settings(app.state.session_factory),
-            contract_spec_provider=app.state.deepcoin_contract_spec_provider,
-            known_history_symbols=[
-                str(row.get("symbol") or "")
-                for row in exited_positions
-                if row.get("symbol")
-            ],
-        )
+        history_pagination = None
+        if tab_name == "position-history" and browse_token:
+            try:
+                page = app.state.history_position_browse_snapshots.page(
+                    token=browse_token,
+                    cursor=cursor,
+                    page_size=20,
+                    filter_key=(None, None),
+                )
+            except ValueError:
+                return {
+                    "tab_name": tab_name,
+                    "exchange_snapshot": {**_empty_exchange_snapshot(), "error": "unavailable"},
+                    "exchange_tab_captured_at": None,
+                }
+            exchange_snapshot = _empty_exchange_snapshot()
+            exchange_snapshot["position_history"] = list(page.rows)
+            history_pagination = {
+                "token": browse_token,
+                "next_cursor": page.next_cursor,
+                "has_more": page.has_more,
+                "visible_count": len(page.rows),
+                "total_count": page.total_count,
+            }
+        else:
+            exchange_snapshot = _load_exchange_tab_snapshot(
+                app.state.session_factory,
+                tab_name=tab_name,
+                deepcoin_client_factory=app.state.deepcoin_client_factory,
+                group_label_by_chat_id=group_label_by_chat_id,
+                pending_entry_signals=pending_entry_signals,
+                trading_settings=load_trading_settings(app.state.session_factory),
+                contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+                order_limit=100 if tab_name == "position-history" else 20,
+                known_history_symbols=[
+                    str(row.get("symbol") or "")
+                    for row in exited_positions
+                    if row.get("symbol")
+                ],
+            )
+            if tab_name == "position-history" and not exchange_snapshot.get("error"):
+                rows = tuple(exchange_snapshot["position_history"])
+                token = app.state.history_position_browse_snapshots.create(
+                    rows=rows,
+                    filter_key=(None, None),
+                )
+                page = app.state.history_position_browse_snapshots.page(
+                    token=token,
+                    cursor=None,
+                    page_size=20,
+                    filter_key=(None, None),
+                )
+                exchange_snapshot["position_history"] = list(page.rows)
+                history_pagination = {
+                    "token": token,
+                    "next_cursor": page.next_cursor,
+                    "has_more": page.has_more,
+                    "visible_count": len(page.rows),
+                    "total_count": page.total_count,
+                }
         exchange_snapshot = _annotate_exchange_snapshot_attribution(
             exchange_snapshot,
             holding_positions=holding_positions,
@@ -5343,6 +5394,7 @@ def create_web_app(
             "exchange_tab_captured_at": (
                 None if exchange_snapshot.get("error") else captured_at
             ),
+            "history_pagination": history_pagination,
         }
 
     def build_strategy_record_payload(
@@ -5872,13 +5924,22 @@ def create_web_app(
         )
 
     @app.get("/positions-panel/tabs/{tab_name}")
-    def positions_panel_tab_partial(request: Request, tab_name: str):
+    def positions_panel_tab_partial(
+        request: Request,
+        tab_name: str,
+        browse_token: str | None = None,
+        cursor: str | None = None,
+    ):
         if tab_name not in {"open-orders", "order-history", "position-history"}:
             raise HTTPException(status_code=404, detail="unknown exchange position tab")
         return templates.TemplateResponse(
             request,
             "_exchange_position_tab.html",
-            build_exchange_position_tab_context(tab_name),
+            build_exchange_position_tab_context(
+                tab_name,
+                browse_token=browse_token,
+                cursor=cursor,
+            ),
         )
 
     @app.get("/")

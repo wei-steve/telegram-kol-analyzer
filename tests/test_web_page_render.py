@@ -1351,6 +1351,54 @@ def test_positions_panel_tab_route_reads_only_requested_dataset(
     )
 
 
+def test_position_history_tab_serves_continuation_from_stable_browse_snapshot(tmp_path):
+    class ManyHistoryClient(_RecordingExchangePositionsClient):
+        def list_position_history(self, *, inst_id):
+            self.calls.append(("list_position_history", inst_id))
+            if inst_id != "BTC-USDT-SWAP":
+                return []
+            return [
+                {
+                    "posId": f"pos-{index:03d}",
+                    "instId": inst_id,
+                    "posSide": "long",
+                    "avgPx": "60000",
+                    "closeAvgPx": "61000",
+                    "closePos": "0.01",
+                    "pnl": "10",
+                    "uTime": str(1_700_000_000_000 - index),
+                }
+                for index in range(45)
+            ]
+
+    exchange = ManyHistoryClient()
+    client = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            deepcoin_client_factory=lambda: exchange,
+        )
+    )
+
+    first = client.get("/positions-panel/tabs/position-history")
+
+    assert first.status_code == 200
+    assert 'data-history-browse-token="' in first.text
+    assert 'data-history-next-cursor="deepcoin-position:pos-019"' in first.text
+    assert 'data-history-visible-count="20"' in first.text
+    assert 'data-history-has-more="true"' in first.text
+    token = re.search(r'data-history-browse-token="([^"]+)"', first.text).group(1)
+
+    second = client.get(
+        "/positions-panel/tabs/position-history",
+        params={"browse_token": token, "cursor": "deepcoin-position:pos-019"},
+    )
+
+    assert second.status_code == 200
+    assert "pos-020" in second.text
+    assert "pos-000" not in second.text
+    assert len(exchange.calls) == 2
+
+
 def test_positions_panel_tab_failure_stays_retryable(tmp_path):
     class BrokenOpenOrdersClient(_RecordingExchangePositionsClient):
         def list_open_orders(self):
