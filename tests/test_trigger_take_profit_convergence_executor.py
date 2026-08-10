@@ -1145,6 +1145,41 @@ def test_unknown_take_profit_submit_is_frozen_without_automatic_retry(tmp_path):
     assert len(client.submit_calls) == 1
 
 
+def test_definite_take_profit_submit_rejection_is_not_marked_unknown(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.deepcoin_client import DeepcoinDefiniteRejection
+    from telegram_kol_research.models import TriggerTakeProfitConvergence
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        execute_trigger_take_profit_convergence,
+    )
+
+    class _RejectedClient(_Client):
+        def set_position_sltp(self, payload):
+            self.submit_calls.append(dict(payload))
+            raise DeepcoinDefiniteRejection("price below lower limit")
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id = _ready_convergence(session_factory, existing_take_profit=False)
+    client = _RejectedClient()
+
+    result = execute_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result == {
+        "convergence_id": convergence_id,
+        "status": "conflicted",
+        "reason": "convergence_submit_rejected",
+    }
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        assert convergence.status == "conflicted"
+        assert convergence.reason_code == "convergence_submit_rejected"
+
+
 def test_unexplained_partial_position_change_freezes_submitted_convergence(tmp_path):
     from telegram_kol_research.db import create_session_factory
     from telegram_kol_research.models import TriggerTakeProfitConvergence
@@ -1201,6 +1236,7 @@ def test_terminal_entry_leg_expires_absent_take_profits_and_completes_convergenc
         leg.status = "manually_closed"
         leg.terminal_reason = "manual_position_missing"
         binding.status = "closed"
+        binding.pos_id = None
         session.commit()
 
         reconcile_trigger_take_profit_order_history(
@@ -1221,6 +1257,93 @@ def test_terminal_entry_leg_expires_absent_take_profits_and_completes_convergenc
     assert convergence.reason_code == "convergence_position_terminal"
     assert [(row.order_id, row.status) for row in orders] == [("tp-old-1", "expired")]
     assert all(row.completed_at is not None for row in orders)
+
+
+def test_terminal_entry_leg_with_active_binding_requires_binding_position_identity(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import (
+        ExecutionBinding,
+        ExecutionOrderLeg,
+        PositionTakeProfitOrder,
+        TriggerTakeProfitConvergence,
+    )
+    from telegram_kol_research.position_take_profit_orders import (
+        reconcile_trigger_take_profit_order_history,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id = _ready_convergence(session_factory)
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        convergence.status = "submitted"
+        leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+        binding = session.get(ExecutionBinding, convergence.execution_binding_id)
+        leg.status = "manually_closed"
+        binding.pos_id = None
+        reconcile_trigger_take_profit_order_history(
+            session,
+            positions=[],
+            pending_orders=[],
+            trigger_history=[],
+            observed_at=NOW,
+            position_snapshot_complete=True,
+            pending_snapshot_complete_by_instrument={"BTC-USDT-SWAP": True},
+        )
+        session.commit()
+
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        order = session.query(PositionTakeProfitOrder).one()
+        assert convergence.status == "submitted"
+        assert order.status == "active"
+
+
+def test_rejected_take_profit_convergence_completes_after_position_is_terminal(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import (
+        ExecutionBinding,
+        ExecutionOrderLeg,
+        PositionTakeProfitOrder,
+        TriggerTakeProfitConvergence,
+    )
+    from telegram_kol_research.position_take_profit_orders import (
+        reconcile_trigger_take_profit_order_history,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id = _ready_convergence(
+        session_factory,
+        existing_take_profit=False,
+    )
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        convergence.status = "conflicted"
+        convergence.reason_code = "convergence_submit_rejected"
+        leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+        binding = session.get(ExecutionBinding, convergence.execution_binding_id)
+        leg.status = "manually_closed"
+        binding.status = "closed"
+        binding.pos_id = None
+        session.flush()
+        reconcile_trigger_take_profit_order_history(
+            session,
+            positions=[],
+            pending_orders=[],
+            trigger_history=[],
+            observed_at=NOW,
+            position_snapshot_complete=True,
+            pending_snapshot_complete_by_instrument={"BTC-USDT-SWAP": True},
+        )
+        session.commit()
+
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        assert session.query(PositionTakeProfitOrder).count() == 0
+        assert convergence.status == "completed"
+        assert (
+            convergence.reason_code
+            == "convergence_submit_rejected_position_terminal"
+        )
 
 
 def test_terminal_entry_leg_does_not_expire_take_profit_still_pending_on_exchange(tmp_path):

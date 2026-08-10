@@ -10,6 +10,7 @@ from decimal import Decimal, InvalidOperation
 
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.deepcoin_client import DeepcoinDefiniteRejection
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
@@ -159,6 +160,14 @@ def execute_trigger_take_profit_convergence(
                     session_factory, pos_id=target_pos_id
                 ),
                 now_provider=lambda: now,
+            )
+        except DeepcoinDefiniteRejection as exc:
+            return _freeze(
+                session_factory,
+                convergence_id,
+                now,
+                "convergence_submit_rejected",
+                error=exc,
             )
         except Exception as exc:
             return _freeze(session_factory, convergence_id, now, "convergence_submit_unknown", error=exc)

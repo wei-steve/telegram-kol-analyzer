@@ -22,6 +22,11 @@ from telegram_kol_research.native_tpsl import native_tpsl_take_profit_is_market
 from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
 
 
+_TERMINAL_BINDING_STATES = frozenset(
+    {"closed", "cancelled", "completed", "failed", "resolved", "superseded"}
+)
+
+
 def canonical_take_profit_evidence_rows(rows) -> tuple[dict[str, object], ...]:
     """Return stable, side-effect-free evidence dictionaries for TP planning."""
 
@@ -260,20 +265,28 @@ def reconcile_trigger_take_profit_order_history(
 
     convergences = (
         session.query(TriggerTakeProfitConvergence)
-        .filter(TriggerTakeProfitConvergence.status == "submitted")
+        .filter(TriggerTakeProfitConvergence.status.in_(("submitted", "conflicted")))
         .all()
     )
     for convergence in convergences:
         if not convergence.pos_id:
+            continue
+        rejected_without_submission = bool(
+            convergence.status == "conflicted"
+            and convergence.reason_code == "convergence_submit_rejected"
+        )
+        if convergence.status != "submitted" and not rejected_without_submission:
             continue
         orders = (
             session.query(PositionTakeProfitOrder)
             .filter(PositionTakeProfitOrder.trigger_take_profit_convergence_id == convergence.id)
             .all()
         )
-        if not orders:
+        if not orders and not rejected_without_submission:
             continue
-        if not _take_profit_orders_match_convergence(orders, convergence=convergence):
+        if orders and not _take_profit_orders_match_convergence(
+            orders, convergence=convergence
+        ):
             convergence.status = "conflicted"
             convergence.reason_code = "convergence_take_profit_ownership_mismatch"
             convergence.completed_at = now
@@ -296,6 +309,14 @@ def reconcile_trigger_take_profit_order_history(
                 pos_id=str(convergence.pos_id),
             )
         ):
+            if rejected_without_submission and not orders:
+                convergence.status = "completed"
+                convergence.reason_code = (
+                    "convergence_submit_rejected_position_terminal"
+                )
+                convergence.completed_at = now
+                convergence.updated_at = now
+                continue
             for row in orders:
                 if row.status != "active" or row.order_id in pending_ids:
                     continue
@@ -347,6 +368,10 @@ def _exact_convergence_leg_is_terminal(
         for item in str(binding.pos_id or "").split(",")
         if item.strip()
     } if binding is not None else set()
+    binding_is_terminal = bool(
+        binding is not None
+        and str(binding.status or "").lower() in _TERMINAL_BINDING_STATES
+    )
     return bool(
         leg is not None
         and binding is not None
@@ -354,7 +379,10 @@ def _exact_convergence_leg_is_terminal(
         and str(leg.purpose) == "entry"
         and str(leg.venue).lower() == str(convergence.venue).lower()
         and str(leg.pos_id or "") == str(convergence.pos_id or "")
-        and str(convergence.pos_id or "") in binding_pos_ids
+        and (
+            str(convergence.pos_id or "") in binding_pos_ids
+            or binding_is_terminal
+        )
         and str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
     )
 
