@@ -1823,7 +1823,10 @@ def test_terminal_entry_leg_requires_nonblank_position_identity(tmp_path):
         assert order.status == "active"
 
 
-@pytest.mark.parametrize("ambiguous_kind", ["position", "order"])
+@pytest.mark.parametrize(
+    "ambiguous_kind",
+    ["position", "whitespace_position", "order"],
+)
 def test_terminal_entry_leg_fails_closed_for_unidentifiable_exchange_row(
     tmp_path,
     ambiguous_kind,
@@ -1849,8 +1852,14 @@ def test_terminal_entry_leg_fails_closed_for_unidentifiable_exchange_row(
         reconcile_trigger_take_profit_order_history(
             session,
             positions=(
-                [{"instId": "BTC-USDT-SWAP", "pos": "1"}]
-                if ambiguous_kind == "position"
+                [
+                    {
+                        "instId": "BTC-USDT-SWAP",
+                        "posId": (" " if ambiguous_kind == "whitespace_position" else None),
+                        "pos": "1",
+                    }
+                ]
+                if ambiguous_kind in {"position", "whitespace_position"}
                 else []
             ),
             pending_orders=(

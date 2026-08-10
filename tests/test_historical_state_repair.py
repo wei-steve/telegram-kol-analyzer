@@ -936,6 +936,38 @@ def test_plan_refuses_unidentifiable_live_exchange_rows(tmp_path, ambiguous_kind
     )
 
 
+def test_exchange_fingerprint_binds_all_position_identity_and_size_aliases(tmp_path):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    first = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(
+            positions=[{"positionId": "pos-a", "positionSize": "1"}]
+        ),
+        planned_at=NOW,
+    )
+    changed_identity = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(
+            positions=[{"positionId": "pos-b", "positionSize": "1"}]
+        ),
+        planned_at=NOW,
+    )
+    changed_size = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(
+            positions=[{"positionId": "pos-a", "positionSize": "2"}]
+        ),
+        planned_at=NOW,
+    )
+
+    assert first.exchange_fingerprint != changed_identity.exchange_fingerprint
+    assert first.exchange_fingerprint != changed_size.exchange_fingerprint
+
+
 def test_plan_refuses_incomplete_exchange_snapshot(tmp_path):
     from telegram_kol_research.historical_state_repair import (
         build_historical_state_repair_plan,

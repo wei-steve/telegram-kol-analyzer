@@ -1152,13 +1152,19 @@ def _exchange_evidence(snapshot) -> dict[str, Any]:
     }
 
 
-def _normalized_position(row: Any) -> dict[str, str]:
+def _normalized_position(row: Any) -> dict[str, Any]:
     row = row if isinstance(row, dict) else {}
+    identity_ids = sorted(_position_identity_ids(row))
+    size_values = {
+        key: str(row[key])
+        for key in ("pos", "size", "sz", "positionSize", "position_size")
+        if key in row
+    }
     return {
         "inst_id": str(row.get("instId") or row.get("inst_id") or "").upper(),
-        "pos_id": str(row.get("posId") or row.get("pos_id") or ""),
+        "identity_ids": identity_ids,
         "side": str(row.get("posSide") or row.get("side") or "").lower(),
-        "size": str(row.get("pos") or row.get("size") or row.get("sz") or ""),
+        "size_values": size_values,
     }
 
 

@@ -462,7 +462,7 @@ def _position_id_is_live(positions: list[dict], *, pos_id: str) -> bool:
                 "position_id",
                 "id",
             )
-            if row.get(key) not in (None, "")
+            if row.get(key) not in (None, "") and str(row[key]).strip()
         }
         if not row_pos_ids:
             if _position_row_is_live_or_unknown(row):
