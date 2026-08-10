@@ -13,6 +13,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased, sessionmaker
 
 from telegram_kol_research.execution_bindings import build_strategy_instance_id
+from telegram_kol_research.instruction_execution_outcomes import (
+    VISIBILITY_DEFER_REASONS,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
     ManagementMessageTarget,
@@ -26,21 +29,14 @@ from telegram_kol_research.models import (
 MANAGEMENT_EVENT_TYPES = frozenset(
     {"close_signal", "position_update", "strategy_revision"}
 )
-FINISH_STATUSES = frozenset({"submitted", "succeeded", "failed", "unknown"})
+FINISH_STATUSES = frozenset(
+    {"executing", "submitted", "succeeded", "failed", "unknown"}
+)
 ERROR_STATUSES = frozenset({"failed", "unknown"})
 SUMMARY_NOTIFICATION_LEASE = timedelta(minutes=5)
 VISIBILITY_RETRY_DELAYS = (5, 15, 30, 60, 120, 300)
 VISIBILITY_RETRY_DEADLINE = timedelta(hours=6)
 VISIBILITY_RETRY_CLAIM_LEASE = timedelta(minutes=5)
-VISIBILITY_DEFER_REASONS = frozenset(
-    {
-        "adjacent_entry_context_pending",
-        "target_strategy_binding_not_visible_yet",
-        "preceding_entry_context_unresolved",
-    }
-)
-
-
 def should_defer_instruction_result(result: dict) -> bool:
     return (
         str(result.get("status") or "") == "deferred"
@@ -474,6 +470,7 @@ def finish_message_instruction_item(
             raise RuntimeError("instruction item is missing or not executing")
         result_status = str(result.get("status") or "").strip().lower()
         target_state = {
+            "executing": "executing",
             "submitted": "submitted",
             "succeeded": "confirmed",
             "failed": "failed",

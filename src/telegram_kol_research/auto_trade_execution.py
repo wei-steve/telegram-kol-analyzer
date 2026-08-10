@@ -46,6 +46,10 @@ from telegram_kol_research.message_instruction_items import (
     list_message_instruction_item_results,
     should_defer_instruction_result,
 )
+from telegram_kol_research.instruction_execution_outcomes import (
+    InstructionOutcomeContractError,
+    legacy_status_for_instruction_result,
+)
 from telegram_kol_research.price_normalization import extract_normalized_prices
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import persist_recovery_evaluations
@@ -209,6 +213,9 @@ def execute_message_instruction_items(
     """Claim and execute each durable instruction independently in sequence."""
 
     now = processed_at or datetime.now(UTC)
+    enforcement_mode = load_trading_settings(
+        session_factory
+    ).instruction_execution_contract_mode
     while True:
         item = claim_next_message_instruction_item(
             session_factory,
@@ -236,7 +243,20 @@ def execute_message_instruction_items(
             finish_status = "failed"
             result = {"type": type(exc).__name__, "message": str(exc)}
         else:
-            finish_status = _instruction_finish_status(result)
+            try:
+                finish_status = _instruction_finish_status(
+                    result,
+                    intent_kind=item.instruction_kind,
+                    enforcement_mode=enforcement_mode,
+                )
+            except InstructionOutcomeContractError as exc:
+                finish_status = "failed"
+                result = {
+                    "status": "failed",
+                    "reason": "instruction_outcome_contract_invalid",
+                    "observed_status": str(result.get("status") or "")[:64],
+                    "error": str(exc)[:256],
+                }
         if should_defer_instruction_result(result):
             defer_message_instruction_item_for_visibility(
                 session_factory,
@@ -260,25 +280,17 @@ def execute_message_instruction_items(
     return {"status": _message_instruction_status(items), "items": items}
 
 
-def _instruction_finish_status(result: dict[str, Any]) -> str:
-    status = str(result.get("status") or "").strip().lower()
-    reason = str(result.get("reason") or "").strip().lower()
-    leg_statuses = {
-        str(leg.get("status") or "").strip().lower()
-        for leg in result.get("legs", [])
-        if isinstance(leg, dict)
-    }
-    if (
-        status in {"unknown", "submit_unknown", "recovery_required"}
-        or "unknown" in reason
-        or "submit_unknown" in leg_statuses
-    ):
-        return "unknown"
-    if status in {"failed", "partial_failed", "blocked"}:
-        return "failed"
-    if status == "submitted" or result.get("submitted") is True:
-        return "submitted"
-    return "succeeded"
+def _instruction_finish_status(
+    result: dict[str, Any],
+    *,
+    intent_kind: str = "entry",
+    enforcement_mode: str = "disabled",
+) -> str:
+    return legacy_status_for_instruction_result(
+        result,
+        intent_kind=intent_kind,
+        enforcement_mode=enforcement_mode,
+    )
 
 
 def _message_instruction_status(items: list[dict[str, Any]]) -> str:

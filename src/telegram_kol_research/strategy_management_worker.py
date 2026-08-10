@@ -43,6 +43,10 @@ from telegram_kol_research.message_instruction_items import (
     defer_message_instruction_item_for_visibility,
     finish_message_instruction_item,
 )
+from telegram_kol_research.instruction_execution_outcomes import (
+    InstructionOutcomeContractError,
+    legacy_status_for_instruction_result,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
@@ -204,6 +208,9 @@ def run_strategy_management_worker_tick(
                 break
             counts["discovered"] += 1
             try:
+                enforcement_mode = load_trading_settings(
+                    session_factory
+                ).instruction_execution_contract_mode
                 prior_result = json.loads(item.result_json or "{}")
                 execution_mode = str(
                     prior_result.get("execution_mode") or "live"
@@ -271,14 +278,19 @@ def run_strategy_management_worker_tick(
                     counts["failed"] += 1
                     continue
                 if execution_mode == "shadow":
+                    shadow_result = {
+                        "status": "shadow_planned",
+                        "batch_id": planning_result.batch.id,
+                    }
                     finish_message_instruction_item(
                         session_factory,
                         item_id=item.id,
-                        status="succeeded",
-                        result={
-                            "status": "shadow_planned",
-                            "batch_id": planning_result.batch.id,
-                        },
+                        status=legacy_status_for_instruction_result(
+                            shadow_result,
+                            intent_kind="management",
+                            enforcement_mode=enforcement_mode,
+                        ),
+                        result=shadow_result,
                         now=now,
                     )
                     counts["recovered"] += 1
@@ -289,14 +301,22 @@ def run_strategy_management_worker_tick(
                     deepcoin_client=get_client(),
                     executed_at=now,
                 )
-                finish_status = (
-                    "submitted"
-                    if execution_result.get("submitted") is True
-                    else "failed"
-                    if str(execution_result.get("status") or "").lower()
-                    in {"failed", "partial_failed", "blocked"}
-                    else "succeeded"
-                )
+                try:
+                    finish_status = legacy_status_for_instruction_result(
+                        execution_result,
+                        intent_kind="management",
+                        enforcement_mode=enforcement_mode,
+                    )
+                except InstructionOutcomeContractError as exc:
+                    finish_status = "failed"
+                    execution_result = {
+                        "status": "failed",
+                        "reason": "instruction_outcome_contract_invalid",
+                        "observed_status": str(
+                            execution_result.get("status") or ""
+                        )[:64],
+                        "error": str(exc)[:256],
+                    }
                 finish_message_instruction_item(
                     session_factory,
                     item_id=item.id,

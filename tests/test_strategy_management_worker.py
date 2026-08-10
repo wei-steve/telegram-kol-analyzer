@@ -122,6 +122,10 @@ def test_visibility_retry_expiry_becomes_actionable_terminal_block(tmp_path):
 
 def test_worker_retries_due_visibility_item_and_finishes_same_item(tmp_path):
     session_factory = create_session_factory(tmp_path / "item-visibility.db")
+    save_trading_settings(
+        session_factory,
+        {"instruction_execution_contract_mode": "live"},
+    )
     with session_factory() as session:
         raw = RawMessage(chat_id=100, message_id=30, text="BTC exit")
         session.add(raw)
@@ -185,8 +189,73 @@ def test_worker_retries_due_visibility_item_and_finishes_same_item(tmp_path):
     assert result.executed == 1
     with session_factory() as session:
         item = session.get(MessageInstructionItem, item_id)
-        assert item.status == "submitted"
+        assert item.status == "executing"
         assert item.visibility_retry_attempts == 1
+
+
+def test_worker_fails_closed_on_unregistered_executor_outcome(tmp_path):
+    session_factory = create_session_factory(tmp_path / "unknown-worker-outcome.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=100, message_id=32, text="BTC exit")
+        session.add(raw)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=raw.id,
+            symbol="BTC",
+            side="short",
+            event_type="close_signal",
+            management_action="full_exit",
+        )
+        session.add(candidate)
+        session.flush()
+        item = MessageInstructionItem(
+            raw_message_id=raw.id,
+            signal_candidate_id=candidate.id,
+            sequence=0,
+            instruction_kind="management",
+            idempotency_key="u" * 64,
+            status="pending",
+            result_json=json.dumps(
+                {
+                    "status": "deferred",
+                    "reason": "target_strategy_binding_not_visible_yet",
+                    "execution_mode": "live",
+                }
+            ),
+            visibility_first_failed_at=NOW - timedelta(seconds=5),
+            visibility_retry_attempts=1,
+            visibility_next_attempt_at=NOW,
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+    planned = SimpleNamespace(
+        status="ready",
+        reason_code=None,
+        batch=SimpleNamespace(id=78),
+        batch_id=78,
+    )
+
+    result = run_strategy_management_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: object(),
+        max_batches=1,
+        batch_lister=lambda *_args, **_kwargs: [],
+        binding_reconciler=lambda *_args, **_kwargs: None,
+        take_profit_convergence_runner=lambda *_args, **_kwargs: 0,
+        instruction_planner=lambda *_args, **_kwargs: planned,
+        executor=lambda *_args, **_kwargs: {"status": "mystery"},
+        contract_spec_provider=object(),
+        processed_at=NOW,
+    )
+
+    assert result.failed == 1
+    with session_factory() as session:
+        item = session.get(MessageInstructionItem, item_id)
+        assert item.status == "failed"
+        assert json.loads(item.error_json)["reason"] == (
+            "instruction_outcome_contract_invalid"
+        )
 
 
 def test_worker_captures_target_orchestration_failure_after_item_commit(

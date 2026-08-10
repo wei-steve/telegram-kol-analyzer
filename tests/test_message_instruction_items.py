@@ -655,6 +655,34 @@ def test_finish_persists_result_in_the_matching_channel(
         assert getattr(stored, empty_column) is None
 
 
+def test_finish_can_persist_nonterminal_submitting_compatibility_state(tmp_path):
+    session_factory = create_session_factory(tmp_path / "finish-executing.db")
+    raw_id, _, _, _ = _persist_dual_instruction_message(session_factory)
+    with session_factory() as session:
+        create_message_instruction_items_in_session(session, raw_message_id=raw_id)
+        session.commit()
+    item = claim_next_message_instruction_item(
+        session_factory, raw_message_id=raw_id, now=NOW
+    )
+
+    finish_message_instruction_item(
+        session_factory,
+        item_id=item.id,
+        status="executing",
+        result={"status": "reconciling", "submitted": True},
+        now=NOW,
+    )
+
+    with session_factory() as session:
+        stored = session.get(MessageInstructionItem, item.id)
+        assert stored.status == "executing"
+        assert json.loads(stored.result_json) == {
+            "status": "reconciling",
+            "submitted": True,
+        }
+        assert stored.error_json is None
+
+
 def test_finish_rejects_invalid_or_unclaimed_transitions(tmp_path):
     session_factory = create_session_factory(tmp_path / "invalid-finish.db")
     raw_id, _, _, _ = _persist_dual_instruction_message(session_factory)
@@ -669,7 +697,7 @@ def test_finish_rejects_invalid_or_unclaimed_transitions(tmp_path):
         finish_message_instruction_item(
             session_factory,
             item_id=pending_id,
-            status="executing",
+            status="pending",
             result={},
             now=NOW,
         )

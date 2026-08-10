@@ -486,6 +486,38 @@ def test_management_recovery_required_is_unknown_and_does_not_block_same_message
     assert result["items"][0]["reason"] == "protection_recovery_required"
 
 
+def test_unrecognized_instruction_outcome_fails_instead_of_defaulting_success(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "unknown-outcome.db")
+    raw_message_id, _, _ = _persist_same_message_instruction_items(session_factory)
+
+    import telegram_kol_research.auto_trade_execution as auto_module
+
+    monkeypatch.setattr(
+        auto_module,
+        "_auto_process_single_message_trade_signal",
+        lambda *args, **kwargs: {
+            "status": "mystery",
+            "reason": "unregistered_adapter_value",
+        },
+    )
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=_FakeDeepcoinClient(),
+    )
+
+    assert result["status"] == "partial_failed"
+    assert [item["status"] for item in result["items"]] == ["failed", "failed"]
+    assert all(
+        item["reason"] == "instruction_outcome_contract_invalid"
+        for item in result["items"]
+    )
+
+
 def test_hold_update_is_informational_and_needs_no_deepcoin_client(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
