@@ -1245,10 +1245,12 @@ def test_positions_panel_tab_route_reads_only_requested_dataset(
     expected_methods,
 ):
     exchange = _RecordingExchangePositionsClient()
+    captured_at = datetime(2026, 8, 10, 0, 5, 6, tzinfo=UTC)
     client = TestClient(
         create_web_app(
             database_path=tmp_path / "research.db",
             deepcoin_client_factory=lambda: exchange,
+            now_provider=lambda: captured_at,
         )
     )
 
@@ -1258,6 +1260,11 @@ def test_positions_panel_tab_route_reads_only_requested_dataset(
     assert {method for method, _inst_id in exchange.calls} == expected_methods
     assert f'data-exchange-position-panel="{tab_name}"' in response.text
     assert 'data-exchange-tab-loaded="true"' in response.text
+    assert 'data-exchange-tab-item-count="0"' in response.text
+    assert (
+        'data-exchange-tab-captured-at="2026-08-10T00:05:06+00:00"'
+        in response.text
+    )
 
 
 def test_positions_panel_tab_failure_stays_retryable(tmp_path):
@@ -1279,6 +1286,9 @@ def test_positions_panel_tab_failure_stays_retryable(tmp_path):
     assert response.status_code == 200
     assert 'data-exchange-tab-loaded="false"' in response.text
     assert "Deepcoin 数据暂不可用" in response.text
+    assert 'data-exchange-tab-retry="open-orders"' in response.text
+    assert "重新加载" in response.text
+    assert "data-exchange-tab-captured-at" not in response.text
 
 
 def test_positions_panel_open_orders_does_not_drop_tpsl_after_twenty_regular_orders(

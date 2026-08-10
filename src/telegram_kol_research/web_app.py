@@ -5224,9 +5224,17 @@ def create_web_app(
             exited_positions=exited_positions,
             group_label_by_chat_id=group_label_by_chat_id,
         )
+        captured_at = app.state.now_provider()
+        if captured_at.tzinfo is None:
+            captured_at = captured_at.replace(tzinfo=UTC)
+        else:
+            captured_at = captured_at.astimezone(UTC)
         return {
             "tab_name": tab_name,
             "exchange_snapshot": exchange_snapshot,
+            "exchange_tab_captured_at": (
+                None if exchange_snapshot.get("error") else captured_at
+            ),
         }
 
     def build_strategy_record_payload(

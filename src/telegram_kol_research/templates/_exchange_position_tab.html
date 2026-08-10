@@ -21,10 +21,19 @@
   class="exchange-tab-panel"
   data-exchange-position-panel="{{ tab_name }}"
   data-exchange-tab-loaded="{{ 'false' if exchange_snapshot.error else 'true' }}"
+  data-exchange-tab-item-count="{{ items|length }}"
+  {% if exchange_tab_captured_at %}data-exchange-tab-captured-at="{{ exchange_tab_captured_at.isoformat() }}"{% endif %}
   {% if tab_name == 'position-history' %}data-exchange-history-panel{% endif %}
 >
   {% if exchange_snapshot.error %}
-    <p class="exchange-empty" role="status">Deepcoin 数据暂不可用，请稍后重试。</p>
+    <div class="exchange-tab-load-error" role="status">
+      <p class="exchange-empty">Deepcoin 数据暂不可用，请稍后重试。</p>
+      <button
+        type="button"
+        class="secondary-button"
+        data-exchange-tab-retry="{{ tab_name }}"
+      >重新加载</button>
+    </div>
   {% else %}
     <div class="exchange-view-panel is-active" data-exchange-view-panel="list">
       {{ card_list(items | list, empty_text, kind) }}
