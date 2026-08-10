@@ -74,9 +74,10 @@
 - 无策略关联的 21 条删除退出：`succeeded/non_strategy_or_unlinked`，源事件 `ignored`。
 - 已过期且无执行证据的 1 条：`succeeded/strategy_terminal_without_execution`。
 - 生命周期、绑定、入场腿均终态且精确委托/仓位均不存在的 1 条：`succeeded/strategy_already_terminal`，保存精确空仓证据。
-- 13 条历史 `submitted` 止盈收敛：`completed/convergence_position_terminal`；其 23 条活跃止盈台账为 `expired`，增加终态化证据。
+- 12 条身份链完整的历史 `submitted` 止盈收敛：`completed/convergence_position_terminal`；其 20 条活跃止盈台账为 `expired`，增加终态化证据。
 - 1 条明确拒单且仓位已终态的收敛：`completed/convergence_submit_rejected_position_terminal`。
 - 当前活跃仓位的收敛记录保持原状态，并在计划中显式标记为排除项。
+- 1 条入场腿归属为 `attribution_conflict` 的旧 `submitted` 记录保留不动，在计划中显式标记为 `take_profit_identity_not_terminal`，不用模糊身份证据终态化。
 
 ## 部署与回滚
 
@@ -96,9 +97,20 @@
 - `cancelling_entries` 和过期 claim 均为 0。
 - 23 条删除退出均终态化且可审计。
 - 明确拒单不再被标记为 `submit_unknown`。
-- 13 条历史收敛完成，23 条历史止盈台账过期。
+- 12 条历史 `submitted` 收敛和 1 条明确拒单收敛完成，20 条历史止盈台账过期。
 - 当前活跃收敛和止盈保护不变。
 - 应用后干跑为零动作，交易所前后快照指纹一致。
+
+## 生产实施记录
+
+- 实施时间：2026-08-10；生产代码 SHA：`d4e3a9f`。
+- 已验证备份：`/opt/telegram-kol-analyzer/data/research.db.pre-historical-repair-20260810T031110Z.bak`；源库与备份库 `PRAGMA integrity_check` 均为 `ok`。
+- 干跑计划指纹：`3fc39006fc814d21f5f202ca664c4db31999ea9f2ba08bc4c3f6d4b030a4a64b`；动作数 36，冲突数 0。
+- 应用结果：23 条删除退出收敛为 `succeeded`；12 条历史 `submitted` 收敛为 `completed`；1 条 `submit_unknown` 明确拒单收敛为 `completed`；20 条历史止盈台账为 `expired`。
+- 应用后 `cancelling_entries=0`、`submit_unknown=0`；再次干跑 `action_count=0`、`conflicts=0`。
+- 当前交易所快照在修复前后均为 3 个仓位、0 个普通委托、10 个条件单；活跃收敛 119 和 125 因精确仓位/委托仍存在而排除，另一当前仓位不在任何修复动作证据中。
+- 旧收敛 40 因归属冲突保留不动并显式排除。整个修复没有物理删除业务行，仅新增 1 条审计事件（ID 3368，`notification_status=not_needed`）和 1 条一次性确认凭证。
+- 服务重启后为 `active`；主页与当前委托分页均返回 HTTP 200，启动日志无错误，重启后交易所计数仍为 3/0/10。
 
 ## 生产操作手册
 
