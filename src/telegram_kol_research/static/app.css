@@ -1161,6 +1161,30 @@ body {
   overflow-x: auto;
 }
 
+.exchange-view-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+}
+
+.exchange-tab-refresh-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.exchange-tab-refresh-controls[hidden] {
+  display: none;
+}
+
+.exchange-tab-refresh-status {
+  color: #94a3b8;
+  font-size: 0.78rem;
+}
+
 .exchange-view-button {
   min-height: 30px;
   padding: 0 10px;

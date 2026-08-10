@@ -246,23 +246,40 @@
   {% endif %}
 
   <div class="exchange-tab-strip" role="tablist" aria-label="交易持仓分页">
-    <button type="button" class="exchange-tab is-active" data-exchange-position-tab="positions" aria-selected="true">
+    <button type="button" class="exchange-tab is-active" data-exchange-position-tab="positions" data-exchange-position-label="持仓" aria-selected="true">
       持仓({{ exchange_snapshot.positions|length }})
     </button>
-    <button type="button" class="exchange-tab" data-exchange-position-tab="open-orders" aria-selected="false">
+    <button type="button" class="exchange-tab" data-exchange-position-tab="open-orders" data-exchange-position-label="当前委托" aria-selected="false">
       当前委托{% if not lazy_exchange_tabs %}({{ exchange_snapshot.open_orders|length }}){% endif %}
     </button>
-    <button type="button" class="exchange-tab" data-exchange-position-tab="order-history" aria-selected="false">
+    <button type="button" class="exchange-tab" data-exchange-position-tab="order-history" data-exchange-position-label="历史委托" aria-selected="false">
       历史委托{% if not lazy_exchange_tabs %}({{ exchange_snapshot.order_history|length }}){% endif %}
     </button>
-    <button type="button" class="exchange-tab" data-exchange-position-tab="position-history" aria-selected="false">
+    <button type="button" class="exchange-tab" data-exchange-position-tab="position-history" data-exchange-position-label="历史仓位" aria-selected="false">
       历史仓位{% if not lazy_exchange_tabs %}({{ exchange_snapshot.position_history|length }}){% endif %}
     </button>
   </div>
 
-  <div class="exchange-view-switch" role="tablist" aria-label="交易持仓视图">
-    <button type="button" class="exchange-view-button is-active" data-exchange-view-mode="list" aria-selected="true">真实列表</button>
-    <button type="button" class="exchange-view-button" data-exchange-view-mode="grouped" aria-selected="false">按群组</button>
+  <div class="exchange-view-toolbar">
+    <div class="exchange-view-switch" role="tablist" aria-label="交易持仓视图">
+      <button type="button" class="exchange-view-button is-active" data-exchange-view-mode="list" aria-selected="true">真实列表</button>
+      <button type="button" class="exchange-view-button" data-exchange-view-mode="grouped" aria-selected="false">按群组</button>
+    </div>
+    <div
+      class="exchange-tab-refresh-controls"
+      data-exchange-tab-refresh-controls
+      hidden
+    >
+      <button type="button" class="secondary-button" data-exchange-tab-refresh>
+        刷新当前分页
+      </button>
+      <span
+        class="exchange-tab-refresh-status"
+        data-exchange-tab-refresh-status
+        role="status"
+        aria-live="polite"
+      ></span>
+    </div>
   </div>
 
   {% if exchange_snapshot.error %}

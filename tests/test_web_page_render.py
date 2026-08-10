@@ -1853,6 +1853,12 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     assert 'data-exchange-position-tab="open-orders"' in response.text
     assert 'data-exchange-position-tab="order-history"' in response.text
     assert 'data-exchange-position-tab="position-history"' in response.text
+    assert 'data-exchange-position-label="当前委托"' in response.text
+    assert 'data-exchange-position-label="历史委托"' in response.text
+    assert 'data-exchange-position-label="历史仓位"' in response.text
+    assert "data-exchange-tab-refresh-controls" in response.text
+    assert "data-exchange-tab-refresh" in response.text
+    assert "data-exchange-tab-refresh-status" in response.text
     exchange_tabs = re.search(
         r'<div class="exchange-tab-strip".*?</div>', response.text, re.S
     )

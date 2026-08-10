@@ -111,6 +111,9 @@ def test_deepcoin_history_assets_are_scoped_to_the_history_panel(tmp_path):
     ]
 
     assert ".exchange-tab.is-active::after" in css
+    assert ".exchange-view-toolbar" in css
+    assert ".exchange-tab-refresh-controls" in css
+    assert ".exchange-tab-refresh-status" in css
     assert "background: #3b82f6;" in css
     assert "background: #f97316;" in css
     assert "[data-exchange-history-panel]" in css
