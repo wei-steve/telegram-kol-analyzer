@@ -2414,6 +2414,57 @@ function bindHistoryBrowseControls(root) {
     button.dataset.historyLoadMoreBound = 'true';
     button.addEventListener('click', () => loadMoreHistoryPositions(root));
   });
+  const apply = root?.querySelector?.('[data-history-filter-apply]');
+  if (apply && apply.dataset.historyFilterBound !== 'true') {
+    apply.dataset.historyFilterBound = 'true';
+    apply.addEventListener('click', () => reloadHistoryPositionsWithFilter(root));
+  }
+  const clear = root?.querySelector?.('[data-history-filter-clear]');
+  if (clear && clear.dataset.historyFilterBound !== 'true') {
+    clear.dataset.historyFilterBound = 'true';
+    clear.addEventListener('click', () => {
+      const start = root.querySelector('[data-history-filter-start]');
+      const end = root.querySelector('[data-history-filter-end]');
+      if (start) start.value = '';
+      if (end) end.value = '';
+      reloadHistoryPositionsWithFilter(root);
+    });
+  }
+  root?.querySelectorAll?.('[data-history-filter-preset]').forEach((button) => {
+    if (button.dataset.historyFilterBound === 'true') return;
+    button.dataset.historyFilterBound = 'true';
+    button.addEventListener('click', () => {
+      const days = Number(button.dataset.historyFilterPreset.replace('d', ''));
+      const end = new Date();
+      const start = new Date(end);
+      start.setUTCDate(start.getUTCDate() - days);
+      const format = (date) => date.toISOString().slice(0, 10);
+      root.querySelector('[data-history-filter-start]').value = format(start);
+      root.querySelector('[data-history-filter-end]').value = format(end);
+      reloadHistoryPositionsWithFilter(root);
+    });
+  });
+}
+
+function reloadHistoryPositionsWithFilter(root) {
+  const selector = '[data-exchange-position-panel="position-history"]';
+  const current = root?.querySelector?.(selector);
+  if (!current) return Promise.resolve(false);
+  const params = new URLSearchParams();
+  const start = root.querySelector('[data-history-filter-start]')?.value;
+  const end = root.querySelector('[data-history-filter-end]')?.value;
+  if (start) params.set('closed_after', start);
+  if (end) params.set('closed_before', end);
+  return fetchWorkbenchPartial(`/positions-panel/tabs/position-history?${params}`, selector)
+    .then((fragment) => {
+      current.replaceWith(fragment);
+      const uiState = exchangePositionUiState(root);
+      setExchangePositionTab(root, uiState.tab);
+      setExchangePositionView(root, uiState.view);
+      bindHistoryBrowseControls(root);
+      return true;
+    })
+    .catch(() => false);
 }
 
 function loadMoreHistoryPositions(root) {

@@ -539,6 +539,16 @@ def test_app_js_loads_more_history_positions_without_a_second_exchange_snapshot(
     assert "data-history-load-more" in js
 
 
+def test_app_js_applies_and_clears_history_position_date_filters(tmp_path):
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+
+    assert "function reloadHistoryPositionsWithFilter(root)" in js
+    assert "data-history-filter-apply" in js
+    assert "data-history-filter-clear" in js
+
+
 def test_exchange_position_tab_manual_refresh_is_single_flight_and_preserves_data(
     tmp_path,
 ):
