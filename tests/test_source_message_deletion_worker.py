@@ -592,6 +592,25 @@ def test_worker_routes_already_terminal_target_without_exchange_mutation(tmp_pat
         session_factory,
         deepcoin_client_factory=lambda: object(),
         snapshot_loader=lambda *_args, **_kwargs: SimpleNamespace(
+            errors={"positions": "temporary timeout"},
+            positions=[],
+            open_orders=[],
+            pending_trigger_orders=[],
+        ),
+        binding_reconciler=forbidden_binding_reconciler,
+        processed_at=NOW,
+    )
+
+    assert second.waiting == 1
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        assert deletion_exit.state == "reconciling"
+        assert deletion_exit.last_reason == "flat_snapshot_retry"
+
+    third = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: object(),
+        snapshot_loader=lambda *_args, **_kwargs: SimpleNamespace(
             errors={},
             positions=[],
             open_orders=[],
@@ -601,7 +620,7 @@ def test_worker_routes_already_terminal_target_without_exchange_mutation(tmp_pat
         processed_at=NOW,
     )
 
-    assert second.finalized == 1
+    assert third.finalized == 1
 
 
 def test_worker_unknown_cancel_enters_recovery_without_resubmit(tmp_path):

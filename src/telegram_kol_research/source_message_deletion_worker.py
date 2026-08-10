@@ -167,6 +167,28 @@ def run_source_message_deletion_worker_tick(
                     claimed_exit is not None
                     and claimed_exit.last_reason == "strategy_already_terminal"
                 )
+                terminal_lifecycle_id = (
+                    int(claimed_exit.target_lifecycle_id)
+                    if claimed_exit is not None
+                    and claimed_exit.target_lifecycle_id is not None
+                    else None
+                )
+                terminal_binding_id = (
+                    int(claimed_exit.execution_binding_id)
+                    if claimed_exit is not None
+                    and claimed_exit.execution_binding_id is not None
+                    else None
+                )
+            if (
+                not terminal_target_reconciliation
+                and terminal_lifecycle_id is not None
+                and terminal_binding_id is not None
+            ):
+                terminal_target_reconciliation = _deletion_target_is_already_terminal(
+                    session_factory,
+                    lifecycle_id=terminal_lifecycle_id,
+                    binding_id=terminal_binding_id,
+                )
             if snapshot_loader is None:
                 if terminal_target_reconciliation:
                     from telegram_kol_research.execution_bindings import (

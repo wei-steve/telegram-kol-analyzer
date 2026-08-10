@@ -265,7 +265,10 @@ def reconcile_trigger_take_profit_order_history(
 
     convergences = (
         session.query(TriggerTakeProfitConvergence)
-        .filter(TriggerTakeProfitConvergence.status.in_(("submitted", "conflicted")))
+        .filter(
+            TriggerTakeProfitConvergence.venue == "deepcoin",
+            TriggerTakeProfitConvergence.status.in_(("submitted", "conflicted")),
+        )
         .all()
     )
     for convergence in convergences:
@@ -383,6 +386,8 @@ def _exact_convergence_leg_is_terminal(
         and int(leg.execution_binding_id) == int(convergence.execution_binding_id)
         and str(leg.purpose) == "entry"
         and str(leg.venue).lower() == str(convergence.venue).lower()
+        and str(convergence.venue or "").lower() == "deepcoin"
+        and str(binding.venue or "").lower() == "deepcoin"
         and str(leg.pos_id or "") == str(convergence.pos_id or "")
         and str(leg.attribution_status or "") == "verified"
         and binding_strategy_instance_id

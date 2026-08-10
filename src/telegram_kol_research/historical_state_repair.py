@@ -331,6 +331,7 @@ def build_historical_state_repair_plan(
         convergences = (
             session.query(TriggerTakeProfitConvergence)
             .filter(
+                TriggerTakeProfitConvergence.venue == "deepcoin",
                 TriggerTakeProfitConvergence.status.in_(
                     tuple(_TP_CANDIDATE_STATUSES)
                 )
@@ -931,6 +932,8 @@ def _terminal_convergence_identity(convergence, binding, leg) -> bool:
         == binding_strategy_instance_id
         and str(leg.pos_id or "") == str(convergence.pos_id or "")
         and str(leg.venue or "").lower() == str(convergence.venue or "").lower()
+        and str(convergence.venue or "").lower() == "deepcoin"
+        and str(binding.venue or "").lower() == "deepcoin"
     )
 
 

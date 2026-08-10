@@ -1470,6 +1470,52 @@ def test_terminal_take_profit_requires_matching_strategy_identity(tmp_path):
         assert order.status == "active"
 
 
+def test_terminal_take_profit_does_not_use_deepcoin_snapshot_for_other_venue(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import (
+        ExecutionBinding,
+        ExecutionOrderLeg,
+        PositionTakeProfitOrder,
+        TriggerTakeProfitConvergence,
+    )
+    from telegram_kol_research.position_take_profit_orders import (
+        reconcile_trigger_take_profit_order_history,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id = _ready_convergence(session_factory)
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        binding = session.get(ExecutionBinding, convergence.execution_binding_id)
+        leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+        order = session.query(PositionTakeProfitOrder).one()
+        convergence.status = "submitted"
+        convergence.venue = "binance"
+        binding.status = "closed"
+        binding.pos_id = None
+        binding.venue = "binance"
+        leg.status = "manually_closed"
+        leg.venue = "binance"
+        order.venue = "binance"
+        session.flush()
+        reconcile_trigger_take_profit_order_history(
+            session,
+            positions=[],
+            pending_orders=[],
+            trigger_history=[],
+            observed_at=NOW,
+            position_snapshot_complete=True,
+            pending_snapshot_complete_by_instrument={"BTC-USDT-SWAP": True},
+        )
+        session.commit()
+
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        order = session.query(PositionTakeProfitOrder).one()
+        assert convergence.status == "submitted"
+        assert order.status == "active"
+
+
 def test_terminal_entry_leg_does_not_expire_take_profit_still_pending_on_exchange(tmp_path):
     from telegram_kol_research.db import create_session_factory
     from telegram_kol_research.models import (
