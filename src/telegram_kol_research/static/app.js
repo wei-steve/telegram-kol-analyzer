@@ -2408,6 +2408,49 @@ function bindExchangeTabRetryControls(root) {
   });
 }
 
+function bindHistoryBrowseControls(root) {
+  root?.querySelectorAll?.('[data-history-load-more]').forEach((button) => {
+    if (button.dataset.historyLoadMoreBound === 'true') return;
+    button.dataset.historyLoadMoreBound = 'true';
+    button.addEventListener('click', () => loadMoreHistoryPositions(root));
+  });
+}
+
+function loadMoreHistoryPositions(root) {
+  const selector = '[data-exchange-position-panel="position-history"]';
+  const panel = root?.querySelector?.(selector);
+  const token = panel?.dataset?.historyBrowseToken;
+  const cursor = panel?.dataset?.historyNextCursor;
+  if (!panel || !token || !cursor || panel.dataset.historyLoading === 'true') {
+    return Promise.resolve(false);
+  }
+  panel.dataset.historyLoading = 'true';
+  const button = panel.querySelector('[data-history-load-more]');
+  const status = panel.querySelector('[data-history-browse-status]');
+  if (button) { button.disabled = true; button.textContent = '加载中…'; }
+  if (status) status.textContent = '正在加载更多历史仓位…';
+  const query = new URLSearchParams({ browse_token: token, cursor });
+  return fetchWorkbenchPartial(`/positions-panel/tabs/position-history?${query}`, selector)
+    .then((fragment) => {
+      const list = panel.querySelector('[data-exchange-view-panel="list"] .exchange-card-list');
+      const nextList = fragment.querySelector('[data-exchange-view-panel="list"] .exchange-card-list');
+      if (!list || !nextList) return false;
+      Array.from(nextList.children).forEach((card) => list.appendChild(card));
+      panel.dataset.historyNextCursor = fragment.dataset.historyNextCursor || '';
+      panel.dataset.historyHasMore = fragment.dataset.historyHasMore || 'false';
+      const footer = fragment.querySelector('[data-history-browse-footer]');
+      panel.querySelector('[data-history-browse-footer]')?.replaceWith(footer);
+      bindHistoryBrowseControls(root);
+      return true;
+    })
+    .catch(() => {
+      if (status) status.textContent = '加载失败，重试';
+      if (button) { button.disabled = false; button.textContent = '加载更多'; }
+      return false;
+    })
+    .finally(() => { delete panel.dataset.historyLoading; });
+}
+
 function bindExchangePositionTabs() {
   document.querySelectorAll('[data-exchange-position-tabs]').forEach((root) => {
     const tabs = root.querySelectorAll('[data-exchange-position-tab]');
@@ -2436,6 +2479,7 @@ function bindExchangePositionTabs() {
       });
     }
     bindExchangeTabRetryControls(root);
+    bindHistoryBrowseControls(root);
     restoreExchangePositionTab(root);
     restoreExchangePositionView(root);
     const restoredTab = exchangePositionTab();
@@ -2505,6 +2549,7 @@ function loadExchangePositionTab(root, tab, { force = false } = {}) {
       setExchangePositionView(root, uiState.view);
       updateExchangeTabRefreshMetadata(root, tab, fragment);
       bindExchangeTabRetryControls(root);
+      bindHistoryBrowseControls(root);
       bindBoundPositionCloseButtons();
       bindLivePositionAttributionButtons();
       return true;

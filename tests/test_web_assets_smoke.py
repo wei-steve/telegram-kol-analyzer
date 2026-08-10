@@ -529,6 +529,16 @@ def test_app_js_lazy_loads_exchange_position_tabs(tmp_path):
     assert "/positions-panel?initial=positions" in js
 
 
+def test_app_js_loads_more_history_positions_without_a_second_exchange_snapshot(tmp_path):
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+
+    assert "function loadMoreHistoryPositions(root)" in js
+    assert "browse_token" in js
+    assert "data-history-load-more" in js
+
+
 def test_exchange_position_tab_manual_refresh_is_single_flight_and_preserves_data(
     tmp_path,
 ):
