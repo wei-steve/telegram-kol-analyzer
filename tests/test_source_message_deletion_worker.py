@@ -623,6 +623,66 @@ def test_worker_routes_already_terminal_target_without_exchange_mutation(tmp_pat
     assert third.finalized == 1
 
 
+def test_worker_does_not_trust_stale_terminal_reason_after_target_reactivates(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _, lifecycle_id, binding_id, leg_id = _seed_pending_strategy(
+        session_factory,
+        chat_id=93,
+        message_id=903,
+        order_id="order-reactivated",
+    )
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        lifecycle.lifecycle_status = "exited"
+        binding = session.get(ExecutionBinding, binding_id)
+        binding.status = "closed"
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        leg.status = "exchange_cancelled"
+        session.commit()
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=93,
+        message_id=903,
+        deleted_at=NOW,
+    )
+
+    first = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: (_ for _ in ()).throw(
+            AssertionError("terminal routing must not create a client")
+        ),
+        processed_at=NOW,
+    )
+    assert first.waiting == 1
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        assert deletion_exit.last_reason == "strategy_already_terminal"
+        session.get(StrategyLifecycle, lifecycle_id).lifecycle_status = "position_open"
+        session.get(ExecutionBinding, binding_id).status = "active"
+        session.get(ExecutionOrderLeg, leg_id).status = "active"
+        session.commit()
+
+    reconciled: list[int] = []
+
+    def record_reconciliation(*_args, **_kwargs):
+        reconciled.append(binding_id)
+
+    run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: object(),
+        snapshot_loader=lambda *_args, **_kwargs: SimpleNamespace(
+            errors={},
+            positions=[],
+            open_orders=[],
+            pending_trigger_orders=[],
+        ),
+        binding_reconciler=record_reconciliation,
+        processed_at=NOW,
+    )
+
+    assert reconciled == [binding_id]
+
+
 def test_worker_unknown_cancel_enters_recovery_without_resubmit(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_pending_strategy(

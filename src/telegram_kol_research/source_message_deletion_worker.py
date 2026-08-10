@@ -163,10 +163,6 @@ def run_source_message_deletion_worker_tick(
         if state == "reconciling":
             with session_factory() as session:
                 claimed_exit = session.get(SourceMessageDeletionExit, exit_id)
-                terminal_target_reconciliation = bool(
-                    claimed_exit is not None
-                    and claimed_exit.last_reason == "strategy_already_terminal"
-                )
                 terminal_lifecycle_id = (
                     int(claimed_exit.target_lifecycle_id)
                     if claimed_exit is not None
@@ -179,11 +175,8 @@ def run_source_message_deletion_worker_tick(
                     and claimed_exit.execution_binding_id is not None
                     else None
                 )
-            if (
-                not terminal_target_reconciliation
-                and terminal_lifecycle_id is not None
-                and terminal_binding_id is not None
-            ):
+            terminal_target_reconciliation = False
+            if terminal_lifecycle_id is not None and terminal_binding_id is not None:
                 terminal_target_reconciliation = _deletion_target_is_already_terminal(
                     session_factory,
                     lifecycle_id=terminal_lifecycle_id,

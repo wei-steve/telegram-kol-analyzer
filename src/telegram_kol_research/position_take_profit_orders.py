@@ -186,14 +186,29 @@ def reconcile_trigger_take_profit_order_history(
     """
 
     now = observed_at or utc_now()
-    pending_ids = {_order_id(row) for row in pending_orders if isinstance(row, dict)}
+    pending_ids = {
+        order_id
+        for exchange_row in pending_orders
+        if isinstance(exchange_row, dict)
+        for order_id in _order_identity_ids(exchange_row)
+    }
+    history_candidates: dict[str, list[dict]] = {}
+    for exchange_row in trigger_history:
+        if not isinstance(exchange_row, dict):
+            continue
+        for order_id in _order_identity_ids(exchange_row):
+            history_candidates.setdefault(order_id, []).append(exchange_row)
     history_by_id = {
-        order_id: row for row in trigger_history if isinstance(row, dict)
-        if (order_id := _order_id(row)) is not None
+        order_id: rows[0]
+        for order_id, rows in history_candidates.items()
+        if len(rows) == 1
     }
     active_rows = (
         session.query(PositionTakeProfitOrder)
-        .filter(PositionTakeProfitOrder.status == "active")
+        .filter(
+            PositionTakeProfitOrder.venue == "deepcoin",
+            PositionTakeProfitOrder.status == "active",
+        )
         .all()
     )
     for row in active_rows:
@@ -566,8 +581,30 @@ def _json(value: dict[str, object] | None) -> str | None:
 
 
 def _order_id(row: dict) -> str | None:
-    value = row.get("ordId") or row.get("orderId") or row.get("order_id")
-    return str(value) if value not in (None, "") else None
+    return next(iter(_order_identity_ids(row)), None)
+
+
+def _order_identity_ids(row: dict) -> tuple[str, ...]:
+    aliases = (
+        "ordId",
+        "orderId",
+        "order_id",
+        "algoId",
+        "triggerOrderId",
+        "orderSysID",
+        "OrderSysID",
+        "id",
+        "clOrdId",
+        "clientOrderId",
+        "client_order_id",
+    )
+    values: list[str] = []
+    for key in aliases:
+        value = row.get(key)
+        normalized = str(value).strip() if value not in (None, "") else ""
+        if normalized and normalized not in values:
+            values.append(normalized)
+    return tuple(values)
 
 
 def _terminal_order_status(row: dict) -> str | None:

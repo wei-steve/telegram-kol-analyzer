@@ -1529,7 +1529,42 @@ def test_terminal_take_profit_does_not_use_deepcoin_snapshot_for_other_venue(tmp
         assert order.status == "active"
 
 
-def test_terminal_entry_leg_does_not_expire_take_profit_still_pending_on_exchange(tmp_path):
+def test_deepcoin_history_does_not_terminalize_same_id_order_from_other_venue(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import PositionTakeProfitOrder
+    from telegram_kol_research.position_take_profit_orders import (
+        reconcile_trigger_take_profit_order_history,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _ready_convergence(session_factory)
+    with session_factory() as session:
+        order = session.query(PositionTakeProfitOrder).one()
+        order.venue = "binance"
+        session.flush()
+        reconcile_trigger_take_profit_order_history(
+            session,
+            positions=[],
+            pending_orders=[],
+            trigger_history=[{"ordId": order.order_id, "state": "cancelled"}],
+            observed_at=NOW,
+        )
+        session.commit()
+
+    with session_factory() as session:
+        order = session.query(PositionTakeProfitOrder).one()
+        assert order.status == "active"
+        assert order.completed_at is None
+
+
+@pytest.mark.parametrize(
+    "pending_identity_key",
+    ["ordId", "algoId", "clOrdId", "orderSysID"],
+)
+def test_terminal_entry_leg_does_not_expire_take_profit_still_pending_on_exchange(
+    tmp_path,
+    pending_identity_key,
+):
     from telegram_kol_research.db import create_session_factory
     from telegram_kol_research.models import (
         ExecutionOrderLeg,
@@ -1553,7 +1588,7 @@ def test_terminal_entry_leg_does_not_expire_take_profit_still_pending_on_exchang
         reconcile_trigger_take_profit_order_history(
             session,
             positions=[],
-            pending_orders=[{"ordId": "tp-old-1"}],
+            pending_orders=[{pending_identity_key: "tp-old-1"}],
             trigger_history=[],
             observed_at=NOW,
             position_snapshot_complete=True,
