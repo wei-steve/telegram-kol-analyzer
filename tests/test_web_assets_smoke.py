@@ -351,6 +351,7 @@ def test_positions_refresh_normalizes_and_restores_in_memory_ui_state(tmp_path):
             setItem: () => { throw new Error('storage unavailable'); },
           },
         };
+        function syncExchangeTabRefreshControls() {}
         const EXCHANGE_POSITION_TABS = [
           'positions', 'open-orders', 'order-history', 'position-history',
         ];
@@ -521,7 +522,7 @@ def test_app_js_lazy_loads_exchange_position_tabs(tmp_path):
 
     js = client.get("/static/app.js").text
 
-    assert "async function loadExchangePositionTab(root, tab, { force = false } = {})" in js
+    assert "function loadExchangePositionTab(root, tab, { force = false } = {})" in js
     assert "/positions-panel/tabs/${encodeURIComponent(tab)}" in js
     assert "panel.dataset.exchangeTabLoaded === 'true'" in js
     assert "loadExchangePositionTab(root, target)" in js
@@ -683,10 +684,10 @@ def test_exchange_position_tab_manual_refresh_is_single_flight_and_preserves_dat
           throw new Error('open-orders tab did not expose the correct refresh control');
         }
         let fetchCount = 0;
-        let resolveFetch;
+        const pendingFetches = [];
         var fetchWorkbenchPartial = () => {
           fetchCount += 1;
-          return new Promise((resolve) => { resolveFetch = resolve; });
+          return new Promise((resolve) => { pendingFetches.push(resolve); });
         };
 
         await loadExchangePositionTab(root, 'open-orders');
@@ -694,10 +695,21 @@ def test_exchange_position_tab_manual_refresh_is_single_flight_and_preserves_dat
 
         const first = loadExchangePositionTab(root, 'open-orders', { force: true });
         const second = loadExchangePositionTab(root, 'open-orders', { force: true });
+        if (first !== second) throw new Error('refresh did not reuse the in-flight promise');
         await new Promise((resolve) => setTimeout(resolve, 0));
         if (fetchCount !== 1) throw new Error(`expected one refresh, got ${fetchCount}`);
         if (!root.refreshButton.disabled || root.refreshButton.textContent !== '刷新中…') {
           throw new Error('refresh button did not enter busy state');
+        }
+
+        root.panels.get('order-history').dataset.exchangeTabLoaded = 'false';
+        setExchangePositionTab(root, 'order-history');
+        const historyRequest = loadExchangePositionTab(root, 'order-history');
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        if (fetchCount !== 2) throw new Error('second tab did not begin its own request');
+        setExchangePositionTab(root, 'open-orders');
+        if (!root.refreshButton.disabled || root.refreshButton.textContent !== '刷新中…') {
+          throw new Error('active tab lost its busy state while another tab loaded');
         }
 
         const refreshed = new FakePanel(
@@ -707,7 +719,7 @@ def test_exchange_position_tab_manual_refresh_is_single_flight_and_preserves_dat
           '5',
           '2026-08-10T00:05:06+00:00',
         );
-        resolveFetch(refreshed);
+        pendingFetches[0](refreshed);
         await Promise.all([first, second]);
         if (root.currentPanel !== refreshed) throw new Error('fresh partial not committed');
         if (root.refreshButton.disabled) throw new Error('refresh button stayed disabled');
@@ -715,12 +727,21 @@ def test_exchange_position_tab_manual_refresh_is_single_flight_and_preserves_dat
         if (!root.refreshStatus.textContent.includes('00:05:06 UTC')) {
           throw new Error('capture timestamp not reported');
         }
+        pendingFetches[1](new FakePanel(
+          root,
+          'order-history',
+          true,
+          '3',
+          '2026-08-10T00:05:07+00:00',
+        ));
+        await historyRequest;
+        setExchangePositionTab(root, 'open-orders');
 
-        const beforeFailure = root.currentPanel;
+        const beforeFailure = root.panels.get('open-orders');
         fetchWorkbenchPartial = async () => { throw new Error('network unavailable'); };
         await loadExchangePositionTab(root, 'open-orders', { force: true });
-        if (root.currentPanel !== beforeFailure) throw new Error('refresh failure discarded old data');
-        if (root.currentPanel.dataset.exchangeTabLoaded !== 'true') {
+        if (root.panels.get('open-orders') !== beforeFailure) throw new Error('refresh failure discarded old data');
+        if (root.panels.get('open-orders').dataset.exchangeTabLoaded !== 'true') {
           throw new Error('refresh failure made loaded panel retry-only');
         }
         if (root.refreshButton.disabled) throw new Error('failed refresh left button disabled');

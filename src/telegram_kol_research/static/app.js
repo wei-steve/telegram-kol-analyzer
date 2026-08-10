@@ -15,6 +15,7 @@ let positionSnapshotRetryTimer = null;
 let positionSnapshotRetryToken = 0;
 let positionSnapshotRetryAttempt = 0;
 const exchangePositionTabRequests = new WeakMap();
+const exchangePositionTabBusyTabs = new WeakMap();
 const STRATEGY_RECORD_FILTER_KEY = 'telegram-workbench:strategy-filter';
 const STRATEGY_RECORD_GROUP_KEY = 'telegram-workbench:strategy-group';
 const STRATEGY_RECORD_SCROLL_KEY = 'telegram-workbench:strategy-scroll';
@@ -2330,6 +2331,15 @@ function setExchangeTabRefreshStatus(root, message = '', isError = false, tab = 
   }
 }
 
+function exchangePositionBusyTabs(root) {
+  let tabs = exchangePositionTabBusyTabs.get(root);
+  if (!tabs) {
+    tabs = new Set();
+    exchangePositionTabBusyTabs.set(root, tabs);
+  }
+  return tabs;
+}
+
 function syncExchangeTabRefreshControls(root, tab) {
   const controls = root?.querySelector?.('[data-exchange-tab-refresh-controls]');
   const button = root?.querySelector?.('[data-exchange-tab-refresh]');
@@ -2338,7 +2348,7 @@ function syncExchangeTabRefreshControls(root, tab) {
   const supported = tab !== 'positions' && Boolean(label);
   if (controls) controls.hidden = !supported;
   if (!button) return;
-  const busy = root?.dataset?.exchangeTabRefreshing === tab;
+  const busy = root ? exchangePositionBusyTabs(root).has(tab) : false;
   button.disabled = !supported || busy;
   button.textContent = busy ? '刷新中…' : `刷新${label}`;
   if (!supported) {
@@ -2352,13 +2362,10 @@ function syncExchangeTabRefreshControls(root, tab) {
 }
 
 function setExchangeTabRefreshBusy(root, tab, busy) {
-  if (root?.dataset) {
-    if (busy) {
-      root.dataset.exchangeTabRefreshing = tab;
-    } else if (root.dataset.exchangeTabRefreshing === tab) {
-      delete root.dataset.exchangeTabRefreshing;
-    }
-  }
+  if (!root) return;
+  const busyTabs = exchangePositionBusyTabs(root);
+  if (busy) busyTabs.add(tab);
+  else busyTabs.delete(tab);
   const activeTab = exchangePositionUiState(root).tab;
   syncExchangeTabRefreshControls(root, activeTab);
 }
@@ -2440,16 +2447,16 @@ function bindExchangePositionTabs() {
   });
 }
 
-async function loadExchangePositionTab(root, tab, { force = false } = {}) {
+function loadExchangePositionTab(root, tab, { force = false } = {}) {
   if (!root || tab === 'positions' || !EXCHANGE_POSITION_TABS.includes(tab)) {
-    return tab === 'positions';
+    return Promise.resolve(tab === 'positions');
   }
-  if (typeof root.querySelector !== 'function') return false;
+  if (typeof root.querySelector !== 'function') return Promise.resolve(false);
   const selector = `[data-exchange-position-panel="${tab}"]`;
   const panel = root.querySelector(selector);
-  if (!panel) return false;
+  if (!panel) return Promise.resolve(false);
   const wasLoaded = panel.dataset.exchangeTabLoaded === 'true';
-  if (wasLoaded && !force) return true;
+  if (wasLoaded && !force) return Promise.resolve(true);
 
   let requests = exchangePositionTabRequests.get(root);
   if (!requests) {
