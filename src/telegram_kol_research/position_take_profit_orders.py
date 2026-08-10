@@ -287,7 +287,7 @@ def reconcile_trigger_take_profit_order_history(
         .all()
     )
     for convergence in convergences:
-        if not convergence.pos_id:
+        if not str(convergence.pos_id or "").strip():
             continue
         rejected_without_submission = bool(
             convergence.status == "conflicted"
@@ -397,6 +397,8 @@ def _exact_convergence_leg_is_terminal(
         if binding is not None
         else ""
     )
+    convergence_pos_id = str(convergence.pos_id or "").strip()
+    leg_pos_id = str(leg.pos_id or "").strip() if leg is not None else ""
     return bool(
         leg is not None
         and binding is not None
@@ -405,13 +407,14 @@ def _exact_convergence_leg_is_terminal(
         and str(leg.venue).lower() == str(convergence.venue).lower()
         and str(convergence.venue or "").lower() == "deepcoin"
         and str(binding.venue or "").lower() == "deepcoin"
-        and str(leg.pos_id or "") == str(convergence.pos_id or "")
+        and convergence_pos_id
+        and leg_pos_id == convergence_pos_id
         and str(leg.attribution_status or "") == "verified"
         and binding_strategy_instance_id
         and str(leg.strategy_instance_id or "").strip()
         == binding_strategy_instance_id
         and (
-            str(convergence.pos_id or "") in binding_pos_ids
+            convergence_pos_id in binding_pos_ids
             or binding_is_terminal
         )
         and str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES

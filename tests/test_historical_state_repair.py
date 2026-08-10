@@ -475,6 +475,46 @@ def test_plan_refuses_conflicted_rejection_without_definite_exchange_evidence(
     )
 
 
+def test_plan_reports_blank_take_profit_position_identity_as_conflict(tmp_path):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id, _ = _seed_convergence(
+        session_factory,
+        chat_id=34,
+        message_id=304,
+        pos_id="pos-to-blank",
+        status="submitted",
+        binding_status="closed",
+        with_order=True,
+    )
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        convergence.pos_id = " "
+        leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+        leg.pos_id = " "
+        order = session.query(PositionTakeProfitOrder).filter_by(
+            trigger_take_profit_convergence_id=convergence_id
+        ).one()
+        order.pos_id = " "
+        session.commit()
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(),
+        planned_at=NOW,
+    )
+
+    assert all(action.target_id != convergence_id for action in plan.actions)
+    assert any(
+        finding.target_id == convergence_id
+        and finding.reason_code == "take_profit_position_identity_missing"
+        for finding in plan.conflicts
+    )
+
+
 def test_apply_requires_exact_gates_preserves_rows_and_is_single_use(tmp_path):
     from telegram_kol_research.historical_state_repair import (
         HistoricalStateRepairRefused,

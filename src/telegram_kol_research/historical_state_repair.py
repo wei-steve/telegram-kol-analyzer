@@ -408,8 +408,6 @@ def build_historical_state_repair_plan(
             .all()
         )
         for convergence in convergences:
-            if not str(convergence.pos_id or "").strip():
-                continue
             binding = session.get(
                 ExecutionBinding, int(convergence.execution_binding_id)
             )
@@ -475,9 +473,19 @@ def build_historical_state_repair_plan(
                 "updated_at": convergence.updated_at,
             }
             database_evidence.append({"take_profit_convergence": evidence})
+            pos_id = str(convergence.pos_id or "").strip()
+            if not pos_id:
+                conflicts.append(
+                    HistoricalStateRepairFinding(
+                        kind="take_profit_convergence",
+                        target_id=int(convergence.id),
+                        reason_code="take_profit_position_identity_missing",
+                        evidence_json=_canonical_json(evidence),
+                    )
+                )
+                continue
             if snapshot_errors:
                 continue
-            pos_id = str(convergence.pos_id)
             order_ids = {
                 str(row.order_id) for row in orders if str(row.order_id or "").strip()
             }
@@ -1041,6 +1049,8 @@ def _terminal_convergence_identity(convergence, binding, leg) -> bool:
         if binding is not None
         else ""
     )
+    convergence_pos_id = str(convergence.pos_id or "").strip()
+    leg_pos_id = str(leg.pos_id or "").strip() if leg is not None else ""
     return bool(
         binding is not None
         and leg is not None
@@ -1054,7 +1064,8 @@ def _terminal_convergence_identity(convergence, binding, leg) -> bool:
         and binding_strategy_instance_id
         and str(leg.strategy_instance_id or "").strip()
         == binding_strategy_instance_id
-        and str(leg.pos_id or "") == str(convergence.pos_id or "")
+        and convergence_pos_id
+        and leg_pos_id == convergence_pos_id
         and str(leg.venue or "").lower() == str(convergence.venue or "").lower()
         and str(convergence.venue or "").lower() == "deepcoin"
         and str(binding.venue or "").lower() == "deepcoin"
