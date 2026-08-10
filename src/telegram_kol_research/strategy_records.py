@@ -29,6 +29,7 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    InstructionExecutionContract,
     EntryRevisionReplacement,
     MediaAsset,
     MessageRecognition,
@@ -64,6 +65,9 @@ from telegram_kol_research.position_management_capabilities import (
 )
 from telegram_kol_research.deepcoin_normalization import (
     normalize_deepcoin_swap_instrument,
+)
+from telegram_kol_research.execution_state_projection import (
+    project_lifecycle_execution_state,
 )
 
 
@@ -506,6 +510,12 @@ def load_strategy_record_detail(
             .all()
             if binding_id is not None
             else []
+        )
+        execution_state_projection = project_lifecycle_execution_state(
+            session,
+            lifecycle,
+            binding=binding,
+            entry_legs=[row for row in order_legs if row.purpose == "entry"],
         )
         entry_revision_batch = (
             session.query(StrategyRevisionBatch)
@@ -1202,6 +1212,7 @@ def load_strategy_record_detail(
         },
         "overview": {
             "lifecycle_status": lifecycle.lifecycle_status,
+            "execution_state": execution_state_projection.as_dict(),
             "recognition_evidence_state": (
                 "present" if authoritative_decision is not None else "missing"
             ),
@@ -2457,6 +2468,64 @@ def load_strategy_record_summaries(
             if binding_ids
             else []
         )
+        contract_predicates = []
+        if candidate_ids:
+            contract_predicates.append(
+                InstructionExecutionContract.signal_candidate_id.in_(candidate_ids)
+            )
+        if strategy_instance_ids:
+            contract_predicates.append(
+                InstructionExecutionContract.strategy_instance_id.in_(
+                    strategy_instance_ids
+                )
+            )
+        execution_contracts = (
+            session.query(InstructionExecutionContract)
+            .filter(or_(*contract_predicates))
+            .order_by(InstructionExecutionContract.id.desc())
+            .all()
+            if contract_predicates
+            else []
+        )
+        contracts_by_candidate_id: dict[int, InstructionExecutionContract] = {}
+        contracts_by_strategy_instance_id: dict[str, InstructionExecutionContract] = {}
+        for execution_contract in execution_contracts:
+            contracts_by_candidate_id.setdefault(
+                int(execution_contract.signal_candidate_id), execution_contract
+            )
+            if execution_contract.strategy_instance_id:
+                contracts_by_strategy_instance_id.setdefault(
+                    str(execution_contract.strategy_instance_id), execution_contract
+                )
+        projection_legs_by_binding_id: dict[int, list[ExecutionOrderLeg]] = defaultdict(list)
+        for entry_leg in entry_legs:
+            projection_legs_by_binding_id[int(entry_leg.execution_binding_id)].append(entry_leg)
+        execution_projection_by_lifecycle_id = {
+            int(row.id): project_lifecycle_execution_state(
+                session,
+                row,
+                binding=bindings_by_id.get(int(row.execution_binding_id or 0)),
+                entry_legs=projection_legs_by_binding_id.get(
+                    int(row.execution_binding_id or 0),
+                    [],
+                ),
+                contract=(
+                    contracts_by_candidate_id.get(int(row.signal_candidate_id))
+                    if row.signal_candidate_id is not None
+                    else contracts_by_strategy_instance_id.get(
+                        str(
+                            getattr(
+                                bindings_by_id.get(int(row.execution_binding_id or 0)),
+                                "strategy_instance_id",
+                                "",
+                            )
+                            or ""
+                        )
+                    )
+                ),
+            )
+            for row in lifecycles
+        }
 
     events_by_binding_id, events_by_strategy_instance_id = _index_events(events)
     batches_by_lifecycle_id: dict[int, list[StrategyManagementBatch]] = defaultdict(list)
@@ -2531,6 +2600,7 @@ def load_strategy_record_summaries(
             *lifecycle_events,
             *batches,
         ) or fallback_time
+        execution_projection = execution_projection_by_lifecycle_id[int(lifecycle.id)]
         rows.append(
             {
                 "lifecycle_id": int(lifecycle.id),
@@ -2548,6 +2618,12 @@ def load_strategy_record_summaries(
                     candidate,
                 ),
                 "execution_state": _execution_state(binding, lifecycle_events),
+                "execution_truth_state": execution_projection.state,
+                "execution_state_label": execution_projection.label,
+                "execution_state_detail": execution_projection.detail,
+                "price_touched": execution_projection.price_touched,
+                "exchange_execution_verified": execution_projection.exchange_verified,
+                "execution_reason_codes": list(execution_projection.reason_codes),
                 "attribution_state": _attribution_state(binding),
                 "pos_id": str(binding.pos_id) if binding is not None and binding.pos_id else None,
                 "pos_ids": (

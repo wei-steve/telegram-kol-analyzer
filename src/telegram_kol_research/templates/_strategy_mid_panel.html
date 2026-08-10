@@ -79,7 +79,7 @@
                   <span class="side-badge{% if h.side == 'long' %} side-long{% elif h.side == 'short' %} side-short{% endif %}">
                     {{ '多' if h.side == 'long' else '空' if h.side == 'short' else h.side }}
                   </span>
-                  <code class="position-status">持仓中</code>
+                  <code class="position-status">{{ h.execution_state_label or h.current_status_label or '执行状态未知' }}</code>
                 </div>
                 <div class="position-meta">
                   {% if h.entry_text %}
@@ -131,7 +131,7 @@
                   <span class="side-badge{% if item.side == 'long' %} side-long{% elif item.side == 'short' %} side-short{% endif %}">
                     {{ '多' if item.side == 'long' else '空' if item.side == 'short' else item.side }}
                   </span>
-                  <code>{{ item.execution_status }}</code>
+                  <code>{{ item.execution_state_label or item.execution_status }}</code>
                   {% if item.contract_spec_status is defined %}
                     <span class="contract-spec-badge contract-spec-badge--{{ item.contract_spec_status.code }}">
                       {{ item.contract_spec_status.label }}

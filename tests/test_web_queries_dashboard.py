@@ -215,3 +215,29 @@ def test_holding_dashboard_surfaces_critical_unprotected_position(tmp_path):
         "exposure_started_at": started.replace(tzinfo=None).isoformat(),
         "rescue_state": "not_planned",
     }]
+
+
+def test_entered_lifecycle_without_binding_is_labeled_as_price_touch(tmp_path):
+    session_factory = create_session_factory(tmp_path / "dashboard-price-touch.db")
+    started = datetime(2026, 8, 3, 8, 0, tzinfo=UTC)
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=10,
+                message_id=21,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=started,
+                entered_at=started,
+            )
+        )
+        session.commit()
+
+    overview = list_execution_strategy_overview(session_factory, status="holding")
+
+    item = overview["items"][0]
+    assert item["execution_state"] == "price_touched"
+    assert item["execution_state_label"] == "价格触发，未提交交易所订单"
+    assert item["price_touched"] is True
+    assert item["exchange_execution_verified"] is False

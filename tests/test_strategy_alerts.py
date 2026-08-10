@@ -443,6 +443,8 @@ def test_process_strategy_alert_formats_lifecycle_events(tmp_path):
         assert f"信号类型: {alert_type}" in sent_messages[0]
         assert "方向: 空" in sent_messages[0]
         assert "交易对: ETH" in sent_messages[0]
+        if index == 1:
+            assert "执行状态: 价格触发，未提交交易所订单" in sent_messages[0]
         with session_factory() as session:
             assert session.query(StrategyAlert).one().strategy_kind == strategy_kind
 

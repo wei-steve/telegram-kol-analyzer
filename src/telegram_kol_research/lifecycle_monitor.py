@@ -1418,6 +1418,17 @@ class LifecycleMonitor:
         from_status: str,
         to_status: str,
     ) -> None:
+        from telegram_kol_research.execution_state_projection import (
+            project_lifecycle_execution_state,
+        )
+
+        with self._session_factory() as session:
+            current = session.get(StrategyLifecycle, int(row.id))
+            execution_projection = (
+                project_lifecycle_execution_state(session, current)
+                if current is not None
+                else None
+            )
         self._broker.publish_event(
             event_type="lifecycle_status_changed",
             payload={
@@ -1431,6 +1442,19 @@ class LifecycleMonitor:
                 "exit_reason": row.exit_reason,
                 "entry_price_actual": row.entry_price_actual,
                 "exit_price_actual": row.exit_price_actual,
+                "price_touched": bool(
+                    execution_projection is not None
+                    and execution_projection.price_touched
+                ),
+                "exchange_execution_verified": bool(
+                    execution_projection is not None
+                    and execution_projection.exchange_verified
+                ),
+                "execution_state": (
+                    execution_projection.state
+                    if execution_projection is not None
+                    else "unknown"
+                ),
                 "occurred_at": (row.updated_at.isoformat() if row.updated_at else None),
             },
         )

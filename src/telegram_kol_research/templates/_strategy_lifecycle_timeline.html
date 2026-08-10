@@ -1,3 +1,14 @@
+{% if strategy.execution_state_label %}
+  <div class="position-lifecycle" data-execution-state="{{ strategy.execution_state or 'unknown' }}">
+    <div class="position-lifecycle-title">交易所执行状态</div>
+    <div class="position-lifecycle-row">
+      <strong>{{ strategy.execution_state_label }}</strong>
+      {% if strategy.price_touched %}<code>price_touched</code>{% endif %}
+      {% if strategy.exchange_execution_verified %}<code>exchange_verified</code>{% endif %}
+    </div>
+    {% if strategy.execution_state_detail %}<p class="position-lifecycle-detail">{{ strategy.execution_state_detail }}</p>{% endif %}
+  </div>
+{% endif %}
 {% if strategy.lifecycle_events %}
   <div class="position-lifecycle">
     <div class="position-lifecycle-title">事件时间线</div>

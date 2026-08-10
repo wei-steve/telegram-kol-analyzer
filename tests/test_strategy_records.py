@@ -182,6 +182,58 @@ def test_composite_completion_rejects_componentless_expected_leg():
 NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
 
 
+def test_strategy_detail_separates_price_touch_from_exchange_execution(tmp_path):
+    sf = create_session_factory(tmp_path / "price-touch-detail.db")
+    with sf() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=10,
+            message_id=100,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=NOW,
+            entered_at=NOW,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    detail = load_strategy_record_detail(
+        sf,
+        lifecycle_id=lifecycle_id,
+        group_labels_by_chat_id={10: "测试群"},
+    )
+
+    assert detail is not None
+    assert detail["overview"]["execution_state"]["state"] == "price_touched"
+    assert detail["overview"]["execution_state"]["label"] == "价格触发，未提交交易所订单"
+
+
+def test_strategy_summary_uses_shared_exchange_truth_projection(tmp_path):
+    sf = create_session_factory(tmp_path / "price-touch-summary.db")
+    with sf() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=10,
+            message_id=101,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=NOW,
+            entered_at=NOW,
+        )
+        session.add(lifecycle)
+        session.commit()
+
+    rows = load_strategy_record_summaries(
+        sf,
+        group_labels_by_chat_id={10: "测试群"},
+        filter_name="all",
+    )
+
+    assert rows[0]["execution_truth_state"] == "price_touched"
+    assert rows[0]["execution_state_label"] == "价格触发，未提交交易所订单"
+
+
 def test_strategy_detail_projects_shadow_break_even_decision_as_not_executed(tmp_path):
     sf = create_session_factory(tmp_path / "break-even-detail.db")
     with sf() as session:
@@ -3066,4 +3118,4 @@ def test_loader_query_count_does_not_scale_with_strategy_count(tmp_path):
     finally:
         event.remove(engine, "before_cursor_execute", count_selects)
 
-    assert baseline_count == expanded_count == 11
+    assert baseline_count == expanded_count == 12

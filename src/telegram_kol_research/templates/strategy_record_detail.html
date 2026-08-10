@@ -24,6 +24,8 @@
     <h2 id="strategy-overview-title">概览</h2>
     <dl>
       <dt>策略状态</dt><dd>{{ record.overview.lifecycle_status }}</dd>
+      <dt>交易所执行状态</dt><dd>{{ record.overview.execution_state.label }}</dd>
+      <dt>执行证据</dt><dd>{% if record.overview.execution_state.exchange_verified %}已核验{% elif record.overview.execution_state.price_touched %}仅价格触发{% else %}未核验{% endif %}</dd>
       <dt>AI 主判模型</dt><dd>{{ record.overview.authoritative_model or '证据缺失' }}</dd>
       <dt>AI 识别状态</dt><dd>{{ record.overview.authoritative_status }}</dd>
       <dt>AI 权威证据</dt><dd>{% if record.overview.recognition_evidence_state == 'present' %}已记录{% else %}缺失，需人工核对{% endif %}</dd>

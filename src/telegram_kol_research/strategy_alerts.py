@@ -34,6 +34,9 @@ from telegram_kol_research.prompt_defaults import STRATEGY_ALERT_PROMPT, seed_de
 from telegram_kol_research.prompt_registry import PromptInvocationRecord, record_prompt_invocation
 from telegram_kol_research.raw_ingest import NormalizedMessageRecord
 from telegram_kol_research.time_utils import utc_naive_to_local
+from telegram_kol_research.execution_state_projection import (
+    project_lifecycle_execution_state,
+)
 
 
 @dataclass(slots=True)
@@ -226,6 +229,7 @@ def format_structured_strategy_alert_message(
     message_id: int,
     entry_assembly: dict[str, object] | None = None,
     entry_revision: dict[str, object] | None = None,
+    execution_state: dict[str, object] | None = None,
 ) -> str:
     """Format a unified human-readable Telegram alert message."""
 
@@ -259,6 +263,10 @@ def format_structured_strategy_alert_message(
     ]
     if management_action_text != "-":
         lines.append(f"管理动作: {management_action_text}")
+    if execution_state:
+        execution_label = str(execution_state.get("label") or "")[:64]
+        if execution_label:
+            lines.append(f"执行状态: {execution_label}")
     if entry_assembly:
         state_label = str(entry_assembly.get("state_label") or "")[:48]
         risk_calculation = str(entry_assembly.get("risk_calculation") or "")[:96]
@@ -288,7 +296,11 @@ def _entry_status_for_alert(
     session_factory: sessionmaker,
     *,
     record: NormalizedMessageRecord,
-) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+) -> tuple[
+    dict[str, object] | None,
+    dict[str, object] | None,
+    dict[str, object] | None,
+]:
     with session_factory() as session:
         binding = (
             session.query(ExecutionBinding)
@@ -317,6 +329,15 @@ def _entry_status_for_alert(
             )
         if batch is not None and binding is None:
             binding = session.get(ExecutionBinding, int(batch.execution_binding_id))
+        lifecycle = None
+        if raw is not None:
+            candidate = (
+                session.query(SignalCandidate)
+                .filter(SignalCandidate.raw_message_id == int(raw.id))
+                .order_by(SignalCandidate.id.asc())
+                .first()
+            )
+            lifecycle = _find_related_lifecycle(session, raw, candidate)
         assembly = None
         if binding is not None:
             try:
@@ -355,7 +376,16 @@ def _entry_status_for_alert(
                     "market_snapshot": market,
                 }
             )
-    return assembly, revision
+        execution_state = (
+            project_lifecycle_execution_state(
+                session,
+                lifecycle,
+                binding=binding,
+            ).as_dict()
+            if lifecycle is not None
+            else None
+        )
+    return assembly, revision, execution_state
 
 
 def build_strategy_alert_event_from_recognition(
@@ -512,7 +542,7 @@ async def process_strategy_alert_for_record(
         recognition_result=recognition_result,
     )
     if event is not None:
-        entry_assembly, entry_revision = _entry_status_for_alert(
+        entry_assembly, entry_revision, execution_state = _entry_status_for_alert(
             session_factory, record=record
         )
         message = format_structured_strategy_alert_message(
@@ -521,6 +551,7 @@ async def process_strategy_alert_for_record(
             message_id=record.message_id,
             entry_assembly=entry_assembly,
             entry_revision=entry_revision,
+            execution_state=execution_state,
         )
         try:
             await _retry_async(

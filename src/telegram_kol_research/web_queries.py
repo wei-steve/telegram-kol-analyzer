@@ -41,6 +41,10 @@ from telegram_kol_research.reporting import (
     format_entry_revision_summary,
 )
 from telegram_kol_research.runtime_agent_metrics import get_runtime_agent_metrics
+from telegram_kol_research.execution_state_projection import (
+    ExecutionStateProjection,
+    project_lifecycle_execution_state,
+)
 
 STRATEGY_TIME_DISPLAY_FIELDS = (
     "posted_at",
@@ -1792,6 +1796,7 @@ def _apply_lifecycle_display_fields(
     original_message=None,
     latest_event_message=None,
     session=None,
+    execution_projection: ExecutionStateProjection | None = None,
 ) -> dict[str, object]:
     latest_at = lifecycle.exited_at or lifecycle.entered_at or lifecycle.signal_at
     if lifecycle.lifecycle_status == "pending_entry":
@@ -1801,16 +1806,27 @@ def _apply_lifecycle_display_fields(
     if management_message_id is not None:
         latest_at = latest_event_message.posted_at if latest_event_message is not None else latest_at
 
+    if execution_projection is None and session is not None:
+        execution_projection = project_lifecycle_execution_state(session, lifecycle)
+    lifecycle_is_execution_active = lifecycle.lifecycle_status in {
+        "pending_entry",
+        "entered",
+    }
+    projected_label = (
+        execution_projection.label
+        if execution_projection is not None and lifecycle_is_execution_active
+        else _lifecycle_status_label(lifecycle.lifecycle_status, lifecycle.exit_reason)
+    )
+    projected_detail = (
+        execution_projection.detail
+        if execution_projection is not None and lifecycle_is_execution_active
+        else _lifecycle_status_detail(lifecycle.lifecycle_status, lifecycle.exit_reason)
+    )
+
     row.update(
         {
-            "current_status_label": _lifecycle_status_label(
-                lifecycle.lifecycle_status,
-                lifecycle.exit_reason,
-            ),
-            "status_detail": _lifecycle_status_detail(
-                lifecycle.lifecycle_status,
-                lifecycle.exit_reason,
-            ),
+            "current_status_label": projected_label,
+            "status_detail": projected_detail,
             "management_action_label": _management_action_label(management_action),
             "management_note": getattr(lifecycle, "management_note", None),
             "transition_text": _transition_text(
@@ -1849,6 +1865,19 @@ def _apply_lifecycle_display_fields(
             ),
         }
     )
+    if execution_projection is not None:
+        row.update(
+            {
+                "execution_state": execution_projection.state,
+                "execution_state_label": execution_projection.label,
+                "execution_state_detail": execution_projection.detail,
+                "execution_state_severity": execution_projection.severity,
+                "price_touched": execution_projection.price_touched,
+                "exchange_execution_verified": execution_projection.exchange_verified,
+                "execution_retry_allowed": execution_projection.retry_allowed,
+                "execution_reason_codes": list(execution_projection.reason_codes),
+            }
+        )
     if session is not None:
         row["lifecycle_events"] = _build_lifecycle_event_timeline(
             session,
@@ -1918,8 +1947,8 @@ def _build_lifecycle_event_timeline(
                 .one_or_none()
             )
         add_event(
-            kind="entry_confirm",
-            label="入场确认",
+            kind="price_touch",
+            label="价格触发",
             at=entry_message.posted_at if entry_message is not None else lifecycle.entered_at,
             message_id=(
                 lifecycle.entry_signal_message_id
@@ -1932,7 +1961,7 @@ def _build_lifecycle_event_timeline(
                 if lifecycle.entry_price_actual is not None
                 else None
             ),
-            transition="pending_entry → entered",
+            transition="pending_entry → price_touched",
         )
 
     binding_id = getattr(lifecycle, "execution_binding_id", None)

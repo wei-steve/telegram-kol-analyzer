@@ -59,6 +59,43 @@ def test_lifecycle_monitor_rejects_entry_before_signal_time(tmp_path):
     assert lifecycle.entry_price_actual is None
 
 
+def test_lifecycle_entry_event_exposes_price_touch_without_exchange_claim(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    occurred_at = datetime(2026, 6, 19, 12, 0, tzinfo=UTC)
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=9044,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 6, 19, 11, 0, tzinfo=UTC),
+            entry_range_low=62000,
+            entry_range_high=62500,
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    broker = LiveUpdateBroker()
+    LifecycleMonitor(session_factory, broker)._apply_transitions(
+        [
+            StateTransition(
+                signal_id=lifecycle_id,
+                from_status="pending_entry",
+                to_status="entered",
+                trigger_price=62400,
+                occurred_at=occurred_at,
+            )
+        ]
+    )
+
+    event = broker.published_events[-1]
+    assert event["to_status"] == "entered"
+    assert event["price_touched"] is True
+    assert event["exchange_execution_verified"] is False
+
+
 def test_lifecycle_monitor_skips_simulated_exit_for_live_execution_binding(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
