@@ -837,6 +837,56 @@ def test_plan_builds_one_proven_terminal_attribution_repair(tmp_path):
     assert plan.conflicts == ()
 
 
+def test_plan_accepts_production_shaped_confirmed_close_intent(tmp_path):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    seeded = _seed_proven_attribution_repair_candidate(session_factory)
+    with session_factory() as session:
+        mutation = session.get(PositionMutationIntent, seeded["mutation_id"])
+        mutation.request_json = json.dumps(
+            {
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "ordType": "market",
+                "sz": "5",
+                "closePosId": seeded["pos_id"],
+            }
+        )
+        mutation.response_json = json.dumps(
+            {
+                "code": "0",
+                "data": {"ordId": "close-order-1"},
+                "reconciled_from_exchange_readback": True,
+            }
+        )
+        session.commit()
+    snapshot = _snapshot(
+        position_history=[
+            {
+                "instId": "BTC-USDT-SWAP",
+                "posId": seeded["pos_id"],
+                "posSide": "short",
+                "pos": "5",
+                "closePos": "5",
+            }
+        ]
+    )
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=snapshot,
+        planned_at=NOW,
+    )
+
+    assert [
+        (row.kind, row.target_id) for row in plan.actions
+    ] == [("take_profit_attribution_repair", seeded["convergence_id"])]
+    assert plan.conflicts == ()
+
+
 @pytest.mark.parametrize(
     ("mutation", "expected_failure"),
     [
@@ -1237,6 +1287,65 @@ def test_apply_atomically_restores_terminal_authority_and_expires_ledgers(
         "position_attribution_audits": before_counts["position_attribution_audits"]
         + 1,
     }
+
+
+@pytest.mark.parametrize(
+    ("original_evidence", "preserved_key", "preserved_value"),
+    [
+        ("not-json", "original_evidence_raw", "not-json"),
+        ("[]", "original_evidence", []),
+    ],
+)
+def test_apply_preserves_non_object_take_profit_evidence(
+    tmp_path,
+    original_evidence,
+    preserved_key,
+    preserved_value,
+):
+    from telegram_kol_research.historical_state_repair import (
+        apply_historical_state_repair_plan,
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    seeded = _seed_proven_attribution_repair_candidate(session_factory)
+    with session_factory() as session:
+        session.get(
+            PositionTakeProfitOrder,
+            seeded["order_ids"][0],
+        ).evidence_json = original_evidence
+        session.commit()
+    snapshot = _snapshot(
+        position_history=[
+            {
+                "instId": "BTC-USDT-SWAP",
+                "posId": seeded["pos_id"],
+                "posSide": "short",
+                "pos": "5",
+                "closePos": "5",
+            }
+        ]
+    )
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=snapshot,
+        planned_at=NOW,
+    )
+
+    apply_historical_state_repair_plan(
+        session_factory,
+        snapshot_loader=lambda: snapshot,
+        expected_fingerprint=plan.fingerprint,
+        expected_action_count=1,
+        confirmation_token=plan.confirmation_token,
+        applied_at=NOW,
+    )
+
+    with session_factory() as session:
+        row = session.get(PositionTakeProfitOrder, seeded["order_ids"][0])
+        evidence = json.loads(row.evidence_json)
+    assert evidence[preserved_key] == preserved_value
+    assert evidence["terminalization"]["plan_fingerprint"] == plan.fingerprint
 
 
 def test_apply_refuses_leg_attribution_evidence_change_after_fresh_plan(

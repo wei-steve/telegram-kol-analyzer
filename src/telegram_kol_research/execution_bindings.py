@@ -803,7 +803,32 @@ def _apply_reconcile_snapshot(
             }
             for leg_id in evidence["candidate_leg_ids"]:
                 conflict_evidence_by_leg[int(leg_id)] = evidence
-        assignments = dict(attribution.assignments)
+        local_owner_leg_ids_by_position: dict[str, set[int]] = {}
+        for leg in legs:
+            if int(leg.execution_binding_id) in manual_terminal_binding_ids:
+                continue
+            if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
+                continue
+            for pos_id in _split_ids(leg.pos_id):
+                local_owner_leg_ids_by_position.setdefault(str(pos_id), set()).add(
+                    int(leg.id)
+                )
+        for pos_id, owner_leg_ids in local_owner_leg_ids_by_position.items():
+            if len(owner_leg_ids) <= 1:
+                continue
+            incident_leg_ids = sorted(owner_leg_ids)
+            conflict_leg_ids.update(incident_leg_ids)
+            incident_evidence = {
+                "candidate_leg_ids": incident_leg_ids,
+                "candidate_position_ids": [str(pos_id)],
+            }
+            for incident_leg_id in incident_leg_ids:
+                conflict_evidence_by_leg[incident_leg_id] = incident_evidence
+        assignments = {
+            int(leg_id): pos_id
+            for leg_id, pos_id in attribution.assignments.items()
+            if int(leg_id) not in conflict_leg_ids
+        }
         existing_owner_by_position = {
             str(leg.pos_id): int(leg.id)
             for leg in legs

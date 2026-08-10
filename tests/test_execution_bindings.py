@@ -3151,6 +3151,89 @@ def test_reconcile_does_not_restore_prior_authority_over_current_identity_confli
     assert "pos-new" in conflicts[0].evidence_json
 
 
+def test_reconcile_does_not_restore_prior_authority_over_local_position_owner_conflict(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(pos_id="pos-shared", status="active"),
+    )
+    authoritative_leg_id = _add_entry_leg(
+        session_factory,
+        binding_id,
+        leg_index=1,
+        order_id="order-authoritative",
+        client_order_id="client-authoritative",
+        pos_id="pos-shared",
+        status="active",
+        attribution_status="evidence_unavailable",
+    )
+    competing_leg_id = _add_entry_leg(
+        session_factory,
+        binding_id,
+        leg_index=2,
+        order_id="order-competing",
+        client_order_id="client-competing",
+        pos_id="pos-shared,legacy-other",
+        status="active",
+        attribution_status="attribution_conflict",
+    )
+    with session_factory() as session:
+        session.add(
+            PositionAttributionAudit(
+                execution_binding_id=binding_id,
+                execution_order_leg_id=authoritative_leg_id,
+                venue="deepcoin",
+                pos_id="pos-shared",
+                event_type="ownership_verified",
+                prior_state="unassigned",
+                new_state="verified",
+                fingerprint="prior-local-conflict-" + "c" * 43,
+                evidence_json=json.dumps(
+                    {
+                        "policy_version": 2,
+                        "evidence_type": "direct_order_position_id",
+                    }
+                ),
+                created_at=datetime(2026, 8, 10, 3, 0),
+            )
+        )
+        session.commit()
+
+    class CompleteEmptyClient:
+        def list_positions(self):
+            return []
+
+        def list_open_orders(self):
+            return []
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=CompleteEmptyClient(),
+        recovered_at=datetime(2026, 8, 10, 3, 1),
+    )
+
+    with session_factory() as session:
+        authoritative_leg = session.get(
+            ExecutionOrderLeg,
+            authoritative_leg_id,
+        )
+        competing_leg = session.get(ExecutionOrderLeg, competing_leg_id)
+        conflicts = (
+            session.query(PositionAttributionAudit)
+            .filter(PositionAttributionAudit.event_type == "attribution_conflict")
+            .all()
+        )
+    assert authoritative_leg.attribution_status == "attribution_conflict"
+    assert competing_leg.attribution_status == "attribution_conflict"
+    assert any(
+        str(authoritative_leg_id) in row.evidence_json
+        and str(competing_leg_id) in row.evidence_json
+        for row in conflicts
+    )
+
+
 def test_repair_execution_order_legs_from_binding_payloads_backfills_legacy_rows(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = upsert_execution_binding(

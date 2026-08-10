@@ -1244,13 +1244,15 @@ def _apply_take_profit_action(
                 "take-profit order state changed before apply"
             )
         if row.status == "active":
-            evidence = _json_object(row.evidence_json)
-            evidence["terminalization"] = {
-                "source": "historical_state_repair",
-                "reason_code": "position_terminal_order_absent",
-                "plan_fingerprint": fingerprint,
-                "observed_at": applied_at.isoformat(),
-            }
+            evidence = _append_terminalization_evidence(
+                row.evidence_json,
+                terminalization={
+                    "source": "historical_state_repair",
+                    "reason_code": "position_terminal_order_absent",
+                    "plan_fingerprint": fingerprint,
+                    "observed_at": applied_at.isoformat(),
+                },
+            )
             row.evidence_json = _canonical_json(evidence)
             row.status = "expired"
             row.completed_at = applied_at
@@ -1552,9 +1554,13 @@ def _proven_take_profit_attribution_repair(
     if len(mutations) != 1:
         return None, "confirmed_close_mutation_missing_or_ambiguous"
     mutation = mutations[0]
-    if _json_position_ids(mutation.request_json) != {pos_id} or _json_position_ids(
-        mutation.response_json
-    ) != {pos_id}:
+    response_object = _json_object(mutation.response_json)
+    response_position_ids = _json_position_ids(mutation.response_json)
+    if (
+        _json_position_ids(mutation.request_json) != {pos_id}
+        or not response_object
+        or (response_position_ids and response_position_ids != {pos_id})
+    ):
         return None, "close_mutation_payload_identity_mismatch"
 
     reservations = (
@@ -1904,6 +1910,8 @@ def _json_position_ids(value: str | None) -> set[str]:
                     "PositionID",
                     "positionId",
                     "position_id",
+                    "closePosId",
+                    "close_pos_id",
                 }:
                     normalized = str(child or "").strip()
                     if normalized:
@@ -1940,6 +1948,33 @@ def _json_object(value: str | None) -> dict[str, Any]:
     except (TypeError, json.JSONDecodeError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _append_terminalization_evidence(
+    value: str | None,
+    *,
+    terminalization: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        parsed = json.loads(str(value)) if value is not None else {}
+    except (TypeError, json.JSONDecodeError):
+        parsed = None
+        evidence: dict[str, Any] = {
+            "original_evidence_raw": str(value or ""),
+            "original_evidence_format": "raw_text",
+        }
+    else:
+        if isinstance(parsed, dict):
+            evidence = dict(parsed)
+            if "terminalization" in evidence:
+                evidence["prior_terminalization"] = evidence["terminalization"]
+        else:
+            evidence = {
+                "original_evidence": parsed,
+                "original_evidence_format": "json_non_object",
+            }
+    evidence["terminalization"] = terminalization
+    return evidence
 
 
 def _action_counts(actions) -> dict[str, int]:
