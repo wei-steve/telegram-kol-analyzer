@@ -48,7 +48,7 @@ from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.deepcoin_contract_specs import StaticDeepcoinContractSpecProvider
 from telegram_kol_research.models import PositionBackupStopOrder
 from telegram_kol_research.models import PositionProtectionIncident
-from telegram_kol_research.position_attribution import FillEvidence
+from telegram_kol_research.position_attribution import AttributionResult, FillEvidence
 from telegram_kol_research.position_protection_legs import create_or_get_protection_leg
 from telegram_kol_research.trigger_backup_stop_executor import (
     submit_verified_trigger_backup_stops,
@@ -2987,6 +2987,168 @@ def test_reconcile_api_failure_preserves_position_and_deduplicates_audit(tmp_pat
     assert len(audits) == 2
     assert audits[0].fingerprint != audits[1].fingerprint
     assert all(row.notification_status == "pending" for row in audits)
+
+
+def test_reconcile_restores_prior_authority_after_outage_and_position_close(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(pos_id="pos-verified", status="active"),
+    )
+    leg_id = _add_entry_leg(
+        session_factory,
+        binding_id,
+        pos_id="pos-verified",
+        status="active",
+        attribution_status="verified",
+    )
+    with session_factory() as session:
+        session.add(
+            PositionAttributionAudit(
+                execution_binding_id=binding_id,
+                execution_order_leg_id=leg_id,
+                venue="deepcoin",
+                pos_id="pos-verified",
+                event_type="ownership_verified",
+                prior_state="unassigned",
+                new_state="verified",
+                fingerprint="prior-outage-close-" + "a" * 45,
+                evidence_json=json.dumps(
+                    {
+                        "policy_version": 2,
+                        "evidence_type": "direct_order_position_id",
+                    }
+                ),
+                created_at=datetime(2026, 8, 10, 1, 0),
+            )
+        )
+        session.commit()
+
+    class FailingClient:
+        def list_positions(self):
+            raise RuntimeError("positions temporarily unavailable")
+
+        def list_open_orders(self):
+            return []
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=FailingClient(),
+        recovered_at=datetime(2026, 8, 10, 1, 1),
+    )
+    with session_factory() as session:
+        assert session.get(ExecutionOrderLeg, leg_id).attribution_status == (
+            "evidence_unavailable"
+        )
+
+    class CompleteEmptyClient:
+        def list_positions(self):
+            return []
+
+        def list_open_orders(self):
+            return []
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=CompleteEmptyClient(),
+        recovered_at=datetime(2026, 8, 10, 1, 2),
+    )
+
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        conflict_count = (
+            session.query(PositionAttributionAudit)
+            .filter(PositionAttributionAudit.execution_order_leg_id == leg_id)
+            .filter(PositionAttributionAudit.event_type == "attribution_conflict")
+            .count()
+        )
+    assert leg.pos_id == "pos-verified"
+    assert leg.attribution_status == "verified"
+    assert conflict_count == 0
+
+
+def test_reconcile_does_not_restore_prior_authority_over_current_identity_conflict(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(pos_id="pos-old", status="active"),
+    )
+    leg_id = _add_entry_leg(
+        session_factory,
+        binding_id,
+        pos_id="pos-old",
+        status="active",
+        attribution_status="evidence_unavailable",
+        request={
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "sz": "5",
+            "px": "63000",
+        },
+    )
+    with session_factory() as session:
+        session.add(
+            PositionAttributionAudit(
+                execution_binding_id=binding_id,
+                execution_order_leg_id=leg_id,
+                venue="deepcoin",
+                pos_id="pos-old",
+                event_type="ownership_verified",
+                prior_state="unassigned",
+                new_state="verified",
+                fingerprint="prior-current-conflict-" + "b" * 42,
+                evidence_json=json.dumps(
+                    {
+                        "policy_version": 2,
+                        "evidence_type": "direct_order_position_id",
+                    }
+                ),
+                created_at=datetime(2026, 8, 10, 2, 0),
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        execution_bindings_module,
+        "match_entry_legs_to_positions",
+        lambda *args, **kwargs: AttributionResult(
+            conflicts=[
+                {
+                    "leg_ids": [leg_id],
+                    "position_ids": ["pos-new"],
+                }
+            ]
+        ),
+    )
+
+    class ConflictingClient:
+        def list_positions(self):
+            return []
+
+        def list_open_orders(self):
+            return []
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=ConflictingClient(),
+        recovered_at=datetime(2026, 8, 10, 2, 1),
+    )
+
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        conflicts = (
+            session.query(PositionAttributionAudit)
+            .filter(PositionAttributionAudit.execution_order_leg_id == leg_id)
+            .filter(PositionAttributionAudit.event_type == "attribution_conflict")
+            .all()
+        )
+    assert leg.pos_id == "pos-old"
+    assert leg.attribution_status == "attribution_conflict"
+    assert len(conflicts) == 1
+    assert "pos-new" in conflicts[0].evidence_json
 
 
 def test_repair_execution_order_legs_from_binding_payloads_backfills_legacy_rows(tmp_path):

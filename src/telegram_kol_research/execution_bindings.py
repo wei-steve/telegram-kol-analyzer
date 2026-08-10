@@ -865,7 +865,10 @@ def _apply_reconcile_snapshot(
                 continue
             previously_verified_position_missing = bool(
                 leg.pos_id
-                and str(leg.attribution_status or "") == "verified"
+                and (
+                    str(leg.attribution_status or "") == "verified"
+                    or leg_id in prior_authoritative_leg_ids
+                )
                 and str(leg.pos_id) not in live_position_ids
                 and leg_id not in conflict_leg_ids
             )
@@ -873,6 +876,19 @@ def _apply_reconcile_snapshot(
                 # A successful empty positions snapshot proves closure, not a new
                 # owner conflict. Preserve authority long enough for manual-close
                 # sync to terminalize the exact leg and lifecycle.
+                if str(leg.attribution_status or "") != "verified":
+                    _transition_leg_attribution(
+                        session,
+                        leg=leg,
+                        event_type="ownership_restored",
+                        new_state="verified",
+                        evidence={
+                            "evidence_type": "prior_authoritative_position_audit",
+                            "policy_version": ATTRIBUTION_POLICY_VERSION,
+                            "pos_id": str(leg.pos_id),
+                        },
+                        recovered_at=recovered_at,
+                    )
                 continue
             if leg_id in conflict_leg_ids or leg.pos_id:
                 _transition_leg_attribution(
