@@ -292,6 +292,8 @@ def reconcile_trigger_take_profit_order_history(
         rejected_without_submission = bool(
             convergence.status == "conflicted"
             and convergence.reason_code == "convergence_submit_rejected"
+            and str(_load_evidence(convergence.error_json).get("type") or "")
+            == "DeepcoinDefiniteRejection"
         )
         if convergence.status != "submitted" and not rejected_without_submission:
             continue

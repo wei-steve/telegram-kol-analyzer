@@ -1319,6 +1319,7 @@ def test_rejected_take_profit_convergence_completes_after_position_is_terminal(t
         convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
         convergence.status = "conflicted"
         convergence.reason_code = "convergence_submit_rejected"
+        convergence.error_json = '{"type":"DeepcoinDefiniteRejection"}'
         leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
         binding = session.get(ExecutionBinding, convergence.execution_binding_id)
         leg.status = "manually_closed"
@@ -1344,6 +1345,57 @@ def test_rejected_take_profit_convergence_completes_after_position_is_terminal(t
             convergence.reason_code
             == "convergence_submit_rejected_position_terminal"
         )
+
+
+@pytest.mark.parametrize(
+    "error_json",
+    [None, '{"type":"TimeoutError"}', "not-json"],
+)
+def test_rejected_take_profit_requires_definite_exchange_rejection_evidence(
+    tmp_path,
+    error_json,
+):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import (
+        ExecutionBinding,
+        ExecutionOrderLeg,
+        TriggerTakeProfitConvergence,
+    )
+    from telegram_kol_research.position_take_profit_orders import (
+        reconcile_trigger_take_profit_order_history,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id = _ready_convergence(
+        session_factory,
+        existing_take_profit=False,
+    )
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        convergence.status = "conflicted"
+        convergence.reason_code = "convergence_submit_rejected"
+        convergence.error_json = error_json
+        leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+        binding = session.get(ExecutionBinding, convergence.execution_binding_id)
+        leg.status = "manually_closed"
+        binding.status = "closed"
+        binding.pos_id = None
+        session.flush()
+        reconcile_trigger_take_profit_order_history(
+            session,
+            positions=[],
+            pending_orders=[],
+            trigger_history=[],
+            observed_at=NOW,
+            position_snapshot_complete=True,
+            pending_snapshot_complete_by_instrument={"BTC-USDT-SWAP": True},
+        )
+        session.commit()
+
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        assert convergence.status == "conflicted"
+        assert convergence.reason_code == "convergence_submit_rejected"
 
 
 @pytest.mark.parametrize(
@@ -1376,6 +1428,7 @@ def test_rejected_take_profit_convergence_keeps_unknown_or_nonzero_position_live
         convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
         convergence.status = "conflicted"
         convergence.reason_code = "convergence_submit_rejected"
+        convergence.error_json = '{"type":"DeepcoinDefiniteRejection"}'
         leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
         binding = session.get(ExecutionBinding, convergence.execution_binding_id)
         leg.status = "manually_closed"
