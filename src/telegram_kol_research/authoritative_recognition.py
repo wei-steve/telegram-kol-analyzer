@@ -25,6 +25,9 @@ from telegram_kol_research.contextual_message_window import (
 from telegram_kol_research.entry_preambles import (
     persist_authoritative_entry_preamble,
 )
+from telegram_kol_research.entry_admission_reconciler import (
+    reconcile_due_entry_admissions,
+)
 from telegram_kol_research.entry_strategy_fragments import (
     persist_authoritative_entry_fragments,
 )
@@ -900,6 +903,17 @@ def apply_authoritative_assessment(
             "Instruction execution shadow projection failed open: "
             "raw_message_id=%s error=%s",
             int(assessment.raw_message_id),
+            type(exc).__name__,
+        )
+    try:
+        reconcile_due_entry_admissions(
+            session_factory,
+            now=utc_now(),
+            limit=10,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Entry admission reconciliation failed open: error=%s",
             type(exc).__name__,
         )
     return result

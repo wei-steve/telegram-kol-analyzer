@@ -77,6 +77,25 @@ from telegram_kol_research.system_operator_bot import (
 NOW = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
 
 
+def test_operator_maintenance_tick_runs_bounded_entry_reconciler(monkeypatch):
+    calls = []
+    expected = SimpleNamespace(released=1, expired=0, incidents=0, skipped=0)
+    monkeypatch.setattr(
+        operator_bot_module,
+        "reconcile_due_entry_admissions",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or expected,
+    )
+
+    result = operator_bot_module.run_operator_maintenance_tick(
+        object(),
+        now=NOW,
+        entry_admission_limit=7,
+    )
+
+    assert result is expected
+    assert calls[0][1] == {"now": NOW, "limit": 7}
+
+
 def test_automatic_break_even_alert_contains_exact_non_sensitive_handoff():
     rendered = format_position_protection_incident_message({
         "incident_type": "automatic_break_even_recovery_required",

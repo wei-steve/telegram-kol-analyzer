@@ -40,6 +40,7 @@ from telegram_kol_research.message_evidence import (
 
 ADJACENT_ENTRY_MAX_AGE = timedelta(minutes=30)
 ADJACENT_ENTRY_MAX_MESSAGES_PER_SIDE = 20
+ENTRY_ADMISSION_EXECUTION_DEADLINE = timedelta(hours=6)
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +50,9 @@ class EntryAdmissionDecision:
     proposed_status: str
     cutoff: SourceOrderKey
     selection: AdjacentEntryDecision
+    blocking_raw_message_ids: tuple[int, ...] = ()
+    deadline_at: datetime | None = None
+    recheck_fingerprint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -466,6 +470,18 @@ def _persist_attempt(
     )
     desired_status = "shadow" if mode == "shadow" else "pending"
     blockers_json = _canonical_json(sorted(set(int(value) for value in blocking_ids)))
+    item = (
+        session.query(MessageInstructionItem)
+        .filter(
+            MessageInstructionItem.raw_message_id == int(strategy_raw_message_id),
+            MessageInstructionItem.signal_candidate_id == int(signal_candidate_id),
+            MessageInstructionItem.instruction_kind == "entry",
+            MessageInstructionItem.retired_at.is_(None),
+        )
+        .one_or_none()
+    )
+    if item is not None and item.execution_deadline_at is None:
+        item.execution_deadline_at = now + ENTRY_ADMISSION_EXECUTION_DEADLINE
     if existing is not None:
         if existing.status in {"shadow", "pending"}:
             existing.status = desired_status
@@ -549,9 +565,11 @@ def assess_entry_assembly_admission(
             cutoff=cutoff,
         )
         proposed_status = "deferred" if selection.status == "pending" else selection.status
+        attempt = None
+        blocking_ids: list[int] = []
         if selection.status == "pending" and mode in {"shadow", "live"}:
             blocking_ids = list(selection.pending_raw_message_ids)
-            _persist_attempt(
+            attempt = _persist_attempt(
                 session,
                 strategy_raw_message_id=int(strategy.id),
                 signal_candidate_id=int(candidate.id),
@@ -566,7 +584,14 @@ def assess_entry_assembly_admission(
             session.commit()
         if mode == "live" and selection.status == "pending":
             return EntryAdmissionDecision(
-                "deferred", selection.reason_code, proposed_status, cutoff, selection
+                "deferred",
+                selection.reason_code,
+                proposed_status,
+                cutoff,
+                selection,
+                tuple(sorted(set(blocking_ids))),
+                assessed_at + ENTRY_ADMISSION_EXECUTION_DEADLINE,
+                attempt.fingerprint if attempt is not None else None,
             )
         if mode == "live" and selection.status == "blocked":
             return EntryAdmissionDecision(

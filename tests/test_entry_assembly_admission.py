@@ -75,6 +75,9 @@ def test_live_admission_persists_defer_and_wakes_once_on_terminal_evidence(tmp_p
 
     assert decision.status == "deferred"
     assert decision.reason_code == "adjacent_entry_context_pending"
+    assert decision.blocking_raw_message_ids == (later_id,)
+    assert decision.deadline_at == NOW + timedelta(hours=6, seconds=2)
+    assert len(decision.recheck_fingerprint or "") == 64
     with session_factory() as session:
         attempt = session.query(EntryAssemblyAttempt).one()
         assert json.loads(attempt.blocking_raw_message_ids_json) == [later_id]

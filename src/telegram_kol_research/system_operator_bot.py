@@ -23,6 +23,9 @@ from telegram_kol_research.config import (
     RuntimeIncidentConfig,
     load_runtime_incident_config,
 )
+from telegram_kol_research.entry_admission_reconciler import (
+    reconcile_due_entry_admissions,
+)
 from telegram_kol_research.llm_chat import _load_env_file_values
 from telegram_kol_research.message_instruction_items import (
     FINISH_STATUSES,
@@ -2572,6 +2575,10 @@ async def run_runtime_incident_notification_loop(
         feature_config = runtime_config
     while True:
         try:
+            run_operator_maintenance_tick(
+                session_factory,
+                now=datetime.now(UTC),
+            )
             await deliver_runtime_incident_notifications(
                 session_factory,
                 config=config,
@@ -2582,6 +2589,21 @@ async def run_runtime_incident_notification_loop(
         except Exception:
             pass
         await asyncio.sleep(max(0.1, float(interval_seconds)))
+
+
+def run_operator_maintenance_tick(
+    session_factory,
+    *,
+    now: datetime,
+    entry_admission_limit: int = 20,
+):
+    """Run bounded non-exchange maintenance owned by the operator loop."""
+
+    return reconcile_due_entry_admissions(
+        session_factory,
+        now=now,
+        limit=max(0, min(int(entry_admission_limit), 100)),
+    )
 
 
 def build_pending_entry_expiry_review_reply_markup(payload: dict[str, Any]) -> dict[str, Any]:
