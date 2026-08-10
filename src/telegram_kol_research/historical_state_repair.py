@@ -7,6 +7,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import and_, not_, or_
@@ -619,17 +620,33 @@ def build_historical_state_repair_plan(
                             row.trigger_take_profit_convergence_id or 0
                         ),
                         "order_id": str(row.order_id),
+                        "trigger_price": str(row.trigger_price),
+                        "size_text": row.size_text,
                         "status": str(row.status),
                         "pos_id": str(row.pos_id),
+                        "cancel_request_hash": _optional_text_hash(
+                            row.cancel_request_json
+                        ),
+                        "cancel_response_hash": _optional_text_hash(
+                            row.cancel_response_json
+                        ),
+                        "cancel_requested_at": row.cancel_requested_at,
+                        "cancelled_at": row.cancelled_at,
+                        "completed_at": row.completed_at,
                         "updated_at": row.updated_at,
                         "evidence_hash": _optional_text_hash(row.evidence_json),
                     }
                     for row in orders
                 ],
                 "error_type": _error_type(convergence.error_json),
+                "desired_take_profits_hash": _optional_text_hash(
+                    convergence.desired_take_profits_json
+                ),
                 "request_hash": _optional_text_hash(convergence.request_json),
                 "response_hash": _optional_text_hash(convergence.response_json),
                 "error_hash": _optional_text_hash(convergence.error_json),
+                "reserved_at": convergence.reserved_at,
+                "completed_at": convergence.completed_at,
                 "updated_at": convergence.updated_at,
             }
             attribution_repair_proof = None
@@ -861,6 +878,13 @@ def apply_historical_state_repair_plan(
                     "take_profit_rejection",
                 }:
                     _apply_take_profit_action(
+                        session,
+                        action=action,
+                        fingerprint=plan.fingerprint,
+                        applied_at=now,
+                    )
+                elif action.kind == "take_profit_attribution_repair":
+                    _apply_take_profit_attribution_repair_action(
                         session,
                         action=action,
                         fingerprint=plan.fingerprint,
@@ -1135,9 +1159,14 @@ def _apply_take_profit_action(
             else None
         ),
         "leg": _leg_evidence(leg) if leg is not None else None,
+        "desired_take_profits_hash": _optional_text_hash(
+            convergence.desired_take_profits_json
+        ),
         "request_hash": _optional_text_hash(convergence.request_json),
         "response_hash": _optional_text_hash(convergence.response_json),
         "error_hash": _optional_text_hash(convergence.error_json),
+        "reserved_at": convergence.reserved_at,
+        "completed_at": convergence.completed_at,
         "updated_at": convergence.updated_at,
         "orders": [
             {
@@ -1149,8 +1178,19 @@ def _apply_take_profit_action(
                     item.trigger_take_profit_convergence_id or 0
                 ),
                 "order_id": str(item.order_id),
+                "trigger_price": str(item.trigger_price),
+                "size_text": item.size_text,
                 "status": str(item.status),
                 "pos_id": str(item.pos_id),
+                "cancel_request_hash": _optional_text_hash(
+                    item.cancel_request_json
+                ),
+                "cancel_response_hash": _optional_text_hash(
+                    item.cancel_response_json
+                ),
+                "cancel_requested_at": item.cancel_requested_at,
+                "cancelled_at": item.cancelled_at,
+                "completed_at": item.completed_at,
                 "updated_at": item.updated_at,
                 "evidence_hash": _optional_text_hash(item.evidence_json),
             }
@@ -1185,8 +1225,15 @@ def _apply_take_profit_action(
             "execution_order_leg_id": int(row.execution_order_leg_id),
             "convergence_id": int(row.trigger_take_profit_convergence_id or 0),
             "order_id": str(row.order_id),
+            "trigger_price": str(row.trigger_price),
+            "size_text": row.size_text,
             "status": str(row.status),
             "pos_id": str(row.pos_id),
+            "cancel_request_hash": _optional_text_hash(row.cancel_request_json),
+            "cancel_response_hash": _optional_text_hash(row.cancel_response_json),
+            "cancel_requested_at": row.cancel_requested_at,
+            "cancelled_at": row.cancelled_at,
+            "completed_at": row.completed_at,
             "updated_at": row.updated_at,
             "evidence_hash": _optional_text_hash(row.evidence_json),
         }
@@ -1212,6 +1259,114 @@ def _apply_take_profit_action(
     convergence.reason_code = action.reason_code
     convergence.completed_at = applied_at
     convergence.updated_at = applied_at
+
+
+def _apply_take_profit_attribution_repair_action(
+    session,
+    *,
+    action,
+    fingerprint: str,
+    applied_at: datetime,
+) -> None:
+    convergence = session.get(TriggerTakeProfitConvergence, int(action.target_id))
+    if convergence is None:
+        raise HistoricalStateRepairRefused(
+            "take-profit attribution convergence disappeared before apply"
+        )
+    expected = _json_object(action.evidence_json)
+    expected_proof = expected.get("attribution_repair_proof")
+    if not isinstance(expected_proof, dict):
+        raise HistoricalStateRepairRefused(
+            "take-profit attribution proof missing before apply"
+        )
+    binding = session.get(ExecutionBinding, int(convergence.execution_binding_id))
+    leg = session.get(ExecutionOrderLeg, int(convergence.execution_order_leg_id))
+    orders = (
+        session.query(PositionTakeProfitOrder)
+        .filter(
+            PositionTakeProfitOrder.trigger_take_profit_convergence_id
+            == int(convergence.id)
+        )
+        .order_by(PositionTakeProfitOrder.id.asc())
+        .all()
+    )
+    history_row = expected_proof.get("position_history")
+    current_proof, failure = _proven_take_profit_attribution_repair(
+        session,
+        convergence=convergence,
+        binding=binding,
+        leg=leg,
+        orders=orders,
+        snapshot=SimpleNamespace(
+            position_history=[history_row] if isinstance(history_row, dict) else []
+        ),
+    )
+    if failure is not None or _canonical_json(current_proof) != _canonical_json(
+        expected_proof
+    ):
+        raise HistoricalStateRepairRefused(
+            "take-profit attribution local proof changed before apply"
+        )
+    if leg is None:
+        raise HistoricalStateRepairRefused(
+            "take-profit attribution leg disappeared before apply"
+        )
+    prior_state = str(leg.attribution_status or "unassigned")
+
+    _apply_take_profit_action(
+        session,
+        action=action,
+        fingerprint=fingerprint,
+        applied_at=applied_at,
+    )
+
+    restoration_evidence = {
+        "evidence_type": "historical_authority_restored",
+        "policy_version": ATTRIBUTION_POLICY_VERSION,
+        "plan_fingerprint": fingerprint,
+        "pos_id": str(leg.pos_id),
+        "authority_audit_ids": [
+            int(row["id"])
+            for row in expected_proof.get("authority_audits", [])
+            if isinstance(row, dict) and row.get("id") is not None
+        ],
+    }
+    restoration_fingerprint = _fingerprint(
+        {
+            "venue": str(leg.venue),
+            "execution_binding_id": int(leg.execution_binding_id),
+            "execution_order_leg_id": int(leg.id),
+            "pos_id": str(leg.pos_id),
+            "event_type": "historical_authority_restored",
+            "reason_code": action.reason_code,
+            "plan_fingerprint": fingerprint,
+        }
+    )
+    existing_audit = (
+        session.query(PositionAttributionAudit.id)
+        .filter(PositionAttributionAudit.fingerprint == restoration_fingerprint)
+        .one_or_none()
+    )
+    if existing_audit is None:
+        session.add(
+            PositionAttributionAudit(
+                execution_binding_id=int(leg.execution_binding_id),
+                execution_order_leg_id=int(leg.id),
+                venue=str(leg.venue),
+                pos_id=str(leg.pos_id),
+                event_type="historical_authority_restored",
+                prior_state=prior_state,
+                new_state="verified",
+                fingerprint=restoration_fingerprint,
+                evidence_json=_canonical_json(restoration_evidence),
+                notification_status="not_needed",
+                created_at=applied_at,
+            )
+        )
+    leg.attribution_status = "verified"
+    leg.attribution_evidence_json = _canonical_json(restoration_evidence)
+    leg.last_verified_at = applied_at
+    leg.updated_at = applied_at
 
 
 def _terminal_strategy_identity(deletion_exit, lifecycle, binding, legs) -> bool:
@@ -1661,9 +1816,16 @@ def _leg_evidence(row) -> dict[str, Any]:
         "purpose": str(row.purpose),
         "status": str(row.status),
         "attribution_status": str(row.attribution_status),
+        "attribution_evidence_hash": _optional_text_hash(
+            row.attribution_evidence_json
+        ),
+        "terminal_reason": row.terminal_reason,
+        "last_verified_at": row.last_verified_at,
         "order_id": row.order_id,
         "client_order_id": row.client_order_id,
         "pos_id": row.pos_id,
+        "request_hash": _optional_text_hash(row.request_json),
+        "response_hash": _optional_text_hash(row.response_json),
         "updated_at": row.updated_at,
     }
 
