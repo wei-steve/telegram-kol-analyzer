@@ -99,3 +99,47 @@
 - 13 条历史收敛完成，23 条历史止盈台账过期。
 - 当前活跃收敛和止盈保护不变。
 - 应用后干跑为零动作，交易所前后快照指纹一致。
+
+## 生产操作手册
+
+以下命令只能在安全窗口内使用。所有数据库修复命令必须在 `telegram-kol.service` 已停止后执行。
+
+```bash
+systemctl stop telegram-kol.service
+systemctl is-active telegram-kol.service
+```
+
+使用 Python SQLite backup API 创建带 UTC 时间戳的备份，不使用未锁定的普通文件拷贝。备份后对源库与备份库分别执行 `PRAGMA integrity_check`，两者都必须返回 `ok`。
+
+```bash
+python -m telegram_kol_research.cli repair-historical-state-convergence \
+  --database-path /opt/telegram-kol-analyzer/data/research.db
+```
+
+干跑 JSON 必须同时满足：
+
+- `conflicts` 为空。
+- `actions` 只包含本设计列出的历史类别。
+- 当前活跃仓位的收敛 ID 出现在 `exclusions`，原因是 `exact_position_or_order_still_live`。
+- `exchange_fingerprint` 已与停服前只读快照记录对比。
+
+将同一次干跑输出的值原样填入：
+
+```bash
+python -m telegram_kol_research.cli repair-historical-state-convergence \
+  --database-path /opt/telegram-kol-analyzer/data/research.db \
+  --apply \
+  --expected-fingerprint '<64-hex-fingerprint>' \
+  --expected-action-count '<exact-action-count>' \
+  --confirmation-token '<16-hex-token>'
+```
+
+应用成功后立即再次执行干跑；`action_count` 必须为 0，且原指纹必须无法再次应用。然后核对数据库计数、审计事件与 Deepcoin 前后快照，最后启动服务：
+
+```bash
+systemctl start telegram-kol.service
+systemctl is-active telegram-kol.service
+journalctl -u telegram-kol.service --since '10 minutes ago' --no-pager
+```
+
+如在启动前任一验证失败，保持服务停止，先对当前库留存事故副本，再用已通过完整性检查的 SQLite 备份恢复原库；恢复后再次执行 `PRAGMA integrity_check`。若代码验证同时失败，将工作树回退到已记录的上一生产 SHA，重新安装后才可启动服务。

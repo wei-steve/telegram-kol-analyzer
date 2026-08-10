@@ -98,6 +98,11 @@ from telegram_kol_research.position_attribution_repair import (
     apply_position_attribution_repair_plan,
     build_position_attribution_repair_plan,
 )
+from telegram_kol_research.historical_state_repair import (
+    HistoricalStateRepairRefused,
+    apply_historical_state_repair_plan,
+    build_historical_state_repair_plan,
+)
 from telegram_kol_research.position_management_remediation import (
     apply_position_management_remediation_action,
     build_position_management_remediation_plan,
@@ -4059,6 +4064,83 @@ def repair_position_attribution(
         expected_fingerprint=expected_fingerprint,
     )
     typer.echo(f"Applied {result.applied} repair action(s).")
+
+
+@app.command("repair-historical-state-convergence")
+def repair_historical_state_convergence(
+    database_path: Path = typer.Option(
+        Path("data/research.db"), "--database-path"
+    ),
+    apply: bool = typer.Option(False, "--apply"),
+    expected_fingerprint: str | None = typer.Option(
+        None, "--expected-fingerprint"
+    ),
+    expected_action_count: int | None = typer.Option(
+        None, "--expected-action-count"
+    ),
+    confirmation_token: str | None = typer.Option(
+        None, "--confirmation-token"
+    ),
+) -> None:
+    """Plan or explicitly apply local-only historical state convergence."""
+
+    session_factory = create_existing_session_factory(database_path)
+    client = build_deepcoin_client_from_env()
+    snapshot = load_deepcoin_execution_reconciliation_snapshot_read_only(
+        session_factory,
+        client=client,
+    )
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=snapshot,
+        planned_at=datetime.now(UTC),
+    )
+    payload = asdict(plan)
+    payload["action_count"] = plan.action_count
+    typer.echo("APPLY" if apply else "DRY RUN")
+    typer.echo(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    )
+    if not apply:
+        return
+    missing = []
+    if not expected_fingerprint:
+        missing.append("--expected-fingerprint")
+    if expected_action_count is None:
+        missing.append("--expected-action-count")
+    if not confirmation_token:
+        missing.append("--confirmation-token")
+    if missing:
+        typer.echo(
+            "Refusing apply: required gate(s) missing: " + ", ".join(missing),
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if plan.conflicts:
+        typer.echo("Refusing apply: unresolved repair conflicts remain.", err=True)
+        raise typer.Exit(code=2)
+    try:
+        result = apply_historical_state_repair_plan(
+            session_factory,
+            snapshot=snapshot,
+            expected_fingerprint=expected_fingerprint,
+            expected_action_count=expected_action_count,
+            confirmation_token=confirmation_token,
+            applied_at=datetime.now(UTC),
+        )
+    except HistoricalStateRepairRefused as exc:
+        typer.echo(f"Refusing apply: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(
+        f"Applied {result.applied_actions} historical repair action(s). "
+        f"Audit event {result.audit_event_id}."
+    )
 
 
 @app.command("recover-management-history")
