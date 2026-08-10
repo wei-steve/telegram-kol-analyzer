@@ -42,7 +42,7 @@ def test_repair_historical_state_convergence_defaults_to_json_dry_run(
     monkeypatch.setattr(cli, "build_deepcoin_client_from_env", lambda: object())
     monkeypatch.setattr(
         cli,
-        "load_deepcoin_execution_reconciliation_snapshot_read_only",
+        "load_historical_state_repair_snapshot_read_only",
         lambda *_args, **_kwargs: snapshot,
     )
     monkeypatch.setattr(
@@ -77,6 +77,57 @@ def test_repair_historical_state_convergence_defaults_to_json_dry_run(
     assert applied == []
 
 
+def test_repair_historical_state_convergence_uses_exact_history_snapshot_loader(
+    tmp_path,
+    monkeypatch,
+):
+    plan = _plan()
+    session_factory = object()
+    client = object()
+    snapshot = object()
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "create_existing_session_factory",
+        lambda _path: session_factory,
+    )
+    monkeypatch.setattr(cli, "build_deepcoin_client_from_env", lambda: client)
+    monkeypatch.setattr(
+        cli,
+        "load_historical_state_repair_snapshot_read_only",
+        lambda supplied_factory, *, client: (
+            calls.append((supplied_factory, client)),
+            snapshot,
+        )[1],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli,
+        "load_deepcoin_execution_reconciliation_snapshot_read_only",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("generic snapshot loader must not be used")
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_historical_state_repair_plan",
+        lambda *_args, **_kwargs: plan,
+        raising=False,
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "repair-historical-state-convergence",
+            "--database-path",
+            str(tmp_path / "research.db"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [(session_factory, client)]
+
+
 def test_repair_historical_state_convergence_dry_run_conflict_exits_two(
     tmp_path,
     monkeypatch,
@@ -94,7 +145,7 @@ def test_repair_historical_state_convergence_dry_run_conflict_exits_two(
     monkeypatch.setattr(cli, "build_deepcoin_client_from_env", lambda: object())
     monkeypatch.setattr(
         cli,
-        "load_deepcoin_execution_reconciliation_snapshot_read_only",
+        "load_historical_state_repair_snapshot_read_only",
         lambda *_args, **_kwargs: object(),
     )
     monkeypatch.setattr(
@@ -125,7 +176,7 @@ def test_repair_historical_state_convergence_apply_requires_all_three_gates(
     monkeypatch.setattr(cli, "build_deepcoin_client_from_env", lambda: object())
     monkeypatch.setattr(
         cli,
-        "load_deepcoin_execution_reconciliation_snapshot_read_only",
+        "load_historical_state_repair_snapshot_read_only",
         lambda *_args, **_kwargs: object(),
     )
     monkeypatch.setattr(
@@ -158,7 +209,7 @@ def test_repair_historical_state_convergence_applies_exact_plan(tmp_path, monkey
     monkeypatch.setattr(cli, "build_deepcoin_client_from_env", lambda: object())
     monkeypatch.setattr(
         cli,
-        "load_deepcoin_execution_reconciliation_snapshot_read_only",
+        "load_historical_state_repair_snapshot_read_only",
         lambda *_args, **_kwargs: snapshot,
     )
     monkeypatch.setattr(

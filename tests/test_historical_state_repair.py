@@ -11,6 +11,7 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    PositionAttributionAudit,
     PositionTakeProfitOrder,
     RawMessage,
     RepairConfirmationToken,
@@ -211,6 +212,83 @@ def _seed_convergence(
             order_id = order.id
         session.commit()
         return convergence.id, order_id
+
+
+def _seed_restorable_authority_candidate(
+    session_factory,
+    *,
+    pos_id: str = "pos-restorable",
+) -> int:
+    convergence_id, _ = _seed_convergence(
+        session_factory,
+        chat_id=39,
+        message_id=309,
+        pos_id=pos_id,
+        status="submitted",
+        binding_status="closed",
+        with_order=True,
+    )
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+        leg.attribution_status = "attribution_conflict"
+        session.add(
+            PositionAttributionAudit(
+                execution_binding_id=leg.execution_binding_id,
+                execution_order_leg_id=leg.id,
+                venue="deepcoin",
+                pos_id=leg.pos_id,
+                event_type="ownership_verified",
+                prior_state="unassigned",
+                new_state="verified",
+                fingerprint="b" * 64,
+                evidence_json=json.dumps(
+                    {
+                        "policy_version": 2,
+                        "evidence_type": "direct_order_position_id",
+                    }
+                ),
+                created_at=NOW,
+            )
+        )
+        session.commit()
+    return convergence_id
+
+
+class _ReadOnlyHistoryClient:
+    def __init__(self, history_response):
+        self.history_response = history_response
+        self.history_calls = []
+
+    def list_positions(self):
+        return []
+
+    def list_open_orders(self):
+        return []
+
+    def list_trigger_orders_pending(self, *, inst_id):
+        return []
+
+    def list_order_history(self, *, inst_id):
+        return []
+
+    def list_trade_fills(self, *, inst_id):
+        return []
+
+    def list_trigger_order_history(self, *, inst_id):
+        return []
+
+    def list_position_history(self, *, inst_id, pos_id):
+        self.history_calls.append((inst_id, pos_id))
+        if isinstance(self.history_response, Exception):
+            raise self.history_response
+        return self.history_response
+
+    def submit_order(self, *_args, **_kwargs):
+        raise AssertionError("historical repair snapshot must remain read-only")
+
+    cancel_order = submit_order
+    close_position = submit_order
 
 
 def test_plan_classifies_terminal_history_and_excludes_current_live_position(tmp_path):
@@ -458,6 +536,93 @@ def test_plan_excludes_submitted_take_profit_with_unverified_identity(tmp_path):
         and exclusion.reason_code == "take_profit_identity_not_terminal"
         for exclusion in plan.exclusions
     )
+
+
+def test_historical_repair_snapshot_loads_exact_history_for_restorable_authority(
+    tmp_path,
+):
+    from telegram_kol_research.historical_state_repair import (
+        load_historical_state_repair_snapshot_read_only,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_restorable_authority_candidate(session_factory)
+    history_row = {
+        "instId": "BTC-USDT-SWAP",
+        "posId": "pos-restorable",
+        "posSide": "short",
+        "pos": "1",
+        "closePos": "1",
+    }
+    client = _ReadOnlyHistoryClient([history_row])
+    snapshot = load_historical_state_repair_snapshot_read_only(
+        session_factory,
+        client=client,
+    )
+
+    assert client.history_calls == [("BTC-USDT-SWAP", "pos-restorable")]
+    assert snapshot.position_history == [history_row]
+    assert snapshot.errors == {}
+
+
+@pytest.mark.parametrize(
+    ("history_response", "expected_error"),
+    [
+        (RuntimeError("history unavailable"), "history unavailable"),
+        ({"posId": "pos-restorable"}, "invalid list response schema"),
+        (["not-a-row"], "invalid list response schema"),
+        (
+            [{"posId": "different-position", "pos": "1", "closePos": "1"}],
+            "position history response identity mismatch",
+        ),
+        (
+            [{"instId": "BTC-USDT-SWAP", "pos": "1", "closePos": "1"}],
+            "position history response identity mismatch",
+        ),
+    ],
+)
+def test_historical_repair_snapshot_fails_closed_on_invalid_exact_history(
+    tmp_path,
+    history_response,
+    expected_error,
+):
+    from telegram_kol_research.historical_state_repair import (
+        load_historical_state_repair_snapshot_read_only,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_restorable_authority_candidate(session_factory)
+    snapshot = load_historical_state_repair_snapshot_read_only(
+        session_factory,
+        client=_ReadOnlyHistoryClient(history_response),
+    )
+
+    source = "position_history:BTC-USDT-SWAP:pos-restorable"
+    assert expected_error in snapshot.errors[source]
+    assert snapshot.position_history == []
+
+
+def test_historical_repair_snapshot_deduplicates_exact_history_rows(tmp_path):
+    from telegram_kol_research.historical_state_repair import (
+        load_historical_state_repair_snapshot_read_only,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_restorable_authority_candidate(session_factory)
+    row = {
+        "instId": "BTC-USDT-SWAP",
+        "posId": "pos-restorable",
+        "posSide": "short",
+        "pos": "5",
+        "closePos": "5",
+    }
+    snapshot = load_historical_state_repair_snapshot_read_only(
+        session_factory,
+        client=_ReadOnlyHistoryClient([row, dict(row)]),
+    )
+
+    assert snapshot.position_history == [row]
+    assert snapshot.errors == {}
 
 
 def test_plan_refuses_unlinked_deletion_when_source_binding_exists(tmp_path):

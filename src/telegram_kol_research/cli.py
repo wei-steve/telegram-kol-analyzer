@@ -102,6 +102,7 @@ from telegram_kol_research.historical_state_repair import (
     HistoricalStateRepairRefused,
     apply_historical_state_repair_plan,
     build_historical_state_repair_plan,
+    load_historical_state_repair_snapshot_read_only,
 )
 from telegram_kol_research.position_management_remediation import (
     apply_position_management_remediation_action,
@@ -4086,7 +4087,7 @@ def repair_historical_state_convergence(
 
     session_factory = create_existing_session_factory(database_path)
     client = build_deepcoin_client_from_env()
-    snapshot = load_deepcoin_execution_reconciliation_snapshot_read_only(
+    snapshot = load_historical_state_repair_snapshot_read_only(
         session_factory,
         client=client,
     )
@@ -4132,7 +4133,7 @@ def repair_historical_state_convergence(
         result = apply_historical_state_repair_plan(
             session_factory,
             snapshot_loader=lambda: (
-                load_deepcoin_execution_reconciliation_snapshot_read_only(
+                load_historical_state_repair_snapshot_read_only(
                     session_factory,
                     client=client,
                 )

@@ -12,10 +12,14 @@ from typing import Any
 from sqlalchemy import and_, not_, or_
 from sqlalchemy.exc import IntegrityError
 
+from telegram_kol_research.execution_bindings import (
+    load_deepcoin_execution_reconciliation_snapshot_read_only,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    PositionAttributionAudit,
     PositionTakeProfitOrder,
     RepairConfirmationToken,
     SignalCandidate,
@@ -26,7 +30,10 @@ from telegram_kol_research.models import (
     TriggerTakeProfitConvergence,
     utc_now,
 )
-from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
+from telegram_kol_research.position_attribution import (
+    ATTRIBUTION_POLICY_VERSION,
+    TERMINAL_ENTRY_LEG_STATES,
+)
 
 
 _ACTIVE_DELETION_STATES = frozenset(
@@ -88,6 +95,107 @@ class HistoricalStateRepairResult:
     fingerprint: str
     applied_actions: int
     audit_event_id: int | None
+
+
+def load_historical_state_repair_snapshot_read_only(
+    session_factory,
+    *,
+    client,
+):
+    """Load the normal snapshot plus bounded exact history for repair candidates."""
+
+    snapshot = load_deepcoin_execution_reconciliation_snapshot_read_only(
+        session_factory,
+        client=client,
+    )
+    with session_factory() as session:
+        candidates: set[tuple[str, str]] = set()
+        convergences = (
+            session.query(TriggerTakeProfitConvergence)
+            .filter(TriggerTakeProfitConvergence.venue == "deepcoin")
+            .filter(TriggerTakeProfitConvergence.status == "submitted")
+            .order_by(TriggerTakeProfitConvergence.id.asc())
+            .all()
+        )
+        for convergence in convergences:
+            leg = session.get(
+                ExecutionOrderLeg,
+                int(convergence.execution_order_leg_id),
+            )
+            binding = session.get(
+                ExecutionBinding,
+                int(convergence.execution_binding_id),
+            )
+            pos_id = str(convergence.pos_id or "").strip()
+            if (
+                leg is None
+                or binding is None
+                or not pos_id
+                or str(leg.status or "").lower() not in TERMINAL_ENTRY_LEG_STATES
+                or str(leg.attribution_status or "")
+                not in {"attribution_conflict", "evidence_unavailable"}
+                or str(leg.pos_id or "").strip() != pos_id
+                or str(binding.status or "").lower()
+                not in _TERMINAL_BINDING_STATES
+            ):
+                continue
+            audits = (
+                session.query(PositionAttributionAudit)
+                .filter(PositionAttributionAudit.execution_order_leg_id == int(leg.id))
+                .filter(PositionAttributionAudit.venue == "deepcoin")
+                .filter(PositionAttributionAudit.pos_id == pos_id)
+                .filter(PositionAttributionAudit.event_type == "ownership_verified")
+                .filter(PositionAttributionAudit.new_state == "verified")
+                .all()
+            )
+            if not any(_is_policy_v2_authority_audit(row) for row in audits):
+                continue
+            candidates.add((f"{str(binding.symbol).upper()}-USDT-SWAP", pos_id))
+
+    history_reader = getattr(client, "list_position_history", None)
+    for instrument_id, pos_id in sorted(candidates):
+        source = f"position_history:{instrument_id}:{pos_id}"
+        if history_reader is None:
+            snapshot.errors[source] = "list_position_history unavailable"
+            continue
+        try:
+            rows = history_reader(inst_id=instrument_id, pos_id=pos_id)
+        except Exception as exc:
+            snapshot.errors[source] = str(exc)
+            continue
+        if not isinstance(rows, list) or not all(
+            isinstance(row, dict) for row in rows
+        ):
+            snapshot.errors[source] = "invalid list response schema"
+            continue
+        if any(_position_identity_ids(row) != {pos_id} for row in rows):
+            snapshot.errors[source] = (
+                "position history response identity mismatch: "
+                f"expected {pos_id}"
+            )
+            continue
+        known = {
+            _canonical_json(row)
+            for row in list(getattr(snapshot, "position_history", []) or [])
+        }
+        for row in rows:
+            fingerprint = _canonical_json(row)
+            if fingerprint in known:
+                continue
+            snapshot.position_history.append(row)
+            known.add(fingerprint)
+    return snapshot
+
+
+def _is_policy_v2_authority_audit(row: PositionAttributionAudit) -> bool:
+    try:
+        evidence = json.loads(row.evidence_json or "{}")
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        isinstance(evidence, dict)
+        and evidence.get("policy_version") == ATTRIBUTION_POLICY_VERSION
+    )
 
 
 def build_historical_state_repair_plan(
