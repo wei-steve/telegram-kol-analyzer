@@ -55,6 +55,20 @@ class TradeSignalRecord:
     last_error: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class TradeSignalExecutionEvidence:
+    id: int
+    status: str
+    strategy_instance_id: str | None
+    chat_id: int
+    message_id: int
+    symbol: str
+    side: str
+    draft: dict[str, Any]
+    result: dict[str, Any] | None
+    last_error: str | None
+
+
 class TradeSignalFingerprintSyncError(RuntimeError):
     """The pending signal could not be synchronized without ambiguity."""
 
@@ -435,6 +449,41 @@ def load_trade_signal(
         if row is None:
             raise LookupError("trade signal not found")
         return _row_to_record(row)
+
+
+def load_trade_signal_execution_evidence(
+    session_factory: sessionmaker,
+    *,
+    signal_id: int,
+) -> TradeSignalExecutionEvidence:
+    """Load the exact durable entry signal and its terminal result evidence."""
+
+    with session_factory() as session:
+        row = session.get(TradeSignal, int(signal_id))
+        if row is None:
+            raise LookupError("trade signal not found")
+        payload = _row_payload(row)
+        draft = payload.get("deepcoin_order_draft")
+        if not isinstance(draft, dict):
+            draft = {}
+        try:
+            result = json.loads(row.result_json) if row.result_json else None
+        except (json.JSONDecodeError, TypeError):
+            result = None
+        if not isinstance(result, dict):
+            result = None
+        return TradeSignalExecutionEvidence(
+            id=int(row.id),
+            status=str(row.status),
+            strategy_instance_id=row.strategy_instance_id,
+            chat_id=int(row.chat_id),
+            message_id=int(row.message_id),
+            symbol=str(row.symbol),
+            side=str(row.side),
+            draft=dict(draft),
+            result=result,
+            last_error=row.last_error,
+        )
 
 
 def list_pending_trade_signals(

@@ -234,6 +234,7 @@ def execute_message_instruction_items(
                 processed_at=now,
                 instruction_kind=item.instruction_kind,
                 candidate_id=item.signal_candidate_id,
+                message_instruction_item_id=item.id,
                 revision_replacement_writer=revision_replacement_writer,
             )
         except DeepcoinRequestOutcomeUnknown as exc:
@@ -258,6 +259,26 @@ def execute_message_instruction_items(
                     "error": str(exc)[:256],
                 }
         if should_defer_instruction_result(result):
+            if item.instruction_kind == "entry":
+                from telegram_kol_research.instruction_execution_entry_adapter import (
+                    project_entry_deferred_contract,
+                )
+
+                try:
+                    project_entry_deferred_contract(
+                        session_factory,
+                        message_instruction_item_id=item.id,
+                        reason_code=str(result.get("reason") or "entry_deferred"),
+                        blocker_ids=tuple(
+                            int(value)
+                            for value in result.get("blocking_raw_message_ids", [])
+                        ),
+                        projected_at=now,
+                        mode=enforcement_mode,
+                    )
+                except Exception:
+                    if enforcement_mode == "live":
+                        raise
             defer_message_instruction_item_for_visibility(
                 session_factory,
                 item_id=item.id,
@@ -314,6 +335,7 @@ def _auto_process_single_message_trade_signal(
     processed_at: datetime | None = None,
     instruction_kind: str | None = None,
     candidate_id: int | None = None,
+    message_instruction_item_id: int | None = None,
     revision_replacement_writer: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Execute exactly one selected candidate through the existing venue path."""
@@ -916,6 +938,8 @@ def _auto_process_single_message_trade_signal(
             deepcoin_client=deepcoin_client,
             contract_spec_provider=contract_spec_provider,
             processed_at=now,
+            message_instruction_item_id=message_instruction_item_id,
+            execution_contract_mode=settings.instruction_execution_contract_mode,
         )
     else:
         trade_signal = enqueue_recovery_trade_signal(
@@ -989,6 +1013,8 @@ def _auto_process_single_message_trade_signal(
             contract_spec_provider=contract_spec_provider,
             processed_at=now,
             max_order_legs=1 if entry_execution_type == "market" else None,
+            message_instruction_item_id=message_instruction_item_id,
+            execution_contract_mode=settings.instruction_execution_contract_mode,
         )
     return {
         "status": "submitted",

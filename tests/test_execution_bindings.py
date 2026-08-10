@@ -23,6 +23,7 @@ from telegram_kol_research.execution_bindings import (
     bind_deepcoin_position_to_lifecycle,
     list_execution_order_legs,
     load_deepcoin_order_bindings,
+    load_entry_binding_evidence,
     reconcile_deepcoin_execution_bindings,
     repair_execution_order_legs_from_binding_payloads,
     sync_manual_closed_deepcoin_positions,
@@ -176,6 +177,43 @@ def _add_entry_leg(
             request=request,
         ),
     )
+
+
+def test_entry_binding_evidence_requires_exact_order_and_client_ids(tmp_path):
+    session_factory = create_session_factory(tmp_path / "entry-evidence.db")
+    strategy_instance_id = "deepcoin:100:55:BTC:long"
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(strategy_instance_id=strategy_instance_id),
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        leg_index=1,
+        order_id="order-1",
+        client_order_id="client-1",
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        leg_index=2,
+        order_id=None,
+        client_order_id="client-2",
+    )
+
+    evidence = load_entry_binding_evidence(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        strategy_instance_id=strategy_instance_id,
+    )
+
+    assert evidence.binding_id == binding_id
+    assert evidence.leg_indices == (1,)
+    assert evidence.client_order_ids == ("client-1",)
+    assert evidence.exact is False
 
 
 def _seed_trigger_protection_adoption(session_factory):

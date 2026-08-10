@@ -131,6 +131,14 @@ class ExecutionOrderLegSnapshot:
     last_verified_at: datetime | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class EntryBindingEvidence:
+    binding_id: int | None
+    leg_indices: tuple[int, ...]
+    client_order_ids: tuple[str, ...]
+    exact: bool
+
+
 @dataclass(slots=True)
 class ExecutionReconciliationResult:
     active: int = 0
@@ -307,6 +315,58 @@ def load_deepcoin_order_bindings(
             )
             for row in rows
         ]
+
+
+def load_entry_binding_evidence(
+    session_factory: sessionmaker,
+    *,
+    chat_id: int,
+    message_id: int,
+    symbol: str,
+    side: str,
+    strategy_instance_id: str | None,
+) -> EntryBindingEvidence:
+    """Load exact local binding and durable entry-leg identifiers for one signal."""
+
+    with session_factory() as session:
+        binding = (
+            session.query(ExecutionBinding)
+            .filter(
+                ExecutionBinding.venue == "deepcoin",
+                ExecutionBinding.chat_id == int(chat_id),
+                ExecutionBinding.message_id == int(message_id),
+                ExecutionBinding.symbol == str(symbol).upper(),
+                ExecutionBinding.side == str(side).lower(),
+            )
+            .one_or_none()
+        )
+        if binding is None or (
+            strategy_instance_id
+            and binding.strategy_instance_id != strategy_instance_id
+        ):
+            return EntryBindingEvidence(None, (), (), False)
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(
+                ExecutionOrderLeg.execution_binding_id == int(binding.id),
+                ExecutionOrderLeg.purpose == "entry",
+            )
+            .order_by(ExecutionOrderLeg.leg_index.asc())
+            .all()
+        )
+        exact_legs = [
+            leg
+            for leg in legs
+            if bool(leg.order_id or leg.pos_id)
+            and bool(leg.client_order_id)
+            and leg.status not in {"unknown", "submit_unknown"}
+        ]
+        return EntryBindingEvidence(
+            int(binding.id),
+            tuple(int(leg.leg_index) for leg in exact_legs),
+            tuple(str(leg.client_order_id) for leg in exact_legs),
+            len(exact_legs) == len(legs),
+        )
 
 
 def reconcile_deepcoin_execution_bindings(

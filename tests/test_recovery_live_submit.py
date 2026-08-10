@@ -20,6 +20,8 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    InstructionExecutionContract,
+    MessageInstructionItem,
     RawMessage,
     SignalCandidate,
     StrategyRevisionBatch,
@@ -403,6 +405,54 @@ def test_live_submit_revalidates_capability_before_exchange_or_binding_write(tmp
     assert client.protection_payloads == []
     with session_factory() as session:
         assert session.query(ExecutionBinding).count() == 0
+
+
+def test_shadow_entry_contract_observes_writer_without_changing_calls(tmp_path):
+    session_factory = create_session_factory(tmp_path / "entry-contract-shadow.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    with session_factory() as session:
+        raw = session.query(RawMessage).filter_by(chat_id=100, message_id=55).one()
+        candidate = session.query(SignalCandidate).filter_by(raw_message_id=raw.id).one()
+        item = MessageInstructionItem(
+            raw_message_id=raw.id,
+            signal_candidate_id=candidate.id,
+            sequence=0,
+            instruction_kind="entry",
+            strategy_instance_id=signal.strategy_instance_id,
+            idempotency_key="e" * 64,
+        )
+        session.add(item)
+        session.commit()
+        item_id = item.id
+    client = _FakeDeepcoinClient()
+    expected_calls = len(signal.payload["deepcoin_order_draft"]["order_legs"])
+
+    result = process_trade_signal_live(
+        session_factory,
+        signal_id=signal.id,
+        deepcoin_client=client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        message_instruction_item_id=item_id,
+        execution_contract_mode="shadow",
+        processed_at=datetime(2026, 8, 10, 12, 0, tzinfo=UTC),
+    )
+
+    assert result["order_count"] == expected_calls
+    assert len(client.trigger_payloads) == expected_calls
+    with session_factory() as session:
+        contract = session.query(InstructionExecutionContract).one()
+        assert contract.state == "verified"
+        assert contract.trade_signal_id == signal.id
+        assert contract.execution_binding_id is not None
 
 
 def _finalize_v2_assembly_for_signal(session_factory, signal):

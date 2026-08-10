@@ -611,6 +611,8 @@ def process_trade_signal_live(
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
     processed_at: datetime | None = None,
     max_order_legs: int | None = None,
+    message_instruction_item_id: int | None = None,
+    execution_contract_mode: str = "disabled",
 ) -> dict[str, Any]:
     """Receive and execute one pending trade signal."""
 
@@ -618,11 +620,12 @@ def process_trade_signal_live(
     if not settings.auto_trade_enabled:
         raise RecoveryLiveSubmitError("auto_trade_disabled")
 
+    now = processed_at or datetime.now(UTC)
     try:
         trade_signal = claim_pending_trade_signal(
             session_factory,
             signal_id=signal_id,
-            claimed_at=processed_at,
+            claimed_at=now,
         )
     except TradeSignalClaimError as exc:
         raise RecoveryLiveSubmitError(str(exc)) from exc
@@ -634,12 +637,19 @@ def process_trade_signal_live(
                 session_factory,
                 trade_signal=trade_signal,
             )
+            _prepare_instruction_entry_submission(
+                session_factory,
+                trade_signal=trade_signal,
+                message_instruction_item_id=message_instruction_item_id,
+                execution_contract_mode=execution_contract_mode,
+                prepared_at=now,
+            )
             result = _submit_recovery_signal_direct(
                 session_factory,
                 trade_signal=trade_signal,
                 deepcoin_client=deepcoin_client,
                 contract_spec_provider=contract_spec_provider,
-                submitted_at=processed_at,
+                submitted_at=now,
                 max_order_legs=max_order_legs,
                 verified_v2_assembly=verified_v2_assembly,
                 submission_progress=submission_progress,
@@ -657,7 +667,7 @@ def process_trade_signal_live(
                 session_factory,
                 trade_signal=trade_signal,
                 deepcoin_client=deepcoin_client,
-                executed_at=processed_at,
+                executed_at=now,
             )
     except Exception as exc:
         failure = exc
@@ -668,12 +678,21 @@ def process_trade_signal_live(
             session_factory,
             signal_id=signal_id,
             error=str(failure),
-            failed_at=processed_at,
+            failed_at=now,
             expected_status="processing",
             terminal_status=_entry_submission_failure_status(
                 failure,
                 progress=submission_progress,
             ),
+        )
+        _project_instruction_entry_submission(
+            session_factory,
+            trade_signal=trade_signal,
+            message_instruction_item_id=message_instruction_item_id,
+            execution_contract_mode=execution_contract_mode,
+            submission_progress=submission_progress,
+            error=failure,
+            projected_at=now,
         )
         if failure is not exc:
             raise failure from exc
@@ -682,10 +701,84 @@ def process_trade_signal_live(
         session_factory,
         signal_id=signal_id,
         result=result,
-        processed_at=processed_at,
+        processed_at=now,
         expected_status="processing",
     )
+    _project_instruction_entry_submission(
+        session_factory,
+        trade_signal=trade_signal,
+        message_instruction_item_id=message_instruction_item_id,
+        execution_contract_mode=execution_contract_mode,
+        submission_progress=submission_progress,
+        error=None,
+        projected_at=now,
+    )
     return result
+
+
+def _prepare_instruction_entry_submission(
+    session_factory,
+    *,
+    trade_signal: TradeSignalRecord,
+    message_instruction_item_id: int | None,
+    execution_contract_mode: str,
+    prepared_at: datetime,
+) -> None:
+    if message_instruction_item_id is None or execution_contract_mode == "disabled":
+        return
+    from telegram_kol_research.instruction_execution_entry_adapter import (
+        prepare_entry_submission_contract,
+    )
+
+    draft = (
+        trade_signal.payload.get("deepcoin_order_draft")
+        if isinstance(trade_signal.payload, dict)
+        else None
+    )
+    try:
+        prepare_entry_submission_contract(
+            session_factory,
+            message_instruction_item_id=int(message_instruction_item_id),
+            trade_signal_id=int(trade_signal.id),
+            draft=draft if isinstance(draft, dict) else {},
+            prepared_at=prepared_at,
+            mode=execution_contract_mode,
+        )
+    except Exception:
+        if execution_contract_mode == "live":
+            raise
+
+
+def _project_instruction_entry_submission(
+    session_factory,
+    *,
+    trade_signal: TradeSignalRecord,
+    message_instruction_item_id: int | None,
+    execution_contract_mode: str,
+    submission_progress: EntrySubmissionProgress,
+    error: Exception | None,
+    projected_at: datetime,
+) -> None:
+    if message_instruction_item_id is None or execution_contract_mode == "disabled":
+        return
+    from telegram_kol_research.instruction_execution_entry_adapter import (
+        project_entry_submission_result,
+    )
+
+    try:
+        project_entry_submission_result(
+            session_factory,
+            message_instruction_item_id=int(message_instruction_item_id),
+            trade_signal_id=int(trade_signal.id),
+            attempted_writes=int(submission_progress.attempted_writes),
+            confirmed_legs=int(submission_progress.confirmed_legs),
+            error=error,
+            projected_at=projected_at,
+            mode=execution_contract_mode,
+        )
+    except Exception:
+        if execution_contract_mode == "live":
+            raise
 
 
 def process_next_trade_signal_live(
