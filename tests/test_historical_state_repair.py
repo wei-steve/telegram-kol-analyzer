@@ -449,6 +449,44 @@ def test_apply_reloads_exchange_snapshot_and_refuses_new_live_position(tmp_path)
         assert session.query(PositionTakeProfitOrder).one().status == "active"
 
 
+@pytest.mark.parametrize(
+    "live_position",
+    [
+        {"posId": "pos-terminal"},
+        {"posId": "pos-terminal", "pos": ""},
+        {"posId": "pos-terminal", "size": ""},
+        {"posId": "pos-terminal", "sz": ""},
+        {"posId": "pos-terminal", "pos": "NaN"},
+    ],
+)
+def test_plan_fails_closed_when_exact_position_size_is_unknown(
+    tmp_path,
+    live_position,
+):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id, _ = _seed_convergence(
+        session_factory,
+        chat_id=46,
+        message_id=460,
+        pos_id="pos-terminal",
+        status="submitted",
+        binding_status="closed",
+        with_order=True,
+    )
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(positions=[live_position]),
+        planned_at=NOW,
+    )
+
+    assert all(action.target_id != convergence_id for action in plan.actions)
+
+
 def test_plan_refuses_incomplete_exchange_snapshot(tmp_path):
     from telegram_kol_research.historical_state_repair import (
         build_historical_state_repair_plan,

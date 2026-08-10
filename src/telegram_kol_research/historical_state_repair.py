@@ -1042,12 +1042,27 @@ def _live_position_ids(rows) -> set[str]:
     for row in rows:
         if not isinstance(row, dict):
             continue
-        pos_id = str(row.get("posId") or row.get("pos_id") or "").strip()
+        pos_id = str(
+            row.get("posId")
+            or row.get("pos_id")
+            or row.get("PositionID")
+            or row.get("positionId")
+            or row.get("position_id")
+            or row.get("id")
+            or ""
+        ).strip()
+        if not pos_id:
+            continue
+        raw_size = next(
+            (row[key] for key in ("pos", "size", "sz") if key in row),
+            None,
+        )
         try:
-            size = Decimal(str(row.get("pos") or row.get("size") or row.get("sz") or "0"))
-        except (InvalidOperation, ValueError):
-            size = Decimal("1")
-        if pos_id and abs(size) > 0:
+            size = Decimal(str(raw_size).strip())
+            size_is_live_or_unknown = not size.is_finite() or abs(size) > 0
+        except (InvalidOperation, TypeError, ValueError):
+            size_is_live_or_unknown = True
+        if size_is_live_or_unknown:
             values.add(pos_id)
     return values
 

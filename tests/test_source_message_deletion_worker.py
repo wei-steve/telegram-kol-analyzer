@@ -3,6 +3,8 @@ import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
+import pytest
+
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -1530,7 +1532,14 @@ def test_final_reconcile_reopens_exit_scope_for_a_late_verified_position(tmp_pat
     assert finalized.finalized == 1
 
 
-def test_flat_finalization_waits_while_exact_entry_order_is_live(tmp_path):
+@pytest.mark.parametrize(
+    "exchange_order_key",
+    ["ordId", "orderId", "order_id", "algoId", "triggerOrderId", "orderSysID", "OrderSysID", "id"],
+)
+def test_flat_finalization_waits_while_exact_entry_order_is_live(
+    tmp_path,
+    exchange_order_key,
+):
     session_factory = create_session_factory(tmp_path / "research.db")
     _, _, _, leg_id = _seed_pending_strategy(
         session_factory,
@@ -1558,7 +1567,115 @@ def test_flat_finalization_waits_while_exact_entry_order_is_live(tmp_path):
         snapshot=SimpleNamespace(
             errors={},
             positions=[],
-            open_orders=[{"ordId": "order-deleted"}],
+            open_orders=[{exchange_order_key: "order-deleted"}],
+            pending_trigger_orders=[],
+        ),
+        finalized_at=NOW,
+    )
+
+    assert status == "waiting"
+
+
+def test_flat_finalization_splits_legacy_local_order_identity(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _, _, binding_id, leg_id = _seed_pending_strategy(
+        session_factory,
+        chat_id=11,
+        message_id=101,
+        order_id="order-old",
+    )
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=11,
+        message_id=101,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        deletion_exit.state = "reconciling"
+        binding = session.get(ExecutionBinding, binding_id)
+        binding.order_id = "order-old,order-live"
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        leg.order_id = "order-old,order-live"
+        leg.status = "cancelled"
+        leg.terminal_reason = "source_message_deleted_entry_cancelled"
+        session.commit()
+
+    status = finalize_source_message_deletion_exit(
+        session_factory,
+        deletion_exit_id=deletion.exit_id,
+        snapshot=SimpleNamespace(
+            errors={},
+            positions=[],
+            open_orders=[],
+            pending_trigger_orders=[{"ordId": "order-live"}],
+        ),
+        finalized_at=NOW,
+    )
+
+    assert status == "waiting"
+
+
+@pytest.mark.parametrize("exchange_position_key", ["posId", "pos_id", "PositionID", "positionId", "position_id", "id"])
+def test_flat_finalization_waits_for_all_live_position_identity_aliases(
+    tmp_path,
+    exchange_position_key,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_filled_strategy(session_factory)
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=20,
+        message_id=200,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        session.get(SourceMessageDeletionExit, deletion.exit_id).state = "reconciling"
+        session.commit()
+
+    status = finalize_source_message_deletion_exit(
+        session_factory,
+        deletion_exit_id=deletion.exit_id,
+        snapshot=SimpleNamespace(
+            errors={},
+            positions=[{exchange_position_key: "pos-filled", "pos": "1"}],
+            open_orders=[],
+            pending_trigger_orders=[],
+        ),
+        finalized_at=NOW,
+    )
+
+    assert status == "waiting"
+
+
+def test_flat_finalization_splits_legacy_local_position_identity(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_filled_strategy(session_factory)
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=20,
+        message_id=200,
+        deleted_at=NOW,
+    )
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
+        deletion_exit.state = "reconciling"
+        binding = session.get(ExecutionBinding, deletion_exit.execution_binding_id)
+        binding.pos_id = "pos-old,pos-live"
+        leg = session.query(ExecutionOrderLeg).filter_by(
+            execution_binding_id=binding.id,
+            purpose="entry",
+        ).one()
+        leg.pos_id = "pos-old,pos-live"
+        session.commit()
+
+    status = finalize_source_message_deletion_exit(
+        session_factory,
+        deletion_exit_id=deletion.exit_id,
+        snapshot=SimpleNamespace(
+            errors={},
+            positions=[{"posId": "pos-live", "pos": "1"}],
+            open_orders=[],
             pending_trigger_orders=[],
         ),
         finalized_at=NOW,

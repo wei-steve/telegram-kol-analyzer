@@ -572,8 +572,7 @@ def finalize_source_message_deletion_exit(
                     value
                     for leg in legs
                     if leg.attribution_status == "verified"
-                    for value in (_clean_id(leg.pos_id),)
-                    if value is not None
+                    for value in _split_ids(leg.pos_id)
                 }
                 active_exact_pos_ids = {
                     value
@@ -583,8 +582,7 @@ def finalize_source_message_deletion_exit(
                         and str(leg.status or "").strip().lower()
                         not in TERMINAL_ENTRY_LEG_STATES
                     )
-                    for value in (_clean_id(leg.pos_id),)
-                    if value is not None
+                    for value in _split_ids(leg.pos_id)
                 }
                 leg_order_ids = {
                     value
@@ -870,12 +868,7 @@ def finalize_source_message_deletion_exit(
                 live_order_rows.extend(
                     list(getattr(snapshot, "pending_trigger_orders", []) or [])
                 )
-                exact_order_ids = {
-                    value
-                    for leg in legs
-                    for value in (_clean_id(leg.order_id), _clean_id(leg.client_order_id))
-                    if value is not None
-                }
+                exact_order_ids = leg_order_ids | leg_client_order_ids
                 visible_order_rows = [
                     row
                     for row in live_order_rows
@@ -899,7 +892,7 @@ def finalize_source_message_deletion_exit(
                 visible_position_rows = [
                     row
                     for row in list(getattr(snapshot, "positions", []) or [])
-                    if _clean_id(_row_value(row, "posId", "pos_id")) in exact_pos_ids
+                    if exact_pos_ids.intersection(_row_position_ids(row))
                     and _position_is_not_proven_zero(row)
                 ]
                 if visible_position_rows:
@@ -1056,22 +1049,36 @@ def _deletion_target_is_already_terminal(
 def _row_order_ids(row) -> set[str]:
     return {
         value
-        for value in (
-            _clean_id(
-                _row_value(
-                    row,
-                    "orderId",
-                    "order_id",
-                    "ordId",
-                    "triggerOrderId",
-                    "trigger_order_id",
-                )
-            ),
-            _clean_id(
-                _row_value(row, "clientOrderId", "client_order_id", "clOrdId")
-            ),
+        for key in (
+            "ordId",
+            "orderId",
+            "order_id",
+            "algoId",
+            "triggerOrderId",
+            "trigger_order_id",
+            "orderSysID",
+            "OrderSysID",
+            "id",
+            "clOrdId",
+            "clientOrderId",
+            "client_order_id",
         )
-        if value is not None
+        for value in _split_ids(_row_value(row, key))
+    }
+
+
+def _row_position_ids(row) -> set[str]:
+    return {
+        value
+        for key in (
+            "posId",
+            "pos_id",
+            "PositionID",
+            "positionId",
+            "position_id",
+            "id",
+        )
+        for value in _split_ids(_row_value(row, key))
     }
 
 
