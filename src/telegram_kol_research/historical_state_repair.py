@@ -1585,12 +1585,10 @@ def _proven_take_profit_attribution_repair(
     competing_leg_ids = sorted(
         int(row.id)
         for row in session.query(ExecutionOrderLeg)
-        .filter(
-            ExecutionOrderLeg.venue == "deepcoin",
-            ExecutionOrderLeg.id != int(leg.id),
-        )
+        .filter(ExecutionOrderLeg.id != int(leg.id))
         .all()
-        if pos_id in _split_ids(row.pos_id)
+        if str(row.venue or "").lower() == "deepcoin"
+        and pos_id in _split_ids(row.pos_id)
     )
     if competing_leg_ids:
         return None, "position_owned_by_other_leg"
