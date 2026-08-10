@@ -548,6 +548,27 @@ Append a rollout-result section with deployed SHA, safe-window evidence summary,
 server tests, service status, and the three UI checks. Commit and push that
 documentation-only update. Do not restart for the documentation-only commit.
 
+## Rollout Status — Deployment Deferred (2026-08-10 UTC)
+
+The reviewed implementation through `4fb47b9` was pushed to
+`codex/deepcoin-auto-trading-v1`. Local focused Web tests, the broader relevant
+regression set, compilation, and diff checks passed; the final review reported
+no remaining P1/P2 findings.
+
+The production service and independent safety monitor were healthy, but the
+pre-restart read-only window was not safe. The database showed active
+deleted-source exit claims in `cancelling_entries`, plus current trigger
+take-profit convergence work with submitted and submit-unknown states. Recent
+lifecycle updates were also still occurring. The production service was not
+restarted and production remains on its prior commit.
+
+Before deployment, wait for these operations to reach terminal states, then
+capture two fresh stable read-only snapshots confirming zero in-flight source
+deletion, trigger-convergence, management, mutation, rescue, recognition, and
+reconciliation work; confirm the safety monitor remains healthy and the live
+exchange snapshot is complete. Only then run the standard server-update helper
+and complete the browser checks for all three manual-refresh tabs.
+
 ## Execution Handoff
 
 Execute task-by-task with test-first checkpoints. Local completion is not the
