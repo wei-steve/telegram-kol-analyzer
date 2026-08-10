@@ -63,6 +63,12 @@ def project_execution_state(
         and binding not in LIVE_BINDING_STATUSES
     ):
         reasons = ("verified_without_binding",)
+    if (
+        not reasons
+        and contract in {"failed", "expired"}
+        and binding in LIVE_BINDING_STATUSES
+    ):
+        reasons = ("terminal_contract_with_live_exchange_evidence",)
 
     if reasons:
         return ExecutionStateProjection(
@@ -120,6 +126,18 @@ def project_execution_state(
             retry_allowed=False,
         )
 
+    if contract in {"failed", "expired"}:
+        label = "执行已过期，未下单" if contract == "expired" else "执行失败，未下单"
+        return ExecutionStateProjection(
+            state=contract,
+            label=label,
+            detail="执行已终止，没有可验证的交易所持仓。",
+            severity="warning",
+            price_touched=lifecycle == "entered",
+            exchange_verified=False,
+            retry_allowed=False,
+        )
+
     if binding in LIVE_BINDING_STATUSES and has_live_position:
         return ExecutionStateProjection(
             state="holding",
@@ -146,6 +164,17 @@ def project_execution_state(
             retry_allowed=False,
         )
 
+    if binding in LIVE_BINDING_STATUSES:
+        return ExecutionStateProjection(
+            state="exchange_order_bound",
+            label="交易所订单已绑定，成交待核验",
+            detail="已有交易所绑定，但尚无真实持仓或完整成交证据。",
+            severity="warning",
+            price_touched=lifecycle == "entered",
+            exchange_verified=False,
+            retry_allowed=False,
+        )
+
     if lifecycle == "entered":
         return ExecutionStateProjection(
             state="price_touched",
@@ -154,18 +183,6 @@ def project_execution_state(
             severity="warning",
             price_touched=True,
             exchange_verified=False,
-            retry_allowed=False,
-        )
-
-    if contract in {"failed", "expired"}:
-        label = "执行已过期，未下单" if contract == "expired" else "执行失败，未下单"
-        return ExecutionStateProjection(
-            state=contract,
-            label=label,
-            detail="执行已终止，没有可验证的交易所持仓。",
-            severity="warning",
-            price_touched=False,
-            exchange_verified=True,
             retry_allowed=False,
         )
 
@@ -256,6 +273,17 @@ def project_lifecycle_execution_state(
         )
     ):
         contradictions.append("contract_binding_mismatch")
+    if (
+        contract is not None
+        and binding is not None
+        and _normalized(getattr(binding, "status", None)) in LIVE_BINDING_STATUSES
+        and _normalized(getattr(contract, "state", None))
+        in {"pending", "deferred", "submit_unknown", "failed", "expired"}
+    ):
+        if _normalized(getattr(contract, "state", None)) in {"failed", "expired"}:
+            contradictions.append("terminal_contract_with_live_exchange_evidence")
+        else:
+            contradictions.append("binding_without_verified_contract")
 
     return project_execution_state(
         lifecycle_status=getattr(lifecycle, "lifecycle_status", None),

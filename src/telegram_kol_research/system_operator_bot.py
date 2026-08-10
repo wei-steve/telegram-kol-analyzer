@@ -2601,6 +2601,15 @@ async def run_runtime_incident_notification_loop(
                 execution_contract_mode=execution_mode,
                 execution_reconciliation_client=execution_client,
             )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        finally:
+            close_client = getattr(execution_client, "close", None)
+            if callable(close_client):
+                close_client()
+        try:
             await deliver_runtime_incident_notifications(
                 session_factory,
                 config=config,
@@ -2610,10 +2619,6 @@ async def run_runtime_incident_notification_loop(
             raise
         except Exception:
             pass
-        finally:
-            close_client = getattr(execution_client, "close", None)
-            if callable(close_client):
-                close_client()
         await asyncio.sleep(max(0.1, float(interval_seconds)))
 
 
@@ -2637,14 +2642,141 @@ def run_operator_maintenance_tick(
         execution_contract_mode != "disabled"
         and execution_reconciliation_client is not None
     ):
-        reconcile_instruction_execution_contracts(
+        reconciliation_result = reconcile_instruction_execution_contracts(
             session_factory,
             client=execution_reconciliation_client,
             reconciled_at=now,
             mode=execution_contract_mode,
             limit=max(0, min(int(execution_reconciliation_limit), 100)),
         )
+        _record_execution_reconciliation_monitor_facts(
+            session_factory,
+            result=reconciliation_result,
+            observed_at=now,
+        )
     return entry_result
+
+
+def _record_execution_reconciliation_monitor_facts(
+    session_factory,
+    *,
+    result,
+    observed_at: datetime,
+) -> None:
+    """Bridge transient exact-readback failures into the dormant shadow scanner."""
+
+    from telegram_kol_research.config import load_runtime_scanner_config
+    from telegram_kol_research.models import RuntimeIncidentObservation
+    from telegram_kol_research.runtime_incident_observations import record_observations
+    from telegram_kol_research.runtime_incident_rules import evaluate_rule
+
+    config = load_runtime_scanner_config(
+        environ=dict(os.environ),
+    )
+    rule_id = "instruction_execution_contradiction_v1"
+    if not config.enabled or not config.shadow_only or rule_id not in config.rules:
+        return
+    transient_codes = {
+        "exchange_snapshot_incomplete",
+        "exchange_evidence_duplicate",
+    }
+    resolved_keys = set(
+        str(value)
+        for value in tuple(
+            getattr(result, "resolved_transient_fact_keys", ()) or ()
+        )
+    )
+    current: dict[str, dict[str, object]] = {}
+    for fact in tuple(getattr(result, "facts", ()) or ()):
+        code = str(getattr(fact, "code", "") or "")
+        contract_id = getattr(fact, "contract_id", None)
+        item_id = getattr(fact, "message_instruction_item_id", None)
+        raw_id = getattr(fact, "raw_message_id", None)
+        if code not in transient_codes or not all(
+            isinstance(value, int) and value > 0
+            for value in (contract_id, item_id, raw_id)
+        ):
+            continue
+        object_id = f"{contract_id}-{code}"
+        current[object_id] = {
+            "complete": True,
+            "object_id": object_id,
+            "execution_contradiction": True,
+            "reason_code": code,
+            "contract_id": contract_id,
+            "message_instruction_item_id": item_id,
+            "raw_message_id": raw_id,
+            "future_contract": False,
+            "exact_historical": True,
+            "evidence_references": (
+                f"instruction-contract:{contract_id}",
+                f"instruction-item:{item_id}",
+                f"raw-message:{raw_id}",
+            ),
+        }
+    with session_factory() as session:
+        prior = (
+            session.query(RuntimeIncidentObservation)
+            .filter(
+                RuntimeIncidentObservation.rule_id == rule_id,
+                RuntimeIncidentObservation.state.in_(("observing", "shadow_confirmed")),
+            )
+            .order_by(RuntimeIncidentObservation.last_observed_at.asc())
+            .limit(100)
+            .all()
+        )
+        facts: list[dict[str, object]] = []
+        for observation in prior:
+            object_id = str(observation.object_id)
+            if not object_id.endswith(
+                ("-exchange_snapshot_incomplete", "-exchange_evidence_duplicate")
+            ):
+                continue
+            existing = current.pop(object_id, None)
+            if existing is not None:
+                facts.append(existing)
+                continue
+            if object_id not in resolved_keys:
+                continue
+            try:
+                summary = json.loads(observation.summary_json or "{}")
+            except (json.JSONDecodeError, TypeError):
+                summary = {}
+            if not isinstance(summary, dict):
+                summary = {}
+            contract_id = int(summary.get("contract_id") or object_id.split("-", 1)[0])
+            item_id = int(summary.get("message_instruction_item_id") or 0)
+            raw_id = int(summary.get("raw_message_id") or 0)
+            reason_code = str(summary.get("reason_code") or object_id.split("-", 1)[1])
+            references = [f"instruction-contract:{contract_id}"]
+            if item_id > 0:
+                references.append(f"instruction-item:{item_id}")
+            if raw_id > 0:
+                references.append(f"raw-message:{raw_id}")
+            facts.append(
+                {
+                    "complete": True,
+                    "object_id": object_id,
+                    "execution_contradiction": False,
+                    "reason_code": reason_code,
+                    "contract_id": contract_id,
+                    "message_instruction_item_id": item_id,
+                    "raw_message_id": raw_id,
+                    "future_contract": bool(summary.get("future_contract")),
+                    "exact_historical": bool(summary.get("exact_historical", True)),
+                    "evidence_references": tuple(references),
+                }
+            )
+            if len(facts) == 100:
+                break
+    facts.extend(list(current.values())[: max(0, 100 - len(facts))])
+    if not facts:
+        return
+    record_observations(
+        session_factory,
+        observations=tuple(evaluate_rule(rule_id, fact) for fact in facts),
+        observed_at=observed_at,
+    )
 
 
 def build_pending_entry_expiry_review_reply_markup(payload: dict[str, Any]) -> dict[str, Any]:

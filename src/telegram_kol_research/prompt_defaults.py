@@ -50,6 +50,7 @@ DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT = """
 【价格与字段归一化】
 - symbol 输出大写币种简称；side 只能是 long 或 short。
 - 非策略消息优先输出 "strategy": null；为兼容固定 schema，旧的 strategy 全字段 null 形式也可接受，但不得填入没有证据的字段。
+- instructions 中 kind=entry 的 strategy 必须使用完整对象：{"symbol": null, "side": null, "entry": null, "stop_loss": null, "take_profit": null, "leverage": null, "order_type": null}；非 entry 动作的 strategy 输出 null。
 - entry、stop_loss、take_profit 都输出字符串；多档价格用“/”分隔，区间用“-”连接。
 - order_type 只能是 market、limit、market+limit。
 - 同时出现市价进场和具体点位时，例如“Eth(市价进场)，进场点位1730附近”，entry 输出“市价进场/1730附近”。

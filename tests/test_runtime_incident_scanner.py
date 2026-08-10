@@ -120,6 +120,31 @@ def test_instruction_execution_contradiction_rule_is_shadow_deduplicated(tmp_pat
         assert rows[0].consecutive_count == 2
         assert rows[0].state == "shadow_confirmed"
 
+    with sf() as session:
+        contract = session.get(InstructionExecutionContract, contract_id)
+        contract.state = "verified"
+        contract.terminal_kind = "verified_refusal"
+        contract.completion_scope = "full"
+        session.commit()
+    recovered_facts = build_scanner_facts(
+        sf,
+        rules=config.rules,
+        observed_at=observed + timedelta(minutes=2),
+    )
+    assert recovered_facts["instruction_execution_contradiction_v1"][0][
+        "execution_contradiction"
+    ] is False
+    run_scanner_cycle(
+        session_factory=sf,
+        config=config,
+        facts_by_rule=recovered_facts,
+        observed_at=observed + timedelta(minutes=2),
+    )
+    with sf() as session:
+        row = session.query(RuntimeIncidentObservation).one()
+        assert row.state == "resolved_without_incident"
+        assert row.recovered_at is not None
+
 
 def test_runtime_incident_tool_registry_has_no_exchange_write_authority():
     forbidden = {"submit_order", "place_order", "cancel_order", "close_position"}

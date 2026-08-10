@@ -86,10 +86,16 @@ ALLOWED_PACKAGE_IMPORTS_BY_MODULE = {
         {"models", "runtime_incident_scanner"}
     ),
     "runtime_incident_scanner.py": frozenset(
-        {"config", "models", "runtime_incident_observations", "runtime_incident_rules"}
+        {
+            "config",
+            "models",
+            "runtime_incident_observations",
+            "runtime_incident_rules",
+            "runtime_incident_snapshot",
+        }
     ),
     "runtime_incident_rules.py": frozenset({"runtime_incident_scanner"}),
-    "runtime_incident_snapshot.py": frozenset({"models"}),
+    "runtime_incident_snapshot.py": frozenset({"models", "trading_settings"}),
     "message_operation_contracts.py": frozenset(
         {"message_operation_types", "models"}
     ),
@@ -100,6 +106,7 @@ ALLOWED_PACKAGE_IMPORTS_BY_MODULE = {
             "message_operation_types",
             "models",
             "runtime_incident_adapters",
+            "runtime_incident_snapshot",
             "trading_settings",
         }
     ),

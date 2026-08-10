@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
+    ExecutionBinding,
     InstructionExecutionContract,
     MessageInstructionItem,
     RawMessage,
@@ -123,3 +124,62 @@ def test_disabled_execution_contract_mode_suppresses_nonexact_legacy_noise(tmp_p
 
     assert snapshot["facts"] == ()
     assert snapshot["contradictions_total"] == 0
+
+
+def test_old_contradiction_is_not_starved_by_new_clean_terminal_contracts(tmp_path):
+    sf = create_session_factory(tmp_path / "snapshot-growth.db")
+    with sf() as session:
+        contradiction_id, _, _ = _add_contract(
+            session,
+            state="verified",
+            terminal_kind="verified_entry",
+        )
+        for _ in range(90):
+            _add_contract(
+                session,
+                state="verified",
+                terminal_kind="verified_refusal",
+            )
+        session.commit()
+
+    snapshot = build_instruction_execution_contradiction_snapshot(
+        sf,
+        observed_at=NOW,
+        limit=20,
+    )
+
+    assert snapshot["scan_truncated"] is False
+    assert [(row["contract_id"], row["reason_code"]) for row in snapshot["facts"]] == [
+        (contradiction_id, "verified_without_binding")
+    ]
+
+
+def test_closed_binding_is_not_reported_as_live_terminal_contradiction(tmp_path):
+    sf = create_session_factory(tmp_path / "closed-binding.db")
+    with sf() as session:
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:10:101:BTC:long",
+            kol_id="chen",
+            chat_id=10,
+            message_id=101,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            status="closed",
+        )
+        session.add(binding)
+        session.flush()
+        contract_id, _, _ = _add_contract(session, state="failed")
+        contract = session.get(InstructionExecutionContract, contract_id)
+        contract.execution_binding_id = binding.id
+        contract.strategy_instance_id = binding.strategy_instance_id
+        session.commit()
+
+    snapshot = build_instruction_execution_contradiction_snapshot(
+        sf,
+        observed_at=NOW,
+        limit=20,
+    )
+
+    assert snapshot["facts"] == ()
+    assert snapshot["scan_truncated"] is False

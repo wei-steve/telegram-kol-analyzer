@@ -103,3 +103,44 @@ def test_verified_live_order_without_position_is_not_called_holding_or_unsubmitt
     assert projection.state == "exchange_order_verified"
     assert projection.label == "交易所订单已核验，等待成交"
     assert projection.exchange_verified is True
+
+
+def test_legacy_live_binding_without_position_is_not_called_unsubmitted():
+    projection = project_execution_state(
+        lifecycle_status="entered",
+        binding_status="open",
+        has_live_position=False,
+    )
+
+    assert projection.state == "exchange_order_bound"
+    assert projection.label == "交易所订单已绑定，成交待核验"
+    assert projection.exchange_verified is False
+
+
+def test_failed_contract_with_live_binding_is_a_contradiction():
+    projection = project_execution_state(
+        contract_state="failed",
+        binding_status="open",
+    )
+
+    assert projection.state == "contradiction"
+    assert projection.reason_codes == ("terminal_contract_with_live_exchange_evidence",)
+    assert projection.exchange_verified is False
+
+
+def test_expired_contract_without_exchange_evidence_is_not_exchange_verified():
+    projection = project_execution_state(contract_state="expired")
+
+    assert projection.state == "expired"
+    assert projection.label == "执行已过期，未下单"
+    assert projection.exchange_verified is False
+
+
+def test_fresh_submitting_contract_with_writer_binding_is_not_a_contradiction():
+    projection = project_execution_state(
+        contract_state="submitting",
+        binding_status="open",
+    )
+
+    assert projection.state == "submitting"
+    assert projection.label == "正在提交交易所"

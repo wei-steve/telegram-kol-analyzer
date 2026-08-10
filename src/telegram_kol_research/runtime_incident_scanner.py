@@ -219,6 +219,44 @@ class InvariantObservation:
         object.__setattr__(self, "summary", MappingProxyType(clean))
 
 
+def _resolved_execution_contradiction_fact(
+    observation: RuntimeIncidentObservation,
+) -> Mapping:
+    try:
+        summary = json.loads(observation.summary_json or "{}")
+    except (json.JSONDecodeError, TypeError):
+        summary = {}
+    if not isinstance(summary, dict):
+        summary = {}
+    object_id = str(observation.object_id)
+    try:
+        contract_id = int(summary.get("contract_id") or object_id.split("-", 1)[0])
+    except (TypeError, ValueError):
+        contract_id = 0
+    reason_code = str(
+        summary.get("reason_code") or object_id.split("-", 1)[-1]
+    )[:128]
+    references = [f"instruction-contract:{contract_id}"]
+    item_id = summary.get("message_instruction_item_id")
+    raw_id = summary.get("raw_message_id")
+    if isinstance(item_id, int):
+        references.append(f"instruction-item:{item_id}")
+    if isinstance(raw_id, int):
+        references.append(f"raw-message:{raw_id}")
+    return {
+        "complete": True,
+        "object_id": object_id,
+        "execution_contradiction": False,
+        "reason_code": reason_code,
+        "contract_id": contract_id,
+        "message_instruction_item_id": item_id if isinstance(item_id, int) else 0,
+        "raw_message_id": raw_id if isinstance(raw_id, int) else 0,
+        "future_contract": bool(summary.get("future_contract")),
+        "exact_historical": bool(summary.get("exact_historical")),
+        "evidence_references": tuple(references),
+    }
+
+
 def build_scanner_facts(session_factory, *, rules: frozenset[str], observed_at):
     """Build only deployed projections; dormant catalog rules yield no facts."""
     result: dict[str, tuple[Mapping, ...]] = {}
@@ -228,8 +266,8 @@ def build_scanner_facts(session_factory, *, rules: frozenset[str], observed_at):
             observed_at=observed_at,
             limit=100,
         )
-        result["instruction_execution_contradiction_v1"] = tuple(
-            {
+        current = {
+            f"{row['contract_id']}-{row['reason_code']}": {
                 "complete": True,
                 "object_id": f"{row['contract_id']}-{row['reason_code']}",
                 "execution_contradiction": True,
@@ -248,7 +286,40 @@ def build_scanner_facts(session_factory, *, rules: frozenset[str], observed_at):
                 ),
             }
             for row in snapshot["facts"]
-        )
+        }
+        with session_factory() as session:
+            prior = (
+                session.query(RuntimeIncidentObservation)
+                .filter(
+                    RuntimeIncidentObservation.rule_id
+                    == "instruction_execution_contradiction_v1",
+                    RuntimeIncidentObservation.state.in_(("observing", "shadow_confirmed")),
+                )
+                .order_by(RuntimeIncidentObservation.last_observed_at.asc())
+                .limit(100)
+                .all()
+            )
+            projected: list[Mapping] = []
+            for observation in prior:
+                object_id = str(observation.object_id)
+                fact = current.pop(object_id, None)
+                if fact is not None:
+                    projected.append(fact)
+                elif object_id.endswith(
+                    ("-exchange_snapshot_incomplete", "-exchange_evidence_duplicate")
+                ):
+                    # These facts are owned by the exact exchange-readback tick,
+                    # which also emits their recovery. A DB-only scan cannot
+                    # prove that a transient exchange condition disappeared.
+                    continue
+                else:
+                    projected.append(
+                        _resolved_execution_contradiction_fact(observation)
+                    )
+                if len(projected) == 100:
+                    break
+        projected.extend(list(current.values())[: max(0, 100 - len(projected))])
+        result["instruction_execution_contradiction_v1"] = tuple(projected)
     if "active_position_missing_protection_v1" in rules:
         risks = list_critical_unprotected_positions(
             session_factory, prefer_unobserved=True, limit=100

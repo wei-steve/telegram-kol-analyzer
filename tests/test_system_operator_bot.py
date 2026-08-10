@@ -168,6 +168,93 @@ def test_runtime_notification_loop_wires_execution_reconciliation_only_in_mode(
     assert calls[0]["execution_reconciliation_client"] is client
 
 
+def test_runtime_notification_delivery_survives_maintenance_failure(monkeypatch):
+    delivered = []
+    monkeypatch.setattr(
+        operator_bot_module,
+        "load_trading_settings",
+        lambda session_factory: (_ for _ in ()).throw(RuntimeError("db unavailable")),
+    )
+
+    async def stop_after_delivery(*args, **kwargs):
+        delivered.append(True)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        operator_bot_module,
+        "deliver_runtime_incident_notifications",
+        stop_after_delivery,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            operator_bot_module.run_runtime_incident_notification_loop(
+                session_factory=object(),
+                config=SimpleNamespace(),
+            )
+        )
+
+    assert delivered == [True]
+
+
+def test_transient_execution_readback_fact_is_recorded_and_recovered(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research.models import RuntimeIncidentObservation
+    import telegram_kol_research.config as config_module
+
+    sf = create_session_factory(tmp_path / "transient-readback.db")
+    config_calls = []
+
+    def load_scanner_config(**kwargs):
+        config_calls.append(kwargs)
+        return SimpleNamespace(
+            enabled=True,
+            shadow_only=True,
+            rules=frozenset({"instruction_execution_contradiction_v1"}),
+        )
+
+    monkeypatch.setattr(
+        config_module,
+        "load_runtime_scanner_config",
+        load_scanner_config,
+    )
+    fact = SimpleNamespace(
+        code="exchange_snapshot_incomplete",
+        contract_id=7,
+        message_instruction_item_id=8,
+        raw_message_id=9,
+    )
+    operator_bot_module._record_execution_reconciliation_monitor_facts(
+        sf,
+        result=SimpleNamespace(facts=[fact]),
+        observed_at=NOW,
+    )
+    operator_bot_module._record_execution_reconciliation_monitor_facts(
+        sf,
+        result=SimpleNamespace(facts=[]),
+        observed_at=NOW + timedelta(minutes=1),
+    )
+    with sf() as session:
+        assert session.query(RuntimeIncidentObservation).one().state == "observing"
+
+    operator_bot_module._record_execution_reconciliation_monitor_facts(
+        sf,
+        result=SimpleNamespace(
+            facts=[],
+            resolved_transient_fact_keys=["7-exchange_snapshot_incomplete"],
+        ),
+        observed_at=NOW + timedelta(minutes=2),
+    )
+
+    with sf() as session:
+        row = session.query(RuntimeIncidentObservation).one()
+        assert row.object_id == "7-exchange_snapshot_incomplete"
+        assert row.state == "resolved_without_incident"
+        assert row.recovered_at is not None
+    assert all("env_file_paths" not in call for call in config_calls)
+
+
 def test_automatic_break_even_alert_contains_exact_non_sensitive_handoff():
     rendered = format_position_protection_incident_message({
         "incident_type": "automatic_break_even_recovery_required",

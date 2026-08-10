@@ -7,6 +7,8 @@ from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Mapping, Any
 
+from sqlalchemy import and_, case, exists, func, or_
+
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
@@ -15,6 +17,7 @@ from telegram_kol_research.models import (
     MessageInstructionItem,
     PositionAttributionAudit,
     RuntimeIncident,
+    RuntimeIncidentObservation,
     StrategyLifecycle,
 )
 from telegram_kol_research.trading_settings import load_trading_settings
@@ -29,6 +32,9 @@ INSTRUCTION_EXECUTION_CONTRADICTION_CODES = frozenset(
         "binding_without_verified_contract",
         "contract_binding_mismatch",
         "multi_leg_partial",
+        "terminal_contract_with_live_exchange_evidence",
+        "exchange_snapshot_incomplete",
+        "exchange_evidence_duplicate",
     }
 )
 _EXACT_HISTORICAL_EXECUTION_CODES = frozenset(
@@ -38,6 +44,9 @@ _EXACT_HISTORICAL_EXECUTION_CODES = frozenset(
         "binding_without_verified_contract",
         "contract_binding_mismatch",
         "multi_leg_partial",
+        "terminal_contract_with_live_exchange_evidence",
+        "exchange_snapshot_incomplete",
+        "exchange_evidence_duplicate",
     }
 )
 _SUBMITTING_STALE_AFTER = timedelta(minutes=2)
@@ -86,13 +95,99 @@ def build_instruction_execution_contradiction_snapshot(
     mode = settings.instruction_execution_contract_mode
     scan_budget = min(400, max(limit * 4, limit))
     with session_factory() as session:
+        unresolved = (
+            session.query(RuntimeIncidentObservation.object_id)
+            .filter(
+                RuntimeIncidentObservation.rule_id
+                == "instruction_execution_contradiction_v1",
+                RuntimeIncidentObservation.state.in_(("observing", "shadow_confirmed")),
+            )
+            .order_by(RuntimeIncidentObservation.last_observed_at.asc())
+            .limit(100)
+            .all()
+        )
+        prior_contract_ids = []
+        for (object_id,) in unresolved:
+            try:
+                prior_contract_ids.append(int(str(object_id).split("-", 1)[0]))
+            except (TypeError, ValueError):
+                continue
+        comparable_now = now.replace(tzinfo=None)
+        live_binding_predicate = and_(
+            ExecutionBinding.venue == "deepcoin",
+            ExecutionBinding.status.in_(("open", "active")),
+        )
+        any_strategy_binding = exists().where(
+            and_(
+                ExecutionBinding.venue == "deepcoin",
+                ExecutionBinding.strategy_instance_id
+                == InstructionExecutionContract.strategy_instance_id,
+            )
+        )
+        live_strategy_binding = exists().where(
+            and_(
+                live_binding_predicate,
+                ExecutionBinding.strategy_instance_id
+                == InstructionExecutionContract.strategy_instance_id,
+            )
+        )
+        live_exact_binding = exists().where(
+            and_(
+                live_binding_predicate,
+                ExecutionBinding.id
+                == InstructionExecutionContract.execution_binding_id,
+            )
+        )
+        candidate_filter = or_(
+            InstructionExecutionContract.state == "submit_unknown",
+            and_(
+                InstructionExecutionContract.state == "verified",
+                InstructionExecutionContract.completion_scope == "partial",
+            ),
+            and_(
+                InstructionExecutionContract.state == "verified",
+                InstructionExecutionContract.terminal_kind == "verified_entry",
+                InstructionExecutionContract.execution_binding_id.is_(None),
+                ~any_strategy_binding,
+            ),
+            and_(
+                InstructionExecutionContract.state == "deferred",
+                InstructionExecutionContract.deadline_at.is_not(None),
+                InstructionExecutionContract.deadline_at <= comparable_now,
+            ),
+            and_(
+                InstructionExecutionContract.state == "submitting",
+                func.coalesce(
+                    InstructionExecutionContract.last_progress_at,
+                    InstructionExecutionContract.updated_at,
+                    InstructionExecutionContract.created_at,
+                )
+                <= comparable_now - _SUBMITTING_STALE_AFTER,
+            ),
+            and_(
+                InstructionExecutionContract.state.in_(
+                    ("pending", "deferred", "failed", "expired")
+                ),
+                or_(live_exact_binding, live_strategy_binding),
+            ),
+        )
+        query = session.query(InstructionExecutionContract).filter(candidate_filter)
+        candidate_count = query.count()
         contracts = (
-            session.query(InstructionExecutionContract)
-            .order_by(InstructionExecutionContract.id.desc())
+            query.order_by(
+                case(
+                    (
+                        InstructionExecutionContract.id.in_(prior_contract_ids),
+                        0,
+                    ),
+                    else_=1,
+                ),
+                InstructionExecutionContract.id.desc(),
+            )
             .limit(scan_budget + 1)
             .all()
         )
-        scanned_truncated = len(contracts) > scan_budget
+        scanned_truncated = candidate_count > scan_budget
         contracts = contracts[:scan_budget]
         binding_ids = {
             int(row.execution_binding_id)
@@ -107,6 +202,7 @@ def build_instruction_execution_contradiction_snapshot(
         bindings = (
             session.query(ExecutionBinding)
             .filter(
+                ExecutionBinding.venue == "deepcoin",
                 (ExecutionBinding.id.in_(binding_ids))
                 | (ExecutionBinding.strategy_instance_id.in_(strategy_ids))
             )
@@ -147,10 +243,23 @@ def build_instruction_execution_contradiction_snapshot(
         state = str(contract.state or "").strip().lower()
         if state == "submit_unknown":
             codes.append("submit_unknown")
-        if state == "verified" and binding is None:
+        if (
+            state == "verified"
+            and str(contract.terminal_kind or "").strip().lower() == "verified_entry"
+            and binding is None
+        ):
             codes.append("verified_without_binding")
-        if binding is not None and state != "verified":
-            codes.append("binding_without_verified_contract")
+        binding_live = bool(
+            binding is not None
+            and str(binding.venue or "").lower() == "deepcoin"
+            and str(binding.status or "").lower() in {"open", "active"}
+        )
+        if binding_live and state != "verified":
+            codes.append(
+                "terminal_contract_with_live_exchange_evidence"
+                if state in {"failed", "expired"}
+                else "binding_without_verified_contract"
+            )
         if (
             contract.execution_binding_id is not None
             and (
