@@ -1021,6 +1021,7 @@ def _record_owned_position_observations(
     """Persist bounded observations only for verified exact live positions."""
 
     from telegram_kol_research.position_reconciliation_observations import (
+        build_position_observation_payload,
         record_position_reconciliation_observation,
     )
 
@@ -1051,6 +1052,21 @@ def _record_owned_position_observations(
         if position is None or binding is None or not binding.strategy_instance_id:
             continue
         instrument_id = _first_string(position, "instId", "inst_id") or ""
+        pending_tpsl = pending_by_position.get(pos_id, [])
+        snapshot_complete = bool(
+            not snapshot.errors
+            and completeness_by_instrument.get(instrument_id.upper(), False)
+        )
+        try:
+            build_position_observation_payload(
+                position=position,
+                pending_tpsl=pending_tpsl,
+                complete=snapshot_complete,
+            )
+        except ValueError:
+            # An ambiguous/malformed position row remains live for fail-closed
+            # reconciliation, but it is not valid immutable observation evidence.
+            continue
         record_position_reconciliation_observation(
             session,
             venue=str(binding.venue),
@@ -1058,11 +1074,8 @@ def _record_owned_position_observations(
             execution_order_leg_id=int(leg.id),
             strategy_instance_id=str(binding.strategy_instance_id),
             position=position,
-            pending_tpsl=pending_by_position.get(pos_id, []),
-            snapshot_complete=(
-                not snapshot.errors
-                and completeness_by_instrument.get(instrument_id.upper(), False)
-            ),
+            pending_tpsl=pending_tpsl,
+            snapshot_complete=snapshot_complete,
             observed_at=observed_at,
         )
 

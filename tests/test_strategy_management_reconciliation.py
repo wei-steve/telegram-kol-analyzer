@@ -1308,6 +1308,8 @@ def test_invalid_current_size_freezes_only_the_leg(invalid_size, tmp_path):
     assert stored.status == "recovery_required"
     assert stored.legs[0].status == "inconsistent"
     assert stored.legs[0].last_error == {"reason": "management_position_size_invalid"}
+    with sf() as session:
+        assert session.query(PositionReconciliationObservation).count() == 0
 
 
 def test_overclose_or_position_growth_is_inconsistent_and_never_succeeds(tmp_path):
