@@ -67,6 +67,9 @@ from telegram_kol_research.system_operator_bot import (
     send_system_operator_bot_message,
     system_operator_bot_enabled,
 )
+from telegram_kol_research.runtime_incident_snapshot import (
+    INSTRUCTION_EXECUTION_CONTRADICTION_CODES,
+)
 
 
 MAX_ALERT_LENGTH = 1200
@@ -236,6 +239,7 @@ _FIXED_REASON_CODES = frozenset(
         "message_operation_supervisor_stale",
         "message_operation_supervisor_policy_invalid",
         "message_operation_coverage_incomplete",
+        "instruction_execution_contradiction",
     }
 )
 _LOW_REPEAT_REASON_CODES = frozenset({"audit_abnormal"})
@@ -372,6 +376,9 @@ _FINGERPRINT_DETAIL_KEYS_BY_REASON = {
     "entry_preamble_ambiguous": ("entry_preamble_invariant_codes",),
     "live_entry_preamble_binding_evidence_missing": (
         "entry_preamble_invariant_codes",
+    ),
+    "instruction_execution_contradiction": (
+        "instruction_execution_facts",
     ),
 }
 _NOTIFICATION_SUPPRESSION = timedelta(hours=6)
@@ -3387,6 +3394,7 @@ _MESSAGE_OPERATION_COVERAGE_COUNT_FIELDS = frozenset(
         "stage2_delivered",
         "stage2_failed",
         "oldest_nonterminal_age_seconds",
+        "instruction_execution_contradictions_total",
     }
 )
 _MESSAGE_OPERATION_COVERAGE_FIELDS = _MESSAGE_OPERATION_COVERAGE_COUNT_FIELDS | {
@@ -3395,6 +3403,8 @@ _MESSAGE_OPERATION_COVERAGE_FIELDS = _MESSAGE_OPERATION_COVERAGE_COUNT_FIELDS | 
     "scan_truncated",
     "supervisor_policy_status",
     "supervisor_last_success_at",
+    "instruction_execution_scan_truncated",
+    "instruction_execution_facts",
 }
 _MESSAGE_OPERATION_HEARTBEAT_MAX_AGE = timedelta(minutes=5)
 _MESSAGE_OPERATION_HEARTBEAT_FUTURE_SKEW = timedelta(minutes=1)
@@ -3431,6 +3441,16 @@ def _evaluate_message_operation_coverage(
             reasons.add("message_operation_coverage_incomplete")
             return
         counts[name] = raw
+    execution_scan_truncated = value.get("instruction_execution_scan_truncated")
+    execution_facts = _safe_instruction_execution_facts(
+        value.get("instruction_execution_facts")
+    )
+    if type(execution_scan_truncated) is not bool or execution_facts is None:
+        reasons.add("message_operation_coverage_incomplete")
+        return
+    if counts["instruction_execution_contradictions_total"] != len(execution_facts):
+        reasons.add("message_operation_coverage_incomplete")
+        return
     heartbeat_raw = value.get("supervisor_last_success_at")
     heartbeat = None
     if heartbeat_raw is not None:
@@ -3452,6 +3472,8 @@ def _evaluate_message_operation_coverage(
         reasons.add("message_operation_coverage_incomplete")
         return
     if truncated:
+        reasons.add("message_operation_coverage_incomplete")
+    if execution_scan_truncated:
         reasons.add("message_operation_coverage_incomplete")
     if (
         counts["contracts_created_total"]
@@ -3477,6 +3499,9 @@ def _evaluate_message_operation_coverage(
         reasons.add("contract_violation_missing_stage1")
     if counts["incidents_without_terminal_stage2_total"]:
         reasons.add("message_operation_incident_missing_terminal")
+    if execution_facts:
+        reasons.add("instruction_execution_contradiction")
+        details["instruction_execution_facts"] = execution_facts
     if (
         heartbeat is None
         or checked_at - heartbeat > _MESSAGE_OPERATION_HEARTBEAT_MAX_AGE
@@ -3487,6 +3512,43 @@ def _evaluate_message_operation_coverage(
         name: counts[name]
         for name in sorted(_MESSAGE_OPERATION_COVERAGE_COUNT_FIELDS)
     }
+
+
+def _safe_instruction_execution_facts(
+    value: object,
+) -> tuple[dict[str, object], ...] | None:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return None
+    if len(value) > 20:
+        return None
+    required = {
+        "reason_code",
+        "contract_id",
+        "message_instruction_item_id",
+        "raw_message_id",
+        "future_contract",
+        "exact_historical",
+    }
+    facts: list[dict[str, object]] = []
+    for row in value:
+        if not isinstance(row, Mapping) or set(row) != required:
+            return None
+        reason_code = row.get("reason_code")
+        identifiers = (
+            row.get("contract_id"),
+            row.get("message_instruction_item_id"),
+            row.get("raw_message_id"),
+        )
+        if (
+            reason_code not in INSTRUCTION_EXECUTION_CONTRADICTION_CODES
+            or any(type(identifier) is not int or identifier <= 0 for identifier in identifiers)
+            or type(row.get("future_contract")) is not bool
+            or type(row.get("exact_historical")) is not bool
+            or not (row["future_contract"] or row["exact_historical"])
+        ):
+            return None
+        facts.append({key: row[key] for key in sorted(required)})
+    return tuple(facts)
 
 
 _COMPOSITE_INVARIANT_CODES = frozenset(
@@ -4052,6 +4114,11 @@ _ALERT_RULES: Mapping[str, tuple[str, str, str]] = {
         "消息操作覆盖检查不完整",
         "端到端覆盖投影被截断、格式错误或计数不一致。",
     ),
+    "instruction_execution_contradiction": (
+        "critical",
+        "交易指令执行状态存在矛盾",
+        "交易指令的本地终态与订单或绑定证据不一致。",
+    ),
 }
 _ALERT_REASON_PRIORITY = (
     "authoritative_processor_required",
@@ -4061,6 +4128,7 @@ _ALERT_REASON_PRIORITY = (
     "live_position_retained_tp_oversized",
     "completed_batch_missing_component_evidence",
     "stalled_composite_component",
+    "instruction_execution_contradiction",
     "executable_message_missing_contract",
     "contract_violation_missing_stage1",
     "message_operation_incident_missing_terminal",
@@ -4119,6 +4187,21 @@ def build_monitor_alert_presentation(result: MonitorResult) -> MonitorAlertPrese
         title_text = f"{total}条历史交易管理记录无法确认"
 
     problems = tuple(_ALERT_RULES[reason][2] for reason in known_reasons[:3])
+    if "instruction_execution_contradiction" in known_reasons:
+        execution_facts = result.details.get("instruction_execution_facts")
+        if isinstance(execution_facts, Sequence) and execution_facts:
+            fact_problems = tuple(
+                "执行合约 #{contract_id} · 指令 #{item_id} · 消息 #{raw_id}：{code}".format(
+                    contract_id=fact["contract_id"],
+                    item_id=fact["message_instruction_item_id"],
+                    raw_id=fact["raw_message_id"],
+                    code=fact["reason_code"],
+                )
+                for fact in execution_facts[:3]
+                if isinstance(fact, Mapping)
+            )
+            if fact_problems:
+                problems = fact_problems
     batch_ids = _safe_actionable_batch_ids(result.details.get("actionable_batch_refs"))
     additional_batch_count = max(0, (total or 0) - len(batch_ids))
 
@@ -4133,6 +4216,7 @@ def build_monitor_alert_presentation(result: MonitorResult) -> MonitorAlertPrese
             "event_unknown_status",
             "event_recovery_status",
             "duplicate_manual_close",
+            "instruction_execution_contradiction",
         }.intersection(known_reasons) or audit_submit_unknown:
             impact = "对应订单或仓位的最终状态尚未确认，重复操作可能扩大风险。"
             operator_action = "不要重复下单或平仓，请先由开发者核对交易所订单和当前仓位。"

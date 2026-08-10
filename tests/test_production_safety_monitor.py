@@ -276,9 +276,41 @@ def _healthy_message_operation_coverage(**overrides):
         "stage2_failed": 0,
         "oldest_nonterminal_age_seconds": 0,
         "supervisor_last_success_at": "2026-08-09T01:59:30+00:00",
+        "instruction_execution_scan_truncated": False,
+        "instruction_execution_contradictions_total": 0,
+        "instruction_execution_facts": [],
     }
     values.update(overrides)
     return values
+
+
+def test_monitor_surfaces_bounded_instruction_execution_contradiction_in_chinese():
+    coverage = _healthy_message_operation_coverage(
+        instruction_execution_contradictions_total=1,
+        instruction_execution_facts=[
+            {
+                "reason_code": "submit_unknown",
+                "contract_id": 31,
+                "message_instruction_item_id": 41,
+                "raw_message_id": 51,
+                "future_contract": True,
+                "exact_historical": False,
+            }
+        ],
+    )
+
+    result = evaluate_monitor_snapshot(
+        _snapshot(message_operation_coverage=coverage),
+        EXPECTATIONS,
+        checked_at=datetime(2026, 8, 9, 2, 0, tzinfo=UTC),
+    )
+    presentation = monitor_module.build_monitor_alert_presentation(result)
+
+    assert "instruction_execution_contradiction" in result.reason_codes
+    assert "执行合约 #31" in " ".join(presentation.problems)
+    assert "指令 #41" in " ".join(presentation.problems)
+    assert "消息 #51" in " ".join(presentation.problems)
+    assert "pos" not in str(result.details).lower()
 
 
 @pytest.mark.parametrize(

@@ -31,6 +31,10 @@ _RULES = {
         "high",
         "management-target",
     ),
+    "instruction_execution_contradiction_v1": (
+        "critical",
+        "execution-contract",
+    ),
 }
 _REQUIRED_BOOLEAN_FACTS = {
     "terminal_high_risk_management_without_instruction_v1": (
@@ -56,6 +60,11 @@ _REQUIRED_BOOLEAN_FACTS = {
     ),
     "management_target_batch_state_inconsistent_v1": (
         "target_state_consistent_with_batch",
+    ),
+    "instruction_execution_contradiction_v1": (
+        "execution_contradiction",
+        "future_contract",
+        "exact_historical",
     ),
 }
 
@@ -96,6 +105,10 @@ def _abnormal(rule_id: str, facts: Mapping[str, Any]) -> bool:
         )
     if rule_id == "management_target_batch_state_inconsistent_v1":
         return not bool(facts.get("target_state_consistent_with_batch"))
+    if rule_id == "instruction_execution_contradiction_v1":
+        return bool(facts.get("execution_contradiction")) and bool(
+            facts.get("future_contract") or facts.get("exact_historical")
+        )
     return bool(facts.get("monitor_abnormal")) and not bool(facts.get("incident_present"))
 
 
@@ -156,6 +169,18 @@ def evaluate_rule(rule_id: str, facts: Mapping[str, Any]) -> InvariantObservatio
             "exchange_snapshot_fingerprint",
             "refused_at",
             "health_observed_at",
+        ):
+            value = facts.get(key)
+            if value is None or isinstance(value, (str, int, float, bool)):
+                summary[key] = value
+    elif rule_id == "instruction_execution_contradiction_v1":
+        for key in (
+            "reason_code",
+            "contract_id",
+            "message_instruction_item_id",
+            "raw_message_id",
+            "future_contract",
+            "exact_historical",
         ):
             value = facts.get(key)
             if value is None or isinstance(value, (str, int, float, bool)):

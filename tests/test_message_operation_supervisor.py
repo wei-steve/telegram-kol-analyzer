@@ -580,6 +580,9 @@ def test_coverage_snapshot_reports_every_pipeline_stage_and_silent_gap(tmp_path)
         "stage2_failed": 0,
         "oldest_nonterminal_age_seconds": 120,
         "supervisor_last_success_at": "2026-08-09T01:59:30+00:00",
+        "instruction_execution_scan_truncated": False,
+        "instruction_execution_contradictions_total": 0,
+        "instruction_execution_facts": [],
     }
     assert missing_raw_id > 0
     assert incident.id > 0

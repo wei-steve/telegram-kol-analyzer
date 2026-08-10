@@ -3,19 +3,44 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Mapping, Any
 
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
+    InstructionExecutionContract,
     ManagementMessageTarget,
     MessageInstructionItem,
     PositionAttributionAudit,
     RuntimeIncident,
     StrategyLifecycle,
 )
+from telegram_kol_research.trading_settings import load_trading_settings
+
+
+INSTRUCTION_EXECUTION_CONTRADICTION_CODES = frozenset(
+    {
+        "deferred_overdue",
+        "submitting_stale",
+        "submit_unknown",
+        "verified_without_binding",
+        "binding_without_verified_contract",
+        "contract_binding_mismatch",
+        "multi_leg_partial",
+    }
+)
+_EXACT_HISTORICAL_EXECUTION_CODES = frozenset(
+    {
+        "submit_unknown",
+        "verified_without_binding",
+        "binding_without_verified_contract",
+        "contract_binding_mismatch",
+        "multi_leg_partial",
+    }
+)
+_SUBMITTING_STALE_AFTER = timedelta(minutes=2)
 
 
 MANAGEMENT_TARGET_DIAGNOSIS_INCIDENT_TYPES = frozenset(
@@ -44,6 +69,157 @@ class InvariantSnapshot:
                 raise ValueError("snapshot objects are unbounded")
             bounded[rule_id] = tuple(MappingProxyType(dict(item)) for item in items)
         object.__setattr__(self, "facts_by_rule", MappingProxyType(bounded))
+
+
+def build_instruction_execution_contradiction_snapshot(
+    session_factory,
+    *,
+    observed_at: datetime,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Project bounded execution contradictions without raw or exchange IDs."""
+
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("instruction execution contradiction limit must be 1..100")
+    now = _aware_utc(observed_at)
+    settings = load_trading_settings(session_factory)
+    mode = settings.instruction_execution_contract_mode
+    scan_budget = min(400, max(limit * 4, limit))
+    with session_factory() as session:
+        contracts = (
+            session.query(InstructionExecutionContract)
+            .order_by(InstructionExecutionContract.id.desc())
+            .limit(scan_budget + 1)
+            .all()
+        )
+        scanned_truncated = len(contracts) > scan_budget
+        contracts = contracts[:scan_budget]
+        binding_ids = {
+            int(row.execution_binding_id)
+            for row in contracts
+            if row.execution_binding_id is not None
+        }
+        strategy_ids = {
+            str(row.strategy_instance_id)
+            for row in contracts
+            if row.strategy_instance_id
+        }
+        bindings = (
+            session.query(ExecutionBinding)
+            .filter(
+                (ExecutionBinding.id.in_(binding_ids))
+                | (ExecutionBinding.strategy_instance_id.in_(strategy_ids))
+            )
+            .all()
+            if binding_ids or strategy_ids
+            else []
+        )
+
+    bindings_by_id = {int(row.id): row for row in bindings}
+    bindings_by_strategy: dict[str, list[ExecutionBinding]] = {}
+    for binding in bindings:
+        if binding.strategy_instance_id:
+            bindings_by_strategy.setdefault(
+                str(binding.strategy_instance_id), []
+            ).append(binding)
+
+    facts: list[dict[str, Any]] = []
+    for contract in contracts:
+        binding = (
+            bindings_by_id.get(int(contract.execution_binding_id))
+            if contract.execution_binding_id is not None
+            else None
+        )
+        strategy_matches = bindings_by_strategy.get(
+            str(contract.strategy_instance_id or ""), []
+        )
+        if binding is None and len(strategy_matches) == 1:
+            binding = strategy_matches[0]
+        future_contract = _execution_contract_is_future(
+            contract,
+            mode=mode,
+            entry_watermark=settings.instruction_execution_entry_after_item_id,
+            management_watermark=(
+                settings.instruction_execution_management_after_item_id
+            ),
+        )
+        codes: list[str] = []
+        state = str(contract.state or "").strip().lower()
+        if state == "submit_unknown":
+            codes.append("submit_unknown")
+        if state == "verified" and binding is None:
+            codes.append("verified_without_binding")
+        if binding is not None and state != "verified":
+            codes.append("binding_without_verified_contract")
+        if (
+            contract.execution_binding_id is not None
+            and (
+                binding is None
+                or int(binding.id) != int(contract.execution_binding_id)
+            )
+        ):
+            codes.append("contract_binding_mismatch")
+        if state == "verified" and contract.completion_scope == "partial":
+            codes.append("multi_leg_partial")
+        if state == "deferred" and contract.deadline_at is not None and now >= _aware_utc(contract.deadline_at):
+            codes.append("deferred_overdue")
+        if state == "submitting" and _contract_progress_age(contract, now=now) >= _SUBMITTING_STALE_AFTER:
+            codes.append("submitting_stale")
+
+        for code in dict.fromkeys(codes):
+            exact_historical = code in _EXACT_HISTORICAL_EXECUTION_CODES or (
+                code == "submitting_stale"
+                and bool(contract.attempted_exchange_write)
+            )
+            if not future_contract and not exact_historical:
+                continue
+            facts.append(
+                {
+                    "reason_code": code,
+                    "contract_id": int(contract.id),
+                    "message_instruction_item_id": int(
+                        contract.message_instruction_item_id
+                    ),
+                    "raw_message_id": int(contract.raw_message_id),
+                    "future_contract": future_contract,
+                    "exact_historical": exact_historical,
+                }
+            )
+            if len(facts) > limit:
+                break
+        if len(facts) > limit:
+            break
+
+    facts_truncated = len(facts) > limit
+    bounded_facts = tuple(facts[:limit])
+    return {
+        "scan_truncated": bool(scanned_truncated or facts_truncated),
+        "contradictions_total": len(bounded_facts),
+        "facts": bounded_facts,
+    }
+
+
+def _execution_contract_is_future(
+    contract,
+    *,
+    mode: str,
+    entry_watermark: int,
+    management_watermark: int,
+) -> bool:
+    if mode not in {"shadow", "live"}:
+        return False
+    intent = str(contract.intent_kind or "").strip().lower()
+    watermark = entry_watermark if "entry" in intent else management_watermark
+    return int(contract.message_instruction_item_id) > int(watermark)
+
+
+def _contract_progress_age(contract, *, now: datetime) -> timedelta:
+    progress = contract.last_progress_at or contract.updated_at or contract.created_at
+    return now - _aware_utc(progress)
+
+
+def _aware_utc(value: datetime) -> datetime:
+    return value.astimezone(UTC) if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def _isoformat(value: Any) -> str | None:

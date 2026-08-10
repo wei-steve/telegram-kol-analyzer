@@ -17,11 +17,18 @@ from telegram_kol_research.models import (
     PositionProtectionHealthObservation,
     RuntimeIncidentObservation,
     StrategyManagementBatch,
+    InstructionExecutionContract,
+    MessageInstructionItem,
+    RawMessage,
+    SignalCandidate,
 )
 from telegram_kol_research.runtime_incident_scanner import InvariantObservation, build_scanner_facts
 from telegram_kol_research.runtime_incident_scanner import list_critical_unprotected_positions
 from telegram_kol_research.runtime_incident_scanner import run_scanner_cycle
 from sqlalchemy import event
+from telegram_kol_research.trading_settings import save_trading_settings
+from telegram_kol_research.runtime_incident_rules import evaluate_rule
+from telegram_kol_research.runtime_agent_tools import READ_ONLY_RUNTIME_AGENT_TOOL_NAMES
 
 
 def test_scanner_defaults_are_dormant_and_fail_closed():
@@ -30,6 +37,94 @@ def test_scanner_defaults_are_dormant_and_fail_closed():
     assert config.shadow_only is True
     assert config.rules == frozenset()
     assert config.interval_seconds == 60.0
+
+
+def test_instruction_execution_contradiction_rule_is_shadow_deduplicated(tmp_path):
+    sf = create_session_factory(tmp_path / "instruction-contradiction.db")
+    observed = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
+    with sf() as session:
+        raw = RawMessage(chat_id=10, message_id=100, text="must not enter facts")
+        session.add(raw)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=raw.id,
+            symbol="BTC",
+            side="long",
+            event_type="entry_signal",
+        )
+        session.add(candidate)
+        session.flush()
+        item = MessageInstructionItem(
+            raw_message_id=raw.id,
+            signal_candidate_id=candidate.id,
+            sequence=0,
+            instruction_kind="entry",
+            idempotency_key="x" * 64,
+        )
+        session.add(item)
+        session.flush()
+        contract = InstructionExecutionContract(
+            message_instruction_item_id=item.id,
+            raw_message_id=raw.id,
+            signal_candidate_id=candidate.id,
+            intent_kind="entry",
+            state="submit_unknown",
+            state_version=1,
+            attempted_exchange_write=True,
+            created_at=observed - timedelta(minutes=1),
+            updated_at=observed - timedelta(minutes=1),
+        )
+        session.add(contract)
+        session.commit()
+        contract_id = contract.id
+    save_trading_settings(
+        sf,
+        {
+            "instruction_execution_contract_mode": "live",
+            "instruction_execution_entry_after_item_id": 0,
+        },
+    )
+    config = load_runtime_scanner_config(
+        environ={
+            "TELEGRAM_KOL_RUNTIME_SCANNER_ENABLED": "true",
+            "TELEGRAM_KOL_RUNTIME_SCANNER_SHADOW_ONLY": "true",
+            "TELEGRAM_KOL_RUNTIME_SCANNER_RULES": "instruction_execution_contradiction_v1",
+        },
+        env_file_paths=[],
+    )
+
+    facts = build_scanner_facts(sf, rules=config.rules, observed_at=observed)
+    candidate_fact = facts["instruction_execution_contradiction_v1"][0]
+    assert candidate_fact["reason_code"] == "submit_unknown"
+    assert candidate_fact["contract_id"] == contract_id
+    assert "must not enter facts" not in str(candidate_fact)
+    assert evaluate_rule(
+        "instruction_execution_contradiction_v1", candidate_fact
+    ).outcome == "abnormal"
+
+    run_scanner_cycle(
+        session_factory=sf,
+        config=config,
+        facts_by_rule=facts,
+        observed_at=observed,
+    )
+    run_scanner_cycle(
+        session_factory=sf,
+        config=config,
+        facts_by_rule=facts,
+        observed_at=observed + timedelta(minutes=1),
+    )
+    with sf() as session:
+        rows = session.query(RuntimeIncidentObservation).all()
+        assert len(rows) == 1
+        assert rows[0].consecutive_count == 2
+        assert rows[0].state == "shadow_confirmed"
+
+
+def test_runtime_incident_tool_registry_has_no_exchange_write_authority():
+    forbidden = {"submit_order", "place_order", "cancel_order", "close_position"}
+    assert READ_ONLY_RUNTIME_AGENT_TOOL_NAMES.isdisjoint(forbidden)
+    assert all("mutation" not in name for name in READ_ONLY_RUNTIME_AGENT_TOOL_NAMES)
 
 
 def _seed_safety_gate_refusal(

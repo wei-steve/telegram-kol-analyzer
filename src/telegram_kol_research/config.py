@@ -50,6 +50,7 @@ RUNTIME_SCANNER_RULE_IDS = frozenset(
         "management_safety_gate_divergence_v1",
         "admitted_target_item_nonterminal_after_deadline_v1",
         "management_target_batch_state_inconsistent_v1",
+        "instruction_execution_contradiction_v1",
     }
 )
 RUNTIME_SCANNER_DEPLOYABLE_RULE_IDS = frozenset(
@@ -57,6 +58,7 @@ RUNTIME_SCANNER_DEPLOYABLE_RULE_IDS = frozenset(
         "active_position_missing_protection_v1",
         "cancel_outcome_stale_unknown_v1",
         "management_safety_gate_divergence_v1",
+        "instruction_execution_contradiction_v1",
     }
 )
 

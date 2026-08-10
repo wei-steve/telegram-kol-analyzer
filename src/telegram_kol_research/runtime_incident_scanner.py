@@ -27,6 +27,9 @@ from telegram_kol_research.models import (
     StrategyManagementLeg,
     TriggerProtectionStopRescue,
 )
+from telegram_kol_research.runtime_incident_snapshot import (
+    build_instruction_execution_contradiction_snapshot,
+)
 
 _REFERENCE = re.compile(r"[a-z][a-z0-9_-]{0,63}:[A-Za-z0-9_.:-]{1,255}")
 _SAFE_KEY = re.compile(r"[a-z][a-z0-9_]{0,63}")
@@ -219,6 +222,33 @@ class InvariantObservation:
 def build_scanner_facts(session_factory, *, rules: frozenset[str], observed_at):
     """Build only deployed projections; dormant catalog rules yield no facts."""
     result: dict[str, tuple[Mapping, ...]] = {}
+    if "instruction_execution_contradiction_v1" in rules:
+        snapshot = build_instruction_execution_contradiction_snapshot(
+            session_factory,
+            observed_at=observed_at,
+            limit=100,
+        )
+        result["instruction_execution_contradiction_v1"] = tuple(
+            {
+                "complete": True,
+                "object_id": f"{row['contract_id']}-{row['reason_code']}",
+                "execution_contradiction": True,
+                "reason_code": str(row["reason_code"]),
+                "contract_id": int(row["contract_id"]),
+                "message_instruction_item_id": int(
+                    row["message_instruction_item_id"]
+                ),
+                "raw_message_id": int(row["raw_message_id"]),
+                "future_contract": bool(row["future_contract"]),
+                "exact_historical": bool(row["exact_historical"]),
+                "evidence_references": (
+                    f"instruction-contract:{row['contract_id']}",
+                    f"instruction-item:{row['message_instruction_item_id']}",
+                    f"raw-message:{row['raw_message_id']}",
+                ),
+            }
+            for row in snapshot["facts"]
+        )
     if "active_position_missing_protection_v1" in rules:
         risks = list_critical_unprotected_positions(
             session_factory, prefer_unobserved=True, limit=100

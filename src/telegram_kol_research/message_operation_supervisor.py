@@ -45,6 +45,9 @@ from telegram_kol_research.runtime_incident_adapters import (
     capture_message_operation_failure,
 )
 from telegram_kol_research.trading_settings import load_trading_settings
+from telegram_kol_research.runtime_incident_snapshot import (
+    build_instruction_execution_contradiction_snapshot,
+)
 
 
 OUTCOME_STATES = frozenset(
@@ -276,6 +279,12 @@ def build_message_operation_coverage_snapshot(
     if not coverage_enabled:
         return _disabled_message_operation_coverage_snapshot()
 
+    execution_contradictions = build_instruction_execution_contradiction_snapshot(
+        session_factory,
+        observed_at=now,
+        limit=20,
+    )
+
     with session_factory() as session:
         source_rows = session.execute(
             select(
@@ -489,6 +498,15 @@ def build_message_operation_coverage_snapshot(
         "supervisor_last_success_at": (
             heartbeat.isoformat() if heartbeat is not None else None
         ),
+        "instruction_execution_scan_truncated": bool(
+            execution_contradictions["scan_truncated"]
+        ),
+        "instruction_execution_contradictions_total": int(
+            execution_contradictions["contradictions_total"]
+        ),
+        "instruction_execution_facts": [
+            dict(row) for row in execution_contradictions["facts"]
+        ],
     }
 
 
@@ -517,6 +535,9 @@ def _disabled_message_operation_coverage_snapshot() -> dict[str, object]:
         "stage2_failed": 0,
         "oldest_nonterminal_age_seconds": 0,
         "supervisor_last_success_at": None,
+        "instruction_execution_scan_truncated": False,
+        "instruction_execution_contradictions_total": 0,
+        "instruction_execution_facts": [],
     }
 
 
