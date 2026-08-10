@@ -112,3 +112,14 @@
 - 修复后干跑为零动作，数据库完整性正常，业务行数不减少。
 - 当前 Deepcoin 仓位、普通委托和条件单在修复前后不变。
 - 服务恢复 `active/monitoring`，交易执行和本次修复路径无新错误。
+
+## 生产实施结果（2026-08-10）
+
+- 部署提交：`46da2c74159429623c14151bc3564468b2bbfd63`。
+- 停服前确认管理批次无在途状态、仓位 mutation 全部终态；SQLite 源库与备份均通过 `integrity_check`。可恢复备份：`data/backups/research.db.pre-id40-20260810T131457Z`。
+- 首次生产干跑发现终态 binding 会按现有状态机清空 `pos_id` 并保留 `last_exchange_status=entry_legs_terminal`。已补防复发回归与 CAS 证据；空 `pos_id` 仅在该精确终态标记及其余完整强证据同时成立时可接受。
+- 最终干跑仅生成一个 `take_profit_attribution_repair` 动作，目标 convergence 40、关联 TP 11–13，冲突为零；当前活跃 convergence 125 因交易所身份仍活跃而被排除。
+- 应用后 leg 378 为 `verified/manually_closed`；convergence 40 为 `completed/convergence_position_terminal_prior_authority_restored`；TP 11–13 均为 `expired`；新增 restoration audit 2148 与 summary audit 3373，均为 `not_needed` 通知状态。
+- 修复后二次干跑为 0 动作、0 冲突；数据库完整性正常，核心业务表无行数减少。
+- Deepcoin 修复前后均为 2 个活跃仓位、0 个普通委托、7 个条件单，精确 ID 集合未变化。
+- `telegram-kol.service` 已恢复 `active`，页面根路由、持仓面板和当前委托分页均返回 HTTP 200，页面显示“监控中”，启动后无 warning/error 日志。
