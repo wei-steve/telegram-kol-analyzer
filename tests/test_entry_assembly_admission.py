@@ -113,6 +113,89 @@ def test_live_admission_persists_defer_and_wakes_once_on_terminal_evidence(tmp_p
     assert repeated == ()
 
 
+def test_final_wakeup_releases_matching_adjacent_deferred_entry_item(tmp_path):
+    from telegram_kol_research.entry_assembly_admission import (
+        assess_entry_assembly_admission,
+        claim_ready_entry_assembly_wakeups,
+    )
+    from telegram_kol_research.message_instruction_items import (
+        claim_next_message_instruction_item,
+        create_message_instruction_items_in_session,
+    )
+    from telegram_kol_research.models import MessageInstructionItem
+
+    session_factory = create_session_factory(tmp_path / "wakeup-item-release.db")
+    strategy_id, candidate_id, later_id = _persist_strategy_and_later_claim(
+        session_factory
+    )
+    assess_entry_assembly_admission(
+        session_factory,
+        strategy_raw_message_id=strategy_id,
+        signal_candidate_id=candidate_id,
+        mode="live",
+        assessed_at=NOW + timedelta(seconds=2),
+    )
+
+    with session_factory() as session:
+        create_message_instruction_items_in_session(
+            session,
+            raw_message_id=strategy_id,
+        )
+        item = session.query(MessageInstructionItem).one()
+        item.result_json = json.dumps(
+            {
+                "status": "deferred",
+                "reason": "adjacent_entry_context_pending",
+            }
+        )
+        item.visibility_first_failed_at = NOW + timedelta(seconds=2)
+        item.visibility_retry_attempts = 1
+        item.visibility_next_attempt_at = NOW + timedelta(minutes=1)
+        item_id = item.id
+        session.query(MessageEvidenceExtractionClaim).filter_by(
+            raw_message_id=later_id
+        ).delete()
+        session.add(
+            MessageEvidenceVersion(
+                raw_message_id=later_id,
+                version=1,
+                input_fingerprint="later-input",
+                model="mimo",
+                prompt_versions_json="{}",
+                extraction_status="completed",
+                confidence=1,
+                text_evidence_json="{}",
+                image_evidence_json="{}",
+                normalized_evidence_json=(
+                    '{"recognition_result":"非策略","strategy":{},'
+                    '"lifecycle_event":{"event_type":"none"}}'
+                ),
+            )
+        )
+        session.commit()
+
+    claims = claim_ready_entry_assembly_wakeups(
+        session_factory,
+        completed_raw_message_id=later_id,
+        now=NOW + timedelta(seconds=3),
+    )
+
+    assert tuple(claim.strategy_raw_message_id for claim in claims) == (strategy_id,)
+    with session_factory() as session:
+        item = session.get(MessageInstructionItem, item_id)
+        assert item is not None
+        assert item.status == "pending"
+        assert item.visibility_next_attempt_at is None
+
+    claimed = claim_next_message_instruction_item(
+        session_factory,
+        raw_message_id=strategy_id,
+        now=NOW + timedelta(seconds=3),
+    )
+    assert claimed is not None
+    assert claimed.id == item_id
+
+
 def test_shadow_records_proposal_without_deferring(tmp_path):
     from telegram_kol_research.entry_assembly_admission import (
         assess_entry_assembly_admission,
@@ -385,6 +468,56 @@ def test_completed_strategy_evidence_without_candidate_stays_deferred(tmp_path):
     )
 
     assert decision.status == "deferred"
+
+
+def test_completed_non_strategy_placeholder_is_not_treated_as_pending_action(tmp_path):
+    from telegram_kol_research.entry_assembly_admission import (
+        assess_entry_assembly_admission,
+    )
+    from telegram_kol_research.models import EntryAssemblyAttempt
+
+    session_factory = create_session_factory(tmp_path / "null-strategy-placeholder.db")
+    strategy_id, candidate_id, later_id = _persist_strategy_and_later_claim(
+        session_factory
+    )
+    with session_factory() as session:
+        session.query(MessageEvidenceExtractionClaim).filter_by(
+            raw_message_id=later_id
+        ).delete()
+        session.add(
+            MessageEvidenceVersion(
+                raw_message_id=later_id,
+                version=1,
+                input_fingerprint="later-input",
+                model="mimo",
+                prompt_versions_json="{}",
+                extraction_status="completed",
+                confidence=1,
+                text_evidence_json="{}",
+                image_evidence_json="{}",
+                normalized_evidence_json=(
+                    '{"recognition_result":"非策略","strategy":'
+                    '{"entry":null,"leverage":null,"order_type":null,'
+                    '"side":null,"stop_loss":null,"symbol":null,'
+                    '"take_profit":null},'
+                    '"lifecycle_event":{"event_type":"none"}}'
+                ),
+            )
+        )
+        session.commit()
+
+    decision = assess_entry_assembly_admission(
+        session_factory,
+        strategy_raw_message_id=strategy_id,
+        signal_candidate_id=candidate_id,
+        mode="live",
+        assessed_at=NOW + timedelta(seconds=2),
+    )
+
+    assert decision.status == "ready"
+    assert decision.reason_code is None
+    with session_factory() as session:
+        assert session.query(EntryAssemblyAttempt).count() == 0
 
 
 def test_preamble_outside_adjacent_time_window_is_not_selected(tmp_path):

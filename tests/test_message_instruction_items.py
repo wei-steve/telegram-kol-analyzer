@@ -179,11 +179,12 @@ def test_submit_unknown_blocks_only_same_collision_group(tmp_path):
 @pytest.mark.parametrize(
     "reason",
     [
+        "adjacent_entry_context_pending",
         "target_strategy_binding_not_visible_yet",
         "preceding_entry_context_unresolved",
     ],
 )
-def test_visibility_deferral_reasons_include_preceding_entry_context(reason):
+def test_visibility_deferral_reasons_are_persisted_for_retry(reason):
     from telegram_kol_research.message_instruction_items import (
         should_defer_instruction_result,
     )

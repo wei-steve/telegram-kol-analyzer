@@ -34,6 +34,7 @@ VISIBILITY_RETRY_DEADLINE = timedelta(hours=6)
 VISIBILITY_RETRY_CLAIM_LEASE = timedelta(minutes=5)
 VISIBILITY_DEFER_REASONS = frozenset(
     {
+        "adjacent_entry_context_pending",
         "target_strategy_binding_not_visible_yet",
         "preceding_entry_context_unresolved",
     }

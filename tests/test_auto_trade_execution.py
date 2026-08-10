@@ -955,6 +955,75 @@ def test_live_adjacent_admission_defers_before_exchange_or_trade_signal(tmp_path
         assert session.query(TradeSignal).count() == 0
 
 
+def test_adjacent_entry_deferral_keeps_instruction_pending_for_wakeup(tmp_path):
+    session_factory = create_session_factory(tmp_path / "adjacent-item-defer.db")
+    strategy_raw_id = _persist_candidate(
+        session_factory,
+        text="BTC short 63900-64200 SL 64900 TP 62800",
+        entry_text="63900-64200",
+        stop_loss_text="64900",
+        take_profit_text="62800",
+        symbol="BTC",
+        side="short",
+    )
+    processed_at = datetime(2026, 8, 5, 12, 2, tzinfo=UTC)
+    with session_factory() as session:
+        strategy = session.get(RawMessage, strategy_raw_id)
+        later = RawMessage(
+            chat_id=strategy.chat_id,
+            message_id=strategy.message_id + 1,
+            posted_at=strategy.posted_at + timedelta(seconds=1),
+            text="50%仓位",
+        )
+        session.add(later)
+        session.flush()
+        session.add(
+            MessageEvidenceExtractionClaim(
+                raw_message_id=later.id,
+                input_fingerprint="later",
+                claim_token="later-active",
+                claimed_at=processed_at,
+                lease_expires_at=processed_at + timedelta(minutes=5),
+            )
+        )
+        create_message_instruction_items_in_session(
+            session,
+            raw_message_id=strategy_raw_id,
+        )
+        session.commit()
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "allowed_symbols": ["BTC"],
+            "entry_message_assembly_v2_mode": "live",
+        },
+    )
+    client = _TickerForbiddenDeepcoinClient()
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=strategy_raw_id,
+        group_config=_group_config(),
+        deepcoin_client=client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=processed_at,
+    )
+
+    assert result["status"] == "in_progress"
+    assert client.ticker_calls == 0
+    with session_factory() as session:
+        item = session.query(MessageInstructionItem).one()
+        assert item.status == "pending"
+        assert json.loads(item.result_json) == {
+            "status": "deferred",
+            "reason": "adjacent_entry_context_pending",
+        }
+        assert item.visibility_next_attempt_at.replace(tzinfo=UTC) == (
+            processed_at + timedelta(seconds=5)
+        )
+
+
 def test_v2_shadow_proposal_preserves_legacy_blocking_decision():
     from telegram_kol_research.auto_trade_execution import (
         _overlay_v2_shadow_proposal,

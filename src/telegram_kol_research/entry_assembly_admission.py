@@ -86,6 +86,62 @@ def _fragment_signature(
     )
 
 
+def _has_material_strategy_fields(value: object) -> bool:
+    """Return whether normalized strategy evidence contains a real field value.
+
+    MiMo emits the fixed ``strategy`` schema for non-strategy messages too.
+    A mapping whose fields are all null is therefore a placeholder, not evidence
+    that candidate projection is still pending.
+    """
+
+    if not isinstance(value, dict):
+        return False
+    return any(
+        str(field_value).strip()
+        for field_value in value.values()
+        if field_value is not None
+    )
+
+
+def _is_adjacent_entry_context_defer(result_json: str | None) -> bool:
+    try:
+        result = json.loads(result_json or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(result, dict)
+        and str(result.get("status") or "") == "deferred"
+        and str(result.get("reason") or "") == "adjacent_entry_context_pending"
+    )
+
+
+def _release_adjacent_entry_visibility_delay(
+    session,
+    *,
+    attempt: EntryAssemblyAttempt,
+    now: datetime,
+) -> None:
+    """Make the exact entry item immediately claimable after its final wakeup."""
+
+    item = (
+        session.query(MessageInstructionItem)
+        .filter(
+            MessageInstructionItem.raw_message_id
+            == int(attempt.strategy_raw_message_id),
+            MessageInstructionItem.signal_candidate_id
+            == int(attempt.signal_candidate_id),
+            MessageInstructionItem.instruction_kind == "entry",
+            MessageInstructionItem.status == "pending",
+            MessageInstructionItem.retired_at.is_(None),
+        )
+        .one_or_none()
+    )
+    if item is None or not _is_adjacent_entry_context_defer(item.result_json):
+        return
+    item.visibility_next_attempt_at = None
+    item.updated_at = now
+
+
 def _load_source_facts(
     session,
     *,
@@ -370,7 +426,7 @@ def _load_source_facts(
                 lifecycle = normalized.get("lifecycle_event")
                 action_expected = (
                     str(normalized.get("recognition_result") or "") == "是策略"
-                    or bool(normalized.get("strategy"))
+                    or _has_material_strategy_fields(normalized.get("strategy"))
                     or (
                         isinstance(lifecycle, dict)
                         and str(lifecycle.get("event_type") or "none") != "none"
@@ -639,8 +695,13 @@ def claim_ready_entry_assembly_wakeups(
                         updated_at=now,
                     )
                 )
-                session.commit()
                 if int(result.rowcount or 0) == 1:
+                    _release_adjacent_entry_visibility_delay(
+                        session,
+                        attempt=attempt,
+                        now=now,
+                    )
+                    session.commit()
                     claimed.append(
                         EntryAssemblyWakeClaim(
                             attempt_id=int(attempt.id),
@@ -651,6 +712,7 @@ def claim_ready_entry_assembly_wakeups(
                         )
                     )
                     break
+                session.commit()
     return tuple(claimed)
 
 
