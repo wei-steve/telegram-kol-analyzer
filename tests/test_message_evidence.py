@@ -5,12 +5,33 @@ import pytest
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.message_evidence import (
+    has_material_strategy_evidence,
     load_current_message_evidence,
     normalize_entry_strategy_fragments,
     normalize_mimo_evidence,
     save_message_evidence_version,
 )
 from telegram_kol_research.models import RawMessage
+from telegram_kol_research.prompt_defaults import DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
+
+
+@pytest.mark.parametrize(
+    ("strategy", "expected_material"),
+    [
+        (None, False),
+        ({"symbol": None, "side": None, "entry": None}, False),
+        ({"symbol": "", "side": "  "}, False),
+        ({"symbol": "BTC", "side": None}, True),
+    ],
+)
+def test_material_strategy_evidence(strategy, expected_material):
+    assert has_material_strategy_evidence(strategy) is expected_material
+
+
+def test_non_strategy_prompt_prefers_null_strategy_evidence():
+    assert '非策略消息优先输出 "strategy": null' in (
+        DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
+    )
 
 
 @pytest.mark.parametrize(

@@ -33,6 +33,7 @@ from telegram_kol_research.models import (
     SignalCandidate,
 )
 from telegram_kol_research.message_evidence import (
+    has_material_strategy_evidence,
     normalize_entry_strategy_fragments,
 )
 
@@ -83,23 +84,6 @@ def _fragment_signature(
         str(symbol).upper(),
         str(side).lower(),
         _canonical_json(normalized_payload),
-    )
-
-
-def _has_material_strategy_fields(value: object) -> bool:
-    """Return whether normalized strategy evidence contains a real field value.
-
-    MiMo emits the fixed ``strategy`` schema for non-strategy messages too.
-    A mapping whose fields are all null is therefore a placeholder, not evidence
-    that candidate projection is still pending.
-    """
-
-    if not isinstance(value, dict):
-        return False
-    return any(
-        str(field_value).strip()
-        for field_value in value.values()
-        if field_value is not None
     )
 
 
@@ -426,7 +410,7 @@ def _load_source_facts(
                 lifecycle = normalized.get("lifecycle_event")
                 action_expected = (
                     str(normalized.get("recognition_result") or "") == "是策略"
-                    or _has_material_strategy_fields(normalized.get("strategy"))
+                    or has_material_strategy_evidence(normalized.get("strategy"))
                     or (
                         isinstance(lifecycle, dict)
                         and str(lifecycle.get("event_type") or "none") != "none"

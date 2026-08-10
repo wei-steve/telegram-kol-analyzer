@@ -470,6 +470,89 @@ def test_completed_strategy_evidence_without_candidate_stays_deferred(tmp_path):
     assert decision.status == "deferred"
 
 
+def test_completed_lifecycle_evidence_without_candidate_stays_deferred(tmp_path):
+    from telegram_kol_research.entry_assembly_admission import (
+        assess_entry_assembly_admission,
+    )
+
+    session_factory = create_session_factory(tmp_path / "lifecycle-apply-gap.db")
+    strategy_id, candidate_id, later_id = _persist_strategy_and_later_claim(
+        session_factory
+    )
+    with session_factory() as session:
+        session.query(MessageEvidenceExtractionClaim).filter_by(
+            raw_message_id=later_id
+        ).delete()
+        session.add(
+            MessageEvidenceVersion(
+                raw_message_id=later_id,
+                version=1,
+                input_fingerprint="later-input",
+                model="mimo",
+                prompt_versions_json="{}",
+                extraction_status="completed",
+                confidence=1,
+                text_evidence_json="{}",
+                image_evidence_json="{}",
+                normalized_evidence_json=(
+                    '{"recognition_result":"非策略","strategy":null,'
+                    '"lifecycle_event":{"event_type":"cancel_entry"}}'
+                ),
+            )
+        )
+        session.commit()
+
+    decision = assess_entry_assembly_admission(
+        session_factory,
+        strategy_raw_message_id=strategy_id,
+        signal_candidate_id=candidate_id,
+        mode="live",
+        assessed_at=NOW + timedelta(seconds=2),
+    )
+
+    assert decision.status == "deferred"
+
+
+def test_completed_malformed_normalized_evidence_stays_deferred(tmp_path):
+    from telegram_kol_research.entry_assembly_admission import (
+        assess_entry_assembly_admission,
+    )
+
+    session_factory = create_session_factory(tmp_path / "malformed-evidence.db")
+    strategy_id, candidate_id, later_id = _persist_strategy_and_later_claim(
+        session_factory
+    )
+    with session_factory() as session:
+        session.query(MessageEvidenceExtractionClaim).filter_by(
+            raw_message_id=later_id
+        ).delete()
+        session.add(
+            MessageEvidenceVersion(
+                raw_message_id=later_id,
+                version=1,
+                input_fingerprint="later-input",
+                model="mimo",
+                prompt_versions_json="{}",
+                extraction_status="completed",
+                confidence=1,
+                text_evidence_json="{}",
+                image_evidence_json="{}",
+                normalized_evidence_json="{not-json",
+            )
+        )
+        session.commit()
+
+    decision = assess_entry_assembly_admission(
+        session_factory,
+        strategy_raw_message_id=strategy_id,
+        signal_candidate_id=candidate_id,
+        mode="live",
+        assessed_at=NOW + timedelta(seconds=2),
+    )
+
+    assert decision.status == "deferred"
+
+
 def test_completed_non_strategy_placeholder_is_not_treated_as_pending_action(tmp_path):
     from telegram_kol_research.entry_assembly_admission import (
         assess_entry_assembly_admission,

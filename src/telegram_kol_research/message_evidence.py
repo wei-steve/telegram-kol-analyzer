@@ -47,6 +47,22 @@ class EntryPreambleEvidence:
         }
 
 
+def has_material_strategy_evidence(value: object) -> bool:
+    """Return whether normalized strategy evidence contains a real field value.
+
+    Non-strategy MiMo output may use either ``null`` or the legacy fixed mapping
+    whose fields are all null. Neither shape is actionable strategy evidence.
+    """
+
+    if not isinstance(value, dict):
+        return False
+    return any(
+        str(field_value).strip()
+        for field_value in value.values()
+        if field_value is not None
+    )
+
+
 def normalize_entry_preamble_evidence(value: Any) -> EntryPreambleEvidence | None:
     """Validate a model-produced, explicitly non-executable sizing fragment."""
 

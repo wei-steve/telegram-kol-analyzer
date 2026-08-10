@@ -1022,6 +1022,7 @@ def test_adjacent_entry_deferral_keeps_instruction_pending_for_wakeup(tmp_path):
         assert item.visibility_next_attempt_at.replace(tzinfo=UTC) == (
             processed_at + timedelta(seconds=5)
         )
+        assert session.query(TradeSignal).count() == 0
 
 
 def test_v2_shadow_proposal_preserves_legacy_blocking_decision():
