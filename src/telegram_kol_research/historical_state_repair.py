@@ -1524,11 +1524,16 @@ def _proven_take_profit_attribution_repair(
         and row.created_at >= latest_authority_at
     ]
     for row in later_conflicts:
-        conflict_evidence = _json_object(row.evidence_json)
-        candidate_leg_ids = conflict_evidence.get("candidate_leg_ids", [])
-        candidate_position_ids = conflict_evidence.get(
-            "candidate_position_ids", []
-        )
+        try:
+            conflict_evidence = json.loads(str(row.evidence_json or ""))
+        except (TypeError, json.JSONDecodeError):
+            return None, "later_competing_attribution_evidence"
+        if not isinstance(conflict_evidence, dict) or "candidate_leg_ids" not in (
+            conflict_evidence
+        ):
+            return None, "later_competing_attribution_evidence"
+        candidate_leg_ids = conflict_evidence["candidate_leg_ids"]
+        candidate_position_ids = conflict_evidence.get("candidate_position_ids", [])
         if (
             not isinstance(candidate_leg_ids, list)
             or not isinstance(candidate_position_ids, list)

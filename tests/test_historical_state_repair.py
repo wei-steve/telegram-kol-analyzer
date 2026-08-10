@@ -888,6 +888,39 @@ def test_plan_accepts_production_shaped_confirmed_close_intent(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "position_id_key",
+    ["PositionID", "positionId", "position_id"],
+)
+def test_plan_accepts_supported_exact_history_position_aliases(
+    tmp_path,
+    position_id_key,
+):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    seeded = _seed_proven_attribution_repair_candidate(session_factory)
+    history_row = {
+        "instId": "BTC-USDT-SWAP",
+        position_id_key: seeded["pos_id"],
+        "posSide": "short",
+        "pos": "5",
+        "closePos": "5",
+    }
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(position_history=[history_row]),
+        planned_at=NOW,
+    )
+
+    assert [row.kind for row in plan.actions] == [
+        "take_profit_attribution_repair"
+    ]
+
+
+@pytest.mark.parametrize(
     ("mutation", "expected_failure"),
     [
         ("authority_missing", "policy_v2_authority_missing"),
@@ -896,6 +929,7 @@ def test_plan_accepts_production_shaped_confirmed_close_intent(tmp_path):
         ("authority_wrong_venue", "policy_v2_authority_missing"),
         ("authority_wrong_pos", "policy_v2_authority_missing"),
         ("later_true_conflict", "later_competing_attribution_evidence"),
+        ("later_unexplained_conflict", "later_competing_attribution_evidence"),
         ("close_mutation_unconfirmed", "confirmed_close_mutation_missing_or_ambiguous"),
         ("close_mutation_wrong_leg", "confirmed_close_mutation_missing_or_ambiguous"),
         ("close_mutation_wrong_strategy", "confirmed_close_mutation_missing_or_ambiguous"),
@@ -942,13 +976,17 @@ def test_plan_fails_closed_when_local_attribution_repair_proof_changes(
             elif mutation == "authority_wrong_pos":
                 for row in audits:
                     row.pos_id = "different-position"
-        elif mutation == "later_true_conflict":
+        elif mutation in {"later_true_conflict", "later_unexplained_conflict"}:
             row = session.get(
                 PositionAttributionAudit,
                 seeded["conflict_audit_id"],
             )
-            row.evidence_json = json.dumps(
-                {"candidate_leg_ids": [999], "candidate_position_ids": []}
+            row.evidence_json = (
+                json.dumps(
+                    {"candidate_leg_ids": [999], "candidate_position_ids": []}
+                )
+                if mutation == "later_true_conflict"
+                else "{}"
             )
         elif mutation.startswith("close_mutation_"):
             row = session.get(PositionMutationIntent, seeded["mutation_id"])
