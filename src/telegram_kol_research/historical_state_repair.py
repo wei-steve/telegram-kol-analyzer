@@ -566,7 +566,7 @@ def build_historical_state_repair_plan(
                 )
                 continue
             if not _terminal_convergence_identity(convergence, binding, leg):
-                conflicts.append(
+                exclusions.append(
                     HistoricalStateRepairFinding(
                         kind="take_profit_convergence",
                         target_id=int(convergence.id),

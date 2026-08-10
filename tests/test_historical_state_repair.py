@@ -424,6 +424,42 @@ def test_plan_leaves_unrelated_conflicted_take_profit_state_out_of_scope(tmp_pat
     assert all(exclusion.target_id != convergence_id for exclusion in plan.exclusions)
 
 
+def test_plan_excludes_submitted_take_profit_with_unverified_identity(tmp_path):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id, _ = _seed_convergence(
+        session_factory,
+        chat_id=38,
+        message_id=308,
+        pos_id="pos-unverified-history",
+        status="submitted",
+        binding_status="closed",
+        with_order=True,
+    )
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+        leg.attribution_status = "attribution_conflict"
+        session.commit()
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(),
+        planned_at=NOW,
+    )
+
+    assert all(action.target_id != convergence_id for action in plan.actions)
+    assert all(conflict.target_id != convergence_id for conflict in plan.conflicts)
+    assert any(
+        exclusion.target_id == convergence_id
+        and exclusion.reason_code == "take_profit_identity_not_terminal"
+        for exclusion in plan.exclusions
+    )
+
+
 def test_plan_refuses_unlinked_deletion_when_source_binding_exists(tmp_path):
     from telegram_kol_research.historical_state_repair import (
         build_historical_state_repair_plan,
