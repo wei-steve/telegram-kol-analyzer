@@ -535,3 +535,29 @@ def test_plan_conflicts_when_terminal_binding_identity_is_missing_from_legs(tmp_
         and row.reason_code == "source_deletion_identity_not_terminal"
         for row in plan.conflicts
     )
+
+
+def test_plan_conflicts_when_deletion_frozen_strategy_differs_from_binding(tmp_path):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    deletion_exit_id = _seed_terminal_deletion_with_client_order(session_factory)
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion_exit_id)
+        deletion_exit.strategy_instance_id = "deepcoin:other:strategy:BTC:short"
+        session.commit()
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(),
+        planned_at=NOW,
+    )
+
+    assert not any(row.target_id == deletion_exit_id for row in plan.actions)
+    assert any(
+        row.target_id == deletion_exit_id
+        and row.reason_code == "source_deletion_identity_not_terminal"
+        for row in plan.conflicts
+    )

@@ -208,9 +208,14 @@ def build_historical_state_repair_plan(
                 "claimed_at": deletion_exit.claimed_at,
                 "strategy_instance_id": deletion_exit.strategy_instance_id,
                 "target_fingerprint": deletion_exit.target_fingerprint,
+                "raw_message_id": deletion_exit.raw_message_id,
                 "event_id": int(event.id) if event is not None else None,
                 "event_status": (
                     str(event.processing_status) if event is not None else None
+                ),
+                "event_chat_id": int(event.chat_id) if event is not None else None,
+                "event_message_id": (
+                    int(event.message_id) if event is not None else None
                 ),
                 "lifecycle_id": int(lifecycle.id) if lifecycle is not None else None,
                 "lifecycle_status": (
@@ -218,6 +223,9 @@ def build_historical_state_repair_plan(
                 ),
                 "binding_id": int(binding.id) if binding is not None else None,
                 "binding_status": str(binding.status) if binding is not None else None,
+                "binding_venue": str(binding.venue) if binding is not None else None,
+                "binding_symbol": str(binding.symbol) if binding is not None else None,
+                "binding_side": str(binding.side) if binding is not None else None,
                 "binding_strategy_instance_id": (
                     str(binding.strategy_instance_id) if binding is not None else None
                 ),
@@ -372,6 +380,12 @@ def build_historical_state_repair_plan(
                 "orders": [
                     {
                         "id": int(row.id),
+                        "venue": str(row.venue),
+                        "execution_binding_id": int(row.execution_binding_id),
+                        "execution_order_leg_id": int(row.execution_order_leg_id),
+                        "convergence_id": int(
+                            row.trigger_take_profit_convergence_id or 0
+                        ),
                         "order_id": str(row.order_id),
                         "status": str(row.status),
                         "pos_id": str(row.pos_id),
@@ -629,6 +643,42 @@ def _apply_source_deletion_action(session, *, action, applied_at: datetime) -> N
         if binding is not None
         else []
     )
+    candidate_count = (
+        session.query(SignalCandidate)
+        .filter(SignalCandidate.raw_message_id == row.raw_message_id)
+        .count()
+        if row.raw_message_id is not None
+        else 0
+    )
+    trade_signal_count = (
+        session.query(TradeSignal)
+        .filter(
+            TradeSignal.chat_id == int(event.chat_id),
+            TradeSignal.message_id == int(event.message_id),
+        )
+        .count()
+    )
+    execution_event_count = (
+        session.query(ExecutionEvent)
+        .filter(
+            ExecutionEvent.chat_id == int(event.chat_id),
+            ExecutionEvent.message_id == int(event.message_id),
+            ExecutionEvent.action.not_in(
+                {
+                    "source_message_deletion_outcome",
+                    "terminal_entry_cleanup_outcome",
+                }
+            ),
+            or_(
+                ExecutionEvent.order_id.is_not(None),
+                ExecutionEvent.client_order_id.is_not(None),
+                ExecutionEvent.pos_id.is_not(None),
+                ExecutionEvent.request_json.is_not(None),
+                ExecutionEvent.response_json.is_not(None),
+            ),
+        )
+        .count()
+    )
     current = {
         "state": str(row.state),
         "attempt_count": int(row.attempt_count or 0),
@@ -636,14 +686,20 @@ def _apply_source_deletion_action(session, *, action, applied_at: datetime) -> N
         "claimed_at": row.claimed_at,
         "strategy_instance_id": row.strategy_instance_id,
         "target_fingerprint": row.target_fingerprint,
+        "raw_message_id": row.raw_message_id,
         "event_id": int(event.id),
         "event_status": str(event.processing_status),
+        "event_chat_id": int(event.chat_id),
+        "event_message_id": int(event.message_id),
         "lifecycle_id": int(lifecycle.id) if lifecycle is not None else None,
         "lifecycle_status": (
             str(lifecycle.lifecycle_status) if lifecycle is not None else None
         ),
         "binding_id": int(binding.id) if binding is not None else None,
         "binding_status": str(binding.status) if binding is not None else None,
+        "binding_venue": str(binding.venue) if binding is not None else None,
+        "binding_symbol": str(binding.symbol) if binding is not None else None,
+        "binding_side": str(binding.side) if binding is not None else None,
         "binding_strategy_instance_id": (
             str(binding.strategy_instance_id) if binding is not None else None
         ),
@@ -652,6 +708,9 @@ def _apply_source_deletion_action(session, *, action, applied_at: datetime) -> N
             binding.client_order_id if binding is not None else None
         ),
         "binding_pos_id": binding.pos_id if binding is not None else None,
+        "candidate_count": int(candidate_count),
+        "trade_signal_count": int(trade_signal_count),
+        "execution_event_count": int(execution_event_count),
         "legs": [_leg_evidence(item) for item in legs],
     }
     for key, value in current.items():
@@ -698,6 +757,15 @@ def _apply_take_profit_action(
     expected = _json_object(action.evidence_json)
     binding = session.get(ExecutionBinding, int(convergence.execution_binding_id))
     leg = session.get(ExecutionOrderLeg, int(convergence.execution_order_leg_id))
+    orders = (
+        session.query(PositionTakeProfitOrder)
+        .filter(
+            PositionTakeProfitOrder.trigger_take_profit_convergence_id
+            == int(convergence.id)
+        )
+        .order_by(PositionTakeProfitOrder.id.asc())
+        .all()
+    )
     current = {
         "status": str(convergence.status),
         "reason_code": convergence.reason_code,
@@ -722,6 +790,23 @@ def _apply_take_profit_action(
         "response_hash": _optional_text_hash(convergence.response_json),
         "error_hash": _optional_text_hash(convergence.error_json),
         "updated_at": convergence.updated_at,
+        "orders": [
+            {
+                "id": int(item.id),
+                "venue": str(item.venue),
+                "execution_binding_id": int(item.execution_binding_id),
+                "execution_order_leg_id": int(item.execution_order_leg_id),
+                "convergence_id": int(
+                    item.trigger_take_profit_convergence_id or 0
+                ),
+                "order_id": str(item.order_id),
+                "status": str(item.status),
+                "pos_id": str(item.pos_id),
+                "updated_at": item.updated_at,
+                "evidence_hash": _optional_text_hash(item.evidence_json),
+            }
+            for item in orders
+        ],
     }
     for key, value in current.items():
         if _canonical_json(expected.get(key)) != _canonical_json(value):
@@ -746,6 +831,10 @@ def _apply_take_profit_action(
         )
         current_order = {
             "id": int(row.id),
+            "venue": str(row.venue),
+            "execution_binding_id": int(row.execution_binding_id),
+            "execution_order_leg_id": int(row.execution_order_leg_id),
+            "convergence_id": int(row.trigger_take_profit_convergence_id or 0),
             "order_id": str(row.order_id),
             "status": str(row.status),
             "pos_id": str(row.pos_id),
@@ -798,6 +887,7 @@ def _terminal_strategy_identity(deletion_exit, lifecycle, binding, legs) -> bool
         and str(lifecycle.lifecycle_status or "").lower()
         in _TERMINAL_LIFECYCLE_STATES
         and str(binding.status or "").lower() in _TERMINAL_BINDING_STATES
+        and str(binding.venue or "").lower() == "deepcoin"
         and binding_strategy_instance_id
         and str(deletion_exit.strategy_instance_id or "").strip()
         == binding_strategy_instance_id
@@ -806,6 +896,7 @@ def _terminal_strategy_identity(deletion_exit, lifecycle, binding, legs) -> bool
             int(row.execution_binding_id) == int(binding.id)
             and str(row.strategy_instance_id or "").strip()
             == binding_strategy_instance_id
+            and str(row.venue or "").lower() == str(binding.venue or "").lower()
             and str(row.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
             and (
                 not str(row.pos_id or "").strip()
