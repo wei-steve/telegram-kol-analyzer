@@ -450,7 +450,11 @@ def _position_id_is_live(positions: list[dict], *, pos_id: str) -> bool:
         }
         if pos_id not in row_pos_ids:
             continue
-        raw_sizes = [row[key] for key in ("pos", "size", "sz") if key in row]
+        raw_sizes = [
+            row[key]
+            for key in ("pos", "size", "sz", "positionSize", "position_size")
+            if key in row
+        ]
         if not raw_sizes:
             return True
         for raw_size in raw_sizes:

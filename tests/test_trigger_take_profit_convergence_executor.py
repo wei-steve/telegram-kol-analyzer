@@ -1706,6 +1706,7 @@ def test_terminal_entry_leg_fails_closed_when_pending_snapshot_is_incomplete(tmp
         {"position_id": "pos-10", "pos": "1"},
         {"id": "pos-10", "pos": "1"},
         {"posId": "pos-10", "pos": "0", "size": "1"},
+        {"posId": "pos-10", "pos": "0", "positionSize": "1"},
     ],
 )
 def test_terminal_entry_leg_fails_closed_when_position_id_is_still_live(

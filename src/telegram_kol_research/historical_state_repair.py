@@ -160,11 +160,31 @@ def build_historical_state_repair_plan(
                 if binding is not None
                 else []
             )
+            exit_raw_message_id = (
+                int(deletion_exit.raw_message_id)
+                if deletion_exit.raw_message_id is not None
+                else None
+            )
+            event_raw_message_id = (
+                int(event.raw_message_id)
+                if event is not None and event.raw_message_id is not None
+                else None
+            )
+            raw_message_identity_conflict = bool(
+                exit_raw_message_id is not None
+                and event_raw_message_id is not None
+                and exit_raw_message_id != event_raw_message_id
+            )
+            effective_raw_message_id = (
+                exit_raw_message_id
+                if exit_raw_message_id is not None
+                else event_raw_message_id
+            )
             candidate_count = (
                 session.query(SignalCandidate)
-                .filter(SignalCandidate.raw_message_id == deletion_exit.raw_message_id)
+                .filter(SignalCandidate.raw_message_id == effective_raw_message_id)
                 .count()
-                if deletion_exit.raw_message_id is not None
+                if effective_raw_message_id is not None
                 else 0
             )
             trade_signal_count = (
@@ -200,6 +220,34 @@ def build_historical_state_repair_plan(
                 if event is not None
                 else 0
             )
+            source_lifecycle_ids = (
+                [
+                    int(row.id)
+                    for row in session.query(StrategyLifecycle.id)
+                    .filter(
+                        StrategyLifecycle.chat_id == int(event.chat_id),
+                        StrategyLifecycle.message_id == int(event.message_id),
+                    )
+                    .order_by(StrategyLifecycle.id.asc())
+                    .all()
+                ]
+                if event is not None
+                else []
+            )
+            source_binding_ids = (
+                [
+                    int(row.id)
+                    for row in session.query(ExecutionBinding.id)
+                    .filter(
+                        ExecutionBinding.chat_id == int(event.chat_id),
+                        ExecutionBinding.message_id == int(event.message_id),
+                    )
+                    .order_by(ExecutionBinding.id.asc())
+                    .all()
+                ]
+                if event is not None
+                else []
+            )
             evidence = {
                 "exit_id": int(deletion_exit.id),
                 "state": str(deletion_exit.state),
@@ -209,6 +257,9 @@ def build_historical_state_repair_plan(
                 "strategy_instance_id": deletion_exit.strategy_instance_id,
                 "target_fingerprint": deletion_exit.target_fingerprint,
                 "raw_message_id": deletion_exit.raw_message_id,
+                "event_raw_message_id": event_raw_message_id,
+                "effective_raw_message_id": effective_raw_message_id,
+                "raw_message_identity_conflict": raw_message_identity_conflict,
                 "event_id": int(event.id) if event is not None else None,
                 "event_status": (
                     str(event.processing_status) if event is not None else None
@@ -220,6 +271,12 @@ def build_historical_state_repair_plan(
                 "lifecycle_id": int(lifecycle.id) if lifecycle is not None else None,
                 "lifecycle_status": (
                     str(lifecycle.lifecycle_status) if lifecycle is not None else None
+                ),
+                "lifecycle_execution_binding_id": (
+                    int(lifecycle.execution_binding_id)
+                    if lifecycle is not None
+                    and lifecycle.execution_binding_id is not None
+                    else None
                 ),
                 "binding_id": int(binding.id) if binding is not None else None,
                 "binding_status": str(binding.status) if binding is not None else None,
@@ -237,6 +294,8 @@ def build_historical_state_repair_plan(
                 "candidate_count": int(candidate_count),
                 "trade_signal_count": int(trade_signal_count),
                 "execution_event_count": int(execution_event_count),
+                "source_lifecycle_ids": source_lifecycle_ids,
+                "source_binding_ids": source_binding_ids,
                 "legs": [_leg_evidence(row) for row in legs],
             }
             database_evidence.append({"source_deletion": evidence})
@@ -249,6 +308,9 @@ def build_historical_state_repair_plan(
                 and candidate_count == 0
                 and trade_signal_count == 0
                 and execution_event_count == 0
+                and not raw_message_identity_conflict
+                and not source_lifecycle_ids
+                and not source_binding_ids
             ):
                 actions.append(
                     HistoricalStateRepairAction(
@@ -268,6 +330,10 @@ def build_historical_state_repair_plan(
                 and not legs
                 and trade_signal_count == 0
                 and execution_event_count == 0
+                and not raw_message_identity_conflict
+                and lifecycle.execution_binding_id is None
+                and source_lifecycle_ids == [int(lifecycle.id)]
+                and not source_binding_ids
             ):
                 actions.append(
                     HistoricalStateRepairAction(
@@ -278,12 +344,14 @@ def build_historical_state_repair_plan(
                     )
                 )
                 continue
-            if _terminal_strategy_identity(
+            if not raw_message_identity_conflict and _terminal_strategy_identity(
                 deletion_exit,
                 lifecycle,
                 binding,
                 legs,
-            ):
+            ) and source_lifecycle_ids == [int(lifecycle.id)] and source_binding_ids == [
+                int(binding.id)
+            ]:
                 exact_pos_ids = {
                     value for row in legs for value in _split_ids(row.pos_id)
                 }
@@ -651,11 +719,25 @@ def _apply_source_deletion_action(session, *, action, applied_at: datetime) -> N
         if binding is not None
         else []
     )
+    exit_raw_message_id = int(row.raw_message_id) if row.raw_message_id is not None else None
+    event_raw_message_id = (
+        int(event.raw_message_id) if event.raw_message_id is not None else None
+    )
+    raw_message_identity_conflict = bool(
+        exit_raw_message_id is not None
+        and event_raw_message_id is not None
+        and exit_raw_message_id != event_raw_message_id
+    )
+    effective_raw_message_id = (
+        exit_raw_message_id
+        if exit_raw_message_id is not None
+        else event_raw_message_id
+    )
     candidate_count = (
         session.query(SignalCandidate)
-        .filter(SignalCandidate.raw_message_id == row.raw_message_id)
+        .filter(SignalCandidate.raw_message_id == effective_raw_message_id)
         .count()
-        if row.raw_message_id is not None
+        if effective_raw_message_id is not None
         else 0
     )
     trade_signal_count = (
@@ -687,6 +769,26 @@ def _apply_source_deletion_action(session, *, action, applied_at: datetime) -> N
         )
         .count()
     )
+    source_lifecycle_ids = [
+        int(item.id)
+        for item in session.query(StrategyLifecycle.id)
+        .filter(
+            StrategyLifecycle.chat_id == int(event.chat_id),
+            StrategyLifecycle.message_id == int(event.message_id),
+        )
+        .order_by(StrategyLifecycle.id.asc())
+        .all()
+    ]
+    source_binding_ids = [
+        int(item.id)
+        for item in session.query(ExecutionBinding.id)
+        .filter(
+            ExecutionBinding.chat_id == int(event.chat_id),
+            ExecutionBinding.message_id == int(event.message_id),
+        )
+        .order_by(ExecutionBinding.id.asc())
+        .all()
+    ]
     current = {
         "state": str(row.state),
         "attempt_count": int(row.attempt_count or 0),
@@ -695,6 +797,9 @@ def _apply_source_deletion_action(session, *, action, applied_at: datetime) -> N
         "strategy_instance_id": row.strategy_instance_id,
         "target_fingerprint": row.target_fingerprint,
         "raw_message_id": row.raw_message_id,
+        "event_raw_message_id": event_raw_message_id,
+        "effective_raw_message_id": effective_raw_message_id,
+        "raw_message_identity_conflict": raw_message_identity_conflict,
         "event_id": int(event.id),
         "event_status": str(event.processing_status),
         "event_chat_id": int(event.chat_id),
@@ -702,6 +807,11 @@ def _apply_source_deletion_action(session, *, action, applied_at: datetime) -> N
         "lifecycle_id": int(lifecycle.id) if lifecycle is not None else None,
         "lifecycle_status": (
             str(lifecycle.lifecycle_status) if lifecycle is not None else None
+        ),
+        "lifecycle_execution_binding_id": (
+            int(lifecycle.execution_binding_id)
+            if lifecycle is not None and lifecycle.execution_binding_id is not None
+            else None
         ),
         "binding_id": int(binding.id) if binding is not None else None,
         "binding_status": str(binding.status) if binding is not None else None,
@@ -719,6 +829,8 @@ def _apply_source_deletion_action(session, *, action, applied_at: datetime) -> N
         "candidate_count": int(candidate_count),
         "trade_signal_count": int(trade_signal_count),
         "execution_event_count": int(execution_event_count),
+        "source_lifecycle_ids": source_lifecycle_ids,
+        "source_binding_ids": source_binding_ids,
         "legs": [_leg_evidence(item) for item in legs],
     }
     for key, value in current.items():
@@ -1054,18 +1166,25 @@ def _live_position_ids(rows) -> set[str]:
     for row in rows:
         if not isinstance(row, dict):
             continue
-        pos_id = str(
-            row.get("posId")
-            or row.get("pos_id")
-            or row.get("PositionID")
-            or row.get("positionId")
-            or row.get("position_id")
-            or row.get("id")
-            or ""
-        ).strip()
-        if not pos_id:
+        pos_ids = {
+            str(row[key]).strip()
+            for key in (
+                "posId",
+                "pos_id",
+                "PositionID",
+                "positionId",
+                "position_id",
+                "id",
+            )
+            if row.get(key) not in (None, "") and str(row[key]).strip()
+        }
+        if not pos_ids:
             continue
-        raw_sizes = [row[key] for key in ("pos", "size", "sz") if key in row]
+        raw_sizes = [
+            row[key]
+            for key in ("pos", "size", "sz", "positionSize", "position_size")
+            if key in row
+        ]
         size_is_live_or_unknown = not raw_sizes
         for raw_size in raw_sizes:
             try:
@@ -1077,7 +1196,7 @@ def _live_position_ids(rows) -> set[str]:
                 size_is_live_or_unknown = True
                 break
         if size_is_live_or_unknown:
-            values.add(pos_id)
+            values.update(pos_ids)
     return values
 
 

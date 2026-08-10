@@ -14,6 +14,7 @@ from telegram_kol_research.models import (
     PositionTakeProfitOrder,
     RawMessage,
     RepairConfirmationToken,
+    SignalCandidate,
     SourceMessageDeletionExit,
     StrategyLifecycle,
     TelegramSourceMessageEvent,
@@ -334,6 +335,109 @@ def test_plan_refuses_terminal_strategy_with_no_exact_execution_identity(tmp_pat
     )
 
 
+def test_plan_refuses_unlinked_deletion_when_source_binding_exists(tmp_path):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    deletion_exit_id = _seed_dirty_non_strategy_deletion(session_factory)
+    with session_factory() as session:
+        session.add(
+            ExecutionBinding(
+                strategy_instance_id="deepcoin:10:20:BTC:long",
+                kol_id="group:10",
+                chat_id=10,
+                message_id=20,
+                symbol="BTC",
+                side="long",
+                venue="deepcoin",
+                order_id="live-source-order",
+                status="active",
+            )
+        )
+        session.commit()
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(),
+        planned_at=NOW,
+    )
+
+    assert all(action.target_id != deletion_exit_id for action in plan.actions)
+    assert any(
+        finding.target_id == deletion_exit_id
+        and finding.reason_code == "source_deletion_identity_not_terminal"
+        for finding in plan.conflicts
+    )
+
+
+def test_plan_refuses_no_execution_when_lifecycle_still_references_binding(tmp_path):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    deletion_exit_id = _seed_terminal_deletion_with_client_order(session_factory)
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion_exit_id)
+        binding = session.get(ExecutionBinding, deletion_exit.execution_binding_id)
+        deletion_exit.execution_binding_id = None
+        binding.chat_id = 999
+        binding.message_id = 999
+        session.commit()
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(),
+        planned_at=NOW,
+    )
+
+    assert all(action.target_id != deletion_exit_id for action in plan.actions)
+    assert any(
+        finding.target_id == deletion_exit_id
+        and finding.reason_code == "source_deletion_identity_not_terminal"
+        for finding in plan.conflicts
+    )
+
+
+def test_plan_uses_source_event_raw_message_candidate_evidence(tmp_path):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    deletion_exit_id = _seed_dirty_non_strategy_deletion(session_factory)
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion_exit_id)
+        event = session.get(TelegramSourceMessageEvent, deletion_exit.source_event_id)
+        deletion_exit.raw_message_id = None
+        session.add(
+            SignalCandidate(
+                raw_message_id=event.raw_message_id,
+                symbol="BTC",
+                side="long",
+                event_type="entry_signal",
+                parse_source="test",
+                confidence=1.0,
+            )
+        )
+        session.commit()
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(),
+        planned_at=NOW,
+    )
+
+    assert all(action.target_id != deletion_exit_id for action in plan.actions)
+    assert any(
+        finding.target_id == deletion_exit_id
+        and finding.reason_code == "source_deletion_identity_not_terminal"
+        for finding in plan.conflicts
+    )
+
+
 def test_plan_refuses_conflicted_rejection_without_definite_exchange_evidence(
     tmp_path,
 ):
@@ -582,6 +686,67 @@ def test_apply_refuses_convergence_venue_change_after_fresh_plan(
         assert order.status == "active"
 
 
+def test_apply_refuses_source_binding_inserted_after_fresh_plan(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.historical_state_repair as repair_module
+    from telegram_kol_research.historical_state_repair import (
+        HistoricalStateRepairRefused,
+        apply_historical_state_repair_plan,
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    deletion_exit_id = _seed_dirty_non_strategy_deletion(session_factory)
+    snapshot = _snapshot()
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=snapshot,
+        planned_at=NOW,
+    )
+    original_builder = repair_module.build_historical_state_repair_plan
+
+    def build_then_insert_binding(*args, **kwargs):
+        fresh_plan = original_builder(*args, **kwargs)
+        with session_factory() as session:
+            session.add(
+                ExecutionBinding(
+                    strategy_instance_id="deepcoin:10:20:BTC:long",
+                    kol_id="group:10",
+                    chat_id=10,
+                    message_id=20,
+                    symbol="BTC",
+                    side="long",
+                    venue="deepcoin",
+                    order_id="late-live-source-order",
+                    status="active",
+                )
+            )
+            session.commit()
+        return fresh_plan
+
+    monkeypatch.setattr(
+        repair_module,
+        "build_historical_state_repair_plan",
+        build_then_insert_binding,
+    )
+
+    with pytest.raises(HistoricalStateRepairRefused, match="source_binding_ids"):
+        apply_historical_state_repair_plan(
+            session_factory,
+            snapshot_loader=lambda: snapshot,
+            expected_fingerprint=plan.fingerprint,
+            expected_action_count=plan.action_count,
+            confirmation_token=plan.confirmation_token,
+            applied_at=NOW,
+        )
+
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, deletion_exit_id)
+        assert deletion_exit.state == "cancelling_entries"
+
+
 @pytest.mark.parametrize(
     "live_position",
     [
@@ -591,6 +756,8 @@ def test_apply_refuses_convergence_venue_change_after_fresh_plan(
         {"posId": "pos-terminal", "sz": ""},
         {"posId": "pos-terminal", "pos": "NaN"},
         {"posId": "pos-terminal", "pos": "0", "size": "1"},
+        {"posId": "pos-terminal", "pos": "0", "positionSize": "1"},
+        {"posId": "other-position", "positionId": "pos-terminal", "pos": "1"},
     ],
 )
 def test_plan_fails_closed_when_exact_position_size_is_unknown(
