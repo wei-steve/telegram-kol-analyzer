@@ -9,6 +9,7 @@ from hashlib import sha256
 import json
 from typing import Any
 
+from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 
 from telegram_kol_research.models import (
@@ -176,10 +177,37 @@ def build_historical_state_repair_plan(
                 if event is not None
                 else 0
             )
+            execution_event_count = (
+                session.query(ExecutionEvent)
+                .filter(
+                    ExecutionEvent.chat_id == int(event.chat_id),
+                    ExecutionEvent.message_id == int(event.message_id),
+                    ExecutionEvent.action.not_in(
+                        {
+                            "source_message_deletion_outcome",
+                            "terminal_entry_cleanup_outcome",
+                        }
+                    ),
+                    or_(
+                        ExecutionEvent.order_id.is_not(None),
+                        ExecutionEvent.client_order_id.is_not(None),
+                        ExecutionEvent.pos_id.is_not(None),
+                        ExecutionEvent.request_json.is_not(None),
+                        ExecutionEvent.response_json.is_not(None),
+                    ),
+                )
+                .count()
+                if event is not None
+                else 0
+            )
             evidence = {
                 "exit_id": int(deletion_exit.id),
                 "state": str(deletion_exit.state),
                 "attempt_count": int(deletion_exit.attempt_count or 0),
+                "claim_token": deletion_exit.claim_token,
+                "claimed_at": deletion_exit.claimed_at,
+                "strategy_instance_id": deletion_exit.strategy_instance_id,
+                "target_fingerprint": deletion_exit.target_fingerprint,
                 "event_id": int(event.id) if event is not None else None,
                 "event_status": (
                     str(event.processing_status) if event is not None else None
@@ -190,8 +218,17 @@ def build_historical_state_repair_plan(
                 ),
                 "binding_id": int(binding.id) if binding is not None else None,
                 "binding_status": str(binding.status) if binding is not None else None,
+                "binding_strategy_instance_id": (
+                    str(binding.strategy_instance_id) if binding is not None else None
+                ),
+                "binding_order_id": binding.order_id if binding is not None else None,
+                "binding_client_order_id": (
+                    binding.client_order_id if binding is not None else None
+                ),
+                "binding_pos_id": binding.pos_id if binding is not None else None,
                 "candidate_count": int(candidate_count),
                 "trade_signal_count": int(trade_signal_count),
+                "execution_event_count": int(execution_event_count),
                 "legs": [_leg_evidence(row) for row in legs],
             }
             database_evidence.append({"source_deletion": evidence})
@@ -203,6 +240,7 @@ def build_historical_state_repair_plan(
                 and binding is None
                 and candidate_count == 0
                 and trade_signal_count == 0
+                and execution_event_count == 0
             ):
                 actions.append(
                     HistoricalStateRepairAction(
@@ -221,6 +259,7 @@ def build_historical_state_repair_plan(
                 and binding is None
                 and not legs
                 and trade_signal_count == 0
+                and execution_event_count == 0
             ):
                 actions.append(
                     HistoricalStateRepairAction(
@@ -231,7 +270,12 @@ def build_historical_state_repair_plan(
                     )
                 )
                 continue
-            if _terminal_strategy_identity(lifecycle, binding, legs):
+            if _terminal_strategy_identity(
+                deletion_exit,
+                lifecycle,
+                binding,
+                legs,
+            ):
                 exact_pos_ids = {
                     str(row.pos_id).strip() for row in legs if str(row.pos_id or "").strip()
                 }
@@ -313,8 +357,13 @@ def build_historical_state_repair_plan(
                     {
                         "id": int(binding.id),
                         "status": str(binding.status),
+                        "strategy_instance_id": binding.strategy_instance_id,
+                        "venue": str(binding.venue),
+                        "order_id": binding.order_id,
+                        "client_order_id": binding.client_order_id,
                         "pos_id": binding.pos_id,
                         "symbol": str(binding.symbol),
+                        "updated_at": binding.updated_at,
                     }
                     if binding is not None
                     else None
@@ -326,10 +375,16 @@ def build_historical_state_repair_plan(
                         "order_id": str(row.order_id),
                         "status": str(row.status),
                         "pos_id": str(row.pos_id),
+                        "updated_at": row.updated_at,
+                        "evidence_hash": _optional_text_hash(row.evidence_json),
                     }
                     for row in orders
                 ],
                 "error_type": _error_type(convergence.error_json),
+                "request_hash": _optional_text_hash(convergence.request_json),
+                "response_hash": _optional_text_hash(convergence.response_json),
+                "error_hash": _optional_text_hash(convergence.error_json),
+                "updated_at": convergence.updated_at,
             }
             database_evidence.append({"take_profit_convergence": evidence})
             if snapshot_errors:
@@ -446,7 +501,7 @@ def build_historical_state_repair_plan(
 def apply_historical_state_repair_plan(
     session_factory,
     *,
-    snapshot,
+    snapshot_loader,
     expected_fingerprint: str,
     expected_action_count: int,
     confirmation_token: str,
@@ -455,6 +510,7 @@ def apply_historical_state_repair_plan(
     """Apply one freshly rebuilt plan using only local database transitions."""
 
     now = applied_at or utc_now()
+    snapshot = snapshot_loader()
     plan = build_historical_state_repair_plan(
         session_factory,
         snapshot=snapshot,
@@ -492,6 +548,7 @@ def apply_historical_state_repair_plan(
                     consumed_at=now,
                 )
             )
+            session.flush()
             for action in plan.actions:
                 if action.kind == "source_deletion_exit":
                     _apply_source_deletion_action(session, action=action, applied_at=now)
@@ -550,6 +607,58 @@ def _apply_source_deletion_action(session, *, action, applied_at: datetime) -> N
     event = session.get(TelegramSourceMessageEvent, int(row.source_event_id))
     if event is None:
         raise HistoricalStateRepairRefused("source deletion event disappeared before apply")
+    expected = _json_object(action.evidence_json)
+    lifecycle = (
+        session.get(StrategyLifecycle, int(row.target_lifecycle_id))
+        if row.target_lifecycle_id is not None
+        else None
+    )
+    binding = (
+        session.get(ExecutionBinding, int(row.execution_binding_id))
+        if row.execution_binding_id is not None
+        else None
+    )
+    legs = (
+        session.query(ExecutionOrderLeg)
+        .filter(
+            ExecutionOrderLeg.execution_binding_id == int(binding.id),
+            ExecutionOrderLeg.purpose == "entry",
+        )
+        .order_by(ExecutionOrderLeg.id.asc())
+        .all()
+        if binding is not None
+        else []
+    )
+    current = {
+        "state": str(row.state),
+        "attempt_count": int(row.attempt_count or 0),
+        "claim_token": row.claim_token,
+        "claimed_at": row.claimed_at,
+        "strategy_instance_id": row.strategy_instance_id,
+        "target_fingerprint": row.target_fingerprint,
+        "event_id": int(event.id),
+        "event_status": str(event.processing_status),
+        "lifecycle_id": int(lifecycle.id) if lifecycle is not None else None,
+        "lifecycle_status": (
+            str(lifecycle.lifecycle_status) if lifecycle is not None else None
+        ),
+        "binding_id": int(binding.id) if binding is not None else None,
+        "binding_status": str(binding.status) if binding is not None else None,
+        "binding_strategy_instance_id": (
+            str(binding.strategy_instance_id) if binding is not None else None
+        ),
+        "binding_order_id": binding.order_id if binding is not None else None,
+        "binding_client_order_id": (
+            binding.client_order_id if binding is not None else None
+        ),
+        "binding_pos_id": binding.pos_id if binding is not None else None,
+        "legs": [_leg_evidence(item) for item in legs],
+    }
+    for key, value in current.items():
+        if _canonical_json(expected.get(key)) != _canonical_json(value):
+            raise HistoricalStateRepairRefused(
+                f"source deletion identity changed before apply: {key}"
+            )
     row.state = "succeeded"
     row.claim_token = None
     row.claimed_at = None
@@ -586,6 +695,39 @@ def _apply_take_profit_action(
     convergence = session.get(TriggerTakeProfitConvergence, int(action.target_id))
     if convergence is None:
         raise HistoricalStateRepairRefused("take-profit convergence disappeared before apply")
+    expected = _json_object(action.evidence_json)
+    binding = session.get(ExecutionBinding, int(convergence.execution_binding_id))
+    leg = session.get(ExecutionOrderLeg, int(convergence.execution_order_leg_id))
+    current = {
+        "status": str(convergence.status),
+        "reason_code": convergence.reason_code,
+        "pos_id": str(convergence.pos_id),
+        "binding": (
+            {
+                "id": int(binding.id),
+                "status": str(binding.status),
+                "strategy_instance_id": binding.strategy_instance_id,
+                "venue": str(binding.venue),
+                "order_id": binding.order_id,
+                "client_order_id": binding.client_order_id,
+                "pos_id": binding.pos_id,
+                "symbol": str(binding.symbol),
+                "updated_at": binding.updated_at,
+            }
+            if binding is not None
+            else None
+        ),
+        "leg": _leg_evidence(leg) if leg is not None else None,
+        "request_hash": _optional_text_hash(convergence.request_json),
+        "response_hash": _optional_text_hash(convergence.response_json),
+        "error_hash": _optional_text_hash(convergence.error_json),
+        "updated_at": convergence.updated_at,
+    }
+    for key, value in current.items():
+        if _canonical_json(expected.get(key)) != _canonical_json(value):
+            raise HistoricalStateRepairRefused(
+                f"take-profit convergence identity changed before apply: {key}"
+            )
     for order_id in action.related_ids:
         row = session.get(PositionTakeProfitOrder, int(order_id))
         if row is None or int(row.trigger_take_profit_convergence_id or 0) != int(
@@ -593,6 +735,28 @@ def _apply_take_profit_action(
         ):
             raise HistoricalStateRepairRefused(
                 "take-profit order identity changed before apply"
+            )
+        expected_order = next(
+            (
+                item
+                for item in expected.get("orders", [])
+                if int(item.get("id") or 0) == int(row.id)
+            ),
+            None,
+        )
+        current_order = {
+            "id": int(row.id),
+            "order_id": str(row.order_id),
+            "status": str(row.status),
+            "pos_id": str(row.pos_id),
+            "updated_at": row.updated_at,
+            "evidence_hash": _optional_text_hash(row.evidence_json),
+        }
+        if expected_order is None or _canonical_json(expected_order) != _canonical_json(
+            current_order
+        ):
+            raise HistoricalStateRepairRefused(
+                "take-profit order state changed before apply"
             )
         if row.status == "active":
             evidence = _json_object(row.evidence_json)
@@ -612,7 +776,21 @@ def _apply_take_profit_action(
     convergence.updated_at = applied_at
 
 
-def _terminal_strategy_identity(lifecycle, binding, legs) -> bool:
+def _terminal_strategy_identity(deletion_exit, lifecycle, binding, legs) -> bool:
+    binding_strategy_instance_id = (
+        str(binding.strategy_instance_id or "").strip()
+        if binding is not None
+        else ""
+    )
+    leg_pos_ids = {
+        value for row in legs for value in _split_ids(row.pos_id)
+    }
+    leg_order_ids = {
+        value for row in legs for value in _split_ids(row.order_id)
+    }
+    leg_client_order_ids = {
+        value for row in legs for value in _split_ids(row.client_order_id)
+    }
     return bool(
         lifecycle is not None
         and binding is not None
@@ -620,16 +798,33 @@ def _terminal_strategy_identity(lifecycle, binding, legs) -> bool:
         and str(lifecycle.lifecycle_status or "").lower()
         in _TERMINAL_LIFECYCLE_STATES
         and str(binding.status or "").lower() in _TERMINAL_BINDING_STATES
+        and binding_strategy_instance_id
+        and str(deletion_exit.strategy_instance_id or "").strip()
+        == binding_strategy_instance_id
         and legs
         and all(
             int(row.execution_binding_id) == int(binding.id)
+            and str(row.strategy_instance_id or "").strip()
+            == binding_strategy_instance_id
             and str(row.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
+            and (
+                not str(row.pos_id or "").strip()
+                or str(row.attribution_status or "") == "verified"
+            )
             for row in legs
         )
+        and _split_ids(binding.pos_id).issubset(leg_pos_ids)
+        and _split_ids(binding.order_id).issubset(leg_order_ids)
+        and _split_ids(binding.client_order_id).issubset(leg_client_order_ids)
     )
 
 
 def _terminal_convergence_identity(convergence, binding, leg) -> bool:
+    binding_strategy_instance_id = (
+        str(binding.strategy_instance_id or "").strip()
+        if binding is not None
+        else ""
+    )
     return bool(
         binding is not None
         and leg is not None
@@ -639,6 +834,10 @@ def _terminal_convergence_identity(convergence, binding, leg) -> bool:
         and str(binding.status or "").lower() in _TERMINAL_BINDING_STATES
         and str(leg.purpose or "") == "entry"
         and str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
+        and str(leg.attribution_status or "") == "verified"
+        and binding_strategy_instance_id
+        and str(leg.strategy_instance_id or "").strip()
+        == binding_strategy_instance_id
         and str(leg.pos_id or "") == str(convergence.pos_id or "")
         and str(leg.venue or "").lower() == str(convergence.venue or "").lower()
     )
@@ -699,21 +898,48 @@ def _normalized_position(row: Any) -> dict[str, str]:
     }
 
 
-def _normalized_order(row: Any) -> dict[str, str]:
+def _normalized_order(row: Any) -> dict[str, Any]:
     row = row if isinstance(row, dict) else {}
+    identity_ids = sorted(
+        {
+            str(row.get(key)).strip()
+            for key in (
+                "ordId",
+                "orderId",
+                "order_id",
+                "algoId",
+                "triggerOrderId",
+                "orderSysID",
+                "OrderSysID",
+                "id",
+                "clOrdId",
+                "clientOrderId",
+                "client_order_id",
+            )
+            if str(row.get(key) or "").strip()
+        }
+    )
     return {
         "inst_id": str(row.get("instId") or row.get("inst_id") or "").upper(),
         "order_id": str(
             row.get("ordId")
             or row.get("orderId")
             or row.get("order_id")
+            or row.get("algoId")
             or row.get("triggerOrderId")
+            or row.get("orderSysID")
+            or row.get("OrderSysID")
+            or row.get("id")
             or ""
         ),
         "client_order_id": str(
-            row.get("clientOrderId") or row.get("client_order_id") or ""
+            row.get("clOrdId")
+            or row.get("clientOrderId")
+            or row.get("client_order_id")
+            or ""
         ),
         "pos_id": str(row.get("posId") or row.get("pos_id") or ""),
+        "identity_ids": identity_ids,
     }
 
 
@@ -736,14 +962,7 @@ def _live_order_ids(rows) -> set[str]:
     values = set()
     for row in rows:
         normalized = _normalized_order(row)
-        values.update(
-            value
-            for value in (
-                normalized["order_id"],
-                normalized["client_order_id"],
-            )
-            if value
-        )
+        values.update(normalized["identity_ids"])
     return values
 
 
@@ -751,17 +970,32 @@ def _leg_evidence(row) -> dict[str, Any]:
     return {
         "id": int(row.id),
         "binding_id": int(row.execution_binding_id),
+        "strategy_instance_id": row.strategy_instance_id,
         "venue": str(row.venue),
         "purpose": str(row.purpose),
         "status": str(row.status),
+        "attribution_status": str(row.attribution_status),
         "order_id": row.order_id,
         "client_order_id": row.client_order_id,
         "pos_id": row.pos_id,
+        "updated_at": row.updated_at,
+    }
+
+
+def _split_ids(value: Any) -> set[str]:
+    return {
+        item
+        for raw in str(value or "").split(",")
+        if (item := raw.strip())
     }
 
 
 def _error_type(value: str | None) -> str | None:
     return str(_json_object(value).get("type") or "") or None
+
+
+def _optional_text_hash(value: str | None) -> str | None:
+    return sha256(str(value).encode("utf-8")).hexdigest() if value is not None else None
 
 
 def _json_object(value: str | None) -> dict[str, Any]:

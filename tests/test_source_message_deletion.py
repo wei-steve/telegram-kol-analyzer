@@ -105,6 +105,47 @@ def test_record_source_message_deleted_marks_raw_without_changing_evidence(tmp_p
         assert raw.deletion_event_fingerprint == result.event_fingerprint
 
 
+def test_record_source_message_deleted_does_not_ignore_persisted_execution_event(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=56,
+            message_id=9,
+            text="BTC long",
+            archived_target_group=True,
+        )
+        session.add(raw)
+        session.flush()
+        session.add(
+            ExecutionEvent(
+                action="submit_entry",
+                status="submitted",
+                chat_id=56,
+                message_id=9,
+                source_message_id=raw.id,
+                order_id="historical-entry-order",
+                request_json="{}",
+            )
+        )
+        session.commit()
+
+    result = record_source_message_deleted(
+        session_factory,
+        chat_id=56,
+        message_id=9,
+        deleted_at=datetime(2026, 8, 2, 3, 5, tzinfo=UTC),
+    )
+
+    assert result.exit_state == "pending"
+    with session_factory() as session:
+        event = session.query(TelegramSourceMessageEvent).one()
+        deletion_exit = session.query(SourceMessageDeletionExit).one()
+        assert event.processing_status == "recorded"
+        assert deletion_exit.completed_at is None
+
+
 def test_record_source_message_deleted_keeps_missing_raw_event_unbound(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
 

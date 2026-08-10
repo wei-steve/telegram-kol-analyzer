@@ -163,10 +163,11 @@ def test_repair_historical_state_convergence_applies_exact_plan(tmp_path, monkey
     assert "Applied 1 historical repair action(s)." in result.output
     assert calls == [
         {
-            "snapshot": snapshot,
+            "snapshot_loader": calls[0]["snapshot_loader"],
             "expected_fingerprint": plan.fingerprint,
             "expected_action_count": 1,
             "confirmation_token": plan.confirmation_token,
             "applied_at": calls[0]["applied_at"],
         }
     ]
+    assert calls[0]["snapshot_loader"]() is snapshot

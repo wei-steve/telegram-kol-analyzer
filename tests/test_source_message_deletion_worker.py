@@ -1,6 +1,5 @@
 import asyncio
 import json
-import logging
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -86,13 +85,18 @@ def test_outcome_transition_supports_production_partial_notification_index(tmp_p
         )
 
 
-def test_worker_loop_logs_worker_loop_exception(tmp_path, caplog):
+def test_worker_loop_logs_worker_loop_exception(tmp_path, monkeypatch):
     session_factory = create_session_factory(tmp_path / "research.db")
     save_trading_settings(
         session_factory,
         {"telegram_source_deletion_exit_enabled": True},
     )
     attempts = 0
+    logged = []
+    monkeypatch.setattr(
+        "telegram_kol_research.source_message_deletion_worker.logger.exception",
+        lambda message: logged.append(message),
+    )
 
     def failing_worker(*_args, **_kwargs):
         nonlocal attempts
@@ -116,15 +120,10 @@ def test_worker_loop_logs_worker_loop_exception(tmp_path, caplog):
         except asyncio.CancelledError:
             pass
 
-    with caplog.at_level(
-        logging.ERROR,
-        logger="telegram_kol_research.source_message_deletion_worker",
-    ):
-        asyncio.run(run_until_first_failure())
+    asyncio.run(run_until_first_failure())
 
     assert attempts >= 1
-    assert "source message deletion worker tick failed" in caplog.text
-    assert "partial-index-transition-failed" in caplog.text
+    assert logged == ["source message deletion worker tick failed"]
 
 
 def test_rollout_flag_keeps_exchange_worker_dormant_until_enabled(tmp_path):
@@ -585,6 +584,24 @@ def test_worker_routes_already_terminal_target_without_exchange_mutation(tmp_pat
         deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
         assert deletion_exit.state == "reconciling"
         assert deletion_exit.last_reason == "strategy_already_terminal"
+
+    def forbidden_binding_reconciler(*_args, **_kwargs):
+        raise AssertionError("terminal deletion reconciliation must remain read-only")
+
+    second = run_source_message_deletion_worker_tick(
+        session_factory,
+        deepcoin_client_factory=lambda: object(),
+        snapshot_loader=lambda *_args, **_kwargs: SimpleNamespace(
+            errors={},
+            positions=[],
+            open_orders=[],
+            pending_trigger_orders=[],
+        ),
+        binding_reconciler=forbidden_binding_reconciler,
+        processed_at=NOW,
+    )
+
+    assert second.finalized == 1
 
 
 def test_worker_unknown_cancel_enters_recovery_without_resubmit(tmp_path):

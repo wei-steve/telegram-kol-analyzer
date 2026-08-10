@@ -4128,7 +4128,12 @@ def repair_historical_state_convergence(
     try:
         result = apply_historical_state_repair_plan(
             session_factory,
-            snapshot=snapshot,
+            snapshot_loader=lambda: (
+                load_deepcoin_execution_reconciliation_snapshot_read_only(
+                    session_factory,
+                    client=client,
+                )
+            ),
             expected_fingerprint=expected_fingerprint,
             expected_action_count=expected_action_count,
             confirmation_token=confirmation_token,

@@ -372,6 +372,11 @@ def _exact_convergence_leg_is_terminal(
         binding is not None
         and str(binding.status or "").lower() in _TERMINAL_BINDING_STATES
     )
+    binding_strategy_instance_id = (
+        str(binding.strategy_instance_id or "").strip()
+        if binding is not None
+        else ""
+    )
     return bool(
         leg is not None
         and binding is not None
@@ -379,6 +384,10 @@ def _exact_convergence_leg_is_terminal(
         and str(leg.purpose) == "entry"
         and str(leg.venue).lower() == str(convergence.venue).lower()
         and str(leg.pos_id or "") == str(convergence.pos_id or "")
+        and str(leg.attribution_status or "") == "verified"
+        and binding_strategy_instance_id
+        and str(leg.strategy_instance_id or "").strip()
+        == binding_strategy_instance_id
         and (
             str(convergence.pos_id or "") in binding_pos_ids
             or binding_is_terminal
@@ -405,7 +414,7 @@ def _position_id_is_live(positions: list[dict], *, pos_id: str) -> bool:
     return any(
         isinstance(row, dict)
         and str(row.get("posId") or row.get("pos_id") or "") == pos_id
-        and _decimal_or_zero(row.get("pos")) > 0
+        and abs(_decimal_or_zero(row.get("pos"))) > 0
         for row in positions
     )
 

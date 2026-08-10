@@ -11,6 +11,7 @@ import json
 from threading import RLock
 from typing import Any
 
+from sqlalchemy import or_
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import sessionmaker
 
@@ -20,6 +21,7 @@ from telegram_kol_research.entry_preambles import (
 
 from telegram_kol_research.models import (
     ExecutionBinding,
+    ExecutionEvent,
     RawMessage,
     SignalCandidate,
     SourceMessageDeletionExit,
@@ -343,7 +345,58 @@ def _bind_deletion_event_in_session(
             .order_by(ExecutionBinding.id.asc())
             .first()
         )
-    exit_target_is_mutable = deletion_exit.state in {"unbound", "pending"}
+    has_trade_signal = (
+        session.query(TradeSignal.id)
+        .filter(
+            TradeSignal.chat_id == int(event.chat_id),
+            TradeSignal.message_id == int(event.message_id),
+        )
+        .first()
+        is not None
+    )
+    has_signal_candidate = (
+        session.query(SignalCandidate.id)
+        .filter(SignalCandidate.raw_message_id == int(raw_message.id))
+        .first()
+        is not None
+    )
+    has_execution_event = (
+        session.query(ExecutionEvent.id)
+        .filter(
+            ExecutionEvent.chat_id == int(event.chat_id),
+            ExecutionEvent.message_id == int(event.message_id),
+            ExecutionEvent.action.not_in(
+                {
+                    "source_message_deletion_outcome",
+                    "terminal_entry_cleanup_outcome",
+                }
+            ),
+            or_(
+                ExecutionEvent.order_id.is_not(None),
+                ExecutionEvent.client_order_id.is_not(None),
+                ExecutionEvent.pos_id.is_not(None),
+                ExecutionEvent.request_json.is_not(None),
+                ExecutionEvent.response_json.is_not(None),
+            ),
+        )
+        .first()
+        is not None
+    )
+    new_strategy_evidence = bool(
+        lifecycle is not None
+        or binding is not None
+        or has_signal_candidate
+        or has_trade_signal
+        or has_execution_event
+    )
+    reopening_ignored_exit = bool(
+        deletion_exit.state == "succeeded"
+        and deletion_exit.last_reason == "non_strategy_or_unlinked"
+        and new_strategy_evidence
+    )
+    exit_target_is_mutable = (
+        deletion_exit.state in {"unbound", "pending"} or reopening_ignored_exit
+    )
     if exit_target_is_mutable:
         deletion_exit.raw_message_id = raw_message.id
         deletion_exit.target_lifecycle_id = (
@@ -353,8 +406,14 @@ def _bind_deletion_event_in_session(
         deletion_exit.strategy_instance_id = (
             binding.strategy_instance_id if binding is not None else None
         )
-        if deletion_exit.state == "unbound":
+        if deletion_exit.state == "unbound" or reopening_ignored_exit:
             deletion_exit.state = "pending"
+            deletion_exit.last_reason = None
+            deletion_exit.last_error = None
+            deletion_exit.completed_at = None
+            event.processing_status = "recorded"
+            event.reason_code = None
+            event.completed_at = None
         deletion_exit.updated_at = updated_at
         target_identity = {
             "event_id": int(event.id),
@@ -372,26 +431,12 @@ def _bind_deletion_event_in_session(
         deletion_exit.target_fingerprint = sha256(
             json.dumps(target_identity, sort_keys=True).encode("utf-8")
         ).hexdigest()
-        has_trade_signal = (
-            session.query(TradeSignal.id)
-            .filter(
-                TradeSignal.chat_id == int(event.chat_id),
-                TradeSignal.message_id == int(event.message_id),
-            )
-            .first()
-            is not None
-        )
-        has_signal_candidate = (
-            session.query(SignalCandidate.id)
-            .filter(SignalCandidate.raw_message_id == int(raw_message.id))
-            .first()
-            is not None
-        )
         if (
             lifecycle is None
             and binding is None
             and not has_signal_candidate
             and not has_trade_signal
+            and not has_execution_event
         ):
             deletion_exit.state = "succeeded"
             deletion_exit.last_reason = "non_strategy_or_unlinked"

@@ -161,31 +161,47 @@ def run_source_message_deletion_worker_tick(
         exit_id, state, claim_token = claim
         processed_exit_ids.add(exit_id)
         if state == "reconciling":
-            if snapshot_loader is None:
-                from telegram_kol_research.execution_bindings import (
-                    load_deepcoin_execution_reconciliation_snapshot,
+            with session_factory() as session:
+                claimed_exit = session.get(SourceMessageDeletionExit, exit_id)
+                terminal_target_reconciliation = bool(
+                    claimed_exit is not None
+                    and claimed_exit.last_reason == "strategy_already_terminal"
                 )
+            if snapshot_loader is None:
+                if terminal_target_reconciliation:
+                    from telegram_kol_research.execution_bindings import (
+                        load_deepcoin_execution_reconciliation_snapshot_read_only,
+                    )
 
-                loader = load_deepcoin_execution_reconciliation_snapshot
+                    loader = (
+                        load_deepcoin_execution_reconciliation_snapshot_read_only
+                    )
+                else:
+                    from telegram_kol_research.execution_bindings import (
+                        load_deepcoin_execution_reconciliation_snapshot,
+                    )
+
+                    loader = load_deepcoin_execution_reconciliation_snapshot
             else:
                 loader = snapshot_loader
             try:
                 with position_authority_lock():
                     snapshot = loader(session_factory, client=get_client())
-                    if binding_reconciler is None:
-                        from telegram_kol_research.execution_bindings import (
-                            reconcile_deepcoin_execution_bindings,
-                        )
+                    if not terminal_target_reconciliation:
+                        if binding_reconciler is None:
+                            from telegram_kol_research.execution_bindings import (
+                                reconcile_deepcoin_execution_bindings,
+                            )
 
-                        reconcile_bindings = reconcile_deepcoin_execution_bindings
-                    else:
-                        reconcile_bindings = binding_reconciler
-                    reconcile_bindings(
-                        session_factory,
-                        client=get_client(),
-                        recovered_at=now,
-                        snapshot=snapshot,
-                    )
+                            reconcile_bindings = reconcile_deepcoin_execution_bindings
+                        else:
+                            reconcile_bindings = binding_reconciler
+                        reconcile_bindings(
+                            session_factory,
+                            client=get_client(),
+                            recovered_at=now,
+                            snapshot=snapshot,
+                        )
                     final_state = finalize_source_message_deletion_exit(
                         session_factory,
                         deletion_exit_id=exit_id,

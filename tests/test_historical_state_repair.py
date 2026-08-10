@@ -15,6 +15,7 @@ from telegram_kol_research.models import (
     RawMessage,
     RepairConfirmationToken,
     SourceMessageDeletionExit,
+    StrategyLifecycle,
     TelegramSourceMessageEvent,
     TriggerTakeProfitConvergence,
 )
@@ -74,6 +75,62 @@ def _seed_dirty_non_strategy_deletion(session_factory) -> int:
         event.reason_code = None
         event.completed_at = None
         session.commit()
+    return deletion.exit_id
+
+
+def _seed_terminal_deletion_with_client_order(
+    session_factory,
+    *,
+    binding_order_id: str | None = None,
+) -> int:
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=11,
+            message_id=21,
+            text="BTC short",
+            archived_target_group=True,
+        )
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:11:21:BTC:short",
+            kol_id="group:11",
+            chat_id=11,
+            message_id=21,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            order_id=binding_order_id,
+            status="closed",
+        )
+        session.add_all([raw, binding])
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=11,
+            message_id=21,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="exited",
+            signal_at=NOW,
+            execution_binding_id=binding.id,
+        )
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            leg_index=1,
+            purpose="entry",
+            order_kind="trigger_limit",
+            client_order_id="client-order-still-live",
+            venue="deepcoin",
+            attribution_status="verified",
+            status="exchange_cancelled",
+        )
+        session.add_all([lifecycle, leg])
+        session.commit()
+    deletion = record_source_message_deleted(
+        session_factory,
+        chat_id=11,
+        message_id=21,
+        deleted_at=NOW,
+    )
     return deletion.exit_id
 
 
@@ -269,7 +326,7 @@ def test_apply_requires_exact_gates_preserves_rows_and_is_single_use(tmp_path):
     with pytest.raises(HistoricalStateRepairRefused, match="fingerprint"):
         apply_historical_state_repair_plan(
             session_factory,
-            snapshot=snapshot,
+            snapshot_loader=lambda: snapshot,
             expected_fingerprint="0" * 64,
             expected_action_count=plan.action_count,
             confirmation_token=plan.confirmation_token,
@@ -278,7 +335,7 @@ def test_apply_requires_exact_gates_preserves_rows_and_is_single_use(tmp_path):
     with pytest.raises(HistoricalStateRepairRefused, match="action count"):
         apply_historical_state_repair_plan(
             session_factory,
-            snapshot=snapshot,
+            snapshot_loader=lambda: snapshot,
             expected_fingerprint=plan.fingerprint,
             expected_action_count=plan.action_count + 1,
             confirmation_token=plan.confirmation_token,
@@ -287,7 +344,7 @@ def test_apply_requires_exact_gates_preserves_rows_and_is_single_use(tmp_path):
     with pytest.raises(HistoricalStateRepairRefused, match="confirmation token"):
         apply_historical_state_repair_plan(
             session_factory,
-            snapshot=snapshot,
+            snapshot_loader=lambda: snapshot,
             expected_fingerprint=plan.fingerprint,
             expected_action_count=plan.action_count,
             confirmation_token="wrong-token",
@@ -296,7 +353,7 @@ def test_apply_requires_exact_gates_preserves_rows_and_is_single_use(tmp_path):
 
     result = apply_historical_state_repair_plan(
         session_factory,
-        snapshot=snapshot,
+        snapshot_loader=lambda: snapshot,
         expected_fingerprint=plan.fingerprint,
         expected_action_count=plan.action_count,
         confirmation_token=plan.confirmation_token,
@@ -336,12 +393,60 @@ def test_apply_requires_exact_gates_preserves_rows_and_is_single_use(tmp_path):
     with pytest.raises(HistoricalStateRepairRefused, match="fingerprint"):
         apply_historical_state_repair_plan(
             session_factory,
-            snapshot=snapshot,
+            snapshot_loader=lambda: snapshot,
             expected_fingerprint=plan.fingerprint,
             expected_action_count=plan.action_count,
             confirmation_token=plan.confirmation_token,
             applied_at=NOW,
         )
+
+
+def test_apply_reloads_exchange_snapshot_and_refuses_new_live_position(tmp_path):
+    from telegram_kol_research.historical_state_repair import (
+        HistoricalStateRepairRefused,
+        apply_historical_state_repair_plan,
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _seed_convergence(
+        session_factory,
+        chat_id=45,
+        message_id=450,
+        pos_id="pos-terminal",
+        status="submitted",
+        binding_status="closed",
+        with_order=True,
+    )
+    dry_snapshot = _snapshot()
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=dry_snapshot,
+        planned_at=NOW,
+    )
+    changed_snapshot = _snapshot(
+        positions=[{"posId": "pos-terminal", "pos": "-1"}],
+    )
+    loads = []
+
+    def reload_snapshot():
+        loads.append("loaded")
+        return changed_snapshot
+
+    with pytest.raises(HistoricalStateRepairRefused, match="fingerprint"):
+        apply_historical_state_repair_plan(
+            session_factory,
+            snapshot_loader=reload_snapshot,
+            expected_fingerprint=plan.fingerprint,
+            expected_action_count=plan.action_count,
+            confirmation_token=plan.confirmation_token,
+            applied_at=NOW,
+        )
+
+    assert loads == ["loaded"]
+    with session_factory() as session:
+        assert session.query(TriggerTakeProfitConvergence).one().status == "submitted"
+        assert session.query(PositionTakeProfitOrder).one().status == "active"
 
 
 def test_plan_refuses_incomplete_exchange_snapshot(tmp_path):
@@ -368,3 +473,65 @@ def test_plan_refuses_incomplete_exchange_snapshot(tmp_path):
 
     assert plan.action_count == 0
     assert any(row.reason_code == "exchange_snapshot_incomplete" for row in plan.conflicts)
+
+
+def test_plan_excludes_terminal_deletion_when_deepcoin_client_order_is_live(tmp_path):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    deletion_exit_id = _seed_terminal_deletion_with_client_order(session_factory)
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(
+            pending=[
+                {
+                    "algoId": "exchange-algo-id",
+                    "clOrdId": "client-order-still-live",
+                }
+            ]
+        ),
+        planned_at=NOW,
+    )
+
+    assert not any(
+        row.kind == "source_deletion_exit" and row.target_id == deletion_exit_id
+        for row in plan.actions
+    )
+    assert any(
+        row.kind == "source_deletion_exit"
+        and row.target_id == deletion_exit_id
+        and row.reason_code == "exact_position_or_order_still_live"
+        for row in plan.exclusions
+    )
+
+
+def test_plan_conflicts_when_terminal_binding_identity_is_missing_from_legs(tmp_path):
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    deletion_exit_id = _seed_terminal_deletion_with_client_order(
+        session_factory,
+        binding_order_id="binding-order-not-in-leg",
+    )
+
+    plan = build_historical_state_repair_plan(
+        session_factory,
+        snapshot=_snapshot(),
+        planned_at=NOW,
+    )
+
+    assert not any(
+        row.kind == "source_deletion_exit" and row.target_id == deletion_exit_id
+        for row in plan.actions
+    )
+    assert any(
+        row.kind == "source_deletion_exit"
+        and row.target_id == deletion_exit_id
+        and row.reason_code == "source_deletion_identity_not_terminal"
+        for row in plan.conflicts
+    )
