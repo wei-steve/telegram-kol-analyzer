@@ -140,6 +140,7 @@ input.
 The closed intent enum is:
 
 - `new_strategy`;
+- `entry_confirmation`;
 - `position_management`;
 - `exit`;
 - `cancel_entry`;
@@ -156,10 +157,13 @@ entry.
 
 ### Action kinds
 
-Executable candidate action kinds remain bounded to the existing supported
-vocabulary, including:
+Semantic action kinds remain bounded. Executable actions retain the existing
+supported vocabulary, while explicitly non-executable compatibility evidence
+is distinguished by kind:
 
 - `entry`;
+- `confirm_entry`;
+- `entry_fragment` (non-executable compatibility evidence);
 - `cancel_pending_entry`;
 - `replace_entry`;
 - `full_exit`;
@@ -172,6 +176,12 @@ vocabulary, including:
 Informational intents have no executable action. The model cannot authorize a
 trade merely by calling an intent actionable; only a supported, valid action
 can enter the deterministic adapter and all existing safety gates.
+
+`confirm_entry` preserves the existing `entry_confirm` lifecycle behavior for
+a previously pending strategy. `entry_fragment` is deliberately non-executable:
+the adapter may project it only into the current `entry_context` and
+`entry_fragments` evidence fields. It must never become an entry instruction or
+an exchange write on its own.
 
 ### Evidence references
 

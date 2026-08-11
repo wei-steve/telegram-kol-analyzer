@@ -233,6 +233,7 @@ def record_mimo_attempt(
             created_at=completed,
         )
         session.add(row)
+        run.attempt_count = ordinal
         try:
             session.commit()
         except IntegrityError as exc:

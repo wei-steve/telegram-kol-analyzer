@@ -127,6 +127,11 @@ def test_mimo_v2_composition_has_one_contract_and_preserves_v1(prompt_factory):
     assert '"contract_version": "mimo-authoritative-v2"' not in legacy.system_prompt
     assert v2.system_prompt.count('"contract_version": "mimo-authoritative-v2"') == 1
     assert "生命周期事件与仓位管理" in v2.system_prompt
+    assert "entry_confirmation" in v2.system_prompt
+    assert "confirm_entry" in v2.system_prompt
+    assert "entry_fragment" in v2.system_prompt
+    assert "leg_allocation" in v2.system_prompt
+    assert "supplemental_entry" in v2.system_prompt
     assert "图文证据分离" in v2.system_prompt
     assert "每张图片" in v2.system_prompt
     assert v2.version_map.keys() == {MIMO_V2_AUTHORITATIVE_PROMPT}
@@ -230,6 +235,10 @@ def test_mimo_v2_validation_accepts_closed_default_contract():
         '"images"',
         '"source"',
         "不得静默合并",
+        "entry_confirmation + confirm_entry",
+        "entry_context + entry_fragment",
+        "leg_allocation=[0.5,0.5]",
+        "supplemental_entry",
         "只输出一个 JSON 对象",
         "不得添加额外字段",
     ),

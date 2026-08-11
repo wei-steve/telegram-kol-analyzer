@@ -344,6 +344,13 @@ def adapt_mimo_v2_to_current_payload(
     return AdaptedMimoV2Payload(...)
 ```
 
+The adapter must also preserve two current-path semantics that are not direct
+execution instructions: map `entry_confirmation + confirm_entry` to the
+existing `lifecycle_event.event_type=entry_confirm` view, and map
+`entry_context + entry_fragment` only to the existing non-executable
+`entry_context`/`entry_fragments` fields. Neither mapping may bypass existing
+target resolution, evidence persistence, or execution safety gates.
+
 Reuse closed action semantics from `authoritative_instructions.py`; do not call
 the database, read source text, or query external state. Reject any combination
 that the current execution projection cannot safely represent.

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from decimal import Decimal, DecimalException, InvalidOperation
+from types import MappingProxyType
 from typing import Any, Mapping
 
 
@@ -11,6 +13,7 @@ CONTRACT_VERSION = "mimo-authoritative-v2"
 INTENT_TYPES = frozenset(
     {
         "new_strategy",
+        "entry_confirmation",
         "position_management",
         "exit",
         "cancel_entry",
@@ -25,6 +28,8 @@ INTENT_TYPES = frozenset(
 ACTION_KINDS = frozenset(
     {
         "entry",
+        "confirm_entry",
+        "entry_fragment",
         "cancel_pending_entry",
         "replace_entry",
         "full_exit",
@@ -56,6 +61,12 @@ MAX_CONFLICTS = 24
 MAX_SUMMARY_LENGTH = 2_000
 MAX_REASON_LENGTH = 4_000
 MAX_OBSERVED_TEXT_LENGTH = 10_000
+MAX_EVIDENCE_FIELDS = 32
+MAX_EVIDENCE_FIELD_NAME_LENGTH = 64
+MAX_EVIDENCE_FIELD_VALUE_LENGTH = 2_000
+MAX_PARAMETER_TEXT_LENGTH = 255
+MAX_DECIMAL_TEXT_LENGTH = 128
+MAX_SQLITE_INTEGER = 2**63 - 1
 
 _TOP_LEVEL_FIELDS = {
     "contract_version",
@@ -96,13 +107,16 @@ _STRATEGY_ALLOWED_FIELDS = {
 }
 _ACTIONABLE_INTENT_TYPES = {
     "new_strategy",
+    "entry_confirmation",
     "position_management",
     "exit",
     "cancel_entry",
     "strategy_revision",
+    "entry_context",
 }
 _INTENT_ACTIONS = {
     "new_strategy": {"entry"},
+    "entry_confirmation": {"confirm_entry"},
     "position_management": {
         "partial_take_profit",
         "move_stop_to_protect",
@@ -112,6 +126,33 @@ _INTENT_ACTIONS = {
     "exit": {"full_exit", "partial_exit"},
     "cancel_entry": {"cancel_pending_entry"},
     "strategy_revision": {"replace_entry"},
+    "entry_context": {"entry_fragment"},
+}
+_ACTION_PARAMETER_FIELDS = {
+    "entry": frozenset(),
+    "confirm_entry": frozenset({"entry_price"}),
+    "entry_fragment": frozenset(
+        {
+            "fragment_kind",
+            "symbol",
+            "side",
+            "risk_multiplier",
+            "allocations",
+            "entry_price",
+        }
+    ),
+    "cancel_pending_entry": frozenset(),
+    "replace_entry": frozenset(),
+    "full_exit": frozenset({"exit_price"}),
+    "partial_exit": frozenset({"exit_price", "management_fraction"}),
+    "partial_take_profit": frozenset(
+        {"exit_price", "take_profit", "management_fraction"}
+    ),
+    "move_stop_to_protect": frozenset({"stop_loss"}),
+    "hold_update": frozenset({"stop_loss", "take_profit"}),
+    "risk_update": frozenset(
+        {"stop_loss", "take_profit", "risk_multiplier", "leverage"}
+    ),
 }
 
 
@@ -124,8 +165,8 @@ class MimoV2Action:
     kind: str
     target_lifecycle_id: int | None
     target_thread_id: int | None
-    strategy: dict[str, Any] | None
-    parameters: dict[str, Any]
+    strategy: Mapping[str, Any] | None
+    parameters: Mapping[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,7 +181,7 @@ class MimoV2Intent:
 @dataclass(frozen=True, slots=True)
 class MimoV2TextEvidence:
     observed_text: str
-    fields: dict[str, dict[str, Any]]
+    fields: Mapping[str, Mapping[str, Any]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,7 +191,7 @@ class MimoV2ImageEvidence:
     quality: str
     observed_text: str
     summary: str
-    fields: dict[str, dict[str, Any]]
+    fields: Mapping[str, Mapping[str, Any]]
     confidence: float
 
 
@@ -203,6 +244,8 @@ def _parse_intents(
 ) -> tuple[MimoV2Intent, ...]:
     if not isinstance(raw, list):
         raise MimoV2ContractError("intents_not_list")
+    if not raw:
+        raise MimoV2ContractError("intent_count_invalid")
     if len(raw) > MAX_INTENTS:
         raise MimoV2ContractError("intent_count_exceeded")
     parsed: list[MimoV2Intent] = []
@@ -237,6 +280,10 @@ def _parse_intents(
             ordinal=ordinal,
             evidence=evidence,
         )
+        if intent_type in _ACTIONABLE_INTENT_TYPES and not refs:
+            raise MimoV2ContractError(
+                f"intent_{ordinal}_evidence_refs_missing"
+            )
         parsed.append(
             MimoV2Intent(
                 intent_type=intent_type,
@@ -301,15 +348,23 @@ def _parse_action(
         raise MimoV2ContractError(f"intent_{ordinal}_strategy_not_allowed")
     else:
         strategy = None
-    parameters = raw.get("parameters")
-    if not isinstance(parameters, Mapping):
-        raise MimoV2ContractError(f"intent_{ordinal}_parameters_not_object")
+    parameters = _parse_action_parameters(
+        raw.get("parameters"),
+        ordinal=ordinal,
+        kind=kind,
+        lifecycle_id=lifecycle_id,
+        thread_id=thread_id,
+    )
     return MimoV2Action(
         kind=kind,
         target_lifecycle_id=lifecycle_id,
         target_thread_id=thread_id,
-        strategy=dict(strategy) if isinstance(strategy, Mapping) else None,
-        parameters=dict(parameters),
+        strategy=(
+            MappingProxyType(dict(strategy))
+            if isinstance(strategy, Mapping)
+            else None
+        ),
+        parameters=MappingProxyType(parameters),
     )
 
 
@@ -324,12 +379,214 @@ def _parse_complete_strategy(raw: Any, *, ordinal: int) -> dict[str, Any]:
     side = str(raw.get("side") or "").strip().lower()
     if side not in {"long", "short"}:
         raise MimoV2ContractError(f"intent_{ordinal}_strategy_side_invalid")
+    symbol = raw.get("symbol")
+    if not isinstance(symbol, str) or not symbol.strip() or len(symbol.strip()) > 32:
+        raise MimoV2ContractError(f"intent_{ordinal}_strategy_symbol_invalid")
     strategy = dict(raw)
-    strategy["symbol"] = str(raw["symbol"]).strip().upper()
+    strategy["symbol"] = symbol.strip().upper()
     strategy["side"] = side
     for field in ("entry", "stop_loss", "take_profit"):
-        strategy[field] = str(raw[field]).strip()
+        strategy[field] = _bounded_parameter_text(
+            raw[field],
+            error=f"intent_{ordinal}_strategy_{field}_invalid",
+        )
+    leverage = raw.get("leverage")
+    if leverage is not None:
+        strategy["leverage"] = _bounded_parameter_text(
+            leverage,
+            error=f"intent_{ordinal}_strategy_leverage_invalid",
+            max_length=32,
+        )
+    order_type = raw.get("order_type")
+    if order_type is not None:
+        if not isinstance(order_type, str) or order_type.strip() not in {
+            "market",
+            "limit",
+            "market+limit",
+        }:
+            raise MimoV2ContractError(
+                f"intent_{ordinal}_strategy_order_type_invalid"
+            )
+        strategy["order_type"] = order_type.strip()
     return strategy
+
+
+def _parse_action_parameters(
+    raw: Any,
+    *,
+    ordinal: int,
+    kind: str,
+    lifecycle_id: int | None,
+    thread_id: int | None,
+) -> dict[str, Any]:
+    if not isinstance(raw, Mapping):
+        raise MimoV2ContractError(f"intent_{ordinal}_parameters_not_object")
+    allowed = _ACTION_PARAMETER_FIELDS[kind]
+    if set(raw) - allowed:
+        raise MimoV2ContractError(
+            f"intent_{ordinal}_parameters_fields_invalid"
+        )
+    if kind in {"entry", "replace_entry", "cancel_pending_entry"} and raw:
+        raise MimoV2ContractError(
+            f"intent_{ordinal}_parameters_fields_invalid"
+        )
+    if kind == "entry_fragment":
+        if lifecycle_id is not None or thread_id is not None:
+            raise MimoV2ContractError(
+                f"intent_{ordinal}_entry_fragment_target_not_allowed"
+            )
+        return _parse_entry_fragment_parameters(raw, ordinal=ordinal)
+
+    normalized: dict[str, Any] = {}
+    for field, value in raw.items():
+        if field == "management_fraction":
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not 0 < float(value) <= 1
+            ):
+                raise MimoV2ContractError(
+                    f"intent_{ordinal}_management_fraction_invalid"
+                )
+            normalized[field] = float(value)
+        elif field == "risk_multiplier":
+            normalized[field] = _bounded_positive_decimal(
+                value,
+                error=f"intent_{ordinal}_risk_multiplier_invalid",
+                maximum=Decimal("1"),
+            )
+        elif field == "leverage":
+            normalized[field] = _bounded_parameter_text(
+                value,
+                error=f"intent_{ordinal}_leverage_invalid",
+                max_length=32,
+            )
+        else:
+            normalized[field] = _bounded_parameter_text(
+                value,
+                error=f"intent_{ordinal}_{field}_invalid",
+            )
+    return normalized
+
+
+def _parse_entry_fragment_parameters(
+    raw: Mapping[str, Any],
+    *,
+    ordinal: int,
+) -> dict[str, Any]:
+    fragment_kind = str(raw.get("fragment_kind") or "").strip()
+    common = {"fragment_kind", "symbol", "side"}
+    kind_fields = {
+        "risk_multiplier": common | {"risk_multiplier"},
+        "leg_allocation": common | {"allocations"},
+        "supplemental_entry": common | {"entry_price"},
+    }
+    expected = kind_fields.get(fragment_kind)
+    if expected is None or set(raw) != expected:
+        raise MimoV2ContractError(
+            f"intent_{ordinal}_entry_fragment_fields_invalid"
+        )
+    symbol = raw.get("symbol")
+    if not isinstance(symbol, str) or not symbol.strip() or len(symbol.strip()) > 32:
+        raise MimoV2ContractError(
+            f"intent_{ordinal}_entry_fragment_symbol_invalid"
+        )
+    side = str(raw.get("side") or "").strip().lower()
+    if side not in {"long", "short"}:
+        raise MimoV2ContractError(
+            f"intent_{ordinal}_entry_fragment_side_invalid"
+        )
+    normalized: dict[str, Any] = {
+        "fragment_kind": fragment_kind,
+        "symbol": symbol.strip().upper(),
+        "side": side,
+    }
+    if fragment_kind == "risk_multiplier":
+        normalized["risk_multiplier"] = _bounded_positive_decimal(
+            raw.get("risk_multiplier"),
+            error=f"intent_{ordinal}_entry_fragment_multiplier_invalid",
+            maximum=Decimal("1"),
+        )
+    elif fragment_kind == "leg_allocation":
+        values = raw.get("allocations")
+        if not isinstance(values, list) or not 1 <= len(values) <= 5:
+            raise MimoV2ContractError(
+                f"intent_{ordinal}_entry_fragment_allocations_invalid"
+            )
+        allocations = tuple(
+            _bounded_positive_decimal(
+                value,
+                error=f"intent_{ordinal}_entry_fragment_allocations_invalid",
+                maximum=Decimal("1"),
+            )
+            for value in values
+        )
+        if sum(Decimal(value) for value in allocations) != Decimal("1"):
+            raise MimoV2ContractError(
+                f"intent_{ordinal}_entry_fragment_allocations_invalid"
+            )
+        normalized["allocations"] = allocations
+    else:
+        normalized["entry_price"] = _bounded_positive_decimal(
+            raw.get("entry_price"),
+            error=f"intent_{ordinal}_entry_fragment_price_invalid",
+        )
+    return normalized
+
+
+def _bounded_positive_decimal(
+    value: Any,
+    *,
+    error: str,
+    maximum: Decimal | None = None,
+) -> str:
+    if isinstance(value, bool):
+        raise MimoV2ContractError(error)
+    raw = str(value).strip()
+    if not raw or len(raw) > MAX_DECIMAL_TEXT_LENGTH:
+        raise MimoV2ContractError(error)
+    if "e" in raw.lower():
+        _, exponent = raw.lower().rsplit("e", 1)
+        exponent_digits = exponent.lstrip("+-")
+        if (
+            not exponent_digits.isdigit()
+            or len(exponent_digits) > 4
+            or abs(int(exponent)) > MAX_DECIMAL_TEXT_LENGTH
+        ):
+            raise MimoV2ContractError(error)
+    try:
+        decimal = Decimal(raw)
+    except (DecimalException, InvalidOperation, TypeError, ValueError) as exc:
+        raise MimoV2ContractError(error) from exc
+    if not decimal.is_finite() or decimal <= 0:
+        raise MimoV2ContractError(error)
+    if maximum is not None and decimal > maximum:
+        raise MimoV2ContractError(error)
+    if len(decimal.as_tuple().digits) > MAX_DECIMAL_TEXT_LENGTH:
+        raise MimoV2ContractError(error)
+    if not -MAX_DECIMAL_TEXT_LENGTH <= decimal.adjusted() <= MAX_DECIMAL_TEXT_LENGTH:
+        raise MimoV2ContractError(error)
+    try:
+        normalized = format(decimal.normalize(), "f")
+    except DecimalException as exc:
+        raise MimoV2ContractError(error) from exc
+    if len(normalized) > MAX_DECIMAL_TEXT_LENGTH:
+        raise MimoV2ContractError(error)
+    return normalized.rstrip("0").rstrip(".") if "." in normalized else normalized
+
+
+def _bounded_parameter_text(
+    value: Any,
+    *,
+    error: str,
+    max_length: int = MAX_PARAMETER_TEXT_LENGTH,
+) -> str:
+    if not isinstance(value, str):
+        raise MimoV2ContractError(error)
+    normalized = value.strip()
+    if not normalized or len(normalized) > max_length:
+        raise MimoV2ContractError(error)
+    return normalized
 
 
 def _parse_evidence(raw: Any) -> MimoV2Evidence:
@@ -357,10 +614,18 @@ def _parse_evidence(raw: Any) -> MimoV2Evidence:
         raise MimoV2ContractError("conflicts_invalid")
     if len(conflicts_raw) > MAX_CONFLICTS:
         raise MimoV2ContractError("conflict_count_exceeded")
+    conflicts = tuple(
+        _bounded_text(
+            value,
+            field=f"conflict_{ordinal}",
+            max_length=MAX_REASON_LENGTH,
+        )
+        for ordinal, value in enumerate(conflicts_raw)
+    )
     return MimoV2Evidence(
         text=text,
         images=tuple(images),
-        conflicts=tuple(value.strip() for value in conflicts_raw),
+        conflicts=conflicts,
     )
 
 
@@ -423,13 +688,23 @@ def _parse_image_evidence(raw: Any, *, ordinal: int) -> MimoV2ImageEvidence:
     )
 
 
-def _parse_evidence_field_map(raw: Any, *, prefix: str) -> dict[str, dict[str, Any]]:
+def _parse_evidence_field_map(
+    raw: Any,
+    *,
+    prefix: str,
+) -> Mapping[str, Mapping[str, Any]]:
     if not isinstance(raw, Mapping):
         raise MimoV2ContractError(f"{prefix}_evidence_fields_not_object")
-    fields: dict[str, dict[str, Any]] = {}
+    if len(raw) > MAX_EVIDENCE_FIELDS:
+        raise MimoV2ContractError(f"{prefix}_evidence_field_count_exceeded")
+    fields: dict[str, Mapping[str, Any]] = {}
     for name, value in raw.items():
         field_name = str(name).strip()
-        if not field_name or not isinstance(value, Mapping):
+        if (
+            not field_name
+            or len(field_name) > MAX_EVIDENCE_FIELD_NAME_LENGTH
+            or not isinstance(value, Mapping)
+        ):
             raise MimoV2ContractError(f"{prefix}_field_invalid")
         _require_exact_fields(
             value,
@@ -439,15 +714,38 @@ def _parse_evidence_field_map(raw: Any, *, prefix: str) -> dict[str, dict[str, A
         source = str(value.get("source") or "").strip()
         if source not in EVIDENCE_SOURCES:
             raise MimoV2ContractError(f"{prefix}_{field_name}_source_invalid")
-        fields[field_name] = {
-            "value": value.get("value"),
-            "source": source,
-            "confidence": _confidence(
-                value.get("confidence"),
-                field=f"{prefix}_{field_name}_confidence",
-            ),
-        }
-    return fields
+        fields[field_name] = MappingProxyType(
+            {
+                "value": _parse_evidence_field_value(
+                    value.get("value"),
+                    field=f"{prefix}_{field_name}",
+                ),
+                "source": source,
+                "confidence": _confidence(
+                    value.get("confidence"),
+                    field=f"{prefix}_{field_name}_confidence",
+                ),
+            }
+        )
+    return MappingProxyType(fields)
+
+
+def _parse_evidence_field_value(value: Any, *, field: str) -> Any:
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if len(str(value)) > 128:
+            raise MimoV2ContractError(f"{field}_field_value_too_long")
+        return value
+    if isinstance(value, float):
+        if value != value or value in {float("inf"), float("-inf")}:
+            raise MimoV2ContractError(f"{field}_field_value_invalid")
+        return value
+    if isinstance(value, str):
+        if len(value) > MAX_EVIDENCE_FIELD_VALUE_LENGTH:
+            raise MimoV2ContractError(f"{field}_field_value_too_long")
+        return value
+    raise MimoV2ContractError(f"{field}_field_value_invalid")
 
 
 def _parse_evidence_refs(
@@ -511,13 +809,21 @@ def _action_identity(action: MimoV2Action) -> str:
                 "lifecycle_id": action.target_lifecycle_id,
                 "thread_id": action.target_thread_id,
             },
-            "strategy": action.strategy,
-            "parameters": action.parameters,
+            "strategy": _plain_json_value(action.strategy),
+            "parameters": _plain_json_value(action.parameters),
         },
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _plain_json_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _plain_json_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_plain_json_value(item) for item in value]
+    return value
 
 
 def _confidence(raw: Any, *, field: str) -> float:
@@ -532,7 +838,12 @@ def _confidence(raw: Any, *, field: str) -> float:
 def _optional_positive_int(raw: Any, *, field: str) -> int | None:
     if raw is None:
         return None
-    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+    if (
+        isinstance(raw, bool)
+        or not isinstance(raw, int)
+        or raw <= 0
+        or raw > MAX_SQLITE_INTEGER
+    ):
         raise MimoV2ContractError(f"{field}_invalid")
     return int(raw)
 

@@ -185,7 +185,8 @@ DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT = """
 - 正文明示会员单盈利、已盈利、做个参考或复盘时，完整参数属于历史信号回顾，不得创建新策略。
 
 【生命周期事件与仓位管理】
-- 当前消息可能同时包含新策略、仓位管理、退出、取消入场、策略修订、入场前置语义、持仓报告、市场评论或非交易内容；每个独立意图分别输出，不能互相覆盖。
+- 当前消息可能同时包含新策略、入场确认、仓位管理、退出、取消入场、策略修订、入场前置语义、持仓报告、市场评论或非交易内容；每个独立意图分别输出，不能互相覆盖。
+- entry_confirmation：此前 pending_entry 策略现在、现价、市价、直接入场，或明确已经进场；输出 entry_confirmation + confirm_entry。可核对的实际入场价写入 parameters.entry_price，无法唯一对应时 target 保持 null 并降低置信度。
 - cancel_entry：明确取消此前 pending_entry 挂单或等待入场策略，action.kind=cancel_pending_entry。
 - exit：关闭已 entered 策略；全平、清仓、出局、离场、止盈了、止损了、保本走等输出 full_exit；明确只退出一部分时输出 partial_exit。
 - position_management：管理已 entered 策略但没有完全离场，例如分批止盈、减仓、推保护、移动止损、调整风险或继续持有；分别使用 partial_take_profit、move_stop_to_protect、risk_update 或 hold_update。
@@ -197,15 +198,17 @@ DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT = """
 - 上下文只用于关联 target 和理解消息，不能作为当前消息的新动作证据；不得把旧上下文复制成当前意图。
 
 【入场前置语义和非执行信息】
-- 有明确标的、方向和“半仓”或明确百分比仓位，但没有完整策略时，输出 entry_context，action 必须为 null；它不得单独下单。
+- 有明确标的、方向和“半仓”、明确百分比仓位、分腿比例或补仓价，但没有完整策略时，输出 entry_context + entry_fragment；它是非执行证据，适配器只能把它保存为 entry_context/entry_fragments，绝不能直接下单。
 - “半仓”解释为该币种已配置最大亏损预算乘以 50%；明确 30% 输出 risk_multiplier=0.3。只接受大于 0 且小于等于 1 的明确倍率。
 - “轻仓”、杠杆倍数或“加仓”本身不生成倍率，不得猜测。
+- entry_fragment.parameters 必须严格使用以下三种结构之一：risk_multiplier 使用 fragment_kind、symbol、side、risk_multiplier；leg_allocation 使用 fragment_kind、symbol、side、allocations，1 至 5 项且总和为 1；supplemental_entry 使用 fragment_kind、symbol、side、entry_price。
+- “两个点位各半仓”输出 leg_allocation=[0.5,0.5]；“补仓：63400附近”输出 supplemental_entry；不得根据价格区间宽度推断半仓。
 - 仅报告持仓截图、订单状态或盈利结果且没有当前管理动作时，输出 position_report，action 必须为 null。
 - 普通走势观点输出 market_commentary；广告、群公告或无关内容输出 non_trading；无法确定时输出 unclear。这些意图均不得包含 action。
 
 【动作与字段归一化】
-- action.kind 只能是 entry、cancel_pending_entry、replace_entry、full_exit、partial_exit、partial_take_profit、move_stop_to_protect、hold_update、risk_update。
-- new_strategy 只能对应 entry；position_management 只能对应 partial_take_profit、move_stop_to_protect、hold_update、risk_update；exit 只能对应 full_exit 或 partial_exit；cancel_entry 只能对应 cancel_pending_entry；strategy_revision 只能对应 replace_entry。
+- action.kind 只能是 entry、confirm_entry、entry_fragment、cancel_pending_entry、replace_entry、full_exit、partial_exit、partial_take_profit、move_stop_to_protect、hold_update、risk_update。
+- new_strategy 只能对应 entry；entry_confirmation 只能对应 confirm_entry；entry_context 只能对应非执行的 entry_fragment；position_management 只能对应 partial_take_profit、move_stop_to_protect、hold_update、risk_update；exit 只能对应 full_exit 或 partial_exit；cancel_entry 只能对应 cancel_pending_entry；strategy_revision 只能对应 replace_entry。
 - entry 与 replace_entry 的 strategy 必须包含非空 symbol、side、entry、stop_loss、take_profit；symbol 大写，side 只能是 long 或 short；价格使用字符串，不要输出数组或对象。
 - order_type 只能是 market、limit、market+limit；多档价格用“/”分隔，区间用“-”连接。
 - BTC 的“5.89-5.93附近、5.89万-5.93万、5.89-5.93w”统一为“58900-59300”；ETH 等其他币种不得套用 BTC 万位规则，除非原文明确带“万”。
@@ -238,9 +241,9 @@ DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT = """
   "confidence": 0.0,
   "intents": [
     {
-      "intent_type": "new_strategy | position_management | exit | cancel_entry | strategy_revision | entry_context | position_report | market_commentary | non_trading | unclear",
+      "intent_type": "new_strategy | entry_confirmation | position_management | exit | cancel_entry | strategy_revision | entry_context | position_report | market_commentary | non_trading | unclear",
       "action": {
-        "kind": "entry | cancel_pending_entry | replace_entry | full_exit | partial_exit | partial_take_profit | move_stop_to_protect | hold_update | risk_update",
+        "kind": "entry | confirm_entry | entry_fragment | cancel_pending_entry | replace_entry | full_exit | partial_exit | partial_take_profit | move_stop_to_protect | hold_update | risk_update",
         "target": {"lifecycle_id": null, "thread_id": null},
         "strategy": {"symbol": "BTC", "side": "long", "entry": "100000", "stop_loss": "99000", "take_profit": "102000", "leverage": null, "order_type": "limit"},
         "parameters": {}

@@ -180,12 +180,16 @@ def validate_prompt_content(
             '"conflicts"',
         )
         required_contract_markers = (
-            "new_strategy | position_management | exit | cancel_entry | "
+            "new_strategy | entry_confirmation | position_management | exit | cancel_entry | "
             "strategy_revision | entry_context | position_report | "
             "market_commentary | non_trading | unclear",
-            "entry | cancel_pending_entry | replace_entry | full_exit | "
-            "partial_exit | partial_take_profit | move_stop_to_protect | "
-            "hold_update | risk_update",
+            "entry | confirm_entry | entry_fragment | cancel_pending_entry | "
+            "replace_entry | full_exit | partial_exit | partial_take_profit | "
+            "move_stop_to_protect | hold_update | risk_update",
+            "entry_confirmation + confirm_entry",
+            "entry_context + entry_fragment",
+            "leg_allocation=[0.5,0.5]",
+            "supplemental_entry",
             "strategy_screenshot、position_screenshot、order_screenshot、"
             "market_chart、profit_review、advertisement、unrelated、unknown",
             "clear、blurry、cropped、unreadable",

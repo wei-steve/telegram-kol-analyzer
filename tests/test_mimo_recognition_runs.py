@@ -58,6 +58,8 @@ def test_run_records_ordered_attempts_and_terminal_selection(tmp_path):
         response_payload="timeout-body",
         duration_ms=1500,
     )
+    with factory() as session:
+        assert session.get(MimoRecognitionRun, run.id).attempt_count == 1
     second = record_mimo_attempt(
         factory,
         run_id=run.id,

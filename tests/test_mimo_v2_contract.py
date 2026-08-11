@@ -83,7 +83,7 @@ def test_parse_preserves_ordered_actionable_and_informational_intents():
             "action": None,
             "reason": "记录当前震荡观点",
             "confidence": 0.82,
-            "evidence_refs": [],
+            "evidence_refs": ["text:observed_text"],
         }
     )
 
@@ -117,7 +117,7 @@ def test_parse_complete_entry_strategy():
             },
             "reason": "完整入场参数",
             "confidence": 0.93,
-            "evidence_refs": [],
+            "evidence_refs": ["text:observed_text"],
         }
     ]
 
@@ -126,6 +126,282 @@ def test_parse_complete_entry_strategy():
     assert parsed.intents[0].action is not None
     assert parsed.intents[0].action.strategy["symbol"] == "ETH"
     assert parsed.intents[0].action.strategy["side"] == "long"
+
+
+def test_parse_entry_confirmation_for_pending_strategy():
+    payload = _valid_payload()
+    payload["intents"] = [
+        {
+            "intent_type": "entry_confirmation",
+            "action": {
+                "kind": "confirm_entry",
+                "target": {"lifecycle_id": 790, "thread_id": 52},
+                "strategy": None,
+                "parameters": {"entry_price": "1730"},
+            },
+            "reason": "消息明确说现价进场",
+            "confidence": 0.96,
+            "evidence_refs": ["text:observed_text"],
+        }
+    ]
+
+    parsed = parse_mimo_v2_payload(payload)
+
+    assert parsed.intents[0].intent_type == "entry_confirmation"
+    assert parsed.intents[0].action.kind == "confirm_entry"
+    assert parsed.intents[0].action.parameters["entry_price"] == "1730"
+
+
+@pytest.mark.parametrize(
+    ("parameters", "expected_kind"),
+    (
+        (
+            {
+                "fragment_kind": "risk_multiplier",
+                "symbol": "btc",
+                "side": "long",
+                "risk_multiplier": "0.5",
+            },
+            "risk_multiplier",
+        ),
+        (
+            {
+                "fragment_kind": "leg_allocation",
+                "symbol": "ETH",
+                "side": "short",
+                "allocations": ["0.5", "0.5"],
+            },
+            "leg_allocation",
+        ),
+        (
+            {
+                "fragment_kind": "supplemental_entry",
+                "symbol": "ETH",
+                "side": "long",
+                "entry_price": "63400",
+            },
+            "supplemental_entry",
+        ),
+    ),
+)
+def test_parse_non_executable_entry_fragment(parameters, expected_kind):
+    payload = _valid_payload()
+    payload["intents"] = [
+        {
+            "intent_type": "entry_context",
+            "action": {
+                "kind": "entry_fragment",
+                "target": {"lifecycle_id": None, "thread_id": None},
+                "strategy": None,
+                "parameters": parameters,
+            },
+            "reason": "相邻入场片段",
+            "confidence": 0.95,
+            "evidence_refs": ["text:observed_text"],
+        }
+    ]
+
+    parsed = parse_mimo_v2_payload(payload)
+
+    assert parsed.intents[0].action.kind == "entry_fragment"
+    assert parsed.intents[0].action.parameters["fragment_kind"] == expected_kind
+
+
+@pytest.mark.parametrize(
+    ("mutator", "error"),
+    (
+        (
+            lambda payload: payload["intents"][0]["action"]["strategy"].update(
+                order_type="stop"
+            ),
+            "strategy_order_type_invalid",
+        ),
+        (
+            lambda payload: payload["intents"][0]["action"]["strategy"].update(
+                entry={"price": "1880"}
+            ),
+            "strategy_entry_invalid",
+        ),
+        (
+            lambda payload: payload["intents"][0]["action"]["strategy"].update(
+                leverage={"value": 20}
+            ),
+            "strategy_leverage_invalid",
+        ),
+        (
+            lambda payload: payload["intents"][0]["action"].update(
+                parameters={"nested": {"unsafe": True}}
+            ),
+            "parameters_fields_invalid",
+        ),
+    ),
+)
+def test_rejects_invalid_entry_fields_and_parameters(mutator, error):
+    payload = _valid_payload()
+    payload["intents"] = [
+        {
+            "intent_type": "new_strategy",
+            "action": {
+                "kind": "entry",
+                "target": {"lifecycle_id": None, "thread_id": None},
+                "strategy": {
+                    "symbol": "ETH",
+                    "side": "long",
+                    "entry": "1880",
+                    "stop_loss": "1850",
+                    "take_profit": "1950",
+                    "leverage": "20",
+                    "order_type": "limit",
+                },
+                "parameters": {},
+            },
+            "reason": "完整策略",
+            "confidence": 0.9,
+            "evidence_refs": ["text:observed_text"],
+        }
+    ]
+    mutator(payload)
+
+    with pytest.raises(MimoV2ContractError, match=error):
+        parse_mimo_v2_payload(payload)
+
+
+def test_rejects_action_specific_parameter_mismatch():
+    payload = _valid_payload()
+    payload["intents"][0]["action"]["parameters"] = {
+        "stop_loss": "1940",
+        "nested": {"unsafe": True},
+    }
+
+    with pytest.raises(MimoV2ContractError, match="parameters_fields_invalid"):
+        parse_mimo_v2_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    (
+        {
+            "fragment_kind": "leg_allocation",
+            "symbol": "BTC",
+            "side": "long",
+            "allocations": ["0.6", "0.5"],
+        },
+        {
+            "fragment_kind": "risk_multiplier",
+            "symbol": "BTC",
+            "side": "long",
+            "risk_multiplier": "1.5",
+        },
+        {
+            "fragment_kind": "supplemental_entry",
+            "symbol": "BTC",
+            "side": "long",
+            "entry_price": {"value": "63400"},
+        },
+        {
+            "fragment_kind": "supplemental_entry",
+            "symbol": "BTC",
+            "side": "long",
+            "entry_price": "9" * 129,
+        },
+        {
+            "fragment_kind": "supplemental_entry",
+            "symbol": "BTC",
+            "side": "long",
+            "entry_price": "1e999999999",
+        },
+    ),
+)
+def test_rejects_invalid_entry_fragment_parameters(parameters):
+    payload = _valid_payload()
+    payload["intents"] = [
+        {
+            "intent_type": "entry_context",
+            "action": {
+                "kind": "entry_fragment",
+                "target": {"lifecycle_id": None, "thread_id": None},
+                "strategy": None,
+                "parameters": parameters,
+            },
+            "reason": "invalid fragment",
+            "confidence": 0.9,
+            "evidence_refs": ["text:observed_text"],
+        }
+    ]
+
+    with pytest.raises(MimoV2ContractError, match="entry_fragment"):
+        parse_mimo_v2_payload(payload)
+
+
+def test_parsed_contract_is_deeply_immutable():
+    payload = _valid_payload()
+    parsed = parse_mimo_v2_payload(payload)
+
+    with pytest.raises(TypeError):
+        parsed.intents[0].action.parameters["stop_loss"] = "2000"
+    with pytest.raises(TypeError):
+        parsed.evidence.images[0].fields["side"]["value"] = "long"
+
+    entry_payload = _valid_payload()
+    entry_payload["intents"] = [
+        {
+            "intent_type": "new_strategy",
+            "action": {
+                "kind": "entry",
+                "target": {"lifecycle_id": None, "thread_id": None},
+                "strategy": {
+                    "symbol": "ETH",
+                    "side": "long",
+                    "entry": "1880",
+                    "stop_loss": "1850",
+                    "take_profit": "1950",
+                    "leverage": None,
+                    "order_type": "limit",
+                },
+                "parameters": {},
+            },
+            "reason": "完整策略",
+            "confidence": 0.9,
+            "evidence_refs": ["text:observed_text"],
+        }
+    ]
+    parsed_entry = parse_mimo_v2_payload(entry_payload)
+    with pytest.raises(TypeError):
+        parsed_entry.intents[0].action.strategy["stop_loss"] = "1800"
+
+
+def test_rejects_empty_intent_list():
+    payload = _valid_payload()
+    payload["intents"] = []
+
+    with pytest.raises(MimoV2ContractError, match="intent_count_invalid"):
+        parse_mimo_v2_payload(payload)
+
+
+def test_rejects_unbounded_evidence_fields_and_values():
+    payload = _valid_payload()
+    payload["evidence"]["text"]["fields"] = {
+        f"field_{index}": _field(str(index), source="text")
+        for index in range(33)
+    }
+    with pytest.raises(MimoV2ContractError, match="evidence_field_count_exceeded"):
+        parse_mimo_v2_payload(payload)
+
+    payload = _valid_payload()
+    payload["evidence"]["text"]["fields"]["oversized"] = _field(
+        "x" * 2001,
+        source="text",
+    )
+    with pytest.raises(MimoV2ContractError, match="field_value_too_long"):
+        parse_mimo_v2_payload(payload)
+
+
+def test_actionable_intent_requires_evidence_reference():
+    payload = _valid_payload()
+    payload["intents"][0]["evidence_refs"] = []
+
+    with pytest.raises(MimoV2ContractError, match="evidence_refs_missing"):
+        parse_mimo_v2_payload(payload)
 
 
 @pytest.mark.parametrize(
@@ -150,6 +426,12 @@ def test_parse_complete_entry_strategy():
         (
             lambda payload: payload["intents"][0]["action"]["target"].update(
                 lifecycle_id=0
+            ),
+            "intent_0_target_lifecycle_id_invalid",
+        ),
+        (
+            lambda payload: payload["intents"][0]["action"]["target"].update(
+                lifecycle_id=2**63
             ),
             "intent_0_target_lifecycle_id_invalid",
         ),
