@@ -73,6 +73,30 @@ from telegram_kol_research.trading_settings import save_trading_settings
 NOW = datetime(2026, 7, 15, 9, 0, tzinfo=UTC)
 
 
+def test_post_write_contract_observer_failure_never_changes_writer_result(
+    monkeypatch,
+):
+    from telegram_kol_research import instruction_execution_management_adapter
+    from telegram_kol_research.strategy_management_executor import (
+        _observe_linked_contract_after_management_execution,
+    )
+
+    monkeypatch.setattr(
+        instruction_execution_management_adapter,
+        "project_linked_management_batch_contract",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("observer")),
+    )
+
+    @_observe_linked_contract_after_management_execution
+    def writer(session_factory, *, batch_id, executed_at=None):
+        return {"status": "submitted", "batch_id": batch_id}
+
+    assert writer(object(), batch_id=17, executed_at=NOW) == {
+        "status": "submitted",
+        "batch_id": 17,
+    }
+
+
 def test_break_even_stop_uses_exact_live_average_not_context_support() -> None:
     batch = SimpleNamespace(effective_action="move_stop_to_break_even")
     leg = SimpleNamespace(

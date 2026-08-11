@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -62,6 +63,7 @@ TERMINAL_ORDER_STATES = frozenset(
 )
 FILLED_ORDER_STATES = frozenset({"filled", "active", "position_open"})
 ENTRY_REVISION_CLAIM_LEASE = timedelta(minutes=5)
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,7 +175,35 @@ def _mark_recovery(session_factory, *, batch_id: int, reason: str, now: datetime
         batch.advance_claimed_at = None
         batch.updated_at = now
         session.commit()
+    _observe_linked_revision_contract_best_effort(
+        session_factory,
+        batch_id=int(batch_id),
+        observed_at=now,
+    )
     return EntryRevisionExecutionResult("recovery_required", int(batch_id), reason)
+
+
+def _observe_linked_revision_contract_best_effort(
+    session_factory,
+    *,
+    batch_id: int,
+    observed_at: datetime,
+) -> None:
+    try:
+        from telegram_kol_research.instruction_execution_management_adapter import (
+            project_linked_revision_batch_contract,
+        )
+
+        project_linked_revision_batch_contract(
+            session_factory,
+            revision_batch_id=int(batch_id),
+            projected_at=observed_at,
+        )
+    except Exception:
+        logger.exception(
+            "revision execution-contract observation failed: batch_id=%s",
+            int(batch_id),
+        )
 
 
 def _replacement_payload(*, replacement: dict[str, Any], binding: ExecutionBinding, desired: dict[str, Any]):
@@ -1334,6 +1364,11 @@ def execute_entry_revision(
         batch.completed_at = now
         batch.updated_at = now
         session.commit()
+    _observe_linked_revision_contract_best_effort(
+        session_factory,
+        batch_id=int(batch_id),
+        observed_at=now,
+    )
     return EntryRevisionExecutionResult("succeeded", int(batch_id))
 
 

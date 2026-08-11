@@ -47,13 +47,18 @@ from telegram_kol_research.instruction_execution_outcomes import (
     InstructionOutcomeContractError,
     legacy_status_for_instruction_result,
 )
+from telegram_kol_research.instruction_execution_projection import (
+    instruction_execution_mode_for_item,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
     ManagementMessageTarget,
+    MessageInstructionItem,
     PositionMutationIntent,
     StrategyLifecycle,
     StrategyManagementBatch,
+    SignalCandidate,
 )
 from telegram_kol_research.runtime_incident_adapters import (
     capture_management_target_failure,
@@ -161,6 +166,18 @@ def run_strategy_management_worker_tick(
         "failed": 0,
     }
     now = processed_at or datetime.now(UTC)
+    try:
+        from telegram_kol_research.instruction_execution_management_adapter import (
+            converge_unknown_management_instruction_contracts,
+        )
+
+        converge_unknown_management_instruction_contracts(
+            session_factory,
+            converged_at=now,
+            limit=limit,
+        )
+    except Exception:
+        logger.exception("unknown management execution-contract convergence failed")
     client = None
     snapshot = None
 
@@ -207,10 +224,23 @@ def run_strategy_management_worker_tick(
             if item is None:
                 break
             counts["discovered"] += 1
+            enforcement_mode = "disabled"
+            planning_result = None
             try:
-                enforcement_mode = load_trading_settings(
-                    session_factory
-                ).instruction_execution_contract_mode
+                execution_settings = load_trading_settings(session_factory)
+                enforcement_mode = instruction_execution_mode_for_item(
+                    item,
+                    execution_settings,
+                )
+                if enforcement_mode != "disabled":
+                    with session_factory() as session:
+                        parse_source = session.query(
+                            SignalCandidate.parse_source
+                        ).filter(
+                            SignalCandidate.id == int(item.signal_candidate_id)
+                        ).scalar()
+                    if parse_source != "mimo_authoritative":
+                        enforcement_mode = "disabled"
                 prior_result = json.loads(item.result_json or "{}")
                 execution_mode = str(
                     prior_result.get("execution_mode") or "live"
@@ -253,6 +283,21 @@ def run_strategy_management_worker_tick(
                     counts["recovered"] += 1
                     continue
                 if planning_result.status != "ready" or planning_result.batch is None:
+                    if (
+                        enforcement_mode != "disabled"
+                        and planning_result.batch_id is not None
+                    ):
+                        from telegram_kol_research.instruction_execution_management_adapter import (
+                            project_management_instruction_contract,
+                        )
+
+                        project_management_instruction_contract(
+                            session_factory,
+                            message_instruction_item_id=int(item.id),
+                            management_batch_id=int(planning_result.batch_id),
+                            projected_at=now,
+                            mode=enforcement_mode,
+                        )
                     finish_message_instruction_item(
                         session_factory,
                         item_id=item.id,
@@ -263,6 +308,7 @@ def run_strategy_management_worker_tick(
                             "batch_id": planning_result.batch_id,
                         },
                         now=now,
+                        execution_contract_mode=enforcement_mode,
                     )
                     _capture_committed_instruction_target_failure(
                         session_factory,
@@ -282,6 +328,18 @@ def run_strategy_management_worker_tick(
                         "status": "shadow_planned",
                         "batch_id": planning_result.batch.id,
                     }
+                    if enforcement_mode != "disabled":
+                        from telegram_kol_research.instruction_execution_management_adapter import (
+                            project_management_instruction_contract,
+                        )
+
+                        project_management_instruction_contract(
+                            session_factory,
+                            message_instruction_item_id=int(item.id),
+                            management_batch_id=int(planning_result.batch.id),
+                            projected_at=now,
+                            mode=enforcement_mode,
+                        )
                     finish_message_instruction_item(
                         session_factory,
                         item_id=item.id,
@@ -292,6 +350,7 @@ def run_strategy_management_worker_tick(
                         ),
                         result=shadow_result,
                         now=now,
+                        execution_contract_mode=enforcement_mode,
                     )
                     counts["recovered"] += 1
                     continue
@@ -301,6 +360,18 @@ def run_strategy_management_worker_tick(
                     deepcoin_client=get_client(),
                     executed_at=now,
                 )
+                if enforcement_mode != "disabled":
+                    from telegram_kol_research.instruction_execution_management_adapter import (
+                        project_management_instruction_contract,
+                    )
+
+                    project_management_instruction_contract(
+                        session_factory,
+                        message_instruction_item_id=int(item.id),
+                        management_batch_id=int(planning_result.batch.id),
+                        projected_at=now,
+                        mode=enforcement_mode,
+                    )
                 try:
                     finish_status = legacy_status_for_instruction_result(
                         execution_result,
@@ -323,6 +394,7 @@ def run_strategy_management_worker_tick(
                     status=finish_status,
                     result=execution_result,
                     now=now,
+                    execution_contract_mode=enforcement_mode,
                 )
                 if finish_status == "failed":
                     _capture_committed_instruction_target_failure(
@@ -347,6 +419,7 @@ def run_strategy_management_worker_tick(
                     status="unknown",
                     result={"type": type(exc).__name__, "message": str(exc)},
                     now=now,
+                    execution_contract_mode=enforcement_mode,
                 )
                 _capture_committed_instruction_target_failure(
                     session_factory,
@@ -368,6 +441,7 @@ def run_strategy_management_worker_tick(
                     status="failed",
                     result={"type": type(exc).__name__, "message": str(exc)},
                     now=now,
+                    execution_contract_mode=enforcement_mode,
                 )
                 _capture_committed_instruction_target_failure(
                     session_factory,
@@ -691,7 +765,76 @@ def run_strategy_management_worker_tick(
         except Exception:
             counts["failed"] += 1
             logger.exception("strategy management batch %s failed", batch.id)
+        finally:
+            _synchronize_linked_management_item_best_effort(
+                session_factory,
+                batch_id=int(batch.id),
+                synchronized_at=now,
+            )
     return StrategyManagementWorkerResult(**counts)
+
+
+def _synchronize_linked_management_item_best_effort(
+    session_factory,
+    *,
+    batch_id: int,
+    synchronized_at: datetime,
+) -> None:
+    """Converge a linked item from durable evidence without retrying a writer."""
+
+    try:
+        from telegram_kol_research.instruction_execution_management_adapter import (
+            project_linked_management_batch_contract,
+        )
+
+        linked = project_linked_management_batch_contract(
+            session_factory,
+            management_batch_id=int(batch_id),
+            projected_at=synchronized_at,
+        )
+        if (
+            linked is None
+            or linked.mode != "live"
+            or linked.contract.state not in {
+                "submitting",
+                "submit_unknown",
+                "verified",
+                "failed",
+                "expired",
+            }
+        ):
+            return
+        with session_factory() as session:
+            item_status = session.query(MessageInstructionItem.status).filter(
+                MessageInstructionItem.id
+                == int(linked.message_instruction_item_id)
+            ).scalar()
+        if item_status not in {"executing", "unknown"}:
+            return
+        finish_message_instruction_item(
+            session_factory,
+            item_id=int(linked.message_instruction_item_id),
+            status="executing",
+            result={
+                "status": {
+                    "submitting": "reconciling",
+                    "submit_unknown": "submit_unknown",
+                    "verified": "succeeded",
+                    "failed": "failed",
+                    "expired": "expired",
+                }[linked.contract.state],
+                "reason": "durable_management_reconciled",
+                "batch_id": int(batch_id),
+            },
+            now=synchronized_at,
+            execution_contract_mode=linked.mode,
+            expected_current_statuses=("executing", "unknown"),
+        )
+    except Exception:
+        logger.exception(
+            "management execution-contract synchronization failed: batch_id=%s",
+            int(batch_id),
+        )
 
 
 def _capture_committed_instruction_target_failure(

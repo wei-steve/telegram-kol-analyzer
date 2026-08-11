@@ -284,6 +284,42 @@ def execute_message_instruction_items(
                     except Exception:
                         if enforcement_mode == "live":
                             raise
+                if (
+                    item.instruction_kind == "management"
+                    and enforcement_mode != "disabled"
+                    and result.get("batch_id") is not None
+                ):
+                    from telegram_kol_research.instruction_execution_management_adapter import (
+                        project_management_instruction_contract,
+                        project_revision_instruction_contract,
+                    )
+
+                    try:
+                        with session_factory() as session:
+                            candidate_event_type = session.query(
+                                SignalCandidate.event_type
+                            ).filter(
+                                SignalCandidate.id == int(item.signal_candidate_id)
+                            ).scalar()
+                        if candidate_event_type == "strategy_revision":
+                            project_revision_instruction_contract(
+                                session_factory,
+                                message_instruction_item_id=int(item.id),
+                                revision_batch_id=int(result["batch_id"]),
+                                projected_at=now,
+                                mode=enforcement_mode,
+                            )
+                        else:
+                            project_management_instruction_contract(
+                                session_factory,
+                                message_instruction_item_id=int(item.id),
+                                management_batch_id=int(result["batch_id"]),
+                                projected_at=now,
+                                mode=enforcement_mode,
+                            )
+                    except Exception:
+                        if enforcement_mode == "live":
+                            raise
             except InstructionOutcomeContractError as exc:
                 finish_status = "failed"
                 result = {

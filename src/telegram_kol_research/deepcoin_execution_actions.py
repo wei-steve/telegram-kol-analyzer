@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -69,6 +70,9 @@ from telegram_kol_research.source_message_deletion import (
     serialized_source_message_execution,
     source_identity_execution_barrier,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class DeepcoinExecutionActionError(RuntimeError):
@@ -757,12 +761,30 @@ def close_position_market(
         execute_management_batch,
     )
 
-    return execute_management_batch(
+    result = execute_management_batch(
         session_factory,
         batch_id=normalized_batch_id,
         deepcoin_client=deepcoin_client,
         executed_at=executed_at,
     )
+    try:
+        from telegram_kol_research.instruction_execution_management_adapter import (
+            project_linked_management_batch_contract,
+        )
+
+        project_linked_management_batch_contract(
+            session_factory,
+            management_batch_id=int(normalized_batch_id),
+            projected_at=executed_at or datetime.now(UTC),
+        )
+    except Exception:
+        # The exchange writer has already returned. Observation must never turn
+        # that completed call into a retryable failure.
+        logger.exception(
+            "management execution-contract observation failed: batch_id=%s",
+            int(normalized_batch_id),
+        )
+    return result
 
 
 def _canonical_positive_int(value: Any) -> int | None:

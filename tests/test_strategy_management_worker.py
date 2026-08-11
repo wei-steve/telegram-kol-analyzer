@@ -16,6 +16,7 @@ from telegram_kol_research.execution_bindings import (
 )
 from telegram_kol_research.models import (
     ExecutionBinding,
+    InstructionExecutionContract,
     ExecutionOrderLeg,
     ManagementMessageEnvelope,
     ManagementMessageTarget,
@@ -189,8 +190,9 @@ def test_worker_retries_due_visibility_item_and_finishes_same_item(tmp_path):
     assert result.executed == 1
     with session_factory() as session:
         item = session.get(MessageInstructionItem, item_id)
-        assert item.status == "executing"
+        assert item.status == "submitted"
         assert item.visibility_retry_attempts == 1
+        assert session.query(InstructionExecutionContract).count() == 0
 
 
 def test_worker_fails_closed_on_unregistered_executor_outcome(tmp_path):

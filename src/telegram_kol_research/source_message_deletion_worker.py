@@ -247,6 +247,11 @@ def run_source_message_deletion_worker_tick(
                             expected_claim_token=claim_token,
                             require_terminal_target=terminal_target_reconciliation,
                         )
+                        _observe_source_deletion_management_contract(
+                            session_factory,
+                            deletion_exit_id=exit_id,
+                            observed_at=now,
+                        )
             except Exception as exc:
                 _transition_claimed(
                     session_factory,
@@ -526,6 +531,39 @@ def run_source_message_deletion_worker_tick(
         counts["cancelled"] += 1
 
     return SourceMessageDeletionWorkerResult(**counts)
+
+
+def _observe_source_deletion_management_contract(
+    session_factory,
+    *,
+    deletion_exit_id: int,
+    observed_at: datetime,
+) -> None:
+    """Observe only an exact linked batch; deletion targeting stays authoritative."""
+
+    try:
+        with session_factory() as session:
+            batch_id = session.query(
+                SourceMessageDeletionExit.management_batch_id
+            ).filter(
+                SourceMessageDeletionExit.id == int(deletion_exit_id)
+            ).scalar()
+        if batch_id is None:
+            return
+        from telegram_kol_research.instruction_execution_management_adapter import (
+            project_linked_management_batch_contract,
+        )
+
+        project_linked_management_batch_contract(
+            session_factory,
+            management_batch_id=int(batch_id),
+            projected_at=observed_at,
+        )
+    except Exception:
+        logger.exception(
+            "source deletion execution-contract observation failed: exit_id=%s",
+            int(deletion_exit_id),
+        )
 
 
 def finalize_source_message_deletion_exit(

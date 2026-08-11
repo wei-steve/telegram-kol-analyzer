@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+from functools import wraps
 from typing import Any
 
 from sqlalchemy.orm import sessionmaker
@@ -84,6 +86,40 @@ from telegram_kol_research.strategy_management_market_policy import (
 )
 from telegram_kol_research.trigger_protection_intents import transition_trigger_protection_intent
 from telegram_kol_research.trading_settings import load_trading_settings
+
+
+logger = logging.getLogger(__name__)
+
+
+def _observe_linked_contract_after_management_execution(function):
+    """Observe committed evidence after releasing the position-writer lock."""
+
+    @wraps(function)
+    def wrapped(session_factory, *args, **kwargs):
+        try:
+            return function(session_factory, *args, **kwargs)
+        finally:
+            batch_id = kwargs.get("batch_id")
+            if batch_id is not None:
+                try:
+                    from telegram_kol_research.instruction_execution_management_adapter import (
+                        project_linked_management_batch_contract,
+                    )
+
+                    project_linked_management_batch_contract(
+                        session_factory,
+                        management_batch_id=int(batch_id),
+                        projected_at=kwargs.get("executed_at") or datetime.now(UTC),
+                    )
+                except Exception:
+                    # The writer outcome is already durable. Never make observer
+                    # failure look like a retryable exchange failure.
+                    logger.exception(
+                        "management execution-contract observation failed: batch_id=%s",
+                        int(batch_id),
+                    )
+
+    return wrapped
 
 
 DEEPCOIN_CLIENT_ORDER_ID_MAX_LENGTH = 20
@@ -1218,6 +1254,7 @@ def _recover_break_even_post_write_restart(
     return _result(result_batch, reason=reason)
 
 
+@_observe_linked_contract_after_management_execution
 @serialized_position_authority_mutation
 def execute_management_batch(
     session_factory: sessionmaker,

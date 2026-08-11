@@ -440,19 +440,40 @@ def finish_message_instruction_item(
     result: dict,
     now: datetime,
     execution_contract_mode: str = "disabled",
+    expected_current_statuses: tuple[str, ...] = ("executing",),
 ) -> None:
     """Finish a claimed item exactly once and persist its result channel."""
 
     if status not in FINISH_STATUSES:
         raise ValueError(f"unsupported finish status: {status}")
+    allowed_current_statuses = tuple(
+        str(value) for value in expected_current_statuses
+    )
+    if not allowed_current_statuses or any(
+        value not in FINISH_STATUSES for value in allowed_current_statuses
+    ):
+        raise ValueError("unsupported expected current instruction status")
 
     from telegram_kol_research.instruction_execution_entry_adapter import (
         resolve_entry_instruction_mirror,
     )
+    from telegram_kol_research.instruction_execution_management_adapter import (
+        resolve_management_instruction_mirror,
+    )
+
+    with session_factory() as session:
+        instruction_kind = session.query(
+            MessageInstructionItem.instruction_kind
+        ).filter(MessageInstructionItem.id == int(item_id)).scalar()
+    mirror_resolver = (
+        resolve_management_instruction_mirror
+        if instruction_kind == "management"
+        else resolve_entry_instruction_mirror
+    )
 
     for attempt in range(4):
         result_payload = dict(result)
-        mirror = resolve_entry_instruction_mirror(
+        mirror = mirror_resolver(
             session_factory,
             message_instruction_item_id=int(item_id),
             requested_status=status,
@@ -492,7 +513,7 @@ def finish_message_instruction_item(
         with session_factory() as session:
             conditions = [
                 MessageInstructionItem.id == int(item_id),
-                MessageInstructionItem.status == "executing",
+                MessageInstructionItem.status.in_(allowed_current_statuses),
             ]
             if contract_guard is not None:
                 conditions.append(contract_guard)
@@ -527,8 +548,14 @@ def finish_message_instruction_item(
                 return
             session.rollback()
             item = session.get(MessageInstructionItem, int(item_id))
-            if item is None or item.status != "executing":
-                raise RuntimeError("instruction item is missing or not executing")
+            if item is None or item.status not in allowed_current_statuses:
+                if allowed_current_statuses == ("executing",):
+                    raise RuntimeError(
+                        "instruction item is missing or not executing"
+                    )
+                raise RuntimeError(
+                    "instruction item is missing or not in an expected current status"
+                )
         if attempt == 3:
             raise RuntimeError("instruction execution contract changed during finish")
 
