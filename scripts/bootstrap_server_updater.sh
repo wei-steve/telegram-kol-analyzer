@@ -21,18 +21,23 @@ EXPECTED_COMMIT="$(printf '%s' "$EXPECTED_COMMIT" | tr '[:upper:]' '[:lower:]')"
 if command -v shasum >/dev/null 2>&1; then
   UPDATER_SHA256="$(shasum -a 256 "$ROOT/deploy/telegram-kol-update" | awk '{print $1}')"
 else
-  UPDATER_SHA256="$(sha256sum "$ROOT/deploy/telegram-kol-update" | awk '{print $1}')"
+UPDATER_SHA256="$(sha256sum "$ROOT/deploy/telegram-kol-update" | awk '{print $1}')"
 fi
+shadow_arg="${REVIEWED_SHADOW_EVIDENCE_PATH:-__EMPTY__}"
+previous_arg="${PREVIOUS_LIVE_SNAPSHOT_PATH:-__EMPTY__}"
+authorization_arg="${LIVE_PROMOTION_AUTHORIZATION:-__EMPTY__}"
 
 # The server extracts the helper from the exact reviewed commit and verifies it
 # against the reviewed workstation copy before installing or executing it.
 exec ssh -i "$KEY_PATH" "$SERVER" bash -s -- \
   "$EXPECTED_COMMIT" "$BRANCH" "$UPDATER_SHA256" "$CHANGE_CLASS" \
-  "$REVIEWED_SHADOW_EVIDENCE_PATH" "$PREVIOUS_LIVE_SNAPSHOT_PATH" \
-  "$LIVE_PROMOTION_AUTHORIZATION" <<'REMOTE'
+  "$shadow_arg" "$previous_arg" "$authorization_arg" <<'REMOTE'
 set -euo pipefail
 expected_commit="$1"; branch="$2"; expected_sha="$3"; change_class="$4"
 shadow_path="$5"; previous_snapshot="$6"; authorization="$7"
+[ "$shadow_path" != "__EMPTY__" ] || shadow_path=""
+[ "$previous_snapshot" != "__EMPTY__" ] || previous_snapshot=""
+[ "$authorization" != "__EMPTY__" ] || authorization=""
 app_dir="/opt/telegram-kol-analyzer"
 temporary="$(mktemp /run/telegram-kol-update.bootstrap.XXXXXX)"
 trap 'rm -f "$temporary"' EXIT

@@ -89,6 +89,7 @@ def test_bootstrap_installs_only_sha_verified_helper_from_expected_commit():
     assert "git -C \"$app_dir\" show" in script
     assert "sha256sum" in script
     assert "UPDATER_SHA256" in script
+    assert "__EMPTY__" in script
     assert script.index("sha256sum") < script.index("/usr/local/bin/telegram-kol-update")
 
 
