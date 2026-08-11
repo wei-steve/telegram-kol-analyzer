@@ -473,6 +473,23 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
 }
 
 SQLITE_COMPAT_INDEXES: dict[str, str] = {
+    "ix_mimo_recognition_runs_message_status_created": (
+        "CREATE INDEX IF NOT EXISTS "
+        "ix_mimo_recognition_runs_message_status_created "
+        "ON mimo_recognition_runs (raw_message_id, status, created_at)"
+    ),
+    "ix_mimo_recognition_runs_status_created": (
+        "CREATE INDEX IF NOT EXISTS ix_mimo_recognition_runs_status_created "
+        "ON mimo_recognition_runs (status, created_at)"
+    ),
+    "ix_mimo_recognition_attempts_run_created": (
+        "CREATE INDEX IF NOT EXISTS ix_mimo_recognition_attempts_run_created "
+        "ON mimo_recognition_attempts (run_id, created_at)"
+    ),
+    "ix_mimo_recognition_attempts_status_created": (
+        "CREATE INDEX IF NOT EXISTS ix_mimo_recognition_attempts_status_created "
+        "ON mimo_recognition_attempts (status, created_at)"
+    ),
     "uq_strategy_revision_batches_entry_assembly": (
         "CREATE UNIQUE INDEX IF NOT EXISTS "
         "uq_strategy_revision_batches_entry_assembly "

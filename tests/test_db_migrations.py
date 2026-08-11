@@ -31,10 +31,104 @@ def test_context_resolution_schema_is_created(tmp_path):
     assert inspector.has_table("management_message_targets")
     assert inspector.has_table("instruction_execution_contracts")
     assert inspector.has_table("instruction_execution_transitions")
+    assert inspector.has_table("mimo_recognition_runs")
+    assert inspector.has_table("mimo_recognition_attempts")
     assert "strategy_thread_id" in {
         column["name"]
         for column in inspector.get_columns("strategy_lifecycles")
     }
+
+
+def test_mimo_recognition_audit_schema_is_additive_and_indexed(tmp_path):
+    database_path = tmp_path / "legacy-mimo-audit.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE sources "
+            "(id INTEGER PRIMARY KEY, display_name VARCHAR(255) NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO sources (id, display_name) VALUES (97, 'Legacy Source')"
+        )
+
+    session_factory = create_session_factory(database_path)
+    inspector = inspect(session_factory.kw["bind"])
+
+    assert inspector.has_table("mimo_recognition_runs")
+    assert inspector.has_table("mimo_recognition_attempts")
+    run_columns = {
+        column["name"]
+        for column in inspector.get_columns("mimo_recognition_runs")
+    }
+    assert {
+        "raw_message_id",
+        "run_kind",
+        "contract_version",
+        "model",
+        "input_kind",
+        "input_fingerprint",
+        "prompt_versions_json",
+        "status",
+        "attempt_count",
+        "retry_of_run_id",
+        "selected_attempt_ordinal",
+        "final_error_code",
+        "final_error_message",
+        "became_authoritative",
+        "canonical_payload_fingerprint",
+        "projection_fingerprint",
+        "started_at",
+        "completed_at",
+        "created_at",
+    } <= run_columns
+    attempt_columns = {
+        column["name"]
+        for column in inspector.get_columns("mimo_recognition_attempts")
+    }
+    assert {
+        "run_id",
+        "ordinal",
+        "retry_of_ordinal",
+        "status",
+        "error_code",
+        "error_message",
+        "response_fingerprint",
+        "started_at",
+        "completed_at",
+        "duration_ms",
+        "created_at",
+    } <= attempt_columns
+    run_indexes = {
+        index["name"]
+        for index in inspector.get_indexes("mimo_recognition_runs")
+    }
+    attempt_indexes = {
+        index["name"]
+        for index in inspector.get_indexes("mimo_recognition_attempts")
+    }
+    assert {
+        "ix_mimo_recognition_runs_message_status_created",
+        "ix_mimo_recognition_runs_status_created",
+    } <= run_indexes
+    assert {
+        "ix_mimo_recognition_attempts_run_created",
+        "ix_mimo_recognition_attempts_status_created",
+    } <= attempt_indexes
+    assert any(
+        constraint["column_names"] == ["run_id", "ordinal"]
+        for constraint in inspector.get_unique_constraints(
+            "mimo_recognition_attempts"
+        )
+    )
+    assert {
+        "ix_mimo_recognition_runs_message_status_created",
+        "ix_mimo_recognition_runs_status_created",
+        "ix_mimo_recognition_attempts_run_created",
+        "ix_mimo_recognition_attempts_status_created",
+    } <= set(SQLITE_COMPAT_INDEXES)
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT id, display_name FROM sources WHERE id = 97"
+        ).fetchone() == (97, "Legacy Source")
 
 
 def test_execution_contract_schema_bootstrap_is_idempotent_on_legacy_database(
