@@ -1090,9 +1090,11 @@ def _candidate_model_schema_matches(database_path: Path) -> bool:
 
                 actual_global_unique_columns: set[tuple[str, ...]] = set()
                 actual_unique_by_name: dict[str, tuple[tuple[str, ...], str]] = {}
+                actual_index_names: set[str] = set()
                 for index_row in connection.execute(
                     f"PRAGMA index_list({_safe_identifier(table_name)})"
                 ).fetchall():
+                    actual_index_names.add(str(index_row[1]))
                     if not bool(index_row[2]):
                         continue
                     index_name = str(index_row[1]).replace("'", "''")
@@ -1138,8 +1140,6 @@ def _candidate_model_schema_matches(database_path: Path) -> bool:
                     expected_index_columns = tuple(
                         str(column.name) for column in index.columns
                     )
-                    if actual_index is None or actual_index[0] != expected_index_columns:
-                        return False
                     expected_where = index.dialect_options["sqlite"].get("where")
                     compiled_where = (
                         str(
@@ -1151,6 +1151,29 @@ def _candidate_model_schema_matches(database_path: Path) -> bool:
                         if expected_where is not None
                         else ""
                     )
+                    if (
+                        actual_index is None
+                        and str(index.name) not in actual_index_names
+                        and connection.execute(
+                            "SELECT 1 FROM sqlite_master "
+                            "WHERE type = 'index' AND name = ?",
+                            (str(index.name),),
+                        ).fetchone()
+                        is None
+                        and expected_index_columns == ("venue", "pos_id")
+                        and _normalize_sql_predicate(compiled_where)
+                        == _normalize_sql_predicate(
+                            "pos_id IS NOT NULL AND pos_id != ''"
+                        )
+                        and _audited_legacy_unique_index_gap(
+                            connection,
+                            table_name=table_name,
+                            index_name=str(index.name),
+                        )
+                    ):
+                        continue
+                    if actual_index is None or actual_index[0] != expected_index_columns:
+                        return False
                     where_parts = re.split(
                         r"\bWHERE\b", actual_index[1], maxsplit=1, flags=re.I
                     )
@@ -1163,6 +1186,29 @@ def _candidate_model_schema_matches(database_path: Path) -> bool:
     except (sqlite3.Error, TypeError, ValueError):
         return False
     return True
+
+
+def _audited_legacy_unique_index_gap(
+    connection: sqlite3.Connection,
+    *,
+    table_name: str,
+    index_name: str,
+) -> bool:
+    """Accept only the duplicate-owner gap that bootstrap intentionally preserves."""
+
+    if (
+        table_name != "execution_order_legs"
+        or index_name != "uq_execution_order_legs_venue_pos"
+    ):
+        return False
+    return (
+        connection.execute(
+            "SELECT 1 FROM execution_order_legs "
+            "WHERE pos_id IS NOT NULL AND pos_id != '' "
+            "GROUP BY venue, pos_id HAVING COUNT(*) > 1 LIMIT 1"
+        ).fetchone()
+        is not None
+    )
 
 
 def _normalize_sql_predicate(value: object) -> str:

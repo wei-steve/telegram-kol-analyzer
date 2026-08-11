@@ -1113,6 +1113,108 @@ def test_schema_dry_run_rejects_expression_key_in_global_unique_index(tmp_path):
     assert module._candidate_model_schema_matches(dry_run) is False
 
 
+def test_schema_dry_run_accepts_audited_legacy_position_owner_duplicates(tmp_path):
+    import sqlite3
+    import telegram_kol_research.deployment_preflight as module
+
+    dry_run = tmp_path / "legacy-position-duplicates.db"
+    create_session_factory(dry_run)
+    connection = sqlite3.connect(dry_run)
+    connection.execute("DROP INDEX uq_execution_order_legs_venue_pos")
+    connection.executemany(
+        "INSERT INTO execution_order_legs "
+        "(execution_binding_id, leg_index, purpose, order_kind, pos_id, status, "
+        "venue, attribution_status, created_at, updated_at) VALUES "
+        "(?, 1, 'entry', 'unknown', "
+        "'legacy-duplicate-pos', 'active', 'deepcoin', 'unassigned', CURRENT_TIMESTAMP, "
+        "CURRENT_TIMESTAMP)",
+        [(1,), (2,)],
+    )
+    connection.commit()
+    connection.close()
+    create_session_factory(dry_run)
+
+    assert module._candidate_model_schema_matches(dry_run) is True
+
+
+def test_schema_dry_run_rejects_missing_position_owner_index_without_duplicates(
+    tmp_path,
+):
+    import sqlite3
+    import telegram_kol_research.deployment_preflight as module
+
+    dry_run = tmp_path / "missing-position-owner-index.db"
+    create_session_factory(dry_run)
+    connection = sqlite3.connect(dry_run)
+    connection.execute("DROP INDEX uq_execution_order_legs_venue_pos")
+    connection.commit()
+    connection.close()
+
+    assert module._candidate_model_schema_matches(dry_run) is False
+
+
+@pytest.mark.parametrize(
+    "replacement_sql",
+    [
+        "CREATE INDEX uq_execution_order_legs_venue_pos "
+        "ON execution_order_legs (venue, pos_id)",
+        "CREATE UNIQUE INDEX uq_execution_order_legs_venue_pos "
+        "ON execution_order_legs (venue, pos_id, id + 0)",
+    ],
+)
+def test_schema_dry_run_rejects_invalid_named_position_index_with_duplicates(
+    tmp_path,
+    replacement_sql,
+):
+    import sqlite3
+    import telegram_kol_research.deployment_preflight as module
+
+    dry_run = tmp_path / "invalid-named-position-index.db"
+    create_session_factory(dry_run)
+    connection = sqlite3.connect(dry_run)
+    connection.execute("DROP INDEX uq_execution_order_legs_venue_pos")
+    connection.executemany(
+        "INSERT INTO execution_order_legs "
+        "(execution_binding_id, leg_index, purpose, order_kind, pos_id, status, "
+        "venue, attribution_status, created_at, updated_at) VALUES "
+        "(?, 1, 'entry', 'unknown', 'legacy-duplicate-pos', 'active', "
+        "'deepcoin', 'unassigned', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        [(1,), (2,)],
+    )
+    connection.execute(replacement_sql)
+    connection.commit()
+    connection.close()
+
+    assert module._candidate_model_schema_matches(dry_run) is False
+
+
+def test_schema_dry_run_rejects_position_index_name_owned_by_another_table(
+    tmp_path,
+):
+    import sqlite3
+    import telegram_kol_research.deployment_preflight as module
+
+    dry_run = tmp_path / "cross-table-position-index.db"
+    create_session_factory(dry_run)
+    connection = sqlite3.connect(dry_run)
+    connection.execute("DROP INDEX uq_execution_order_legs_venue_pos")
+    connection.executemany(
+        "INSERT INTO execution_order_legs "
+        "(execution_binding_id, leg_index, purpose, order_kind, pos_id, status, "
+        "venue, attribution_status, created_at, updated_at) VALUES "
+        "(?, 1, 'entry', 'unknown', 'legacy-duplicate-pos', 'active', "
+        "'deepcoin', 'unassigned', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        [(1,), (2,)],
+    )
+    connection.execute(
+        "CREATE UNIQUE INDEX uq_execution_order_legs_venue_pos ON raw_messages(id)"
+    )
+    connection.commit()
+    connection.close()
+
+    assert module._candidate_model_schema_matches(dry_run) is False
+
+
 def test_collector_rejects_incomplete_database_schema(tmp_path):
     database = tmp_path / "empty.db"
     database.touch()
