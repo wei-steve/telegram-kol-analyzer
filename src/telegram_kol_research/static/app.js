@@ -591,9 +591,7 @@ function bindGroupContext() {
 
 async function refreshGroupList() {
   const selectedChatId = getSelectedChatId();
-  const url = `/groups?selected_chat_id=${selectedChatId}&_t=${Date.now()}`;
-  const response = await fetch(url, { cache: 'no-store' });
-  const html = await response.text();
+  const html = await fetchWorkbenchHtml(`/groups?selected_chat_id=${selectedChatId}`);
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, 'text/html');
 
@@ -636,22 +634,16 @@ function sidebarLooksLikeZeroRegression(currentList, nextList) {
 
 async function fetchMessagePanel(chatId, options = {}) {
   const url = buildMessagesUrl(chatId, options);
-  const cacheBusted = url.includes('?') ? `${url}&_t=${Date.now()}` : `${url}?_t=${Date.now()}`;
-  const response = await fetch(cacheBusted, { cache: 'no-store' });
-  const html = await response.text();
+  const html = await fetchWorkbenchHtml(url);
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, 'text/html');
   return doc.querySelector('[data-messages-panel]');
 }
 
 async function fetchDetailPanel(chatId, options = {}) {
-  const url = `/groups/${chatId}/detail?_t=${Date.now()}`;
-  const response = await fetch(url, {
-    cache: 'no-store',
+  const html = await fetchWorkbenchHtml(`/groups/${chatId}/detail`, {
     signal: options.signal,
   });
-  if (!response.ok) throw new Error(`detail request failed: ${response.status}`);
-  const html = await response.text();
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, 'text/html');
   const fragment = doc.querySelector('.strategy-detail-shell');
@@ -660,13 +652,9 @@ async function fetchDetailPanel(chatId, options = {}) {
 }
 
 async function fetchStrategyMidPanel(chatId, filter, options = {}) {
-  const url = `/groups/${chatId}/strategy-mid-panel?filter=${filter}&_t=${Date.now()}`;
-  const response = await fetch(url, {
-    cache: 'no-store',
+  const html = await fetchWorkbenchHtml(`/groups/${chatId}/strategy-mid-panel?filter=${filter}`, {
     signal: options.signal,
   });
-  if (!response.ok) throw new Error(`strategy request failed: ${response.status}`);
-  const html = await response.text();
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, 'text/html');
   const fragment = doc.querySelector('.strategy-panel-content');
@@ -742,8 +730,7 @@ function bindDetailPanelControls() {
           } else {
             url = `/groups/${chatId}/detail/tab/${targetPanel}`;
           }
-          const response = await fetch(url, { cache: 'no-store' });
-          const html = await response.text();
+          const html = await fetchWorkbenchHtml(url);
           panel.innerHTML = html;
           delete panel.dataset.tabLazy;
           
@@ -1360,6 +1347,7 @@ function markWorkbenchLoaded(view, key = workbenchLoadKey(view)) {
 }
 
 function showWorkbenchLoadError(view, error, retryLoader = null) {
+  if (error instanceof WorkbenchAssetVersionMismatchError) return;
   const container = document.querySelector(`[data-lazy-workbench="${view}"]`);
   if (!container) return;
   if (view === 'more') {
@@ -1446,8 +1434,9 @@ function handleWorkbenchAssetVersionMismatch(serverVersion) {
   window.location.reload();
 }
 
-async function fetchWorkbenchPartial(url, selector) {
-  const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}_t=${Date.now()}`, { cache: 'no-store' });
+async function fetchWorkbenchHtml(url, options = {}) {
+  const requestUrl = `${url}${url.includes('?') ? '&' : '?'}_t=${Date.now()}`;
+  const response = await fetch(requestUrl, { ...options, cache: 'no-store' });
   if (!response.ok) throw new Error(`请求失败 (${response.status})`);
   const pageVersion = document.documentElement?.dataset?.workbenchAssetVersion || '';
   const serverVersion = response.headers?.get?.('X-Workbench-Asset-Version') || '';
@@ -1457,7 +1446,11 @@ async function fetchWorkbenchPartial(url, selector) {
       `workbench asset version changed from ${pageVersion} to ${serverVersion}`,
     );
   }
-  const html = await response.text();
+  return response.text();
+}
+
+async function fetchWorkbenchPartial(url, selector, options = {}) {
+  const html = await fetchWorkbenchHtml(url, options);
   const doc = new DOMParser().parseFromString(html, 'text/html');
   const fragment = doc.querySelector(selector);
   if (!fragment) throw new Error('返回内容不完整');
@@ -1651,9 +1644,7 @@ async function loadStrategyRecords({
   if (current && resolvedScrollMode === 'preserve') saveStrategyRecordScrollPosition();
   if (container) container.setAttribute('aria-busy', 'true');
   try {
-    const response = await fetch(`/strategy-records?${params}`, { cache: 'no-store' });
-    if (!response.ok) throw new Error(`请求失败 (${response.status})`);
-    const html = await response.text();
+    const html = await fetchWorkbenchHtml(`/strategy-records?${params}`);
     if (requestId !== strategyRecordRequestId) return false;
     const doc = new DOMParser().parseFromString(html, 'text/html');
     const fragment = doc.querySelector('[data-strategy-record-list]');
@@ -1666,6 +1657,7 @@ async function loadStrategyRecords({
     updateStrategyRecordChangesBadge();
     return true;
   } catch (error) {
+    if (error instanceof WorkbenchAssetVersionMismatchError) return false;
     if (requestId !== strategyRecordRequestId) return false;
     if (strategyRecordSelectionMatches(selection)) {
       rollbackStrategyRecordSelection();
@@ -1917,9 +1909,8 @@ async function loadGroupsPanel() {
 async function loadMorePanel() {
   const container = document.querySelector('[data-lazy-workbench="more"]');
   if (!container) return;
-  const response = await fetch(`/more-panel?_t=${Date.now()}`, { cache: 'no-store' });
-  if (!response.ok) throw new Error(`请求失败 (${response.status})`);
-  const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+  const html = await fetchWorkbenchHtml('/more-panel');
+  const doc = new DOMParser().parseFromString(html, 'text/html');
   const dashboard = document.querySelector('[data-trader-dashboard]');
   if (!dashboard) throw new Error('工作台容器不完整');
   doc.querySelectorAll('[data-dashboard-panel]:not([data-workbench-panel])').forEach((panel) => {
@@ -2432,6 +2423,11 @@ function bindExchangeTabRetryControls(root) {
 }
 
 function bindHistoryBrowseControls(root) {
+  const panel = root?.querySelector?.('[data-exchange-position-panel="position-history"]');
+  if (panel && panel.dataset.historyLoadedCount === undefined) {
+    const list = panel.querySelector('[data-exchange-view-panel="list"] .exchange-card-list');
+    panel.dataset.historyLoadedCount = String(historyPositionIdSet(list).size);
+  }
   root?.querySelectorAll?.('[data-history-load-more]').forEach((button) => {
     if (button.dataset.historyLoadMoreBound === 'true') return;
     button.dataset.historyLoadMoreBound = 'true';
@@ -2561,7 +2557,8 @@ function loadMoreHistoryPositions(root) {
       bindHistoryBrowseControls(root);
       return true;
     })
-    .catch(() => {
+    .catch((error) => {
+      if (error instanceof WorkbenchAssetVersionMismatchError) return false;
       if (status) status.textContent = '加载失败，重试';
       if (button) { button.disabled = false; button.textContent = '加载更多'; }
       return false;
@@ -2573,12 +2570,18 @@ function appendHistoryGroups(panel, fragment, acceptedIds) {
   const currentGroups = panel.querySelector('[data-exchange-view-panel="grouped"] .exchange-group-list');
   const nextGroups = fragment.querySelector('[data-exchange-view-panel="grouped"] .exchange-group-list');
   if (!currentGroups || !nextGroups) return;
+  const remainingAcceptedIds = new Set(acceptedIds);
   nextGroups.querySelectorAll('[data-exchange-group-section]').forEach((incoming) => {
     const name = incoming.dataset.exchangeGroupName;
     const incomingCards = incoming.querySelector('.exchange-card-list');
     if (!incomingCards) return;
     Array.from(incomingCards.querySelectorAll('[data-history-position-id]')).forEach((card) => {
-      if (!acceptedIds.has(historyPositionCardId(card))) card.remove();
+      const id = historyPositionCardId(card);
+      if (!remainingAcceptedIds.has(id)) {
+        card.remove();
+        return;
+      }
+      remainingAcceptedIds.delete(id);
     });
     const acceptedCards = Array.from(
       incomingCards.querySelectorAll('[data-history-position-id]'),
@@ -2704,7 +2707,8 @@ function loadExchangePositionTab(root, tab, { force = false } = {}) {
       bindBoundPositionCloseButtons();
       bindLivePositionAttributionButtons();
       return true;
-    } catch {
+    } catch (error) {
+      if (error instanceof WorkbenchAssetVersionMismatchError) return false;
       const current = root.querySelector(selector);
       if (wasLoaded && force) {
         setExchangeTabRefreshStatus(

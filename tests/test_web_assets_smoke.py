@@ -615,6 +615,25 @@ def test_workbench_partial_asset_version_mismatch_reloads_once_without_returning
     assert result.returncode == 0, result.stderr
 
 
+def test_all_workbench_html_loaders_use_the_asset_version_handshake(tmp_path):
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+
+    for function_name in (
+        "refreshGroupList",
+        "fetchMessagePanel",
+        "fetchDetailPanel",
+        "fetchStrategyMidPanel",
+        "loadStrategyRecords",
+        "loadMorePanel",
+    ):
+        start = js.index(f"function {function_name}")
+        end = js.index("\nfunction ", start + 1)
+        block = js[start:end]
+        assert "fetchWorkbenchHtml(" in block
+
+
 def test_history_load_more_tracks_cumulative_unique_count(tmp_path):
     if shutil.which("node") is None:
         pytest.skip("Node.js is required for the history pagination behavior test")
@@ -663,30 +682,147 @@ def test_history_load_more_tracks_cumulative_unique_count(tmp_path):
           historyHasMore: 'true',
           historyTotalCount: '100',
         });
-        const nextIds = ['pos-19', ...Array.from({ length: 19 }, (_, index) => `pos-${index + 20}`)];
-        const next = new FakePanel(nextIds, {
+        const next = new FakePanel(Array.from({ length: 20 }, (_, index) => `pos-${index + 20}`), {
           historyNextCursor: 'cursor-2',
           historyHasMore: 'true',
           historyTotalCount: '100',
         });
+        const final = new FakePanel(
+          ['pos-39', ...Array.from({ length: 19 }, (_, index) => `pos-${index + 40}`)],
+          {
+            historyNextCursor: 'cursor-3',
+            historyHasMore: 'true',
+            historyTotalCount: '100',
+          },
+        );
+        let activePanel = current;
         const root = {
           querySelector: (selector) => selector === '[data-exchange-position-panel="position-history"]'
-            ? current
+            ? activePanel
             : null,
           querySelectorAll: () => [],
         };
-        var fetchWorkbenchPartial = async () => next;
+        const fragments = [next, final];
+        var fetchWorkbenchPartial = async () => fragments.shift();
+
+        bindHistoryBrowseControls(root);
+        if (current.dataset.historyLoadedCount !== '20') {
+          throw new Error(`expected initial count 20, got ${current.dataset.historyLoadedCount}`);
+        }
 
         await loadMoreHistoryPositions(root);
 
+        if (current.dataset.historyLoadedCount !== '40') {
+          throw new Error(`expected cumulative count 40, got ${current.dataset.historyLoadedCount}`);
+        }
+        if (current.status.textContent !== '已显示 40 / 100 条') {
+          throw new Error(`unexpected first status: ${current.status.textContent}`);
+        }
+        await loadMoreHistoryPositions(root);
         const ids = current.list.children.map((card) => card.dataset.historyPositionId);
         if (ids.length !== new Set(ids).size) throw new Error('duplicate history card appended');
-        if (ids.length !== 39) throw new Error(`expected 39 unique cards, got ${ids.length}`);
-        if (current.dataset.historyLoadedCount !== '39') {
-          throw new Error(`expected cumulative count 39, got ${current.dataset.historyLoadedCount}`);
+        if (ids.length !== 59) throw new Error(`expected 59 unique cards, got ${ids.length}`);
+        if (current.dataset.historyLoadedCount !== '59') {
+          throw new Error(`expected cumulative count 59, got ${current.dataset.historyLoadedCount}`);
         }
-        if (current.status.textContent !== '已显示 39 / 100 条') {
-          throw new Error(`unexpected status: ${current.status.textContent}`);
+        if (current.status.textContent !== '已显示 59 / 100 条') {
+          throw new Error(`unexpected second status: ${current.status.textContent}`);
+        }
+
+        class WorkbenchAssetVersionMismatchError extends Error {}
+        fetchWorkbenchPartial = async () => {
+          current.status.textContent = '检测到新版本，正在刷新…';
+          throw new WorkbenchAssetVersionMismatchError();
+        };
+        await loadMoreHistoryPositions(root);
+        if (current.status.textContent !== '检测到新版本，正在刷新…') {
+          throw new Error('asset mismatch status was overwritten');
+        }
+
+        const fresh = new FakePanel(['fresh-1', 'fresh-2'], {
+          historyBrowseToken: 'fresh-token',
+          historyNextCursor: 'fresh-cursor',
+          historyHasMore: 'false',
+          historyTotalCount: '2',
+        });
+        activePanel = fresh;
+        bindHistoryBrowseControls(root);
+        if (fresh.dataset.historyLoadedCount !== '2') {
+          throw new Error(`expected fresh count 2, got ${fresh.dataset.historyLoadedCount}`);
+        }
+        """
+    )
+    result = subprocess.run(
+        ["node", "-e", "\n".join((js[functions_start:functions_end], harness))],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_history_group_merge_consumes_each_accepted_id_once(tmp_path):
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is required for the grouped history behavior test")
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+    functions_start = js.index("function historyPositionCardId")
+    functions_end = js.index("\nfunction bindExchangePositionTabs", functions_start)
+    harness = textwrap.dedent(
+        """
+        class FakeCard {
+          constructor(id) { this.dataset = { historyPositionId: id }; this.parent = null; }
+          remove() { this.parent.children = this.parent.children.filter((card) => card !== this); }
+        }
+        class FakeList {
+          constructor(ids) {
+            this.children = ids.map((id) => new FakeCard(id));
+            this.children.forEach((card) => { card.parent = this; });
+          }
+          querySelectorAll(selector) {
+            if (selector === '[data-history-position-id]') return this.children;
+            if (selector === '[data-deepcoin-history-position]') return this.children;
+            return [];
+          }
+          querySelector() { return null; }
+          appendChild(card) { card.parent = this; this.children.push(card); }
+        }
+        class FakeSection {
+          constructor(name, ids) {
+            this.dataset = { exchangeGroupName: name };
+            this.list = new FakeList(ids);
+            this.count = { textContent: String(ids.length) };
+          }
+          querySelector(selector) {
+            if (selector === '.exchange-card-list') return this.list;
+            if (selector === '.exchange-group-header span') return this.count;
+            return null;
+          }
+        }
+        class FakeGroups {
+          constructor(sections = []) { this.sections = sections; }
+          querySelectorAll(selector) {
+            return selector === '[data-exchange-group-section]' ? this.sections : [];
+          }
+          querySelector() { return null; }
+          appendChild(section) { this.sections.push(section); }
+        }
+        const currentGroups = new FakeGroups();
+        const nextGroups = new FakeGroups([
+          new FakeSection('group-a', ['pos-20', 'pos-20']),
+          new FakeSection('group-b', ['pos-20', 'pos-21']),
+        ]);
+        const panel = { querySelector: (selector) => selector.includes('grouped') ? currentGroups : null };
+        const fragment = { querySelector: (selector) => selector.includes('grouped') ? nextGroups : null };
+
+        appendHistoryGroups(panel, fragment, new Set(['pos-20', 'pos-21']));
+
+        const cards = currentGroups.sections.flatMap((section) => section.list.children);
+        const ids = cards.map((card) => card.dataset.historyPositionId);
+        if (ids.length !== 2 || new Set(ids).size !== 2) {
+          throw new Error(`expected one grouped card per accepted ID, got ${ids}`);
         }
         """
     )
@@ -715,6 +851,7 @@ def test_exchange_position_tab_manual_refresh_is_single_flight_and_preserves_dat
     functions_end = js.index("\nfunction boundedContractSpecStatusText", functions_start)
     harness = textwrap.dedent(
         """
+        class WorkbenchAssetVersionMismatchError extends Error {}
         const storage = new Map([
           [EXCHANGE_POSITION_TAB_KEY, 'open-orders'],
           [EXCHANGE_POSITION_VIEW_KEY, 'list'],
@@ -1419,7 +1556,7 @@ def test_app_js_lazy_loads_workbench_destinations_without_forced_startup_refresh
     assert "loadStrategyRecords" in js
     assert "'/strategy-records?filter=needs_attention'" in js
     assert "loadPositionsPanel" in js
-    assert "fetch(`/strategy-records?${params}`, { cache: 'no-store' })" in js
+    assert "fetchWorkbenchHtml(`/strategy-records?${params}`)" in js
     assert js.count("bindWorkflowFilters();") >= 5
     assert "workflowFilterBound" in js
     assert "refreshFromDatabaseChanges({ force: true });" not in js
