@@ -24,7 +24,11 @@ from telegram_kol_research.prompt_registry import (
     save_prompt_draft,
     seed_prompt_definition,
 )
-from telegram_kol_research.prompt_defaults import DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
+from telegram_kol_research.prompt_defaults import (
+    DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT,
+    DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT,
+    MIMO_V2_AUTHORITATIVE_PROMPT,
+)
 
 
 def test_shared_prompt_defines_non_executable_entry_preamble_contract():
@@ -242,6 +246,46 @@ def test_publish_rejects_a_draft_without_successful_validation(tmp_path):
             "trading.analysis.shared",
             expected_draft_version_id=detail.draft_version.id,
             expected_active_version_id=detail.active_version.id,
+        )
+
+
+def test_publish_rejects_invalid_mimo_v2_even_if_validation_was_marked_successful(
+    tmp_path,
+):
+    factory = create_session_factory(tmp_path / "research.db")
+    original = seed_prompt_definition(
+        factory,
+        PromptSeed(
+            prompt_key=MIMO_V2_AUTHORITATIVE_PROMPT,
+            display_name="MiMo v2",
+            description="MiMo v2 authoritative contract",
+            category="trading",
+            consumers=("mimo",),
+            required_variables=(),
+            validation_profile="mimo_v2_authoritative",
+            content=DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT,
+        ),
+    )
+    detail = save_prompt_draft(
+        factory,
+        MIMO_V2_AUTHORITATIVE_PROMPT,
+        content=DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT.replace('"intents"', ""),
+        change_note="unsafe removal",
+    )
+    record_prompt_validation(
+        factory,
+        MIMO_V2_AUTHORITATIVE_PROMPT,
+        expected_draft_version_id=detail.draft_version.id,
+        success=True,
+        errors=(),
+    )
+
+    with pytest.raises(PromptRegistryValidationError, match="MiMo v2"):
+        publish_prompt_draft(
+            factory,
+            MIMO_V2_AUTHORITATIVE_PROMPT,
+            expected_draft_version_id=detail.draft_version.id,
+            expected_active_version_id=original.active_version.id,
         )
 
 

@@ -9,9 +9,10 @@ from telegram_kol_research.prompt_composition import (
     validate_prompt_content,
 )
 from telegram_kol_research.prompt_defaults import (
+    DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT,
     DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT,
     DEFAULT_SEMANTIC_DISAGREEMENT_REVIEW_PROMPT,
-    DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT,
+    MIMO_V2_AUTHORITATIVE_PROMPT,
     MIMO_VISION_PROMPT,
     SHARED_TRADING_PROMPT,
     STRATEGY_ALERT_PROMPT,
@@ -65,6 +66,12 @@ def prompt_factory(tmp_path):
     factory = create_session_factory(tmp_path / "research.db")
     _seed(factory, key=SHARED_TRADING_PROMPT, content="A_MARKER")
     _seed(factory, key=MIMO_VISION_PROMPT, content="B_MARKER IMAGE_ONLY_MARKER")
+    _seed(
+        factory,
+        key=MIMO_V2_AUTHORITATIVE_PROMPT,
+        content=DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT,
+        profile="mimo_v2_authoritative",
+    )
     return factory
 
 
@@ -95,6 +102,44 @@ def test_mimo_uses_a_and_b_exactly_once(prompt_factory):
         SHARED_TRADING_PROMPT,
         MIMO_VISION_PROMPT,
     }
+
+
+def test_mimo_v2_composition_has_one_contract_and_preserves_v1(prompt_factory):
+    legacy = compose_trading_prompt(
+        prompt_factory,
+        model_kind="mimo",
+        context="C",
+    )
+    explicit_v1 = compose_trading_prompt(
+        prompt_factory,
+        model_kind="mimo",
+        context="C",
+        contract_version="v1",
+    )
+    v2 = compose_trading_prompt(
+        prompt_factory,
+        model_kind="mimo",
+        context="C",
+        contract_version="v2",
+    )
+
+    assert explicit_v1 == legacy
+    assert '"contract_version": "mimo-authoritative-v2"' not in legacy.system_prompt
+    assert v2.system_prompt.count('"contract_version": "mimo-authoritative-v2"') == 1
+    assert "生命周期事件与仓位管理" in v2.system_prompt
+    assert "图文证据分离" in v2.system_prompt
+    assert "每张图片" in v2.system_prompt
+    assert v2.version_map.keys() == {MIMO_V2_AUTHORITATIVE_PROMPT}
+
+
+def test_deepseek_rejects_mimo_v2_contract(prompt_factory):
+    with pytest.raises(PromptCompositionError, match="MiMo v2"):
+        compose_trading_prompt(
+            prompt_factory,
+            model_kind="deepseek",
+            context="C",
+            contract_version="v2",
+        )
 
 
 def test_unknown_trading_model_kind_fails_closed(prompt_factory):
@@ -163,6 +208,42 @@ def test_mimo_vision_validation_rejects_json_output_instruction():
 
     assert result.success is False
     assert any("输出结构" in error for error in result.errors)
+
+
+def test_mimo_v2_validation_accepts_closed_default_contract():
+    result = validate_prompt_content(
+        MIMO_V2_AUTHORITATIVE_PROMPT,
+        DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT,
+        validation_profile="mimo_v2_authoritative",
+        required_variables=(),
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.parametrize(
+    "marker",
+    (
+        '"intents"',
+        '"intent_type"',
+        '"evidence"',
+        '"images"',
+        '"source"',
+        "不得静默合并",
+        "只输出一个 JSON 对象",
+        "不得添加额外字段",
+    ),
+)
+def test_mimo_v2_validation_rejects_missing_contract_or_safety_marker(marker):
+    result = validate_prompt_content(
+        MIMO_V2_AUTHORITATIVE_PROMPT,
+        DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT.replace(marker, ""),
+        validation_profile="mimo_v2_authoritative",
+        required_variables=(),
+    )
+
+    assert result.success is False
+    assert any(marker in error for error in result.errors)
 
 
 def test_semantic_disagreement_review_validation_accepts_default_prompt():

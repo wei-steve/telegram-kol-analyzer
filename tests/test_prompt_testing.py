@@ -14,7 +14,9 @@ from telegram_kol_research.models import (
     StrategyLifecycle,
 )
 from telegram_kol_research.prompt_defaults import (
+    DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT,
     DEFAULT_MIMO_VISION_PROMPT,
+    MIMO_V2_AUTHORITATIVE_PROMPT,
     MIMO_VISION_PROMPT,
     DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT,
     SHARED_TRADING_PROMPT,
@@ -31,6 +33,28 @@ def _payload(event_type: str) -> dict:
         "lifecycle_event": {"event_type": event_type, "confidence": 0.9},
         "input_reading": {"observed_text": "出局", "image_quality": "none"},
         "confidence": 0.9,
+    }
+
+
+def _v2_payload(summary: str = "普通市场评论") -> dict:
+    return {
+        "contract_version": "mimo-authoritative-v2",
+        "summary": summary,
+        "confidence": 0.9,
+        "intents": [
+            {
+                "intent_type": "market_commentary",
+                "action": None,
+                "reason": "当前消息只表达市场观点",
+                "confidence": 0.9,
+                "evidence_refs": ["text:observed_text"],
+            }
+        ],
+        "evidence": {
+            "text": {"observed_text": "看多市场", "fields": {}},
+            "images": [],
+            "conflicts": [],
+        },
     }
 
 
@@ -159,6 +183,66 @@ def test_draft_test_rejects_parseable_but_invalid_model_payload(tmp_path):
     assert "invalid recognition_result" in result.error_message
     with factory() as session:
         assert session.query(AiPromptTestRun).one().status == "failed"
+
+
+def test_mimo_v2_draft_test_uses_strict_v2_parser(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    seed_default_prompt_registry(factory, AiRecognitionConfig())
+    with factory() as session:
+        message = RawMessage(chat_id=1, message_id=3, text="看多市场")
+        session.add(message)
+        session.commit()
+        raw_id = message.id
+    detail = save_prompt_draft(
+        factory,
+        MIMO_V2_AUTHORITATIVE_PROMPT,
+        content=DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT + "\n<!-- draft -->",
+        change_note="v2 parser regression",
+    )
+
+    result = run_prompt_draft_test(
+        factory,
+        prompt_key=MIMO_V2_AUTHORITATIVE_PROMPT,
+        draft_version_id=detail.draft_version.id,
+        raw_message_id=raw_id,
+        model_kind="mimo",
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+        model_caller=lambda **_: _v2_payload(),
+    )
+
+    assert result.error_message is None
+    with factory() as session:
+        assert session.query(AiPromptTestRun).one().status == "completed"
+
+
+def test_mimo_v2_draft_test_rejects_legacy_payload(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    seed_default_prompt_registry(factory, AiRecognitionConfig())
+    with factory() as session:
+        message = RawMessage(chat_id=1, message_id=4, text="hello")
+        session.add(message)
+        session.commit()
+        raw_id = message.id
+    detail = save_prompt_draft(
+        factory,
+        MIMO_V2_AUTHORITATIVE_PROMPT,
+        content=DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT + "\n<!-- draft -->",
+        change_note="reject v1 output",
+    )
+
+    result = run_prompt_draft_test(
+        factory,
+        prompt_key=MIMO_V2_AUTHORITATIVE_PROMPT,
+        draft_version_id=detail.draft_version.id,
+        raw_message_id=raw_id,
+        model_kind="mimo",
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+        model_caller=lambda **_: _payload("none"),
+    )
+
+    assert "top_level_fields_invalid" in result.error_message
 
 
 def test_mimo_vision_draft_test_forwards_readable_image_assets(tmp_path):

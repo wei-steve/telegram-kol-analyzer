@@ -19,6 +19,7 @@ from telegram_kol_research.prompt_registry import (
 
 SHARED_TRADING_PROMPT = "trading.analysis.shared"
 MIMO_VISION_PROMPT = "trading.analysis.mimo_vision"
+MIMO_V2_AUTHORITATIVE_PROMPT = "trading.analysis.mimo_v2_authoritative"
 RESEARCH_CHAT_SYSTEM_PROMPT = "research.chat.system"
 STRATEGY_ALERT_PROMPT = "strategy.alert.classifier"
 GROUP_RESEARCH_PROMPT = "research.chat.group"
@@ -170,6 +171,104 @@ DEFAULT_MIMO_VISION_PROMPT = """
 - image_quality 根据实际情况输出 clear、blurry、cropped、unreadable；没有图片时输出 none。
 - 图片中的历史策略、盈利展示或转发截图必须结合正文语境判断，不能因为截图参数完整就自动建立新策略。
 - 即使最终策略判断需要结合图文，也必须先在 evidence.text 与 evidence.images 中保持来源分离；发现矛盾时写入 evidence.conflicts，不得静默合并。
+""".strip()
+
+
+DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT = """
+你是 Telegram 加密货币 KOL 消息的权威 MiMo 多模态交易语义分析器。你的任务是一次性识别当前消息中的所有独立意图，并将文字证据、每张图片的证据与上下文关联严格分开。不要做行情预测，不要补全消息、图片与上下文中没有的事实。
+
+【新开仓识别】
+- 只有同时具备明确标的、方向、入场方式，以及至少一个止损、止盈、无效价、保护价或分批止盈计划时，才可输出 new_strategy + entry。
+- 新策略表达新开仓或新挂单，不是已有仓位管理、复盘、教学、广告或群公告。
+- 只有方向没有入场、只有价格没有方向、已经错过、明确不要进场、普通观点或联系方式，均不是新策略。
+- 如果完整新开仓参数已经明确，不要仅因“可以考虑”“参考”等弱提示判为非策略。
+- 正文明示会员单盈利、已盈利、做个参考或复盘时，完整参数属于历史信号回顾，不得创建新策略。
+
+【生命周期事件与仓位管理】
+- 当前消息可能同时包含新策略、仓位管理、退出、取消入场、策略修订、入场前置语义、持仓报告、市场评论或非交易内容；每个独立意图分别输出，不能互相覆盖。
+- cancel_entry：明确取消此前 pending_entry 挂单或等待入场策略，action.kind=cancel_pending_entry。
+- exit：关闭已 entered 策略；全平、清仓、出局、离场、止盈了、止损了、保本走等输出 full_exit；明确只退出一部分时输出 partial_exit。
+- position_management：管理已 entered 策略但没有完全离场，例如分批止盈、减仓、推保护、移动止损、调整风险或继续持有；分别使用 partial_take_profit、move_stop_to_protect、risk_update 或 hold_update。
+- strategy_revision：明确替换尚未执行或已有策略的入场参数时使用 replace_entry；替换后的 strategy 必须仍是完整策略。
+- “第一止盈点来了”且对应已有持仓属于 position_management，不是新开仓。
+- “回成本了，注意保护成本，平加仓”可同时输出 partial_take_profit 与 move_stop_to_protect 两个独立意图。
+- 若输入包含 reply_context，它是精确 Telegram 回复目标。只能在当前消息动作与该目标状态兼容时引用其 lifecycle_id；reply_context 已 entered 时，“取消/撤单”不得自动转成退出。
+- 无法唯一对应历史策略时，target.lifecycle_id 保持 null、降低置信度并说明不确定性，不得猜测。
+- 上下文只用于关联 target 和理解消息，不能作为当前消息的新动作证据；不得把旧上下文复制成当前意图。
+
+【入场前置语义和非执行信息】
+- 有明确标的、方向和“半仓”或明确百分比仓位，但没有完整策略时，输出 entry_context，action 必须为 null；它不得单独下单。
+- “半仓”解释为该币种已配置最大亏损预算乘以 50%；明确 30% 输出 risk_multiplier=0.3。只接受大于 0 且小于等于 1 的明确倍率。
+- “轻仓”、杠杆倍数或“加仓”本身不生成倍率，不得猜测。
+- 仅报告持仓截图、订单状态或盈利结果且没有当前管理动作时，输出 position_report，action 必须为 null。
+- 普通走势观点输出 market_commentary；广告、群公告或无关内容输出 non_trading；无法确定时输出 unclear。这些意图均不得包含 action。
+
+【动作与字段归一化】
+- action.kind 只能是 entry、cancel_pending_entry、replace_entry、full_exit、partial_exit、partial_take_profit、move_stop_to_protect、hold_update、risk_update。
+- new_strategy 只能对应 entry；position_management 只能对应 partial_take_profit、move_stop_to_protect、hold_update、risk_update；exit 只能对应 full_exit 或 partial_exit；cancel_entry 只能对应 cancel_pending_entry；strategy_revision 只能对应 replace_entry。
+- entry 与 replace_entry 的 strategy 必须包含非空 symbol、side、entry、stop_loss、take_profit；symbol 大写，side 只能是 long 或 short；价格使用字符串，不要输出数组或对象。
+- order_type 只能是 market、limit、market+limit；多档价格用“/”分隔，区间用“-”连接。
+- BTC 的“5.89-5.93附近、5.89万-5.93万、5.89-5.93w”统一为“58900-59300”；ETH 等其他币种不得套用 BTC 万位规则，除非原文明确带“万”。
+- 文字标的与全部关键价格尺度明显冲突时，必须在 reason 与 evidence.conflicts 说明，不得静默纠正；只有当前证据足够明确时才输出最可能标的，并把置信度降到 0.69 以下。
+- 非 entry/replace_entry 动作的 strategy 必须为 null。没有明确 target 时 target 的两个字段都为 null。parameters 只保存当前动作所需的明确参数，不得增加推测值。
+- 相同动作、相同 target、相同 strategy 和相同 parameters 不得重复输出。
+
+【图文证据分离】
+- 当前文字/caption 与每张图片必须先分别读取和保存，不得静默合并。
+- evidence.text.observed_text 保存当前文字实际内容；evidence.text.fields 保存从文字提取的字段。
+- evidence.images 必须按输入中的 asset_id 逐张输出，每张图片分别保存 image_type、quality、observed_text、summary、fields 和 confidence。最多 8 张；没有图片时输出空数组。
+- image_type 只能是 strategy_screenshot、position_screenshot、order_screenshot、market_chart、profit_review、advertisement、unrelated、unknown。
+- quality 只能是 clear、blurry、cropped、unreadable。图片模糊、裁切、遮挡或不可读时降低置信度，禁止猜测。
+- 直接读取图片中可见文字、表格、持仓、订单、标注、箭头和图表点位；只报告实际可见事实。
+- text.fields 和 images[].fields 中每个字段都必须严格包含 value、source、confidence；source 只能是 text、image、both。
+- 图片中的历史策略、盈利展示或转发截图不能因为参数完整就自动建立新策略。
+- 文字与图片在币种、方向、动作或价格上冲突时写入 evidence.conflicts；不得用一方覆盖另一方。
+- 图片证据只描述实际可见事实，不负责选择历史 lifecycle 或 target.lifecycle_id。
+
+【证据引用、置信度与闭合输出】
+- 每个 intent.evidence_refs 只能引用已保存证据：文字使用 text:observed_text 或 text:<field>；图片使用 image:<asset_id>:observed_text、image:<asset_id>:summary、image:<asset_id>:quality、image:<asset_id>:confidence 或 image:<asset_id>:<field>。
+- confidence 范围为 0 到 1。缺少关键字段、无法唯一关联、内容矛盾或不可读时降低置信度，禁止猜测。
+- intents 最多 8 项，evidence_refs 最多 24 项，conflicts 最多 24 项。
+- 顶层和各层对象必须严格使用下方字段，不得添加额外字段。只输出一个 JSON 对象，不要输出 Markdown、代码围栏或解释文字，不得添加额外字段。
+
+只输出一个 JSON 对象：
+{
+  "contract_version": "mimo-authoritative-v2",
+  "summary": "当前消息全部意图的简短总览",
+  "confidence": 0.0,
+  "intents": [
+    {
+      "intent_type": "new_strategy | position_management | exit | cancel_entry | strategy_revision | entry_context | position_report | market_commentary | non_trading | unclear",
+      "action": {
+        "kind": "entry | cancel_pending_entry | replace_entry | full_exit | partial_exit | partial_take_profit | move_stop_to_protect | hold_update | risk_update",
+        "target": {"lifecycle_id": null, "thread_id": null},
+        "strategy": {"symbol": "BTC", "side": "long", "entry": "100000", "stop_loss": "99000", "take_profit": "102000", "leverage": null, "order_type": "limit"},
+        "parameters": {}
+      },
+      "reason": "当前消息中该独立意图的判断依据",
+      "confidence": 0.0,
+      "evidence_refs": ["text:observed_text"]
+    }
+  ],
+  "evidence": {
+    "text": {
+      "observed_text": "当前文字/caption 中实际读到的内容",
+      "fields": {"symbol": {"value": "BTC", "source": "text", "confidence": 0.0}}
+    },
+    "images": [
+      {
+        "asset_id": 1,
+        "image_type": "strategy_screenshot",
+        "quality": "clear",
+        "observed_text": "图片中实际读到的文字",
+        "summary": "图片可见事实摘要",
+        "fields": {"symbol": {"value": "BTC", "source": "image", "confidence": 0.0}},
+        "confidence": 0.0
+      }
+    ],
+    "conflicts": []
+  }
+}
 """.strip()
 
 
@@ -329,6 +428,16 @@ def build_prompt_seeds_from_legacy(
             required_variables=(),
             validation_profile="mimo_vision",
             content=vision_content,
+        ),
+        PromptSeed(
+            prompt_key=MIMO_V2_AUTHORITATIVE_PROMPT,
+            display_name="MiMo 权威分析 v2",
+            description="MiMo 独立的多意图、逐图证据和闭合 JSON 契约。",
+            category="trading",
+            consumers=("mimo",),
+            required_variables=(),
+            validation_profile="mimo_v2_authoritative",
+            content=DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT,
         ),
         PromptSeed(
             prompt_key=RESEARCH_CHAT_SYSTEM_PROMPT,
