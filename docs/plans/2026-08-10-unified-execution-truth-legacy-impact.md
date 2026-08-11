@@ -136,3 +136,50 @@ legacy completion writers are `compatibility_mirror` or
 `retire_after_shadow`; exchange binding/leg and exact-position ownership
 writers remain `authoritative_writer`. This exhausts the search without
 granting the new contract strategy-selection or exchange-write authority.
+
+## Dormant production deployment evidence (2026-08-11)
+
+The additive execution-contract implementation was deployed at reviewed commit
+`eb05d4380331d5d330af3b939d98997003126adf`. The rollout remains dormant:
+
+- `instruction_execution_contract_mode=disabled`;
+- entry and management activation watermarks remain `0`;
+- `instruction_execution_contracts` and `instruction_execution_transitions`
+  both contain zero production rows;
+- no historical message was replayed and no legacy row was backfilled into a
+  contract.
+
+Before deployment, one active verified entry had a split truth between its
+logical TP protection leg and an already verified, ledger-owned Deepcoin TP
+order. A supervised repair bound exactly one existing order after two fresh
+read-only exchange checks and a fingerprinted confirmation. It made no exchange
+request, created no signal/binding/order/event row, reduced the actionable
+unbound TP count from one to zero, and appended one confirmation token. Other
+legacy TP rows belong to inactive entry legs and were not changed.
+
+Both deployment preflights returned reviewed `WARN`, with no fresh active work,
+five protected and zero unprotected open positions, and valid backup plus
+migration dry-run evidence. The warnings were limited to protected live
+positions, historical residue/unknown outcomes, and the non-stable display
+snapshot required only as a warning for this change class.
+
+Server verification passed 643 focused execution/protection/preflight tests
+before the final monitor-only patch and 285 production-safety-monitor tests
+after it. The final no-notify full audit returned `healthy=true`, ran the full
+audit, emitted zero reason codes, and did not notify. The service is active,
+the settings endpoint returns HTTP 200, and the editable package resolves from
+the deployed checkout.
+
+The post-deployment audit also exposed a deployment-preexisting, terminal
+baseline-read refusal. The entry writer had failed before creating an exchange
+intent, order leg, binding, or event. The monitor now recognizes only that
+closed legacy shape: one exact failed signal and instruction, no contract, no
+attempted write evidence, and no downstream artifact. Any contract (including
+`submit_unknown`), exact signal-linked event, leg, binding, schema gap, or
+identity mismatch remains fail closed.
+
+Rollback does not delete the supervised repair token or rewrite the repaired
+ownership evidence. Keep contract mode disabled, revert code through a new
+reviewed commit and the same deterministic preflight, and preserve all legacy
+and monitor evidence. Shadow or live activation requires a separate future
+watermark, evidence artifact, review, and explicit authorization.

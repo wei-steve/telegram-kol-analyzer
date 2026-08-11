@@ -1833,3 +1833,34 @@ TradeSignal、ExecutionBinding、ExecutionEvent、订单草稿或 execution cont
 上述任一门禁失败都阻止发布，不允许把 execution、unknown outcome 或 migration
 失败标记为无关基线。调查失败时保留数据库和 fixture 证据，不重放旧 Telegram
 消息，也不调用任何交易所变更接口。
+
+## 2026-08-11 统一执行真相休眠发布记录
+
+生产已通过确定性更新器部署 commit
+`eb05d4380331d5d330af3b939d98997003126adf`。本次只安装 additive schema、
+兼容镜像和只读监控能力，没有启用新执行权：
+
+- execution contract 模式仍为 `disabled`；
+- entry/management 水位均为 `0`；
+- contract/transition 表生产行数均为 `0`；
+- 未回放旧消息，未重跑历史订单，也未切换 shadow/live。
+
+发布前用监督修复命令收敛了一个 TP 逻辑腿分裂真相。dry-run 必须只有一个
+action，并以 fingerprint 和一次性 confirmation token 应用。该操作只把已经由
+durable order、ledger、活仓和 Deepcoin pending readback 共同证明的现有 TP 订单
+绑定到逻辑腿；不调用交易所 writer。生产核验显示 signal、binding、entry leg、
+TP order、ledger 和 execution event 的数量与最大 ID 均无变化，待修复的活跃
+TP 逻辑腿由一条降为零，verified TP 增加一条，confirmation token 增加一条。
+
+两次正式预检均无 fresh active work，五个活仓都有止损保护，未保护仓位为零，
+backup 和 migration dry-run 均有效。`schema_compatible` 的 WARN 仅保留历史 residue、
+历史 unknown、已保护活仓和非稳定 display snapshot 事实，不构成执行权放开。
+
+部署后验证：服务为 active，settings API 为 HTTP 200，包路径指向生产 checkout；
+服务器聚焦测试先通过 643 项，最终 monitor 补丁再通过 285 项。最后一次不带
+`--notify` 的 full audit 为 `healthy=true`、零 reason code、无 monitor error，
+notification status 为 `not_needed`。
+
+若回滚，先保持 contract 模式 `disabled`，通过新评审的 revert commit 和同一预检
+流程发布；不得删除监督修复 token、解绑已验证 TP、清理历史 unknown 或重放旧消息。
+任何 shadow/live 灰度必须另取未来水位、生成并评审证据 artifact，再取得明确授权。
