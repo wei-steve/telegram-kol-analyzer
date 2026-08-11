@@ -1804,3 +1804,32 @@ checkout、安装和重启前失败关闭。
 `I_AUTHORIZE_LIVE_PROMOTION` 显式授权。一般代码发布、之前的“认可”或
 沉默都不等于 live 授权。预检会重算 artifact 指纹，并校验 commit、水位、
 观察窗口、覆盖面、有效样本数和零未解释差异，不接受单独输入的 64 位字符串。
+
+## 统一执行真相故障与回放门禁
+
+任何 instruction execution contract、entry writer、management writer、相邻消息
+组装或历史迁移改动，在提交前必须运行以下门禁：
+
+```bash
+uv run pytest -q tests/test_instruction_execution_fault_injection.py
+uv run pytest -q tests/test_instruction_execution_replay.py
+uv run pytest -q tests/test_historical_state_repair.py
+uv run pytest -q
+```
+
+故障注入覆盖 contract transition 前、进入 `submitting` 后但 HTTP 前、HTTP
+发送后响应丢失、交易所接受后本地提交前、两条 entry leg 之间、建仓后保护
+提交前、wakeup 丢失和重启对账中断。只要存在交易所写入可能性，重启路径就
+必须保持 `submitting`/`submit_unknown` 并只允许只读对账，不能再次进入 writer。
+所有入场腿的 `client_order_id` 必须唯一且重启后不变。
+
+脱敏回放语料固定在
+`tests/fixtures/instruction_execution/replay_corpus.json`。语料只能追加或经过
+独立评审后更新，必须固定校验草稿指纹、总风险、目标 identity、contract 终态
+和交易所写入次数；不能用生产消息正文、交易所 ID、账户 ID 或密钥。历史快照
+迁移测试必须连续 bootstrap 两次，并证明不会为旧 lifecycle 自动创建
+TradeSignal、ExecutionBinding、ExecutionEvent、订单草稿或 execution contract。
+
+上述任一门禁失败都阻止发布，不允许把 execution、unknown outcome 或 migration
+失败标记为无关基线。调查失败时保留数据库和 fixture 证据，不重放旧 Telegram
+消息，也不调用任何交易所变更接口。

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -9,9 +10,12 @@ import pytest
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     BoundPositionCloseReservation,
+    EntryStrategyAssembly,
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    InstructionExecutionContract,
+    MessageInstructionItem,
     PositionAttributionAudit,
     PositionMutationIntent,
     PositionTakeProfitOrder,
@@ -21,6 +25,7 @@ from telegram_kol_research.models import (
     SourceMessageDeletionExit,
     StrategyLifecycle,
     TelegramSourceMessageEvent,
+    TradeSignal,
     TriggerTakeProfitConvergence,
 )
 from telegram_kol_research.source_message_deletion import record_source_message_deleted
@@ -2615,3 +2620,123 @@ def test_plan_conflicts_when_deletion_frozen_strategy_differs_from_binding(tmp_p
         and row.reason_code == "source_deletion_identity_not_terminal"
         for row in plan.conflicts
     )
+
+
+def test_sanitized_legacy_snapshot_bootstraps_twice_without_execution_backfill(
+    tmp_path,
+):
+    """Additive schema bootstrap must never reinterpret historical truth."""
+
+    from telegram_kol_research.historical_state_repair import (
+        build_historical_state_repair_plan,
+    )
+
+    database = tmp_path / "sanitized-production-snapshot.db"
+    initial_factory = create_session_factory(database)
+    with initial_factory() as session:
+        rows = [
+            RawMessage(
+                chat_id=501,
+                message_id=4100,
+                text="redacted non-strategy neighbor",
+                posted_at=NOW - timedelta(minutes=2),
+            ),
+            RawMessage(
+                chat_id=501,
+                message_id=4101,
+                text="redacted legacy pending entry",
+                posted_at=NOW - timedelta(minutes=1),
+            ),
+            RawMessage(
+                chat_id=501,
+                message_id=4102,
+                text="redacted legacy entered position",
+                posted_at=NOW,
+            ),
+        ]
+        session.add_all(rows)
+        session.flush()
+        session.add_all(
+            [
+                SignalCandidate(
+                    raw_message_id=rows[1].id,
+                    symbol="BTC",
+                    side="long",
+                    event_type="entry_signal",
+                    parse_source="legacy_text_ai",
+                ),
+                StrategyLifecycle(
+                    chat_id=501,
+                    message_id=4101,
+                    symbol="BTC",
+                    side="long",
+                    lifecycle_status="pending_entry",
+                    signal_at=NOW - timedelta(minutes=1),
+                ),
+                StrategyLifecycle(
+                    chat_id=501,
+                    message_id=4102,
+                    symbol="ETH",
+                    side="short",
+                    lifecycle_status="entered",
+                    signal_at=NOW,
+                ),
+            ]
+        )
+        session.commit()
+    initial_factory.kw["bind"].dispose()
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE instruction_execution_transitions")
+        connection.execute("DROP TABLE instruction_execution_contracts")
+        connection.commit()
+
+    execution_models = (
+        MessageInstructionItem,
+        TradeSignal,
+        ExecutionBinding,
+        ExecutionEvent,
+        EntryStrategyAssembly,
+        InstructionExecutionContract,
+    )
+
+    first_factory = create_session_factory(database)
+    with first_factory() as session:
+        first_counts = {
+            model.__tablename__: session.query(model).count()
+            for model in execution_models
+        }
+        assert first_counts == {
+            "message_instruction_items": 0,
+            "trade_signals": 0,
+            "execution_bindings": 0,
+            "execution_events": 0,
+            "entry_strategy_assemblies": 0,
+            "instruction_execution_contracts": 0,
+        }
+
+    second_factory = create_session_factory(database)
+    with second_factory() as session:
+        second_counts = {
+            model.__tablename__: session.query(model).count()
+            for model in execution_models
+        }
+    assert second_counts == first_counts
+    plan = build_historical_state_repair_plan(
+        second_factory,
+        snapshot=_snapshot(),
+        planned_at=NOW,
+    )
+
+    assert plan.action_count == 0
+    with second_factory() as session:
+        assert session.query(RawMessage).count() == 3
+        assert session.query(SignalCandidate).count() == 1
+        assert session.query(StrategyLifecycle).count() == 2
+        assert session.query(MessageInstructionItem).count() == 0
+        assert session.query(TradeSignal).count() == 0
+        assert session.query(ExecutionBinding).count() == 0
+        assert session.query(ExecutionEvent).count() == 0
+        assert session.query(EntryStrategyAssembly).count() == 0
+        assert session.query(InstructionExecutionContract).count() == 0
+    first_factory.kw["bind"].dispose()
+    second_factory.kw["bind"].dispose()

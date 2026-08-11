@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "case_id": "fixed_all_null_non_strategy_neighbor",
+      "kind": "adjacent_context",
+      "strategy": {"venue": "deepcoin", "chat_id": 900, "raw_message_id": 20, "message_id": 9902, "symbol": "BTC", "side": "short"},
+      "facts": [
+        {"raw_message_id": 19, "message_id": 9901, "kind": "completed_evidence", "strategy": {"symbol": null, "side": null, "entry": null, "stop_loss": null, "take_profit": null}}
+      ],
+      "configured_risk_usdt": "20",
+      "expected_risk_usdt": "20",
+      "expected_fragment_ids": [],
+      "execution_result": {"status": "skipped", "reason": "auto_trade_disabled", "submitted": false},
+      "expected_target_identity": "deepcoin:900:9902:BTC:short",
+      "expected_contract_outcome": "verified_refusal",
+      "expected_exchange_write_count": 0
+    },
+    {
+      "case_id": "real_half_size_preamble_before_strategy",
+      "kind": "adjacent_context",
+      "strategy": {"venue": "deepcoin", "chat_id": 900, "raw_message_id": 20, "message_id": 9902, "symbol": "BTC", "side": "short"},
+      "facts": [
+        {"raw_message_id": 19, "message_id": 9901, "kind": "fragment", "fragment_id": 1, "fragment_kind": "risk_multiplier", "payload": {"risk_multiplier": "0.5"}, "symbol": "BTC", "side": "short"}
+      ],
+      "configured_risk_usdt": "20",
+      "expected_risk_usdt": "10.0",
+      "expected_fragment_ids": [1],
+      "execution_result": {"status": "skipped", "reason": "auto_trade_disabled", "submitted": false},
+      "expected_target_identity": "deepcoin:900:9902:BTC:short",
+      "expected_contract_outcome": "verified_refusal",
+      "expected_exchange_write_count": 0
+    },
+    {
+      "case_id": "following_sizing_fragment",
+      "kind": "adjacent_context",
+      "strategy": {"venue": "deepcoin", "chat_id": 900, "raw_message_id": 20, "message_id": 9902, "symbol": "BTC", "side": "short"},
+      "facts": [
+        {"raw_message_id": 21, "message_id": 9903, "kind": "fragment", "fragment_id": 2, "fragment_kind": "risk_multiplier", "payload": {"risk_multiplier": "0.5"}, "symbol": "BTC", "side": "short"}
+      ],
+      "configured_risk_usdt": "20",
+      "expected_risk_usdt": "10.0",
+      "expected_fragment_ids": [2],
+      "execution_result": {"status": "skipped", "reason": "auto_trade_disabled", "submitted": false},
+      "expected_target_identity": "deepcoin:900:9902:BTC:short",
+      "expected_contract_outcome": "verified_refusal",
+      "expected_exchange_write_count": 0
+    },
+    {
+      "case_id": "two_leg_eager_limit",
+      "kind": "entry_draft",
+      "payload": {
+        "venue": "deepcoin", "contract": "BTC-USDT", "order_type": "limit",
+        "open_side": "buy", "position_side": "long", "entry_range": "68000-68200",
+        "stop_loss": "67500", "take_profit": "69000/70000", "risk_budget_usdt": 20,
+        "market_leg_threshold": "0", "source": {"kol_id": "redacted", "chat_id": 100, "message_id": 55}
+      },
+      "expected_order_types": ["limit", "limit"],
+      "expected_risk_usdt": "20.0",
+      "expected_target_identity": "deepcoin:100:55:BTC:long",
+      "expected_contract_outcome": "verified_entry",
+      "expected_exchange_write_count": 2,
+      "expected_draft_fingerprint": "b2622551e53084d19f29a16e9c45c10be2f92cd98eb5e75780111133248d1573"
+    },
+    {
+      "case_id": "hybrid_market_plus_limit",
+      "kind": "entry_draft",
+      "payload": {
+        "venue": "deepcoin", "contract": "BTC-USDT", "order_type": "limit",
+        "open_side": "buy", "position_side": "long", "entry_range": "68000-68200",
+        "stop_loss": "67500", "take_profit": "69000/70000", "risk_budget_usdt": 20,
+        "current_price": "68150", "market_leg_threshold": "100",
+        "source": {"kol_id": "redacted", "chat_id": 100, "message_id": 56}
+      },
+      "expected_order_types": ["market", "limit"],
+      "expected_risk_usdt": "20.0",
+      "expected_target_identity": "deepcoin:100:56:BTC:long",
+      "expected_contract_outcome": "verified_entry",
+      "expected_exchange_write_count": 2,
+      "expected_draft_fingerprint": "efb9ddd7dec2b4265d27d42b331993915fa0cfbca07d9e5d18de8ba3e15f95db"
+    },
+    {
+      "case_id": "multi_instruction_entry_management",
+      "kind": "instruction_outcomes",
+      "instructions": [
+        {"intent_kind": "management", "result": {"status": "succeeded", "submitted": true, "management_action": "partial_take_profit"}},
+        {"intent_kind": "entry", "result": {"status": "submitted", "submitted": true}}
+      ],
+      "expected_states": ["verified", "verified"],
+      "expected_terminal_kinds": ["verified_management", "verified_entry"],
+      "source_target": {"venue": "deepcoin", "chat_id": 901, "message_id": 7000, "symbol": "BTC", "side": "long"},
+      "expected_target_identity": "deepcoin:901:7000:BTC:long",
+      "expected_contract_outcome": "verified",
+      "expected_exchange_write_count": 2
+    },
+    {
+      "case_id": "old_lifecycle_without_instruction_item",
+      "kind": "legacy_projection",
+      "expected_draft_fingerprint": null,
+      "expected_risk_usdt": null,
+      "expected_target_identity": "legacy:lifecycle-only",
+      "expected_contract_outcome": "not_projected",
+      "expected_exchange_write_count": 0
+    },
+    {
+      "case_id": "partial_exchange_outcome",
+      "kind": "instruction_outcomes",
+      "instructions": [
+        {"intent_kind": "entry", "result": {"status": "partial_failed", "submitted": true, "legs": [{"status": "succeeded"}, {"status": "submit_unknown"}]}}
+      ],
+      "expected_states": ["submit_unknown"],
+      "expected_terminal_kinds": [null],
+      "source_target": {"venue": "deepcoin", "chat_id": 902, "message_id": 7001, "symbol": "BTC", "side": "long"},
+      "expected_target_identity": "deepcoin:902:7001:BTC:long",
+      "expected_contract_outcome": "submit_unknown",
+      "expected_exchange_write_count": 1
+    },
+    {
+      "case_id": "unknown_exchange_outcome",
+      "kind": "instruction_outcomes",
+      "instructions": [
+        {"intent_kind": "management", "result": {"status": "submit_unknown", "submitted": true}}
+      ],
+      "expected_states": ["submit_unknown"],
+      "expected_terminal_kinds": [null],
+      "source_target": {"venue": "deepcoin", "chat_id": 903, "message_id": 7002, "symbol": "BTC", "side": "long"},
+      "expected_target_identity": "deepcoin:903:7002:BTC:long",
+      "expected_contract_outcome": "submit_unknown",
+      "expected_exchange_write_count": 1
+    }
+  ]
+}
