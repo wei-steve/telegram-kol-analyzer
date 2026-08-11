@@ -62,6 +62,7 @@ def plan_trigger_take_profit_convergence(
     deepcoin_client,
     contract_spec_provider=None,
     planned_at: datetime | None = None,
+    allow_logical_adoption: bool = False,
 ) -> TriggerTakeProfitConvergencePlan:
     """Produce a TP-only plan or fail closed before any exchange mutation."""
 
@@ -82,9 +83,12 @@ def plan_trigger_take_profit_convergence(
                 if contract_spec_provider is not None
                 else getattr(deepcoin_client, "contract_spec_provider", None)
             ),
+            allow_logical_adoption=allow_logical_adoption,
         )
         if isinstance(prepared, str):
             if prepared == "convergence_take_profit_already_converged":
+                if allow_logical_adoption:
+                    session.commit()
                 return TriggerTakeProfitConvergencePlan("already_converged", prepared)
             convergence.status = (
                 "waiting_backup_stop"
@@ -121,6 +125,7 @@ def execute_trigger_take_profit_convergence(
         deepcoin_client=deepcoin_client,
         contract_spec_provider=contract_spec_provider,
         planned_at=now,
+        allow_logical_adoption=True,
     )
     if plan.status != "ready":
         if plan.status == "already_converged":
@@ -195,66 +200,40 @@ def execute_trigger_take_profit_convergence(
                 session_factory,
                 convergence_id,
                 now,
-                "convergence_take_profit_pending_readback",
+                "convergence_take_profit_submit_unknown",
                 error=exc,
             )
         if verified is None:
+            reason = (
+                "convergence_take_profit_pending_readback"
+                if _pending_contains_order_id(pending, order_id=order_id)
+                else "convergence_take_profit_submit_unknown"
+            )
             return _freeze(
                 session_factory,
                 convergence_id,
                 now,
-                "convergence_take_profit_pending_readback",
+                reason,
                 error="native TPSL take-profit was not verified in pending orders",
             )
-        with session_factory() as session:
-            convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
-            if convergence is None or convergence.status != "reserved":
-                return _freeze(session_factory, convergence_id, now, "convergence_response_persist_conflict")
-            record_take_profit_order(
-                session,
-                venue="deepcoin",
-                execution_binding_id=int(convergence.execution_binding_id),
-                execution_order_leg_id=int(convergence.execution_order_leg_id),
-                trigger_take_profit_convergence_id=int(convergence.id),
-                pos_id=str(convergence.pos_id),
+        try:
+            _persist_verified_take_profit(
+                session_factory,
+                convergence_id=convergence_id,
+                payload=payload,
                 order_id=order_id,
-                trigger_price=str(payload["tpTriggerPx"]),
-                size_text=str(payload["sz"]),
-                created_at=now,
-                evidence={
-                    "source": "native_tpsl_pending_readback",
-                    "response": _response_dict(response),
-                    "native_tpsl": verified.raw,
-                },
+                response=response,
+                verified=verified,
+                persisted_at=now,
             )
-            protection_leg = (
-                session.query(PositionProtectionLeg)
-                .filter(PositionProtectionLeg.execution_order_leg_id == convergence.execution_order_leg_id)
-                .filter(PositionProtectionLeg.role == "take_profit")
-                .filter(PositionProtectionLeg.planned_trigger_price == str(payload["tpTriggerPx"]))
-                .one_or_none()
+        except Exception as exc:
+            return _freeze(
+                session_factory,
+                convergence_id,
+                now,
+                "convergence_logical_protection_persist_unknown",
+                error=exc,
             )
-            if protection_leg is not None:
-                bind_verified_exchange_order(
-                    session,
-                    protection_leg,
-                    exchange_order_id=order_id,
-                    readback_evidence={"response": _response_dict(response), "native_tpsl": verified.raw},
-                )
-            upsert_protection_ledger_row(
-                session,
-                venue="deepcoin",
-                execution_binding_id=int(convergence.execution_binding_id),
-                execution_order_leg_id=int(convergence.execution_order_leg_id),
-                strategy_instance_id=session.get(ExecutionOrderLeg, convergence.execution_order_leg_id).strategy_instance_id,
-                pos_id=str(convergence.pos_id),
-                instrument_id=str(payload["instId"]), side=str(payload["posSide"]),
-                order_id=order_id, purpose="take_profit", trigger_price=str(payload["tpTriggerPx"]),
-                size_text=str(payload["sz"]), status="verified",
-                evidence_source="trigger_take_profit_pending_readback",
-                evidence={"native_tpsl": verified.raw}, seen_at=now,
-            )
-            session.commit()
     with session_factory() as session:
         convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
         if convergence is None or convergence.status != "reserved":
@@ -264,6 +243,86 @@ def execute_trigger_take_profit_convergence(
         convergence.updated_at = now
         session.commit()
     return {"convergence_id": convergence_id, "status": "submitted", "reason": None}
+
+
+def _persist_verified_take_profit(
+    session_factory,
+    *,
+    convergence_id: int,
+    payload: dict[str, str],
+    order_id: str,
+    response: object,
+    verified: NativeTpslOrder,
+    persisted_at: datetime,
+) -> None:
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        if convergence is None or convergence.status != "reserved":
+            raise ValueError("convergence_response_persist_conflict")
+        protection_legs = _matching_take_profit_protection_legs(
+            session,
+            execution_binding_id=int(convergence.execution_binding_id),
+            execution_order_leg_id=int(convergence.execution_order_leg_id),
+            pos_id=str(convergence.pos_id),
+            trigger_price=payload["tpTriggerPx"],
+        )
+        if (
+            len(protection_legs) != 1
+            or protection_legs[0].exchange_order_id is not None
+            or str(protection_legs[0].status or "")
+            not in {"waiting_fill", "protection_recovery_pending"}
+        ):
+            raise ValueError("convergence_logical_protection_persist_conflict")
+        record_take_profit_order(
+            session,
+            venue="deepcoin",
+            execution_binding_id=int(convergence.execution_binding_id),
+            execution_order_leg_id=int(convergence.execution_order_leg_id),
+            trigger_take_profit_convergence_id=int(convergence.id),
+            pos_id=str(convergence.pos_id),
+            order_id=order_id,
+            trigger_price=str(payload["tpTriggerPx"]),
+            size_text=str(payload["sz"]),
+            created_at=persisted_at,
+            evidence={
+                "source": "native_tpsl_pending_readback",
+                "response": _response_dict(response),
+                "native_tpsl": verified.raw,
+            },
+        )
+        bind_verified_exchange_order(
+            session,
+            protection_legs[0],
+            exchange_order_id=order_id,
+            readback_evidence={
+                "response": _response_dict(response),
+                "native_tpsl": verified.raw,
+            },
+        )
+        entry_leg = session.get(
+            ExecutionOrderLeg, int(convergence.execution_order_leg_id)
+        )
+        if entry_leg is None:
+            raise ValueError("convergence_entry_leg_persist_conflict")
+        upsert_protection_ledger_row(
+            session,
+            venue="deepcoin",
+            execution_binding_id=int(convergence.execution_binding_id),
+            execution_order_leg_id=int(convergence.execution_order_leg_id),
+            strategy_instance_id=entry_leg.strategy_instance_id,
+            pos_id=str(convergence.pos_id),
+            instrument_id=str(payload["instId"]),
+            side=str(payload["posSide"]),
+            order_id=order_id,
+            purpose="take_profit",
+            trigger_price=str(payload["tpTriggerPx"]),
+            size_text=str(payload["sz"]),
+            status="verified",
+            evidence_source="trigger_take_profit_pending_readback",
+            evidence={"native_tpsl": verified.raw},
+            seen_at=persisted_at,
+        )
+        session.commit()
 
 
 def execute_ready_trigger_take_profit_convergences(
@@ -345,7 +404,27 @@ def _response_order_id(response: object) -> str | None:
     return str(value) if value not in (None, "") else None
 
 
-def _prepare_plan(session, *, convergence, deepcoin_client, contract_spec_provider):
+def _pending_contains_order_id(
+    pending: list[dict[str, object]],
+    *,
+    order_id: str,
+) -> bool:
+    return any(
+        normalized is not None and normalized.ord_id == str(order_id)
+        for row in pending
+        if isinstance(row, dict)
+        for normalized in (normalize_native_tpsl(row),)
+    )
+
+
+def _prepare_plan(
+    session,
+    *,
+    convergence,
+    deepcoin_client,
+    contract_spec_provider,
+    allow_logical_adoption: bool,
+):
     if str(convergence.status) != "ready":
         return "convergence_not_ready"
     leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
@@ -489,6 +568,7 @@ def _prepare_plan(session, *, convergence, deepcoin_client, contract_spec_provid
             return "convergence_protection_leg_conflict"
     active_orders = (
         session.query(PositionTakeProfitOrder)
+        .filter(PositionTakeProfitOrder.venue == "deepcoin")
         .filter(PositionTakeProfitOrder.execution_binding_id == binding.id)
         .filter(PositionTakeProfitOrder.execution_order_leg_id == leg.id)
         .filter(PositionTakeProfitOrder.pos_id == pos_id)
@@ -511,14 +591,46 @@ def _prepare_plan(session, *, convergence, deepcoin_client, contract_spec_provid
         payload = desired_by_price.get(str(order.trigger_price))
         if payload is None or str(order.size_text or "") != payload["sz"]:
             return "convergence_owned_take_profit_mismatch"
-        if _verified_native_take_profit(
+        verified_take_profit = _verified_native_take_profit(
             position=matches[0],
             open_positions=positions,
             pending=pending,
             order_id=str(order.order_id),
             payload=payload,
-        ) is None:
+        )
+        if verified_take_profit is None:
             return "convergence_take_profit_missing_on_exchange"
+        logical_matches = _matching_take_profit_protection_legs(
+            session,
+            execution_binding_id=int(binding.id),
+            execution_order_leg_id=int(leg.id),
+            pos_id=pos_id,
+            trigger_price=payload["tpTriggerPx"],
+        )
+        if len(logical_matches) != 1:
+            return "convergence_protection_leg_conflict"
+        logical_leg = logical_matches[0]
+        if logical_leg.exchange_order_id is None:
+            if str(logical_leg.status or "") not in {
+                "waiting_fill",
+                "protection_recovery_pending",
+            }:
+                return "convergence_protection_leg_conflict"
+            if allow_logical_adoption:
+                bind_verified_exchange_order(
+                    session,
+                    logical_leg,
+                    exchange_order_id=str(order.order_id),
+                    readback_evidence={
+                        "source": "existing_native_tpsl_pending_readback",
+                        "native_tpsl": verified_take_profit.raw,
+                    },
+                )
+        elif (
+            str(logical_leg.exchange_order_id) != str(order.order_id)
+            or str(logical_leg.status or "") != "verified"
+        ):
+            return "convergence_protection_leg_conflict"
         satisfied_order_ids.add(str(order.order_id))
     if _unowned_pending_take_profit_present(
         pending=pending,
@@ -538,6 +650,21 @@ def _prepare_plan(session, *, convergence, deepcoin_client, contract_spec_provid
             for order in active_orders
         )
     ]
+    for payload in missing_payloads:
+        logical_matches = _matching_take_profit_protection_legs(
+            session,
+            execution_binding_id=int(binding.id),
+            execution_order_leg_id=int(leg.id),
+            pos_id=pos_id,
+            trigger_price=payload["tpTriggerPx"],
+        )
+        if (
+            len(logical_matches) != 1
+            or logical_matches[0].exchange_order_id is not None
+            or str(logical_matches[0].status or "")
+            not in {"waiting_fill", "protection_recovery_pending"}
+        ):
+            return "convergence_protection_leg_conflict"
     if not missing_payloads:
         return "convergence_take_profit_already_converged"
     return [], missing_payloads
@@ -916,6 +1043,40 @@ def _positive_decimal(value: object) -> Decimal | None:
     except (InvalidOperation, TypeError, ValueError):
         return None
     return parsed if parsed.is_finite() and parsed > 0 else None
+
+
+def _matching_take_profit_protection_legs(
+    session,
+    *,
+    execution_binding_id: int,
+    execution_order_leg_id: int,
+    pos_id: str,
+    trigger_price: object,
+) -> list[PositionProtectionLeg]:
+    expected = _positive_decimal(trigger_price)
+    if expected is None:
+        return []
+    rows = (
+        session.query(PositionProtectionLeg)
+        .filter(PositionProtectionLeg.venue == "deepcoin")
+        .filter(
+            PositionProtectionLeg.execution_binding_id
+            == int(execution_binding_id)
+        )
+        .filter(
+            PositionProtectionLeg.execution_order_leg_id
+            == int(execution_order_leg_id)
+        )
+        .filter(PositionProtectionLeg.role == "take_profit")
+        .filter(PositionProtectionLeg.pos_id == str(pos_id))
+        .order_by(PositionProtectionLeg.id.asc())
+        .all()
+    )
+    return [
+        row
+        for row in rows
+        if _positive_decimal(row.planned_trigger_price) == expected
+    ]
 
 
 def _decimal_text(value: Decimal) -> str:

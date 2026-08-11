@@ -192,10 +192,16 @@ def bind_filled_position(
     *,
     pos_id: str,
 ) -> PositionProtectionLeg:
+    previous_pos_id = str(protection_leg.pos_id or "").strip()
+    previous_status = str(protection_leg.status or "")
     _bind_immutable_text(protection_leg, "pos_id", pos_id)
     if protection_leg.status == "planned":
         protection_leg.status = "waiting_fill"
-    _touch(protection_leg)
+    if (
+        str(protection_leg.pos_id or "").strip() != previous_pos_id
+        or str(protection_leg.status or "") != previous_status
+    ):
+        _touch(protection_leg)
     session.flush()
     return protection_leg
 

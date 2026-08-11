@@ -825,7 +825,11 @@ def test_plan_submits_only_missing_targets_after_exact_owned_target_is_verified(
 
 def test_execution_marks_already_verified_take_profit_set_submitted_without_write(tmp_path):
     from telegram_kol_research.db import create_session_factory
-    from telegram_kol_research.models import PositionTakeProfitOrder, TriggerTakeProfitConvergence
+    from telegram_kol_research.models import (
+        PositionProtectionLeg,
+        PositionTakeProfitOrder,
+        TriggerTakeProfitConvergence,
+    )
     from telegram_kol_research.position_take_profit_orders import record_take_profit_order
     from telegram_kol_research.trigger_take_profit_convergence_executor import (
         execute_trigger_take_profit_convergence,
@@ -866,6 +870,138 @@ def test_execution_marks_already_verified_take_profit_set_submitted_without_writ
 
     assert result == {"convergence_id": convergence_id, "status": "submitted", "reason": None}
     assert client.submit_calls == []
+    with session_factory() as session:
+        logical_legs = session.query(PositionProtectionLeg).filter_by(
+            role="take_profit"
+        ).all()
+        assert len(logical_legs) == 3
+        assert {row.status for row in logical_legs} == {"verified"}
+        assert {row.exchange_order_id for row in logical_legs} == {
+            "tp-old-1",
+            "tp-old-2",
+            "tp-old-3",
+        }
+
+
+def test_shadow_plan_never_adopts_existing_order_onto_failed_logical_leg(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import (
+        ExecutionOrderLeg,
+        PositionProtectionLeg,
+        PositionTakeProfitOrder,
+        TriggerTakeProfitConvergence,
+    )
+    from telegram_kol_research.position_protection_legs import (
+        bind_filled_position,
+        create_or_get_protection_leg,
+    )
+    from telegram_kol_research.trading_settings import save_trading_settings
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        execute_ready_trigger_take_profit_convergences,
+    )
+
+    session_factory = create_session_factory(tmp_path / "shadow-failed-logical.db")
+    convergence_id = _ready_convergence(
+        session_factory,
+        existing_take_profit=True,
+        desired_take_profits=[
+            {"price": "64500", "allocation_pct": "50"},
+            {"price": "63800", "allocation_pct": "50"},
+        ],
+    )
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+        existing_order = session.query(PositionTakeProfitOrder).one()
+        existing_order.size_text = "5"
+        logical_leg = create_or_get_protection_leg(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=int(leg.id),
+            role="take_profit",
+            leg_index=1,
+            planned_trigger_price="64500.0",
+            planned_size="10",
+        )
+        bind_filled_position(session, logical_leg, pos_id="pos-10")
+        logical_leg.status = "failed"
+        session.commit()
+    save_trading_settings(
+        session_factory,
+        {"position_management_liveness_v2_mode": "shadow"},
+    )
+    client = _Client()
+    client.pending.append(
+        {
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-10",
+            "posSide": "short",
+            "ordId": "tp-old-1",
+            "triggerOrderType": "TPSL",
+            "tpTriggerPx": "64500",
+            "tpOrdPx": "-1",
+            "tpPrice": "0",
+            "sz": "5",
+        }
+    )
+
+    completed = execute_ready_trigger_take_profit_convergences(
+        session_factory,
+        deepcoin_client=client,
+        processed_at=NOW,
+    )
+
+    assert completed == 0
+    assert client.submit_calls == []
+    with session_factory() as session:
+        logical_leg = session.query(PositionProtectionLeg).one()
+        assert logical_leg.status == "failed"
+        assert logical_leg.exchange_order_id is None
+
+
+def test_plan_never_adopts_take_profit_order_from_other_venue(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import PositionTakeProfitOrder
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        plan_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "other-venue-tp.db")
+    convergence_id = _ready_convergence(
+        session_factory,
+        existing_take_profit=True,
+        desired_take_profits=[{"price": "64500", "allocation_pct": "100"}],
+    )
+    with session_factory() as session:
+        order = session.query(PositionTakeProfitOrder).one()
+        order.venue = "other"
+        session.commit()
+    client = _Client()
+    client.pending.append(
+        {
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-10",
+            "posSide": "short",
+            "ordId": "tp-old-1",
+            "triggerOrderType": "TPSL",
+            "tpTriggerPx": "64500",
+            "tpOrdPx": "-1",
+            "tpPrice": "0",
+            "sz": "10",
+        }
+    )
+
+    plan = plan_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        planned_at=NOW,
+    )
+
+    assert (plan.status, plan.reason_code) == (
+        "conflicted",
+        "convergence_unowned_take_profit_present",
+    )
 
 
 def test_execution_submits_initial_take_profits_without_cancelling_any_order(tmp_path):
@@ -894,6 +1030,221 @@ def test_execution_submits_initial_take_profits_without_cancelling_any_order(tmp
         convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
     assert [row.status for row in new] == ["active", "active", "active"]
     assert convergence.status == "submitted"
+
+
+def test_execution_binds_logical_take_profit_with_equivalent_decimal_price(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import (
+        ExecutionOrderLeg,
+        PositionProtectionLeg,
+        TriggerTakeProfitConvergence,
+    )
+    from telegram_kol_research.position_protection_legs import (
+        bind_filled_position,
+        create_or_get_protection_leg,
+    )
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        execute_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "decimal-price.db")
+    convergence_id = _ready_convergence(
+        session_factory,
+        existing_take_profit=False,
+        desired_take_profits=[{"price": "64500", "allocation_pct": "100"}],
+    )
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+        logical_leg = create_or_get_protection_leg(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=int(leg.id),
+            role="take_profit",
+            leg_index=1,
+            planned_trigger_price="64500.0",
+            planned_size="10",
+        )
+        bind_filled_position(session, logical_leg, pos_id="pos-10")
+        logical_leg.status = "protection_recovery_pending"
+        session.commit()
+
+    client = _Client()
+    result = execute_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "submitted"
+    assert len(client.submit_calls) == 1
+    with session_factory() as session:
+        logical_leg = session.query(PositionProtectionLeg).filter_by(
+            role="take_profit"
+        ).one()
+        assert logical_leg.status == "verified"
+        assert logical_leg.exchange_order_id == "tp-new-1"
+
+
+def test_plan_blocks_ambiguous_equivalent_decimal_logical_take_profit_legs(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import ExecutionOrderLeg, TriggerTakeProfitConvergence
+    from telegram_kol_research.position_protection_legs import (
+        bind_filled_position,
+        create_or_get_protection_leg,
+    )
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        plan_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "ambiguous-decimal-price.db")
+    convergence_id = _ready_convergence(
+        session_factory,
+        existing_take_profit=False,
+        desired_take_profits=[{"price": "64500", "allocation_pct": "100"}],
+    )
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+        for leg_index, price in ((1, "64500.0"), (2, "64500.00")):
+            logical_leg = create_or_get_protection_leg(
+                session,
+                venue="deepcoin",
+                execution_order_leg_id=int(leg.id),
+                role="take_profit",
+                leg_index=leg_index,
+                planned_trigger_price=price,
+                planned_size="10",
+            )
+            bind_filled_position(session, logical_leg, pos_id="pos-10")
+        session.commit()
+    client = _Client()
+
+    plan = plan_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        planned_at=NOW,
+    )
+
+    assert (plan.status, plan.reason_code) == (
+        "conflicted",
+        "convergence_protection_leg_conflict",
+    )
+    assert client.submit_calls == []
+
+
+@pytest.mark.parametrize("ownership_mismatch", ["position", "venue"])
+def test_plan_blocks_equivalent_decimal_logical_leg_with_wrong_owner(
+    tmp_path, ownership_mismatch
+):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import ExecutionOrderLeg, TriggerTakeProfitConvergence
+    from telegram_kol_research.position_protection_legs import (
+        bind_filled_position,
+        create_or_get_protection_leg,
+    )
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        plan_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(
+        tmp_path / f"wrong-{ownership_mismatch}-price.db"
+    )
+    convergence_id = _ready_convergence(
+        session_factory,
+        existing_take_profit=False,
+        desired_take_profits=[{"price": "64500", "allocation_pct": "100"}],
+    )
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+        logical_leg = create_or_get_protection_leg(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=int(leg.id),
+            role="take_profit",
+            leg_index=1,
+            planned_trigger_price="64500.0",
+            planned_size="10",
+        )
+        bind_filled_position(
+            session,
+            logical_leg,
+            pos_id="pos-other" if ownership_mismatch == "position" else "pos-10",
+        )
+        if ownership_mismatch == "venue":
+            logical_leg.venue = "other"
+        session.commit()
+    client = _Client()
+
+    plan = plan_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        planned_at=NOW,
+    )
+
+    assert (plan.status, plan.reason_code) == (
+        "conflicted",
+        "convergence_protection_leg_conflict",
+    )
+    assert client.submit_calls == []
+
+
+def test_plan_blocks_missing_target_when_logical_leg_owns_another_order(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import ExecutionOrderLeg, TriggerTakeProfitConvergence
+    from telegram_kol_research.position_protection_legs import (
+        bind_filled_position,
+        bind_verified_exchange_order,
+        create_or_get_protection_leg,
+    )
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        plan_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "conflicting-order-owner.db")
+    convergence_id = _ready_convergence(
+        session_factory,
+        existing_take_profit=False,
+        desired_take_profits=[{"price": "64500", "allocation_pct": "100"}],
+    )
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+        logical_leg = create_or_get_protection_leg(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=int(leg.id),
+            role="take_profit",
+            leg_index=1,
+            planned_trigger_price="64500.0",
+            planned_size="10",
+        )
+        bind_filled_position(session, logical_leg, pos_id="pos-10")
+        bind_verified_exchange_order(
+            session,
+            logical_leg,
+            exchange_order_id="stale-tp-order",
+            readback_evidence={"source": "test"},
+        )
+        session.commit()
+    client = _Client()
+
+    plan = plan_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        planned_at=NOW,
+    )
+
+    assert (plan.status, plan.reason_code) == (
+        "conflicted",
+        "convergence_protection_leg_conflict",
+    )
+    assert client.submit_calls == []
 
 
 def test_execution_freezes_when_native_take_profit_response_has_no_pending_readback(tmp_path):
@@ -927,15 +1278,104 @@ def test_execution_freezes_when_native_take_profit_response_has_no_pending_readb
 
     assert result == {
         "convergence_id": convergence_id,
-        "status": "conflicted",
-        "reason": "convergence_take_profit_pending_readback",
+        "status": "submit_unknown",
+        "reason": "convergence_take_profit_submit_unknown",
     }
     with session_factory() as session:
         assert session.query(PositionTakeProfitOrder).count() == 0
         convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
-    assert convergence.status == "conflicted"
+    assert convergence.status == "submit_unknown"
     assert retry["status"] == "blocked"
     assert len(client.submit_calls) == 1
+
+
+def test_execution_freezes_unknown_when_post_write_readback_raises(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import TriggerTakeProfitConvergence
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        execute_trigger_take_profit_convergence,
+    )
+
+    class _ReadbackFailureClient(_Client):
+        def __init__(self):
+            super().__init__()
+            self.pending_reads = 0
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            self.pending_reads += 1
+            if self.pending_reads > 1:
+                raise RuntimeError("simulated post-write readback failure")
+            return super().list_trigger_orders_pending(inst_id=inst_id)
+
+    session_factory = create_session_factory(tmp_path / "readback-raises.db")
+    convergence_id = _ready_convergence(
+        session_factory,
+        existing_take_profit=False,
+        desired_take_profits=[{"price": "64500", "allocation_pct": "100"}],
+    )
+    client = _ReadbackFailureClient()
+
+    result = execute_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result == {
+        "convergence_id": convergence_id,
+        "status": "submit_unknown",
+        "reason": "convergence_take_profit_submit_unknown",
+    }
+    assert len(client.submit_calls) == 1
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        assert convergence.status == "submit_unknown"
+
+
+def test_execution_freezes_unknown_when_logical_leg_persistence_fails(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import PositionTakeProfitOrder, TriggerTakeProfitConvergence
+    import telegram_kol_research.trigger_take_profit_convergence_executor as executor
+
+    session_factory = create_session_factory(tmp_path / "logical-persist-failure.db")
+    convergence_id = _ready_convergence(
+        session_factory,
+        existing_take_profit=False,
+        desired_take_profits=[{"price": "64500", "allocation_pct": "100"}],
+    )
+    client = _Client()
+
+    def fail_bind(*args, **kwargs):
+        raise RuntimeError("simulated logical-leg persistence failure")
+
+    monkeypatch.setattr(executor, "bind_verified_exchange_order", fail_bind)
+    result = executor.execute_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+    retry = executor.execute_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result == {
+        "convergence_id": convergence_id,
+        "status": "submit_unknown",
+        "reason": "convergence_logical_protection_persist_unknown",
+    }
+    assert retry["status"] == "blocked"
+    assert len(client.submit_calls) == 1
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        assert convergence.status == "submit_unknown"
+        assert session.query(PositionTakeProfitOrder).count() == 0
 
 
 def test_execution_rejects_native_take_profit_with_nonmarket_tp_price(tmp_path):

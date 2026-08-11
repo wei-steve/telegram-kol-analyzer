@@ -524,6 +524,7 @@ def test_cli_help_renders():
     assert "recovery-dry-run" in result.stdout
     assert "repair-position-attribution" in result.stdout
     assert "repair-entry-protection-ledger" in result.stdout
+    assert "repair-take-profit-protection-leg" in result.stdout
     assert "repair-position-management" in result.stdout
     assert "recover-position-management-liveness" in result.stdout
     assert "audit-management-batches" in result.stdout
@@ -532,6 +533,19 @@ def test_cli_help_renders():
     assert "audit-tpsl-ownership" in result.stdout
     assert "audit-kol-pnl" in result.stdout
     assert "backfill-canonical-tpsl-ledger" in result.stdout
+
+
+def test_take_profit_protection_leg_repair_help_exposes_review_gates():
+    result = CliRunner().invoke(
+        app, ["repair-take-profit-protection-leg", "--help"]
+    )
+
+    assert result.exit_code == 0
+    assert "--database-path" in result.output
+    assert "--apply" in result.output
+    assert "--action-id" in result.output
+    assert "--expected-fingerprint" in result.output
+    assert "--confirmation-token" in result.output
 
 
 def test_recover_position_management_liveness_help_requires_exact_review_inputs():

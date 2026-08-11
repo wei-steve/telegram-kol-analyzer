@@ -86,6 +86,10 @@ from telegram_kol_research.entry_protection_ledger_repair import (
     apply_entry_protection_ledger_repair_plan,
     build_entry_protection_ledger_repair_plan,
 )
+from telegram_kol_research.take_profit_protection_leg_repair import (
+    apply_take_profit_protection_leg_repair_plan,
+    build_take_profit_protection_leg_repair_plan,
+)
 from telegram_kol_research.entry_assembly_fingerprint_repair import (
     apply_entry_assembly_fingerprint_repair_plan,
     build_entry_assembly_fingerprint_repair_plan,
@@ -4727,6 +4731,80 @@ def repair_entry_protection_ledger(
         confirmation_token=confirmation_token or "",
     )
     typer.echo(f"Applied {result.applied} entry protection ledger repair(s).")
+
+
+@app.command("repair-take-profit-protection-leg")
+def repair_take_profit_protection_leg(
+    database_path: Path = typer.Option(
+        Path("data/research.db"), "--database-path"
+    ),
+    apply: bool = typer.Option(False, "--apply"),
+    action_id: str | None = typer.Option(None, "--action-id"),
+    expected_fingerprint: str | None = typer.Option(
+        None, "--expected-fingerprint"
+    ),
+    confirmation_token: str | None = typer.Option(
+        None, "--confirmation-token"
+    ),
+) -> None:
+    """Converge one verified existing TP order onto its logical leg."""
+
+    resolved_path = database_path.expanduser().resolve()
+    if not resolved_path.is_file():
+        typer.echo(
+            "Refusing repair: database does not exist; no file was created.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if apply and (
+        not action_id or not expected_fingerprint or not confirmation_token
+    ):
+        typer.echo(
+            "Refusing apply: --action-id, --expected-fingerprint, and "
+            "--confirmation-token are required.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    session_factory = create_existing_session_factory(resolved_path)
+    client = build_deepcoin_client_from_env()
+    plan = build_take_profit_protection_leg_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        observed_at=datetime.now(UTC),
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "mode": "apply" if apply else "dry_run",
+                "database_path": str(resolved_path),
+                "plan": asdict(plan),
+            },
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    )
+    if not apply:
+        return
+    if len(plan.actions) != 1:
+        typer.echo(
+            "Refusing apply: the current repair plan must contain exactly "
+            "one action.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    result = apply_take_profit_protection_leg_repair_plan(
+        session_factory,
+        plan,
+        deepcoin_client=client,
+        action_id=action_id or "",
+        expected_fingerprint=expected_fingerprint or "",
+        confirmation_token=confirmation_token or "",
+        applied_at=datetime.now(UTC),
+    )
+    typer.echo(
+        f"Applied {result.applied} take-profit protection-leg repair(s)."
+    )
 
 
 def _redacted_entry_assembly_fingerprint_plan(plan: Any) -> dict[str, Any]:

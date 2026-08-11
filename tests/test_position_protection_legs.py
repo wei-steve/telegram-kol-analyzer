@@ -202,6 +202,29 @@ def test_bind_verified_filled_position_to_all_planned_protection_legs(tmp_path):
         assert all(row.status == "protection_recovery_pending" for row in rows)
 
 
+def test_bind_filled_position_does_not_touch_unchanged_leg(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    entry_leg_id = _entry_leg_id(session_factory)
+
+    with session_factory() as session:
+        row = create_or_get_protection_leg(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=entry_leg_id,
+            role="take_profit",
+            leg_index=1,
+            planned_trigger_price="65100",
+            planned_size="3",
+        )
+        bind_filled_position(session, row, pos_id="pos-1")
+        first_updated_at = row.updated_at
+
+        bind_filled_position(session, row, pos_id="pos-1")
+
+        assert row.status == "waiting_fill"
+        assert row.updated_at == first_updated_at
+
+
 def test_bind_verified_filled_position_rejects_unverified_entry_leg(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     entry_leg_id = _entry_leg_id(session_factory)
