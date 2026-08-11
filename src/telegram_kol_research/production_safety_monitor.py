@@ -86,6 +86,7 @@ _TERMINAL_PREBINDING_ERROR_PREFIX = "signal_enqueue_blocked:"
 _TERMINAL_PREBINDING_REASONS = frozenset(
     {"missing_ready_confirmation", "contract_size_unverified"}
 )
+_TERMINAL_BASELINE_PREBINDING_ERROR = "trigger_protection_baseline_unavailable"
 _RECONCILIATION_EVENT_COLUMNS = frozenset(
     {
         "id",
@@ -891,7 +892,7 @@ def _has_exact_terminal_prebinding_refusal(
 
     instruction_rows = connection.execute(
         """
-        SELECT raw_message_id, instruction_kind, strategy_instance_id,
+        SELECT id, raw_message_id, instruction_kind, strategy_instance_id,
                status, result_json, error_json, retired_at
         FROM message_instruction_items
         WHERE signal_candidate_id = ?
@@ -903,6 +904,7 @@ def _has_exact_terminal_prebinding_refusal(
     if len(instruction_rows) != 1:
         return False
     (
+        instruction_item_id,
         raw_message_id,
         instruction_kind,
         instruction_strategy_instance_id,
@@ -912,7 +914,9 @@ def _has_exact_terminal_prebinding_refusal(
         retired_at,
     ) = instruction_rows[0]
     if (
-        type(raw_message_id) is not int
+        type(instruction_item_id) is not int
+        or instruction_item_id <= 0
+        or type(raw_message_id) is not int
         or raw_message_id <= 0
         or raw_message_id != strategy_raw_message_id
         or instruction_kind != "entry"
@@ -926,18 +930,22 @@ def _has_exact_terminal_prebinding_refusal(
     if error is None or set(error) != {"type", "message"}:
         return False
     message = error.get("message")
-    if (
-        error.get("type") != _TERMINAL_PREBINDING_ERROR_TYPE
-        or not isinstance(message, str)
-        or not message.startswith(_TERMINAL_PREBINDING_ERROR_PREFIX)
+    if error.get("type") != _TERMINAL_PREBINDING_ERROR_TYPE or not isinstance(
+        message, str
     ):
         return False
-    reasons = message.removeprefix(_TERMINAL_PREBINDING_ERROR_PREFIX).split(",")
-    if (
-        len(reasons) != 2
-        or len(set(reasons)) != 2
-        or frozenset(reasons) != _TERMINAL_PREBINDING_REASONS
-    ):
+    baseline_prebinding_refusal = message == _TERMINAL_BASELINE_PREBINDING_ERROR
+    reasons = (
+        message.removeprefix(_TERMINAL_PREBINDING_ERROR_PREFIX).split(",")
+        if message.startswith(_TERMINAL_PREBINDING_ERROR_PREFIX)
+        else []
+    )
+    enqueue_prebinding_refusal = (
+        len(reasons) == 2
+        and len(set(reasons)) == 2
+        and frozenset(reasons) == _TERMINAL_PREBINDING_REASONS
+    )
+    if not enqueue_prebinding_refusal and not baseline_prebinding_refusal:
         return False
 
     source = connection.execute(
@@ -954,6 +962,17 @@ def _has_exact_terminal_prebinding_refusal(
         or message_id <= 0
     ):
         return False
+    if baseline_prebinding_refusal:
+        return _has_exact_failed_baseline_trade_signal(
+            connection,
+            available_tables=available_tables,
+            instruction_item_id=instruction_item_id,
+            raw_message_id=raw_message_id,
+            signal_candidate_id=signal_candidate_id,
+            strategy_instance_id=strategy_instance_id,
+            chat_id=chat_id,
+            message_id=message_id,
+        )
     if connection.execute(
         """
         SELECT 1 FROM trade_signals
@@ -979,6 +998,138 @@ def _has_exact_terminal_prebinding_refusal(
     ).fetchone():
         return False
     return True
+
+
+def _has_exact_failed_baseline_trade_signal(
+    connection: sqlite3.Connection,
+    *,
+    available_tables: set[str],
+    instruction_item_id: int,
+    raw_message_id: int,
+    signal_candidate_id: int,
+    strategy_instance_id: str,
+    chat_id: int,
+    message_id: int,
+) -> bool:
+    """Prove a baseline read failed before any exchange-write intent existed."""
+
+    required = {
+        "trade_signals": {
+            "id",
+            "strategy_instance_id",
+            "source_type",
+            "venue",
+            "chat_id",
+            "message_id",
+            "action",
+            "status",
+            "result_json",
+            "last_error",
+            "attempts",
+        },
+        "execution_order_legs": {"strategy_instance_id"},
+        "execution_events": {
+            "trade_signal_id",
+            "strategy_instance_id",
+            "chat_id",
+            "message_id",
+            "source_message_id",
+        },
+        "instruction_execution_contracts": {
+            "message_instruction_item_id",
+            "raw_message_id",
+            "signal_candidate_id",
+            "strategy_instance_id",
+            "state",
+            "trade_signal_id",
+            "execution_binding_id",
+            "attempted_exchange_write",
+            "terminal_kind",
+            "completion_scope",
+            "reason_code",
+        },
+    }
+    if not set(required).issubset(available_tables):
+        return False
+    for table, expected in required.items():
+        actual = {
+            str(row[1])
+            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if not expected.issubset(actual):
+            return False
+    rows = connection.execute(
+        """
+        SELECT id, strategy_instance_id, source_type, venue, chat_id,
+               message_id, action, status, result_json, last_error, attempts
+        FROM trade_signals
+        WHERE strategy_instance_id = ? OR (chat_id = ? AND message_id = ?)
+        ORDER BY id
+        LIMIT 2
+        """,
+        (strategy_instance_id, chat_id, message_id),
+    ).fetchall()
+    if len(rows) != 1:
+        return False
+    row = rows[0]
+    if not (
+        type(row[0]) is int
+        and row[0] > 0
+        and row[1] == strategy_instance_id
+        and row[2] == "recovery"
+        and row[3] == "deepcoin"
+        and row[4] == chat_id
+        and row[5] == message_id
+        and row[6] == "open_position"
+        and row[7] == "failed"
+        and row[8] is None
+        and row[9] == _TERMINAL_BASELINE_PREBINDING_ERROR
+        and type(row[10]) is int
+        and row[10] == 1
+    ):
+        return False
+    if connection.execute(
+        "SELECT 1 FROM execution_order_legs WHERE strategy_instance_id = ? LIMIT 1",
+        (strategy_instance_id,),
+    ).fetchone():
+        return False
+    if connection.execute(
+        """
+        SELECT 1 FROM instruction_execution_contracts
+        WHERE message_instruction_item_id = ?
+           OR raw_message_id = ?
+           OR signal_candidate_id = ?
+           OR strategy_instance_id = ?
+           OR trade_signal_id = ?
+        LIMIT 1
+        """,
+        (
+            instruction_item_id,
+            raw_message_id,
+            signal_candidate_id,
+            strategy_instance_id,
+            row[0],
+        ),
+    ).fetchone():
+        return False
+    if connection.execute(
+        "SELECT 1 FROM execution_bindings WHERE strategy_instance_id = ? LIMIT 1",
+        (strategy_instance_id,),
+    ).fetchone():
+        return False
+    return (
+        connection.execute(
+            """
+            SELECT 1 FROM execution_events
+            WHERE trade_signal_id = ?
+               OR strategy_instance_id = ?
+               OR (chat_id = ? AND (message_id = ? OR source_message_id = ?))
+            LIMIT 1
+            """,
+            (row[0], strategy_instance_id, chat_id, message_id, message_id),
+        ).fetchone()
+        is None
+    )
 
 
 def _reconciliation_stale_evidence_matches(

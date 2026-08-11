@@ -585,6 +585,91 @@ def test_entry_preamble_monitor_accepts_exact_terminal_prebinding_refusal(tmp_pa
     assert database.read_bytes() == before
 
 
+def _seed_terminal_baseline_prebinding_refusal(database):
+    _seed_terminal_prebinding_refusal(database)
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            ALTER TABLE trade_signals ADD COLUMN source_type TEXT;
+            ALTER TABLE trade_signals ADD COLUMN venue TEXT;
+            ALTER TABLE trade_signals ADD COLUMN action TEXT;
+            ALTER TABLE trade_signals ADD COLUMN status TEXT;
+            ALTER TABLE trade_signals ADD COLUMN result_json TEXT;
+            ALTER TABLE trade_signals ADD COLUMN last_error TEXT;
+            ALTER TABLE trade_signals ADD COLUMN attempts INTEGER;
+            ALTER TABLE execution_events ADD COLUMN trade_signal_id INTEGER;
+            CREATE TABLE execution_order_legs (
+              id INTEGER PRIMARY KEY, strategy_instance_id TEXT
+            );
+            CREATE TABLE instruction_execution_contracts (
+              id INTEGER PRIMARY KEY, message_instruction_item_id INTEGER,
+              raw_message_id INTEGER, signal_candidate_id INTEGER,
+              strategy_instance_id TEXT, state TEXT, trade_signal_id INTEGER,
+              execution_binding_id INTEGER, attempted_exchange_write INTEGER,
+              terminal_kind TEXT, completion_scope TEXT, reason_code TEXT
+            );
+            UPDATE message_instruction_items
+            SET error_json = '{"type":"RecoveryLiveSubmitError","message":"trigger_protection_baseline_unavailable"}';
+            INSERT INTO trade_signals (
+              id, strategy_instance_id, chat_id, message_id, source_type,
+              venue, action, status, result_json, last_error, attempts
+            ) VALUES (
+              1, 'deepcoin:-1001:3478:SOL:short', -1001, 3478, 'recovery',
+              'deepcoin', 'open_position', 'failed', NULL,
+              'trigger_protection_baseline_unavailable', 1
+            );
+            """
+        )
+
+
+def test_entry_preamble_monitor_accepts_exact_terminal_baseline_refusal(tmp_path):
+    database = tmp_path / "terminal-baseline-prebinding-refusal.db"
+    _seed_terminal_baseline_prebinding_refusal(database)
+    before = database.read_bytes()
+
+    codes = read_entry_preamble_invariants(
+        database,
+        now=datetime(2026, 8, 8, tzinfo=UTC),
+    )
+
+    assert codes == ()
+    assert database.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "UPDATE trade_signals SET status = 'unknown'",
+        "UPDATE trade_signals SET last_error = 'other'",
+        "UPDATE trade_signals SET result_json = '{}'",
+        "UPDATE trade_signals SET attempts = 2",
+        "UPDATE trade_signals SET source_type = 'manual'",
+        "UPDATE trade_signals SET venue = 'other'",
+        "UPDATE trade_signals SET action = 'close_position'",
+        "INSERT INTO execution_bindings VALUES "
+        "(1, 'deepcoin:-1001:3478:SOL:short', '{}')",
+        "INSERT INTO execution_events VALUES "
+        "(1, 'deepcoin:-1001:3478:SOL:short', -1001, 3478, 3478, NULL)",
+        "INSERT INTO execution_order_legs VALUES "
+        "(1, 'deepcoin:-1001:3478:SOL:short')",
+        "INSERT INTO instruction_execution_contracts VALUES "
+        "(1, 438, 9955, 1643, 'deepcoin:-1001:3478:SOL:short', "
+        "'submit_unknown', 1, NULL, 1, NULL, NULL, 'unknown')",
+        "INSERT INTO execution_events VALUES "
+        "(1, 'other-strategy', 9, 9, 9, 1)",
+    ),
+)
+def test_entry_preamble_monitor_terminal_baseline_refusal_is_fail_closed(
+    tmp_path, mutation
+):
+    database = tmp_path / "terminal-baseline-prebinding-mismatch.db"
+    _seed_terminal_baseline_prebinding_refusal(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(mutation)
+
+    _assert_terminal_prebinding_refusal_fails_closed(database)
+
+
 def _assert_terminal_prebinding_refusal_fails_closed(database):
     before = database.read_bytes()
     codes = read_entry_preamble_invariants(
