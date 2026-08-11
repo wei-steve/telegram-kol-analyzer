@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
-from sqlalchemy import update
+from sqlalchemy import or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
@@ -141,6 +141,7 @@ def transition_instruction_execution_contract(
     execution_binding_id: int | None = None,
     terminal_kind: str | None = None,
     completion_scope: str | None = None,
+    require_unexpired_at: datetime | None = None,
 ) -> InstructionExecutionContract:
     """Atomically update one expected version and append its immutable audit row."""
 
@@ -163,6 +164,10 @@ def transition_instruction_execution_contract(
     if attempted_exchange_write is True and new_state != "submitting":
         raise InstructionExecutionTransitionError(
             "exchange-write intent may only be recorded when entering submitting"
+        )
+    if require_unexpired_at is not None and new_state != "submitting":
+        raise InstructionExecutionTransitionError(
+            "deadline guard may only be applied when entering submitting"
         )
     if new_state == "verified":
         if terminal_kind not in INSTRUCTION_EXECUTION_TERMINAL_KINDS:
@@ -204,15 +209,21 @@ def transition_instruction_execution_contract(
         values["terminal_at"] = transitioned_at
 
     with session_factory() as session:
-        updated = session.execute(
-            update(InstructionExecutionContract)
-            .where(
-                InstructionExecutionContract.id == int(contract_id),
-                InstructionExecutionContract.state == expected_state,
-                InstructionExecutionContract.state_version == int(expected_version),
+        statement = update(InstructionExecutionContract).where(
+            InstructionExecutionContract.id == int(contract_id),
+            InstructionExecutionContract.state == expected_state,
+            InstructionExecutionContract.state_version == int(expected_version),
+        )
+        if require_unexpired_at is not None:
+            statement = statement.where(
+                or_(
+                    InstructionExecutionContract.deadline_at.is_(None),
+                    InstructionExecutionContract.deadline_at
+                    > require_unexpired_at,
+                )
             )
-            .values(**values)
-            .returning(InstructionExecutionContract.id)
+        updated = session.execute(
+            statement.values(**values).returning(InstructionExecutionContract.id)
         ).scalar_one_or_none()
         if updated is None:
             session.rollback()

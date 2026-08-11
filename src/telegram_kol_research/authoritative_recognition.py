@@ -892,10 +892,13 @@ def apply_authoritative_assessment(
             session_factory,
             assessment=assessment,
         )
+    execution_settings = None
     try:
+        execution_settings = load_trading_settings(session_factory)
         project_instruction_execution_contracts(
             session_factory,
             raw_message_id=assessment.raw_message_id,
+            settings=execution_settings,
             projected_at=utc_now(),
         )
     except Exception as exc:
@@ -905,17 +908,24 @@ def apply_authoritative_assessment(
             int(assessment.raw_message_id),
             type(exc).__name__,
         )
-    try:
-        reconcile_due_entry_admissions(
-            session_factory,
-            now=utc_now(),
-            limit=10,
-        )
-    except Exception as exc:
-        logger.warning(
-            "Entry admission reconciliation failed open: error=%s",
-            type(exc).__name__,
-        )
+    if execution_settings is not None:
+        try:
+            reconcile_due_entry_admissions(
+                session_factory,
+                now=utc_now(),
+                limit=10,
+                execution_contract_mode=(
+                    execution_settings.instruction_execution_contract_mode
+                ),
+                entry_after_item_id=(
+                    execution_settings.instruction_execution_entry_after_item_id
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Entry admission reconciliation failed open: error=%s",
+                type(exc).__name__,
+            )
     return result
 
 

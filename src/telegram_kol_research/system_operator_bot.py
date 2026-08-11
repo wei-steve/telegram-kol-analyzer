@@ -2581,10 +2581,9 @@ async def run_runtime_incident_notification_loop(
     while True:
         execution_client = None
         try:
+            execution_settings = load_trading_settings(session_factory)
             execution_mode = str(
-                load_trading_settings(
-                    session_factory
-                ).instruction_execution_contract_mode
+                execution_settings.instruction_execution_contract_mode
             )
             if execution_mode != "disabled":
                 if deepcoin_client_factory is None:
@@ -2599,6 +2598,9 @@ async def run_runtime_incident_notification_loop(
                 session_factory,
                 now=datetime.now(UTC),
                 execution_contract_mode=execution_mode,
+                execution_entry_after_item_id=int(
+                    execution_settings.instruction_execution_entry_after_item_id
+                ),
                 execution_reconciliation_client=execution_client,
             )
         except asyncio.CancelledError:
@@ -2628,6 +2630,7 @@ def run_operator_maintenance_tick(
     now: datetime,
     entry_admission_limit: int = 20,
     execution_contract_mode: str = "disabled",
+    execution_entry_after_item_id: int = 0,
     execution_reconciliation_client=None,
     execution_reconciliation_limit: int = 20,
 ):
@@ -2637,6 +2640,8 @@ def run_operator_maintenance_tick(
         session_factory,
         now=now,
         limit=max(0, min(int(entry_admission_limit), 100)),
+        execution_contract_mode=execution_contract_mode,
+        entry_after_item_id=int(execution_entry_after_item_id),
     )
     if (
         execution_contract_mode != "disabled"

@@ -896,6 +896,7 @@ def process_trade_signal_live(
     max_order_legs: int | None = None,
     message_instruction_item_id: int | None = None,
     execution_contract_mode: str = "disabled",
+    writer_boundary_at: datetime | None = None,
 ) -> dict[str, Any]:
     """Receive and execute one pending trade signal."""
 
@@ -914,25 +915,27 @@ def process_trade_signal_live(
         raise RecoveryLiveSubmitError(str(exc)) from exc
     verified_v2_assembly = False
     submission_progress = EntrySubmissionProgress()
+    execution_boundary_at = now
     try:
         if trade_signal.action == "open_position":
             verified_v2_assembly = _require_synchronized_finalized_entry_assembly(
                 session_factory,
                 trade_signal=trade_signal,
             )
+            execution_boundary_at = writer_boundary_at or datetime.now(UTC)
             _prepare_instruction_entry_submission(
                 session_factory,
                 trade_signal=trade_signal,
                 message_instruction_item_id=message_instruction_item_id,
                 execution_contract_mode=execution_contract_mode,
-                prepared_at=now,
+                prepared_at=execution_boundary_at,
             )
             result = _submit_recovery_signal_direct(
                 session_factory,
                 trade_signal=trade_signal,
                 deepcoin_client=deepcoin_client,
                 contract_spec_provider=contract_spec_provider,
-                submitted_at=now,
+                submitted_at=execution_boundary_at,
                 max_order_legs=max_order_legs,
                 verified_v2_assembly=verified_v2_assembly,
                 submission_progress=submission_progress,
@@ -961,7 +964,7 @@ def process_trade_signal_live(
             session_factory,
             signal_id=signal_id,
             error=str(failure),
-            failed_at=now,
+            failed_at=execution_boundary_at,
             expected_status="processing",
             terminal_status=_entry_submission_failure_status(
                 failure,
@@ -975,7 +978,7 @@ def process_trade_signal_live(
             execution_contract_mode=execution_contract_mode,
             submission_progress=submission_progress,
             error=failure,
-            projected_at=now,
+            projected_at=execution_boundary_at,
         )
         if failure is not exc:
             raise failure from exc
@@ -984,7 +987,7 @@ def process_trade_signal_live(
         session_factory,
         signal_id=signal_id,
         result=result,
-        processed_at=now,
+        processed_at=execution_boundary_at,
         expected_status="processing",
     )
     _project_instruction_entry_submission(
@@ -994,7 +997,7 @@ def process_trade_signal_live(
         execution_contract_mode=execution_contract_mode,
         submission_progress=submission_progress,
         error=None,
-        projected_at=now,
+        projected_at=execution_boundary_at,
     )
     return result
 

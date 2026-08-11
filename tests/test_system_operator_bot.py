@@ -90,10 +90,17 @@ def test_operator_maintenance_tick_runs_bounded_entry_reconciler(monkeypatch):
         object(),
         now=NOW,
         entry_admission_limit=7,
+        execution_contract_mode="live",
+        execution_entry_after_item_id=480,
     )
 
     assert result is expected
-    assert calls[0][1] == {"now": NOW, "limit": 7}
+    assert calls[0][1] == {
+        "now": NOW,
+        "limit": 7,
+        "execution_contract_mode": "live",
+        "entry_after_item_id": 480,
+    }
 
 
 def test_operator_maintenance_tick_runs_bounded_read_only_execution_reconciler(
@@ -140,7 +147,8 @@ def test_runtime_notification_loop_wires_execution_reconciliation_only_in_mode(
         operator_bot_module,
         "load_trading_settings",
         lambda session_factory: SimpleNamespace(
-            instruction_execution_contract_mode="shadow"
+            instruction_execution_contract_mode="shadow",
+            instruction_execution_entry_after_item_id=480,
         ),
         raising=False,
     )
@@ -165,6 +173,7 @@ def test_runtime_notification_loop_wires_execution_reconciliation_only_in_mode(
         )
 
     assert calls[0]["execution_contract_mode"] == "shadow"
+    assert calls[0]["execution_entry_after_item_id"] == 480
     assert calls[0]["execution_reconciliation_client"] is client
 
 

@@ -674,6 +674,37 @@ def test_existing_submitting_contract_never_reenters_writer(tmp_path):
         )
 
 
+def test_expired_deferred_contract_cannot_reenter_entry_writer(tmp_path):
+    session_factory = create_session_factory(tmp_path / "expired-deferred-submit.db")
+    item_id, signal_id, draft = _persist_chain(session_factory)
+    project_entry_deferred_contract(
+        session_factory,
+        message_instruction_item_id=item_id,
+        reason_code="adjacent_entry_context_pending",
+        blocker_ids=(17,),
+        deadline_at=NOW,
+        projected_at=NOW,
+        mode="live",
+    )
+    with session_factory() as session:
+        session.get(MessageInstructionItem, item_id).status = "executing"
+        session.commit()
+
+    with pytest.raises(EntryExecutionContractBlocked, match="deadline_expired"):
+        prepare_entry_submission_contract(
+            session_factory,
+            message_instruction_item_id=item_id,
+            trade_signal_id=signal_id,
+            draft=draft,
+            prepared_at=NOW.replace(microsecond=1),
+            mode="live",
+        )
+
+    contract = _contract(session_factory)
+    assert contract.state == "expired"
+    assert contract.attempted_exchange_write is False
+
+
 def test_stale_same_index_binding_with_different_client_id_stays_unknown(tmp_path):
     session_factory = create_session_factory(tmp_path / "stale-binding.db")
     item_id, signal_id, draft = _persist_chain(session_factory)

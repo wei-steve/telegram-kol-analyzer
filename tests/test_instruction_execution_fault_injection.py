@@ -5,6 +5,11 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+import telegram_kol_research.auto_trade_execution as auto_trade_execution_module
+
+from telegram_kol_research.auto_trade_execution import (
+    execute_message_instruction_items,
+)
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.entry_assembly_admission import (
@@ -17,6 +22,10 @@ from telegram_kol_research.instruction_execution_contracts import (
 from telegram_kol_research.instruction_execution_entry_adapter import (
     EntryExecutionContractBlocked,
     prepare_entry_submission_contract,
+    project_entry_deferred_contract,
+)
+from telegram_kol_research.message_instruction_items import (
+    claim_next_message_instruction_item,
 )
 from telegram_kol_research.instruction_execution_reconciliation import (
     reconcile_instruction_execution_contracts,
@@ -228,6 +237,7 @@ def _run_real_writer(session_factory, *, signal, item_id, client, provider):
         message_instruction_item_id=item_id,
         execution_contract_mode="live",
         processed_at=NOW,
+        writer_boundary_at=NOW,
     )
 
 
@@ -243,6 +253,91 @@ def _assert_real_writer_restart_blocked(
             provider=provider,
         )
     assert len(client.trigger_payloads) + len(client.payloads) == call_count
+
+
+def test_worker_start_before_deadline_cannot_write_after_boundary_expiry(tmp_path):
+    from test_recovery_live_submit import _FakeDeepcoinClient
+
+    session_factory = create_session_factory(tmp_path / "boundary-expired.db")
+    signal, item_id, provider = _persist_real_writer_case(session_factory)
+    client = _FakeDeepcoinClient()
+
+    with pytest.raises(EntryExecutionContractBlocked, match="deadline_expired"):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=provider,
+            message_instruction_item_id=item_id,
+            execution_contract_mode="live",
+            processed_at=NOW,
+            writer_boundary_at=NOW + timedelta(minutes=6),
+        )
+
+    assert client.trigger_payloads == client.payloads == []
+    assert _contract(session_factory) == ("expired", False)
+
+
+def test_expired_claimed_item_finishes_terminal_and_cannot_be_reclaimed(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "expired-item-mirror.db")
+    item_id, signal_id, draft = _persist_entry_chain(session_factory)
+    project_entry_deferred_contract(
+        session_factory,
+        message_instruction_item_id=item_id,
+        reason_code="adjacent_entry_context_pending",
+        blocker_ids=(17,),
+        deadline_at=NOW + timedelta(minutes=5),
+        projected_at=NOW,
+        mode="live",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "instruction_execution_contract_mode": "live",
+            "instruction_execution_entry_after_item_id": 0,
+        },
+    )
+    writer_calls = []
+
+    def blocked_before_writer(*args, **kwargs):
+        prepare_entry_submission_contract(
+            session_factory,
+            message_instruction_item_id=item_id,
+            trade_signal_id=signal_id,
+            draft=draft,
+            prepared_at=NOW + timedelta(minutes=6),
+            mode="live",
+        )
+        writer_calls.append("called")
+
+    monkeypatch.setattr(
+        auto_trade_execution_module,
+        "_auto_process_single_message_trade_signal",
+        blocked_before_writer,
+    )
+    with session_factory() as session:
+        raw_message_id = session.get(MessageInstructionItem, item_id).raw_message_id
+
+    execute_message_instruction_items(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=object(),
+        deepcoin_client=None,
+        processed_at=NOW,
+    )
+
+    assert writer_calls == []
+    with session_factory() as session:
+        assert session.get(MessageInstructionItem, item_id).status == "failed"
+        assert session.query(InstructionExecutionContract).one().state == "expired"
+    assert claim_next_message_instruction_item(
+        session_factory,
+        raw_message_id=raw_message_id,
+        now=NOW + timedelta(minutes=7),
+    ) is None
 
 
 def test_crash_before_contract_transition_never_reaches_real_writer(

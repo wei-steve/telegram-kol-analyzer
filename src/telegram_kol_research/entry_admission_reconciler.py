@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from sqlalchemy import and_, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.entry_assembly_admission import (
@@ -14,17 +15,12 @@ from telegram_kol_research.entry_assembly_admission import (
     _release_adjacent_entry_visibility_delay,
     assess_entry_assembly_admission,
 )
-from telegram_kol_research.instruction_execution_contracts import (
-    InstructionExecutionConflictError,
-    InstructionExecutionTransitionError,
-    transition_instruction_execution_contract,
-)
 from telegram_kol_research.models import (
     EntryAssemblyAttempt,
     InstructionExecutionContract,
+    InstructionExecutionTransition,
     MessageInstructionItem,
 )
-from telegram_kol_research.runtime_incidents import record_runtime_incident
 
 
 ENTRY_ADMISSION_RECHECK_DELAY = timedelta(seconds=5)
@@ -43,9 +39,13 @@ def reconcile_due_entry_admissions(
     *,
     now: datetime,
     limit: int = 20,
+    execution_contract_mode: str = "disabled",
+    entry_after_item_id: int = 0,
 ) -> EntryAdmissionReconcileResult:
     """Release or expire due attempts without invoking any exchange writer."""
 
+    if execution_contract_mode != "live":
+        return EntryAdmissionReconcileResult()
     bounded_limit = max(0, min(int(limit), 100))
     if bounded_limit == 0:
         return EntryAdmissionReconcileResult()
@@ -54,10 +54,29 @@ def reconcile_due_entry_admissions(
             int(row_id)
             for (row_id,) in (
                 session.query(EntryAssemblyAttempt.id)
+                .join(
+                    MessageInstructionItem,
+                    and_(
+                        MessageInstructionItem.raw_message_id
+                        == EntryAssemblyAttempt.strategy_raw_message_id,
+                        MessageInstructionItem.signal_candidate_id
+                        == EntryAssemblyAttempt.signal_candidate_id,
+                    ),
+                )
+                .join(
+                    InstructionExecutionContract,
+                    InstructionExecutionContract.message_instruction_item_id
+                    == MessageInstructionItem.id,
+                )
                 .filter(
                     EntryAssemblyAttempt.status == "pending",
                     EntryAssemblyAttempt.updated_at
                     <= now - ENTRY_ADMISSION_RECHECK_DELAY,
+                    MessageInstructionItem.id > int(entry_after_item_id),
+                    MessageInstructionItem.instruction_kind == "entry",
+                    MessageInstructionItem.status == "pending",
+                    MessageInstructionItem.retired_at.is_(None),
+                    InstructionExecutionContract.state == "deferred",
                 )
                 .order_by(EntryAssemblyAttempt.updated_at, EntryAssemblyAttempt.id)
                 .limit(bounded_limit)
@@ -71,47 +90,42 @@ def reconcile_due_entry_admissions(
         if snapshot is None:
             continue
         attempt, item, contract = snapshot
-        if contract is not None and contract.state == "submit_unknown":
-            counts["skipped"] += 1
-            continue
         if item is None:
             counts["skipped"] += 1
             continue
-        if item.status == "succeeded" and _is_adjacent_entry_context_defer(
-            item.result_json
-        ):
-            if _expire_attempt_only(session_factory, attempt_id=attempt_id, now=now):
-                _record_legacy_stale_incident(
-                    session_factory,
-                    attempt_id=attempt_id,
-                    now=now,
-                )
-                counts["incidents"] += 1
-            continue
-        if item.status != "pending" or not _is_adjacent_entry_context_defer(
-            item.result_json
+        if (
+            int(item.id) <= int(entry_after_item_id)
+            or contract is None
+            or contract.state != "deferred"
         ):
             counts["skipped"] += 1
             continue
-        deadline = _as_utc(item.execution_deadline_at)
-        if deadline is not None and now >= deadline:
-            contract_snapshot = (
-                (contract.id, contract.state, contract.state_version)
-                if contract is not None
-                else None
-            )
-            if _expire_attempt_and_item(
+        if item.status != "pending":
+            counts["skipped"] += 1
+            continue
+        if not _is_adjacent_entry_context_defer(item.result_json):
+            if _expire_deferred_entry_truth(
                 session_factory,
                 attempt_id=attempt_id,
                 item_id=int(item.id),
+                contract_id=int(contract.id),
+                contract_version=int(contract.state_version),
+                now=now,
+                reason="entry_admission_recheck_state_mismatch",
+            ):
+                counts["expired"] += 1
+            continue
+        deadline = _as_utc(item.execution_deadline_at)
+        if deadline is not None and now >= deadline:
+            if _expire_deferred_entry_truth(
+                session_factory,
+                attempt_id=attempt_id,
+                item_id=int(item.id),
+                contract_id=int(contract.id),
+                contract_version=int(contract.state_version),
                 now=now,
             ):
                 counts["expired"] += 1
-                _expire_contract_best_effort(
-                    session_factory,
-                    contract_snapshot=contract_snapshot,
-                    now=now,
-                )
             continue
 
         decision = assess_entry_assembly_admission(
@@ -124,24 +138,16 @@ def reconcile_due_entry_admissions(
         if decision.status == "deferred":
             continue
         if decision.status == "blocked":
-            contract_snapshot = (
-                (contract.id, contract.state, contract.state_version)
-                if contract is not None
-                else None
-            )
-            if _expire_attempt_and_item(
+            if _expire_deferred_entry_truth(
                 session_factory,
                 attempt_id=attempt_id,
                 item_id=int(item.id),
+                contract_id=int(contract.id),
+                contract_version=int(contract.state_version),
                 now=now,
                 reason="entry_admission_recheck_blocked",
             ):
                 counts["expired"] += 1
-                _expire_contract_best_effort(
-                    session_factory,
-                    contract_snapshot=contract_snapshot,
-                    now=now,
-                )
             continue
         with session_factory() as session:
             current_attempt = session.get(EntryAssemblyAttempt, attempt_id)
@@ -199,14 +205,17 @@ def _load_attempt_snapshot(session_factory, *, attempt_id: int):
         return attempt, item, contract
 
 
-def _expire_attempt_and_item(
+def _expire_deferred_entry_truth(
     session_factory,
     *,
     attempt_id: int,
     item_id: int,
+    contract_id: int,
+    contract_version: int,
     now: datetime,
     reason: str = "entry_admission_deadline_expired",
 ) -> bool:
+    evidence_json = '[{"kind":"entry_assembly_attempt"}]'
     error_json = json.dumps(
         {"status": "expired", "reason": reason},
         ensure_ascii=False,
@@ -214,98 +223,72 @@ def _expire_attempt_and_item(
         separators=(",", ":"),
     )
     with session_factory() as session:
-        attempt = session.get(EntryAssemblyAttempt, int(attempt_id))
-        item = session.get(MessageInstructionItem, int(item_id))
-        if (
-            attempt is None
-            or attempt.status != "pending"
-            or item is None
-            or item.status != "pending"
-        ):
-            return False
-        attempt.status = "expired"
-        attempt.updated_at = now
-        item.status = "failed"
-        item.result_json = None
-        item.error_json = error_json
-        item.visibility_next_attempt_at = None
-        item.updated_at = now
-        session.commit()
-        return True
-
-
-def _expire_attempt_only(session_factory, *, attempt_id: int, now: datetime) -> bool:
-    with session_factory() as session:
-        attempt = session.get(EntryAssemblyAttempt, int(attempt_id))
-        if attempt is None or attempt.status != "pending":
-            return False
-        attempt.status = "expired"
-        attempt.updated_at = now
-        session.commit()
-        return True
-
-
-def _expire_contract_best_effort(
-    session_factory,
-    *,
-    contract_snapshot,
-    now: datetime,
-) -> None:
-    if contract_snapshot is None:
-        return
-    contract_id, state, version = contract_snapshot
-    if state not in {"pending", "deferred"}:
-        return
-    try:
-        transition_instruction_execution_contract(
-            session_factory,
-            contract_id=int(contract_id),
-            expected_state=str(state),
-            expected_version=int(version),
-            new_state="expired",
-            reason_code="entry_admission_deadline_expired",
-            evidence_refs=[{"kind": "entry_assembly_attempt"}],
-            transitioned_at=now,
+        contract_result = session.execute(
+            update(InstructionExecutionContract)
+            .where(
+                InstructionExecutionContract.id == int(contract_id),
+                InstructionExecutionContract.message_instruction_item_id
+                == int(item_id),
+                InstructionExecutionContract.state == "deferred",
+                InstructionExecutionContract.state_version
+                == int(contract_version),
+            )
+            .values(
+                state="expired",
+                state_version=int(contract_version) + 1,
+                reason_code=reason,
+                evidence_refs_json=evidence_json,
+                last_progress_at=now,
+                terminal_at=now,
+                updated_at=now,
+            )
         )
-    except (
-        InstructionExecutionConflictError,
-        InstructionExecutionTransitionError,
-    ):
-        return
-
-
-def _record_legacy_stale_incident(
-    session_factory,
-    *,
-    attempt_id: int,
-    now: datetime,
-) -> None:
-    summary = json.dumps(
-        {
-            "component": "entry_admission_reconciler",
-            "impact": "legacy_deferred_item_has_no_exchange_proof",
-            "reason_code": "succeeded_deferred_contradiction",
-            "source_status": "legacy_unproven",
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    fingerprint = hashlib.sha256(
-        f"entry-admission-legacy:{attempt_id}".encode()
-    ).hexdigest()
-    record_runtime_incident(
-        session_factory,
-        source_kind="entry_assembly_attempt",
-        source_record_id=str(int(attempt_id)),
-        incident_type="unclassified_operation_failure",
-        severity="high",
-        fingerprint=fingerprint,
-        redacted_summary=summary,
-        occurred_at=now,
-        feature_policy_version="execution-truth-v1",
-        prompt_version="none",
-        tool_policy_version="read-only-v1",
-    )
+        item_result = session.execute(
+            update(MessageInstructionItem)
+            .where(
+                MessageInstructionItem.id == int(item_id),
+                MessageInstructionItem.status == "pending",
+            )
+            .values(
+                status="failed",
+                result_json=None,
+                error_json=error_json,
+                visibility_next_attempt_at=None,
+                updated_at=now,
+            )
+        )
+        attempt_result = session.execute(
+            update(EntryAssemblyAttempt)
+            .where(
+                EntryAssemblyAttempt.id == int(attempt_id),
+                EntryAssemblyAttempt.status == "pending",
+            )
+            .values(status="expired", updated_at=now)
+        )
+        if (
+            contract_result.rowcount != 1
+            or item_result.rowcount != 1
+            or attempt_result.rowcount != 1
+        ):
+            session.rollback()
+            return False
+        session.add(
+            InstructionExecutionTransition(
+                contract_id=int(contract_id),
+                state_version=int(contract_version) + 1,
+                previous_state="deferred",
+                next_state="expired",
+                reason_code=reason,
+                evidence_refs_json=evidence_json,
+                created_at=now,
+            )
+        )
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            return False
+        return True
 
 
 def _as_utc(value: datetime | None) -> datetime | None:

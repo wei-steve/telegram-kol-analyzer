@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Mapping
 
 from sqlalchemy import update
@@ -485,6 +485,15 @@ def prepare_entry_submission_contract(
         raise EntryExecutionContractBlocked(
             "entry_contract_submitting_requires_reconciliation"
         )
+    if contract.deadline_at is not None and _as_utc(prepared_at) >= _as_utc(
+        contract.deadline_at
+    ):
+        _expire_entry_contract_deadline(
+            session_factory,
+            contract=contract,
+            expired_at=prepared_at,
+        )
+        raise EntryExecutionContractBlocked("entry_contract_deadline_expired")
     if contract.state == "deferred":
         contract = transition_instruction_execution_contract(
             session_factory,
@@ -496,29 +505,83 @@ def prepare_entry_submission_contract(
             evidence_refs=[{"kind": "entry_admission_recheck"}],
             transitioned_at=prepared_at,
         )
-    transitioned = transition_instruction_execution_contract(
-        session_factory,
-        contract_id=int(contract.id),
-        expected_state="pending",
-        expected_version=int(contract.state_version),
-        new_state="submitting",
-        reason_code="entry_writer_call_imminent",
-        evidence_refs=[
-            {
-                "kind": "entry_draft",
-                "fingerprint": fingerprint,
-                "trade_signal_id": int(trade_signal_id),
-            }
-        ],
-        transitioned_at=prepared_at,
-        attempted_exchange_write=True,
-        trade_signal_id=int(trade_signal_id),
-    )
+    try:
+        transitioned = transition_instruction_execution_contract(
+            session_factory,
+            contract_id=int(contract.id),
+            expected_state="pending",
+            expected_version=int(contract.state_version),
+            new_state="submitting",
+            reason_code="entry_writer_call_imminent",
+            evidence_refs=[
+                {
+                    "kind": "entry_draft",
+                    "fingerprint": fingerprint,
+                    "trade_signal_id": int(trade_signal_id),
+                }
+            ],
+            transitioned_at=prepared_at,
+            attempted_exchange_write=True,
+            trade_signal_id=int(trade_signal_id),
+            require_unexpired_at=prepared_at,
+        )
+    except InstructionExecutionConflictError:
+        latest = _load_contract(
+            session_factory,
+            message_instruction_item_id=message_instruction_item_id,
+        )
+        if (
+            latest is not None
+            and latest.deadline_at is not None
+            and _as_utc(prepared_at) >= _as_utc(latest.deadline_at)
+        ):
+            _expire_entry_contract_deadline(
+                session_factory,
+                contract=latest,
+                expired_at=prepared_at,
+            )
+            raise EntryExecutionContractBlocked("entry_contract_deadline_expired")
+        raise
     return EntrySubmissionPreparation(
         transitioned.state,
         int(transitioned.id),
         fingerprint,
     )
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def _expire_entry_contract_deadline(
+    session_factory: sessionmaker,
+    *,
+    contract: InstructionExecutionContract,
+    expired_at: datetime,
+) -> InstructionExecutionContract:
+    if contract.state == "expired":
+        return contract
+    if contract.state not in {"pending", "deferred"}:
+        raise EntryExecutionContractBlocked(f"entry_contract_{contract.state}")
+    try:
+        return transition_instruction_execution_contract(
+            session_factory,
+            contract_id=int(contract.id),
+            expected_state=str(contract.state),
+            expected_version=int(contract.state_version),
+            new_state="expired",
+            reason_code="entry_execution_deadline_expired",
+            evidence_refs=[{"kind": "entry_execution_deadline"}],
+            transitioned_at=expired_at,
+        )
+    except InstructionExecutionConflictError:
+        latest = _load_contract(
+            session_factory,
+            message_instruction_item_id=int(contract.message_instruction_item_id),
+        )
+        if latest is not None and latest.state == "expired":
+            return latest
+        raise EntryExecutionContractBlocked("entry_contract_deadline_expiry_conflict")
 
 
 def project_entry_submission_result(
@@ -543,7 +606,7 @@ def project_entry_submission_result(
     )
     if contract is None:
         raise EntryExecutionContractBlocked("entry_contract_missing")
-    if contract.state in {"verified", "failed", "submit_unknown"}:
+    if contract.state in {"verified", "failed", "expired", "submit_unknown"}:
         return EntrySubmissionProjection(
             contract.state,
             completion_scope=contract.completion_scope,

@@ -231,6 +231,29 @@ def test_submitting_marks_exchange_write_only_at_explicit_writer_boundary(tmp_pa
     assert written.attempted_exchange_write is True
 
 
+def test_submitting_deadline_guard_is_part_of_atomic_contract_cas(tmp_path):
+    session_factory = create_session_factory(tmp_path / "expired-submit.db")
+    contract_id = _persist_contract(session_factory)
+    with session_factory() as session:
+        session.get(InstructionExecutionContract, contract_id).deadline_at = NOW
+        session.commit()
+
+    with pytest.raises(InstructionExecutionConflictError):
+        transition_instruction_execution_contract(
+            session_factory,
+            contract_id=contract_id,
+            attempted_exchange_write=True,
+            require_unexpired_at=NOW,
+            **_transition_kwargs("pending", "submitting"),
+        )
+
+    with session_factory() as session:
+        contract = session.get(InstructionExecutionContract, contract_id)
+        assert contract.state == "pending"
+        assert contract.attempted_exchange_write is False
+        assert session.query(InstructionExecutionTransition).count() == 0
+
+
 def test_exchange_write_flag_cannot_be_set_outside_submitting_transition(tmp_path):
     session_factory = create_session_factory(tmp_path / "invalid-write-flag.db")
     contract_id = _persist_contract(session_factory)

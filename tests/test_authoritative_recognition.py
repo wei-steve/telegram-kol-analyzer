@@ -764,7 +764,10 @@ def test_unambiguous_entry_skips_injected_context_resolver(tmp_path, monkeypatch
     assert result.status == "是策略"
 
 
-def test_authoritative_apply_projects_future_shadow_contract_idempotently(tmp_path):
+def test_authoritative_apply_projects_future_shadow_contract_idempotently(
+    tmp_path,
+    monkeypatch,
+):
     from telegram_kol_research.trading_settings import save_trading_settings
 
     session_factory = create_session_factory(tmp_path / "shadow-contract.db")
@@ -810,9 +813,29 @@ def test_authoritative_apply_projects_future_shadow_contract_idempotently(tmp_pa
         differences=[],
         authoritative_generation="shadow-generation",
     )
+    reconcile_calls = []
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.reconcile_due_entry_admissions",
+        lambda *args, **kwargs: reconcile_calls.append(kwargs),
+    )
 
     apply_authoritative_assessment(session_factory, assessment)
     apply_authoritative_assessment(session_factory, assessment)
+
+    assert reconcile_calls == [
+        {
+            "now": reconcile_calls[0]["now"],
+            "limit": 10,
+            "execution_contract_mode": "shadow",
+            "entry_after_item_id": 0,
+        },
+        {
+            "now": reconcile_calls[1]["now"],
+            "limit": 10,
+            "execution_contract_mode": "shadow",
+            "entry_after_item_id": 0,
+        },
+    ]
 
     with session_factory() as session:
         contract = session.query(InstructionExecutionContract).one()
