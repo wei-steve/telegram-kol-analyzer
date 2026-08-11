@@ -2490,6 +2490,42 @@ function reloadHistoryPositionsWithFilter(root) {
     .catch(() => false);
 }
 
+function historyPositionCardId(card) {
+  return card?.dataset?.historyPositionId || '';
+}
+
+function historyPositionIdSet(list) {
+  return new Set(
+    Array.from(list?.querySelectorAll?.('[data-history-position-id]') || [])
+      .map(historyPositionCardId)
+      .filter(Boolean),
+  );
+}
+
+function updateHistoryBrowseFooter(panel, fragment, loadedCount) {
+  const status = panel.querySelector('[data-history-browse-status]');
+  const currentButton = panel.querySelector('[data-history-load-more]');
+  const nextButton = fragment.querySelector('[data-history-load-more]');
+  const totalCount = Number(
+    fragment.dataset.historyTotalCount
+    || panel.dataset.historyTotalCount
+    || loadedCount,
+  );
+  panel.dataset.historyLoadedCount = String(loadedCount);
+  panel.dataset.historyTotalCount = String(totalCount);
+  if (status) {
+    status.textContent = fragment.dataset.historyHasMore === 'true'
+      ? `已显示 ${loadedCount} / ${totalCount} 条`
+      : `已显示全部 ${totalCount} 条`;
+  }
+  if (nextButton) {
+    if (currentButton) currentButton.replaceWith(nextButton);
+    else panel.querySelector('[data-history-browse-footer]')?.appendChild(nextButton);
+  } else {
+    currentButton?.remove();
+  }
+}
+
 function loadMoreHistoryPositions(root) {
   const selector = '[data-exchange-position-panel="position-history"]';
   const panel = root?.querySelector?.(selector);
@@ -2509,12 +2545,19 @@ function loadMoreHistoryPositions(root) {
       const list = panel.querySelector('[data-exchange-view-panel="list"] .exchange-card-list');
       const nextList = fragment.querySelector('[data-exchange-view-panel="list"] .exchange-card-list');
       if (!list || !nextList) return false;
-      Array.from(nextList.children).forEach((card) => list.appendChild(card));
-      appendHistoryGroups(panel, fragment);
+      const existingIds = historyPositionIdSet(list);
+      const acceptedIds = new Set();
+      Array.from(nextList.children).forEach((card) => {
+        const id = historyPositionCardId(card);
+        if (!id || existingIds.has(id) || acceptedIds.has(id)) return;
+        acceptedIds.add(id);
+        list.appendChild(card);
+      });
+      appendHistoryGroups(panel, fragment, acceptedIds);
+      const loadedCount = existingIds.size + acceptedIds.size;
       panel.dataset.historyNextCursor = fragment.dataset.historyNextCursor || '';
       panel.dataset.historyHasMore = fragment.dataset.historyHasMore || 'false';
-      const footer = fragment.querySelector('[data-history-browse-footer]');
-      panel.querySelector('[data-history-browse-footer]')?.replaceWith(footer);
+      updateHistoryBrowseFooter(panel, fragment, loadedCount);
       bindHistoryBrowseControls(root);
       return true;
     })
@@ -2526,24 +2569,34 @@ function loadMoreHistoryPositions(root) {
     .finally(() => { delete panel.dataset.historyLoading; });
 }
 
-function appendHistoryGroups(panel, fragment) {
+function appendHistoryGroups(panel, fragment, acceptedIds) {
   const currentGroups = panel.querySelector('[data-exchange-view-panel="grouped"] .exchange-group-list');
   const nextGroups = fragment.querySelector('[data-exchange-view-panel="grouped"] .exchange-group-list');
   if (!currentGroups || !nextGroups) return;
   nextGroups.querySelectorAll('[data-exchange-group-section]').forEach((incoming) => {
     const name = incoming.dataset.exchangeGroupName;
+    const incomingCards = incoming.querySelector('.exchange-card-list');
+    if (!incomingCards) return;
+    Array.from(incomingCards.querySelectorAll('[data-history-position-id]')).forEach((card) => {
+      if (!acceptedIds.has(historyPositionCardId(card))) card.remove();
+    });
+    const acceptedCards = Array.from(
+      incomingCards.querySelectorAll('[data-history-position-id]'),
+    );
+    if (!acceptedCards.length) return;
     const existing = Array.from(currentGroups.querySelectorAll('[data-exchange-group-section]'))
       .find((section) => section.dataset.exchangeGroupName === name);
     if (!existing) {
       currentGroups.querySelector('.exchange-empty')?.remove();
+      const incomingCount = incoming.querySelector('.exchange-group-header span');
+      if (incomingCount) incomingCount.textContent = String(acceptedCards.length);
       currentGroups.appendChild(incoming);
       return;
     }
     const cards = existing.querySelector('.exchange-card-list');
-    const incomingCards = incoming.querySelector('.exchange-card-list');
-    if (!cards || !incomingCards) return;
+    if (!cards) return;
     cards.querySelector('.exchange-empty')?.remove();
-    Array.from(incomingCards.children).forEach((card) => cards.appendChild(card));
+    acceptedCards.forEach((card) => cards.appendChild(card));
     const count = existing.querySelector('.exchange-group-header span');
     if (count) count.textContent = String(cards.querySelectorAll('[data-deepcoin-history-position]').length);
   });

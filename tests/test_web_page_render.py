@@ -1384,7 +1384,9 @@ def test_position_history_tab_serves_continuation_from_stable_browse_snapshot(tm
     assert first.status_code == 200
     assert 'data-history-browse-token="' in first.text
     assert 'data-history-next-cursor="deepcoin-position:pos-019"' in first.text
-    assert 'data-history-visible-count="20"' in first.text
+    assert 'data-history-page-item-count="20"' in first.text
+    assert 'data-history-total-count="45"' in first.text
+    assert "data-history-visible-count" not in first.text
     assert 'data-history-has-more="true"' in first.text
     token = re.search(r'data-history-browse-token="([^"]+)"', first.text).group(1)
 
@@ -1394,6 +1396,8 @@ def test_position_history_tab_serves_continuation_from_stable_browse_snapshot(tm
     )
 
     assert second.status_code == 200
+    assert 'data-history-page-item-count="20"' in second.text
+    assert 'data-history-total-count="45"' in second.text
     assert "pos-020" in second.text
     assert "pos-000" not in second.text
     assert len(exchange.calls) == 2

@@ -5342,7 +5342,7 @@ def create_web_app(
                 "token": browse_token,
                 "next_cursor": page.next_cursor,
                 "has_more": page.has_more,
-                "visible_count": len(page.rows),
+                "page_item_count": len(page.rows),
                 "total_count": page.total_count,
             }
         else:
@@ -5388,7 +5388,7 @@ def create_web_app(
                     "token": token,
                     "next_cursor": page.next_cursor,
                     "has_more": page.has_more,
-                    "visible_count": len(page.rows),
+                    "page_item_count": len(page.rows),
                     "total_count": page.total_count,
                 }
         exchange_snapshot = _annotate_exchange_snapshot_attribution(

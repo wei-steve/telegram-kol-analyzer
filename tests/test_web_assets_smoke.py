@@ -615,6 +615,91 @@ def test_workbench_partial_asset_version_mismatch_reloads_once_without_returning
     assert result.returncode == 0, result.stderr
 
 
+def test_history_load_more_tracks_cumulative_unique_count(tmp_path):
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is required for the history pagination behavior test")
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+    functions_start = js.index("function bindHistoryBrowseControls")
+    functions_end = js.index("\nfunction bindExchangePositionTabs", functions_start)
+    harness = textwrap.dedent(
+        """
+        class FakeCard {
+          constructor(id) { this.dataset = { historyPositionId: id }; }
+        }
+        class FakeList {
+          constructor(ids) { this.children = ids.map((id) => new FakeCard(id)); }
+          appendChild(card) { this.children.push(card); }
+          querySelectorAll(selector) {
+            return selector === '[data-history-position-id]' ? this.children : [];
+          }
+        }
+        class FakeButton {
+          constructor() { this.disabled = false; this.textContent = '加载更多'; }
+          replaceWith() {}
+          remove() {}
+        }
+        class FakePanel {
+          constructor(ids, dataset) {
+            this.dataset = dataset;
+            this.list = new FakeList(ids);
+            this.status = { textContent: '' };
+            this.button = new FakeButton();
+          }
+          querySelector(selector) {
+            if (selector === '[data-exchange-view-panel="list"] .exchange-card-list') return this.list;
+            if (selector === '[data-history-load-more]') return this.button;
+            if (selector === '[data-history-browse-status]') return this.status;
+            if (selector === '[data-history-browse-footer]') return null;
+            if (selector.includes('grouped')) return null;
+            return null;
+          }
+        }
+        const firstIds = Array.from({ length: 20 }, (_, index) => `pos-${index}`);
+        const current = new FakePanel(firstIds, {
+          historyBrowseToken: 'token',
+          historyNextCursor: 'cursor-1',
+          historyHasMore: 'true',
+          historyTotalCount: '100',
+        });
+        const nextIds = ['pos-19', ...Array.from({ length: 19 }, (_, index) => `pos-${index + 20}`)];
+        const next = new FakePanel(nextIds, {
+          historyNextCursor: 'cursor-2',
+          historyHasMore: 'true',
+          historyTotalCount: '100',
+        });
+        const root = {
+          querySelector: (selector) => selector === '[data-exchange-position-panel="position-history"]'
+            ? current
+            : null,
+          querySelectorAll: () => [],
+        };
+        var fetchWorkbenchPartial = async () => next;
+
+        await loadMoreHistoryPositions(root);
+
+        const ids = current.list.children.map((card) => card.dataset.historyPositionId);
+        if (ids.length !== new Set(ids).size) throw new Error('duplicate history card appended');
+        if (ids.length !== 39) throw new Error(`expected 39 unique cards, got ${ids.length}`);
+        if (current.dataset.historyLoadedCount !== '39') {
+          throw new Error(`expected cumulative count 39, got ${current.dataset.historyLoadedCount}`);
+        }
+        if (current.status.textContent !== '已显示 39 / 100 条') {
+          throw new Error(`unexpected status: ${current.status.textContent}`);
+        }
+        """
+    )
+    result = subprocess.run(
+        ["node", "-e", "\n".join((js[functions_start:functions_end], harness))],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_exchange_position_tab_manual_refresh_is_single_flight_and_preserves_data(
     tmp_path,
 ):

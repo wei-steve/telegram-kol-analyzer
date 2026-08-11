@@ -23,7 +23,7 @@
   data-exchange-tab-loaded="{{ 'false' if exchange_snapshot.error else 'true' }}"
   data-exchange-tab-item-count="{{ items|length }}"
   {% if exchange_tab_captured_at %}data-exchange-tab-captured-at="{{ exchange_tab_captured_at.isoformat() }}"{% endif %}
-  {% if history_pagination %}data-history-browse-token="{{ history_pagination.token }}" data-history-visible-count="{{ history_pagination.visible_count }}" data-history-has-more="{{ 'true' if history_pagination.has_more else 'false' }}"{% if history_pagination.next_cursor %} data-history-next-cursor="{{ history_pagination.next_cursor }}"{% endif %}{% endif %}
+  {% if history_pagination %}data-history-browse-token="{{ history_pagination.token }}" data-history-page-item-count="{{ history_pagination.page_item_count }}" data-history-total-count="{{ history_pagination.total_count }}" data-history-has-more="{{ 'true' if history_pagination.has_more else 'false' }}"{% if history_pagination.next_cursor %} data-history-next-cursor="{{ history_pagination.next_cursor }}"{% endif %}{% endif %}
   {% if tab_name == 'position-history' %}data-exchange-history-panel{% endif %}
 >
   {% if exchange_snapshot.error %}
@@ -44,7 +44,7 @@
     </div>
     {% if history_pagination %}
       <footer class="exchange-history-browse-footer" data-history-browse-footer>
-        <span data-history-browse-status role="status" aria-live="polite">已显示 {{ history_pagination.visible_count }} / {{ history_pagination.total_count }} 条</span>
+        <span data-history-browse-status role="status" aria-live="polite">已显示 {{ history_pagination.page_item_count }} / {{ history_pagination.total_count }} 条</span>
         {% if history_pagination.has_more %}
           <button type="button" class="secondary-button" data-history-load-more>加载更多</button>
         {% endif %}
