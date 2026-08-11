@@ -59,7 +59,25 @@ fi
 stage_dir=""
 service_stopped=0
 checkout_mutated=0
+schema_backup=""
+schema_dry_run=""
 previous_commit="$(git -C "$APP_DIR" rev-parse HEAD)"
+cleanup_schema_dry_run() {
+  if [ -z "$schema_dry_run" ]; then
+    return
+  fi
+  case "$schema_dry_run" in
+    "$APP_DIR"/data/backups/schema-dry-run-*)
+      rm -f -- "$schema_dry_run" "$schema_dry_run-wal" \
+        "$schema_dry_run-shm" "$schema_dry_run-journal"
+      schema_dry_run=""
+      ;;
+    *)
+      echo "Refusing to remove unexpected schema dry-run path." >&2
+      return 1
+      ;;
+  esac
+}
 cleanup() {
   status=$?
   trap - EXIT INT TERM
@@ -97,6 +115,7 @@ cleanup() {
   if [ -n "$stage_dir" ] && [ -d "$stage_dir" ]; then
     git -C "$APP_DIR" worktree remove --force "$stage_dir" >/dev/null 2>&1 || true
   fi
+  cleanup_schema_dry_run || true
   exit "$status"
 }
 trap cleanup EXIT INT TERM
@@ -113,13 +132,12 @@ git worktree add --detach "$stage_dir" "$EXPECTED_COMMIT" >/dev/null
 candidate_cli=(env "PYTHONPATH=$stage_dir/src" "$APP_DIR/.venv/bin/python" -m telegram_kol_research.cli)
 
 install -d -m 0700 "$PREFLIGHT_DIR"
-schema_backup=""
-schema_dry_run=""
 create_schema_evidence() {
   local label="$1"
   install -d -m 0700 "$APP_DIR/data/backups"
+  cleanup_schema_dry_run
   schema_backup="$APP_DIR/data/backups/research-preflight-${EXPECTED_COMMIT}-${label}-$(date -u +%Y%m%dT%H%M%SZ).db"
-  schema_dry_run="$PREFLIGHT_DIR/schema-dry-run-${EXPECTED_COMMIT}-${label}-$$.db"
+  schema_dry_run="$APP_DIR/data/backups/schema-dry-run-${EXPECTED_COMMIT}-${label}-$$.db"
   "$APP_DIR/.venv/bin/python" - "$DATABASE_PATH" "$schema_backup" "$schema_dry_run" <<'PY'
 import os, sqlite3, sys
 source_path, backup_path, dry_run_path = sys.argv[1:]
@@ -219,5 +237,6 @@ service_stopped=0
 checkout_mutated=0
 git -C "$APP_DIR" worktree remove --force "$stage_dir" >/dev/null
 stage_dir=""
+cleanup_schema_dry_run
 trap - EXIT INT TERM
 systemctl --no-pager --full status telegram-kol.service | head -n 18

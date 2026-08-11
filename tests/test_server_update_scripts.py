@@ -100,3 +100,12 @@ def test_server_updater_refuses_unpinned_or_mismatched_remote_commit():
     assert 'CHANGE_CLASS="${CHANGE_CLASS:?' in script
     assert 'remote_head="$(git rev-parse FETCH_HEAD)"' in script
     assert 'if [ "$remote_head" != "$EXPECTED_COMMIT" ]' in script
+
+
+def test_schema_dry_run_uses_persistent_disk_and_is_always_removed():
+    script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
+
+    assert '$APP_DIR/data/backups/schema-dry-run-' in script
+    assert "cleanup_schema_dry_run" in script
+    assert script.count("cleanup_schema_dry_run") >= 3
+    assert '$PREFLIGHT_DIR/schema-dry-run-' not in script
