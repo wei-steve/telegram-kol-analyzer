@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="${APP_DIR:-/opt/telegram-kol-analyzer}"
+BRANCH="${BRANCH:-codex/deepcoin-auto-trading-v1}"
+EXPECTED_COMMIT="${EXPECTED_COMMIT:?set EXPECTED_COMMIT to the reviewed 40-character commit}"
+CHANGE_CLASS="${CHANGE_CLASS:?set CHANGE_CLASS to code, schema_compatible, execution_writer, or live_promotion}"
+DATABASE_PATH="${DATABASE_PATH:-$APP_DIR/data/research.db}"
+LIVE_SNAPSHOT_PATH="${LIVE_SNAPSHOT_PATH:-$APP_DIR/data/web_cache/deepcoin_live_positions.json}"
+PREVIOUS_LIVE_SNAPSHOT_PATH="${PREVIOUS_LIVE_SNAPSHOT_PATH:-}"
+PREFLIGHT_DIR="${PREFLIGHT_DIR:-/run/telegram-kol}"
+REVIEWED_SHADOW_EVIDENCE_PATH="${REVIEWED_SHADOW_EVIDENCE_PATH:-}"
+LIVE_PROMOTION_AUTHORIZATION="${LIVE_PROMOTION_AUTHORIZATION:-}"
+
+if [[ ! "$EXPECTED_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
+  echo "EXPECTED_COMMIT must be a full 40-character hexadecimal commit." >&2
+  exit 4
+fi
+EXPECTED_COMMIT="${EXPECTED_COMMIT,,}"
+case "$CHANGE_CLASS" in
+  code|schema_compatible|execution_writer|live_promotion) ;;
+  *) echo "Unsupported CHANGE_CLASS: $CHANGE_CLASS" >&2; exit 4 ;;
+esac
+if [[ ! "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+  echo "BRANCH contains unsupported characters." >&2
+  exit 4
+fi
+if [ "$CHANGE_CLASS" = "live_promotion" ]; then
+  [ -f "$REVIEWED_SHADOW_EVIDENCE_PATH" ] || {
+    echo "live_promotion requires a reviewed shadow evidence artifact." >&2
+    exit 4
+  }
+  [ "$LIVE_PROMOTION_AUTHORIZATION" = "I_AUTHORIZE_LIVE_PROMOTION" ] || {
+    echo "live_promotion requires explicit authorization." >&2
+    exit 4
+  }
+fi
+if [[ "$CHANGE_CLASS" = "execution_writer" || "$CHANGE_CLASS" = "live_promotion" ]]; then
+  [ -f "$PREVIOUS_LIVE_SNAPSHOT_PATH" ] || {
+    echo "Writer-sensitive deployment requires a prior independent live snapshot." >&2
+    exit 4
+  }
+fi
+if [ ! -d "$APP_DIR/.git" ] || [ ! -f "$DATABASE_PATH" ] || [ ! -x "$APP_DIR/.venv/bin/python" ]; then
+  echo "Production checkout, database, or Python environment is unavailable." >&2
+  exit 4
+fi
+if ! systemctl is-active --quiet telegram-kol.service; then
+  echo "Exchange-writer service must be active before a managed deployment." >&2
+  exit 4
+fi
+
+exec 9>"/run/telegram-kol-update.lock"
+if ! flock -n 9; then
+  echo "Another deployment is already running." >&2
+  exit 3
+fi
+
+stage_dir=""
+service_stopped=0
+checkout_mutated=0
+previous_commit="$(git -C "$APP_DIR" rev-parse HEAD)"
+cleanup() {
+  status=$?
+  trap - EXIT INT TERM
+  if [ "$service_stopped" -eq 1 ]; then
+    rollback_ok=1
+    systemctl stop telegram-kol.service || rollback_ok=0
+    if [ "$checkout_mutated" -eq 1 ]; then
+      if [ "$rollback_ok" -eq 1 ]; then
+        git -C "$APP_DIR" checkout --detach "$previous_commit" >/dev/null 2>&1 || rollback_ok=0
+      fi
+      if [ "$rollback_ok" -eq 1 ]; then
+        git -C "$APP_DIR" update-ref "refs/heads/$BRANCH" "$previous_commit" "$EXPECTED_COMMIT" || rollback_ok=0
+      fi
+      if [ "$rollback_ok" -eq 1 ]; then
+        git -C "$APP_DIR" checkout "$BRANCH" >/dev/null 2>&1 || rollback_ok=0
+      fi
+      if [ "$rollback_ok" -eq 1 ]; then
+        [ "$(git -C "$APP_DIR" rev-parse HEAD)" = "$previous_commit" ] || rollback_ok=0
+        [ "$(git -C "$APP_DIR" rev-parse "refs/heads/$BRANCH")" = "$previous_commit" ] || rollback_ok=0
+      fi
+      if [ "$rollback_ok" -eq 1 ]; then
+        env "PYTHONPATH=$APP_DIR/src" "$APP_DIR/.venv/bin/python" -m pip install -e "$APP_DIR" >/dev/null 2>&1 || rollback_ok=0
+      fi
+    fi
+    if [ "$rollback_ok" -eq 1 ]; then
+      if ! systemctl start telegram-kol.service || ! systemctl is-active --quiet telegram-kol.service; then
+        echo "Rollback restored files but could not restore a healthy service." >&2
+        status=4
+      fi
+    else
+      echo "ROLLBACK FAILED; telegram-kol.service remains stopped." >&2
+      status=4
+    fi
+  fi
+  if [ -n "$stage_dir" ] && [ -d "$stage_dir" ]; then
+    git -C "$APP_DIR" worktree remove --force "$stage_dir" >/dev/null 2>&1 || true
+  fi
+  exit "$status"
+}
+trap cleanup EXIT INT TERM
+
+cd "$APP_DIR"
+git fetch origin "$BRANCH"
+remote_head="$(git rev-parse FETCH_HEAD)"
+if [ "$remote_head" != "$EXPECTED_COMMIT" ]; then
+  echo "Remote branch does not match EXPECTED_COMMIT." >&2
+  exit 4
+fi
+stage_dir="$(mktemp -d /run/telegram-kol-stage.XXXXXX)"
+git worktree add --detach "$stage_dir" "$EXPECTED_COMMIT" >/dev/null
+candidate_cli=(env "PYTHONPATH=$stage_dir/src" "$APP_DIR/.venv/bin/python" -m telegram_kol_research.cli)
+
+install -d -m 0700 "$PREFLIGHT_DIR"
+schema_backup=""
+schema_dry_run=""
+create_schema_evidence() {
+  local label="$1"
+  install -d -m 0700 "$APP_DIR/data/backups"
+  schema_backup="$APP_DIR/data/backups/research-preflight-${EXPECTED_COMMIT}-${label}-$(date -u +%Y%m%dT%H%M%SZ).db"
+  schema_dry_run="$PREFLIGHT_DIR/schema-dry-run-${EXPECTED_COMMIT}-${label}-$$.db"
+  "$APP_DIR/.venv/bin/python" - "$DATABASE_PATH" "$schema_backup" "$schema_dry_run" <<'PY'
+import os, sqlite3, sys
+source_path, backup_path, dry_run_path = sys.argv[1:]
+for target_path in (backup_path, dry_run_path):
+    descriptor = os.open(target_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    os.close(descriptor)
+source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
+backup = sqlite3.connect(backup_path)
+try:
+    source.execute("PRAGMA query_only = ON")
+    source.backup(backup)
+finally:
+    backup.close(); source.close()
+source = sqlite3.connect(f"file:{backup_path}?mode=ro", uri=True)
+dry_run = sqlite3.connect(dry_run_path)
+try:
+    source.backup(dry_run)
+finally:
+    dry_run.close(); source.close()
+PY
+  env "PYTHONPATH=$stage_dir/src" "$APP_DIR/.venv/bin/python" - "$schema_dry_run" <<'PY'
+import sys
+from telegram_kol_research.db import create_session_factory
+factory = create_session_factory(sys.argv[1])
+with factory() as session:
+    session.execute(__import__("sqlalchemy").text("SELECT 1"))
+PY
+}
+if [ "$CHANGE_CLASS" = "schema_compatible" ]; then
+  create_schema_evidence preliminary
+fi
+
+build_args() {
+  PREFLIGHT_ARGS=(
+    deployment-preflight --database-path "$DATABASE_PATH"
+    --expected-commit "$EXPECTED_COMMIT" --change-class "$CHANGE_CLASS"
+    --live-snapshot-path "$LIVE_SNAPSHOT_PATH" --output "$1"
+  )
+  [ -z "$PREVIOUS_LIVE_SNAPSHOT_PATH" ] || PREFLIGHT_ARGS+=(--previous-live-snapshot-path "$PREVIOUS_LIVE_SNAPSHOT_PATH")
+  [ -z "$schema_backup" ] || PREFLIGHT_ARGS+=(--schema-backup-path "$schema_backup")
+  [ -z "$schema_dry_run" ] || PREFLIGHT_ARGS+=(--schema-migration-dry-run-path "$schema_dry_run")
+  [ -z "$REVIEWED_SHADOW_EVIDENCE_PATH" ] || PREFLIGHT_ARGS+=(--reviewed-shadow-evidence-path "$REVIEWED_SHADOW_EVIDENCE_PATH")
+  [ "$LIVE_PROMOTION_AUTHORIZATION" != "I_AUTHORIZE_LIVE_PROMOTION" ] || PREFLIGHT_ARGS+=(--authorize-live-promotion)
+}
+
+run_preflight() {
+  local artifact_path="$1"
+  build_args "$artifact_path"
+  set +e
+  "${candidate_cli[@]}" "${PREFLIGHT_ARGS[@]}"
+  local result=$?
+  set -e
+  case "$result" in
+    0) ;;
+    2) echo "Deployment preflight returned WARN; reviewed warnings are deployable." >&2 ;;
+    3) echo "Deployment preflight returned BLOCK." >&2; exit 3 ;;
+    *) echo "Deployment preflight was malformed or incomplete." >&2; exit 4 ;;
+  esac
+}
+
+# First gate prevents interrupting a time-sensitive operation.  Then stop the
+# sole exchange-writer service and repeat the gate while no new writer can start.
+run_preflight "$PREFLIGHT_DIR/preliminary-$EXPECTED_COMMIT.json"
+systemctl stop telegram-kol.service
+service_stopped=1
+if systemctl is-active --quiet telegram-kol.service; then
+  echo "Exchange-writer service did not stop." >&2
+  exit 4
+fi
+if [ "$CHANGE_CLASS" = "schema_compatible" ]; then
+  create_schema_evidence final
+fi
+
+artifact="$PREFLIGHT_DIR/deployment-preflight-$EXPECTED_COMMIT.json"
+run_preflight "$artifact"
+set +e
+"${candidate_cli[@]}" verify-deployment-preflight --input "$artifact" \
+  --expected-commit "$EXPECTED_COMMIT" --change-class "$CHANGE_CLASS"
+verify_status=$?
+set -e
+case "$verify_status" in
+  0|2) ;;
+  3) echo "Verified artifact contains BLOCK." >&2; exit 3 ;;
+  *) echo "Deployment artifact validation failed." >&2; exit 4 ;;
+esac
+
+git checkout "$BRANCH"
+git merge --ff-only "$EXPECTED_COMMIT"
+[ "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT" ] || exit 4
+checkout_mutated=1
+. .venv/bin/activate
+python -m pip install -e .
+install -o root -g root -m 0755 deploy/telegram-kol-update /usr/local/bin/telegram-kol-update
+systemctl start telegram-kol.service
+systemctl is-active --quiet telegram-kol.service
+service_stopped=0
+checkout_mutated=0
+git -C "$APP_DIR" worktree remove --force "$stage_dir" >/dev/null
+stage_dir=""
+trap - EXIT INT TERM
+systemctl --no-pager --full status telegram-kol.service | head -n 18

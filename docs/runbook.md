@@ -1754,3 +1754,53 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
 回滚只把 `multi_instruction_mode` 改为 `disabled`，保留水位线、识别负载、
 候选项、执行项、交易所事件及异常证据。不得删除审计行，也不得为验证回滚
 而重放历史消息。
+
+## 确定性部署预检
+
+新的部署路径不再依赖操作员临时拼 SQL 判断。本地必须先推送已评审的
+40 位 commit，再显式声明变更类型：
+
+```bash
+EXPECTED_COMMIT="$(git rev-parse HEAD)" \
+CHANGE_CLASS=code \
+./scripts/server_git_update.sh
+```
+
+PowerShell 使用 `-ExpectedCommit <sha>` 和 `-ChangeClass <class>`。可用类型仅为
+`code`、`schema_compatible`、`execution_writer`、`live_promotion`。
+缺少参数、分支尖端与预期 commit 不一致或预检证据不完整，都在
+checkout、安装和重启前失败关闭。
+
+预检仅读取本地 SQLite 和已持久化的 Deepcoin 只读快照，检查：
+
+- TradeSignal 和 instruction execution contract；
+- management batch/component；
+- position mutation、精确平仓保留、保护与 rescue；
+- source-message deletion job；
+- 历史 unknown 残留、活仓数、快照完整性和数据库水位。
+
+任意新鲜在途操作或未证明止损保护的活仓都是 `BLOCK`。旧 unknown 和已保护活仓是显式
+`WARN`，不能被隐藏为 PASS。对 `execution_writer` 和 `live_promotion`，
+止损只能由仓位自身的 SL 字段，或同时精确匹配 `posId` 与 durable ledger `ordId` 的 TPSL 证明；
+同品种同方向的其他订单不构成 ownership。
+交易所快照必须是两个不同 version/抓取时间的独立采集，且规范化事实一致；
+同一缓存文件连读两次不构成稳定证据。其他类型的快照缺失仍会以 WARN 显示。
+`schema_compatible` 会生成 SQLite backup，再用候选 commit 对可丢弃副本执行迁移演练和
+`quick_check`，因此允许已知旧 schema 在真实迁移前进入预检。
+
+输出文件位于 `/run/telegram-kol/deployment-preflight-<sha>.json`，权限为
+`0600`，五分钟后过期。更新器先做一次预检，通过后停止唯一交易写服务，
+再在无新 writer 可启动的状态下重新采集和校验，并保持到安装完成。中途失败
+会由 trap 恢复原服务。退出码为：
+
+```text
+0 PASS
+2 WARN（允许发布，但必须保留原因）
+3 BLOCK
+4 输入或证据不完整
+```
+
+`live_promotion` 还必须提供已评审 shadow 证据 artifact 的服务器路径和
+`I_AUTHORIZE_LIVE_PROMOTION` 显式授权。一般代码发布、之前的“认可”或
+沉默都不等于 live 授权。预检会重算 artifact 指纹，并校验 commit、水位、
+观察窗口、覆盖面、有效样本数和零未解释差异，不接受单独输入的 64 位字符串。

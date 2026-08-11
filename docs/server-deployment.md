@@ -127,20 +127,82 @@ git push origin codex/deepcoin-auto-trading-v1
 macOS / Linux:
 
 ```bash
+EXPECTED_COMMIT="$(git rev-parse HEAD)" \
+CHANGE_CLASS=code \
 ./scripts/server_git_update.sh
 ```
 
 Windows:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1
+$commit = git rev-parse HEAD
+powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1 `
+  -ExpectedCommit $commit `
+  -ChangeClass code
 ```
 
-Both helpers tell the server to:
+Both helpers require the full reviewed commit and one change class:
 
-1. Fetch and pull the latest GitHub code.
-2. Reinstall the package in editable mode with the server virtualenv.
-3. Restart `telegram-kol.service`.
+| Change class | Intended scope | Exchange snapshot policy |
+|---|---|---|
+| `code` | Ordinary code with no new writer authority | Incomplete snapshot is `WARN` |
+| `schema_compatible` | Additive/backward-compatible schema | Creates and validates a SQLite backup; incomplete snapshot is `WARN` |
+| `execution_writer` | Changes an exchange mutation boundary | Complete, fresh, stable read-only snapshot is mandatory |
+| `live_promotion` | Enables a dormant execution path | Same as writer, plus a validated reviewed-shadow artifact and explicit authorization |
+
+The server updater then:
+
+1. Fetches the branch and refuses unless `FETCH_HEAD` exactly equals
+   `EXPECTED_COMMIT`.
+2. Runs the candidate commit from a detached staging worktree, collects all
+   SQLite facts in one read transaction, and compares two independently
+   versioned Deepcoin captures when the change is writer-sensitive.
+3. Refuses fresh active work and any unprotected open position for every change
+   class. Historical unknown rows and protected open positions are warnings,
+   not silent passes.
+4. After the preliminary gate passes, stops the sole exchange-writer service,
+   repeats preflight, and keeps the service stopped through artifact
+   verification, checkout, installation, and startup. Failure restarts the old
+   service through the cleanup trap.
+5. Fast-forwards to the exact commit, reinstalls the editable package, updates
+   the versioned server helper, and starts `telegram-kol.service`.
+
+Preflight exit codes are stable: `0=PASS`, `2=WARN` (deployable), `3=BLOCK`, and
+`4=malformed/incomplete` (refused). The artifact contains only commit/class,
+aggregate watermarks and counts, reason codes, times, and its fingerprint. It
+never contains raw Telegram text, order payloads, position IDs, or credentials.
+
+For an additive schema deployment use:
+
+```bash
+EXPECTED_COMMIT="$(git rev-parse HEAD)" \
+CHANGE_CLASS=schema_compatible \
+./scripts/server_git_update.sh
+```
+
+For `execution_writer` and `live_promotion`, provide the server path to an
+independent previous capture whose version and capture time differ from the
+current cache. For `live_promotion`, also provide a reviewed shadow-evidence
+JSON artifact. The preflight recomputes its fingerprint and verifies the exact
+commit, watermarks, observation window, coverage, eligible count, zero
+unexplained divergence, and approved conclusion. Promotion approval is not
+inferred from a caller-supplied digest:
+
+```bash
+EXPECTED_COMMIT="$(git rev-parse HEAD)" \
+CHANGE_CLASS=live_promotion \
+PREVIOUS_LIVE_SNAPSHOT_PATH='/run/telegram-kol/deepcoin-live-previous.json' \
+REVIEWED_SHADOW_EVIDENCE_PATH='/var/lib/telegram-kol/shadow-review.json' \
+LIVE_PROMOTION_AUTHORIZATION=I_AUTHORIZE_LIVE_PROMOTION \
+./scripts/server_git_update.sh
+```
+
+The workstation helper bootstraps the updater safely on first use: it extracts
+`deploy/telegram-kol-update` from the exact expected commit on the server,
+compares its SHA-256 with the reviewed local file, and only then installs and
+executes it. This avoids depending on an older checkout or older installed
+helper. For `schema_compatible`, the candidate code migrates a disposable copy
+of the verified backup; the live database remains unchanged until deployment.
 
 ## Backup-stop rollout gate
 
@@ -167,7 +229,10 @@ Telegram message or open a test holding for this verification.
 The equivalent server-side command is:
 
 ```bash
-BRANCH=codex/deepcoin-auto-trading-v1 /usr/local/bin/telegram-kol-update
+EXPECTED_COMMIT='<full-reviewed-commit>' \
+CHANGE_CLASS=code \
+BRANCH=codex/deepcoin-auto-trading-v1 \
+/usr/local/bin/telegram-kol-update
 ```
 
 ## Install the production safety monitor

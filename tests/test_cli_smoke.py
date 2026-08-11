@@ -1,6 +1,6 @@
 from typer.testing import CliRunner
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -44,6 +44,132 @@ from telegram_kol_research.trading_settings import load_trading_settings
 
 _ENTRY_REPAIR_NOW = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
 _ENTRY_REPAIR_STRATEGY_ID = "deepcoin:-1001:55:BTC:long"
+
+
+def test_deployment_preflight_cli_writes_verifiable_json(tmp_path):
+    database = tmp_path / "preflight.db"
+    snapshot = tmp_path / "snapshot.json"
+    output = tmp_path / "preflight.json"
+    expected_commit = "a" * 40
+    now = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE raw_messages (id INTEGER PRIMARY KEY);
+        CREATE TABLE message_instruction_items (id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT);
+        CREATE TABLE trade_signals (id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT);
+        CREATE TABLE execution_events (id INTEGER PRIMARY KEY);
+        CREATE TABLE execution_order_legs (id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT);
+        CREATE TABLE instruction_execution_contracts (id INTEGER PRIMARY KEY, state TEXT, updated_at TEXT);
+        CREATE TABLE strategy_revision_batches (id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT);
+        CREATE TABLE strategy_management_batches (id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT);
+        CREATE TABLE strategy_management_legs (id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT);
+        CREATE TABLE strategy_management_components (id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT);
+        CREATE TABLE position_mutation_intents (id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT);
+        CREATE TABLE bound_position_close_reservations (id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT);
+        CREATE TABLE position_protection_legs (id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT);
+        CREATE TABLE position_backup_stop_orders (id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT);
+        CREATE TABLE position_take_profit_orders (id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT);
+        CREATE TABLE trigger_protection_intents (id INTEGER PRIMARY KEY, recovery_state TEXT, recovery_disposition TEXT, updated_at TEXT);
+        CREATE TABLE trigger_protection_stop_rescues (id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT);
+        CREATE TABLE trigger_take_profit_convergences (id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT);
+        CREATE TABLE strategy_break_even_convergences (id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT);
+        CREATE TABLE strategy_break_even_convergence_legs (id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT);
+        CREATE TABLE position_protection_ledger (
+            id INTEGER PRIMARY KEY, venue TEXT, order_id TEXT, pos_id TEXT,
+            instrument_id TEXT, side TEXT, purpose TEXT, status TEXT
+        );
+        CREATE TABLE source_message_deletion_exits (id INTEGER PRIMARY KEY, state TEXT, updated_at TEXT);
+        """
+    )
+    connection.execute(
+        "INSERT INTO trade_signals VALUES (1, 'processing', ?)",
+        ((now - timedelta(minutes=1)).replace(tzinfo=None).isoformat(" "),),
+    )
+    connection.commit()
+    connection.close()
+    snapshot.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "version": "snapshot-v1",
+                "captured_at": (now - timedelta(seconds=10)).isoformat(),
+                "payload": {
+                    "error": None,
+                    "_live_source": {
+                        "positions": [],
+                        "tpsl_evidence_available": True,
+                        "tpsl_orders": [],
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "deployment-preflight",
+            "--database-path",
+            str(database),
+            "--expected-commit",
+            expected_commit,
+            "--change-class",
+            "code",
+            "--live-snapshot-path",
+            str(snapshot),
+            "--output",
+            str(output),
+            "--now",
+            now.isoformat(),
+        ],
+    )
+
+    assert result.exit_code == 3
+    payload = json.loads(result.output)
+    assert payload == json.loads(output.read_text(encoding="utf-8"))
+    assert payload["decision"] == "BLOCK"
+    assert "fresh_active_exchange_work" in payload["reason_codes"]
+
+
+def test_verify_deployment_preflight_cli_rejects_expired_artifact(tmp_path):
+    from telegram_kol_research.deployment_preflight import (
+        DeploymentPreflightFacts,
+        build_deployment_preflight_artifact,
+        write_deployment_preflight_artifact,
+    )
+
+    created = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
+    artifact = build_deployment_preflight_artifact(
+        expected_commit="b" * 40,
+        change_class="code",
+        facts=DeploymentPreflightFacts.empty(),
+        now=created,
+    )
+    path = tmp_path / "artifact.json"
+    write_deployment_preflight_artifact(path, artifact)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "verify-deployment-preflight",
+            "--input",
+            str(path),
+            "--expected-commit",
+            "b" * 40,
+            "--change-class",
+            "code",
+            "--now",
+            (created + timedelta(minutes=6)).isoformat(),
+        ],
+    )
+
+    assert result.exit_code == 4
+    assert json.loads(result.output) == {
+        "decision": "MALFORMED",
+        "reason_codes": ["preflight_artifact_expired"],
+    }
 
 
 def _canonical_json(value):

@@ -61,6 +61,14 @@ from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
 from telegram_kol_research.deepcoin_order_builder import (
     deepcoin_order_draft_fingerprint,
 )
+from telegram_kol_research.deployment_preflight import (
+    DeploymentPreflightInputError,
+    build_deployment_preflight_artifact,
+    collect_deployment_preflight_facts,
+    read_deployment_preflight_artifact,
+    verify_deployment_preflight_artifact,
+    write_deployment_preflight_artifact,
+)
 from telegram_kol_research.entry_draft_revisions import (
     EntryDraftRevisionError,
     revise_entry_draft,
@@ -2534,6 +2542,134 @@ def repair_execution_order_legs(
     session_factory = create_session_factory(database_path)
     repaired = repair_execution_order_legs_from_binding_payloads(session_factory)
     typer.echo(f"Repaired {repaired} execution order leg(s) in {database_path}")
+
+
+def _deployment_preflight_now(value: str | None) -> datetime:
+    if value is None:
+        return datetime.now(UTC)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise DeploymentPreflightInputError("preflight_time_invalid") from exc
+    if parsed.tzinfo is None:
+        raise DeploymentPreflightInputError("preflight_time_invalid")
+    return parsed.astimezone(UTC)
+
+
+def _echo_deployment_preflight_error(error: DeploymentPreflightInputError) -> None:
+    typer.echo(
+        json.dumps(
+            {
+                "decision": "MALFORMED",
+                "reason_codes": [error.reason_code],
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
+@app.command("deployment-preflight")
+def deployment_preflight(
+    expected_commit: str = typer.Option(..., "--expected-commit"),
+    change_class: str = typer.Option(..., "--change-class"),
+    database_path: Path = typer.Option(
+        Path("data/research.db"), "--database-path"
+    ),
+    output: Path = typer.Option(..., "--output"),
+    live_snapshot_path: Path = typer.Option(
+        Path("data/web_cache/deepcoin_live_positions.json"),
+        "--live-snapshot-path",
+    ),
+    previous_live_snapshot_path: Path | None = typer.Option(
+        None, "--previous-live-snapshot-path"
+    ),
+    schema_backup_path: Path | None = typer.Option(
+        None, "--schema-backup-path"
+    ),
+    schema_migration_dry_run_path: Path | None = typer.Option(
+        None, "--schema-migration-dry-run-path"
+    ),
+    reviewed_shadow_evidence_path: Path | None = typer.Option(
+        None, "--reviewed-shadow-evidence-path"
+    ),
+    authorize_live_promotion: bool = typer.Option(
+        False, "--authorize-live-promotion"
+    ),
+    now: str | None = typer.Option(None, "--now", hidden=True),
+) -> None:
+    """Create a bounded, expiring deployment decision without exchange calls."""
+
+    try:
+        checked_at = _deployment_preflight_now(now)
+        facts = collect_deployment_preflight_facts(
+            database_path=database_path,
+            change_class=change_class,
+            now=checked_at,
+            live_snapshot_path=live_snapshot_path,
+            previous_live_snapshot_path=previous_live_snapshot_path,
+            schema_backup_path=schema_backup_path,
+            schema_migration_dry_run_path=schema_migration_dry_run_path,
+            reviewed_shadow_evidence_path=reviewed_shadow_evidence_path,
+            expected_commit=expected_commit,
+            explicit_live_authorization=authorize_live_promotion,
+        )
+        artifact = build_deployment_preflight_artifact(
+            expected_commit=expected_commit,
+            change_class=change_class,
+            facts=facts,
+            now=checked_at,
+        )
+        write_deployment_preflight_artifact(output, artifact)
+    except DeploymentPreflightInputError as exc:
+        _echo_deployment_preflight_error(exc)
+        raise typer.Exit(code=4)
+    typer.echo(
+        json.dumps(
+            artifact,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    exit_code = {"PASS": 0, "WARN": 2, "BLOCK": 3}[str(artifact["decision"])]
+    if exit_code:
+        raise typer.Exit(code=exit_code)
+
+
+@app.command("verify-deployment-preflight")
+def verify_deployment_preflight(
+    input_path: Path = typer.Option(..., "--input"),
+    expected_commit: str = typer.Option(..., "--expected-commit"),
+    change_class: str = typer.Option(..., "--change-class"),
+    now: str | None = typer.Option(None, "--now", hidden=True),
+) -> None:
+    """Verify an unexpired deployment artifact immediately before mutation."""
+
+    try:
+        artifact = read_deployment_preflight_artifact(input_path)
+        decision = verify_deployment_preflight_artifact(
+            artifact,
+            expected_commit=expected_commit,
+            change_class=change_class,
+            now=_deployment_preflight_now(now),
+        )
+    except DeploymentPreflightInputError as exc:
+        _echo_deployment_preflight_error(exc)
+        raise typer.Exit(code=4)
+    typer.echo(
+        json.dumps(
+            {"decision": decision, "valid": True},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    if decision == "BLOCK":
+        raise typer.Exit(code=3)
+    if decision == "WARN":
+        raise typer.Exit(code=2)
 
 
 @app.command("monitor-production-safety")
