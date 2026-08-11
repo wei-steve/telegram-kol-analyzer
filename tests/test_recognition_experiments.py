@@ -2,17 +2,94 @@ import json
 from datetime import UTC, datetime
 
 import httpx
+import pytest
 
 from telegram_kol_research.ai_recognition_config import AiModelConfig, AiRecognitionConfig
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import AiPromptInvocation, MediaAsset, MessageRecognition, RawMessage, RecognitionExperiment, SignalCandidate, StrategyLifecycle
-from telegram_kol_research.prompt_defaults import MIMO_VISION_PROMPT, SHARED_TRADING_PROMPT
+from telegram_kol_research.mimo_recognition_runs import load_mimo_attempts
+from telegram_kol_research.models import (
+    AiPromptInvocation,
+    MediaAsset,
+    MessageRecognition,
+    MimoRecognitionRun,
+    RawMessage,
+    RecognitionExperiment,
+    SignalCandidate,
+    StrategyLifecycle,
+)
+from telegram_kol_research.prompt_defaults import (
+    MIMO_V2_AUTHORITATIVE_PROMPT,
+    MIMO_VISION_PROMPT,
+    SHARED_TRADING_PROMPT,
+)
 from telegram_kol_research.recognition_experiments import (
     _build_mimo_payload,
+    infer_mimo_authoritative_v2,
     run_mimo_authoritative_for_message,
     run_mimo_direct_for_message,
     run_mimo_direct_experiment,
 )
+
+
+def _v2_config() -> AiRecognitionConfig:
+    return AiRecognitionConfig(
+        ai_models=[
+            AiModelConfig(
+                id="mimo-v2.5",
+                label="MiMo",
+                base_url="https://api.xiaomimimo.com/v1",
+                api_key="test-key",
+                model="mimo-v2.5",
+                supports_text=True,
+                supports_image=True,
+            )
+        ]
+    )
+
+
+def _v2_payload(observed_text: str = "BTC 偏多观点") -> dict:
+    return {
+        "contract_version": "mimo-authoritative-v2",
+        "summary": "普通市场观点",
+        "confidence": 0.82,
+        "intents": [
+            {
+                "intent_type": "market_commentary",
+                "action": None,
+                "reason": "没有完整交易动作",
+                "confidence": 0.82,
+                "evidence_refs": ["text:observed_text"],
+            }
+        ],
+        "evidence": {
+            "text": {"observed_text": observed_text, "fields": {}},
+            "images": [],
+            "conflicts": [],
+        },
+    }
+
+
+def _v2_message(factory, *, text: str = "BTC 偏多观点") -> int:
+    with factory() as session:
+        row = RawMessage(chat_id=900, message_id=17, text=text)
+        session.add(row)
+        session.commit()
+        return int(row.id)
+
+
+def _sequence_requester(*outcomes):
+    remaining = list(outcomes)
+
+    def request(**kwargs):
+        if not remaining:
+            raise AssertionError("requester called too many times")
+        outcome = remaining.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    request.remaining = remaining
+    return request
 
 
 def test_run_mimo_authoritative_for_message_returns_unified_actionable_result(
@@ -839,3 +916,515 @@ def test_run_mimo_direct_experiment_persists_http_error_response_body(tmp_path, 
         experiment = session.query(RecognitionExperiment).one()
         assert "response_body=" in experiment.error_message
         assert "bad image" in experiment.error_message
+
+
+def test_mimo_v2_first_attempt_success_records_selected_attempt_and_prompt(
+    tmp_path,
+):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _v2_message(factory)
+    captured: dict = {}
+
+    def requester(**kwargs):
+        captured.update(kwargs)
+        return _v2_payload()
+
+    result = infer_mimo_authoritative_v2(
+        factory,
+        raw_message_id=raw_message_id,
+        config=_v2_config(),
+        context_text="Recent context: no active strategy",
+        requester=requester,
+        retry_delay_seconds=0,
+    )
+
+    assert result.error_message is None
+    assert result.error_code is None
+    assert result.parsed_result is not None
+    assert result.parsed_result.contract_version == "mimo-authoritative-v2"
+    assert result.input_kind == "text"
+    assert result.prompt_versions.keys() == {MIMO_V2_AUTHORITATIVE_PROMPT}
+    assert "mimo-authoritative-v2" in captured["prompt"]
+    assert captured["context_text"] == "Recent context: no active strategy"
+    attempts = load_mimo_attempts(factory, run_id=result.run_id)
+    assert [row.status for row in attempts] == ["completed"]
+    assert attempts[0].selected is True
+    with factory() as session:
+        run = session.get(MimoRecognitionRun, result.run_id)
+        assert run.status == "completed"
+        assert run.run_kind == "v2_authoritative"
+        assert run.selected_attempt_ordinal == 1
+        assert run.became_authoritative is True
+        assert result.adapted_result is not None
+        assert run.canonical_payload_fingerprint == (
+            result.adapted_result.canonical_v2_fingerprint
+        )
+        assert run.projection_fingerprint == (
+            result.adapted_result.projection_fingerprint
+        )
+        assert json.loads(run.prompt_versions_json) == result.prompt_versions
+        invocation = session.query(AiPromptInvocation).one()
+        assert invocation.status == "completed"
+        assert json.loads(invocation.prompt_versions_json) == result.prompt_versions
+        assert session.query(RecognitionExperiment).count() == 0
+        assert session.query(MessageRecognition).count() == 0
+        assert session.query(SignalCandidate).count() == 0
+        assert session.query(StrategyLifecycle).count() == 0
+
+
+def test_mimo_v2_timeout_then_success_records_two_attempts(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _v2_message(factory)
+    requester = _sequence_requester(TimeoutError("slow"), _v2_payload())
+
+    result = infer_mimo_authoritative_v2(
+        factory,
+        raw_message_id=raw_message_id,
+        config=_v2_config(),
+        requester=requester,
+        retry_delay_seconds=0,
+    )
+
+    assert result.error_message is None
+    attempts = load_mimo_attempts(factory, run_id=result.run_id)
+    assert [row.status for row in attempts] == ["timeout", "completed"]
+    assert [row.error_code for row in attempts] == ["provider_timeout", None]
+    assert [row.retry_of_ordinal for row in attempts] == [None, 1]
+    assert [row.selected for row in attempts] == [False, True]
+
+
+def test_mimo_v2_exhausted_timeout_fails_run_without_selection(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _v2_message(factory)
+
+    result = infer_mimo_authoritative_v2(
+        factory,
+        raw_message_id=raw_message_id,
+        config=_v2_config(),
+        requester=_sequence_requester(
+            TimeoutError("first slow"),
+            TimeoutError("Authorization: Bearer private-token second slow"),
+        ),
+        retry_delay_seconds=0,
+    )
+
+    assert result.parsed_result is None
+    assert result.error_code == "provider_timeout"
+    assert "private-token" not in (result.error_message or "")
+    attempts = load_mimo_attempts(factory, run_id=result.run_id)
+    assert [row.status for row in attempts] == ["timeout", "timeout"]
+    assert not any(row.selected for row in attempts)
+    with factory() as session:
+        run = session.get(MimoRecognitionRun, result.run_id)
+        assert run.status == "failed"
+        assert run.selected_attempt_ordinal is None
+        assert run.final_error_code == "provider_timeout"
+
+
+def test_mimo_v2_http_failure_retries_and_sanitizes_error(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _v2_message(factory)
+    request = httpx.Request("POST", "https://api.xiaomimimo.com/v1/chat/completions")
+    response = httpx.Response(503, request=request)
+    failures = (
+        httpx.HTTPStatusError(
+            "api_key=private-key unavailable",
+            request=request,
+            response=response,
+        ),
+        httpx.HTTPStatusError(
+            "api_key=private-key still unavailable",
+            request=request,
+            response=response,
+        ),
+    )
+
+    result = infer_mimo_authoritative_v2(
+        factory,
+        raw_message_id=raw_message_id,
+        config=_v2_config(),
+        requester=_sequence_requester(*failures),
+        retry_delay_seconds=0,
+    )
+
+    assert result.error_code == "provider_http_error"
+    assert "private-key" not in (result.error_message or "")
+    attempts = load_mimo_attempts(factory, run_id=result.run_id)
+    assert [row.status for row in attempts] == ["http_error", "http_error"]
+
+
+def test_mimo_v2_unexpected_provider_error_does_not_leave_running_run(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _v2_message(factory)
+
+    class UnexpectedProviderError(Exception):
+        pass
+
+    result = infer_mimo_authoritative_v2(
+        factory,
+        raw_message_id=raw_message_id,
+        config=_v2_config(),
+        requester=_sequence_requester(
+            UnexpectedProviderError("provider SDK failed unexpectedly"),
+            UnexpectedProviderError("provider SDK failed again"),
+        ),
+        retry_delay_seconds=0,
+    )
+
+    assert result.error_code == "provider_http_error"
+    attempts = load_mimo_attempts(factory, run_id=result.run_id)
+    assert [row.status for row in attempts] == ["http_error", "http_error"]
+    with factory() as session:
+        assert session.get(MimoRecognitionRun, result.run_id).status == "failed"
+
+
+def test_mimo_v2_invalid_json_fails_without_retry(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _v2_message(factory)
+    requester = _sequence_requester("not-json", _v2_payload())
+
+    result = infer_mimo_authoritative_v2(
+        factory,
+        raw_message_id=raw_message_id,
+        config=_v2_config(),
+        requester=requester,
+        retry_delay_seconds=0,
+    )
+
+    assert result.error_code == "invalid_json"
+    attempts = load_mimo_attempts(factory, run_id=result.run_id)
+    assert [row.status for row in attempts] == ["invalid_json"]
+    assert requester.remaining == [_v2_payload()]
+    assert attempts[0].response_fingerprint is not None
+
+
+def test_mimo_v2_contract_failure_records_response_and_stops(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _v2_message(factory)
+    invalid = _v2_payload()
+    invalid["contract_version"] = "mimo-authoritative-v3"
+
+    result = infer_mimo_authoritative_v2(
+        factory,
+        raw_message_id=raw_message_id,
+        config=_v2_config(),
+        requester=_sequence_requester(invalid),
+        retry_delay_seconds=0,
+    )
+
+    assert result.error_code == "contract_validation_failed"
+    attempts = load_mimo_attempts(factory, run_id=result.run_id)
+    assert [row.status for row in attempts] == ["contract_failure"]
+    assert attempts[0].response_fingerprint is not None
+
+
+def test_mimo_v2_adapter_rejection_is_audited_as_contract_failure(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _v2_message(factory, text="ETH 减仓一半，剩余仓位继续持有")
+    payload = _v2_payload("ETH 减仓一半，剩余仓位继续持有")
+    payload["intents"] = [
+        {
+            "intent_type": "position_management",
+            "action": {
+                "kind": "partial_take_profit",
+                "target": {"lifecycle_id": 790, "thread_id": 52},
+                "strategy": None,
+                "parameters": {"management_fraction": 0.5},
+            },
+            "reason": "明确要求减仓一半",
+            "confidence": 0.95,
+            "evidence_refs": ["text:observed_text"],
+        },
+        {
+            "intent_type": "position_management",
+            "action": {
+                "kind": "hold_update",
+                "target": {"lifecycle_id": 790, "thread_id": 52},
+                "strategy": None,
+                "parameters": {"take_profit": "1750"},
+            },
+            "reason": "剩余仓位继续持有",
+            "confidence": 0.91,
+            "evidence_refs": ["text:observed_text"],
+        },
+    ]
+
+    result = infer_mimo_authoritative_v2(
+        factory,
+        raw_message_id=raw_message_id,
+        config=_v2_config(),
+        requester=lambda **kwargs: payload,
+        retry_delay_seconds=0,
+    )
+
+    assert result.error_code == "contract_validation_failed"
+    assert "unsupported_multiple_lifecycle_actions" in result.error_message
+    attempts = load_mimo_attempts(factory, run_id=result.run_id)
+    assert [row.status for row in attempts] == ["contract_failure"]
+
+
+@pytest.mark.parametrize(
+    ("response", "attempt_status"),
+    (
+        ("not-json", "invalid_json"),
+        (
+            {
+                **_v2_payload(),
+                "contract_version": "mimo-authoritative-v3",
+            },
+            "contract_failure",
+        ),
+    ),
+)
+def test_mimo_v2_input_change_takes_precedence_over_invalid_response(
+    tmp_path,
+    response,
+    attempt_status,
+):
+    factory = create_session_factory(tmp_path / f"{attempt_status}.db")
+    raw_message_id = _v2_message(factory)
+
+    def mutate_input(**kwargs):
+        with factory() as session:
+            raw = session.get(RawMessage, raw_message_id)
+            raw.text = "edited while invalid response was returning"
+            session.commit()
+        return response
+
+    result = infer_mimo_authoritative_v2(
+        factory,
+        raw_message_id=raw_message_id,
+        config=_v2_config(),
+        requester=mutate_input,
+        retry_delay_seconds=0,
+    )
+
+    assert result.error_code == "input_changed_during_analysis"
+    attempts = load_mimo_attempts(factory, run_id=result.run_id)
+    assert [row.status for row in attempts] == [attempt_status]
+
+
+def test_mimo_v2_unreadable_declared_image_fails_before_provider(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _v2_message(factory, text="ETH 持仓截图")
+    with factory() as session:
+        session.add(
+            MediaAsset(
+                raw_message_id=raw_message_id,
+                kind="photo",
+                mime_type="image/jpeg",
+                local_path="missing/position.jpg",
+            )
+        )
+        session.commit()
+
+    def should_not_call(**kwargs):
+        raise AssertionError("provider must not be called")
+
+    result = infer_mimo_authoritative_v2(
+        factory,
+        raw_message_id=raw_message_id,
+        config=_v2_config(),
+        media_root=tmp_path / "media",
+        requester=should_not_call,
+        retry_delay_seconds=0,
+    )
+
+    assert result.error_code == "image_unavailable"
+    assert result.input_kind == "text+image"
+    assert load_mimo_attempts(factory, run_id=result.run_id) == []
+    with factory() as session:
+        run = session.get(MimoRecognitionRun, result.run_id)
+        assert run.status == "failed"
+        assert run.attempt_count == 0
+
+
+@pytest.mark.parametrize("media_error", (OSError("read failed"), RuntimeError("symlink loop")))
+def test_mimo_v2_image_read_error_does_not_leave_running_run(
+    tmp_path,
+    monkeypatch,
+    media_error,
+):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _v2_message(factory, text="ETH 持仓截图")
+    image_path = tmp_path / "position.jpg"
+    image_path.write_bytes(b"image")
+    with factory() as session:
+        session.add(
+            MediaAsset(
+                raw_message_id=raw_message_id,
+                kind="photo",
+                mime_type="image/jpeg",
+                local_path=str(image_path),
+            )
+        )
+        session.commit()
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._media_asset_to_data_url",
+        lambda *args, **kwargs: (_ for _ in ()).throw(media_error),
+    )
+
+    result = infer_mimo_authoritative_v2(
+        factory,
+        raw_message_id=raw_message_id,
+        config=_v2_config(),
+        media_root=tmp_path,
+        requester=lambda **kwargs: _v2_payload(),
+        retry_delay_seconds=0,
+    )
+
+    assert result.error_code == "image_unavailable"
+    assert load_mimo_attempts(factory, run_id=result.run_id) == []
+    with factory() as session:
+        assert session.get(MimoRecognitionRun, result.run_id).status == "failed"
+
+
+def test_mimo_v2_input_change_after_response_fails_closed(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _v2_message(factory)
+
+    def mutate_input(**kwargs):
+        with factory() as session:
+            raw = session.get(RawMessage, raw_message_id)
+            raw.text = "edited while MiMo was running"
+            session.commit()
+        return _v2_payload()
+
+    result = infer_mimo_authoritative_v2(
+        factory,
+        raw_message_id=raw_message_id,
+        config=_v2_config(),
+        media_root=tmp_path / "media",
+        requester=mutate_input,
+        retry_delay_seconds=0,
+    )
+
+    assert result.parsed_result is None
+    assert result.error_code == "input_changed_during_analysis"
+    attempts = load_mimo_attempts(factory, run_id=result.run_id)
+    assert [row.status for row in attempts] == ["completed"]
+    assert attempts[0].selected is False
+    with factory() as session:
+        run = session.get(MimoRecognitionRun, result.run_id)
+        assert run.status == "failed"
+        assert run.canonical_payload_fingerprint is None
+        assert run.projection_fingerprint is None
+
+
+def test_mimo_v2_dynamic_context_change_after_response_fails_closed(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    with factory() as session:
+        prior = RawMessage(
+            chat_id=900,
+            message_id=16,
+            posted_at=datetime(2026, 8, 11, 1, 0, tzinfo=UTC),
+            text="BTC long strategy remains active",
+        )
+        current = RawMessage(
+            chat_id=900,
+            message_id=17,
+            posted_at=datetime(2026, 8, 11, 2, 0, tzinfo=UTC),
+            text="BTC 偏多观点",
+        )
+        session.add_all([prior, current])
+        session.commit()
+        prior_id = int(prior.id)
+        current_id = int(current.id)
+    captured: dict = {}
+
+    def mutate_context(**kwargs):
+        captured.update(kwargs)
+        with factory() as session:
+            prior = session.get(RawMessage, prior_id)
+            prior.text = "BTC strategy was cancelled"
+            session.commit()
+        return _v2_payload()
+
+    result = infer_mimo_authoritative_v2(
+        factory,
+        raw_message_id=current_id,
+        config=_v2_config(),
+        requester=mutate_context,
+        retry_delay_seconds=0,
+    )
+
+    assert "BTC long strategy remains active" in captured["context_text"]
+    assert result.error_code == "input_changed_during_analysis"
+    attempts = load_mimo_attempts(factory, run_id=result.run_id)
+    assert [row.status for row in attempts] == ["completed"]
+    assert attempts[0].selected is False
+
+
+def test_mimo_v2_invalid_retry_settings_do_not_create_running_run(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _v2_message(factory)
+
+    with pytest.raises(ValueError, match="max_attempts"):
+        infer_mimo_authoritative_v2(
+            factory,
+            raw_message_id=raw_message_id,
+            config=_v2_config(),
+            requester=lambda **kwargs: _v2_payload(),
+            max_attempts="invalid",
+            retry_delay_seconds=0,
+        )
+
+    with factory() as session:
+        assert session.query(MimoRecognitionRun).count() == 0
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        {"max_attempts": 4},
+        {"retry_delay_seconds": float("nan")},
+        {"retry_delay_seconds": float("inf")},
+        {"retry_delay_seconds": float("-inf")},
+    ),
+)
+def test_mimo_v2_unbounded_retry_settings_do_not_create_running_run(
+    tmp_path,
+    kwargs,
+):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _v2_message(factory)
+
+    with pytest.raises(ValueError):
+        infer_mimo_authoritative_v2(
+            factory,
+            raw_message_id=raw_message_id,
+            config=_v2_config(),
+            requester=lambda **request_kwargs: _v2_payload(),
+            **kwargs,
+        )
+
+    with factory() as session:
+        assert session.query(MimoRecognitionRun).count() == 0
+
+
+def test_mimo_v2_prompt_invocation_failure_does_not_reverse_success(
+    tmp_path,
+    monkeypatch,
+):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _v2_message(factory)
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments.record_prompt_invocation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("prompt audit unavailable")
+        ),
+    )
+
+    result = infer_mimo_authoritative_v2(
+        factory,
+        raw_message_id=raw_message_id,
+        config=_v2_config(),
+        requester=lambda **kwargs: _v2_payload(),
+        retry_delay_seconds=0,
+    )
+
+    assert result.succeeded is True
+    with factory() as session:
+        run = session.get(MimoRecognitionRun, result.run_id)
+        assert run.status == "completed"
+        assert run.became_authoritative is True

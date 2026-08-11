@@ -190,6 +190,64 @@ def test_failed_run_has_sanitized_terminal_error_and_no_selected_attempt(tmp_pat
     assert '2"' not in failed.final_error_message
 
 
+def test_json_shaped_provider_errors_redact_named_secrets(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _message(factory)
+    run = _start(factory, raw_message_id)
+    provider_error = (
+        'payload={"api_key":"private-key","token":"private-\\\"suffix",'
+        '"access_token":"private-access","client_secret":"private-client",'
+        '"password":"private-password"}'
+    )
+
+    attempt = record_mimo_attempt(
+        factory,
+        run_id=run.id,
+        ordinal=1,
+        status="http_error",
+        error_code="provider_http_error",
+        error_message=provider_error,
+    )
+    failed = complete_mimo_run(
+        factory,
+        run_id=run.id,
+        status="failed",
+        selected_ordinal=None,
+        final_error_code="provider_http_error",
+        final_error_message=provider_error,
+    )
+
+    for error_message in (attempt.error_message, failed.final_error_message):
+        assert error_message is not None
+        assert "private-key" not in error_message
+        assert "private-token" not in error_message
+        assert "suffix" not in error_message
+        assert "private-access" not in error_message
+        assert "private-client" not in error_message
+        assert "private-password" not in error_message
+        assert error_message.count("[redacted]") == 5
+
+
+def test_provider_response_body_is_redacted_as_an_opaque_value(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _message(factory)
+    run = _start(factory, raw_message_id)
+
+    attempt = record_mimo_attempt(
+        factory,
+        run_id=run.id,
+        ordinal=1,
+        status="http_error",
+        error_code="provider_http_error",
+        error_message=(
+            '503 unavailable; response_body={"diagnostic":"private detail",'
+            '"unknown_secret_field":"private-value"}'
+        ),
+    )
+
+    assert attempt.error_message == "503 unavailable; response_body=[redacted]"
+
+
 def test_run_kinds_and_whole_run_retry_are_closed_and_linked(tmp_path):
     factory = create_session_factory(tmp_path / "research.db")
     raw_message_id = _message(factory)

@@ -31,9 +31,17 @@ MAX_ERROR_MESSAGE_LENGTH = 512
 
 _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 _BEARER_SECRET = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
+_RESPONSE_BODY = re.compile(r"(?i)\b(response_body\s*=\s*).*$")
+_SECRET_FIELD_PATTERN = (
+    r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|"
+    r"token|secret|password|passphrase|credential|authorization|cookie)"
+)
+_JSON_NAMED_SECRET = re.compile(
+    rf"(?i)([\"']{_SECRET_FIELD_PATTERN}[\"']\s*:\s*)"
+    r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;}]+)"
+)
 _NAMED_SECRET = re.compile(
-    r"(?i)\b(api[_-]?key|token|secret|password|passphrase|credential|"
-    r"authorization|cookie)\b\s*[:=]\s*"
+    rf"(?i)\b({_SECRET_FIELD_PATTERN})\b\s*[:=]\s*"
     r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
 
@@ -424,6 +432,12 @@ def _sanitize_error_message(value: str | None) -> str | None:
         return None
     normalized = " ".join(str(value).split())
     normalized = _BEARER_SECRET.sub("Bearer [redacted]", normalized)
+    normalized = _RESPONSE_BODY.sub(
+        lambda match: f"{match.group(1)}[redacted]", normalized
+    )
+    normalized = _JSON_NAMED_SECRET.sub(
+        lambda match: f'{match.group(1)}"[redacted]"', normalized
+    )
     normalized = _NAMED_SECRET.sub(
         lambda match: f"{match.group(1)}=[redacted]",
         normalized,
