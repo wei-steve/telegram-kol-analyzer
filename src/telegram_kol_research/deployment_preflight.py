@@ -876,16 +876,22 @@ def _parse_exchange_snapshot(
                 if not isinstance(order, dict):
                     complete = False
                     continue
-                identity = _position_side_identity(order)
                 order_id = _exchange_order_id(order)
-                pos_id = str(order.get("posId") or "").strip()
-                ownership = (
-                    order_id or "",
-                    pos_id,
-                    identity[0] if identity else "",
-                    identity[1] if identity else "",
-                )
-                if ownership in stop_ownership and any(
+                raw_pos_ids = {
+                    str(order.get(field)).strip()
+                    for field in (
+                        "closePosId",
+                        "close_pos_id",
+                        "closePositionId",
+                        "posId",
+                        "pos_id",
+                        "positionId",
+                    )
+                    if order.get(field) not in (None, "")
+                }
+                raw_instrument = str(order.get("instId") or "").strip().upper()
+                raw_side = str(order.get("posSide") or "").strip().lower()
+                if order_id and any(
                     _is_positive_decimal(order.get(field))
                     for field in (
                         "slTriggerPx",
@@ -893,7 +899,17 @@ def _parse_exchange_snapshot(
                         "closeSLTriggerPrice",
                     )
                 ):
-                    owned_stop_identities.add(ownership)
+                    for ownership in stop_ownership:
+                        owned_order_id, pos_id, instrument, side = ownership
+                        if owned_order_id != order_id:
+                            continue
+                        if raw_pos_ids and raw_pos_ids != {pos_id}:
+                            continue
+                        if raw_instrument and raw_instrument != instrument:
+                            continue
+                        if raw_side and raw_side != side:
+                            continue
+                        owned_stop_identities.add(ownership)
             if len(tpsl_orders) > 1000:
                 complete = False
         owned_positions = {

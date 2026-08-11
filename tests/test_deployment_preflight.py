@@ -825,9 +825,6 @@ def test_exact_owned_native_sl_trigger_px_proves_protection(tmp_path):
     payload["payload"]["_live_source"]["tpsl_orders"] = [
         {
             "ordId": "OWNED-ORDER",
-            "posId": "SECRET-POS-ID",
-            "instId": "BTC-USDT-SWAP",
-            "posSide": "long",
             "slTriggerPx": "59000",
         }
     ]
@@ -842,6 +839,44 @@ def test_exact_owned_native_sl_trigger_px_proves_protection(tmp_path):
 
     assert facts.protected_open_position_count == 1
     assert facts.unprotected_open_position_count == 0
+
+
+def test_ledger_owned_stop_with_conflicting_close_position_is_rejected(tmp_path):
+    database = tmp_path / "research.db"
+    snapshot = tmp_path / "snapshot.json"
+    _create_preflight_database(database)
+    import sqlite3
+
+    connection = sqlite3.connect(database)
+    connection.execute("DELETE FROM trade_signals")
+    connection.execute(
+        "INSERT INTO position_protection_ledger "
+        "(id, venue, order_id, pos_id, instrument_id, side, purpose, status) "
+        "VALUES (1, 'deepcoin', 'OWNED-ORDER', 'SECRET-POS-ID', "
+        "'BTC-USDT-SWAP', 'long', 'stop_loss', 'verified')"
+    )
+    connection.commit(); connection.close()
+    _write_snapshot(snapshot)
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    payload["payload"]["_live_source"]["positions"][0]["slTriggerPx"] = ""
+    payload["payload"]["_live_source"]["tpsl_orders"] = [
+        {
+            "ordId": "OWNED-ORDER",
+            "closePosId": "OTHER-POS",
+            "slTriggerPx": "59000",
+        }
+    ]
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+
+    facts = collect_deployment_preflight_facts(
+        database_path=database,
+        change_class="code",
+        live_snapshot_path=snapshot,
+        now=NOW,
+    )
+
+    assert facts.protected_open_position_count == 0
+    assert facts.unprotected_open_position_count == 1
 
 
 def test_two_distinct_equal_captures_are_required_for_stability(tmp_path):
