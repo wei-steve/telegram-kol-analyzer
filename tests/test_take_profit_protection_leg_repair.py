@@ -185,6 +185,58 @@ def test_plan_requires_exact_durable_and_exchange_evidence(tmp_path):
     assert client.write_calls == 0
 
 
+def test_plan_accepts_ledger_owned_exchange_order_without_pos_id(tmp_path):
+    from telegram_kol_research.take_profit_protection_leg_repair import (
+        build_take_profit_protection_leg_repair_plan,
+    )
+
+    session_factory, logical_leg_id = _seed_split_truth(tmp_path)
+    client = _ReadOnlyClient()
+    client.pending[0].pop("posId")
+
+    plan = build_take_profit_protection_leg_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        observed_at=NOW,
+    )
+
+    assert [row.logical_leg_id for row in plan.actions] == [logical_leg_id]
+    assert plan.refusals == ()
+    assert client.write_calls == 0
+
+
+@pytest.mark.parametrize(
+    "pending_patch",
+    [
+        {"closePosId": "pos-other"},
+        {"PositionID": "pos-1", "posId": "pos-other"},
+    ],
+)
+def test_plan_refuses_any_explicit_exchange_position_id_conflict(
+    tmp_path, pending_patch
+):
+    from telegram_kol_research.take_profit_protection_leg_repair import (
+        build_take_profit_protection_leg_repair_plan,
+    )
+
+    session_factory, _ = _seed_split_truth(tmp_path)
+    client = _ReadOnlyClient()
+    client.pending[0].pop("posId")
+    client.pending[0].update(pending_patch)
+
+    plan = build_take_profit_protection_leg_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        observed_at=NOW,
+    )
+
+    assert plan.actions == ()
+    assert [row.reason for row in plan.refusals] == [
+        "exchange_take_profit_mismatch"
+    ]
+    assert client.write_calls == 0
+
+
 @pytest.mark.parametrize(
     ("mutate", "reason"),
     [

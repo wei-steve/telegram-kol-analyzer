@@ -293,10 +293,16 @@ def _plan_one(
         ),
         open_positions=positions_cache[instrument_id],
     )
+    explicit_exchange_pos_ids = _exchange_row_position_ids(
+        match.order.raw if match.order is not None else {}
+    )
     if (
         match.status != "verified"
         or match.order is None
-        or match.order.pos_id != str(logical_leg.pos_id)
+        or (
+            explicit_exchange_pos_ids
+            and explicit_exchange_pos_ids != {str(logical_leg.pos_id)}
+        )
     ):
         return refuse("exchange_take_profit_mismatch")
     if not native_tpsl_take_profit_is_market(match.order.raw):
@@ -529,6 +535,23 @@ def _decimal(value: object) -> Decimal | None:
 
 def _split_ids(value: object) -> set[str]:
     return {item.strip() for item in str(value or "").split(",") if item.strip()}
+
+
+def _exchange_row_position_ids(row: dict[str, Any]) -> set[str]:
+    return {
+        value
+        for key in (
+            "closePosId",
+            "close_pos_id",
+            "closePositionId",
+            "posId",
+            "pos_id",
+            "PositionID",
+            "positionId",
+            "position_id",
+        )
+        for value in _split_ids(row.get(key))
+    }
 
 
 def _fingerprint(value: object) -> str:
