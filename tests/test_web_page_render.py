@@ -4444,6 +4444,7 @@ def test_index_page_versions_static_assets_to_avoid_stale_browser_cache(tmp_path
     assert response.status_code == 200
     assert "/static/app.css?v=" in response.text
     assert "/static/app.js?v=" in response.text
+    assert 'data-workbench-asset-version="' in response.text
 
 
 def test_trading_symbol_capability_ui_is_explicit_and_renders_errors_safely(tmp_path):

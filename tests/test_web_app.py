@@ -6653,6 +6653,25 @@ def test_versioned_workbench_assets_are_immutable_but_mismatches_revalidate(
     assert "immutable" not in unversioned.headers.get("cache-control", "")
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/",
+        "/positions-panel?initial=positions",
+        "/positions-panel/tabs/position-history",
+        "/groups",
+        "/more-panel",
+    ],
+)
+def test_workbench_pages_and_partials_expose_running_asset_version(tmp_path, path):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    response = TestClient(app).get(path)
+
+    assert response.headers["x-workbench-asset-version"] == str(
+        app.state.asset_version
+    )
+
+
 @pytest.mark.parametrize("corrupt_cache", [False, True])
 def test_app_startup_prewarms_missing_or_corrupt_position_snapshot(
     tmp_path,

@@ -558,6 +558,63 @@ def test_app_js_merges_history_continuation_into_grouped_view(tmp_path):
     assert "dataset.exchangeGroupName" in js
 
 
+def test_workbench_partial_asset_version_mismatch_reloads_once_without_returning_fragment(
+    tmp_path,
+):
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is required for the asset-version behavior test")
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+    assert "class WorkbenchAssetVersionMismatchError" in js
+    functions_start = js.index("class WorkbenchAssetVersionMismatchError")
+    functions_end = js.index("\nfunction strategyRecordStorageGet", functions_start)
+    harness = textwrap.dedent(
+        """
+        const storage = new Map();
+        let reloadCalls = 0;
+        global.window = {
+          sessionStorage: {
+            getItem: (key) => storage.get(key) || null,
+            setItem: (key, value) => storage.set(key, value),
+          },
+          location: { reload: () => { reloadCalls += 1; } },
+        };
+        global.document = {
+          documentElement: { dataset: { workbenchAssetVersion: '100' } },
+          querySelector: () => null,
+        };
+        global.fetch = async () => ({
+          ok: true,
+          status: 200,
+          headers: { get: (name) => name === 'X-Workbench-Asset-Version' ? '101' : null },
+          text: async () => '<section data-target></section>',
+        });
+        global.DOMParser = class {
+          parseFromString() { return { querySelector: () => ({ dataset: {} }) }; }
+        };
+
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          try {
+            await fetchWorkbenchPartial('/positions-panel', '[data-target]');
+            throw new Error('mismatched fragment was returned');
+          } catch (error) {
+            if (!(error instanceof WorkbenchAssetVersionMismatchError)) throw error;
+          }
+        }
+        if (reloadCalls !== 1) throw new Error(`expected one reload, got ${reloadCalls}`);
+        """
+    )
+    result = subprocess.run(
+        ["node", "-e", "\n".join((js[functions_start:functions_end], harness))],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_exchange_position_tab_manual_refresh_is_single_flight_and_preserves_data(
     tmp_path,
 ):

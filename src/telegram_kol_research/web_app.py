@@ -4526,6 +4526,10 @@ def create_web_app(
     @app.middleware("http")
     async def cache_versioned_workbench_assets(request: Request, call_next):
         response = await call_next(request)
+        if response.headers.get("content-type", "").startswith("text/html"):
+            response.headers["X-Workbench-Asset-Version"] = str(
+                app.state.asset_version
+            )
         if (
             request.url.path in {"/static/app.js", "/static/app.css"}
             and request.query_params.get("v") == str(app.state.asset_version)

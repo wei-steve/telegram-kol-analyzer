@@ -1431,9 +1431,32 @@ function clearDashboardPanelLoadError() {
   document.querySelectorAll('[data-dashboard-load-error]').forEach((notice) => notice.remove());
 }
 
+class WorkbenchAssetVersionMismatchError extends Error {}
+
+function handleWorkbenchAssetVersionMismatch(serverVersion) {
+  const status = document.querySelector?.('[data-exchange-tab-refresh-status]');
+  if (status) status.textContent = '检测到新版本，正在刷新…';
+  const markerKey = 'telegram-workbench:asset-refresh-target';
+  try {
+    if (window.sessionStorage.getItem(markerKey) === serverVersion) return;
+    window.sessionStorage.setItem(markerKey, serverVersion);
+  } catch {
+    // A blocked session store must not prevent one convergence reload.
+  }
+  window.location.reload();
+}
+
 async function fetchWorkbenchPartial(url, selector) {
   const response = await fetch(`${url}${url.includes('?') ? '&' : '?'}_t=${Date.now()}`, { cache: 'no-store' });
   if (!response.ok) throw new Error(`请求失败 (${response.status})`);
+  const pageVersion = document.documentElement?.dataset?.workbenchAssetVersion || '';
+  const serverVersion = response.headers?.get?.('X-Workbench-Asset-Version') || '';
+  if (pageVersion && serverVersion && pageVersion !== serverVersion) {
+    handleWorkbenchAssetVersionMismatch(serverVersion);
+    throw new WorkbenchAssetVersionMismatchError(
+      `workbench asset version changed from ${pageVersion} to ${serverVersion}`,
+    );
+  }
   const html = await response.text();
   const doc = new DOMParser().parseFromString(html, 'text/html');
   const fragment = doc.querySelector(selector);
