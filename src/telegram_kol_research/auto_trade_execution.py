@@ -229,6 +229,15 @@ def execute_message_instruction_items(
             item,
             execution_settings,
         )
+        if enforcement_mode != "disabled":
+            with session_factory() as session:
+                candidate_parse_source = session.query(
+                    SignalCandidate.parse_source
+                ).filter(
+                    SignalCandidate.id == int(item.signal_candidate_id)
+                ).scalar()
+            if candidate_parse_source != "mimo_authoritative":
+                enforcement_mode = "disabled"
         try:
             result = _auto_process_single_message_trade_signal(
                 session_factory,
@@ -256,6 +265,25 @@ def execute_message_instruction_items(
                     intent_kind=item.instruction_kind,
                     enforcement_mode=enforcement_mode,
                 )
+                if (
+                    item.instruction_kind == "entry"
+                    and enforcement_mode != "disabled"
+                ):
+                    from telegram_kol_research.instruction_execution_entry_adapter import (
+                        project_entry_non_writer_result_contract,
+                    )
+
+                    try:
+                        project_entry_non_writer_result_contract(
+                            session_factory,
+                            message_instruction_item_id=int(item.id),
+                            result=result,
+                            projected_at=now,
+                            mode=enforcement_mode,
+                        )
+                    except Exception:
+                        if enforcement_mode == "live":
+                            raise
             except InstructionOutcomeContractError as exc:
                 finish_status = "failed"
                 result = {
@@ -298,6 +326,7 @@ def execute_message_instruction_items(
             status=finish_status,
             result=result,
             now=now,
+            execution_contract_mode=enforcement_mode,
         )
 
     items = list_message_instruction_item_results(
@@ -471,9 +500,19 @@ def _auto_process_single_message_trade_signal(
             candidate=candidate,
             reason="symbol_price_scale_conflict_review_required",
             processed_at=now,
+            message_instruction_item_id=message_instruction_item_id,
+            execution_contract_mode=execution_contract_mode,
         )
     if not settings.auto_trade_enabled:
-        return {"status": "skipped", "reason": "auto_trade_disabled"}
+        return _record_entry_auto_trade_skip(
+            session_factory,
+            raw_message=raw_message,
+            candidate=candidate,
+            reason="auto_trade_disabled",
+            processed_at=now,
+            message_instruction_item_id=message_instruction_item_id,
+            execution_contract_mode=execution_contract_mode,
+        )
     if deepcoin_client is None:
         return {"status": "blocked", "reason": "deepcoin_client_unavailable"}
     if candidate.parse_source in {"entry_confirm_heuristic", "lifecycle_ai"}:
@@ -483,6 +522,8 @@ def _auto_process_single_message_trade_signal(
             candidate=candidate,
             reason="lifecycle_event_not_new_entry",
             processed_at=now,
+            message_instruction_item_id=message_instruction_item_id,
+            execution_contract_mode=execution_contract_mode,
         )
 
     runtime_group_config = apply_trading_settings_to_group_config(group_config, settings)
@@ -498,6 +539,8 @@ def _auto_process_single_message_trade_signal(
             candidate=candidate,
             reason="group_not_configured_for_auto_trade",
             processed_at=now,
+            message_instruction_item_id=message_instruction_item_id,
+            execution_contract_mode=execution_contract_mode,
         )
     if runtime_config["trading_mode"] != "auto_trade":
         return _record_entry_auto_trade_skip(
@@ -507,6 +550,8 @@ def _auto_process_single_message_trade_signal(
             reason="kol_or_group_auto_trade_disabled",
             runtime_kol_id=str(runtime_config.get("kol_id") or ""),
             processed_at=now,
+            message_instruction_item_id=message_instruction_item_id,
+            execution_contract_mode=execution_contract_mode,
         )
 
     symbol = (candidate.symbol or "").upper()
@@ -520,6 +565,8 @@ def _auto_process_single_message_trade_signal(
             runtime_kol_id=str(runtime_config.get("kol_id") or ""),
             processed_at=now,
             extra={"symbol": symbol},
+            message_instruction_item_id=message_instruction_item_id,
+            execution_contract_mode=execution_contract_mode,
         )
     capability = evaluate_deepcoin_entry_capability(
         session_factory,
@@ -535,6 +582,8 @@ def _auto_process_single_message_trade_signal(
             runtime_kol_id=str(runtime_config.get("kol_id") or ""),
             processed_at=now,
             extra={"symbol": symbol, "instrument_id": capability.instrument_id},
+            message_instruction_item_id=message_instruction_item_id,
+            execution_contract_mode=execution_contract_mode,
         )
     validated_contract_spec_provider = pinned_contract_spec_provider(capability)
     entry_thresholds = settings.entry_thresholds_for_symbol(symbol)
@@ -546,6 +595,8 @@ def _auto_process_single_message_trade_signal(
             reason="confidence_below_minimum",
             runtime_kol_id=str(runtime_config.get("kol_id") or ""),
             processed_at=now,
+            message_instruction_item_id=message_instruction_item_id,
+            execution_contract_mode=execution_contract_mode,
         )
     if has_media and not settings.allow_vision_auto_trade:
         return _record_entry_auto_trade_skip(
@@ -555,6 +606,8 @@ def _auto_process_single_message_trade_signal(
             reason="vision_auto_trade_disabled",
             runtime_kol_id=str(runtime_config.get("kol_id") or ""),
             processed_at=now,
+            message_instruction_item_id=message_instruction_item_id,
+            execution_contract_mode=execution_contract_mode,
         )
 
     from telegram_kol_research.entry_assembly_admission import (
@@ -622,6 +675,8 @@ def _auto_process_single_message_trade_signal(
                 "current_position_count": current_position_count,
                 "max_concurrent_positions": settings.max_concurrent_positions,
             },
+            message_instruction_item_id=message_instruction_item_id,
+            execution_contract_mode=execution_contract_mode,
         )
 
     instrument_id = _to_deepcoin_swap_instrument(symbol)
@@ -646,6 +701,8 @@ def _auto_process_single_message_trade_signal(
                 reason="market_price_unavailable",
                 runtime_kol_id=str(runtime_config.get("kol_id") or ""),
                 processed_at=now,
+                message_instruction_item_id=message_instruction_item_id,
+                execution_contract_mode=execution_contract_mode,
             )
         entry_range = (market_price, market_price)
     if entry_range is None:
@@ -656,6 +713,8 @@ def _auto_process_single_message_trade_signal(
             reason="missing_entry_range",
             runtime_kol_id=str(runtime_config.get("kol_id") or ""),
             processed_at=now,
+            message_instruction_item_id=message_instruction_item_id,
+            execution_contract_mode=execution_contract_mode,
         )
     if (
         entry_execution_type == "limit"
@@ -931,6 +990,8 @@ def _auto_process_single_message_trade_signal(
             runtime_kol_id=str(runtime_config.get("kol_id") or ""),
             processed_at=now,
             extra={"symbol": symbol, "instrument_id": capability.instrument_id},
+            message_instruction_item_id=message_instruction_item_id,
+            execution_contract_mode=execution_contract_mode,
         )
     if auto_draft is not None:
         auto_draft["entry_preamble_assembly"] = assembly_evidence
@@ -1075,6 +1136,8 @@ def _record_entry_auto_trade_skip(
     runtime_kol_id: str | None = None,
     processed_at: datetime,
     extra: dict[str, Any] | None = None,
+    message_instruction_item_id: int | None = None,
+    execution_contract_mode: str = "disabled",
 ) -> dict[str, Any]:
     symbol = (candidate.symbol or "").upper() or None
     side = (candidate.side or "").lower() or None
@@ -1089,7 +1152,7 @@ def _record_entry_auto_trade_skip(
     }
     if extra:
         payload.update(extra)
-    record_execution_event(
+    execution_event_id = record_execution_event(
         session_factory,
         ExecutionEventRecord(
             action="auto_trade_skipped",
@@ -1104,6 +1167,29 @@ def _record_entry_auto_trade_skip(
             created_at=processed_at,
         ),
     )
+    if message_instruction_item_id is not None:
+        from telegram_kol_research.instruction_execution_entry_adapter import (
+            project_entry_refusal_contract,
+        )
+
+        try:
+            project_entry_refusal_contract(
+                session_factory,
+                message_instruction_item_id=message_instruction_item_id,
+                reason_code=reason,
+                evidence_refs=[
+                    {
+                        "kind": "entry_safety_refusal",
+                        "execution_event_id": int(execution_event_id),
+                        "candidate_id": int(candidate.id),
+                    }
+                ],
+                projected_at=processed_at,
+                mode=execution_contract_mode,
+            )
+        except Exception:
+            if execution_contract_mode == "live":
+                raise
     result: dict[str, Any] = {"status": "skipped", "reason": reason}
     if extra:
         result.update(extra)

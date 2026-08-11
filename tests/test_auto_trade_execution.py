@@ -22,7 +22,7 @@ from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecLo
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.message_instruction_items import create_message_instruction_items_in_session
-from telegram_kol_research.models import EntryPreamble, EntryStrategyAssembly, EntryStrategyFragment, ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, MediaAsset, MessageEvidenceExtractionClaim, MessageEvidenceVersion, MessageInstructionItem, PositionProtectionLeg, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal, TriggerProtectionIntent, TriggerTakeProfitConvergence
+from telegram_kol_research.models import EntryPreamble, EntryStrategyAssembly, EntryStrategyFragment, ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, InstructionExecutionContract, MediaAsset, MessageEvidenceExtractionClaim, MessageEvidenceVersion, MessageInstructionItem, PositionProtectionLeg, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal, TriggerProtectionIntent, TriggerTakeProfitConvergence
 from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
 from telegram_kol_research.recovery_live_submit import _trigger_protection_lock_key
 from telegram_kol_research.recovery_live_submit import _trigger_protection_request_fingerprint
@@ -1064,6 +1064,115 @@ def test_adjacent_entry_deferral_keeps_instruction_pending_for_wakeup(
             processed_at + timedelta(seconds=5)
         )
         assert session.query(TradeSignal).count() == 0
+
+
+def test_future_live_entry_refusal_requires_verified_contract_mirror(tmp_path):
+    session_factory = create_session_factory(tmp_path / "future-live-refusal.db")
+    raw_message_id = _persist_candidate(
+        session_factory, parse_source="mimo_authoritative"
+    )
+    with session_factory() as session:
+        items = create_message_instruction_items_in_session(
+            session, raw_message_id=raw_message_id
+        )
+        session.commit()
+        item_id = items[0].id
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": False,
+            "instruction_execution_contract_mode": "live",
+            "instruction_execution_entry_after_item_id": 0,
+        },
+    )
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=None,
+        processed_at=datetime(2026, 8, 10, 12, 0, tzinfo=UTC),
+    )
+
+    assert result["status"] == "completed"
+    with session_factory() as session:
+        item = session.get(MessageInstructionItem, item_id)
+        contract = session.query(InstructionExecutionContract).one()
+        assert item.status == "succeeded"
+        assert contract.state == "verified"
+        assert contract.terminal_kind == "verified_refusal"
+        assert json.loads(item.result_json)["instruction_execution_contract"][
+            "contract_id"
+        ] == contract.id
+
+
+def test_entry_below_live_watermark_preserves_legacy_without_contract(tmp_path):
+    session_factory = create_session_factory(tmp_path / "legacy-below-watermark.db")
+    raw_message_id = _persist_candidate(
+        session_factory, parse_source="mimo_authoritative"
+    )
+    with session_factory() as session:
+        items = create_message_instruction_items_in_session(
+            session, raw_message_id=raw_message_id
+        )
+        session.commit()
+        item_id = items[0].id
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": False,
+            "instruction_execution_contract_mode": "live",
+            "instruction_execution_entry_after_item_id": item_id,
+        },
+    )
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=None,
+        processed_at=datetime(2026, 8, 10, 12, 0, tzinfo=UTC),
+    )
+
+    assert result["status"] == "completed"
+    with session_factory() as session:
+        item = session.get(MessageInstructionItem, item_id)
+        assert item.status == "succeeded"
+        assert session.query(InstructionExecutionContract).count() == 0
+        assert "instruction_execution_contract" not in json.loads(item.result_json)
+
+
+def test_non_authoritative_entry_above_watermark_preserves_legacy(tmp_path):
+    session_factory = create_session_factory(tmp_path / "legacy-non-authoritative.db")
+    raw_message_id = _persist_candidate(session_factory, parse_source="text_ai")
+    with session_factory() as session:
+        items = create_message_instruction_items_in_session(
+            session, raw_message_id=raw_message_id
+        )
+        session.commit()
+        item_id = items[0].id
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": False,
+            "instruction_execution_contract_mode": "live",
+            "instruction_execution_entry_after_item_id": 0,
+        },
+    )
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=None,
+        processed_at=datetime(2026, 8, 10, 12, 0, tzinfo=UTC),
+    )
+
+    assert result["status"] == "completed"
+    with session_factory() as session:
+        item = session.get(MessageInstructionItem, item_id)
+        assert item.status == "succeeded"
+        assert session.query(InstructionExecutionContract).count() == 0
 
 
 def test_v2_shadow_proposal_preserves_legacy_blocking_decision():

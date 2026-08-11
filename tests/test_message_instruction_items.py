@@ -21,8 +21,13 @@ from telegram_kol_research.message_instruction_items import (
     finish_message_instruction_summary_delivery,
     list_message_instruction_item_results,
 )
+from telegram_kol_research.instruction_execution_contracts import (
+    load_or_create_instruction_execution_contract,
+    transition_instruction_execution_contract,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
+    InstructionExecutionContract,
     ManagementMessageEnvelope,
     ManagementMessageTarget,
     MessageInstructionItem,
@@ -709,6 +714,280 @@ def test_finish_rejects_invalid_or_unclaimed_transitions(tmp_path):
             result={},
             now=NOW,
         )
+
+
+def _claim_entry_item_with_contract(session_factory):
+    raw_id, _, _, _ = _persist_dual_instruction_message(session_factory)
+    with session_factory() as session:
+        items = create_message_instruction_items_in_session(
+            session, raw_message_id=raw_id
+        )
+        session.commit()
+        entry_id = next(
+            item.id for item in items if item.instruction_kind == "entry"
+        )
+    while True:
+        item = claim_next_message_instruction_item(
+            session_factory, raw_message_id=raw_id, now=NOW
+        )
+        assert item is not None
+        if item.id == entry_id:
+            break
+        finish_message_instruction_item(
+            session_factory,
+            item_id=item.id,
+            status="failed",
+            result={"status": "failed"},
+            now=NOW,
+        )
+    contract = load_or_create_instruction_execution_contract(
+        session_factory,
+        message_instruction_item_id=entry_id,
+        projected_at=NOW,
+    )
+    return raw_id, item, contract
+
+
+def test_live_entry_success_without_verified_contract_is_rejected(tmp_path):
+    session_factory = create_session_factory(tmp_path / "live-gate-pending.db")
+    _, item, _ = _claim_entry_item_with_contract(session_factory)
+
+    finish_message_instruction_item(
+        session_factory,
+        item_id=item.id,
+        status="succeeded",
+        result={"status": "skipped", "reason": "auto_trade_disabled"},
+        now=NOW,
+        execution_contract_mode="live",
+    )
+
+    with session_factory() as session:
+        stored = session.get(MessageInstructionItem, item.id)
+        assert stored.status == "failed"
+        evidence = json.loads(stored.error_json)["instruction_execution_contract"]
+        assert evidence["state"] == "pending"
+        assert evidence["reason_code"] == "verified_terminal_contract_required"
+
+
+def test_live_verified_refusal_mirrors_to_succeeded_with_evidence(tmp_path):
+    session_factory = create_session_factory(tmp_path / "live-gate-refusal.db")
+    _, item, contract = _claim_entry_item_with_contract(session_factory)
+    transition_instruction_execution_contract(
+        session_factory,
+        contract_id=contract.id,
+        expected_state="pending",
+        expected_version=contract.state_version,
+        new_state="verified",
+        reason_code="auto_trade_disabled",
+        evidence_refs=[{"kind": "entry_refusal"}],
+        transitioned_at=NOW,
+        terminal_kind="verified_refusal",
+        completion_scope="full",
+    )
+
+    finish_message_instruction_item(
+        session_factory,
+        item_id=item.id,
+        status="submitted",
+        result={"status": "submitted"},
+        now=NOW,
+        execution_contract_mode="live",
+    )
+
+    with session_factory() as session:
+        stored = session.get(MessageInstructionItem, item.id)
+        assert stored.status == "succeeded"
+        evidence = json.loads(stored.result_json)["instruction_execution_contract"]
+        assert evidence["terminal_kind"] == "verified_refusal"
+        assert evidence["contract_id"] == contract.id
+
+
+def test_live_submit_unknown_mirrors_to_unknown_and_is_not_claimable(tmp_path):
+    session_factory = create_session_factory(tmp_path / "live-gate-unknown.db")
+    raw_id, item, contract = _claim_entry_item_with_contract(session_factory)
+    submitting = transition_instruction_execution_contract(
+        session_factory,
+        contract_id=contract.id,
+        expected_state="pending",
+        expected_version=contract.state_version,
+        new_state="submitting",
+        reason_code="writer_started",
+        evidence_refs=[{"kind": "entry_writer"}],
+        transitioned_at=NOW,
+        attempted_exchange_write=True,
+    )
+    transition_instruction_execution_contract(
+        session_factory,
+        contract_id=contract.id,
+        expected_state="submitting",
+        expected_version=submitting.state_version,
+        new_state="submit_unknown",
+        reason_code="exchange_outcome_unknown",
+        evidence_refs=[{"kind": "entry_readback"}],
+        transitioned_at=NOW,
+    )
+
+    finish_message_instruction_item(
+        session_factory,
+        item_id=item.id,
+        status="submitted",
+        result={"status": "submitted"},
+        now=NOW,
+        execution_contract_mode="live",
+    )
+
+    with session_factory() as session:
+        stored = session.get(MessageInstructionItem, item.id)
+        assert stored.status == "unknown"
+        assert json.loads(stored.error_json)["instruction_execution_contract"][
+            "state"
+        ] == "submit_unknown"
+    assert claim_next_message_instruction_item(
+        session_factory, raw_message_id=raw_id, now=NOW
+    ) is None
+
+
+def test_shadow_entry_contract_divergence_is_recorded_without_enforcement(tmp_path):
+    session_factory = create_session_factory(tmp_path / "shadow-gate.db")
+    _, item, _ = _claim_entry_item_with_contract(session_factory)
+
+    finish_message_instruction_item(
+        session_factory,
+        item_id=item.id,
+        status="succeeded",
+        result={"status": "skipped"},
+        now=NOW,
+        execution_contract_mode="shadow",
+    )
+
+    with session_factory() as session:
+        stored = session.get(MessageInstructionItem, item.id)
+        assert stored.status == "succeeded"
+        evidence = json.loads(stored.result_json)["instruction_execution_contract"]
+        assert evidence["divergence"] is True
+        assert evidence["expected_item_status"] == "failed"
+
+
+def test_disabled_entry_contract_mode_preserves_legacy_finish(tmp_path):
+    session_factory = create_session_factory(tmp_path / "disabled-gate.db")
+    _, item, _ = _claim_entry_item_with_contract(session_factory)
+
+    finish_message_instruction_item(
+        session_factory,
+        item_id=item.id,
+        status="succeeded",
+        result={"status": "skipped"},
+        now=NOW,
+        execution_contract_mode="disabled",
+    )
+
+    with session_factory() as session:
+        stored = session.get(MessageInstructionItem, item.id)
+        assert stored.status == "succeeded"
+        assert "instruction_execution_contract" not in json.loads(stored.result_json)
+
+
+def test_live_finish_retries_when_contract_changes_after_mirror_read(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research import instruction_execution_entry_adapter
+
+    session_factory = create_session_factory(tmp_path / "live-gate-race.db")
+    _, item, contract = _claim_entry_item_with_contract(session_factory)
+    original_resolver = (
+        instruction_execution_entry_adapter.resolve_entry_instruction_mirror
+    )
+    transitioned = False
+
+    def racing_resolver(*args, **kwargs):
+        nonlocal transitioned
+        mirror = original_resolver(*args, **kwargs)
+        if not transitioned:
+            transitioned = True
+            transition_instruction_execution_contract(
+                session_factory,
+                contract_id=contract.id,
+                expected_state="pending",
+                expected_version=contract.state_version,
+                new_state="verified",
+                reason_code="entry_submission_verified",
+                evidence_refs=[{"kind": "entry_binding", "id": 7}],
+                transitioned_at=NOW,
+                terminal_kind="verified_entry",
+                completion_scope="full",
+            )
+        return mirror
+
+    monkeypatch.setattr(
+        instruction_execution_entry_adapter,
+        "resolve_entry_instruction_mirror",
+        racing_resolver,
+    )
+
+    finish_message_instruction_item(
+        session_factory,
+        item_id=item.id,
+        status="succeeded",
+        result={"status": "succeeded"},
+        now=NOW,
+        execution_contract_mode="live",
+    )
+
+    with session_factory() as session:
+        stored = session.get(MessageInstructionItem, item.id)
+        assert stored.status == "submitted"
+        evidence = json.loads(stored.result_json)["instruction_execution_contract"]
+        assert evidence["state_version"] == 1
+
+
+def test_shadow_finish_ignores_contract_churn_and_preserves_legacy_status(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research import instruction_execution_entry_adapter
+
+    session_factory = create_session_factory(tmp_path / "shadow-gate-race.db")
+    _, item, contract = _claim_entry_item_with_contract(session_factory)
+    original_resolver = (
+        instruction_execution_entry_adapter.resolve_entry_instruction_mirror
+    )
+    calls = 0
+
+    def churning_resolver(*args, **kwargs):
+        nonlocal calls, contract
+        calls += 1
+        mirror = original_resolver(*args, **kwargs)
+        new_state = "deferred" if contract.state == "pending" else "pending"
+        contract = transition_instruction_execution_contract(
+            session_factory,
+            contract_id=contract.id,
+            expected_state=contract.state,
+            expected_version=contract.state_version,
+            new_state=new_state,
+            reason_code="shadow_observation_churn",
+            evidence_refs=[{"kind": "shadow_test"}],
+            transitioned_at=NOW,
+        )
+        return mirror
+
+    monkeypatch.setattr(
+        instruction_execution_entry_adapter,
+        "resolve_entry_instruction_mirror",
+        churning_resolver,
+    )
+
+    finish_message_instruction_item(
+        session_factory,
+        item_id=item.id,
+        status="succeeded",
+        result={"status": "succeeded"},
+        now=NOW,
+        execution_contract_mode="shadow",
+    )
+
+    with session_factory() as session:
+        stored = session.get(MessageInstructionItem, item.id)
+        assert stored.status == "succeeded"
+    assert calls == 1
 
 
 def test_public_results_include_persisted_sequence_and_strategy_identity(tmp_path):

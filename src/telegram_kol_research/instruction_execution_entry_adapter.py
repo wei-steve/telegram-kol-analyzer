@@ -6,17 +6,24 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Mapping
 
 from sqlalchemy import update
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.execution_bindings import load_entry_binding_evidence
 from telegram_kol_research.instruction_execution_contracts import (
+    InstructionExecutionConflictError,
     load_or_create_instruction_execution_contract,
     transition_instruction_execution_contract,
 )
-from telegram_kol_research.models import InstructionExecutionContract
+from telegram_kol_research.instruction_execution_outcomes import (
+    interpret_instruction_outcome,
+)
+from telegram_kol_research.models import (
+    InstructionExecutionContract,
+    MessageInstructionItem,
+)
 from telegram_kol_research.trade_signals import (
     load_trade_signal_execution_evidence,
 )
@@ -39,6 +46,16 @@ class EntrySubmissionProjection:
     completion_scope: str | None = None
     verified_leg_indices: tuple[int, ...] = ()
     incident_facts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class EntryInstructionMirror:
+    effective_status: str
+    contract_id: int | None
+    contract_state: str | None
+    contract_state_version: int | None
+    divergence: bool
+    evidence: Mapping[str, object]
 
 
 def _enabled(mode: str) -> bool:
@@ -70,6 +87,312 @@ def _load_contract(session_factory, *, message_instruction_item_id: int):
         if row is not None:
             session.expunge(row)
         return row
+
+
+def project_entry_non_writer_result_contract(
+    session_factory: sessionmaker,
+    *,
+    message_instruction_item_id: int,
+    result: dict[str, Any],
+    projected_at: datetime,
+    mode: str,
+) -> InstructionExecutionContract | None:
+    """Project deterministic non-writer outcomes before the item mirror gate."""
+
+    if not _enabled(mode):
+        return None
+    initial_contract = load_or_create_instruction_execution_contract(
+        session_factory,
+        message_instruction_item_id=int(message_instruction_item_id),
+        projected_at=projected_at,
+    )
+    outcome = interpret_instruction_outcome(result, intent_kind="entry")
+    contract = initial_contract
+    for _attempt in range(8):
+        if contract.intent_kind != "entry":
+            return contract
+        if contract.state in {"verified", "failed", "expired", "submit_unknown"}:
+            return contract
+        if outcome.attempted_exchange_write:
+            if contract.state == "deferred":
+                try:
+                    contract = transition_instruction_execution_contract(
+                        session_factory,
+                        contract_id=int(contract.id),
+                        expected_state="deferred",
+                        expected_version=int(contract.state_version),
+                        new_state="pending",
+                        reason_code="entry_result_write_contradicts_deferral",
+                        evidence_refs=[{"kind": "entry_result_contradiction"}],
+                        transitioned_at=projected_at,
+                    )
+                except InstructionExecutionConflictError:
+                    contract = _load_contract(
+                        session_factory,
+                        message_instruction_item_id=message_instruction_item_id,
+                    )
+                    if contract is None:
+                        raise EntryExecutionContractBlocked(
+                            "entry_contract_missing_after_conflict"
+                        )
+                continue
+            if contract.state == "pending":
+                try:
+                    contract = transition_instruction_execution_contract(
+                        session_factory,
+                        contract_id=int(contract.id),
+                        expected_state="pending",
+                        expected_version=int(contract.state_version),
+                        new_state="submitting",
+                        reason_code="entry_result_reports_exchange_write",
+                        evidence_refs=[
+                            {
+                                "kind": "entry_attempted_write_result",
+                                "status": str(result.get("status") or "")[:64],
+                            }
+                        ],
+                        transitioned_at=projected_at,
+                        attempted_exchange_write=True,
+                    )
+                except InstructionExecutionConflictError:
+                    contract = _load_contract(
+                        session_factory,
+                        message_instruction_item_id=message_instruction_item_id,
+                    )
+                    if contract is None:
+                        raise EntryExecutionContractBlocked(
+                            "entry_contract_missing_after_conflict"
+                        )
+                continue
+            if contract.state == "submitting":
+                try:
+                    return transition_instruction_execution_contract(
+                        session_factory,
+                        contract_id=int(contract.id),
+                        expected_state="submitting",
+                        expected_version=int(contract.state_version),
+                        new_state="submit_unknown",
+                        reason_code="entry_result_attempted_write_unverified",
+                        evidence_refs=[
+                            {
+                                "kind": "entry_attempted_write_result",
+                                "status": str(result.get("status") or "")[:64],
+                                "reason": str(result.get("reason") or "")[:128],
+                            }
+                        ],
+                        transitioned_at=projected_at,
+                    )
+                except InstructionExecutionConflictError:
+                    contract = _load_contract(
+                        session_factory,
+                        message_instruction_item_id=message_instruction_item_id,
+                    )
+                    if contract is None:
+                        raise EntryExecutionContractBlocked(
+                            "entry_contract_missing_after_conflict"
+                        )
+                    continue
+            return contract
+
+        target_state: str | None = None
+        if outcome.state in {"failed", "expired"}:
+            if contract.state in {"pending", "deferred"}:
+                target_state = outcome.state
+        elif outcome.state == "deferred" and contract.state == "pending":
+            target_state = "deferred"
+        if target_state is None:
+            return contract
+        try:
+            return transition_instruction_execution_contract(
+                session_factory,
+                contract_id=int(contract.id),
+                expected_state=str(contract.state),
+                expected_version=int(contract.state_version),
+                new_state=target_state,
+                reason_code=str(outcome.reason_code)[:128],
+                evidence_refs=[
+                    {
+                        "kind": "entry_non_writer_result",
+                        "status": str(result.get("status") or "")[:64],
+                        "reason": str(result.get("reason") or "")[:128],
+                    }
+                ],
+                transitioned_at=projected_at,
+            )
+        except InstructionExecutionConflictError:
+            contract = _load_contract(
+                session_factory,
+                message_instruction_item_id=message_instruction_item_id,
+            )
+            if contract is None:
+                raise EntryExecutionContractBlocked(
+                    "entry_contract_missing_after_conflict"
+                )
+    raise EntryExecutionContractBlocked("entry_contract_projection_conflict")
+
+
+def project_entry_refusal_contract(
+    session_factory: sessionmaker,
+    *,
+    message_instruction_item_id: int,
+    reason_code: str,
+    evidence_refs: list[dict[str, object]],
+    projected_at: datetime,
+    mode: str,
+) -> InstructionExecutionContract | None:
+    """Persist one explicit pre-writer entry refusal from its decision point."""
+
+    if not _enabled(mode):
+        return None
+    contract = load_or_create_instruction_execution_contract(
+        session_factory,
+        message_instruction_item_id=int(message_instruction_item_id),
+        projected_at=projected_at,
+    )
+    for _attempt in range(8):
+        if contract.intent_kind != "entry":
+            raise EntryExecutionContractBlocked("non_entry_instruction_contract")
+        if contract.state in {
+            "verified",
+            "failed",
+            "expired",
+            "submit_unknown",
+            "submitting",
+        }:
+            return contract
+        if contract.state == "deferred":
+            try:
+                contract = transition_instruction_execution_contract(
+                    session_factory,
+                    contract_id=int(contract.id),
+                    expected_state="deferred",
+                    expected_version=int(contract.state_version),
+                    new_state="pending",
+                    reason_code="entry_admission_released_without_writer",
+                    evidence_refs=[{"kind": "entry_refusal_admission_release"}],
+                    transitioned_at=projected_at,
+                )
+            except InstructionExecutionConflictError:
+                contract = _load_contract(
+                    session_factory,
+                    message_instruction_item_id=message_instruction_item_id,
+                )
+                if contract is None:
+                    raise EntryExecutionContractBlocked(
+                        "entry_contract_missing_after_conflict"
+                    )
+            continue
+        try:
+            return transition_instruction_execution_contract(
+                session_factory,
+                contract_id=int(contract.id),
+                expected_state="pending",
+                expected_version=int(contract.state_version),
+                new_state="verified",
+                reason_code=str(reason_code)[:128],
+                evidence_refs=evidence_refs,
+                transitioned_at=projected_at,
+                terminal_kind="verified_refusal",
+                completion_scope="full",
+            )
+        except InstructionExecutionConflictError:
+            contract = _load_contract(
+                session_factory,
+                message_instruction_item_id=message_instruction_item_id,
+            )
+            if contract is None:
+                raise EntryExecutionContractBlocked(
+                    "entry_contract_missing_after_conflict"
+                )
+    raise EntryExecutionContractBlocked("entry_contract_projection_conflict")
+
+
+def resolve_entry_instruction_mirror(
+    session_factory: sessionmaker,
+    *,
+    message_instruction_item_id: int,
+    requested_status: str,
+    mode: str,
+) -> EntryInstructionMirror:
+    """Resolve the item mirror exclusively from durable entry-contract truth."""
+
+    if mode not in {"disabled", "shadow", "live"}:
+        raise ValueError("execution contract mode must be disabled, shadow, or live")
+    requested = str(requested_status)
+    if mode == "disabled":
+        return EntryInstructionMirror(requested, None, None, None, False, {})
+    with session_factory() as session:
+        item = session.get(MessageInstructionItem, int(message_instruction_item_id))
+        if item is None:
+            raise LookupError("message instruction item not found")
+        if str(item.instruction_kind) != "entry":
+            return EntryInstructionMirror(requested, None, None, None, False, {})
+    contract = _load_contract(
+        session_factory,
+        message_instruction_item_id=int(message_instruction_item_id),
+    )
+    expected = "failed"
+    reason_code = "execution_contract_missing"
+    state = None
+    terminal_kind = None
+    completion_scope = None
+    contract_id = None
+    state_version = None
+    if contract is not None:
+        contract_id = int(contract.id)
+        state = str(contract.state)
+        state_version = int(contract.state_version)
+        terminal_kind = contract.terminal_kind
+        completion_scope = contract.completion_scope
+        reason_code = str(contract.reason_code or "") or "execution_contract_pending"
+        if state == "deferred":
+            expected = "pending"
+        elif state == "submitting":
+            expected = "executing"
+        elif state == "submit_unknown":
+            expected = "unknown"
+        elif state in {"failed", "expired"}:
+            expected = "failed"
+        elif (
+            state == "verified"
+            and contract.intent_kind == "entry"
+            and terminal_kind == "verified_refusal"
+            and completion_scope == "full"
+        ):
+            expected = "succeeded"
+        elif (
+            state == "verified"
+            and contract.intent_kind == "entry"
+            and terminal_kind == "verified_entry"
+            and completion_scope in {"full", "partial"}
+        ):
+            expected = "submitted"
+        elif state == "verified":
+            expected = "failed"
+            reason_code = "entry_terminal_contract_invalid"
+        else:
+            expected = "failed"
+            reason_code = "verified_terminal_contract_required"
+    divergence = expected != requested
+    evidence: dict[str, object] = {
+        "contract_id": contract_id,
+        "state": state or "missing",
+        "state_version": state_version,
+        "terminal_kind": terminal_kind,
+        "completion_scope": completion_scope,
+        "reason_code": reason_code[:128],
+        "expected_item_status": expected,
+        "observed_item_status": requested,
+        "divergence": divergence,
+    }
+    return EntryInstructionMirror(
+        expected if mode == "live" else requested,
+        contract_id,
+        state,
+        state_version,
+        divergence,
+        evidence,
+    )
 
 
 def project_entry_deferred_contract(

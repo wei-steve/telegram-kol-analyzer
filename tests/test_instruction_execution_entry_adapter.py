@@ -7,12 +7,16 @@ import pytest
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.instruction_execution_contracts import (
     load_or_create_instruction_execution_contract,
+    transition_instruction_execution_contract,
 )
 from telegram_kol_research.instruction_execution_entry_adapter import (
     EntryExecutionContractBlocked,
     prepare_entry_submission_contract,
+    project_entry_non_writer_result_contract,
+    project_entry_refusal_contract,
     project_entry_deferred_contract,
     project_entry_submission_result,
+    resolve_entry_instruction_mirror,
 )
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -160,6 +164,389 @@ def test_pending_entry_can_be_projected_as_deferred(tmp_path):
         assert evidence["raw_message_ids"] == [17]
         assert evidence["deadline_at"] == NOW.isoformat()
         assert evidence["recheck_fingerprint"] == "f" * 64
+
+
+def test_deferred_contract_resolves_to_pending_item_mirror(tmp_path):
+    session_factory = create_session_factory(tmp_path / "deferred-mirror.db")
+    item_id, _, _ = _persist_chain(session_factory)
+    project_entry_deferred_contract(
+        session_factory,
+        message_instruction_item_id=item_id,
+        reason_code="adjacent_entry_context_pending",
+        blocker_ids=(17,),
+        projected_at=NOW,
+        mode="live",
+    )
+
+    mirror = resolve_entry_instruction_mirror(
+        session_factory,
+        message_instruction_item_id=item_id,
+        requested_status="succeeded",
+        mode="live",
+    )
+
+    assert mirror.effective_status == "pending"
+    assert mirror.contract_state == "deferred"
+
+
+def test_non_writer_refusal_is_projected_before_live_mirror(tmp_path):
+    session_factory = create_session_factory(tmp_path / "refusal-projection.db")
+    item_id, _, _ = _persist_chain(session_factory)
+
+    projected = project_entry_refusal_contract(
+        session_factory,
+        message_instruction_item_id=item_id,
+        reason_code="auto_trade_disabled",
+        evidence_refs=[{"kind": "entry_safety_refusal", "gate": "settings"}],
+        projected_at=NOW,
+        mode="live",
+    )
+    mirror = resolve_entry_instruction_mirror(
+        session_factory,
+        message_instruction_item_id=item_id,
+        requested_status="succeeded",
+        mode="live",
+    )
+
+    assert projected.state == "verified"
+    assert projected.terminal_kind == "verified_refusal"
+    assert mirror.effective_status == "succeeded"
+    assert mirror.evidence["reason_code"] == "auto_trade_disabled"
+
+
+def test_deferred_entry_can_finish_as_verified_non_writer_refusal(tmp_path):
+    session_factory = create_session_factory(tmp_path / "deferred-refusal.db")
+    item_id, _, _ = _persist_chain(session_factory)
+    project_entry_deferred_contract(
+        session_factory,
+        message_instruction_item_id=item_id,
+        reason_code="adjacent_entry_context_pending",
+        blocker_ids=(17,),
+        projected_at=NOW,
+        mode="live",
+    )
+
+    projected = project_entry_refusal_contract(
+        session_factory,
+        message_instruction_item_id=item_id,
+        reason_code="auto_trade_disabled",
+        evidence_refs=[{"kind": "entry_safety_refusal", "gate": "settings"}],
+        projected_at=NOW,
+        mode="live",
+    )
+
+    assert projected.state == "verified"
+    assert projected.terminal_kind == "verified_refusal"
+
+
+def test_generic_skip_result_cannot_manufacture_verified_refusal(tmp_path):
+    session_factory = create_session_factory(tmp_path / "generic-skip.db")
+    item_id, _, _ = _persist_chain(session_factory)
+
+    projected = project_entry_non_writer_result_contract(
+        session_factory,
+        message_instruction_item_id=item_id,
+        result={
+            "status": "skipped",
+            "reason": "auto_trade_disabled",
+            "legs": [{"status": "submitted"}],
+        },
+        projected_at=NOW,
+        mode="live",
+    )
+
+    assert projected.state == "pending"
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"status": "failed", "submitted": True},
+        {"status": "partial_failed", "legs": [{"status": "submitted"}]},
+    ],
+)
+def test_attempted_write_failure_projects_submit_unknown(tmp_path, result):
+    session_factory = create_session_factory(tmp_path / "attempted-failure.db")
+    item_id, _, _ = _persist_chain(session_factory)
+
+    projected = project_entry_non_writer_result_contract(
+        session_factory,
+        message_instruction_item_id=item_id,
+        result=result,
+        projected_at=NOW,
+        mode="live",
+    )
+
+    assert projected.state == "submit_unknown"
+    assert projected.attempted_exchange_write is True
+
+
+def test_attempted_write_projection_reloads_concurrent_terminal_truth(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research import instruction_execution_entry_adapter
+
+    session_factory = create_session_factory(tmp_path / "attempted-race.db")
+    item_id, _, _ = _persist_chain(session_factory)
+    original_transition = transition_instruction_execution_contract
+    injected = False
+
+    def racing_transition(*args, **kwargs):
+        nonlocal injected
+        transitioned = original_transition(*args, **kwargs)
+        if kwargs["new_state"] == "submitting" and not injected:
+            injected = True
+            original_transition(
+                session_factory,
+                contract_id=transitioned.id,
+                expected_state="submitting",
+                expected_version=transitioned.state_version,
+                new_state="submit_unknown",
+                reason_code="concurrent_reconciler_unknown",
+                evidence_refs=[{"kind": "exchange_readback"}],
+                transitioned_at=NOW,
+            )
+        return transitioned
+
+    monkeypatch.setattr(
+        instruction_execution_entry_adapter,
+        "transition_instruction_execution_contract",
+        racing_transition,
+    )
+
+    projected = project_entry_non_writer_result_contract(
+        session_factory,
+        message_instruction_item_id=item_id,
+        result={"status": "failed", "submitted": True},
+        projected_at=NOW,
+        mode="live",
+    )
+
+    assert projected.state == "submit_unknown"
+    assert projected.reason_code == "concurrent_reconciler_unknown"
+
+
+@pytest.mark.parametrize("reloaded_state", ["pending", "deferred"])
+def test_attempted_write_projection_retries_concurrent_nonterminal_truth(
+    tmp_path, monkeypatch, reloaded_state
+):
+    from telegram_kol_research import instruction_execution_entry_adapter
+
+    session_factory = create_session_factory(
+        tmp_path / f"attempted-{reloaded_state}-race.db"
+    )
+    item_id, _, _ = _persist_chain(session_factory)
+    if reloaded_state == "pending":
+        project_entry_deferred_contract(
+            session_factory,
+            message_instruction_item_id=item_id,
+            reason_code="adjacent_entry_context_pending",
+            blocker_ids=(17,),
+            projected_at=NOW,
+            mode="live",
+        )
+    original_transition = transition_instruction_execution_contract
+    injected = False
+
+    def racing_transition(*args, **kwargs):
+        nonlocal injected
+        if not injected and (
+            (reloaded_state == "pending" and kwargs["expected_state"] == "deferred")
+            or (reloaded_state == "deferred" and kwargs["expected_state"] == "pending")
+        ):
+            injected = True
+            if reloaded_state == "pending":
+                original_transition(*args, **kwargs)
+            else:
+                original_transition(
+                    session_factory,
+                    contract_id=kwargs["contract_id"],
+                    expected_state="pending",
+                    expected_version=kwargs["expected_version"],
+                    new_state="deferred",
+                    reason_code="concurrent_admission_deferred",
+                    evidence_refs=[{"kind": "admission"}],
+                    transitioned_at=NOW,
+                )
+        return original_transition(*args, **kwargs)
+
+    monkeypatch.setattr(
+        instruction_execution_entry_adapter,
+        "transition_instruction_execution_contract",
+        racing_transition,
+    )
+
+    projected = project_entry_non_writer_result_contract(
+        session_factory,
+        message_instruction_item_id=item_id,
+        result={"status": "failed", "submitted": True},
+        projected_at=NOW,
+        mode="live",
+    )
+
+    assert projected.state == "submit_unknown"
+    assert projected.attempted_exchange_write is True
+
+
+def test_deferred_refusal_projection_reloads_concurrent_terminal_truth(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research import instruction_execution_entry_adapter
+
+    session_factory = create_session_factory(tmp_path / "refusal-race.db")
+    item_id, _, _ = _persist_chain(session_factory)
+    project_entry_deferred_contract(
+        session_factory,
+        message_instruction_item_id=item_id,
+        reason_code="adjacent_entry_context_pending",
+        blocker_ids=(17,),
+        projected_at=NOW,
+        mode="live",
+    )
+    original_transition = transition_instruction_execution_contract
+    injected = False
+
+    def racing_transition(*args, **kwargs):
+        nonlocal injected
+        transitioned = original_transition(*args, **kwargs)
+        if kwargs["new_state"] == "pending" and not injected:
+            injected = True
+            submitting = original_transition(
+                session_factory,
+                contract_id=transitioned.id,
+                expected_state="pending",
+                expected_version=transitioned.state_version,
+                new_state="submitting",
+                reason_code="concurrent_writer",
+                evidence_refs=[{"kind": "entry_writer"}],
+                transitioned_at=NOW,
+                attempted_exchange_write=True,
+            )
+            original_transition(
+                session_factory,
+                contract_id=submitting.id,
+                expected_state="submitting",
+                expected_version=submitting.state_version,
+                new_state="submit_unknown",
+                reason_code="concurrent_reconciler_unknown",
+                evidence_refs=[{"kind": "exchange_readback"}],
+                transitioned_at=NOW,
+            )
+        return transitioned
+
+    monkeypatch.setattr(
+        instruction_execution_entry_adapter,
+        "transition_instruction_execution_contract",
+        racing_transition,
+    )
+
+    projected = project_entry_refusal_contract(
+        session_factory,
+        message_instruction_item_id=item_id,
+        reason_code="auto_trade_disabled",
+        evidence_refs=[{"kind": "entry_safety_refusal"}],
+        projected_at=NOW,
+        mode="live",
+    )
+
+    assert projected.state == "submit_unknown"
+    assert projected.reason_code == "concurrent_reconciler_unknown"
+
+
+def test_deferred_refusal_projection_retries_concurrent_pending_truth(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research import instruction_execution_entry_adapter
+
+    session_factory = create_session_factory(tmp_path / "refusal-pending-race.db")
+    item_id, _, _ = _persist_chain(session_factory)
+    project_entry_deferred_contract(
+        session_factory,
+        message_instruction_item_id=item_id,
+        reason_code="adjacent_entry_context_pending",
+        blocker_ids=(17,),
+        projected_at=NOW,
+        mode="live",
+    )
+    original_transition = transition_instruction_execution_contract
+    injected = False
+
+    def racing_transition(*args, **kwargs):
+        nonlocal injected
+        if kwargs["expected_state"] == "deferred" and not injected:
+            injected = True
+            original_transition(*args, **kwargs)
+        return original_transition(*args, **kwargs)
+
+    monkeypatch.setattr(
+        instruction_execution_entry_adapter,
+        "transition_instruction_execution_contract",
+        racing_transition,
+    )
+
+    projected = project_entry_refusal_contract(
+        session_factory,
+        message_instruction_item_id=item_id,
+        reason_code="auto_trade_disabled",
+        evidence_refs=[{"kind": "entry_safety_refusal"}],
+        projected_at=NOW,
+        mode="live",
+    )
+
+    assert projected.state == "verified"
+    assert projected.terminal_kind == "verified_refusal"
+
+
+@pytest.mark.parametrize(
+    ("terminal_kind", "completion_scope", "intent_kind"),
+    [
+        ("verified_management", "full", "entry"),
+        ("verified_entry", None, "entry"),
+        ("verified_entry", "full", "management"),
+    ],
+)
+def test_invalid_verified_terminal_tuple_fails_closed_for_entry_mirror(
+    tmp_path, terminal_kind, completion_scope, intent_kind
+):
+    session_factory = create_session_factory(tmp_path / "wrong-terminal-kind.db")
+    item_id, _, _ = _persist_chain(session_factory)
+    contract = load_or_create_instruction_execution_contract(
+        session_factory,
+        message_instruction_item_id=item_id,
+        projected_at=NOW,
+    )
+    transition_instruction_execution_contract(
+        session_factory,
+        contract_id=contract.id,
+        expected_state="pending",
+        expected_version=contract.state_version,
+        new_state="verified",
+        reason_code="wrong_writer",
+        evidence_refs=[{"kind": "management_batch"}],
+        transitioned_at=NOW,
+        terminal_kind=(
+            terminal_kind
+            if terminal_kind in {"verified_management", "verified_entry"}
+            else "verified_entry"
+        ),
+        completion_scope="full",
+    )
+    with session_factory() as session:
+        stored = session.get(InstructionExecutionContract, contract.id)
+        stored.terminal_kind = terminal_kind
+        stored.completion_scope = completion_scope
+        stored.intent_kind = intent_kind
+        session.commit()
+
+    mirror = resolve_entry_instruction_mirror(
+        session_factory,
+        message_instruction_item_id=item_id,
+        requested_status="succeeded",
+        mode="live",
+    )
+
+    assert mirror.effective_status == "failed"
+    assert mirror.evidence["reason_code"] == "entry_terminal_contract_invalid"
 
 
 def test_successful_one_leg_submission_becomes_verified_entry(tmp_path):

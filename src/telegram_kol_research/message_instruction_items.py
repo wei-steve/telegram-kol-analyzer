@@ -18,6 +18,7 @@ from telegram_kol_research.instruction_execution_outcomes import (
 )
 from telegram_kol_research.models import (
     ExecutionBinding,
+    InstructionExecutionContract,
     ManagementMessageTarget,
     MessageInstructionItem,
     RawMessage,
@@ -438,55 +439,130 @@ def finish_message_instruction_item(
     status: str,
     result: dict,
     now: datetime,
+    execution_contract_mode: str = "disabled",
 ) -> None:
     """Finish a claimed item exactly once and persist its result channel."""
 
     if status not in FINISH_STATUSES:
         raise ValueError(f"unsupported finish status: {status}")
 
-    payload_json = json.dumps(
-        result,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
+    from telegram_kol_research.instruction_execution_entry_adapter import (
+        resolve_entry_instruction_mirror,
     )
-    values = {
-        "status": status,
-        "result_json": None if status in ERROR_STATUSES else payload_json,
-        "error_json": payload_json if status in ERROR_STATUSES else None,
-        "updated_at": now,
-    }
-    with session_factory() as session:
-        update_result = session.execute(
-            update(MessageInstructionItem)
-            .where(
+
+    for attempt in range(4):
+        result_payload = dict(result)
+        mirror = resolve_entry_instruction_mirror(
+            session_factory,
+            message_instruction_item_id=int(item_id),
+            requested_status=status,
+            mode=execution_contract_mode,
+        )
+        effective_status = mirror.effective_status
+        if mirror.evidence:
+            result_payload["instruction_execution_contract"] = dict(
+                mirror.evidence
+            )
+        payload_json = json.dumps(
+            result_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        values = {
+            "status": effective_status,
+            "result_json": (
+                None if effective_status in ERROR_STATUSES else payload_json
+            ),
+            "error_json": (
+                payload_json if effective_status in ERROR_STATUSES else None
+            ),
+            "updated_at": now,
+        }
+        contract_guard = (
+            _instruction_contract_mirror_guard(
+                item_id=int(item_id),
+                contract_id=mirror.contract_id,
+                contract_state=mirror.contract_state,
+                contract_state_version=mirror.contract_state_version,
+            )
+            if execution_contract_mode == "live" and mirror.evidence
+            else None
+        )
+        with session_factory() as session:
+            conditions = [
                 MessageInstructionItem.id == int(item_id),
                 MessageInstructionItem.status == "executing",
+            ]
+            if contract_guard is not None:
+                conditions.append(contract_guard)
+            update_result = session.execute(
+                update(MessageInstructionItem)
+                .where(*conditions)
+                .values(**values)
             )
-            .values(**values)
-        )
-        if update_result.rowcount != 1:
+            if update_result.rowcount == 1:
+                result_status = str(
+                    result_payload.get("status") or ""
+                ).strip().lower()
+                target_state = {
+                    "pending": "pending",
+                    "executing": "executing",
+                    "submitted": "submitted",
+                    "succeeded": "confirmed",
+                    "failed": "failed",
+                    "unknown": (
+                        "recovery_required"
+                        if result_status == "recovery_required"
+                        else "submit_unknown"
+                    ),
+                }[effective_status]
+                _update_linked_target_state_in_session(
+                    session,
+                    item_id=int(item_id),
+                    state=target_state,
+                    now=now,
+                )
+                session.commit()
+                return
             session.rollback()
-            raise RuntimeError("instruction item is missing or not executing")
-        result_status = str(result.get("status") or "").strip().lower()
-        target_state = {
-            "executing": "executing",
-            "submitted": "submitted",
-            "succeeded": "confirmed",
-            "failed": "failed",
-            "unknown": (
-                "recovery_required"
-                if result_status == "recovery_required"
-                else "submit_unknown"
-            ),
-        }[status]
-        _update_linked_target_state_in_session(
-            session,
-            item_id=int(item_id),
-            state=target_state,
-            now=now,
+            item = session.get(MessageInstructionItem, int(item_id))
+            if item is None or item.status != "executing":
+                raise RuntimeError("instruction item is missing or not executing")
+        if attempt == 3:
+            raise RuntimeError("instruction execution contract changed during finish")
+
+
+def _instruction_contract_mirror_guard(
+    *,
+    item_id: int,
+    contract_id: int | None,
+    contract_state: str | None,
+    contract_state_version: int | None,
+):
+    if contract_id is None and contract_state is None:
+        return ~exists(
+            select(InstructionExecutionContract.id).where(
+                InstructionExecutionContract.message_instruction_item_id
+                == int(item_id)
+            )
         )
-        session.commit()
+    if (
+        contract_id is None
+        or contract_state is None
+        or contract_state_version is None
+    ):
+        return None
+    return exists(
+        select(InstructionExecutionContract.id).where(
+            InstructionExecutionContract.id == int(contract_id),
+            InstructionExecutionContract.message_instruction_item_id
+            == int(item_id),
+            InstructionExecutionContract.state == str(contract_state),
+            InstructionExecutionContract.state_version
+            == int(contract_state_version),
+        )
+    )
 
 
 def _update_linked_target_state_in_session(
