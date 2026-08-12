@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import ast
 from copy import deepcopy
+from dataclasses import replace
+import json
 import math
+import os
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +25,42 @@ from telegram_kol_research.mimo_v2_replay import (
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import MediaAsset, RawMessage
 from telegram_kol_research.mimo_v2_contract import parse_mimo_v2_payload
+
+
+_COMPARISON_ARTIFACT_FIELDS = (
+    "raw_message_id",
+    "status",
+    "reason_code",
+    "v1_status",
+    "v2_status",
+    "v1_duration_ms",
+    "v2_duration_ms",
+    "adapter_duration_ms",
+    "v1_projection_fingerprint",
+    "v2_projection_fingerprint",
+)
+_SUMMARY_ARTIFACT_FIELDS = (
+    "schema_version",
+    "processed",
+    "comparable",
+    "unsafe_mismatches",
+    "validation_failures",
+    "production_writes",
+    "notifications_sent",
+    "execution_calls",
+    "v1_p95_ms",
+    "v2_p95_ms",
+    "adapter_p95_ms",
+    "v2_to_v1_ratio",
+    "performance_passed",
+    "performance_failure_codes",
+    "passed",
+)
+_REPLAY_ARTIFACT_NAMES = (
+    "comparisons.csv",
+    "comparisons.json",
+    "summary.json",
+)
 
 
 def _write_ids(tmp_path: Path, content: str = "7\n") -> Path:
@@ -153,7 +192,11 @@ def _no_action_payload(*, reason: str) -> dict[str, object]:
     }
 
 
-def _parsed_entry_v2(*, stop_loss: str = "1940"):
+def _parsed_entry_v2(
+    *,
+    stop_loss: str = "1940",
+    observed_text: str = "private replay text",
+):
     strategy = dict(_entry_payload()["strategy"])
     strategy["stop_loss"] = stop_loss
     return parse_mimo_v2_payload(
@@ -176,7 +219,7 @@ def _parsed_entry_v2(*, stop_loss: str = "1940"):
                 }
             ],
             "evidence": {
-                "text": {"observed_text": "private replay text", "fields": {}},
+                "text": {"observed_text": observed_text, "fields": {}},
                 "images": [],
                 "conflicts": [],
             },
@@ -644,7 +687,9 @@ def test_runner_writes_only_disposable_copy_and_reuses_exact_context(tmp_path):
     assert len(set(seen_contexts)) == 1
     assert all(path != inputs.source_database for path in seen_database_paths)
     assert all(not path.exists() for path in seen_database_paths)
-    assert list(inputs.artifact_dir.iterdir()) == []
+    assert tuple(
+        sorted(path.name for path in inputs.artifact_dir.iterdir())
+    ) == _REPLAY_ARTIFACT_NAMES
     source_uri = inputs.source_database.as_uri() + "?mode=ro&immutable=1"
     with sqlite3.connect(source_uri, uri=True) as connection:
         assert connection.execute(
@@ -691,7 +736,9 @@ def test_runner_cleans_disposable_copy_after_runner_exception(tmp_path):
     assert result.validation_failures == 1
     assert result.comparisons[0].reason_code == "v1_runner_error"
     assert all(not path.exists() for path in seen_database_paths)
-    assert list(inputs.artifact_dir.iterdir()) == []
+    assert tuple(
+        sorted(path.name for path in inputs.artifact_dir.iterdir())
+    ) == _REPLAY_ARTIFACT_NAMES
 
 
 def test_runner_processes_messages_in_approved_order(tmp_path):
@@ -944,6 +991,200 @@ def test_runner_continues_after_unexpected_v2_exception(tmp_path):
     assert result.comparisons[0].reason_code == "v2_runner_error"
     assert "sensitive" not in repr(result)
     assert result.passed is False
+
+
+def test_replay_artifacts_are_bounded_deterministic_and_redacted(tmp_path):
+    inputs, message_id = _validated_replay_inputs(tmp_path)
+    secret_markers = (
+        "PRIVATE_SOURCE_TEXT",
+        "data:image/png;base64,PRIVATE_IMAGE_BYTES",
+        "PRIVATE_PROMPT_TEXT",
+        "Bearer PRIVATE_AUTHORIZATION",
+        "api_key=PRIVATE_API_KEY",
+        "password=PRIVATE_PASSWORD",
+        "PRIVATE_RAW_PROVIDER_RESPONSE",
+    )
+    image_path = inputs.media_root / "private-image.png"
+    image_path.write_text(secret_markers[1], encoding="utf-8")
+    factory = create_session_factory(inputs.source_database)
+    with factory() as session:
+        message = session.get(RawMessage, message_id)
+        message.text = " ".join(secret_markers)
+        session.add(
+            MediaAsset(
+                raw_message_id=message_id,
+                telegram_file_id="private-image",
+                kind="image",
+                mime_type="image/png",
+                local_path=image_path.name,
+                ocr_text=" ".join(secret_markers),
+            )
+        )
+        session.commit()
+    factory.kw["bind"].dispose()
+    v1_payload = _entry_payload(reason=" ".join(secret_markers))
+
+    result = run_mimo_v2_replay(
+        inputs=inputs,
+        ai_recognition_config_path=tmp_path / "ai.yaml",
+        v1_runner=lambda *args, **kwargs: SimpleNamespace(
+            payload=v1_payload,
+            status="是策略",
+            error_message=None,
+        ),
+        v2_runner=lambda *args, **kwargs: SimpleNamespace(
+            succeeded=True,
+            parsed_result=_parsed_entry_v2(
+                observed_text=" ".join(secret_markers)
+            ),
+            error_code=None,
+            raw_response=" ".join(secret_markers),
+        ),
+        clock=_SequenceClock(0.0, 0.1, 0.1, 0.2, 0.2, 0.201),
+    )
+
+    assert result.passed is True
+    assert tuple(
+        sorted(path.name for path in inputs.artifact_dir.iterdir())
+    ) == _REPLAY_ARTIFACT_NAMES
+    comparisons_json = (inputs.artifact_dir / "comparisons.json").read_text(
+        encoding="utf-8"
+    )
+    comparisons = json.loads(comparisons_json)
+    assert len(comparisons) == 1
+    assert tuple(comparisons[0]) == _COMPARISON_ARTIFACT_FIELDS
+    summary = json.loads(
+        (inputs.artifact_dir / "summary.json").read_text(encoding="utf-8")
+    )
+    assert tuple(summary) == _SUMMARY_ARTIFACT_FIELDS
+    csv_header = (
+        inputs.artifact_dir / "comparisons.csv"
+    ).read_text(encoding="utf-8").splitlines()[0]
+    assert tuple(csv_header.split(",")) == _COMPARISON_ARTIFACT_FIELDS
+    retained = "".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(inputs.artifact_dir.iterdir())
+    )
+    for marker in secret_markers:
+        assert marker not in retained
+
+
+def test_replay_artifacts_use_atomic_replacement(tmp_path, monkeypatch):
+    import telegram_kol_research.mimo_v2_replay as replay_module
+
+    inputs, _ = _validated_replay_inputs(tmp_path)
+    real_replace = os.replace
+    replacements: list[tuple[Path, Path]] = []
+
+    def recording_replace(source, destination):
+        replacements.append((Path(source), Path(destination)))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(replay_module.os, "replace", recording_replace)
+    run_mimo_v2_replay(
+        inputs=inputs,
+        ai_recognition_config_path=tmp_path / "ai.yaml",
+        v1_runner=lambda *args, **kwargs: SimpleNamespace(
+            payload=_entry_payload(),
+            status="是策略",
+            error_message=None,
+        ),
+        v2_runner=lambda *args, **kwargs: SimpleNamespace(
+            succeeded=True,
+            parsed_result=_parsed_entry_v2(),
+            error_code=None,
+        ),
+        clock=_SequenceClock(0.0, 0.1, 0.1, 0.2, 0.2, 0.201),
+    )
+
+    assert [source.name for source, _ in replacements] == [
+        ".comparisons.json.tmp",
+        ".comparisons.csv.tmp",
+        ".summary.json.tmp",
+    ]
+    assert [destination.name for _, destination in replacements] == [
+        "comparisons.json",
+        "comparisons.csv",
+        "summary.json",
+    ]
+    assert all(
+        source.parent == inputs.artifact_dir
+        and destination.parent == inputs.artifact_dir
+        for source, destination in replacements
+    )
+    assert not list(inputs.artifact_dir.glob(".*.tmp"))
+
+
+def test_replay_artifact_temp_files_use_exclusive_creation(tmp_path, monkeypatch):
+    import telegram_kol_research.mimo_v2_replay as replay_module
+
+    inputs, _ = _validated_replay_inputs(tmp_path)
+    result = run_mimo_v2_replay(
+        inputs=inputs,
+        ai_recognition_config_path=tmp_path / "ai.yaml",
+        v1_runner=lambda *args, **kwargs: SimpleNamespace(
+            payload=_entry_payload(),
+            status="是策略",
+            error_message=None,
+        ),
+        v2_runner=lambda *args, **kwargs: SimpleNamespace(
+            succeeded=True,
+            parsed_result=_parsed_entry_v2(),
+            error_code=None,
+        ),
+        clock=_SequenceClock(0.0, 0.1, 0.1, 0.2, 0.2, 0.201),
+    )
+    real_open = os.open
+    flags_seen: list[int] = []
+
+    def recording_open(path, flags, mode=0o777, *, dir_fd=None):
+        flags_seen.append(flags)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(replay_module.os, "open", recording_open)
+
+    replay_module.write_replay_artifacts(result)
+
+    assert len(flags_seen) == 3
+    assert all(flags & os.O_EXCL for flags in flags_seen)
+
+
+def test_replay_artifacts_reject_nonfinite_values_before_replacement(tmp_path):
+    import telegram_kol_research.mimo_v2_replay as replay_module
+
+    inputs, _ = _validated_replay_inputs(tmp_path)
+    result = run_mimo_v2_replay(
+        inputs=inputs,
+        ai_recognition_config_path=tmp_path / "ai.yaml",
+        v1_runner=lambda *args, **kwargs: SimpleNamespace(
+            payload=_entry_payload(),
+            status="是策略",
+            error_message=None,
+        ),
+        v2_runner=lambda *args, **kwargs: SimpleNamespace(
+            succeeded=True,
+            parsed_result=_parsed_entry_v2(),
+            error_code=None,
+        ),
+        clock=_SequenceClock(0.0, 0.1, 0.1, 0.2, 0.2, 0.201),
+    )
+    before = {
+        path.name: path.read_bytes()
+        for path in inputs.artifact_dir.iterdir()
+    }
+    invalid_row = replace(
+        result.comparisons[0],
+        v1_duration_ms=math.nan,
+    )
+    invalid_result = replace(result, comparisons=(invalid_row,))
+
+    with pytest.raises(MimoV2ReplayInputError, match="artifact_value_invalid"):
+        replay_module.write_replay_artifacts(invalid_result)
+
+    assert {
+        path.name: path.read_bytes()
+        for path in inputs.artifact_dir.iterdir()
+    } == before
 
 
 def test_replay_module_has_no_prohibited_writer_or_authority_imports():

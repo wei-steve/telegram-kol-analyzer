@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import json
 import math
 import os
@@ -30,7 +32,25 @@ from telegram_kol_research.recognition_experiments import (
 
 
 MAX_REPLAY_MESSAGES = 200
+REPLAY_ARTIFACT_SCHEMA_VERSION = 1
 _POSITIVE_MESSAGE_ID = re.compile(r"^[1-9][0-9]*$")
+_COMPARISON_ARTIFACT_FIELDS = (
+    "raw_message_id",
+    "status",
+    "reason_code",
+    "v1_status",
+    "v2_status",
+    "v1_duration_ms",
+    "v2_duration_ms",
+    "adapter_duration_ms",
+    "v1_projection_fingerprint",
+    "v2_projection_fingerprint",
+)
+_REPLAY_ARTIFACT_NAMES = (
+    "comparisons.json",
+    "comparisons.csv",
+    "summary.json",
+)
 
 
 class MimoV2ReplayInputError(ValueError):
@@ -525,26 +545,213 @@ def run_mimo_v2_replay(
         row.status in {"safe_match", "unsafe_mismatch"}
         for row in comparisons
     )
-    invariant_zero = 0
+    production_writes = 0
+    notifications_sent = 0
+    execution_calls = 0
     passed = (
         len(comparisons) == len(inputs.raw_message_ids)
         and unsafe_mismatches == 0
         and validation_failures == 0
         and performance.passed
+        and production_writes == 0
+        and notifications_sent == 0
+        and execution_calls == 0
     )
-    return MimoV2ReplayResult(
+    result = MimoV2ReplayResult(
         processed=len(comparisons),
         comparable=comparable,
         unsafe_mismatches=unsafe_mismatches,
         validation_failures=validation_failures,
-        production_writes=invariant_zero,
-        notifications_sent=invariant_zero,
-        execution_calls=invariant_zero,
+        production_writes=production_writes,
+        notifications_sent=notifications_sent,
+        execution_calls=execution_calls,
         passed=passed,
         comparisons=tuple(comparisons),
         performance=performance,
         artifact_dir=inputs.artifact_dir,
     )
+    write_replay_artifacts(result)
+    return result
+
+
+def write_replay_artifacts(result: MimoV2ReplayResult) -> tuple[Path, ...]:
+    """Atomically retain only allowlisted, non-sensitive replay fields."""
+
+    if not isinstance(result, MimoV2ReplayResult):
+        raise MimoV2ReplayInputError("artifact_result_invalid")
+    artifact_dir = _validated_replay_artifact_output_directory(
+        result.artifact_dir
+    )
+    rows = [
+        {
+            field: getattr(comparison, field)
+            for field in _COMPARISON_ARTIFACT_FIELDS
+        }
+        for comparison in result.comparisons
+    ]
+    summary = build_replay_summary(result)
+    _validate_artifact_value(rows)
+    _validate_artifact_value(summary)
+
+    comparisons_json = json.dumps(
+        rows,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ) + "\n"
+    summary_json = json.dumps(
+        summary,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ) + "\n"
+    csv_buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(
+        csv_buffer,
+        fieldnames=_COMPARISON_ARTIFACT_FIELDS,
+        extrasaction="raise",
+        lineterminator="\n",
+    )
+    writer.writeheader()
+    writer.writerows(rows)
+    payloads = (
+        ("comparisons.json", comparisons_json),
+        ("comparisons.csv", csv_buffer.getvalue()),
+        ("summary.json", summary_json),
+    )
+    written: list[Path] = []
+    for name, content in payloads:
+        written.append(
+            _atomic_write_artifact_text(
+                artifact_dir,
+                name=name,
+                content=content,
+            )
+        )
+    return tuple(written)
+
+
+def build_replay_summary(result: MimoV2ReplayResult) -> dict[str, Any]:
+    """Build the compact allowlisted summary shared by artifacts and CLI."""
+
+    if not isinstance(result, MimoV2ReplayResult):
+        raise MimoV2ReplayInputError("artifact_result_invalid")
+    effective_passed = (
+        result.passed
+        and result.unsafe_mismatches == 0
+        and result.validation_failures == 0
+        and result.performance.passed
+        and result.production_writes == 0
+        and result.notifications_sent == 0
+        and result.execution_calls == 0
+    )
+    summary = {
+        "schema_version": REPLAY_ARTIFACT_SCHEMA_VERSION,
+        "processed": result.processed,
+        "comparable": result.comparable,
+        "unsafe_mismatches": result.unsafe_mismatches,
+        "validation_failures": result.validation_failures,
+        "production_writes": result.production_writes,
+        "notifications_sent": result.notifications_sent,
+        "execution_calls": result.execution_calls,
+        "v1_p95_ms": result.performance.v1_p95_ms,
+        "v2_p95_ms": result.performance.v2_p95_ms,
+        "adapter_p95_ms": result.performance.adapter_p95_ms,
+        "v2_to_v1_ratio": result.performance.v2_to_v1_ratio,
+        "performance_passed": result.performance.passed,
+        "performance_failure_codes": list(
+            result.performance.failure_codes
+        ),
+        "passed": effective_passed,
+    }
+    _validate_artifact_value(summary)
+    return summary
+
+
+def _validated_replay_artifact_output_directory(path: Path) -> Path:
+    candidate = Path(path)
+    if (
+        _path_has_symlink_component(candidate)
+        or not candidate.is_dir()
+    ):
+        raise MimoV2ReplayInputError("artifact_dir_invalid")
+    try:
+        if stat.S_IMODE(candidate.stat().st_mode) != 0o700:
+            raise MimoV2ReplayInputError("artifact_dir_invalid")
+        for entry in candidate.iterdir():
+            if (
+                entry.name not in _REPLAY_ARTIFACT_NAMES
+                or entry.is_symlink()
+                or not entry.is_file()
+            ):
+                raise MimoV2ReplayInputError("artifact_dir_invalid")
+        return candidate.resolve(strict=True)
+    except OSError as exc:
+        raise MimoV2ReplayInputError("artifact_dir_invalid") from exc
+
+
+def _validate_artifact_value(value: Any) -> None:
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return
+        raise MimoV2ReplayInputError("artifact_value_invalid")
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise MimoV2ReplayInputError("artifact_value_invalid")
+            _validate_artifact_value(item)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _validate_artifact_value(item)
+        return
+    raise MimoV2ReplayInputError("artifact_value_invalid")
+
+
+def _atomic_write_artifact_text(
+    artifact_dir: Path,
+    *,
+    name: str,
+    content: str,
+) -> Path:
+    if name not in _REPLAY_ARTIFACT_NAMES:
+        raise MimoV2ReplayInputError("artifact_name_invalid")
+    temporary = artifact_dir / f".{name}.tmp"
+    destination = artifact_dir / name
+    if temporary.exists() or temporary.is_symlink():
+        raise MimoV2ReplayInputError("artifact_write_failed")
+    try:
+        def secure_opener(path, flags):
+            return os.open(
+                path,
+                flags
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+
+        with open(
+            temporary,
+            "w",
+            encoding="utf-8",
+            newline="",
+            opener=secure_opener,
+        ) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.chmod(0o600)
+        os.replace(temporary, destination)
+        destination.chmod(0o600)
+        return destination
+    except (OSError, UnicodeError) as exc:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise MimoV2ReplayInputError("artifact_write_failed") from exc
 
 
 def _validate_selected_messages(

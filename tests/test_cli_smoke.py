@@ -46,6 +46,265 @@ _ENTRY_REPAIR_NOW = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
 _ENTRY_REPAIR_STRATEGY_ID = "deepcoin:-1001:55:BTC:long"
 
 
+def _mimo_v2_replay_cli_args(tmp_path: Path) -> list[str]:
+    return [
+        "replay-mimo-v2",
+        "--database",
+        str(tmp_path / "source.db"),
+        "--message-id-file",
+        str(tmp_path / "approved-ids.txt"),
+        "--media-root",
+        str(tmp_path / "media"),
+        "--artifact-dir",
+        str(tmp_path / "artifacts"),
+        "--ai-config-path",
+        str(tmp_path / "ai.yaml"),
+        "--max-messages",
+        "7",
+    ]
+
+
+def _mimo_v2_replay_cli_result(
+    tmp_path: Path,
+    *,
+    unsafe_mismatches: int = 0,
+    performance_passed: bool = True,
+    production_writes: int = 0,
+    notifications_sent: int = 0,
+    execution_calls: int = 0,
+):
+    from telegram_kol_research.mimo_v2_replay import (
+        MimoV2ReplayResult,
+        ReplayComparisonRow,
+        ReplayPerformanceGate,
+    )
+
+    semantic_passed = unsafe_mismatches == 0
+    return MimoV2ReplayResult(
+        processed=1,
+        comparable=1,
+        unsafe_mismatches=unsafe_mismatches,
+        validation_failures=0,
+        production_writes=production_writes,
+        notifications_sent=notifications_sent,
+        execution_calls=execution_calls,
+        passed=semantic_passed and performance_passed,
+        comparisons=(
+            ReplayComparisonRow(
+                raw_message_id=17,
+                status=(
+                    "safe_match" if semantic_passed else "unsafe_mismatch"
+                ),
+                reason_code=(
+                    "execution_projections_equal"
+                    if semantic_passed
+                    else "execution_projection_mismatch"
+                ),
+                v1_status="completed",
+                v2_status="completed",
+                v1_duration_ms=100.0,
+                v2_duration_ms=110.0,
+                adapter_duration_ms=1.0,
+                v1_projection_fingerprint="sha256:" + "a" * 64,
+                v2_projection_fingerprint=(
+                    "sha256:" + ("a" if semantic_passed else "b") * 64
+                ),
+            ),
+        ),
+        performance=ReplayPerformanceGate(
+            passed=performance_passed,
+            failure_codes=(
+                () if performance_passed else ("v2_latency_ratio_exceeded",)
+            ),
+            v1_p95_ms=100.0,
+            v2_p95_ms=110.0 if performance_passed else 116.0,
+            adapter_p95_ms=1.0,
+            v2_to_v1_ratio=1.1 if performance_passed else 1.16,
+        ),
+        artifact_dir=tmp_path / "artifacts",
+    )
+
+
+def test_mimo_v2_replay_cli_help_requires_explicit_boundaries(tmp_path):
+    root = CliRunner().invoke(app, ["--help"])
+    command = CliRunner().invoke(app, ["replay-mimo-v2", "--help"])
+    missing = CliRunner().invoke(app, ["replay-mimo-v2"])
+
+    assert root.exit_code == 0
+    assert "replay-mimo-v2" in root.output
+    assert command.exit_code == 0
+    for option in (
+        "--database",
+        "--message-id-file",
+        "--media-root",
+        "--artifact-dir",
+        "--ai-config-path",
+        "--max-messages",
+    ):
+        assert option in command.output
+    assert missing.exit_code == 2
+
+
+def test_mimo_v2_replay_cli_input_error_exits_two_before_runner(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.mimo_v2_replay as replay_module
+
+    monkeypatch.setattr(
+        replay_module,
+        "run_mimo_v2_replay",
+        lambda **kwargs: pytest.fail("runner must not run before validation"),
+    )
+
+    result = CliRunner().invoke(app, _mimo_v2_replay_cli_args(tmp_path))
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert "source_database_invalid" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("unsafe_mismatches", "performance_passed"),
+    [(1, True), (0, False)],
+)
+def test_mimo_v2_replay_cli_failed_gate_exits_one_with_compact_summary(
+    tmp_path,
+    monkeypatch,
+    unsafe_mismatches,
+    performance_passed,
+):
+    import telegram_kol_research.mimo_v2_replay as replay_module
+
+    validated_inputs = object()
+    replay_result = _mimo_v2_replay_cli_result(
+        tmp_path,
+        unsafe_mismatches=unsafe_mismatches,
+        performance_passed=performance_passed,
+    )
+    monkeypatch.setattr(
+        replay_module,
+        "validate_replay_inputs",
+        lambda **kwargs: validated_inputs,
+    )
+    monkeypatch.setattr(
+        replay_module,
+        "run_mimo_v2_replay",
+        lambda **kwargs: replay_result,
+    )
+
+    result = CliRunner().invoke(app, _mimo_v2_replay_cli_args(tmp_path))
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["passed"] is False
+    assert len(result.stdout.splitlines()) == 1
+    assert ": " not in result.stdout
+
+
+def test_mimo_v2_replay_cli_passes_without_execution_or_notifications(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+    import telegram_kol_research.mimo_v2_replay as replay_module
+
+    validated_inputs = object()
+    replay_result = _mimo_v2_replay_cli_result(tmp_path)
+    received: list[dict[str, object]] = []
+
+    def prohibited(*args, **kwargs):
+        pytest.fail("isolated replay reached a prohibited integration")
+
+    for name in (
+        "build_deepcoin_client_from_env",
+        "load_notification_bot_config",
+        "send_monitor_test_notification",
+        "run_live_listener",
+        "process_authoritative_message",
+    ):
+        monkeypatch.setattr(cli_module, name, prohibited)
+    monkeypatch.setattr(
+        replay_module,
+        "validate_replay_inputs",
+        lambda **kwargs: validated_inputs,
+    )
+
+    def fake_run(**kwargs):
+        received.append(kwargs)
+        return replay_result
+
+    monkeypatch.setattr(replay_module, "run_mimo_v2_replay", fake_run)
+
+    result = CliRunner().invoke(app, _mimo_v2_replay_cli_args(tmp_path))
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == {
+        "schema_version": 1,
+        "processed": 1,
+        "comparable": 1,
+        "unsafe_mismatches": 0,
+        "validation_failures": 0,
+        "production_writes": 0,
+        "notifications_sent": 0,
+        "execution_calls": 0,
+        "v1_p95_ms": 100.0,
+        "v2_p95_ms": 110.0,
+        "adapter_p95_ms": 1.0,
+        "v2_to_v1_ratio": 1.1,
+        "performance_passed": True,
+        "performance_failure_codes": [],
+        "passed": True,
+    }
+    assert len(result.stdout.splitlines()) == 1
+    assert ": " not in result.stdout
+    assert received == [
+        {
+            "inputs": validated_inputs,
+            "ai_recognition_config_path": tmp_path / "ai.yaml",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("counter_name", "counter_value"),
+    [
+        ("production_writes", 1),
+        ("notifications_sent", 1),
+        ("execution_calls", 1),
+    ],
+)
+def test_mimo_v2_replay_cli_fails_closed_on_nonzero_safety_counter(
+    tmp_path,
+    monkeypatch,
+    counter_name,
+    counter_value,
+):
+    import telegram_kol_research.mimo_v2_replay as replay_module
+
+    validated_inputs = object()
+    replay_result = _mimo_v2_replay_cli_result(
+        tmp_path,
+        **{counter_name: counter_value},
+    )
+    monkeypatch.setattr(
+        replay_module,
+        "validate_replay_inputs",
+        lambda **kwargs: validated_inputs,
+    )
+    monkeypatch.setattr(
+        replay_module,
+        "run_mimo_v2_replay",
+        lambda **kwargs: replay_result,
+    )
+
+    result = CliRunner().invoke(app, _mimo_v2_replay_cli_args(tmp_path))
+
+    assert result.exit_code == 1
+    summary = json.loads(result.stdout)
+    assert summary[counter_name] == counter_value
+    assert summary["passed"] is False
+
+
 def test_deployment_preflight_cli_writes_verifiable_json(tmp_path):
     database = tmp_path / "preflight.db"
     snapshot = tmp_path / "snapshot.json"
