@@ -10,6 +10,7 @@ from telegram_kol_research.models import (
     MimoRecognitionRun,
     RawMessage,
     RecognitionDecision,
+    SignalCandidate,
 )
 from telegram_kol_research.web_queries import load_group_messages
 
@@ -212,7 +213,7 @@ def test_web_projection_exposes_failed_v2_run_before_authoritative_v1_fallback(
             input_fingerprint="sha256:fallback",
             prompt_versions_json="{}",
             status="failed",
-            attempt_count=1,
+            attempt_count=2,
             final_error_code="contract_invalid",
             final_error_message="schema rejected",
             became_authoritative=False,
@@ -221,6 +222,31 @@ def test_web_projection_exposes_failed_v2_run_before_authoritative_v1_fallback(
         )
         session.add(failed)
         session.flush()
+        session.add_all(
+            [
+                MimoRecognitionAttempt(
+                    run_id=failed.id,
+                    ordinal=1,
+                    status="invalid_json",
+                    error_code="invalid_json",
+                    error_message="response was not JSON",
+                    started_at=NOW,
+                    completed_at=NOW + timedelta(milliseconds=100),
+                    duration_ms=100,
+                ),
+                MimoRecognitionAttempt(
+                    run_id=failed.id,
+                    ordinal=2,
+                    retry_of_ordinal=1,
+                    status="contract_failure",
+                    error_code="contract_invalid",
+                    error_message="schema rejected",
+                    started_at=NOW + timedelta(milliseconds=101),
+                    completed_at=NOW + timedelta(milliseconds=300),
+                    duration_ms=199,
+                ),
+            ]
+        )
         fallback = MimoRecognitionRun(
             raw_message_id=raw.id,
             run_kind="v1_fallback",
@@ -239,6 +265,17 @@ def test_web_projection_exposes_failed_v2_run_before_authoritative_v1_fallback(
         )
         session.add(fallback)
         session.flush()
+        session.add(
+            MimoRecognitionAttempt(
+                run_id=fallback.id,
+                ordinal=1,
+                status="completed",
+                response_fingerprint="b" * 64,
+                started_at=NOW + timedelta(milliseconds=301),
+                completed_at=NOW + timedelta(milliseconds=701),
+                duration_ms=400,
+            )
+        )
         session.add(
             MessageEvidenceVersion(
                 raw_message_id=raw.id,
@@ -261,15 +298,28 @@ def test_web_projection_exposes_failed_v2_run_before_authoritative_v1_fallback(
 
     analysis = load_group_messages(factory, chat_id=88, limit=10)[0]["mimo_analysis"]
 
-    assert analysis["format"] == "historical_v1"
+    assert analysis["format"] == "v1"
+    assert analysis["history_label"] is None
+    assert analysis["version_label"] == "MiMo v1回退结果"
+    assert analysis["projection"] == {"status": "v1", "reason_code": None}
     assert analysis["runtime"]["status"] == "fallback"
     assert analysis["runtime"]["retry_count"] == 1
+    assert analysis["runtime"]["attempt_count"] == 3
+    assert analysis["runtime"]["duration_ms"] == 701
+    assert [row["run_kind"] for row in analysis["runtime"]["attempts"]] == [
+        "v2_authoritative",
+        "v2_authoritative",
+        "v1_fallback",
+    ]
+    assert [row["status"] for row in analysis["runtime"]["run_history"]] == [
+        "failed",
+        "completed",
+    ]
     assert analysis["runtime"]["fallback_source"] == {
         "contract_version": "mimo-authoritative-v2",
         "error_code": "contract_invalid",
         "error_message": "schema rejected",
     }
-    assert analysis["history_label"] == "MiMo 历史结果 · v1格式"
     assert analysis["intents"] == []
 
 
@@ -434,3 +484,150 @@ def test_web_projection_keeps_pre_evidence_mimo_history_visible(tmp_path):
         "attempts_recorded": False,
         "per_image_evidence_recorded": False,
     }
+
+
+def test_web_projection_keeps_running_mimo_distinct_from_success(tmp_path):
+    factory = create_session_factory(tmp_path / "running.db")
+    with factory() as session:
+        raw = RawMessage(chat_id=88, message_id=37, text="BTC long")
+        session.add(raw)
+        session.flush()
+        session.add(
+            MimoRecognitionRun(
+                raw_message_id=raw.id,
+                run_kind="v2_authoritative",
+                contract_version="mimo-authoritative-v2",
+                model="mimo-v2.5",
+                input_kind="text",
+                input_fingerprint="sha256:running",
+                prompt_versions_json="{}",
+                status="running",
+                attempt_count=0,
+                became_authoritative=False,
+                started_at=NOW,
+            )
+        )
+        session.commit()
+
+    analysis = load_group_messages(factory, chat_id=88, limit=10)[0]["mimo_analysis"]
+
+    assert analysis["runtime"]["status"] == "running"
+    assert analysis["runtime"]["status_label"] == "MiMo识别进行中"
+    assert analysis["projection"] == {
+        "status": "not_available",
+        "reason_code": "canonical_result_not_persisted",
+    }
+
+
+def test_web_projection_does_not_label_current_v1_run_as_history(tmp_path):
+    factory = create_session_factory(tmp_path / "current-v1.db")
+    with factory() as session:
+        raw = RawMessage(chat_id=88, message_id=40, text="普通消息")
+        session.add(raw)
+        session.flush()
+        session.add(
+            MimoRecognitionRun(
+                raw_message_id=raw.id,
+                run_kind="v1_authoritative",
+                contract_version="v1",
+                model="mimo-v2.5",
+                input_kind="text",
+                input_fingerprint="sha256:current-v1",
+                prompt_versions_json="{}",
+                status="completed",
+                attempt_count=1,
+                selected_attempt_ordinal=1,
+                became_authoritative=True,
+                started_at=NOW,
+                completed_at=NOW + timedelta(milliseconds=50),
+            )
+        )
+        session.commit()
+
+    analysis = load_group_messages(factory, chat_id=88, limit=10)[0]["mimo_analysis"]
+
+    assert analysis["format"] == "v1"
+    assert analysis["version_label"] == "MiMo v1结果"
+    assert analysis["history_label"] is None
+    assert analysis["projection"] == {"status": "v1", "reason_code": None}
+
+
+def test_web_projection_does_not_accept_stale_candidate_after_no_action_reanalysis(
+    tmp_path,
+):
+    factory = create_session_factory(tmp_path / "stale-candidate.db")
+    with factory() as session:
+        raw = RawMessage(chat_id=88, message_id=38, text="普通聊天")
+        session.add(raw)
+        session.flush()
+        session.add(
+            MessageRecognition(
+                raw_message_id=raw.id,
+                status="非策略",
+                reason="当前消息没有交易动作。",
+                engine="mimo-v2.5",
+            )
+        )
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="BTC",
+                side="long",
+                parse_source="mimo_authoritative",
+                confidence=0.9,
+            )
+        )
+        _add_decision(session, raw, status="skipped", reason="mimo_no_action")
+        session.commit()
+
+    acceptance = load_group_messages(factory, chat_id=88, limit=10)[0][
+        "system_acceptance"
+    ]
+
+    assert acceptance["status"] == "not_accepted"
+    assert acceptance["accepted_candidate_count"] == 0
+
+
+def test_web_projection_rejects_cross_message_image_asset_reference(tmp_path):
+    factory = create_session_factory(tmp_path / "cross-message-image.db")
+    with factory() as session:
+        raw = RawMessage(chat_id=88, message_id=39, text="移动止损")
+        foreign_raw = RawMessage(chat_id=99, message_id=1, text="private image")
+        session.add_all([raw, foreign_raw])
+        session.flush()
+        foreign_media = MediaAsset(
+            raw_message_id=foreign_raw.id,
+            kind="photo",
+            mime_type="image/jpeg",
+            local_path="data/media/99/private.jpg",
+        )
+        session.add(foreign_media)
+        session.flush()
+        foreign_media_id = int(foreign_media.id)
+        run = MimoRecognitionRun(
+            raw_message_id=raw.id,
+            run_kind="v2_authoritative",
+            contract_version="mimo-authoritative-v2",
+            model="mimo-v2.5",
+            input_kind="text+image",
+            input_fingerprint="sha256:cross-message",
+            prompt_versions_json="{}",
+            status="completed",
+            attempt_count=1,
+            selected_attempt_ordinal=1,
+            became_authoritative=True,
+            started_at=NOW,
+            completed_at=NOW + timedelta(milliseconds=50),
+        )
+        session.add(run)
+        session.flush()
+        _add_v2_evidence(session, raw, _v2_payload(asset_id=foreign_media.id), run)
+        _add_decision(session, raw, status="skipped", reason="not_actionable")
+        session.commit()
+
+    image = load_group_messages(factory, chat_id=88, limit=10)[0]["mimo_analysis"][
+        "evidence"
+    ]["images"][0]
+
+    assert image["asset_id"] == foreign_media_id
+    assert image["media"] is None

@@ -955,16 +955,18 @@ def _serialize_mimo_analysis(
     runtime = _serialize_mimo_runtime(
         run=linked_run,
         runs=runs,
-        attempts=(
-            attempts_by_run_id.get(int(linked_run.id), [])
-            if linked_run is not None
-            else []
-        ),
+        attempts_by_run_id=attempts_by_run_id,
     )
     raw_images = image_evidence.get("images")
     raw_images = raw_images if isinstance(raw_images, list) else []
     images = [
-        _serialize_mimo_image(item, media_by_id=media_by_id)
+        _serialize_mimo_image(
+            item,
+            evidence_raw_message_id=(
+                int(evidence.raw_message_id) if evidence is not None else None
+            ),
+            media_by_id=media_by_id,
+        )
         for item in raw_images
         if isinstance(item, dict)
     ]
@@ -977,6 +979,7 @@ def _serialize_mimo_analysis(
     raw_intents = raw_intents if isinstance(raw_intents, list) else []
     projection = _serialize_mimo_projection(
         is_v2=is_v2,
+        is_historical_v1=linked_run is None,
         evidence=evidence,
         normalized=normalized,
         text_evidence=text_evidence,
@@ -991,9 +994,27 @@ def _serialize_mimo_analysis(
             for item in raw_images
         )
     )
+    result_format = (
+        "v2"
+        if is_v2
+        else "v1"
+        if linked_run is not None
+        else "historical_v1"
+    )
     return {
-        "format": "v2" if is_v2 else "historical_v1",
-        "history_label": None if is_v2 else "MiMo 历史结果 · v1格式",
+        "format": result_format,
+        "version_label": (
+            "MiMo v1回退结果"
+            if linked_run is not None and linked_run.run_kind == "v1_fallback"
+            else "MiMo v1结果"
+            if result_format == "v1"
+            else None
+        ),
+        "history_label": (
+            "MiMo 历史结果 · v1格式"
+            if result_format == "historical_v1"
+            else None
+        ),
         "runtime": runtime,
         "summary": (
             normalized.get("summary")
@@ -1053,13 +1074,17 @@ def _serialize_mimo_analysis(
 def _serialize_mimo_projection(
     *,
     is_v2: bool,
+    is_historical_v1: bool,
     evidence: MessageEvidenceVersion | None,
     normalized: dict[str, object],
     text_evidence: dict[str, object],
     image_evidence: dict[str, object],
 ) -> dict[str, object]:
     if not is_v2:
-        return {"status": "historical", "reason_code": None}
+        return {
+            "status": "historical" if is_historical_v1 else "v1",
+            "reason_code": None,
+        }
     if evidence is None:
         return {
             "status": "not_available",
@@ -1090,16 +1115,32 @@ def _serialize_mimo_runtime(
     *,
     run: MimoRecognitionRun | None,
     runs: list[MimoRecognitionRun],
-    attempts: list[MimoRecognitionAttempt],
+    attempts_by_run_id: dict[int, list[MimoRecognitionAttempt]],
 ) -> dict[str, object] | None:
     if run is None:
         return None
     prior_by_id = {int(item.id): item for item in runs}
-    whole_run_retry_count = 0
+    lineage = [run]
     prior = prior_by_id.get(int(run.retry_of_run_id or 0))
-    while prior is not None:
-        whole_run_retry_count += 1
+    seen_run_ids = {int(run.id)}
+    while prior is not None and int(prior.id) not in seen_run_ids:
+        lineage.append(prior)
+        seen_run_ids.add(int(prior.id))
         prior = prior_by_id.get(int(prior.retry_of_run_id or 0))
+    lineage.reverse()
+    whole_run_retry_count = max(0, len(lineage) - 1)
+    attempts = [
+        (lineage_run, attempt)
+        for lineage_run in lineage
+        for attempt in attempts_by_run_id.get(int(lineage_run.id), [])
+    ]
+    attempt_count = sum(
+        max(
+            int(lineage_run.attempt_count),
+            len(attempts_by_run_id.get(int(lineage_run.id), [])),
+        )
+        for lineage_run in lineage
+    )
     fallback_from = None
     fallback_source = None
     if run.run_kind == "v1_fallback" and run.retry_of_run_id is not None:
@@ -1111,7 +1152,10 @@ def _serialize_mimo_runtime(
                 "error_code": previous.final_error_code,
                 "error_message": previous.final_error_message,
             }
-    if run.status == "failed":
+    if run.status == "running":
+        status = "running"
+        status_label = "MiMo识别进行中"
+    elif run.status == "failed":
         status = "failed"
         status_label = "MiMo识别失败"
     elif run.run_kind == "v1_fallback":
@@ -1121,10 +1165,11 @@ def _serialize_mimo_runtime(
         status = "completed"
         status_label = "MiMo识别成功"
     duration_ms = None
-    if run.completed_at is not None and run.started_at is not None:
+    first_started_at = lineage[0].started_at
+    if run.completed_at is not None and first_started_at is not None:
         duration_ms = max(
             0,
-            round((run.completed_at - run.started_at).total_seconds() * 1000),
+            round((run.completed_at - first_started_at).total_seconds() * 1000),
         )
     return {
         "status": status,
@@ -1132,21 +1177,46 @@ def _serialize_mimo_runtime(
         "model": run.model,
         "contract_version": run.contract_version,
         "input_kind": run.input_kind,
-        "attempt_count": int(run.attempt_count),
-        "provider_retry_count": max(0, len(attempts) - 1),
+        "attempt_count": attempt_count,
+        "provider_retry_count": sum(
+            max(
+                0,
+                max(
+                    int(lineage_run.attempt_count),
+                    len(attempts_by_run_id.get(int(lineage_run.id), [])),
+                )
+                - 1,
+            )
+            for lineage_run in lineage
+        ),
         "whole_run_retry_count": whole_run_retry_count,
         "duration_ms": duration_ms,
         "attempts": [
             {
+                "run_id": int(lineage_run.id),
+                "run_kind": lineage_run.run_kind,
+                "contract_version": lineage_run.contract_version,
                 "ordinal": int(attempt.ordinal),
                 "status": attempt.status,
                 "duration_ms": int(attempt.duration_ms),
                 "error_code": attempt.error_code,
                 "error_message": attempt.error_message,
-                "selected": int(attempt.ordinal)
-                == int(run.selected_attempt_ordinal or 0),
+                "selected": int(lineage_run.id) == int(run.id)
+                and int(attempt.ordinal) == int(run.selected_attempt_ordinal or 0),
             }
-            for attempt in attempts
+            for lineage_run, attempt in attempts
+        ],
+        "run_history": [
+            {
+                "run_id": int(lineage_run.id),
+                "run_kind": lineage_run.run_kind,
+                "contract_version": lineage_run.contract_version,
+                "status": lineage_run.status,
+                "error_code": lineage_run.final_error_code,
+                "error_message": lineage_run.final_error_message,
+                "became_authoritative": bool(lineage_run.became_authoritative),
+            }
+            for lineage_run in lineage
         ],
         "retry_count": whole_run_retry_count,
         "final_error_code": run.final_error_code,
@@ -1218,6 +1288,7 @@ def _serialize_mimo_intent(intent: dict[str, object]) -> dict[str, object]:
 def _serialize_mimo_image(
     image: dict[str, object],
     *,
+    evidence_raw_message_id: int | None,
     media_by_id: dict[int, MediaAsset],
 ) -> dict[str, object]:
     try:
@@ -1225,6 +1296,12 @@ def _serialize_mimo_image(
     except (TypeError, ValueError):
         asset_id = 0
     media = media_by_id.get(asset_id)
+    if (
+        media is not None
+        and evidence_raw_message_id is not None
+        and int(media.raw_message_id) != evidence_raw_message_id
+    ):
+        media = None
     image_type = image.get("image_type")
     quality = image.get("quality")
     return {
@@ -1271,6 +1348,8 @@ def _serialize_system_acceptance(
         if decision is not None
         else recognition.status if recognition is not None else None
     )
+    if reason_code == "mimo_no_action":
+        accepted = []
     if authoritative_status == "识别失败" or automation_status in {
         "failed",
         "error",
