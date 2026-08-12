@@ -374,6 +374,15 @@ def authorize_composite_batch_recovery_resume(
         )
         if isinstance(contract, str) or isinstance(target, str):
             raise CompositeBatchRecoveryConflict("resume_source_state_conflict")
+        original_owned_stop_refs = _original_owned_stop_refs(
+            session,
+            batch=batch,
+            leg=leg,
+            entry=entry,
+            audit_created_at=event.created_at,
+        )
+        if after["original_owned_stop_refs"] != original_owned_stop_refs:
+            raise CompositeBatchRecoveryConflict("resume_audit_invalid")
         disposition = str(after["position_disposition"])
         _validate_progressed_recovery_state(
             session,
@@ -387,6 +396,7 @@ def authorize_composite_batch_recovery_resume(
             expected_fingerprint=expected_fingerprint,
             snapshot=snapshot,
             approved_current_size=after["current_size"],
+            original_owned_stop_refs=original_owned_stop_refs,
         )
         if not _resume_exchange_close_evidence_is_owned(
             session,
@@ -461,6 +471,7 @@ def _validated_resume_audit_event(
         "current_size",
         "target_remaining_size",
         "exchange_call_possible",
+        "original_owned_stop_refs",
     }
     expected_before_keys = {
         "batch_id",
@@ -521,6 +532,10 @@ def _validated_resume_audit_event(
             else ["recovery_required", "pending", "pending"]
         )
         or event.reason != expected_reason
+        or not _valid_original_owned_stop_refs(
+            after.get("original_owned_stop_refs"),
+            position_absent=position_absent,
+        )
         or any(
             getattr(event, field) is not None
             for field in (
@@ -578,6 +593,7 @@ def _validate_progressed_recovery_state(
     expected_fingerprint: str,
     snapshot: Any,
     approved_current_size: Any,
+    original_owned_stop_refs: list[str],
 ) -> None:
     position_absent = disposition == "position_absent"
     if str(batch.status) not in (
@@ -659,6 +675,7 @@ def _validate_progressed_recovery_state(
             kind=kind,
             execution=execution,
             target=target,
+            original_owned_stop_refs=original_owned_stop_refs,
         ):
             raise CompositeBatchRecoveryConflict("resume_component_conflict")
         expected_key = hashlib.sha256(
@@ -1288,6 +1305,7 @@ def _resume_component_execution_matches_locked_state(
     kind: str,
     execution: Any,
     target: Mapping[str, Any],
+    original_owned_stop_refs: list[str],
 ) -> bool:
     intents = [
         row
@@ -1436,6 +1454,11 @@ def _resume_component_execution_matches_locked_state(
     }:
         return False
     old_order_ids = execution.get("old_stop_order_ids")
+    if sorted(
+        _redacted_ref("protection_order", order_id)
+        for order_id in (old_order_ids or [])
+    ) != original_owned_stop_refs:
+        return False
     primary = _decimal_or_none(execution.get("primary_stop"))
     backup = _decimal_or_none(execution.get("backup_stop"))
     effective = _decimal_or_none(execution.get("effective_remaining_size"))
@@ -1792,6 +1815,7 @@ def apply_composite_batch_false_state_repair(
             batch_status=str(batch.status),
             leg_status=str(leg.status),
             component_statuses=[str(row.status) for row in components],
+            original_owned_stop_refs=_owned_stop_refs_from_ledger(ledger),
         )
         event = ExecutionEvent(
             execution_binding_id=int(binding.id),
@@ -2195,6 +2219,7 @@ def _recovery_audit_after(
     batch_status: str,
     leg_status: str,
     component_statuses: list[str],
+    original_owned_stop_refs: list[str],
 ) -> dict[str, Any]:
     return {
         "batch_id": BATCH_119_RECOVERY.batch_id,
@@ -2209,7 +2234,57 @@ def _recovery_audit_after(
         "current_size": plan.position.current_size if plan.position else None,
         "target_remaining_size": BATCH_119_RECOVERY.target_remaining_size,
         "exchange_call_possible": False,
+        "original_owned_stop_refs": list(original_owned_stop_refs),
     }
+
+
+def _owned_stop_refs_from_ledger(ledger: Sequence[Any]) -> list[str]:
+    refs = sorted(
+        _redacted_ref("protection_order", row.order_id)
+        for row in ledger
+        if str(row.purpose) in {"stop_loss", "backup_stop"}
+    )
+    if len(refs) != len(set(refs)):
+        raise CompositeBatchRecoveryConflict("owned_stop_identity_conflict")
+    return refs
+
+
+def _valid_original_owned_stop_refs(
+    value: Any,
+    *,
+    position_absent: bool,
+) -> bool:
+    expected_count = 0 if position_absent else 2
+    return bool(
+        isinstance(value, list)
+        and len(value) == expected_count
+        and value == sorted(value)
+        and len(set(value)) == len(value)
+        and all(_is_sha256(item) for item in value)
+    )
+
+
+def _original_owned_stop_refs(
+    session,
+    *,
+    batch,
+    leg,
+    entry,
+    audit_created_at: Any,
+) -> list[str]:
+    rows = (
+        session.query(PositionProtectionLedger)
+        .filter(
+            PositionProtectionLedger.execution_binding_id
+            == int(batch.execution_binding_id),
+            PositionProtectionLedger.execution_order_leg_id == int(entry.id),
+            PositionProtectionLedger.pos_id == str(leg.pos_id),
+            PositionProtectionLedger.purpose.in_(("stop_loss", "backup_stop")),
+            PositionProtectionLedger.created_at <= audit_created_at,
+        )
+        .all()
+    )
+    return _owned_stop_refs_from_ledger(rows)
 
 
 def _under_target_attestation(
@@ -2373,6 +2448,13 @@ def _repaired_state_and_event_match(
         batch_status="resolved" if position_absent else "ready",
         leg_status="failed" if position_absent else "planned",
         component_statuses=list(expected_component_statuses),
+        original_owned_stop_refs=_original_owned_stop_refs(
+            session,
+            batch=batch,
+            leg=leg,
+            entry=entry,
+            audit_created_at=event.created_at,
+        ),
     )
     return (
         str(batch.status) == ("resolved" if position_absent else "ready")

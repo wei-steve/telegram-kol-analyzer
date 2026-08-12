@@ -2194,6 +2194,14 @@ def test_apply_repairs_only_false_legacy_state_in_one_transaction(tmp_path):
         assert after["evidence_fingerprint"] == plan.evidence_fingerprint
         assert before["component_attempt_counts"] == [1, 0, 0]
         assert after["component_attempt_counts"] == [1, 0, 0]
+        assert after["original_owned_stop_refs"] == sorted(
+            sha256(f"protection_order:{order_id}".encode("utf-8")).hexdigest()
+            for order_id in (PRIMARY_ORDER_ID, BACKUP_ORDER_ID)
+        )
+        assert all(
+            len(value) == 64
+            for value in after["original_owned_stop_refs"]
+        )
         serialized_event = json.dumps(
             {"before": before, "after": after}, sort_keys=True
         )
@@ -2915,6 +2923,123 @@ def test_resume_authorization_rejects_recovery_audit_binding_drift(tmp_path):
                         "pos": "38",
                     }
                 ]
+            ),
+        )
+
+
+def test_resume_authorization_rejects_shrunk_original_stop_set(tmp_path):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    plan = _plan(factory)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        components = (
+            session.query(StrategyManagementComponent)
+            .filter_by(management_batch_id=119)
+            .order_by(StrategyManagementComponent.sequence)
+            .all()
+        )
+        batch.status = "executing"
+        components[0].status = "confirmed"
+        components[0].attempt_count = 1
+        components[0].completed_at = NOW
+        components[0].evidence_json = json.dumps(
+            [
+                {"error_type": "RuntimeError"},
+                {
+                    "phase": "no_cancel_required",
+                    "evidence_tier": "exact_terminal_no_fill",
+                },
+                {"proven_filled_quantity": "0"},
+            ],
+            sort_keys=True,
+        )
+        components[1].status = "confirmed"
+        components[1].attempt_count = 1
+        components[1].completed_at = NOW
+        components[1].evidence_json = json.dumps(
+            [
+                {"close_delta": "0"},
+                {
+                    "evidence_tier": "exact_position_target",
+                    "remaining_size": "19",
+                },
+            ],
+            sort_keys=True,
+        )
+        components[2].status = "awaiting_exchange"
+        components[2].attempt_count = 1
+        desired = json.loads(components[2].desired_json)
+        desired["protection_replacement_execution"] = {
+            "backup_stop": "63872",
+            "effective_remaining_size": "19",
+            "old_stop_order_ids": [],
+            "primary_stop": "64000",
+            "retained_take_profit_total": "0",
+        }
+        components[2].desired_json = json.dumps(desired, sort_keys=True)
+        entry_id = session.query(StrategyManagementLeg).one().execution_order_leg_id
+        binding_id = int(batch.execution_binding_id)
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                strategy_instance_id="deepcoin:incident:btc:long",
+                pos_id=POS_ID,
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id="terminal-first-tp",
+                purpose="take_profit",
+                trigger_price="66000",
+                size_text="19",
+                status="cancelled",
+                evidence_source="test_terminal_readback",
+                evidence_json="{}",
+                first_seen_at=NOW,
+                last_seen_at=NOW,
+                last_verified_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="resume_component_conflict",
+    ):
+        module.authorize_composite_batch_recovery_resume(
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=_snapshot(
+                positions=[
+                    {
+                        "posId": POS_ID,
+                        "instId": "BTC-USDT-SWAP",
+                        "posSide": "long",
+                        "pos": "19",
+                    }
+                ],
+                trigger_history=[
+                    {
+                        "ordId": "terminal-first-tp",
+                        "posId": POS_ID,
+                        "instId": "BTC-USDT-SWAP",
+                        "posSide": "long",
+                        "triggerOrderType": "TPSL",
+                        "tpTriggerPx": "66000",
+                        "sz": "19",
+                        "state": "cancelled",
+                    }
+                ],
             ),
         )
 
