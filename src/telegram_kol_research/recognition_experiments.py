@@ -95,6 +95,10 @@ class MimoAuthoritativeResult:
     status: str
     error_message: str | None = None
     prompt_versions: dict[str, int] = field(default_factory=dict)
+    contract_version: str = "v1"
+    run_id: int | None = None
+    fallback_from: str | None = None
+    projection_fingerprint: str | None = None
 
     @property
     def is_actionable(self) -> bool:
@@ -463,8 +467,17 @@ def infer_mimo_authoritative_v2(
                 continue
             break
         except (MimoV2ContractError, MimoV2ExecutionAdapterError) as exc:
-            last_error_code = "contract_validation_failed"
-            last_error_message = str(exc) or "MiMo v2 contract validation failed"
+            adapter_failed = isinstance(exc, MimoV2ExecutionAdapterError)
+            last_error_code = (
+                "adapter_failure"
+                if adapter_failed
+                else "contract_validation_failed"
+            )
+            last_error_message = str(exc) or (
+                "MiMo v2 execution adapter failed"
+                if adapter_failed
+                else "MiMo v2 contract validation failed"
+            )
             attempt = _record_v2_attempt(
                 session_factory,
                 run_id=run.id,

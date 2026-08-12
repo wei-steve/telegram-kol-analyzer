@@ -6,6 +6,7 @@ import json
 import inspect
 import logging
 import re
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -45,11 +46,29 @@ from telegram_kol_research.message_evidence import (
     build_current_message_input_fingerprint,
     claim_message_evidence_extraction,
     finalize_claimed_mimo_message_evidence,
+    finalize_claimed_mimo_v2_message_evidence,
     release_message_evidence_extraction_claim,
 )
+from telegram_kol_research.mimo_contract_circuit import (
+    load_mimo_contract_circuit,
+    record_mimo_v2_outcome,
+)
+from telegram_kol_research.mimo_recognition_runs import (
+    canonical_json_fingerprint,
+    complete_mimo_run,
+    record_mimo_attempt,
+    start_mimo_run,
+)
+from telegram_kol_research.mimo_v2_contract import parse_mimo_v2_payload
+from telegram_kol_research.mimo_v2_execution_adapter import (
+    _execution_projection,
+    adapt_mimo_v2_to_current_payload,
+)
 from telegram_kol_research.models import (
+    MediaAsset,
     MessageEvidenceVersion,
     MessageInstructionItem,
+    MimoRecognitionRun,
     RawMessage,
     SignalCandidate,
     StrategyLifecycle,
@@ -67,6 +86,7 @@ from telegram_kol_research.recognition_decisions import (
 from telegram_kol_research.recognition_experiments import (
     MimoAuthoritativeResult,
     build_authoritative_context_for_message,
+    infer_mimo_authoritative_v2,
     run_mimo_authoritative_for_message,
 )
 from telegram_kol_research.strategy_thread_candidates import (
@@ -105,6 +125,16 @@ EXACT_CONTEXT_RISK_REDUCTION_MARKER = (
     "_exact_context_risk_reduction_authorized"
 )
 logger = logging.getLogger(__name__)
+MIMO_V2_CONTRACT_VERSION = "mimo-authoritative-v2"
+MIMO_V2_FALLBACK_ERROR_CODES = frozenset(
+    {
+        "provider_timeout",
+        "provider_http_error",
+        "invalid_json",
+        "contract_validation_failed",
+        "adapter_failure",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -273,12 +303,15 @@ def _load_resolution_inputs(
     normalized_evidence = json.loads(evidence_row.normalized_evidence_json or "{}")
     text_evidence = json.loads(evidence_row.text_evidence_json or "{}")
     image_evidence = json.loads(evidence_row.image_evidence_json or "{}")
+    conflicts = image_evidence.get("conflicts")
+    if not isinstance(conflicts, list):
+        conflicts = normalized_evidence.get("conflicts", [])
     evidence = {
         "version_id": int(evidence_row.id),
         "text": text_evidence,
         "images": image_evidence.get("images", []),
         "normalized": normalized_evidence,
-        "conflicts": normalized_evidence.get("conflicts", []),
+        "conflicts": conflicts,
     }
     strategy = first_pass_payload.get("strategy")
     strategy = strategy if isinstance(strategy, dict) else {}
@@ -351,6 +384,113 @@ def _load_current_mimo_evidence_result(
     text_evidence = json.loads(row.text_evidence_json or "{}")
     image_evidence = json.loads(row.image_evidence_json or "{}")
     images = image_evidence.get("images", [])
+    if normalized.get("contract_version") == MIMO_V2_CONTRACT_VERSION:
+        canonical_v2 = {
+            "contract_version": MIMO_V2_CONTRACT_VERSION,
+            "summary": normalized.get("summary"),
+            "confidence": normalized.get("confidence", row.confidence),
+            "intents": normalized.get("intents", []),
+            "evidence": {
+                "text": text_evidence,
+                "images": images if isinstance(images, list) else [],
+                "conflicts": image_evidence.get("conflicts", []),
+            },
+        }
+        input_kind = (
+            "text+image" if canonical_v2["evidence"]["images"] else "text"
+        )
+        try:
+            parsed = parse_mimo_v2_payload(canonical_v2)
+            adapted = adapt_mimo_v2_to_current_payload(parsed)
+        except (KeyError, TypeError, ValueError) as exc:
+            return (
+                MimoAuthoritativeResult(
+                    raw_message_id=int(raw_message_id),
+                    payload={},
+                    input_kind=input_kind,
+                    model=row.model,
+                    status="识别失败",
+                    error_message=f"stored MiMo v2 evidence invalid: {exc}",
+                    contract_version=MIMO_V2_CONTRACT_VERSION,
+                    run_id=row.mimo_recognition_run_id,
+                ),
+                row,
+            )
+        try:
+            prompt_versions = json.loads(row.prompt_versions_json or "{}")
+        except (TypeError, json.JSONDecodeError):
+            prompt_versions = {}
+        projection_fingerprint = None
+        if row.mimo_recognition_run_id is None:
+            return (
+                MimoAuthoritativeResult(
+                    raw_message_id=int(raw_message_id),
+                    payload={},
+                    input_kind=input_kind,
+                    model=row.model,
+                    status="识别失败",
+                    error_message="stored MiMo v2 evidence provenance invalid",
+                    contract_version=MIMO_V2_CONTRACT_VERSION,
+                ),
+                row,
+            )
+        else:
+            with session_factory() as session:
+                run = session.get(
+                    MimoRecognitionRun,
+                    int(row.mimo_recognition_run_id),
+                )
+                if (
+                    run is None
+                    or int(run.raw_message_id) != int(raw_message_id)
+                    or run.contract_version != MIMO_V2_CONTRACT_VERSION
+                    or run.status != "completed"
+                    or not run.became_authoritative
+                    or run.model != row.model
+                    or run.prompt_versions_json != row.prompt_versions_json
+                    or run.canonical_payload_fingerprint
+                    != adapted.canonical_v2_fingerprint
+                    or run.projection_fingerprint
+                    != canonical_json_fingerprint(
+                        _execution_projection(adapted.payload)
+                    )
+                ):
+                    return (
+                        MimoAuthoritativeResult(
+                            raw_message_id=int(raw_message_id),
+                            payload={},
+                            input_kind=input_kind,
+                            model=row.model,
+                            status="识别失败",
+                            error_message=(
+                                "stored MiMo v2 evidence provenance invalid"
+                            ),
+                            contract_version=MIMO_V2_CONTRACT_VERSION,
+                            run_id=row.mimo_recognition_run_id,
+                        ),
+                        row,
+                    )
+                projection_fingerprint = run.projection_fingerprint
+        return (
+            MimoAuthoritativeResult(
+                raw_message_id=int(raw_message_id),
+                payload=adapted.payload,
+                input_kind=input_kind,
+                model=row.model,
+                status=str(
+                    adapted.payload.get("recognition_result") or "非策略"
+                ),
+                prompt_versions=(
+                    prompt_versions
+                    if isinstance(prompt_versions, dict)
+                    else {}
+                ),
+                contract_version=MIMO_V2_CONTRACT_VERSION,
+                run_id=row.mimo_recognition_run_id,
+                projection_fingerprint=projection_fingerprint,
+            ),
+            row,
+        )
     payload = {
         "recognition_result": normalized.get("recognition_result"),
         "reason": normalized.get("reason"),
@@ -696,13 +836,93 @@ def assess_message_authoritatively(
                 session_factory,
                 raw_message_id,
             )
-            mimo = run_mimo_authoritative_for_message(
+            settings = load_trading_settings(session_factory)
+            use_v2 = _mimo_v2_is_eligible(
                 session_factory,
                 raw_message_id=raw_message_id,
-                ai_recognition_config=ai_recognition_config,
-                media_root=media_root,
-                context_text=context_text,
+                settings=settings,
             )
+            selected_v2 = None
+            terminal_v2_failure = False
+            if use_v2:
+                v2 = infer_mimo_authoritative_v2(
+                    session_factory,
+                    raw_message_id=raw_message_id,
+                    config=ai_recognition_config,
+                    media_root=media_root,
+                    context_text=context_text,
+                )
+                if v2.succeeded:
+                    if v2.parsed_result is None or v2.adapted_result is None:
+                        raise RuntimeError(
+                            "successful MiMo v2 result is incomplete"
+                        )
+                    record_mimo_v2_outcome(
+                        session_factory,
+                        outcome="success",
+                    )
+                    selected_v2 = v2
+                    mimo = MimoAuthoritativeResult(
+                        raw_message_id=int(raw_message_id),
+                        payload=v2.adapted_result.payload,
+                        input_kind=v2.input_kind,
+                        model=v2.model,
+                        status=str(
+                            v2.adapted_result.payload.get(
+                                "recognition_result"
+                            )
+                            or "非策略"
+                        ),
+                        prompt_versions=dict(v2.prompt_versions),
+                        contract_version=MIMO_V2_CONTRACT_VERSION,
+                        run_id=int(v2.run_id),
+                        projection_fingerprint=(
+                            v2.adapted_result.projection_fingerprint
+                        ),
+                    )
+                else:
+                    _record_v2_circuit_failure(
+                        session_factory,
+                        error_code=v2.error_code,
+                    )
+                    if v2.error_code in MIMO_V2_FALLBACK_ERROR_CODES:
+                        mimo = _run_v1_authority_with_audit(
+                            session_factory,
+                            raw_message_id=raw_message_id,
+                            ai_recognition_config=ai_recognition_config,
+                            media_root=media_root,
+                            context_text=context_text,
+                            input_fingerprint=input_fingerprint,
+                            run_kind="v1_fallback",
+                            retry_of_run_id=int(v2.run_id),
+                            fallback_from=MIMO_V2_CONTRACT_VERSION,
+                        )
+                    else:
+                        terminal_v2_failure = True
+                        mimo = MimoAuthoritativeResult(
+                            raw_message_id=int(raw_message_id),
+                            payload={},
+                            input_kind=v2.input_kind,
+                            model=v2.model,
+                            status="识别失败",
+                            error_message=(
+                                v2.error_message
+                                or "MiMo v2 analysis failed"
+                            ),
+                            prompt_versions=dict(v2.prompt_versions),
+                            contract_version=MIMO_V2_CONTRACT_VERSION,
+                            run_id=int(v2.run_id),
+                        )
+            else:
+                mimo = _run_v1_authority_with_audit(
+                    session_factory,
+                    raw_message_id=raw_message_id,
+                    ai_recognition_config=ai_recognition_config,
+                    media_root=media_root,
+                    context_text=context_text,
+                    input_fingerprint=input_fingerprint,
+                    run_kind="v1_authoritative",
+                )
             if build_current_message_input_fingerprint(
                 session_factory,
                 raw_message_id,
@@ -711,19 +931,35 @@ def assess_message_authoritatively(
                 raise RuntimeError(
                     "message input changed during evidence extraction"
                 )
-            evidence_row = finalize_claimed_mimo_message_evidence(
-                session_factory,
-                raw_message_id=raw_message_id,
-                claim_token=claim_token,
-                expected_input_fingerprint=input_fingerprint,
-                payload=mimo.payload,
-                input_kind=mimo.input_kind,
-                model=mimo.model,
-                prompt_versions=mimo.prompt_versions,
-                error_message=mimo.error_message,
-                media_root=media_root,
-            )
-            if evidence_row is None:
+            if selected_v2 is not None:
+                evidence_row = finalize_claimed_mimo_v2_message_evidence(
+                    session_factory,
+                    raw_message_id=raw_message_id,
+                    claim_token=claim_token,
+                    expected_input_fingerprint=input_fingerprint,
+                    result=selected_v2.parsed_result,
+                    run_id=int(selected_v2.run_id),
+                    model=mimo.model,
+                    prompt_versions=mimo.prompt_versions,
+                    media_root=media_root,
+                )
+            elif terminal_v2_failure:
+                evidence_row = None
+            else:
+                evidence_row = finalize_claimed_mimo_message_evidence(
+                    session_factory,
+                    raw_message_id=raw_message_id,
+                    claim_token=claim_token,
+                    expected_input_fingerprint=input_fingerprint,
+                    payload=mimo.payload,
+                    input_kind=mimo.input_kind,
+                    model=mimo.model,
+                    prompt_versions=mimo.prompt_versions,
+                    error_message=mimo.error_message,
+                    media_root=media_root,
+                    mimo_recognition_run_id=mimo.run_id,
+                )
+            if evidence_row is None and not terminal_v2_failure:
                 raise RuntimeError(
                     "message evidence finalize refused stale input or claim"
                 )
@@ -855,6 +1091,199 @@ def assess_message_authoritatively(
         context_resolution=context_decision,
         context_resolution_triggers=context_triggers,
     )
+
+
+def _mimo_v2_is_eligible(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    settings,
+) -> bool:
+    if settings.mimo_contract_mode != "v2_live_adapter":
+        return False
+    if int(raw_message_id) <= int(
+        settings.mimo_v2_activation_after_raw_message_id
+    ):
+        return False
+    return not load_mimo_contract_circuit(session_factory).is_open
+
+
+def _record_v2_circuit_failure(
+    session_factory: sessionmaker,
+    *,
+    error_code: str | None,
+) -> None:
+    if error_code in MIMO_V2_FALLBACK_ERROR_CODES:
+        record_mimo_v2_outcome(
+            session_factory,
+            outcome=str(error_code),
+        )
+
+
+def _run_v1_authority_with_audit(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    ai_recognition_config: AiRecognitionConfig,
+    media_root: str | Path,
+    context_text: str,
+    input_fingerprint: str,
+    run_kind: str,
+    retry_of_run_id: int | None = None,
+    fallback_from: str | None = None,
+) -> MimoAuthoritativeResult:
+    model = _configured_mimo_model_name(ai_recognition_config)
+    input_kind = _message_input_kind(session_factory, raw_message_id)
+    started_at = utc_now()
+    started = time.perf_counter()
+    try:
+        mimo = run_mimo_authoritative_for_message(
+            session_factory,
+            raw_message_id=raw_message_id,
+            ai_recognition_config=ai_recognition_config,
+            media_root=media_root,
+            context_text=context_text,
+        )
+    except Exception as exc:
+        completed_at = utc_now()
+        run = start_mimo_run(
+            session_factory,
+            raw_message_id=int(raw_message_id),
+            run_kind=run_kind,
+            contract_version="v1",
+            model=model,
+            input_kind=input_kind,
+            input_fingerprint=input_fingerprint,
+            prompt_versions={},
+            retry_of_run_id=retry_of_run_id,
+            started_at=started_at,
+        )
+        record_mimo_attempt(
+            session_factory,
+            run_id=run.id,
+            ordinal=1,
+            status="http_error",
+            error_code="v1_provider_error",
+            error_message=str(exc),
+            duration_ms=max(
+                0,
+                round((time.perf_counter() - started) * 1000),
+            ),
+            started_at=started_at,
+            completed_at=completed_at,
+        )
+        complete_mimo_run(
+            session_factory,
+            run_id=run.id,
+            status="failed",
+            selected_ordinal=None,
+            final_error_code="v1_provider_error",
+            final_error_message=str(exc),
+            completed_at=completed_at,
+        )
+        raise
+
+    run = start_mimo_run(
+        session_factory,
+        raw_message_id=int(raw_message_id),
+        run_kind=run_kind,
+        contract_version="v1",
+        model=mimo.model or model,
+        input_kind=mimo.input_kind or input_kind,
+        input_fingerprint=input_fingerprint,
+        prompt_versions=mimo.prompt_versions,
+        retry_of_run_id=retry_of_run_id,
+        started_at=started_at,
+    )
+    failed = bool(mimo.error_message) or mimo.status == "识别失败"
+    completed_at = utc_now()
+    attempt = record_mimo_attempt(
+        session_factory,
+        run_id=run.id,
+        ordinal=1,
+        status="http_error" if failed else "completed",
+        error_code="v1_authoritative_failed" if failed else None,
+        error_message=(
+            mimo.error_message
+            or ("MiMo v1 recognition failed" if failed else None)
+        ),
+        response_payload=mimo.payload if not failed else None,
+        duration_ms=max(
+            0,
+            round((time.perf_counter() - started) * 1000),
+        ),
+        started_at=started_at,
+        completed_at=completed_at,
+    )
+    if failed:
+        completed = complete_mimo_run(
+            session_factory,
+            run_id=run.id,
+            status="failed",
+            selected_ordinal=None,
+            final_error_code="v1_authoritative_failed",
+            final_error_message=(
+                mimo.error_message or "MiMo v1 recognition failed"
+            ),
+            completed_at=completed_at,
+        )
+    else:
+        completed = complete_mimo_run(
+            session_factory,
+            run_id=run.id,
+            status="completed",
+            selected_ordinal=attempt.ordinal,
+            canonical_payload=mimo.payload,
+            projection_payload=mimo.payload,
+            became_authoritative=True,
+            completed_at=completed_at,
+        )
+    return replace(
+        mimo,
+        contract_version="v1",
+        run_id=int(completed.id),
+        fallback_from=fallback_from,
+        projection_fingerprint=completed.projection_fingerprint,
+    )
+
+
+def _configured_mimo_model_name(config: AiRecognitionConfig) -> str:
+    for model in config.ai_models:
+        if model.id == "mimo-v2.5" or model.model == "mimo-v2.5":
+            return model.model or "mimo-v2.5"
+    for provider in (config.image_provider, config.text_provider):
+        if provider.model.strip():
+            return provider.model.strip()
+    return "mimo-v2.5"
+
+
+def _message_input_kind(
+    session_factory: sessionmaker,
+    raw_message_id: int,
+) -> str:
+    with session_factory() as session:
+        raw_message = session.get(RawMessage, int(raw_message_id))
+        if raw_message is None:
+            raise LookupError("raw message not found")
+        assets = (
+            session.query(MediaAsset)
+            .filter(MediaAsset.raw_message_id == int(raw_message_id))
+            .all()
+        )
+    has_text = bool((raw_message.text or "").strip())
+    has_image = any(
+        "photo" in str(asset.kind or "").lower()
+        or "image" in str(asset.kind or "").lower()
+        or str(asset.mime_type or "").lower().startswith("image/")
+        for asset in assets
+    )
+    if has_text and has_image:
+        return "text+image"
+    if has_image:
+        return "image"
+    if has_text:
+        return "text"
+    return "empty"
 
 
 def apply_authoritative_assessment(

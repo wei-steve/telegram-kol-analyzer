@@ -8,6 +8,8 @@ import pytest
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
 from telegram_kol_research.authoritative_recognition import (
     AuthoritativeAssessment,
+    _load_current_mimo_evidence_result,
+    _load_resolution_inputs,
     _resolved_mimo_result,
     _authorizes_exact_context_risk_reduction_from_db,
     apply_authoritative_assessment,
@@ -27,6 +29,7 @@ from telegram_kol_research.models import (
     InstructionExecutionContract,
     MessageInstructionItem,
     MessageEvidenceVersion,
+    MimoRecognitionRun,
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
@@ -38,7 +41,20 @@ from telegram_kol_research.models import (
     PositionMutationIntent,
 )
 from telegram_kol_research.message_evidence import save_message_evidence_version
-from telegram_kol_research.recognition_experiments import MimoAuthoritativeResult
+from telegram_kol_research.mimo_recognition_runs import (
+    complete_mimo_run,
+    record_mimo_attempt,
+    start_mimo_run,
+)
+from telegram_kol_research.mimo_v2_contract import parse_mimo_v2_payload
+from telegram_kol_research.mimo_v2_execution_adapter import (
+    _execution_projection,
+    adapt_mimo_v2_to_current_payload,
+)
+from telegram_kol_research.recognition_experiments import (
+    MimoAuthoritativeResult,
+    MimoV2InferenceResult,
+)
 from telegram_kol_research.recognition_decisions import (
     RecognitionDecisionRecord,
     claim_authoritative_execution,
@@ -50,6 +66,143 @@ from telegram_kol_research.strategy_threads import (
     link_message_to_strategy_thread,
 )
 from telegram_kol_research.strategy_thread_candidates import StrategyThreadCandidate
+from telegram_kol_research.trading_settings import save_trading_settings
+
+
+def _v1_nontrading_result(raw_message_id: int) -> MimoAuthoritativeResult:
+    return MimoAuthoritativeResult(
+        raw_message_id=raw_message_id,
+        payload={
+            "recognition_result": "非策略",
+            "reason": "ordinary commentary",
+            "summary": "ordinary commentary",
+            "confidence": 0.96,
+            "strategy": {},
+            "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+            "evidence": {
+                "text": {
+                    "observed_text": "ordinary commentary",
+                    "fields": {},
+                },
+                "images": [],
+                "conflicts": [],
+            },
+        },
+        input_kind="text",
+        model="mimo-v2.5",
+        status="非策略",
+        prompt_versions={"trading.analysis.shared": 11},
+    )
+
+
+def _v2_nontrading_inference(session_factory, raw_message_id: int):
+    parsed = parse_mimo_v2_payload(
+        {
+            "contract_version": "mimo-authoritative-v2",
+            "summary": "ordinary commentary",
+            "confidence": 0.96,
+            "intents": [
+                {
+                    "intent_type": "market_commentary",
+                    "action": None,
+                    "reason": "ordinary commentary",
+                    "confidence": 0.96,
+                    "evidence_refs": [],
+                }
+            ],
+            "evidence": {
+                "text": {
+                    "observed_text": "ordinary commentary",
+                    "fields": {},
+                },
+                "images": [],
+                "conflicts": [],
+            },
+        }
+    )
+    adapted = adapt_mimo_v2_to_current_payload(parsed)
+    prompt_versions = {"trading.analysis.mimo_v2_authoritative": 1}
+    run = start_mimo_run(
+        session_factory,
+        raw_message_id=raw_message_id,
+        run_kind="v2_authoritative",
+        contract_version="mimo-authoritative-v2",
+        model="mimo-v2.5",
+        input_kind="text",
+        input_fingerprint="sha256:v2-test-input",
+        prompt_versions=prompt_versions,
+    )
+    attempt = record_mimo_attempt(
+        session_factory,
+        run_id=run.id,
+        ordinal=1,
+        status="completed",
+        response_payload=json.loads(adapted.canonical_v2_json),
+    )
+    completed = complete_mimo_run(
+        session_factory,
+        run_id=run.id,
+        status="completed",
+        selected_ordinal=attempt.ordinal,
+        canonical_payload=json.loads(adapted.canonical_v2_json),
+        projection_payload=_execution_projection(adapted.payload),
+        became_authoritative=True,
+    )
+    return MimoV2InferenceResult(
+        raw_message_id=raw_message_id,
+        run_id=completed.id,
+        parsed_result=parsed,
+        adapted_result=adapted,
+        input_kind="text",
+        model="mimo-v2.5",
+        prompt_versions=prompt_versions,
+    )
+
+
+def _failed_v2_inference(
+    session_factory,
+    raw_message_id: int,
+    *,
+    error_code: str = "contract_validation_failed",
+):
+    prompt_versions = {"trading.analysis.mimo_v2_authoritative": 1}
+    run = start_mimo_run(
+        session_factory,
+        raw_message_id=raw_message_id,
+        run_kind="v2_authoritative",
+        contract_version="mimo-authoritative-v2",
+        model="mimo-v2.5",
+        input_kind="text",
+        input_fingerprint="sha256:v2-failed-input",
+        prompt_versions=prompt_versions,
+    )
+    record_mimo_attempt(
+        session_factory,
+        run_id=run.id,
+        ordinal=1,
+        status="contract_failure",
+        error_code=error_code,
+        error_message="invalid contract",
+    )
+    failed = complete_mimo_run(
+        session_factory,
+        run_id=run.id,
+        status="failed",
+        selected_ordinal=None,
+        final_error_code=error_code,
+        final_error_message="invalid contract",
+    )
+    return MimoV2InferenceResult(
+        raw_message_id=raw_message_id,
+        run_id=failed.id,
+        parsed_result=None,
+        adapted_result=None,
+        input_kind="text",
+        model="mimo-v2.5",
+        prompt_versions=prompt_versions,
+        error_code=error_code,
+        error_message="invalid contract",
+    )
 
 
 def _context_candidate(
@@ -2238,3 +2391,496 @@ def test_mimo_non_strategy_never_executes_stale_deepseek_candidate(tmp_path, mon
 
     assert auto_trade_calls == []
     assert result.automation == {"status": "skipped", "reason": "mimo_no_action"}
+
+
+def test_mimo_v1_remains_default_without_calling_v2(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "mimo-v1-default.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=90, message_id=1, text="ordinary commentary")
+        session.add(raw)
+        session.commit()
+        raw_id = int(raw.id)
+
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.infer_mimo_authoritative_v2",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("v2 must remain disabled by default")
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: _v1_nontrading_result(raw_id),
+    )
+
+    result = process_authoritative_message(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+    )
+
+    assert result.assessment.mimo.contract_version == "v1"
+    assert result.assessment.mimo.fallback_from is None
+
+
+def test_mimo_v2_runs_only_strictly_above_future_watermark(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "mimo-watermark.db")
+    with session_factory() as session:
+        at_watermark = RawMessage(
+            chat_id=91,
+            message_id=1,
+            text="ordinary commentary",
+        )
+        future = RawMessage(
+            chat_id=91,
+            message_id=2,
+            text="ordinary commentary",
+        )
+        session.add_all([at_watermark, future])
+        session.commit()
+        watermark_id = int(at_watermark.id)
+        future_id = int(future.id)
+    save_trading_settings(
+        session_factory,
+        {
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": watermark_id,
+        },
+    )
+    v2_calls: list[int] = []
+    v1_calls: list[int] = []
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.infer_mimo_authoritative_v2",
+        lambda *args, **kwargs: v2_calls.append(kwargs["raw_message_id"])
+        or _v2_nontrading_inference(
+            session_factory,
+            kwargs["raw_message_id"],
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: v1_calls.append(kwargs["raw_message_id"])
+        or _v1_nontrading_result(kwargs["raw_message_id"]),
+    )
+
+    at_result = process_authoritative_message(
+        session_factory,
+        raw_message_id=watermark_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+    )
+    future_result = process_authoritative_message(
+        session_factory,
+        raw_message_id=future_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+    )
+
+    assert at_result.assessment.mimo.contract_version == "v1"
+    assert future_result.assessment.mimo.contract_version == (
+        "mimo-authoritative-v2"
+    )
+    assert v1_calls == [watermark_id]
+    assert v2_calls == [future_id]
+    with session_factory() as session:
+        evidence = (
+            session.query(MessageEvidenceVersion)
+            .filter(MessageEvidenceVersion.raw_message_id == future_id)
+            .one()
+        )
+    assert evidence.mimo_recognition_run_id == future_result.assessment.mimo.run_id
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    ["contract_validation_failed", "adapter_failure"],
+)
+def test_mimo_v2_contract_failure_falls_back_once_before_execution_claim(
+    tmp_path,
+    monkeypatch,
+    error_code,
+):
+    session_factory = create_session_factory(tmp_path / "mimo-fallback.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=92, message_id=1, text="ordinary commentary")
+        session.add(raw)
+        session.commit()
+        raw_id = int(raw.id)
+    save_trading_settings(
+        session_factory,
+        {
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 0,
+        },
+    )
+    events: list[str] = []
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.infer_mimo_authoritative_v2",
+        lambda *args, **kwargs: events.append("v2")
+        or _failed_v2_inference(
+            session_factory,
+            raw_id,
+            error_code=error_code,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: events.append("v1")
+        or _v1_nontrading_result(raw_id),
+    )
+    from telegram_kol_research import authoritative_recognition
+
+    real_claim = authoritative_recognition.claim_authoritative_execution
+
+    def claim(*args, **kwargs):
+        events.append("claim")
+        return real_claim(*args, **kwargs)
+
+    monkeypatch.setattr(
+        authoritative_recognition,
+        "claim_authoritative_execution",
+        claim,
+    )
+
+    result = process_authoritative_message(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+    )
+
+    assert events == ["v2", "v1", "claim"]
+    assert result.assessment.mimo.contract_version == "v1"
+    assert result.assessment.mimo.fallback_from == "mimo-authoritative-v2"
+    with session_factory() as session:
+        runs = (
+            session.query(MimoRecognitionRun)
+            .filter(MimoRecognitionRun.raw_message_id == raw_id)
+            .all()
+        )
+        evidence = (
+            session.query(MessageEvidenceVersion)
+            .filter(MessageEvidenceVersion.raw_message_id == raw_id)
+            .one()
+        )
+        candidates = (
+            session.query(SignalCandidate)
+            .filter(SignalCandidate.raw_message_id == raw_id)
+            .all()
+        )
+    runs_by_kind = {run.run_kind: run for run in runs}
+    assert set(runs_by_kind) == {"v2_authoritative", "v1_fallback"}
+    assert runs_by_kind["v1_fallback"].retry_of_run_id == (
+        runs_by_kind["v2_authoritative"].id
+    )
+    assert evidence.mimo_recognition_run_id == runs_by_kind["v1_fallback"].id
+    assert candidates == []
+
+
+def test_open_mimo_v2_circuit_routes_future_message_to_v1(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "mimo-circuit-route.db")
+    with session_factory() as session:
+        first = RawMessage(chat_id=93, message_id=1, text="ordinary commentary")
+        second = RawMessage(chat_id=93, message_id=2, text="ordinary commentary")
+        session.add_all([first, second])
+        session.commit()
+        first_id = int(first.id)
+        second_id = int(second.id)
+    save_trading_settings(
+        session_factory,
+        {
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 0,
+        },
+    )
+    v2_calls: list[int] = []
+
+    def fail_v2(*args, **kwargs):
+        raw_message_id = kwargs["raw_message_id"]
+        v2_calls.append(raw_message_id)
+        return _failed_v2_inference(session_factory, raw_message_id)
+
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.infer_mimo_authoritative_v2",
+        fail_v2,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: _v1_nontrading_result(
+            kwargs["raw_message_id"]
+        ),
+    )
+
+    process_authoritative_message(
+        session_factory,
+        raw_message_id=first_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+    )
+    second_result = process_authoritative_message(
+        session_factory,
+        raw_message_id=second_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+    )
+
+    assert v2_calls == [first_id]
+    assert second_result.assessment.mimo.contract_version == "v1"
+    assert second_result.assessment.mimo.fallback_from is None
+
+
+def test_nonfallback_mimo_v2_failure_creates_no_evidence_or_candidate(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "mimo-no-evidence.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=96, message_id=1, text="ordinary commentary")
+        session.add(raw)
+        session.commit()
+        raw_id = int(raw.id)
+    save_trading_settings(
+        session_factory,
+        {
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 0,
+        },
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.infer_mimo_authoritative_v2",
+        lambda *args, **kwargs: _failed_v2_inference(
+            session_factory,
+            raw_id,
+            error_code="image_unavailable",
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("nonfallback v2 failure must not call v1")
+        ),
+    )
+
+    result = process_authoritative_message(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+    )
+
+    assert result.automation == {
+        "status": "skipped",
+        "reason": "mimo_authoritative_failed",
+    }
+    with session_factory() as session:
+        assert (
+            session.query(MessageEvidenceVersion)
+            .filter(MessageEvidenceVersion.raw_message_id == raw_id)
+            .count()
+            == 0
+        )
+        assert (
+            session.query(SignalCandidate)
+            .filter(SignalCandidate.raw_message_id == raw_id)
+            .count()
+            == 0
+        )
+
+
+def test_mimo_v2_never_falls_back_after_execution_claim(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "mimo-no-late-fallback.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=94, message_id=1, text="ordinary commentary")
+        session.add(raw)
+        session.commit()
+        raw_id = int(raw.id)
+    save_trading_settings(
+        session_factory,
+        {
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 0,
+        },
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.infer_mimo_authoritative_v2",
+        lambda *args, **kwargs: _v2_nontrading_inference(
+            session_factory,
+            raw_id,
+        ),
+        raising=False,
+    )
+    v1_calls: list[int] = []
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: v1_calls.append(raw_id)
+        or _v1_nontrading_result(raw_id),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.apply_authoritative_assessment",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("apply failed after claim")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="apply failed after claim"):
+        process_authoritative_message(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(),
+            media_root=tmp_path,
+        )
+
+    assert v1_calls == []
+    with session_factory() as session:
+        decision = (
+            session.query(RecognitionDecision)
+            .filter(RecognitionDecision.raw_message_id == raw_id)
+            .one()
+        )
+    assert decision.comparison_status == "execution_running"
+
+
+def test_mimo_v2_current_evidence_reloads_canonical_projection(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "mimo-v2-reload.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=95, message_id=1, text="ordinary commentary")
+        session.add(raw)
+        session.commit()
+        raw_id = int(raw.id)
+    save_trading_settings(
+        session_factory,
+        {
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 0,
+        },
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.infer_mimo_authoritative_v2",
+        lambda *args, **kwargs: _v2_nontrading_inference(
+            session_factory,
+            raw_id,
+        ),
+        raising=False,
+    )
+
+    assessment = assess_message_authoritatively(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+    )
+    loaded = _load_current_mimo_evidence_result(session_factory, raw_id)
+
+    assert loaded is not None
+    reloaded, evidence = loaded
+    assert reloaded.contract_version == "mimo-authoritative-v2"
+    assert reloaded.run_id == evidence.mimo_recognition_run_id
+    assert reloaded.payload == assessment.mimo.payload
+
+
+@pytest.mark.parametrize("corruption", ["projection", "model"])
+def test_mimo_v2_current_evidence_quarantines_run_provenance_mismatch(
+    tmp_path,
+    monkeypatch,
+    corruption,
+):
+    session_factory = create_session_factory(tmp_path / "mimo-v2-corrupt.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=98, message_id=1, text="ordinary commentary")
+        session.add(raw)
+        session.commit()
+        raw_id = int(raw.id)
+    save_trading_settings(
+        session_factory,
+        {
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 0,
+        },
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.infer_mimo_authoritative_v2",
+        lambda *args, **kwargs: _v2_nontrading_inference(
+            session_factory,
+            raw_id,
+        ),
+        raising=False,
+    )
+    assessment = assess_message_authoritatively(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+    )
+    with session_factory() as session:
+        run = session.get(MimoRecognitionRun, assessment.mimo.run_id)
+        if corruption == "projection":
+            run.projection_fingerprint = "0" * 64
+        else:
+            run.model = "unexpected-model"
+        session.commit()
+
+    loaded = _load_current_mimo_evidence_result(session_factory, raw_id)
+
+    assert loaded is not None
+    reloaded, _ = loaded
+    assert reloaded.status == "识别失败"
+    assert "provenance" in str(reloaded.error_message)
+
+
+def test_mimo_v2_resolution_uses_source_separated_image_conflicts(tmp_path):
+    session_factory = create_session_factory(tmp_path / "mimo-v2-conflict.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=97, message_id=1, text="ETH commentary")
+        session.add(raw)
+        session.commit()
+        raw_id = int(raw.id)
+    evidence_row = save_message_evidence_version(
+        session_factory,
+        raw_message_id=raw_id,
+        input_fingerprint="sha256:conflict",
+        model="mimo-v2.5",
+        prompt_versions={"trading.analysis.mimo_v2_authoritative": 1},
+        extraction_status="completed",
+        confidence=0.8,
+        text_evidence={"observed_text": "ETH commentary", "fields": {}},
+        image_evidence={
+            "images": [],
+            "conflicts": ["文字说多，图片标注为空"],
+        },
+        normalized_evidence={
+            "contract_version": "mimo-authoritative-v2",
+            "summary": "conflicting evidence",
+            "confidence": 0.8,
+            "intents": [],
+        },
+    )
+
+    evidence, _, _ = _load_resolution_inputs(
+        session_factory,
+        raw_message_id=raw_id,
+        first_pass_payload={
+            "recognition_result": "非策略",
+            "strategy": {},
+            "lifecycle_event": {"event_type": "none"},
+        },
+        evidence_row=evidence_row,
+    )
+
+    assert evidence["conflicts"] == ["文字说多，图片标注为空"]
