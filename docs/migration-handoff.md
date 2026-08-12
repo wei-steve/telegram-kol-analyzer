@@ -945,3 +945,56 @@ failure for the same message. The 17-message corpus was therefore not run, and
 v2 was not activated. This is a model-contract/evidence stability gate, not a
 Web rendering or automatic-trading regression; production remains safely on
 v1 until a later fix passes the same isolated gate.
+
+### 2026-08-11 structured-output and full-corpus verification
+
+Commits `d2267d3ad39ea3219e1a28a075803e9f1308b106` and
+`dead8297066fa359810f10c2ee7690238e119147` made the v2-only provider request
+use MiMo JSON mode with deep thinking disabled and normalized only one exact,
+non-executable informational action shell to `action=null`. V1 requests and
+fallback transport remain unchanged. Any non-empty shell, unknown action, or
+actionable intent still fails strict contract validation.
+
+Both commits were deployed through the managed `code` preflight. Each pass
+found no fresh active work and no unprotected open position; the accepted
+warnings remained stale/incomplete exchange snapshot metadata, historical
+active/unknown residue, and five protected open positions. The service
+returned active after each restart. Server-focused tests passed 95 cases, and
+the final local suite passed 5561 cases with one skipped.
+
+The one-message smoke replay then passed:
+
+- raw message: `10505`;
+- classification: `reviewable_nonexecuting_difference`;
+- evidence differences and unsafe mismatches: zero;
+- v1 duration: `17324.267 ms`;
+- v2 duration: `9888.832 ms`;
+- adapter duration: `0.102 ms`;
+- response size: `1477 bytes`;
+- all performance gates passed;
+- production writes and notifications: both zero.
+
+Its redacted artifacts are
+`/run/telegram-kol/mimo-v2-replay-smoke-dead829/summary.json` (SHA-256
+`931338908b470946c7e441d0f845b181157aa88d76d06af0e17e85b951298063`)
+and `comparisons.csv` (SHA-256
+`782eaf597a3ce70af7fa14e0b26aa80727478aee00f4e6326c6f46b25c8f898f`).
+
+The required 17-message isolated corpus still failed the semantic/contract
+gate despite passing every performance gate. It produced six unsafe execution
+mismatches, seven unsafe evidence mismatches, two v2 contract failures, one
+row where both projections failed, and one reviewable non-executing
+difference. Evidence differences comprised four text-field attribution
+changes, one image-asset-ID change, two image-field attribution changes, and
+three unavailable-evidence results. Performance was acceptable: v1 P95
+`46638.657 ms`, v2 P95 `11765.171 ms`, adapter P95 `0.519 ms`, and maximum
+response size `4349 bytes`. Production writes and notifications remained zero.
+
+The full-corpus redacted artifacts are
+`/run/telegram-kol/mimo-v2-replay-dead829/summary.json` (SHA-256
+`85e83ca8c6144caf1bd028402dd4bc8026227215225d862b4b54c621d8cffa4c`)
+and `comparisons.csv` (SHA-256
+`082388b9be801984ab6e8d47706dfcdfa4b8f1193b7aa1f07c7b3c396f8c6e93`).
+Production therefore remains `mimo_contract_mode=v1` with activation watermark
+`0`; no v2 activation, production replay, trading write, or notification was
+attempted.
