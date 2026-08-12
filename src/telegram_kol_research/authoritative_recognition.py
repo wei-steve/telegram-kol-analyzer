@@ -78,8 +78,8 @@ from telegram_kol_research.models import (
 from telegram_kol_research.recognition_decisions import (
     RecognitionDecisionRecord,
     claim_authoritative_execution,
+    claim_authoritative_execution_if_input_current,
     finalize_authoritative_automation_outcome,
-    refuse_authoritative_execution,
     save_pending_authoritative_decision,
     save_terminal_authoritative_decision,
     update_recognition_execution_outcome,
@@ -1537,32 +1537,22 @@ def process_authoritative_message(
         if assessment.authoritative_generation is None:
             raise RuntimeError("authoritative execution generation is missing")
         if assessment.analysis_input_fingerprint is not None:
-            try:
-                current_analysis_fingerprint = (
+            reason = "mimo_input_changed_before_claim"
+            claim_result = claim_authoritative_execution_if_input_current(
+                session_factory,
+                raw_message_id=raw_message_id,
+                authoritative_generation=assessment.authoritative_generation,
+                changed_reason=reason,
+                input_is_current=lambda: (
                     build_current_mimo_v2_analysis_input_fingerprint(
                         session_factory,
                         raw_message_id=raw_message_id,
                         media_root=media_root,
                     )
-                )
-            except (LookupError, OSError, ValueError):
-                current_analysis_fingerprint = None
-            if (
-                current_analysis_fingerprint
-                != assessment.analysis_input_fingerprint
-            ):
-                reason = "mimo_input_changed_before_claim"
-                if not refuse_authoritative_execution(
-                    session_factory,
-                    raw_message_id=raw_message_id,
-                    authoritative_generation=(
-                        assessment.authoritative_generation
-                    ),
-                    reason=reason,
-                ):
-                    raise RuntimeError(
-                        "authoritative execution refusal failed for stale generation"
-                    )
+                    == assessment.analysis_input_fingerprint
+                ),
+            )
+            if claim_result == "input_changed":
                 failed_assessment = replace(
                     assessment,
                     mimo=replace(
@@ -1590,7 +1580,11 @@ def process_authoritative_message(
                     ),
                     automation={"status": "skipped", "reason": reason},
                 )
-        if not claim_authoritative_execution(
+            if claim_result != "claimed":
+                raise RuntimeError(
+                    "authoritative execution claim failed for stale generation"
+                )
+        elif not claim_authoritative_execution(
             session_factory,
             raw_message_id=raw_message_id,
             authoritative_generation=assessment.authoritative_generation,

@@ -1757,7 +1757,8 @@ def test_audit_management_batches_uses_online_backup_after_component_churn(
     import telegram_kol_research.cli as cli_module
 
     database_path = tmp_path / "churning.db"
-    create_session_factory(database_path)
+    session_factory = create_session_factory(database_path)
+    session_factory.kw["bind"].dispose()
     before = database_path.read_bytes(), database_path.stat()
     monkeypatch.setattr(
         cli_module,
