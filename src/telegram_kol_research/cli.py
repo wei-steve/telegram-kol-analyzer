@@ -4693,7 +4693,9 @@ def recover_composite_management_batch(
         refuse("evidence_fingerprint_mismatch")
 
     contract_spec_provider = None
-    settings = None
+    settings = load_trading_settings(session_factory)
+    if settings.mimo_contract_mode != "v1":
+        refuse("mimo_contract_mode_not_v1")
     if (
         plan.position is not None
         and plan.position.disposition != "position_absent"
@@ -4704,11 +4706,15 @@ def recover_composite_management_batch(
             )
         except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError):
             refuse("contract_specs_invalid")
-        settings = load_trading_settings(session_factory)
-        if settings.mimo_contract_mode != "v1":
-            refuse("mimo_contract_mode_not_v1")
         if settings.effective_composite_management_v2_mode != "live":
             refuse("composite_management_live_gate_closed")
+
+    def live_recovery_execution_gate() -> bool:
+        current = load_trading_settings(session_factory)
+        return bool(
+            current.mimo_contract_mode == "v1"
+            and current.effective_composite_management_v2_mode == "live"
+        )
 
     if resume_authorization is None:
         try:
@@ -4729,7 +4735,7 @@ def recover_composite_management_batch(
         plan.position is not None
         and plan.position.disposition != "position_absent"
     ):
-        assert contract_spec_provider is not None and settings is not None
+        assert contract_spec_provider is not None
         if resume_authorization is not None:
             reconcile_composite_management_components(
                 session_factory,
@@ -4742,12 +4748,7 @@ def recover_composite_management_batch(
             batch_id=BATCH_119_RECOVERY.batch_id,
             deepcoin_client=client,
             contract_spec_provider=contract_spec_provider,
-            live_execution_gate=lambda: (
-                load_trading_settings(
-                    session_factory
-                ).effective_composite_management_v2_mode
-                == "live"
-            ),
+            live_execution_gate=live_recovery_execution_gate,
             now_provider=lambda: datetime.now(UTC),
             backup_buffer_bps=str(
                 settings.trigger_backup_stop_buffer_bps

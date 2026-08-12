@@ -806,6 +806,51 @@ close submissions, oversized retained TP, missing verified stops, and stalled
 components are fixed critical invariants. Live enablement requires a later
 reviewed shadow report and explicit approval.
 
+### Batch 119 recovery handoff
+
+The local recovery implementation is complete on
+`codex/mimo-v2-safe-rebuild`, but production deployment and the actual recovery
+remain pending a separate instruction. The incident is a false local
+submission state caused by legacy reconciliation taking ownership of a
+composite batch; the closed planner requires exact proof that no close request,
+response, order identity, execution event, mutation intent, matching exchange
+order, or fill exists before it can return `ready`.
+
+The recovery command is allowlisted to batch `119`, defaults to a read-only
+dry run, uses one reviewed evidence fingerprint plus the exact authorization
+`I_AUTHORIZE_BATCH_119_TO_REMAINING_19`, and resumes only the existing durable
+composite workflow. Its immutable target is remaining size `19`: a larger
+position closes only the exact difference, an at-target position submits no
+close, a smaller positive position is protection-only with no increase, and an
+absent position terminalizes with zero exchange writer construction. It never
+replays the historical message or creates a compensation batch.
+
+Legacy and composite reconciliation ownership are now exclusive. Recovery
+state repair uses `BEGIN IMMEDIATE` before its first reread, binds its audit to
+the exact durable source and exchange snapshot, and keeps all exchange writes
+behind the existing `PositionMutationGateway`. A possible or unknown exchange
+result never retries. Confirmed replacement primary and backup stops must be
+read back before original protection cancellation; resume authorization binds
+the original stop set to the repair-time durable audit using only SHA-256
+references. The position-absent audit uses an exact empty stop set and remains
+repeatable with zero exchange writes.
+
+Task 7 must not start unless two read-only checks prove there is no other real
+instruction, management, mutation, recovery, reconciliation, protection, or
+time-sensitive strategy operation in flight. The service must then be stopped,
+the SQLite database and sidecars verifiably backed up, and the candidate dry
+run repeated before installation. Generate a fresh final fingerprint after
+installation and invoke apply only once. Before any possible exchange request,
+the verified backup may be restored; afterward the database must not be rolled
+back and reconciliation must proceed from exchange truth and the durable
+idempotency records.
+
+MiMo must remain `mimo_contract_mode=v1` before, during, and after this incident
+procedure. No ordinary deployment-preflight exception was added. Detailed
+commands, output boundaries, position dispositions, verification order, and
+rollback rules are in `docs/runbook.md` under “Batch 119
+composite-management recovery”.
+
 ## Position-management liveness v2 handoff
 
 Position ownership and protection-order ownership remain separate authorities.

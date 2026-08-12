@@ -3186,9 +3186,15 @@ def test_recover_composite_management_batch_stale_fingerprint_stops_before_repai
     assert repair_calls == []
 
 
+@pytest.mark.parametrize(
+    ("writer_mimo_mode", "expected_live_gate"),
+    [("v1", True), ("v2_live_adapter", False)],
+)
 def test_recover_composite_management_batch_apply_repairs_then_executes_once(
     tmp_path,
     monkeypatch,
+    writer_mimo_mode,
+    expected_live_gate,
 ):
     import telegram_kol_research.cli as cli_module
     from telegram_kol_research.composite_management_batch_recovery import (
@@ -3262,21 +3268,26 @@ def test_recover_composite_management_batch_apply_repairs_then_executes_once(
         "load_deepcoin_contract_specs",
         lambda path: order.append("contract_specs") or provider,
     )
-    monkeypatch.setattr(
-        cli_module,
-        "load_trading_settings",
-        lambda session_factory: SimpleNamespace(
+    settings_reads = 0
+
+    def load_settings(session_factory):
+        nonlocal settings_reads
+        settings_reads += 1
+        return SimpleNamespace(
             effective_composite_management_v2_mode="live",
             trigger_backup_stop_buffer_bps=20,
-            mimo_contract_mode="v1",
-        ),
-    )
+            mimo_contract_mode=(
+                "v1" if settings_reads == 1 else writer_mimo_mode
+            ),
+        )
+
+    monkeypatch.setattr(cli_module, "load_trading_settings", load_settings)
     executor_calls = []
 
     def execute(session_factory, **kwargs):
         order.append("execute")
         executor_calls.append((session_factory, kwargs))
-        assert kwargs["live_execution_gate"]() is True
+        assert kwargs["live_execution_gate"]() is expected_live_gate
         return execution
 
     monkeypatch.setattr(
@@ -3374,6 +3385,15 @@ def test_recover_composite_management_batch_invalid_specs_stop_before_repair(
         "build_composite_batch_recovery_plan",
         lambda *args, **kwargs: plan,
     )
+    monkeypatch.setattr(
+        cli_module,
+        "load_trading_settings",
+        lambda factory: SimpleNamespace(
+            effective_composite_management_v2_mode="live",
+            trigger_backup_stop_buffer_bps=20,
+            mimo_contract_mode="v1",
+        ),
+    )
     repair_calls = []
     monkeypatch.setattr(
         cli_module,
@@ -3460,6 +3480,15 @@ def test_recover_composite_management_batch_position_absent_never_builds_writer(
         cli_module,
         "build_composite_batch_recovery_plan",
         lambda *args, **kwargs: plan,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_trading_settings",
+        lambda factory: SimpleNamespace(
+            effective_composite_management_v2_mode="live",
+            trigger_backup_stop_buffer_bps=20,
+            mimo_contract_mode="v1",
+        ),
     )
     monkeypatch.setattr(
         cli_module,

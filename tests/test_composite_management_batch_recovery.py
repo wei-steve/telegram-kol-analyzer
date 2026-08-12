@@ -4016,6 +4016,86 @@ def test_recovery_cli_position_absent_is_repeatable_without_exchange_writes(
         assert json.loads(event.after_json)["original_owned_stop_refs"] == []
 
 
+def test_recovery_cli_position_absent_refuses_non_v1_without_database_write(
+    tmp_path,
+    monkeypatch,
+):
+    from typer.testing import CliRunner
+
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.cli import app
+    from telegram_kol_research.trading_settings import save_trading_settings
+
+    factory, database_path, _, _, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    save_trading_settings(
+        factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+            "composite_management_v2_mode": "live",
+            "mimo_contract_mode": "v2_live_adapter",
+        },
+        updated_at=NOW,
+    )
+    specs_path = tmp_path / "deepcoin-contract-specs.yaml"
+    specs_path.write_text(
+        "contracts:\n"
+        "  - instrument_id: BTC-USDT-SWAP\n"
+        "    contract_value: 1\n"
+        "    quantity_step: 1\n"
+        "    min_quantity: 1\n"
+        "    price_tick: 0.1\n",
+        encoding="utf-8",
+    )
+    client = _Batch119RecoveryClient()
+    client.pending = []
+    client.list_positions = lambda *, inst_id=None: []
+    monkeypatch.setattr(
+        cli_module, "build_deepcoin_client_from_env", lambda: client
+    )
+    common = [
+        "recover-composite-management-batch",
+        "--database-path",
+        str(database_path),
+        "--batch-id",
+        "119",
+        "--deepcoin-contract-specs-path",
+        str(specs_path),
+    ]
+    runner = CliRunner()
+    dry_run = runner.invoke(app, common)
+
+    assert dry_run.exit_code == 0, dry_run.stdout
+    fingerprint = json.loads(dry_run.stdout)["plan"]["evidence_fingerprint"]
+    before = database_path.read_bytes()
+
+    applied = runner.invoke(
+        app,
+        [
+            *common,
+            "--apply",
+            "--expected-fingerprint",
+            fingerprint,
+            "--authorization",
+            "I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        ],
+    )
+
+    assert applied.exit_code == 2
+    assert json.loads(applied.stdout)["reason_code"] == (
+        "mimo_contract_mode_not_v1"
+    )
+    assert database_path.read_bytes() == before
+    assert client.cancel_calls == []
+    assert client.close_calls == []
+    assert client.set_calls == []
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
 @pytest.mark.parametrize("interrupt_close_readback", [False, True])
 def test_recovery_cli_dry_run_then_apply_closes_exactly_once_and_preserves_settings(
     tmp_path,

@@ -1486,6 +1486,81 @@ WHERE idempotency_key LIKE :component_id || ':%' ORDER BY id;
 将模式切为 `disabled` 只会阻止新批次，不会把已发出的未知结果当作回滚。
 米娅和三姐的历史消息永不自动重放；历史补操作必须单独只读规划、人工批准和交易所回读。
 
+## Batch 119 composite-management recovery
+
+这是仅适用于批次 `119` 的封闭恢复流程，不是通用数据库编辑器。根因是旧管理对账器
+错误取得了复合管理批次的状态机所有权：第一个复合组件因交易所快照不完整而正确停在
+`recovery_required`，但旧路径后来把管理腿标记为 `submitted`、批次标记为
+`reconciling`。只有同时证明 request、response、client order ID、exchange order ID、
+平仓 `ExecutionEvent`、平仓 `PositionMutationIntent`、匹配订单和成交全部不存在，且当前
+交易所快照完整时，才能认定这是本地假提交状态，而不是长时间等待的 Deepcoin 订单。
+
+恢复目标始终是不可变的剩余数量 `19`，不对当前仓位重新计算 50%，也不得增加暴露。
+首先在候选代码上运行默认只读 dry-run：
+
+```bash
+python -m telegram_kol_research.cli recover-composite-management-batch \
+  --database-path /opt/telegram-kol-analyzer/data/research.db \
+  --batch-id 119 \
+  --deepcoin-contract-specs-path \
+    /opt/telegram-kol-analyzer/config/deepcoin_contract_specs.yaml
+```
+
+输出外层只有 `mode=dry_run` 和 `plan`；`plan` 只允许包含 `batch_id`、`status`、
+`reason_code`、`position`、`source_fingerprint`、`exchange_snapshot_fingerprint`、
+`evidence_fingerprint`、有界且脱敏的 `evidence`、`production_writes` 和
+`exchange_calls`。准备进入下一步时
+必须为 `status=ready`、`production_writes=0`、`exchange_calls=0`，并由人工审阅新鲜
+`evidence_fingerprint`。任何 `refused`、不完整快照、身份漂移或新的持久化证据都必须停止。
+
+四种仓位分类的含义固定：
+
+- `resume_to_target`：当前数量大于 `19`，只允许平掉 `current_size - 19`。
+- `protection_only_at_target`：当前数量等于 `19`，不平仓，只验证并替换剩余保护。
+- `protection_only_below_target`：当前数量大于零但小于 `19`，不加仓、不再平仓，只保护实际数量。
+- `position_absent`：精确仓位已不存在，本地安全终态化，不构造交易所 writer。
+
+产生最终指纹前必须连续两次通过只读安全窗口检查。除批次 `119` 的已审阅假活跃状态外，
+不得存在其他 `executing`、`submitted`、`submitting`、`unknown`、`submit_unknown`、
+`recovery_required` 的 instruction、management component、mutation intent、recovery 或交易所对账；
+每个开放仓位还必须具有已验证保护。只要其他真实操作在途，就不能用时间流逝将其视为历史行，
+必须保持原服务并停止恢复。
+
+受控操作顺序：
+
+1. 在不更改运行 checkout 的候选代码上执行只读 dry-run，审阅完整快照和分类。
+2. 连续两次证明无其他在途工作，然后停止 `telegram-kol.service`并确认其为 inactive。
+3. 按 SQLite main/WAL/SHM 一致备份流程创建可验证备份，打开备份检查 schema 与有界计数。
+4. 服务停止后再运行候选 dry-run，必须保持同一 source fingerprint 和已审阅仓位关系。
+5. 安装精确已审阅 commit，执行只添加 schema bootstrap，并在前后都证明
+   `mimo_contract_mode=v1`。此时仍不启动服务。
+6. 用已安装代码重新 dry-run，只使用这一次的最终指纹调用一次 apply：
+
+   ```bash
+   python -m telegram_kol_research.cli recover-composite-management-batch \
+     --database-path /opt/telegram-kol-analyzer/data/research.db \
+     --batch-id 119 \
+     --deepcoin-contract-specs-path \
+       /opt/telegram-kol-analyzer/config/deepcoin_contract_specs.yaml \
+     --apply \
+     --expected-fingerprint '<FINAL_FINGERPRINT>' \
+     --authorization I_AUTHORIZE_BATCH_119_TO_REMAINING_19
+   ```
+
+7. 不得为了“确认”立即第二次 apply。先只读核对实际剩余数量、唯一平仓意图、两张新保护单、
+   旧保护取消顺序、保留止盈总量、组件顺序以及唯一恢复审计事件。
+8. 只有批次已终态或真实地等待一个已知交易所结果时才重启服务；随后验证 systemd、HTTP、Telegram 自然入站、
+   无重复交易所写入、运行 commit 精确且 MiMo 仍为 `v1`。
+
+应用之前的回滚界限：在任何交易所请求都不可能已发送时，可恢复已验证数据库备份和之前的
+已审阅代码。一旦请求可能已到达 Deepcoin，绝对不得恢复旧数据库或重新提交；当前数据库中的
+reservation、idempotency 和回读证据是防止重复交易的唯一权威。只读从交易所真相对账，未知结果继续
+冻结，并且在没有另一张已验证保护单时不取消新保护。
+
+整个流程必须保持 `mimo_contract_mode=v1`。它不启用 MiMo v2，不重放历史原始消息，不新建补偿
+管理批次，也不给常规部署预检增加例外。本节只文档化已批准程序；真实部署与批次恢复需要后续
+单独指令。
+
 ## 精确仓位管理活性 v2
 
 `execution_order_legs.pos_id` 只有在账户级唯一、`verified`、具有权威持久化证据且未终态时，
