@@ -1909,10 +1909,13 @@ listener；命令入口仍复用项目统一 CLI 注册模块。它不向生产�
 ```text
 mimo_contract_mode=v2_live_adapter
 mimo_v2_activation_after_raw_message_id=<captured-current-max-id>
+mimo_contract_expected_mode=v1
+mimo_contract_expected_watermark=<currently-stored-watermark>
 ```
 
 API 会拒绝空水位、低于当前最大消息 ID 的首次激活，以及不支持的
-`shadow`/`live` 模式。断路器状态会在设置 API 和页面显示。只检查自然到达且
+`shadow`/`live` 模式。MiMo 模式或水位变更必须同时提交页面读到的当前模式与水位；
+若期望值与服务器现值不同，API 返回 409，必须重新加载后再操作。断路器状态会在设置 API 和页面显示。只检查自然到达且
 ID 大于水位线的新消息，不发送仿真实盘策略、不回放历史消息。可用以下
 只读查询核对首批消息：
 

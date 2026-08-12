@@ -1201,6 +1201,8 @@ def test_trading_settings_api_round_trips_mimo_v2_future_activation(tmp_path):
         json={
             "mimo_contract_mode": "v2_live_adapter",
             "mimo_v2_activation_after_raw_message_id": watermark,
+            "mimo_contract_expected_mode": "v1",
+            "mimo_contract_expected_watermark": 0,
         },
     )
 
@@ -1235,6 +1237,8 @@ def test_trading_settings_activation_holds_telegram_operation_lock(
         json={
             "mimo_contract_mode": "v2_live_adapter",
             "mimo_v2_activation_after_raw_message_id": 7,
+            "mimo_contract_expected_mode": "v1",
+            "mimo_contract_expected_watermark": 0,
         },
     )
 
@@ -1303,6 +1307,8 @@ def test_trading_settings_api_rejects_mimo_v2_watermark_below_current_message(
         json={
             "mimo_contract_mode": "v2_live_adapter",
             "mimo_v2_activation_after_raw_message_id": current_max - 1,
+            "mimo_contract_expected_mode": "v1",
+            "mimo_contract_expected_watermark": 0,
         },
     )
 
@@ -1319,13 +1325,19 @@ def test_trading_settings_api_v1_rollback_preserves_mimo_watermark(tmp_path):
         json={
             "mimo_contract_mode": "v2_live_adapter",
             "mimo_v2_activation_after_raw_message_id": 7,
+            "mimo_contract_expected_mode": "v1",
+            "mimo_contract_expected_watermark": 0,
         },
     )
     assert enabled.status_code == 200
 
     rolled_back = client.post(
         "/api/trading-settings",
-        json={"mimo_contract_mode": "v1"},
+        json={
+            "mimo_contract_mode": "v1",
+            "mimo_contract_expected_mode": "v2_live_adapter",
+            "mimo_contract_expected_watermark": 7,
+        },
     )
 
     assert rolled_back.status_code == 200
@@ -1341,6 +1353,8 @@ def test_trading_settings_api_v1_rollback_rejects_watermark_change(tmp_path):
         json={
             "mimo_contract_mode": "v2_live_adapter",
             "mimo_v2_activation_after_raw_message_id": 7,
+            "mimo_contract_expected_mode": "v1",
+            "mimo_contract_expected_watermark": 0,
         },
     )
     assert enabled.status_code == 200
@@ -1350,6 +1364,8 @@ def test_trading_settings_api_v1_rollback_rejects_watermark_change(tmp_path):
         json={
             "mimo_contract_mode": "v1",
             "mimo_v2_activation_after_raw_message_id": 0,
+            "mimo_contract_expected_mode": "v2_live_adapter",
+            "mimo_contract_expected_watermark": 7,
         },
     )
 
@@ -1368,16 +1384,26 @@ def test_trading_settings_api_preserves_watermark_after_v1_rollback(tmp_path):
         json={
             "mimo_contract_mode": "v2_live_adapter",
             "mimo_v2_activation_after_raw_message_id": 7,
+            "mimo_contract_expected_mode": "v1",
+            "mimo_contract_expected_watermark": 0,
         },
     ).status_code == 200
     assert client.post(
         "/api/trading-settings",
-        json={"mimo_contract_mode": "v1"},
+        json={
+            "mimo_contract_mode": "v1",
+            "mimo_contract_expected_mode": "v2_live_adapter",
+            "mimo_contract_expected_watermark": 7,
+        },
     ).status_code == 200
 
     changed = client.post(
         "/api/trading-settings",
-        json={"mimo_v2_activation_after_raw_message_id": 0},
+        json={
+            "mimo_v2_activation_after_raw_message_id": 0,
+            "mimo_contract_expected_mode": "v1",
+            "mimo_contract_expected_watermark": 7,
+        },
     )
 
     assert changed.status_code == 422
@@ -1385,6 +1411,59 @@ def test_trading_settings_api_preserves_watermark_after_v1_rollback(tmp_path):
     stored = client.get("/api/trading-settings").json()
     assert stored["mimo_contract_mode"] == "v1"
     assert stored["mimo_v2_activation_after_raw_message_id"] == 7
+
+
+def test_stale_v2_settings_page_cannot_reverse_v1_rollback(tmp_path):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    client = TestClient(app)
+    assert client.post(
+        "/api/trading-settings",
+        json={
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 7,
+            "mimo_contract_expected_mode": "v1",
+            "mimo_contract_expected_watermark": 0,
+        },
+    ).status_code == 200
+    assert client.post(
+        "/api/trading-settings",
+        json={
+            "mimo_contract_mode": "v1",
+            "mimo_contract_expected_mode": "v2_live_adapter",
+            "mimo_contract_expected_watermark": 7,
+        },
+    ).status_code == 200
+
+    stale_save = client.post(
+        "/api/trading-settings",
+        json={
+            "default_max_loss_usdt": 25,
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 7,
+            "mimo_contract_expected_mode": "v2_live_adapter",
+            "mimo_contract_expected_watermark": 7,
+        },
+    )
+
+    assert stale_save.status_code == 409
+    stored = client.get("/api/trading-settings").json()
+    assert stored["mimo_contract_mode"] == "v1"
+    assert stored["mimo_v2_activation_after_raw_message_id"] == 7
+
+
+def test_mimo_contract_change_requires_expected_current_state(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.post(
+        "/api/trading-settings",
+        json={
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 7,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "expected current state" in response.json()["detail"]
 
 
 def test_trading_settings_api_and_ui_show_mimo_circuit_state(tmp_path):
@@ -1416,6 +1495,8 @@ def test_trading_settings_api_and_ui_show_mimo_circuit_state(tmp_path):
     assert "contract_validation_failed" in page_response.text
     assert "2026-08-11T12:00:00+00:00" in page_response.text
     assert 'name="mimo_v2_activation_after_raw_message_id"' in page_response.text
+    assert 'data-mimo-contract-mode="v1"' in page_response.text
+    assert 'data-mimo-contract-watermark="0"' in page_response.text
 
 
 def test_trading_settings_api_rejects_negative_fixed_entry_threshold(tmp_path):

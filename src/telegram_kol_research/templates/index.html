@@ -318,7 +318,12 @@
         </div>
         <button type="button" class="secondary-button" data-dashboard-tab="main">返回</button>
       </div>
-      <form class="ai-recognition-prompt-form trading-settings-form" data-trading-settings-form>
+      <form
+        class="ai-recognition-prompt-form trading-settings-form"
+        data-trading-settings-form
+        data-mimo-contract-mode="{{ trading_settings.mimo_contract_mode }}"
+        data-mimo-contract-watermark="{{ trading_settings.mimo_v2_activation_after_raw_message_id }}"
+      >
         <div class="trading-settings-grid">
           <label class="trading-toggle-row">
             <input type="checkbox" name="auto_trade_enabled" {% if trading_settings.auto_trade_enabled %}checked{% endif %} />

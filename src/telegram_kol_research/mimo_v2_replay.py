@@ -494,10 +494,10 @@ def _evidence_difference_codes(
     v1: dict[str, Any] | None,
     v2: dict[str, Any] | None,
 ) -> tuple[str, ...]:
-    if v1 == v2:
-        return ()
     if v1 is None or v2 is None:
         return ("evidence_unavailable",)
+    if v1 == v2:
+        return ()
     codes: list[str] = []
     if _evidence_field_sources(v1["text_fields"]) != _evidence_field_sources(
         v2["text_fields"]

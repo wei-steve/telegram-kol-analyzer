@@ -3868,6 +3868,32 @@ def _validate_mimo_contract_activation(
         )
 
 
+def _require_expected_mimo_contract_state(
+    current,
+    *,
+    payload: dict[str, Any],
+) -> None:
+    if (
+        "mimo_contract_expected_mode" not in payload
+        or "mimo_contract_expected_watermark" not in payload
+    ):
+        raise ValueError("mimo contract changes require the expected current state")
+    expected_mode = str(payload["mimo_contract_expected_mode"])
+    try:
+        expected_watermark = int(payload["mimo_contract_expected_watermark"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("mimo contract expected watermark must be an integer") from exc
+    if (
+        expected_mode != current.mimo_contract_mode
+        or expected_watermark
+        != current.mimo_v2_activation_after_raw_message_id
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="mimo contract settings changed; reload before saving",
+        )
+
+
 def create_web_app(
     database_path: str | Path,
     media_root: str | Path | None = None,
@@ -6755,6 +6781,13 @@ def create_web_app(
             )
             if mimo_contract_change:
                 async with app.state.telegram_operation_lock:
+                    locked_current = load_trading_settings(
+                        app.state.session_factory
+                    )
+                    _require_expected_mimo_contract_state(
+                        locked_current,
+                        payload=payload,
+                    )
                     _validate_mimo_contract_activation(
                         app.state.session_factory,
                         payload=payload,
@@ -6769,6 +6802,14 @@ def create_web_app(
                 payload_without_unchanged_mimo.pop("mimo_contract_mode", None)
                 payload_without_unchanged_mimo.pop(
                     "mimo_v2_activation_after_raw_message_id",
+                    None,
+                )
+                payload_without_unchanged_mimo.pop(
+                    "mimo_contract_expected_mode",
+                    None,
+                )
+                payload_without_unchanged_mimo.pop(
+                    "mimo_contract_expected_watermark",
                     None,
                 )
                 response = save_trading_settings(

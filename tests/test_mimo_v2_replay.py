@@ -488,6 +488,34 @@ def test_replay_classifies_model_failures_without_leaking_error_text(tmp_path):
     assert "SECRET_TOKEN" not in serialized
 
 
+def test_replay_fails_when_both_evidence_payloads_are_malformed(tmp_path):
+    source = tmp_path / "production.db"
+    [message_id] = _seed_source_database(source, count=1)
+    v1_payload = _v1_payload()
+    v1_payload["evidence"] = "invalid"
+    v2 = _v2_result()
+    v2.adapted_result.payload["evidence"] = "invalid"
+
+    result = run_mimo_v2_replay(
+        source_database=source,
+        artifact_dir=tmp_path / "artifacts",
+        raw_message_ids=[message_id],
+        v1_runner=lambda **kwargs: SimpleNamespace(
+            error_message=None,
+            status="是策略",
+            payload=v1_payload,
+            replay_duration_ms=100.0,
+        ),
+        v2_runner=lambda **kwargs: v2,
+    )
+
+    assert result.passed is False
+    assert result.comparisons[0].classification == "unsafe_evidence_mismatch"
+    assert result.comparisons[0].evidence_difference_codes == (
+        "evidence_unavailable",
+    )
+
+
 def test_replay_performance_uses_p95_and_enforces_both_gates():
     passing = evaluate_replay_performance(
         v1_duration_ms=[100.0, 100.0, 100.0],
