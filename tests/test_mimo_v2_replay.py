@@ -14,6 +14,7 @@ from telegram_kol_research.mimo_v2_execution_adapter import (
 )
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.mimo_v2_replay import (
+    MAX_CANONICAL_V2_RESPONSE_BYTES,
     evaluate_replay_performance,
     run_mimo_v2_replay,
 )
@@ -35,8 +36,13 @@ def _seed_source_database(path: Path, *, count: int = 2) -> list[int]:
         return [int(row.id) for row in rows]
 
 
-def _v1_payload(*, symbol: str = "BTC") -> dict:
-    return {
+def _v1_payload(
+    *,
+    symbol: str = "BTC",
+    include_instructions: bool = True,
+    evidence_asset_id: int | None = None,
+) -> dict:
+    payload = {
         "instructions": [
             {
                 "kind": "entry",
@@ -77,9 +83,61 @@ def _v1_payload(*, symbol: str = "BTC") -> dict:
         },
         "confidence": 0.95,
     }
+    if not include_instructions:
+        payload.pop("instructions")
+        payload["lifecycle_event"].update(
+            {
+                "target_lifecycle_id": None,
+                "symbol": None,
+                "side": None,
+                "stop_loss": None,
+            }
+        )
+    if evidence_asset_id is not None:
+        payload["evidence"] = {
+            "text": {"observed_text": "entry", "fields": {}},
+            "images": [
+                {
+                    "asset_id": evidence_asset_id,
+                    "image_type": "strategy_screenshot",
+                    "quality": "clear",
+                    "observed_text": "BTC long",
+                    "summary": "entry screenshot",
+                    "fields": {
+                        "symbol": {
+                            "value": symbol,
+                            "source": "image",
+                            "confidence": 0.99,
+                        }
+                    },
+                    "confidence": 0.99,
+                }
+            ],
+            "conflicts": [],
+        }
+    return payload
 
 
-def _v2_result(*, symbol: str = "BTC"):
+def _v2_result(*, symbol: str = "BTC", evidence_asset_id: int | None = None):
+    images = []
+    if evidence_asset_id is not None:
+        images.append(
+            {
+                "asset_id": evidence_asset_id,
+                "image_type": "strategy_screenshot",
+                "quality": "clear",
+                "observed_text": "BTC long",
+                "summary": "entry screenshot",
+                "fields": {
+                    "symbol": {
+                        "value": symbol,
+                        "source": "image",
+                        "confidence": 0.99,
+                    }
+                },
+                "confidence": 0.99,
+            }
+        )
     parsed = parse_mimo_v2_payload(
         {
             "contract_version": "mimo-authoritative-v2",
@@ -112,7 +170,7 @@ def _v2_result(*, symbol: str = "BTC"):
                     "observed_text": "PRIVATE SOURCE MESSAGE",
                     "fields": {},
                 },
-                "images": [],
+                "images": images,
                 "conflicts": [],
             },
         }
@@ -228,6 +286,50 @@ def test_replay_classifies_execution_drift_as_unsafe(tmp_path):
     assert result.comparisons[0].classification == "unsafe_mismatch"
 
 
+def test_replay_normalizes_legacy_v1_without_explicit_instructions(tmp_path):
+    source = tmp_path / "production.db"
+    [message_id] = _seed_source_database(source, count=1)
+
+    result = run_mimo_v2_replay(
+        source_database=source,
+        artifact_dir=tmp_path / "artifacts",
+        raw_message_ids=[message_id],
+        v1_runner=lambda **kwargs: SimpleNamespace(
+            error_message=None,
+            status="是策略",
+            payload=_v1_payload(include_instructions=False),
+            replay_duration_ms=100.0,
+        ),
+        v2_runner=_v2_runner,
+    )
+
+    assert result.passed is True
+    assert result.comparisons[0].classification == "match"
+
+
+def test_replay_rejects_image_source_attribution_drift(tmp_path):
+    source = tmp_path / "production.db"
+    [message_id] = _seed_source_database(source, count=1)
+
+    result = run_mimo_v2_replay(
+        source_database=source,
+        artifact_dir=tmp_path / "artifacts",
+        raw_message_ids=[message_id],
+        v1_runner=lambda **kwargs: SimpleNamespace(
+            error_message=None,
+            status="是策略",
+            payload=_v1_payload(evidence_asset_id=41),
+            replay_duration_ms=100.0,
+        ),
+        v2_runner=lambda **kwargs: _v2_result(evidence_asset_id=42),
+    )
+
+    assert result.passed is False
+    comparison = result.comparisons[0]
+    assert comparison.classification == "unsafe_evidence_mismatch"
+    assert comparison.evidence_difference_codes == ("image_asset_ids_changed",)
+
+
 def test_replay_classifies_model_failures_without_leaking_error_text(tmp_path):
     source = tmp_path / "production.db"
     [message_id] = _seed_source_database(source, count=1)
@@ -259,16 +361,25 @@ def test_replay_performance_uses_p95_and_enforces_both_gates():
         v1_duration_ms=[100.0, 100.0, 100.0],
         v2_duration_ms=[110.0, 110.0, 110.0],
         adapter_duration_ms=[1.0, 2.0, 3.0],
+        canonical_v2_response_bytes=[1_000, 2_000, 3_000],
     )
     slow_adapter = evaluate_replay_performance(
         v1_duration_ms=[100.0],
         v2_duration_ms=[100.0],
         adapter_duration_ms=[50.0],
+        canonical_v2_response_bytes=[1_000],
     )
     slow_v2 = evaluate_replay_performance(
         v1_duration_ms=[100.0],
         v2_duration_ms=[116.0],
         adapter_duration_ms=[1.0],
+        canonical_v2_response_bytes=[1_000],
+    )
+    oversized = evaluate_replay_performance(
+        v1_duration_ms=[100.0],
+        v2_duration_ms=[100.0],
+        adapter_duration_ms=[1.0],
+        canonical_v2_response_bytes=[MAX_CANONICAL_V2_RESPONSE_BYTES + 1],
     )
 
     assert passing.passed is True
@@ -279,3 +390,24 @@ def test_replay_performance_uses_p95_and_enforces_both_gates():
     assert "adapter_p95_at_or_above_50ms" in slow_adapter.failure_reasons
     assert slow_v2.passed is False
     assert "v2_p95_above_115_percent_of_v1" in slow_v2.failure_reasons
+    assert oversized.passed is False
+    assert "canonical_v2_response_size_exceeded" in oversized.failure_reasons
+
+
+def test_replay_module_has_no_production_side_effect_dependencies():
+    source = (
+        Path(__file__).parents[1]
+        / "src"
+        / "telegram_kol_research"
+        / "mimo_v2_replay.py"
+    ).read_text(encoding="utf-8")
+
+    forbidden = (
+        "deepcoin_client",
+        "auto_trade_execution",
+        "telegram_live_listener",
+        "system_operator_bot",
+        "production_safety_monitor",
+        "send_notification",
+    )
+    assert not [name for name in forbidden if name in source]

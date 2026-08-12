@@ -17,9 +17,13 @@ from urllib.parse import quote
 from sqlalchemy import select
 
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
+from telegram_kol_research.authoritative_instructions import (
+    AuthoritativeInstruction,
+    AuthoritativeInstructionError,
+    normalize_authoritative_instructions,
+)
 from telegram_kol_research.db import create_existing_session_factory
 from telegram_kol_research.mimo_v2_execution_adapter import (
-    _execution_projection,
     adapt_mimo_v2_to_current_payload,
 )
 from telegram_kol_research.models import RawMessage
@@ -30,6 +34,7 @@ from telegram_kol_research.recognition_experiments import (
 
 
 MAX_REPLAY_MESSAGES = 200
+MAX_CANONICAL_V2_RESPONSE_BYTES = 256 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,8 +46,12 @@ class ReplayComparison:
     v1_duration_ms: float
     v2_duration_ms: float
     adapter_duration_ms: float
+    canonical_v2_response_bytes: int
     v1_projection_fingerprint: str | None
     v2_projection_fingerprint: str | None
+    v1_evidence_fingerprint: str | None
+    v2_evidence_fingerprint: str | None
+    evidence_difference_codes: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +61,7 @@ class ReplayPerformance:
     adapter_p95_ms: float
     passed: bool
     failure_reasons: tuple[str, ...]
+    canonical_v2_response_max_bytes: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,9 +152,13 @@ def run_mimo_v2_replay(
         v1_duration_ms=[row.v1_duration_ms for row in comparisons],
         v2_duration_ms=[row.v2_duration_ms for row in comparisons],
         adapter_duration_ms=[row.adapter_duration_ms for row in comparisons],
+        canonical_v2_response_bytes=[
+            row.canonical_v2_response_bytes for row in comparisons
+        ],
     )
     unsafe_mismatches = sum(
-        row.classification == "unsafe_mismatch" for row in comparisons
+        row.classification in {"unsafe_mismatch", "unsafe_evidence_mismatch"}
+        for row in comparisons
     )
     has_terminal_failure = any(
         row.classification in {"v1_failed", "v2_failed", "both_failed"}
@@ -172,23 +186,31 @@ def evaluate_replay_performance(
     v1_duration_ms: Sequence[float],
     v2_duration_ms: Sequence[float],
     adapter_duration_ms: Sequence[float],
+    canonical_v2_response_bytes: Sequence[int] = (),
 ) -> ReplayPerformance:
     """Apply the approved adapter and end-to-end P95 gates."""
 
     v1_p95 = _percentile_95(v1_duration_ms)
     v2_p95 = _percentile_95(v2_duration_ms)
     adapter_p95 = _percentile_95(adapter_duration_ms)
+    response_max = max(
+        (int(value) for value in canonical_v2_response_bytes),
+        default=0,
+    )
     reasons: list[str] = []
     if adapter_p95 >= 50.0:
         reasons.append("adapter_p95_at_or_above_50ms")
     if v1_p95 <= 0.0 or v2_p95 > v1_p95 * 1.15:
         reasons.append("v2_p95_above_115_percent_of_v1")
+    if response_max > MAX_CANONICAL_V2_RESPONSE_BYTES:
+        reasons.append("canonical_v2_response_size_exceeded")
     return ReplayPerformance(
         v1_p95_ms=round(v1_p95, 3),
         v2_p95_ms=round(v2_p95, 3),
         adapter_p95_ms=round(adapter_p95, 3),
         passed=not reasons,
         failure_reasons=tuple(reasons),
+        canonical_v2_response_max_bytes=response_max,
     )
 
 
@@ -281,6 +303,15 @@ def _compare_results(
 ) -> ReplayComparison:
     v1_projection = _safe_v1_projection(v1)
     v2_projection = _safe_v2_projection(v2)
+    v1_payload = getattr(v1, "payload", None)
+    adapted = getattr(v2, "adapted_result", None)
+    v2_payload = getattr(adapted, "payload", None)
+    v1_evidence = _safe_evidence_projection(v1_payload)
+    v2_evidence = _safe_evidence_projection(v2_payload)
+    evidence_difference_codes = _evidence_difference_codes(
+        v1_evidence,
+        v2_evidence,
+    )
     adapter_duration_ms = 0.0
     parsed = getattr(v2, "parsed_result", None)
     if parsed is not None:
@@ -296,7 +327,9 @@ def _compare_results(
         classification = "v1_failed"
     elif v2_failed:
         classification = "v2_failed"
-    elif _semantic_projection(v1_projection) == _semantic_projection(v2_projection):
+    elif evidence_difference_codes:
+        classification = "unsafe_evidence_mismatch"
+    elif v1_projection == v2_projection:
         classification = "match"
     elif not _has_executable_semantics(v1_projection) and not _has_executable_semantics(
         v2_projection
@@ -317,8 +350,12 @@ def _compare_results(
         v1_duration_ms=round(max(0.0, v1_duration_ms), 3),
         v2_duration_ms=round(max(0.0, v2_duration_ms), 3),
         adapter_duration_ms=round(max(0.0, adapter_duration_ms), 3),
+        canonical_v2_response_bytes=_canonical_v2_response_size(v2),
         v1_projection_fingerprint=_projection_fingerprint(v1_projection),
         v2_projection_fingerprint=_projection_fingerprint(v2_projection),
+        v1_evidence_fingerprint=_value_fingerprint(v1_evidence),
+        v2_evidence_fingerprint=_value_fingerprint(v2_evidence),
+        evidence_difference_codes=evidence_difference_codes,
     )
 
 
@@ -329,8 +366,8 @@ def _safe_v1_projection(result: Any) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
     try:
-        return _execution_projection(payload)
-    except (KeyError, TypeError, ValueError):
+        return _normalized_execution_projection(payload)
+    except (AuthoritativeInstructionError, KeyError, TypeError, ValueError):
         return None
 
 
@@ -342,17 +379,49 @@ def _safe_v2_projection(result: Any) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
     try:
-        return _execution_projection(payload)
-    except (KeyError, TypeError, ValueError):
+        return _normalized_execution_projection(payload)
+    except (AuthoritativeInstructionError, KeyError, TypeError, ValueError):
         return None
 
 
-def _semantic_projection(projection: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in projection.items()
-        if key != "input_reading"
+def _normalized_execution_projection(payload: dict[str, Any]) -> dict[str, Any]:
+    instructions = normalize_authoritative_instructions(payload)
+    projection: dict[str, Any] = {
+        "instructions": [_instruction_projection(row) for row in instructions],
+        "recognition_result": str(payload.get("recognition_result") or ""),
+        "strategy": _drop_missing(payload.get("strategy") or {}),
+        "lifecycle_event": _drop_missing(payload.get("lifecycle_event") or {}),
+        "confidence": float(payload.get("confidence") or 0.0),
     }
+    for field in ("entry_context", "entry_fragments"):
+        if field in payload:
+            projection[field] = _drop_missing(payload[field])
+    return projection
+
+
+def _instruction_projection(row: AuthoritativeInstruction) -> dict[str, Any]:
+    return {
+        "kind": row.kind,
+        "confidence": row.confidence,
+        "strategy": _drop_missing(row.strategy),
+        "target": {
+            "lifecycle_id": row.target_lifecycle_id,
+            "thread_id": row.target_thread_id,
+        },
+        "parameters": _drop_missing(row.parameters or {}),
+    }
+
+
+def _drop_missing(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _drop_missing(item)
+            for key, item in value.items()
+            if key != "reason" and item not in (None, "")
+        }
+    if isinstance(value, (list, tuple)):
+        return [_drop_missing(item) for item in value]
+    return value
 
 
 def _has_executable_semantics(projection: dict[str, Any]) -> bool:
@@ -368,15 +437,126 @@ def _has_executable_semantics(projection: dict[str, Any]) -> bool:
 
 
 def _projection_fingerprint(projection: dict[str, Any] | None) -> str | None:
-    if projection is None:
+    return _value_fingerprint(projection)
+
+
+def _value_fingerprint(value: Any | None) -> str | None:
+    if value is None:
         return None
     canonical = json.dumps(
-        _semantic_projection(projection),
+        value,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _safe_evidence_projection(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    evidence = payload.get("evidence")
+    if evidence is None:
+        return {"text_fields": {}, "images": [], "conflicts": []}
+    if not isinstance(evidence, dict):
+        return None
+    text = evidence.get("text") if isinstance(evidence.get("text"), dict) else {}
+    images = evidence.get("images")
+    conflicts = evidence.get("conflicts")
+    if not isinstance(images, list) or not isinstance(conflicts, list):
+        return None
+    projected_images = []
+    for row in images:
+        if not isinstance(row, dict):
+            return None
+        projected_images.append(
+            {
+                "asset_id": row.get("asset_id"),
+                "image_type": row.get("image_type"),
+                "quality": row.get("quality"),
+                "fields": _drop_missing(row.get("fields") or {}),
+                "confidence": row.get("confidence"),
+            }
+        )
+    return {
+        "text_fields": _drop_missing(text.get("fields") or {}),
+        "images": projected_images,
+        "conflicts": list(conflicts),
+    }
+
+
+def _evidence_difference_codes(
+    v1: dict[str, Any] | None,
+    v2: dict[str, Any] | None,
+) -> tuple[str, ...]:
+    if v1 == v2:
+        return ()
+    if v1 is None or v2 is None:
+        return ("evidence_unavailable",)
+    codes: list[str] = []
+    if v1["text_fields"] != v2["text_fields"]:
+        codes.append("text_field_attribution_changed")
+    v1_images = v1["images"]
+    v2_images = v2["images"]
+    v1_asset_ids = [row.get("asset_id") for row in v1_images]
+    v2_asset_ids = [row.get("asset_id") for row in v2_images]
+    if v1_asset_ids != v2_asset_ids:
+        codes.append("image_asset_ids_changed")
+    else:
+        v1_metadata = [
+            {
+                "asset_id": row.get("asset_id"),
+                "image_type": row.get("image_type"),
+                "quality": row.get("quality"),
+            }
+            for row in v1_images
+        ]
+        v2_metadata = [
+            {
+                "asset_id": row.get("asset_id"),
+                "image_type": row.get("image_type"),
+                "quality": row.get("quality"),
+            }
+            for row in v2_images
+        ]
+        if v1_metadata != v2_metadata:
+            codes.append("image_metadata_changed")
+        v1_fields = [
+            {
+                "asset_id": row.get("asset_id"),
+                "fields": row.get("fields"),
+                "confidence": row.get("confidence"),
+            }
+            for row in v1_images
+        ]
+        v2_fields = [
+            {
+                "asset_id": row.get("asset_id"),
+                "fields": row.get("fields"),
+                "confidence": row.get("confidence"),
+            }
+            for row in v2_images
+        ]
+        if v1_fields != v2_fields:
+            codes.append("image_field_attribution_changed")
+    if v1["conflicts"] != v2["conflicts"]:
+        codes.append("evidence_conflicts_changed")
+    return tuple(codes or ["evidence_changed"])
+
+
+def _canonical_v2_response_size(result: Any) -> int:
+    explicit = getattr(result, "response_size_bytes", None)
+    if (
+        isinstance(explicit, int)
+        and not isinstance(explicit, bool)
+        and explicit >= 0
+    ):
+        return explicit
+    adapted = getattr(result, "adapted_result", None)
+    canonical = getattr(adapted, "canonical_v2_json", None)
+    if not isinstance(canonical, str):
+        return 0
+    return len(canonical.encode("utf-8"))
 
 
 def _reported_duration(result: Any, measured_ms: float) -> float:
