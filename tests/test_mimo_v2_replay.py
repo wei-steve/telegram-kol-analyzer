@@ -100,9 +100,6 @@ def _v1_payload(
                 {
                     "asset_id": evidence_asset_id,
                     "image_type": "strategy_screenshot",
-                    "quality": "clear",
-                    "observed_text": "BTC long",
-                    "summary": "entry screenshot",
                     "fields": {
                         "symbol": {
                             "value": symbol,
@@ -171,6 +168,73 @@ def _v2_result(*, symbol: str = "BTC", evidence_asset_id: int | None = None):
                     "fields": {},
                 },
                 "images": images,
+                "conflicts": [],
+            },
+        }
+    )
+    return SimpleNamespace(
+        error_code=None,
+        error_message=None,
+        parsed_result=parsed,
+        adapted_result=adapt_mimo_v2_to_current_payload(parsed),
+        replay_duration_ms=110.0,
+    )
+
+
+def _v1_move_stop_payload(*, include_instructions: bool) -> dict:
+    payload = {
+        "instructions": [
+            {
+                "kind": "move_stop_to_protect",
+                "confidence": 0.95,
+                "reason": "legacy wording",
+                "strategy": None,
+                "target": {"lifecycle_id": 77, "thread_id": None},
+                "parameters": {"stop_loss": "59000"},
+            }
+        ],
+        "recognition_result": "非策略",
+        "reason": "legacy wording",
+        "strategy": {},
+        "lifecycle_event": {
+            "event_type": "position_update",
+            "target_lifecycle_id": 77,
+            "stop_loss": "59000",
+            "management_action": "move_stop_to_protect",
+            "confidence": 0.95,
+            "reason": "legacy wording",
+        },
+        "input_reading": {"observed_text": "move stop", "image_quality": "none"},
+        "confidence": 0.95,
+    }
+    if not include_instructions:
+        payload.pop("instructions")
+    return payload
+
+
+def _v2_move_stop_result():
+    parsed = parse_mimo_v2_payload(
+        {
+            "contract_version": "mimo-authoritative-v2",
+            "summary": "move stop",
+            "confidence": 0.95,
+            "intents": [
+                {
+                    "intent_type": "position_management",
+                    "action": {
+                        "kind": "move_stop_to_protect",
+                        "target": {"lifecycle_id": 77, "thread_id": None},
+                        "strategy": None,
+                        "parameters": {"stop_loss": "59000"},
+                    },
+                    "reason": "structured wording",
+                    "confidence": 0.95,
+                    "evidence_refs": ["text:observed_text"],
+                }
+            ],
+            "evidence": {
+                "text": {"observed_text": "move stop", "fields": {}},
+                "images": [],
                 "conflicts": [],
             },
         }
@@ -328,6 +392,74 @@ def test_replay_rejects_image_source_attribution_drift(tmp_path):
     comparison = result.comparisons[0]
     assert comparison.classification == "unsafe_evidence_mismatch"
     assert comparison.evidence_difference_codes == ("image_asset_ids_changed",)
+
+
+def test_replay_ignores_v2_only_image_evidence_enrichment(tmp_path):
+    source = tmp_path / "production.db"
+    [message_id] = _seed_source_database(source, count=1)
+
+    result = run_mimo_v2_replay(
+        source_database=source,
+        artifact_dir=tmp_path / "artifacts",
+        raw_message_ids=[message_id],
+        v1_runner=lambda **kwargs: SimpleNamespace(
+            error_message=None,
+            status="是策略",
+            payload=_v1_payload(evidence_asset_id=41),
+            replay_duration_ms=100.0,
+        ),
+        v2_runner=lambda **kwargs: _v2_result(evidence_asset_id=41),
+    )
+
+    assert result.passed is True
+    assert result.comparisons[0].classification == "match"
+
+
+def test_replay_normalizes_legacy_management_without_instructions(tmp_path):
+    source = tmp_path / "production.db"
+    [message_id] = _seed_source_database(source, count=1)
+
+    result = run_mimo_v2_replay(
+        source_database=source,
+        artifact_dir=tmp_path / "artifacts",
+        raw_message_ids=[message_id],
+        v1_runner=lambda **kwargs: SimpleNamespace(
+            error_message=None,
+            status="非策略",
+            payload=_v1_move_stop_payload(include_instructions=False),
+            replay_duration_ms=100.0,
+        ),
+        v2_runner=lambda **kwargs: _v2_move_stop_result(),
+    )
+
+    assert result.passed is True
+    assert result.comparisons[0].classification == "match"
+
+
+def test_replay_allows_v2_only_image_summary_quality_enrichment(tmp_path):
+    source = tmp_path / "production.db"
+    [message_id] = _seed_source_database(source, count=1)
+    legacy_payload = _v1_payload(evidence_asset_id=41)
+    legacy_image = legacy_payload["evidence"]["images"][0]
+    legacy_image.pop("quality", None)
+    legacy_image["confidence"] = 0.75
+
+    result = run_mimo_v2_replay(
+        source_database=source,
+        artifact_dir=tmp_path / "artifacts",
+        raw_message_ids=[message_id],
+        v1_runner=lambda **kwargs: SimpleNamespace(
+            error_message=None,
+            status="是策略",
+            payload=legacy_payload,
+            replay_duration_ms=100.0,
+        ),
+        v2_runner=lambda **kwargs: _v2_result(evidence_asset_id=41),
+    )
+
+    assert result.passed is True
+    assert result.comparisons[0].classification == "match"
+    assert result.comparisons[0].evidence_difference_codes == ()
 
 
 def test_replay_classifies_model_failures_without_leaking_error_text(tmp_path):

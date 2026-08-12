@@ -1428,3 +1428,22 @@ def test_mimo_v2_prompt_invocation_failure_does_not_reverse_success(
         run = session.get(MimoRecognitionRun, result.run_id)
         assert run.status == "completed"
         assert run.became_authoritative is True
+
+
+def test_mimo_v2_reports_raw_provider_response_size(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _v2_message(factory)
+
+    class SizedPayload(dict):
+        response_size_bytes = 400_000
+
+    result = infer_mimo_authoritative_v2(
+        factory,
+        raw_message_id=raw_message_id,
+        config=_v2_config(),
+        requester=lambda **kwargs: SizedPayload(_v2_payload()),
+        retry_delay_seconds=0,
+    )
+
+    assert result.succeeded is True
+    assert result.response_size_bytes == 400_000

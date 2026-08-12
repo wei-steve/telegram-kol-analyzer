@@ -12,7 +12,6 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
-from urllib.parse import quote
 
 from sqlalchemy import select
 
@@ -246,7 +245,11 @@ def _validated_message_ids(
     *,
     max_messages: int,
 ) -> list[int]:
-    if isinstance(max_messages, bool) or not 1 <= int(max_messages) <= MAX_REPLAY_MESSAGES:
+    if (
+        isinstance(max_messages, bool)
+        or not isinstance(max_messages, int)
+        or not 1 <= max_messages <= MAX_REPLAY_MESSAGES
+    ):
         raise ValueError(f"max_messages must be between 1 and {MAX_REPLAY_MESSAGES}")
     rows: list[int] = []
     seen: set[int] = set()
@@ -274,7 +277,7 @@ def _prepare_artifact_dir(path: str | Path) -> Path:
 
 
 def _copy_sqlite_database_read_only(source: Path, destination: Path) -> None:
-    uri = f"file:{quote(str(source), safe='/:')}?mode=ro"
+    uri = f"{source.as_uri()}?mode=ro"
     with sqlite3.connect(uri, uri=True) as source_connection:
         source_connection.execute("PRAGMA query_only = ON")
         with sqlite3.connect(destination) as destination_connection:
@@ -400,6 +403,8 @@ def _normalized_execution_projection(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _instruction_projection(row: AuthoritativeInstruction) -> dict[str, Any]:
+    parameters = dict(row.parameters or {})
+    parameters.pop("management_action", None)
     return {
         "kind": row.kind,
         "confidence": row.confidence,
@@ -408,7 +413,7 @@ def _instruction_projection(row: AuthoritativeInstruction) -> dict[str, Any]:
             "lifecycle_id": row.target_lifecycle_id,
             "thread_id": row.target_thread_id,
         },
-        "parameters": _drop_missing(row.parameters or {}),
+        "parameters": _drop_missing(parameters),
     }
 
 
@@ -494,7 +499,9 @@ def _evidence_difference_codes(
     if v1 is None or v2 is None:
         return ("evidence_unavailable",)
     codes: list[str] = []
-    if v1["text_fields"] != v2["text_fields"]:
+    if _evidence_field_sources(v1["text_fields"]) != _evidence_field_sources(
+        v2["text_fields"]
+    ):
         codes.append("text_field_attribution_changed")
     v1_images = v1["images"]
     v2_images = v2["images"]
@@ -507,7 +514,6 @@ def _evidence_difference_codes(
             {
                 "asset_id": row.get("asset_id"),
                 "image_type": row.get("image_type"),
-                "quality": row.get("quality"),
             }
             for row in v1_images
         ]
@@ -515,7 +521,6 @@ def _evidence_difference_codes(
             {
                 "asset_id": row.get("asset_id"),
                 "image_type": row.get("image_type"),
-                "quality": row.get("quality"),
             }
             for row in v2_images
         ]
@@ -524,16 +529,14 @@ def _evidence_difference_codes(
         v1_fields = [
             {
                 "asset_id": row.get("asset_id"),
-                "fields": row.get("fields"),
-                "confidence": row.get("confidence"),
+                "fields": _evidence_field_sources(row.get("fields")),
             }
             for row in v1_images
         ]
         v2_fields = [
             {
                 "asset_id": row.get("asset_id"),
-                "fields": row.get("fields"),
-                "confidence": row.get("confidence"),
+                "fields": _evidence_field_sources(row.get("fields")),
             }
             for row in v2_images
         ]
@@ -541,7 +544,23 @@ def _evidence_difference_codes(
             codes.append("image_field_attribution_changed")
     if v1["conflicts"] != v2["conflicts"]:
         codes.append("evidence_conflicts_changed")
-    return tuple(codes or ["evidence_changed"])
+    return tuple(codes)
+
+
+def _evidence_field_sources(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    projected: dict[str, Any] = {}
+    for key, item in value.items():
+        if isinstance(item, dict):
+            projected[str(key)] = {
+                field: _drop_missing(item.get(field))
+                for field in ("value", "source")
+                if item.get(field) not in (None, "")
+            }
+        else:
+            projected[str(key)] = _drop_missing(item)
+    return projected
 
 
 def _canonical_v2_response_size(result: Any) -> int:

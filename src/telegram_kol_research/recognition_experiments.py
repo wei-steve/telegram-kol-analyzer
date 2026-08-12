@@ -123,6 +123,7 @@ class MimoV2InferenceResult:
     prompt_versions: dict[str, int]
     error_code: str | None = None
     error_message: str | None = None
+    response_size_bytes: int = 0
 
     @property
     def succeeded(self) -> bool:
@@ -133,6 +134,14 @@ class _MimoV2InvalidJson(ValueError):
     def __init__(self, message: str, *, response_payload: Any | None = None):
         super().__init__(message)
         self.response_payload = response_payload
+
+
+class _MimoProviderPayload(dict[str, Any]):
+    """Parsed provider payload retaining the raw HTTP response size."""
+
+    def __init__(self, payload: Mapping[str, Any], *, response_size_bytes: int):
+        super().__init__(payload)
+        self.response_size_bytes = max(0, int(response_size_bytes))
 
 
 def run_mimo_direct_experiment(
@@ -639,6 +648,7 @@ def infer_mimo_authoritative_v2(
                 input_kind=input_kind,
                 model=model,
                 prompt_versions=dict(composition.version_map),
+                response_size_bytes=_provider_response_size(response_payload),
             )
 
     return _complete_v2_failure(
@@ -669,6 +679,28 @@ def _coerce_mimo_v2_payload(response: Any) -> dict[str, Any]:
         "MiMo response JSON is not an object",
         response_payload=response,
     )
+
+
+def _provider_response_size(response: Any) -> int:
+    explicit = getattr(response, "response_size_bytes", None)
+    if (
+        isinstance(explicit, int)
+        and not isinstance(explicit, bool)
+        and explicit >= 0
+    ):
+        return explicit
+    if isinstance(response, str):
+        return len(response.encode("utf-8"))
+    if isinstance(response, Mapping):
+        return len(
+            json.dumps(
+                response,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+    return 0
 
 
 def _record_v2_attempt(
@@ -1087,7 +1119,10 @@ def _call_mimo_direct_model(
             raise RuntimeError(f"{exc}; response_body={response_body}") from exc
         data = response.json()
     content = _extract_chat_content(data)
-    return _parse_json_object(content)
+    return _MimoProviderPayload(
+        _parse_json_object(content),
+        response_size_bytes=len(response.content),
+    )
 
 
 def _build_mimo_payload(
