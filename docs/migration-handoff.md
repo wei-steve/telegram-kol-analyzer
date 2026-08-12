@@ -906,3 +906,42 @@ unnecessary provider calls; its terminated temporary database copy was
 deleted. Production remains `mimo_contract_mode=v1` with activation watermark
 `0`. No historical message was replayed into the execution path, and no v2
 activation was attempted.
+
+### 2026-08-11 additive-evidence fix verification
+
+Commit `b39a5e98e90ad7ad43af37016ad79fa8676cbd22` changed the replay
+comparison so a v2-only structured text-evidence field is treated as additive
+enrichment, while a v1 field that is lost or changed by v2 remains an unsafe
+mismatch. Local verification passed 365 MiMo-focused tests, 602
+execution-critical tests, and the full suite with 5551 passing and one skipped.
+
+The commit was deployed with the managed `code` preflight. Both preflight
+passes found no fresh active work and no unprotected open position. The
+accepted warnings were stale/incomplete exchange snapshot metadata,
+historical active/unknown residue, and five protected open positions. The
+service returned active after restart and production stayed on
+`mimo_contract_mode=v1` with activation watermark `0`.
+
+The repeated isolated replay of raw message `10505` still failed the semantic
+evidence gate:
+
+- classification: `unsafe_evidence_mismatch`;
+- difference: `text_field_attribution_changed` (therefore not merely a
+  v2-only additive text field under the new comparator);
+- v1 duration: `25761.729 ms`;
+- v2 duration: `20301.090 ms`;
+- adapter duration: `0.197 ms`;
+- response size: `7608 bytes`;
+- all performance gates passed;
+- production writes and notifications: both zero.
+
+The redacted artifacts are
+`/run/telegram-kol/mimo-v2-replay-smoke-b39a5e9/summary.json` (SHA-256
+`c8f84226c6b49be10d2cccfb014ad9ea2f5445f0589952ea139d64b87defcdec`)
+and `comparisons.csv` (SHA-256
+`7bb00a77bda57201e704b49a1ae3c71c18238de6020ba34fbe864880af84e5d8`).
+A subsequent isolated diagnostic call also returned a v2 contract-validation
+failure for the same message. The 17-message corpus was therefore not run, and
+v2 was not activated. This is a model-contract/evidence stability gate, not a
+Web rendering or automatic-trading regression; production remains safely on
+v1 until a later fix passes the same isolated gate.
