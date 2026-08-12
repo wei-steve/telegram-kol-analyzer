@@ -875,3 +875,34 @@ initial watermark and exposes the durable circuit state. Verification observes
 only naturally arriving later messages. Rollback sets the mode back to `v1`
 and preserves the watermark, v2 runs and attempts, image evidence, instruction
 state, lifecycle state, and all exchange audit records.
+
+### 2026-08-11 server verification result
+
+Commit `21e8bee968dc4d1637bfe4539e08f2f2f783289b` was deployed with the
+managed `code` preflight. Both preflight passes reported no fresh active work
+and no unprotected open position; the accepted warnings were incomplete/stale
+exchange snapshot metadata, historical active/unknown residue, and five
+protected open positions. The service returned healthy after the restart.
+
+The isolated replay smoke gate then failed on raw message `10505`, before any
+production activation:
+
+- classification: `unsafe_evidence_mismatch`;
+- difference: `text_field_attribution_changed`;
+- v1 duration: `17912.640 ms`;
+- v2 duration: `22615.577 ms`;
+- adapter duration: `0.124 ms`;
+- response size: `7896 bytes`;
+- performance failure: `v2_p95_above_115_percent_of_v1`;
+- production writes and notifications: both zero.
+
+The redacted server artifacts are
+`/run/telegram-kol/mimo-v2-replay-smoke/summary.json` (SHA-256
+`a1f6649b3a87d88d1c42f28bf6ac10c16decb51488bc0f8333098351d8786e09`)
+and `comparisons.csv` (SHA-256
+`738fa7cf2b94482494a1882355417de6caa3eaca561a590203523bb3097cb720`).
+The larger 17-message replay was stopped after this hard gate failure to avoid
+unnecessary provider calls; its terminated temporary database copy was
+deleted. Production remains `mimo_contract_mode=v1` with activation watermark
+`0`. No historical message was replayed into the execution path, and no v2
+activation was attempted.
