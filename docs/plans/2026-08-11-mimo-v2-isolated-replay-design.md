@@ -20,10 +20,11 @@ The command accepts an existing source database, a read-only media root, an
 explicit message-ID file, and a new empty artifact directory.
 
 Before any model call, it opens the source database read-only and uses SQLite's
-online backup API to create one consistent working database inside the artifact
-directory. The source connection is then closed. All later prompt-registry,
-run-attempt, recognition-experiment, and replay bookkeeping writes occur only
-in the working copy.
+online backup API to create one consistent working database inside a private
+temporary directory. The source connection is then closed. All later
+prompt-registry, run-attempt, recognition-experiment, and replay bookkeeping
+writes occur only in the working copy. The temporary database is deleted on
+both success and failure and is never a retained artifact.
 
 The command never constructs a session factory against the source path. The
 working database is disposable and is not an authority for production
@@ -106,9 +107,8 @@ results agree.
 
 ## Artifacts
 
-The new artifact directory contains only:
+The new artifact directory retains only:
 
-- `replay.db`, the disposable working database copy;
 - `comparisons.json`, bounded per-message statuses, timings, error codes and
   fingerprints;
 - `comparisons.csv`, the same bounded comparison fields; and
@@ -118,8 +118,9 @@ Artifacts exclude source message text, image bytes/data URLs, provider raw
 responses, credentials, authorization headers, full prompt text, and exchange
 responses. Errors are sanitized and bounded using existing error conventions.
 
-Artifacts are written atomically where practical. A partial run remains
-non-authoritative and the CLI exits nonzero.
+Artifacts are written atomically where practical. The private working database
+is cleaned up before returning. A partial run remains non-authoritative and the
+CLI exits nonzero.
 
 ## Prohibited dependencies
 
@@ -167,4 +168,3 @@ Tests must prove:
 
 Server execution is not part of Task 12 implementation. It remains a later
 deployment/verification step while production stays on `mimo_contract_mode=v1`.
-
