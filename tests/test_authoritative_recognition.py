@@ -5,7 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
+from telegram_kol_research.ai_recognition_config import (
+    AiModelConfig,
+    AiRecognitionConfig,
+)
 from telegram_kol_research.authoritative_recognition import (
     AuthoritativeAssessment,
     _load_current_mimo_evidence_result,
@@ -93,6 +96,47 @@ def _v1_nontrading_result(raw_message_id: int) -> MimoAuthoritativeResult:
         status="非策略",
         prompt_versions={"trading.analysis.shared": 11},
     )
+
+
+def _configured_v2_ai() -> AiRecognitionConfig:
+    return AiRecognitionConfig(
+        ai_models=[
+            AiModelConfig(
+                id="mimo-v2.5",
+                label="MiMo",
+                base_url="https://api.xiaomimimo.com/v1",
+                api_key="test-key",
+                model="mimo-v2.5",
+                supports_text=True,
+                supports_image=True,
+            )
+        ]
+    )
+
+
+def _v2_commentary_payload(*, summary: str) -> dict:
+    return {
+        "contract_version": "mimo-authoritative-v2",
+        "summary": summary,
+        "confidence": 0.96,
+        "intents": [
+            {
+                "intent_type": "market_commentary",
+                "action": None,
+                "reason": "ordinary commentary",
+                "confidence": 0.96,
+                "evidence_refs": ["text:observed_text"],
+            }
+        ],
+        "evidence": {
+            "text": {
+                "observed_text": "ordinary commentary",
+                "fields": {},
+            },
+            "images": [],
+            "conflicts": [],
+        },
+    }
 
 
 def _v2_nontrading_inference(session_factory, raw_message_id: int):
@@ -2752,6 +2796,395 @@ def test_mimo_v2_never_falls_back_after_execution_claim(
             .one()
         )
     assert decision.comparison_status == "execution_running"
+
+
+def test_v2_discards_first_result_and_retries_after_prior_message_changes(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "mimo-prior-drift.db")
+    with session_factory() as session:
+        prior = RawMessage(
+            chat_id=940,
+            message_id=10,
+            text="BTC position remains active",
+            posted_at=datetime(2026, 8, 11, 1, 0, tzinfo=UTC),
+        )
+        current = RawMessage(
+            chat_id=940,
+            message_id=11,
+            text="ordinary commentary",
+            posted_at=datetime(2026, 8, 11, 2, 0, tzinfo=UTC),
+        )
+        session.add_all([prior, current])
+        session.commit()
+        prior_id = int(prior.id)
+        current_id = int(current.id)
+    save_trading_settings(
+        session_factory,
+        {
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 0,
+        },
+    )
+    calls: list[str] = []
+
+    def requester(**kwargs):
+        calls.append(kwargs["context_text"])
+        if len(calls) == 1:
+            with session_factory() as session:
+                session.get(RawMessage, prior_id).text = "BTC position was closed"
+                session.commit()
+        return _v2_commentary_payload(summary=f"run-{len(calls)}")
+
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
+        requester,
+    )
+
+    assessment = assess_message_authoritatively(
+        session_factory,
+        raw_message_id=current_id,
+        ai_recognition_config=_configured_v2_ai(),
+        media_root=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert "BTC position remains active" in calls[0]
+    assert "BTC position was closed" in calls[1]
+    assert assessment.mimo.payload["summary"] == "run-2"
+    assert assessment.analysis_input_fingerprint
+    with session_factory() as session:
+        runs = (
+            session.query(MimoRecognitionRun)
+            .filter(MimoRecognitionRun.raw_message_id == current_id)
+            .order_by(MimoRecognitionRun.id.asc())
+            .all()
+        )
+        evidence_count = (
+            session.query(MessageEvidenceVersion)
+            .filter(MessageEvidenceVersion.raw_message_id == current_id)
+            .count()
+        )
+    assert [(run.status, run.became_authoritative) for run in runs] == [
+        ("failed", False),
+        ("completed", True),
+    ]
+    assert runs[1].retry_of_run_id == runs[0].id
+    assert evidence_count == 1
+
+
+def test_v2_retries_after_active_lifecycle_changes(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "mimo-lifecycle-drift.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=941,
+            message_id=20,
+            symbol="ETH",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 8, 11, 1, 0, tzinfo=UTC),
+            entered_at=datetime(2026, 8, 11, 1, 5, tzinfo=UTC),
+            stop_loss=3500,
+        )
+        current = RawMessage(
+            chat_id=941,
+            message_id=21,
+            text="ordinary commentary",
+            posted_at=datetime(2026, 8, 11, 2, 0, tzinfo=UTC),
+        )
+        session.add_all([lifecycle, current])
+        session.commit()
+        lifecycle_id = int(lifecycle.id)
+        current_id = int(current.id)
+    save_trading_settings(
+        session_factory,
+        {
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 0,
+        },
+    )
+    calls = 0
+
+    def requester(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            with session_factory() as session:
+                session.get(StrategyLifecycle, lifecycle_id).stop_loss = 3600
+                session.commit()
+        return _v2_commentary_payload(summary=f"lifecycle-run-{calls}")
+
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
+        requester,
+    )
+
+    assessment = assess_message_authoritatively(
+        session_factory,
+        raw_message_id=current_id,
+        ai_recognition_config=_configured_v2_ai(),
+        media_root=tmp_path,
+    )
+
+    assert calls == 2
+    assert assessment.mimo.payload["summary"] == "lifecycle-run-2"
+
+
+def test_second_joint_input_change_stops_without_candidate_or_claim(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "mimo-second-drift.db")
+    with session_factory() as session:
+        prior = RawMessage(
+            chat_id=942,
+            message_id=30,
+            text="context version 0",
+            posted_at=datetime(2026, 8, 11, 1, 0, tzinfo=UTC),
+        )
+        current = RawMessage(
+            chat_id=942,
+            message_id=31,
+            text="ordinary commentary",
+            posted_at=datetime(2026, 8, 11, 2, 0, tzinfo=UTC),
+        )
+        session.add_all([prior, current])
+        session.commit()
+        prior_id = int(prior.id)
+        current_id = int(current.id)
+    save_trading_settings(
+        session_factory,
+        {
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 0,
+        },
+    )
+    calls = 0
+
+    def requester(**kwargs):
+        nonlocal calls
+        calls += 1
+        with session_factory() as session:
+            session.get(RawMessage, prior_id).text = f"context version {calls}"
+            session.commit()
+        return _v2_commentary_payload(summary=f"stale-run-{calls}")
+
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
+        requester,
+    )
+    auto_trade_calls: list[int] = []
+
+    result = process_authoritative_message(
+        session_factory,
+        raw_message_id=current_id,
+        ai_recognition_config=_configured_v2_ai(),
+        media_root=tmp_path,
+        auto_trade_executor=auto_trade_calls.append,
+    )
+
+    assert calls == 2
+    assert result.automation == {
+        "status": "skipped",
+        "reason": "mimo_input_changed_twice",
+    }
+    assert auto_trade_calls == []
+    with session_factory() as session:
+        runs = (
+            session.query(MimoRecognitionRun)
+            .filter(MimoRecognitionRun.raw_message_id == current_id)
+            .order_by(MimoRecognitionRun.id.asc())
+            .all()
+        )
+        decision = session.query(RecognitionDecision).one()
+        assert session.query(MessageEvidenceVersion).count() == 0
+        assert session.query(SignalCandidate).count() == 0
+    assert [run.status for run in runs] == ["failed", "failed"]
+    assert runs[1].retry_of_run_id == runs[0].id
+    assert decision.comparison_status == "completed"
+    assert decision.comparison_claim_token is None
+
+
+def test_joint_context_change_before_claim_refuses_execution(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "mimo-preclaim-drift.db")
+    with session_factory() as session:
+        prior = RawMessage(
+            chat_id=943,
+            message_id=40,
+            text="stable context",
+            posted_at=datetime(2026, 8, 11, 1, 0, tzinfo=UTC),
+        )
+        current = RawMessage(
+            chat_id=943,
+            message_id=41,
+            text="ordinary commentary",
+            posted_at=datetime(2026, 8, 11, 2, 0, tzinfo=UTC),
+        )
+        session.add_all([prior, current])
+        session.commit()
+        prior_id = int(prior.id)
+        current_id = int(current.id)
+    save_trading_settings(
+        session_factory,
+        {
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 0,
+        },
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
+        lambda **kwargs: _v2_commentary_payload(summary="selected result"),
+    )
+    from telegram_kol_research import authoritative_recognition
+
+    real_fingerprint = getattr(
+        authoritative_recognition,
+        "build_current_mimo_v2_analysis_input_fingerprint",
+        None,
+    )
+
+    def change_context_before_claim(*args, **kwargs):
+        with session_factory() as session:
+            session.get(RawMessage, prior_id).text = "changed before claim"
+            session.commit()
+        if real_fingerprint is None:
+            return "sha256:changed-before-claim"
+        return real_fingerprint(*args, **kwargs)
+
+    monkeypatch.setattr(
+        authoritative_recognition,
+        "build_current_mimo_v2_analysis_input_fingerprint",
+        change_context_before_claim,
+        raising=False,
+    )
+    applied: list[int] = []
+    real_apply = authoritative_recognition.apply_authoritative_assessment
+
+    def track_apply(*args, **kwargs):
+        applied.append(current_id)
+        return real_apply(*args, **kwargs)
+
+    monkeypatch.setattr(
+        authoritative_recognition,
+        "apply_authoritative_assessment",
+        track_apply,
+    )
+    auto_trade_calls: list[int] = []
+
+    result = process_authoritative_message(
+        session_factory,
+        raw_message_id=current_id,
+        ai_recognition_config=_configured_v2_ai(),
+        media_root=tmp_path,
+        auto_trade_executor=auto_trade_calls.append,
+    )
+
+    assert result.automation == {
+        "status": "skipped",
+        "reason": "mimo_input_changed_before_claim",
+    }
+    assert applied == []
+    assert auto_trade_calls == []
+    with session_factory() as session:
+        decision = session.query(RecognitionDecision).one()
+        assert session.query(SignalCandidate).count() == 0
+    assert decision.comparison_status == "completed"
+    assert decision.comparison_claim_token is None
+
+
+def test_v2_evidence_finalization_does_not_create_false_preclaim_drift(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "mimo-self-evidence.db")
+    with session_factory() as session:
+        current = RawMessage(
+            chat_id=944,
+            message_id=51,
+            text="ordinary commentary",
+            posted_at=datetime(2026, 8, 11, 2, 0, tzinfo=UTC),
+        )
+        session.add(current)
+        session.commit()
+        current_id = int(current.id)
+    save_trading_settings(
+        session_factory,
+        {
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 0,
+        },
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
+        lambda **kwargs: _v2_commentary_payload(summary="fresh authority"),
+    )
+
+    result = process_authoritative_message(
+        session_factory,
+        raw_message_id=current_id,
+        ai_recognition_config=_configured_v2_ai(),
+        media_root=tmp_path,
+    )
+
+    assert result.assessment.mimo.payload["summary"] == "fresh authority"
+    assert result.automation == {"status": "skipped", "reason": "mimo_no_action"}
+
+
+def test_v2_reuse_current_evidence_rechecks_original_joint_fingerprint(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "mimo-v2-reuse-safe.db")
+    with session_factory() as session:
+        current = RawMessage(
+            chat_id=945,
+            message_id=61,
+            text="ordinary commentary",
+            posted_at=datetime(2026, 8, 11, 2, 0, tzinfo=UTC),
+        )
+        session.add(current)
+        session.commit()
+        current_id = int(current.id)
+    save_trading_settings(
+        session_factory,
+        {
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 0,
+        },
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
+        lambda **kwargs: _v2_commentary_payload(summary="reusable authority"),
+    )
+    first = assess_message_authoritatively(
+        session_factory,
+        raw_message_id=current_id,
+        ai_recognition_config=_configured_v2_ai(),
+        media_root=tmp_path,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.infer_mimo_authoritative_v2",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("current v2 evidence must be reused")
+        ),
+    )
+
+    result = process_authoritative_message(
+        session_factory,
+        raw_message_id=current_id,
+        ai_recognition_config=_configured_v2_ai(),
+        media_root=tmp_path,
+        reuse_current_evidence=True,
+    )
+
+    assert result.assessment.analysis_input_fingerprint == (
+        first.analysis_input_fingerprint
+    )
+    assert result.automation == {"status": "skipped", "reason": "mimo_no_action"}
 
 
 def test_mimo_v2_current_evidence_reloads_canonical_projection(

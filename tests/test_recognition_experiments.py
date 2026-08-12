@@ -955,6 +955,7 @@ def test_mimo_v2_first_attempt_success_records_selected_attempt_and_prompt(
         assert run.run_kind == "v2_authoritative"
         assert run.selected_attempt_ordinal == 1
         assert run.became_authoritative is True
+        assert run.input_fingerprint == result.analysis_input_fingerprint
         assert result.adapted_result is not None
         assert run.canonical_payload_fingerprint == (
             result.adapted_result.canonical_v2_fingerprint

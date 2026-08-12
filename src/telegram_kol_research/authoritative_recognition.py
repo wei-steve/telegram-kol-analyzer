@@ -79,6 +79,7 @@ from telegram_kol_research.recognition_decisions import (
     RecognitionDecisionRecord,
     claim_authoritative_execution,
     finalize_authoritative_automation_outcome,
+    refuse_authoritative_execution,
     save_pending_authoritative_decision,
     save_terminal_authoritative_decision,
     update_recognition_execution_outcome,
@@ -86,6 +87,7 @@ from telegram_kol_research.recognition_decisions import (
 from telegram_kol_research.recognition_experiments import (
     MimoAuthoritativeResult,
     build_authoritative_context_for_message,
+    build_current_mimo_v2_analysis_input_fingerprint,
     infer_mimo_authoritative_v2,
     run_mimo_authoritative_for_message,
 )
@@ -148,6 +150,8 @@ class AuthoritativeAssessment:
     authoritative_generation: str | None = None
     context_resolution: ContextResolutionDecision | None = None
     context_resolution_triggers: tuple[str, ...] = ()
+    analysis_input_fingerprint: str | None = None
+    safety_stop_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -811,6 +815,8 @@ def assess_message_authoritatively(
     exchange_state_provider=None,
     reuse_current_evidence: bool = False,
 ) -> AuthoritativeAssessment:
+    analysis_input_fingerprint: str | None = None
+    safety_stop_reason: str | None = None
     saved = (
         _load_current_mimo_evidence_result(session_factory, raw_message_id)
         if reuse_current_evidence
@@ -818,6 +824,14 @@ def assess_message_authoritatively(
     )
     if saved is not None:
         mimo, evidence_row = saved
+        if (
+            mimo.contract_version == MIMO_V2_CONTRACT_VERSION
+            and mimo.run_id is not None
+        ):
+            with session_factory() as session:
+                selected_run = session.get(MimoRecognitionRun, int(mimo.run_id))
+                if selected_run is not None:
+                    analysis_input_fingerprint = selected_run.input_fingerprint
     else:
         input_fingerprint = build_current_message_input_fingerprint(
             session_factory,
@@ -845,13 +859,22 @@ def assess_message_authoritatively(
             selected_v2 = None
             terminal_v2_failure = False
             if use_v2:
-                v2 = infer_mimo_authoritative_v2(
-                    session_factory,
-                    raw_message_id=raw_message_id,
-                    config=ai_recognition_config,
-                    media_root=media_root,
-                    context_text=context_text,
-                )
+                prior_run_id: int | None = None
+                for whole_run_ordinal in (1, 2):
+                    v2 = infer_mimo_authoritative_v2(
+                        session_factory,
+                        raw_message_id=raw_message_id,
+                        config=ai_recognition_config,
+                        media_root=media_root,
+                        context_text=None,
+                        retry_of_run_id=prior_run_id,
+                    )
+                    if v2.error_code != "input_changed_during_analysis":
+                        break
+                    if whole_run_ordinal == 2:
+                        safety_stop_reason = "mimo_input_changed_twice"
+                        break
+                    prior_run_id = int(v2.run_id)
                 if v2.succeeded:
                     if v2.parsed_result is None or v2.adapted_result is None:
                         raise RuntimeError(
@@ -862,6 +885,9 @@ def assess_message_authoritatively(
                         outcome="success",
                     )
                     selected_v2 = v2
+                    analysis_input_fingerprint = (
+                        v2.analysis_input_fingerprint
+                    )
                     mimo = MimoAuthoritativeResult(
                         raw_message_id=int(raw_message_id),
                         payload=v2.adapted_result.payload,
@@ -885,13 +911,35 @@ def assess_message_authoritatively(
                         session_factory,
                         error_code=v2.error_code,
                     )
-                    if v2.error_code in MIMO_V2_FALLBACK_ERROR_CODES:
+                    if safety_stop_reason is not None:
+                        terminal_v2_failure = True
+                        mimo = MimoAuthoritativeResult(
+                            raw_message_id=int(raw_message_id),
+                            payload={},
+                            input_kind=v2.input_kind,
+                            model=v2.model,
+                            status="识别失败",
+                            error_message=(
+                                "MiMo v2 joint input changed during both "
+                                "bounded analysis runs"
+                            ),
+                            prompt_versions=dict(v2.prompt_versions),
+                            contract_version=MIMO_V2_CONTRACT_VERSION,
+                            run_id=int(v2.run_id),
+                        )
+                    elif v2.error_code in MIMO_V2_FALLBACK_ERROR_CODES:
+                        fallback_context = (
+                            build_authoritative_context_for_message(
+                                session_factory,
+                                raw_message_id,
+                            )
+                        )
                         mimo = _run_v1_authority_with_audit(
                             session_factory,
                             raw_message_id=raw_message_id,
                             ai_recognition_config=ai_recognition_config,
                             media_root=media_root,
-                            context_text=context_text,
+                            context_text=fallback_context,
                             input_fingerprint=input_fingerprint,
                             run_kind="v1_fallback",
                             retry_of_run_id=int(v2.run_id),
@@ -923,11 +971,15 @@ def assess_message_authoritatively(
                     input_fingerprint=input_fingerprint,
                     run_kind="v1_authoritative",
                 )
-            if build_current_message_input_fingerprint(
-                session_factory,
-                raw_message_id,
-                media_root=media_root,
-            ) != input_fingerprint:
+            if (
+                safety_stop_reason is None
+                and build_current_message_input_fingerprint(
+                    session_factory,
+                    raw_message_id,
+                    media_root=media_root,
+                )
+                != input_fingerprint
+            ):
                 raise RuntimeError(
                     "message input changed during evidence extraction"
                 )
@@ -1090,6 +1142,8 @@ def assess_message_authoritatively(
         ),
         context_resolution=context_decision,
         context_resolution_triggers=context_triggers,
+        analysis_input_fingerprint=analysis_input_fingerprint,
+        safety_stop_reason=safety_stop_reason,
     )
 
 
@@ -1482,6 +1536,60 @@ def process_authoritative_message(
     if assessment.agreement_status != "authoritative_failed":
         if assessment.authoritative_generation is None:
             raise RuntimeError("authoritative execution generation is missing")
+        if assessment.analysis_input_fingerprint is not None:
+            try:
+                current_analysis_fingerprint = (
+                    build_current_mimo_v2_analysis_input_fingerprint(
+                        session_factory,
+                        raw_message_id=raw_message_id,
+                        media_root=media_root,
+                    )
+                )
+            except (LookupError, OSError, ValueError):
+                current_analysis_fingerprint = None
+            if (
+                current_analysis_fingerprint
+                != assessment.analysis_input_fingerprint
+            ):
+                reason = "mimo_input_changed_before_claim"
+                if not refuse_authoritative_execution(
+                    session_factory,
+                    raw_message_id=raw_message_id,
+                    authoritative_generation=(
+                        assessment.authoritative_generation
+                    ),
+                    reason=reason,
+                ):
+                    raise RuntimeError(
+                        "authoritative execution refusal failed for stale generation"
+                    )
+                failed_assessment = replace(
+                    assessment,
+                    mimo=replace(
+                        assessment.mimo,
+                        status="识别失败",
+                        error_message=(
+                            "MiMo v2 joint input changed before execution claim"
+                        ),
+                    ),
+                    agreement_status="authoritative_failed",
+                    differences=[],
+                    semantic_review_status="completed",
+                    authoritative_generation=None,
+                    safety_stop_reason=reason,
+                )
+                return AuthoritativeProcessingResult(
+                    assessment=failed_assessment,
+                    recognition=MessageRecognitionResult(
+                        raw_message_id=int(raw_message_id),
+                        status="识别失败",
+                        summary=None,
+                        reason=reason,
+                        ai_payload=None,
+                        parse_source="mimo_authoritative",
+                    ),
+                    automation={"status": "skipped", "reason": reason},
+                )
         if not claim_authoritative_execution(
             session_factory,
             raw_message_id=raw_message_id,
@@ -1499,7 +1607,12 @@ def process_authoritative_message(
         session_factory,
         raw_message_id=raw_message_id,
     )
-    if barrier.status == "block":
+    if assessment.safety_stop_reason is not None:
+        automation = {
+            "status": "skipped",
+            "reason": assessment.safety_stop_reason,
+        }
+    elif barrier.status == "block":
         automation = {"status": "blocked", "reason": barrier.reason}
     elif barrier.status == "hold":
         automation = {"status": "deferred", "reason": barrier.reason}
