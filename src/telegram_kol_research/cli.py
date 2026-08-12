@@ -1980,6 +1980,79 @@ def mimo_experiment(
     )
 
 
+@app.command("replay-mimo-v2")
+def replay_mimo_v2(
+    database: Path = typer.Option(
+        ...,
+        "--database",
+        help="Existing source SQLite database (opened read-only for backup).",
+    ),
+    message_id_file: Path = typer.Option(
+        ...,
+        "--message-id-file",
+        help="Explicit bounded raw-message ID allowlist.",
+    ),
+    media_root: Path = typer.Option(
+        ...,
+        "--media-root",
+        help="Existing read-only media root for the selected messages.",
+    ),
+    artifact_dir: Path = typer.Option(
+        ...,
+        "--artifact-dir",
+        help="New or empty private directory for redacted artifacts.",
+    ),
+    ai_config_path: Path = typer.Option(
+        ...,
+        "--ai-config-path",
+        help="Explicit AI recognition configuration path.",
+    ),
+    max_messages: int = typer.Option(
+        200,
+        "--max-messages",
+        min=1,
+        max=200,
+        help="Maximum approved messages to replay (hard limit: 200).",
+    ),
+) -> None:
+    """Compare MiMo v1/v2 only inside a disposable database copy."""
+
+    from telegram_kol_research.mimo_v2_replay import (
+        MimoV2ReplayInputError,
+        build_replay_summary,
+        run_mimo_v2_replay,
+        validate_replay_inputs,
+    )
+
+    try:
+        inputs = validate_replay_inputs(
+            source_database=database,
+            message_id_file=message_id_file,
+            media_root=media_root,
+            artifact_dir=artifact_dir,
+            max_messages=max_messages,
+        )
+        result = run_mimo_v2_replay(
+            inputs=inputs,
+            ai_recognition_config_path=ai_config_path,
+        )
+        summary = build_replay_summary(result)
+    except MimoV2ReplayInputError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+
+    typer.echo(
+        json.dumps(
+            summary,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    )
+    if not summary["passed"]:
+        raise typer.Exit(code=1)
+
+
 @app.command()
 def sync(
     config_path: Path = Path("config/groups.yaml"),
