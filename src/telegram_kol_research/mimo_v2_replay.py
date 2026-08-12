@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 import os
 import re
 import sqlite3
 import stat
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 MAX_REPLAY_MESSAGES = 200
@@ -25,6 +30,24 @@ class MimoV2ReplayInputs:
     media_root: Path
     artifact_dir: Path
     raw_message_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayProjectionComparison:
+    status: str
+    reason_code: str
+    v1_fingerprint: str
+    v2_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayPerformanceGate:
+    passed: bool
+    failure_codes: tuple[str, ...]
+    v1_p95_ms: float | None
+    v2_p95_ms: float | None
+    adapter_p95_ms: float | None
+    v2_to_v1_ratio: float | None
 
 
 def load_replay_message_ids(
@@ -144,6 +167,217 @@ def create_read_only_replay_snapshot(
         except OSError:
             pass
         raise MimoV2ReplayInputError("sqlite_online_backup_failed") from exc
+
+
+def compare_execution_projections(
+    v1_payload: Mapping[str, Any],
+    v2_payload: Mapping[str, Any],
+) -> ReplayProjectionComparison:
+    """Compare closed execution semantics without reading prose or evidence."""
+
+    v1_executable = _has_executable_projection(v1_payload)
+    v2_executable = _has_executable_projection(v2_payload)
+    v1_projection = _canonical_execution_projection(
+        v1_payload,
+        executable=v1_executable,
+    )
+    v2_projection = _canonical_execution_projection(
+        v2_payload,
+        executable=v2_executable,
+    )
+    v1_fingerprint = _projection_fingerprint(v1_projection)
+    v2_fingerprint = _projection_fingerprint(v2_projection)
+    if not v1_executable and not v2_executable:
+        return ReplayProjectionComparison(
+            status="safe_match",
+            reason_code="both_non_executable",
+            v1_fingerprint=v1_fingerprint,
+            v2_fingerprint=v2_fingerprint,
+        )
+    if v1_projection == v2_projection:
+        return ReplayProjectionComparison(
+            status="safe_match",
+            reason_code="execution_projections_equal",
+            v1_fingerprint=v1_fingerprint,
+            v2_fingerprint=v2_fingerprint,
+        )
+    return ReplayProjectionComparison(
+        status="unsafe_mismatch",
+        reason_code="execution_projection_mismatch",
+        v1_fingerprint=v1_fingerprint,
+        v2_fingerprint=v2_fingerprint,
+    )
+
+
+def nearest_rank_percentile(
+    samples: Iterable[float],
+    percentile: float,
+) -> float | None:
+    """Return one deterministic nearest-rank percentile for finite timings."""
+
+    if (
+        isinstance(percentile, bool)
+        or not isinstance(percentile, (int, float))
+        or not math.isfinite(float(percentile))
+        or not 0 < float(percentile) <= 1
+    ):
+        raise MimoV2ReplayInputError("percentile_invalid")
+    normalized: list[float] = []
+    for sample in samples:
+        if isinstance(sample, bool):
+            raise MimoV2ReplayInputError("latency_sample_invalid")
+        try:
+            value = float(sample)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise MimoV2ReplayInputError("latency_sample_invalid") from exc
+        if not math.isfinite(value) or value < 0:
+            raise MimoV2ReplayInputError("latency_sample_invalid")
+        normalized.append(value)
+    if not normalized:
+        return None
+    normalized.sort()
+    index = math.ceil(float(percentile) * len(normalized)) - 1
+    return normalized[index]
+
+
+def evaluate_replay_performance(
+    *,
+    v1_duration_ms: Iterable[float],
+    v2_duration_ms: Iterable[float],
+    adapter_duration_ms: Iterable[float],
+) -> ReplayPerformanceGate:
+    """Evaluate the approved adapter and end-to-end P95 gates."""
+
+    v1_samples = tuple(v1_duration_ms)
+    v2_samples = tuple(v2_duration_ms)
+    adapter_samples = tuple(adapter_duration_ms)
+    if not (len(v1_samples) == len(v2_samples) == len(adapter_samples)):
+        raise MimoV2ReplayInputError("latency_samples_misaligned")
+    v1_p95 = nearest_rank_percentile(v1_samples, 0.95)
+    v2_p95 = nearest_rank_percentile(v2_samples, 0.95)
+    adapter_p95 = nearest_rank_percentile(adapter_samples, 0.95)
+    if v1_p95 is None or v2_p95 is None or adapter_p95 is None:
+        return ReplayPerformanceGate(
+            passed=False,
+            failure_codes=("no_comparable_pairs",),
+            v1_p95_ms=None,
+            v2_p95_ms=None,
+            adapter_p95_ms=None,
+            v2_to_v1_ratio=None,
+        )
+    failure_codes: list[str] = []
+    if adapter_p95 >= 50.0:
+        failure_codes.append("adapter_latency_exceeded")
+    v2_limit = v1_p95 * 1.15
+    if v2_p95 > v2_limit and not math.isclose(
+        v2_p95,
+        v2_limit,
+        rel_tol=1e-12,
+        abs_tol=1e-9,
+    ):
+        failure_codes.append("v2_latency_ratio_exceeded")
+    if v1_p95 == 0:
+        ratio = 1.0 if v2_p95 == 0 else None
+    else:
+        ratio = v2_p95 / v1_p95
+    return ReplayPerformanceGate(
+        passed=not failure_codes,
+        failure_codes=tuple(failure_codes),
+        v1_p95_ms=v1_p95,
+        v2_p95_ms=v2_p95,
+        adapter_p95_ms=adapter_p95,
+        v2_to_v1_ratio=ratio,
+    )
+
+
+def _has_executable_projection(payload: Mapping[str, Any]) -> bool:
+    if str(payload.get("recognition_result") or "") == "是策略":
+        return True
+    instructions = payload.get("instructions")
+    if isinstance(instructions, list) and bool(instructions):
+        return True
+    lifecycle = payload.get("lifecycle_event")
+    return bool(
+        isinstance(lifecycle, Mapping)
+        and str(lifecycle.get("event_type") or "none") != "none"
+    )
+
+
+def _canonical_execution_projection(
+    payload: Mapping[str, Any],
+    *,
+    executable: bool,
+) -> dict[str, Any]:
+    if not executable:
+        return {"executable": False}
+    strategy = payload.get("strategy")
+    lifecycle = payload.get("lifecycle_event")
+    instructions = payload.get("instructions")
+    entry_context = payload.get("entry_context")
+    entry_fragments = payload.get("entry_fragments")
+    projection: dict[str, Any] = {
+        "executable": True,
+        "recognition_result": str(payload.get("recognition_result") or ""),
+        "confidence": payload.get("confidence"),
+        "strategy": _plain_projection_value(
+            strategy if isinstance(strategy, Mapping) else {}
+        ),
+        "instructions": [
+            _projection_row(row)
+            for row in instructions
+            if isinstance(row, Mapping)
+        ]
+        if isinstance(instructions, list)
+        else [],
+        "lifecycle_event": _projection_row(lifecycle)
+        if isinstance(lifecycle, Mapping)
+        else {},
+    }
+    if isinstance(entry_context, Mapping):
+        projection["entry_context"] = _projection_row(entry_context)
+    if isinstance(entry_fragments, list):
+        projection["entry_fragments"] = [
+            _projection_row(row)
+            for row in entry_fragments
+            if isinstance(row, Mapping)
+        ]
+    return projection
+
+
+def _projection_row(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        str(key): _plain_projection_value(item)
+        for key, item in value.items()
+        if key not in {"reason", "_exact_context_risk_reduction_authorized"}
+    }
+
+
+def _plain_projection_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _plain_projection_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_plain_projection_value(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise MimoV2ReplayInputError("execution_projection_invalid")
+
+
+def _projection_fingerprint(projection: Mapping[str, Any]) -> str:
+    try:
+        canonical = json.dumps(
+            projection,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise MimoV2ReplayInputError("execution_projection_invalid") from exc
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
 
 
 def _validated_regular_file(path: str | Path, *, reason: str) -> Path:
