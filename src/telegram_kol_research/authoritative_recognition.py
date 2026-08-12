@@ -899,6 +899,7 @@ def assess_message_authoritatively(
                     error_message=mimo.error_message,
                     media_root=media_root,
                     mimo_recognition_run_id=mimo.run_id,
+                    expected_contract_version=mimo.contract_version,
                 )
             if evidence_row is None:
                 raise RuntimeError(

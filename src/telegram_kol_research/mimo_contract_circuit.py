@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from sqlalchemy import text
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import MimoContractCircuitState
@@ -60,6 +61,10 @@ def record_mimo_v2_outcome(
         raise ValueError("mimo_v2_outcome_invalid")
     now = _as_utc(observed_at or datetime.now(UTC))
     with session_factory() as session:
+        # SQLite does not provide row-level locks. Acquire the write lock before
+        # reading the singleton so concurrent recognizers cannot lose failure
+        # increments or race while creating the initial row.
+        session.execute(text("BEGIN IMMEDIATE"))
         row = session.get(MimoContractCircuitState, _SINGLETON_ID)
         if row is None:
             row = MimoContractCircuitState(id=_SINGLETON_ID)

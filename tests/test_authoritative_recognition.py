@@ -2556,6 +2556,76 @@ def test_mimo_v2_contract_failure_falls_back_once_before_execution_claim(
     )
 
 
+@pytest.mark.parametrize(
+    "error_code",
+    ["image_unavailable", "input_changed_during_analysis"],
+)
+def test_mimo_v2_nonfallback_failure_is_persisted_without_v1_run_link_error(
+    tmp_path,
+    monkeypatch,
+    error_code,
+):
+    session_factory = create_session_factory(
+        tmp_path / f"mimo-nonfallback-{error_code}.db"
+    )
+    with session_factory() as session:
+        raw = RawMessage(chat_id=921, message_id=1, text="ordinary commentary")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    save_trading_settings(
+        session_factory,
+        {
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 0,
+        },
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.infer_mimo_authoritative_v2",
+        lambda *args, **kwargs: _failed_v2_inference(
+            session_factory,
+            raw_id,
+            error_code=error_code,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("non-fallback v2 failure must not invoke v1")
+        ),
+    )
+
+    result = process_authoritative_message(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+    )
+
+    assert result.assessment.agreement_status == "authoritative_failed"
+    assert result.assessment.mimo.contract_version == "mimo-authoritative-v2"
+    assert result.assessment.mimo.error_message == "invalid"
+    assert result.automation == {
+        "status": "skipped",
+        "reason": "mimo_authoritative_failed",
+    }
+    with session_factory() as session:
+        evidence = (
+            session.query(MessageEvidenceVersion)
+            .filter(MessageEvidenceVersion.raw_message_id == raw_id)
+            .one()
+        )
+        linked_run = session.get(
+            MimoRecognitionRun,
+            evidence.mimo_recognition_run_id,
+        )
+    assert evidence.extraction_status == "failed"
+    assert linked_run is not None
+    assert linked_run.contract_version == "mimo-authoritative-v2"
+    assert linked_run.status == "failed"
+
+
 def test_open_mimo_v2_circuit_routes_later_message_to_v1(tmp_path, monkeypatch):
     session_factory = create_session_factory(tmp_path / "mimo-circuit-route.db")
     with session_factory() as session:

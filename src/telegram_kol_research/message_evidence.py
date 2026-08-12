@@ -801,6 +801,7 @@ def finalize_claimed_mimo_message_evidence(
     error_message: str | None,
     media_root: str | Path,
     mimo_recognition_run_id: int | None = None,
+    expected_contract_version: str = "v1",
 ) -> MessageEvidenceVersion | None:
     """Atomically validate the input/claim and persist one MiMo result."""
 
@@ -831,11 +832,11 @@ def finalize_claimed_mimo_message_evidence(
             if (
                 run is None
                 or int(run.raw_message_id) != int(raw_message_id)
-                or str(run.contract_version) != "v1"
+                or str(run.contract_version) != str(expected_contract_version)
                 or str(run.status) not in {"completed", "failed"}
             ):
                 session.rollback()
-                raise ValueError("mimo_v1_run_link_invalid")
+                raise ValueError("mimo_run_link_invalid")
         media_assets = (
             session.query(MediaAsset)
             .filter(MediaAsset.raw_message_id == int(raw_message_id))

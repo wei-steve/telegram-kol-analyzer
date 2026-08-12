@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from threading import Barrier
 
 import pytest
 
@@ -95,3 +97,21 @@ def test_unknown_circuit_outcome_is_rejected(tmp_path):
 
     with pytest.raises(ValueError, match="mimo_v2_outcome_invalid"):
         record_mimo_v2_outcome(factory, outcome="unknown")
+
+
+def test_concurrent_transport_failures_are_counted_atomically(tmp_path):
+    factory = create_session_factory(tmp_path / "concurrent.db")
+    worker_count = 8
+    barrier = Barrier(worker_count)
+
+    def record_failure(_):
+        barrier.wait()
+        return record_mimo_v2_outcome(factory, outcome="provider_timeout")
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        list(executor.map(record_failure, range(worker_count)))
+
+    state = load_mimo_contract_circuit(factory)
+    assert state.consecutive_transport_failures == worker_count
+    assert state.is_open is True
+    assert state.opened_reason == "consecutive_transport_failures"
