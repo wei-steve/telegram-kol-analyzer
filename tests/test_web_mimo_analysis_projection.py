@@ -5,6 +5,7 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     MediaAsset,
     MessageEvidenceVersion,
+    MessageRecognition,
     MimoRecognitionAttempt,
     MimoRecognitionRun,
     RawMessage,
@@ -398,3 +399,38 @@ def test_web_projection_labels_history_without_inventing_v2_intents(tmp_path):
         "per_image_evidence_recorded": False,
     }
     assert analysis["legacy_image_evidence"] == {"fields": {"symbol": "ETH"}}
+
+
+def test_web_projection_keeps_pre_evidence_mimo_history_visible(tmp_path):
+    factory = create_session_factory(tmp_path / "pre-evidence-history.db")
+    with factory() as session:
+        raw = RawMessage(chat_id=88, message_id=36, text="ETH long")
+        session.add(raw)
+        session.flush()
+        session.add(
+            MessageRecognition(
+                raw_message_id=raw.id,
+                status="非策略",
+                reason="这是已有仓位的更新。",
+                summary="ETH 多单持仓更新",
+                engine="mimo-v2.5",
+            )
+        )
+        _add_decision(session, raw, status="skipped", reason="not_actionable")
+        session.commit()
+
+    analysis = load_group_messages(factory, chat_id=88, limit=10)[0]["mimo_analysis"]
+
+    assert analysis["format"] == "historical_v1"
+    assert analysis["history_label"] == "MiMo 历史结果 · v1格式"
+    assert analysis["summary"] == "ETH 多单持仓更新"
+    assert analysis["intents"] == []
+    assert analysis["legacy_result"] == {
+        "status": "非策略",
+        "reason": "这是已有仓位的更新。",
+        "model": "mimo-v2.5",
+    }
+    assert analysis["detail_flags"] == {
+        "attempts_recorded": False,
+        "per_image_evidence_recorded": False,
+    }

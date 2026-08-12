@@ -808,6 +808,8 @@ def _serialize_raw_messages(
         semantic_review = _serialize_semantic_review(decision)
         message_evidence = evidence_by_msg_id.get(raw_message.id)
         mimo_analysis = _serialize_mimo_analysis(
+            recognition=rec_by_msg_id.get(raw_message.id),
+            decision=decision,
             evidence=message_evidence,
             runs=mimo_runs_by_msg_id.get(raw_message.id, []),
             attempts_by_run_id=mimo_attempts_by_run_id,
@@ -903,6 +905,8 @@ def _serialize_raw_messages(
 
 def _serialize_mimo_analysis(
     *,
+    recognition: MessageRecognition | None,
+    decision: RecognitionDecision | None,
     evidence: MessageEvidenceVersion | None,
     runs: list[MimoRecognitionRun],
     attempts_by_run_id: dict[int, list[MimoRecognitionAttempt]],
@@ -910,8 +914,13 @@ def _serialize_mimo_analysis(
 ) -> dict[str, object] | None:
     """Serialize stored MiMo facts without reinterpreting source prose."""
 
-    if evidence is None and not runs:
+    if evidence is None and not runs and recognition is None and decision is None:
         return None
+    legacy_payload = (
+        _safe_json_dict(decision.authoritative_payload_json)
+        if decision is not None
+        else {}
+    )
     normalized = (
         _safe_json_dict(evidence.normalized_evidence_json)
         if evidence is not None
@@ -986,8 +995,14 @@ def _serialize_mimo_analysis(
         "format": "v2" if is_v2 else "historical_v1",
         "history_label": None if is_v2 else "MiMo 历史结果 · v1格式",
         "runtime": runtime,
-        "summary": normalized.get("summary") or normalized.get("reason"),
-        "confidence": normalized.get("confidence"),
+        "summary": (
+            normalized.get("summary")
+            or normalized.get("reason")
+            or (recognition.summary if recognition is not None else None)
+            or legacy_payload.get("summary")
+            or legacy_payload.get("reason")
+        ),
+        "confidence": normalized.get("confidence") or legacy_payload.get("confidence"),
         "intents": [
             _serialize_mimo_intent(item)
             for item in raw_intents
@@ -1007,6 +1022,26 @@ def _serialize_mimo_analysis(
             "attempts_recorded": attempts_recorded,
             "per_image_evidence_recorded": per_image_recorded,
         },
+        "legacy_result": (
+            {
+                "status": (
+                    decision.authoritative_status
+                    if decision is not None
+                    else recognition.status if recognition is not None else None
+                ),
+                "reason": (
+                    legacy_payload.get("reason")
+                    or (recognition.reason if recognition is not None else None)
+                ),
+                "model": (
+                    decision.authoritative_model
+                    if decision is not None
+                    else recognition.engine if recognition is not None else None
+                ),
+            }
+            if not is_v2
+            else None
+        ),
         "legacy_image_evidence": image_evidence if not is_v2 else None,
     }
 
