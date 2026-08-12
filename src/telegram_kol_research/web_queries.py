@@ -19,6 +19,8 @@ from telegram_kol_research.models import (
     MediaAsset,
     MessageRecognition,
     MessageEvidenceVersion,
+    MimoRecognitionAttempt,
+    MimoRecognitionRun,
     RawMessage,
     RecognitionDecision,
     PositionAttributionAudit,
@@ -35,6 +37,7 @@ from telegram_kol_research.models import (
     TriggerProtectionStopRescue,
     utc_now,
 )
+from telegram_kol_research.mimo_v2_contract import parse_mimo_v2_payload
 from telegram_kol_research.time_utils import normalize_to_utc_naive, utc_naive_to_local
 from telegram_kol_research.reporting import (
     format_entry_assembly_summary,
@@ -56,6 +59,49 @@ STRATEGY_TIME_DISPLAY_FIELDS = (
     "latest_event_at",
 )
 MAX_MEDIA_ASSETS_PER_MESSAGE = 3
+
+MIMO_INTENT_LABELS = {
+    "new_strategy": "新策略",
+    "entry_confirmation": "入场确认",
+    "position_management": "仓位管理",
+    "exit": "退出仓位",
+    "cancel_entry": "取消入场",
+    "strategy_revision": "修改策略",
+    "entry_context": "入场上下文",
+    "position_report": "仓位报告",
+    "market_commentary": "市场评论",
+    "non_trading": "非交易信息",
+    "unclear": "意图不明",
+}
+MIMO_ACTION_LABELS = {
+    "entry": "新建入场",
+    "confirm_entry": "确认入场",
+    "entry_fragment": "入场片段",
+    "cancel_pending_entry": "取消待入场委托",
+    "replace_entry": "替换入场计划",
+    "full_exit": "全部退出",
+    "partial_exit": "部分退出",
+    "partial_take_profit": "分批止盈",
+    "move_stop_to_protect": "移动止损保护",
+    "hold_update": "继续持有更新",
+    "risk_update": "风险参数更新",
+}
+MIMO_IMAGE_TYPE_LABELS = {
+    "strategy_screenshot": "策略截图",
+    "position_screenshot": "持仓截图",
+    "order_screenshot": "委托截图",
+    "market_chart": "市场图表",
+    "profit_review": "盈亏复盘",
+    "advertisement": "广告",
+    "unrelated": "无关图片",
+    "unknown": "未知图片",
+}
+MIMO_IMAGE_QUALITY_LABELS = {
+    "clear": "清晰",
+    "blurry": "模糊",
+    "cropped": "已裁剪",
+    "unreadable": "无法读取",
+}
 
 
 def load_runtime_agent_metrics(
@@ -641,6 +687,53 @@ def _serialize_raw_messages(
         .all()
     )
     evidence_by_msg_id = {row.raw_message_id: row for row in evidence_rows}
+    mimo_runs = (
+        session.query(MimoRecognitionRun)
+        .filter(MimoRecognitionRun.raw_message_id.in_(raw_message_ids))
+        .order_by(
+            MimoRecognitionRun.raw_message_id.asc(),
+            MimoRecognitionRun.id.asc(),
+        )
+        .all()
+    )
+    mimo_runs_by_msg_id: dict[int, list[MimoRecognitionRun]] = {}
+    for run in mimo_runs:
+        mimo_runs_by_msg_id.setdefault(run.raw_message_id, []).append(run)
+    mimo_run_ids = [int(run.id) for run in mimo_runs]
+    mimo_attempts = (
+        session.query(MimoRecognitionAttempt)
+        .filter(MimoRecognitionAttempt.run_id.in_(mimo_run_ids))
+        .order_by(
+            MimoRecognitionAttempt.run_id.asc(),
+            MimoRecognitionAttempt.ordinal.asc(),
+        )
+        .all()
+        if mimo_run_ids
+        else []
+    )
+    mimo_attempts_by_run_id: dict[int, list[MimoRecognitionAttempt]] = {}
+    for attempt in mimo_attempts:
+        mimo_attempts_by_run_id.setdefault(attempt.run_id, []).append(attempt)
+    evidence_asset_ids: set[int] = set()
+    for evidence in evidence_rows:
+        image_evidence = _safe_json_dict(evidence.image_evidence_json)
+        images = image_evidence.get("images")
+        if not isinstance(images, list):
+            continue
+        for image in images:
+            asset_id = image.get("asset_id") if isinstance(image, dict) else None
+            if isinstance(asset_id, int) and not isinstance(asset_id, bool):
+                evidence_asset_ids.add(asset_id)
+    evidence_media_by_id = {
+        int(media.id): media
+        for media in (
+            session.query(MediaAsset)
+            .filter(MediaAsset.id.in_(evidence_asset_ids))
+            .all()
+            if evidence_asset_ids
+            else []
+        )
+    }
     context_links = (
         session.query(StrategyMessageLink, StrategyThread)
         .join(StrategyThread, StrategyThread.id == StrategyMessageLink.strategy_thread_id)
@@ -713,6 +806,16 @@ def _serialize_raw_messages(
         )
         decision = decisions_by_msg_id.get(raw_message.id)
         semantic_review = _serialize_semantic_review(decision)
+        message_evidence = evidence_by_msg_id.get(raw_message.id)
+        mimo_analysis = _serialize_mimo_analysis(
+            raw_message=raw_message,
+            recognition=rec_by_msg_id.get(raw_message.id),
+            decision=decision,
+            evidence=message_evidence,
+            runs=mimo_runs_by_msg_id.get(raw_message.id, []),
+            attempts_by_run_id=mimo_attempts_by_run_id,
+            media_by_id=evidence_media_by_id,
+        )
         matching_bindings = bindings_by_message_key.get(
             (int(raw_message.chat_id), int(raw_message.message_id)), []
         )
@@ -761,6 +864,13 @@ def _serialize_raw_messages(
                     candidate=selected_candidate,
                     media_assets=media_assets,
                 ),
+                "mimo_analysis": mimo_analysis,
+                "system_acceptance": _serialize_system_acceptance(
+                    recognition=rec_by_msg_id.get(raw_message.id),
+                    decision=decision,
+                    candidates=candidates_by_msg_id.get(raw_message.id, []),
+                    mimo_analysis=mimo_analysis,
+                ),
                 "semantic_review": semantic_review,
                 "execution_outcome": _serialize_execution_outcome(
                     decision,
@@ -793,6 +903,361 @@ def _serialize_raw_messages(
         )
 
     return rows
+
+
+def _serialize_mimo_analysis(
+    *,
+    raw_message: RawMessage,
+    recognition: MessageRecognition | None,
+    decision: RecognitionDecision | None,
+    evidence: MessageEvidenceVersion | None,
+    runs: list[MimoRecognitionRun],
+    attempts_by_run_id: dict[int, list[MimoRecognitionAttempt]],
+    media_by_id: dict[int, MediaAsset],
+) -> dict[str, object] | None:
+    """Serialize stored MiMo facts without reinterpreting source prose."""
+
+    if evidence is None and not runs:
+        return None
+    normalized = (
+        _safe_json_dict(evidence.normalized_evidence_json)
+        if evidence is not None
+        else {}
+    )
+    text_evidence = (
+        _safe_json_dict(evidence.text_evidence_json)
+        if evidence is not None
+        else {}
+    )
+    image_evidence = (
+        _safe_json_dict(evidence.image_evidence_json)
+        if evidence is not None
+        else {}
+    )
+    contract_version = str(normalized.get("contract_version") or "")
+    linked_run = None
+    if evidence is not None and evidence.mimo_recognition_run_id is not None:
+        linked_run = next(
+            (
+                run
+                for run in runs
+                if int(run.id) == int(evidence.mimo_recognition_run_id)
+            ),
+            None,
+        )
+    if linked_run is None:
+        linked_run = next(
+            (run for run in reversed(runs) if run.became_authoritative),
+            runs[-1] if runs else None,
+        )
+    runtime = _serialize_mimo_runtime(
+        run=linked_run,
+        runs=runs,
+        attempts=(
+            attempts_by_run_id.get(int(linked_run.id), [])
+            if linked_run is not None
+            else []
+        ),
+    )
+    raw_images = image_evidence.get("images")
+    raw_images = raw_images if isinstance(raw_images, list) else []
+    images = [
+        _serialize_mimo_image(item, media_by_id=media_by_id)
+        for item in raw_images
+        if isinstance(item, dict)
+    ]
+    is_v2 = contract_version == "mimo-authoritative-v2" or (
+        evidence is None
+        and linked_run is not None
+        and linked_run.contract_version == "mimo-authoritative-v2"
+    )
+    raw_intents = normalized.get("intents") if is_v2 else []
+    raw_intents = raw_intents if isinstance(raw_intents, list) else []
+    projection = _serialize_mimo_projection(
+        is_v2=is_v2,
+        evidence=evidence,
+        normalized=normalized,
+        text_evidence=text_evidence,
+        image_evidence=image_evidence,
+    )
+    attempts_recorded = any(attempts_by_run_id.get(int(run.id), []) for run in runs)
+    per_image_recorded = bool(
+        raw_images
+        and all(
+            isinstance(item, dict)
+            and bool(str(item.get("summary") or "").strip())
+            for item in raw_images
+        )
+    )
+    return {
+        "format": "v2" if is_v2 else "historical_v1",
+        "history_label": None if is_v2 else "MiMo 历史结果 · v1格式",
+        "runtime": runtime,
+        "summary": normalized.get("summary") or normalized.get("reason"),
+        "confidence": normalized.get("confidence"),
+        "intents": [
+            _serialize_mimo_intent(item)
+            for item in raw_intents
+            if isinstance(item, dict)
+        ],
+        "evidence": {
+            "text": text_evidence,
+            "images": images,
+            "conflicts": (
+                image_evidence.get("conflicts")
+                if isinstance(image_evidence.get("conflicts"), list)
+                else []
+            ),
+        },
+        "projection": projection,
+        "detail_flags": {
+            "attempts_recorded": attempts_recorded,
+            "per_image_evidence_recorded": per_image_recorded,
+        },
+        "legacy_image_evidence": image_evidence if not is_v2 else None,
+    }
+
+
+def _serialize_mimo_projection(
+    *,
+    is_v2: bool,
+    evidence: MessageEvidenceVersion | None,
+    normalized: dict[str, object],
+    text_evidence: dict[str, object],
+    image_evidence: dict[str, object],
+) -> dict[str, object]:
+    if not is_v2:
+        return {"status": "historical", "reason_code": None}
+    if evidence is None:
+        return {
+            "status": "not_available",
+            "reason_code": "canonical_result_not_persisted",
+        }
+    canonical = {
+        "contract_version": "mimo-authoritative-v2",
+        "summary": normalized.get("summary"),
+        "confidence": normalized.get("confidence"),
+        "intents": normalized.get("intents"),
+        "evidence": {
+            "text": text_evidence,
+            "images": image_evidence.get("images") or [],
+            "conflicts": image_evidence.get("conflicts") or [],
+        },
+    }
+    try:
+        parse_mimo_v2_payload(canonical)
+    except ValueError:
+        return {
+            "status": "failed",
+            "reason_code": "stored_v2_contract_invalid",
+        }
+    return {"status": "completed", "reason_code": None}
+
+
+def _serialize_mimo_runtime(
+    *,
+    run: MimoRecognitionRun | None,
+    runs: list[MimoRecognitionRun],
+    attempts: list[MimoRecognitionAttempt],
+) -> dict[str, object] | None:
+    if run is None:
+        return None
+    prior_by_id = {int(item.id): item for item in runs}
+    whole_run_retry_count = 0
+    prior = prior_by_id.get(int(run.retry_of_run_id or 0))
+    while prior is not None:
+        whole_run_retry_count += 1
+        prior = prior_by_id.get(int(prior.retry_of_run_id or 0))
+    fallback_from = None
+    fallback_source = None
+    if run.run_kind == "v1_fallback" and run.retry_of_run_id is not None:
+        previous = prior_by_id.get(int(run.retry_of_run_id))
+        fallback_from = previous.contract_version if previous is not None else None
+        if previous is not None:
+            fallback_source = {
+                "contract_version": previous.contract_version,
+                "error_code": previous.final_error_code,
+                "error_message": previous.final_error_message,
+            }
+    if run.status == "failed":
+        status = "failed"
+        status_label = "MiMo识别失败"
+    elif run.run_kind == "v1_fallback":
+        status = "fallback"
+        status_label = "MiMo v2失败，已使用v1结果"
+    else:
+        status = "completed"
+        status_label = "MiMo识别成功"
+    duration_ms = None
+    if run.completed_at is not None and run.started_at is not None:
+        duration_ms = max(
+            0,
+            round((run.completed_at - run.started_at).total_seconds() * 1000),
+        )
+    return {
+        "status": status,
+        "status_label": status_label,
+        "model": run.model,
+        "contract_version": run.contract_version,
+        "input_kind": run.input_kind,
+        "attempt_count": int(run.attempt_count),
+        "provider_retry_count": max(0, len(attempts) - 1),
+        "whole_run_retry_count": whole_run_retry_count,
+        "duration_ms": duration_ms,
+        "attempts": [
+            {
+                "ordinal": int(attempt.ordinal),
+                "status": attempt.status,
+                "duration_ms": int(attempt.duration_ms),
+                "error_code": attempt.error_code,
+                "error_message": attempt.error_message,
+                "selected": int(attempt.ordinal)
+                == int(run.selected_attempt_ordinal or 0),
+            }
+            for attempt in attempts
+        ],
+        "retry_count": whole_run_retry_count,
+        "final_error_code": run.final_error_code,
+        "final_error_message": run.final_error_message,
+        "error_code": run.final_error_code,
+        "error_message": run.final_error_message,
+        "became_authoritative": bool(run.became_authoritative),
+        "fallback_from": fallback_from,
+        "fallback_source": fallback_source,
+    }
+
+
+def _serialize_mimo_intent(intent: dict[str, object]) -> dict[str, object]:
+    intent_type = str(intent.get("intent_type") or "unclear")
+    action = intent.get("action")
+    action = action if isinstance(action, dict) else None
+    action_kind = str(action.get("kind") or "") if action is not None else None
+    target = action.get("target") if action is not None else None
+    action_payload = (
+        {
+            "kind": action_kind,
+            "action_label": MIMO_ACTION_LABELS.get(action_kind, action_kind),
+            "target": target if isinstance(target, dict) else {},
+            "strategy": (
+                action.get("strategy")
+                if isinstance(action.get("strategy"), dict)
+                else None
+            ),
+            "parameters": (
+                action.get("parameters")
+                if isinstance(action.get("parameters"), dict)
+                else {}
+            ),
+        }
+        if action is not None and action_kind
+        else None
+    )
+    return {
+        "intent_type": intent_type,
+        "intent_label": MIMO_INTENT_LABELS.get(intent_type, intent_type),
+        "action": action_payload,
+        "action_kind": action_kind,
+        "action_label": (
+            MIMO_ACTION_LABELS.get(action_kind, action_kind)
+            if action_kind
+            else None
+        ),
+        "target": target if isinstance(target, dict) else {},
+        "strategy": (
+            action.get("strategy")
+            if action is not None and isinstance(action.get("strategy"), dict)
+            else None
+        ),
+        "parameters": (
+            action.get("parameters")
+            if action is not None and isinstance(action.get("parameters"), dict)
+            else {}
+        ),
+        "confidence": intent.get("confidence"),
+        "reason": intent.get("reason"),
+        "evidence_refs": (
+            intent.get("evidence_refs")
+            if isinstance(intent.get("evidence_refs"), list)
+            else []
+        ),
+    }
+
+
+def _serialize_mimo_image(
+    image: dict[str, object],
+    *,
+    media_by_id: dict[int, MediaAsset],
+) -> dict[str, object]:
+    try:
+        asset_id = int(image.get("asset_id"))
+    except (TypeError, ValueError):
+        asset_id = 0
+    media = media_by_id.get(asset_id)
+    return {
+        "asset_id": asset_id or None,
+        "image_type": image.get("image_type"),
+        "quality": image.get("quality"),
+        "observed_text": image.get("observed_text"),
+        "summary": image.get("summary"),
+        "fields": image.get("fields") if isinstance(image.get("fields"), dict) else {},
+        "confidence": image.get("confidence"),
+        "media": (
+            {
+                "id": int(media.id),
+                "kind": media.kind,
+                "mime_type": media.mime_type,
+                "local_path": media.local_path,
+            }
+            if media is not None
+            else None
+        ),
+        "raw_evidence": dict(image),
+    }
+
+
+def _serialize_system_acceptance(
+    *,
+    recognition: MessageRecognition | None,
+    decision: RecognitionDecision | None,
+    candidates: list[SignalCandidate],
+    mimo_analysis: dict[str, object] | None,
+) -> dict[str, object] | None:
+    if decision is None and recognition is None:
+        return None
+    accepted = [
+        candidate
+        for candidate in candidates
+        if candidate.parse_source == "mimo_authoritative"
+    ]
+    automation_status = decision.automation_status if decision is not None else None
+    reason_code = decision.automation_reason if decision is not None else None
+    authoritative_status = (
+        decision.authoritative_status
+        if decision is not None
+        else recognition.status if recognition is not None else None
+    )
+    if authoritative_status == "识别失败" or automation_status in {
+        "failed",
+        "error",
+        "blocked",
+        "partial_failed",
+        "recovery_required",
+    }:
+        status = "failed"
+        status_label = "系统未安全接纳"
+    elif accepted:
+        status = "accepted"
+        status_label = "系统已接纳"
+    else:
+        status = "not_accepted"
+        status_label = "系统未接纳可执行动作"
+    return {
+        "status": status,
+        "status_label": status_label,
+        "reason_code": reason_code,
+        "accepted_candidate_count": len(accepted),
+        "automation_status": automation_status,
+    }
 
 
 def _serialize_context_resolution(
