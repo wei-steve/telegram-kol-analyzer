@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import text
+from sqlalchemy.orm import Session, sessionmaker
 
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
@@ -223,10 +225,17 @@ def save_trading_settings(
     payload: dict[str, Any],
     *,
     updated_at: datetime | None = None,
+    locked_validator: Callable[
+        [Session, TradingSettings, TradingSettings],
+        None,
+    ]
+    | None = None,
 ) -> TradingSettings:
     """Validate and persist global trading settings."""
 
     with session_factory() as session:
+        if locked_validator is not None:
+            session.execute(text("BEGIN IMMEDIATE"))
         row = (
             session.query(TradingSetting)
             .filter(TradingSetting.key == TRADING_SETTINGS_KEY)
@@ -242,6 +251,14 @@ def save_trading_settings(
                 persisted_payload = parsed_persisted
         merged_payload = {**persisted_payload, **payload}
         settings = trading_settings_from_payload(merged_payload)
+        try:
+            current_settings = trading_settings_from_payload(
+                persisted_payload
+            )
+        except ValueError:
+            current_settings = TradingSettings()
+        if locked_validator is not None:
+            locked_validator(session, current_settings, settings)
         prior_revision_mode = str(
             persisted_payload.get("entry_revision_v2_mode") or "disabled"
         )

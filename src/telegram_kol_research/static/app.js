@@ -3249,6 +3249,11 @@ function bindTradingSettingsForm() {
   }
   initTradingSymbolSelector(form);
   const status = form.querySelector('[data-trading-settings-save-status]');
+  const mimoModeSelect = form.querySelector('[name="mimo_contract_mode"]');
+  const mimoWatermarkInput = form.querySelector(
+    '[name="mimo_v2_activation_after_raw_message_id"]',
+  );
+  const mimoRollbackButton = form.querySelector('[data-mimo-v2-rollback]');
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     const formData = new FormData(form);
@@ -3290,6 +3295,10 @@ function bindTradingSettingsForm() {
       entry_preamble_mode: String(formData.get('entry_preamble_mode') || 'disabled'),
       entry_message_assembly_v2_mode: String(formData.get('entry_message_assembly_v2_mode') || 'disabled'),
       entry_revision_v2_mode: String(formData.get('entry_revision_v2_mode') || 'disabled'),
+      mimo_contract_mode: String(formData.get('mimo_contract_mode') || 'v1'),
+      mimo_v2_activation_after_raw_message_id: Number(
+        formData.get('mimo_v2_activation_after_raw_message_id') || 0,
+      ),
       default_max_loss_usdt: numericValue('default_max_loss_usdt', 20),
       daily_max_loss_usdt: numericValue('daily_max_loss_usdt', 500),
       max_concurrent_positions: numericValue('max_concurrent_positions', 4),
@@ -3321,6 +3330,17 @@ function bindTradingSettingsForm() {
       if (status) {
         status.textContent = `已保存，默认单笔最大亏损 ${result.default_max_loss_usdt} USDT`;
       }
+      if (mimoModeSelect) {
+        mimoModeSelect.value = result.mimo_contract_mode;
+      }
+      if (mimoWatermarkInput) {
+        mimoWatermarkInput.value = String(
+          result.mimo_v2_activation_after_raw_message_id,
+        );
+      }
+      if (mimoRollbackButton) {
+        mimoRollbackButton.disabled = result.mimo_contract_mode === 'v1';
+      }
     } catch {
       if (status) {
         status.textContent = '保存失败，请检查服务状态';
@@ -3332,6 +3352,47 @@ function bindTradingSettingsForm() {
       }
     }
   });
+  if (mimoRollbackButton) {
+    mimoRollbackButton.addEventListener('click', async () => {
+      const confirmed = window.confirm(
+        '仅将自然到达的未来消息回退到 v1；历史 MiMo 结果、交易和审计记录都会保留。确认继续？',
+      );
+      if (!confirmed) {
+        return;
+      }
+      mimoRollbackButton.disabled = true;
+      if (status) {
+        status.textContent = '正在回退未来消息...';
+        status.classList.remove('is-error');
+      }
+      try {
+        const response = await fetch('/api/trading-settings/mimo-rollback', {
+          method: 'POST',
+        });
+        const result = await response.json();
+        if (!response.ok) {
+          throw new Error(result.detail || '回退失败');
+        }
+        if (mimoModeSelect) {
+          mimoModeSelect.value = result.mimo_contract_mode;
+        }
+        if (mimoWatermarkInput) {
+          mimoWatermarkInput.value = String(
+            result.mimo_v2_activation_after_raw_message_id,
+          );
+        }
+        if (status) {
+          status.textContent = '已将未来消息回退到 v1；历史记录未变更';
+        }
+      } catch (error) {
+        mimoRollbackButton.disabled = false;
+        if (status) {
+          status.textContent = error.message || '回退失败，请检查服务状态';
+          status.classList.add('is-error');
+        }
+      }
+    });
+  }
 }
 
 function bindAiRecognitionPromptForm() {

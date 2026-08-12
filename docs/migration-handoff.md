@@ -830,6 +830,31 @@ mode to `disabled` and leaves confirmed exchange orders, ledger rows, recovery
 records, and incident history intact. Never delete them to make rollback appear
 clean.
 
+## MiMo v2 contract rollout handoff
+
+The canonical MiMo v2 contract, compatibility adapter, durable attempt/evidence
+audit, truthful Web analysis card, isolated replay command, and operator
+controls are implemented on `codex/mimo-v2-safe-rebuild`. Production remains
+`mimo_contract_mode=v1` until the reviewed branch is deployed dormant and the
+server-only isolated replay passes every semantic, validation, redaction, and
+performance gate.
+
+There is no production Shadow dual-call mode. The Web exposes only `v1` and
+`v2_live_adapter`, the current maximum raw-message ID, the explicit future
+watermark, and durable circuit status. Enabling from v1 requires a submitted
+watermark at least as high as the current maximum `raw_messages.id`; this keeps
+all already stored messages on their existing authority. A dedicated rollback
+endpoint sets only the mode back to v1 and retains the watermark, circuit,
+runs, attempts, evidence, candidates, instructions, lifecycle, and exchange
+history.
+
+The exact local gates, server replay command, safe-window checks, activation
+payload, first-future-message audit queries, fallback rules, and rollback
+procedure are in `docs/runbook.md` under “MiMo v2 隔离验证、未来启用与回滚”.
+Server deployment, corpus selection, replay, and any live activation remain
+pending. Live activation requires a separate explicit approval after the
+deployed v1 service is healthy and the isolated replay artifact is reviewed.
+
 ## Multi-instruction recognition handoff
 
 Authoritative recognition now has a bounded per-action `instructions` contract.

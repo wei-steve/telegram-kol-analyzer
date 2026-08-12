@@ -384,6 +384,44 @@
               <option value="live" {% if trading_settings.entry_revision_v2_mode == 'live' %}selected{% endif %}>实盘：精确撤单与重建</option>
             </select>
           </label>
+          <label>
+            MiMo 结构化合约模式
+            <select name="mimo_contract_mode">
+              <option value="v1" {% if trading_settings.mimo_contract_mode == 'v1' %}selected{% endif %}>v1：当前生产兼容路径</option>
+              <option value="v2_live_adapter" {% if trading_settings.mimo_contract_mode == 'v2_live_adapter' %}selected{% endif %}>v2：仅水位线后的未来消息，经兼容适配器进入原安全路径</option>
+            </select>
+          </label>
+          <label>
+            MiMo v2 未来消息水位线
+            <input
+              name="mimo_v2_activation_after_raw_message_id"
+              type="number"
+              min="0"
+              step="1"
+              value="{{ trading_settings.mimo_v2_activation_after_raw_message_id }}"
+              aria-describedby="mimo-v2-watermark-help"
+            />
+            <span id="mimo-v2-watermark-help" class="ai-helper-text">
+              v2 只处理 ID 严格大于此值的消息。当前最大消息 ID：{{ mimo_v2_latest_raw_message_id }}。
+            </span>
+          </label>
+          <div
+            class="recognition-profile-section"
+            data-mimo-contract-circuit
+            data-circuit-open="{{ 'true' if mimo_contract_circuit.is_open else 'false' }}"
+          >
+            <h4>MiMo v2 技术熔断</h4>
+            {% if mimo_contract_circuit.is_open %}
+            <p class="ai-helper-text is-error">
+              已打开；未来消息自动走 v1。原因：{{ mimo_contract_circuit.opened_reason or 'unknown' }}；时间：{{ mimo_contract_circuit.opened_at or 'unknown' }}。
+            </p>
+            {% else %}
+            <p class="ai-helper-text">
+              已关闭；连续传输失败 {{ mimo_contract_circuit.consecutive_transport_failures }} 次。
+            </p>
+            {% endif %}
+            <p class="ai-helper-text">回滚和熔断都不会重放、删除或重解释历史消息。</p>
+          </div>
           <label>默认单笔最大亏损 USDT<input name="default_max_loss_usdt" type="number" min="1" step="1" value="{{ trading_settings.default_max_loss_usdt }}" /></label>
           <label>每日最大亏损 USDT<input name="daily_max_loss_usdt" type="number" min="1" step="1" value="{{ trading_settings.daily_max_loss_usdt }}" /></label>
           <label>每群组最大有效持仓数<input name="max_concurrent_positions" type="number" min="1" step="1" value="{{ trading_settings.max_concurrent_positions }}" /></label>
@@ -415,6 +453,12 @@
         </div>
         <div class="prompt-actions">
           <button type="submit">保存交易设置</button>
+          <button
+            type="button"
+            class="secondary-button"
+            data-mimo-v2-rollback
+            {% if trading_settings.mimo_contract_mode == 'v1' %}disabled{% endif %}
+          >仅将未来消息回退到 v1</button>
           <span class="ai-recognition-save-status" data-trading-settings-save-status aria-live="polite"></span>
         </div>
       </form>

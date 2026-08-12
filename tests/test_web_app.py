@@ -1187,6 +1187,241 @@ def test_trading_settings_api_returns_fresh_fixed_entry_defaults(tmp_path):
     }
 
 
+def test_trading_settings_mimo_rollout_round_trips_current_future_watermark(
+    tmp_path,
+):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    with app.state.session_factory() as session:
+        session.add_all(
+            [
+                RawMessage(chat_id=77, message_id=91, text="first"),
+                RawMessage(chat_id=77, message_id=92, text="second"),
+            ]
+        )
+        session.commit()
+        latest_raw_message_id = max(row.id for row in session.query(RawMessage))
+    client = TestClient(app)
+
+    initial = client.get("/api/trading-settings")
+    enabled = client.post(
+        "/api/trading-settings",
+        json={
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": latest_raw_message_id,
+        },
+    )
+    reloaded = client.get("/api/trading-settings")
+
+    assert initial.status_code == 200
+    assert initial.json()["mimo_contract_mode"] == "v1"
+    assert initial.json()["mimo_v2_latest_raw_message_id"] == latest_raw_message_id
+    assert initial.json()["mimo_contract_circuit"]["is_open"] is False
+    assert enabled.status_code == 200
+    assert enabled.json()["mimo_contract_mode"] == "v2_live_adapter"
+    assert (
+        enabled.json()["mimo_v2_activation_after_raw_message_id"]
+        == latest_raw_message_id
+    )
+    assert reloaded.json()["mimo_contract_mode"] == "v2_live_adapter"
+
+
+def test_trading_settings_mimo_rollout_rejects_shadow_mode(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.post(
+        "/api/trading-settings",
+        json={
+            "mimo_contract_mode": "shadow",
+            "mimo_v2_activation_after_raw_message_id": 1,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "mimo_contract_mode" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("watermark", [None, 0, 1])
+def test_trading_settings_mimo_rollout_rejects_missing_or_stale_watermark(
+    tmp_path,
+    watermark,
+):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    with app.state.session_factory() as session:
+        session.add_all(
+            [
+                RawMessage(chat_id=77, message_id=91, text="first"),
+                RawMessage(chat_id=77, message_id=92, text="second"),
+            ]
+        )
+        session.commit()
+    client = TestClient(app)
+    payload = {"mimo_contract_mode": "v2_live_adapter"}
+    if watermark is not None:
+        payload["mimo_v2_activation_after_raw_message_id"] = watermark
+
+    response = client.post("/api/trading-settings", json=payload)
+
+    assert response.status_code == 422
+    assert "mimo_v2_activation_after_raw_message_id" in response.json()["detail"]
+    assert client.get("/api/trading-settings").json()["mimo_contract_mode"] == "v1"
+
+
+@pytest.mark.parametrize(
+    ("raw_mode", "watermark"),
+    [
+        (" V2_LIVE_ADAPTER ", None),
+        ("V2_LIVE_ADAPTER", 1),
+    ],
+)
+def test_trading_settings_mimo_rollout_cannot_bypass_watermark_with_normalized_mode(
+    tmp_path,
+    raw_mode,
+    watermark,
+):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    with app.state.session_factory() as session:
+        session.add_all(
+            [
+                RawMessage(chat_id=77, message_id=91, text="first"),
+                RawMessage(chat_id=77, message_id=92, text="second"),
+            ]
+        )
+        session.commit()
+    payload = {"mimo_contract_mode": raw_mode}
+    if watermark is not None:
+        payload["mimo_v2_activation_after_raw_message_id"] = watermark
+    client = TestClient(app)
+
+    response = client.post("/api/trading-settings", json=payload)
+
+    assert response.status_code == 422
+    assert "mimo_v2_activation_after_raw_message_id" in response.json()["detail"]
+    assert client.get("/api/trading-settings").json()["mimo_contract_mode"] == "v1"
+
+
+def test_trading_settings_mimo_rollout_rechecks_watermark_inside_save_transaction(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.web_app as web_module
+
+    app = create_web_app(database_path=tmp_path / "research.db")
+    with app.state.session_factory() as session:
+        first = RawMessage(chat_id=77, message_id=91, text="first")
+        session.add(first)
+        session.commit()
+        requested_watermark = int(first.id)
+    original_validate = web_module._validate_mimo_rollout_settings_update
+
+    def insert_after_initial_validation(session_factory, *, payload):
+        original_validate(session_factory, payload=payload)
+        with session_factory() as session:
+            session.add(RawMessage(chat_id=77, message_id=92, text="racing"))
+            session.commit()
+
+    monkeypatch.setattr(
+        web_module,
+        "_validate_mimo_rollout_settings_update",
+        insert_after_initial_validation,
+    )
+
+    client = TestClient(app)
+    response = client.post(
+        "/api/trading-settings",
+        json={
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": requested_watermark,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "future-only activation" in response.json()["detail"]
+    assert client.get("/api/trading-settings").json()["mimo_contract_mode"] == "v1"
+
+
+def test_trading_settings_mimo_rollout_exposes_open_circuit_state(tmp_path):
+    from telegram_kol_research.mimo_contract_circuit import record_mimo_v2_outcome
+
+    app = create_web_app(database_path=tmp_path / "research.db")
+    observed_at = datetime(2026, 8, 12, 12, 30, tzinfo=UTC)
+    record_mimo_v2_outcome(
+        app.state.session_factory,
+        outcome="contract_validation_failed",
+        observed_at=observed_at,
+    )
+
+    response = TestClient(app).get("/api/trading-settings")
+
+    assert response.status_code == 200
+    assert response.json()["mimo_contract_circuit"] == {
+        "consecutive_transport_failures": 0,
+        "is_open": True,
+        "opened_reason": "contract_validation_failed",
+        "opened_at": "2026-08-12T12:30:00Z",
+        "last_success_at": None,
+        "updated_at": "2026-08-12T12:30:00Z",
+    }
+
+
+def test_trading_settings_mimo_future_only_rollback_preserves_audit_state(
+    tmp_path,
+):
+    from telegram_kol_research.mimo_contract_circuit import record_mimo_v2_outcome
+
+    app = create_web_app(database_path=tmp_path / "research.db")
+    with app.state.session_factory() as session:
+        raw = RawMessage(chat_id=77, message_id=91, text="keep me")
+        session.add(raw)
+        session.commit()
+        watermark = int(raw.id)
+    save_trading_settings(
+        app.state.session_factory,
+        {
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": watermark,
+        },
+    )
+    record_mimo_v2_outcome(
+        app.state.session_factory,
+        outcome="adapter_failure",
+        observed_at=datetime(2026, 8, 12, 12, 30, tzinfo=UTC),
+    )
+    client = TestClient(app)
+
+    response = client.post("/api/trading-settings/mimo-rollback")
+
+    assert response.status_code == 200
+    assert response.json()["mimo_contract_mode"] == "v1"
+    assert response.json()["mimo_v2_activation_after_raw_message_id"] == watermark
+    assert response.json()["mimo_contract_circuit"]["is_open"] is True
+    with app.state.session_factory() as session:
+        assert session.get(RawMessage, watermark).text == "keep me"
+
+
+def test_trading_settings_mimo_ui_has_only_live_adapter_and_future_rollback(
+    tmp_path,
+):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.get("/more-panel")
+    html = response.text
+    mode_select = re.search(
+        r'<select name="mimo_contract_mode"[^>]*>(.*?)</select>',
+        html,
+        re.DOTALL,
+    )
+
+    assert response.status_code == 200
+    assert mode_select is not None
+    assert 'value="v1"' in mode_select.group(1)
+    assert 'value="v2_live_adapter"' in mode_select.group(1)
+    assert 'value="shadow"' not in mode_select.group(1)
+    assert 'name="mimo_v2_activation_after_raw_message_id"' in html
+    assert "data-mimo-contract-circuit" in html
+    assert "data-mimo-v2-rollback" in html
+    assert "replay-mimo-v2" not in html
+
+
 def test_trading_settings_api_rejects_negative_fixed_entry_threshold(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
