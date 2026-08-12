@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable, Literal
 from uuid import uuid4
 
 from sqlalchemy import and_, case, or_, update
@@ -282,6 +282,67 @@ def claim_authoritative_execution(
         )
         session.commit()
         return result.rowcount == 1
+
+
+def claim_authoritative_execution_if_input_current(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    authoritative_generation: str,
+    input_is_current: Callable[[], bool],
+    changed_reason: str,
+) -> Literal["claimed", "input_changed", "stale_generation"]:
+    """Check freshness and claim one generation under the same SQLite lock.
+
+    The freshness callback must be read-only. SQLite's reserved write lock
+    keeps ingestion/context writers from committing between that read and the
+    execution claim while still allowing the callback's separate read sessions.
+    """
+
+    with session_factory() as session:
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        row = (
+            session.query(RecognitionDecision)
+            .filter(
+                RecognitionDecision.raw_message_id == raw_message_id,
+                RecognitionDecision.comparison_status == "execution_pending",
+                RecognitionDecision.comparison_claim_token
+                == authoritative_generation,
+            )
+            .one_or_none()
+        )
+        if row is None:
+            session.rollback()
+            return "stale_generation"
+        try:
+            current = bool(input_is_current())
+        except Exception:
+            current = False
+        if not current:
+            row.authoritative_status = "识别失败"
+            row.auxiliary_model = None
+            row.auxiliary_status = None
+            row.auxiliary_payload_json = None
+            row.agreement_status = "authoritative_failed"
+            row.differences_json = "[]"
+            row.disagreement_severity = None
+            row.comparison_model = None
+            row.comparison_payload_json = None
+            row.comparison_error = None
+            row.comparison_next_attempt_at = None
+            row.automation_status = "skipped"
+            row.automation_reason = changed_reason
+            row.comparison_status = "completed"
+            row.comparison_claim_token = None
+            row.comparison_started_at = None
+            row.compared_at = None
+            row.updated_at = utc_now()
+            session.commit()
+            return "input_changed"
+        row.comparison_status = "execution_running"
+        row.updated_at = utc_now()
+        session.commit()
+        return "claimed"
 
 
 def refuse_authoritative_execution(

@@ -1,4 +1,5 @@
 import json
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -3041,9 +3042,9 @@ def test_joint_context_change_before_claim_refuses_execution(
     )
     from telegram_kol_research import authoritative_recognition
 
-    real_fingerprint = getattr(
+    real_claim = getattr(
         authoritative_recognition,
-        "build_current_mimo_v2_analysis_input_fingerprint",
+        "claim_authoritative_execution_if_input_current",
         None,
     )
 
@@ -3051,15 +3052,12 @@ def test_joint_context_change_before_claim_refuses_execution(
         with session_factory() as session:
             session.get(RawMessage, prior_id).text = "changed before claim"
             session.commit()
-        if real_fingerprint is None:
-            return "sha256:changed-before-claim"
-        return real_fingerprint(*args, **kwargs)
+        return real_claim(*args, **kwargs)
 
     monkeypatch.setattr(
         authoritative_recognition,
-        "build_current_mimo_v2_analysis_input_fingerprint",
+        "claim_authoritative_execution_if_input_current",
         change_context_before_claim,
-        raising=False,
     )
     applied: list[int] = []
     real_apply = authoritative_recognition.apply_authoritative_assessment
@@ -3093,6 +3091,111 @@ def test_joint_context_change_before_claim_refuses_execution(
         decision = session.query(RecognitionDecision).one()
         assert session.query(SignalCandidate).count() == 0
     assert decision.comparison_status == "completed"
+    assert decision.comparison_claim_token is None
+
+
+def test_preclaim_lock_prevents_context_change_between_read_and_claim(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "mimo-preclaim-toctou.db")
+    with session_factory() as session:
+        prior = RawMessage(
+            chat_id=945,
+            message_id=60,
+            text="stable context",
+            posted_at=datetime(2026, 8, 11, 1, 0, tzinfo=UTC),
+        )
+        current = RawMessage(
+            chat_id=945,
+            message_id=61,
+            text="ordinary commentary",
+            posted_at=datetime(2026, 8, 11, 2, 0, tzinfo=UTC),
+        )
+        session.add_all([prior, current])
+        session.commit()
+        prior_id = int(prior.id)
+        current_id = int(current.id)
+    save_trading_settings(
+        session_factory,
+        {
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 0,
+        },
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
+        lambda **kwargs: _v2_commentary_payload(summary="selected result"),
+    )
+    from telegram_kol_research import authoritative_recognition
+
+    real_fingerprint = (
+        authoritative_recognition.build_current_mimo_v2_analysis_input_fingerprint
+    )
+
+    writer_started = threading.Event()
+    writer_committed = threading.Event()
+    writer_threads: list[threading.Thread] = []
+    committed_before_fingerprint_return: list[bool] = []
+
+    def change_context_after_read(*args, **kwargs):
+        fingerprint = real_fingerprint(*args, **kwargs)
+
+        def mutate_context():
+            writer_started.set()
+            with session_factory() as session:
+                session.get(RawMessage, prior_id).text = "changed after preclaim read"
+                session.commit()
+            writer_committed.set()
+
+        writer = threading.Thread(target=mutate_context)
+        writer_threads.append(writer)
+        writer.start()
+        assert writer_started.wait(timeout=1)
+        committed_before_fingerprint_return.append(
+            writer_committed.wait(timeout=0.2)
+        )
+        return fingerprint
+
+    monkeypatch.setattr(
+        authoritative_recognition,
+        "build_current_mimo_v2_analysis_input_fingerprint",
+        change_context_after_read,
+    )
+    applied: list[int] = []
+    real_apply = authoritative_recognition.apply_authoritative_assessment
+
+    def track_apply(*args, **kwargs):
+        applied.append(current_id)
+        return real_apply(*args, **kwargs)
+
+    monkeypatch.setattr(
+        authoritative_recognition,
+        "apply_authoritative_assessment",
+        track_apply,
+    )
+    auto_trade_calls: list[int] = []
+
+    result = process_authoritative_message(
+        session_factory,
+        raw_message_id=current_id,
+        ai_recognition_config=_configured_v2_ai(),
+        media_root=tmp_path,
+        auto_trade_executor=auto_trade_calls.append,
+    )
+
+    for writer in writer_threads:
+        writer.join(timeout=2)
+
+    assert committed_before_fingerprint_return == [False]
+    assert writer_committed.is_set()
+    assert result.automation == {"status": "skipped", "reason": "mimo_no_action"}
+    assert applied == [current_id]
+    assert auto_trade_calls == []
+    with session_factory() as session:
+        decision = session.query(RecognitionDecision).one()
+        assert session.query(SignalCandidate).count() == 0
+    assert decision.comparison_status == "pending"
     assert decision.comparison_claim_token is None
 
 
