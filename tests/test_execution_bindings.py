@@ -42,7 +42,12 @@ from telegram_kol_research.models import (
     PositionProtectionRevision,
     PositionMutationIntent,
     PendingTpslSnapshotObservation,
+    RawMessage,
+    RecognitionDecision,
     StrategyLifecycle,
+    StrategyManagementBatch,
+    StrategyManagementComponent,
+    StrategyManagementLeg,
     TriggerProtectionIntent,
 )
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
@@ -142,6 +147,202 @@ def test_live_reconcile_runs_due_stop_rescue_before_retry_rescheduling(
 
     assert result is expected_result
     assert calls == ["rescue", "reconcile", "management"]
+
+
+def _seed_global_management_reconciliation_batch(
+    session_factory,
+    *,
+    identity,
+    symbol,
+    pos_id,
+    composite,
+):
+    now = datetime(2026, 8, 12, 10, 0)
+    strategy_instance_id = f"deepcoin:100:{identity}:{symbol}:long"
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=100,
+            message_id=identity + 100,
+            text="manage",
+            posted_at=now,
+        )
+        session.add(raw)
+        session.flush()
+        decision = RecognitionDecision(
+            raw_message_id=raw.id,
+            input_kind="text",
+            authoritative_model="mimo",
+            authoritative_status="非策略",
+            authoritative_payload_json="{}",
+            agreement_status="authoritative_only",
+            differences_json="[]",
+        )
+        lifecycle = StrategyLifecycle(
+            chat_id=100,
+            message_id=identity,
+            symbol=symbol,
+            side="long",
+            lifecycle_status="entered",
+            signal_at=now,
+        )
+        binding = ExecutionBinding(
+            strategy_instance_id=strategy_instance_id,
+            kol_id="alice",
+            chat_id=100,
+            message_id=identity,
+            symbol=symbol,
+            side="long",
+            venue="deepcoin",
+            pos_id=pos_id,
+            status="active",
+            last_exchange_status="positions_verified",
+        )
+        session.add_all([decision, lifecycle, binding])
+        session.flush()
+        lifecycle.execution_binding_id = binding.id
+        entry = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=strategy_instance_id,
+            leg_index=0,
+            purpose="entry",
+            order_kind="market",
+            order_id=f"entry-{identity}",
+            pos_id=pos_id,
+            venue="deepcoin",
+            attribution_status="verified",
+            attribution_evidence_json='{"policy_version":2}',
+            status="active",
+        )
+        session.add(entry)
+        session.flush()
+        batch = StrategyManagementBatch(
+            idempotency_fingerprint=(str(identity) * 64)[:64],
+            raw_message_id=raw.id,
+            recognition_decision_id=decision.id,
+            recognition_generation=f"generation-{identity}",
+            target_lifecycle_id=lifecycle.id,
+            strategy_instance_id=strategy_instance_id,
+            execution_binding_id=binding.id,
+            intent="partial_take_profit",
+            effective_action="partial_close",
+            execution_mode="live",
+            requested_fraction=0.5,
+            effective_fraction=0.5,
+            partial_round_before=0,
+            status="reconciling",
+            target_fingerprint=(symbol.lower() * 64)[:64],
+            target_snapshot_json=json.dumps(
+                {
+                    "identity": {
+                        "execution_binding_id": binding.id,
+                        "deferred_entry_leg_ids": [],
+                        "capability_deferred_entry_leg_ids": [],
+                    }
+                }
+            ),
+            planned_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(batch)
+        session.flush()
+        leg = StrategyManagementLeg(
+            management_batch_id=batch.id,
+            execution_order_leg_id=entry.id,
+            pos_id=pos_id,
+            leg_index=0,
+            status="planned",
+            preflight_size="38",
+            planned_close_size="19",
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(leg)
+        session.flush()
+        if composite:
+            session.add(
+                StrategyManagementComponent(
+                    management_batch_id=batch.id,
+                    strategy_management_leg_id=leg.id,
+                    strategy_management_leg_scope=leg.id,
+                    component_kind="converge_partial_close",
+                    sequence=0,
+                    status="pending",
+                    idempotency_key=f"global-component-{identity}",
+                    desired_json="{}",
+                    evidence_json="[]",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        session.commit()
+        return int(batch.id), int(leg.id)
+
+
+def test_global_binding_reconcile_changes_legacy_but_not_composite_batch(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "mixed-management.db")
+    legacy_batch_id, legacy_leg_id = _seed_global_management_reconciliation_batch(
+        session_factory,
+        identity=41,
+        symbol="BTC",
+        pos_id="legacy-pos",
+        composite=False,
+    )
+    composite_batch_id, composite_leg_id = (
+        _seed_global_management_reconciliation_batch(
+            session_factory,
+            identity=42,
+            symbol="ETH",
+            pos_id="composite-pos",
+            composite=True,
+        )
+    )
+    snapshot = execution_bindings_module._ReconcileSnapshot(
+        positions=[
+            {
+                "instId": "BTC-USDT-SWAP",
+                "posId": "legacy-pos",
+                "posSide": "long",
+                "pos": "38",
+            },
+            {
+                "instId": "ETH-USDT-SWAP",
+                "posId": "composite-pos",
+                "posSide": "long",
+                "pos": "38",
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        execution_bindings_module,
+        "_apply_reconcile_snapshot",
+        lambda *args, **kwargs: object(),
+    )
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=object(),
+        snapshot=snapshot,
+        recovered_at=datetime(2026, 8, 12, 10, 1),
+    )
+
+    with session_factory() as session:
+        legacy_batch = session.get(StrategyManagementBatch, legacy_batch_id)
+        legacy_leg = session.get(StrategyManagementLeg, legacy_leg_id)
+        composite_batch = session.get(
+            StrategyManagementBatch, composite_batch_id
+        )
+        composite_leg = session.get(StrategyManagementLeg, composite_leg_id)
+        assert (legacy_batch.status, legacy_leg.status) == (
+            "reconciling",
+            "submitted",
+        )
+        assert (composite_batch.status, composite_leg.status) == (
+            "reconciling",
+            "planned",
+        )
 
 
 def _add_entry_leg(

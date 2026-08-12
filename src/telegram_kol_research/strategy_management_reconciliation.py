@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from sqlalchemy import exists
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.deepcoin_normalization import (
@@ -24,6 +25,7 @@ from telegram_kol_research.models import (
     RawMessage,
     StrategyLifecycle,
     StrategyManagementBatch,
+    StrategyManagementComponent,
     StrategyManagementLeg,
 )
 from telegram_kol_research.position_authority_lock import (
@@ -72,6 +74,20 @@ _MANAGEABLE_ENTRY_LEG_STATES = frozenset(
     {"active", "open", "filled", "partial_closed"}
 )
 _DEFERRED_ENTRY_LEG_STATES = frozenset({"open", "pending", "submitted"})
+
+
+def _legacy_reconciliation_ownership_predicates():
+    """Exclude every batch carrying any durable composite ownership marker."""
+
+    return (
+        StrategyManagementBatch.management_contract_json.is_(None),
+        StrategyManagementBatch.management_contract_fingerprint.is_(None),
+        StrategyManagementBatch.contract_version.is_(None),
+        ~exists().where(
+            StrategyManagementComponent.management_batch_id
+            == StrategyManagementBatch.id
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,7 +202,8 @@ def reconcile_strategy_management_batches(
 
     with session_factory() as session:
         query = session.query(StrategyManagementBatch).filter(
-            StrategyManagementBatch.status.in_(_ACTIVE_RECONCILIATION_STATUSES)
+            StrategyManagementBatch.status.in_(_ACTIVE_RECONCILIATION_STATUSES),
+            *_legacy_reconciliation_ownership_predicates(),
         )
         if batch_ids is not None:
             ids = tuple(int(batch_id) for batch_id in batch_ids)
@@ -555,6 +572,7 @@ def _recover_confirmed_protection_legs(
             .filter(
                 StrategyManagementBatch.status == "recovery_required",
                 StrategyManagementBatch.reason_code.like("%protection%"),
+                *_legacy_reconciliation_ownership_predicates(),
             )
             .all()
         )

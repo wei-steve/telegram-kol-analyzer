@@ -21,6 +21,7 @@ from telegram_kol_research.models import (
     StrategyLifecycle,
     StrategyBreakEvenConvergence,
     StrategyManagementBatch,
+    StrategyManagementComponent,
     StrategyManagementLeg,
     StrategyManagementMarketDecision,
 )
@@ -33,6 +34,11 @@ from telegram_kol_research.strategy_management_batches import (
 )
 from telegram_kol_research.strategy_management_reconciliation import (
     reconcile_strategy_management_batches,
+)
+from telegram_kol_research.strategy_management_contracts import (
+    ManagementInstructionContract,
+    management_contract_fingerprint,
+    serialize_management_contract,
 )
 from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.strategy_management_market_decisions import (
@@ -147,6 +153,392 @@ def _persist_batch(
         status="reconciling",
     )
     return batch
+
+
+def _composite_contract(batch):
+    contract = ManagementInstructionContract(
+        version=2,
+        target_lifecycle_id=batch.target_lifecycle_id,
+        strategy_instance_id=batch.strategy_instance_id,
+        symbol="BTC",
+        side="short",
+        close_fraction="0.5",
+        stop_mode="actual_entry_price",
+        stop_price=None,
+        stop_price_source=None,
+        take_profit_consumption="consume_first_stage",
+        cancel_deferred_entries=True,
+        required_components=(
+            "consume_take_profit_stage",
+            "converge_partial_close",
+            "replace_remaining_protection",
+        ),
+        current_message_text="止盈50%，止损移动至开仓价",
+    )
+    return (
+        serialize_management_contract(contract),
+        management_contract_fingerprint(contract),
+    )
+
+
+def _add_composite_component(
+    session,
+    *,
+    batch_id,
+    leg_id,
+    component_kind="consume_take_profit_stage",
+    sequence=0,
+    status="pending",
+    reason_code=None,
+):
+    component = StrategyManagementComponent(
+        management_batch_id=batch_id,
+        strategy_management_leg_id=leg_id,
+        strategy_management_leg_scope=leg_id,
+        component_kind=component_kind,
+        sequence=sequence,
+        status=status,
+        idempotency_key=f"{batch_id}:{leg_id}:{component_kind}",
+        desired_json="{}",
+        evidence_json="[]",
+        reason_code=reason_code,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    session.add(component)
+    session.flush()
+    return component
+
+
+def _seed_composite_snapshot_failure(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    created = _persist_batch(
+        session_factory,
+        action="partial_then_break_even",
+        sizes=("19",),
+        preflight=("38",),
+        initial_status="planned",
+    )
+    contract_json, fingerprint = _composite_contract(created)
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, created.id)
+        batch.management_contract_json = contract_json
+        batch.management_contract_fingerprint = fingerprint
+        batch.contract_version = 2
+        leg = (
+            session.query(StrategyManagementLeg)
+            .filter_by(management_batch_id=batch.id)
+            .one()
+        )
+        leg.client_order_id = None
+        leg.exchange_order_id = None
+        leg.request_json = None
+        leg.response_json = None
+        components = [
+            _add_composite_component(
+                session,
+                batch_id=batch.id,
+                leg_id=leg.id,
+                component_kind=kind,
+                sequence=index,
+                status="recovery_required" if index == 0 else "pending",
+                reason_code=(
+                    "take_profit_exchange_snapshot_incomplete"
+                    if index == 0
+                    else None
+                ),
+            )
+            for index, kind in enumerate(
+                (
+                    "consume_take_profit_stage",
+                    "converge_partial_close",
+                    "replace_remaining_protection",
+                )
+            )
+        ]
+        session.commit()
+        return (
+            session_factory,
+            int(batch.id),
+            int(leg.id),
+            tuple(int(component.id) for component in components),
+        )
+
+
+def _management_state(session_factory, batch_id):
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, batch_id)
+        legs = (
+            session.query(StrategyManagementLeg)
+            .filter_by(management_batch_id=batch_id)
+            .order_by(StrategyManagementLeg.id)
+            .all()
+        )
+        components = (
+            session.query(StrategyManagementComponent)
+            .filter_by(management_batch_id=batch_id)
+            .order_by(StrategyManagementComponent.id)
+            .all()
+        )
+        return (
+            (
+                batch.status,
+                batch.reason_code,
+                batch.reconciled_at,
+                batch.completed_at,
+                batch.updated_at,
+            ),
+            tuple(
+                (
+                    leg.status,
+                    leg.client_order_id,
+                    leg.exchange_order_id,
+                    leg.request_json,
+                    leg.response_json,
+                    leg.last_error,
+                    leg.last_exchange_snapshot_json,
+                    leg.updated_at,
+                )
+                for leg in legs
+            ),
+            tuple(
+                (
+                    component.status,
+                    component.reason_code,
+                    component.evidence_json,
+                    component.attempt_count,
+                    component.updated_at,
+                    component.completed_at,
+                )
+                for component in components
+            ),
+        )
+
+
+def _load_management_leg(session_factory, leg_id):
+    with session_factory() as session:
+        leg = session.get(StrategyManagementLeg, leg_id)
+        return SimpleNamespace(
+            status=leg.status,
+            client_order_id=leg.client_order_id,
+            exchange_order_id=leg.exchange_order_id,
+            request_json=leg.request_json,
+            response_json=leg.response_json,
+        )
+
+
+def _load_management_component(session_factory, component_id):
+    with session_factory() as session:
+        component = session.get(StrategyManagementComponent, component_id)
+        return SimpleNamespace(
+            status=component.status,
+            reason_code=component.reason_code,
+        )
+
+
+def test_legacy_reconciliation_never_mutates_composite_batch(tmp_path):
+    session_factory, batch_id, leg_id, component_ids = (
+        _seed_composite_snapshot_failure(tmp_path)
+    )
+    before = _management_state(session_factory, batch_id)
+
+    result = reconcile_strategy_management_batches(
+        session_factory,
+        snapshot=SimpleNamespace(
+            positions=[_position("pos-1", "38")],
+            open_orders=[],
+            order_history=[],
+            trade_fills=[],
+            pending_trigger_orders=[],
+            errors={},
+        ),
+        reconciled_at=NOW,
+    )
+
+    assert result.checked == 0
+    assert _management_state(session_factory, batch_id) == before
+    assert _load_management_leg(session_factory, leg_id).status == "planned"
+    assert [
+        _load_management_component(session_factory, value).status
+        for value in component_ids
+    ] == ["recovery_required", "pending", "pending"]
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "management_contract_json",
+        "management_contract_fingerprint",
+        "contract_version",
+        "component_row",
+    ],
+)
+def test_legacy_reconciliation_fails_closed_for_any_composite_marker(
+    tmp_path, marker
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    created = _persist_batch(
+        session_factory,
+        action="partial_then_break_even",
+        sizes=("19",),
+        preflight=("38",),
+        initial_status="planned",
+    )
+    contract_json, fingerprint = _composite_contract(created)
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, created.id)
+        leg = (
+            session.query(StrategyManagementLeg)
+            .filter_by(management_batch_id=batch.id)
+            .one()
+        )
+        leg.client_order_id = None
+        leg.exchange_order_id = None
+        if marker == "management_contract_json":
+            batch.management_contract_json = contract_json
+        elif marker == "management_contract_fingerprint":
+            batch.management_contract_fingerprint = fingerprint
+        elif marker == "contract_version":
+            batch.contract_version = 2
+        else:
+            _add_composite_component(
+                session,
+                batch_id=batch.id,
+                leg_id=leg.id,
+            )
+        session.commit()
+        batch_id = int(batch.id)
+        leg_id = int(leg.id)
+    before = _management_state(session_factory, batch_id)
+
+    result = reconcile_strategy_management_batches(
+        session_factory,
+        snapshot=SimpleNamespace(
+            positions=[_position("pos-1", "38")],
+            open_orders=[],
+            order_history=[],
+            trade_fills=[],
+            pending_trigger_orders=[],
+            errors={},
+        ),
+        reconciled_at=NOW,
+    )
+
+    assert result.checked == 0
+    assert _management_state(session_factory, batch_id) == before
+    assert _load_management_leg(session_factory, leg_id).status == "planned"
+
+
+def test_legacy_reconciliation_still_reconciles_traditional_close_batch(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    created = _persist_batch(
+        session_factory,
+        sizes=("19",),
+        preflight=("38",),
+        initial_status="planned",
+    )
+
+    result = reconcile_strategy_management_batches(
+        session_factory,
+        snapshot=SimpleNamespace(
+            positions=[_position("pos-1", "38")],
+            open_orders=[],
+            order_history=[],
+            trade_fills=[],
+            pending_trigger_orders=[],
+            errors={},
+        ),
+        reconciled_at=NOW,
+    )
+
+    stored = load_management_batch(session_factory, created.id)
+    assert result.checked == 1
+    assert stored.status == "reconciling"
+    assert stored.legs[0].status == "submitted"
+
+
+def test_legacy_protection_recovery_never_mutates_component_marked_batch(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    created = _persist_batch(
+        session_factory,
+        action="partial_then_break_even",
+    )
+    assert transition_batch(
+        session_factory,
+        created.id,
+        expected_statuses={"reconciling"},
+        new_status="recovery_required",
+        reason_code="protection_recovery_required",
+    )
+    assert transition_leg(
+        session_factory,
+        created.legs[0].id,
+        expected_statuses={"submitted"},
+        new_status="recovery_required",
+        request={"expected_replacement_count": 1},
+        last_error={"stage": "replace_protection_outcome_unknown"},
+    )
+    with session_factory() as session:
+        leg = session.get(StrategyManagementLeg, created.legs[0].id)
+        _add_composite_component(
+            session,
+            batch_id=created.id,
+            leg_id=leg.id,
+        )
+        session.add(
+            PositionMutationIntent(
+                idempotency_key=(
+                    f"management:{created.id}:{leg.id}:set:stop_loss:0"
+                ),
+                venue="deepcoin",
+                operation="set_position_sltp",
+                strategy_instance_id=created.strategy_instance_id,
+                execution_binding_id=created.execution_binding_id,
+                execution_order_leg_id=leg.execution_order_leg_id,
+                pos_id=leg.pos_id,
+                authority_fingerprint="a" * 64,
+                request_fingerprint="b" * 64,
+                status="submitted",
+                request_json=json.dumps(
+                    {
+                        "instId": "BTC-USDT-SWAP",
+                        "posId": "pos-1",
+                        "posSide": "short",
+                        "slTriggerPx": "64000",
+                    }
+                ),
+                response_json='{"data":{"ordId":"new-stop-1"}}',
+                reserved_at=NOW,
+                submitted_at=NOW,
+            )
+        )
+        session.commit()
+    before = _management_state(session_factory, created.id)
+
+    reconcile_strategy_management_batches(
+        session_factory,
+        snapshot=SimpleNamespace(
+            positions=[_position("pos-1", "2")],
+            open_orders=[],
+            pending_trigger_orders=[
+                {
+                    "ordId": "new-stop-1",
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-1",
+                    "posSide": "short",
+                    "slTriggerPx": "64000.0",
+                }
+            ],
+            order_history=[],
+            trade_fills=[],
+            errors={},
+        ),
+        reconciled_at=NOW,
+    )
+
+    assert _management_state(session_factory, created.id) == before
 
 
 class _Client:
