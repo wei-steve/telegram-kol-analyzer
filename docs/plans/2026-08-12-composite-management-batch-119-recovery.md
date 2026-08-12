@@ -917,8 +917,10 @@ python -m telegram_kol_research.cli recover-composite-management-batch \
 ```
 
 Expected: `status=ready`, `close_delta` derived from current minus 19, complete
-snapshot, zero writes, and no other active work. Save only the redacted JSON in
-a new `0700` artifact directory.
+snapshot, zero writes, and no unclassified or genuinely active instruction
+work. The durable evidence must include the reviewed instruction-population
+counts and SHA-256 digest without raw instruction, strategy, position, or order
+identities. Save only the redacted JSON in a new `0700` artifact directory.
 
 If the position relation is not the reviewed relation, stop and inspect the new
 plan before continuing. Do not reuse an earlier fingerprint.
@@ -929,12 +931,19 @@ Run the bounded read-only active-work check twice around a fresh exchange
 snapshot. Both checks must prove:
 
 - batch 119 is the only false-active management row;
-- no instruction or mutation is executing/submitted/unknown/recovery-required;
+- the instruction-population classifier returns exactly one
+  `target_incident_frozen` row, all other nonterminal-looking rows are closed
+  durable mirrors or frozen history, and no row is unclassified;
+- the instruction-population counts and digest match across both checks;
+- no mutation intent or unrelated durable descendant is executing, submitting,
+  unknown, or recovery-required;
 - no other management, revision, deletion, entry, recovery, or protection write
   is in flight; and
 - every open position has verified protection.
 
-Do not rely on elapsed time to make an active row “historical.”
+Do not infer a disposition from elapsed time or raw instruction status. The
+classifier must bind each row to exact durable evidence, and it never changes,
+retires, replays, or backfills historical instruction rows.
 
 **Step 5: Stop, back up, and revalidate before installing**
 
@@ -945,8 +954,8 @@ Stop `telegram-kol.service`. Immediately:
    procedure;
 3. validate the backup opens and contains the expected schema/counts;
 4. rerun the candidate dry-run; and
-5. require the same source fingerprint and the reviewed current exchange
-   relation.
+5. require the same source fingerprint, instruction-population digest, and the
+   reviewed current exchange relation.
 
 If any check fails, restart the unchanged service and stop.
 

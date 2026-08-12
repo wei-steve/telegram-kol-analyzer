@@ -835,15 +835,27 @@ the original stop set to the repair-time durable audit using only SHA-256
 references. The position-absent audit uses an exact empty stop set and remains
 repeatable with zero exchange writes.
 
-Task 7 must not start unless two read-only checks prove there is no other real
+The first Task 7 baseline found 186 non-retired instruction rows outside raw
+`succeeded`/`failed`: 177 verified terminal compatibility mirrors, five
+historical pending residues with no execution authority, three closed historical
+unknown rows that remain frozen, and one exact batch-119 target incident. None
+were rewritten. The dedicated recovery now classifies every row from exact
+durable links and binds redacted per-row evidence into a canonical population
+digest, the source fingerprint, the repair audit, locked apply, repeated apply,
+and resume authorization. Any unclassified, executing, scheduled, malformed,
+identity-drifting, or nonterminal descendant fails closed. This is not a global
+relaxation of instruction terminality.
+
+Task 7 must not resume unless two read-only checks return the same reviewed
+instruction counts and population digest and prove there is no other real
 instruction, management, mutation, recovery, reconciliation, protection, or
 time-sensitive strategy operation in flight. The service must then be stopped,
-the SQLite database and sidecars verifiably backed up, and the candidate dry
-run repeated before installation. Generate a fresh final fingerprint after
-installation and invoke apply only once. Before any possible exchange request,
-the verified backup may be restored; afterward the database must not be rolled
-back and reconciliation must proceed from exchange truth and the durable
-idempotency records.
+the SQLite database and sidecars verifiably backed up, and the candidate dry run
+repeated before installation with the same digest. Generate a fresh final
+fingerprint after installation and invoke apply only once. Before any possible
+exchange request, the verified backup may be restored; afterward the database
+must not be rolled back and reconciliation must proceed from exchange truth and
+the durable idempotency records.
 
 MiMo must remain `mimo_contract_mode=v1` before, during, and after this incident
 procedure. No ordinary deployment-preflight exception was added. Detailed

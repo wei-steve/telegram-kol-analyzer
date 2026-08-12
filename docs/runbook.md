@@ -1520,18 +1520,25 @@ python -m telegram_kol_research.cli recover-composite-management-batch \
 - `protection_only_below_target`：当前数量大于零但小于 `19`，不加仓、不再平仓，只保护实际数量。
 - `position_absent`：精确仓位已不存在，本地安全终态化，不构造交易所 writer。
 
-产生最终指纹前必须连续两次通过只读安全窗口检查。除批次 `119` 的已审阅假活跃状态外，
-不得存在其他 `executing`、`submitted`、`submitting`、`unknown`、`submit_unknown`、
-`recovery_required` 的 instruction、management component、mutation intent、recovery 或交易所对账；
-每个开放仓位还必须具有已验证保护。只要其他真实操作在途，就不能用时间流逝将其视为历史行，
-必须保持原服务并停止恢复。
+产生最终指纹前必须连续两次通过只读安全窗口检查。不能直接把 instruction 的
+`submitted`、`pending` 或 `unknown` 字样当作在途或终态；批次专用分类器必须逐条绑定
+持久化证据，并且两次都得到完全相同的数量与 SHA-256 population digest：恰好一条
+`target_incident_frozen`，其余只能是 `verified_terminal_mirror`、
+`historical_residue_no_authority` 或 `historical_unknown_frozen`。任何 `executing`、未分类、
+身份矛盾、非终态 descendant/contract、计划重试或两次 digest 漂移都必须停止。
+
+该分类只服务于批次 `119` 的封闭恢复，不会更新、retire、重放或回填历史 instruction，
+也不会改变自动交易和普通部署预检的全局终态规则。除目标批次外，不得存在真实在途的
+management component、mutation intent、recovery 或交易所对账；每个开放仓位还必须具有
+已验证保护。不能用时间流逝将真实操作认定为历史行，必须保持原服务并停止恢复。
 
 受控操作顺序：
 
 1. 在不更改运行 checkout 的候选代码上执行只读 dry-run，审阅完整快照和分类。
 2. 连续两次证明无其他在途工作，然后停止 `telegram-kol.service`并确认其为 inactive。
 3. 按 SQLite main/WAL/SHM 一致备份流程创建可验证备份，打开备份检查 schema 与有界计数。
-4. 服务停止后再运行候选 dry-run，必须保持同一 source fingerprint 和已审阅仓位关系。
+4. 服务停止后再运行候选 dry-run，必须保持同一 source fingerprint、instruction population
+   数量与 digest，以及已审阅仓位关系。
 5. 安装精确已审阅 commit，执行只添加 schema bootstrap，并在前后都证明
    `mimo_contract_mode=v1`。此时仍不启动服务。
 6. 用已安装代码重新 dry-run，只使用这一次的最终指纹调用一次 apply：
