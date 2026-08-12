@@ -1206,6 +1206,38 @@ class MimoRecognitionAttempt(Base):
     )
 
 
+class MimoContractCircuitState(Base):
+    """Singleton future-message circuit state for MiMo v2 selection."""
+
+    __tablename__ = "mimo_contract_circuit_state"
+    __table_args__ = (
+        CheckConstraint(
+            "id = 1",
+            name="ck_mimo_contract_circuit_state_singleton",
+        ),
+        CheckConstraint(
+            "consecutive_transport_failures >= 0",
+            name="ck_mimo_contract_circuit_state_failure_count",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    consecutive_transport_failures: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    is_open: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    opened_reason: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
+    opened_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_success_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+
 class MessageRecognition(Base):
     __tablename__ = "message_recognitions"
     __table_args__ = (

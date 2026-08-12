@@ -33,6 +33,7 @@ def test_context_resolution_schema_is_created(tmp_path):
     assert inspector.has_table("instruction_execution_transitions")
     assert inspector.has_table("mimo_recognition_runs")
     assert inspector.has_table("mimo_recognition_attempts")
+    assert inspector.has_table("mimo_contract_circuit_state")
     assert "strategy_thread_id" in {
         column["name"]
         for column in inspector.get_columns("strategy_lifecycles")
@@ -162,6 +163,25 @@ def test_mimo_evidence_run_link_is_added_to_existing_evidence_table(tmp_path):
         index["name"]
         for index in inspector.get_indexes("message_evidence_versions")
     }
+
+
+def test_mimo_contract_circuit_state_schema_is_durable_and_bounded(tmp_path):
+    session_factory = create_session_factory(tmp_path / "mimo-circuit-schema.db")
+    inspector = inspect(session_factory.kw["bind"])
+
+    columns = {
+        column["name"]
+        for column in inspector.get_columns("mimo_contract_circuit_state")
+    }
+    assert {
+        "id",
+        "consecutive_transport_failures",
+        "is_open",
+        "opened_reason",
+        "opened_at",
+        "last_success_at",
+        "updated_at",
+    } <= columns
 
 
 def test_execution_contract_schema_bootstrap_is_idempotent_on_legacy_database(
