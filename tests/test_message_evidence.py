@@ -1,6 +1,6 @@
 import json
-from datetime import UTC, datetime
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 
 import pytest
 
@@ -14,6 +14,9 @@ from telegram_kol_research.message_evidence import (
     save_message_evidence_version,
 )
 from telegram_kol_research.mimo_v2_contract import parse_mimo_v2_payload
+from telegram_kol_research.mimo_v2_execution_adapter import (
+    adapt_mimo_v2_to_current_payload,
+)
 from telegram_kol_research.models import MediaAsset, MimoRecognitionRun, RawMessage
 from telegram_kol_research.prompt_defaults import DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
 
@@ -361,6 +364,9 @@ def test_v2_evidence_preserves_each_image_and_links_authoritative_run(tmp_path):
         )
         session.add_all([first, second])
         session.flush()
+        asset_ids = (first.id, second.id)
+        parsed_result = _parsed_v2_result(asset_ids=asset_ids)
+        adapted_result = adapt_mimo_v2_to_current_payload(parsed_result)
         run = MimoRecognitionRun(
             raw_message_id=message.id,
             run_kind="v2_authoritative",
@@ -373,19 +379,18 @@ def test_v2_evidence_preserves_each_image_and_links_authoritative_run(tmp_path):
             attempt_count=1,
             selected_attempt_ordinal=1,
             became_authoritative=True,
-            canonical_payload_fingerprint=None,
+            canonical_payload_fingerprint=adapted_result.canonical_v2_fingerprint,
             projection_fingerprint="b" * 64,
             completed_at=datetime(2026, 8, 11, 12, tzinfo=UTC),
         )
         session.add(run)
         session.commit()
-        asset_ids = (first.id, second.id)
         run_id = run.id
 
     saved = persist_mimo_v2_message_evidence(
         session_factory,
         raw_message_id=message.id,
-        result=_parsed_v2_result(asset_ids=asset_ids),
+        result=parsed_result,
         run_id=run_id,
         model="mimo-v2.5",
         prompt_versions={"mimo_v2": 12},
@@ -405,6 +410,14 @@ def test_v2_evidence_preserves_each_image_and_links_authoritative_run(tmp_path):
     assert normalized["contract_version"] == "mimo-authoritative-v2"
     assert normalized["intents"][0]["intent_type"] == "position_management"
     assert normalized["intents"][0]["evidence_refs"][1].startswith("image:")
+    assert json.loads(adapted_result.canonical_v2_json) == {
+        **normalized,
+        "evidence": {
+            "text": text_evidence,
+            "images": image_evidence["images"],
+            "conflicts": image_evidence["conflicts"],
+        },
+    }
     assert saved.mimo_recognition_run_id == run_id
     assert "data:image" not in saved.image_evidence_json
 
