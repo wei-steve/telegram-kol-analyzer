@@ -33,6 +33,7 @@ def test_context_resolution_schema_is_created(tmp_path):
     assert inspector.has_table("instruction_execution_transitions")
     assert inspector.has_table("mimo_recognition_runs")
     assert inspector.has_table("mimo_recognition_attempts")
+    assert inspector.has_table("mimo_contract_circuit_state")
     assert "strategy_thread_id" in {
         column["name"]
         for column in inspector.get_columns("strategy_lifecycles")
@@ -169,6 +170,41 @@ def test_mimo_evidence_run_link_is_added_to_existing_evidence_table(tmp_path):
             "message_evidence_versions"
         )
     )
+
+
+def test_mimo_contract_circuit_state_schema_is_durable_and_bounded(tmp_path):
+    database_path = tmp_path / "legacy-mimo-circuit.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE sources "
+            "(id INTEGER PRIMARY KEY, display_name VARCHAR(255) NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO sources (id, display_name) VALUES (97, 'Legacy Source')"
+        )
+
+    session_factory = create_session_factory(database_path)
+    inspector = inspect(session_factory.kw["bind"])
+
+    assert inspector.has_table("mimo_contract_circuit_state")
+    columns = {
+        column["name"]
+        for column in inspector.get_columns("mimo_contract_circuit_state")
+    }
+    assert {
+        "id",
+        "consecutive_transport_failures",
+        "is_open",
+        "opened_reason",
+        "opened_at",
+        "last_success_at",
+        "updated_at",
+    } <= columns
+    with sqlite3.connect(database_path) as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
+            == 1
+        )
 
 
 def test_execution_contract_schema_bootstrap_is_idempotent_on_legacy_database(
