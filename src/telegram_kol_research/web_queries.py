@@ -998,11 +998,15 @@ def _serialize_mimo_analysis(
         "summary": (
             normalized.get("summary")
             or normalized.get("reason")
-            or (recognition.summary if recognition is not None else None)
             or legacy_payload.get("summary")
+            or (recognition.summary if recognition is not None else None)
             or legacy_payload.get("reason")
         ),
-        "confidence": normalized.get("confidence") or legacy_payload.get("confidence"),
+        "confidence": (
+            normalized.get("confidence")
+            if "confidence" in normalized
+            else legacy_payload.get("confidence")
+        ),
         "intents": [
             _serialize_mimo_intent(item)
             for item in raw_intents
