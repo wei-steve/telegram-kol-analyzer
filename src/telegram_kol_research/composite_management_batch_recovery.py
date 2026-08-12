@@ -38,6 +38,9 @@ from telegram_kol_research.strategy_management_planner import (
 from telegram_kol_research.strategy_management_components import (
     transition_component_for_exact_position_absent_recovery,
 )
+from telegram_kol_research.strategy_management_take_profit_consumption import (
+    plan_take_profit_consumption,
+)
 from telegram_kol_research.position_attribution import (
     has_authoritative_persisted_position,
 )
@@ -378,6 +381,7 @@ def authorize_composite_batch_recovery_resume(
             leg=leg,
             entry=entry,
             components=components,
+            contract=contract,
             target=target,
             disposition=disposition,
             expected_fingerprint=expected_fingerprint,
@@ -568,6 +572,7 @@ def _validate_progressed_recovery_state(
     leg,
     entry,
     components,
+    contract,
     target,
     disposition: str,
     expected_fingerprint: str,
@@ -678,6 +683,7 @@ def _validate_progressed_recovery_state(
                 entry=entry,
                 component=component,
                 kind=kind,
+                contract=contract,
                 execution=execution,
                 evidence=evidence,
                 snapshot=snapshot,
@@ -791,6 +797,7 @@ def _resume_confirmed_component_matches_locked_state(
     entry,
     component,
     kind: str,
+    contract,
     execution: Any,
     evidence: list[Any],
     snapshot: Any,
@@ -812,10 +819,13 @@ def _resume_confirmed_component_matches_locked_state(
             leg=leg,
             entry=entry,
             component=component,
+            contract=contract,
             execution=execution,
             evidence=evidence,
             intents=intents,
             snapshot=snapshot,
+            target=target,
+            approved_current_size=approved_current_size,
         )
     if kind == "converge_partial_close":
         return _resume_confirmed_close_matches(
@@ -849,10 +859,13 @@ def _resume_confirmed_take_profit_matches(
     leg,
     entry,
     component,
+    contract,
     execution: Any,
     evidence: list[Any],
     intents: list[Any],
     snapshot: Any,
+    target: Mapping[str, Any],
+    approved_current_size: Any,
 ) -> bool:
     if execution is None:
         if intents or len(evidence) < 2:
@@ -864,21 +877,72 @@ def _resume_confirmed_take_profit_matches(
             if isinstance(result, Mapping)
             else None
         )
-        return bool(
+        if not (
             isinstance(phase, Mapping)
             and set(phase) == {"phase", "evidence_tier"}
             and phase.get("phase") == "no_cancel_required"
-            and isinstance(phase.get("evidence_tier"), str)
+            and phase.get("evidence_tier")
+            in {"exact_terminal_fill", "exact_terminal_no_fill"}
             and isinstance(result, Mapping)
             and set(result) == {"proven_filled_quantity"}
             and quantity is not None
             and quantity >= 0
+        ):
+            return False
+        ledger_rows = session.query(PositionProtectionLedger).filter(
+            PositionProtectionLedger.execution_binding_id
+            == int(batch.execution_binding_id),
+            PositionProtectionLedger.execution_order_leg_id == int(entry.id),
+            PositionProtectionLedger.pos_id == str(leg.pos_id),
+            PositionProtectionLedger.purpose == "take_profit",
+        ).all()
+        target_remaining = _decimal_or_none(
+            target.get("target_remaining_size")
+        )
+        approved_current = _decimal_or_none(approved_current_size)
+        if target_remaining is None or approved_current is None:
+            return False
+        effective_remaining = min(target_remaining, approved_current)
+        try:
+            rebuilt = plan_take_profit_consumption(
+                contract=contract,
+                target_leg={
+                    "execution_binding_id": int(batch.execution_binding_id),
+                    "execution_order_leg_id": int(entry.id),
+                    "pos_id": str(leg.pos_id),
+                    "instrument_id": BATCH_119_RECOVERY.instrument_id,
+                    "side": BATCH_119_RECOVERY.side,
+                },
+                pending_orders=snapshot.pending_trigger_orders,
+                trigger_history=snapshot.trigger_history,
+                order_history=snapshot.order_history,
+                trade_fills=snapshot.trade_fills,
+                protection_ledger=ledger_rows,
+                trusted_start_size=str(target["trusted_start_size"]),
+                target_remaining_size=_decimal_text(effective_remaining),
+            )
+        except (TypeError, ValueError, RecursionError, OverflowError):
+            return False
+        return (
+            rebuilt.refusal_code is None
+            and not rebuilt.cancel_order_ids
+            and not rebuilt.cancel_actions
+            and rebuilt.evidence_tier == phase.get("evidence_tier")
+            and rebuilt.proven_filled_quantity
+            == str(result["proven_filled_quantity"])
         )
     order_ids = list(execution["cancel_order_ids"])
     intent_ids = list(execution["cancel_intent_ids"])
     selected = {int(row.id): row for row in intents}
     if set(selected) != set(intent_ids) or any(
-        str(row.status) != "confirmed" for row in selected.values()
+        str(row.status) != "confirmed"
+        or _safe_json_value(row.request_json)
+        != {
+            "instId": BATCH_119_RECOVERY.instrument_id,
+            "instType": "SWAP",
+            "ordId": str(row.order_id),
+        }
+        for row in selected.values()
     ):
         return False
     first_fact = {
@@ -1032,12 +1096,25 @@ def _resume_confirmed_protection_matches(
         str(row.status) != "confirmed" for row in by_key.values()
     ):
         return False
+    binding = session.get(ExecutionBinding, int(batch.execution_binding_id))
+    if binding is None:
+        return False
     set_intents = [
         by_key[f"{int(component.id)}:set:{role}"]
         for role in ("primary", "backup")
     ]
     if {str(row.order_id or "") for row in set_intents} != set(new_ids):
         return False
+    for old_order_id in old_ids:
+        cancel_intent = by_key[
+            f"{int(component.id)}:cancel-old:{old_order_id}"
+        ]
+        if _safe_json_value(cancel_intent.request_json) != {
+            "instId": BATCH_119_RECOVERY.instrument_id,
+            "instType": "SWAP",
+            "ordId": old_order_id,
+        }:
+            return False
     old_ledgers = session.query(PositionProtectionLedger).filter(
         PositionProtectionLedger.order_id.in_(old_ids)
     ).all()
@@ -1073,34 +1150,102 @@ def _resume_confirmed_protection_matches(
         for row in new_ledgers
     ):
         return False
-    pending = {
-        order_id: row
-        for row in snapshot.pending_trigger_orders
-        if isinstance(row, Mapping)
-        and (
-            order_id := str(
+    pending_rows = {
+        order_id: [
+            row
+            for row in snapshot.pending_trigger_orders
+            if isinstance(row, Mapping)
+            and str(
                 row.get("ordId")
                 or row.get("orderId")
                 or row.get("order_id")
                 or ""
             )
-        )
-        in set(new_ids)
+            == order_id
+        ]
+        for order_id in new_ids
     }
-    return len(pending) == 2 and all(
-        str(row.get("posId") or row.get("pos_id") or "") == str(leg.pos_id)
-        and str(row.get("instId") or row.get("instrument_id") or "").upper()
-        == BATCH_119_RECOVERY.instrument_id
-        and str(row.get("posSide") or row.get("side") or "").lower()
-        == BATCH_119_RECOVERY.side
-        and _decimal_or_none(row.get("sz") or row.get("size")) == expected_size
-        and _decimal_or_none(
-            row.get("slTriggerPx")
-            or row.get("slTriggerPrice")
-            or row.get("trigger_price")
-        ) in set(expected_prices.values())
-        for row in pending.values()
-    )
+    pending = {
+        order_id: rows[0]
+        for order_id, rows in pending_rows.items()
+        if len(rows) == 1
+    }
+    if (
+        any(len(rows) != 1 for rows in pending_rows.values())
+        or set(old_ids).intersection(
+            _snapshot_order_ids(snapshot.pending_trigger_orders)
+        )
+    ):
+        return False
+    ledger_by_id = {str(row.order_id): row for row in new_ledgers}
+    for role, purpose in (("primary", "stop_loss"), ("backup", "backup_stop")):
+        intent = by_key[f"{int(component.id)}:set:{role}"]
+        order_id = str(intent.order_id or "")
+        ledger = ledger_by_id.get(order_id)
+        pending_row = pending.get(order_id)
+        request = _safe_json_value(intent.request_json)
+        if (
+            ledger is None
+            or pending_row is None
+            or not isinstance(request, Mapping)
+            or set(request) != {
+                "_ledger_purpose",
+                "instId",
+                "instType",
+                "mrgPosition",
+                "posId",
+                "posSide",
+                "slOrdPx",
+                "slTriggerPx",
+                "slTriggerPxType",
+                "sz",
+                "tdMode",
+            }
+            or request.get("_ledger_purpose") != purpose
+            or request.get("instId") != BATCH_119_RECOVERY.instrument_id
+            or request.get("instType") != "SWAP"
+            or str(request.get("mrgPosition") or "").lower()
+            != str(binding.position_mode).lower()
+            or request.get("posId") != str(leg.pos_id)
+            or str(request.get("posSide") or "").lower()
+            != BATCH_119_RECOVERY.side
+            or request.get("slOrdPx") != "-1"
+            or request.get("slTriggerPxType") != "last"
+            or _decimal_or_none(request.get("slTriggerPx"))
+            != expected_prices[purpose]
+            or _decimal_or_none(request.get("sz")) != expected_size
+            or str(request.get("tdMode") or "").lower()
+            != str(binding.margin_mode).lower()
+            or str(ledger.purpose) != purpose
+            or _decimal_or_none(ledger.trigger_price)
+            != expected_prices[purpose]
+            or str(pending_row.get("posId") or pending_row.get("pos_id") or "")
+            != str(leg.pos_id)
+            or str(
+                pending_row.get("instId")
+                or pending_row.get("instrument_id")
+                or ""
+            ).upper()
+            != BATCH_119_RECOVERY.instrument_id
+            or str(
+                pending_row.get("posSide")
+                or pending_row.get("side")
+                or ""
+            ).lower()
+            != BATCH_119_RECOVERY.side
+            or _decimal_or_none(
+                pending_row.get("sz") or pending_row.get("size")
+            )
+            != expected_size
+            or _decimal_or_none(
+                pending_row.get("slTriggerPx")
+                or pending_row.get("slTriggerPrice")
+                or pending_row.get("trigger_price")
+            )
+            != expected_prices[purpose]
+        ):
+            return False
+    return len(pending) == 2
 
 
 def _snapshot_order_ids(rows: Any) -> set[str]:
@@ -1149,6 +1294,23 @@ def _resume_component_execution_matches_locked_state(
         for row in session.query(PositionMutationIntent).all()
         if str(row.idempotency_key or "").startswith(f"{int(component.id)}:")
     ]
+    try:
+        if any(
+            not isinstance((request := _safe_json_value(row.request_json)), Mapping)
+            or not _is_sha256(row.request_fingerprint)
+            or _fingerprint(
+                {
+                    key: value
+                    for key, value in request.items()
+                    if key != "_ledger_purpose"
+                }
+            )
+            != str(row.request_fingerprint)
+            for row in intents
+        ):
+            return False
+    except (TypeError, ValueError, RecursionError, OverflowError):
+        return False
     expected_operations = {
         "consume_take_profit_stage": {"cancel_position_sltp"},
         "converge_partial_close": {"close_position"},
@@ -1220,11 +1382,27 @@ def _resume_component_execution_matches_locked_state(
             return False
         intent = selected[0]
         request = _safe_json_value(intent.request_json)
+        binding = session.get(
+            ExecutionBinding,
+            int(batch.execution_binding_id),
+        )
         close_delta = _decimal_or_none(execution.get("close_delta"))
         pre_submit_size = _decimal_or_none(execution.get("pre_submit_size"))
         target_remaining = _decimal_or_none(target.get("target_remaining_size"))
         return bool(
             isinstance(request, Mapping)
+            and binding is not None
+            and set(request) == {
+                "clOrdId",
+                "closePosId",
+                "instId",
+                "mrgPosition",
+                "ordType",
+                "posSide",
+                "side",
+                "sz",
+                "tdMode",
+            }
             and close_delta is not None
             and close_delta > 0
             and pre_submit_size is not None
@@ -1243,6 +1421,11 @@ def _resume_component_execution_matches_locked_state(
             and str(request.get("posSide") or "").lower()
             == BATCH_119_RECOVERY.side
             and str(request.get("side") or "").lower() == "sell"
+            and str(request.get("ordType") or "").lower() == "market"
+            and str(request.get("mrgPosition") or "").lower()
+            == str(binding.position_mode).lower()
+            and str(request.get("tdMode") or "").lower()
+            == str(binding.margin_mode).lower()
         )
     if set(execution) != {
         "primary_stop",

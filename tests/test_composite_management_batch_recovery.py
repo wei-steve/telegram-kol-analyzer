@@ -2560,8 +2560,42 @@ def test_resume_authorization_accepts_only_audited_progressed_batch_state(
             ],
             sort_keys=True,
         )
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                strategy_instance_id="deepcoin:incident:btc:long",
+                pos_id=POS_ID,
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id="terminal-first-tp",
+                purpose="take_profit",
+                trigger_price="66000",
+                size_text="19",
+                status="cancelled",
+                evidence_source="test_terminal_readback",
+                evidence_json="{}",
+                first_seen_at=NOW,
+                last_seen_at=NOW,
+                last_verified_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
         components[1].status = "awaiting_exchange"
         components[1].attempt_count = 1
+        close_request = {
+            "clOrdId": "CM119L1A1",
+            "closePosId": POS_ID,
+            "instId": "BTC-USDT-SWAP",
+            "mrgPosition": "split",
+            "ordType": "market",
+            "posSide": "long",
+            "side": "sell",
+            "sz": "19",
+            "tdMode": "cross",
+        }
         close_desired = json.loads(components[1].desired_json)
         close_desired["partial_close_execution"] = {
             "client_order_id": "CM119L1A1",
@@ -2581,19 +2615,15 @@ def test_resume_authorization_accepts_only_audited_progressed_batch_state(
                 execution_order_leg_id=entry_id,
                 pos_id=POS_ID,
                 authority_fingerprint="a" * 64,
-                request_fingerprint="b" * 64,
+                request_fingerprint=sha256(
+                    json.dumps(
+                        close_request,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
                 status="submitted",
-                request_json=json.dumps(
-                    {
-                        "clOrdId": "CM119L1A1",
-                        "closePosId": POS_ID,
-                        "instId": "BTC-USDT-SWAP",
-                        "posSide": "long",
-                        "side": "sell",
-                        "sz": "19",
-                    },
-                    sort_keys=True,
-                ),
+                request_json=json.dumps(close_request, sort_keys=True),
                 response_json='{"data":{"ordId":"close-1"}}',
                 reserved_at=NOW,
                 submitted_at=NOW,
@@ -2614,7 +2644,19 @@ def test_resume_authorization_accepts_only_audited_progressed_batch_state(
                     "posSide": "long",
                     "pos": "19",
                 }
-            ]
+            ],
+            trigger_history=[
+                {
+                    "ordId": "terminal-first-tp",
+                    "posId": POS_ID,
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "triggerOrderType": "TPSL",
+                    "tpTriggerPx": "66000",
+                    "sz": "19",
+                    "state": "cancelled",
+                }
+            ],
         ),
     )
 
@@ -2676,6 +2718,7 @@ def test_resume_authorization_rejects_forged_component_execution_plan(
         applied_at=NOW,
     )
     with factory() as session:
+        session.get(StrategyManagementBatch, 119).status = "executing"
         component = (
             session.query(StrategyManagementComponent)
             .filter_by(management_batch_id=119, sequence=sequence)
@@ -2747,6 +2790,92 @@ def test_resume_authorization_rejects_forged_confirmed_component(
                         "posSide": "long",
                         "pos": "38",
                     }
+                ]
+            ),
+        )
+
+
+def test_resume_authorization_rejects_no_cancel_tp_while_still_pending(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    plan = _plan(factory)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with factory() as session:
+        session.get(StrategyManagementBatch, 119).status = "executing"
+        component = (
+            session.query(StrategyManagementComponent)
+            .filter_by(management_batch_id=119, sequence=0)
+            .one()
+        )
+        component.status = "confirmed"
+        component.attempt_count = 1
+        component.completed_at = NOW
+        component.evidence_json = json.dumps(
+            [
+                {"error_type": "RuntimeError"},
+                {
+                    "phase": "no_cancel_required",
+                    "evidence_tier": "exact_terminal_no_fill",
+                },
+                {"proven_filled_quantity": "0"},
+            ],
+            sort_keys=True,
+        )
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                strategy_instance_id="deepcoin:incident:btc:long",
+                pos_id=POS_ID,
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id="still-pending-first-tp",
+                purpose="take_profit",
+                trigger_price="66000",
+                size_text="19",
+                status="verified",
+                evidence_source="test_pending_readback",
+                evidence_json="{}",
+                first_seen_at=NOW,
+                last_seen_at=NOW,
+                last_verified_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="resume_component_conflict",
+    ):
+        module.authorize_composite_batch_recovery_resume(
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=_snapshot(
+                pending_trigger_orders=[
+                    *_snapshot().pending_trigger_orders,
+                    {
+                        "ordId": "still-pending-first-tp",
+                        "posId": POS_ID,
+                        "instId": "BTC-USDT-SWAP",
+                        "posSide": "long",
+                        "triggerOrderType": "TPSL",
+                        "tpTriggerPx": "66000",
+                        "sz": "19",
+                        "state": "live",
+                    },
                 ]
             ),
         )
@@ -3829,6 +3958,51 @@ def test_recovery_cli_dry_run_then_apply_closes_exactly_once_and_preserves_setti
             == 1
         )
     assert load_trading_settings(factory).to_dict() == settings_before
+
+    old_stops = [
+        {
+            "ordId": PRIMARY_ORDER_ID,
+            "posId": POS_ID,
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "triggerOrderType": "TPSL",
+            "slTriggerPx": "64000",
+            "sz": "38",
+            "state": "live",
+        },
+        {
+            "ordId": BACKUP_ORDER_ID,
+            "posId": POS_ID,
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "triggerOrderType": "TPSL",
+            "slTriggerPx": "63000",
+            "sz": "38",
+            "state": "live",
+        },
+    ]
+    client.pending.extend(old_stops)
+    unsafe_repeat = CliRunner().invoke(
+        app,
+        [
+            *common,
+            "--apply",
+            "--expected-fingerprint",
+            fingerprint,
+            "--authorization",
+            "I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        ],
+    )
+    assert unsafe_repeat.exit_code == 2
+    assert json.loads(unsafe_repeat.stdout)["reason_code"] == (
+        "resume_component_conflict"
+    )
+    assert len(client.close_calls) == 1
+    assert len(client.set_calls) == 2
+    client.pending = [
+        row for row in client.pending
+        if row["ordId"] not in {PRIMARY_ORDER_ID, BACKUP_ORDER_ID}
+    ]
 
     repeated = CliRunner().invoke(
         app,
