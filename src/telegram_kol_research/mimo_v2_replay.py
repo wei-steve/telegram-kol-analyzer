@@ -499,8 +499,9 @@ def _evidence_difference_codes(
     if v1 == v2:
         return ()
     codes: list[str] = []
-    if _evidence_field_sources(v1["text_fields"]) != _evidence_field_sources(
-        v2["text_fields"]
+    if _v2_evidence_fields_changed_or_lost(
+        v1["text_fields"],
+        v2["text_fields"],
     ):
         codes.append("text_field_attribution_changed")
     v1_images = v1["images"]
@@ -561,6 +562,17 @@ def _evidence_field_sources(value: Any) -> Any:
         else:
             projected[str(key)] = _drop_missing(item)
     return projected
+
+
+def _v2_evidence_fields_changed_or_lost(v1: Any, v2: Any) -> bool:
+    if not isinstance(v1, dict) or not isinstance(v2, dict):
+        return v1 != v2
+    v1_fields = set(v1)
+    if not v1_fields.issubset(v2):
+        return True
+    return _evidence_field_sources(v1) != _evidence_field_sources(
+        {field: v2[field] for field in v1_fields}
+    )
 
 
 def _canonical_v2_response_size(result: Any) -> int:

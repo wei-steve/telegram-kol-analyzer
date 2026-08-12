@@ -462,6 +462,164 @@ def test_replay_allows_v2_only_image_summary_quality_enrichment(tmp_path):
     assert result.comparisons[0].evidence_difference_codes == ()
 
 
+def test_replay_allows_v2_only_text_field_enrichment(tmp_path):
+    source = tmp_path / "production.db"
+    [message_id] = _seed_source_database(source, count=1)
+    v2 = _v2_result()
+    v2.adapted_result.payload["evidence"]["text"]["fields"] = {
+        "symbol": {
+            "value": "BTC",
+            "source": "text",
+            "confidence": 0.99,
+        }
+    }
+
+    result = run_mimo_v2_replay(
+        source_database=source,
+        artifact_dir=tmp_path / "artifacts",
+        raw_message_ids=[message_id],
+        v1_runner=_v1_runner,
+        v2_runner=lambda **kwargs: v2,
+    )
+
+    assert result.passed is True
+    assert result.comparisons[0].classification == "match"
+    assert result.comparisons[0].evidence_difference_codes == ()
+
+
+def test_replay_rejects_overlapping_text_field_source_drift(tmp_path):
+    source = tmp_path / "production.db"
+    [message_id] = _seed_source_database(source, count=1)
+    legacy_payload = _v1_payload()
+    legacy_payload["evidence"] = {
+        "text": {
+            "observed_text": "entry",
+            "fields": {
+                "symbol": {
+                    "value": "BTC",
+                    "source": "text",
+                    "confidence": 0.99,
+                }
+            },
+        },
+        "images": [],
+        "conflicts": [],
+    }
+    v2 = _v2_result()
+    v2.adapted_result.payload["evidence"]["text"]["fields"] = {
+        "symbol": {
+            "value": "BTC",
+            "source": "image",
+            "confidence": 0.99,
+        }
+    }
+
+    result = run_mimo_v2_replay(
+        source_database=source,
+        artifact_dir=tmp_path / "artifacts",
+        raw_message_ids=[message_id],
+        v1_runner=lambda **kwargs: SimpleNamespace(
+            error_message=None,
+            status="是策略",
+            payload=legacy_payload,
+            replay_duration_ms=100.0,
+        ),
+        v2_runner=lambda **kwargs: v2,
+    )
+
+    assert result.passed is False
+    assert result.comparisons[0].classification == "unsafe_evidence_mismatch"
+    assert result.comparisons[0].evidence_difference_codes == (
+        "text_field_attribution_changed",
+    )
+
+
+def test_replay_rejects_overlapping_text_field_value_drift(tmp_path):
+    source = tmp_path / "production.db"
+    [message_id] = _seed_source_database(source, count=1)
+    legacy_payload = _v1_payload()
+    legacy_payload["evidence"] = {
+        "text": {
+            "observed_text": "entry",
+            "fields": {
+                "symbol": {
+                    "value": "BTC",
+                    "source": "text",
+                    "confidence": 0.99,
+                }
+            },
+        },
+        "images": [],
+        "conflicts": [],
+    }
+    v2 = _v2_result(symbol="ETH")
+    v2.adapted_result.payload["evidence"]["text"]["fields"] = {
+        "symbol": {
+            "value": "ETH",
+            "source": "text",
+            "confidence": 0.99,
+        }
+    }
+
+    result = run_mimo_v2_replay(
+        source_database=source,
+        artifact_dir=tmp_path / "artifacts",
+        raw_message_ids=[message_id],
+        v1_runner=lambda **kwargs: SimpleNamespace(
+            error_message=None,
+            status="是策略",
+            payload=legacy_payload,
+            replay_duration_ms=100.0,
+        ),
+        v2_runner=lambda **kwargs: v2,
+    )
+
+    assert result.passed is False
+    assert result.comparisons[0].classification == "unsafe_evidence_mismatch"
+    assert result.comparisons[0].evidence_difference_codes == (
+        "text_field_attribution_changed",
+    )
+
+
+def test_replay_rejects_text_field_evidence_lost_by_v2(tmp_path):
+    source = tmp_path / "production.db"
+    [message_id] = _seed_source_database(source, count=1)
+    legacy_payload = _v1_payload()
+    legacy_payload["evidence"] = {
+        "text": {
+            "observed_text": "entry",
+            "fields": {
+                "symbol": {
+                    "value": "BTC",
+                    "source": "text",
+                    "confidence": 0.99,
+                }
+            },
+        },
+        "images": [],
+        "conflicts": [],
+    }
+
+    result = run_mimo_v2_replay(
+        source_database=source,
+        artifact_dir=tmp_path / "artifacts",
+        raw_message_ids=[message_id],
+        v1_runner=lambda **kwargs: SimpleNamespace(
+            error_message=None,
+            status="是策略",
+            payload=legacy_payload,
+            replay_duration_ms=100.0,
+        ),
+        v2_runner=lambda **kwargs: _v2_result(),
+    )
+
+    assert result.passed is False
+    assert result.comparisons[0].classification == "unsafe_evidence_mismatch"
+    assert result.comparisons[0].evidence_difference_codes == (
+        "text_field_attribution_changed",
+    )
+
+
 def test_replay_classifies_model_failures_without_leaking_error_text(tmp_path):
     source = tmp_path / "production.db"
     [message_id] = _seed_source_database(source, count=1)
