@@ -1889,15 +1889,17 @@ telegram-kol-research replay-mimo-v2 \
 ```
 
 命令以 SQLite 只读连接复制一份临时数据库，v1/v2 调用只在临时副本中
-记录 prompt/run/attempt。它不导入或构建 Deepcoin writer 和通知器，不进入 live
-listener，不向生产数据库写入。`summary.json` 和 `comparisons.csv` 只保留消息
+记录 prompt/run/attempt。回放模块不构建或调用 Deepcoin writer、通知器或 live
+listener；命令入口仍复用项目统一 CLI 注册模块。它不向生产数据库写入。`summary.json` 和 `comparisons.csv` 只保留消息
 数据库 ID、状态、延迟与投影指纹，不保留消息正文、图片字节、凭证或供应商
 异常文本。以下任一条会以非零状态退出：
 
 - v1 或 v2 未得到可比较的结构化投影；
 - 出现可执行语义差异；
+- 出现文字/图片或跨图片证据归因差异；
 - adapter P95 大于或等于 50 ms；
-- v2 端到端 P95 超过 v1 P95 的 115%。
+- v2 端到端 P95 超过 v1 P95 的 115%；
+- MiMo v2 原始供应商响应超过 256 KiB。
 
 输出通过后，仍需运行发布预检，证明没有 `executing`、`submitted`、
 `unknown` 或 `recovery_required` 指令，没有活跃恢复/对账，也没有时效性策略
@@ -1930,6 +1932,8 @@ WHERE run_id IN (
 ORDER BY run_id, ordinal;
 ```
 
-回滚只把 `mimo_contract_mode` 改回 `v1`。保留水位线、v2 run/attempt、证据、
+设置 API 在 Telegram 操作锁内完成水位校验与保存，避免 live listener 在两步之间
+插入新消息。回滚只把 `mimo_contract_mode` 改回 `v1`，不得同时修改水位线。
+保留水位线、v2 run/attempt、证据、
 candidate、instruction、lifecycle 和交易所审计记录；不删除、不重放、不重试
 未知交易所结果。

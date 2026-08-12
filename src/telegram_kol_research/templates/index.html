@@ -391,6 +391,9 @@
             合同断路器：
             {% if mimo_contract_circuit.is_open %}
             已打开 · {{ mimo_contract_circuit.opened_reason or '未知原因' }}
+            {% if mimo_contract_circuit.opened_at %}
+            · {{ mimo_contract_circuit.opened_at.isoformat() }}
+            {% endif %}
             {% else %}
             已关闭 · 连续传输失败 {{ mimo_contract_circuit.consecutive_transport_failures }} 次
             {% endif %}

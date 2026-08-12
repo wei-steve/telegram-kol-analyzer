@@ -3842,6 +3842,13 @@ def _validate_mimo_contract_activation(
 ) -> None:
     current = load_trading_settings(session_factory)
     candidate = trading_settings_from_payload({**current.to_dict(), **payload})
+    if (
+        current.mimo_contract_mode == "v2_live_adapter"
+        and candidate.mimo_contract_mode == "v1"
+        and candidate.mimo_v2_activation_after_raw_message_id
+        != current.mimo_v2_activation_after_raw_message_id
+    ):
+        raise ValueError("mimo v1 rollback must preserve the activation watermark")
     if candidate.mimo_contract_mode != "v2_live_adapter":
         return
     is_activation = current.mimo_contract_mode != "v2_live_adapter"
@@ -6738,15 +6745,16 @@ def create_web_app(
             # rejects the global allowlist.
             refresh_status = await orchestrator.refresh_once()
         try:
-            _validate_mimo_contract_activation(
-                app.state.session_factory,
-                payload=payload,
-            )
-            response = save_trading_settings(
-                app.state.session_factory,
-                payload,
-                updated_at=app.state.now_provider(),
-            ).to_dict()
+            async with app.state.telegram_operation_lock:
+                _validate_mimo_contract_activation(
+                    app.state.session_factory,
+                    payload=payload,
+                )
+                response = save_trading_settings(
+                    app.state.session_factory,
+                    payload,
+                    updated_at=app.state.now_provider(),
+                ).to_dict()
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if refresh_status is not None:

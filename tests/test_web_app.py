@@ -1214,6 +1214,34 @@ def test_trading_settings_api_round_trips_mimo_v2_future_activation(tmp_path):
     )
 
 
+def test_trading_settings_activation_holds_telegram_operation_lock(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.web_app as web_module
+
+    app = create_web_app(database_path=tmp_path / "research.db")
+    real_save = web_module.save_trading_settings
+    observed: list[bool] = []
+
+    def guarded_save(*args, **kwargs):
+        observed.append(app.state.telegram_operation_lock.locked())
+        return real_save(*args, **kwargs)
+
+    monkeypatch.setattr(web_module, "save_trading_settings", guarded_save)
+
+    response = TestClient(app).post(
+        "/api/trading-settings",
+        json={
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 7,
+        },
+    )
+
+    assert response.status_code == 200
+    assert observed == [True]
+
+
 @pytest.mark.parametrize("mode", ["shadow", "v2", "live"])
 def test_trading_settings_api_rejects_unsupported_mimo_mode(tmp_path, mode):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
@@ -1280,6 +1308,33 @@ def test_trading_settings_api_v1_rollback_preserves_mimo_watermark(tmp_path):
     assert rolled_back.json()["mimo_v2_activation_after_raw_message_id"] == 7
 
 
+def test_trading_settings_api_v1_rollback_rejects_watermark_change(tmp_path):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    client = TestClient(app)
+    enabled = client.post(
+        "/api/trading-settings",
+        json={
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 7,
+        },
+    )
+    assert enabled.status_code == 200
+
+    rolled_back = client.post(
+        "/api/trading-settings",
+        json={
+            "mimo_contract_mode": "v1",
+            "mimo_v2_activation_after_raw_message_id": 0,
+        },
+    )
+
+    assert rolled_back.status_code == 422
+    assert "preserve" in rolled_back.json()["detail"]
+    stored = client.get("/api/trading-settings").json()
+    assert stored["mimo_contract_mode"] == "v2_live_adapter"
+    assert stored["mimo_v2_activation_after_raw_message_id"] == 7
+
+
 def test_trading_settings_api_and_ui_show_mimo_circuit_state(tmp_path):
     from telegram_kol_research.mimo_contract_circuit import record_mimo_v2_outcome
 
@@ -1307,6 +1362,7 @@ def test_trading_settings_api_and_ui_show_mimo_circuit_state(tmp_path):
     assert "MiMo 识别合同" in page_response.text
     assert "v2_live_adapter" in page_response.text
     assert "contract_validation_failed" in page_response.text
+    assert "2026-08-11T12:00:00+00:00" in page_response.text
     assert 'name="mimo_v2_activation_after_raw_message_id"' in page_response.text
 
 

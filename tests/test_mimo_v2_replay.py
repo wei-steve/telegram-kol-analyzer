@@ -543,3 +543,33 @@ def test_replay_module_has_no_production_side_effect_dependencies():
         "send_notification",
     )
     assert not [name for name in forbidden if name in source]
+
+
+def test_replay_never_constructs_production_clients_or_notifiers(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.deepcoin_client as deepcoin_module
+    import telegram_kol_research.production_safety_monitor as monitor_module
+    import telegram_kol_research.telegram_live_listener as listener_module
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("production side effect dependency was called")
+
+    monkeypatch.setattr(deepcoin_module, "build_deepcoin_client_from_env", forbidden)
+    monkeypatch.setattr(monitor_module, "send_monitor_test_notification", forbidden)
+    monkeypatch.setattr(listener_module, "run_live_listener", forbidden)
+    source = tmp_path / "production.db"
+    [message_id] = _seed_source_database(source, count=1)
+
+    result = run_mimo_v2_replay(
+        source_database=source,
+        artifact_dir=tmp_path / "artifacts",
+        raw_message_ids=[message_id],
+        v1_runner=_v1_runner,
+        v2_runner=_v2_runner,
+    )
+
+    assert result.passed is True
+    assert result.production_writes == 0
+    assert result.notifications_sent == 0
