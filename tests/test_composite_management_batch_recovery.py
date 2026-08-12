@@ -2548,6 +2548,18 @@ def test_resume_authorization_accepts_only_audited_progressed_batch_state(
         components[0].status = "confirmed"
         components[0].reason_code = None
         components[0].attempt_count = 2
+        components[0].completed_at = NOW
+        components[0].evidence_json = json.dumps(
+            [
+                {"error_type": "RuntimeError"},
+                {
+                    "phase": "no_cancel_required",
+                    "evidence_tier": "exact_terminal_no_fill",
+                },
+                {"proven_filled_quantity": "0"},
+            ],
+            sort_keys=True,
+        )
         components[1].status = "awaiting_exchange"
         components[1].attempt_count = 1
         close_desired = json.loads(components[1].desired_json)
@@ -2672,6 +2684,52 @@ def test_resume_authorization_rejects_forged_component_execution_plan(
         desired = json.loads(component.desired_json)
         desired[execution_key] = forged_execution
         component.desired_json = json.dumps(desired, sort_keys=True)
+        session.commit()
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="resume_component_conflict",
+    ):
+        module.authorize_composite_batch_recovery_resume(
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=_snapshot(
+                positions=[
+                    {
+                        "posId": POS_ID,
+                        "instId": "BTC-USDT-SWAP",
+                        "posSide": "long",
+                        "pos": "38",
+                    }
+                ]
+            ),
+        )
+
+
+@pytest.mark.parametrize("sequence", [0, 2])
+def test_resume_authorization_rejects_forged_confirmed_component(
+    tmp_path,
+    sequence,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    plan = _plan(factory)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with factory() as session:
+        component = (
+            session.query(StrategyManagementComponent)
+            .filter_by(management_batch_id=119, sequence=sequence)
+            .one()
+        )
+        component.status = "confirmed"
+        component.completed_at = NOW
+        component.evidence_json = '[{"forged":true}]'
         session.commit()
 
     with pytest.raises(

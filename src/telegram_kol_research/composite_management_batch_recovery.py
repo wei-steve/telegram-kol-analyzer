@@ -381,6 +381,8 @@ def authorize_composite_batch_recovery_resume(
             target=target,
             disposition=disposition,
             expected_fingerprint=expected_fingerprint,
+            snapshot=snapshot,
+            approved_current_size=after["current_size"],
         )
         if not _resume_exchange_close_evidence_is_owned(
             session,
@@ -569,6 +571,8 @@ def _validate_progressed_recovery_state(
     target,
     disposition: str,
     expected_fingerprint: str,
+    snapshot: Any,
+    approved_current_size: Any,
 ) -> None:
     position_absent = disposition == "position_absent"
     if str(batch.status) not in (
@@ -596,6 +600,13 @@ def _validate_progressed_recovery_state(
         "operator_required",
         "safely_skipped",
     }
+    statuses = [str(row.status) for row in components]
+    if not _resume_component_status_order_is_valid(
+        batch_status=str(batch.status),
+        statuses=statuses,
+        position_absent=position_absent,
+    ):
+        raise CompositeBatchRecoveryConflict("resume_component_conflict")
     mutable_keys = {
         "consume_take_profit_stage": "take_profit_consumption_execution",
         "converge_partial_close": "partial_close_execution",
@@ -659,6 +670,23 @@ def _validate_progressed_recovery_state(
             raise CompositeBatchRecoveryConflict(
                 "resume_component_conflict"
             ) from None
+        if str(component.status) == "confirmed" and not (
+            _resume_confirmed_component_matches_locked_state(
+                session,
+                batch=batch,
+                leg=leg,
+                entry=entry,
+                component=component,
+                kind=kind,
+                execution=execution,
+                evidence=evidence,
+                snapshot=snapshot,
+                target=target,
+                disposition=disposition,
+                approved_current_size=approved_current_size,
+            )
+        ):
+            raise CompositeBatchRecoveryConflict("resume_component_conflict")
         if disposition == "protection_only_below_target":
             attestations = [
                 row
@@ -709,6 +737,400 @@ def _validate_progressed_recovery_state(
         is not None
     ):
         raise CompositeBatchRecoveryConflict("additional_active_work_present")
+
+
+def _resume_component_status_order_is_valid(
+    *,
+    batch_status: str,
+    statuses: list[str],
+    position_absent: bool,
+) -> bool:
+    if position_absent:
+        return batch_status == "resolved" and statuses == [
+            "safely_skipped",
+            "safely_skipped",
+            "safely_skipped",
+        ]
+    executable = {
+        "pending",
+        "preflighting",
+        "submitting",
+        "awaiting_exchange",
+        "definitely_rejected",
+        "recovery_required",
+    }
+    if len(statuses) != 3 or any(
+        status not in executable | {"confirmed"} for status in statuses
+    ):
+        return False
+    confirmed_count = 0
+    for status in statuses:
+        if status != "confirmed":
+            break
+        confirmed_count += 1
+    if any(status == "confirmed" for status in statuses[confirmed_count:]):
+        return False
+    if any(status != "pending" for status in statuses[confirmed_count + 1 :]):
+        return False
+    if batch_status == "succeeded":
+        return confirmed_count == 3
+    if batch_status == "ready":
+        return confirmed_count == 0 and statuses == [
+            "recovery_required",
+            "pending",
+            "pending",
+        ]
+    return batch_status == "executing"
+
+
+def _resume_confirmed_component_matches_locked_state(
+    session,
+    *,
+    batch,
+    leg,
+    entry,
+    component,
+    kind: str,
+    execution: Any,
+    evidence: list[Any],
+    snapshot: Any,
+    target: Mapping[str, Any],
+    disposition: str,
+    approved_current_size: Any,
+) -> bool:
+    if component.completed_at is None or int(component.attempt_count or 0) <= 0:
+        return False
+    intents = [
+        row
+        for row in session.query(PositionMutationIntent).all()
+        if str(row.idempotency_key or "").startswith(f"{int(component.id)}:")
+    ]
+    if kind == "consume_take_profit_stage":
+        return _resume_confirmed_take_profit_matches(
+            session,
+            batch=batch,
+            leg=leg,
+            entry=entry,
+            component=component,
+            execution=execution,
+            evidence=evidence,
+            intents=intents,
+            snapshot=snapshot,
+        )
+    if kind == "converge_partial_close":
+        return _resume_confirmed_close_matches(
+            leg=leg,
+            component=component,
+            execution=execution,
+            evidence=evidence,
+            intents=intents,
+            snapshot=snapshot,
+            target=target,
+            disposition=disposition,
+            approved_current_size=approved_current_size,
+        )
+    return _resume_confirmed_protection_matches(
+        session,
+        batch=batch,
+        leg=leg,
+        entry=entry,
+        component=component,
+        execution=execution,
+        evidence=evidence,
+        intents=intents,
+        snapshot=snapshot,
+    )
+
+
+def _resume_confirmed_take_profit_matches(
+    session,
+    *,
+    batch,
+    leg,
+    entry,
+    component,
+    execution: Any,
+    evidence: list[Any],
+    intents: list[Any],
+    snapshot: Any,
+) -> bool:
+    if execution is None:
+        if intents or len(evidence) < 2:
+            return False
+        phase = evidence[-2]
+        result = evidence[-1]
+        quantity = (
+            _decimal_or_none(result.get("proven_filled_quantity"))
+            if isinstance(result, Mapping)
+            else None
+        )
+        return bool(
+            isinstance(phase, Mapping)
+            and set(phase) == {"phase", "evidence_tier"}
+            and phase.get("phase") == "no_cancel_required"
+            and isinstance(phase.get("evidence_tier"), str)
+            and isinstance(result, Mapping)
+            and set(result) == {"proven_filled_quantity"}
+            and quantity is not None
+            and quantity >= 0
+        )
+    order_ids = list(execution["cancel_order_ids"])
+    intent_ids = list(execution["cancel_intent_ids"])
+    selected = {int(row.id): row for row in intents}
+    if set(selected) != set(intent_ids) or any(
+        str(row.status) != "confirmed" for row in selected.values()
+    ):
+        return False
+    first_fact = {
+        "cancel_order_ids": order_ids,
+        "intent_id": intent_ids[0],
+    }
+    if first_fact not in evidence:
+        return False
+    terminal_fact = evidence[-1] if evidence else None
+    terminal_valid = (
+        isinstance(terminal_fact, Mapping)
+        and set(terminal_fact) in (
+            {"intent_id"},
+            {"intent_id", "fill_race"},
+        )
+        and int(terminal_fact.get("intent_id") or 0) in set(intent_ids)
+        and (
+            "fill_race" not in terminal_fact
+            or terminal_fact.get("fill_race") is True
+        )
+    ) or str(component.reason_code) == "take_profit_cancel_exchange_confirmed"
+    if not terminal_valid:
+        return False
+    ledgers = session.query(PositionProtectionLedger).filter(
+        PositionProtectionLedger.order_id.in_(order_ids)
+    ).all()
+    pending_ids = _snapshot_order_ids(snapshot.pending_trigger_orders)
+    return len(ledgers) == len(order_ids) and all(
+        str(row.venue) == "deepcoin"
+        and int(row.execution_binding_id) == int(batch.execution_binding_id)
+        and int(row.execution_order_leg_id) == int(entry.id)
+        and str(row.pos_id) == str(leg.pos_id)
+        and str(row.status) == "cancelled"
+        for row in ledgers
+    ) and not set(order_ids).intersection(pending_ids)
+
+
+def _resume_confirmed_close_matches(
+    *,
+    leg,
+    component,
+    execution: Any,
+    evidence: list[Any],
+    intents: list[Any],
+    snapshot: Any,
+    target: Mapping[str, Any],
+    disposition: str,
+    approved_current_size: Any,
+) -> bool:
+    expected_remaining = (
+        _decimal_or_none(approved_current_size)
+        if disposition == "protection_only_below_target"
+        else _decimal_or_none(target.get("target_remaining_size"))
+    )
+    live_remaining = _snapshot_exact_position_size(
+        snapshot,
+        pos_id=str(leg.pos_id),
+    )
+    if (
+        expected_remaining is None
+        or live_remaining is None
+        or live_remaining != expected_remaining
+    ):
+        return False
+    if execution is None:
+        if intents or len(evidence) < 2:
+            return False
+        plan_fact = evidence[-2]
+        terminal_fact = evidence[-1]
+        return bool(
+            isinstance(plan_fact, Mapping)
+            and plan_fact == {"close_delta": "0"}
+            and isinstance(terminal_fact, Mapping)
+            and terminal_fact.get("remaining_size")
+            == _decimal_text(expected_remaining)
+            and terminal_fact.get("evidence_tier")
+            in {
+                "exact_position_target",
+                "approved_under_target_recovery",
+            }
+        )
+    intent_id = int(execution["intent_id"])
+    if len(intents) != 1 or int(intents[0].id) != intent_id:
+        return False
+    intent = intents[0]
+    if str(intent.status) != "confirmed":
+        return False
+    plan_fact = {
+        "close_delta": str(execution["close_delta"]),
+        "intent_id": intent_id,
+    }
+    if plan_fact not in evidence:
+        return False
+    terminal_fact = evidence[-1] if evidence else None
+    return bool(
+        isinstance(terminal_fact, Mapping)
+        and int(terminal_fact.get("intent_id") or 0) == intent_id
+        and (
+            (
+                terminal_fact.get("remaining_size")
+                == _decimal_text(expected_remaining)
+                and terminal_fact.get("evidence_tier")
+                == "exact_position_target"
+            )
+            or terminal_fact.get("unresolved_delta") == "0"
+        )
+    )
+
+
+def _resume_confirmed_protection_matches(
+    session,
+    *,
+    batch,
+    leg,
+    entry,
+    component,
+    execution: Any,
+    evidence: list[Any],
+    intents: list[Any],
+    snapshot: Any,
+) -> bool:
+    if not isinstance(execution, Mapping) or len(evidence) < 2:
+        return False
+    old_ids = list(execution["old_stop_order_ids"])
+    terminal = evidence[-1]
+    if (
+        not isinstance(terminal, Mapping)
+        or set(terminal) != {
+            "new_stop_order_ids",
+            "cancelled_old_stop_order_ids",
+            "retained_take_profit_total",
+            "effective_remaining_size",
+        }
+        or not _unique_nonempty_strings(terminal.get("new_stop_order_ids"))
+        or len(terminal["new_stop_order_ids"]) != 2
+        or terminal.get("cancelled_old_stop_order_ids") != sorted(old_ids)
+        or terminal.get("retained_take_profit_total")
+        != execution.get("retained_take_profit_total")
+        or terminal.get("effective_remaining_size")
+        != execution.get("effective_remaining_size")
+    ):
+        return False
+    new_ids = list(terminal["new_stop_order_ids"])
+    by_key = {str(row.idempotency_key): row for row in intents}
+    expected_keys = {
+        f"{int(component.id)}:set:primary",
+        f"{int(component.id)}:set:backup",
+        *(f"{int(component.id)}:cancel-old:{order_id}" for order_id in old_ids),
+    }
+    if set(by_key) != expected_keys or any(
+        str(row.status) != "confirmed" for row in by_key.values()
+    ):
+        return False
+    set_intents = [
+        by_key[f"{int(component.id)}:set:{role}"]
+        for role in ("primary", "backup")
+    ]
+    if {str(row.order_id or "") for row in set_intents} != set(new_ids):
+        return False
+    old_ledgers = session.query(PositionProtectionLedger).filter(
+        PositionProtectionLedger.order_id.in_(old_ids)
+    ).all()
+    new_ledgers = session.query(PositionProtectionLedger).filter(
+        PositionProtectionLedger.order_id.in_(new_ids)
+    ).all()
+    if len(old_ledgers) != len(old_ids) or len(new_ledgers) != 2:
+        return False
+    if any(
+        str(row.status) != "cancelled"
+        or int(row.execution_binding_id) != int(batch.execution_binding_id)
+        or int(row.execution_order_leg_id) != int(entry.id)
+        or str(row.pos_id) != str(leg.pos_id)
+        for row in old_ledgers
+    ):
+        return False
+    expected_prices = {
+        "stop_loss": _decimal_or_none(execution.get("primary_stop")),
+        "backup_stop": _decimal_or_none(execution.get("backup_stop")),
+    }
+    expected_size = _decimal_or_none(execution.get("effective_remaining_size"))
+    if expected_size is None or any(
+        str(row.status) != "verified"
+        or int(row.execution_binding_id) != int(batch.execution_binding_id)
+        or int(row.execution_order_leg_id) != int(entry.id)
+        or str(row.pos_id) != str(leg.pos_id)
+        or str(row.instrument_id).upper() != BATCH_119_RECOVERY.instrument_id
+        or str(row.side).lower() != BATCH_119_RECOVERY.side
+        or str(row.purpose) not in expected_prices
+        or _decimal_or_none(row.trigger_price)
+        != expected_prices[str(row.purpose)]
+        or _decimal_or_none(row.size_text) != expected_size
+        for row in new_ledgers
+    ):
+        return False
+    pending = {
+        order_id: row
+        for row in snapshot.pending_trigger_orders
+        if isinstance(row, Mapping)
+        and (
+            order_id := str(
+                row.get("ordId")
+                or row.get("orderId")
+                or row.get("order_id")
+                or ""
+            )
+        )
+        in set(new_ids)
+    }
+    return len(pending) == 2 and all(
+        str(row.get("posId") or row.get("pos_id") or "") == str(leg.pos_id)
+        and str(row.get("instId") or row.get("instrument_id") or "").upper()
+        == BATCH_119_RECOVERY.instrument_id
+        and str(row.get("posSide") or row.get("side") or "").lower()
+        == BATCH_119_RECOVERY.side
+        and _decimal_or_none(row.get("sz") or row.get("size")) == expected_size
+        and _decimal_or_none(
+            row.get("slTriggerPx")
+            or row.get("slTriggerPrice")
+            or row.get("trigger_price")
+        ) in set(expected_prices.values())
+        for row in pending.values()
+    )
+
+
+def _snapshot_order_ids(rows: Any) -> set[str]:
+    return {
+        order_id
+        for row in rows
+        if isinstance(row, Mapping)
+        and (
+            order_id := str(
+                row.get("ordId")
+                or row.get("orderId")
+                or row.get("order_id")
+                or ""
+            )
+        )
+    }
+
+
+def _snapshot_exact_position_size(snapshot: Any, *, pos_id: str) -> Decimal | None:
+    matches = [
+        row
+        for row in snapshot.positions
+        if isinstance(row, Mapping)
+        and str(row.get("posId") or row.get("pos_id") or "") == pos_id
+    ]
+    return (
+        _decimal_or_none(matches[0].get("pos") or matches[0].get("size"))
+        if len(matches) == 1
+        else None
+    )
 
 
 def _resume_component_execution_matches_locked_state(
