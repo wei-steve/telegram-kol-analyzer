@@ -85,6 +85,8 @@ class TradingSettings:
     instruction_execution_entry_after_item_id: int = 0
     instruction_execution_management_after_item_id: int = 0
     deepcoin_contract_specs_mode: Literal["static", "shadow", "live"] = "static"
+    mimo_contract_mode: Literal["v1", "v2_live_adapter"] = "v1"
+    mimo_v2_activation_after_raw_message_id: int = 0
     default_max_loss_usdt: float = 20.0
     daily_max_loss_usdt: float = 500.0
     max_concurrent_positions: int = 4
@@ -390,6 +392,16 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
             defaults.deepcoin_contract_specs_mode,
         )
     )
+    mimo_contract_mode = _mimo_contract_mode(
+        raw.get("mimo_contract_mode", defaults.mimo_contract_mode)
+    )
+    mimo_v2_activation_after_raw_message_id = _nonnegative_int_setting(
+        raw.get(
+            "mimo_v2_activation_after_raw_message_id",
+            defaults.mimo_v2_activation_after_raw_message_id,
+        ),
+        field_name="mimo_v2_activation_after_raw_message_id",
+    )
     return TradingSettings(
         auto_trade_enabled=_boolean_setting(
             raw,
@@ -420,6 +432,10 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
             instruction_execution_management_after_item_id
         ),
         deepcoin_contract_specs_mode=deepcoin_contract_specs_mode,
+        mimo_contract_mode=mimo_contract_mode,
+        mimo_v2_activation_after_raw_message_id=(
+            mimo_v2_activation_after_raw_message_id
+        ),
         default_max_loss_usdt=_positive_float(
             raw.get("default_max_loss_usdt"),
             defaults.default_max_loss_usdt,
@@ -557,6 +573,17 @@ def _deepcoin_contract_specs_mode(
         raise ValueError(
             "deepcoin_contract_specs_mode must be static, shadow, or live"
         )
+    return normalized
+
+
+def _mimo_contract_mode(
+    value: Any,
+) -> Literal["v1", "v2_live_adapter"]:
+    if not isinstance(value, str):
+        raise ValueError("mimo_contract_mode must be v1 or v2_live_adapter")
+    normalized = value.strip().lower()
+    if normalized not in {"v1", "v2_live_adapter"}:
+        raise ValueError("mimo_contract_mode must be v1 or v2_live_adapter")
     return normalized
 
 
