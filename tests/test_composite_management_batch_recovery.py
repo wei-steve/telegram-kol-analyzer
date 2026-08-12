@@ -1,0 +1,1305 @@
+from __future__ import annotations
+
+import importlib
+import json
+from dataclasses import asdict
+from datetime import UTC, datetime
+from hashlib import sha256
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.models import (
+    ExecutionBinding,
+    ExecutionEvent,
+    ExecutionOrderLeg,
+    MessageInstructionItem,
+    PositionMutationIntent,
+    PositionProtectionLedger,
+    RawMessage,
+    RecognitionDecision,
+    SignalCandidate,
+    StrategyLifecycle,
+    StrategyManagementBatch,
+    StrategyManagementComponent,
+    StrategyManagementLeg,
+)
+from telegram_kol_research.strategy_management_contracts import (
+    ManagementInstructionContract,
+    management_contract_fingerprint,
+    serialize_management_contract,
+)
+from telegram_kol_research.strategy_management_planner import (
+    management_target_fingerprint,
+)
+
+
+NOW = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
+POS_ID = "sensitive-position-119"
+PRIMARY_ORDER_ID = "sensitive-primary-order"
+BACKUP_ORDER_ID = "sensitive-backup-order"
+SOURCE_TEXT = "private source message text should never be retained"
+
+
+def _recovery_module():
+    return importlib.import_module(
+        "telegram_kol_research.composite_management_batch_recovery"
+    )
+
+
+def _profile():
+    module = _recovery_module()
+    return module.CompositeBatchRecoveryProfile(
+        batch_id=7,
+        raw_message_id=11,
+        lifecycle_id=13,
+        trusted_start_size="38",
+        target_remaining_size="19",
+        instrument_id="BTC-USDT-SWAP",
+        side="long",
+    )
+
+
+def test_batch_119_recovery_profile_is_closed_and_immutable():
+    module = _recovery_module()
+
+    assert module.BATCH_119_RECOVERY == module.CompositeBatchRecoveryProfile(
+        batch_id=119,
+        raw_message_id=10532,
+        lifecycle_id=794,
+        trusted_start_size="38",
+        target_remaining_size="19",
+        instrument_id="BTC-USDT-SWAP",
+        side="long",
+    )
+    with pytest.raises((AttributeError, TypeError)):
+        module.BATCH_119_RECOVERY.batch_id = 120
+
+
+@pytest.mark.parametrize(
+    ("current", "disposition", "close_delta", "effective_remaining"),
+    [
+        ("38", "resume_to_target", "19", "19"),
+        ("19", "protection_only_at_target", "0", "19"),
+        ("12", "protection_only_below_target", "0", "12"),
+        (None, "position_absent", "0", "0"),
+    ],
+)
+def test_classify_recovery_position(
+    current, disposition, close_delta, effective_remaining
+):
+    module = _recovery_module()
+    positions = [] if current is None else [
+        {
+            "posId": "sensitive-position-id",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "pos": current,
+        }
+    ]
+
+    result = module.classify_recovery_position(
+        profile=_profile(),
+        positions=positions,
+        expected_pos_id="sensitive-position-id",
+        instrument_id="BTC-USDT-SWAP",
+        side="long",
+        quantity_step="1",
+        min_quantity="1",
+    )
+
+    assert result.disposition == disposition
+    assert result.current_size == current
+    assert result.close_delta == close_delta
+    assert result.effective_remaining_size == effective_remaining
+
+
+@pytest.mark.parametrize("current", ["0", "-1", "NaN", "Infinity"])
+def test_classify_recovery_position_rejects_invalid_live_size(current):
+    module = _recovery_module()
+    with pytest.raises(module.CompositeBatchRecoveryRefusal):
+        module.classify_recovery_position(
+            profile=_profile(),
+            positions=[
+                {
+                    "posId": "sensitive-position-id",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "pos": current,
+                }
+            ],
+            expected_pos_id="sensitive-position-id",
+            instrument_id="BTC-USDT-SWAP",
+            side="long",
+            quantity_step="1",
+            min_quantity="1",
+        )
+
+
+def test_classify_recovery_position_rejects_duplicate_exact_positions():
+    module = _recovery_module()
+    row = {
+        "posId": "sensitive-position-id",
+        "instId": "BTC-USDT-SWAP",
+        "posSide": "long",
+        "pos": "38",
+    }
+    with pytest.raises(module.CompositeBatchRecoveryRefusal):
+        module.classify_recovery_position(
+            profile=_profile(),
+            positions=[row, dict(row)],
+            expected_pos_id="sensitive-position-id",
+            instrument_id="BTC-USDT-SWAP",
+            side="long",
+            quantity_step="1",
+            min_quantity="1",
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"pos": "39"},
+        {"posSide": "short"},
+        {"instId": "ETH-USDT-SWAP"},
+    ],
+)
+def test_classify_recovery_position_rejects_identity_or_exposure_drift(overrides):
+    module = _recovery_module()
+    row = {
+        "posId": "sensitive-position-id",
+        "instId": "BTC-USDT-SWAP",
+        "posSide": "long",
+        "pos": "38",
+        **overrides,
+    }
+    with pytest.raises(module.CompositeBatchRecoveryRefusal):
+        module.classify_recovery_position(
+            profile=_profile(),
+            positions=[row],
+            expected_pos_id="sensitive-position-id",
+            instrument_id="BTC-USDT-SWAP",
+            side="long",
+            quantity_step="1",
+            min_quantity="1",
+        )
+
+
+def _snapshot(**overrides):
+    values = {
+        "positions": [
+            {
+                "posId": POS_ID,
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "pos": "38",
+            }
+        ],
+        "position_history": [],
+        "open_orders": [],
+        "pending_trigger_orders": [
+            {
+                "ordId": PRIMARY_ORDER_ID,
+                "posId": POS_ID,
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "triggerOrderType": "TPSL",
+                "slTriggerPx": "64000",
+                "state": "live",
+            },
+            {
+                "ordId": BACKUP_ORDER_ID,
+                "posId": POS_ID,
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "triggerOrderType": "TPSL",
+                "slTriggerPx": "63000",
+                "state": "live",
+            },
+        ],
+        "order_history": [],
+        "trade_fills": [],
+        "trigger_history": [],
+        "pending_tpsl_observations": [
+            {"instrument_id": "BTC-USDT-SWAP", "complete": True}
+        ],
+        "errors": {},
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _seed_batch_119_false_submission(tmp_path):
+    database = tmp_path / "batch-119.db"
+    factory = create_session_factory(database)
+    strategy_id = "deepcoin:incident:btc:long"
+    contract = ManagementInstructionContract(
+        version=2,
+        target_lifecycle_id=794,
+        strategy_instance_id=strategy_id,
+        symbol="BTC",
+        side="long",
+        close_fraction="0.5",
+        stop_mode="actual_entry_price",
+        stop_price=None,
+        stop_price_source=None,
+        take_profit_consumption="consume_first_stage",
+        cancel_deferred_entries=True,
+        required_components=(
+            "consume_take_profit_stage",
+            "converge_partial_close",
+            "replace_remaining_protection",
+        ),
+        current_message_text="historical message text excluded from plans",
+    )
+    contract_json = serialize_management_contract(contract)
+    fingerprint = management_contract_fingerprint(contract)
+    with factory() as session:
+        raw = RawMessage(
+            id=10532,
+            chat_id=701,
+            message_id=9001,
+            text=SOURCE_TEXT,
+            raw_payload=json.dumps({"credential": "secret-api-key"}),
+            posted_at=NOW,
+        )
+        decision = RecognitionDecision(
+            raw_message_id=10532,
+            input_kind="text",
+            authoritative_model="mimo",
+            authoritative_status="仓位管理",
+            authoritative_payload_json='{"source_text":"private"}',
+            agreement_status="authoritative_only",
+            differences_json="[]",
+        )
+        lifecycle = StrategyLifecycle(
+            id=794,
+            chat_id=701,
+            message_id=8999,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=NOW,
+        )
+        binding = ExecutionBinding(
+            strategy_instance_id=strategy_id,
+            kol_id="incident-source",
+            chat_id=701,
+            message_id=8999,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            pos_id=POS_ID,
+            status="active",
+        )
+        session.add_all([raw, decision, lifecycle, binding])
+        session.flush()
+        lifecycle.execution_binding_id = binding.id
+        entry = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=strategy_id,
+            leg_index=0,
+            purpose="entry",
+            order_kind="market",
+            order_id="sensitive-entry-order",
+            client_order_id="sensitive-entry-client-order",
+            pos_id=POS_ID,
+            venue="deepcoin",
+            attribution_status="verified",
+            attribution_evidence_json='{"provider_error":"private"}',
+            status="active",
+        )
+        session.add(entry)
+        session.flush()
+        target_snapshot = {
+            "execution_mode": "live",
+            "identity": {
+                "target_lifecycle_id": 794,
+                "execution_binding_id": binding.id,
+                "strategy_instance_id": strategy_id,
+                "manageable_entry_leg_ids": [entry.id],
+                "deferred_entry_leg_ids": [],
+                "capability_deferred_entry_leg_ids": [],
+            },
+            "positions": [
+                {
+                    "pos_id": POS_ID,
+                    "instrument_id": "BTC-USDT-SWAP",
+                    "side": "long",
+                    "size": "38",
+                    "trusted_start_size": "38",
+                    "target_remaining_size": "19",
+                    "avg_entry_price": "62000",
+                    "quantity_step": "1",
+                    "min_quantity": "1",
+                    "margin_mode": "cross",
+                    "position_mode": "split",
+                }
+            ]
+        }
+        batch = StrategyManagementBatch(
+            id=119,
+            idempotency_fingerprint="i" * 64,
+            raw_message_id=10532,
+            recognition_decision_id=decision.id,
+            recognition_generation="incident-generation",
+            target_lifecycle_id=794,
+            strategy_instance_id=strategy_id,
+            execution_binding_id=binding.id,
+            intent="partial_then_break_even",
+            effective_action="partial_then_break_even",
+            execution_mode="live",
+            requested_fraction=0.5,
+            effective_fraction=0.5,
+            management_contract_json=contract_json,
+            management_contract_fingerprint=fingerprint,
+            contract_version=2,
+            status="reconciling",
+            reason_code="management_close_pending_exchange_confirmation",
+            target_fingerprint=management_target_fingerprint(target_snapshot),
+            target_snapshot_json=json.dumps(
+                target_snapshot,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            planned_at=NOW,
+            started_at=NOW,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(batch)
+        session.flush()
+        leg = StrategyManagementLeg(
+            management_batch_id=119,
+            execution_order_leg_id=entry.id,
+            pos_id=POS_ID,
+            leg_index=0,
+            status="submitted",
+            preflight_size="38",
+            planned_close_size="19",
+            avg_entry_price="62000",
+            quantity_step="1",
+            client_order_id=None,
+            exchange_order_id=None,
+            request_json=None,
+            response_json=None,
+            last_error=None,
+            last_exchange_snapshot_json=json.dumps(
+                {
+                    "position_rows": [
+                        {
+                            "posId": POS_ID,
+                            "instId": "BTC-USDT-SWAP",
+                            "posSide": "long",
+                            "pos": "38",
+                        }
+                    ],
+                    "matching_regular_orders": [],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(leg)
+        session.flush()
+        for sequence, kind in enumerate(contract.required_components):
+            desired = {
+                "contract_fingerprint": fingerprint,
+                "pos_id": POS_ID,
+                "execution_order_leg_id": entry.id,
+                "trusted_start_size": "38",
+                "target_remaining_size": "19",
+                "avg_entry_price": "62000",
+                "quantity_step": "1",
+                "min_quantity": "1",
+                "component_kind": kind,
+            }
+            session.add(
+                StrategyManagementComponent(
+                    management_batch_id=119,
+                    strategy_management_leg_id=leg.id,
+                    strategy_management_leg_scope=leg.id,
+                    component_kind=kind,
+                    sequence=sequence,
+                    status="recovery_required" if sequence == 0 else "pending",
+                    idempotency_key=f"119:{leg.id}:{kind}",
+                    desired_json=json.dumps(desired, sort_keys=True),
+                    evidence_json=(
+                        '[{"error_type":"RuntimeError"}]'
+                        if sequence == 0
+                        else "[]"
+                    ),
+                    reason_code=(
+                        "take_profit_exchange_snapshot_incomplete"
+                        if sequence == 0
+                        else None
+                    ),
+                    attempt_count=1 if sequence == 0 else 0,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+        for order_id, purpose, price in (
+            (PRIMARY_ORDER_ID, "stop_loss", "64000"),
+            (BACKUP_ORDER_ID, "backup_stop_loss", "63000"),
+        ):
+            session.add(
+                PositionProtectionLedger(
+                    venue="deepcoin",
+                    execution_binding_id=binding.id,
+                    execution_order_leg_id=entry.id,
+                    strategy_instance_id=strategy_id,
+                    pos_id=POS_ID,
+                    instrument_id="BTC-USDT-SWAP",
+                    side="long",
+                    order_id=order_id,
+                    purpose=purpose,
+                    trigger_price=price,
+                    size_text="38",
+                    status="verified",
+                    evidence_source="entry_protection_response",
+                    evidence_json='{"response":"private provider response"}',
+                    first_seen_at=NOW,
+                    last_seen_at=NOW,
+                    last_verified_at=NOW,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+        session.commit()
+        return factory, database, int(binding.id), int(entry.id), int(leg.id)
+
+
+def _plan(factory, snapshot=None):
+    module = _recovery_module()
+    return module.build_composite_batch_recovery_plan(
+        factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=snapshot or _snapshot(),
+        planned_at=NOW,
+    )
+
+
+def test_batch_119_false_submission_is_ready_for_repair(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+
+    plan = _plan(factory)
+
+    assert plan.status == "ready"
+    assert plan.reason_code == "false_legacy_submission_proven"
+    assert plan.position.disposition == "resume_to_target"
+    assert plan.position.close_delta == "19"
+    assert plan.production_writes == 0
+    assert plan.exchange_calls == 0
+    assert len(plan.source_fingerprint) == 64
+    assert len(plan.exchange_snapshot_fingerprint) == 64
+    assert len(plan.evidence_fingerprint) == 64
+
+
+def test_planner_refuses_profile_outside_batch_119_allowlist(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    profile = module.CompositeBatchRecoveryProfile(
+        batch_id=120,
+        raw_message_id=10532,
+        lifecycle_id=794,
+        trusted_start_size="38",
+        target_remaining_size="19",
+        instrument_id="BTC-USDT-SWAP",
+        side="long",
+    )
+
+    plan = module.build_composite_batch_recovery_plan(
+        factory, profile=profile, snapshot=_snapshot(), planned_at=NOW
+    )
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "incident_profile_not_allowlisted"
+
+
+@pytest.mark.parametrize(
+    ("field", "snapshot"),
+    [
+        ("positions", SimpleNamespace(**{
+            key: value for key, value in vars(_snapshot()).items() if key != "positions"
+        })),
+        ("pending_trigger_orders", SimpleNamespace(**{
+            key: value for key, value in vars(_snapshot()).items()
+            if key != "pending_trigger_orders"
+        })),
+        ("trigger_history", SimpleNamespace(**{
+            key: value for key, value in vars(_snapshot()).items()
+            if key != "trigger_history"
+        })),
+        ("order_history", SimpleNamespace(**{
+            key: value for key, value in vars(_snapshot()).items()
+            if key != "order_history"
+        })),
+        ("trade_fills", SimpleNamespace(**{
+            key: value for key, value in vars(_snapshot()).items()
+            if key != "trade_fills"
+        })),
+        ("pending_tpsl", _snapshot(pending_tpsl_observations=[{
+            "instrument_id": "BTC-USDT-SWAP", "complete": False
+        }])),
+    ],
+)
+def test_planner_refuses_each_incomplete_exchange_evidence_source(
+    tmp_path, field, snapshot
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+
+    plan = _plan(factory, snapshot)
+
+    assert plan.status == "refused", field
+    assert plan.reason_code == "exchange_snapshot_incomplete"
+
+
+@pytest.mark.parametrize(
+    ("model", "field", "value"),
+    [
+        (StrategyManagementBatch, "raw_message_id", 1),
+        (StrategyManagementBatch, "target_lifecycle_id", 1),
+        (StrategyLifecycle, "side", "short"),
+        (ExecutionBinding, "strategy_instance_id", "drifted-strategy"),
+        (StrategyManagementLeg, "preflight_size", "37"),
+    ],
+)
+def test_planner_refuses_durable_identity_mismatch(
+    tmp_path, model, field, value
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        row = session.query(model).first()
+        setattr(row, field, value)
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert "mismatch" in plan.reason_code or "not_allowlisted" in plan.reason_code
+
+
+@pytest.mark.parametrize("drift", ["fingerprint", "topology"])
+def test_planner_refuses_contract_fingerprint_or_component_topology_mismatch(
+    tmp_path, drift
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        if drift == "fingerprint":
+            session.get(StrategyManagementBatch, 119).management_contract_fingerprint = (
+                "0" * 64
+            )
+        else:
+            component = (
+                session.query(StrategyManagementComponent)
+                .filter_by(management_batch_id=119, sequence=2)
+                .one()
+            )
+            component.status = "confirmed"
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code in {
+        "management_contract_fingerprint_mismatch",
+        "component_topology_mismatch",
+        "false_submission_state_mismatch",
+    }
+
+
+@pytest.mark.parametrize(
+    ("model", "field", "value"),
+    [
+        (StrategyManagementBatch, "status", "executing"),
+        (StrategyManagementLeg, "status", "planned"),
+        (StrategyManagementComponent, "status", "confirmed"),
+    ],
+)
+def test_planner_refuses_status_other_than_exact_false_state(
+    tmp_path, model, field, value
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        row = session.query(model).order_by(model.id).first()
+        setattr(row, field, value)
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code in {
+        "false_submission_state_mismatch",
+        "component_topology_mismatch",
+    }
+
+
+@pytest.mark.parametrize(
+    "field", ["request_json", "response_json", "client_order_id", "exchange_order_id"]
+)
+def test_planner_refuses_any_management_leg_submission_payload_or_identity(
+    tmp_path, field
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        leg = session.query(StrategyManagementLeg).one()
+        setattr(leg, field, '{"secret":"value"}' if field.endswith("json") else "id")
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "durable_close_submission_evidence_present"
+
+
+def test_planner_refuses_matching_close_execution_event(tmp_path):
+    factory, _, binding_id, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        session.add(
+            ExecutionEvent(
+                execution_binding_id=binding_id,
+                strategy_instance_id="deepcoin:incident:btc:long",
+                action="strategy_management_close_submit",
+                status="submitted",
+                symbol="BTC",
+                side="long",
+                pos_id=POS_ID,
+                request_json='{"credential":"secret"}',
+                created_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "durable_close_submission_evidence_present"
+
+
+def test_planner_refuses_matching_position_mutation_intent(tmp_path):
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        session.add(
+            PositionMutationIntent(
+                idempotency_key="incident-close",
+                operation="close_position",
+                strategy_instance_id="deepcoin:incident:btc:long",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                pos_id=POS_ID,
+                authority_fingerprint="a" * 64,
+                request_fingerprint="r" * 64,
+                status="reserved",
+                request_json='{"credential":"secret"}',
+                reserved_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "durable_close_submission_evidence_present"
+
+
+@pytest.mark.parametrize("snapshot_field", ["open_orders", "order_history", "trade_fills"])
+def test_planner_refuses_matching_regular_close_order_or_fill(
+    tmp_path, snapshot_field
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    close_row = {
+        "ordId": "sensitive-close-order",
+        "posId": POS_ID,
+        "instId": "BTC-USDT-SWAP",
+        "posSide": "long",
+        "side": "sell",
+        "reduceOnly": True,
+        "state": "filled",
+    }
+    snapshot = _snapshot(**{snapshot_field: [close_row]})
+
+    plan = _plan(factory, snapshot)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "exchange_close_submission_evidence_present"
+
+
+def test_planner_refuses_additional_active_management_batch(tmp_path):
+    factory, _, binding_id, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        session.add(
+            StrategyManagementBatch(
+                idempotency_fingerprint="other-active",
+                raw_message_id=batch.raw_message_id,
+                recognition_decision_id=batch.recognition_decision_id,
+                recognition_generation="other",
+                target_lifecycle_id=batch.target_lifecycle_id,
+                strategy_instance_id="other-active-strategy",
+                execution_binding_id=binding_id,
+                intent="full_exit",
+                effective_action="full_exit",
+                execution_mode="live",
+                status="executing",
+                target_fingerprint="other-target",
+                target_snapshot_json="{}",
+                planned_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "additional_active_work_present"
+
+
+def test_planner_refuses_additional_active_component(tmp_path):
+    factory, _, _, _, leg_id = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        session.add(
+            StrategyManagementComponent(
+                management_batch_id=119,
+                strategy_management_leg_id=leg_id,
+                strategy_management_leg_scope=leg_id,
+                component_kind="cancel_deferred_entries",
+                sequence=9,
+                status="pending",
+                idempotency_key="unexpected-component",
+                desired_json="{}",
+                evidence_json="[]",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "component_topology_mismatch"
+
+
+def test_planner_refuses_additional_active_instruction(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        candidate = SignalCandidate(
+            raw_message_id=10532,
+            symbol="BTC",
+            side="long",
+            event_type="management",
+            management_action="partial_then_break_even",
+            review_status="confirmed",
+            created_at=NOW,
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            MessageInstructionItem(
+                raw_message_id=10532,
+                signal_candidate_id=candidate.id,
+                sequence=0,
+                instruction_kind="management",
+                strategy_instance_id="deepcoin:incident:btc:long",
+                idempotency_key="instruction-active",
+                status="executing",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "additional_active_work_present"
+
+
+def test_planner_refuses_unexpected_protection_ownership(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    unexpected = {
+        "ordId": "unowned-sensitive-order",
+        "posId": POS_ID,
+        "instId": "BTC-USDT-SWAP",
+        "posSide": "long",
+        "triggerOrderType": "TPSL",
+        "slTriggerPx": "61000",
+        "state": "live",
+    }
+    snapshot = _snapshot(
+        pending_trigger_orders=[*_snapshot().pending_trigger_orders, unexpected]
+    )
+
+    plan = _plan(factory, snapshot)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "unexpected_protection_ownership"
+
+
+@pytest.mark.parametrize(
+    ("field", "before_rows", "after_rows"),
+    [
+        (
+            "positions",
+            [{
+                "posId": POS_ID, "instId": "BTC-USDT-SWAP",
+                "posSide": "long", "pos": "38", "avgPx": "62000",
+            }],
+            [{
+                "posId": POS_ID, "instId": "BTC-USDT-SWAP",
+                "posSide": "long", "pos": "38", "avgPx": "62001",
+            }],
+        ),
+        (
+            "position_history",
+            [{"posId": POS_ID, "state": "open", "closedSize": "0"}],
+            [{"posId": POS_ID, "state": "open", "closedSize": "1"}],
+        ),
+        (
+            "open_orders",
+            [{"posId": POS_ID, "side": "buy", "ordId": "historical-a"}],
+            [{"posId": POS_ID, "side": "buy", "ordId": "historical-b"}],
+        ),
+        (
+            "pending_trigger_orders",
+            [
+                {**_snapshot().pending_trigger_orders[0], "slTriggerPx": "64000"},
+                _snapshot().pending_trigger_orders[1],
+            ],
+            [
+                {**_snapshot().pending_trigger_orders[0], "slTriggerPx": "64001"},
+                _snapshot().pending_trigger_orders[1],
+            ],
+        ),
+        (
+            "order_history",
+            [{"posId": POS_ID, "side": "buy", "ordId": "historical-a"}],
+            [{"posId": POS_ID, "side": "buy", "ordId": "historical-b"}],
+        ),
+        (
+            "trade_fills",
+            [{"posId": POS_ID, "side": "buy", "fillPx": "62000"}],
+            [{"posId": POS_ID, "side": "buy", "fillPx": "62001"}],
+        ),
+        (
+            "trigger_history",
+            [{"posId": POS_ID, "state": "cancelled", "triggerPx": "60000"}],
+            [{"posId": POS_ID, "state": "cancelled", "triggerPx": "60001"}],
+        ),
+        (
+            "pending_tpsl_observations",
+            [{
+                "instrument_id": "BTC-USDT-SWAP", "complete": True,
+                "response_count": 2,
+            }],
+            [{
+                "instrument_id": "BTC-USDT-SWAP", "complete": True,
+                "response_count": 3,
+            }],
+        ),
+    ],
+)
+def test_exchange_snapshot_fingerprint_changes_when_same_count_content_changes(
+    tmp_path, field, before_rows, after_rows
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+
+    before = _plan(factory, _snapshot(**{field: before_rows}))
+    after = _plan(factory, _snapshot(**{field: after_rows}))
+
+    assert before.status == after.status == "ready"
+    assert before.exchange_snapshot_fingerprint != after.exchange_snapshot_fingerprint
+    assert before.evidence_fingerprint != after.evidence_fingerprint
+
+
+def test_exchange_snapshot_fingerprint_is_stable_across_collection_reordering(
+    tmp_path
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    first = _snapshot(
+        pending_trigger_orders=list(_snapshot().pending_trigger_orders),
+        trigger_history=[
+            {"posId": POS_ID, "state": "cancelled", "triggerPx": "60000"},
+            {"posId": POS_ID, "state": "filled", "triggerPx": "61000"},
+        ],
+    )
+    reordered = _snapshot(
+        pending_trigger_orders=list(reversed(_snapshot().pending_trigger_orders)),
+        trigger_history=list(reversed(first.trigger_history)),
+    )
+
+    before = _plan(factory, first)
+    after = _plan(factory, reordered)
+
+    assert before.status == after.status == "ready"
+    assert before.exchange_snapshot_fingerprint == after.exchange_snapshot_fingerprint
+    assert before.evidence_fingerprint == after.evidence_fingerprint
+
+
+@pytest.mark.parametrize("drift", ["target_fingerprint", "target_snapshot_json"])
+def test_planner_refuses_target_snapshot_fingerprint_drift(tmp_path, drift):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        if drift == "target_fingerprint":
+            batch.target_fingerprint = "0" * 64
+        else:
+            payload = json.loads(batch.target_snapshot_json)
+            payload["positions"][0]["margin_mode"] = "isolated"
+            batch.target_snapshot_json = json.dumps(payload, sort_keys=True)
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "target_snapshot_fingerprint_mismatch"
+
+
+def test_planner_refuses_any_incomplete_pending_tpsl_observation(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    snapshot = _snapshot(
+        pending_tpsl_observations=[
+            {"instrument_id": "BTC-USDT-SWAP", "complete": True},
+            {"instrument_id": "ETH-USDT-SWAP", "complete": False},
+        ]
+    )
+
+    plan = _plan(factory, snapshot)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "exchange_snapshot_incomplete"
+
+
+def test_planner_refuses_active_component_even_beneath_terminal_batch(tmp_path):
+    factory, _, binding_id, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        batch119 = session.get(StrategyManagementBatch, 119)
+        terminal = StrategyManagementBatch(
+            idempotency_fingerprint="terminal-with-active-component",
+            raw_message_id=batch119.raw_message_id,
+            recognition_decision_id=batch119.recognition_decision_id,
+            recognition_generation="old-terminal",
+            target_lifecycle_id=batch119.target_lifecycle_id,
+            strategy_instance_id="old-terminal-strategy",
+            execution_binding_id=binding_id,
+            intent="full_exit",
+            effective_action="full_exit",
+            execution_mode="live",
+            status="resolved",
+            target_fingerprint="old-terminal-target",
+            target_snapshot_json="{}",
+            planned_at=NOW,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(terminal)
+        session.flush()
+        session.add(
+            StrategyManagementComponent(
+                management_batch_id=terminal.id,
+                strategy_management_leg_id=None,
+                strategy_management_leg_scope=-1,
+                component_kind="cancel_deferred_entries",
+                sequence=0,
+                status="recovery_required",
+                idempotency_key="terminal-active-component",
+                desired_json="{}",
+                evidence_json="[]",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "additional_active_work_present"
+
+
+def test_planner_refuses_unknown_outcome_position_mutation(tmp_path):
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        session.add(
+            PositionMutationIntent(
+                idempotency_key="unknown-unrelated-mutation",
+                operation="cancel_tpsl",
+                strategy_instance_id="deepcoin:incident:btc:long",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                pos_id=POS_ID,
+                order_id=PRIMARY_ORDER_ID,
+                authority_fingerprint="u" * 64,
+                request_fingerprint="v" * 64,
+                status="submit_unknown",
+                request_json='{"sensitive":"payload"}',
+                reserved_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "additional_active_work_present"
+
+
+@pytest.mark.parametrize(
+    ("field", "rows"),
+    [
+        ("positions", [object()]),
+        ("open_orders", [{"not_json": object()}]),
+        ("pending_trigger_orders", [object()]),
+        ("order_history", [object()]),
+        ("trade_fills", [object()]),
+        ("trigger_history", [object()]),
+    ],
+)
+def test_planner_refuses_malformed_snapshot_rows_without_raising(
+    tmp_path, field, rows
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+
+    plan = _plan(factory, _snapshot(**{field: rows}))
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "exchange_snapshot_incomplete"
+
+
+def test_source_fingerprint_covers_same_count_protection_ledger_drift(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    before = _plan(factory)
+    assert before.status == "ready"
+    with factory() as session:
+        row = (
+            session.query(PositionProtectionLedger)
+            .order_by(PositionProtectionLedger.id)
+            .first()
+        )
+        row.evidence_json = '{"response":"different private response"}'
+        session.commit()
+
+    after = _plan(factory)
+
+    assert after.status == "ready"
+    assert after.source_fingerprint != before.source_fingerprint
+
+
+@pytest.mark.parametrize(
+    ("current", "expected"),
+    [
+        ("38", {"batch_status": "ready", "leg_status": "planned"}),
+        (
+            "12",
+            {
+                "batch_status": "ready",
+                "leg_status": "planned",
+                "attestation_kind": "approved_under_target_recovery",
+            },
+        ),
+        (
+            None,
+            {
+                "batch_status": "resolved",
+                "leg_status": "failed",
+                "component_statuses": (
+                    "safely_skipped", "safely_skipped", "safely_skipped"
+                ),
+            },
+        ),
+    ],
+)
+def test_proposed_transition_matches_position_disposition(tmp_path, current, expected):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    positions = [] if current is None else [{
+        "posId": POS_ID,
+        "instId": "BTC-USDT-SWAP",
+        "posSide": "long",
+        "pos": current,
+    }]
+
+    plan = _plan(factory, _snapshot(positions=positions))
+
+    assert plan.status == "ready"
+    transition = plan.evidence["proposed_transition"]
+    for key, value in expected.items():
+        assert transition[key] == value
+
+
+@pytest.mark.parametrize(
+    ("model", "field", "value"),
+    [
+        (RawMessage, "chat_id", 999),
+        (ExecutionBinding, "chat_id", 999),
+        (ExecutionBinding, "message_id", 999),
+    ],
+)
+def test_planner_refuses_chat_or_message_identity_drift(
+    tmp_path, model, field, value
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        row = session.query(model).first()
+        setattr(row, field, value)
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code.endswith("identity_mismatch")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("target_lifecycle_id", 1),
+        ("execution_binding_id", 999),
+        ("strategy_instance_id", "drifted-strategy"),
+        ("manageable_entry_leg_ids", [999]),
+    ],
+)
+def test_planner_refuses_self_consistent_target_identity_drift(
+    tmp_path, field, value
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        payload = json.loads(batch.target_snapshot_json)
+        payload["identity"][field] = value
+        batch.target_snapshot_json = json.dumps(payload, sort_keys=True)
+        batch.target_fingerprint = management_target_fingerprint(payload)
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "target_snapshot_identity_mismatch"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "batch_execution_mode",
+        "batch_action",
+        "lifecycle_status",
+        "binding_status",
+        "entry_status",
+        "leg_economics",
+        "leg_snapshot",
+        "component_attempt",
+        "component_desired",
+        "component_evidence",
+    ],
+)
+def test_source_fingerprint_covers_every_verified_or_cas_dependency(
+    tmp_path, mutation
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    before = _plan(factory)
+    assert before.status == "ready"
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        lifecycle = session.get(StrategyLifecycle, 794)
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        leg = session.query(StrategyManagementLeg).one()
+        entry = session.get(ExecutionOrderLeg, leg.execution_order_leg_id)
+        component = (
+            session.query(StrategyManagementComponent)
+            .filter_by(management_batch_id=119, sequence=0)
+            .one()
+        )
+        if mutation == "batch_execution_mode":
+            batch.execution_mode = "disabled"
+        elif mutation == "batch_action":
+            batch.effective_action = "partial_close"
+        elif mutation == "lifecycle_status":
+            lifecycle.lifecycle_status = "exited"
+        elif mutation == "binding_status":
+            binding.status = "closed"
+        elif mutation == "entry_status":
+            entry.status = "closed"
+        elif mutation == "leg_economics":
+            leg.avg_entry_price = "62001"
+        elif mutation == "leg_snapshot":
+            payload = json.loads(leg.last_exchange_snapshot_json)
+            payload["position_rows"][0]["pos"] = "37"
+            leg.last_exchange_snapshot_json = json.dumps(payload, sort_keys=True)
+        elif mutation == "component_attempt":
+            component.attempt_count += 1
+        elif mutation == "component_desired":
+            desired = json.loads(component.desired_json)
+            desired["avg_entry_price"] = "62001"
+            component.desired_json = json.dumps(desired, sort_keys=True)
+        elif mutation == "component_evidence":
+            component.evidence_json = '[{"error_type":"TimeoutError"}]'
+        session.commit()
+
+    after = _plan(factory)
+
+    if after.status == "ready":
+        assert after.source_fingerprint != before.source_fingerprint
+    else:
+        assert after.reason_code != "false_legacy_submission_proven"
+
+
+def test_serialized_plan_is_strictly_redacted(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    plan = _plan(factory)
+
+    serialized = json.dumps(module.serialize_composite_batch_recovery_plan(plan))
+
+    for sensitive in (
+        SOURCE_TEXT,
+        POS_ID,
+        PRIMARY_ORDER_ID,
+        BACKUP_ORDER_ID,
+        "sensitive-entry-order",
+        "sensitive-entry-client-order",
+        "private provider response",
+        "secret-api-key",
+        "credential",
+        "request_json",
+        "response_json",
+        "provider_error",
+    ):
+        assert sensitive not in serialized
+
+
+def _file_signature(path: Path):
+    if not path.exists():
+        return None
+    return (path.stat().st_size, sha256(path.read_bytes()).hexdigest())
+
+
+def test_planner_operates_against_readonly_database_without_file_changes(tmp_path):
+    factory, database, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    factory.kw["bind"].dispose()
+    paths = [database, Path(str(database) + "-wal"), Path(str(database) + "-shm")]
+    before = [_file_signature(path) for path in paths]
+    readonly_engine = create_engine(
+        f"sqlite+pysqlite:///file:{database.resolve()}?mode=ro&immutable=1&uri=true"
+    )
+    readonly_factory = sessionmaker(
+        bind=readonly_engine, autoflush=False, expire_on_commit=False
+    )
+
+    plan = _plan(readonly_factory)
+
+    readonly_engine.dispose()
+    assert plan.status == "ready"
+    assert [_file_signature(path) for path in paths] == before
