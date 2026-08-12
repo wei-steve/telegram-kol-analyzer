@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 import telegram_kol_research.web_app as web_app_module
+import telegram_kol_research.trading_settings as trading_settings_module
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
 from telegram_kol_research.config import (
@@ -1396,6 +1397,81 @@ def test_trading_settings_mimo_future_only_rollback_preserves_audit_state(
     assert response.json()["mimo_contract_circuit"]["is_open"] is True
     with app.state.session_factory() as session:
         assert session.get(RawMessage, watermark).text == "keep me"
+
+
+def test_trading_settings_mimo_rollback_serializes_with_other_settings_save(
+    tmp_path,
+    monkeypatch,
+):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    save_trading_settings(
+        app.state.session_factory,
+        {
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 0,
+            "auto_trade_enabled": False,
+        },
+    )
+    rollback_read = threading.Event()
+    other_save_finished = threading.Event()
+    paused = False
+    original_parser = trading_settings_module.trading_settings_from_payload
+
+    def pause_rollback_after_its_settings_read(payload):
+        nonlocal paused
+        parsed = original_parser(payload)
+        if (
+            not paused
+            and parsed.mimo_contract_mode == "v1"
+            and parsed.auto_trade_enabled is False
+        ):
+            paused = True
+            rollback_read.set()
+            other_save_finished.wait(timeout=1)
+        return parsed
+
+    monkeypatch.setattr(
+        trading_settings_module,
+        "trading_settings_from_payload",
+        pause_rollback_after_its_settings_read,
+    )
+    rollback_responses = []
+    worker_errors = []
+
+    def run_rollback():
+        try:
+            rollback_responses.append(
+                TestClient(app).post("/api/trading-settings/mimo-rollback")
+            )
+        except Exception as exc:  # pragma: no cover - asserted below
+            worker_errors.append(exc)
+
+    def save_other_setting():
+        try:
+            save_trading_settings(
+                app.state.session_factory,
+                {"auto_trade_enabled": True},
+                locked_validator=lambda _session, _current, _requested: None,
+            )
+            other_save_finished.set()
+        except Exception as exc:  # pragma: no cover - asserted below
+            worker_errors.append(exc)
+
+    rollback_thread = threading.Thread(target=run_rollback)
+    rollback_thread.start()
+    assert rollback_read.wait(timeout=3)
+    other_thread = threading.Thread(target=save_other_setting)
+    other_thread.start()
+    rollback_thread.join(timeout=5)
+    other_thread.join(timeout=5)
+
+    assert not rollback_thread.is_alive()
+    assert not other_thread.is_alive()
+    assert worker_errors == []
+    assert rollback_responses[0].status_code == 200
+    reloaded = TestClient(app).get("/api/trading-settings").json()
+    assert reloaded["mimo_contract_mode"] == "v1"
+    assert reloaded["auto_trade_enabled"] is True
 
 
 def test_trading_settings_mimo_ui_has_only_live_adapter_and_future_rollback(

@@ -6849,6 +6849,10 @@ def create_web_app(
             app.state.session_factory,
             {"mimo_contract_mode": "v1"},
             updated_at=app.state.now_provider(),
+            # save_trading_settings rewrites the complete settings document.
+            # Take the same pre-read SQLite write lock as ordinary Web saves so
+            # rollback cannot overwrite a concurrent risk-setting update.
+            locked_validator=lambda _session, _current, _requested: None,
         )
         return _build_web_trading_settings_payload(
             app.state.session_factory,
