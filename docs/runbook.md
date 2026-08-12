@@ -1524,7 +1524,12 @@ python -m telegram_kol_research.cli recover-composite-management-batch \
 `submitted`、`pending` 或 `unknown` 字样当作在途或终态；批次专用分类器必须逐条绑定
 持久化证据，并且两次都得到完全相同的数量与 SHA-256 population digest：恰好一条
 `target_incident_frozen`，其余只能是 `verified_terminal_mirror`、
-`historical_residue_no_authority` 或 `historical_unknown_frozen`。任何 `executing`、未分类、
+`approved_historical_pending_frozen` 或 `historical_unknown_frozen`。五条 pending 仅因完整
+item/candidate/raw/source/media/evidence/MiMo run-attempt/recognition/context/admission ORM
+状态与已审阅 SHA-256 allowlist 精确匹配而在本次恢复中冻结；任何 running MiMo run 或
+evidence extraction claim 都必须停止，当前 lifecycle/binding/descendant 则另外进入计划和
+锁内 CAS 指纹。敏感文本只进入最终 hash。这不表示普通
+executor 本身无法 claim 它们。任何 `executing`、未分类、
 身份矛盾、非终态 descendant/contract、计划重试或两次 digest 漂移都必须停止。
 
 该分类只服务于批次 `119` 的封闭恢复，不会更新、retire、重放或回填历史 instruction，

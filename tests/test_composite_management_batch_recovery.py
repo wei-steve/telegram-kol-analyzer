@@ -16,16 +16,22 @@ from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
+    ContextResolutionAttempt,
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
     InstructionExecutionContract,
+    MessageEvidenceExtractionClaim,
+    MessageEvidenceVersion,
     MessageInstructionItem,
+    MimoRecognitionAttempt,
+    MimoRecognitionRun,
     PositionMutationIntent,
     PositionProtectionLedger,
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
+    Source,
     StrategyLifecycle,
     StrategyManagementBatch,
     StrategyManagementComponent,
@@ -82,6 +88,20 @@ def test_batch_119_recovery_profile_is_closed_and_immutable():
     )
     with pytest.raises((AttributeError, TypeError)):
         module.BATCH_119_RECOVERY.batch_id = 120
+
+
+def test_batch_119_pending_residue_allowlist_is_exactly_five_sha256_identities():
+    module = _recovery_module()
+
+    identities = module._APPROVED_BATCH_119_PENDING_RESIDUE_IDENTITY_DIGESTS
+
+    assert isinstance(identities, frozenset)
+    assert len(identities) == 5
+    assert all(
+        len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+        for value in identities
+    )
 
 
 def test_recovery_read_only_session_factory_cannot_write_or_change_file(tmp_path):
@@ -582,7 +602,7 @@ def _add_audited_instruction_population(factory):
         trade_signal = TradeSignal(
             signal_uid="audit-entry-signal",
             strategy_instance_id="deepcoin:audit:entry",
-            source_type="telegram",
+            source_type="recovery",
             venue="deepcoin",
             kol_id="audit-source",
             chat_id=801,
@@ -792,14 +812,54 @@ def _add_audited_instruction_population(factory):
                 updated_at=NOW,
             )
         )
+        session.add(
+            ContextResolutionAttempt(
+                raw_message_id=20003,
+                context_fingerprint="synthetic-pending-context",
+                model="deepseek",
+                prompt_versions_json="{}",
+                request_summary_json="{}",
+                decision_json='{"decision":"new_thread"}',
+                status="completed",
+                reanalysis_triggers_json="[]",
+                attempts=1,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
         session.commit()
+
+
+def _approve_audited_pending_residue(monkeypatch, factory):
+    module = _recovery_module()
+    with factory() as session:
+        item = (
+            session.query(MessageInstructionItem)
+            .filter_by(idempotency_key="audited-pending-residue")
+            .one()
+        )
+        candidate = session.get(SignalCandidate, item.signal_candidate_id)
+        raw = session.get(RawMessage, item.raw_message_id)
+        digest = module._historical_pending_residue_identity_digest(
+            session,
+            item=item,
+            candidate=candidate,
+            raw=raw,
+        )
+    monkeypatch.setattr(
+        module,
+        "_APPROVED_BATCH_119_PENDING_RESIDUE_IDENTITY_DIGESTS",
+        frozenset({digest}),
+    )
 
 
 def test_instruction_population_allows_audited_dispositions_without_writes(
     tmp_path,
+    monkeypatch,
 ):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     _add_audited_instruction_population(factory)
+    _approve_audited_pending_residue(monkeypatch, factory)
     with factory() as session:
         before = [
             (
@@ -822,7 +882,7 @@ def test_instruction_population_allows_audited_dispositions_without_writes(
     assert population["schema_version"] == 1
     assert population["total_count"] == 5
     assert population["counts"] == {
-        "historical_residue_no_authority": 1,
+        "approved_historical_pending_frozen": 1,
         "historical_unknown_frozen": 1,
         "target_incident_frozen": 1,
         "verified_terminal_mirror": 2,
@@ -845,11 +905,36 @@ def test_instruction_population_allows_audited_dispositions_without_writes(
     assert after == before
 
 
+def test_instruction_population_rejects_generic_pending_row_that_is_claimable(
+    tmp_path,
+):
+    from telegram_kol_research.message_instruction_items import (
+        claim_next_message_instruction_item,
+    )
+
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+
+    plan = _plan(factory)
+    claimed = claim_next_message_instruction_item(
+        factory,
+        raw_message_id=20003,
+        now=NOW,
+    )
+
+    assert claimed is not None
+    assert claimed.idempotency_key == "audited-pending-residue"
+    assert plan.status == "refused"
+    assert plan.reason_code == "additional_active_work_present"
+
+
 def test_instruction_population_rejects_submitted_mirror_with_active_contract(
     tmp_path,
+    monkeypatch,
 ):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     _add_audited_instruction_population(factory)
+    _approve_audited_pending_residue(monkeypatch, factory)
     with factory() as session:
         item = (
             session.query(MessageInstructionItem)
@@ -882,9 +967,11 @@ def test_instruction_population_rejects_submitted_mirror_with_active_contract(
 
 def test_instruction_population_rejects_contradictory_historical_unknown(
     tmp_path,
+    monkeypatch,
 ):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     _add_audited_instruction_population(factory)
+    _approve_audited_pending_residue(monkeypatch, factory)
     with factory() as session:
         item = (
             session.query(MessageInstructionItem)
@@ -906,35 +993,95 @@ def test_instruction_population_rejects_contradictory_historical_unknown(
     assert plan.reason_code == "additional_active_work_present"
 
 
+def test_historical_unknown_rejects_lifecycle_binding_pointer_mismatch(
+    tmp_path,
+    monkeypatch,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+    _approve_audited_pending_residue(monkeypatch, factory)
+    with factory() as session:
+        submitted = (
+            session.query(MessageInstructionItem)
+            .filter_by(idempotency_key="audited-management-submitted")
+            .one()
+        )
+        submitted.retired_at = NOW
+        lifecycle = session.get(StrategyLifecycle, 9001)
+        entry_binding = (
+            session.query(ExecutionBinding)
+            .filter_by(strategy_instance_id="deepcoin:audit:entry")
+            .one()
+        )
+        lifecycle.execution_binding_id = entry_binding.id
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "additional_active_work_present"
+
+
 @pytest.mark.parametrize(
     "attack",
     [
         "target_missing",
         "target_duplicate",
+        "target_candidate_symbol_drift",
+        "target_candidate_side_drift",
         "executing_item",
         "entry_signal_not_submitted",
+        "entry_signal_action_drift",
+        "entry_signal_source_type_drift",
         "entry_duplicate_binding",
+        "entry_binding_chat_drift",
+        "entry_binding_message_drift",
+        "entry_binding_symbol_drift",
+        "entry_binding_side_drift",
+        "entry_binding_venue_drift",
         "management_batch_identity_drift",
+        "management_binding_identity_drift",
         "pending_has_result",
         "pending_has_scheduled_retry",
         "pending_has_contract",
         "pending_has_trade_signal",
         "pending_has_active_lifecycle",
+        "pending_context_state_drift",
         "unknown_has_active_lifecycle",
         "unknown_has_active_binding",
         "unknown_has_active_descendant",
+        "unknown_has_scheduled_retry",
+        "unknown_has_deadline",
+        "unknown_has_escalation",
+        "unknown_has_progress",
+        "unknown_candidate_symbol_drift",
+        "unknown_candidate_side_drift",
+        "unknown_candidate_event_type_drift",
+        "unknown_binding_chat_drift",
+        "unknown_binding_message_drift",
+        "unknown_binding_symbol_drift",
+        "unknown_binding_side_drift",
+        "unknown_binding_venue_drift",
         "malformed_entry_payload",
         "oversized_entry_payload",
         "deep_entry_payload",
+        "bounded_deep_entry_payload",
+        "excessive_entry_payload_nodes",
+        "duplicate_target_payload_key",
+        "entry_payload_nan",
+        "entry_payload_positive_infinity",
+        "entry_payload_negative_infinity",
         "target_payload_has_extra_key",
     ],
 )
 def test_instruction_population_fails_closed_on_ambiguous_or_active_rows(
     tmp_path,
     attack,
+    monkeypatch,
 ):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     _add_audited_instruction_population(factory)
+    _approve_audited_pending_residue(monkeypatch, factory)
     with factory() as session:
         target = (
             session.query(MessageInstructionItem)
@@ -986,11 +1133,21 @@ def test_instruction_population_fails_closed_on_ambiguous_or_active_rows(
                     updated_at=NOW,
                 )
             )
+        elif attack == "target_candidate_symbol_drift":
+            session.get(SignalCandidate, target.signal_candidate_id).symbol = "ETH"
+        elif attack == "target_candidate_side_drift":
+            session.get(SignalCandidate, target.signal_candidate_id).side = "short"
         elif attack == "executing_item":
             pending.status = "executing"
         elif attack == "entry_signal_not_submitted":
             signal_id = json.loads(entry.result_json)["result"]["signal_id"]
             session.get(TradeSignal, signal_id).status = "failed"
+        elif attack == "entry_signal_action_drift":
+            signal_id = json.loads(entry.result_json)["result"]["signal_id"]
+            session.get(TradeSignal, signal_id).action = "close_position"
+        elif attack == "entry_signal_source_type_drift":
+            signal_id = json.loads(entry.result_json)["result"]["signal_id"]
+            session.get(TradeSignal, signal_id).source_type = "other"
         elif attack == "entry_duplicate_binding":
             session.add(
                 ExecutionBinding(
@@ -1006,8 +1163,27 @@ def test_instruction_population_fails_closed_on_ambiguous_or_active_rows(
                     updated_at=NOW,
                 )
             )
+        elif attack.startswith("entry_binding_"):
+            binding = (
+                session.query(ExecutionBinding)
+                .filter_by(strategy_instance_id=entry.strategy_instance_id)
+                .one()
+            )
+            if attack == "entry_binding_chat_drift":
+                binding.chat_id += 1
+            elif attack == "entry_binding_message_drift":
+                binding.message_id += 1
+            elif attack == "entry_binding_symbol_drift":
+                binding.symbol = "SOL"
+            elif attack == "entry_binding_side_drift":
+                binding.side = "short"
+            elif attack == "entry_binding_venue_drift":
+                binding.venue = "other"
         elif attack == "management_batch_identity_drift":
             session.get(StrategyManagementBatch, 901).raw_message_id = 20003
+        elif attack == "management_binding_identity_drift":
+            linked = session.get(StrategyManagementBatch, 901)
+            session.get(ExecutionBinding, linked.execution_binding_id).symbol = "BTC"
         elif attack == "pending_has_result":
             pending.result_json = '{"status":"submitted"}'
         elif attack == "pending_has_scheduled_retry":
@@ -1053,6 +1229,12 @@ def test_instruction_population_fails_closed_on_ambiguous_or_active_rows(
             )
         elif attack == "pending_has_active_lifecycle":
             session.get(SignalCandidate, pending.signal_candidate_id).target_lifecycle_id = 794
+        elif attack == "pending_context_state_drift":
+            (
+                session.query(ContextResolutionAttempt)
+                .filter_by(raw_message_id=pending.raw_message_id)
+                .one()
+            ).status = "pending_reanalysis"
         elif attack == "unknown_has_active_lifecycle":
             session.get(StrategyLifecycle, 9001).lifecycle_status = "entered"
         elif attack == "unknown_has_active_binding":
@@ -1064,6 +1246,39 @@ def test_instruction_population_fails_closed_on_ambiguous_or_active_rows(
             binding.status = "active"
         elif attack == "unknown_has_active_descendant":
             session.get(StrategyManagementBatch, 902).status = "executing"
+        elif attack == "unknown_has_scheduled_retry":
+            unknown.visibility_next_attempt_at = NOW
+        elif attack == "unknown_has_deadline":
+            unknown.execution_deadline_at = NOW
+        elif attack == "unknown_has_escalation":
+            unknown.operator_escalation_at = NOW
+            unknown.escalation_state = "pending"
+        elif attack == "unknown_has_progress":
+            unknown.last_progress_at = NOW
+        elif attack == "unknown_candidate_symbol_drift":
+            session.get(SignalCandidate, unknown.signal_candidate_id).symbol = "BTC"
+        elif attack == "unknown_candidate_side_drift":
+            session.get(SignalCandidate, unknown.signal_candidate_id).side = "long"
+        elif attack == "unknown_candidate_event_type_drift":
+            session.get(
+                SignalCandidate, unknown.signal_candidate_id
+            ).event_type = "entry_signal"
+        elif attack.startswith("unknown_binding_"):
+            binding = (
+                session.query(ExecutionBinding)
+                .filter_by(strategy_instance_id=unknown.strategy_instance_id)
+                .one()
+            )
+            if attack == "unknown_binding_chat_drift":
+                binding.chat_id += 1
+            elif attack == "unknown_binding_message_drift":
+                binding.message_id += 1
+            elif attack == "unknown_binding_symbol_drift":
+                binding.symbol = "BTC"
+            elif attack == "unknown_binding_side_drift":
+                binding.side = "long"
+            elif attack == "unknown_binding_venue_drift":
+                binding.venue = "other"
         elif attack == "malformed_entry_payload":
             entry.result_json = "{"
         elif attack == "oversized_entry_payload":
@@ -1076,6 +1291,34 @@ def test_instruction_population_fails_closed_on_ambiguous_or_active_rows(
                 + "]" * 1100
                 + "}"
             )
+        elif attack == "bounded_deep_entry_payload":
+            payload = json.loads(entry.result_json)
+            nested = 0
+            for _ in range(65):
+                nested = [nested]
+            payload["unexpected_nested"] = nested
+            entry.result_json = json.dumps(payload, separators=(",", ":"))
+        elif attack == "excessive_entry_payload_nodes":
+            payload = json.loads(entry.result_json)
+            payload["unexpected_nodes"] = [0] * 3000
+            entry.result_json = json.dumps(payload, separators=(",", ":"))
+        elif attack == "duplicate_target_payload_key":
+            target.error_json = (
+                '{"batch_id":119,"batch_id":119,"reason":null,'
+                '"status":"recovery_required","submitted":false}'
+            )
+        elif attack == "entry_payload_nan":
+            payload = json.loads(entry.result_json)
+            payload["unexpected_number"] = float("nan")
+            entry.result_json = json.dumps(payload, separators=(",", ":"))
+        elif attack == "entry_payload_positive_infinity":
+            payload = json.loads(entry.result_json)
+            payload["unexpected_number"] = float("inf")
+            entry.result_json = json.dumps(payload, separators=(",", ":"))
+        elif attack == "entry_payload_negative_infinity":
+            payload = json.loads(entry.result_json)
+            payload["unexpected_number"] = float("-inf")
+            entry.result_json = json.dumps(payload, separators=(",", ":"))
         elif attack == "target_payload_has_extra_key":
             payload = json.loads(target.error_json)
             payload["unexpected"] = True
@@ -1088,7 +1331,506 @@ def test_instruction_population_fails_closed_on_ambiguous_or_active_rows(
     assert plan.reason_code == "additional_active_work_present"
 
 
-def test_resume_rejects_new_valid_instruction_population_after_repair(tmp_path):
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "raw_message_id",
+        "signal_candidate_id",
+        "strategy_instance_id",
+        "trade_signal_id",
+        "execution_binding_id",
+    ],
+)
+def test_instruction_population_rejects_verified_contract_identity_drift(
+    tmp_path,
+    monkeypatch,
+    drift,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+    _approve_audited_pending_residue(monkeypatch, factory)
+    with factory() as session:
+        item = (
+            session.query(MessageInstructionItem)
+            .filter_by(idempotency_key="audited-entry-terminal-mirror")
+            .one()
+        )
+        signal_id = json.loads(item.result_json)["result"]["signal_id"]
+        binding = (
+            session.query(ExecutionBinding)
+            .filter_by(strategy_instance_id=item.strategy_instance_id)
+            .one()
+        )
+        contract = InstructionExecutionContract(
+            message_instruction_item_id=item.id,
+            raw_message_id=item.raw_message_id,
+            signal_candidate_id=item.signal_candidate_id,
+            strategy_instance_id=item.strategy_instance_id,
+            intent_kind="entry",
+            state="verified",
+            state_version=2,
+            trade_signal_id=signal_id,
+            execution_binding_id=binding.id,
+            attempted_exchange_write=True,
+            terminal_kind="verified_entry",
+            completion_scope="full",
+            evidence_refs_json="[]",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(contract)
+        session.flush()
+        if drift in {
+            "raw_message_id",
+            "signal_candidate_id",
+            "trade_signal_id",
+            "execution_binding_id",
+        }:
+            setattr(contract, drift, 999_999)
+        else:
+            contract.strategy_instance_id = "deepcoin:wrong:identity"
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "additional_active_work_present"
+
+
+def test_instruction_population_accepts_exact_verified_contract_identity(
+    tmp_path,
+    monkeypatch,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+    _approve_audited_pending_residue(monkeypatch, factory)
+    with factory() as session:
+        item = (
+            session.query(MessageInstructionItem)
+            .filter_by(idempotency_key="audited-entry-terminal-mirror")
+            .one()
+        )
+        signal_id = json.loads(item.result_json)["result"]["signal_id"]
+        binding = (
+            session.query(ExecutionBinding)
+            .filter_by(strategy_instance_id=item.strategy_instance_id)
+            .one()
+        )
+        session.add(
+            InstructionExecutionContract(
+                message_instruction_item_id=item.id,
+                raw_message_id=item.raw_message_id,
+                signal_candidate_id=item.signal_candidate_id,
+                strategy_instance_id=item.strategy_instance_id,
+                intent_kind="entry",
+                state="verified",
+                state_version=2,
+                trade_signal_id=signal_id,
+                execution_binding_id=binding.id,
+                attempted_exchange_write=True,
+                terminal_kind="verified_entry",
+                completion_scope="full",
+                evidence_refs_json="[]",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "ready"
+
+
+def test_instruction_population_rejects_malformed_verified_contract_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+    _approve_audited_pending_residue(monkeypatch, factory)
+    with factory() as session:
+        item = (
+            session.query(MessageInstructionItem)
+            .filter_by(idempotency_key="audited-entry-terminal-mirror")
+            .one()
+        )
+        signal_id = json.loads(item.result_json)["result"]["signal_id"]
+        binding = (
+            session.query(ExecutionBinding)
+            .filter_by(strategy_instance_id=item.strategy_instance_id)
+            .one()
+        )
+        session.add(
+            InstructionExecutionContract(
+                message_instruction_item_id=item.id,
+                raw_message_id=item.raw_message_id,
+                signal_candidate_id=item.signal_candidate_id,
+                strategy_instance_id=item.strategy_instance_id,
+                intent_kind="entry",
+                state="verified",
+                state_version=2,
+                trade_signal_id=signal_id,
+                execution_binding_id=binding.id,
+                attempted_exchange_write=True,
+                terminal_kind="verified_entry",
+                completion_scope="full",
+                evidence_refs_json="{",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "additional_active_work_present"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "visibility_next_attempt_at",
+        "execution_deadline_at",
+        "operator_escalation_at",
+        "last_progress_at",
+        "escalation_state",
+    ],
+)
+def test_target_workflow_marker_drift_conflicts_under_lock_without_writes(
+    tmp_path,
+    field,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    plan = _plan(factory)
+    with factory() as session:
+        target = (
+            session.query(MessageInstructionItem)
+            .filter_by(idempotency_key="target-incident-instruction")
+            .one()
+        )
+        setattr(target, field, "pending" if field == "escalation_state" else NOW)
+        session.commit()
+
+    assert _plan(factory).status == "refused"
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="source_state_conflict",
+    ):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+def test_unknown_workflow_marker_drift_conflicts_under_lock_without_writes(
+    tmp_path,
+    monkeypatch,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+    _approve_audited_pending_residue(monkeypatch, factory)
+    plan = _plan(factory)
+    with factory() as session:
+        unknown = (
+            session.query(MessageInstructionItem)
+            .filter_by(idempotency_key="audited-management-unknown")
+            .one()
+        )
+        unknown.visibility_next_attempt_at = NOW
+        session.commit()
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="source_state_conflict",
+    ):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+def test_approved_pending_execution_semantics_drift_conflicts_without_writes(
+    tmp_path,
+    monkeypatch,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+    _approve_audited_pending_residue(monkeypatch, factory)
+    plan = _plan(factory)
+    with factory() as session:
+        item = (
+            session.query(MessageInstructionItem)
+            .filter_by(idempotency_key="audited-pending-residue")
+            .one()
+        )
+        candidate = session.get(SignalCandidate, item.signal_candidate_id)
+        candidate.entry_text = "100-101"
+        candidate.stop_loss_text = "95"
+        candidate.stop_price_source = "model"
+        candidate.take_profit_text = "110/120"
+        candidate.leverage_text = "50"
+        candidate.confidence = 0.99
+        candidate.review_status = "approved"
+        candidate.review_note = "semantics changed"
+        session.commit()
+
+    drifted = _plan(factory)
+
+    assert drifted.status == "refused"
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="source_state_conflict",
+    ):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("text", "changed execution text"),
+        ("raw_payload", '{"changed":true}'),
+        ("reply_to_message_id", 999),
+        ("archived_target_group", True),
+        ("edit_date", NOW),
+        ("source_status", "deleted"),
+        ("deleted_at", NOW),
+    ],
+)
+def test_approved_pending_raw_message_drift_is_rejected(
+    tmp_path,
+    monkeypatch,
+    field,
+    value,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+    _approve_audited_pending_residue(monkeypatch, factory)
+    with factory() as session:
+        raw = session.get(RawMessage, 20003)
+        setattr(raw, field, value)
+        session.commit()
+
+    assert _plan(factory).status == "refused"
+
+
+def test_approved_pending_source_identity_drift_is_rejected(
+    tmp_path,
+    monkeypatch,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+    with factory() as session:
+        source = Source(
+            telegram_sender_id=803,
+            chat_id=803,
+            username="synthetic",
+            display_name="Synthetic",
+            custom_label="approved",
+            is_active=True,
+            created_at=NOW,
+        )
+        session.add(source)
+        session.flush()
+        item = (
+            session.query(MessageInstructionItem)
+            .filter_by(idempotency_key="audited-pending-residue")
+            .one()
+        )
+        session.get(SignalCandidate, item.signal_candidate_id).source_id = source.id
+        session.commit()
+    _approve_audited_pending_residue(monkeypatch, factory)
+    with factory() as session:
+        session.query(Source).filter_by(username="synthetic").one().is_active = False
+        session.commit()
+
+    assert _plan(factory).status == "refused"
+
+
+def test_approved_pending_running_mimo_run_conflicts_without_writes(
+    tmp_path,
+    monkeypatch,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+    _approve_audited_pending_residue(monkeypatch, factory)
+    before = _plan(factory)
+    with factory() as session:
+        session.add(
+            MimoRecognitionRun(
+                raw_message_id=20003,
+                run_kind="v1_authoritative",
+                contract_version="v1",
+                model="mimo-v2.5",
+                input_kind="text",
+                input_fingerprint="synthetic-running-recognition",
+                prompt_versions_json="{}",
+                status="running",
+                attempt_count=0,
+                became_authoritative=False,
+                started_at=NOW,
+                created_at=NOW,
+            )
+        )
+        session.commit()
+
+    after = _plan(factory)
+
+    assert before.status == "ready"
+    assert after.status == "refused"
+    assert after.reason_code == "additional_active_work_present"
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="source_state_conflict",
+    ):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=before,
+            expected_fingerprint=before.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+def test_approved_pending_extraction_claim_conflicts_without_writes(
+    tmp_path,
+    monkeypatch,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+    _approve_audited_pending_residue(monkeypatch, factory)
+    before = _plan(factory)
+    with factory() as session:
+        session.add(
+            MessageEvidenceExtractionClaim(
+                raw_message_id=20003,
+                input_fingerprint="synthetic-claim-input",
+                claim_token="synthetic-claim-token",
+                claimed_at=NOW,
+                lease_expires_at=NOW,
+            )
+        )
+        session.commit()
+
+    after = _plan(factory)
+
+    assert before.status == "ready"
+    assert after.status == "refused"
+    assert after.reason_code == "additional_active_work_present"
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="source_state_conflict",
+    ):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=before,
+            expected_fingerprint=before.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+def test_approved_pending_terminal_mimo_and_evidence_drift_is_rejected(
+    tmp_path,
+    monkeypatch,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+    _approve_audited_pending_residue(monkeypatch, factory)
+    with factory() as session:
+        run = MimoRecognitionRun(
+            raw_message_id=20003,
+            run_kind="v1_authoritative",
+            contract_version="v1",
+            model="mimo-v2.5",
+            input_kind="text",
+            input_fingerprint="synthetic-terminal-recognition",
+            prompt_versions_json="{}",
+            status="completed",
+            attempt_count=1,
+            selected_attempt_ordinal=1,
+            became_authoritative=True,
+            canonical_payload_fingerprint="a" * 64,
+            projection_fingerprint="b" * 64,
+            started_at=NOW,
+            completed_at=NOW,
+            created_at=NOW,
+        )
+        session.add(run)
+        session.flush()
+        session.add_all(
+            [
+                MimoRecognitionAttempt(
+                    run_id=run.id,
+                    ordinal=1,
+                    status="completed",
+                    response_fingerprint="c" * 64,
+                    started_at=NOW,
+                    completed_at=NOW,
+                    duration_ms=1,
+                    created_at=NOW,
+                ),
+                MessageEvidenceVersion(
+                    raw_message_id=20003,
+                    mimo_recognition_run_id=run.id,
+                    version=1,
+                    input_fingerprint="synthetic-terminal-recognition",
+                    model="mimo-v2.5",
+                    prompt_versions_json="{}",
+                    extraction_status="completed",
+                    confidence=1.0,
+                    text_evidence_json="{}",
+                    image_evidence_json="{}",
+                    normalized_evidence_json="{}",
+                    created_at=NOW,
+                ),
+            ]
+        )
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "additional_active_work_present"
+
+
+def test_resume_rejects_new_valid_instruction_population_after_repair(
+    tmp_path,
+    monkeypatch,
+):
     module = _recovery_module()
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     plan = _plan(factory)
@@ -1100,6 +1842,7 @@ def test_resume_rejects_new_valid_instruction_population_after_repair(tmp_path):
         applied_at=NOW,
     )
     _add_audited_instruction_population(factory)
+    _approve_audited_pending_residue(monkeypatch, factory)
 
     with pytest.raises(
         module.CompositeBatchRecoveryConflict,
@@ -1116,12 +1859,14 @@ def test_resume_rejects_new_valid_instruction_population_after_repair(tmp_path):
         assert session.query(ExecutionEvent).count() == 1
 
 
-def test_instruction_population_same_count_drift_changes_fingerprint_and_cas(
+def test_entry_terminal_mirror_binding_drift_changes_fingerprint_and_cas(
     tmp_path,
+    monkeypatch,
 ):
     module = _recovery_module()
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     _add_audited_instruction_population(factory)
+    _approve_audited_pending_residue(monkeypatch, factory)
     before = _plan(factory)
     with factory() as session:
         binding = (
@@ -1150,9 +1895,148 @@ def test_instruction_population_same_count_drift_changes_fingerprint_and_cas(
             authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
             applied_at=NOW,
         )
+
+
+def test_unknown_lifecycle_full_row_drift_changes_fingerprint_and_cas(
+    tmp_path,
+    monkeypatch,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+    _approve_audited_pending_residue(monkeypatch, factory)
+    before = _plan(factory)
+    with factory() as session:
+        lifecycle = session.get(StrategyLifecycle, 9001)
+        lifecycle.management_note = "durable lifecycle drift"
+        session.commit()
+
+    after = _plan(factory)
+
+    assert before.status == after.status == "ready"
+    assert before.source_fingerprint != after.source_fingerprint
+    assert before.evidence_fingerprint != after.evidence_fingerprint
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="source_fingerprint_conflict",
+    ):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=before,
+            expected_fingerprint=before.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+
+def test_verified_entry_binding_full_row_drift_changes_fingerprint_and_cas(
+    tmp_path,
+    monkeypatch,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+    _approve_audited_pending_residue(monkeypatch, factory)
+    before = _plan(factory)
+    with factory() as session:
+        binding = (
+            session.query(ExecutionBinding)
+            .filter_by(strategy_instance_id="deepcoin:audit:entry")
+            .one()
+        )
+        binding.margin_mode = "isolated"
+        session.commit()
+
+    after = _plan(factory)
+
+    assert before.status == after.status == "ready"
+    assert before.source_fingerprint != after.source_fingerprint
+    assert before.evidence_fingerprint != after.evidence_fingerprint
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="source_fingerprint_conflict",
+    ):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=before,
+            expected_fingerprint=before.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
     with factory() as session:
         assert session.get(StrategyManagementBatch, 119).status == "reconciling"
         assert session.query(ExecutionEvent).count() == 0
+
+
+def test_verified_management_binding_full_row_drift_changes_fingerprint_and_cas(
+    tmp_path,
+    monkeypatch,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+    _approve_audited_pending_residue(monkeypatch, factory)
+    with factory() as session:
+        unknown = (
+            session.query(MessageInstructionItem)
+            .filter_by(idempotency_key="audited-management-unknown")
+            .one()
+        )
+        unknown.retired_at = NOW
+        session.commit()
+    before = _plan(factory)
+    with factory() as session:
+        binding = (
+            session.query(ExecutionBinding)
+            .filter_by(strategy_instance_id="deepcoin:audit:historical")
+            .one()
+        )
+        binding.margin_mode = "isolated"
+        session.commit()
+
+    after = _plan(factory)
+
+    assert before.status == after.status == "ready"
+    assert before.source_fingerprint != after.source_fingerprint
+    assert before.evidence_fingerprint != after.evidence_fingerprint
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="source_fingerprint_conflict",
+    ):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=before,
+            expected_fingerprint=before.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+def test_verified_management_binding_identity_drift_is_refused(
+    tmp_path,
+    monkeypatch,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+    _approve_audited_pending_residue(monkeypatch, factory)
+    with factory() as session:
+        unknown = (
+            session.query(MessageInstructionItem)
+            .filter_by(idempotency_key="audited-management-unknown")
+            .one()
+        )
+        unknown.retired_at = NOW
+        linked = session.get(StrategyManagementBatch, 901)
+        session.get(ExecutionBinding, linked.execution_binding_id).symbol = "BTC"
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "additional_active_work_present"
 
 
 def _plan(factory, snapshot=None):

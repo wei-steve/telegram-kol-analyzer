@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
+import math
 from pathlib import Path
 import sqlite3
 from types import MappingProxyType
@@ -16,16 +17,25 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
+    ContextResolutionAttempt,
+    EntryAssemblyAttempt,
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
     InstructionExecutionContract,
     ManagementMessageTarget,
+    MediaAsset,
+    MessageEvidenceExtractionClaim,
+    MessageEvidenceVersion,
     MessageInstructionItem,
+    MimoRecognitionAttempt,
+    MimoRecognitionRun,
     PositionMutationIntent,
     PositionProtectionLedger,
     RawMessage,
+    RecognitionDecision,
     SignalCandidate,
+    Source,
     StrategyLifecycle,
     StrategyManagementBatch,
     StrategyManagementComponent,
@@ -229,13 +239,15 @@ _SAFE_TERMINAL_MANAGEMENT_STATUSES = frozenset(
 )
 _SAFE_TERMINAL_INSTRUCTION_STATUSES = frozenset({"succeeded", "failed"})
 _INSTRUCTION_DISPOSITIONS = (
-    "historical_residue_no_authority",
+    "approved_historical_pending_frozen",
     "historical_unknown_frozen",
     "target_incident_frozen",
     "verified_terminal_mirror",
 )
 _MAX_INSTRUCTION_POPULATION = 4096
 _MAX_INSTRUCTION_PAYLOAD_BYTES = 16_384
+_MAX_INSTRUCTION_PAYLOAD_DEPTH = 64
+_MAX_INSTRUCTION_PAYLOAD_NODES = 2048
 _TERMINAL_MUTATION_STATUSES = frozenset({"confirmed", "rejected", "blocked"})
 _SAFE_TERMINAL_COMPONENT_STATUSES = frozenset(
     {"confirmed", "operator_required", "safely_skipped"}
@@ -244,6 +256,19 @@ BATCH_119_RECOVERY_AUTHORIZATION = (
     "I_AUTHORIZE_BATCH_119_TO_REMAINING_19"
 )
 _RECOVERY_AUTHORIZATION = BATCH_119_RECOVERY_AUTHORIZATION
+
+# Exact SHA-256 identities from the approved read-only production baseline.
+# Raw message, strategy, and idempotency identifiers are deliberately not
+# embedded in source or serialized recovery evidence.
+_APPROVED_BATCH_119_PENDING_RESIDUE_IDENTITY_DIGESTS = frozenset(
+    {
+        "d1e645c74fa18c41cd45c8f910e2676feb5fa5cd09b6efad43c6e8b19d38c06e",
+        "9bb950cc68e52b4378d7e33732698f3ca7bf455e29fccf6baf10c8fbb450a72c",
+        "3c5a472352b2114d9a44109feae544b018a946a981b09e96573a31593d41d9e5",
+        "27302072a8aa513970ec337921b72a927d0d11eecc5bc2472aede90d29ddb8fc",
+        "ff1854e636bf9bf7fbcb90191caa8cbef18ac26de0b9ba01ac40a68d17ba9046",
+    }
+)
 _RECOVERY_AUDIT_ACTION = "composite_batch_false_state_repaired"
 _RECOVERY_REASON = "composite_recovery_false_submission_repaired"
 
@@ -3293,6 +3318,9 @@ def _instruction_population_payload(
                 "management_action": candidate.management_action,
                 "disposition": disposition,
                 "updated_at": str(item.updated_at),
+                "item_fingerprint": _durable_row_fingerprint(item),
+                "candidate_fingerprint": _durable_row_fingerprint(candidate),
+                "raw_fingerprint": _durable_row_fingerprint(raw),
                 "facts": facts,
             }
         )
@@ -3341,7 +3369,7 @@ def _classify_instruction_disposition(
             raw=raw,
         )
         if residue_facts is not None:
-            return "historical_residue_no_authority", residue_facts
+            return "approved_historical_pending_frozen", residue_facts
     elif str(item.status) == "unknown":
         unknown_facts = _historical_unknown_facts(
             session,
@@ -3370,6 +3398,10 @@ def _target_incident_instruction_facts(
         and int(candidate.target_lifecycle_id or 0) == profile.lifecycle_id
         and str(candidate.event_type) == "position_update"
         and str(candidate.management_action or "") == str(batch.intent)
+        and str(candidate.symbol or "").upper()
+        == profile.instrument_id.split("-", 1)[0].upper()
+        and str(candidate.side or "").lower() == profile.side.lower()
+        and _instruction_workflow_is_clear(item)
     ):
         return None
     payload = _bounded_instruction_payload(item.error_json)
@@ -3387,6 +3419,7 @@ def _target_incident_instruction_facts(
         raise CompositeBatchRecoveryRefusal("additional_active_work_present")
     return {
         "batch_ref": _redacted_ref("instruction_batch", batch.id),
+        "candidate_identity_fingerprint": _durable_row_fingerprint(candidate),
         "payload_fingerprint": _fingerprint(payload),
     }
 
@@ -3432,10 +3465,13 @@ def _verified_terminal_mirror_facts(
         bindings = _instruction_bindings(
             session, strategy_instance_id=item.strategy_instance_id
         )
+        binding = bindings[0] if len(bindings) == 1 else None
         if (
             signal is None
-            or len(bindings) != 1
+            or binding is None
             or str(signal.status) != "submitted"
+            or str(signal.source_type) != "recovery"
+            or str(signal.action) != "open_position"
             or str(signal.venue) != "deepcoin"
             or str(signal.strategy_instance_id or "")
             != str(item.strategy_instance_id or "")
@@ -3443,25 +3479,58 @@ def _verified_terminal_mirror_facts(
             or int(signal.message_id) != int(raw.message_id)
             or str(signal.symbol) != str(candidate.symbol)
             or str(signal.side) != str(candidate.side)
+            or str(binding.strategy_instance_id or "")
+            != str(item.strategy_instance_id or "")
+            or int(binding.chat_id) != int(raw.chat_id)
+            or int(binding.message_id) != int(raw.message_id)
+            or str(binding.symbol) != str(candidate.symbol)
+            or str(binding.side) != str(candidate.side)
+            or str(binding.venue) != "deepcoin"
+            or (
+                contract is not None
+                and not _verified_contract_identity_matches(
+                    contract,
+                    item=item,
+                    intent_kind="entry",
+                    trade_signal_id=int(signal.id),
+                    execution_binding_id=int(binding.id),
+                )
+            )
         ):
             return None
         return {
             "binding_ref": _redacted_ref(
-                "instruction_binding", bindings[0].id
+                "instruction_binding", binding.id
             ),
-            "binding_status": str(bindings[0].status),
+            "binding_status": str(binding.status),
+            "binding_fingerprint": _durable_row_fingerprint(binding),
+            "contract_fingerprint": _verified_contract_fingerprint(contract),
             "payload_fingerprint": _fingerprint(payload),
             "trade_signal_ref": _redacted_ref(
                 "instruction_trade_signal", signal.id
             ),
             "trade_signal_status": str(signal.status),
+            "trade_signal_fingerprint": _durable_row_fingerprint(signal),
         }
     if str(item.instruction_kind) != "management":
         return None
     batch_id = _exact_int(payload.get("batch_id"))
     linked = session.get(StrategyManagementBatch, batch_id) if batch_id else None
+    lifecycle = (
+        session.get(StrategyLifecycle, int(candidate.target_lifecycle_id))
+        if candidate.target_lifecycle_id is not None
+        else None
+    )
+    binding = (
+        session.get(ExecutionBinding, int(linked.execution_binding_id))
+        if linked is not None
+        else None
+    )
     if (
         linked is None
+        or lifecycle is None
+        or binding is None
+        or str(candidate.event_type) not in {"position_update", "close_signal"}
         or payload.get("submitted") is not True
         or payload.get("status") not in {"reconciling", "submitted", "succeeded"}
         or str(linked.status) not in _SAFE_TERMINAL_MANAGEMENT_STATUSES
@@ -3471,6 +3540,30 @@ def _verified_terminal_mirror_facts(
         or str(linked.strategy_instance_id)
         != str(item.strategy_instance_id or "")
         or str(linked.intent) != str(candidate.management_action or "")
+        or int(lifecycle.id) != int(linked.target_lifecycle_id)
+        or lifecycle.execution_binding_id is None
+        or int(lifecycle.execution_binding_id) != int(binding.id)
+        or str(candidate.symbol or "") != str(lifecycle.symbol)
+        or str(candidate.side or "") != str(lifecycle.side)
+        or int(binding.id) != int(linked.execution_binding_id)
+        or str(binding.strategy_instance_id or "")
+        != str(item.strategy_instance_id or "")
+        or int(binding.chat_id) != int(lifecycle.chat_id)
+        or int(binding.message_id) != int(lifecycle.message_id)
+        or str(binding.symbol) != str(lifecycle.symbol)
+        or str(binding.side) != str(lifecycle.side)
+        or str(binding.venue) != "deepcoin"
+        or str(binding.status).lower() not in {"open", "active", "closed"}
+        or (
+            contract is not None
+            and not _verified_contract_identity_matches(
+                contract,
+                item=item,
+                intent_kind="management",
+                trade_signal_id=None,
+                execution_binding_id=int(linked.execution_binding_id),
+            )
+        )
         or (
             contract is not None
             and not (
@@ -3486,9 +3579,71 @@ def _verified_terminal_mirror_facts(
         return None
     return {
         "batch_ref": _redacted_ref("instruction_batch", linked.id),
+        "batch_fingerprint": _durable_row_fingerprint(linked),
         "batch_status": str(linked.status),
+        "binding_fingerprint": _durable_row_fingerprint(binding),
+        "contract_fingerprint": _verified_contract_fingerprint(contract),
+        "lifecycle_fingerprint": _durable_row_fingerprint(lifecycle),
         "payload_fingerprint": _fingerprint(payload),
     }
+
+
+def _verified_contract_identity_matches(
+    contract: InstructionExecutionContract,
+    *,
+    item: MessageInstructionItem,
+    intent_kind: str,
+    trade_signal_id: int | None,
+    execution_binding_id: int,
+) -> bool:
+    evidence_text = contract.evidence_refs_json
+    evidence_refs = (
+        _bounded_instruction_list(evidence_text)
+        if isinstance(evidence_text, str)
+        and len(evidence_text.encode("utf-8")) <= 4096
+        else None
+    )
+    return bool(
+        evidence_refs is not None
+        and all(isinstance(row, Mapping) for row in evidence_refs)
+        and int(contract.message_instruction_item_id) == int(item.id)
+        and int(contract.raw_message_id) == int(item.raw_message_id)
+        and int(contract.signal_candidate_id) == int(item.signal_candidate_id)
+        and str(contract.strategy_instance_id or "")
+        == str(item.strategy_instance_id or "")
+        and str(contract.intent_kind) == intent_kind
+        and (
+            (contract.trade_signal_id is None and trade_signal_id is None)
+            or (
+                contract.trade_signal_id is not None
+                and trade_signal_id is not None
+                and int(contract.trade_signal_id) == int(trade_signal_id)
+            )
+        )
+        and contract.execution_binding_id is not None
+        and int(contract.execution_binding_id) == int(execution_binding_id)
+    )
+
+
+def _verified_contract_fingerprint(
+    contract: InstructionExecutionContract | None,
+) -> str | None:
+    if contract is None:
+        return None
+    return _durable_row_fingerprint(contract)
+
+
+def _instruction_workflow_is_clear(item: MessageInstructionItem) -> bool:
+    return bool(
+        item.visibility_first_failed_at is None
+        and int(item.visibility_retry_attempts or 0) == 0
+        and item.visibility_next_attempt_at is None
+        and item.execution_deadline_at is None
+        and item.operator_escalation_at is None
+        and item.last_progress_at is None
+        and item.escalation_state is None
+        and item.escalation_notified_at is None
+    )
 
 
 def _historical_pending_residue_facts(
@@ -3512,6 +3667,18 @@ def _historical_pending_residue_facts(
         or _instruction_contract_exists(session, item_id=item.id)
         or _management_target_exists(session, item_id=item.id)
         or _has_nonterminal_descendant(session, raw_message_id=item.raw_message_id)
+        or session.query(MimoRecognitionRun.id)
+        .filter(
+            MimoRecognitionRun.raw_message_id == int(item.raw_message_id),
+            MimoRecognitionRun.status == "running",
+        )
+        .first()
+        is not None
+        or session.get(
+            MessageEvidenceExtractionClaim,
+            int(item.raw_message_id),
+        )
+        is not None
     ):
         return None
     lifecycle = (
@@ -3541,16 +3708,157 @@ def _historical_pending_residue_facts(
     )
     if signal_exists:
         return None
+    identity_digest = _historical_pending_residue_identity_digest(
+        session,
+        item=item,
+        candidate=candidate,
+        raw=raw,
+    )
+    if (
+        identity_digest
+        not in _APPROVED_BATCH_119_PENDING_RESIDUE_IDENTITY_DIGESTS
+    ):
+        return None
+    management_descendants = (
+        session.query(StrategyManagementBatch)
+        .filter(StrategyManagementBatch.raw_message_id == int(item.raw_message_id))
+        .order_by(StrategyManagementBatch.id)
+        .all()
+    )
+    revision_descendants = (
+        session.query(StrategyRevisionBatch)
+        .filter(StrategyRevisionBatch.raw_message_id == int(item.raw_message_id))
+        .order_by(StrategyRevisionBatch.id)
+        .all()
+    )
     return {
+        "approved_identity_digest": identity_digest,
         "binding_count": len(bindings),
+        "binding_fingerprints": [
+            _durable_row_fingerprint(row) for row in bindings
+        ],
         "binding_states": sorted(str(row.status) for row in bindings),
+        "management_descendant_fingerprints": [
+            _durable_row_fingerprint(row) for row in management_descendants
+        ],
+        "revision_descendant_fingerprints": [
+            _durable_row_fingerprint(row) for row in revision_descendants
+        ],
         "lifecycle_ref": (
             None
             if lifecycle is None
             else _redacted_ref("instruction_lifecycle", lifecycle.id)
         ),
+        "lifecycle_fingerprint": (
+            None if lifecycle is None else _durable_row_fingerprint(lifecycle)
+        ),
         "lifecycle_status": None if lifecycle is None else "exited",
     }
+
+
+def _historical_pending_residue_identity_digest(
+    session,
+    *,
+    item: MessageInstructionItem,
+    candidate: SignalCandidate,
+    raw: RawMessage,
+) -> str:
+    decisions = (
+        session.query(RecognitionDecision)
+        .filter(RecognitionDecision.raw_message_id == int(item.raw_message_id))
+        .order_by(RecognitionDecision.id)
+        .all()
+    )
+    context_attempts = (
+        session.query(ContextResolutionAttempt)
+        .filter(ContextResolutionAttempt.raw_message_id == int(item.raw_message_id))
+        .order_by(ContextResolutionAttempt.id)
+        .all()
+    )
+    entry_attempts = (
+        session.query(EntryAssemblyAttempt)
+        .filter(
+            EntryAssemblyAttempt.strategy_raw_message_id
+            == int(item.raw_message_id),
+            EntryAssemblyAttempt.signal_candidate_id
+            == int(item.signal_candidate_id),
+        )
+        .order_by(EntryAssemblyAttempt.id)
+        .all()
+    )
+    source = (
+        session.get(Source, int(candidate.source_id))
+        if candidate.source_id is not None
+        else None
+    )
+    media_assets = (
+        session.query(MediaAsset)
+        .filter(MediaAsset.raw_message_id == int(item.raw_message_id))
+        .order_by(MediaAsset.id)
+        .all()
+    )
+    evidence_versions = (
+        session.query(MessageEvidenceVersion)
+        .filter(MessageEvidenceVersion.raw_message_id == int(item.raw_message_id))
+        .order_by(MessageEvidenceVersion.id)
+        .all()
+    )
+    recognition_runs = (
+        session.query(MimoRecognitionRun)
+        .filter(MimoRecognitionRun.raw_message_id == int(item.raw_message_id))
+        .order_by(MimoRecognitionRun.id)
+        .all()
+    )
+    run_ids = [int(row.id) for row in recognition_runs]
+    recognition_attempts = (
+        []
+        if not run_ids
+        else session.query(MimoRecognitionAttempt)
+        .filter(MimoRecognitionAttempt.run_id.in_(run_ids))
+        .order_by(MimoRecognitionAttempt.run_id, MimoRecognitionAttempt.id)
+        .all()
+    )
+    extraction_claim = session.get(
+        MessageEvidenceExtractionClaim,
+        int(item.raw_message_id),
+    )
+    return _fingerprint(
+        {
+            "schema_version": 1,
+            "item_fingerprint": _durable_row_fingerprint(item),
+            "candidate_fingerprint": _durable_row_fingerprint(candidate),
+            "raw_fingerprint": _durable_row_fingerprint(raw),
+            "source_fingerprint": (
+                None if source is None else _durable_row_fingerprint(source)
+            ),
+            "media_fingerprints": [
+                _durable_row_fingerprint(row) for row in media_assets
+            ],
+            "evidence_version_fingerprints": [
+                _durable_row_fingerprint(row) for row in evidence_versions
+            ],
+            "recognition_run_fingerprints": [
+                _durable_row_fingerprint(row) for row in recognition_runs
+            ],
+            "recognition_attempt_fingerprints": [
+                _durable_row_fingerprint(row) for row in recognition_attempts
+            ],
+            "extraction_claim_fingerprint": (
+                None
+                if extraction_claim is None
+                else _durable_row_fingerprint(extraction_claim)
+            ),
+            "recognition_decision_fingerprints": [
+                _durable_row_fingerprint(row) for row in decisions
+            ],
+            "context_attempt_fingerprints": [
+                _durable_row_fingerprint(row) for row in context_attempts
+            ],
+            "entry_attempt_fingerprints": [
+                _durable_row_fingerprint(row) for row in entry_attempts
+            ],
+        }
+    )
 
 
 def _historical_unknown_facts(
@@ -3561,6 +3869,7 @@ def _historical_unknown_facts(
 ) -> dict[str, Any] | None:
     if (
         item.result_json is not None
+        or not _instruction_workflow_is_clear(item)
         or _instruction_contract_exists(session, item_id=item.id)
         or _management_target_exists(session, item_id=item.id)
     ):
@@ -3584,10 +3893,23 @@ def _historical_unknown_facts(
         session, strategy_instance_id=item.strategy_instance_id
     )
     if (
-        lifecycle is None
+        str(item.instruction_kind) != "management"
+        or lifecycle is None
         or str(lifecycle.lifecycle_status) != "exited"
         or not bindings
         or any(str(row.status) != "closed" for row in bindings)
+        or str(candidate.symbol or "") != str(lifecycle.symbol)
+        or str(candidate.side or "") != str(lifecycle.side)
+        or any(
+            str(row.strategy_instance_id or "")
+            != str(item.strategy_instance_id or "")
+            or int(row.chat_id) != int(lifecycle.chat_id)
+            or int(row.message_id) != int(lifecycle.message_id)
+            or str(row.symbol) != str(lifecycle.symbol)
+            or str(row.side) != str(lifecycle.side)
+            or str(row.venue) != "deepcoin"
+            for row in bindings
+        )
     ):
         return None
     linked: Any
@@ -3595,32 +3917,75 @@ def _historical_unknown_facts(
     if str(candidate.event_type) == "strategy_revision":
         linked = session.get(StrategyRevisionBatch, batch_id)
         terminal_statuses = {"succeeded", "blocked"}
-    else:
+    elif str(candidate.event_type) in {"position_update", "close_signal"}:
         linked = session.get(StrategyManagementBatch, batch_id)
         terminal_statuses = _SAFE_TERMINAL_MANAGEMENT_STATUSES
+    else:
+        return None
     if (
         linked is None
         or str(linked.status) not in terminal_statuses
         or int(linked.raw_message_id) != int(item.raw_message_id)
         or int(linked.target_lifecycle_id) != int(candidate.target_lifecycle_id)
+        or lifecycle.execution_binding_id is None
+        or int(lifecycle.execution_binding_id) != int(linked.execution_binding_id)
         or int(linked.execution_binding_id)
         not in {int(row.id) for row in bindings}
+        or (
+            isinstance(linked, StrategyManagementBatch)
+            and (
+                str(linked.strategy_instance_id)
+                != str(item.strategy_instance_id or "")
+                or str(linked.intent) != str(candidate.management_action or "")
+            )
+        )
+        or (
+            isinstance(linked, StrategyRevisionBatch)
+            and str(candidate.management_action or "") != "replace_entry"
+        )
     ):
         return None
     return {
-        "binding_refs": sorted(
-            _redacted_ref("instruction_binding", row.id) for row in bindings
+        "binding_fingerprints": sorted(
+            _execution_binding_fingerprint(row) for row in bindings
         ),
+        "candidate_fingerprint": _signal_candidate_fingerprint(candidate),
         "descendant_ref": _redacted_ref("instruction_descendant", linked.id),
+        "descendant_fingerprint": _historical_descendant_fingerprint(linked),
         "descendant_status": str(linked.status),
         "lifecycle_ref": _redacted_ref(
             "instruction_lifecycle", lifecycle.id
         ),
+        "lifecycle_fingerprint": _durable_row_fingerprint(lifecycle),
         "payload_fingerprint": _fingerprint(payload),
     }
 
 
+def _signal_candidate_fingerprint(candidate: SignalCandidate) -> str:
+    return _durable_row_fingerprint(candidate)
+
+
+def _execution_binding_fingerprint(binding: ExecutionBinding) -> str:
+    return _durable_row_fingerprint(binding)
+
+
+def _historical_descendant_fingerprint(
+    row: StrategyManagementBatch | StrategyRevisionBatch,
+) -> str:
+    return _durable_row_fingerprint(row)
+
+
 def _bounded_instruction_payload(value: str | None) -> Mapping[str, Any] | None:
+    payload = _bounded_instruction_json(value)
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _bounded_instruction_list(value: str | None) -> list[Any] | None:
+    payload = _bounded_instruction_json(value)
+    return payload if isinstance(payload, list) else None
+
+
+def _bounded_instruction_json(value: str | None) -> Any:
     if (
         not isinstance(value, str)
         or not value
@@ -3628,13 +3993,81 @@ def _bounded_instruction_payload(value: str | None) -> Mapping[str, Any] | None:
     ):
         return None
     try:
-        payload = json.loads(value)
-        if not isinstance(payload, Mapping):
+        payload = json.loads(
+            value,
+            object_pairs_hook=_instruction_json_object,
+            parse_constant=_reject_instruction_json_constant,
+        )
+        if not _instruction_json_shape_is_bounded(payload):
             return None
         _fingerprint(payload)
     except (TypeError, ValueError, RecursionError, OverflowError):
         return None
     return payload
+
+
+def _durable_row_fingerprint(row: Any) -> str:
+    columns = getattr(getattr(row, "__table__", None), "columns", None)
+    if columns is None:
+        raise TypeError("durable ORM row required")
+    return _fingerprint(
+        {
+            str(column.name): _durable_scalar(getattr(row, column.name))
+            for column in columns
+        }
+    )
+
+
+def _durable_scalar(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, bytes):
+        return hashlib.sha256(value).hexdigest()
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("non-finite durable float")
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise TypeError("unsupported durable scalar")
+
+
+def _instruction_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = item
+    return result
+
+
+def _reject_instruction_json_constant(value: str) -> Any:
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _instruction_json_shape_is_bounded(value: Any) -> bool:
+    nodes = 0
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if (
+            nodes > _MAX_INSTRUCTION_PAYLOAD_NODES
+            or depth > _MAX_INSTRUCTION_PAYLOAD_DEPTH
+        ):
+            return False
+        if isinstance(current, Mapping):
+            stack.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, list):
+            stack.extend((item, depth + 1) for item in current)
+        elif isinstance(current, float) and not math.isfinite(current):
+            return False
+        elif current is not None and not isinstance(
+            current,
+            (bool, int, float, str),
+        ):
+            return False
+    return True
 
 
 def _instruction_bindings(

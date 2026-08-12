@@ -15,7 +15,8 @@ Production contains 186 non-retired instruction rows whose status is not
 
 - one exact batch 119 source instruction is genuinely unresolved;
 - 177 `submitted` rows have durable terminal business evidence;
-- five `pending` rows have no current execution authority; and
+- five `pending` rows are frozen by exact reviewed SHA-256 identities for this
+  recovery, although the ordinary executor could otherwise claim them; and
 - three historical `unknown` rows have terminal durable reconciliation but must
   remain frozen.
 
@@ -81,10 +82,19 @@ The approved dispositions are:
 2. `verified_terminal_mirror`: an entry `submitted` mirror with an exact linked
    submitted trade signal and binding, or a management `submitted` mirror whose
    exact referenced batch is terminal and belongs to the same raw message.
-3. `historical_residue_no_authority`: a `pending` row with no result, error,
-   execution contract, management target, scheduled visibility retry, deadline,
-   escalation, trade signal, or active descendant; its target lifecycle is
-   absent or exited and any binding is absent or closed.
+3. `approved_historical_pending_frozen`: one of exactly five SHA-256 identities
+   from the reviewed production baseline. Its complete ORM item, candidate, raw
+   message, source, media, evidence-version, MiMo run/attempt, recognition,
+   context-resolution and entry-admission rows must match the allowlist;
+   sensitive text/blob fields exist only inside the final digest. Any live MiMo
+   run or evidence-extraction claim is rejected. Current lifecycle, binding and
+   descendant rows are separately fingerprinted into every plan and locked CAS,
+   so their normal terminal reconciliation does not silently reuse an old plan.
+   It must also
+   have no result, error, execution contract, management target, scheduled
+   visibility retry, deadline, escalation, trade signal, or active descendant.
+   This disposition freezes the row only for this recovery; it does not claim
+   that the normal instruction executor is intrinsically unable to claim it.
 4. `historical_unknown_frozen`: an `unknown` row whose lifecycle and binding are
    closed and whose exact management or revision descendant is terminal. The row
    remains unchanged and cannot be replayed.
@@ -132,7 +142,9 @@ prove:
 - the target instruction is required exactly once;
 - verified entry and management mirrors are accepted only with exact durable
   links;
-- the five pending-residue conditions are all required;
+- a generic structurally similar pending row remains claimable and is rejected;
+- only the five exact reviewed pending identities are accepted, and any identity
+  or context-resolution drift is rejected;
 - historical unknown rows require terminal descendants and remain untouched;
 - executing, scheduled, malformed, duplicate, active, and identity-drift rows
   fail closed;

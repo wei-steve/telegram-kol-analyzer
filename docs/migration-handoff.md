@@ -837,7 +837,11 @@ repeatable with zero exchange writes.
 
 The first Task 7 baseline found 186 non-retired instruction rows outside raw
 `succeeded`/`failed`: 177 verified terminal compatibility mirrors, five
-historical pending residues with no execution authority, three closed historical
+historical pending rows frozen only by exact reviewed SHA-256 identities over
+their full item/candidate/raw/source/media/evidence/MiMo recognition/context/
+admission ORM state (the ordinary executor could otherwise claim them), with
+current lifecycle/binding/descendant rows bound separately into plan and locked
+CAS evidence, three closed historical
 unknown rows that remain frozen, and one exact batch-119 target incident. None
 were rewritten. The dedicated recovery now classifies every row from exact
 durable links and binds redacted per-row evidence into a canonical population

@@ -22,7 +22,8 @@ Add helpers that create:
 - the exact batch 119 source instruction;
 - one verified submitted entry mirror;
 - one verified submitted management mirror;
-- one pending residue with no execution authority; and
+- one synthetic allowlisted pending residue representing an exact reviewed
+  frozen identity; and
 - one historical frozen unknown with a terminal descendant.
 
 Use only synthetic IDs and payloads.
@@ -80,9 +81,11 @@ Cover:
 - any `executing` instruction;
 - submitted entry without the exact trade signal or binding;
 - submitted management without its exact terminal batch;
-- pending residue with result/error/contract/target/scheduled retry/deadline,
-  escalation, trade signal, active lifecycle, active binding, target row, or
-  active descendant;
+- any generic pending row, including one the production claim function can
+  claim; any non-allowlisted identity; or an allowlisted pending residue with
+  result/error/contract/target/scheduled retry/deadline, escalation, trade
+  signal, active lifecycle, active binding, target row, active descendant, or
+  context/admission drift;
 - historical unknown with active lifecycle/binding or nonterminal descendant;
 - malformed, oversized, deeply nested, or contradictory JSON; and
 - unexpected duplicate durable links.
