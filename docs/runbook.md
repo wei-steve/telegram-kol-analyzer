@@ -1864,3 +1864,72 @@ notification status 为 `not_needed`。
 若回滚，先保持 contract 模式 `disabled`，通过新评审的 revert commit 和同一预检
 流程发布；不得删除监督修复 token、解绑已验证 TP、清理历史 unknown 或重放旧消息。
 任何 shadow/live 灰度必须另取未来水位、生成并评审证据 artifact，再取得明确授权。
+
+## MiMo v2 隔离回放、激活与回滚
+
+MiMo v2 默认保持 `mimo_contract_mode=v1`。激活前先在本地运行：
+
+```bash
+.venv/bin/python -m pytest -q tests/test_mimo_v2_replay.py
+.venv/bin/python -m pytest -q tests/test_web_app.py -k 'trading_settings and mimo'
+.venv/bin/python -m pytest -q
+```
+
+服务器上的比较必须使用人工评审过的有界原始消息数据库 ID 列表，
+并写入一个新建或空的 artifact 目录：
+
+```bash
+telegram-kol-research replay-mimo-v2 \
+  --database data/research.db \
+  --message-id-file /path/to/approved-mimo-v2-message-ids.txt \
+  --artifact-dir /path/to/new-mimo-v2-replay-artifacts \
+  --max-messages 200 \
+  --ai-config-path config/ai_recognition.yaml \
+  --media-root data/media
+```
+
+命令以 SQLite 只读连接复制一份临时数据库，v1/v2 调用只在临时副本中
+记录 prompt/run/attempt。它不导入或构建 Deepcoin writer 和通知器，不进入 live
+listener，不向生产数据库写入。`summary.json` 和 `comparisons.csv` 只保留消息
+数据库 ID、状态、延迟与投影指纹，不保留消息正文、图片字节、凭证或供应商
+异常文本。以下任一条会以非零状态退出：
+
+- v1 或 v2 未得到可比较的结构化投影；
+- 出现可执行语义差异；
+- adapter P95 大于或等于 50 ms；
+- v2 端到端 P95 超过 v1 P95 的 115%。
+
+输出通过后，仍需运行发布预检，证明没有 `executing`、`submitted`、
+`unknown` 或 `recovery_required` 指令，没有活跃恢复/对账，也没有时效性策略
+操作。然后读取当前 `raw_messages.id` 最大值作为水位线，在 Web 交易设置或
+等价配置通道中同时设置：
+
+```text
+mimo_contract_mode=v2_live_adapter
+mimo_v2_activation_after_raw_message_id=<captured-current-max-id>
+```
+
+API 会拒绝空水位、低于当前最大消息 ID 的首次激活，以及不支持的
+`shadow`/`live` 模式。断路器状态会在设置 API 和页面显示。只检查自然到达且
+ID 大于水位线的新消息，不发送仿真实盘策略、不回放历史消息。可用以下
+只读查询核对首批消息：
+
+```sql
+SELECT id, raw_message_id, run_kind, status, attempt_count,
+       final_error_code, became_authoritative, projection_fingerprint
+FROM mimo_recognition_runs
+WHERE raw_message_id > <captured-current-max-id>
+ORDER BY id;
+
+SELECT run_id, ordinal, status, error_code, duration_ms
+FROM mimo_recognition_attempts
+WHERE run_id IN (
+  SELECT id FROM mimo_recognition_runs
+  WHERE raw_message_id > <captured-current-max-id>
+)
+ORDER BY run_id, ordinal;
+```
+
+回滚只把 `mimo_contract_mode` 改回 `v1`。保留水位线、v2 run/attempt、证据、
+candidate、instruction、lifecycle 和交易所审计记录；不删除、不重放、不重试
+未知交易所结果。

@@ -1187,6 +1187,129 @@ def test_trading_settings_api_returns_fresh_fixed_entry_defaults(tmp_path):
     }
 
 
+def test_trading_settings_api_round_trips_mimo_v2_future_activation(tmp_path):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    with app.state.session_factory() as session:
+        row = RawMessage(chat_id=900, message_id=17, text="existing message")
+        session.add(row)
+        session.commit()
+        watermark = int(row.id)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/trading-settings",
+        json={
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": watermark,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["mimo_contract_mode"] == "v2_live_adapter"
+    assert (
+        response.json()["mimo_v2_activation_after_raw_message_id"] == watermark
+    )
+    assert client.get("/api/trading-settings").json()["mimo_contract_mode"] == (
+        "v2_live_adapter"
+    )
+
+
+@pytest.mark.parametrize("mode", ["shadow", "v2", "live"])
+def test_trading_settings_api_rejects_unsupported_mimo_mode(tmp_path, mode):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.post(
+        "/api/trading-settings",
+        json={
+            "mimo_contract_mode": mode,
+            "mimo_v2_activation_after_raw_message_id": 1,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "mimo_contract_mode" in response.json()["detail"]
+
+
+def test_trading_settings_api_rejects_mimo_v2_watermark_below_current_message(
+    tmp_path,
+):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    with app.state.session_factory() as session:
+        session.add_all(
+            [
+                RawMessage(chat_id=900, message_id=17, text="old"),
+                RawMessage(chat_id=900, message_id=18, text="current"),
+            ]
+        )
+        session.commit()
+        current_max = int(session.query(RawMessage.id).order_by(RawMessage.id.desc()).first()[0])
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/trading-settings",
+        json={
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": current_max - 1,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "future-message watermark" in response.json()["detail"]
+    assert client.get("/api/trading-settings").json()["mimo_contract_mode"] == "v1"
+
+
+def test_trading_settings_api_v1_rollback_preserves_mimo_watermark(tmp_path):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    client = TestClient(app)
+    enabled = client.post(
+        "/api/trading-settings",
+        json={
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 7,
+        },
+    )
+    assert enabled.status_code == 200
+
+    rolled_back = client.post(
+        "/api/trading-settings",
+        json={"mimo_contract_mode": "v1"},
+    )
+
+    assert rolled_back.status_code == 200
+    assert rolled_back.json()["mimo_contract_mode"] == "v1"
+    assert rolled_back.json()["mimo_v2_activation_after_raw_message_id"] == 7
+
+
+def test_trading_settings_api_and_ui_show_mimo_circuit_state(tmp_path):
+    from telegram_kol_research.mimo_contract_circuit import record_mimo_v2_outcome
+
+    app = create_web_app(database_path=tmp_path / "research.db")
+    record_mimo_v2_outcome(
+        app.state.session_factory,
+        outcome="contract_validation_failed",
+        observed_at=datetime(2026, 8, 11, 12, 0, tzinfo=UTC),
+    )
+    client = TestClient(app)
+
+    api_response = client.get("/api/trading-settings")
+    page_response = client.get("/more-panel")
+
+    assert api_response.status_code == 200
+    assert api_response.json()["mimo_contract_circuit"] == {
+        "consecutive_transport_failures": 0,
+        "is_open": True,
+        "opened_reason": "contract_validation_failed",
+        "opened_at": "2026-08-11T12:00:00+00:00",
+        "last_success_at": None,
+        "updated_at": "2026-08-11T12:00:00+00:00",
+    }
+    assert page_response.status_code == 200
+    assert "MiMo 识别合同" in page_response.text
+    assert "v2_live_adapter" in page_response.text
+    assert "contract_validation_failed" in page_response.text
+    assert 'name="mimo_v2_activation_after_raw_message_id"' in page_response.text
+
+
 def test_trading_settings_api_rejects_negative_fixed_entry_threshold(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 

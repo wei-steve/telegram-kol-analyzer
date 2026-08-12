@@ -3290,6 +3290,10 @@ function bindTradingSettingsForm() {
       entry_preamble_mode: String(formData.get('entry_preamble_mode') || 'disabled'),
       entry_message_assembly_v2_mode: String(formData.get('entry_message_assembly_v2_mode') || 'disabled'),
       entry_revision_v2_mode: String(formData.get('entry_revision_v2_mode') || 'disabled'),
+      mimo_contract_mode: String(formData.get('mimo_contract_mode') || 'v1'),
+      mimo_v2_activation_after_raw_message_id: Number(
+        formData.get('mimo_v2_activation_after_raw_message_id') || 0,
+      ),
       default_max_loss_usdt: numericValue('default_max_loss_usdt', 20),
       daily_max_loss_usdt: numericValue('daily_max_loss_usdt', 500),
       max_concurrent_positions: numericValue('max_concurrent_positions', 4),

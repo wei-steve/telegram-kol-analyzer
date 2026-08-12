@@ -851,3 +851,27 @@ entries still use `min_ai_confidence`. State-less Deepcoin cancel history is
 accepted only by the strict same-invocation combined proof documented in the
 runbook; ambiguity, fill evidence, exact live-position evidence, or an unknown
 cancel response remains fail-closed.
+
+## MiMo v2 analysis observability handoff
+
+The canonical MiMo v2 result preserves an ordered, multi-dimensional intent
+list and independently attributed evidence for every image. The Web projection
+shows that first-pass result before contextual resolution, system acceptance,
+execution truth, and the collapsed DeepSeek review. Historical rows are never
+reinterpreted: existing reliable v1 fields remain labelled as historical v1,
+and missing run/attempt or per-image detail remains explicitly missing.
+
+Production stays on `mimo_contract_mode=v1` until the isolated server replay
+described in `docs/runbook.md` passes with zero executable mismatch and both
+P95 gates satisfied. The replay operates on a temporary SQLite copy and emits
+redacted JSON/CSV artifacts only; it has no Deepcoin writer, notifier, or live
+listener path.
+
+Activation is future-only. Capture the current terminal maximum raw-message ID
+after deployment preflight proves no in-flight or time-sensitive operation,
+then set `v2_live_adapter` and that exact value as
+`mimo_v2_activation_after_raw_message_id`. The settings API rejects an unsafe
+initial watermark and exposes the durable circuit state. Verification observes
+only naturally arriving later messages. Rollback sets the mode back to `v1`
+and preserves the watermark, v2 runs and attempts, image evidence, instruction
+state, lifecycle state, and all exchange audit records.
