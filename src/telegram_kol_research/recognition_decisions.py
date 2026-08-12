@@ -284,6 +284,49 @@ def claim_authoritative_execution(
         return result.rowcount == 1
 
 
+def refuse_authoritative_execution(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    authoritative_generation: str,
+    reason: str,
+) -> bool:
+    """Atomically retire one still-pending generation without executing it."""
+
+    with session_factory() as session:
+        result = session.execute(
+            update(RecognitionDecision)
+            .where(
+                RecognitionDecision.raw_message_id == raw_message_id,
+                RecognitionDecision.comparison_status == "execution_pending",
+                RecognitionDecision.comparison_claim_token
+                == authoritative_generation,
+            )
+            .values(
+                authoritative_status="识别失败",
+                auxiliary_model=None,
+                auxiliary_status=None,
+                auxiliary_payload_json=None,
+                agreement_status="authoritative_failed",
+                differences_json="[]",
+                disagreement_severity=None,
+                comparison_model=None,
+                comparison_payload_json=None,
+                comparison_error=None,
+                comparison_next_attempt_at=None,
+                automation_status="skipped",
+                automation_reason=reason,
+                comparison_status="completed",
+                comparison_claim_token=None,
+                comparison_started_at=None,
+                compared_at=None,
+                updated_at=utc_now(),
+            )
+        )
+        session.commit()
+        return result.rowcount == 1
+
+
 def finalize_authoritative_automation_outcome(
     session_factory: sessionmaker,
     *,

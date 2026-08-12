@@ -9,7 +9,7 @@ import logging
 import math
 import mimetypes
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping
 
@@ -121,6 +121,7 @@ class MimoV2InferenceResult:
     input_kind: str
     model: str
     prompt_versions: dict[str, int]
+    analysis_input_fingerprint: str | None = None
     error_code: str | None = None
     error_message: str | None = None
 
@@ -302,6 +303,7 @@ def infer_mimo_authoritative_v2(
     requester: Callable[..., Any] | None = None,
     max_attempts: int = MIMO_AUTHORITATIVE_MAX_ATTEMPTS,
     retry_delay_seconds: float = MIMO_AUTHORITATIVE_RETRY_DELAY_SECONDS,
+    retry_of_run_id: int | None = None,
 ) -> MimoV2InferenceResult:
     """Call and audit one strict MiMo v2 analysis without execution writes."""
 
@@ -347,9 +349,12 @@ def infer_mimo_authoritative_v2(
         context=effective_context,
         contract_version="v2",
     )
-    analysis_input_fingerprint = _mimo_v2_analysis_input_fingerprint(
-        message_input_fingerprint=input_fingerprint,
-        context_text=composition.context,
+    analysis_input_fingerprint = build_current_mimo_v2_analysis_input_fingerprint(
+        session_factory,
+        raw_message_id=int(raw_message_id),
+        media_root=media_root,
+        _message_input_fingerprint=input_fingerprint,
+        _context_text=composition.context,
     )
     run = start_mimo_run(
         session_factory,
@@ -360,6 +365,7 @@ def infer_mimo_authoritative_v2(
         input_kind=input_kind,
         input_fingerprint=analysis_input_fingerprint,
         prompt_versions=composition.version_map,
+        retry_of_run_id=retry_of_run_id,
     )
 
     if model_config is None or not model_config.provider.is_configured:
@@ -371,6 +377,7 @@ def infer_mimo_authoritative_v2(
             input_kind=input_kind,
             model=model,
             prompt_versions=composition.version_map,
+            analysis_input_fingerprint=analysis_input_fingerprint,
             error_code="provider_http_error",
             error_message="MiMo model is not configured",
         )
@@ -383,6 +390,7 @@ def infer_mimo_authoritative_v2(
             input_kind=input_kind,
             model=model,
             prompt_versions=composition.version_map,
+            analysis_input_fingerprint=analysis_input_fingerprint,
             error_code="contract_validation_failed",
             error_message="message has no readable text or image",
         )
@@ -406,6 +414,7 @@ def infer_mimo_authoritative_v2(
             input_kind=input_kind,
             model=model,
             prompt_versions=composition.version_map,
+            analysis_input_fingerprint=analysis_input_fingerprint,
             error_code="image_unavailable",
             error_message="image media is declared but unavailable or unreadable",
         )
@@ -459,6 +468,7 @@ def infer_mimo_authoritative_v2(
                     input_kind=input_kind,
                     model=model,
                     prompt_versions=composition.version_map,
+                    analysis_input_fingerprint=analysis_input_fingerprint,
                     error_code="input_changed_during_analysis",
                     error_message="message input changed during MiMo analysis",
                 )
@@ -506,6 +516,7 @@ def infer_mimo_authoritative_v2(
                     input_kind=input_kind,
                     model=model,
                     prompt_versions=composition.version_map,
+                    analysis_input_fingerprint=analysis_input_fingerprint,
                     error_code="input_changed_during_analysis",
                     error_message="message input changed during MiMo analysis",
                 )
@@ -548,6 +559,7 @@ def infer_mimo_authoritative_v2(
                     input_kind=input_kind,
                     model=model,
                     prompt_versions=composition.version_map,
+                    analysis_input_fingerprint=analysis_input_fingerprint,
                     error_code="input_changed_during_analysis",
                     error_message="message input changed during MiMo analysis",
                 )
@@ -584,6 +596,7 @@ def infer_mimo_authoritative_v2(
                     input_kind=input_kind,
                     model=model,
                     prompt_versions=composition.version_map,
+                    analysis_input_fingerprint=analysis_input_fingerprint,
                     error_code="input_changed_during_analysis",
                     error_message="message input changed during MiMo analysis",
                 )
@@ -617,6 +630,7 @@ def infer_mimo_authoritative_v2(
                     input_kind=input_kind,
                     model=model,
                     prompt_versions=composition.version_map,
+                    analysis_input_fingerprint=analysis_input_fingerprint,
                     error_code="input_changed_during_analysis",
                     error_message="message input changed during MiMo analysis",
                 )
@@ -648,6 +662,7 @@ def infer_mimo_authoritative_v2(
                 input_kind=input_kind,
                 model=model,
                 prompt_versions=dict(composition.version_map),
+                analysis_input_fingerprint=analysis_input_fingerprint,
             )
 
     return _complete_v2_failure(
@@ -658,6 +673,7 @@ def infer_mimo_authoritative_v2(
         input_kind=input_kind,
         model=model,
         prompt_versions=composition.version_map,
+        analysis_input_fingerprint=analysis_input_fingerprint,
         error_code=last_error_code,
         error_message=last_error_message,
     )
@@ -756,6 +772,44 @@ def _mimo_v2_analysis_input_fingerprint(
     return f"sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
 
 
+def build_current_mimo_v2_analysis_input_fingerprint(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    media_root: str | Path,
+    _message_input_fingerprint: str | None = None,
+    _context_text: str | None = None,
+) -> str:
+    """Hash the exact message/media and composed context used by MiMo v2."""
+
+    if (_message_input_fingerprint is None) != (_context_text is None):
+        raise ValueError("fingerprint snapshot must include message and context")
+    message_fingerprint = _message_input_fingerprint
+    context_text = _context_text
+    if message_fingerprint is None:
+        message_fingerprint = build_current_message_input_fingerprint(
+            session_factory,
+            int(raw_message_id),
+            media_root=media_root,
+        )
+        context_text = str(
+            build_authoritative_context_for_message(
+                session_factory,
+                int(raw_message_id),
+            )
+        )
+    composition = compose_trading_prompt(
+        session_factory,
+        model_kind="mimo",
+        context=str(context_text),
+        contract_version="v2",
+    )
+    return _mimo_v2_analysis_input_fingerprint(
+        message_input_fingerprint=message_fingerprint,
+        context_text=composition.context,
+    )
+
+
 def _mimo_v2_input_is_current(
     session_factory: sessionmaker,
     *,
@@ -766,27 +820,29 @@ def _mimo_v2_input_is_current(
     rebuild_context: bool,
 ) -> bool:
     try:
-        current_message_fingerprint = build_current_message_input_fingerprint(
-            session_factory,
-            raw_message_id,
-            media_root=media_root,
-        )
-        current_context = (
-            str(
-                build_authoritative_context_for_message(
+        if rebuild_context:
+            current = build_current_mimo_v2_analysis_input_fingerprint(
+                session_factory,
+                raw_message_id=raw_message_id,
+                media_root=media_root,
+            )
+        else:
+            current_message_fingerprint = (
+                build_current_message_input_fingerprint(
                     session_factory,
                     raw_message_id,
+                    media_root=media_root,
                 )
             )
-            if rebuild_context
-            else expected_context
-        )
-    except (LookupError, OSError):
+            current = build_current_mimo_v2_analysis_input_fingerprint(
+                session_factory,
+                raw_message_id=raw_message_id,
+                media_root=media_root,
+                _message_input_fingerprint=current_message_fingerprint,
+                _context_text=expected_context,
+            )
+    except Exception:
         return False
-    current = _mimo_v2_analysis_input_fingerprint(
-        message_input_fingerprint=current_message_fingerprint,
-        context_text=current_context,
-    )
     return current == expected_fingerprint
 
 
@@ -804,6 +860,7 @@ def _complete_v2_failure(
     input_kind: str,
     model: str,
     prompt_versions: Mapping[str, int],
+    analysis_input_fingerprint: str,
     error_code: str,
     error_message: str,
 ) -> MimoV2InferenceResult:
@@ -833,6 +890,7 @@ def _complete_v2_failure(
         input_kind=input_kind,
         model=model,
         prompt_versions=dict(prompt_versions),
+        analysis_input_fingerprint=analysis_input_fingerprint,
         error_code=failed.final_error_code,
         error_message=failed.final_error_message,
     )
@@ -1145,12 +1203,23 @@ def _build_mimo_payload(
 
 
 def _build_authoritative_context(session, raw_message: RawMessage) -> str:
-    return render_authoritative_context(
-        build_contextual_message_window(
-            session,
-            raw_message_id=int(raw_message.id),
-        )
+    window = build_contextual_message_window(
+        session,
+        raw_message_id=int(raw_message.id),
     )
+    # Current-message evidence and links are outputs of this same authority
+    # pipeline. Excluding them keeps the prompt input stable after evidence is
+    # finalized while retaining prior-message evidence and active lifecycles.
+    prompt_window = replace(
+        window,
+        current=replace(
+            window.current,
+            evidence_version_id=None,
+            normalized_evidence={},
+            strategy_links=(),
+        ),
+    )
+    return render_authoritative_context(prompt_window)
 
 
 def build_authoritative_context_for_message(
