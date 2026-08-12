@@ -1119,9 +1119,21 @@ def _call_mimo_direct_model(
             raise RuntimeError(f"{exc}; response_body={response_body}") from exc
         data = response.json()
     content = _extract_chat_content(data)
+    raw_response_content = getattr(response, "content", None)
+    if isinstance(raw_response_content, bytes):
+        response_size_bytes = len(raw_response_content)
+    else:
+        response_size_bytes = len(
+            json.dumps(
+                data,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
     return _MimoProviderPayload(
         _parse_json_object(content),
-        response_size_bytes=len(response.content),
+        response_size_bytes=response_size_bytes,
     )
 
 
