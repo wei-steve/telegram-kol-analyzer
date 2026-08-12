@@ -434,6 +434,8 @@ def infer_mimo_authoritative_v2(
                 prompt=composition.system_prompt,
                 media_root=media_root,
                 context_text=composition.context,
+                json_mode=True,
+                disable_thinking=True,
             )
             payload = _coerce_mimo_v2_payload(response_payload)
             parsed = parse_mimo_v2_payload(payload)
@@ -1094,6 +1096,8 @@ def _call_mimo_direct_model(
     prompt: str = "",
     media_root: str | Path,
     context_text: str = "",
+    json_mode: bool = False,
+    disable_thinking: bool = False,
 ) -> dict[str, Any]:
     headers = {"Content-Type": "application/json"}
     if model_config.api_key:
@@ -1105,6 +1109,8 @@ def _call_mimo_direct_model(
         model=model_config.model,
         media_root=media_root,
         context_text=context_text,
+        json_mode=json_mode,
+        disable_thinking=disable_thinking,
     )
     with httpx.Client(timeout=model_config.timeout_seconds) as client:
         response = client.post(
@@ -1145,6 +1151,8 @@ def _build_mimo_payload(
     prompt: str = "",
     media_root: str | Path = "data/media",
     context_text: str = "",
+    json_mode: bool = False,
+    disable_thinking: bool = False,
 ) -> dict[str, Any]:
     image_parts: list[tuple[int, int | None, str]] = []
     for image_index, media_asset in enumerate(media_assets, start=1):
@@ -1172,7 +1180,7 @@ def _build_mimo_payload(
     user_parts: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
     for _, _, data_url in image_parts:
         user_parts.append({"type": "image_url", "image_url": {"url": data_url}})
-    return {
+    payload: dict[str, Any] = {
         "model": model,
         "messages": [
             {"role": "system", "content": prompt},
@@ -1180,6 +1188,11 @@ def _build_mimo_payload(
         ],
         "temperature": 0,
     }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    if disable_thinking:
+        payload["thinking"] = {"type": "disabled"}
+    return payload
 
 
 def _build_authoritative_context(session, raw_message: RawMessage) -> str:

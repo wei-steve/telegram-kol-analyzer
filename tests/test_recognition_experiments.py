@@ -380,6 +380,8 @@ def test_build_mimo_payload_uses_raw_image_without_ocr_text(tmp_path):
     assert user_content[1]["type"] == "image_url"
     assert user_content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
     assert "OLD OCR TEXT SHOULD NOT BE SENT" not in json.dumps(payload)
+    assert "response_format" not in payload
+    assert "thinking" not in payload
 
 
 def test_authoritative_mimo_fails_closed_when_declared_image_is_missing(
@@ -458,6 +460,26 @@ def test_build_mimo_payload_skips_empty_images_and_uses_configured_prompt(tmp_pa
     user_content = payload["messages"][1]["content"]
     assert isinstance(user_content, list)
     assert len([part for part in user_content if part["type"] == "image_url"]) == 1
+
+
+def test_build_mimo_payload_can_request_fast_json_mode():
+    payload = _build_mimo_payload(
+        raw_message=RawMessage(
+            id=1,
+            chat_id=100,
+            message_id=2,
+            sender_name="Trader",
+            text="BTC market commentary",
+        ),
+        media_assets=[],
+        model="mimo-v2.5",
+        media_root="data/media",
+        json_mode=True,
+        disable_thinking=True,
+    )
+
+    assert payload["response_format"] == {"type": "json_object"}
+    assert payload["thinking"] == {"type": "disabled"}
 
 
 def test_run_mimo_direct_experiment_persists_side_channel_only(tmp_path, monkeypatch):
@@ -946,6 +968,8 @@ def test_mimo_v2_first_attempt_success_records_selected_attempt_and_prompt(
     assert result.prompt_versions.keys() == {MIMO_V2_AUTHORITATIVE_PROMPT}
     assert "mimo-authoritative-v2" in captured["prompt"]
     assert captured["context_text"] == "Recent context: no active strategy"
+    assert captured["json_mode"] is True
+    assert captured["disable_thinking"] is True
     attempts = load_mimo_attempts(factory, run_id=result.run_id)
     assert [row.status for row in attempts] == ["completed"]
     assert attempts[0].selected is True
