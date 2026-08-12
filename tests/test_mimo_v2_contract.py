@@ -96,6 +96,96 @@ def test_parse_preserves_ordered_actionable_and_informational_intents():
     assert parsed.intents[1].action is None
 
 
+def test_parse_normalizes_exact_empty_informational_action_shell():
+    payload = _valid_payload()
+    payload["intents"] = [
+        {
+            "intent_type": "market_commentary",
+            "action": {
+                "kind": None,
+                "target": {"lifecycle_id": None, "thread_id": None},
+                "strategy": None,
+                "parameters": {},
+            },
+            "reason": "仅是市场观点",
+            "confidence": 0.82,
+            "evidence_refs": ["text:observed_text"],
+        }
+    ]
+
+    parsed = parse_mimo_v2_payload(payload)
+
+    assert parsed.intents[0].action is None
+
+
+def test_parse_rejects_nonempty_informational_action_shell():
+    payload = _valid_payload()
+    payload["intents"] = [
+        {
+            "intent_type": "market_commentary",
+            "action": {
+                "kind": None,
+                "target": {"lifecycle_id": 790, "thread_id": None},
+                "strategy": None,
+                "parameters": {},
+            },
+            "reason": "仅是市场观点",
+            "confidence": 0.82,
+            "evidence_refs": ["text:observed_text"],
+        }
+    ]
+
+    with pytest.raises(MimoV2ContractError, match="action_kind_invalid"):
+        parse_mimo_v2_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    (
+        lambda action: action.update(extra=None),
+        lambda action: action["target"].update(extra=None),
+        lambda action: action["target"].update(thread_id=52),
+        lambda action: action.update(kind="full_exit"),
+        lambda action: action.update(strategy={"symbol": "BTC"}),
+        lambda action: action.update(parameters={"exit_price": "100000"}),
+    ),
+)
+def test_parse_rejects_near_empty_informational_action_shell(mutator):
+    payload = _valid_payload()
+    action = {
+        "kind": None,
+        "target": {"lifecycle_id": None, "thread_id": None},
+        "strategy": None,
+        "parameters": {},
+    }
+    mutator(action)
+    payload["intents"] = [
+        {
+            "intent_type": "market_commentary",
+            "action": action,
+            "reason": "仅是市场观点",
+            "confidence": 0.82,
+            "evidence_refs": ["text:observed_text"],
+        }
+    ]
+
+    with pytest.raises(MimoV2ContractError):
+        parse_mimo_v2_payload(payload)
+
+
+def test_parse_rejects_empty_action_shell_for_actionable_intent():
+    payload = _valid_payload()
+    payload["intents"][0]["action"] = {
+        "kind": None,
+        "target": {"lifecycle_id": None, "thread_id": None},
+        "strategy": None,
+        "parameters": {},
+    }
+
+    with pytest.raises(MimoV2ContractError, match="action_kind_invalid"):
+        parse_mimo_v2_payload(payload)
+
+
 def test_parse_complete_entry_strategy():
     payload = _valid_payload()
     payload["intents"] = [

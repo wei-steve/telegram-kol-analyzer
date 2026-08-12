@@ -261,8 +261,14 @@ def _parse_intents(
         intent_type = str(row.get("intent_type") or "").strip()
         if intent_type not in INTENT_TYPES:
             raise MimoV2ContractError(f"intent_{ordinal}_type_invalid")
+        raw_action = row.get("action")
+        if (
+            intent_type not in _ACTIONABLE_INTENT_TYPES
+            and _is_empty_action_shell(raw_action)
+        ):
+            raw_action = None
         action = _parse_action(
-            row.get("action"),
+            raw_action,
             ordinal=ordinal,
             intent_type=intent_type,
         )
@@ -301,6 +307,21 @@ def _parse_intents(
             )
         )
     return tuple(parsed)
+
+
+def _is_empty_action_shell(raw: Any) -> bool:
+    if not isinstance(raw, Mapping) or set(raw) != _ACTION_FIELDS:
+        return False
+    target = raw.get("target")
+    return (
+        raw.get("kind") is None
+        and isinstance(target, Mapping)
+        and set(target) == _TARGET_FIELDS
+        and target.get("lifecycle_id") is None
+        and target.get("thread_id") is None
+        and raw.get("strategy") is None
+        and raw.get("parameters") == {}
+    )
 
 
 def _parse_action(
