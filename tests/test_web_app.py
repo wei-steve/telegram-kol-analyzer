@@ -1242,6 +1242,31 @@ def test_trading_settings_activation_holds_telegram_operation_lock(
     assert observed == [True]
 
 
+def test_unrelated_trading_settings_save_does_not_take_telegram_operation_lock(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.web_app as web_module
+
+    app = create_web_app(database_path=tmp_path / "research.db")
+    real_save = web_module.save_trading_settings
+    observed: list[bool] = []
+
+    def guarded_save(*args, **kwargs):
+        observed.append(app.state.telegram_operation_lock.locked())
+        return real_save(*args, **kwargs)
+
+    monkeypatch.setattr(web_module, "save_trading_settings", guarded_save)
+
+    response = TestClient(app).post(
+        "/api/trading-settings",
+        json={"default_max_loss_usdt": 25},
+    )
+
+    assert response.status_code == 200
+    assert observed == [False]
+
+
 @pytest.mark.parametrize("mode", ["shadow", "v2", "live"])
 def test_trading_settings_api_rejects_unsupported_mimo_mode(tmp_path, mode):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
@@ -1332,6 +1357,33 @@ def test_trading_settings_api_v1_rollback_rejects_watermark_change(tmp_path):
     assert "preserve" in rolled_back.json()["detail"]
     stored = client.get("/api/trading-settings").json()
     assert stored["mimo_contract_mode"] == "v2_live_adapter"
+    assert stored["mimo_v2_activation_after_raw_message_id"] == 7
+
+
+def test_trading_settings_api_preserves_watermark_after_v1_rollback(tmp_path):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    client = TestClient(app)
+    assert client.post(
+        "/api/trading-settings",
+        json={
+            "mimo_contract_mode": "v2_live_adapter",
+            "mimo_v2_activation_after_raw_message_id": 7,
+        },
+    ).status_code == 200
+    assert client.post(
+        "/api/trading-settings",
+        json={"mimo_contract_mode": "v1"},
+    ).status_code == 200
+
+    changed = client.post(
+        "/api/trading-settings",
+        json={"mimo_v2_activation_after_raw_message_id": 0},
+    )
+
+    assert changed.status_code == 422
+    assert "preserve" in changed.json()["detail"]
+    stored = client.get("/api/trading-settings").json()
+    assert stored["mimo_contract_mode"] == "v1"
     assert stored["mimo_v2_activation_after_raw_message_id"] == 7
 
 

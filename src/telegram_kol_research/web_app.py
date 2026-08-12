@@ -3843,8 +3843,7 @@ def _validate_mimo_contract_activation(
     current = load_trading_settings(session_factory)
     candidate = trading_settings_from_payload({**current.to_dict(), **payload})
     if (
-        current.mimo_contract_mode == "v2_live_adapter"
-        and candidate.mimo_contract_mode == "v1"
+        candidate.mimo_contract_mode == "v1"
         and candidate.mimo_v2_activation_after_raw_message_id
         != current.mimo_v2_activation_after_raw_message_id
     ):
@@ -6745,14 +6744,36 @@ def create_web_app(
             # rejects the global allowlist.
             refresh_status = await orchestrator.refresh_once()
         try:
-            async with app.state.telegram_operation_lock:
-                _validate_mimo_contract_activation(
-                    app.state.session_factory,
-                    payload=payload,
+            current = load_trading_settings(app.state.session_factory)
+            candidate = trading_settings_from_payload(
+                {**current.to_dict(), **payload}
+            )
+            mimo_contract_change = (
+                candidate.mimo_contract_mode != current.mimo_contract_mode
+                or candidate.mimo_v2_activation_after_raw_message_id
+                != current.mimo_v2_activation_after_raw_message_id
+            )
+            if mimo_contract_change:
+                async with app.state.telegram_operation_lock:
+                    _validate_mimo_contract_activation(
+                        app.state.session_factory,
+                        payload=payload,
+                    )
+                    response = save_trading_settings(
+                        app.state.session_factory,
+                        payload,
+                        updated_at=app.state.now_provider(),
+                    ).to_dict()
+            else:
+                payload_without_unchanged_mimo = dict(payload)
+                payload_without_unchanged_mimo.pop("mimo_contract_mode", None)
+                payload_without_unchanged_mimo.pop(
+                    "mimo_v2_activation_after_raw_message_id",
+                    None,
                 )
                 response = save_trading_settings(
                     app.state.session_factory,
-                    payload,
+                    payload_without_unchanged_mimo,
                     updated_at=app.state.now_provider(),
                 ).to_dict()
         except ValueError as exc:
