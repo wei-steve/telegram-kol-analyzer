@@ -808,9 +808,6 @@ def _serialize_raw_messages(
         semantic_review = _serialize_semantic_review(decision)
         message_evidence = evidence_by_msg_id.get(raw_message.id)
         mimo_analysis = _serialize_mimo_analysis(
-            raw_message=raw_message,
-            recognition=rec_by_msg_id.get(raw_message.id),
-            decision=decision,
             evidence=message_evidence,
             runs=mimo_runs_by_msg_id.get(raw_message.id, []),
             attempts_by_run_id=mimo_attempts_by_run_id,
@@ -869,7 +866,6 @@ def _serialize_raw_messages(
                     recognition=rec_by_msg_id.get(raw_message.id),
                     decision=decision,
                     candidates=candidates_by_msg_id.get(raw_message.id, []),
-                    mimo_analysis=mimo_analysis,
                 ),
                 "semantic_review": semantic_review,
                 "execution_outcome": _serialize_execution_outcome(
@@ -907,9 +903,6 @@ def _serialize_raw_messages(
 
 def _serialize_mimo_analysis(
     *,
-    raw_message: RawMessage,
-    recognition: MessageRecognition | None,
-    decision: RecognitionDecision | None,
     evidence: MessageEvidenceVersion | None,
     runs: list[MimoRecognitionRun],
     attempts_by_run_id: dict[int, list[MimoRecognitionAttempt]],
@@ -1193,10 +1186,14 @@ def _serialize_mimo_image(
     except (TypeError, ValueError):
         asset_id = 0
     media = media_by_id.get(asset_id)
+    image_type = image.get("image_type")
+    quality = image.get("quality")
     return {
         "asset_id": asset_id or None,
-        "image_type": image.get("image_type"),
-        "quality": image.get("quality"),
+        "image_type": image_type,
+        "image_type_label": MIMO_IMAGE_TYPE_LABELS.get(image_type, image_type),
+        "quality": quality,
+        "quality_label": MIMO_IMAGE_QUALITY_LABELS.get(quality, quality),
         "observed_text": image.get("observed_text"),
         "summary": image.get("summary"),
         "fields": image.get("fields") if isinstance(image.get("fields"), dict) else {},
@@ -1220,7 +1217,6 @@ def _serialize_system_acceptance(
     recognition: MessageRecognition | None,
     decision: RecognitionDecision | None,
     candidates: list[SignalCandidate],
-    mimo_analysis: dict[str, object] | None,
 ) -> dict[str, object] | None:
     if decision is None and recognition is None:
         return None
