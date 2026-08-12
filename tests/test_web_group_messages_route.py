@@ -197,13 +197,29 @@ def test_group_messages_route_renders_mimo_first_multidimensional_analysis(tmp_p
     assert "清晰" in body
     assert "尝试 1" in body and "provider_timeout" in body
     assert "系统处理失败" in body and "target_unresolved" in body
+    assert "仓位管理 · 移动止损保护：rejected" in body
+    assert "市场评论：not_actionable" in body
     assert "原始图片证据 JSON" in body
     assert '"asset_id"' in body
     assert "展示投影失败" not in body
+    collapsed = re.search(
+        r'<div class="message-collapsed-ai-summary"[^>]*>(.*?)</div>',
+        body,
+        re.S,
+    )
+    assert collapsed is not None
+    assert "MiMo识别结果" in collapsed.group(1)
+    assert "仓位管理" in collapsed.group(1)
+    assert "市场评论" in collapsed.group(1)
+    assert "AI识别结果：非策略" not in collapsed.group(1)
+    assert '<section class="message-decision-card' not in body
+    assert "v2_authoritative · mimo-authoritative-v2 · 尝试 1" in body
+    assert "当前运行已成为权威结果" in body
     assert re.search(r'<details[^>]*class="[^"]*mimo-deepseek-review[^"]*"(?![^>]* open)', body)
+    assert body.count("DeepSeek辅助复核") == 1
+    assert body.rindex("自动交易：") < body.index("DeepSeek辅助复核")
     assert not re.search(
-        r'<details\s+class="message-ai-insights[^"]*is-decision-card-history[^"]*"\s+'
-        r'data-message-ai-insights\s+open',
+        r'<details\s+class="message-ai-insights[^"]*"[^>]*\sopen(?:\s|>)',
         body,
     )
 

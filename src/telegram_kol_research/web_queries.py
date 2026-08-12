@@ -19,6 +19,7 @@ from telegram_kol_research.models import (
     MediaAsset,
     MessageRecognition,
     MessageEvidenceVersion,
+    MessageInstructionItem,
     MimoRecognitionAttempt,
     MimoRecognitionRun,
     RawMessage,
@@ -776,6 +777,19 @@ def _serialize_raw_messages(
         candidates_by_msg_id.setdefault(c.raw_message_id, []).append(c)
         if c.raw_message_id not in cand_by_msg_id:
             cand_by_msg_id[c.raw_message_id] = c
+    candidate_ids = [int(candidate.id) for candidate in all_candidates]
+    instruction_items = (
+        session.query(MessageInstructionItem)
+        .filter(MessageInstructionItem.signal_candidate_id.in_(candidate_ids))
+        .all()
+        if candidate_ids
+        else []
+    )
+    instruction_items_by_candidate_id: dict[int, list[MessageInstructionItem]] = {}
+    for item in instruction_items:
+        instruction_items_by_candidate_id.setdefault(
+            int(item.signal_candidate_id), []
+        ).append(item)
 
     # Strategy-record links must follow the exact candidate relation.  Do not
     # infer ownership from message symbol/side, and fail closed if legacy data
@@ -799,6 +813,18 @@ def _serialize_raw_messages(
         media_assets = media_by_msg_id.get(raw_message.id, [])
         media_asset_rows = _serialize_media_assets(media_assets)
         selected_candidate = cand_by_msg_id.get(raw_message.id)
+        current_authoritative_candidates = [
+            candidate
+            for candidate in candidates_by_msg_id.get(raw_message.id, [])
+            if candidate.parse_source == "mimo_authoritative"
+            and (
+                not instruction_items_by_candidate_id.get(int(candidate.id))
+                or any(
+                    item.retired_at is None
+                    for item in instruction_items_by_candidate_id[int(candidate.id)]
+                )
+            )
+        ]
         lifecycle_ids = (
             lifecycle_ids_by_candidate_id.get(selected_candidate.id, [])
             if selected_candidate is not None
@@ -867,7 +893,8 @@ def _serialize_raw_messages(
                 "system_acceptance": _serialize_system_acceptance(
                     recognition=rec_by_msg_id.get(raw_message.id),
                     decision=decision,
-                    candidates=candidates_by_msg_id.get(raw_message.id, []),
+                    candidates=current_authoritative_candidates,
+                    mimo_analysis=mimo_analysis,
                 ),
                 "semantic_review": semantic_review,
                 "execution_outcome": _serialize_execution_outcome(
@@ -916,6 +943,16 @@ def _serialize_mimo_analysis(
 
     if evidence is None and not runs and recognition is None and decision is None:
         return None
+    has_mimo_provenance = bool(runs) or any(
+        "mimo" in str(value or "").lower()
+        for value in (
+            evidence.model if evidence is not None else None,
+            decision.authoritative_model if decision is not None else None,
+            recognition.engine if recognition is not None else None,
+        )
+    )
+    if not has_mimo_provenance:
+        return None
     legacy_payload = (
         _safe_json_dict(decision.authoritative_payload_json)
         if decision is not None
@@ -957,7 +994,22 @@ def _serialize_mimo_analysis(
         runs=runs,
         attempts_by_run_id=attempts_by_run_id,
     )
-    raw_images = image_evidence.get("images")
+    is_v2 = contract_version == "mimo-authoritative-v2" or (
+        linked_run is not None
+        and linked_run.contract_version == "mimo-authoritative-v2"
+    )
+    projection = _serialize_mimo_projection(
+        is_v2=is_v2,
+        is_historical_v1=linked_run is None,
+        evidence=evidence,
+        normalized=normalized,
+        text_evidence=text_evidence,
+        image_evidence=image_evidence,
+    )
+    semantic_projection_allowed = (
+        not is_v2 or projection.get("status") == "completed"
+    )
+    raw_images = image_evidence.get("images") if semantic_projection_allowed else []
     raw_images = raw_images if isinstance(raw_images, list) else []
     images = [
         _serialize_mimo_image(
@@ -970,21 +1022,12 @@ def _serialize_mimo_analysis(
         for item in raw_images
         if isinstance(item, dict)
     ]
-    is_v2 = contract_version == "mimo-authoritative-v2" or (
-        evidence is None
-        and linked_run is not None
-        and linked_run.contract_version == "mimo-authoritative-v2"
+    raw_intents = (
+        normalized.get("intents")
+        if is_v2 and semantic_projection_allowed
+        else []
     )
-    raw_intents = normalized.get("intents") if is_v2 else []
     raw_intents = raw_intents if isinstance(raw_intents, list) else []
-    projection = _serialize_mimo_projection(
-        is_v2=is_v2,
-        is_historical_v1=linked_run is None,
-        evidence=evidence,
-        normalized=normalized,
-        text_evidence=text_evidence,
-        image_evidence=image_evidence,
-    )
     attempts_recorded = any(attempts_by_run_id.get(int(run.id), []) for run in runs)
     per_image_recorded = bool(
         raw_images
@@ -1001,6 +1044,27 @@ def _serialize_mimo_analysis(
         if linked_run is not None
         else "historical_v1"
     )
+    projected_summary = (
+        normalized.get("summary")
+        or normalized.get("reason")
+        or legacy_payload.get("summary")
+        or (recognition.summary if recognition is not None else None)
+        or legacy_payload.get("reason")
+    )
+    projected_confidence = (
+        normalized.get("confidence")
+        if "confidence" in normalized
+        else legacy_payload.get("confidence")
+    )
+    projected_conflicts = (
+        image_evidence.get("conflicts")
+        if isinstance(image_evidence.get("conflicts"), list)
+        else []
+    )
+    if is_v2 and not semantic_projection_allowed:
+        projected_summary = None
+        projected_confidence = None
+        projected_conflicts = []
     return {
         "format": result_format,
         "version_label": (
@@ -1016,18 +1080,8 @@ def _serialize_mimo_analysis(
             else None
         ),
         "runtime": runtime,
-        "summary": (
-            normalized.get("summary")
-            or normalized.get("reason")
-            or legacy_payload.get("summary")
-            or (recognition.summary if recognition is not None else None)
-            or legacy_payload.get("reason")
-        ),
-        "confidence": (
-            normalized.get("confidence")
-            if "confidence" in normalized
-            else legacy_payload.get("confidence")
-        ),
+        "summary": projected_summary,
+        "confidence": projected_confidence,
         "intents": [
             _serialize_mimo_intent(item)
             for item in raw_intents
@@ -1036,11 +1090,7 @@ def _serialize_mimo_analysis(
         "evidence": {
             "text": text_evidence,
             "images": images,
-            "conflicts": (
-                image_evidence.get("conflicts")
-                if isinstance(image_evidence.get("conflicts"), list)
-                else []
-            ),
+            "conflicts": projected_conflicts,
         },
         "projection": projection,
         "detail_flags": {
@@ -1091,7 +1141,7 @@ def _serialize_mimo_projection(
             "reason_code": "canonical_result_not_persisted",
         }
     canonical = {
-        "contract_version": "mimo-authoritative-v2",
+        "contract_version": normalized.get("contract_version"),
         "summary": normalized.get("summary"),
         "confidence": normalized.get("confidence"),
         "intents": normalized.get("intents"),
@@ -1333,14 +1383,10 @@ def _serialize_system_acceptance(
     recognition: MessageRecognition | None,
     decision: RecognitionDecision | None,
     candidates: list[SignalCandidate],
+    mimo_analysis: dict[str, object] | None,
 ) -> dict[str, object] | None:
     if decision is None and recognition is None:
         return None
-    accepted = [
-        candidate
-        for candidate in candidates
-        if candidate.parse_source == "mimo_authoritative"
-    ]
     automation_status = decision.automation_status if decision is not None else None
     reason_code = decision.automation_reason if decision is not None else None
     authoritative_status = (
@@ -1348,20 +1394,92 @@ def _serialize_system_acceptance(
         if decision is not None
         else recognition.status if recognition is not None else None
     )
-    if reason_code == "mimo_no_action":
-        accepted = []
-    if authoritative_status == "识别失败" or automation_status in {
-        "failed",
-        "error",
-        "blocked",
-        "partial_failed",
-        "recovery_required",
-    }:
+    projected_intents = (
+        mimo_analysis.get("intents")
+        if isinstance(mimo_analysis, dict)
+        and isinstance(mimo_analysis.get("intents"), list)
+        else []
+    )
+    intent_rows: list[dict[str, object]] = []
+    accepted_candidate_ids: set[int] = set()
+    for ordinal, intent in enumerate(projected_intents, start=1):
+        if not isinstance(intent, dict):
+            continue
+        action = intent.get("action")
+        action = action if isinstance(action, dict) else None
+        action_kind = str(action.get("kind") or "") if action is not None else ""
+        if not action_kind:
+            intent_rows.append(
+                {
+                    "ordinal": ordinal,
+                    "intent_type": intent.get("intent_type"),
+                    "intent_label": intent.get("intent_label"),
+                    "action_kind": None,
+                    "action_label": None,
+                    "status": "not_actionable",
+                    "reason_code": None,
+                    "candidate_ids": [],
+                }
+            )
+            continue
+        matching = [
+            candidate
+            for candidate in candidates
+            if _candidate_matches_mimo_intent(candidate, action)
+        ]
+        candidate_ids = [int(candidate.id) for candidate in matching]
+        if len(candidate_ids) == 1:
+            accepted_candidate_ids.update(candidate_ids)
+        intent_rows.append(
+            {
+                "ordinal": ordinal,
+                "intent_type": intent.get("intent_type"),
+                "intent_label": intent.get("intent_label"),
+                "action_kind": action_kind,
+                "action_label": action.get("action_label"),
+                "status": (
+                    "accepted"
+                    if len(matching) == 1
+                    else "ambiguous"
+                    if len(matching) > 1
+                    else "rejected"
+                ),
+                "reason_code": (
+                    None
+                    if len(matching) == 1
+                    else "ambiguous_candidate_projection"
+                    if len(matching) > 1
+                    else reason_code or "not_projected"
+                ),
+                "candidate_ids": candidate_ids,
+            }
+        )
+
+    actionable_rows = [
+        row for row in intent_rows if row["status"] != "not_actionable"
+    ]
+    accepted_rows = [row for row in actionable_rows if row["status"] == "accepted"]
+    admission_failure_reasons = {
+        "target_unresolved",
+        "mimo_authoritative_failed",
+        "mimo_authoritative_not_safely_applied",
+    }
+    if authoritative_status == "识别失败" and not accepted_rows:
         status = "failed"
         status_label = "系统未安全接纳"
-    elif accepted:
+    elif actionable_rows and len(accepted_rows) == len(actionable_rows):
         status = "accepted"
         status_label = "系统已接纳"
+    elif accepted_rows:
+        status = "partial"
+        status_label = "系统部分接纳"
+    elif reason_code in admission_failure_reasons:
+        status = "failed"
+        status_label = "系统未安全接纳"
+    elif candidates and not actionable_rows and reason_code != "mimo_no_action":
+        status = "accepted"
+        status_label = "系统已接纳"
+        accepted_candidate_ids.update(int(candidate.id) for candidate in candidates)
     else:
         status = "not_accepted"
         status_label = "系统未接纳可执行动作"
@@ -1369,9 +1487,54 @@ def _serialize_system_acceptance(
         "status": status,
         "status_label": status_label,
         "reason_code": reason_code,
-        "accepted_candidate_count": len(accepted),
+        "accepted_candidate_count": len(accepted_candidate_ids),
+        "intents": intent_rows,
         "automation_status": automation_status,
     }
+
+
+def _candidate_matches_mimo_intent(
+    candidate: SignalCandidate,
+    action: dict[str, object],
+) -> bool:
+    action_kind = str(action.get("kind") or "")
+    candidate_action = _candidate_action_kind(candidate)
+    if action_kind != candidate_action:
+        return False
+    target = action.get("target")
+    target = target if isinstance(target, dict) else {}
+    lifecycle_id = target.get("lifecycle_id")
+    if lifecycle_id is not None and candidate.target_lifecycle_id != int(lifecycle_id):
+        return False
+    strategy = action.get("strategy")
+    if action_kind == "entry" and isinstance(strategy, dict):
+        symbol = str(strategy.get("symbol") or "").upper()
+        side = str(strategy.get("side") or "").lower()
+        if symbol and str(candidate.symbol or "").upper() != symbol:
+            return False
+        if side and str(candidate.side or "").lower() != side:
+            return False
+    return True
+
+
+def _candidate_action_kind(candidate: SignalCandidate) -> str:
+    management_action = str(candidate.management_action or "")
+    aliases = {
+        "cancel_entry": "cancel_pending_entry",
+        "exit_full": "full_exit",
+        "exit_partial": "partial_exit",
+        "adjust_stop_loss": "move_stop_to_protect",
+        "move_stop_to_break_even": "move_stop_to_protect",
+    }
+    if management_action:
+        return aliases.get(management_action, management_action)
+    event_type = str(candidate.event_type or "")
+    return {
+        "entry_signal": "entry",
+        "entry_confirm": "confirm_entry",
+        "strategy_revision": "replace_entry",
+        "close_signal": "full_exit",
+    }.get(event_type, event_type)
 
 
 def _serialize_context_resolution(
@@ -1653,9 +1816,12 @@ def _serialize_semantic_review(
         return None
 
     payload: dict[str, object] = {}
-    if decision.comparison_payload_json:
+    review_payload_json = (
+        decision.comparison_payload_json or decision.auxiliary_payload_json
+    )
+    if review_payload_json:
         try:
-            loaded = json.loads(decision.comparison_payload_json)
+            loaded = json.loads(review_payload_json)
         except (json.JSONDecodeError, TypeError):
             loaded = None
         if isinstance(loaded, dict):
@@ -1672,7 +1838,8 @@ def _serialize_semantic_review(
         conflict_types = []
     conflict_types = [item for item in conflict_types if isinstance(item, str)]
 
-    status = decision.comparison_status or "pending"
+    legacy_auxiliary = bool(decision.auxiliary_model and not decision.comparison_model)
+    status = "completed" if legacy_auxiliary else decision.comparison_status or "pending"
     if status == "failed" or decision.agreement_status == "authoritative_failed":
         severity = "failed"
         label = "失败"
@@ -1696,6 +1863,9 @@ def _serialize_semantic_review(
     ):
         severity = "agreed"
         label = "一致"
+    elif legacy_auxiliary:
+        severity = "legacy"
+        label = decision.auxiliary_status or "历史辅助复核"
     elif status == "completed":
         severity = "unclassified"
         label = "待重新复核"
@@ -1711,7 +1881,7 @@ def _serialize_semantic_review(
         "label": label,
         "reason": reason,
         "conflict_types": conflict_types,
-        "model": decision.comparison_model,
+        "model": decision.comparison_model or decision.auxiliary_model,
     }
 
 

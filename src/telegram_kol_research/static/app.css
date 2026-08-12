@@ -3338,6 +3338,9 @@ body {
 .mimo-attempts ol { margin-bottom: 0; padding-left: 22px; }
 .mimo-attempts li { margin-top: 5px; }
 .mimo-attempts li small { display: block; }
+.mimo-system-intents { margin: 2px 0 0; padding-left: 22px; }
+.mimo-system-intents li { margin-top: 4px; }
+.mimo-system-intents li small { display: block; color: #94a3b8; }
 
 @media (max-width: 640px) {
   .mimo-image-evidence-row { flex-direction: column; }

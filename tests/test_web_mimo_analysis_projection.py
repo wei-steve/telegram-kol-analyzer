@@ -5,6 +5,7 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     MediaAsset,
     MessageEvidenceVersion,
+    MessageInstructionItem,
     MessageRecognition,
     MimoRecognitionAttempt,
     MimoRecognitionRun,
@@ -66,7 +67,16 @@ def _v2_payload(*, asset_id: int | None = None) -> dict[str, object]:
             },
         ],
         "evidence": {
-            "text": {"observed_text": "移动止损到1940", "fields": {}},
+            "text": {
+                "observed_text": "移动止损到1940",
+                "fields": {
+                    "stop_loss": {
+                        "value": "1940",
+                        "source": "text",
+                        "confidence": 0.99,
+                    }
+                },
+            },
             "images": images,
             "conflicts": [],
         },
@@ -631,3 +641,345 @@ def test_web_projection_rejects_cross_message_image_asset_reference(tmp_path):
 
     assert image["asset_id"] == foreign_media_id
     assert image["media"] is None
+
+
+def test_web_projection_quarantines_invalid_v2_semantics_and_images(tmp_path):
+    factory = create_session_factory(tmp_path / "invalid-semantics.db")
+    with factory() as session:
+        raw = RawMessage(chat_id=88, message_id=40, text="unsafe")
+        session.add(raw)
+        session.flush()
+        media = MediaAsset(
+            raw_message_id=raw.id,
+            kind="photo",
+            mime_type="image/jpeg",
+            local_path="data/media/88/unsafe.jpg",
+        )
+        session.add(media)
+        session.flush()
+        run = MimoRecognitionRun(
+            raw_message_id=raw.id,
+            run_kind="v2_authoritative",
+            contract_version="mimo-authoritative-v2",
+            model="mimo-v2.5",
+            input_kind="text+image",
+            input_fingerprint="sha256:unsafe",
+            prompt_versions_json="{}",
+            status="completed",
+            attempt_count=1,
+            selected_attempt_ordinal=1,
+            became_authoritative=True,
+            started_at=NOW,
+            completed_at=NOW + timedelta(milliseconds=50),
+        )
+        session.add(run)
+        session.flush()
+        session.add(
+            MessageEvidenceVersion(
+                raw_message_id=raw.id,
+                mimo_recognition_run_id=run.id,
+                version=1,
+                input_fingerprint="sha256:unsafe",
+                model="mimo-v2.5",
+                extraction_status="completed",
+                confidence=0.9,
+                text_evidence_json='{"observed_text":"unsafe","fields":{}}',
+                image_evidence_json=json.dumps(
+                    {
+                        "images": [
+                            {
+                                "asset_id": media.id,
+                                "image_type": "invented_type",
+                                "quality": "clear",
+                                "observed_text": "unsafe",
+                                "summary": "must not render",
+                                "fields": {},
+                                "confidence": 0.9,
+                            }
+                        ],
+                        "conflicts": ["must not render"],
+                    }
+                ),
+                normalized_evidence_json=json.dumps(
+                    {
+                        "contract_version": "mimo-authoritative-v2",
+                        "summary": "unsafe",
+                        "confidence": 0.9,
+                        "intents": [
+                            {
+                                "intent_type": "invented_intent",
+                                "action": {
+                                    "kind": "full_exit",
+                                    "target": {
+                                        "lifecycle_id": 790,
+                                        "thread_id": 52,
+                                    },
+                                    "strategy": None,
+                                    "parameters": {},
+                                },
+                                "reason": "must not render",
+                                "confidence": 0.9,
+                                "evidence_refs": ["text:unsafe"],
+                            }
+                        ],
+                    }
+                ),
+            )
+        )
+        _add_decision(session, raw, status="failed", reason="target_unresolved")
+        session.commit()
+
+    analysis = load_group_messages(factory, chat_id=88, limit=10)[0]["mimo_analysis"]
+
+    assert analysis["format"] == "v2"
+    assert analysis["runtime"]["status"] == "completed"
+    assert analysis["projection"] == {
+        "status": "failed",
+        "reason_code": "stored_v2_contract_invalid",
+    }
+    assert analysis["summary"] is None
+    assert analysis["confidence"] is None
+    assert analysis["intents"] == []
+    assert analysis["evidence"]["images"] == []
+    assert analysis["evidence"]["conflicts"] == []
+
+
+def test_web_projection_treats_missing_contract_marker_on_v2_run_as_failure(tmp_path):
+    factory = create_session_factory(tmp_path / "missing-marker.db")
+    with factory() as session:
+        raw = RawMessage(chat_id=88, message_id=41, text="hold")
+        session.add(raw)
+        session.flush()
+        run = MimoRecognitionRun(
+            raw_message_id=raw.id,
+            run_kind="v2_authoritative",
+            contract_version="mimo-authoritative-v2",
+            model="mimo-v2.5",
+            input_kind="text",
+            input_fingerprint="sha256:missing-marker",
+            prompt_versions_json="{}",
+            status="completed",
+            attempt_count=1,
+            selected_attempt_ordinal=1,
+            became_authoritative=True,
+            started_at=NOW,
+            completed_at=NOW + timedelta(milliseconds=50),
+        )
+        session.add(run)
+        session.flush()
+        session.add(
+            MessageEvidenceVersion(
+                raw_message_id=raw.id,
+                mimo_recognition_run_id=run.id,
+                version=1,
+                input_fingerprint="sha256:missing-marker",
+                model="mimo-v2.5",
+                extraction_status="completed",
+                confidence=0.9,
+                text_evidence_json='{"observed_text":"hold","fields":{}}',
+                image_evidence_json='{"images":[],"conflicts":[]}',
+                normalized_evidence_json=(
+                    '{"summary":"hold","confidence":0.9,"intents":['
+                    '{"intent_type":"market_commentary","action":null,'
+                    '"reason":"hold","confidence":0.9,"evidence_refs":[]}]}'
+                ),
+            )
+        )
+        _add_decision(session, raw, status="skipped", reason="mimo_no_action")
+        session.commit()
+
+    analysis = load_group_messages(factory, chat_id=88, limit=10)[0]["mimo_analysis"]
+
+    assert analysis["format"] == "v2"
+    assert analysis["projection"]["status"] == "failed"
+    assert analysis["intents"] == []
+
+
+def test_web_projection_does_not_relabel_non_mimo_history(tmp_path):
+    factory = create_session_factory(tmp_path / "deepseek-history.db")
+    with factory() as session:
+        raw = RawMessage(chat_id=88, message_id=42, text="legacy")
+        session.add(raw)
+        session.flush()
+        session.add(
+            MessageRecognition(
+                raw_message_id=raw.id,
+                status="非策略",
+                reason="legacy deepseek result",
+                engine="deepseek-v4-flash",
+            )
+        )
+        session.commit()
+
+    message = load_group_messages(factory, chat_id=88, limit=10)[0]
+
+    assert message["mimo_analysis"] is None
+
+
+def test_web_projection_reports_acceptance_per_intent_without_conflating_execution(
+    tmp_path,
+):
+    factory = create_session_factory(tmp_path / "intent-acceptance.db")
+    with factory() as session:
+        raw = RawMessage(chat_id=88, message_id=43, text="move stop")
+        session.add(raw)
+        session.flush()
+        run = MimoRecognitionRun(
+            raw_message_id=raw.id,
+            run_kind="v2_authoritative",
+            contract_version="mimo-authoritative-v2",
+            model="mimo-v2.5",
+            input_kind="text",
+            input_fingerprint="sha256:accepted",
+            prompt_versions_json="{}",
+            status="completed",
+            attempt_count=1,
+            selected_attempt_ordinal=1,
+            became_authoritative=True,
+            started_at=NOW,
+            completed_at=NOW + timedelta(milliseconds=50),
+        )
+        session.add(run)
+        session.flush()
+        payload = _v2_payload()
+        _add_v2_evidence(session, raw, payload, run)
+        candidate = SignalCandidate(
+            raw_message_id=raw.id,
+            symbol="ETH",
+            side="short",
+            event_type="position_update",
+            target_lifecycle_id=790,
+            management_action="move_stop_to_protect",
+            parse_source="mimo_authoritative",
+            confidence=0.95,
+        )
+        session.add(candidate)
+        session.flush()
+        candidate_id = int(candidate.id)
+        _add_decision(
+            session,
+            raw,
+            status="failed",
+            reason="exchange_submit_failed",
+        )
+        session.commit()
+
+    acceptance = load_group_messages(factory, chat_id=88, limit=10)[0][
+        "system_acceptance"
+    ]
+
+    assert acceptance["status"] == "accepted"
+    assert acceptance["accepted_candidate_count"] == 1
+    assert acceptance["intents"] == [
+        {
+            "ordinal": 1,
+            "intent_type": "position_management",
+            "intent_label": "仓位管理",
+            "action_kind": "move_stop_to_protect",
+            "action_label": "移动止损保护",
+            "status": "accepted",
+            "reason_code": None,
+            "candidate_ids": [candidate_id],
+        },
+        {
+            "ordinal": 2,
+            "intent_type": "market_commentary",
+            "intent_label": "市场评论",
+            "action_kind": None,
+            "action_label": None,
+            "status": "not_actionable",
+            "reason_code": None,
+            "candidate_ids": [],
+        },
+    ]
+
+
+def test_web_projection_excludes_retired_instruction_candidate_from_acceptance(tmp_path):
+    factory = create_session_factory(tmp_path / "retired-candidate.db")
+    with factory() as session:
+        raw = RawMessage(chat_id=88, message_id=44, text="move stop")
+        session.add(raw)
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=raw.id,
+            symbol="ETH",
+            side="short",
+            event_type="position_update",
+            target_lifecycle_id=790,
+            management_action="move_stop_to_protect",
+            parse_source="mimo_authoritative",
+            confidence=0.95,
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            MessageInstructionItem(
+                raw_message_id=raw.id,
+                signal_candidate_id=candidate.id,
+                sequence=0,
+                instruction_kind="management",
+                idempotency_key="r" * 64,
+                status="succeeded",
+                retired_at=NOW,
+            )
+        )
+        _add_decision(session, raw, status="skipped", reason="mimo_no_action")
+        session.commit()
+
+    acceptance = load_group_messages(factory, chat_id=88, limit=10)[0][
+        "system_acceptance"
+    ]
+
+    assert acceptance["accepted_candidate_count"] == 0
+    assert acceptance["status"] == "not_accepted"
+
+
+def test_web_projection_does_not_count_ambiguous_candidates_as_accepted(tmp_path):
+    factory = create_session_factory(tmp_path / "ambiguous-candidates.db")
+    with factory() as session:
+        raw = RawMessage(chat_id=88, message_id=45, text="move stop")
+        session.add(raw)
+        session.flush()
+        run = MimoRecognitionRun(
+            raw_message_id=raw.id,
+            run_kind="v2_authoritative",
+            contract_version="mimo-authoritative-v2",
+            model="mimo-v2.5",
+            input_kind="text",
+            input_fingerprint="sha256:ambiguous",
+            prompt_versions_json="{}",
+            status="completed",
+            attempt_count=1,
+            selected_attempt_ordinal=1,
+            became_authoritative=True,
+            started_at=NOW,
+            completed_at=NOW + timedelta(milliseconds=50),
+        )
+        session.add(run)
+        session.flush()
+        _add_v2_evidence(session, raw, _v2_payload(), run)
+        session.add_all(
+            [
+                SignalCandidate(
+                    raw_message_id=raw.id,
+                    symbol="ETH",
+                    side="short",
+                    event_type="position_update",
+                    target_lifecycle_id=790,
+                    management_action="move_stop_to_protect",
+                    parse_source="mimo_authoritative",
+                    confidence=0.95,
+                )
+                for _ in range(2)
+            ]
+        )
+        _add_decision(session, raw, status="skipped", reason="target_ambiguous")
+        session.commit()
+
+    acceptance = load_group_messages(factory, chat_id=88, limit=10)[0][
+        "system_acceptance"
+    ]
+
+    assert acceptance["status"] == "not_accepted"
+    assert acceptance["accepted_candidate_count"] == 0
+    assert acceptance["intents"][0]["status"] == "ambiguous"
