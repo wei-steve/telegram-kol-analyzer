@@ -107,17 +107,10 @@ _REQUIRED_SNAPSHOT_FIELDS = (
 _SAFE_TERMINAL_MANAGEMENT_STATUSES = frozenset(
     {"succeeded", "blocked", "resolved"}
 )
-_ACTIVE_INSTRUCTION_STATUSES = frozenset({"pending", "executing", "unknown"})
+_SAFE_TERMINAL_INSTRUCTION_STATUSES = frozenset({"succeeded", "failed"})
 _TERMINAL_MUTATION_STATUSES = frozenset({"confirmed", "rejected", "blocked"})
-_ACTIVE_COMPONENT_STATUSES = frozenset(
-    {
-        "pending",
-        "preflighting",
-        "submitting",
-        "awaiting_exchange",
-        "recovery_required",
-        "operator_required",
-    }
+_SAFE_TERMINAL_COMPONENT_STATUSES = frozenset(
+    {"confirmed", "operator_required", "safely_skipped"}
 )
 
 
@@ -128,11 +121,35 @@ def build_composite_batch_recovery_plan(
     snapshot: Any,
     planned_at: Any = None,
 ) -> CompositeBatchRecoveryPlan:
+    """Fail closed at every untrusted durable/snapshot decoding boundary."""
+
+    try:
+        return _build_composite_batch_recovery_plan(
+            session_factory,
+            profile=profile,
+            snapshot=snapshot,
+            planned_at=planned_at,
+        )
+    except CompositeBatchRecoveryRefusal as exc:
+        return _refusal(_refusal_batch_id(profile), exc.reason_code)
+    except (TypeError, ValueError, RecursionError, OverflowError):
+        return _refusal(_refusal_batch_id(profile), "planner_evidence_invalid")
+
+
+def _build_composite_batch_recovery_plan(
+    session_factory,
+    *,
+    profile: CompositeBatchRecoveryProfile,
+    snapshot: Any,
+    planned_at: Any = None,
+) -> CompositeBatchRecoveryPlan:
     """Prove the single approved incident without writes or exchange access."""
 
     _ = planned_at
     if profile != BATCH_119_RECOVERY:
-        return _refusal(int(profile.batch_id), "incident_profile_not_allowlisted")
+        return _refusal(
+            _refusal_batch_id(profile), "incident_profile_not_allowlisted"
+        )
     if not _snapshot_is_complete(snapshot, profile=profile):
         return _refusal(profile.batch_id, "exchange_snapshot_incomplete")
 
@@ -188,7 +205,7 @@ def build_composite_batch_recovery_plan(
         contract = contract_result
 
         target_result = _validated_target_snapshot(
-            batch, leg=leg, entry=entry, profile=profile
+            batch, binding=binding, leg=leg, entry=entry, profile=profile
         )
         if isinstance(target_result, str):
             return _refusal(profile.batch_id, target_result)
@@ -208,6 +225,11 @@ def build_composite_batch_recovery_plan(
             return _refusal(profile.batch_id, topology_reason)
         if not _exact_false_submission_state(batch, leg=leg, components=components):
             return _refusal(profile.batch_id, "false_submission_state_mismatch")
+        legacy_state_reason = _legacy_false_state_evidence_refusal(
+            leg, profile=profile
+        )
+        if legacy_state_reason is not None:
+            return _refusal(profile.batch_id, legacy_state_reason)
         if any(
             value not in (None, "")
             for value in (
@@ -259,25 +281,32 @@ def build_composite_batch_recovery_plan(
         )
         protection_reason = _protection_ownership_refusal(
             snapshot.pending_trigger_orders,
+            batch=batch,
+            binding=binding,
+            entry=entry,
             ledger=ledger,
             pos_id=str(leg.pos_id),
+            position=position,
             profile=profile,
         )
         if protection_reason is not None:
             return _refusal(profile.batch_id, protection_reason)
 
-        source_payload = _source_evidence_payload(
-            batch=batch,
-            raw=raw,
-            lifecycle=lifecycle,
-            binding=binding,
-            entry=entry,
-            leg=leg,
-            components=components,
-            target=target,
-            contract=contract,
-            protection_ledger=ledger,
-        )
+        try:
+            source_payload = _source_evidence_payload(
+                batch=batch,
+                raw=raw,
+                lifecycle=lifecycle,
+                binding=binding,
+                entry=entry,
+                leg=leg,
+                components=components,
+                target=target,
+                contract=contract,
+                protection_ledger=ledger,
+            )
+        except CompositeBatchRecoveryRefusal:
+            return _refusal(profile.batch_id, "durable_evidence_invalid")
         source_fingerprint = _fingerprint(source_payload)
         exchange_payload = _exchange_evidence_payload(
             snapshot,
@@ -376,7 +405,7 @@ def _snapshot_is_complete(
                 if not isinstance(row, Mapping):
                     return False
                 _fingerprint(dict(row))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError, OverflowError):
         return False
     observations = list(snapshot.pending_tpsl_observations)
     if not observations or any(
@@ -471,11 +500,11 @@ def _validated_contract(
         return "management_contract_missing"
     try:
         contract = load_management_contract(batch.management_contract_json)
-    except ValueError:
+        actual_fingerprint = management_contract_fingerprint(contract)
+    except (TypeError, ValueError, RecursionError, OverflowError):
         return "management_contract_invalid"
     if (
-        management_contract_fingerprint(contract)
-        != str(batch.management_contract_fingerprint)
+        actual_fingerprint != str(batch.management_contract_fingerprint)
     ):
         return "management_contract_fingerprint_mismatch"
     expected_symbol = profile.instrument_id.split("-", 1)[0].upper()
@@ -495,28 +524,33 @@ def _validated_contract(
     return contract
 
 
-def _validated_target_snapshot(batch, *, leg, entry, profile):
+def _validated_target_snapshot(batch, *, binding, leg, entry, profile):
     try:
         payload = json.loads(batch.target_snapshot_json)
-    except (TypeError, json.JSONDecodeError):
+        actual_target_fingerprint = management_target_fingerprint(payload)
+    except (TypeError, ValueError, RecursionError, OverflowError):
         return "target_snapshot_invalid"
     rows = payload.get("positions") if isinstance(payload, Mapping) else None
     if not isinstance(rows, list):
         return "target_snapshot_invalid"
-    if management_target_fingerprint(payload) != str(batch.target_fingerprint):
+    if actual_target_fingerprint != str(batch.target_fingerprint):
         return "target_snapshot_fingerprint_mismatch"
     identity = payload.get("identity")
     if not isinstance(identity, Mapping):
         return "target_snapshot_identity_mismatch"
+    target_lifecycle_id = _exact_int(identity.get("target_lifecycle_id"))
+    execution_binding_id = _exact_int(identity.get("execution_binding_id"))
     if (
         str(payload.get("execution_mode") or "") != str(batch.execution_mode)
-        or int(identity.get("target_lifecycle_id") or 0)
-        != int(batch.target_lifecycle_id)
-        or int(identity.get("execution_binding_id") or 0)
-        != int(batch.execution_binding_id)
+        or target_lifecycle_id != int(batch.target_lifecycle_id)
+        or execution_binding_id != int(batch.execution_binding_id)
         or str(identity.get("strategy_instance_id") or "")
         != str(batch.strategy_instance_id)
         or identity.get("manageable_entry_leg_ids") != [int(entry.id)]
+        or identity.get("deferred_entry_leg_ids") != []
+        or identity.get("capability_deferred_entry_leg_ids") != []
+        or identity.get("capability_deferred_pos_ids") != []
+        or payload.get("deferred_entry_legs") != []
     ):
         return "target_snapshot_identity_mismatch"
     matches = [
@@ -547,6 +581,9 @@ def _validated_target_snapshot(batch, *, leg, entry, profile):
         or str(leg.avg_entry_price) != str(row["avg_entry_price"])
         or str(leg.quantity_step) != str(row["quantity_step"])
         or int(leg.execution_order_leg_id) != int(entry.id)
+        or _exact_int(row.get("execution_order_leg_id")) != int(entry.id)
+        or str(row.get("margin_mode") or "") != str(binding.margin_mode)
+        or str(row.get("position_mode") or "") != str(binding.position_mode)
     ):
         return "target_snapshot_identity_mismatch"
     try:
@@ -584,7 +621,7 @@ def _component_topology_refusal(
             return "component_topology_mismatch"
         try:
             desired = json.loads(component.desired_json)
-        except (TypeError, json.JSONDecodeError):
+        except (TypeError, ValueError, RecursionError):
             return "component_topology_mismatch"
         if not isinstance(desired, Mapping):
             return "component_topology_mismatch"
@@ -599,17 +636,25 @@ def _component_topology_refusal(
             "min_quantity": str(target["min_quantity"]),
             "component_kind": kind,
         }
-        if any(desired.get(key) != value for key, value in expected.items()):
+        if dict(desired) != expected:
             return "component_topology_mismatch"
-        if any(
-            key in desired
-            for key in (
-                "partial_close_execution",
-                "take_profit_consumption_execution",
-                "protection_replacement_execution",
-            )
-        ):
-            return "durable_close_submission_evidence_present"
+        expected_idempotency_key = hashlib.sha256(
+            (
+                f"{expected_contract_fingerprint}|{int(batch.id)}|"
+                f"{int(leg.id)}|{kind}"
+            ).encode("utf-8")
+        ).hexdigest()
+        if str(component.idempotency_key) != expected_idempotency_key:
+            return "component_topology_mismatch"
+        try:
+            evidence = json.loads(component.evidence_json)
+        except (TypeError, ValueError, RecursionError):
+            return "component_topology_mismatch"
+        if sequence == 0:
+            if not _is_bounded_snapshot_incomplete_evidence(evidence):
+                return "component_topology_mismatch"
+        elif evidence != []:
+            return "component_topology_mismatch"
     if (
         components[0].reason_code
         != "take_profit_exchange_snapshot_incomplete"
@@ -628,6 +673,47 @@ def _exact_false_submission_state(batch, *, leg, components) -> bool:
         and [str(row.status) for row in components]
         == ["recovery_required", "pending", "pending"]
     )
+
+
+def _legacy_false_state_evidence_refusal(leg, *, profile) -> str | None:
+    try:
+        snapshot = json.loads(str(leg.last_exchange_snapshot_json))
+    except (TypeError, ValueError, RecursionError):
+        return "durable_evidence_invalid"
+    if not isinstance(snapshot, Mapping) or set(snapshot) != {
+        "position_rows", "matching_regular_orders"
+    }:
+        return "false_submission_state_mismatch"
+    position_rows = snapshot.get("position_rows")
+    if (
+        not isinstance(position_rows, list)
+        or len(position_rows) != 1
+        or snapshot.get("matching_regular_orders") != []
+    ):
+        return "false_submission_state_mismatch"
+    position_row = position_rows[0]
+    if not isinstance(position_row, Mapping) or set(position_row) != {
+        "posId", "instId", "posSide", "pos"
+    }:
+        return "false_submission_state_mismatch"
+    if (
+        str(position_row.get("posId") or "") != str(leg.pos_id)
+        or str(position_row.get("instId") or "").upper()
+        != profile.instrument_id.upper()
+        or str(position_row.get("posSide") or "").lower()
+        != profile.side.lower()
+        or str(position_row.get("pos") or "") != profile.trusted_start_size
+    ):
+        return "false_submission_state_mismatch"
+    if leg.last_error in (None, ""):
+        return None
+    try:
+        last_error = json.loads(str(leg.last_error))
+    except (TypeError, ValueError, RecursionError):
+        return "durable_evidence_invalid"
+    if last_error != {"reason": "management_close_order_not_found"}:
+        return "false_submission_state_mismatch"
+    return None
 
 
 def _has_durable_close_submission(session, *, batch, leg, entry) -> bool:
@@ -673,7 +759,9 @@ def _has_additional_active_database_work(session, *, batch_id: int) -> bool:
         session.query(StrategyManagementComponent.id)
         .filter(
             StrategyManagementComponent.management_batch_id != int(batch_id),
-            StrategyManagementComponent.status.in_(_ACTIVE_COMPONENT_STATUSES),
+            StrategyManagementComponent.status.notin_(
+                _SAFE_TERMINAL_COMPONENT_STATUSES
+            ),
         )
         .first()
         is not None
@@ -688,36 +776,113 @@ def _has_additional_active_database_work(session, *, batch_id: int) -> bool:
         return True
     return (
         session.query(MessageInstructionItem.id)
-        .filter(MessageInstructionItem.status.in_(_ACTIVE_INSTRUCTION_STATUSES))
+        .filter(
+            MessageInstructionItem.retired_at.is_(None),
+            MessageInstructionItem.status.notin_(
+                _SAFE_TERMINAL_INSTRUCTION_STATUSES
+            ),
+        )
         .first()
         is not None
     )
 
 
 def _has_exchange_close_submission(snapshot: Any, *, pos_id: str) -> bool:
+    for row in snapshot.position_history:
+        if not isinstance(row, Mapping):
+            return True
+        if not _row_matches_position(row, pos_id=pos_id):
+            continue
+        if _row_matches_close_position(row, pos_id=pos_id):
+            return True
+        state = str(row.get("state") or row.get("status") or "").lower()
+        close_size = _decimal_or_none(
+            row.get("closeSz")
+            or row.get("closedSize")
+            or row.get("close_size")
+        )
+        if state in {"closed", "filled", "completed", "exited"} or (
+            close_size is not None and close_size > 0
+        ):
+            return True
+
     for field in ("open_orders", "order_history", "trade_fills"):
         for row in getattr(snapshot, field):
             if not isinstance(row, Mapping):
                 return True
-            if str(row.get("posId") or row.get("pos_id") or "") != str(pos_id):
+            if not _row_matches_position(row, pos_id=pos_id):
                 continue
+            if _row_matches_close_position(row, pos_id=pos_id):
+                return True
             reduce_only = str(
                 row.get("reduceOnly") or row.get("reduce_only") or ""
             ).lower() in {"true", "1", "yes"}
             side = str(row.get("side") or "").lower()
             if reduce_only or side == "sell":
                 return True
+    for row in snapshot.trigger_history:
+        if not isinstance(row, Mapping):
+            return True
+        if not _row_matches_position(row, pos_id=pos_id):
+            continue
+        if _row_matches_close_position(row, pos_id=pos_id):
+            return True
+        state = str(row.get("state") or row.get("status") or "").lower()
+        reduce_only = str(
+            row.get("reduceOnly") or row.get("reduce_only") or ""
+        ).lower() in {"true", "1", "yes"}
+        side = str(row.get("side") or "").lower()
+        if state in {"filled", "triggered", "completed"} and (
+            reduce_only or side == "sell"
+        ):
+            return True
     return False
 
 
 def _protection_ownership_refusal(
-    pending_rows, *, ledger, pos_id: str, profile
+    pending_rows,
+    *,
+    batch,
+    binding,
+    entry,
+    ledger,
+    pos_id: str,
+    position: CompositeRecoveryPosition,
+    profile,
 ) -> str | None:
-    ledger_by_id = {
-        str(row.order_id): row
-        for row in ledger
-        if str(row.status).lower() in {"verified", "active", "pending"}
-    }
+    ledger_by_id: dict[str, Any] = {}
+    purpose_counts = {"stop_loss": 0, "backup_stop": 0, "take_profit": 0}
+    for row in ledger:
+        order_id = str(row.order_id or "")
+        purpose = str(row.purpose or "")
+        if (
+            not order_id
+            or order_id in ledger_by_id
+            or str(row.venue or "").lower() != "deepcoin"
+            or int(row.execution_binding_id) != int(binding.id)
+            or int(row.execution_order_leg_id) != int(entry.id)
+            or str(row.strategy_instance_id or "")
+            != str(batch.strategy_instance_id)
+            or str(row.pos_id or "") != str(pos_id)
+            or str(row.instrument_id or "").upper()
+            != profile.instrument_id.upper()
+            or str(row.side or "").lower() != profile.side.lower()
+            or purpose not in {"stop_loss", "backup_stop", "take_profit"}
+            or str(row.status or "").lower() != "verified"
+        ):
+            return "unexpected_protection_ownership"
+        try:
+            _optional_json_fingerprint(row.evidence_json)
+        except CompositeBatchRecoveryRefusal:
+            return "durable_evidence_invalid"
+        ledger_by_id[order_id] = row
+        purpose_counts[purpose] += 1
+    if position.current_size is not None and (
+        purpose_counts["stop_loss"] != 1
+        or purpose_counts["backup_stop"] != 1
+    ):
+        return "unexpected_protection_ownership"
+
     pending_by_id: dict[str, Mapping[str, object]] = {}
     for row in pending_rows:
         if not isinstance(row, Mapping):
@@ -734,17 +899,27 @@ def _protection_ownership_refusal(
             != profile.instrument_id.upper()
             or str(row.get("posSide") or row.get("side") or "").lower()
             != profile.side.lower()
+            or str(row.get("triggerOrderType") or "").upper() != "TPSL"
+            or str(row.get("state") or row.get("status") or "").lower()
+            != "live"
         ):
             return "unexpected_protection_ownership"
         pending_by_id[order_id] = row
+    if position.current_size is None and not pending_by_id:
+        return None
     if set(pending_by_id) != set(ledger_by_id):
         return "unexpected_protection_ownership"
-    for order_id, row in ledger_by_id.items():
-        if (
-            str(row.instrument_id).upper() != profile.instrument_id.upper()
-            or str(row.side).lower() != profile.side.lower()
-            or order_id not in pending_by_id
-        ):
+    for order_id, ledger_row in ledger_by_id.items():
+        pending_row = pending_by_id[order_id]
+        trigger_price = _pending_protection_trigger_price(
+            pending_row, purpose=str(ledger_row.purpose)
+        )
+        if not _same_optional_decimal(trigger_price, ledger_row.trigger_price):
+            return "unexpected_protection_ownership"
+        pending_size = pending_row.get("sz")
+        if pending_size in (None, ""):
+            pending_size = pending_row.get("size")
+        if not _same_optional_decimal(pending_size, ledger_row.size_text):
             return "unexpected_protection_ownership"
     return None
 
@@ -759,6 +934,12 @@ def _source_evidence_payload(
         "raw_message_id": int(batch.raw_message_id),
         "raw_chat_ref": _redacted_ref("raw_chat", raw.chat_id),
         "lifecycle_id": int(lifecycle.id),
+        "lifecycle_chat_ref": _redacted_ref("lifecycle_chat", lifecycle.chat_id),
+        "lifecycle_message_ref": _redacted_ref(
+            "lifecycle_message", lifecycle.message_id
+        ),
+        "lifecycle_symbol": str(lifecycle.symbol),
+        "lifecycle_side": str(lifecycle.side),
         "binding_ref": _redacted_ref("binding", binding.id),
         "strategy_ref": _redacted_ref("strategy", batch.strategy_instance_id),
         "entry_leg_ref": _redacted_ref("entry_leg", entry.id),
@@ -773,17 +954,41 @@ def _source_evidence_payload(
             "lifecycle_binding", lifecycle.execution_binding_id
         ),
         "binding_status": str(binding.status),
+        "binding_strategy_ref": _redacted_ref(
+            "binding_strategy", binding.strategy_instance_id
+        ),
+        "binding_chat_ref": _redacted_ref("binding_chat", binding.chat_id),
+        "binding_message_ref": _redacted_ref(
+            "binding_message", binding.message_id
+        ),
         "binding_venue": str(binding.venue),
         "binding_symbol": str(binding.symbol),
         "binding_side": str(binding.side),
+        "binding_margin_mode": str(binding.margin_mode),
+        "binding_position_mode": str(binding.position_mode),
         "binding_position_ref": _redacted_ref("binding_position", binding.pos_id),
         "entry_status": str(entry.status),
+        "entry_strategy_ref": _redacted_ref(
+            "entry_strategy", entry.strategy_instance_id
+        ),
+        "entry_venue": str(entry.venue),
+        "entry_purpose": str(entry.purpose),
+        "entry_leg_index": int(entry.leg_index),
         "entry_attribution_status": str(entry.attribution_status),
         "entry_binding_ref": _redacted_ref(
             "entry_binding", entry.execution_binding_id
         ),
         "entry_position_ref": _redacted_ref("entry_position", entry.pos_id),
         "leg_status": str(leg.status),
+        "management_leg_ref": _redacted_ref("management_leg", leg.id),
+        "management_leg_batch_id": int(leg.management_batch_id),
+        "management_leg_entry_ref": _redacted_ref(
+            "management_leg_entry", leg.execution_order_leg_id
+        ),
+        "management_leg_index": int(leg.leg_index),
+        "management_leg_position_ref": _redacted_ref(
+            "management_leg_position", leg.pos_id
+        ),
         "leg_preflight_size": str(leg.preflight_size),
         "leg_planned_close_size": str(leg.planned_close_size),
         "leg_avg_entry_price": str(leg.avg_entry_price),
@@ -809,6 +1014,9 @@ def _source_evidence_payload(
                 "sequence": int(row.sequence),
                 "kind": str(row.component_kind),
                 "status": str(row.status),
+                "idempotency_ref": _redacted_ref(
+                    "component_idempotency", row.idempotency_key
+                ),
                 "reason_code": row.reason_code,
                 "attempt_count": int(row.attempt_count),
                 "desired_fingerprint": _optional_json_fingerprint(
@@ -1028,9 +1236,90 @@ def _optional_json_fingerprint(value: str | None) -> str:
         return _fingerprint(None)
     try:
         payload = json.loads(str(value))
-    except (TypeError, json.JSONDecodeError) as exc:
+        return _fingerprint(payload)
+    except (TypeError, ValueError, RecursionError) as exc:
         raise CompositeBatchRecoveryRefusal("durable_json_invalid") from exc
-    return _fingerprint(payload)
+
+
+def _exact_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and len(value) <= 20 and value.isdigit():
+        try:
+            parsed = int(value)
+        except ValueError:
+            return None
+        return parsed if str(parsed) == value else None
+    return None
+
+
+def _refusal_batch_id(profile: object) -> int:
+    value = getattr(profile, "batch_id", None)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _is_bounded_snapshot_incomplete_evidence(value: object) -> bool:
+    if not isinstance(value, list) or len(value) != 1:
+        return False
+    fact = value[0]
+    if not isinstance(fact, Mapping) or set(fact) != {"error_type"}:
+        return False
+    error_type = fact.get("error_type")
+    return (
+        isinstance(error_type, str)
+        and 0 < len(error_type) <= 64
+        and error_type.replace("_", "").replace(".", "").isalnum()
+    )
+
+
+def _row_matches_position(row: Mapping[str, object], *, pos_id: str) -> bool:
+    return any(
+        str(row.get(key) or "") == str(pos_id)
+        for key in ("posId", "pos_id", "closePosId", "close_pos_id")
+    )
+
+
+def _row_matches_close_position(
+    row: Mapping[str, object], *, pos_id: str
+) -> bool:
+    return any(
+        str(row.get(key) or "") == str(pos_id)
+        for key in ("closePosId", "close_pos_id")
+    )
+
+
+def _pending_protection_trigger_price(
+    row: Mapping[str, object], *, purpose: str
+) -> object:
+    keys = (
+        ("slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")
+        if purpose in {"stop_loss", "backup_stop"}
+        else ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")
+    )
+    for key in keys:
+        if row.get(key) not in (None, ""):
+            return row.get(key)
+    return None
+
+
+def _same_optional_decimal(left: object, right: object) -> bool:
+    if left in (None, "") and right in (None, ""):
+        return True
+    if left in (None, "") or right in (None, ""):
+        return False
+    left_decimal = _decimal_or_none(left)
+    right_decimal = _decimal_or_none(right)
+    return left_decimal is not None and left_decimal == right_decimal
+
+
+def _decimal_or_none(value: object) -> Decimal | None:
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return result if result.is_finite() else None
 
 
 def classify_recovery_position(

@@ -209,6 +209,7 @@ def _snapshot(**overrides):
                 "posSide": "long",
                 "triggerOrderType": "TPSL",
                 "slTriggerPx": "64000",
+                "sz": "38",
                 "state": "live",
             },
             {
@@ -218,6 +219,7 @@ def _snapshot(**overrides):
                 "posSide": "long",
                 "triggerOrderType": "TPSL",
                 "slTriggerPx": "63000",
+                "sz": "38",
                 "state": "live",
             },
         ],
@@ -294,6 +296,8 @@ def _seed_batch_119_false_submission(tmp_path):
             side="long",
             venue="deepcoin",
             pos_id=POS_ID,
+            margin_mode="cross",
+            position_mode="split",
             status="active",
         )
         session.add_all([raw, decision, lifecycle, binding])
@@ -324,6 +328,7 @@ def _seed_batch_119_false_submission(tmp_path):
                 "manageable_entry_leg_ids": [entry.id],
                 "deferred_entry_leg_ids": [],
                 "capability_deferred_entry_leg_ids": [],
+                "capability_deferred_pos_ids": [],
             },
             "positions": [
                 {
@@ -338,8 +343,10 @@ def _seed_batch_119_false_submission(tmp_path):
                     "min_quantity": "1",
                     "margin_mode": "cross",
                     "position_mode": "split",
+                    "execution_order_leg_id": entry.id,
                 }
-            ]
+            ],
+            "deferred_entry_legs": [],
         }
         batch = StrategyManagementBatch(
             id=119,
@@ -429,7 +436,9 @@ def _seed_batch_119_false_submission(tmp_path):
                     component_kind=kind,
                     sequence=sequence,
                     status="recovery_required" if sequence == 0 else "pending",
-                    idempotency_key=f"119:{leg.id}:{kind}",
+                    idempotency_key=sha256(
+                        f"{fingerprint}|119|{leg.id}|{kind}".encode("utf-8")
+                    ).hexdigest(),
                     desired_json=json.dumps(desired, sort_keys=True),
                     evidence_json=(
                         '[{"error_type":"RuntimeError"}]'
@@ -448,7 +457,7 @@ def _seed_batch_119_false_submission(tmp_path):
             )
         for order_id, purpose, price in (
             (PRIMARY_ORDER_ID, "stop_loss", "64000"),
-            (BACKUP_ORDER_ID, "backup_stop_loss", "63000"),
+            (BACKUP_ORDER_ID, "backup_stop", "63000"),
         ):
             session.add(
                 PositionProtectionLedger(
@@ -521,6 +530,28 @@ def test_planner_refuses_profile_outside_batch_119_allowlist(tmp_path):
     )
 
     assert plan.status == "refused"
+    assert plan.reason_code == "incident_profile_not_allowlisted"
+
+
+def test_planner_refuses_malformed_profile_identity_without_raising(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    malformed = module.CompositeBatchRecoveryProfile(
+        batch_id="not-an-integer",
+        raw_message_id=10532,
+        lifecycle_id=794,
+        trusted_start_size="38",
+        target_remaining_size="19",
+        instrument_id="BTC-USDT-SWAP",
+        side="long",
+    )
+
+    plan = module.build_composite_batch_recovery_plan(
+        factory, profile=malformed, snapshot=_snapshot(), planned_at=NOW
+    )
+
+    assert plan.status == "refused"
+    assert plan.batch_id == 0
     assert plan.reason_code == "incident_profile_not_allowlisted"
 
 
@@ -864,8 +895,8 @@ def test_planner_refuses_unexpected_protection_ownership(tmp_path):
         ),
         (
             "position_history",
-            [{"posId": POS_ID, "state": "open", "closedSize": "0"}],
-            [{"posId": POS_ID, "state": "open", "closedSize": "1"}],
+            [{"posId": POS_ID, "state": "open", "closedSize": "0", "uTime": "1"}],
+            [{"posId": POS_ID, "state": "open", "closedSize": "0", "uTime": "2"}],
         ),
         (
             "open_orders",
@@ -875,11 +906,11 @@ def test_planner_refuses_unexpected_protection_ownership(tmp_path):
         (
             "pending_trigger_orders",
             [
-                {**_snapshot().pending_trigger_orders[0], "slTriggerPx": "64000"},
+                {**_snapshot().pending_trigger_orders[0], "uTime": "1"},
                 _snapshot().pending_trigger_orders[1],
             ],
             [
-                {**_snapshot().pending_trigger_orders[0], "slTriggerPx": "64001"},
+                {**_snapshot().pending_trigger_orders[0], "uTime": "2"},
                 _snapshot().pending_trigger_orders[1],
             ],
         ),
@@ -1303,3 +1334,760 @@ def test_planner_operates_against_readonly_database_without_file_changes(tmp_pat
     readonly_engine.dispose()
     assert plan.status == "ready"
     assert [_file_signature(path) for path in paths] == before
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        _snapshot(
+            position_history=[
+                {"posId": POS_ID, "state": "closed", "closeSz": "19"}
+            ]
+        ),
+        _snapshot(
+            trigger_history=[
+                {
+                    "posId": POS_ID,
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "side": "sell",
+                    "reduceOnly": True,
+                    "state": "triggered",
+                }
+            ]
+        ),
+        _snapshot(
+            order_history=[
+                {
+                    "closePosId": POS_ID,
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "side": "sell",
+                    "state": "filled",
+                }
+            ]
+        ),
+    ],
+)
+def test_planner_refuses_all_exact_exchange_close_history_shapes(tmp_path, snapshot):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+
+    plan = _plan(factory, snapshot)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "exchange_close_submission_evidence_present"
+
+
+def test_live_position_requires_primary_and_backup_verified_stops(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        session.query(PositionProtectionLedger).delete()
+        session.commit()
+
+    plan = _plan(factory, _snapshot(pending_trigger_orders=[]))
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "unexpected_protection_ownership"
+
+
+def test_live_position_rejects_take_profit_without_primary_and_backup_stops(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        rows = session.query(PositionProtectionLedger).order_by(
+            PositionProtectionLedger.id
+        ).all()
+        session.delete(rows[1])
+        rows[0].purpose = "take_profit"
+        rows[0].trigger_price = "65000"
+        session.commit()
+    pending = [{
+        **_snapshot().pending_trigger_orders[0],
+        "tpTriggerPx": "65000",
+        "slTriggerPx": "",
+    }]
+
+    plan = _plan(factory, _snapshot(pending_trigger_orders=pending))
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "unexpected_protection_ownership"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("venue", "other"),
+        ("strategy_instance_id", "drifted-strategy"),
+        ("purpose", "backup_stop_loss"),
+        ("status", "active"),
+        ("size_text", "37"),
+    ],
+)
+def test_live_position_rejects_protection_ledger_identity_drift(
+    tmp_path, field, value
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        row = session.query(PositionProtectionLedger).order_by(
+            PositionProtectionLedger.id
+        ).first()
+        setattr(row, field, value)
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "unexpected_protection_ownership"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("state", "cancelled"),
+        ("triggerOrderType", "conditional"),
+        ("slTriggerPx", "63999"),
+        ("sz", "37"),
+    ],
+)
+def test_live_position_rejects_pending_protection_exchange_drift(
+    tmp_path, field, value
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    pending = [dict(row) for row in _snapshot().pending_trigger_orders]
+    pending[0][field] = value
+
+    plan = _plan(factory, _snapshot(pending_trigger_orders=pending))
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "unexpected_protection_ownership"
+
+
+def test_position_absent_allows_historical_ledger_with_no_pending_exact_orders(
+    tmp_path
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+
+    plan = _plan(
+        factory,
+        _snapshot(positions=[], pending_trigger_orders=[]),
+    )
+
+    assert plan.status == "ready"
+    assert plan.position.disposition == "position_absent"
+
+
+def _add_other_terminal_batch(session, *, binding_id, batch119):
+    row = StrategyManagementBatch(
+        idempotency_fingerprint="other-terminal-active-child",
+        raw_message_id=batch119.raw_message_id,
+        recognition_decision_id=batch119.recognition_decision_id,
+        recognition_generation="old-terminal",
+        target_lifecycle_id=batch119.target_lifecycle_id,
+        strategy_instance_id="other-terminal-strategy",
+        execution_binding_id=binding_id,
+        intent="full_exit",
+        effective_action="full_exit",
+        execution_mode="live",
+        status="resolved",
+        target_fingerprint="other-terminal-target",
+        target_snapshot_json="{}",
+        planned_at=NOW,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def test_planner_refuses_definitely_rejected_component_as_active_work(tmp_path):
+    factory, _, binding_id, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        batch119 = session.get(StrategyManagementBatch, 119)
+        other = _add_other_terminal_batch(
+            session, binding_id=binding_id, batch119=batch119
+        )
+        session.add(
+            StrategyManagementComponent(
+                management_batch_id=other.id,
+                strategy_management_leg_id=None,
+                strategy_management_leg_scope=-1,
+                component_kind="cancel_deferred_entries",
+                sequence=0,
+                status="definitely_rejected",
+                idempotency_key="other-definitely-rejected",
+                desired_json="{}",
+                evidence_json="[]",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "additional_active_work_present"
+
+
+def test_planner_refuses_submitted_instruction_as_active_work(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        candidate = SignalCandidate(
+            raw_message_id=10532,
+            symbol="BTC",
+            side="long",
+            event_type="management",
+            management_action="partial_then_break_even",
+            review_status="confirmed",
+            created_at=NOW,
+        )
+        session.add(candidate)
+        session.flush()
+        session.add(
+            MessageInstructionItem(
+                raw_message_id=10532,
+                signal_candidate_id=candidate.id,
+                sequence=0,
+                instruction_kind="management",
+                strategy_instance_id="deepcoin:incident:btc:long",
+                idempotency_key="submitted-instruction",
+                status="submitted",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "additional_active_work_present"
+
+
+def test_planner_refuses_nonproduction_component_idempotency_key(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        component = session.query(StrategyManagementComponent).order_by(
+            StrategyManagementComponent.id
+        ).first()
+        component.idempotency_key = "not-production-derived"
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "component_topology_mismatch"
+
+
+def test_planner_refuses_extra_desired_json_key(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        component = session.query(StrategyManagementComponent).order_by(
+            StrategyManagementComponent.id
+        ).first()
+        desired = json.loads(component.desired_json)
+        desired["extra_key"] = "not-allowed"
+        component.desired_json = json.dumps(desired, sort_keys=True)
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "component_topology_mismatch"
+
+
+def test_source_fingerprint_covers_binding_modes_when_target_remains_coherent(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    before = _plan(factory)
+    assert before.status == "ready"
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        binding.margin_mode = "isolated"
+        payload = json.loads(batch.target_snapshot_json)
+        payload["positions"][0]["margin_mode"] = "isolated"
+        batch.target_snapshot_json = json.dumps(payload, sort_keys=True)
+        batch.target_fingerprint = management_target_fingerprint(payload)
+        session.commit()
+
+    after = _plan(factory)
+
+    assert after.status == "ready"
+    assert after.source_fingerprint != before.source_fingerprint
+
+
+def test_planner_refuses_target_position_execution_leg_drift(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        payload = json.loads(batch.target_snapshot_json)
+        payload["positions"][0]["execution_order_leg_id"] = 999
+        batch.target_snapshot_json = json.dumps(payload, sort_keys=True)
+        batch.target_fingerprint = management_target_fingerprint(payload)
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "target_snapshot_identity_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("deferred_entry_leg_ids", [999]),
+        ("capability_deferred_entry_leg_ids", [999]),
+    ],
+)
+def test_planner_refuses_target_identity_deferred_topology_drift(
+    tmp_path, field, value
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        payload = json.loads(batch.target_snapshot_json)
+        payload["identity"][field] = value
+        batch.target_snapshot_json = json.dumps(payload, sort_keys=True)
+        batch.target_fingerprint = management_target_fingerprint(payload)
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "target_snapshot_identity_mismatch"
+
+
+def test_planner_refuses_binding_and_target_position_mode_mismatch(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        payload = json.loads(batch.target_snapshot_json)
+        payload["positions"][0]["position_mode"] = "one_way"
+        batch.target_snapshot_json = json.dumps(payload, sort_keys=True)
+        batch.target_fingerprint = management_target_fingerprint(payload)
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "target_snapshot_identity_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("sequence", "evidence"),
+    [
+        (1, [{"client_order_id": "sensitive-close-client"}]),
+        (0, [{"close_intent_ids": [88]}]),
+        (0, [{"error_type": "RuntimeError"}, {"error_type": "TimeoutError"}]),
+    ],
+)
+def test_planner_refuses_component_submission_or_extra_evidence(
+    tmp_path, sequence, evidence
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        component = (
+            session.query(StrategyManagementComponent)
+            .filter_by(management_batch_id=119, sequence=sequence)
+            .one()
+        )
+        component.evidence_json = json.dumps(evidence, sort_keys=True)
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code in {
+        "component_topology_mismatch",
+        "durable_close_submission_evidence_present",
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "component_evidence",
+        "ledger_evidence",
+        "leg_last_error",
+        "target_identity",
+    ],
+)
+def test_planner_refuses_malformed_durable_evidence_without_raising(
+    tmp_path, mutation
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        if mutation == "component_evidence":
+            session.query(StrategyManagementComponent).first().evidence_json = "{"
+        elif mutation == "ledger_evidence":
+            session.query(PositionProtectionLedger).first().evidence_json = "{"
+        elif mutation == "leg_last_error":
+            session.query(StrategyManagementLeg).one().last_error = "{"
+        else:
+            payload = json.loads(batch.target_snapshot_json)
+            payload["identity"]["execution_binding_id"] = "not-an-integer"
+            batch.target_snapshot_json = json.dumps(payload, sort_keys=True)
+            batch.target_fingerprint = management_target_fingerprint(payload)
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code in {
+        "durable_evidence_invalid",
+        "target_snapshot_identity_mismatch",
+        "component_topology_mismatch",
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "matching_order",
+        "position_reduced",
+        "wrong_position",
+        "top_level_provider_payload",
+        "row_provider_payload",
+    ],
+)
+def test_planner_refuses_nonexact_legacy_exchange_snapshot(tmp_path, mutation):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        leg = session.query(StrategyManagementLeg).one()
+        payload = json.loads(leg.last_exchange_snapshot_json)
+        if mutation == "matching_order":
+            payload["matching_regular_orders"] = [{"ordId": "close-order"}]
+        elif mutation == "position_reduced":
+            payload["position_rows"][0]["pos"] = "19"
+        elif mutation == "wrong_position":
+            payload["position_rows"][0]["posId"] = "other-position"
+        elif mutation == "top_level_provider_payload":
+            payload["response"] = {"code": "0"}
+        else:
+            payload["position_rows"][0]["provider_response"] = {"code": "0"}
+        leg.last_exchange_snapshot_json = json.dumps(payload, sort_keys=True)
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "false_submission_state_mismatch"
+
+
+def test_planner_allows_exact_legacy_not_found_error(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        session.query(StrategyManagementLeg).one().last_error = json.dumps(
+            {"reason": "management_close_order_not_found"}, sort_keys=True
+        )
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "ready"
+
+
+@pytest.mark.parametrize(
+    "last_error",
+    [
+        {"reason": "management_close_order_identity_conflict"},
+        {"reason": "management_close_order_not_found", "provider_error": "x"},
+        [],
+    ],
+)
+def test_planner_refuses_nonexact_legacy_last_error(tmp_path, last_error):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        session.query(StrategyManagementLeg).one().last_error = json.dumps(
+            last_error, sort_keys=True
+        )
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "false_submission_state_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "top_level"),
+    [
+        ("capability_deferred_pos_ids", ["deferred-pos"], False),
+        ("deferred_entry_legs", [{"execution_order_leg_id": 999}], True),
+    ],
+)
+def test_planner_refuses_remaining_target_deferred_topology(
+    tmp_path, field, value, top_level
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        payload = json.loads(batch.target_snapshot_json)
+        target = payload if top_level else payload["identity"]
+        target[field] = value
+        batch.target_snapshot_json = json.dumps(payload, sort_keys=True)
+        batch.target_fingerprint = management_target_fingerprint(payload)
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "target_snapshot_identity_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("purpose", "price"),
+    [("stop_loss", "62000"), ("backup_stop", "61000")],
+)
+def test_live_position_rejects_duplicate_required_stop_role(
+    tmp_path, purpose, price
+):
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    duplicate_order_id = f"duplicate-{purpose}"
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                strategy_instance_id=batch.strategy_instance_id,
+                pos_id=POS_ID,
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id=duplicate_order_id,
+                purpose=purpose,
+                trigger_price=price,
+                size_text="38",
+                status="verified",
+                evidence_source="entry_protection_response",
+                evidence_json="{}",
+                first_seen_at=NOW,
+                last_seen_at=NOW,
+                last_verified_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+    pending = [
+        *_snapshot().pending_trigger_orders,
+        {
+            "ordId": duplicate_order_id,
+            "posId": POS_ID,
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "triggerOrderType": "TPSL",
+            "slTriggerPx": price,
+            "sz": "38",
+            "state": "live",
+        },
+    ]
+
+    plan = _plan(factory, _snapshot(pending_trigger_orders=pending))
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "unexpected_protection_ownership"
+
+
+def test_live_position_allows_verified_additional_take_profit(tmp_path):
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    take_profit_id = "verified-additional-take-profit"
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                strategy_instance_id=batch.strategy_instance_id,
+                pos_id=POS_ID,
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id=take_profit_id,
+                purpose="take_profit",
+                trigger_price="65000",
+                size_text="38",
+                status="verified",
+                evidence_source="entry_protection_response",
+                evidence_json="{}",
+                first_seen_at=NOW,
+                last_seen_at=NOW,
+                last_verified_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+    pending = [
+        *_snapshot().pending_trigger_orders,
+        {
+            "ordId": take_profit_id,
+            "posId": POS_ID,
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "triggerOrderType": "TPSL",
+            "tpTriggerPx": "65000",
+            "sz": "38",
+            "state": "live",
+        },
+    ]
+
+    plan = _plan(factory, _snapshot(pending_trigger_orders=pending))
+
+    assert plan.status == "ready"
+
+
+def test_live_position_allows_matching_whole_position_zero_size_semantics(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        for row in session.query(PositionProtectionLedger).all():
+            row.size_text = "0"
+        session.commit()
+    pending = [
+        {**row, "sz": "0"} for row in _snapshot().pending_trigger_orders
+    ]
+
+    plan = _plan(factory, _snapshot(pending_trigger_orders=pending))
+
+    assert plan.status == "ready"
+
+
+def test_planner_refuses_cancelled_trigger_history_with_exact_close_position_id(
+    tmp_path,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    snapshot = _snapshot(
+        trigger_history=[
+            {
+                "closePosId": POS_ID,
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "state": "cancelled",
+            }
+        ]
+    )
+
+    plan = _plan(factory, snapshot)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "exchange_close_submission_evidence_present"
+
+
+def test_planner_allows_cancelled_nonclose_protection_trigger_history(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    snapshot = _snapshot(
+        trigger_history=[
+            {
+                "posId": POS_ID,
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "state": "cancelled",
+                "slTriggerPx": "64000",
+            }
+        ]
+    )
+
+    plan = _plan(factory, snapshot)
+
+    assert plan.status == "ready"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "target_identity_oversized_integer",
+        "ledger_json_oversized_integer",
+        "ledger_json_deeply_nested",
+    ],
+)
+def test_planner_refuses_oversized_durable_integer_without_raising(
+    tmp_path, mutation
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    oversized_digits = "9" * 5000
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        if mutation == "target_identity_oversized_integer":
+            payload = json.loads(batch.target_snapshot_json)
+            payload["identity"]["execution_binding_id"] = oversized_digits
+            batch.target_snapshot_json = json.dumps(payload, sort_keys=True)
+            batch.target_fingerprint = management_target_fingerprint(payload)
+        elif mutation == "ledger_json_oversized_integer":
+            session.query(PositionProtectionLedger).first().evidence_json = (
+                '{"sequence":' + oversized_digits + "}"
+            )
+        else:
+            session.query(PositionProtectionLedger).first().evidence_json = (
+                "[" * 994 + "0" + "]" * 994
+            )
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code in {
+        "durable_evidence_invalid",
+        "target_snapshot_identity_mismatch",
+    }
+
+
+def test_planner_refuses_deep_target_json_without_raising(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    deeply_nested_json = "[" * 994 + "0" + "]" * 994
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        batch.target_snapshot_json = (
+            batch.target_snapshot_json[:-1]
+            + ',"deeply_nested":'
+            + deeply_nested_json
+            + "}"
+        )
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code in {
+        "durable_evidence_invalid",
+        "target_snapshot_invalid",
+        "target_snapshot_fingerprint_mismatch",
+    }
+
+
+def test_planner_refuses_deep_exchange_snapshot_row_without_raising(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    deeply_nested = 0
+    for _ in range(994):
+        deeply_nested = [deeply_nested]
+    position = dict(_snapshot().positions[0])
+    position["deeply_nested"] = deeply_nested
+
+    plan = _plan(factory, _snapshot(positions=[position]))
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "exchange_snapshot_incomplete"
+
+
+def test_source_fingerprint_covers_linked_lifecycle_and_binding_message_identity(
+    tmp_path,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    before = _plan(factory)
+    assert before.status == "ready"
+    with factory() as session:
+        lifecycle = session.get(StrategyLifecycle, 794)
+        binding = session.get(ExecutionBinding, lifecycle.execution_binding_id)
+        lifecycle.message_id = 9000
+        binding.message_id = 9000
+        session.commit()
+
+    after = _plan(factory)
+
+    assert after.status == "ready"
+    assert after.source_fingerprint != before.source_fingerprint
