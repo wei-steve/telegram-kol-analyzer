@@ -10,7 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.db import create_session_factory
@@ -79,6 +80,26 @@ def test_batch_119_recovery_profile_is_closed_and_immutable():
     )
     with pytest.raises((AttributeError, TypeError)):
         module.BATCH_119_RECOVERY.batch_id = 120
+
+
+def test_recovery_read_only_session_factory_cannot_write_or_change_file(tmp_path):
+    module = _recovery_module()
+    database_path = tmp_path / "read-only.db"
+    with create_engine(f"sqlite:///{database_path}").begin() as connection:
+        connection.execute(text("CREATE TABLE probe (value INTEGER NOT NULL)"))
+        connection.execute(text("INSERT INTO probe (value) VALUES (1)"))
+    before = database_path.read_bytes()
+
+    factory = module.create_composite_recovery_read_only_session_factory(
+        database_path
+    )
+    with factory() as session:
+        assert session.execute(text("SELECT value FROM probe")).scalar_one() == 1
+        with pytest.raises(OperationalError, match="readonly"):
+            session.execute(text("UPDATE probe SET value = 2"))
+            session.commit()
+
+    assert database_path.read_bytes() == before
 
 
 @pytest.mark.parametrize(
@@ -315,7 +336,7 @@ def _seed_batch_119_false_submission(tmp_path):
             pos_id=POS_ID,
             venue="deepcoin",
             attribution_status="verified",
-            attribution_evidence_json='{"provider_error":"private"}',
+            attribution_evidence_json='{"policy_version":2}',
             status="active",
         )
         session.add(entry)
@@ -510,6 +531,21 @@ def test_batch_119_false_submission_is_ready_for_repair(tmp_path):
     assert plan.exchange_calls == 0
     assert len(plan.source_fingerprint) == 64
     assert len(plan.exchange_snapshot_fingerprint) == 64
+
+
+def test_planner_refuses_verified_entry_without_authoritative_ownership_evidence(
+    tmp_path,
+):
+    factory, _, _, entry_id, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        entry = session.get(ExecutionOrderLeg, entry_id)
+        entry.attribution_evidence_json = '{"provider_error":"private"}'
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "position_ownership_evidence_not_authoritative"
     assert len(plan.evidence_fingerprint) == 64
 
 
@@ -2172,6 +2208,57 @@ def test_apply_repairs_only_false_legacy_state_in_one_transaction(tmp_path):
             assert sensitive not in serialized_event
 
 
+def test_recovery_status_summary_counts_only_component_owned_mutations(tmp_path):
+    module = _recovery_module()
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    plan = _plan(factory)
+    repair = module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with factory() as session:
+        session.add(
+            PositionMutationIntent(
+                idempotency_key="unrelated-terminal-intent",
+                venue="deepcoin",
+                operation="cancel_position_sltp",
+                strategy_instance_id="deepcoin:incident:btc:long",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                pos_id=POS_ID,
+                order_id="unrelated-order",
+                authority_fingerprint="a" * 64,
+                request_fingerprint="b" * 64,
+                status="confirmed",
+                request_json="{}",
+                response_json="{}",
+                reserved_at=NOW,
+                submitted_at=NOW,
+                confirmed_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    summary = module.build_composite_batch_recovery_status_summary(
+        factory,
+        plan=plan,
+        repair_result=repair,
+        executor_calls=0,
+    )
+
+    assert summary["component_mutation_intent_count"] == 0
+    assert summary["confirmed_close_intent_count"] == 0
+    assert summary["unresolved_mutation_intent_count"] == 0
+    assert "position_mutation_intent_count" not in summary
+
+
 @pytest.mark.parametrize(
     "tamper",
     [
@@ -3067,3 +3154,268 @@ def test_apply_position_absent_terminalizes_without_exchange_intent(tmp_path):
             live_execution_gate=lambda: True,
             now_provider=lambda: NOW,
         )
+
+
+class _Batch119RecoveryClient:
+    def __init__(self):
+        self.current_size = "38"
+        self.pending = [
+            {
+                "ordId": "batch-119-first-tp",
+                "posId": POS_ID,
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "triggerOrderType": "TPSL",
+                "tpTriggerPx": "66000",
+                "sz": "19",
+                "state": "live",
+            },
+            {
+                "ordId": PRIMARY_ORDER_ID,
+                "posId": POS_ID,
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "triggerOrderType": "TPSL",
+                "slTriggerPx": "64000",
+                "sz": "38",
+                "state": "live",
+            },
+            {
+                "ordId": BACKUP_ORDER_ID,
+                "posId": POS_ID,
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "triggerOrderType": "TPSL",
+                "slTriggerPx": "63000",
+                "sz": "38",
+                "state": "live",
+            },
+        ]
+        self.order_history = []
+        self.trigger_history = []
+        self.trade_fills = []
+        self.close_calls = []
+        self.set_calls = []
+        self.cancel_calls = []
+
+    def list_positions(self, *, inst_id=None):
+        return [
+            {
+                "posId": POS_ID,
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "pos": self.current_size,
+                "avgPx": "62000",
+                "markPx": "65000",
+                "mgnMode": "cross",
+                "mrgPosition": "split",
+            }
+        ]
+
+    def list_open_orders(self):
+        return []
+
+    def list_trigger_orders_pending(self, *, inst_id):
+        return [dict(row) for row in self.pending]
+
+    def list_trigger_orders_history(self, *, inst_id):
+        return [dict(row) for row in self.trigger_history]
+
+    def list_trigger_order_history(self, *, inst_id):
+        return [dict(row) for row in self.trigger_history]
+
+    def list_order_history(self, *, inst_id):
+        return [dict(row) for row in self.order_history]
+
+    def list_trade_fills(self, *, inst_id):
+        return [dict(row) for row in self.trade_fills]
+
+    def cancel_position_sltp(self, payload):
+        order_id = str(payload["ordId"])
+        self.cancel_calls.append(dict(payload))
+        matches = [row for row in self.pending if row["ordId"] == order_id]
+        if len(matches) != 1:
+            return {"code": "0", "data": {"ordId": order_id}}
+        row = matches[0]
+        self.pending.remove(row)
+        self.trigger_history.append({**row, "state": "cancelled"})
+        return {"code": "0", "data": {"ordId": order_id}}
+
+    def place_order(self, payload):
+        self.close_calls.append(dict(payload))
+        self.current_size = "19"
+        row = {
+            "ordId": "batch-119-close",
+            "posId": POS_ID,
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "side": "sell",
+            "reduceOnly": True,
+            "sz": str(payload["sz"]),
+            "state": "filled",
+        }
+        self.order_history.append(row)
+        self.trade_fills.append({**row, "fillSz": str(payload["sz"])})
+        return {"code": "0", "data": {"ordId": "batch-119-close"}}
+
+    def set_position_sltp(self, payload):
+        self.set_calls.append(dict(payload))
+        order_id = f"batch-119-new-stop-{len(self.set_calls)}"
+        self.pending.append(
+            {
+                "ordId": order_id,
+                "posId": POS_ID,
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "triggerOrderType": "TPSL",
+                "slTriggerPx": str(payload["slTriggerPx"]),
+                "sz": str(payload["sz"]),
+                "state": "live",
+            }
+        )
+        return {"code": "0", "data": {"ordId": order_id}}
+
+
+def test_recovery_cli_dry_run_then_apply_closes_exactly_once_and_preserves_settings(
+    tmp_path,
+    monkeypatch,
+):
+    from typer.testing import CliRunner
+
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.cli import app
+    from telegram_kol_research.trading_settings import (
+        load_trading_settings,
+        save_trading_settings,
+    )
+
+    factory, database_path, binding_id, entry_id, _ = (
+        _seed_batch_119_false_submission(tmp_path)
+    )
+    with factory() as session:
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                strategy_instance_id="deepcoin:incident:btc:long",
+                pos_id=POS_ID,
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id="batch-119-first-tp",
+                purpose="take_profit",
+                trigger_price="66000",
+                size_text="19",
+                status="verified",
+                evidence_source="entry_protection_response",
+                evidence_json="{}",
+                first_seen_at=NOW,
+                last_seen_at=NOW,
+                last_verified_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+    save_trading_settings(
+        factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+            "composite_management_v2_mode": "live",
+            "mimo_contract_mode": "v1",
+        },
+        updated_at=NOW,
+    )
+    settings_before = load_trading_settings(factory).to_dict()
+    specs_path = tmp_path / "deepcoin-contract-specs.yaml"
+    specs_path.write_text(
+        "contracts:\n"
+        "  - instrument_id: BTC-USDT-SWAP\n"
+        "    contract_value: 1\n"
+        "    quantity_step: 1\n"
+        "    min_quantity: 1\n"
+        "    price_tick: 0.1\n",
+        encoding="utf-8",
+    )
+    client = _Batch119RecoveryClient()
+    monkeypatch.setattr(
+        cli_module, "build_deepcoin_client_from_env", lambda: client
+    )
+    common = [
+        "recover-composite-management-batch",
+        "--database-path",
+        str(database_path),
+        "--batch-id",
+        "119",
+        "--deepcoin-contract-specs-path",
+        str(specs_path),
+    ]
+    before = database_path.read_bytes()
+
+    dry_run = CliRunner().invoke(app, common)
+
+    assert dry_run.exit_code == 0, dry_run.stdout
+    assert database_path.read_bytes() == before
+    dry_payload = json.loads(dry_run.stdout)
+    fingerprint = dry_payload["plan"]["evidence_fingerprint"]
+    assert dry_payload["plan"]["position"]["close_delta"] == "19"
+
+    applied = CliRunner().invoke(
+        app,
+        [
+            *common,
+            "--apply",
+            "--expected-fingerprint",
+            fingerprint,
+            "--authorization",
+            "I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        ],
+    )
+
+    assert applied.exit_code == 0, applied.stdout
+    applied_summary = json.loads(applied.stdout)["result"]
+    with factory() as diagnostic_session:
+        intent_states = [
+            (row.operation, row.status, row.idempotency_key)
+            for row in diagnostic_session.query(PositionMutationIntent)
+            .order_by(PositionMutationIntent.id)
+            .all()
+        ]
+    assert applied_summary["component_status_counts"] == {"confirmed": 3}
+    assert applied_summary["component_mutation_intent_count"] == 6
+    assert applied_summary["confirmed_close_intent_count"] == 1, intent_states
+    assert applied_summary["unresolved_mutation_intent_count"] == 0
+    assert applied_summary["recovery_audit_event_count"] == 1
+    assert len(client.close_calls) == 1
+    assert client.close_calls[0]["sz"] == "19"
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "succeeded"
+        assert (
+            session.query(PositionMutationIntent)
+            .filter_by(execution_binding_id=binding_id, operation="close_position")
+            .count()
+            == 1
+        )
+        assert (
+            session.query(ExecutionEvent)
+            .filter_by(action="composite_batch_false_state_repaired")
+            .count()
+            == 1
+        )
+    assert load_trading_settings(factory).to_dict() == settings_before
+
+    repeated = CliRunner().invoke(
+        app,
+        [
+            *common,
+            "--apply",
+            "--expected-fingerprint",
+            fingerprint,
+            "--authorization",
+            "I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        ],
+    )
+
+    assert repeated.exit_code == 2
+    assert len(client.close_calls) == 1

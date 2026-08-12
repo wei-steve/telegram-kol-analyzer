@@ -7,10 +7,13 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
+from pathlib import Path
+import sqlite3
 from types import MappingProxyType
 from typing import Any, Literal, Mapping, Sequence
 
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -34,6 +37,9 @@ from telegram_kol_research.strategy_management_planner import (
 )
 from telegram_kol_research.strategy_management_components import (
     transition_component_for_exact_position_absent_recovery,
+)
+from telegram_kol_research.position_attribution import (
+    has_authoritative_persisted_position,
 )
 
 
@@ -110,6 +116,84 @@ class CompositeBatchRecoveryApplyResult:
     audit_event_id: int
 
 
+def build_composite_batch_recovery_status_summary(
+    session_factory,
+    *,
+    plan: CompositeBatchRecoveryPlan,
+    repair_result: CompositeBatchRecoveryApplyResult,
+    executor_calls: int,
+) -> dict[str, Any]:
+    """Return bounded durable state after the one-shot recovery invocation."""
+
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, BATCH_119_RECOVERY.batch_id)
+        if batch is None:
+            raise CompositeBatchRecoveryConflict("repaired_batch_missing")
+        components = (
+            session.query(StrategyManagementComponent)
+            .filter_by(management_batch_id=BATCH_119_RECOVERY.batch_id)
+            .order_by(
+                StrategyManagementComponent.sequence,
+                StrategyManagementComponent.id,
+            )
+            .all()
+        )
+        status_counts: dict[str, int] = {}
+        for component in components:
+            status = str(component.status)
+            status_counts[status] = status_counts.get(status, 0) + 1
+        mutation_intents = (
+            session.query(PositionMutationIntent)
+            .filter(
+                PositionMutationIntent.execution_binding_id
+                == batch.execution_binding_id
+            )
+            .all()
+        )
+        component_prefixes = tuple(f"{int(row.id)}:" for row in components)
+        component_mutation_intents = [
+            row
+            for row in mutation_intents
+            if str(row.idempotency_key or "").startswith(component_prefixes)
+        ]
+        recovery_audit_event_count = (
+            session.query(ExecutionEvent)
+            .filter(
+                ExecutionEvent.action == _RECOVERY_AUDIT_ACTION,
+                ExecutionEvent.notification_fingerprint
+                == plan.evidence_fingerprint,
+            )
+            .count()
+        )
+    return {
+        "audit_event_id": int(repair_result.audit_event_id),
+        "batch_id": BATCH_119_RECOVERY.batch_id,
+        "batch_reason_code": str(batch.reason_code or ""),
+        "batch_status": str(batch.status),
+        "component_count": len(components),
+        "component_mutation_intent_count": len(component_mutation_intents),
+        "component_status_counts": {
+            key: status_counts[key] for key in sorted(status_counts)
+        },
+        "confirmed_close_intent_count": sum(
+            str(row.operation) == "close_position"
+            and str(row.status) == "confirmed"
+            for row in component_mutation_intents
+        ),
+        "evidence_fingerprint": plan.evidence_fingerprint,
+        "executor_calls": int(executor_calls),
+        "position_disposition": (
+            None if plan.position is None else plan.position.disposition
+        ),
+        "recovery_audit_event_count": int(recovery_audit_event_count),
+        "repair_status": str(repair_result.status),
+        "unresolved_mutation_intent_count": sum(
+            str(row.status) not in _TERMINAL_MUTATION_STATUSES
+            for row in component_mutation_intents
+        ),
+    }
+
+
 _EXPECTED_COMPONENTS = (
     "consume_take_profit_stage",
     "converge_partial_close",
@@ -134,9 +218,38 @@ _TERMINAL_MUTATION_STATUSES = frozenset({"confirmed", "rejected", "blocked"})
 _SAFE_TERMINAL_COMPONENT_STATUSES = frozenset(
     {"confirmed", "operator_required", "safely_skipped"}
 )
-_RECOVERY_AUTHORIZATION = "I_AUTHORIZE_BATCH_119_TO_REMAINING_19"
+BATCH_119_RECOVERY_AUTHORIZATION = (
+    "I_AUTHORIZE_BATCH_119_TO_REMAINING_19"
+)
+_RECOVERY_AUTHORIZATION = BATCH_119_RECOVERY_AUTHORIZATION
 _RECOVERY_AUDIT_ACTION = "composite_batch_false_state_repaired"
 _RECOVERY_REASON = "composite_recovery_false_submission_repaired"
+
+
+def create_composite_recovery_read_only_session_factory(
+    database_path: str | Path,
+) -> sessionmaker:
+    """Open one existing SQLite database through an OS-enforced read-only URI."""
+
+    resolved_path = Path(database_path).expanduser().resolve(strict=True)
+    if not resolved_path.is_file():
+        raise FileNotFoundError(resolved_path)
+    sqlite_uri = f"file:{resolved_path.as_posix()}?mode=ro"
+    engine = create_engine(
+        "sqlite://",
+        creator=lambda: sqlite3.connect(
+            sqlite_uri,
+            uri=True,
+            timeout=30,
+        ),
+        future=True,
+    )
+    return sessionmaker(
+        bind=engine,
+        autoflush=False,
+        autocommit=False,
+        future=True,
+    )
 
 
 def apply_composite_batch_false_state_repair(
@@ -369,6 +482,7 @@ def _build_composite_batch_recovery_plan(
             return _refusal(profile.batch_id, "durable_identity_mismatch")
 
         identity_reason = _durable_identity_refusal(
+            session=session,
             batch=batch,
             raw=raw,
             lifecycle=lifecycle,
@@ -585,6 +699,7 @@ def _load_locked_recovery_source(session):
     if entry is None:
         return None
     if _durable_identity_refusal(
+        session=session,
         batch=batch,
         raw=raw,
         lifecycle=lifecycle,
@@ -763,6 +878,7 @@ def _repaired_state_and_event_match(
     if entry is None:
         return False
     if _durable_identity_refusal(
+        session=session,
         batch=batch,
         raw=raw,
         lifecycle=lifecycle,
@@ -1181,7 +1297,7 @@ def _snapshot_is_complete(
 
 
 def _durable_identity_refusal(
-    *, batch, raw, lifecycle, binding, entry, leg, profile
+    *, session, batch, raw, lifecycle, binding, entry, leg, profile
 ) -> str | None:
     expected_symbol = profile.instrument_id.split("-", 1)[0].upper()
     if (
@@ -1225,6 +1341,8 @@ def _durable_identity_refusal(
         or str(entry.status) not in {"active", "filled", "partially_filled"}
     ):
         return "execution_leg_identity_mismatch"
+    if not has_authoritative_persisted_position(entry, session=session):
+        return "position_ownership_evidence_not_authoritative"
     if (
         int(leg.management_batch_id) != profile.batch_id
         or int(leg.execution_order_leg_id) != int(entry.id)

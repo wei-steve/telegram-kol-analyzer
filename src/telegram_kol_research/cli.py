@@ -45,6 +45,16 @@ from telegram_kol_research.config import (
     load_runtime_scanner_config,
     message_operation_supervisor_policy_status,
 )
+from telegram_kol_research.composite_management_batch_recovery import (
+    BATCH_119_RECOVERY,
+    BATCH_119_RECOVERY_AUTHORIZATION,
+    CompositeBatchRecoveryConflict,
+    apply_composite_batch_false_state_repair,
+    build_composite_batch_recovery_plan,
+    build_composite_batch_recovery_status_summary,
+    create_composite_recovery_read_only_session_factory,
+    serialize_composite_batch_recovery_plan,
+)
 from telegram_kol_research.message_operation_supervisor import (
     run_message_operation_supervisor_cycle,
 )
@@ -60,6 +70,9 @@ from telegram_kol_research.deepcoin_contract_spec_cache import (
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
 from telegram_kol_research.deepcoin_order_builder import (
     deepcoin_order_draft_fingerprint,
+)
+from telegram_kol_research.strategy_management_composite_executor import (
+    execute_composite_management_batch,
 )
 from telegram_kol_research.deployment_preflight import (
     DeploymentPreflightInputError,
@@ -4575,6 +4588,143 @@ def recover_management_history(
         json.dumps(
             {"mode": "apply", "result": asdict(result)},
             ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("recover-composite-management-batch")
+def recover_composite_management_batch(
+    database_path: Path = typer.Option(..., "--database-path"),
+    batch_id: int = typer.Option(..., "--batch-id", min=1),
+    deepcoin_contract_specs_path: Path = typer.Option(
+        ..., "--deepcoin-contract-specs-path"
+    ),
+    apply: bool = typer.Option(False, "--apply"),
+    expected_fingerprint: str | None = typer.Option(
+        None, "--expected-fingerprint"
+    ),
+    authorization: str | None = typer.Option(None, "--authorization"),
+) -> None:
+    """Dry-run or explicitly apply the exact batch-119 recovery."""
+
+    def refuse(reason_code: str) -> None:
+        typer.echo(
+            json.dumps(
+                {
+                    "batch_id": int(batch_id),
+                    "mode": "apply" if apply else "dry_run",
+                    "reason_code": str(reason_code),
+                    "status": "refused",
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(code=2)
+
+    if batch_id != BATCH_119_RECOVERY.batch_id:
+        refuse("incident_batch_not_allowlisted")
+    resolved_database_path = database_path.expanduser().resolve()
+    if not resolved_database_path.is_file():
+        refuse("database_path_not_existing_file")
+    resolved_specs_path = deepcoin_contract_specs_path.expanduser().resolve()
+    if not resolved_specs_path.is_file():
+        refuse("contract_specs_path_not_existing_file")
+    if apply and (
+        not expected_fingerprint
+        or authorization != BATCH_119_RECOVERY_AUTHORIZATION
+    ):
+        refuse("apply_authorization_incomplete")
+
+    session_factory = (
+        create_existing_session_factory(resolved_database_path)
+        if apply
+        else create_composite_recovery_read_only_session_factory(
+            resolved_database_path
+        )
+    )
+    client = build_deepcoin_client_from_env()
+    snapshot = load_deepcoin_execution_reconciliation_snapshot_read_only(
+        session_factory,
+        client=client,
+    )
+    plan = build_composite_batch_recovery_plan(
+        session_factory,
+        profile=BATCH_119_RECOVERY,
+        snapshot=snapshot,
+        planned_at=datetime.now(UTC),
+    )
+    if not apply:
+        typer.echo(
+            json.dumps(
+                {
+                    "mode": "dry_run",
+                    "plan": serialize_composite_batch_recovery_plan(plan),
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        if plan.status != "ready":
+            raise typer.Exit(code=2)
+        return
+
+    if plan.status != "ready":
+        refuse(plan.reason_code)
+    if expected_fingerprint != plan.evidence_fingerprint:
+        refuse("evidence_fingerprint_mismatch")
+
+    try:
+        repair_result = apply_composite_batch_false_state_repair(
+            session_factory,
+            plan=plan,
+            expected_fingerprint=expected_fingerprint,
+            authorization=authorization,
+            applied_at=datetime.now(UTC),
+        )
+    except CompositeBatchRecoveryConflict as exc:
+        refuse(exc.reason_code)
+
+    executor_calls = 0
+    if (
+        plan.position is not None
+        and plan.position.disposition != "position_absent"
+    ):
+        contract_spec_provider = load_deepcoin_contract_specs(
+            resolved_specs_path
+        )
+        settings = load_trading_settings(session_factory)
+        execute_composite_management_batch(
+            session_factory,
+            batch_id=BATCH_119_RECOVERY.batch_id,
+            deepcoin_client=client,
+            contract_spec_provider=contract_spec_provider,
+            live_execution_gate=lambda: (
+                load_trading_settings(
+                    session_factory
+                ).effective_composite_management_v2_mode
+                == "live"
+            ),
+            now_provider=lambda: datetime.now(UTC),
+            backup_buffer_bps=str(
+                settings.trigger_backup_stop_buffer_bps
+            ),
+        )
+        executor_calls = 1
+    summary = build_composite_batch_recovery_status_summary(
+        session_factory,
+        plan=plan,
+        repair_result=repair_result,
+        executor_calls=executor_calls,
+    )
+    typer.echo(
+        json.dumps(
+            {"mode": "apply", "result": summary},
+            ensure_ascii=True,
+            separators=(",", ":"),
             sort_keys=True,
         )
     )

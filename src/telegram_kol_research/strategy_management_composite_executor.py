@@ -1013,6 +1013,23 @@ def execute_partial_close_component(
         if refreshed_position is None:
             raise RuntimeError("target_live_position_not_unique")
         remaining = str(refreshed_position.get("pos"))
+        order_history = deepcoin_client.list_order_history(
+            inst_id=desired["instrument_id"]
+        )
+        trade_fills = deepcoin_client.list_trade_fills(
+            inst_id=desired["instrument_id"]
+        )
+        if not isinstance(order_history, list) or not isinstance(
+            trade_fills, list
+        ):
+            raise RuntimeError("close_order_snapshot_incomplete")
+        reconcile_submitted_position_mutation_intents(
+            session_factory,
+            pending_trigger_orders=[],
+            order_history=order_history,
+            trade_fills=trade_fills,
+            reconciled_at=now_provider(),
+        )
     except Exception as exc:
         _transition(
             session_factory, component_id, "submitting", "awaiting_exchange",
