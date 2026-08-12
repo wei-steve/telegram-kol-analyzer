@@ -188,9 +188,24 @@ def apply_composite_batch_false_state_repair(
         source = _load_locked_recovery_source(session)
         if source is None:
             raise CompositeBatchRecoveryConflict("source_state_conflict")
-        batch, binding, entry, leg, components, source_fingerprint = source
+        (
+            batch,
+            binding,
+            entry,
+            leg,
+            components,
+            ledger,
+            source_fingerprint,
+        ) = source
         if source_fingerprint != plan.source_fingerprint:
             raise CompositeBatchRecoveryConflict("source_fingerprint_conflict")
+        evidence = _plain_json_value(plan.evidence)
+        if (
+            evidence["durable"]["component_attempt_counts"]
+            != [int(row.attempt_count) for row in components]
+            or evidence["exchange"]["owned_protection_count"] != len(ledger)
+        ):
+            raise CompositeBatchRecoveryConflict("plan_evidence_stale")
         if plan.position is None or plan.position.disposition not in {
             "resume_to_target",
             "protection_only_at_target",
@@ -650,7 +665,7 @@ def _load_locked_recovery_source(session):
         source_fingerprint = _fingerprint(payload)
     except (CompositeBatchRecoveryRefusal, TypeError, ValueError, RecursionError):
         return None
-    return batch, binding, entry, leg, components, source_fingerprint
+    return batch, binding, entry, leg, components, ledger, source_fingerprint
 
 
 def _recovery_audit_after(
@@ -965,7 +980,9 @@ def _validate_recovery_plan_consistency(plan: CompositeBatchRecoveryPlan) -> Non
         "quantity_step": immutable_target.get("quantity_step"),
         "min_quantity": immutable_target.get("min_quantity"),
     }
-    if plan.position is None or not _position_matches_recovery_profile(
+    if not isinstance(
+        plan.position, CompositeRecoveryPosition
+    ) or not _position_matches_recovery_profile(
         plan.position,
         quantity_step=expected_target["quantity_step"],
         min_quantity=expected_target["min_quantity"],

@@ -2809,6 +2809,64 @@ def test_apply_rejects_deep_forged_plan_as_bounded_conflict(tmp_path):
         assert session.query(ExecutionEvent).count() == 0
 
 
+@pytest.mark.parametrize("field", ["attempt_counts", "protection_count"])
+def test_apply_binds_plan_counts_to_locked_durable_rows(tmp_path, field):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    plan = _plan(factory)
+    evidence = module.serialize_composite_batch_recovery_plan(plan)["evidence"]
+    if field == "attempt_counts":
+        evidence["durable"]["component_attempt_counts"] = [99, 98, 97]
+    else:
+        evidence["exchange"]["owned_protection_count"] = 99
+    forged_fingerprint = sha256(
+        json.dumps(
+            evidence,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    forged = replace(
+        plan,
+        evidence=evidence,
+        evidence_fingerprint=forged_fingerprint,
+    )
+
+    with pytest.raises(module.CompositeBatchRecoveryConflict):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=forged,
+            expected_fingerprint=forged.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+def test_apply_rejects_malformed_position_as_bounded_conflict(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    plan = _plan(factory)
+    forged = replace(plan, position=object())
+
+    with pytest.raises(module.CompositeBatchRecoveryConflict):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=forged,
+            expected_fingerprint=forged.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
 def test_apply_under_target_appends_bounded_attestation_without_identity_drift(
     tmp_path,
 ):
