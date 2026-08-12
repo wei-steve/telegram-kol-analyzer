@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 from types import MappingProxyType
 from typing import Any, Literal, Mapping, Sequence
+
+from sqlalchemy import text
 
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -29,10 +32,21 @@ from telegram_kol_research.strategy_management_contracts import (
 from telegram_kol_research.strategy_management_planner import (
     management_target_fingerprint,
 )
+from telegram_kol_research.strategy_management_components import (
+    transition_component_for_exact_position_absent_recovery,
+)
 
 
 class CompositeBatchRecoveryRefusal(ValueError):
     """The supplied incident evidence cannot safely authorize recovery."""
+
+    def __init__(self, reason_code: str):
+        self.reason_code = str(reason_code)
+        super().__init__(self.reason_code)
+
+
+class CompositeBatchRecoveryConflict(RuntimeError):
+    """The approved recovery plan no longer matches durable state."""
 
     def __init__(self, reason_code: str):
         self.reason_code = str(reason_code)
@@ -88,6 +102,14 @@ class CompositeBatchRecoveryPlan:
     exchange_calls: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class CompositeBatchRecoveryApplyResult:
+    batch_id: int
+    status: Literal["repaired", "already_repaired"]
+    evidence_fingerprint: str
+    audit_event_id: int
+
+
 _EXPECTED_COMPONENTS = (
     "consume_take_profit_stage",
     "converge_partial_close",
@@ -112,6 +134,150 @@ _TERMINAL_MUTATION_STATUSES = frozenset({"confirmed", "rejected", "blocked"})
 _SAFE_TERMINAL_COMPONENT_STATUSES = frozenset(
     {"confirmed", "operator_required", "safely_skipped"}
 )
+_RECOVERY_AUTHORIZATION = "I_AUTHORIZE_BATCH_119_TO_REMAINING_19"
+_RECOVERY_AUDIT_ACTION = "composite_batch_false_state_repaired"
+_RECOVERY_REASON = "composite_recovery_false_submission_repaired"
+
+
+def apply_composite_batch_false_state_repair(
+    session_factory,
+    *,
+    plan: CompositeBatchRecoveryPlan,
+    expected_fingerprint: str,
+    authorization: str,
+    applied_at: datetime | None = None,
+) -> CompositeBatchRecoveryApplyResult:
+    """Atomically repair only the proven batch-119 legacy false state."""
+
+    if authorization != _RECOVERY_AUTHORIZATION:
+        raise CompositeBatchRecoveryConflict("authorization_invalid")
+    if (
+        not isinstance(plan, CompositeBatchRecoveryPlan)
+        or plan.status != "ready"
+        or plan.batch_id != BATCH_119_RECOVERY.batch_id
+    ):
+        raise CompositeBatchRecoveryConflict("plan_not_actionable")
+    try:
+        if (
+            str(expected_fingerprint) != plan.evidence_fingerprint
+            or _fingerprint(plan.evidence) != plan.evidence_fingerprint
+        ):
+            raise CompositeBatchRecoveryConflict(
+                "evidence_fingerprint_mismatch"
+            )
+        _validate_recovery_plan_consistency(plan)
+    except CompositeBatchRecoveryConflict:
+        raise
+    except (TypeError, ValueError, RecursionError, OverflowError) as exc:
+        raise CompositeBatchRecoveryConflict("plan_evidence_invalid") from exc
+    applied = applied_at or datetime.now(UTC)
+    with session_factory() as session:
+        _acquire_recovery_write_lock(session)
+        existing = _load_recovery_audit_event(
+            session, evidence_fingerprint=plan.evidence_fingerprint
+        )
+        if existing is not None:
+            if _repaired_state_and_event_match(session, event=existing, plan=plan):
+                return CompositeBatchRecoveryApplyResult(
+                    batch_id=BATCH_119_RECOVERY.batch_id,
+                    status="already_repaired",
+                    evidence_fingerprint=plan.evidence_fingerprint,
+                    audit_event_id=int(existing.id),
+                )
+            raise CompositeBatchRecoveryConflict("recovery_audit_conflict")
+        source = _load_locked_recovery_source(session)
+        if source is None:
+            raise CompositeBatchRecoveryConflict("source_state_conflict")
+        batch, binding, entry, leg, components, source_fingerprint = source
+        if source_fingerprint != plan.source_fingerprint:
+            raise CompositeBatchRecoveryConflict("source_fingerprint_conflict")
+        if plan.position is None or plan.position.disposition not in {
+            "resume_to_target",
+            "protection_only_at_target",
+            "protection_only_below_target",
+            "position_absent",
+        }:
+            raise CompositeBatchRecoveryConflict("plan_disposition_not_supported")
+
+        before = {
+            "batch_id": int(batch.id),
+            "batch_status": str(batch.status),
+            "leg_status": str(leg.status),
+            "component_statuses": [str(row.status) for row in components],
+            "component_attempt_counts": [
+                int(row.attempt_count) for row in components
+            ],
+        }
+        position_absent = plan.position.disposition == "position_absent"
+        recovery_reason = (
+            "composite_recovery_exact_position_absent"
+            if position_absent
+            else _RECOVERY_REASON
+        )
+        batch.status = "resolved" if position_absent else "ready"
+        batch.reason_code = recovery_reason
+        batch.last_progress_at = applied
+        batch.updated_at = applied
+        if position_absent:
+            batch.reconciled_at = applied
+            batch.completed_at = applied
+        leg.status = "failed" if position_absent else "planned"
+        leg.last_error = _canonical_json(
+            {
+                "reason": recovery_reason,
+                "recovery_evidence_fingerprint": plan.evidence_fingerprint,
+            }
+        )
+        leg.updated_at = applied
+        if position_absent:
+            for component in components:
+                if not transition_component_for_exact_position_absent_recovery(
+                    session,
+                    component_id=int(component.id),
+                    expected_status=str(component.status),
+                    recovery_evidence_fingerprint=plan.evidence_fingerprint,
+                    now=applied,
+                ):
+                    raise CompositeBatchRecoveryConflict(
+                        "component_state_conflict"
+                    )
+        elif plan.position.disposition == "protection_only_below_target":
+            attestation = _under_target_attestation(plan)
+            for component in components:
+                evidence = _safe_json_value(component.evidence_json)
+                if not isinstance(evidence, list):
+                    raise CompositeBatchRecoveryConflict(
+                        "component_evidence_invalid"
+                    )
+                component.evidence_json = _canonical_json(
+                    [*evidence, attestation]
+                )
+                component.updated_at = applied
+        after = _recovery_audit_after(
+            plan,
+            batch_status=str(batch.status),
+            leg_status=str(leg.status),
+            component_statuses=[str(row.status) for row in components],
+        )
+        event = ExecutionEvent(
+            execution_binding_id=int(binding.id),
+            venue="deepcoin",
+            action=_RECOVERY_AUDIT_ACTION,
+            status="resolved",
+            reason=recovery_reason,
+            before_json=_canonical_json(before),
+            after_json=_canonical_json(after),
+            notification_fingerprint=plan.evidence_fingerprint,
+            created_at=applied,
+        )
+        session.add(event)
+        session.commit()
+        return CompositeBatchRecoveryApplyResult(
+            batch_id=BATCH_119_RECOVERY.batch_id,
+            status="repaired",
+            evidence_fingerprint=plan.evidence_fingerprint,
+            audit_event_id=int(event.id),
+        )
 
 
 def build_composite_batch_recovery_plan(
@@ -336,6 +502,9 @@ def _build_composite_batch_recovery_plan(
                 "batch_status": str(batch.status),
                 "leg_status": str(leg.status),
                 "component_statuses": [str(row.status) for row in components],
+                "component_attempt_counts": [
+                    int(row.attempt_count) for row in components
+                ],
                 "component_count": len(components),
                 "close_submission_evidence_count": 0,
             },
@@ -358,6 +527,572 @@ def _build_composite_batch_recovery_plan(
             evidence_fingerprint=evidence_fingerprint,
             evidence=_freeze_mapping(evidence),
         )
+
+
+def _acquire_recovery_write_lock(session) -> None:
+    bind = session.get_bind()
+    if bind.dialect.name == "sqlite":
+        session.execute(text("BEGIN IMMEDIATE"))
+
+
+def _load_locked_recovery_source(session):
+    batch = session.get(StrategyManagementBatch, BATCH_119_RECOVERY.batch_id)
+    if batch is None:
+        return None
+    lifecycle = session.get(StrategyLifecycle, BATCH_119_RECOVERY.lifecycle_id)
+    raw = session.get(RawMessage, BATCH_119_RECOVERY.raw_message_id)
+    binding = session.get(ExecutionBinding, int(batch.execution_binding_id))
+    legs = (
+        session.query(StrategyManagementLeg)
+        .filter_by(management_batch_id=BATCH_119_RECOVERY.batch_id)
+        .order_by(StrategyManagementLeg.leg_index, StrategyManagementLeg.id)
+        .all()
+    )
+    components = (
+        session.query(StrategyManagementComponent)
+        .filter_by(management_batch_id=BATCH_119_RECOVERY.batch_id)
+        .order_by(
+            StrategyManagementComponent.sequence,
+            StrategyManagementComponent.id,
+        )
+        .all()
+    )
+    if (
+        raw is None
+        or lifecycle is None
+        or binding is None
+        or len(legs) != 1
+        or len(components) != len(_EXPECTED_COMPONENTS)
+    ):
+        return None
+    leg = legs[0]
+    entry = session.get(ExecutionOrderLeg, int(leg.execution_order_leg_id))
+    if entry is None:
+        return None
+    if _durable_identity_refusal(
+        batch=batch,
+        raw=raw,
+        lifecycle=lifecycle,
+        binding=binding,
+        entry=entry,
+        leg=leg,
+        profile=BATCH_119_RECOVERY,
+    ) is not None:
+        return None
+    contract = _validated_contract(batch, profile=BATCH_119_RECOVERY)
+    if isinstance(contract, str):
+        return None
+    target = _validated_target_snapshot(
+        batch,
+        binding=binding,
+        leg=leg,
+        entry=entry,
+        profile=BATCH_119_RECOVERY,
+    )
+    if isinstance(target, str):
+        return None
+    if _component_topology_refusal(
+        components,
+        batch=batch,
+        leg=leg,
+        entry=entry,
+        target=target,
+        expected_contract_fingerprint=str(batch.management_contract_fingerprint),
+    ) is not None:
+        return None
+    if not _exact_false_submission_state(batch, leg=leg, components=components):
+        return None
+    if _legacy_false_state_evidence_refusal(
+        leg, profile=BATCH_119_RECOVERY
+    ) is not None:
+        return None
+    if any(
+        value not in (None, "")
+        for value in (
+            leg.request_json,
+            leg.response_json,
+            leg.client_order_id,
+            leg.exchange_order_id,
+        )
+    ):
+        return None
+    if _has_durable_close_submission(
+        session, batch=batch, leg=leg, entry=entry
+    ):
+        return None
+    if _has_additional_active_database_work(
+        session, batch_id=BATCH_119_RECOVERY.batch_id
+    ):
+        return None
+    ledger = (
+        session.query(PositionProtectionLedger)
+        .filter(
+            PositionProtectionLedger.execution_binding_id == binding.id,
+            PositionProtectionLedger.execution_order_leg_id == entry.id,
+            PositionProtectionLedger.pos_id == str(leg.pos_id),
+        )
+        .order_by(PositionProtectionLedger.id)
+        .all()
+    )
+    try:
+        payload = _source_evidence_payload(
+            batch=batch,
+            raw=raw,
+            lifecycle=lifecycle,
+            binding=binding,
+            entry=entry,
+            leg=leg,
+            components=components,
+            target=target,
+            contract=contract,
+            protection_ledger=ledger,
+        )
+        source_fingerprint = _fingerprint(payload)
+    except (CompositeBatchRecoveryRefusal, TypeError, ValueError, RecursionError):
+        return None
+    return batch, binding, entry, leg, components, source_fingerprint
+
+
+def _recovery_audit_after(
+    plan: CompositeBatchRecoveryPlan,
+    *,
+    batch_status: str,
+    leg_status: str,
+    component_statuses: list[str],
+) -> dict[str, Any]:
+    return {
+        "batch_id": BATCH_119_RECOVERY.batch_id,
+        "batch_status": str(batch_status),
+        "leg_status": str(leg_status),
+        "component_statuses": list(component_statuses),
+        "component_attempt_counts": _component_attempt_counts_from_plan(plan),
+        "source_fingerprint": plan.source_fingerprint,
+        "exchange_snapshot_fingerprint": plan.exchange_snapshot_fingerprint,
+        "evidence_fingerprint": plan.evidence_fingerprint,
+        "position_disposition": plan.position.disposition if plan.position else None,
+        "current_size": plan.position.current_size if plan.position else None,
+        "target_remaining_size": BATCH_119_RECOVERY.target_remaining_size,
+        "exchange_call_possible": False,
+    }
+
+
+def _under_target_attestation(
+    plan: CompositeBatchRecoveryPlan,
+) -> dict[str, str]:
+    if (
+        plan.position is None
+        or plan.position.disposition != "protection_only_below_target"
+    ):
+        raise CompositeBatchRecoveryConflict("under_target_attestation_invalid")
+    return {
+        "kind": "approved_under_target_recovery",
+        "actual_remaining_size": str(plan.position.effective_remaining_size),
+        "original_target_remaining_size": (
+            BATCH_119_RECOVERY.target_remaining_size
+        ),
+        "recovery_evidence_fingerprint": plan.evidence_fingerprint,
+    }
+
+
+def _position_absent_evidence(
+    plan: CompositeBatchRecoveryPlan,
+) -> dict[str, str]:
+    if plan.position is None or plan.position.disposition != "position_absent":
+        raise CompositeBatchRecoveryConflict("position_absent_evidence_invalid")
+    return {
+        "kind": "composite_recovery_exact_position_absent",
+        "recovery_evidence_fingerprint": plan.evidence_fingerprint,
+    }
+
+
+def _load_recovery_audit_event(session, *, evidence_fingerprint: str):
+    rows = (
+        session.query(ExecutionEvent)
+        .filter(
+            ExecutionEvent.notification_fingerprint
+            == str(evidence_fingerprint)
+        )
+        .all()
+    )
+    if len(rows) > 1:
+        raise CompositeBatchRecoveryConflict("recovery_audit_conflict")
+    return rows[0] if rows else None
+
+
+def _repaired_state_and_event_match(
+    session, *, event: ExecutionEvent, plan: CompositeBatchRecoveryPlan
+) -> bool:
+    batch = session.get(StrategyManagementBatch, BATCH_119_RECOVERY.batch_id)
+    lifecycle = session.get(
+        StrategyLifecycle, BATCH_119_RECOVERY.lifecycle_id
+    )
+    raw = session.get(RawMessage, BATCH_119_RECOVERY.raw_message_id)
+    if batch is None or lifecycle is None or raw is None:
+        return False
+    binding = session.get(ExecutionBinding, int(batch.execution_binding_id))
+    legs = (
+        session.query(StrategyManagementLeg)
+        .filter_by(management_batch_id=BATCH_119_RECOVERY.batch_id)
+        .all()
+    )
+    components = (
+        session.query(StrategyManagementComponent)
+        .filter_by(management_batch_id=BATCH_119_RECOVERY.batch_id)
+        .order_by(StrategyManagementComponent.sequence)
+        .all()
+    )
+    if binding is None or len(legs) != 1 or len(components) != 3:
+        return False
+    leg = legs[0]
+    entry = session.get(ExecutionOrderLeg, int(leg.execution_order_leg_id))
+    if entry is None:
+        return False
+    if _durable_identity_refusal(
+        batch=batch,
+        raw=raw,
+        lifecycle=lifecycle,
+        binding=binding,
+        entry=entry,
+        leg=leg,
+        profile=BATCH_119_RECOVERY,
+    ) is not None:
+        return False
+    contract = _validated_contract(batch, profile=BATCH_119_RECOVERY)
+    if isinstance(contract, str):
+        return False
+    target = _validated_target_snapshot(
+        batch,
+        binding=binding,
+        leg=leg,
+        entry=entry,
+        profile=BATCH_119_RECOVERY,
+    )
+    if isinstance(target, str):
+        return False
+    if plan.position is None:
+        return False
+    position_absent = plan.position.disposition == "position_absent"
+    expected_component_statuses = (
+        ("safely_skipped",) * len(_EXPECTED_COMPONENTS)
+        if position_absent
+        else ("recovery_required", "pending", "pending")
+    )
+    recovery_reason = (
+        "composite_recovery_exact_position_absent"
+        if position_absent
+        else _RECOVERY_REASON
+    )
+    evidence_suffix = (
+        _position_absent_evidence(plan)
+        if position_absent
+        else _under_target_attestation(plan)
+        if plan.position.disposition == "protection_only_below_target"
+        else None
+    )
+    if _component_topology_refusal(
+        components,
+        batch=batch,
+        leg=leg,
+        entry=entry,
+        target=target,
+        expected_contract_fingerprint=str(
+            batch.management_contract_fingerprint
+        ),
+        evidence_suffix=evidence_suffix,
+        expected_statuses=expected_component_statuses,
+        expected_reason_codes=(
+            (recovery_reason,) * len(_EXPECTED_COMPONENTS)
+            if position_absent
+            else (
+                "take_profit_exchange_snapshot_incomplete",
+                None,
+                None,
+            )
+        ),
+    ) is not None:
+        return False
+    if _legacy_false_exchange_snapshot_refusal(
+        leg, profile=BATCH_119_RECOVERY
+    ) is not None:
+        return False
+    if _has_durable_close_submission(
+        session, batch=batch, leg=leg, entry=entry
+    ):
+        return False
+    if _has_additional_active_database_work(
+        session, batch_id=BATCH_119_RECOVERY.batch_id
+    ):
+        return False
+    component_attempt_counts = _component_attempt_counts_from_plan(plan)
+    before = {
+        "batch_id": BATCH_119_RECOVERY.batch_id,
+        "batch_status": "reconciling",
+        "leg_status": "submitted",
+        "component_statuses": ["recovery_required", "pending", "pending"],
+        "component_attempt_counts": component_attempt_counts,
+    }
+    after = _recovery_audit_after(
+        plan,
+        batch_status="resolved" if position_absent else "ready",
+        leg_status="failed" if position_absent else "planned",
+        component_statuses=list(expected_component_statuses),
+    )
+    return (
+        str(batch.status) == ("resolved" if position_absent else "ready")
+        and str(batch.reason_code) == recovery_reason
+        and batch.reconciled_at
+        == (event.created_at if position_absent else None)
+        and batch.completed_at
+        == (event.created_at if position_absent else None)
+        and str(leg.status) == ("failed" if position_absent else "planned")
+        and _safe_json_value(leg.last_error)
+        == {
+            "reason": recovery_reason,
+            "recovery_evidence_fingerprint": plan.evidence_fingerprint,
+        }
+        and leg.request_json is None
+        and leg.response_json is None
+        and leg.client_order_id is None
+        and leg.exchange_order_id is None
+        and [str(row.status) for row in components]
+        == list(expected_component_statuses)
+        and [int(row.attempt_count) for row in components]
+        == component_attempt_counts
+        and all(
+            row.completed_at
+            == (event.created_at if position_absent else None)
+            for row in components
+        )
+        and event.execution_binding_id == int(batch.execution_binding_id)
+        and event.trade_signal_id is None
+        and event.strategy_instance_id is None
+        and event.venue == "deepcoin"
+        and event.action == _RECOVERY_AUDIT_ACTION
+        and event.status == "resolved"
+        and event.reason == recovery_reason
+        and event.before_json == _canonical_json(before)
+        and event.after_json == _canonical_json(after)
+        and event.kol_id is None
+        and event.chat_id is None
+        and event.message_id is None
+        and event.source_message_id is None
+        and event.symbol is None
+        and event.side is None
+        and event.order_id is None
+        and event.client_order_id is None
+        and event.pos_id is None
+        and event.related_order_id is None
+        and event.request_json is None
+        and event.response_json is None
+        and event.exchange_event_time is None
+        and event.notification_status is None
+        and event.notification_fingerprint == plan.evidence_fingerprint
+        and event.notification_message_id is None
+        and event.notification_error is None
+        and event.notification_attempts == 0
+        and event.notification_next_attempt_at is None
+        and event.notification_claim_token is None
+        and event.notification_claimed_at is None
+        and event.notified_at is None
+    )
+
+
+def _safe_json_value(value: str | None) -> Any:
+    if not isinstance(value, str):
+        return None
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+
+def _validate_recovery_plan_consistency(plan: CompositeBatchRecoveryPlan) -> None:
+    if (
+        plan.reason_code != "false_legacy_submission_proven"
+        or plan.production_writes != 0
+        or plan.exchange_calls != 0
+    ):
+        raise CompositeBatchRecoveryConflict("plan_evidence_inconsistent")
+    evidence = _plain_json_value(plan.evidence)
+    if not isinstance(evidence, Mapping):
+        raise CompositeBatchRecoveryConflict("plan_evidence_inconsistent")
+    expected_evidence_keys = {
+        "schema_version",
+        "batch_id",
+        "decision",
+        "reason_code",
+        "source_fingerprint",
+        "exchange_snapshot_fingerprint",
+        "immutable_target",
+        "position",
+        "durable",
+        "exchange",
+        "proposed_transition",
+    }
+    immutable_target = evidence.get("immutable_target")
+    durable = evidence.get("durable")
+    exchange = evidence.get("exchange")
+    if (
+        set(evidence) != expected_evidence_keys
+        or not isinstance(immutable_target, Mapping)
+        or not isinstance(durable, Mapping)
+        or not isinstance(exchange, Mapping)
+    ):
+        raise CompositeBatchRecoveryConflict("plan_evidence_inconsistent")
+    attempt_counts = durable.get("component_attempt_counts")
+    if (
+        not isinstance(attempt_counts, list)
+        or len(attempt_counts) != len(_EXPECTED_COMPONENTS)
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in attempt_counts
+        )
+    ):
+        raise CompositeBatchRecoveryConflict("plan_evidence_inconsistent")
+    expected_durable = {
+        "batch_status": "reconciling",
+        "leg_status": "submitted",
+        "component_statuses": ["recovery_required", "pending", "pending"],
+        "component_attempt_counts": attempt_counts,
+        "component_count": len(_EXPECTED_COMPONENTS),
+        "close_submission_evidence_count": 0,
+    }
+    expected_target = {
+        "instrument_id": BATCH_119_RECOVERY.instrument_id,
+        "side": BATCH_119_RECOVERY.side,
+        "trusted_start_size": BATCH_119_RECOVERY.trusted_start_size,
+        "target_remaining_size": BATCH_119_RECOVERY.target_remaining_size,
+        "quantity_step": immutable_target.get("quantity_step"),
+        "min_quantity": immutable_target.get("min_quantity"),
+    }
+    if plan.position is None or not _position_matches_recovery_profile(
+        plan.position,
+        quantity_step=expected_target["quantity_step"],
+        min_quantity=expected_target["min_quantity"],
+    ):
+        raise CompositeBatchRecoveryConflict("plan_evidence_inconsistent")
+    expected_exchange = {
+        "snapshot_complete": True,
+        "exact_position_count": (
+            0 if plan.position.disposition == "position_absent" else 1
+        ),
+        "regular_close_evidence_count": 0,
+        "owned_protection_count": exchange.get("owned_protection_count"),
+    }
+    owned_protection_count = exchange.get("owned_protection_count")
+    minimum_owned_protection = (
+        0 if plan.position.disposition == "position_absent" else 2
+    )
+    if (
+        evidence.get("schema_version") != 1
+        or evidence.get("batch_id") != BATCH_119_RECOVERY.batch_id
+        or evidence.get("decision") != "repair_false_legacy_submission"
+        or evidence.get("reason_code") != "false_legacy_submission_proven"
+        or evidence.get("source_fingerprint") != plan.source_fingerprint
+        or evidence.get("exchange_snapshot_fingerprint")
+        != plan.exchange_snapshot_fingerprint
+        or evidence.get("immutable_target") != expected_target
+        or durable != expected_durable
+        or not isinstance(owned_protection_count, int)
+        or isinstance(owned_protection_count, bool)
+        or owned_protection_count < minimum_owned_protection
+        or exchange != expected_exchange
+        or evidence.get("position") != _serialize_position(plan.position)
+        or evidence.get("proposed_transition") != _proposed_transition(plan.position)
+        or not all(
+            _is_sha256(value)
+            for value in (
+                plan.source_fingerprint,
+                plan.exchange_snapshot_fingerprint,
+                plan.evidence_fingerprint,
+            )
+        )
+    ):
+        raise CompositeBatchRecoveryConflict("plan_evidence_inconsistent")
+
+
+def _component_attempt_counts_from_plan(
+    plan: CompositeBatchRecoveryPlan,
+) -> list[int]:
+    try:
+        durable = _plain_json_value(plan.evidence)["durable"]
+        values = durable["component_attempt_counts"]
+    except (KeyError, TypeError, ValueError, RecursionError) as exc:
+        raise CompositeBatchRecoveryConflict("plan_evidence_inconsistent") from exc
+    if (
+        not isinstance(values, list)
+        or len(values) != len(_EXPECTED_COMPONENTS)
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in values
+        )
+    ):
+        raise CompositeBatchRecoveryConflict("plan_evidence_inconsistent")
+    return list(values)
+
+
+def _position_matches_recovery_profile(
+    position: CompositeRecoveryPosition,
+    *,
+    quantity_step: object,
+    min_quantity: object,
+) -> bool:
+    try:
+        step = Decimal(str(quantity_step))
+        minimum = Decimal(str(min_quantity))
+        close_delta = Decimal(str(position.close_delta))
+        effective = Decimal(str(position.effective_remaining_size))
+        current = (
+            None
+            if position.current_size is None
+            else Decimal(str(position.current_size))
+        )
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    decimal_values = [close_delta, effective]
+    if current is not None:
+        decimal_values.append(current)
+    if (
+        any(not value.is_finite() for value in [step, minimum, *decimal_values])
+        or step <= 0
+        or minimum <= 0
+        or any(value < 0 or value % step != 0 for value in decimal_values)
+        or _decimal_text(close_delta) != str(position.close_delta)
+        or _decimal_text(effective) != str(position.effective_remaining_size)
+        or (
+            current is not None
+            and _decimal_text(current) != str(position.current_size)
+        )
+    ):
+        return False
+    trusted = Decimal(BATCH_119_RECOVERY.trusted_start_size)
+    target = Decimal(BATCH_119_RECOVERY.target_remaining_size)
+    expected_by_disposition = {
+        "resume_to_target": (trusted, trusted - target, target),
+        "protection_only_at_target": (target, Decimal(0), target),
+        "position_absent": (None, Decimal(0), Decimal(0)),
+    }
+    if position.disposition == "protection_only_below_target":
+        return (
+            current is not None
+            and minimum <= current < target
+            and close_delta == 0
+            and effective == current
+        )
+    expected = expected_by_disposition.get(position.disposition)
+    return expected is not None and (current, close_delta, effective) == expected
+
+
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
 
 
 def serialize_composite_batch_recovery_plan(
@@ -603,10 +1338,20 @@ def _component_topology_refusal(
     entry,
     target,
     expected_contract_fingerprint: str,
+    evidence_suffix: Mapping[str, Any] | None = None,
+    expected_statuses: tuple[str, ...] = (
+        "recovery_required",
+        "pending",
+        "pending",
+    ),
+    expected_reason_codes: tuple[str | None, ...] = (
+        "take_profit_exchange_snapshot_incomplete",
+        None,
+        None,
+    ),
 ) -> str | None:
     if len(components) != len(_EXPECTED_COMPONENTS):
         return "component_topology_mismatch"
-    expected_statuses = ("recovery_required", "pending", "pending")
     for sequence, (component, kind, status) in enumerate(
         zip(components, _EXPECTED_COMPONENTS, expected_statuses, strict=True)
     ):
@@ -650,16 +1395,21 @@ def _component_topology_refusal(
             evidence = json.loads(component.evidence_json)
         except (TypeError, ValueError, RecursionError):
             return "component_topology_mismatch"
+        expected_attestation = (
+            [dict(evidence_suffix)]
+            if evidence_suffix is not None
+            else []
+        )
         if sequence == 0:
-            if not _is_bounded_snapshot_incomplete_evidence(evidence):
+            if not (
+                isinstance(evidence, list)
+                and _is_bounded_snapshot_incomplete_evidence(evidence[:1])
+                and evidence[1:] == expected_attestation
+            ):
                 return "component_topology_mismatch"
-        elif evidence != []:
+        elif evidence != expected_attestation:
             return "component_topology_mismatch"
-    if (
-        components[0].reason_code
-        != "take_profit_exchange_snapshot_incomplete"
-        or any(row.reason_code is not None for row in components[1:])
-    ):
+    if tuple(row.reason_code for row in components) != expected_reason_codes:
         return "component_topology_mismatch"
     return None
 
@@ -669,13 +1419,33 @@ def _exact_false_submission_state(batch, *, leg, components) -> bool:
         str(batch.status) == "reconciling"
         and str(batch.reason_code)
         == "management_close_pending_exchange_confirmation"
+        and batch.reconciled_at is None
+        and batch.completed_at is None
         and str(leg.status) == "submitted"
         and [str(row.status) for row in components]
         == ["recovery_required", "pending", "pending"]
+        and all(row.completed_at is None for row in components)
     )
 
 
 def _legacy_false_state_evidence_refusal(leg, *, profile) -> str | None:
+    snapshot_reason = _legacy_false_exchange_snapshot_refusal(
+        leg, profile=profile
+    )
+    if snapshot_reason is not None:
+        return snapshot_reason
+    if leg.last_error in (None, ""):
+        return None
+    try:
+        last_error = json.loads(str(leg.last_error))
+    except (TypeError, ValueError, RecursionError):
+        return "durable_evidence_invalid"
+    if last_error != {"reason": "management_close_order_not_found"}:
+        return "false_submission_state_mismatch"
+    return None
+
+
+def _legacy_false_exchange_snapshot_refusal(leg, *, profile) -> str | None:
     try:
         snapshot = json.loads(str(leg.last_exchange_snapshot_json))
     except (TypeError, ValueError, RecursionError):
@@ -704,14 +1474,6 @@ def _legacy_false_state_evidence_refusal(leg, *, profile) -> str | None:
         != profile.side.lower()
         or str(position_row.get("pos") or "") != profile.trusted_start_size
     ):
-        return "false_submission_state_mismatch"
-    if leg.last_error in (None, ""):
-        return None
-    try:
-        last_error = json.loads(str(leg.last_error))
-    except (TypeError, ValueError, RecursionError):
-        return "durable_evidence_invalid"
-    if last_error != {"reason": "management_close_order_not_found"}:
         return "false_submission_state_mismatch"
     return None
 

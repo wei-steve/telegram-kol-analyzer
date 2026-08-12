@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import importlib
 import json
-from dataclasses import asdict
+import threading
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -2091,3 +2092,906 @@ def test_source_fingerprint_covers_linked_lifecycle_and_binding_message_identity
 
     assert after.status == "ready"
     assert after.source_fingerprint != before.source_fingerprint
+
+
+def test_apply_repairs_only_false_legacy_state_in_one_transaction(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    plan = _plan(factory)
+
+    result = module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+
+    assert result.status == "repaired"
+    assert result.batch_id == 119
+    assert result.evidence_fingerprint == plan.evidence_fingerprint
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        leg = session.query(StrategyManagementLeg).one()
+        components = (
+            session.query(StrategyManagementComponent)
+            .order_by(StrategyManagementComponent.sequence)
+            .all()
+        )
+        events = session.query(ExecutionEvent).all()
+        assert batch.status == "ready"
+        assert leg.status == "planned"
+        assert [row.status for row in components] == [
+            "recovery_required", "pending", "pending"
+        ]
+        assert leg.request_json is None
+        assert leg.response_json is None
+        assert leg.client_order_id is None
+        assert leg.exchange_order_id is None
+        assert len(events) == 1
+        event = events[0]
+        assert event.action == "composite_batch_false_state_repaired"
+        assert event.notification_fingerprint == plan.evidence_fingerprint
+        assert event.request_json is None
+        assert event.response_json is None
+        assert event.order_id is None
+        assert event.client_order_id is None
+        assert event.pos_id is None
+        before = json.loads(event.before_json)
+        after = json.loads(event.after_json)
+        assert before == {
+            "batch_id": 119,
+            "batch_status": "reconciling",
+            "component_attempt_counts": [1, 0, 0],
+            "component_statuses": ["recovery_required", "pending", "pending"],
+            "leg_status": "submitted",
+        }
+        assert after["batch_status"] == "ready"
+        assert after["leg_status"] == "planned"
+        assert after["component_statuses"] == [
+            "recovery_required", "pending", "pending"
+        ]
+        assert after["source_fingerprint"] == plan.source_fingerprint
+        assert after["exchange_snapshot_fingerprint"] == (
+            plan.exchange_snapshot_fingerprint
+        )
+        assert after["evidence_fingerprint"] == plan.evidence_fingerprint
+        assert before["component_attempt_counts"] == [1, 0, 0]
+        assert after["component_attempt_counts"] == [1, 0, 0]
+        serialized_event = json.dumps(
+            {"before": before, "after": after}, sort_keys=True
+        )
+        for sensitive in (
+            POS_ID,
+            PRIMARY_ORDER_ID,
+            BACKUP_ORDER_ID,
+            SOURCE_TEXT,
+            "secret-api-key",
+            "private provider response",
+        ):
+            assert sensitive not in serialized_event
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "source_fingerprint_field",
+        "exchange_fingerprint_field",
+        "position_field",
+        "immutable_target",
+        "proposed_transition",
+        "plan_reason",
+        "plan_counters",
+    ],
+)
+def test_apply_rejects_internally_forged_plan_without_writes(tmp_path, tamper):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    plan = _plan(factory)
+    evidence = module.serialize_composite_batch_recovery_plan(plan)["evidence"]
+    if tamper == "source_fingerprint_field":
+        forged = replace(plan, source_fingerprint="0" * 64)
+    elif tamper == "exchange_fingerprint_field":
+        forged = replace(plan, exchange_snapshot_fingerprint="1" * 64)
+    elif tamper == "position_field":
+        forged = replace(
+            plan,
+            position=replace(plan.position, current_size="37", close_delta="18"),
+        )
+    elif tamper == "plan_reason":
+        forged = replace(plan, reason_code="forged_reason")
+    elif tamper == "plan_counters":
+        forged = replace(plan, production_writes=1, exchange_calls=1)
+    else:
+        if tamper == "immutable_target":
+            evidence["immutable_target"]["target_remaining_size"] = "18"
+        else:
+            evidence["proposed_transition"]["batch_status"] = "succeeded"
+        forged = replace(plan, evidence=evidence)
+
+    with pytest.raises(module.CompositeBatchRecoveryConflict):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=forged,
+            expected_fingerprint=forged.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(StrategyManagementLeg).one().status == "submitted"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+@pytest.mark.parametrize(
+    ("change", "reason_code"),
+    [
+        ("authorization", "authorization_invalid"),
+        ("expected_fingerprint", "evidence_fingerprint_mismatch"),
+        ("batch_id", "plan_not_actionable"),
+        ("status", "plan_not_actionable"),
+    ],
+)
+def test_apply_rejects_invalid_authority_or_plan_envelope(
+    tmp_path, change, reason_code
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    plan = _plan(factory)
+    authorization = "I_AUTHORIZE_BATCH_119_TO_REMAINING_19"
+    expected = plan.evidence_fingerprint
+    if change == "authorization":
+        authorization = "not-authorized"
+    elif change == "expected_fingerprint":
+        expected = "0" * 64
+    elif change == "batch_id":
+        plan = replace(plan, batch_id=120)
+    else:
+        plan = replace(plan, status="refused")
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict, match=reason_code
+    ):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            expected_fingerprint=expected,
+            authorization=authorization,
+            applied_at=NOW,
+        )
+
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+@pytest.mark.parametrize(
+    ("mutation", "mutate"),
+    [
+        ("batch_status", lambda session: setattr(
+            session.get(StrategyManagementBatch, 119), "status", "ready"
+        )),
+        ("leg_status", lambda session: setattr(
+            session.query(StrategyManagementLeg).one(), "status", "planned"
+        )),
+        ("component_status", lambda session: setattr(
+            session.query(StrategyManagementComponent).order_by(
+                StrategyManagementComponent.sequence
+            ).first(), "status", "confirmed"
+        )),
+        ("request_json", lambda session: setattr(
+            session.query(StrategyManagementLeg).one(), "request_json", "{}"
+        )),
+        ("exchange_order_id", lambda session: setattr(
+            session.query(StrategyManagementLeg).one(),
+            "exchange_order_id", "drifted-order"
+        )),
+    ],
+)
+def test_apply_rejects_durable_state_drift_and_rolls_back(
+    tmp_path, mutation, mutate
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    plan = _plan(factory)
+    with factory() as session:
+        mutate(session)
+        session.commit()
+
+    with pytest.raises(module.CompositeBatchRecoveryConflict):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+    with factory() as session:
+        assert session.query(ExecutionEvent).count() == 0
+        if mutation == "batch_status":
+            assert session.get(StrategyManagementBatch, 119).status == "ready"
+        else:
+            assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+
+
+def test_apply_rejects_new_close_intent_after_plan_and_writes_nothing(tmp_path):
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    plan = _plan(factory)
+    with factory() as session:
+        session.add(
+            PositionMutationIntent(
+                idempotency_key="new-close-intent-after-plan",
+                operation="close_position",
+                strategy_instance_id="deepcoin:incident:btc:long",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                pos_id=POS_ID,
+                authority_fingerprint="a" * 64,
+                request_fingerprint="r" * 64,
+                status="reserved",
+                request_json='{"credential":"secret"}',
+                reserved_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    with pytest.raises(module.CompositeBatchRecoveryConflict):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+def test_apply_acquires_immediate_lock_before_first_read(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    plan = _plan(factory)
+    statements = []
+
+    from sqlalchemy import event
+
+    engine = factory.kw["bind"]
+
+    def record_statement(_conn, _cursor, statement, _params, _context, _many):
+        statements.append(statement.strip().upper())
+
+    event.listen(engine, "before_cursor_execute", record_statement)
+    try:
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record_statement)
+
+    first_read = next(
+        index for index, statement in enumerate(statements)
+        if statement.startswith("SELECT")
+    )
+    begin_immediate = statements.index("BEGIN IMMEDIATE")
+    assert begin_immediate < first_read
+
+
+def test_concurrent_apply_creates_one_audit_and_returns_already_repaired(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    plan = _plan(factory)
+    barrier = threading.Barrier(2)
+    results = []
+    errors = []
+
+    def apply_once():
+        try:
+            barrier.wait()
+            results.append(
+                module.apply_composite_batch_false_state_repair(
+                    factory,
+                    plan=plan,
+                    expected_fingerprint=plan.evidence_fingerprint,
+                    authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+                    applied_at=NOW,
+                )
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=apply_once) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert errors == []
+    assert sorted(row.status for row in results) == [
+        "already_repaired", "repaired"
+    ]
+    assert len({row.audit_event_id for row in results}) == 1
+    with factory() as session:
+        assert (
+            session.query(ExecutionEvent)
+            .filter(
+                ExecutionEvent.notification_fingerprint
+                == plan.evidence_fingerprint
+            )
+            .count()
+            == 1
+        )
+        assert session.query(ExecutionEvent).count() == 1
+
+
+@pytest.mark.parametrize(
+    "kind", ["batch", "component", "mutation", "instruction"]
+)
+def test_apply_rejects_new_additional_active_work_after_plan(tmp_path, kind):
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    module = _recovery_module()
+    plan = _plan(factory)
+    with factory() as session:
+        batch119 = session.get(StrategyManagementBatch, 119)
+        if kind in {"batch", "component"}:
+            other = _add_other_terminal_batch(
+                session, binding_id=binding_id, batch119=batch119
+            )
+            if kind == "batch":
+                other.status = "executing"
+            else:
+                session.add(
+                    StrategyManagementComponent(
+                        management_batch_id=other.id,
+                        strategy_management_leg_id=None,
+                        strategy_management_leg_scope=-1,
+                        component_kind="cancel_deferred_entries",
+                        sequence=0,
+                        status="pending",
+                        idempotency_key="new-active-component-after-plan",
+                        desired_json="{}",
+                        evidence_json="[]",
+                        created_at=NOW,
+                        updated_at=NOW,
+                    )
+                )
+        elif kind == "mutation":
+            session.add(
+                PositionMutationIntent(
+                    idempotency_key="other-mutation-after-plan",
+                    operation="replace_protection",
+                    strategy_instance_id="other-strategy",
+                    execution_binding_id=binding_id,
+                    execution_order_leg_id=entry_id,
+                    pos_id="other-position",
+                    authority_fingerprint="a" * 64,
+                    request_fingerprint="r" * 64,
+                    status="reserved",
+                    request_json="{}",
+                    reserved_at=NOW,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+        else:
+            candidate = SignalCandidate(
+                raw_message_id=10532,
+                symbol="BTC",
+                side="long",
+                event_type="management",
+                management_action="partial_then_break_even",
+                review_status="confirmed",
+                created_at=NOW,
+            )
+            session.add(candidate)
+            session.flush()
+            session.add(
+                MessageInstructionItem(
+                    raw_message_id=10532,
+                    signal_candidate_id=candidate.id,
+                    sequence=0,
+                    instruction_kind="management",
+                    strategy_instance_id="other-strategy",
+                    idempotency_key="new-instruction-after-plan",
+                    status="submitted",
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+        session.commit()
+
+    with pytest.raises(module.CompositeBatchRecoveryConflict):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+def test_repeated_apply_requires_exact_audit_and_after_state(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    plan = _plan(factory)
+    repaired = module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+
+    repeated = module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+
+    assert repaired.status == "repaired"
+    assert repeated.status == "already_repaired"
+    assert repeated.audit_event_id == repaired.audit_event_id
+    with factory() as session:
+        assert (
+            session.query(ExecutionEvent)
+            .filter(
+                ExecutionEvent.action
+                == "composite_batch_false_state_repaired"
+            )
+            .count()
+            == 1
+        )
+        assert session.query(ExecutionEvent).count() == 1
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "batch_state",
+        "batch_reconciled_at",
+        "leg_last_error",
+        "leg_request",
+        "component_evidence",
+        "component_reason",
+        "component_completed",
+        "audit_request",
+        "audit_after",
+        "audit_before_noncanonical",
+        "audit_after_duplicate_key",
+        "audit_action",
+        "new_close_intent",
+        "new_close_event",
+    ],
+)
+def test_repeated_apply_rejects_tampered_audit_or_after_state(tmp_path, tamper):
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    module = _recovery_module()
+    plan = _plan(factory)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with factory() as session:
+        event = session.query(ExecutionEvent).one()
+        if tamper == "batch_state":
+            session.get(StrategyManagementBatch, 119).status = "resolved"
+        elif tamper == "batch_reconciled_at":
+            session.get(StrategyManagementBatch, 119).reconciled_at = NOW
+        elif tamper == "leg_last_error":
+            session.query(StrategyManagementLeg).one().last_error = "{}"
+        elif tamper == "leg_request":
+            session.query(StrategyManagementLeg).one().request_json = "{}"
+        elif tamper == "component_evidence":
+            session.query(StrategyManagementComponent).order_by(
+                StrategyManagementComponent.sequence
+            ).first().evidence_json = "[]"
+        elif tamper == "component_reason":
+            session.query(StrategyManagementComponent).order_by(
+                StrategyManagementComponent.sequence
+            ).first().reason_code = "drifted"
+        elif tamper == "component_completed":
+            session.query(StrategyManagementComponent).order_by(
+                StrategyManagementComponent.sequence
+            ).first().completed_at = NOW
+        elif tamper == "audit_request":
+            event.request_json = "{}"
+        elif tamper == "audit_after":
+            payload = json.loads(event.after_json)
+            payload["batch_status"] = "succeeded"
+            event.after_json = json.dumps(payload, sort_keys=True)
+        elif tamper == "audit_before_noncanonical":
+            event.before_json = json.dumps(json.loads(event.before_json))
+        elif tamper == "audit_after_duplicate_key":
+            event.after_json = (
+                event.after_json[:-1]
+                + ',"exchange_call_possible":false}'
+            )
+        else:
+            if tamper == "audit_action":
+                event.action = "unrelated_action"
+            elif tamper == "new_close_intent":
+                session.add(
+                    PositionMutationIntent(
+                        idempotency_key="new-close-after-repair",
+                        operation="close_position",
+                        strategy_instance_id="deepcoin:incident:btc:long",
+                        execution_binding_id=binding_id,
+                        execution_order_leg_id=entry_id,
+                        pos_id=POS_ID,
+                        authority_fingerprint="a" * 64,
+                        request_fingerprint="r" * 64,
+                        status="reserved",
+                        request_json="{}",
+                        reserved_at=NOW,
+                        created_at=NOW,
+                        updated_at=NOW,
+                    )
+                )
+            else:
+                session.add(
+                    ExecutionEvent(
+                        execution_binding_id=binding_id,
+                        action="position_close_submitted",
+                        status="submitted",
+                        pos_id=POS_ID,
+                        created_at=NOW,
+                    )
+                )
+        session.commit()
+
+    with pytest.raises(module.CompositeBatchRecoveryConflict):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+    with factory() as session:
+        assert (
+            session.query(ExecutionEvent)
+            .filter(
+                ExecutionEvent.notification_fingerprint
+                == plan.evidence_fingerprint
+            )
+            .count()
+            == 1
+        )
+        assert session.query(ExecutionEvent).count() == (
+            2 if tamper == "new_close_event" else 1
+        )
+
+
+@pytest.mark.parametrize("kind", ["component", "mutation", "instruction"])
+def test_repeated_apply_rejects_new_additional_active_work(tmp_path, kind):
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    module = _recovery_module()
+    plan = _plan(factory)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with factory() as session:
+        batch119 = session.get(StrategyManagementBatch, 119)
+        if kind == "component":
+            other = _add_other_terminal_batch(
+                session, binding_id=binding_id, batch119=batch119
+            )
+            session.add(
+                StrategyManagementComponent(
+                    management_batch_id=other.id,
+                    strategy_management_leg_id=None,
+                    strategy_management_leg_scope=-1,
+                    component_kind="cancel_deferred_entries",
+                    sequence=0,
+                    status="pending",
+                    idempotency_key="active-after-recovery-component",
+                    desired_json="{}",
+                    evidence_json="[]",
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+        elif kind == "mutation":
+            session.add(
+                PositionMutationIntent(
+                    idempotency_key="active-after-recovery-mutation",
+                    operation="replace_protection",
+                    strategy_instance_id="other-strategy",
+                    execution_binding_id=binding_id,
+                    execution_order_leg_id=entry_id,
+                    pos_id="other-position",
+                    authority_fingerprint="a" * 64,
+                    request_fingerprint="r" * 64,
+                    status="reserved",
+                    request_json="{}",
+                    reserved_at=NOW,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+        else:
+            candidate = SignalCandidate(
+                raw_message_id=10532,
+                symbol="BTC",
+                side="long",
+                event_type="management",
+                management_action="partial_then_break_even",
+                review_status="confirmed",
+                created_at=NOW,
+            )
+            session.add(candidate)
+            session.flush()
+            session.add(
+                MessageInstructionItem(
+                    raw_message_id=10532,
+                    signal_candidate_id=candidate.id,
+                    sequence=0,
+                    instruction_kind="management",
+                    strategy_instance_id="other-strategy",
+                    idempotency_key="active-after-recovery-instruction",
+                    status="submitted",
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+        session.commit()
+
+    with pytest.raises(module.CompositeBatchRecoveryConflict):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+    with factory() as session:
+        assert (
+            session.query(ExecutionEvent)
+            .filter_by(notification_fingerprint=plan.evidence_fingerprint)
+            .count()
+            == 1
+        )
+
+
+def test_apply_rejects_deep_forged_plan_as_bounded_conflict(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    plan = _plan(factory)
+    evidence = module.serialize_composite_batch_recovery_plan(plan)["evidence"]
+    deeply_nested = 0
+    for _ in range(1100):
+        deeply_nested = [deeply_nested]
+    evidence["untrusted"] = deeply_nested
+    forged = replace(plan, evidence=evidence)
+
+    with pytest.raises(module.CompositeBatchRecoveryConflict):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=forged,
+            expected_fingerprint=forged.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+def test_apply_under_target_appends_bounded_attestation_without_identity_drift(
+    tmp_path,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    position = dict(_snapshot().positions[0], pos="12")
+    plan = _plan(factory, _snapshot(positions=[position]))
+    assert plan.position.disposition == "protection_only_below_target"
+    with factory() as session:
+        components = (
+            session.query(StrategyManagementComponent)
+            .order_by(StrategyManagementComponent.sequence)
+            .all()
+        )
+        identities = [
+            (row.id, row.idempotency_key, row.desired_json) for row in components
+        ]
+
+    result = module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+
+    assert result.status == "repaired"
+    attestation = {
+        "kind": "approved_under_target_recovery",
+        "actual_remaining_size": "12",
+        "original_target_remaining_size": "19",
+        "recovery_evidence_fingerprint": plan.evidence_fingerprint,
+    }
+    with factory() as session:
+        components = (
+            session.query(StrategyManagementComponent)
+            .order_by(StrategyManagementComponent.sequence)
+            .all()
+        )
+        assert [
+            (row.id, row.idempotency_key, row.desired_json) for row in components
+        ] == identities
+        assert json.loads(components[0].evidence_json) == [
+            {"error_type": "RuntimeError"},
+            attestation,
+        ]
+        assert all(
+            json.loads(row.evidence_json) == [attestation]
+            for row in components[1:]
+        )
+
+
+def test_under_target_attestation_cannot_authorize_increased_position(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    position = dict(_snapshot().positions[0], pos="12")
+    plan = _plan(factory, _snapshot(positions=[position]))
+    increased = replace(
+        plan.position,
+        current_size="20",
+        effective_remaining_size="20",
+    )
+    evidence = module.serialize_composite_batch_recovery_plan(plan)["evidence"]
+    evidence["position"] = {
+        "disposition": increased.disposition,
+        "current_size": increased.current_size,
+        "close_delta": increased.close_delta,
+        "effective_remaining_size": increased.effective_remaining_size,
+    }
+    evidence["proposed_transition"]["actual_remaining_size"] = "20"
+    forged_fingerprint = sha256(
+        json.dumps(
+            evidence,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    forged = replace(
+        plan,
+        position=increased,
+        evidence=evidence,
+        evidence_fingerprint=forged_fingerprint,
+    )
+
+    with pytest.raises(module.CompositeBatchRecoveryConflict):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=forged,
+            expected_fingerprint=forged.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+def test_apply_position_absent_terminalizes_without_exchange_intent(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    plan = _plan(
+        factory,
+        _snapshot(positions=[], pending_trigger_orders=[]),
+    )
+    assert plan.position.disposition == "position_absent"
+    with factory() as session:
+        desired = [
+            row.desired_json
+            for row in session.query(StrategyManagementComponent)
+            .order_by(StrategyManagementComponent.sequence)
+            .all()
+        ]
+
+    result = module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+
+    assert result.status == "repaired"
+    terminal_fact = {
+        "kind": "composite_recovery_exact_position_absent",
+        "recovery_evidence_fingerprint": plan.evidence_fingerprint,
+    }
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        leg = session.query(StrategyManagementLeg).one()
+        components = (
+            session.query(StrategyManagementComponent)
+            .order_by(StrategyManagementComponent.sequence)
+            .all()
+        )
+        event = session.query(ExecutionEvent).one()
+        assert batch.status == "resolved"
+        assert batch.reason_code == "composite_recovery_exact_position_absent"
+        assert batch.reconciled_at == NOW.replace(tzinfo=None)
+        assert batch.completed_at == NOW.replace(tzinfo=None)
+        assert leg.status == "failed"
+        assert json.loads(leg.last_error) == {
+            "reason": "composite_recovery_exact_position_absent",
+            "recovery_evidence_fingerprint": plan.evidence_fingerprint,
+        }
+        assert all(
+            value is None
+            for value in (
+                leg.request_json,
+                leg.response_json,
+                leg.client_order_id,
+                leg.exchange_order_id,
+            )
+        )
+        assert [row.status for row in components] == [
+            "safely_skipped",
+            "safely_skipped",
+            "safely_skipped",
+        ]
+        assert [row.reason_code for row in components] == [
+            "composite_recovery_exact_position_absent"
+        ] * 3
+        assert all(row.completed_at == NOW.replace(tzinfo=None) for row in components)
+        assert [row.desired_json for row in components] == desired
+        assert json.loads(components[0].evidence_json) == [
+            {"error_type": "RuntimeError"},
+            terminal_fact,
+        ]
+        assert all(
+            json.loads(row.evidence_json) == [terminal_fact]
+            for row in components[1:]
+        )
+        assert session.query(PositionMutationIntent).count() == 0
+        assert event.action == "composite_batch_false_state_repaired"
+        assert json.loads(event.after_json)["batch_status"] == "resolved"
+        assert json.loads(event.after_json)["exchange_call_possible"] is False
+
+    repeated = module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    assert repeated.status == "already_repaired"

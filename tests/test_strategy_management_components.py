@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+import json
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -8,14 +9,17 @@ from telegram_kol_research.models import StrategyManagementComponent
 from telegram_kol_research.strategy_management_components import (
     claim_management_component,
     create_management_component,
+    transition_component_for_exact_position_absent_recovery,
     transition_management_component,
 )
 
 
-def _create(session, *, idempotency_key="batch:1:tp"):
+def _create(
+    session, *, idempotency_key="batch:1:tp", management_batch_id=1
+):
     return create_management_component(
         session,
-        management_batch_id=1,
+        management_batch_id=management_batch_id,
         strategy_management_leg_id=None,
         component_kind="consume_take_profit_stage",
         sequence=10,
@@ -23,6 +27,59 @@ def _create(session, *, idempotency_key="batch:1:tp"):
         desired={"policy": "consume_first_stage"},
         now=datetime(2026, 8, 4, tzinfo=UTC),
     )
+
+
+@pytest.mark.parametrize("initial_status", ["pending", "recovery_required"])
+def test_exact_position_absent_recovery_can_safely_skip_only_batch_119(
+    tmp_path, initial_status
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    now = datetime(2026, 8, 12, tzinfo=UTC)
+    fingerprint = "a" * 64
+    with session_factory() as session:
+        component = _create(
+            session,
+            idempotency_key=f"batch:119:{initial_status}",
+            management_batch_id=119,
+        )
+        component.status = initial_status
+        session.flush()
+
+        changed = transition_component_for_exact_position_absent_recovery(
+            session,
+            component_id=component.id,
+            expected_status=initial_status,
+            recovery_evidence_fingerprint=fingerprint,
+            now=now,
+        )
+
+        assert changed is True
+        assert component.status == "safely_skipped"
+        assert component.reason_code == (
+            "composite_recovery_exact_position_absent"
+        )
+        assert component.completed_at == now.replace(tzinfo=None)
+        assert json.loads(component.evidence_json) == [
+            {
+                "kind": "composite_recovery_exact_position_absent",
+                "recovery_evidence_fingerprint": fingerprint,
+            }
+        ]
+
+
+def test_normal_component_transition_cannot_safely_skip_pending(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        component = _create(session)
+        session.flush()
+        with pytest.raises(ValueError, match="invalid component transition"):
+            transition_management_component(
+                session,
+                component_id=component.id,
+                expected_status="pending",
+                new_status="safely_skipped",
+                now=datetime(2026, 8, 12, tzinfo=UTC),
+            )
 
 
 def test_component_identity_is_immutable_and_unique(tmp_path):

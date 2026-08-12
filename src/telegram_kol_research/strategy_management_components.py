@@ -149,6 +149,75 @@ def transition_management_component(
     return result.rowcount == 1
 
 
+def transition_component_for_exact_position_absent_recovery(
+    session: Session,
+    *,
+    component_id: int,
+    expected_status: str,
+    recovery_evidence_fingerprint: str,
+    now: datetime,
+) -> bool:
+    """Safely skip only a batch-119 component after exact-position absence."""
+
+    if expected_status not in {"pending", "recovery_required"}:
+        raise ValueError("invalid exact-position-absent recovery status")
+    fingerprint = str(recovery_evidence_fingerprint)
+    if len(fingerprint) != 64 or any(
+        character not in "0123456789abcdef" for character in fingerprint
+    ):
+        raise ValueError("invalid recovery evidence fingerprint")
+    component = session.get(StrategyManagementComponent, int(component_id))
+    if (
+        component is None
+        or int(component.management_batch_id) != 119
+        or str(component.status) != expected_status
+    ):
+        return False
+    try:
+        history = json.loads(component.evidence_json or "[]")
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError("component evidence history is corrupt") from exc
+    if not isinstance(history, list) or len(history) > 1:
+        raise ValueError("component evidence history is corrupt")
+    if history:
+        fact = history[0]
+        error_type = fact.get("error_type") if isinstance(fact, dict) else None
+        if (
+            not isinstance(fact, dict)
+            or set(fact) != {"error_type"}
+            or not isinstance(error_type, str)
+            or not 0 < len(error_type) <= 64
+            or not error_type.replace("_", "").replace(".", "").isalnum()
+        ):
+            raise ValueError("component evidence history is corrupt")
+    history.append(
+        {
+            "kind": "composite_recovery_exact_position_absent",
+            "recovery_evidence_fingerprint": fingerprint,
+        }
+    )
+    result = session.execute(
+        update(StrategyManagementComponent)
+        .where(
+            StrategyManagementComponent.id == int(component_id),
+            StrategyManagementComponent.management_batch_id == 119,
+            StrategyManagementComponent.status == expected_status,
+        )
+        .values(
+            status="safely_skipped",
+            reason_code="composite_recovery_exact_position_absent",
+            evidence_json=_canonical_json(history),
+            last_progress_at=now,
+            updated_at=now,
+            completed_at=now,
+        )
+    )
+    session.flush()
+    if result.rowcount == 1:
+        session.refresh(component)
+    return result.rowcount == 1
+
+
 def claim_management_component(
     session: Session,
     *,
