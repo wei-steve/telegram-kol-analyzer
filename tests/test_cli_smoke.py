@@ -46,6 +46,114 @@ _ENTRY_REPAIR_NOW = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
 _ENTRY_REPAIR_STRATEGY_ID = "deepcoin:-1001:55:BTC:long"
 
 
+def test_mimo_v2_replay_cli_requires_explicit_ids_and_reports_result(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research.mimo_v2_replay import (
+        MimoV2ReplayResult,
+        ReplayPerformance,
+    )
+
+    database = tmp_path / "production.db"
+    database.touch()
+    message_ids = tmp_path / "message-ids.txt"
+    message_ids.write_text("7\n9\n", encoding="utf-8")
+    artifact_dir = tmp_path / "artifacts"
+    captured = {}
+
+    def fake_replay(**kwargs):
+        captured.update(kwargs)
+        return MimoV2ReplayResult(
+            processed=2,
+            comparisons=(),
+            unsafe_mismatches=0,
+            production_writes=0,
+            notifications_sent=0,
+            performance=ReplayPerformance(
+                v1_p95_ms=100.0,
+                v2_p95_ms=110.0,
+                adapter_p95_ms=1.0,
+                passed=True,
+                failure_reasons=(),
+            ),
+            passed=True,
+        )
+
+    monkeypatch.setattr(
+        "telegram_kol_research.cli.run_mimo_v2_replay",
+        fake_replay,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "replay-mimo-v2",
+            "--database",
+            str(database),
+            "--message-id-file",
+            str(message_ids),
+            "--artifact-dir",
+            str(artifact_dir),
+            "--max-messages",
+            "20",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["passed"] is True
+    assert captured["source_database"] == database
+    assert captured["raw_message_ids"] == [7, 9]
+    assert captured["artifact_dir"] == artifact_dir
+    assert captured["max_messages"] == 20
+
+
+def test_mimo_v2_replay_cli_exits_nonzero_when_gate_fails(tmp_path, monkeypatch):
+    from telegram_kol_research.mimo_v2_replay import (
+        MimoV2ReplayResult,
+        ReplayPerformance,
+    )
+
+    database = tmp_path / "production.db"
+    database.touch()
+    message_ids = tmp_path / "message-ids.txt"
+    message_ids.write_text("7\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "telegram_kol_research.cli.run_mimo_v2_replay",
+        lambda **kwargs: MimoV2ReplayResult(
+            processed=1,
+            comparisons=(),
+            unsafe_mismatches=1,
+            production_writes=0,
+            notifications_sent=0,
+            performance=ReplayPerformance(
+                v1_p95_ms=100.0,
+                v2_p95_ms=120.0,
+                adapter_p95_ms=1.0,
+                passed=False,
+                failure_reasons=("v2_p95_above_115_percent_of_v1",),
+            ),
+            passed=False,
+        ),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "replay-mimo-v2",
+            "--database",
+            str(database),
+            "--message-id-file",
+            str(message_ids),
+            "--artifact-dir",
+            str(tmp_path / "artifacts"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.output)["passed"] is False
+
+
 def test_deployment_preflight_cli_writes_verifiable_json(tmp_path):
     database = tmp_path / "preflight.db"
     snapshot = tmp_path / "snapshot.json"

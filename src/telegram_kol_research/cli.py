@@ -171,6 +171,10 @@ from telegram_kol_research.llm_chat import (
 )
 from telegram_kol_research.media_retention import cleanup_media_files
 from telegram_kol_research.media_dedupe import dedupe_media_assets
+from telegram_kol_research.mimo_v2_replay import (
+    load_replay_message_ids,
+    run_mimo_v2_replay,
+)
 from telegram_kol_research.models import (
     ContextResolutionAttempt,
     ExecutionBinding,
@@ -5350,6 +5354,37 @@ def _parse_evidence_backfill_timestamp(
         raise typer.BadParameter(
             f"{option_name} must be an ISO-8601 timestamp"
         ) from exc
+
+
+@app.command("replay-mimo-v2")
+def replay_mimo_v2(
+    database: Path = typer.Option(..., "--database"),
+    message_id_file: Path = typer.Option(..., "--message-id-file"),
+    artifact_dir: Path = typer.Option(..., "--artifact-dir"),
+    max_messages: int = typer.Option(200, "--max-messages", min=1, max=200),
+    ai_config_path: Path = typer.Option(
+        Path("config/ai_recognition.yaml"),
+        "--ai-config-path",
+    ),
+    media_root: Path = typer.Option(Path("data/media"), "--media-root"),
+) -> None:
+    """Compare MiMo v1/v2 in an isolated database copy with no trade writes."""
+
+    try:
+        raw_message_ids = load_replay_message_ids(message_id_file)
+        result = run_mimo_v2_replay(
+            source_database=database,
+            artifact_dir=artifact_dir,
+            raw_message_ids=raw_message_ids,
+            max_messages=max_messages,
+            ai_recognition_config_path=ai_config_path,
+            media_root=media_root,
+        )
+    except (LookupError, OSError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(json.dumps(result.to_dict(), ensure_ascii=False, sort_keys=True))
+    if not result.passed:
+        raise typer.Exit(code=2)
 
 
 @app.command("backfill-mimo-evidence")
