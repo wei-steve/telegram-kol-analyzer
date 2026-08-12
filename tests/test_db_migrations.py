@@ -124,11 +124,44 @@ def test_mimo_recognition_audit_schema_is_additive_and_indexed(tmp_path):
         "ix_mimo_recognition_runs_status_created",
         "ix_mimo_recognition_attempts_run_created",
         "ix_mimo_recognition_attempts_status_created",
+        "ix_message_evidence_versions_mimo_recognition_run_id",
     } <= set(SQLITE_COMPAT_INDEXES)
+    evidence_columns = {
+        column["name"]
+        for column in inspector.get_columns("message_evidence_versions")
+    }
+    evidence_indexes = {
+        index["name"]
+        for index in inspector.get_indexes("message_evidence_versions")
+    }
+    assert "mimo_recognition_run_id" in evidence_columns
+    assert "ix_message_evidence_versions_mimo_recognition_run_id" in (
+        evidence_indexes
+    )
     with sqlite3.connect(database_path) as connection:
         assert connection.execute(
             "SELECT id, display_name FROM sources WHERE id = 97"
         ).fetchone() == (97, "Legacy Source")
+
+
+def test_mimo_evidence_run_link_is_added_to_existing_evidence_table(tmp_path):
+    database_path = tmp_path / "legacy-message-evidence.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE message_evidence_versions (id INTEGER PRIMARY KEY)"
+        )
+
+    session_factory = create_session_factory(database_path)
+    inspector = inspect(session_factory.kw["bind"])
+
+    assert "mimo_recognition_run_id" in {
+        column["name"]
+        for column in inspector.get_columns("message_evidence_versions")
+    }
+    assert "ix_message_evidence_versions_mimo_recognition_run_id" in {
+        index["name"]
+        for index in inspector.get_indexes("message_evidence_versions")
+    }
 
 
 def test_execution_contract_schema_bootstrap_is_idempotent_on_legacy_database(

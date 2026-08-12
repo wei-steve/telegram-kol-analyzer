@@ -45,6 +45,8 @@ class ContextMessage:
     reply_to_message_id: int | None
     evidence_version_id: int | None
     normalized_evidence: dict[str, Any]
+    text_evidence: dict[str, Any]
+    image_evidence: dict[str, Any]
     resolution_status: str = "resolved"
     strategy_links: tuple[StrategyLinkContext, ...] = ()
 
@@ -172,12 +174,12 @@ def _message_context(
 ) -> ContextMessage:
     evidence = _current_evidence(session, int(row.id))
     normalized: dict[str, Any] = {}
+    text_evidence: dict[str, Any] = {}
+    image_evidence: dict[str, Any] = {}
     if evidence is not None:
-        try:
-            value = json.loads(evidence.normalized_evidence_json or "{}")
-            normalized = value if isinstance(value, dict) else {}
-        except json.JSONDecodeError:
-            normalized = {}
+        normalized = _json_object(evidence.normalized_evidence_json)
+        text_evidence = _json_object(evidence.text_evidence_json)
+        image_evidence = _json_object(evidence.image_evidence_json)
     links = (
         session.query(StrategyMessageLink)
         .filter(
@@ -198,6 +200,8 @@ def _message_context(
         reply_to_message_id=row.reply_to_message_id,
         evidence_version_id=(int(evidence.id) if evidence is not None else None),
         normalized_evidence=normalized,
+        text_evidence=text_evidence,
+        image_evidence=image_evidence,
         strategy_links=tuple(
             StrategyLinkContext(
                 strategy_thread_id=int(link.strategy_thread_id),
@@ -213,6 +217,14 @@ def _message_context(
             for link in links
         ),
     )
+
+
+def _json_object(value: str | None) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def build_contextual_message_window(
@@ -287,6 +299,8 @@ def build_contextual_message_window(
                     reply_to_message_id=None,
                     evidence_version_id=None,
                     normalized_evidence={},
+                    text_evidence={},
+                    image_evidence={},
                     resolution_status="missing",
                 )
             )

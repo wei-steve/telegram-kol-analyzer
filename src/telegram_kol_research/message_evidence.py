@@ -20,9 +20,12 @@ from telegram_kol_research.models import (
     MediaAsset,
     MessageEvidenceExtractionClaim,
     MessageEvidenceVersion,
+    MimoRecognitionRun,
     RawMessage,
     utc_now,
 )
+from telegram_kol_research.mimo_recognition_runs import canonical_json_fingerprint
+from telegram_kol_research.mimo_v2_contract import MimoV2Action, MimoV2Result
 
 
 @dataclass(frozen=True, slots=True)
@@ -544,6 +547,151 @@ def persist_mimo_message_evidence(
     )
 
 
+def persist_mimo_v2_message_evidence(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    result: MimoV2Result,
+    run_id: int | None = None,
+    model: str = "mimo-v2.5",
+    prompt_versions: Mapping[str, Any] | None = None,
+    media_root: str | Path = "data/media",
+    expected_input_fingerprint: str | None = None,
+) -> MessageEvidenceVersion:
+    """Persist one validated v2 result with text and images kept separate."""
+
+    canonical_payload = _mimo_v2_result_payload(result)
+    image_asset_ids = {image.asset_id for image in result.evidence.images}
+    with session_factory() as session:
+        raw_message = session.get(RawMessage, int(raw_message_id))
+        if raw_message is None:
+            raise LookupError("raw message not found")
+        media_assets = (
+            session.query(MediaAsset)
+            .filter(MediaAsset.raw_message_id == int(raw_message_id))
+            .order_by(MediaAsset.id.asc())
+            .all()
+        )
+        if not image_asset_ids.issubset(
+            {int(asset.id) for asset in media_assets}
+        ):
+            raise ValueError("mimo_v2_image_asset_mismatch")
+        if run_id is not None:
+            run = session.get(MimoRecognitionRun, int(run_id))
+            if (
+                run is None
+                or int(run.raw_message_id) != int(raw_message_id)
+                or str(run.contract_version) != result.contract_version
+                or str(run.status) != "completed"
+                or not bool(run.became_authoritative)
+            ):
+                raise ValueError("mimo_v2_run_link_invalid")
+            if (
+                run.canonical_payload_fingerprint
+                and run.canonical_payload_fingerprint
+                != canonical_json_fingerprint(canonical_payload)
+            ):
+                raise ValueError("mimo_v2_run_payload_mismatch")
+        input_fingerprint = expected_input_fingerprint or (
+            build_message_input_fingerprint(
+                raw_message,
+                media_assets,
+                media_root=media_root,
+            )
+        )
+
+    evidence = canonical_payload["evidence"]
+    normalized_evidence = {
+        key: canonical_payload[key]
+        for key in ("contract_version", "summary", "confidence", "intents")
+    }
+    return save_message_evidence_version(
+        session_factory,
+        raw_message_id=raw_message_id,
+        input_fingerprint=input_fingerprint,
+        model=model,
+        prompt_versions=dict(prompt_versions or {}),
+        extraction_status="completed",
+        confidence=result.confidence,
+        text_evidence=evidence["text"],
+        image_evidence={
+            "images": evidence["images"],
+            "conflicts": evidence["conflicts"],
+        },
+        normalized_evidence=normalized_evidence,
+        mimo_recognition_run_id=run_id,
+    )
+
+
+def _mimo_v2_result_payload(result: MimoV2Result) -> dict[str, Any]:
+    return {
+        "contract_version": result.contract_version,
+        "summary": result.summary,
+        "confidence": result.confidence,
+        "intents": [
+            {
+                "intent_type": intent.intent_type,
+                "action": (
+                    _mimo_v2_action_payload(intent.action)
+                    if intent.action is not None
+                    else None
+                ),
+                "reason": intent.reason,
+                "confidence": intent.confidence,
+                "evidence_refs": list(intent.evidence_refs),
+            }
+            for intent in result.intents
+        ],
+        "evidence": {
+            "text": {
+                "observed_text": result.evidence.text.observed_text,
+                "fields": _plain_mapping(result.evidence.text.fields),
+            },
+            "images": [
+                {
+                    "asset_id": image.asset_id,
+                    "image_type": image.image_type,
+                    "quality": image.quality,
+                    "observed_text": image.observed_text,
+                    "summary": image.summary,
+                    "fields": _plain_mapping(image.fields),
+                    "confidence": image.confidence,
+                }
+                for image in result.evidence.images
+            ],
+            "conflicts": list(result.evidence.conflicts),
+        },
+    }
+
+
+def _mimo_v2_action_payload(action: MimoV2Action) -> dict[str, Any]:
+    return {
+        "kind": action.kind,
+        "target": {
+            "lifecycle_id": action.target_lifecycle_id,
+            "thread_id": action.target_thread_id,
+        },
+        "strategy": (
+            _plain_mapping(action.strategy)
+            if action.strategy is not None
+            else None
+        ),
+        "parameters": _plain_mapping(action.parameters),
+    }
+
+
+def _plain_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
+    plain: dict[str, Any] = {}
+    for key, item in value.items():
+        if isinstance(item, Mapping):
+            plain[str(key)] = _plain_mapping(item)
+        elif isinstance(item, tuple):
+            plain[str(key)] = list(item)
+        else:
+            plain[str(key)] = item
+    return plain
+
+
 def finalize_claimed_mimo_message_evidence(
     session_factory: sessionmaker,
     *,
@@ -638,6 +786,7 @@ def save_message_evidence_version(
     text_evidence: Mapping[str, Any],
     image_evidence: Mapping[str, Any],
     normalized_evidence: Mapping[str, Any],
+    mimo_recognition_run_id: int | None = None,
 ) -> MessageEvidenceVersion:
     """Save one immutable version, returning an existing identical version."""
 
@@ -653,6 +802,7 @@ def save_message_evidence_version(
             text_evidence=text_evidence,
             image_evidence=image_evidence,
             normalized_evidence=normalized_evidence,
+            mimo_recognition_run_id=mimo_recognition_run_id,
         )
         session.commit()
         session.refresh(row)
@@ -672,6 +822,7 @@ def _save_message_evidence_version_in_session(
     text_evidence: Mapping[str, Any],
     image_evidence: Mapping[str, Any],
     normalized_evidence: Mapping[str, Any],
+    mimo_recognition_run_id: int | None = None,
 ) -> MessageEvidenceVersion:
     if session.get(RawMessage, int(raw_message_id)) is None:
         raise LookupError("raw message not found")
@@ -704,6 +855,7 @@ def _save_message_evidence_version_in_session(
                     normalized_evidence_json=_canonical_json(
                         dict(normalized_evidence)
                     ),
+                    mimo_recognition_run_id=mimo_recognition_run_id,
                     superseded_at=None,
                 )
             )
@@ -729,6 +881,11 @@ def _save_message_evidence_version_in_session(
     )
     row = MessageEvidenceVersion(
         raw_message_id=int(raw_message_id),
+        mimo_recognition_run_id=(
+            int(mimo_recognition_run_id)
+            if mimo_recognition_run_id is not None
+            else None
+        ),
         version=int(last_version or 0) + 1,
         input_fingerprint=str(input_fingerprint),
         model=str(model),

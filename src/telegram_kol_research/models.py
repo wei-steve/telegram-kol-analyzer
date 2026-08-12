@@ -223,6 +223,9 @@ class MessageEvidenceVersion(Base):
     raw_message_id: Mapped[int] = mapped_column(
         ForeignKey("raw_messages.id"), nullable=False, index=True
     )
+    mimo_recognition_run_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("mimo_recognition_runs.id"), nullable=True, index=True
+    )
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     input_fingerprint: Mapped[str] = mapped_column(String(80), nullable=False)
     model: Mapped[str] = mapped_column(String(128), nullable=False)

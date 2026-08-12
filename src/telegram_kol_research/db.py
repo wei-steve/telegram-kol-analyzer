@@ -111,6 +111,12 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
     "media_assets": {
         "ocr_text": "ALTER TABLE media_assets ADD COLUMN ocr_text TEXT",
     },
+    "message_evidence_versions": {
+        "mimo_recognition_run_id": (
+            "ALTER TABLE message_evidence_versions ADD COLUMN "
+            "mimo_recognition_run_id INTEGER REFERENCES mimo_recognition_runs(id)"
+        ),
+    },
     "signal_candidates": {
         "source_id": "ALTER TABLE signal_candidates ADD COLUMN source_id INTEGER",
         "event_type": "ALTER TABLE signal_candidates ADD COLUMN event_type VARCHAR(64) NOT NULL DEFAULT 'entry_signal'",
@@ -473,6 +479,11 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
 }
 
 SQLITE_COMPAT_INDEXES: dict[str, str] = {
+    "ix_message_evidence_versions_mimo_recognition_run_id": (
+        "CREATE INDEX IF NOT EXISTS "
+        "ix_message_evidence_versions_mimo_recognition_run_id "
+        "ON message_evidence_versions (mimo_recognition_run_id)"
+    ),
     "ix_mimo_recognition_runs_message_status_created": (
         "CREATE INDEX IF NOT EXISTS "
         "ix_mimo_recognition_runs_message_status_created "
