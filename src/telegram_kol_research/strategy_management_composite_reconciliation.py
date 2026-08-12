@@ -20,6 +20,10 @@ from telegram_kol_research.position_mutation_intents import (
 from telegram_kol_research.strategy_management_components import (
     transition_management_component,
 )
+from telegram_kol_research.strategy_management_composite_executor import (
+    _approved_effective_remaining_size,
+    _component_evidence_value,
+)
 from telegram_kol_research.strategy_management_reconciliation import (
     classify_composite_close_reconciliation,
 )
@@ -69,6 +73,7 @@ def reconcile_composite_management_components(
             if component is None or component.status not in {"submitting", "awaiting_exchange"}:
                 continue
             desired = json.loads(component.desired_json or "{}")
+            evidence = _component_evidence_value(component.evidence_json)
             instrument_id = _component_instrument(session, component, desired)
             current_status = component.status
         if not instrument_id:
@@ -96,7 +101,7 @@ def reconcile_composite_management_components(
         elif kind == "converge_partial_close":
             outcome = _reconcile_close_component(
                 session_factory, component_id, desired, current_status,
-                snapshot["positions"], reconciled_at,
+                evidence, snapshot["positions"], reconciled_at,
             )
         elif kind == "replace_remaining_protection":
             outcome = _reconcile_protection_component(
@@ -165,9 +170,43 @@ def _reconcile_tp_component(session_factory, component_id, desired, status, now)
 
 
 def _reconcile_close_component(
-    session_factory, component_id, desired, status, positions, now
+    session_factory, component_id, desired, status, evidence, positions, now
 ):
     execution = desired.get("partial_close_execution") or {}
+    matches = [
+        row for row in positions
+        if str(row.get("posId") or "") == str(desired.get("pos_id") or "")
+    ]
+    if len(matches) != 1:
+        return "awaiting"
+    approved_remaining = _approved_effective_remaining_size(
+        desired=desired,
+        evidence=evidence,
+        current_size=matches[0].get("pos"),
+    )
+    if approved_remaining is not None and not execution:
+        with session_factory() as session:
+            has_close_intent = session.query(PositionMutationIntent.id).filter(
+                PositionMutationIntent.idempotency_key.like(
+                    f"{int(component_id)}:close:%"
+                )
+            ).first() is not None
+        if has_close_intent:
+            return "awaiting"
+        _component_transition(
+            session_factory,
+            component_id,
+            status,
+            "confirmed",
+            now,
+            "approved_under_target_exchange_confirmed",
+            {
+                "effective_remaining_size": approved_remaining,
+                "evidence_tier": "approved_under_target_recovery",
+                "remaining_size": approved_remaining,
+            },
+        )
+        return "reconciled"
     intent_id = execution.get("intent_id")
     if not intent_id:
         return "awaiting"
@@ -186,12 +225,6 @@ def _reconcile_close_component(
         _component_transition(session_factory, component_id, status, "recovery_required", now,
                               "close_reserved_before_write")
         return "recoverable"
-    matches = [
-        row for row in positions
-        if str(row.get("posId") or "") == str(desired.get("pos_id") or "")
-    ]
-    if len(matches) != 1:
-        return "awaiting"
     result = classify_composite_close_reconciliation(
         trusted_start_size=desired.get("trusted_start_size"),
         target_remaining_size=desired.get("target_remaining_size"),

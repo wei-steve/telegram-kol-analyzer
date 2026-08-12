@@ -3053,3 +3053,17 @@ def test_apply_position_absent_terminalizes_without_exchange_intent(tmp_path):
         applied_at=NOW,
     )
     assert repeated.status == "already_repaired"
+
+    from telegram_kol_research.strategy_management_composite_executor import (
+        execute_composite_management_batch,
+    )
+
+    with pytest.raises(ValueError, match="composite_batch_not_executable:resolved"):
+        execute_composite_management_batch(
+            factory,
+            batch_id=119,
+            deepcoin_client=SimpleNamespace(),
+            contract_spec_provider=None,
+            live_execution_gate=lambda: True,
+            now_provider=lambda: NOW,
+        )

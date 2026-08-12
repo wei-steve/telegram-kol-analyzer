@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
 from telegram_kol_research.models import (
@@ -69,6 +70,124 @@ class CompositeComponentExecutionResult:
     proven_filled_quantity: str = "0"
     cancel_intent_ids: tuple[int, ...] = ()
     close_intent_ids: tuple[int, ...] = ()
+
+
+def _approved_effective_remaining_size(
+    *, desired: dict[str, Any], evidence: Any, current_size: object
+) -> str | None:
+    """Return one exact reviewed under-target size, otherwise fail closed."""
+
+    if not isinstance(evidence, list):
+        return None
+    records = [
+        row
+        for row in evidence
+        if isinstance(row, dict)
+        and row.get("kind") == "approved_under_target_recovery"
+    ]
+    if len(records) != 1:
+        return None
+    record = records[0]
+    if set(record) != {
+        "kind",
+        "actual_remaining_size",
+        "original_target_remaining_size",
+        "recovery_evidence_fingerprint",
+    }:
+        return None
+    fingerprint = record.get("recovery_evidence_fingerprint")
+    if (
+        not isinstance(fingerprint, str)
+        or len(fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in fingerprint)
+    ):
+        return None
+    target_text = desired.get("target_remaining_size")
+    actual_text = record.get("actual_remaining_size")
+    if (
+        not isinstance(target_text, str)
+        or not isinstance(actual_text, str)
+        or record.get("original_target_remaining_size") != target_text
+    ):
+        return None
+    try:
+        target = Decimal(target_text)
+        actual = Decimal(actual_text)
+        current = Decimal(str(current_size))
+        step = Decimal(str(desired.get("quantity_step")))
+        minimum = Decimal(str(desired.get("min_quantity")))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if (
+        any(
+            not value.is_finite()
+            for value in (target, actual, current, step, minimum)
+        )
+        or target <= 0
+        or step <= 0
+        or minimum <= 0
+        or actual < minimum
+        or actual >= target
+        or actual != current
+        or actual % step != 0
+        or format(actual.normalize(), "f") != actual_text
+    ):
+        return None
+    return actual_text
+
+
+def _effective_remaining_size(
+    *, desired: dict[str, Any], evidence: Any, current_size: object
+) -> str:
+    approved = _approved_effective_remaining_size(
+        desired=desired,
+        evidence=evidence,
+        current_size=current_size,
+    )
+    if approved is not None:
+        return approved
+    target_remaining_close_delta(
+        trusted_start_size=desired["trusted_start_size"],
+        target_remaining_size=desired["target_remaining_size"],
+        current_size=current_size,
+        quantity_step=desired["quantity_step"],
+        min_quantity=desired["min_quantity"],
+    )
+    return str(desired["target_remaining_size"])
+
+
+def _component_evidence_value(value: object) -> Any:
+    if not isinstance(value, str):
+        return None
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+
+def _require_exact_effective_position(
+    *,
+    desired: dict[str, Any],
+    evidence: Any,
+    current_size: object,
+    expected_effective_remaining: str,
+    require_converged: bool = False,
+) -> None:
+    current_effective = _effective_remaining_size(
+        desired=desired,
+        evidence=evidence,
+        current_size=current_size,
+    )
+    if current_effective != expected_effective_remaining:
+        raise ManagementSizingError("effective_remaining_size_changed")
+    if require_converged and target_remaining_close_delta(
+        trusted_start_size=desired["trusted_start_size"],
+        target_remaining_size=expected_effective_remaining,
+        current_size=current_size,
+        quantity_step=desired["quantity_step"],
+        min_quantity=desired["min_quantity"],
+    ) != "0":
+        raise ManagementSizingError("partial_close_component_not_converged")
 
 
 def execute_composite_management_batch(
@@ -339,6 +458,13 @@ def execute_take_profit_consumption_component(
     if isinstance(loaded, CompositeComponentExecutionResult):
         return loaded
     batch, component, leg, contract, desired = loaded
+    component_evidence = _component_evidence_value(component.evidence_json)
+    if not isinstance(component_evidence, list):
+        return CompositeComponentExecutionResult(
+            status="operator_required",
+            component_id=component.id,
+            reason_code="management_component_evidence_invalid",
+        )
     if component.status in PROTECTED_RECONCILIATION_STATUSES:
         return _result(component)
     if component.attempt_count >= 3:
@@ -381,8 +507,33 @@ def execute_take_profit_consumption_component(
             {"error_type": type(exc).__name__},
         )
         return _current_result(session_factory, component_id)
+    live_position = _unique_live_position(snapshot["positions"], desired["pos_id"])
+    if live_position is None:
+        _transition(
+            session_factory, component_id, "preflighting", "recovery_required",
+            now, "target_live_position_not_unique",
+        )
+        return _current_result(session_factory, component_id)
+    try:
+        effective_remaining = _effective_remaining_size(
+            desired=desired,
+            evidence=component_evidence,
+            current_size=live_position.get("pos"),
+        )
+    except ManagementSizingError as exc:
+        _transition(
+            session_factory, component_id, "preflighting", "operator_required",
+            now, str(exc), {"phase": "take_profit_size_preflight"},
+        )
+        return _current_result(session_factory, component_id)
     plan = _plan(
-        session_factory, batch, leg, contract, desired, snapshot
+        session_factory,
+        batch,
+        leg,
+        contract,
+        desired,
+        snapshot,
+        target_remaining_size=effective_remaining,
     )
     if plan.refusal_code:
         _transition(
@@ -421,13 +572,6 @@ def execute_take_profit_consumption_component(
         )
 
     action = plan.cancel_actions[0]
-    live_position = _unique_live_position(snapshot["positions"], desired["pos_id"])
-    if live_position is None:
-        _transition(
-            session_factory, component_id, "preflighting", "recovery_required",
-            now, "target_live_position_not_unique"
-        )
-        return _current_result(session_factory, component_id)
     try:
         with session_factory() as session:
             authority = build_position_mutation_authority(
@@ -493,8 +637,49 @@ def execute_take_profit_consumption_component(
             {"intent_id": result.intent_id, "error_type": type(exc).__name__},
         )
         return _current_result(session_factory, component_id, intent_ids=intent_ids)
+    refreshed_position = _unique_live_position(
+        refreshed["positions"], desired["pos_id"]
+    )
+    if refreshed_position is None:
+        _transition(
+            session_factory,
+            component_id,
+            "submitting",
+            "awaiting_exchange",
+            now_provider(),
+            "take_profit_post_write_position_not_unique",
+            {"intent_id": result.intent_id},
+        )
+        return _current_result(
+            session_factory, component_id, intent_ids=intent_ids
+        )
+    try:
+        refreshed_effective_remaining = _effective_remaining_size(
+            desired=desired,
+            evidence=component_evidence,
+            current_size=refreshed_position.get("pos"),
+        )
+    except ManagementSizingError as exc:
+        _transition(
+            session_factory,
+            component_id,
+            "submitting",
+            "operator_required",
+            now_provider(),
+            str(exc),
+            {"intent_id": result.intent_id, "phase": "take_profit_readback"},
+        )
+        return _current_result(
+            session_factory, component_id, intent_ids=intent_ids
+        )
     refreshed_plan = _plan(
-        session_factory, batch, leg, contract, desired, refreshed
+        session_factory,
+        batch,
+        leg,
+        contract,
+        desired,
+        refreshed,
+        target_remaining_size=refreshed_effective_remaining,
     )
     if result.status == "rejected":
         if (
@@ -588,6 +773,31 @@ def execute_take_profit_consumption_component(
             latest = _exchange_snapshot(
                 deepcoin_client, desired["instrument_id"]
             )
+            latest_position = _unique_live_position(
+                latest["positions"], desired["pos_id"]
+            )
+            if latest_position is None:
+                raise RuntimeError("target_live_position_not_unique")
+            try:
+                _require_exact_effective_position(
+                    desired=desired,
+                    evidence=component_evidence,
+                    current_size=latest_position.get("pos"),
+                    expected_effective_remaining=effective_remaining,
+                )
+            except ManagementSizingError as exc:
+                _transition(
+                    session_factory,
+                    component_id,
+                    "submitting",
+                    "operator_required",
+                    now_provider(),
+                    str(exc),
+                    {"phase": "take_profit_multi_cancel_readback"},
+                )
+                return _current_result(
+                    session_factory, component_id, intent_ids=intent_ids
+                )
             if extra_action["order_id"] in _pending_ids(latest["pending"]):
                 _transition(
                     session_factory, component_id, "submitting",
@@ -641,6 +851,13 @@ def execute_partial_close_component(
     if isinstance(loaded, CompositeComponentExecutionResult):
         return loaded
     batch, component, _leg, _contract, desired = loaded
+    component_evidence = _component_evidence_value(component.evidence_json)
+    if not isinstance(component_evidence, list):
+        return CompositeComponentExecutionResult(
+            status="operator_required",
+            component_id=component.id,
+            reason_code="management_component_evidence_invalid",
+        )
     if component.status in PROTECTED_RECONCILIATION_STATUSES:
         return _result(component)
     with session_factory() as session:
@@ -680,9 +897,14 @@ def execute_partial_close_component(
         live_position = _unique_live_position(positions, desired["pos_id"])
         if live_position is None:
             raise RuntimeError("target_live_position_not_unique")
+        effective_remaining = _effective_remaining_size(
+            desired=desired,
+            evidence=component_evidence,
+            current_size=live_position.get("pos"),
+        )
         delta = target_remaining_close_delta(
             trusted_start_size=desired["trusted_start_size"],
-            target_remaining_size=desired["target_remaining_size"],
+            target_remaining_size=effective_remaining,
             current_size=live_position.get("pos"),
             quantity_step=desired["quantity_step"],
             min_quantity=desired["min_quantity"],
@@ -701,13 +923,22 @@ def execute_partial_close_component(
         return _current_result(session_factory, component_id)
 
     if delta == "0":
+        evidence_tier = (
+            "approved_under_target_recovery"
+            if effective_remaining != desired["target_remaining_size"]
+            else "exact_position_target"
+        )
         _transition(
             session_factory, component_id, "preflighting", "submitting", now,
             evidence={"close_delta": "0"},
         )
         _transition(
             session_factory, component_id, "submitting", "confirmed", now,
-            evidence={"remaining_size": desired["target_remaining_size"]},
+            evidence={
+                "effective_remaining_size": effective_remaining,
+                "evidence_tier": evidence_tier,
+                "remaining_size": effective_remaining,
+            },
         )
         return _current_result(session_factory, component_id)
     try:
@@ -849,6 +1080,13 @@ def execute_protection_replacement_component(
     if isinstance(loaded, CompositeComponentExecutionResult):
         return loaded
     batch, component, leg, contract, desired = loaded
+    component_evidence = _component_evidence_value(component.evidence_json)
+    if not isinstance(component_evidence, list):
+        return CompositeComponentExecutionResult(
+            status="operator_required",
+            component_id=component.id,
+            reason_code="management_component_evidence_invalid",
+        )
     if component.status in PROTECTED_RECONCILIATION_STATUSES:
         return _result(component)
     if component.attempt_count >= 3:
@@ -896,9 +1134,14 @@ def execute_protection_replacement_component(
         live_position = _unique_live_position(positions, desired["pos_id"])
         if live_position is None:
             raise RuntimeError("target_live_position_not_unique")
+        effective_remaining = _effective_remaining_size(
+            desired=desired,
+            evidence=component_evidence,
+            current_size=live_position.get("pos"),
+        )
         if target_remaining_close_delta(
             trusted_start_size=desired["trusted_start_size"],
-            target_remaining_size=desired["target_remaining_size"],
+            target_remaining_size=effective_remaining,
             current_size=live_position.get("pos"),
             quantity_step=desired["quantity_step"],
             min_quantity=desired["min_quantity"],
@@ -970,6 +1213,7 @@ def execute_protection_replacement_component(
         "backup_stop": decision.backup_stop,
         "old_stop_order_ids": old_stop_ids,
         "retained_take_profit_total": retained_total,
+        "effective_remaining_size": effective_remaining,
     }
     _persist_protection_plan_and_enter_submitting(
         session_factory, component_id=component.id, plan=plan, now=now
@@ -978,7 +1222,7 @@ def execute_protection_replacement_component(
         "instId": desired["instrument_id"],
         "posSide": contract.side,
         "posId": desired["pos_id"],
-        "sz": desired["target_remaining_size"],
+        "sz": effective_remaining,
         "slTriggerPxType": "last",
         "slOrdPx": "-1",
     }
@@ -1021,12 +1265,25 @@ def execute_protection_replacement_component(
     # Both new stops are now read back and canonically owned. Only now may old
     # protection be cancelled.
     for old_order_id in sorted(old_stop_ids):
-        positions = deepcoin_client.list_positions(inst_id=desired["instrument_id"])
-        live_position = _unique_live_position(positions, desired["pos_id"])
-        pending_before_cancel = deepcoin_client.list_trigger_orders_pending(
-            inst_id=desired["instrument_id"]
-        )
         try:
+            positions = deepcoin_client.list_positions(
+                inst_id=desired["instrument_id"]
+            )
+            live_position = _unique_live_position(
+                positions, desired["pos_id"]
+            )
+            if live_position is None:
+                raise RuntimeError("target_live_position_not_unique")
+            _require_exact_effective_position(
+                desired=desired,
+                evidence=component_evidence,
+                current_size=live_position.get("pos"),
+                expected_effective_remaining=effective_remaining,
+                require_converged=True,
+            )
+            pending_before_cancel = deepcoin_client.list_trigger_orders_pending(
+                inst_id=desired["instrument_id"]
+            )
             with session_factory() as session:
                 authority = build_position_mutation_authority(
                     session, venue="deepcoin", pos_id=desired["pos_id"],
@@ -1047,6 +1304,17 @@ def execute_protection_replacement_component(
                     else None
                 ),
             )
+        except ManagementSizingError as exc:
+            _transition(
+                session_factory,
+                component.id,
+                "submitting",
+                "operator_required",
+                now_provider(),
+                str(exc),
+                {"phase": "old_stop_cancel_position_recheck"},
+            )
+            return _current_result(session_factory, component.id)
         except Exception as exc:
             _transition(
                 session_factory, component.id, "submitting", "awaiting_exchange",
@@ -1086,6 +1354,13 @@ def execute_protection_replacement_component(
         final_position = _unique_live_position(final_positions, desired["pos_id"])
         if final_position is None:
             raise ValueError("target_live_position_not_unique")
+        _require_exact_effective_position(
+            desired=desired,
+            evidence=component_evidence,
+            current_size=final_position.get("pos"),
+            expected_effective_remaining=effective_remaining,
+            require_converged=True,
+        )
         with session_factory() as session:
             final_rows = session.query(PositionProtectionLedger).filter(
                 PositionProtectionLedger.execution_binding_id == batch.execution_binding_id,
@@ -1136,13 +1411,13 @@ def execute_protection_replacement_component(
                         role="primary_stop",
                         order_id=created_order_ids[0],
                         trigger_price=decision.primary_stop,
-                        size_text=desired["target_remaining_size"],
+                        size_text=effective_remaining,
                     ),
                     VerifiedProtectionReplacement(
                         role="backup_stop",
                         order_id=created_order_ids[1],
                         trigger_price=decision.backup_stop,
-                        size_text=desired["target_remaining_size"],
+                        size_text=effective_remaining,
                     ),
                     *retained_take_profits,
                 ),
@@ -1161,6 +1436,7 @@ def execute_protection_replacement_component(
             "new_stop_order_ids": created_order_ids,
             "cancelled_old_stop_order_ids": sorted(old_stop_ids),
             "retained_take_profit_total": retained_total,
+            "effective_remaining_size": effective_remaining,
         },
     )
     return _current_result(session_factory, component.id)
@@ -1251,7 +1527,16 @@ def _exchange_snapshot(client: Any, instrument_id: str) -> dict[str, list]:
     }
 
 
-def _plan(session_factory, batch, leg, contract, desired, snapshot):
+def _plan(
+    session_factory,
+    batch,
+    leg,
+    contract,
+    desired,
+    snapshot,
+    *,
+    target_remaining_size: str | None = None,
+):
     with session_factory() as session:
         ledger = session.query(PositionProtectionLedger).filter(
             PositionProtectionLedger.execution_binding_id == batch.execution_binding_id,
@@ -1275,7 +1560,9 @@ def _plan(session_factory, batch, leg, contract, desired, snapshot):
             trade_fills=snapshot["fills"],
             protection_ledger=ledger,
             trusted_start_size=desired["trusted_start_size"],
-            target_remaining_size=desired["target_remaining_size"],
+            target_remaining_size=(
+                target_remaining_size or desired["target_remaining_size"]
+            ),
         )
 
 

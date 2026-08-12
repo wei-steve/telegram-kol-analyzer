@@ -5928,6 +5928,226 @@ def test_composite_consumption_executes_all_conservative_owned_tp_cancels(tmp_pa
     ]
 
 
+def test_approved_under_target_bounds_retained_take_profit_to_actual_size(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "consume-under-target.db")
+    batch_id, component_id = _persist_composite_consumption_component(
+        session_factory
+    )
+    with session_factory() as session:
+        first = session.query(PositionProtectionLedger).filter_by(
+            order_id="tp-first"
+        ).one()
+        session.add(
+            PositionProtectionLedger(
+                venue=first.venue,
+                execution_binding_id=first.execution_binding_id,
+                execution_order_leg_id=first.execution_order_leg_id,
+                strategy_instance_id=first.strategy_instance_id,
+                pos_id=first.pos_id,
+                instrument_id=first.instrument_id,
+                side=first.side,
+                order_id="tp-second",
+                purpose="take_profit",
+                trigger_price="66000",
+                size_text="5",
+                status="verified",
+                evidence_source="test",
+                evidence_json='{"stage":2}',
+                first_seen_at=NOW,
+                last_seen_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+    _append_under_target_attestation(session_factory)
+
+    class UnderTargetClient(_CompositeConsumptionClient):
+        def __init__(self):
+            super().__init__()
+            self.pending.append(
+                {
+                    "ordId": "tp-second",
+                    "posId": "pos-composite",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "triggerOrderType": "TPSL",
+                    "tpTriggerPx": "66000",
+                    "sz": "5",
+                }
+            )
+
+        def list_positions(self, *, inst_id=None):
+            rows = super().list_positions(inst_id=inst_id)
+            rows[0]["pos"] = "4"
+            return rows
+
+        def cancel_position_sltp(self, payload):
+            self.cancel_calls.append(dict(payload))
+            self.pending = [
+                row for row in self.pending if row["ordId"] != payload["ordId"]
+            ]
+            return {"code": "0", "data": {"ordId": payload["ordId"]}}
+
+    client = UnderTargetClient()
+    result = _execute_consumption(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "confirmed"
+    assert [call["ordId"] for call in client.cancel_calls] == [
+        "tp-first",
+        "tp-second",
+    ]
+
+
+def test_approved_under_target_take_profit_fails_closed_on_position_change(
+    tmp_path,
+):
+    session_factory = create_session_factory(
+        tmp_path / "consume-under-target-drift.db"
+    )
+    batch_id, component_id = _persist_composite_consumption_component(
+        session_factory
+    )
+    _append_under_target_attestation(session_factory)
+
+    class DriftClient(_CompositeConsumptionClient):
+        def __init__(self):
+            super().__init__()
+            self.current_size = "4"
+
+        def list_positions(self, *, inst_id=None):
+            rows = super().list_positions(inst_id=inst_id)
+            rows[0]["pos"] = self.current_size
+            return rows
+
+        def cancel_position_sltp(self, payload):
+            response = super().cancel_position_sltp(payload)
+            self.current_size = "3"
+            return response
+
+    client = DriftClient()
+    result = _execute_consumption(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "operator_required"
+    assert result.reason_code == "position_below_target_remaining"
+    assert len(client.cancel_calls) == 1
+
+
+def test_under_target_multi_cancel_rechecks_position_after_every_write(tmp_path):
+    session_factory = create_session_factory(
+        tmp_path / "consume-under-target-multi-drift.db"
+    )
+    batch_id, component_id = _persist_composite_consumption_component(
+        session_factory
+    )
+    with session_factory() as session:
+        first = session.query(PositionProtectionLedger).filter_by(
+            order_id="tp-first"
+        ).one()
+        session.add(
+            PositionProtectionLedger(
+                venue=first.venue,
+                execution_binding_id=first.execution_binding_id,
+                execution_order_leg_id=first.execution_order_leg_id,
+                strategy_instance_id=first.strategy_instance_id,
+                pos_id=first.pos_id,
+                instrument_id=first.instrument_id,
+                side=first.side,
+                order_id="tp-second",
+                purpose="take_profit",
+                trigger_price="66000",
+                size_text="5",
+                status="verified",
+                evidence_source="test",
+                evidence_json='{"stage":2}',
+                first_seen_at=NOW,
+                last_seen_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+    _append_under_target_attestation(session_factory)
+
+    class MultiDriftClient(_CompositeConsumptionClient):
+        def __init__(self):
+            super().__init__()
+            self.current_size = "4"
+            self.pending.append(
+                {
+                    "ordId": "tp-second",
+                    "posId": "pos-composite",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "triggerOrderType": "TPSL",
+                    "tpTriggerPx": "66000",
+                    "sz": "5",
+                }
+            )
+
+        def list_positions(self, *, inst_id=None):
+            rows = super().list_positions(inst_id=inst_id)
+            rows[0]["pos"] = self.current_size
+            return rows
+
+        def cancel_position_sltp(self, payload):
+            self.cancel_calls.append(dict(payload))
+            self.pending = [
+                row for row in self.pending if row["ordId"] != payload["ordId"]
+            ]
+            if payload["ordId"] == "tp-second":
+                self.current_size = "3"
+            return {"code": "0", "data": {"ordId": payload["ordId"]}}
+
+    client = MultiDriftClient()
+    result = _execute_consumption(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "operator_required"
+    assert result.reason_code == "position_below_target_remaining"
+    assert [call["ordId"] for call in client.cancel_calls] == [
+        "tp-first",
+        "tp-second",
+    ]
+
+
+def test_malformed_under_target_evidence_fails_closed_without_write(tmp_path):
+    session_factory = create_session_factory(
+        tmp_path / "consume-under-target-malformed.db"
+    )
+    batch_id, component_id = _persist_composite_consumption_component(
+        session_factory
+    )
+    with session_factory() as session:
+        from telegram_kol_research.models import StrategyManagementComponent
+
+        component = session.get(StrategyManagementComponent, component_id)
+        component.evidence_json = "["
+        session.commit()
+
+    class UnderTargetClient(_CompositeConsumptionClient):
+        def list_positions(self, *, inst_id=None):
+            rows = super().list_positions(inst_id=inst_id)
+            rows[0]["pos"] = "4"
+            return rows
+
+    client = UnderTargetClient()
+    result = _execute_consumption(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "operator_required"
+    assert result.reason_code == "management_component_evidence_invalid"
+    assert client.cancel_calls == []
+
+
 def test_composite_cancel_unknown_awaits_exchange_and_restart_never_resubmits(tmp_path):
     session_factory = create_session_factory(tmp_path / "consume-unknown.db")
     batch_id, component_id = _persist_composite_consumption_component(session_factory)
@@ -6163,6 +6383,115 @@ def _execute_composite_close(session_factory, batch_id, component_id, client):
     )
 
 
+def test_approved_effective_remaining_size_requires_exact_bounded_attestation():
+    from telegram_kol_research.strategy_management_composite_executor import (
+        _approved_effective_remaining_size,
+    )
+
+    desired = {
+        "target_remaining_size": "5",
+        "quantity_step": "1",
+        "min_quantity": "1",
+    }
+    attestation = {
+        "kind": "approved_under_target_recovery",
+        "actual_remaining_size": "4",
+        "original_target_remaining_size": "5",
+        "recovery_evidence_fingerprint": "a" * 64,
+    }
+
+    assert _approved_effective_remaining_size(
+        desired=desired,
+        evidence=[{"prior": "fact"}, attestation],
+        current_size="4",
+    ) == "4"
+    assert _approved_effective_remaining_size(
+        desired=desired,
+        evidence=[attestation, attestation],
+        current_size="4",
+    ) is None
+    assert _approved_effective_remaining_size(
+        desired=desired,
+        evidence=[attestation],
+        current_size="3",
+    ) is None
+    assert _approved_effective_remaining_size(
+        desired=desired,
+        evidence=[{**attestation, "actual_remaining_size": "5"}],
+        current_size="5",
+    ) is None
+
+
+def _append_under_target_attestation(
+    session_factory, *, actual_size="4", target_size="5", component_ids=None
+):
+    from telegram_kol_research.models import StrategyManagementComponent
+
+    attestation = {
+        "kind": "approved_under_target_recovery",
+        "actual_remaining_size": actual_size,
+        "original_target_remaining_size": target_size,
+        "recovery_evidence_fingerprint": "a" * 64,
+    }
+    with session_factory() as session:
+        query = session.query(StrategyManagementComponent)
+        if component_ids is not None:
+            query = query.filter(StrategyManagementComponent.id.in_(component_ids))
+        components = query.all()
+        for component in components:
+            evidence = json.loads(component.evidence_json or "[]")
+            component.evidence_json = json.dumps(
+                [*evidence, attestation], sort_keys=True
+            )
+        session.commit()
+    return attestation
+
+
+def test_approved_under_target_confirms_zero_delta_without_close(tmp_path):
+    session_factory = create_session_factory(tmp_path / "close-under-target.db")
+    batch_id, component_id = _prepare_composite_close_component(session_factory)
+    _append_under_target_attestation(session_factory)
+    client = _CompositeCloseClient(current_size="4")
+
+    result = _execute_composite_close(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "confirmed"
+    assert client.close_calls == []
+    with session_factory() as session:
+        from telegram_kol_research.models import StrategyManagementComponent
+
+        component = session.get(StrategyManagementComponent, component_id)
+        assert component.status == "confirmed"
+        assert json.loads(component.desired_json)["target_remaining_size"] == "5"
+        assert json.loads(component.evidence_json)[-1] == {
+            "effective_remaining_size": "4",
+            "evidence_tier": "approved_under_target_recovery",
+            "remaining_size": "4",
+        }
+
+
+@pytest.mark.parametrize("actual_size", ["3", "4"])
+def test_under_target_attestation_fails_if_position_or_evidence_changes(
+    tmp_path, actual_size
+):
+    session_factory = create_session_factory(
+        tmp_path / f"close-under-target-mismatch-{actual_size}.db"
+    )
+    batch_id, component_id = _prepare_composite_close_component(session_factory)
+    _append_under_target_attestation(session_factory, actual_size=actual_size)
+    client = _CompositeCloseClient(current_size="3" if actual_size == "4" else "4")
+
+    result = _execute_composite_close(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "operator_required"
+    assert result.reason_code == "position_below_target_remaining"
+    assert client.close_calls == []
+
+
 def test_composite_close_submits_exact_delta_and_confirms_target_remaining(tmp_path):
     session_factory = create_session_factory(tmp_path / "close-confirmed.db")
     batch_id, component_id = _prepare_composite_close_component(session_factory)
@@ -6175,6 +6504,59 @@ def test_composite_close_submits_exact_delta_and_confirms_target_remaining(tmp_p
     assert result.status == "confirmed"
     assert [call["sz"] for call in client.close_calls] == ["5"]
     assert client.close_calls[0]["closePosId"] == "pos-composite"
+
+
+def test_recovered_batch_closes_only_frozen_delta_38_to_19(tmp_path):
+    session_factory = create_session_factory(tmp_path / "close-frozen-target.db")
+    batch_id, component_id = _prepare_composite_close_component(session_factory)
+    with session_factory() as session:
+        from telegram_kol_research.models import StrategyManagementComponent
+
+        components = session.query(StrategyManagementComponent).filter_by(
+            management_batch_id=batch_id
+        ).all()
+        for component in components:
+            desired = json.loads(component.desired_json)
+            desired["trusted_start_size"] = "38"
+            desired["target_remaining_size"] = "19"
+            component.desired_json = json.dumps(desired, sort_keys=True)
+        leg = session.query(StrategyManagementLeg).filter_by(
+            management_batch_id=batch_id
+        ).one()
+        leg.preflight_size = "38"
+        leg.planned_close_size = "19"
+        session.commit()
+
+    class FrozenTargetClient(_CompositeCloseClient):
+        def __init__(self):
+            super().__init__(current_size="38")
+
+        def place_order(self, payload):
+            self.close_calls.append(dict(payload))
+            self.current_size = "19"
+            return {"code": "0", "data": {"ordId": "close-composite"}}
+
+    client = FrozenTargetClient()
+    result = _execute_composite_close(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "confirmed"
+    assert [call["sz"] for call in client.close_calls] == ["19"]
+    assert all(call["sz"] != "9" for call in client.close_calls)
+
+
+def test_at_target_submits_no_close_and_confirms_exact_remaining(tmp_path):
+    session_factory = create_session_factory(tmp_path / "close-at-target.db")
+    batch_id, component_id = _prepare_composite_close_component(session_factory)
+    client = _CompositeCloseClient(current_size="5")
+
+    result = _execute_composite_close(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "confirmed"
+    assert client.close_calls == []
 
 
 def test_composite_close_unknown_never_retries_on_restart(tmp_path):
@@ -6330,6 +6712,7 @@ class _CompositeProtectionClient(_CompositeCloseClient):
         self.cancel_rejected = cancel_rejected
         self.cancel_unknown_once = cancel_unknown_once
         self.events = []
+        self.set_calls = []
         self.pending = [
             {
                 "ordId": "tp-retained", "posId": "pos-composite",
@@ -6355,6 +6738,7 @@ class _CompositeProtectionClient(_CompositeCloseClient):
         return rows
 
     def set_position_sltp(self, payload):
+        self.set_calls.append(dict(payload))
         self._set_count += 1
         role = "primary" if self._set_count == 1 else "backup"
         self.events.append(f"set_{role}")
@@ -6415,6 +6799,7 @@ def test_composite_protection_creates_and_owns_both_stops_before_cancelling_old(
     )
 
     assert result.status == "confirmed"
+    assert [call["sz"] for call in client.set_calls] == ["5", "5"]
     assert client.events[:4] == [
         "set_primary", "readback", "set_backup", "readback",
     ]
@@ -6462,6 +6847,103 @@ def test_composite_protection_creates_and_owns_both_stops_before_cancelling_old(
             session.query(PositionBackupStopOrder).count(),
             session.query(PositionProtectionRevision).count(),
         ) == counts
+
+
+def test_composite_protection_cannot_run_before_partial_close_confirmation(
+    tmp_path,
+):
+    session_factory = create_session_factory(
+        tmp_path / "protection-predecessor.db"
+    )
+    batch_id, component_id = _prepare_composite_protection_component(
+        session_factory
+    )
+    with session_factory() as session:
+        from telegram_kol_research.models import StrategyManagementComponent
+
+        partial = session.query(StrategyManagementComponent).filter_by(
+            management_batch_id=batch_id,
+            component_kind="converge_partial_close",
+        ).one()
+        partial.status = "awaiting_exchange"
+        partial.completed_at = None
+        session.commit()
+    client = _CompositeProtectionClient()
+
+    result = _execute_composite_protection(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "recovery_required"
+    assert result.reason_code == "composite_predecessor_not_confirmed"
+    assert client.set_calls == []
+    assert not any(event.startswith("cancel_") for event in client.events)
+
+
+def test_approved_under_target_replaces_protection_for_actual_size(tmp_path):
+    session_factory = create_session_factory(
+        tmp_path / "protection-under-target.db"
+    )
+    batch_id, component_id = _prepare_composite_protection_component(
+        session_factory, retained_size="4"
+    )
+    _append_under_target_attestation(session_factory)
+    client = _CompositeProtectionClient()
+    client.current_size = "4"
+
+    result = _execute_composite_protection(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "confirmed"
+    assert [call["sz"] for call in client.set_calls] == ["4", "4"]
+    assert client.close_calls == []
+    with session_factory() as session:
+        from telegram_kol_research.models import StrategyManagementComponent
+
+        component = session.get(StrategyManagementComponent, component_id)
+        assert json.loads(component.desired_json)["target_remaining_size"] == "5"
+        assert json.loads(component.evidence_json)[-1][
+            "effective_remaining_size"
+        ] == "4"
+        new_rows = session.query(PositionProtectionLedger).filter(
+            PositionProtectionLedger.order_id.in_(
+                ("stop-new-primary", "stop-new-backup")
+            )
+        ).all()
+        assert {row.size_text for row in new_rows} == {"4"}
+
+
+def test_under_target_position_drift_retains_old_protection(tmp_path):
+    session_factory = create_session_factory(
+        tmp_path / "protection-under-target-drift.db"
+    )
+    batch_id, component_id = _prepare_composite_protection_component(
+        session_factory, retained_size="3"
+    )
+    _append_under_target_attestation(session_factory)
+
+    class DriftBeforeCancelClient(_CompositeProtectionClient):
+        def __init__(self):
+            super().__init__()
+            self.current_size = "4"
+            self.position_reads = 0
+
+        def list_positions(self, *, inst_id=None):
+            self.position_reads += 1
+            if self.position_reads >= 4:
+                self.current_size = "3"
+            return super().list_positions(inst_id=inst_id)
+
+    client = DriftBeforeCancelClient()
+    result = _execute_composite_protection(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "operator_required"
+    assert result.reason_code == "position_below_target_remaining"
+    assert [call["sz"] for call in client.set_calls] == ["4", "4"]
+    assert not any(event.startswith("cancel_") for event in client.events)
 
 
 def test_verified_replacement_replay_heals_corrupt_and_duplicate_projections(
@@ -6667,6 +7149,61 @@ def _reconcile_composite_components(session_factory, client):
         reconciled_at=NOW,
         allow_new_writes=False,
     )
+
+
+@pytest.mark.parametrize(
+    ("attested_size", "live_size", "expected_status", "reconciled", "awaiting"),
+    [
+        ("4", "4", "confirmed", 1, 0),
+        (None, "4", "submitting", 0, 1),
+        ("4", "3", "submitting", 0, 1),
+    ],
+)
+def test_composite_reconciliation_confirms_only_exact_approved_under_target(
+    tmp_path,
+    attested_size,
+    live_size,
+    expected_status,
+    reconciled,
+    awaiting,
+):
+    session_factory = create_session_factory(
+        tmp_path / f"reconcile-under-target-{attested_size}-{live_size}.db"
+    )
+    batch_id, component_id = _prepare_composite_close_component(session_factory)
+    if attested_size is not None:
+        _append_under_target_attestation(
+            session_factory, actual_size=attested_size
+        )
+    with session_factory() as session:
+        from telegram_kol_research.models import StrategyManagementComponent
+
+        component = session.get(StrategyManagementComponent, component_id)
+        component.status = "submitting"
+        component.started_at = NOW
+        session.commit()
+    client = _CompositeCloseClient(current_size=live_size)
+
+    result = _reconcile_composite_components(session_factory, client)
+
+    assert result.reconciled == reconciled
+    assert result.awaiting == awaiting
+    assert client.close_calls == []
+    with session_factory() as session:
+        from telegram_kol_research.models import (
+            PositionMutationIntent,
+            StrategyManagementComponent,
+        )
+
+        component = session.get(StrategyManagementComponent, component_id)
+        assert component.status == expected_status
+        assert session.query(PositionMutationIntent).count() == 0
+        if expected_status == "confirmed":
+            assert json.loads(component.evidence_json)[-1] == {
+                "effective_remaining_size": "4",
+                "evidence_tier": "approved_under_target_recovery",
+                "remaining_size": "4",
+            }
 
 
 def test_composite_restart_reconciles_unknown_tp_cancel_without_second_write(tmp_path):
