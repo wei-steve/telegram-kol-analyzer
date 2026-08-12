@@ -1,4 +1,5 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+import json
 import re
 
 from fastapi.testclient import TestClient
@@ -7,7 +8,10 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ExecutionBinding,
     MediaAsset,
+    MessageEvidenceVersion,
     MessageRecognition,
+    MimoRecognitionAttempt,
+    MimoRecognitionRun,
     RawMessage,
     RecognitionDecision,
     RecognitionExperiment,
@@ -15,6 +19,228 @@ from telegram_kol_research.models import (
     StrategyLifecycle,
 )
 from telegram_kol_research.web_app import create_web_app
+
+
+def test_group_messages_route_renders_mimo_first_multidimensional_analysis(tmp_path):
+    database_path = tmp_path / "mimo-first.db"
+    session_factory = create_session_factory(database_path)
+    started_at = datetime(2026, 8, 11, 20, 0)
+    with session_factory() as session:
+        message = RawMessage(
+            chat_id=88,
+            message_id=701,
+            sender_name="MiMo UI",
+            text="移动止损到1940，最近震荡很大",
+        )
+        session.add(message)
+        session.flush()
+        media = MediaAsset(
+            raw_message_id=message.id,
+            kind="photo",
+            mime_type="image/jpeg",
+            local_path="data/media/88/701.jpg",
+        )
+        session.add(media)
+        session.flush()
+        run = MimoRecognitionRun(
+            raw_message_id=message.id,
+            run_kind="v2_authoritative",
+            contract_version="mimo-authoritative-v2",
+            model="mimo-v2.5",
+            input_kind="text+image",
+            input_fingerprint="sha256:web",
+            prompt_versions_json="{}",
+            status="completed",
+            attempt_count=2,
+            selected_attempt_ordinal=2,
+            became_authoritative=True,
+            started_at=started_at,
+            completed_at=started_at + timedelta(milliseconds=520),
+        )
+        session.add(run)
+        session.flush()
+        session.add_all(
+            [
+                MimoRecognitionAttempt(
+                    run_id=run.id,
+                    ordinal=1,
+                    status="timeout",
+                    error_code="provider_timeout",
+                    error_message="first attempt timed out",
+                    started_at=started_at,
+                    completed_at=started_at + timedelta(milliseconds=200),
+                    duration_ms=200,
+                ),
+                MimoRecognitionAttempt(
+                    run_id=run.id,
+                    ordinal=2,
+                    retry_of_ordinal=1,
+                    status="completed",
+                    response_fingerprint="a" * 64,
+                    started_at=started_at + timedelta(milliseconds=201),
+                    completed_at=started_at + timedelta(milliseconds=520),
+                    duration_ms=319,
+                ),
+            ]
+        )
+        intents = [
+            {
+                "intent_type": "position_management",
+                "action": {
+                    "kind": "move_stop_to_protect",
+                    "target": {"lifecycle_id": 790, "thread_id": 52},
+                    "strategy": None,
+                    "parameters": {"stop_loss": "1940"},
+                },
+                "reason": "明确要求移动止损",
+                "confidence": 0.95,
+                "evidence_refs": ["text:stop_loss", f"image:{media.id}:symbol"],
+            },
+            {
+                "intent_type": "market_commentary",
+                "action": None,
+                "reason": "评论市场震荡",
+                "confidence": 0.8,
+                "evidence_refs": [],
+            },
+        ]
+        image_rows = [
+            {
+                "asset_id": media.id,
+                "image_type": "position_screenshot",
+                "quality": "clear",
+                "observed_text": "ETHUSDT 空 止损1940",
+                "summary": "ETHUSDT空仓持仓截图",
+                "fields": {
+                    "symbol": {
+                        "value": "ETH",
+                        "source": "image",
+                        "confidence": 0.99,
+                    }
+                },
+                "confidence": 0.97,
+            }
+        ]
+        session.add(
+            MessageEvidenceVersion(
+                raw_message_id=message.id,
+                mimo_recognition_run_id=run.id,
+                version=1,
+                input_fingerprint="sha256:web",
+                model="mimo-v2.5",
+                extraction_status="completed",
+                confidence=0.94,
+                text_evidence_json=json.dumps(
+                    {"observed_text": "移动止损到1940", "fields": {}},
+                    ensure_ascii=False,
+                ),
+                image_evidence_json=json.dumps(
+                    {"images": image_rows, "conflicts": []}, ensure_ascii=False
+                ),
+                normalized_evidence_json=json.dumps(
+                    {
+                        "contract_version": "mimo-authoritative-v2",
+                        "summary": "管理ETH空单并评论市场",
+                        "confidence": 0.94,
+                        "intents": intents,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        )
+        session.add(
+            RecognitionDecision(
+                raw_message_id=message.id,
+                input_kind="text+image",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="非策略",
+                authoritative_payload_json="{}",
+                agreement_status="agreed",
+                differences_json="[]",
+                automation_status="failed",
+                automation_reason="target_unresolved",
+                comparison_status="completed",
+                disagreement_severity="none",
+                comparison_model="deepseek-v4-flash",
+                comparison_payload_json='{"reason":"无实质分歧","conflict_types":[]}',
+            )
+        )
+        session.commit()
+
+    response = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/88/messages"
+    )
+
+    assert response.status_code == 200
+    body = response.text
+    assert body.index("移动止损到1940，最近震荡很大") < body.index(
+        "MiMo第一次识别"
+    )
+    assert body.index("MiMo第一次识别") < body.index("图片证据")
+    assert body.index("图片证据") < body.index("系统接纳与自动交易")
+    assert body.index("系统接纳与自动交易") < body.index(
+        "DeepSeek辅助复核"
+    )
+    assert "仓位管理" in body
+    assert "市场评论" in body
+    assert "ETHUSDT空仓持仓截图" in body
+    assert "持仓截图" in body
+    assert "清晰" in body
+    assert "尝试 1" in body and "provider_timeout" in body
+    assert "系统处理失败" in body and "target_unresolved" in body
+    assert "原始图片证据 JSON" in body
+    assert '"asset_id"' in body
+    assert re.search(r'<details[^>]*class="[^"]*mimo-deepseek-review[^"]*"(?![^>]* open)', body)
+
+
+def test_group_messages_route_labels_historical_v1_without_v2_intents(tmp_path):
+    database_path = tmp_path / "mimo-history.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        message = RawMessage(chat_id=88, message_id=702, text="ETH long")
+        session.add(message)
+        session.flush()
+        session.add(
+            MessageEvidenceVersion(
+                raw_message_id=message.id,
+                version=1,
+                input_fingerprint="sha256:history",
+                model="mimo-v2.5",
+                extraction_status="completed",
+                confidence=0.83,
+                text_evidence_json='{"observed_text":"ETH long"}',
+                image_evidence_json='{"fields":{"symbol":"ETH"}}',
+                normalized_evidence_json=(
+                    '{"recognition_result":"是策略","summary":"ETH多单",'
+                    '"confidence":0.83,"strategy":{"symbol":"ETH","side":"long"}}'
+                ),
+            )
+        )
+        session.add(
+            RecognitionDecision(
+                raw_message_id=message.id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="是策略",
+                authoritative_payload_json="{}",
+                agreement_status="authoritative_only",
+                differences_json="[]",
+                automation_status="skipped",
+                automation_reason="auto_trade_disabled",
+            )
+        )
+        session.commit()
+
+    body = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/88/messages"
+    ).text
+
+    assert "MiMo 历史结果 · v1格式" in body
+    assert "ETH多单" in body
+    assert "历史记录未保存调用尝试明细" in body
+    assert "历史记录未保存逐图摘要" in body
+    assert "历史图片证据" in body
+    assert '"symbol"' in body
 
 
 def test_group_messages_route_returns_partial_for_selected_group(tmp_path):
