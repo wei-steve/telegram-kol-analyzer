@@ -393,7 +393,7 @@
           <details
             class="message-ai-insights {{ ai_panel_class }}{% if decision_card %} is-decision-card-history{% endif %}"
             data-message-ai-insights
-            {% if strategy_related or (semantic_review and semantic_review.severity in ['critical', 'context']) %}open{% endif %}
+            {% if (not decision_card and strategy_related) or (semantic_review and semantic_review.severity in ['critical', 'context']) %}open{% endif %}
           >
             <summary class="message-ai-summary">
               <span class="message-ai-summary-status">{% if decision_card %}历史 AI 细节（调试）{% else %}AI识别结果：{{ detection.status if detection else '待识别' }}{% endif %}</span>

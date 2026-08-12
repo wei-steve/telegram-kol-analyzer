@@ -1,6 +1,6 @@
-from datetime import UTC, datetime, timedelta
 import json
 import re
+from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 
@@ -131,7 +131,16 @@ def test_group_messages_route_renders_mimo_first_multidimensional_analysis(tmp_p
                 extraction_status="completed",
                 confidence=0.94,
                 text_evidence_json=json.dumps(
-                    {"observed_text": "移动止损到1940", "fields": {}},
+                    {
+                        "observed_text": "移动止损到1940",
+                        "fields": {
+                            "stop_loss": {
+                                "value": "1940",
+                                "source": "text",
+                                "confidence": 0.99,
+                            }
+                        },
+                    },
                     ensure_ascii=False,
                 ),
                 image_evidence_json=json.dumps(
@@ -190,7 +199,13 @@ def test_group_messages_route_renders_mimo_first_multidimensional_analysis(tmp_p
     assert "系统处理失败" in body and "target_unresolved" in body
     assert "原始图片证据 JSON" in body
     assert '"asset_id"' in body
+    assert "展示投影失败" not in body
     assert re.search(r'<details[^>]*class="[^"]*mimo-deepseek-review[^"]*"(?![^>]* open)', body)
+    assert not re.search(
+        r'<details\s+class="message-ai-insights[^"]*is-decision-card-history[^"]*"\s+'
+        r'data-message-ai-insights\s+open',
+        body,
+    )
 
 
 def test_group_messages_route_labels_historical_v1_without_v2_intents(tmp_path):
@@ -241,6 +256,43 @@ def test_group_messages_route_labels_historical_v1_without_v2_intents(tmp_path):
     assert "历史记录未保存逐图摘要" in body
     assert "历史图片证据" in body
     assert '"symbol"' in body
+
+
+def test_group_messages_route_labels_current_v1_without_marking_it_historical(
+    tmp_path,
+):
+    database_path = tmp_path / "mimo-current-v1.db"
+    session_factory = create_session_factory(database_path)
+    started_at = datetime(2026, 8, 11, 20, 0)
+    with session_factory() as session:
+        message = RawMessage(chat_id=88, message_id=703, text="普通消息")
+        session.add(message)
+        session.flush()
+        session.add(
+            MimoRecognitionRun(
+                raw_message_id=message.id,
+                run_kind="v1_authoritative",
+                contract_version="v1",
+                model="mimo-v2.5",
+                input_kind="text",
+                input_fingerprint="sha256:current-v1-route",
+                prompt_versions_json="{}",
+                status="completed",
+                attempt_count=1,
+                selected_attempt_ordinal=1,
+                became_authoritative=True,
+                started_at=started_at,
+                completed_at=started_at + timedelta(milliseconds=50),
+            )
+        )
+        session.commit()
+
+    body = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/88/messages"
+    ).text
+
+    assert "MiMo v1结果" in body
+    assert "MiMo 历史结果 · v1格式" not in body
 
 
 def test_group_messages_route_returns_partial_for_selected_group(tmp_path):
