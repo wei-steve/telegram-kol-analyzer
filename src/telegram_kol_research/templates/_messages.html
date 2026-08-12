@@ -192,7 +192,7 @@
           {% if mimo_analysis %}
             <section class="mimo-first-pass" aria-label="MiMo第一次识别">
               <div class="mimo-section-heading">
-                <strong>{{ mimo_analysis.history_label or 'MiMo第一次识别' }}</strong>
+                <strong>{{ mimo_analysis.history_label or mimo_analysis.version_label or 'MiMo第一次识别' }}</strong>
                 {% if mimo_analysis.runtime %}
                   <span class="mimo-runtime-status is-{{ mimo_analysis.runtime.status }}">
                     {{ mimo_analysis.runtime.status_label }}
