@@ -95,6 +95,10 @@ class MimoAuthoritativeResult:
     status: str
     error_message: str | None = None
     prompt_versions: dict[str, int] = field(default_factory=dict)
+    contract_version: str = "v1"
+    run_id: int | None = None
+    fallback_from: str | None = None
+    projection_fingerprint: str | None = None
 
     @property
     def is_actionable(self) -> bool:

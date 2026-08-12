@@ -623,6 +623,102 @@ def persist_mimo_v2_message_evidence(
     )
 
 
+def finalize_claimed_mimo_v2_message_evidence(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    claim_token: str,
+    expected_input_fingerprint: str,
+    result: MimoV2Result,
+    run_id: int,
+    model: str,
+    prompt_versions: Mapping[str, Any],
+    media_root: str | Path,
+) -> MessageEvidenceVersion | None:
+    """Atomically bind validated v2 evidence to the exact claimed input."""
+
+    canonical_payload = _mimo_v2_result_payload(result)
+    image_asset_ids = {image.asset_id for image in result.evidence.images}
+    evidence = canonical_payload["evidence"]
+    normalized_evidence = {
+        key: canonical_payload[key]
+        for key in ("contract_version", "summary", "confidence", "intents")
+    }
+    with session_factory() as session:
+        session.execute(text("BEGIN IMMEDIATE"))
+        raw_message = session.get(RawMessage, int(raw_message_id))
+        if raw_message is None:
+            session.rollback()
+            raise LookupError("raw message not found")
+        media_assets = (
+            session.query(MediaAsset)
+            .filter(MediaAsset.raw_message_id == int(raw_message_id))
+            .order_by(MediaAsset.id.asc())
+            .all()
+        )
+        if not image_asset_ids.issubset({int(asset.id) for asset in media_assets}):
+            session.rollback()
+            raise ValueError("mimo_v2_image_asset_mismatch")
+        run = session.get(MimoRecognitionRun, int(run_id))
+        if (
+            run is None
+            or int(run.raw_message_id) != int(raw_message_id)
+            or str(run.contract_version) != result.contract_version
+            or str(run.status) != "completed"
+            or not bool(run.became_authoritative)
+        ):
+            session.rollback()
+            raise ValueError("mimo_v2_run_link_invalid")
+        if (
+            run.canonical_payload_fingerprint
+            and run.canonical_payload_fingerprint
+            != canonical_json_fingerprint(canonical_payload)
+        ):
+            session.rollback()
+            raise ValueError("mimo_v2_run_payload_mismatch")
+        claim = (
+            session.query(MessageEvidenceExtractionClaim)
+            .filter(
+                MessageEvidenceExtractionClaim.raw_message_id
+                == int(raw_message_id),
+                MessageEvidenceExtractionClaim.claim_token == str(claim_token),
+                MessageEvidenceExtractionClaim.input_fingerprint
+                == str(expected_input_fingerprint),
+                MessageEvidenceExtractionClaim.lease_expires_at > utc_now(),
+            )
+            .one_or_none()
+        )
+        current_fingerprint = build_message_input_fingerprint(
+            raw_message,
+            media_assets,
+            media_root=media_root,
+        )
+        if claim is None or current_fingerprint != expected_input_fingerprint:
+            session.rollback()
+            return None
+        row = _save_message_evidence_version_in_session(
+            session,
+            raw_message_id=raw_message_id,
+            input_fingerprint=expected_input_fingerprint,
+            model=model,
+            prompt_versions=prompt_versions,
+            extraction_status="completed",
+            confidence=result.confidence,
+            text_evidence=evidence["text"],
+            image_evidence={
+                "images": evidence["images"],
+                "conflicts": evidence["conflicts"],
+            },
+            normalized_evidence=normalized_evidence,
+            mimo_recognition_run_id=run_id,
+        )
+        session.delete(claim)
+        session.commit()
+        session.refresh(row)
+        session.expunge(row)
+        return row
+
+
 def _mimo_v2_result_payload(result: MimoV2Result) -> dict[str, Any]:
     return {
         "contract_version": result.contract_version,
@@ -704,6 +800,7 @@ def finalize_claimed_mimo_message_evidence(
     prompt_versions: Mapping[str, Any],
     error_message: str | None,
     media_root: str | Path,
+    mimo_recognition_run_id: int | None = None,
 ) -> MessageEvidenceVersion | None:
     """Atomically validate the input/claim and persist one MiMo result."""
 
@@ -726,6 +823,19 @@ def finalize_claimed_mimo_message_evidence(
         if raw_message is None:
             session.rollback()
             raise LookupError("raw message not found")
+        if mimo_recognition_run_id is not None:
+            run = session.get(
+                MimoRecognitionRun,
+                int(mimo_recognition_run_id),
+            )
+            if (
+                run is None
+                or int(run.raw_message_id) != int(raw_message_id)
+                or str(run.contract_version) != "v1"
+                or str(run.status) not in {"completed", "failed"}
+            ):
+                session.rollback()
+                raise ValueError("mimo_v1_run_link_invalid")
         media_assets = (
             session.query(MediaAsset)
             .filter(MediaAsset.raw_message_id == int(raw_message_id))
@@ -766,6 +876,7 @@ def finalize_claimed_mimo_message_evidence(
             text_evidence=text_evidence,
             image_evidence=image_evidence,
             normalized_evidence=normalized_evidence,
+            mimo_recognition_run_id=mimo_recognition_run_id,
         )
         session.delete(claim)
         session.commit()
