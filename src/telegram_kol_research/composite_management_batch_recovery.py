@@ -374,16 +374,20 @@ def authorize_composite_batch_recovery_resume(
         )
         if isinstance(contract, str) or isinstance(target, str):
             raise CompositeBatchRecoveryConflict("resume_source_state_conflict")
-        original_owned_stop_refs = _original_owned_stop_refs(
-            session,
-            batch=batch,
-            leg=leg,
-            entry=entry,
-            audit_created_at=event.created_at,
+        disposition = str(after["position_disposition"])
+        original_owned_stop_refs = (
+            []
+            if disposition == "position_absent"
+            else _original_owned_stop_refs(
+                session,
+                batch=batch,
+                leg=leg,
+                entry=entry,
+                audit_created_at=event.created_at,
+            )
         )
         if after["original_owned_stop_refs"] != original_owned_stop_refs:
             raise CompositeBatchRecoveryConflict("resume_audit_invalid")
-        disposition = str(after["position_disposition"])
         _validate_progressed_recovery_state(
             session,
             batch=batch,
@@ -1815,7 +1819,11 @@ def apply_composite_batch_false_state_repair(
             batch_status=str(batch.status),
             leg_status=str(leg.status),
             component_statuses=[str(row.status) for row in components],
-            original_owned_stop_refs=_owned_stop_refs_from_ledger(ledger),
+            original_owned_stop_refs=(
+                []
+                if position_absent
+                else _owned_stop_refs_from_ledger(ledger)
+            ),
         )
         event = ExecutionEvent(
             execution_binding_id=int(binding.id),
@@ -2448,12 +2456,16 @@ def _repaired_state_and_event_match(
         batch_status="resolved" if position_absent else "ready",
         leg_status="failed" if position_absent else "planned",
         component_statuses=list(expected_component_statuses),
-        original_owned_stop_refs=_original_owned_stop_refs(
-            session,
-            batch=batch,
-            leg=leg,
-            entry=entry,
-            audit_created_at=event.created_at,
+        original_owned_stop_refs=(
+            []
+            if position_absent
+            else _original_owned_stop_refs(
+                session,
+                batch=batch,
+                leg=leg,
+                entry=entry,
+                audit_created_at=event.created_at,
+            )
         ),
     )
     return (

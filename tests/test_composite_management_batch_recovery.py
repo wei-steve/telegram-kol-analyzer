@@ -3712,8 +3712,10 @@ def test_apply_position_absent_terminalizes_without_exchange_intent(tmp_path):
         )
         assert session.query(PositionMutationIntent).count() == 0
         assert event.action == "composite_batch_false_state_repaired"
-        assert json.loads(event.after_json)["batch_status"] == "resolved"
-        assert json.loads(event.after_json)["exchange_call_possible"] is False
+        after = json.loads(event.after_json)
+        assert after["batch_status"] == "resolved"
+        assert after["exchange_call_possible"] is False
+        assert after["original_owned_stop_refs"] == []
 
     repeated = module.apply_composite_batch_false_state_repair(
         factory,
@@ -3931,6 +3933,87 @@ def test_recovery_snapshot_marks_position_history_failure_incomplete(tmp_path):
     assert snapshot.errors["position_history"] == "unavailable"
     assert plan.status == "refused"
     assert plan.reason_code == "exchange_snapshot_incomplete"
+
+
+def test_recovery_cli_position_absent_is_repeatable_without_exchange_writes(
+    tmp_path,
+    monkeypatch,
+):
+    from typer.testing import CliRunner
+
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.cli import app
+    from telegram_kol_research.trading_settings import save_trading_settings
+
+    factory, database_path, _, _, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    save_trading_settings(
+        factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+            "composite_management_v2_mode": "live",
+            "mimo_contract_mode": "v1",
+        },
+        updated_at=NOW,
+    )
+    specs_path = tmp_path / "deepcoin-contract-specs.yaml"
+    specs_path.write_text(
+        "contracts:\n"
+        "  - instrument_id: BTC-USDT-SWAP\n"
+        "    contract_value: 1\n"
+        "    quantity_step: 1\n"
+        "    min_quantity: 1\n"
+        "    price_tick: 0.1\n",
+        encoding="utf-8",
+    )
+    client = _Batch119RecoveryClient()
+    client.pending = []
+    client.list_positions = lambda *, inst_id=None: []
+    monkeypatch.setattr(
+        cli_module, "build_deepcoin_client_from_env", lambda: client
+    )
+    common = [
+        "recover-composite-management-batch",
+        "--database-path",
+        str(database_path),
+        "--batch-id",
+        "119",
+        "--deepcoin-contract-specs-path",
+        str(specs_path),
+    ]
+    runner = CliRunner()
+    dry_run = runner.invoke(app, common)
+
+    assert dry_run.exit_code == 0, dry_run.stdout
+    dry_payload = json.loads(dry_run.stdout)
+    assert dry_payload["plan"]["position"]["disposition"] == "position_absent"
+    fingerprint = dry_payload["plan"]["evidence_fingerprint"]
+    apply_args = [
+        *common,
+        "--apply",
+        "--expected-fingerprint",
+        fingerprint,
+        "--authorization",
+        "I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+    ]
+
+    applied = runner.invoke(app, apply_args)
+    repeated = runner.invoke(app, apply_args)
+
+    assert applied.exit_code == 0, applied.stdout
+    assert repeated.exit_code == 0, repeated.stdout
+    assert client.cancel_calls == []
+    assert client.close_calls == []
+    assert client.set_calls == []
+    with factory() as session:
+        event = (
+            session.query(ExecutionEvent)
+            .filter_by(action="composite_batch_false_state_repaired")
+            .one()
+        )
+        assert json.loads(event.after_json)["original_owned_stop_refs"] == []
 
 
 @pytest.mark.parametrize("interrupt_close_readback", [False, True])
