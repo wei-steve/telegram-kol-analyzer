@@ -1118,7 +1118,7 @@ def test_mimo_v2_contract_failure_records_response_and_stops(tmp_path):
     assert attempts[0].response_fingerprint is not None
 
 
-def test_mimo_v2_adapter_rejection_is_audited_as_contract_failure(tmp_path):
+def test_mimo_v2_adapter_rejection_is_audited_as_adapter_failure(tmp_path):
     factory = create_session_factory(tmp_path / "research.db")
     raw_message_id = _v2_message(factory, text="ETH 减仓一半，剩余仓位继续持有")
     payload = _v2_payload("ETH 减仓一半，剩余仓位继续持有")
@@ -1157,7 +1157,7 @@ def test_mimo_v2_adapter_rejection_is_audited_as_contract_failure(tmp_path):
         retry_delay_seconds=0,
     )
 
-    assert result.error_code == "contract_validation_failed"
+    assert result.error_code == "adapter_failure"
     assert "unsupported_multiple_lifecycle_actions" in result.error_message
     attempts = load_mimo_attempts(factory, run_id=result.run_id)
     assert [row.status for row in attempts] == ["contract_failure"]

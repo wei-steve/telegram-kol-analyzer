@@ -636,6 +636,7 @@ def finalize_claimed_mimo_message_evidence(
     prompt_versions: Mapping[str, Any],
     error_message: str | None,
     media_root: str | Path,
+    mimo_recognition_run_id: int | None = None,
 ) -> MessageEvidenceVersion | None:
     """Atomically validate the input/claim and persist one MiMo result."""
 
@@ -658,6 +659,20 @@ def finalize_claimed_mimo_message_evidence(
         if raw_message is None:
             session.rollback()
             raise LookupError("raw message not found")
+        if mimo_recognition_run_id is not None:
+            run = session.get(
+                MimoRecognitionRun,
+                int(mimo_recognition_run_id),
+            )
+            if (
+                run is None
+                or int(run.raw_message_id) != int(raw_message_id)
+                or str(run.contract_version) != "v1"
+                or str(run.status) not in {"completed", "failed"}
+                or (run.status == "completed" and not run.became_authoritative)
+            ):
+                session.rollback()
+                raise ValueError("mimo_v1_run_link_invalid")
         media_assets = (
             session.query(MediaAsset)
             .filter(MediaAsset.raw_message_id == int(raw_message_id))
@@ -698,6 +713,7 @@ def finalize_claimed_mimo_message_evidence(
             text_evidence=text_evidence,
             image_evidence=image_evidence,
             normalized_evidence=normalized_evidence,
+            mimo_recognition_run_id=mimo_recognition_run_id,
         )
         session.delete(claim)
         session.commit()
