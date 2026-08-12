@@ -2521,6 +2521,277 @@ def test_concurrent_apply_creates_one_audit_and_returns_already_repaired(tmp_pat
         assert session.query(ExecutionEvent).count() == 1
 
 
+def test_resume_authorization_accepts_only_audited_progressed_batch_state(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    plan = _plan(factory)
+    repair = module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        components = (
+            session.query(StrategyManagementComponent)
+            .filter_by(management_batch_id=119)
+            .order_by(StrategyManagementComponent.sequence)
+            .all()
+        )
+        batch.status = "executing"
+        components[0].status = "confirmed"
+        components[0].reason_code = None
+        components[0].attempt_count = 2
+        components[1].status = "awaiting_exchange"
+        components[1].attempt_count = 1
+        close_desired = json.loads(components[1].desired_json)
+        close_desired["partial_close_execution"] = {
+            "client_order_id": "CM119L1A1",
+            "close_delta": "19",
+            "intent_id": 1,
+            "pre_submit_size": "38",
+        }
+        components[1].desired_json = json.dumps(close_desired, sort_keys=True)
+        session.add(
+            PositionMutationIntent(
+                id=1,
+                idempotency_key=f"{components[1].id}:close:attempt:1",
+                venue="deepcoin",
+                operation="close_position",
+                strategy_instance_id="deepcoin:incident:btc:long",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                pos_id=POS_ID,
+                authority_fingerprint="a" * 64,
+                request_fingerprint="b" * 64,
+                status="submitted",
+                request_json=json.dumps(
+                    {
+                        "clOrdId": "CM119L1A1",
+                        "closePosId": POS_ID,
+                        "instId": "BTC-USDT-SWAP",
+                        "posSide": "long",
+                        "side": "sell",
+                        "sz": "19",
+                    },
+                    sort_keys=True,
+                ),
+                response_json='{"data":{"ordId":"close-1"}}',
+                reserved_at=NOW,
+                submitted_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    authorization = module.authorize_composite_batch_recovery_resume(
+        factory,
+        expected_fingerprint=plan.evidence_fingerprint,
+        snapshot=_snapshot(
+            positions=[
+                {
+                    "posId": POS_ID,
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "pos": "19",
+                }
+            ]
+        ),
+    )
+
+    assert authorization.plan.evidence_fingerprint == plan.evidence_fingerprint
+    assert authorization.plan.position.disposition == "resume_to_target"
+    assert authorization.repair_result.status == "already_repaired"
+    assert authorization.repair_result.audit_event_id == repair.audit_event_id
+
+
+@pytest.mark.parametrize(
+    ("sequence", "execution_key", "forged_execution"),
+    [
+        (
+            0,
+            "take_profit_consumption_execution",
+            {
+                "cancel_intent_ids": [],
+                "cancel_order_ids": ["foreign-order"],
+                "evidence_tier": "owned_pending",
+            },
+        ),
+        (
+            1,
+            "partial_close_execution",
+            {
+                "client_order_id": "forged-close",
+                "close_delta": "19",
+                "intent_id": 999999,
+                "pre_submit_size": "38",
+            },
+        ),
+        (
+            2,
+            "protection_replacement_execution",
+            {
+                "backup_stop": "63000",
+                "effective_remaining_size": "19",
+                "old_stop_order_ids": ["foreign-order"],
+                "primary_stop": "64000",
+                "retained_take_profit_total": "0",
+            },
+        ),
+    ],
+)
+def test_resume_authorization_rejects_forged_component_execution_plan(
+    tmp_path,
+    sequence,
+    execution_key,
+    forged_execution,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    plan = _plan(factory)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with factory() as session:
+        component = (
+            session.query(StrategyManagementComponent)
+            .filter_by(management_batch_id=119, sequence=sequence)
+            .one()
+        )
+        desired = json.loads(component.desired_json)
+        desired[execution_key] = forged_execution
+        component.desired_json = json.dumps(desired, sort_keys=True)
+        session.commit()
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="resume_component_conflict",
+    ):
+        module.authorize_composite_batch_recovery_resume(
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=_snapshot(
+                positions=[
+                    {
+                        "posId": POS_ID,
+                        "instId": "BTC-USDT-SWAP",
+                        "posSide": "long",
+                        "pos": "38",
+                    }
+                ]
+            ),
+        )
+
+
+def test_resume_authorization_rejects_recovery_audit_binding_drift(tmp_path):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    plan = _plan(factory)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with factory() as session:
+        event = session.query(ExecutionEvent).filter_by(
+            action="composite_batch_false_state_repaired"
+        ).one()
+        event.execution_binding_id = int(event.execution_binding_id) + 999
+        session.commit()
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="resume_audit_invalid",
+    ):
+        module.authorize_composite_batch_recovery_resume(
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=_snapshot(
+                positions=[
+                    {
+                        "posId": POS_ID,
+                        "instId": "BTC-USDT-SWAP",
+                        "posSide": "long",
+                        "pos": "38",
+                    }
+                ]
+            ),
+        )
+
+
+def test_resume_authorization_rejects_unowned_new_exchange_close(tmp_path):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    plan = _plan(factory)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="resume_exchange_close_unowned",
+    ):
+        module.authorize_composite_batch_recovery_resume(
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=_snapshot(
+                positions=[
+                    {
+                        "posId": POS_ID,
+                        "instId": "BTC-USDT-SWAP",
+                        "posSide": "long",
+                        "pos": "19",
+                    }
+                ],
+                order_history=[
+                    {
+                        "ordId": "external-close",
+                        "closePosId": POS_ID,
+                        "instId": "BTC-USDT-SWAP",
+                        "posSide": "long",
+                        "side": "sell",
+                        "reduceOnly": True,
+                        "sz": "19",
+                        "state": "filled",
+                    }
+                ],
+            ),
+        )
+
+
+def test_resume_authorization_bounds_malformed_snapshot(tmp_path):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    plan = _plan(factory)
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="resume_evidence_invalid",
+    ):
+        module.authorize_composite_batch_recovery_resume(
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=object(),
+        )
+
+
 @pytest.mark.parametrize(
     "kind", ["batch", "component", "mutation", "instruction"]
 )
@@ -3157,7 +3428,7 @@ def test_apply_position_absent_terminalizes_without_exchange_intent(tmp_path):
 
 
 class _Batch119RecoveryClient:
-    def __init__(self):
+    def __init__(self, *, fail_close_readback_once: bool = False):
         self.current_size = "38"
         self.pending = [
             {
@@ -3194,9 +3465,13 @@ class _Batch119RecoveryClient:
         self.order_history = []
         self.trigger_history = []
         self.trade_fills = []
+        self.position_history = []
+        self.position_history_calls = []
         self.close_calls = []
         self.set_calls = []
         self.cancel_calls = []
+        self.fail_close_readback_once = fail_close_readback_once
+        self.close_submitted = False
 
     def list_positions(self, *, inst_id=None):
         return [
@@ -3215,6 +3490,10 @@ class _Batch119RecoveryClient:
     def list_open_orders(self):
         return []
 
+    def list_position_history(self, *, inst_id, pos_id):
+        self.position_history_calls.append((inst_id, pos_id))
+        return [dict(row) for row in self.position_history]
+
     def list_trigger_orders_pending(self, *, inst_id):
         return [dict(row) for row in self.pending]
 
@@ -3225,6 +3504,9 @@ class _Batch119RecoveryClient:
         return [dict(row) for row in self.trigger_history]
 
     def list_order_history(self, *, inst_id):
+        if self.close_submitted and self.fail_close_readback_once:
+            self.fail_close_readback_once = False
+            raise RuntimeError("simulated close readback interruption")
         return [dict(row) for row in self.order_history]
 
     def list_trade_fills(self, *, inst_id):
@@ -3243,6 +3525,7 @@ class _Batch119RecoveryClient:
 
     def place_order(self, payload):
         self.close_calls.append(dict(payload))
+        self.close_submitted = True
         self.current_size = "19"
         row = {
             "ordId": "batch-119-close",
@@ -3276,9 +3559,73 @@ class _Batch119RecoveryClient:
         return {"code": "0", "data": {"ordId": order_id}}
 
 
+def test_recovery_snapshot_loads_exact_position_history_and_blocks_prior_close(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    client = _Batch119RecoveryClient()
+    client.position_history = [
+        {
+            "closePosId": POS_ID,
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "state": "closed",
+            "closeSz": "1",
+        }
+    ]
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+    plan = module.build_composite_batch_recovery_plan(
+        factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=snapshot,
+        planned_at=NOW,
+    )
+
+    assert client.position_history_calls == [
+        ("BTC-USDT-SWAP", POS_ID)
+    ]
+    assert snapshot.position_history == client.position_history
+    assert plan.status == "refused"
+    assert plan.reason_code == "exchange_close_submission_evidence_present"
+
+
+def test_recovery_snapshot_marks_position_history_failure_incomplete(tmp_path):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    client = _Batch119RecoveryClient()
+
+    def fail_position_history(*, inst_id, pos_id):
+        raise RuntimeError("private provider detail")
+
+    client.list_position_history = fail_position_history
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+    plan = module.build_composite_batch_recovery_plan(
+        factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=snapshot,
+        planned_at=NOW,
+    )
+
+    assert snapshot.position_history == []
+    assert snapshot.errors["position_history"] == "unavailable"
+    assert plan.status == "refused"
+    assert plan.reason_code == "exchange_snapshot_incomplete"
+
+
+@pytest.mark.parametrize("interrupt_close_readback", [False, True])
 def test_recovery_cli_dry_run_then_apply_closes_exactly_once_and_preserves_settings(
     tmp_path,
     monkeypatch,
+    interrupt_close_readback,
 ):
     from typer.testing import CliRunner
 
@@ -3338,7 +3685,9 @@ def test_recovery_cli_dry_run_then_apply_closes_exactly_once_and_preserves_setti
         "    price_tick: 0.1\n",
         encoding="utf-8",
     )
-    client = _Batch119RecoveryClient()
+    client = _Batch119RecoveryClient(
+        fail_close_readback_once=interrupt_close_readback
+    )
     monkeypatch.setattr(
         cli_module, "build_deepcoin_client_from_env", lambda: client
     )
@@ -3374,6 +3723,24 @@ def test_recovery_cli_dry_run_then_apply_closes_exactly_once_and_preserves_setti
     )
 
     assert applied.exit_code == 0, applied.stdout
+    if interrupt_close_readback:
+        interrupted_summary = json.loads(applied.stdout)["result"]
+        assert interrupted_summary["batch_status"] == "executing"
+        assert interrupted_summary["confirmed_close_intent_count"] == 0
+        assert interrupted_summary["unresolved_mutation_intent_count"] == 1
+        assert len(client.close_calls) == 1
+        applied = CliRunner().invoke(
+            app,
+            [
+                *common,
+                "--apply",
+                "--expected-fingerprint",
+                fingerprint,
+                "--authorization",
+                "I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            ],
+        )
+        assert applied.exit_code == 0, applied.stdout
     applied_summary = json.loads(applied.stdout)["result"]
     with factory() as diagnostic_session:
         intent_states = [
@@ -3417,5 +3784,5 @@ def test_recovery_cli_dry_run_then_apply_closes_exactly_once_and_preserves_setti
         ],
     )
 
-    assert repeated.exit_code == 2
+    assert repeated.exit_code == 0, repeated.stdout
     assert len(client.close_calls) == 1

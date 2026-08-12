@@ -7492,6 +7492,42 @@ def test_composite_restart_partial_fill_retries_only_unresolved_delta(tmp_path):
     assert [call["sz"] for call in client.close_calls] == ["5", "2"]
 
 
+def test_composite_close_readback_never_infers_trigger_cancellation(
+    tmp_path,
+    monkeypatch,
+):
+    from telegram_kol_research import strategy_management_composite_executor
+
+    session_factory = create_session_factory(tmp_path / "close-readback-scope.db")
+    batch_id, component_id = _prepare_composite_close_component(session_factory)
+    client = _CompositeCloseClient("confirmed")
+    observed_pending_snapshots = []
+    reconcile = (
+        strategy_management_composite_executor
+        .reconcile_submitted_position_mutation_intents
+    )
+
+    def observe_reconciliation(*args, **kwargs):
+        observed_pending_snapshots.append(kwargs["pending_trigger_orders"])
+        return reconcile(*args, **kwargs)
+
+    monkeypatch.setattr(
+        strategy_management_composite_executor,
+        "reconcile_submitted_position_mutation_intents",
+        observe_reconciliation,
+    )
+
+    result = _execute_composite_close(
+        session_factory,
+        batch_id,
+        component_id,
+        client,
+    )
+
+    assert result.status == "confirmed"
+    assert observed_pending_snapshots == [None]
+
+
 def test_composite_restart_closes_transition_gap_after_exchange_confirmation(tmp_path):
     session_factory = create_session_factory(tmp_path / "restart-close-confirm.db")
     batch_id, component_id = _prepare_composite_close_component(session_factory)

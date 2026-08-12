@@ -3011,7 +3011,7 @@ def test_recover_composite_management_batch_default_is_compact_read_only_dry_run
     )
     monkeypatch.setattr(
         cli_module,
-        "load_deepcoin_execution_reconciliation_snapshot_read_only",
+        "load_composite_batch_recovery_snapshot_read_only",
         lambda factory, *, client: snapshot,
     )
     monkeypatch.setattr(
@@ -3080,7 +3080,7 @@ def test_recover_composite_management_batch_refused_dry_run_exits_two(
     )
     monkeypatch.setattr(
         cli_module,
-        "load_deepcoin_execution_reconciliation_snapshot_read_only",
+        "load_composite_batch_recovery_snapshot_read_only",
         lambda factory, *, client: object(),
     )
     monkeypatch.setattr(
@@ -3146,7 +3146,7 @@ def test_recover_composite_management_batch_stale_fingerprint_stops_before_repai
     )
     monkeypatch.setattr(
         cli_module,
-        "load_deepcoin_execution_reconciliation_snapshot_read_only",
+        "load_composite_batch_recovery_snapshot_read_only",
         lambda session_factory, *, client: object(),
     )
     monkeypatch.setattr(
@@ -3243,7 +3243,7 @@ def test_recover_composite_management_batch_apply_repairs_then_executes_once(
     )
     monkeypatch.setattr(
         cli_module,
-        "load_deepcoin_execution_reconciliation_snapshot_read_only",
+        "load_composite_batch_recovery_snapshot_read_only",
         lambda session_factory, *, client: object(),
     )
     monkeypatch.setattr(
@@ -3268,6 +3268,7 @@ def test_recover_composite_management_batch_apply_repairs_then_executes_once(
         lambda session_factory: SimpleNamespace(
             effective_composite_management_v2_mode="live",
             trigger_backup_stop_buffer_bps=20,
+            mimo_contract_mode="v1",
         ),
     )
     executor_calls = []
@@ -3320,13 +3321,92 @@ def test_recover_composite_management_batch_apply_repairs_then_executes_once(
     )
 
     assert result.exit_code == 0, result.stdout
-    assert order == ["repair", "contract_specs", "execute"]
+    assert order == ["contract_specs", "repair", "execute"]
     assert len(executor_calls) == 1
     assert executor_calls[0][0] is factory
     assert executor_calls[0][1]["deepcoin_client"] is client
     assert executor_calls[0][1]["contract_spec_provider"] is provider
     assert executor_calls[0][1]["backup_buffer_bps"] == "20"
     assert json.loads(result.stdout) == {"mode": "apply", "result": summary}
+
+
+def test_recover_composite_management_batch_invalid_specs_stop_before_repair(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.composite_management_batch_recovery import (
+        CompositeBatchRecoveryPlan,
+        CompositeRecoveryPosition,
+    )
+
+    database_path, specs_path = _recover_composite_management_batch_paths(
+        tmp_path
+    )
+    plan = CompositeBatchRecoveryPlan(
+        batch_id=119,
+        status="ready",
+        reason_code="false_legacy_submission_proven",
+        position=CompositeRecoveryPosition(
+            disposition="resume_to_target",
+            current_size="38",
+            close_delta="19",
+            effective_remaining_size="19",
+        ),
+        source_fingerprint="a" * 64,
+        exchange_snapshot_fingerprint="b" * 64,
+        evidence_fingerprint="c" * 64,
+        evidence={"schema_version": 1},
+    )
+    monkeypatch.setattr(
+        cli_module, "create_existing_session_factory", lambda path: object()
+    )
+    monkeypatch.setattr(
+        cli_module, "build_deepcoin_client_from_env", lambda: object()
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_composite_batch_recovery_snapshot_read_only",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_composite_batch_recovery_plan",
+        lambda *args, **kwargs: plan,
+    )
+    repair_calls = []
+    monkeypatch.setattr(
+        cli_module,
+        "apply_composite_batch_false_state_repair",
+        lambda *args, **kwargs: repair_calls.append(True),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_deepcoin_contract_specs",
+        lambda path: (_ for _ in ()).throw(ValueError("private yaml detail")),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "recover-composite-management-batch",
+            "--database-path",
+            str(database_path),
+            "--batch-id",
+            "119",
+            "--deepcoin-contract-specs-path",
+            str(specs_path),
+            "--apply",
+            "--expected-fingerprint",
+            plan.evidence_fingerprint,
+            "--authorization",
+            "I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout)["reason_code"] == "contract_specs_invalid"
+    assert repair_calls == []
 
 
 def test_recover_composite_management_batch_position_absent_never_builds_writer(
@@ -3373,7 +3453,7 @@ def test_recover_composite_management_batch_position_absent_never_builds_writer(
     )
     monkeypatch.setattr(
         cli_module,
-        "load_deepcoin_execution_reconciliation_snapshot_read_only",
+        "load_composite_batch_recovery_snapshot_read_only",
         lambda *args, **kwargs: object(),
     )
     monkeypatch.setattr(
@@ -3431,4 +3511,146 @@ def test_recover_composite_management_batch_position_absent_never_builds_writer(
     )
 
     assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout) == {"mode": "apply", "result": summary}
+
+
+def test_recover_composite_management_batch_resumes_audited_progress_without_repair(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.composite_management_batch_recovery import (
+        CompositeBatchRecoveryApplyResult,
+        CompositeBatchRecoveryPlan,
+        CompositeBatchRecoveryResumeAuthorization,
+        CompositeRecoveryPosition,
+    )
+
+    database_path, specs_path = _recover_composite_management_batch_paths(
+        tmp_path
+    )
+    fingerprint = "c" * 64
+    refused_plan = CompositeBatchRecoveryPlan(
+        batch_id=119,
+        status="refused",
+        reason_code="component_topology_mismatch",
+        position=None,
+        source_fingerprint="",
+        exchange_snapshot_fingerprint="",
+        evidence_fingerprint="",
+        evidence={},
+    )
+    resume_plan = CompositeBatchRecoveryPlan(
+        batch_id=119,
+        status="ready",
+        reason_code="audited_recovery_resume_authorized",
+        position=CompositeRecoveryPosition(
+            disposition="resume_to_target",
+            current_size="38",
+            close_delta="19",
+            effective_remaining_size="19",
+        ),
+        source_fingerprint="a" * 64,
+        exchange_snapshot_fingerprint="b" * 64,
+        evidence_fingerprint=fingerprint,
+        evidence={},
+    )
+    authorization = CompositeBatchRecoveryResumeAuthorization(
+        plan=resume_plan,
+        repair_result=CompositeBatchRecoveryApplyResult(
+            batch_id=119,
+            status="already_repaired",
+            evidence_fingerprint=fingerprint,
+            audit_event_id=7,
+        ),
+    )
+    factory = object()
+    client = object()
+    snapshot = object()
+    order = []
+    monkeypatch.setattr(
+        cli_module, "create_existing_session_factory", lambda path: factory
+    )
+    monkeypatch.setattr(
+        cli_module, "build_deepcoin_client_from_env", lambda: client
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_composite_batch_recovery_snapshot_read_only",
+        lambda *args, **kwargs: snapshot,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_composite_batch_recovery_plan",
+        lambda *args, **kwargs: refused_plan,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "authorize_composite_batch_recovery_resume",
+        lambda *args, **kwargs: authorization,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "apply_composite_batch_false_state_repair",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("resume must not reapply the state repair")
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_deepcoin_contract_specs",
+        lambda path: order.append("contract_specs") or object(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_trading_settings",
+        lambda factory: SimpleNamespace(
+            effective_composite_management_v2_mode="live",
+            trigger_backup_stop_buffer_bps=20,
+            mimo_contract_mode="v1",
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "reconcile_composite_management_components",
+        lambda *args, **kwargs: order.append("reconcile"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "execute_composite_management_batch",
+        lambda *args, **kwargs: order.append("execute") or object(),
+    )
+    summary = {
+        "batch_id": 119,
+        "batch_status": "succeeded",
+        "repair_status": "already_repaired",
+    }
+    monkeypatch.setattr(
+        cli_module,
+        "build_composite_batch_recovery_status_summary",
+        lambda *args, **kwargs: summary,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "recover-composite-management-batch",
+            "--database-path",
+            str(database_path),
+            "--batch-id",
+            "119",
+            "--deepcoin-contract-specs-path",
+            str(specs_path),
+            "--apply",
+            "--expected-fingerprint",
+            fingerprint,
+            "--authorization",
+            "I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert order == ["contract_specs", "reconcile", "execute"]
     assert json.loads(result.stdout) == {"mode": "apply", "result": summary}

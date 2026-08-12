@@ -1025,7 +1025,7 @@ def execute_partial_close_component(
             raise RuntimeError("close_order_snapshot_incomplete")
         reconcile_submitted_position_mutation_intents(
             session_factory,
-            pending_trigger_orders=[],
+            pending_trigger_orders=None,
             order_history=order_history,
             trade_fills=trade_fills,
             reconciled_at=now_provider(),

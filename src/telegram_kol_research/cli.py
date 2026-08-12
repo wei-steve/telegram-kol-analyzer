@@ -22,6 +22,7 @@ from typing import Any
 
 import httpx
 import typer
+import yaml
 from sqlalchemy import create_engine, tuple_
 from sqlalchemy.orm import sessionmaker
 
@@ -50,9 +51,11 @@ from telegram_kol_research.composite_management_batch_recovery import (
     BATCH_119_RECOVERY_AUTHORIZATION,
     CompositeBatchRecoveryConflict,
     apply_composite_batch_false_state_repair,
+    authorize_composite_batch_recovery_resume,
     build_composite_batch_recovery_plan,
     build_composite_batch_recovery_status_summary,
     create_composite_recovery_read_only_session_factory,
+    load_composite_batch_recovery_snapshot_read_only,
     serialize_composite_batch_recovery_plan,
 )
 from telegram_kol_research.message_operation_supervisor import (
@@ -73,6 +76,9 @@ from telegram_kol_research.deepcoin_order_builder import (
 )
 from telegram_kol_research.strategy_management_composite_executor import (
     execute_composite_management_batch,
+)
+from telegram_kol_research.strategy_management_composite_reconciliation import (
+    reconcile_composite_management_components,
 )
 from telegram_kol_research.deployment_preflight import (
     DeploymentPreflightInputError,
@@ -4646,7 +4652,7 @@ def recover_composite_management_batch(
         )
     )
     client = build_deepcoin_client_from_env()
-    snapshot = load_deepcoin_execution_reconciliation_snapshot_read_only(
+    snapshot = load_composite_batch_recovery_snapshot_read_only(
         session_factory,
         client=client,
     )
@@ -4672,31 +4678,65 @@ def recover_composite_management_batch(
             raise typer.Exit(code=2)
         return
 
+    resume_authorization = None
     if plan.status != "ready":
-        refuse(plan.reason_code)
+        try:
+            resume_authorization = authorize_composite_batch_recovery_resume(
+                session_factory,
+                expected_fingerprint=expected_fingerprint,
+                snapshot=snapshot,
+            )
+        except CompositeBatchRecoveryConflict as exc:
+            refuse(exc.reason_code)
+        plan = resume_authorization.plan
     if expected_fingerprint != plan.evidence_fingerprint:
         refuse("evidence_fingerprint_mismatch")
 
-    try:
-        repair_result = apply_composite_batch_false_state_repair(
-            session_factory,
-            plan=plan,
-            expected_fingerprint=expected_fingerprint,
-            authorization=authorization,
-            applied_at=datetime.now(UTC),
-        )
-    except CompositeBatchRecoveryConflict as exc:
-        refuse(exc.reason_code)
+    contract_spec_provider = None
+    settings = None
+    if (
+        plan.position is not None
+        and plan.position.disposition != "position_absent"
+    ):
+        try:
+            contract_spec_provider = load_deepcoin_contract_specs(
+                resolved_specs_path
+            )
+        except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError):
+            refuse("contract_specs_invalid")
+        settings = load_trading_settings(session_factory)
+        if settings.mimo_contract_mode != "v1":
+            refuse("mimo_contract_mode_not_v1")
+        if settings.effective_composite_management_v2_mode != "live":
+            refuse("composite_management_live_gate_closed")
+
+    if resume_authorization is None:
+        try:
+            repair_result = apply_composite_batch_false_state_repair(
+                session_factory,
+                plan=plan,
+                expected_fingerprint=expected_fingerprint,
+                authorization=authorization,
+                applied_at=datetime.now(UTC),
+            )
+        except CompositeBatchRecoveryConflict as exc:
+            refuse(exc.reason_code)
+    else:
+        repair_result = resume_authorization.repair_result
 
     executor_calls = 0
     if (
         plan.position is not None
         and plan.position.disposition != "position_absent"
     ):
-        contract_spec_provider = load_deepcoin_contract_specs(
-            resolved_specs_path
-        )
-        settings = load_trading_settings(session_factory)
+        assert contract_spec_provider is not None and settings is not None
+        if resume_authorization is not None:
+            reconcile_composite_management_components(
+                session_factory,
+                deepcoin_client=client,
+                reconciled_at=datetime.now(UTC),
+                allow_new_writes=False,
+            )
         execute_composite_management_batch(
             session_factory,
             batch_id=BATCH_119_RECOVERY.batch_id,

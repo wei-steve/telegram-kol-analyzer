@@ -116,6 +116,12 @@ class CompositeBatchRecoveryApplyResult:
     audit_event_id: int
 
 
+@dataclass(frozen=True, slots=True)
+class CompositeBatchRecoveryResumeAuthorization:
+    plan: CompositeBatchRecoveryPlan
+    repair_result: CompositeBatchRecoveryApplyResult
+
+
 def build_composite_batch_recovery_status_summary(
     session_factory,
     *,
@@ -249,6 +255,801 @@ def create_composite_recovery_read_only_session_factory(
         autoflush=False,
         autocommit=False,
         future=True,
+    )
+
+
+def load_composite_batch_recovery_snapshot_read_only(
+    session_factory,
+    *,
+    client: Any,
+):
+    """Load the generic snapshot plus exact batch-119 position history."""
+
+    from telegram_kol_research.execution_bindings import (
+        load_deepcoin_execution_reconciliation_snapshot_read_only,
+    )
+
+    snapshot = load_deepcoin_execution_reconciliation_snapshot_read_only(
+        session_factory,
+        client=client,
+    )
+    history_reader = getattr(client, "list_position_history", None)
+    if history_reader is None:
+        snapshot.errors["position_history"] = "unavailable"
+        return snapshot
+    try:
+        rows = history_reader(
+            inst_id=BATCH_119_RECOVERY.instrument_id,
+            pos_id=_batch_119_position_id(session_factory),
+        )
+    except Exception:
+        snapshot.errors["position_history"] = "unavailable"
+        return snapshot
+    if not isinstance(rows, list) or not all(
+        isinstance(row, dict) for row in rows
+    ):
+        snapshot.errors["position_history"] = "invalid_schema"
+        return snapshot
+    snapshot.position_history = rows
+    return snapshot
+
+
+def authorize_composite_batch_recovery_resume(
+    session_factory,
+    *,
+    expected_fingerprint: str,
+    snapshot: Any,
+) -> CompositeBatchRecoveryResumeAuthorization:
+    """Authorize only a progressed state descended from the exact repair audit."""
+
+    if not _is_sha256(expected_fingerprint) or not _snapshot_is_complete(
+        snapshot,
+        profile=BATCH_119_RECOVERY,
+    ):
+        raise CompositeBatchRecoveryConflict("resume_evidence_invalid")
+    with session_factory() as session:
+        event = _load_recovery_audit_event(
+            session,
+            evidence_fingerprint=expected_fingerprint,
+        )
+        if event is None:
+            raise CompositeBatchRecoveryConflict("resume_audit_missing")
+        after = _validated_resume_audit_event(
+            event,
+            expected_fingerprint=expected_fingerprint,
+        )
+        batch = session.get(
+            StrategyManagementBatch,
+            BATCH_119_RECOVERY.batch_id,
+        )
+        lifecycle = session.get(
+            StrategyLifecycle,
+            BATCH_119_RECOVERY.lifecycle_id,
+        )
+        raw = session.get(RawMessage, BATCH_119_RECOVERY.raw_message_id)
+        if batch is None or lifecycle is None or raw is None:
+            raise CompositeBatchRecoveryConflict("resume_source_state_conflict")
+        binding = session.get(ExecutionBinding, int(batch.execution_binding_id))
+        legs = (
+            session.query(StrategyManagementLeg)
+            .filter_by(management_batch_id=BATCH_119_RECOVERY.batch_id)
+            .all()
+        )
+        components = (
+            session.query(StrategyManagementComponent)
+            .filter_by(management_batch_id=BATCH_119_RECOVERY.batch_id)
+            .order_by(
+                StrategyManagementComponent.sequence,
+                StrategyManagementComponent.id,
+            )
+            .all()
+        )
+        if binding is None or len(legs) != 1 or len(components) != 3:
+            raise CompositeBatchRecoveryConflict("resume_source_state_conflict")
+        if int(event.execution_binding_id) != int(binding.id):
+            raise CompositeBatchRecoveryConflict("resume_audit_invalid")
+        leg = legs[0]
+        entry = session.get(ExecutionOrderLeg, int(leg.execution_order_leg_id))
+        if entry is None or _durable_identity_refusal(
+            session=session,
+            batch=batch,
+            raw=raw,
+            lifecycle=lifecycle,
+            binding=binding,
+            entry=entry,
+            leg=leg,
+            profile=BATCH_119_RECOVERY,
+        ) is not None:
+            raise CompositeBatchRecoveryConflict("resume_source_state_conflict")
+        contract = _validated_contract(batch, profile=BATCH_119_RECOVERY)
+        target = _validated_target_snapshot(
+            batch,
+            binding=binding,
+            leg=leg,
+            entry=entry,
+            profile=BATCH_119_RECOVERY,
+        )
+        if isinstance(contract, str) or isinstance(target, str):
+            raise CompositeBatchRecoveryConflict("resume_source_state_conflict")
+        disposition = str(after["position_disposition"])
+        _validate_progressed_recovery_state(
+            session,
+            batch=batch,
+            leg=leg,
+            entry=entry,
+            components=components,
+            target=target,
+            disposition=disposition,
+            expected_fingerprint=expected_fingerprint,
+        )
+        if not _resume_exchange_close_evidence_is_owned(
+            session,
+            snapshot=snapshot,
+            batch=batch,
+            leg=leg,
+            entry=entry,
+            components=components,
+        ):
+            raise CompositeBatchRecoveryConflict(
+                "resume_exchange_close_unowned"
+            )
+        audit_event_id = int(event.id)
+        source_fingerprint = str(after["source_fingerprint"])
+        exchange_fingerprint = str(after["exchange_snapshot_fingerprint"])
+        current_size = after["current_size"]
+
+    position = _resume_position(
+        disposition=disposition,
+        current_size=current_size,
+    )
+    plan = CompositeBatchRecoveryPlan(
+        batch_id=BATCH_119_RECOVERY.batch_id,
+        status="ready",
+        reason_code="audited_recovery_resume_authorized",
+        position=position,
+        source_fingerprint=source_fingerprint,
+        exchange_snapshot_fingerprint=exchange_fingerprint,
+        evidence_fingerprint=expected_fingerprint,
+        evidence=MappingProxyType({}),
+    )
+    return CompositeBatchRecoveryResumeAuthorization(
+        plan=plan,
+        repair_result=CompositeBatchRecoveryApplyResult(
+            batch_id=BATCH_119_RECOVERY.batch_id,
+            status="already_repaired",
+            evidence_fingerprint=expected_fingerprint,
+            audit_event_id=audit_event_id,
+        ),
+    )
+
+
+def _batch_119_position_id(session_factory) -> str:
+    with session_factory() as session:
+        legs = (
+            session.query(StrategyManagementLeg)
+            .filter_by(management_batch_id=BATCH_119_RECOVERY.batch_id)
+            .all()
+        )
+    if len(legs) != 1 or not str(legs[0].pos_id or ""):
+        raise CompositeBatchRecoveryRefusal("management_leg_identity_mismatch")
+    return str(legs[0].pos_id)
+
+
+def _validated_resume_audit_event(
+    event: ExecutionEvent,
+    *,
+    expected_fingerprint: str,
+) -> Mapping[str, Any]:
+    before = _safe_json_value(event.before_json)
+    after = _safe_json_value(event.after_json)
+    expected_after_keys = {
+        "batch_id",
+        "batch_status",
+        "leg_status",
+        "component_statuses",
+        "component_attempt_counts",
+        "source_fingerprint",
+        "exchange_snapshot_fingerprint",
+        "evidence_fingerprint",
+        "position_disposition",
+        "current_size",
+        "target_remaining_size",
+        "exchange_call_possible",
+    }
+    expected_before_keys = {
+        "batch_id",
+        "batch_status",
+        "leg_status",
+        "component_statuses",
+        "component_attempt_counts",
+    }
+    if (
+        not isinstance(before, Mapping)
+        or not isinstance(after, Mapping)
+        or set(before) != expected_before_keys
+        or set(after) != expected_after_keys
+        or event.before_json != _canonical_json(before)
+        or event.after_json != _canonical_json(after)
+        or before.get("batch_id") != BATCH_119_RECOVERY.batch_id
+        or before.get("batch_status") != "reconciling"
+        or before.get("leg_status") != "submitted"
+        or before.get("component_statuses")
+        != ["recovery_required", "pending", "pending"]
+        or after.get("batch_id") != BATCH_119_RECOVERY.batch_id
+        or after.get("evidence_fingerprint") != expected_fingerprint
+        or after.get("target_remaining_size")
+        != BATCH_119_RECOVERY.target_remaining_size
+        or after.get("exchange_call_possible") is not False
+        or not _is_sha256(after.get("source_fingerprint"))
+        or not _is_sha256(after.get("exchange_snapshot_fingerprint"))
+        or event.action != _RECOVERY_AUDIT_ACTION
+        or event.status != "resolved"
+        or event.notification_fingerprint != expected_fingerprint
+        or event.venue != "deepcoin"
+        or event.execution_binding_id is None
+    ):
+        raise CompositeBatchRecoveryConflict("resume_audit_invalid")
+    disposition = str(after.get("position_disposition") or "")
+    position_absent = disposition == "position_absent"
+    expected_reason = (
+        "composite_recovery_exact_position_absent"
+        if position_absent
+        else _RECOVERY_REASON
+    )
+    if (
+        disposition
+        not in {
+            "resume_to_target",
+            "protection_only_at_target",
+            "protection_only_below_target",
+            "position_absent",
+        }
+        or after.get("batch_status")
+        != ("resolved" if position_absent else "ready")
+        or after.get("leg_status")
+        != ("failed" if position_absent else "planned")
+        or after.get("component_statuses")
+        != (
+            ["safely_skipped"] * 3
+            if position_absent
+            else ["recovery_required", "pending", "pending"]
+        )
+        or event.reason != expected_reason
+        or any(
+            getattr(event, field) is not None
+            for field in (
+                "trade_signal_id",
+                "strategy_instance_id",
+                "kol_id",
+                "chat_id",
+                "message_id",
+                "source_message_id",
+                "symbol",
+                "side",
+                "order_id",
+                "client_order_id",
+                "pos_id",
+                "related_order_id",
+                "request_json",
+                "response_json",
+                "exchange_event_time",
+                "notification_status",
+                "notification_error",
+                "notification_next_attempt_at",
+                "notification_claim_token",
+                "notification_claimed_at",
+                "notified_at",
+            )
+        )
+        or int(event.notification_attempts or 0) != 0
+    ):
+        raise CompositeBatchRecoveryConflict("resume_audit_invalid")
+    attempts = before.get("component_attempt_counts")
+    after_attempts = after.get("component_attempt_counts")
+    if (
+        not isinstance(attempts, list)
+        or attempts != after_attempts
+        or len(attempts) != 3
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in attempts
+        )
+    ):
+        raise CompositeBatchRecoveryConflict("resume_audit_invalid")
+    return after
+
+
+def _validate_progressed_recovery_state(
+    session,
+    *,
+    batch,
+    leg,
+    entry,
+    components,
+    target,
+    disposition: str,
+    expected_fingerprint: str,
+) -> None:
+    position_absent = disposition == "position_absent"
+    if str(batch.status) not in (
+        {"resolved"} if position_absent else {"ready", "executing", "succeeded"}
+    ) or str(leg.status) != ("failed" if position_absent else "planned"):
+        raise CompositeBatchRecoveryConflict("resume_state_not_executable")
+    expected_reason = (
+        "composite_recovery_exact_position_absent"
+        if position_absent
+        else _RECOVERY_REASON
+    )
+    if _safe_json_value(leg.last_error) != {
+        "reason": expected_reason,
+        "recovery_evidence_fingerprint": expected_fingerprint,
+    }:
+        raise CompositeBatchRecoveryConflict("resume_state_not_executable")
+    allowed_statuses = {
+        "pending",
+        "preflighting",
+        "submitting",
+        "awaiting_exchange",
+        "confirmed",
+        "definitely_rejected",
+        "recovery_required",
+        "operator_required",
+        "safely_skipped",
+    }
+    mutable_keys = {
+        "consume_take_profit_stage": "take_profit_consumption_execution",
+        "converge_partial_close": "partial_close_execution",
+        "replace_remaining_protection": "protection_replacement_execution",
+    }
+    for sequence, (component, kind) in enumerate(
+        zip(components, _EXPECTED_COMPONENTS, strict=True)
+    ):
+        if (
+            int(component.management_batch_id) != BATCH_119_RECOVERY.batch_id
+            or int(component.strategy_management_leg_id or 0) != int(leg.id)
+            or int(component.strategy_management_leg_scope) != int(leg.id)
+            or int(component.sequence) != sequence
+            or str(component.component_kind) != kind
+            or str(component.status) not in allowed_statuses
+        ):
+            raise CompositeBatchRecoveryConflict("resume_component_conflict")
+        desired = _safe_json_value(component.desired_json)
+        evidence = _safe_json_value(component.evidence_json)
+        if not isinstance(desired, Mapping) or not isinstance(evidence, list):
+            raise CompositeBatchRecoveryConflict("resume_component_conflict")
+        expected = {
+            "contract_fingerprint": str(batch.management_contract_fingerprint),
+            "pos_id": str(leg.pos_id),
+            "execution_order_leg_id": int(entry.id),
+            "trusted_start_size": str(target["trusted_start_size"]),
+            "target_remaining_size": str(target["target_remaining_size"]),
+            "avg_entry_price": str(target["avg_entry_price"]),
+            "quantity_step": str(target["quantity_step"]),
+            "min_quantity": str(target["min_quantity"]),
+            "component_kind": kind,
+        }
+        desired_copy = dict(desired)
+        execution = desired_copy.pop(mutable_keys[kind], None)
+        if desired_copy != expected or (
+            execution is not None and not isinstance(execution, Mapping)
+        ):
+            raise CompositeBatchRecoveryConflict("resume_component_conflict")
+        if not _resume_component_execution_matches_locked_state(
+            session,
+            batch=batch,
+            leg=leg,
+            entry=entry,
+            component=component,
+            kind=kind,
+            execution=execution,
+            target=target,
+        ):
+            raise CompositeBatchRecoveryConflict("resume_component_conflict")
+        expected_key = hashlib.sha256(
+            (
+                f"{batch.management_contract_fingerprint}|{batch.id}|"
+                f"{leg.id}|{kind}"
+            ).encode("utf-8")
+        ).hexdigest()
+        if str(component.idempotency_key) != expected_key:
+            raise CompositeBatchRecoveryConflict("resume_component_conflict")
+        try:
+            _fingerprint(evidence)
+        except (TypeError, ValueError, RecursionError, OverflowError):
+            raise CompositeBatchRecoveryConflict(
+                "resume_component_conflict"
+            ) from None
+        if disposition == "protection_only_below_target":
+            attestations = [
+                row
+                for row in evidence
+                if isinstance(row, Mapping)
+                and row.get("kind") == "approved_under_target_recovery"
+                and row.get("recovery_evidence_fingerprint")
+                == expected_fingerprint
+            ]
+            if len(attestations) != 1:
+                raise CompositeBatchRecoveryConflict(
+                    "resume_component_conflict"
+                )
+    own_prefixes = tuple(f"{int(row.id)}:" for row in components)
+    for intent in session.query(PositionMutationIntent).filter(
+        PositionMutationIntent.status.notin_(_TERMINAL_MUTATION_STATUSES)
+    ):
+        if not str(intent.idempotency_key or "").startswith(own_prefixes):
+            raise CompositeBatchRecoveryConflict("additional_active_work_present")
+    if (
+        session.query(StrategyManagementBatch.id)
+        .filter(
+            StrategyManagementBatch.id != BATCH_119_RECOVERY.batch_id,
+            StrategyManagementBatch.status.notin_(
+                _SAFE_TERMINAL_MANAGEMENT_STATUSES
+            ),
+        )
+        .first()
+        is not None
+        or session.query(StrategyManagementComponent.id)
+        .filter(
+            StrategyManagementComponent.management_batch_id
+            != BATCH_119_RECOVERY.batch_id,
+            StrategyManagementComponent.status.notin_(
+                _SAFE_TERMINAL_COMPONENT_STATUSES
+            ),
+        )
+        .first()
+        is not None
+        or session.query(MessageInstructionItem.id)
+        .filter(
+            MessageInstructionItem.retired_at.is_(None),
+            MessageInstructionItem.status.notin_(
+                _SAFE_TERMINAL_INSTRUCTION_STATUSES
+            ),
+        )
+        .first()
+        is not None
+    ):
+        raise CompositeBatchRecoveryConflict("additional_active_work_present")
+
+
+def _resume_component_execution_matches_locked_state(
+    session,
+    *,
+    batch,
+    leg,
+    entry,
+    component,
+    kind: str,
+    execution: Any,
+    target: Mapping[str, Any],
+) -> bool:
+    intents = [
+        row
+        for row in session.query(PositionMutationIntent).all()
+        if str(row.idempotency_key or "").startswith(f"{int(component.id)}:")
+    ]
+    expected_operations = {
+        "consume_take_profit_stage": {"cancel_position_sltp"},
+        "converge_partial_close": {"close_position"},
+        "replace_remaining_protection": {
+            "set_position_sltp",
+            "cancel_position_sltp",
+        },
+    }[kind]
+    if any(
+        str(intent.operation) not in expected_operations
+        or str(intent.venue) != "deepcoin"
+        or str(intent.strategy_instance_id) != str(batch.strategy_instance_id)
+        or int(intent.execution_binding_id) != int(batch.execution_binding_id)
+        or int(intent.execution_order_leg_id) != int(entry.id)
+        or str(intent.pos_id) != str(leg.pos_id)
+        for intent in intents
+    ):
+        return False
+    if execution is None:
+        return not intents
+    if kind == "consume_take_profit_stage":
+        if set(execution) != {
+            "cancel_order_ids",
+            "cancel_intent_ids",
+            "evidence_tier",
+        }:
+            return False
+        order_ids = execution.get("cancel_order_ids")
+        intent_ids = execution.get("cancel_intent_ids")
+        if (
+            not _unique_nonempty_strings(order_ids)
+            or not _unique_positive_ints(intent_ids)
+            or not isinstance(execution.get("evidence_tier"), str)
+            or execution.get("evidence_tier")
+            not in {
+                "exact_pending_owned_order",
+                "exact_terminal_fill",
+                "exact_terminal_no_fill",
+                "none",
+            }
+        ):
+            return False
+        selected = [row for row in intents if int(row.id) in set(intent_ids)]
+        return (
+            len(selected) == len(intent_ids)
+            and len(selected) == len(intents)
+            and all(
+                str(row.operation) == "cancel_position_sltp"
+                and str(row.order_id or "") in set(order_ids)
+                and str(row.idempotency_key).startswith(
+                    f"{int(component.id)}:cancel:{str(row.order_id)}:attempt:"
+                )
+                for row in selected
+            )
+        )
+    if kind == "converge_partial_close":
+        if set(execution) != {
+            "close_delta",
+            "client_order_id",
+            "intent_id",
+            "pre_submit_size",
+        } or not _unique_positive_ints([execution.get("intent_id")]):
+            return False
+        selected = [
+            row for row in intents
+            if int(row.id) == int(execution["intent_id"])
+        ]
+        if len(selected) != 1 or len(intents) != 1:
+            return False
+        intent = selected[0]
+        request = _safe_json_value(intent.request_json)
+        close_delta = _decimal_or_none(execution.get("close_delta"))
+        pre_submit_size = _decimal_or_none(execution.get("pre_submit_size"))
+        target_remaining = _decimal_or_none(target.get("target_remaining_size"))
+        return bool(
+            isinstance(request, Mapping)
+            and close_delta is not None
+            and close_delta > 0
+            and pre_submit_size is not None
+            and target_remaining is not None
+            and pre_submit_size - close_delta == target_remaining
+            and str(intent.operation) == "close_position"
+            and str(intent.idempotency_key).startswith(
+                f"{int(component.id)}:close:attempt:"
+            )
+            and str(request.get("clOrdId") or "")
+            == str(execution.get("client_order_id") or "")
+            and _decimal_or_none(request.get("sz")) == close_delta
+            and str(request.get("closePosId") or "") == str(leg.pos_id)
+            and str(request.get("instId") or "").upper()
+            == BATCH_119_RECOVERY.instrument_id
+            and str(request.get("posSide") or "").lower()
+            == BATCH_119_RECOVERY.side
+            and str(request.get("side") or "").lower() == "sell"
+        )
+    if set(execution) != {
+        "primary_stop",
+        "backup_stop",
+        "old_stop_order_ids",
+        "retained_take_profit_total",
+        "effective_remaining_size",
+    }:
+        return False
+    old_order_ids = execution.get("old_stop_order_ids")
+    primary = _decimal_or_none(execution.get("primary_stop"))
+    backup = _decimal_or_none(execution.get("backup_stop"))
+    effective = _decimal_or_none(execution.get("effective_remaining_size"))
+    retained = _decimal_or_none(execution.get("retained_take_profit_total"))
+    target_remaining = _decimal_or_none(target.get("target_remaining_size"))
+    if (
+        not _unique_nonempty_strings(old_order_ids, allow_empty=True)
+        or primary is None
+        or backup is None
+        or primary <= 0
+        or backup <= 0
+        or primary == backup
+        or effective is None
+        or target_remaining is None
+        or effective <= 0
+        or effective > target_remaining
+        or retained is None
+        or retained < 0
+        or retained > effective
+    ):
+        return False
+    ledger_rows = (
+        session.query(PositionProtectionLedger)
+        .filter(PositionProtectionLedger.order_id.in_(list(old_order_ids)))
+        .all()
+        if old_order_ids
+        else []
+    )
+    return len(ledger_rows) == len(old_order_ids) and all(
+        str(row.venue) == "deepcoin"
+        and int(row.execution_binding_id) == int(batch.execution_binding_id)
+        and int(row.execution_order_leg_id) == int(entry.id)
+        and str(row.pos_id) == str(leg.pos_id)
+        and str(row.instrument_id).upper() == BATCH_119_RECOVERY.instrument_id
+        and str(row.side).lower() == BATCH_119_RECOVERY.side
+        and str(row.purpose) in {"stop_loss", "backup_stop"}
+        for row in ledger_rows
+    )
+
+
+def _unique_nonempty_strings(value: Any, *, allow_empty: bool = False) -> bool:
+    return (
+        isinstance(value, list)
+        and (allow_empty or bool(value))
+        and all(isinstance(item, str) and bool(item) for item in value)
+        and len(set(value)) == len(value)
+    )
+
+
+def _unique_positive_ints(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(
+            not isinstance(item, bool) and isinstance(item, int) and item > 0
+            for item in value
+        )
+        and len(set(value)) == len(value)
+    )
+
+
+def _resume_exchange_close_evidence_is_owned(
+    session,
+    *,
+    snapshot: Any,
+    batch,
+    leg,
+    entry,
+    components,
+) -> bool:
+    close_rows = _exchange_close_rows(snapshot, pos_id=str(leg.pos_id))
+    if not close_rows:
+        return True
+    close_component = next(
+        row
+        for row in components
+        if str(row.component_kind) == "converge_partial_close"
+    )
+    intents = [
+        row
+        for row in session.query(PositionMutationIntent).filter_by(
+            execution_binding_id=int(batch.execution_binding_id),
+            execution_order_leg_id=int(entry.id),
+            pos_id=str(leg.pos_id),
+            operation="close_position",
+        )
+        if str(row.idempotency_key or "").startswith(
+            f"{int(close_component.id)}:close:attempt:"
+        )
+    ]
+    order_ids: set[str] = set()
+    client_order_ids: set[str] = set()
+    for intent in intents:
+        request = _safe_json_value(intent.request_json)
+        response = _safe_json_value(intent.response_json)
+        if not isinstance(request, Mapping):
+            return False
+        client_order_id = str(request.get("clOrdId") or "")
+        if client_order_id:
+            client_order_ids.add(client_order_id)
+        order_id = str(intent.order_id or "")
+        if isinstance(response, Mapping):
+            data = response.get("data")
+            if isinstance(data, Mapping):
+                order_id = order_id or str(data.get("ordId") or "")
+            order_id = order_id or str(response.get("ordId") or "")
+        if order_id:
+            order_ids.add(order_id)
+    return bool(intents) and all(
+        str(
+            row.get("ordId")
+            or row.get("orderId")
+            or row.get("order_id")
+            or ""
+        )
+        in order_ids
+        or str(
+            row.get("clOrdId")
+            or row.get("clientOrderId")
+            or row.get("client_order_id")
+            or ""
+        )
+        in client_order_ids
+        for row in close_rows
+    )
+
+
+def _exchange_close_rows(snapshot: Any, *, pos_id: str) -> list[Mapping]:
+    rows: list[Mapping] = []
+    for row in snapshot.position_history:
+        if not isinstance(row, Mapping) or not _row_matches_position(
+            row, pos_id=pos_id
+        ):
+            continue
+        state = str(row.get("state") or row.get("status") or "").lower()
+        close_size = _decimal_or_none(
+            row.get("closeSz")
+            or row.get("closedSize")
+            or row.get("close_size")
+        )
+        if _row_matches_close_position(row, pos_id=pos_id) or state in {
+            "closed",
+            "filled",
+            "completed",
+            "exited",
+        } or (close_size is not None and close_size > 0):
+            rows.append(row)
+    for field in ("open_orders", "order_history", "trade_fills"):
+        for row in getattr(snapshot, field):
+            if not isinstance(row, Mapping) or not _row_matches_position(
+                row, pos_id=pos_id
+            ):
+                continue
+            reduce_only = str(
+                row.get("reduceOnly") or row.get("reduce_only") or ""
+            ).lower() in {"true", "1", "yes"}
+            if (
+                _row_matches_close_position(row, pos_id=pos_id)
+                or reduce_only
+                or str(row.get("side") or "").lower() == "sell"
+            ):
+                rows.append(row)
+    for row in snapshot.trigger_history:
+        if not isinstance(row, Mapping) or not _row_matches_position(
+            row, pos_id=pos_id
+        ):
+            continue
+        state = str(row.get("state") or row.get("status") or "").lower()
+        reduce_only = str(
+            row.get("reduceOnly") or row.get("reduce_only") or ""
+        ).lower() in {"true", "1", "yes"}
+        if _row_matches_close_position(row, pos_id=pos_id) or (
+            state in {"filled", "triggered", "completed"}
+            and (reduce_only or str(row.get("side") or "").lower() == "sell")
+        ):
+            rows.append(row)
+    return rows
+
+
+def _resume_position(
+    *,
+    disposition: str,
+    current_size: Any,
+) -> CompositeRecoveryPosition:
+    if disposition == "position_absent":
+        if current_size is not None:
+            raise CompositeBatchRecoveryConflict("resume_audit_invalid")
+        return CompositeRecoveryPosition(
+            disposition="position_absent",
+            current_size=None,
+            close_delta="0",
+            effective_remaining_size="0",
+        )
+    current = _decimal_or_none(current_size)
+    target = Decimal(BATCH_119_RECOVERY.target_remaining_size)
+    if current is None or current <= 0:
+        raise CompositeBatchRecoveryConflict("resume_audit_invalid")
+    expected_relation = (
+        "resume_to_target"
+        if current > target
+        else "protection_only_at_target"
+        if current == target
+        else "protection_only_below_target"
+    )
+    if disposition != expected_relation:
+        raise CompositeBatchRecoveryConflict("resume_audit_invalid")
+    return CompositeRecoveryPosition(
+        disposition=disposition,
+        current_size=_decimal_text(current),
+        close_delta=(
+            _decimal_text(current - target)
+            if disposition == "resume_to_target"
+            else "0"
+        ),
+        effective_remaining_size=(
+            _decimal_text(current)
+            if disposition == "protection_only_below_target"
+            else BATCH_119_RECOVERY.target_remaining_size
+        ),
     )
 
 
