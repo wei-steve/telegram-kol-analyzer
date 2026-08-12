@@ -86,6 +86,8 @@
       {% set semantic_review = message.semantic_review %}
       {% set execution_outcome = message.execution_outcome %}
       {% set decision_card = message.decision_card %}
+      {% set mimo_analysis = message.mimo_analysis %}
+      {% set system_acceptance = message.system_acceptance %}
       {% set low_confidence_exit_targets = message.low_confidence_exit_targets %}
       {% set ai_panel_class = detection.status_class if detection else 'is-pending' %}
       {% set strategy_related = ai_panel_class == 'is-strategy' %}
@@ -103,6 +105,19 @@
         {% endfor %}
         {% set strategy_related = strategy_ns.value %}
       {% endif %}
+      {% set mimo_attention = namespace(value=false) %}
+      {% if mimo_analysis %}
+        {% for intent in mimo_analysis.intents %}
+          {% if intent.action %}{% set mimo_attention.value = true %}{% endif %}
+        {% endfor %}
+        {% if mimo_analysis.latest_call and mimo_analysis.latest_call.status in ['failed', 'running'] %}
+          {% set mimo_attention.value = true %}
+        {% endif %}
+        {% if mimo_analysis.projection and mimo_analysis.projection.status == 'failed' %}
+          {% set mimo_attention.value = true %}
+        {% endif %}
+      {% endif %}
+      {% set strategy_related = strategy_related or mimo_attention.value %}
       {% set message_default_expanded = strategy_related or ai_panel_class != 'is-not-strategy' or (semantic_review and semantic_review.severity in ['critical', 'context']) %}
       <article
         class="message-card{% if not message_default_expanded %} is-message-collapsed{% endif %}"
@@ -117,8 +132,20 @@
             <span class="message-sender-name">{{ message.sender_name or "Unknown" }}</span>
             <span class="message-posted-at">{{ message.posted_at.strftime('%Y-%m-%d %H:%M') if message.posted_at else '' }}</span>
             <div class="message-collapsed-ai-summary" data-message-collapsed-ai-summary>
-              <span class="message-collapsed-ai-status">AI识别结果：{{ detection.status if detection else '待识别' }}</span>
-              {% if detection and detection.summary %}
+              <span class="message-collapsed-ai-status">
+                {% if mimo_analysis and mimo_analysis.summary %}
+                  MiMo：{{ mimo_analysis.summary }}
+                {% elif mimo_analysis and mimo_analysis.latest_call %}
+                  MiMo：{{ mimo_analysis.latest_call.status_label }}
+                {% elif mimo_analysis %}
+                  MiMo：暂无权威结果
+                {% else %}
+                  AI识别结果：{{ detection.status if detection else '待识别' }}
+                {% endif %}
+              </span>
+              {% if mimo_analysis and mimo_analysis.summary %}
+                <strong>{{ mimo_analysis.summary }}</strong>
+              {% elif detection and detection.summary %}
                 <strong>{{ detection.summary }}</strong>
               {% elif detection and detection.reason %}
                 <small>{{ detection.reason }}</small>
@@ -141,6 +168,200 @@
         <div class="message-card-body">
           {% if message.text %}
             <p class="message-text">{{ message.text }}</p>
+          {% endif %}
+          {% if message.media_assets %}
+            <div class="media-list">
+              {% for media in message.media_assets %}
+                {% set media_kind = (media.kind or '')|lower %}
+                {% set mime_type = (media.mime_type or '')|lower %}
+                <div class="media-item">
+                  {% if 'photo' in media_kind or 'image' in mime_type %}
+                    {% if media.local_path %}
+                      <a
+                        class="media-link"
+                        href="/local-media/{{ media.local_path.replace('\\', '/').split('data/media/')[-1] }}"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        <img
+                          class="message-media-preview"
+                          src="/local-media/{{ media.local_path.replace('\\', '/').split('data/media/')[-1] }}"
+                          alt="message media"
+                        />
+                      </a>
+                    {% else %}
+                      <span class="media-token">[图片]</span>
+                    {% endif %}
+                  {% elif 'video' in media_kind or 'document' in media_kind or mime_type.startswith('video/') %}
+                    <span class="media-token">[视频]</span>
+                  {% else %}
+                    <span class="media-token">[媒体]</span>
+                  {% endif %}
+                  {% if media.ocr_text %}
+                    <div class="ocr-text-block" title="GLM-OCR 识别结果">
+                      <span class="ocr-label">📷 OCR</span>
+                      <pre>{{ media.ocr_text }}</pre>
+                    </div>
+                  {% endif %}
+                </div>
+              {% endfor %}
+            </div>
+          {% endif %}
+          {% if mimo_analysis %}
+            {% set current_runtime = mimo_analysis.authoritative_runtime %}
+            {% set latest_call = mimo_analysis.latest_call %}
+            {% set latest_differs = latest_call and (not current_runtime or latest_call.run_id != current_runtime.run_id) %}
+            <section class="mimo-analysis-card" data-mimo-current-authority aria-label="MiMo当前权威分析">
+              <div class="mimo-analysis-heading">
+                <div>
+                  <strong>当前权威 MiMo 分析</strong>
+                  {% if mimo_analysis.version_label %}<span class="mimo-version-badge">{{ mimo_analysis.version_label }}</span>{% endif %}
+                  {% if mimo_analysis.history_label %}<span class="mimo-version-badge is-history">{{ mimo_analysis.history_label }}</span>{% endif %}
+                </div>
+                {% if current_runtime %}
+                  <span class="mimo-runtime-state is-{{ current_runtime.status }}">{{ current_runtime.status_label }}</span>
+                {% elif mimo_analysis.history_label %}
+                  <span class="mimo-runtime-state is-history">历史记录</span>
+                {% else %}
+                  <span class="mimo-runtime-state is-missing">当前无权威结果</span>
+                {% endif %}
+              </div>
+              {% if current_runtime %}
+                <div class="mimo-runtime-facts">
+                  <span>模型 {{ current_runtime.model or '-' }}</span>
+                  <span>契约 {{ current_runtime.contract_version or '-' }}</span>
+                  <span>输入 {{ current_runtime.input_kind or '-' }}</span>
+                  <span>调用 {{ current_runtime.attempt_count }} 次</span>
+                  <span>供应商重试 {{ current_runtime.provider_retry_count }} 次</span>
+                  <span>整体重试 {{ current_runtime.whole_run_retry_count }} 次</span>
+                  {% if current_runtime.duration_ms is not none %}<span>耗时 {{ current_runtime.duration_ms }} ms</span>{% endif %}
+                </div>
+              {% endif %}
+              {% if mimo_analysis.summary %}<p class="mimo-analysis-summary">{{ mimo_analysis.summary }}</p>{% endif %}
+              {% if mimo_analysis.confidence is not none %}<small class="mimo-confidence">置信度 {{ mimo_analysis.confidence }}</small>{% endif %}
+              {% if mimo_analysis.history_label %}
+                <div class="mimo-history-gaps">
+                  {% if not mimo_analysis.detail_flags.attempts_recorded %}<small>历史记录未保存 MiMo 调用尝试明细</small>{% endif %}
+                  {% if not mimo_analysis.detail_flags.per_image_evidence_recorded %}<small>历史记录未保存逐图 MiMo 证据</small>{% endif %}
+                </div>
+              {% endif %}
+              {% if mimo_analysis.projection and mimo_analysis.projection.status == 'failed' %}
+                <div class="mimo-projection-warning" role="alert">
+                  已保留调用事实，但结构化结果未展示：{{ mimo_analysis.projection.reason_code }}
+                </div>
+              {% endif %}
+              {% if mimo_analysis.intents %}
+                <div class="mimo-intent-list" aria-label="MiMo意图列表">
+                  {% for intent in mimo_analysis.intents %}
+                    <article class="mimo-intent-row">
+                      <div class="mimo-intent-head">
+                        <strong>{{ loop.index }}. {{ intent.intent_label }}</strong>
+                        {% if intent.action_label %}<span>{{ intent.action_label }}</span>{% endif %}
+                        {% if intent.confidence is not none %}<small>置信度 {{ intent.confidence }}</small>{% endif %}
+                      </div>
+                      {% if intent.action %}
+                        {% if intent.target %}
+                          <div class="mimo-structured-facts">
+                            {% if intent.target.lifecycle_id is not none %}<span>持仓周期 #{{ intent.target.lifecycle_id }}</span>{% endif %}
+                            {% if intent.target.thread_id is not none %}<span>策略线程 #{{ intent.target.thread_id }}</span>{% endif %}
+                          </div>
+                        {% endif %}
+                        {% if intent.strategy %}
+                          <dl class="mimo-structured-grid">
+                            {% for key, value in intent.strategy.items() %}
+                              <div><dt>{{ key }}</dt><dd>{{ value if value is not none else '-' }}</dd></div>
+                            {% endfor %}
+                          </dl>
+                        {% endif %}
+                        {% if intent.parameters %}
+                          <dl class="mimo-structured-grid">
+                            {% for key, value in intent.parameters.items() %}
+                              <div><dt>{{ key }}</dt><dd>{{ value if value is not none else '-' }}</dd></div>
+                            {% endfor %}
+                          </dl>
+                        {% endif %}
+                      {% endif %}
+                      {% if intent.reason %}<p>{{ intent.reason }}</p>{% endif %}
+                      {% if intent.evidence_refs %}<small>证据：{{ intent.evidence_refs | join('·') }}</small>{% endif %}
+                    </article>
+                  {% endfor %}
+                </div>
+              {% endif %}
+              {% if current_runtime %}
+                <details class="mimo-runtime-details">
+                  <summary>权威调用与尝试记录</summary>
+                  <div class="mimo-runtime-detail-body">
+                    <span>运行 #{{ current_runtime.run_id }} · {{ current_runtime.status_label }}</span>
+                    {% if current_runtime.error_code %}<span>错误 {{ current_runtime.error_code }}：{{ current_runtime.error_message }}</span>{% endif %}
+                    {% for attempt in current_runtime.attempts %}
+                      <span>尝试 {{ attempt.ordinal }} · {{ attempt.status }} · {{ attempt.duration_ms }} ms{% if attempt.error_code %} · {{ attempt.error_code }}{% endif %}</span>
+                    {% endfor %}
+                  </div>
+                </details>
+              {% endif %}
+            </section>
+            {% if latest_differs %}
+              <section class="mimo-latest-call is-{{ latest_call.status }}" data-mimo-latest-call {% if latest_call.status == 'failed' %}role="alert"{% else %}role="status"{% endif %}>
+                <strong>{% if latest_call.status == 'failed' %}最新 MiMo 调用失败{% elif latest_call.status == 'running' %}最新 MiMo 调用进行中{% else %}最新 MiMo 调用（未取代当前权威结果）{% endif %}</strong>
+                <span>运行 #{{ latest_call.run_id }} · {{ latest_call.contract_version }} · 调用 {{ latest_call.attempt_count }} 次</span>
+                {% if latest_call.error_code %}<small>{{ latest_call.error_code }}：{{ latest_call.error_message }}</small>{% endif %}
+                <details class="mimo-runtime-details">
+                  <summary>查看最新调用尝试记录</summary>
+                  <div class="mimo-runtime-detail-body">
+                    {% for attempt in latest_call.attempts %}
+                      <span>尝试 {{ attempt.ordinal }} · {{ attempt.status }} · {{ attempt.duration_ms }} ms{% if attempt.error_code %} · {{ attempt.error_code }}{% endif %}</span>
+                    {% endfor %}
+                  </div>
+                </details>
+              </section>
+            {% endif %}
+            {% if mimo_analysis.evidence.images %}
+              <section class="mimo-image-evidence" data-mimo-image-evidence aria-label="MiMo图片识别结果">
+                <div class="mimo-section-heading">
+                  <strong>MiMo 图片识别结果</strong>
+                  <small>图片结果已单独保存，供后续纯文字上下文分析使用。</small>
+                </div>
+                {% for image in mimo_analysis.evidence.images %}
+                  <article class="mimo-image-row">
+                    {% if image.media and image.media.local_path %}
+                      <a class="media-link" href="/local-media/{{ image.media.local_path.replace('\\', '/').split('data/media/')[-1] }}" target="_blank" rel="noopener noreferrer">
+                        <img class="mimo-image-preview" src="/local-media/{{ image.media.local_path.replace('\\', '/').split('data/media/')[-1] }}" alt="MiMo图片证据 {{ loop.index }}" />
+                      </a>
+                    {% endif %}
+                    <div class="mimo-image-content">
+                      <div class="mimo-image-head">
+                        <strong>图片 {{ loop.index }} · {{ image.image_type_label }}</strong>
+                        <span>{{ image.quality_label }}</span>
+                        {% if image.confidence is not none %}<small>置信度 {{ image.confidence }}</small>{% endif %}
+                      </div>
+                      {% if image.summary %}<p>{{ image.summary }}</p>{% endif %}
+                      {% if image.observed_text %}<pre class="mimo-observed-text">{{ image.observed_text }}</pre>{% endif %}
+                      {% if image.fields %}
+                        <dl class="mimo-evidence-fields">
+                          {% for key, field in image.fields.items() %}
+                            <div>
+                              <dt>{{ key }}</dt>
+                              <dd>{{ field.value if field is mapping else field }}</dd>
+                              {% if field is mapping %}<small>{{ field.source or '-' }} · 置信度 {{ field.confidence if field.confidence is not none else '-' }}</small>{% endif %}
+                            </div>
+                          {% endfor %}
+                        </dl>
+                      {% endif %}
+                      <details class="mimo-raw-evidence">
+                        <summary>原始结构化证据 JSON</summary>
+                        <pre>{{ image.raw_evidence | tojson(indent=2) }}</pre>
+                      </details>
+                    </div>
+                  </article>
+                {% endfor %}
+                {% if mimo_analysis.evidence.conflicts %}
+                  <div class="mimo-evidence-conflicts" role="alert">
+                    <strong>证据冲突</strong>
+                    {% for conflict in mimo_analysis.evidence.conflicts %}<span>{{ conflict }}</span>{% endfor %}
+                  </div>
+                {% endif %}
+              </section>
+            {% endif %}
           {% endif %}
           {% if message.context_resolution %}
             {% set context = message.context_resolution %}
@@ -185,43 +406,38 @@
               {% endif %}
             </section>
           {% endif %}
-          {% if message.media_assets %}
-            <div class="media-list">
-              {% for media in message.media_assets %}
-                {% set media_kind = (media.kind or '')|lower %}
-                {% set mime_type = (media.mime_type or '')|lower %}
-                <div class="media-item">
-                  {% if 'photo' in media_kind or 'image' in mime_type %}
-                    {% if media.local_path %}
-                      <a
-                        class="media-link"
-                        href="/local-media/{{ media.local_path.replace('\\', '/').split('data/media/')[-1] }}"
-                        target="_blank"
-                        rel="noopener noreferrer"
-                      >
-                        <img
-                          class="message-media-preview"
-                          src="/local-media/{{ media.local_path.replace('\\', '/').split('data/media/')[-1] }}"
-                          alt="message media"
-                        />
-                      </a>
-                    {% else %}
-                      <span class="media-token">[图片]</span>
-                    {% endif %}
-                  {% elif 'video' in media_kind or 'document' in media_kind or mime_type.startswith('video/') %}
-                    <span class="media-token">[视频]</span>
-                  {% else %}
-                    <span class="media-token">[媒体]</span>
-                  {% endif %}
-                  {% if media.ocr_text %}
-                    <div class="ocr-text-block" title="GLM-OCR 识别结果">
-                      <span class="ocr-label">📷 OCR</span>
-                      <pre>{{ media.ocr_text }}</pre>
-                    </div>
-                  {% endif %}
+          {% if system_acceptance %}
+            <section class="message-system-acceptance is-{{ system_acceptance.status }}" data-system-acceptance aria-label="系统接纳结果">
+              <strong>系统接纳：{{ system_acceptance.status_label }}</strong>
+              {% if system_acceptance.reason_code %}<small>原因 {{ system_acceptance.reason_code }}</small>{% endif %}
+              <span>已接纳候选 {{ system_acceptance.accepted_candidate_count }} 个</span>
+              {% if system_acceptance.intents %}
+                <div class="message-system-intents">
+                  {% for intent in system_acceptance.intents %}
+                    <span>{{ intent.ordinal }}. {{ intent.intent_label }}{% if intent.action_label %} / {{ intent.action_label }}{% endif %}：{{ intent.status }}</span>
+                  {% endfor %}
                 </div>
-              {% endfor %}
-            </div>
+              {% endif %}
+            </section>
+          {% endif %}
+          {% if execution_outcome %}
+            <section class="message-execution-outcome is-{{ execution_outcome.state }}" data-automatic-trading-result role="status" aria-label="自动交易结果">
+              <span>自动交易结果：</span>
+              <strong>{{ execution_outcome.label }}</strong>
+              {% if execution_outcome.detail %}<small>{{ execution_outcome.detail }}</small>{% endif %}
+            </section>
+          {% endif %}
+          {% if semantic_review %}
+            <details class="message-auxiliary-review semantic-review semantic-review-{{ semantic_review.severity }}" data-auxiliary-review>
+              <summary>DeepSeek 辅助复核：{{ semantic_review.label }}</summary>
+              <div class="semantic-review-details">
+                {% if semantic_review.reason %}<p>{{ semantic_review.reason }}</p>{% endif %}
+                {% if semantic_review.conflict_types %}
+                  <ul aria-label="分歧类型">{% for conflict_type in semantic_review.conflict_types %}<li>{{ conflict_type }}</li>{% endfor %}</ul>
+                {% endif %}
+                {% if semantic_review.model %}<small>复核模型：{{ semantic_review.model }}</small>{% endif %}
+              </div>
+            </details>
           {% endif %}
           {% if low_confidence_exit_targets %}
             <div class="message-execution-outcome is-waiting" role="status">
@@ -233,6 +449,9 @@
               </small>
             </div>
           {% endif %}
+          <details class="message-legacy-debug" data-legacy-debug>
+            <summary>旧版识别、决策卡与调试详情</summary>
+            <div class="message-legacy-debug-body">
           {% if decision_card %}
             <section class="message-decision-card is-{{ decision_card.state | replace('_', '-') }}" aria-label="交易决策">
               <div class="message-decision-card-final">
@@ -403,6 +622,8 @@
                   {% endfor %}
                 </div>
               {% endif %}
+            </div>
+          </details>
             </div>
           </details>
           <div class="message-actions">
