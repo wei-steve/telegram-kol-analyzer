@@ -225,6 +225,10 @@ def _seed_composite_snapshot_failure(tmp_path):
         batch.management_contract_json = contract_json
         batch.management_contract_fingerprint = fingerprint
         batch.contract_version = 2
+        batch.execution_mode = "live"
+        batch.status = "executing"
+        batch.reason_code = None
+        batch.started_at = NOW
         leg = (
             session.query(StrategyManagementLeg)
             .filter_by(management_batch_id=batch.id)
@@ -341,6 +345,13 @@ def test_legacy_reconciliation_never_mutates_composite_batch(tmp_path):
         _seed_composite_snapshot_failure(tmp_path)
     )
     before = _management_state(session_factory, batch_id)
+    before_batch = load_management_batch(session_factory, batch_id)
+    assert (
+        before_batch.execution_mode,
+        before_batch.status,
+        before_batch.started_at,
+        before_batch.legs[0].status,
+    ) == ("live", "executing", NOW, "planned")
 
     result = reconcile_strategy_management_batches(
         session_factory,
@@ -357,7 +368,13 @@ def test_legacy_reconciliation_never_mutates_composite_batch(tmp_path):
 
     assert result.checked == 0
     assert _management_state(session_factory, batch_id) == before
-    assert _load_management_leg(session_factory, leg_id).status == "planned"
+    after_batch = load_management_batch(session_factory, batch_id)
+    assert (
+        after_batch.execution_mode,
+        after_batch.status,
+        after_batch.started_at,
+        _load_management_leg(session_factory, leg_id).status,
+    ) == ("live", "executing", NOW, "planned")
     assert [
         _load_management_component(session_factory, value).status
         for value in component_ids
