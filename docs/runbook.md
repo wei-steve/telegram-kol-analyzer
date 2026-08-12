@@ -1755,6 +1755,164 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
 候选项、执行项、交易所事件及异常证据。不得删除审计行，也不得为验证回滚
 而重放历史消息。
 
+## MiMo v2 隔离验证、未来启用与回滚
+
+生产模式只允许 `v1` 和 `v2_live_adapter`，没有生产 Shadow 双调用模式。
+首次部署代码和服务器隔离回放期间必须保持 `mimo_contract_mode=v1`。Web 不提供
+回放按钮；回放只能由服务器命令行使用明确批准、最多 200 条的消息 ID 文件执行。
+
+### 本地门禁
+
+提交前至少运行：
+
+```bash
+PYTHONPATH=src .venv/bin/python -m pytest -q \
+  tests/test_mimo_v2_replay.py \
+  tests/test_mimo_v2_contract.py \
+  tests/test_mimo_v2_execution_adapter.py \
+  tests/test_mimo_contract_circuit.py \
+  tests/test_recognition_experiments.py \
+  tests/test_authoritative_recognition.py
+PYTHONPATH=src .venv/bin/python -m pytest -q \
+  tests/test_web_app.py -k 'trading_settings and mimo'
+PYTHONPATH=src .venv/bin/python -m pytest -q \
+  tests/test_trading_settings.py -k mimo
+```
+
+完整发布评审还必须通过实施计划 Task 14 的执行关键回归和全量测试。不得把
+环境失败改成 skip，也不得在测试中构造真实 Deepcoin writer。
+
+### 部署后服务器隔离回放
+
+先按确定性部署流程安装已评审 commit，完成迁移和服务健康检查，再只读确认：
+
+```bash
+curl -fsS http://127.0.0.1:8000/api/trading-settings \
+  | jq '{mimo_contract_mode,mimo_v2_activation_after_raw_message_id,mimo_contract_circuit}'
+```
+
+此时模式必须仍为 `v1`。由人工评审消息类型、图片可用性和上下文覆盖后，把批准
+的正整数 `raw_messages.id` 每行一个写入 root-only 文件；不得把消息正文、图片、
+提示词、响应或凭据写进 ID 文件。然后运行：
+
+```bash
+install -d -m 0700 /run/telegram-kol/mimo-v2-replay
+IDS=/run/telegram-kol/mimo-v2-replay/approved-ids.txt
+ART=/run/telegram-kol/mimo-v2-replay/artifacts-$(date -u +%Y%m%dT%H%M%SZ)
+chmod 0600 "$IDS"
+install -d -m 0700 "$ART"
+
+telegram-kol-research replay-mimo-v2 \
+  --database /opt/telegram-kol-analyzer/data/research.db \
+  --message-id-file "$IDS" \
+  --media-root /opt/telegram-kol-analyzer/data/media \
+  --artifact-dir "$ART" \
+  --ai-config-path /opt/telegram-kol-analyzer/config/ai_recognition.yaml \
+  --max-messages 200
+```
+
+命令只在一次性 SQLite 副本运行 v1/v2；临时数据库退出前删除。保留目录只能有
+`comparisons.json`、`comparisons.csv` 和 `summary.json`。必须同时满足：
+
+- `unsafe_mismatches=0`、`validation_failures=0`；
+- `production_writes=0`、`notifications_sent=0`、`execution_calls=0`；
+- adapter P95 严格低于 50 ms；
+- v2 P95 不超过 v1 P95 的 115%；
+- 工件中没有消息正文、图片/data URL、提示词、provider 原始响应或凭据。
+
+任何一项失败都保持 `v1` 并停止。不得把文字差异手工改写成执行等价，也不得为
+增加样本而把历史消息送回 listener。
+
+### 安全窗口与未来水位线
+
+启用前重新执行本手册“发布前检查”中的全部只读 SQL、两次独立完整交易所审计
+和不带通知的健康诊断。不得存在 `executing`、`submitted`、`submitting`、
+`submit_unknown`、`unknown`、`recovery_required`、活跃 recovery/reconciliation，
+或任何时间敏感策略操作。现有持仓不要求为了启用而关闭，但在途管理会阻止启用。
+
+在同一个稳定窗口读取当前最大消息 ID；API 会拒绝低于该值的启用水位线：
+
+```bash
+WATERMARK="$(sqlite3 -readonly data/research.db \
+  'SELECT COALESCE(MAX(id),0) FROM raw_messages;')"
+test "$WATERMARK" -ge 0
+
+curl -fsS http://127.0.0.1:8000/api/trading-settings \
+  | jq --argjson watermark "$WATERMARK" \
+    'del(.mimo_contract_circuit,.mimo_v2_latest_raw_message_id,.contract_specs)
+     | .mimo_contract_mode="v2_live_adapter"
+     | .mimo_v2_activation_after_raw_message_id=$watermark' \
+  > /run/telegram-kol/mimo-v2-enable.json
+chmod 0600 /run/telegram-kol/mimo-v2-enable.json
+```
+
+只有服务器隔离回放通过并取得一次新的明确生产启用批准后，才 POST 这份完整
+payload。启用只影响 `raw_message_id > WATERMARK` 的自然未来消息，不重启服务，
+不回放旧消息：
+
+```bash
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data-binary @/run/telegram-kol/mimo-v2-enable.json \
+  http://127.0.0.1:8000/api/trading-settings \
+  | jq '{mimo_contract_mode,mimo_v2_activation_after_raw_message_id,mimo_contract_circuit}'
+```
+
+### 首批未来消息与技术失败
+
+仅观察自然到达且 ID 大于水位线的消息。用只读查询分别核对模型调用、尝试、
+权威证据、系统接纳和自动化结果，不能只看 Web 文案：
+
+```sql
+SELECT id, raw_message_id, run_kind, contract_version, status, attempt_count,
+       final_error_code, became_authoritative,
+       canonical_payload_fingerprint, projection_fingerprint,
+       started_at, completed_at
+FROM mimo_recognition_runs
+WHERE raw_message_id > :watermark ORDER BY raw_message_id, id;
+
+SELECT a.run_id, a.ordinal, a.status, a.error_code, a.duration_ms
+FROM mimo_recognition_attempts a
+JOIN mimo_recognition_runs r ON r.id=a.run_id
+WHERE r.raw_message_id > :watermark ORDER BY r.raw_message_id, a.ordinal;
+
+SELECT e.raw_message_id, e.version, e.mimo_recognition_run_id,
+       e.extraction_status, e.input_fingerprint, e.superseded_at
+FROM message_evidence_versions e
+WHERE e.raw_message_id > :watermark ORDER BY e.raw_message_id, e.version;
+
+SELECT d.raw_message_id, d.authoritative_status, d.agreement_status,
+       d.automation_status, d.automation_reason
+FROM recognition_decisions d
+WHERE d.raw_message_id > :watermark ORDER BY d.raw_message_id;
+
+SELECT raw_message_id, id, recognition_generation, event_type, review_status
+FROM signal_candidates WHERE raw_message_id > :watermark
+ORDER BY raw_message_id, id;
+
+SELECT raw_message_id, id, sequence, instruction_kind, status
+FROM message_instruction_items WHERE raw_message_id > :watermark
+ORDER BY raw_message_id, sequence;
+```
+
+v2 provider/JSON/contract/adapter 技术失败只允许在任何执行副作用之前调用一次 v1
+fallback。contract/adapter 失败立即打开熔断；三次连续传输失败打开熔断。熔断后
+未来消息走 v1，当前或历史消息不会重放。若任何写入是否发生不明确，不得 fallback；
+必须冻结并进入只读对账/人工恢复。
+
+### 未来消息回滚
+
+Web 的“仅将未来消息回退到 v1”按钮调用专用接口；命令行等价操作为：
+
+```bash
+curl -fsS -X POST \
+  http://127.0.0.1:8000/api/trading-settings/mimo-rollback \
+  | jq '{mimo_contract_mode,mimo_v2_activation_after_raw_message_id,mimo_contract_circuit}'
+```
+
+回滚只设置 `mimo_contract_mode=v1`，保留水位线、熔断状态、v2/v1 run、attempt、
+证据、候选项、执行项、生命周期、订单和交易所结果。不得删除这些行，不得反转已
+确认交易，不得重试 unknown Deepcoin 结果，也不得用历史回放验证回滚。
+
 ## 确定性部署预检
 
 新的部署路径不再依赖操作员临时拼 SQL 判断。本地必须先推送已评审的
