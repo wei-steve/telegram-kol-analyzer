@@ -9,10 +9,24 @@ import os
 import re
 import sqlite3
 import stat
+import tempfile
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.media_retention import resolve_media_path
+from telegram_kol_research.mimo_v2_execution_adapter import (
+    adapt_mimo_v2_to_current_payload,
+)
+from telegram_kol_research.models import MediaAsset, RawMessage
+from telegram_kol_research.recognition_experiments import (
+    build_authoritative_context_for_message,
+    infer_mimo_authoritative_v2,
+    run_mimo_authoritative_for_message,
+)
 
 
 MAX_REPLAY_MESSAGES = 200
@@ -48,6 +62,35 @@ class ReplayPerformanceGate:
     v2_p95_ms: float | None
     adapter_p95_ms: float | None
     v2_to_v1_ratio: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayComparisonRow:
+    raw_message_id: int
+    status: str
+    reason_code: str
+    v1_status: str
+    v2_status: str
+    v1_duration_ms: float | None
+    v2_duration_ms: float | None
+    adapter_duration_ms: float | None
+    v1_projection_fingerprint: str | None
+    v2_projection_fingerprint: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class MimoV2ReplayResult:
+    processed: int
+    comparable: int
+    unsafe_mismatches: int
+    validation_failures: int
+    production_writes: int
+    notifications_sent: int
+    execution_calls: int
+    passed: bool
+    comparisons: tuple[ReplayComparisonRow, ...]
+    performance: ReplayPerformanceGate
+    artifact_dir: Path
 
 
 def load_replay_message_ids(
@@ -288,6 +331,332 @@ def evaluate_replay_performance(
         adapter_p95_ms=adapter_p95,
         v2_to_v1_ratio=ratio,
     )
+
+
+def run_mimo_v2_replay(
+    *,
+    inputs: MimoV2ReplayInputs,
+    ai_recognition_config_path: str | Path,
+    v1_runner: Callable[..., Any] = run_mimo_authoritative_for_message,
+    v2_runner: Callable[..., Any] = infer_mimo_authoritative_v2,
+    clock: Callable[[], float] = time.perf_counter,
+) -> MimoV2ReplayResult:
+    """Compare MiMo versions using only one disposable database snapshot."""
+
+    if not isinstance(inputs, MimoV2ReplayInputs):
+        raise MimoV2ReplayInputError("replay_inputs_invalid")
+    comparisons: list[ReplayComparisonRow] = []
+    v1_latencies: list[float] = []
+    v2_latencies: list[float] = []
+    adapter_latencies: list[float] = []
+    engine = None
+    with tempfile.TemporaryDirectory(
+        prefix=".working-",
+        dir=inputs.artifact_dir,
+    ) as temporary:
+        working_root = Path(temporary)
+        working_root.chmod(0o700)
+        working_database = create_read_only_replay_snapshot(
+            inputs.source_database,
+            working_root / "working.db",
+        )
+        session_factory = create_session_factory(working_database)
+        engine = session_factory.kw["bind"]
+        try:
+            _validate_selected_messages(
+                session_factory,
+                raw_message_ids=inputs.raw_message_ids,
+            )
+            for raw_message_id in inputs.raw_message_ids:
+                if not _message_images_are_available(
+                    session_factory,
+                    raw_message_id=raw_message_id,
+                    media_root=inputs.media_root,
+                ):
+                    comparisons.append(
+                        _validation_failure_row(
+                            raw_message_id,
+                            reason_code="image_unavailable",
+                        )
+                    )
+                    continue
+                try:
+                    context_text = str(
+                        build_authoritative_context_for_message(
+                            session_factory,
+                            raw_message_id,
+                        )
+                    )
+                except Exception:
+                    comparisons.append(
+                        _validation_failure_row(
+                            raw_message_id,
+                            reason_code="context_build_failed",
+                        )
+                    )
+                    continue
+                v1_started = clock()
+                try:
+                    v1_result = v1_runner(
+                        session_factory,
+                        raw_message_id=raw_message_id,
+                        ai_recognition_config_path=ai_recognition_config_path,
+                        media_root=inputs.media_root,
+                        context_text=context_text,
+                    )
+                except Exception:
+                    v1_duration = _elapsed_ms(v1_started, clock())
+                    comparisons.append(
+                        _validation_failure_row(
+                            raw_message_id,
+                            reason_code="v1_runner_error",
+                            v1_status="error",
+                            v1_duration_ms=v1_duration,
+                        )
+                    )
+                    continue
+                v1_duration = _elapsed_ms(v1_started, clock())
+                v1_payload = getattr(v1_result, "payload", None)
+                if (
+                    getattr(v1_result, "error_message", None)
+                    or str(getattr(v1_result, "status", "")) == "识别失败"
+                    or not isinstance(v1_payload, Mapping)
+                ):
+                    comparisons.append(
+                        _validation_failure_row(
+                            raw_message_id,
+                            reason_code="v1_failed",
+                            v1_status="failed",
+                            v1_duration_ms=v1_duration,
+                        )
+                    )
+                    continue
+                v2_started = clock()
+                try:
+                    v2_result = v2_runner(
+                        session_factory,
+                        raw_message_id=raw_message_id,
+                        ai_recognition_config_path=ai_recognition_config_path,
+                        media_root=inputs.media_root,
+                        context_text=context_text,
+                    )
+                except Exception:
+                    v2_duration = _elapsed_ms(v2_started, clock())
+                    comparisons.append(
+                        _validation_failure_row(
+                            raw_message_id,
+                            reason_code="v2_runner_error",
+                            v1_status="completed",
+                            v2_status="error",
+                            v1_duration_ms=v1_duration,
+                            v2_duration_ms=v2_duration,
+                        )
+                    )
+                    continue
+                v2_duration = _elapsed_ms(v2_started, clock())
+                if not bool(getattr(v2_result, "succeeded", False)):
+                    comparisons.append(
+                        _validation_failure_row(
+                            raw_message_id,
+                            reason_code=_stable_v2_failure_code(
+                                getattr(v2_result, "error_code", None)
+                            ),
+                            v1_status="completed",
+                            v2_status="failed",
+                            v1_duration_ms=v1_duration,
+                            v2_duration_ms=v2_duration,
+                        )
+                    )
+                    continue
+                parsed_result = getattr(v2_result, "parsed_result", None)
+                adapter_started = clock()
+                try:
+                    adapted = adapt_mimo_v2_to_current_payload(parsed_result)
+                except Exception:
+                    adapter_duration = _elapsed_ms(adapter_started, clock())
+                    comparisons.append(
+                        _validation_failure_row(
+                            raw_message_id,
+                            reason_code="adapter_failure",
+                            v1_status="completed",
+                            v2_status="failed",
+                            v1_duration_ms=v1_duration,
+                            v2_duration_ms=v2_duration,
+                            adapter_duration_ms=adapter_duration,
+                        )
+                    )
+                    continue
+                adapter_duration = _elapsed_ms(adapter_started, clock())
+                projection = compare_execution_projections(
+                    v1_payload,
+                    adapted.payload,
+                )
+                comparisons.append(
+                    ReplayComparisonRow(
+                        raw_message_id=raw_message_id,
+                        status=projection.status,
+                        reason_code=projection.reason_code,
+                        v1_status="completed",
+                        v2_status="completed",
+                        v1_duration_ms=v1_duration,
+                        v2_duration_ms=v2_duration,
+                        adapter_duration_ms=adapter_duration,
+                        v1_projection_fingerprint=projection.v1_fingerprint,
+                        v2_projection_fingerprint=projection.v2_fingerprint,
+                    )
+                )
+                v1_latencies.append(v1_duration)
+                v2_latencies.append(v2_duration)
+                adapter_latencies.append(adapter_duration)
+        finally:
+            engine.dispose()
+    performance = evaluate_replay_performance(
+        v1_duration_ms=v1_latencies,
+        v2_duration_ms=v2_latencies,
+        adapter_duration_ms=adapter_latencies,
+    )
+    unsafe_mismatches = sum(
+        row.status == "unsafe_mismatch" for row in comparisons
+    )
+    validation_failures = sum(
+        row.status == "validation_failed" for row in comparisons
+    )
+    comparable = sum(
+        row.status in {"safe_match", "unsafe_mismatch"}
+        for row in comparisons
+    )
+    invariant_zero = 0
+    passed = (
+        len(comparisons) == len(inputs.raw_message_ids)
+        and unsafe_mismatches == 0
+        and validation_failures == 0
+        and performance.passed
+    )
+    return MimoV2ReplayResult(
+        processed=len(comparisons),
+        comparable=comparable,
+        unsafe_mismatches=unsafe_mismatches,
+        validation_failures=validation_failures,
+        production_writes=invariant_zero,
+        notifications_sent=invariant_zero,
+        execution_calls=invariant_zero,
+        passed=passed,
+        comparisons=tuple(comparisons),
+        performance=performance,
+        artifact_dir=inputs.artifact_dir,
+    )
+
+
+def _validate_selected_messages(
+    session_factory,
+    *,
+    raw_message_ids: tuple[int, ...],
+) -> None:
+    with session_factory() as session:
+        found = {
+            int(row[0])
+            for row in session.query(RawMessage.id)
+            .filter(RawMessage.id.in_(raw_message_ids))
+            .all()
+        }
+    if any(raw_message_id not in found for raw_message_id in raw_message_ids):
+        raise MimoV2ReplayInputError("raw_message_not_found")
+
+
+def _message_images_are_available(
+    session_factory,
+    *,
+    raw_message_id: int,
+    media_root: Path,
+) -> bool:
+    with session_factory() as session:
+        assets = (
+            session.query(MediaAsset)
+            .filter(MediaAsset.raw_message_id == raw_message_id)
+            .order_by(MediaAsset.id.asc())
+            .all()
+        )
+    for asset in assets:
+        kind = str(asset.kind or "").lower()
+        mime_type = str(asset.mime_type or "").lower()
+        if not (
+            "image" in kind
+            or "photo" in kind
+            or mime_type.startswith("image/")
+        ):
+            continue
+        resolved = resolve_media_path(asset.local_path, media_root=media_root)
+        if (
+            resolved is None
+            or _path_has_symlink_component(_lexical_media_path(asset, media_root))
+            or not resolved.is_file()
+        ):
+            return False
+        try:
+            if resolved.stat().st_size <= 0:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _lexical_media_path(asset: MediaAsset, media_root: Path) -> Path:
+    local_path = str(asset.local_path or "").replace("\\", "/")
+    while local_path.startswith("data/media/"):
+        local_path = local_path[len("data/media/") :]
+    candidate = Path(local_path)
+    return candidate if candidate.is_absolute() else media_root / candidate
+
+
+def _elapsed_ms(started: float, completed: float) -> float:
+    if (
+        isinstance(started, bool)
+        or isinstance(completed, bool)
+        or not math.isfinite(float(started))
+        or not math.isfinite(float(completed))
+        or completed < started
+    ):
+        raise MimoV2ReplayInputError("clock_invalid")
+    return (float(completed) - float(started)) * 1000.0
+
+
+def _validation_failure_row(
+    raw_message_id: int,
+    *,
+    reason_code: str,
+    v1_status: str = "not_run",
+    v2_status: str = "not_run",
+    v1_duration_ms: float | None = None,
+    v2_duration_ms: float | None = None,
+    adapter_duration_ms: float | None = None,
+) -> ReplayComparisonRow:
+    return ReplayComparisonRow(
+        raw_message_id=raw_message_id,
+        status="validation_failed",
+        reason_code=reason_code,
+        v1_status=v1_status,
+        v2_status=v2_status,
+        v1_duration_ms=v1_duration_ms,
+        v2_duration_ms=v2_duration_ms,
+        adapter_duration_ms=adapter_duration_ms,
+        v1_projection_fingerprint=None,
+        v2_projection_fingerprint=None,
+    )
+
+
+def _stable_v2_failure_code(value: Any) -> str:
+    normalized = str(value or "")
+    if normalized in {
+        "provider_timeout",
+        "provider_http_error",
+        "invalid_json",
+        "contract_validation_failed",
+        "adapter_failure",
+        "image_unavailable",
+        "input_changed_during_analysis",
+    }:
+        return normalized
+    return "v2_failed"
 
 
 def _has_executable_projection(payload: Mapping[str, Any]) -> bool:

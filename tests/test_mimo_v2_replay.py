@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ast
 from copy import deepcopy
 import math
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,10 +16,12 @@ from telegram_kol_research.mimo_v2_replay import (
     evaluate_replay_performance,
     load_replay_message_ids,
     nearest_rank_percentile,
+    run_mimo_v2_replay,
     validate_replay_inputs,
 )
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import RawMessage
+from telegram_kol_research.models import MediaAsset, RawMessage
+from telegram_kol_research.mimo_v2_contract import parse_mimo_v2_payload
 
 
 def _write_ids(tmp_path: Path, content: str = "7\n") -> Path:
@@ -147,6 +151,67 @@ def _no_action_payload(*, reason: str) -> dict[str, object]:
         "summary": reason,
         "input_reading": {"observed_text": reason},
     }
+
+
+def _parsed_entry_v2(*, stop_loss: str = "1940"):
+    strategy = dict(_entry_payload()["strategy"])
+    strategy["stop_loss"] = stop_loss
+    return parse_mimo_v2_payload(
+        {
+            "contract_version": "mimo-authoritative-v2",
+            "summary": "entry",
+            "confidence": 0.94,
+            "intents": [
+                {
+                    "intent_type": "new_strategy",
+                    "action": {
+                        "kind": "entry",
+                        "target": {"lifecycle_id": None, "thread_id": None},
+                        "strategy": strategy,
+                        "parameters": {},
+                    },
+                    "reason": "entry",
+                    "confidence": 0.94,
+                    "evidence_refs": ["text:observed_text"],
+                }
+            ],
+            "evidence": {
+                "text": {"observed_text": "private replay text", "fields": {}},
+                "images": [],
+                "conflicts": [],
+            },
+        }
+    )
+
+
+def _validated_replay_inputs(
+    tmp_path: Path,
+    *,
+    approved_ids: tuple[int, ...] | None = None,
+):
+    source, message_id = _seed_source_database(tmp_path)
+    ids = approved_ids or (message_id,)
+    id_file = tmp_path / "approved-ids.txt"
+    id_file.write_text("".join(f"{value}\n" for value in ids), encoding="utf-8")
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    artifact_dir = tmp_path / "artifacts"
+    inputs = validate_replay_inputs(
+        source_database=source,
+        message_id_file=id_file,
+        media_root=media_root,
+        artifact_dir=artifact_dir,
+        max_messages=200,
+    )
+    return inputs, message_id
+
+
+class _SequenceClock:
+    def __init__(self, *values: float):
+        self._values = iter(values)
+
+    def __call__(self) -> float:
+        return next(self._values)
 
 
 def test_load_replay_message_ids_is_bounded_and_stable(tmp_path):
@@ -529,3 +594,380 @@ def test_performance_gate_fails_without_comparable_pairs():
     assert gate.passed is False
     assert gate.failure_codes == ("no_comparable_pairs",)
     assert gate.v1_p95_ms is None
+
+
+def test_runner_writes_only_disposable_copy_and_reuses_exact_context(tmp_path):
+    inputs, message_id = _validated_replay_inputs(tmp_path)
+    seen_database_paths: list[Path] = []
+    seen_contexts: list[str] = []
+
+    def fake_v1(session_factory, **kwargs):
+        seen_database_paths.append(
+            Path(session_factory.kw["bind"].url.database).resolve()
+        )
+        seen_contexts.append(kwargs["context_text"])
+        with session_factory() as session:
+            session.get(RawMessage, message_id).text = "changed only in copy"
+            session.commit()
+        return SimpleNamespace(
+            payload=_entry_payload(),
+            status="是策略",
+            error_message=None,
+        )
+
+    def fake_v2(session_factory, **kwargs):
+        seen_database_paths.append(
+            Path(session_factory.kw["bind"].url.database).resolve()
+        )
+        seen_contexts.append(kwargs["context_text"])
+        return SimpleNamespace(
+            succeeded=True,
+            parsed_result=_parsed_entry_v2(),
+            error_code=None,
+            error_message=None,
+        )
+
+    result = run_mimo_v2_replay(
+        inputs=inputs,
+        ai_recognition_config_path=tmp_path / "ai.yaml",
+        v1_runner=fake_v1,
+        v2_runner=fake_v2,
+        clock=_SequenceClock(0.0, 0.1, 0.1, 0.2, 0.2, 0.201),
+    )
+
+    assert result.processed == 1
+    assert result.comparable == 1
+    assert result.passed is True
+    assert result.production_writes == 0
+    assert result.notifications_sent == 0
+    assert result.execution_calls == 0
+    assert len(set(seen_contexts)) == 1
+    assert all(path != inputs.source_database for path in seen_database_paths)
+    assert all(not path.exists() for path in seen_database_paths)
+    assert list(inputs.artifact_dir.iterdir()) == []
+    source_uri = inputs.source_database.as_uri() + "?mode=ro&immutable=1"
+    with sqlite3.connect(source_uri, uri=True) as connection:
+        assert connection.execute(
+            "SELECT text FROM raw_messages WHERE id = ?",
+            (message_id,),
+        ).fetchone() == ("private replay text",)
+
+
+def test_runner_rejects_missing_requested_message_before_model_call(tmp_path):
+    inputs, _ = _validated_replay_inputs(tmp_path, approved_ids=(999_999,))
+    calls: list[str] = []
+
+    with pytest.raises(MimoV2ReplayInputError, match="raw_message_not_found"):
+        run_mimo_v2_replay(
+            inputs=inputs,
+            ai_recognition_config_path=tmp_path / "ai.yaml",
+            v1_runner=lambda *args, **kwargs: calls.append("v1"),
+            v2_runner=lambda *args, **kwargs: calls.append("v2"),
+        )
+
+    assert calls == []
+    assert list(inputs.artifact_dir.iterdir()) == []
+
+
+def test_runner_cleans_disposable_copy_after_runner_exception(tmp_path):
+    inputs, _ = _validated_replay_inputs(tmp_path)
+    seen_database_paths: list[Path] = []
+
+    def failing_v1(session_factory, **kwargs):
+        seen_database_paths.append(
+            Path(session_factory.kw["bind"].url.database).resolve()
+        )
+        raise RuntimeError("provider leaked text must not escape")
+
+    result = run_mimo_v2_replay(
+        inputs=inputs,
+        ai_recognition_config_path=tmp_path / "ai.yaml",
+        v1_runner=failing_v1,
+        v2_runner=lambda *args, **kwargs: pytest.fail("v2 must not run"),
+        clock=_SequenceClock(0.0, 0.1),
+    )
+
+    assert result.processed == 1
+    assert result.validation_failures == 1
+    assert result.comparisons[0].reason_code == "v1_runner_error"
+    assert all(not path.exists() for path in seen_database_paths)
+    assert list(inputs.artifact_dir.iterdir()) == []
+
+
+def test_runner_processes_messages_in_approved_order(tmp_path):
+    source = tmp_path / "source.db"
+    factory = create_session_factory(source)
+    with factory() as session:
+        first = RawMessage(chat_id=77, message_id=91, text="first")
+        second = RawMessage(chat_id=77, message_id=92, text="second")
+        session.add_all([first, second])
+        session.commit()
+        approved = (int(second.id), int(first.id))
+    factory.kw["bind"].dispose()
+    id_file = tmp_path / "approved-ids.txt"
+    id_file.write_text("".join(f"{value}\n" for value in approved), encoding="utf-8")
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    inputs = validate_replay_inputs(
+        source_database=source,
+        message_id_file=id_file,
+        media_root=media_root,
+        artifact_dir=tmp_path / "artifacts",
+        max_messages=2,
+    )
+    calls: list[tuple[str, int]] = []
+
+    def fake_v1(session_factory, **kwargs):
+        calls.append(("v1", kwargs["raw_message_id"]))
+        return SimpleNamespace(
+            payload=_entry_payload(),
+            status="是策略",
+            error_message=None,
+        )
+
+    def fake_v2(session_factory, **kwargs):
+        calls.append(("v2", kwargs["raw_message_id"]))
+        return SimpleNamespace(
+            succeeded=True,
+            parsed_result=_parsed_entry_v2(),
+            error_code=None,
+            error_message=None,
+        )
+
+    result = run_mimo_v2_replay(
+        inputs=inputs,
+        ai_recognition_config_path=tmp_path / "ai.yaml",
+        v1_runner=fake_v1,
+        v2_runner=fake_v2,
+        clock=_SequenceClock(
+            0.0, 0.1, 0.1, 0.2, 0.2, 0.201,
+            1.0, 1.1, 1.1, 1.2, 1.2, 1.201,
+        ),
+    )
+
+    assert result.processed == 2
+    assert calls == [
+        ("v1", approved[0]),
+        ("v2", approved[0]),
+        ("v1", approved[1]),
+        ("v2", approved[1]),
+    ]
+
+
+def test_runner_classifies_unsafe_projection_mismatch(tmp_path):
+    inputs, _ = _validated_replay_inputs(tmp_path)
+
+    result = run_mimo_v2_replay(
+        inputs=inputs,
+        ai_recognition_config_path=tmp_path / "ai.yaml",
+        v1_runner=lambda *args, **kwargs: SimpleNamespace(
+            payload=_entry_payload(),
+            status="是策略",
+            error_message=None,
+        ),
+        v2_runner=lambda *args, **kwargs: SimpleNamespace(
+            succeeded=True,
+            parsed_result=_parsed_entry_v2(stop_loss="1950"),
+            error_code=None,
+        ),
+    )
+
+    assert result.unsafe_mismatches == 1
+    assert result.validation_failures == 0
+    assert result.comparisons[0].reason_code == "execution_projection_mismatch"
+    assert result.passed is False
+
+
+def test_runner_classifies_v1_failure_without_calling_v2(tmp_path):
+    inputs, _ = _validated_replay_inputs(tmp_path)
+    v2_calls: list[int] = []
+
+    result = run_mimo_v2_replay(
+        inputs=inputs,
+        ai_recognition_config_path=tmp_path / "ai.yaml",
+        v1_runner=lambda *args, **kwargs: SimpleNamespace(
+            payload=None,
+            status="识别失败",
+            error_message="sensitive provider detail",
+        ),
+        v2_runner=lambda *args, **kwargs: v2_calls.append(
+            kwargs["raw_message_id"]
+        ),
+    )
+
+    assert v2_calls == []
+    assert result.validation_failures == 1
+    assert result.comparisons[0].reason_code == "v1_failed"
+    assert "sensitive" not in repr(result)
+    assert result.passed is False
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    ["provider_http_error", "contract_validation_failed"],
+)
+def test_runner_preserves_stable_v2_failure_codes(tmp_path, error_code):
+    inputs, _ = _validated_replay_inputs(tmp_path)
+
+    result = run_mimo_v2_replay(
+        inputs=inputs,
+        ai_recognition_config_path=tmp_path / "ai.yaml",
+        v1_runner=lambda *args, **kwargs: SimpleNamespace(
+            payload=_entry_payload(),
+            status="是策略",
+            error_message=None,
+        ),
+        v2_runner=lambda *args, **kwargs: SimpleNamespace(
+            succeeded=False,
+            parsed_result=None,
+            error_code=error_code,
+            error_message="sensitive provider detail",
+        ),
+    )
+
+    assert result.validation_failures == 1
+    assert result.comparisons[0].reason_code == error_code
+    assert "sensitive" not in repr(result)
+    assert result.passed is False
+
+
+def test_runner_classifies_adapter_failure(tmp_path, monkeypatch):
+    inputs, _ = _validated_replay_inputs(tmp_path)
+
+    def fail_adapter(*args, **kwargs):
+        raise ValueError("sensitive adapted payload")
+
+    monkeypatch.setattr(
+        "telegram_kol_research.mimo_v2_replay.adapt_mimo_v2_to_current_payload",
+        fail_adapter,
+    )
+    result = run_mimo_v2_replay(
+        inputs=inputs,
+        ai_recognition_config_path=tmp_path / "ai.yaml",
+        v1_runner=lambda *args, **kwargs: SimpleNamespace(
+            payload=_entry_payload(),
+            status="是策略",
+            error_message=None,
+        ),
+        v2_runner=lambda *args, **kwargs: SimpleNamespace(
+            succeeded=True,
+            parsed_result=_parsed_entry_v2(),
+            error_code=None,
+        ),
+    )
+
+    assert result.validation_failures == 1
+    assert result.comparisons[0].reason_code == "adapter_failure"
+    assert "sensitive" not in repr(result)
+    assert result.passed is False
+
+
+def test_runner_classifies_missing_image_before_model_calls(tmp_path):
+    inputs, message_id = _validated_replay_inputs(tmp_path)
+    factory = create_session_factory(inputs.source_database)
+    with factory() as session:
+        session.add(
+            MediaAsset(
+                raw_message_id=message_id,
+                telegram_file_id="missing",
+                kind="image",
+                mime_type="image/png",
+                local_path="missing.png",
+            )
+        )
+        session.commit()
+    factory.kw["bind"].dispose()
+    calls: list[str] = []
+
+    result = run_mimo_v2_replay(
+        inputs=inputs,
+        ai_recognition_config_path=tmp_path / "ai.yaml",
+        v1_runner=lambda *args, **kwargs: calls.append("v1"),
+        v2_runner=lambda *args, **kwargs: calls.append("v2"),
+    )
+
+    assert calls == []
+    assert result.validation_failures == 1
+    assert result.comparisons[0].reason_code == "image_unavailable"
+    assert result.passed is False
+
+
+def test_runner_continues_after_unexpected_v2_exception(tmp_path):
+    source = tmp_path / "source.db"
+    factory = create_session_factory(source)
+    with factory() as session:
+        first = RawMessage(chat_id=77, message_id=91, text="first")
+        second = RawMessage(chat_id=77, message_id=92, text="second")
+        session.add_all([first, second])
+        session.commit()
+        approved = (int(first.id), int(second.id))
+    factory.kw["bind"].dispose()
+    id_file = tmp_path / "approved-ids.txt"
+    id_file.write_text("".join(f"{value}\n" for value in approved), encoding="utf-8")
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    inputs = validate_replay_inputs(
+        source_database=source,
+        message_id_file=id_file,
+        media_root=media_root,
+        artifact_dir=tmp_path / "artifacts",
+        max_messages=2,
+    )
+    completed_v2: list[int] = []
+
+    def fake_v2(session_factory, **kwargs):
+        raw_message_id = kwargs["raw_message_id"]
+        if raw_message_id == approved[0]:
+            raise RuntimeError("sensitive unexpected response")
+        completed_v2.append(raw_message_id)
+        return SimpleNamespace(
+            succeeded=True,
+            parsed_result=_parsed_entry_v2(),
+            error_code=None,
+        )
+
+    result = run_mimo_v2_replay(
+        inputs=inputs,
+        ai_recognition_config_path=tmp_path / "ai.yaml",
+        v1_runner=lambda *args, **kwargs: SimpleNamespace(
+            payload=_entry_payload(),
+            status="是策略",
+            error_message=None,
+        ),
+        v2_runner=fake_v2,
+    )
+
+    assert completed_v2 == [approved[1]]
+    assert result.processed == 2
+    assert result.validation_failures == 1
+    assert result.comparable == 1
+    assert result.comparisons[0].reason_code == "v2_runner_error"
+    assert "sensitive" not in repr(result)
+    assert result.passed is False
+
+
+def test_replay_module_has_no_prohibited_writer_or_authority_imports():
+    from telegram_kol_research import mimo_v2_replay as replay_module
+
+    tree = ast.parse(Path(replay_module.__file__).read_text(encoding="utf-8"))
+    imported = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.append(node.module)
+    prohibited = (
+        "auto_trade",
+        "deepcoin",
+        "listener",
+        "telegram_sync",
+        "notification",
+        "operator_bot",
+        "authoritative_recognition",
+    )
+
+    assert not [
+        module_name
+        for module_name in imported
+        if any(value in module_name for value in prohibited)
+    ]
