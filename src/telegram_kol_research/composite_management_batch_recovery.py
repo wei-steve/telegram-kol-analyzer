@@ -19,14 +19,19 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    InstructionExecutionContract,
+    ManagementMessageTarget,
     MessageInstructionItem,
     PositionMutationIntent,
     PositionProtectionLedger,
     RawMessage,
+    SignalCandidate,
     StrategyLifecycle,
     StrategyManagementBatch,
     StrategyManagementComponent,
     StrategyManagementLeg,
+    StrategyRevisionBatch,
+    TradeSignal,
 )
 from telegram_kol_research.strategy_management_contracts import (
     management_contract_fingerprint,
@@ -223,6 +228,14 @@ _SAFE_TERMINAL_MANAGEMENT_STATUSES = frozenset(
     {"succeeded", "blocked", "resolved"}
 )
 _SAFE_TERMINAL_INSTRUCTION_STATUSES = frozenset({"succeeded", "failed"})
+_INSTRUCTION_DISPOSITIONS = (
+    "historical_residue_no_authority",
+    "historical_unknown_frozen",
+    "target_incident_frozen",
+    "verified_terminal_mirror",
+)
+_MAX_INSTRUCTION_POPULATION = 4096
+_MAX_INSTRUCTION_PAYLOAD_BYTES = 16_384
 _TERMINAL_MUTATION_STATUSES = frozenset({"confirmed", "rejected", "blocked"})
 _SAFE_TERMINAL_COMPONENT_STATUSES = frozenset(
     {"confirmed", "operator_required", "safely_skipped"}
@@ -388,6 +401,25 @@ def authorize_composite_batch_recovery_resume(
         )
         if after["original_owned_stop_refs"] != original_owned_stop_refs:
             raise CompositeBatchRecoveryConflict("resume_audit_invalid")
+        try:
+            current_instruction_population = _instruction_population_summary(
+                _instruction_population_payload(
+                    session,
+                    batch=batch,
+                    profile=BATCH_119_RECOVERY,
+                )
+            )
+        except CompositeBatchRecoveryRefusal as exc:
+            raise CompositeBatchRecoveryConflict(
+                "additional_active_work_present"
+            ) from exc
+        if (
+            current_instruction_population
+            != after.get("instruction_population")
+        ):
+            raise CompositeBatchRecoveryConflict(
+                "additional_active_work_present"
+            )
         _validate_progressed_recovery_state(
             session,
             batch=batch,
@@ -476,6 +508,7 @@ def _validated_resume_audit_event(
         "target_remaining_size",
         "exchange_call_possible",
         "original_owned_stop_refs",
+        "instruction_population",
     }
     expected_before_keys = {
         "batch_id",
@@ -503,6 +536,9 @@ def _validated_resume_audit_event(
         or after.get("exchange_call_possible") is not False
         or not _is_sha256(after.get("source_fingerprint"))
         or not _is_sha256(after.get("exchange_snapshot_fingerprint"))
+        or not _instruction_population_summary_is_valid(
+            after.get("instruction_population")
+        )
         or event.action != _RECOVERY_AUDIT_ACTION
         or event.status != "resolved"
         or event.notification_fingerprint != expected_fingerprint
@@ -733,6 +769,16 @@ def _validate_progressed_recovery_state(
     ):
         if not str(intent.idempotency_key or "").startswith(own_prefixes):
             raise CompositeBatchRecoveryConflict("additional_active_work_present")
+    try:
+        _instruction_population_payload(
+            session,
+            batch=batch,
+            profile=BATCH_119_RECOVERY,
+        )
+    except CompositeBatchRecoveryRefusal as exc:
+        raise CompositeBatchRecoveryConflict(
+            "additional_active_work_present"
+        ) from exc
     if (
         session.query(StrategyManagementBatch.id)
         .filter(
@@ -749,15 +795,6 @@ def _validate_progressed_recovery_state(
             != BATCH_119_RECOVERY.batch_id,
             StrategyManagementComponent.status.notin_(
                 _SAFE_TERMINAL_COMPONENT_STATUSES
-            ),
-        )
-        .first()
-        is not None
-        or session.query(MessageInstructionItem.id)
-        .filter(
-            MessageInstructionItem.retired_at.is_(None),
-            MessageInstructionItem.status.notin_(
-                _SAFE_TERMINAL_INSTRUCTION_STATUSES
             ),
         )
         .first()
@@ -1983,6 +2020,11 @@ def _build_composite_batch_recovery_plan(
             )
         if _has_additional_active_database_work(session, batch_id=batch.id):
             return _refusal(profile.batch_id, "additional_active_work_present")
+        instruction_population = _instruction_population_payload(
+            session,
+            batch=batch,
+            profile=profile,
+        )
 
         positions = list(snapshot.positions)
         try:
@@ -2037,6 +2079,7 @@ def _build_composite_batch_recovery_plan(
                 target=target,
                 contract=contract,
                 protection_ledger=ledger,
+                instruction_population=instruction_population,
             )
         except CompositeBatchRecoveryRefusal:
             return _refusal(profile.batch_id, "durable_evidence_invalid")
@@ -2074,6 +2117,9 @@ def _build_composite_batch_recovery_plan(
                 ],
                 "component_count": len(components),
                 "close_submission_evidence_count": 0,
+                "instruction_population": _instruction_population_summary(
+                    instruction_population
+                ),
             },
             "exchange": {
                 "snapshot_complete": True,
@@ -2192,6 +2238,14 @@ def _load_locked_recovery_source(session):
         session, batch_id=BATCH_119_RECOVERY.batch_id
     ):
         return None
+    try:
+        instruction_population = _instruction_population_payload(
+            session,
+            batch=batch,
+            profile=BATCH_119_RECOVERY,
+        )
+    except CompositeBatchRecoveryRefusal:
+        return None
     ledger = (
         session.query(PositionProtectionLedger)
         .filter(
@@ -2214,6 +2268,7 @@ def _load_locked_recovery_source(session):
             target=target,
             contract=contract,
             protection_ledger=ledger,
+            instruction_population=instruction_population,
         )
         source_fingerprint = _fingerprint(payload)
     except (CompositeBatchRecoveryRefusal, TypeError, ValueError, RecursionError):
@@ -2243,6 +2298,7 @@ def _recovery_audit_after(
         "target_remaining_size": BATCH_119_RECOVERY.target_remaining_size,
         "exchange_call_possible": False,
         "original_owned_stop_refs": list(original_owned_stop_refs),
+        "instruction_population": _instruction_population_from_plan(plan),
     }
 
 
@@ -2443,6 +2499,18 @@ def _repaired_state_and_event_match(
         session, batch_id=BATCH_119_RECOVERY.batch_id
     ):
         return False
+    try:
+        current_instruction_population = _instruction_population_summary(
+            _instruction_population_payload(
+                session,
+                batch=batch,
+                profile=BATCH_119_RECOVERY,
+            )
+        )
+    except CompositeBatchRecoveryRefusal:
+        return False
+    if current_instruction_population != _instruction_population_from_plan(plan):
+        return False
     component_attempt_counts = _component_attempt_counts_from_plan(plan)
     before = {
         "batch_id": BATCH_119_RECOVERY.batch_id,
@@ -2587,7 +2655,31 @@ def _validate_recovery_plan_consistency(plan: CompositeBatchRecoveryPlan) -> Non
         "component_attempt_counts": attempt_counts,
         "component_count": len(_EXPECTED_COMPONENTS),
         "close_submission_evidence_count": 0,
+        "instruction_population": durable.get("instruction_population"),
     }
+    instruction_population = durable.get("instruction_population")
+    if (
+        not isinstance(instruction_population, Mapping)
+        or set(instruction_population)
+        != {"schema_version", "total_count", "counts", "digest"}
+        or instruction_population.get("schema_version") != 1
+        or isinstance(instruction_population.get("total_count"), bool)
+        or not isinstance(instruction_population.get("total_count"), int)
+        or instruction_population.get("total_count", 0) < 1
+        or instruction_population.get("total_count", 0)
+        > _MAX_INSTRUCTION_POPULATION
+        or not isinstance(instruction_population.get("counts"), Mapping)
+        or set(instruction_population["counts"]) != set(_INSTRUCTION_DISPOSITIONS)
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in instruction_population["counts"].values()
+        )
+        or sum(instruction_population["counts"].values())
+        != instruction_population["total_count"]
+        or instruction_population["counts"].get("target_incident_frozen") != 1
+        or not _is_sha256(instruction_population.get("digest"))
+    ):
+        raise CompositeBatchRecoveryConflict("plan_evidence_inconsistent")
     expected_target = {
         "instrument_id": BATCH_119_RECOVERY.instrument_id,
         "side": BATCH_119_RECOVERY.side,
@@ -3139,6 +3231,531 @@ def _has_durable_close_submission(session, *, batch, leg, entry) -> bool:
     return any("close" in str(event.action or "").lower() for event in events)
 
 
+def _instruction_population_payload(
+    session,
+    *,
+    batch: StrategyManagementBatch,
+    profile: CompositeBatchRecoveryProfile,
+) -> dict[str, Any]:
+    rows = (
+        session.query(MessageInstructionItem)
+        .filter(
+            MessageInstructionItem.retired_at.is_(None),
+            MessageInstructionItem.status.notin_(
+                _SAFE_TERMINAL_INSTRUCTION_STATUSES
+            ),
+        )
+        .order_by(MessageInstructionItem.id)
+        .all()
+    )
+    if not rows or len(rows) > _MAX_INSTRUCTION_POPULATION:
+        raise CompositeBatchRecoveryRefusal("additional_active_work_present")
+    evidence_rows: list[dict[str, Any]] = []
+    counts = {key: 0 for key in _INSTRUCTION_DISPOSITIONS}
+    for item in rows:
+        candidate = session.get(SignalCandidate, int(item.signal_candidate_id))
+        raw = session.get(RawMessage, int(item.raw_message_id))
+        if (
+            candidate is None
+            or raw is None
+            or int(candidate.raw_message_id) != int(item.raw_message_id)
+        ):
+            raise CompositeBatchRecoveryRefusal(
+                "additional_active_work_present"
+            )
+        disposition, facts = _classify_instruction_disposition(
+            session,
+            item=item,
+            candidate=candidate,
+            raw=raw,
+            batch=batch,
+            profile=profile,
+        )
+        counts[disposition] += 1
+        evidence_rows.append(
+            {
+                "item_ref": _redacted_ref("instruction_item", item.id),
+                "raw_ref": _redacted_ref("instruction_raw", item.raw_message_id),
+                "candidate_ref": _redacted_ref(
+                    "instruction_candidate", item.signal_candidate_id
+                ),
+                "strategy_ref": (
+                    None
+                    if item.strategy_instance_id in (None, "")
+                    else _redacted_ref(
+                        "instruction_strategy", item.strategy_instance_id
+                    )
+                ),
+                "sequence": int(item.sequence),
+                "instruction_kind": str(item.instruction_kind),
+                "status": str(item.status),
+                "event_type": str(candidate.event_type),
+                "management_action": candidate.management_action,
+                "disposition": disposition,
+                "updated_at": str(item.updated_at),
+                "facts": facts,
+            }
+        )
+    if counts["target_incident_frozen"] != 1:
+        raise CompositeBatchRecoveryRefusal("additional_active_work_present")
+    return {
+        "schema_version": 1,
+        "total_count": len(evidence_rows),
+        "counts": counts,
+        "rows": evidence_rows,
+    }
+
+
+def _classify_instruction_disposition(
+    session,
+    *,
+    item: MessageInstructionItem,
+    candidate: SignalCandidate,
+    raw: RawMessage,
+    batch: StrategyManagementBatch,
+    profile: CompositeBatchRecoveryProfile,
+) -> tuple[str, dict[str, Any]]:
+    target_facts = _target_incident_instruction_facts(
+        session,
+        item=item,
+        candidate=candidate,
+        batch=batch,
+        profile=profile,
+    )
+    if target_facts is not None:
+        return "target_incident_frozen", target_facts
+    if str(item.status) == "submitted":
+        mirror_facts = _verified_terminal_mirror_facts(
+            session,
+            item=item,
+            candidate=candidate,
+            raw=raw,
+        )
+        if mirror_facts is not None:
+            return "verified_terminal_mirror", mirror_facts
+    elif str(item.status) == "pending":
+        residue_facts = _historical_pending_residue_facts(
+            session,
+            item=item,
+            candidate=candidate,
+            raw=raw,
+        )
+        if residue_facts is not None:
+            return "historical_residue_no_authority", residue_facts
+    elif str(item.status) == "unknown":
+        unknown_facts = _historical_unknown_facts(
+            session,
+            item=item,
+            candidate=candidate,
+        )
+        if unknown_facts is not None:
+            return "historical_unknown_frozen", unknown_facts
+    raise CompositeBatchRecoveryRefusal("additional_active_work_present")
+
+
+def _target_incident_instruction_facts(
+    session,
+    *,
+    item: MessageInstructionItem,
+    candidate: SignalCandidate,
+    batch: StrategyManagementBatch,
+    profile: CompositeBatchRecoveryProfile,
+) -> dict[str, Any] | None:
+    if not (
+        int(item.raw_message_id) == profile.raw_message_id
+        and str(item.instruction_kind) == "management"
+        and str(item.status) == "unknown"
+        and str(item.strategy_instance_id or "")
+        == str(batch.strategy_instance_id)
+        and int(candidate.target_lifecycle_id or 0) == profile.lifecycle_id
+        and str(candidate.event_type) == "position_update"
+        and str(candidate.management_action or "") == str(batch.intent)
+    ):
+        return None
+    payload = _bounded_instruction_payload(item.error_json)
+    if (
+        item.result_json is not None
+        or payload is None
+        or set(payload) != {"batch_id", "reason", "status", "submitted"}
+        or _exact_int(payload.get("batch_id")) != int(batch.id)
+        or payload.get("reason") not in (None, "")
+        or payload.get("status") != "recovery_required"
+        or payload.get("submitted") is not False
+        or _instruction_contract_exists(session, item_id=item.id)
+        or _management_target_exists(session, item_id=item.id)
+    ):
+        raise CompositeBatchRecoveryRefusal("additional_active_work_present")
+    return {
+        "batch_ref": _redacted_ref("instruction_batch", batch.id),
+        "payload_fingerprint": _fingerprint(payload),
+    }
+
+
+def _verified_terminal_mirror_facts(
+    session,
+    *,
+    item: MessageInstructionItem,
+    candidate: SignalCandidate,
+    raw: RawMessage,
+) -> dict[str, Any] | None:
+    if item.error_json is not None:
+        return None
+    payload = _bounded_instruction_payload(item.result_json)
+    if payload is None:
+        return None
+    contract = _instruction_contract(session, item_id=item.id)
+    if str(item.instruction_kind) == "entry":
+        result = payload.get("result")
+        if (
+            str(candidate.event_type) != "entry_signal"
+            or payload.get("status") != "submitted"
+            or not isinstance(result, Mapping)
+            or result.get("submitted") is not True
+            or _exact_int(result.get("order_count")) is None
+            or int(result["order_count"]) < 1
+            or not isinstance(result.get("orders"), list)
+            or len(result["orders"]) != int(result["order_count"])
+            or (
+                contract is not None
+                and not (
+                    str(contract.intent_kind) == "entry"
+                    and str(contract.state) == "verified"
+                    and str(contract.terminal_kind) == "verified_entry"
+                    and str(contract.completion_scope) in {"full", "partial"}
+                    and bool(contract.attempted_exchange_write)
+                )
+            )
+        ):
+            return None
+        signal_id = _exact_int(result.get("signal_id"))
+        signal = session.get(TradeSignal, signal_id) if signal_id else None
+        bindings = _instruction_bindings(
+            session, strategy_instance_id=item.strategy_instance_id
+        )
+        if (
+            signal is None
+            or len(bindings) != 1
+            or str(signal.status) != "submitted"
+            or str(signal.venue) != "deepcoin"
+            or str(signal.strategy_instance_id or "")
+            != str(item.strategy_instance_id or "")
+            or int(signal.chat_id) != int(raw.chat_id)
+            or int(signal.message_id) != int(raw.message_id)
+            or str(signal.symbol) != str(candidate.symbol)
+            or str(signal.side) != str(candidate.side)
+        ):
+            return None
+        return {
+            "binding_ref": _redacted_ref(
+                "instruction_binding", bindings[0].id
+            ),
+            "binding_status": str(bindings[0].status),
+            "payload_fingerprint": _fingerprint(payload),
+            "trade_signal_ref": _redacted_ref(
+                "instruction_trade_signal", signal.id
+            ),
+            "trade_signal_status": str(signal.status),
+        }
+    if str(item.instruction_kind) != "management":
+        return None
+    batch_id = _exact_int(payload.get("batch_id"))
+    linked = session.get(StrategyManagementBatch, batch_id) if batch_id else None
+    if (
+        linked is None
+        or payload.get("submitted") is not True
+        or payload.get("status") not in {"reconciling", "submitted", "succeeded"}
+        or str(linked.status) not in _SAFE_TERMINAL_MANAGEMENT_STATUSES
+        or int(linked.raw_message_id) != int(item.raw_message_id)
+        or int(linked.target_lifecycle_id)
+        != int(candidate.target_lifecycle_id or 0)
+        or str(linked.strategy_instance_id)
+        != str(item.strategy_instance_id or "")
+        or str(linked.intent) != str(candidate.management_action or "")
+        or (
+            contract is not None
+            and not (
+                str(contract.intent_kind) == "management"
+                and str(contract.state) == "verified"
+                and str(contract.terminal_kind)
+                in {"verified_management", "verified_cancel", "verified_exit"}
+                and str(contract.completion_scope) in {"full", "partial"}
+                and bool(contract.attempted_exchange_write)
+            )
+        )
+    ):
+        return None
+    return {
+        "batch_ref": _redacted_ref("instruction_batch", linked.id),
+        "batch_status": str(linked.status),
+        "payload_fingerprint": _fingerprint(payload),
+    }
+
+
+def _historical_pending_residue_facts(
+    session,
+    *,
+    item: MessageInstructionItem,
+    candidate: SignalCandidate,
+    raw: RawMessage,
+) -> dict[str, Any] | None:
+    if (
+        item.result_json is not None
+        or item.error_json is not None
+        or item.visibility_first_failed_at is not None
+        or int(item.visibility_retry_attempts or 0) != 0
+        or item.visibility_next_attempt_at is not None
+        or item.execution_deadline_at is not None
+        or item.operator_escalation_at is not None
+        or item.last_progress_at is not None
+        or item.escalation_state is not None
+        or item.escalation_notified_at is not None
+        or _instruction_contract_exists(session, item_id=item.id)
+        or _management_target_exists(session, item_id=item.id)
+        or _has_nonterminal_descendant(session, raw_message_id=item.raw_message_id)
+    ):
+        return None
+    lifecycle = (
+        session.get(StrategyLifecycle, int(candidate.target_lifecycle_id))
+        if candidate.target_lifecycle_id is not None
+        else None
+    )
+    if candidate.target_lifecycle_id is not None and (
+        lifecycle is None or str(lifecycle.lifecycle_status) != "exited"
+    ):
+        return None
+    bindings = _instruction_bindings(
+        session, strategy_instance_id=item.strategy_instance_id
+    )
+    if any(str(row.status) != "closed" for row in bindings):
+        return None
+    signal_exists = (
+        session.query(TradeSignal.id)
+        .filter(
+            TradeSignal.chat_id == int(raw.chat_id),
+            TradeSignal.message_id == int(raw.message_id),
+            TradeSignal.symbol == candidate.symbol,
+            TradeSignal.side == candidate.side,
+        )
+        .first()
+        is not None
+    )
+    if signal_exists:
+        return None
+    return {
+        "binding_count": len(bindings),
+        "binding_states": sorted(str(row.status) for row in bindings),
+        "lifecycle_ref": (
+            None
+            if lifecycle is None
+            else _redacted_ref("instruction_lifecycle", lifecycle.id)
+        ),
+        "lifecycle_status": None if lifecycle is None else "exited",
+    }
+
+
+def _historical_unknown_facts(
+    session,
+    *,
+    item: MessageInstructionItem,
+    candidate: SignalCandidate,
+) -> dict[str, Any] | None:
+    if (
+        item.result_json is not None
+        or _instruction_contract_exists(session, item_id=item.id)
+        or _management_target_exists(session, item_id=item.id)
+    ):
+        return None
+    payload = _bounded_instruction_payload(item.error_json)
+    batch_id = _exact_int(payload.get("batch_id")) if payload else None
+    submitted = payload.get("submitted") if payload is not None else None
+    if (
+        payload is None
+        or payload.get("status") != "recovery_required"
+        or (submitted is not None and submitted is not False)
+        or not batch_id
+    ):
+        return None
+    lifecycle = (
+        session.get(StrategyLifecycle, int(candidate.target_lifecycle_id))
+        if candidate.target_lifecycle_id is not None
+        else None
+    )
+    bindings = _instruction_bindings(
+        session, strategy_instance_id=item.strategy_instance_id
+    )
+    if (
+        lifecycle is None
+        or str(lifecycle.lifecycle_status) != "exited"
+        or not bindings
+        or any(str(row.status) != "closed" for row in bindings)
+    ):
+        return None
+    linked: Any
+    terminal_statuses: set[str] | frozenset[str]
+    if str(candidate.event_type) == "strategy_revision":
+        linked = session.get(StrategyRevisionBatch, batch_id)
+        terminal_statuses = {"succeeded", "blocked"}
+    else:
+        linked = session.get(StrategyManagementBatch, batch_id)
+        terminal_statuses = _SAFE_TERMINAL_MANAGEMENT_STATUSES
+    if (
+        linked is None
+        or str(linked.status) not in terminal_statuses
+        or int(linked.raw_message_id) != int(item.raw_message_id)
+        or int(linked.target_lifecycle_id) != int(candidate.target_lifecycle_id)
+        or int(linked.execution_binding_id)
+        not in {int(row.id) for row in bindings}
+    ):
+        return None
+    return {
+        "binding_refs": sorted(
+            _redacted_ref("instruction_binding", row.id) for row in bindings
+        ),
+        "descendant_ref": _redacted_ref("instruction_descendant", linked.id),
+        "descendant_status": str(linked.status),
+        "lifecycle_ref": _redacted_ref(
+            "instruction_lifecycle", lifecycle.id
+        ),
+        "payload_fingerprint": _fingerprint(payload),
+    }
+
+
+def _bounded_instruction_payload(value: str | None) -> Mapping[str, Any] | None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > _MAX_INSTRUCTION_PAYLOAD_BYTES
+    ):
+        return None
+    try:
+        payload = json.loads(value)
+        if not isinstance(payload, Mapping):
+            return None
+        _fingerprint(payload)
+    except (TypeError, ValueError, RecursionError, OverflowError):
+        return None
+    return payload
+
+
+def _instruction_bindings(
+    session, *, strategy_instance_id: str | None
+) -> list[ExecutionBinding]:
+    if strategy_instance_id in (None, ""):
+        return []
+    return (
+        session.query(ExecutionBinding)
+        .filter(ExecutionBinding.strategy_instance_id == str(strategy_instance_id))
+        .order_by(ExecutionBinding.id)
+        .all()
+    )
+
+
+def _instruction_contract_exists(session, *, item_id: int) -> bool:
+    return _instruction_contract(session, item_id=item_id) is not None
+
+
+def _instruction_contract(
+    session, *, item_id: int
+) -> InstructionExecutionContract | None:
+    return (
+        session.query(InstructionExecutionContract)
+        .filter(
+            InstructionExecutionContract.message_instruction_item_id
+            == int(item_id)
+        )
+        .one_or_none()
+    )
+
+
+def _management_target_exists(session, *, item_id: int) -> bool:
+    return (
+        session.query(ManagementMessageTarget.id)
+        .filter(ManagementMessageTarget.message_instruction_item_id == int(item_id))
+        .first()
+        is not None
+    )
+
+
+def _has_nonterminal_descendant(session, *, raw_message_id: int) -> bool:
+    return bool(
+        session.query(StrategyManagementBatch.id)
+        .filter(
+            StrategyManagementBatch.raw_message_id == int(raw_message_id),
+            StrategyManagementBatch.status.notin_(
+                _SAFE_TERMINAL_MANAGEMENT_STATUSES
+            ),
+        )
+        .first()
+        or session.query(StrategyRevisionBatch.id)
+        .filter(
+            StrategyRevisionBatch.raw_message_id == int(raw_message_id),
+            StrategyRevisionBatch.status.notin_(("succeeded", "blocked")),
+        )
+        .first()
+    )
+
+
+def _instruction_population_summary(
+    population: Mapping[str, Any],
+) -> dict[str, Any]:
+    rows = population.get("rows")
+    counts = population.get("counts")
+    if not isinstance(rows, list) or not isinstance(counts, Mapping):
+        raise CompositeBatchRecoveryRefusal("additional_active_work_present")
+    return {
+        "schema_version": 1,
+        "total_count": int(population["total_count"]),
+        "counts": {key: int(counts[key]) for key in _INSTRUCTION_DISPOSITIONS},
+        "digest": _fingerprint(rows),
+    }
+
+
+def _instruction_population_from_plan(
+    plan: CompositeBatchRecoveryPlan,
+) -> dict[str, Any]:
+    try:
+        value = _plain_json_value(plan.evidence)["durable"][
+            "instruction_population"
+        ]
+    except (KeyError, TypeError, ValueError, RecursionError) as exc:
+        raise CompositeBatchRecoveryConflict(
+            "plan_evidence_inconsistent"
+        ) from exc
+    if not _instruction_population_summary_is_valid(value):
+        raise CompositeBatchRecoveryConflict("plan_evidence_inconsistent")
+    return {
+        "schema_version": 1,
+        "total_count": int(value["total_count"]),
+        "counts": {
+            key: int(value["counts"][key])
+            for key in _INSTRUCTION_DISPOSITIONS
+        },
+        "digest": str(value["digest"]),
+    }
+
+
+def _instruction_population_summary_is_valid(value: Any) -> bool:
+    return bool(
+        isinstance(value, Mapping)
+        and set(value) == {"schema_version", "total_count", "counts", "digest"}
+        and value.get("schema_version") == 1
+        and not isinstance(value.get("total_count"), bool)
+        and isinstance(value.get("total_count"), int)
+        and 1 <= value.get("total_count") <= _MAX_INSTRUCTION_POPULATION
+        and isinstance(value.get("counts"), Mapping)
+        and set(value["counts"]) == set(_INSTRUCTION_DISPOSITIONS)
+        and all(
+            not isinstance(count, bool)
+            and isinstance(count, int)
+            and count >= 0
+            for count in value["counts"].values()
+        )
+        and sum(value["counts"].values()) == value["total_count"]
+        and value["counts"].get("target_incident_frozen") == 1
+        and _is_sha256(value.get("digest"))
+    )
+
+
 def _has_additional_active_database_work(session, *, batch_id: int) -> bool:
     other_batch = (
         session.query(StrategyManagementBatch.id)
@@ -3171,17 +3788,18 @@ def _has_additional_active_database_work(session, *, batch_id: int) -> bool:
         is not None
     ):
         return True
-    return (
-        session.query(MessageInstructionItem.id)
-        .filter(
-            MessageInstructionItem.retired_at.is_(None),
-            MessageInstructionItem.status.notin_(
-                _SAFE_TERMINAL_INSTRUCTION_STATUSES
-            ),
+    batch = session.get(StrategyManagementBatch, int(batch_id))
+    if batch is None:
+        return True
+    try:
+        _instruction_population_payload(
+            session,
+            batch=batch,
+            profile=BATCH_119_RECOVERY,
         )
-        .first()
-        is not None
-    )
+    except CompositeBatchRecoveryRefusal:
+        return True
+    return False
 
 
 def _has_exchange_close_submission(snapshot: Any, *, pos_id: str) -> bool:
@@ -3323,7 +3941,7 @@ def _protection_ownership_refusal(
 
 def _source_evidence_payload(
     *, batch, raw, lifecycle, binding, entry, leg, components, target, contract,
-    protection_ledger
+    protection_ledger, instruction_population
 ):
     return {
         "schema_version": 1,
@@ -3459,6 +4077,7 @@ def _source_evidence_payload(
             }
             for row in protection_ledger
         ],
+        "instruction_population": instruction_population,
         "submission_fields_present": 0,
         "durable_close_evidence_count": 0,
     }

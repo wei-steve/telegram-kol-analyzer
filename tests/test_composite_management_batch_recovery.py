@@ -19,6 +19,7 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    InstructionExecutionContract,
     MessageInstructionItem,
     PositionMutationIntent,
     PositionProtectionLedger,
@@ -29,6 +30,7 @@ from telegram_kol_research.models import (
     StrategyManagementBatch,
     StrategyManagementComponent,
     StrategyManagementLeg,
+    TradeSignal,
 )
 from telegram_kol_research.strategy_management_contracts import (
     ManagementInstructionContract,
@@ -403,6 +405,43 @@ def _seed_batch_119_false_submission(tmp_path):
         )
         session.add(batch)
         session.flush()
+        target_candidate = SignalCandidate(
+            raw_message_id=10532,
+            symbol="BTC",
+            side="long",
+            event_type="position_update",
+            target_lifecycle_id=794,
+            management_action="partial_then_break_even",
+            parse_source="mimo_authoritative",
+            review_status="pending",
+            created_at=NOW,
+        )
+        session.add(target_candidate)
+        session.flush()
+        session.add(
+            MessageInstructionItem(
+                raw_message_id=10532,
+                signal_candidate_id=target_candidate.id,
+                sequence=0,
+                instruction_kind="management",
+                strategy_instance_id=strategy_id,
+                idempotency_key="target-incident-instruction",
+                status="unknown",
+                result_json=None,
+                error_json=json.dumps(
+                    {
+                        "batch_id": 119,
+                        "reason": None,
+                        "status": "recovery_required",
+                        "submitted": False,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
         leg = StrategyManagementLeg(
             management_batch_id=119,
             execution_order_leg_id=entry.id,
@@ -506,6 +545,614 @@ def _seed_batch_119_false_submission(tmp_path):
             )
         session.commit()
         return factory, database, int(binding.id), int(entry.id), int(leg.id)
+
+
+def _add_audited_instruction_population(factory):
+    with factory() as session:
+        entry_raw = RawMessage(
+            id=20001,
+            chat_id=801,
+            message_id=9101,
+            text="synthetic entry",
+            posted_at=NOW,
+        )
+        entry_candidate = SignalCandidate(
+            raw_message_id=20001,
+            symbol="ETH",
+            side="long",
+            event_type="entry_signal",
+            parse_source="mimo_authoritative",
+            review_status="pending",
+            created_at=NOW,
+        )
+        entry_binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:audit:entry",
+            kol_id="audit-source",
+            chat_id=801,
+            message_id=9101,
+            symbol="ETH",
+            side="long",
+            venue="deepcoin",
+            status="closed",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add_all([entry_raw, entry_candidate, entry_binding])
+        session.flush()
+        trade_signal = TradeSignal(
+            signal_uid="audit-entry-signal",
+            strategy_instance_id="deepcoin:audit:entry",
+            source_type="telegram",
+            venue="deepcoin",
+            kol_id="audit-source",
+            chat_id=801,
+            message_id=9101,
+            symbol="ETH",
+            side="long",
+            action="open_position",
+            status="submitted",
+            payload_json="{}",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(trade_signal)
+        session.flush()
+        session.add(
+            MessageInstructionItem(
+                raw_message_id=20001,
+                signal_candidate_id=entry_candidate.id,
+                sequence=0,
+                instruction_kind="entry",
+                strategy_instance_id="deepcoin:audit:entry",
+                idempotency_key="audited-entry-terminal-mirror",
+                status="submitted",
+                result_json=json.dumps(
+                    {
+                        "entry_execution_type": "standard",
+                        "result": {
+                            "order_count": 1,
+                            "orders": [{"leg_index": 0}],
+                            "signal_id": trade_signal.id,
+                            "submitted": True,
+                        },
+                        "status": "submitted",
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+
+        historical_binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:audit:historical",
+            kol_id="audit-source",
+            chat_id=802,
+            message_id=9200,
+            symbol="SOL",
+            side="short",
+            venue="deepcoin",
+            status="closed",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        historical_lifecycle = StrategyLifecycle(
+            id=9001,
+            chat_id=802,
+            message_id=9200,
+            symbol="SOL",
+            side="short",
+            lifecycle_status="exited",
+            signal_at=NOW,
+            exited_at=NOW,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add_all([historical_binding, historical_lifecycle])
+        session.flush()
+        historical_lifecycle.execution_binding_id = historical_binding.id
+
+        management_rows = []
+        for raw_id, message_id, batch_id, batch_status, item_status in (
+            (20002, 9201, 901, "succeeded", "submitted"),
+            (20004, 9202, 902, "resolved", "unknown"),
+        ):
+            raw = RawMessage(
+                id=raw_id,
+                chat_id=802,
+                message_id=message_id,
+                text="synthetic management",
+                posted_at=NOW,
+            )
+            decision = RecognitionDecision(
+                raw_message_id=raw_id,
+                input_kind="text",
+                authoritative_model="mimo",
+                authoritative_status="仓位管理",
+                authoritative_payload_json="{}",
+                agreement_status="authoritative_only",
+                differences_json="[]",
+                automation_status="completed",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            candidate = SignalCandidate(
+                raw_message_id=raw_id,
+                symbol="SOL",
+                side="short",
+                event_type="position_update",
+                target_lifecycle_id=historical_lifecycle.id,
+                management_action="adjust_stop_loss",
+                parse_source="mimo_authoritative",
+                review_status="pending",
+                created_at=NOW,
+            )
+            session.add_all([raw, decision, candidate])
+            session.flush()
+            batch = StrategyManagementBatch(
+                id=batch_id,
+                idempotency_fingerprint=sha256(
+                    f"audit-batch:{batch_id}".encode()
+                ).hexdigest(),
+                raw_message_id=raw_id,
+                recognition_decision_id=decision.id,
+                recognition_generation="audit-generation",
+                target_lifecycle_id=historical_lifecycle.id,
+                strategy_instance_id="deepcoin:audit:historical",
+                execution_binding_id=historical_binding.id,
+                intent="adjust_stop_loss",
+                effective_action="adjust_stop_loss",
+                execution_mode="live",
+                status=batch_status,
+                reason_code=(
+                    "all_position_protection_replaced"
+                    if batch_status == "succeeded"
+                    else "history_no_submission_confirmed"
+                ),
+                target_fingerprint=sha256(
+                    f"audit-target:{batch_id}".encode()
+                ).hexdigest(),
+                target_snapshot_json="{}",
+                planned_at=NOW,
+                completed_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            session.add(batch)
+            session.flush()
+            payload = {
+                "batch_id": batch_id,
+                "reason": (
+                    "all_position_protection_replaced"
+                    if item_status == "submitted"
+                    else "close_final_preflight_failed"
+                ),
+                "status": (
+                    "succeeded"
+                    if item_status == "submitted"
+                    else "recovery_required"
+                ),
+                "submitted": item_status == "submitted",
+            }
+            item = MessageInstructionItem(
+                raw_message_id=raw_id,
+                signal_candidate_id=candidate.id,
+                sequence=0,
+                instruction_kind="management",
+                strategy_instance_id="deepcoin:audit:historical",
+                idempotency_key=f"audited-management-{item_status}",
+                status=item_status,
+                result_json=(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":"))
+                    if item_status == "submitted"
+                    else None
+                ),
+                error_json=(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":"))
+                    if item_status == "unknown"
+                    else None
+                ),
+                created_at=NOW,
+                updated_at=NOW,
+            )
+            session.add(item)
+            management_rows.append(item)
+
+        pending_raw = RawMessage(
+            id=20003,
+            chat_id=803,
+            message_id=9301,
+            text="synthetic abandoned instruction",
+            posted_at=NOW,
+        )
+        pending_candidate = SignalCandidate(
+            raw_message_id=20003,
+            symbol="XRP",
+            side="long",
+            event_type="entry_signal",
+            parse_source="mimo_authoritative",
+            review_status="pending",
+            created_at=NOW,
+        )
+        session.add_all([pending_raw, pending_candidate])
+        session.flush()
+        session.add(
+            MessageInstructionItem(
+                raw_message_id=20003,
+                signal_candidate_id=pending_candidate.id,
+                sequence=0,
+                instruction_kind="entry",
+                strategy_instance_id=None,
+                idempotency_key="audited-pending-residue",
+                status="pending",
+                result_json=None,
+                error_json=None,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+
+def test_instruction_population_allows_audited_dispositions_without_writes(
+    tmp_path,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+    with factory() as session:
+        before = [
+            (
+                row.id,
+                row.status,
+                row.result_json,
+                row.error_json,
+                row.retired_at,
+                row.updated_at,
+            )
+            for row in session.query(MessageInstructionItem)
+            .order_by(MessageInstructionItem.id)
+            .all()
+        ]
+
+    plan = _plan(factory)
+
+    assert plan.status == "ready"
+    population = plan.evidence["durable"]["instruction_population"]
+    assert population["schema_version"] == 1
+    assert population["total_count"] == 5
+    assert population["counts"] == {
+        "historical_residue_no_authority": 1,
+        "historical_unknown_frozen": 1,
+        "target_incident_frozen": 1,
+        "verified_terminal_mirror": 2,
+    }
+    assert len(population["digest"]) == 64
+    with factory() as session:
+        after = [
+            (
+                row.id,
+                row.status,
+                row.result_json,
+                row.error_json,
+                row.retired_at,
+                row.updated_at,
+            )
+            for row in session.query(MessageInstructionItem)
+            .order_by(MessageInstructionItem.id)
+            .all()
+        ]
+    assert after == before
+
+
+def test_instruction_population_rejects_submitted_mirror_with_active_contract(
+    tmp_path,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+    with factory() as session:
+        item = (
+            session.query(MessageInstructionItem)
+            .filter_by(idempotency_key="audited-entry-terminal-mirror")
+            .one()
+        )
+        session.add(
+            InstructionExecutionContract(
+                message_instruction_item_id=item.id,
+                raw_message_id=item.raw_message_id,
+                signal_candidate_id=item.signal_candidate_id,
+                strategy_instance_id=item.strategy_instance_id,
+                intent_kind="entry",
+                state="submitting",
+                state_version=1,
+                reason_code="exchange_submission_in_progress",
+                attempted_exchange_write=True,
+                evidence_refs_json="[]",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "additional_active_work_present"
+
+
+def test_instruction_population_rejects_contradictory_historical_unknown(
+    tmp_path,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+    with factory() as session:
+        item = (
+            session.query(MessageInstructionItem)
+            .filter_by(idempotency_key="audited-management-unknown")
+            .one()
+        )
+        payload = json.loads(item.error_json)
+        payload["submitted"] = True
+        item.error_json = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "additional_active_work_present"
+
+
+@pytest.mark.parametrize(
+    "attack",
+    [
+        "target_missing",
+        "target_duplicate",
+        "executing_item",
+        "entry_signal_not_submitted",
+        "entry_duplicate_binding",
+        "management_batch_identity_drift",
+        "pending_has_result",
+        "pending_has_scheduled_retry",
+        "pending_has_contract",
+        "pending_has_trade_signal",
+        "pending_has_active_lifecycle",
+        "unknown_has_active_lifecycle",
+        "unknown_has_active_binding",
+        "unknown_has_active_descendant",
+        "malformed_entry_payload",
+        "oversized_entry_payload",
+        "deep_entry_payload",
+        "target_payload_has_extra_key",
+    ],
+)
+def test_instruction_population_fails_closed_on_ambiguous_or_active_rows(
+    tmp_path,
+    attack,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+    with factory() as session:
+        target = (
+            session.query(MessageInstructionItem)
+            .filter_by(idempotency_key="target-incident-instruction")
+            .one()
+        )
+        entry = (
+            session.query(MessageInstructionItem)
+            .filter_by(idempotency_key="audited-entry-terminal-mirror")
+            .one()
+        )
+        pending = (
+            session.query(MessageInstructionItem)
+            .filter_by(idempotency_key="audited-pending-residue")
+            .one()
+        )
+        unknown = (
+            session.query(MessageInstructionItem)
+            .filter_by(idempotency_key="audited-management-unknown")
+            .one()
+        )
+        if attack == "target_missing":
+            target.status = "failed"
+        elif attack == "target_duplicate":
+            candidate = SignalCandidate(
+                raw_message_id=10532,
+                symbol="BTC",
+                side="long",
+                event_type="position_update",
+                target_lifecycle_id=794,
+                management_action="partial_then_break_even",
+                parse_source="mimo_authoritative",
+                review_status="pending",
+                created_at=NOW,
+            )
+            session.add(candidate)
+            session.flush()
+            session.add(
+                MessageInstructionItem(
+                    raw_message_id=10532,
+                    signal_candidate_id=candidate.id,
+                    sequence=1,
+                    instruction_kind="management",
+                    strategy_instance_id="deepcoin:incident:btc:long",
+                    idempotency_key="duplicate-target-incident",
+                    status="unknown",
+                    error_json=target.error_json,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+        elif attack == "executing_item":
+            pending.status = "executing"
+        elif attack == "entry_signal_not_submitted":
+            signal_id = json.loads(entry.result_json)["result"]["signal_id"]
+            session.get(TradeSignal, signal_id).status = "failed"
+        elif attack == "entry_duplicate_binding":
+            session.add(
+                ExecutionBinding(
+                    strategy_instance_id=entry.strategy_instance_id,
+                    kol_id="audit-source-duplicate",
+                    chat_id=899,
+                    message_id=9999,
+                    symbol="ETH",
+                    side="long",
+                    venue="deepcoin",
+                    status="closed",
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+        elif attack == "management_batch_identity_drift":
+            session.get(StrategyManagementBatch, 901).raw_message_id = 20003
+        elif attack == "pending_has_result":
+            pending.result_json = '{"status":"submitted"}'
+        elif attack == "pending_has_scheduled_retry":
+            pending.visibility_first_failed_at = NOW
+            pending.visibility_retry_attempts = 1
+            pending.visibility_next_attempt_at = NOW
+        elif attack == "pending_has_contract":
+            session.add(
+                InstructionExecutionContract(
+                    message_instruction_item_id=pending.id,
+                    raw_message_id=pending.raw_message_id,
+                    signal_candidate_id=pending.signal_candidate_id,
+                    strategy_instance_id=None,
+                    intent_kind="entry",
+                    state="pending",
+                    state_version=0,
+                    attempted_exchange_write=False,
+                    evidence_refs_json="[]",
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+        elif attack == "pending_has_trade_signal":
+            raw = session.get(RawMessage, pending.raw_message_id)
+            candidate = session.get(SignalCandidate, pending.signal_candidate_id)
+            session.add(
+                TradeSignal(
+                    signal_uid="unexpected-pending-signal",
+                    strategy_instance_id=None,
+                    source_type="telegram",
+                    venue="deepcoin",
+                    kol_id="audit-source",
+                    chat_id=raw.chat_id,
+                    message_id=raw.message_id,
+                    symbol=candidate.symbol,
+                    side=candidate.side,
+                    action="open_position",
+                    status="pending",
+                    payload_json="{}",
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+        elif attack == "pending_has_active_lifecycle":
+            session.get(SignalCandidate, pending.signal_candidate_id).target_lifecycle_id = 794
+        elif attack == "unknown_has_active_lifecycle":
+            session.get(StrategyLifecycle, 9001).lifecycle_status = "entered"
+        elif attack == "unknown_has_active_binding":
+            binding = (
+                session.query(ExecutionBinding)
+                .filter_by(strategy_instance_id="deepcoin:audit:historical")
+                .one()
+            )
+            binding.status = "active"
+        elif attack == "unknown_has_active_descendant":
+            session.get(StrategyManagementBatch, 902).status = "executing"
+        elif attack == "malformed_entry_payload":
+            entry.result_json = "{"
+        elif attack == "oversized_entry_payload":
+            entry.result_json = json.dumps({"oversized": "x" * 20_000})
+        elif attack == "deep_entry_payload":
+            entry.result_json = (
+                '{"status":"submitted","result":'
+                + "[" * 1100
+                + "0"
+                + "]" * 1100
+                + "}"
+            )
+        elif attack == "target_payload_has_extra_key":
+            payload = json.loads(target.error_json)
+            payload["unexpected"] = True
+            target.error_json = json.dumps(payload, sort_keys=True)
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "additional_active_work_present"
+
+
+def test_resume_rejects_new_valid_instruction_population_after_repair(tmp_path):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    plan = _plan(factory)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    _add_audited_instruction_population(factory)
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="additional_active_work_present",
+    ):
+        module.authorize_composite_batch_recovery_resume(
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=_snapshot(),
+        )
+
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "ready"
+        assert session.query(ExecutionEvent).count() == 1
+
+
+def test_instruction_population_same_count_drift_changes_fingerprint_and_cas(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _add_audited_instruction_population(factory)
+    before = _plan(factory)
+    with factory() as session:
+        binding = (
+            session.query(ExecutionBinding)
+            .filter_by(strategy_instance_id="deepcoin:audit:entry")
+            .one()
+        )
+        binding.status = "open"
+        session.commit()
+
+    after = _plan(factory)
+
+    assert before.status == after.status == "ready"
+    assert before.evidence["durable"]["instruction_population"]["total_count"] == 5
+    assert after.evidence["durable"]["instruction_population"]["total_count"] == 5
+    assert before.source_fingerprint != after.source_fingerprint
+    assert before.evidence_fingerprint != after.evidence_fingerprint
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="source_fingerprint_conflict",
+    ):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=before,
+            expected_fingerprint=before.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
 
 
 def _plan(factory, snapshot=None):
