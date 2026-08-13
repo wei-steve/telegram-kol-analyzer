@@ -60,12 +60,16 @@ def reserve_position_mutation_intent(
     )
     strict_set_identity = (
         operation == "set_position_sltp"
-        and "_ledger_purpose" in request
+        and (
+            "_base_authority_fingerprint" in request
+            or str(idempotency_key).startswith("protected-entry:")
+        )
     )
     if strict_set_identity:
         _require_set_position_request_identity(
             request,
             request_fingerprint=request_fingerprint,
+            authority_fingerprint=authority_fingerprint,
         )
     with session_factory() as session:
         existing = (
@@ -78,9 +82,16 @@ def reserve_position_mutation_intent(
                 _require_existing_set_position_request_identity(
                     existing,
                     incoming_request=request,
+                    incoming_authority_fingerprint=authority_fingerprint,
                     request_fingerprint=request_fingerprint,
                 )
             existing_identity = _intent_identity(existing)
+            if strict_set_identity:
+                existing_identity = (
+                    *existing_identity[:6],
+                    authority_fingerprint,
+                    *existing_identity[7:],
+                )
             if (
                 existing.status == "confirmed"
                 and order_id is None
@@ -170,9 +181,17 @@ def reserve_position_mutation_intent(
                 _require_existing_set_position_request_identity(
                     existing,
                     incoming_request=request,
+                    incoming_authority_fingerprint=authority_fingerprint,
                     request_fingerprint=request_fingerprint,
                 )
-            if _intent_identity(existing) != identity:
+            existing_identity = _intent_identity(existing)
+            if strict_set_identity:
+                existing_identity = (
+                    *existing_identity[:6],
+                    authority_fingerprint,
+                    *existing_identity[7:],
+                )
+            if existing_identity != identity:
                 raise PositionMutationIntentError(
                     "position_mutation_intent_conflict"
                 ) from None
@@ -245,18 +264,28 @@ def _require_existing_set_position_request_identity(
     row: PositionMutationIntent,
     *,
     incoming_request: Mapping[str, Any],
+    incoming_authority_fingerprint: str,
     request_fingerprint: str,
 ) -> None:
     existing = load_validated_set_position_request(
         row.request_json,
         request_fingerprint=request_fingerprint,
+        authority_fingerprint=str(row.authority_fingerprint),
     )
     incoming = dict(incoming_request)
     _require_set_position_request_identity(
         incoming,
         request_fingerprint=request_fingerprint,
+        authority_fingerprint=incoming_authority_fingerprint,
     )
-    if existing.get("_ledger_purpose") != incoming.get("_ledger_purpose"):
+    if (
+        existing.get("_ledger_purpose")
+        != incoming.get("_ledger_purpose")
+        or existing.get("_base_authority_fingerprint")
+        != incoming.get("_base_authority_fingerprint")
+        or existing.get("_base_authority_fingerprint")
+        != incoming_authority_fingerprint
+    ):
         raise PositionMutationIntentError(
             "position_mutation_intent_conflict"
         )
@@ -266,12 +295,14 @@ def load_validated_set_position_request(
     raw: object,
     *,
     request_fingerprint: str,
+    authority_fingerprint: str | None = None,
     require_baseline: bool = False,
 ) -> dict[str, Any]:
     request = _strict_request_object(raw)
     _require_set_position_request_identity(
         request,
         request_fingerprint=request_fingerprint,
+        authority_fingerprint=authority_fingerprint,
     )
     if require_baseline and not _valid_order_refs(
         request.get("_pre_submit_order_refs")
@@ -286,6 +317,7 @@ def _require_set_position_request_identity(
     request: Mapping[str, Any],
     *,
     request_fingerprint: str,
+    authority_fingerprint: str | None = None,
 ) -> None:
     if not isinstance(request, Mapping):
         raise PositionMutationIntentError(
@@ -294,6 +326,9 @@ def _require_set_position_request_identity(
     payload = dict(request)
     baseline = payload.pop("_pre_submit_order_refs", None)
     ledger_purpose = payload.pop("_ledger_purpose", None)
+    base_authority_fingerprint = payload.pop(
+        "_base_authority_fingerprint", None
+    )
     try:
         fingerprint_matches = (
             _request_fingerprint(payload) == request_fingerprint
@@ -302,11 +337,28 @@ def _require_set_position_request_identity(
         fingerprint_matches = False
     if (
         ledger_purpose not in {"stop_loss", "backup_stop", "take_profit"}
+        or not _is_sha256(base_authority_fingerprint)
         or (
             baseline is not None
             and not _valid_order_refs(baseline)
         )
         or not fingerprint_matches
+    ):
+        raise PositionMutationIntentError(
+            "position_mutation_intent_conflict"
+        )
+    expected_authority_fingerprint = (
+        _bound_set_position_authority_fingerprint(
+            base_authority_fingerprint=base_authority_fingerprint,
+            ledger_purpose=ledger_purpose,
+            pre_submit_order_refs=baseline,
+        )
+        if baseline is not None
+        else base_authority_fingerprint
+    )
+    if (
+        authority_fingerprint is not None
+        and authority_fingerprint != expected_authority_fingerprint
     ):
         raise PositionMutationIntentError(
             "position_mutation_intent_conflict"
@@ -369,6 +421,51 @@ def _valid_order_refs(value: object) -> bool:
             and all(character in "0123456789abcdef" for character in item)
             for item in value
         )
+    )
+
+
+def bound_set_position_authority_fingerprint(
+    *,
+    base_authority_fingerprint: str,
+    ledger_purpose: str,
+    pre_submit_order_refs: list[str],
+) -> str:
+    if (
+        not _is_sha256(base_authority_fingerprint)
+        or ledger_purpose
+        not in {"stop_loss", "backup_stop", "take_profit"}
+        or not _valid_order_refs(pre_submit_order_refs)
+    ):
+        raise PositionMutationIntentError(
+            "position_mutation_intent_conflict"
+        )
+    return _bound_set_position_authority_fingerprint(
+        base_authority_fingerprint=base_authority_fingerprint,
+        ledger_purpose=ledger_purpose,
+        pre_submit_order_refs=pre_submit_order_refs,
+    )
+
+
+def _bound_set_position_authority_fingerprint(
+    *,
+    base_authority_fingerprint: str,
+    ledger_purpose: str,
+    pre_submit_order_refs: object,
+) -> str:
+    return _request_fingerprint(
+        {
+            "base_authority_fingerprint": base_authority_fingerprint,
+            "ledger_purpose": ledger_purpose,
+            "pre_submit_order_refs": pre_submit_order_refs,
+        }
+    )
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
     )
 
 

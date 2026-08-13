@@ -3635,7 +3635,10 @@ def test_protected_entry_market_crash_after_post_resumes_readback_without_second
         {"protected_entry_execution_mode": "disabled"},
     )
 
-    with pytest.raises(Exception, match="protected_entry_readback_only"):
+    with pytest.raises(
+        EntrySubmissionProgressError,
+        match="protected_entry_readback_only",
+    ):
         _submit_recovery_signal_direct(
             session_factory,
             trade_signal=load_trade_signal(session_factory, signal.id),
@@ -3777,6 +3780,7 @@ def test_protected_entry_market_crash_after_exact_readback_rebuilds_binding_and_
     assert result["submitted"] is True
     assert len(client.payloads) == 1
     assert len(client.position_protection_payloads) == 1
+    assert client.trigger_payloads == []
     with session_factory() as session:
         assert session.query(ExecutionBinding).count() == 1
         assert session.query(ExecutionOrderLeg).count() == 1
@@ -3815,6 +3819,20 @@ def test_protected_entry_protection_post_crash_resumes_get_only(
         session_factory, chat_id=200, message_id=66,
         symbol="BTC", side="short",
         contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    first_leg = signal.payload["deepcoin_order_draft"]["order_legs"][0]
+    _replace_queued_order_legs(
+        session_factory,
+        signal.id,
+        [
+            first_leg,
+            {
+                **first_leg,
+                "order_type": "limit",
+                "price": 59000.0,
+                "client_order_id": "readback-only-later-leg",
+            },
+        ],
     )
 
     class ResumeClient(_FakeDeepcoinClient):
@@ -3881,10 +3899,16 @@ def test_protected_entry_protection_post_crash_resumes_get_only(
         )
     assert len(client.payloads) == 1
     assert len(client.position_protection_payloads) == 1
+    assert client.trigger_payloads == []
     with session_factory() as session:
         assert session.query(PositionMutationIntent).one().status == (
             "submitting"
         )
+
+    def fail_if_later_leg_is_written(payload):
+        raise AssertionError("readback-only submitted a later leg")
+
+    client.trigger_order = fail_if_later_leg_is_written
 
     monkeypatch.setattr(
         gateway_module,
@@ -3896,15 +3920,18 @@ def test_protected_entry_protection_post_crash_resumes_get_only(
         {"protected_entry_execution_mode": "disabled"},
     )
     loaded_signal = load_trade_signal(session_factory, signal.id)
-    result = _submit_recovery_signal_direct(
-        session_factory,
-        trade_signal=loaded_signal,
-        deepcoin_client=client,
-        submitted_at=datetime(2026, 8, 13, 8, 0, tzinfo=UTC),
-        validated_draft=loaded_signal.payload["deepcoin_order_draft"],
-    )
+    with pytest.raises(
+        EntrySubmissionProgressError,
+        match="protected_entry_readback_only",
+    ):
+        _submit_recovery_signal_direct(
+            session_factory,
+            trade_signal=loaded_signal,
+            deepcoin_client=client,
+            submitted_at=datetime(2026, 8, 13, 8, 0, tzinfo=UTC),
+            validated_draft=loaded_signal.payload["deepcoin_order_draft"],
+        )
 
-    assert result["submitted"] is True
     assert len(client.payloads) == 1
     assert len(client.position_protection_payloads) == 1
     with session_factory() as session:

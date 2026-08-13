@@ -34,6 +34,7 @@ from telegram_kol_research.position_mutation_authority import (
 )
 from telegram_kol_research.position_mutation_intents import (
     PositionMutationIntentError,
+    bound_set_position_authority_fingerprint,
     load_validated_set_position_request,
     reserve_position_mutation_intent,
     transition_position_mutation_intent,
@@ -55,6 +56,15 @@ from telegram_kol_research.protection_ledger import (
 _SAFE_ERROR_CODE = re.compile(r"^[a-z0-9][a-z0-9_]{0,127}$")
 _SAFE_EXCHANGE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$")
 _SAFE_RESPONSE_CODE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+_SENSITIVE_ID_MARKERS = (
+    "AUTHORIZATION",
+    "BEARER",
+    "DC-ACCESS-",
+    "API-KEY",
+    "API_KEY",
+    "SECRET",
+    "PASSPHRASE",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +249,17 @@ class PositionMutationGateway:
         }
         if purpose not in trigger_field_by_purpose:
             raise ValueError("position_sltp_purpose_invalid")
+        protected_identity = str(idempotency_key).startswith(
+            "protected-entry:"
+        )
+        effective_order_refs_provider = pre_submit_order_refs_provider
+        if protected_identity and effective_order_refs_provider is None:
+            effective_order_refs_provider = lambda: (
+                _complete_pending_tpsl_order_refs(
+                    self._client,
+                    instrument_id=authority.instrument_id,
+                )
+            )
         binding, reason = self._load_verified_binding(authority)
         if reason is not None or binding is None:
             payload = {
@@ -276,13 +297,21 @@ class PositionMutationGateway:
             persisted_request={
                 **payload,
                 "_ledger_purpose": ledger_purpose or purpose,
+                **(
+                    {
+                        "_base_authority_fingerprint":
+                        _authority_fingerprint(authority)
+                    }
+                    if effective_order_refs_provider is not None
+                    else {}
+                ),
             },
             idempotency_key=idempotency_key,
             before_submit=before_submit,
             before_exchange_submit=before_exchange_submit,
             expected_intent_id=expected_intent_id,
             propagate_outcome_unknown=propagate_outcome_unknown,
-            pre_submit_order_refs_provider=pre_submit_order_refs_provider,
+            pre_submit_order_refs_provider=effective_order_refs_provider,
             submit=lambda: self._call_client_write(
                 "_set_position_sltp_unchecked",
                 "set_position_sltp",
@@ -855,9 +884,17 @@ def _safe_mutation_success_response(
         if _SAFE_RESPONSE_CODE.fullmatch(code_text):
             projected["code"] = code_text
     order_id = _response_order_id(response)
-    if order_id is not None and _SAFE_EXCHANGE_ID.fullmatch(order_id):
+    if order_id is not None and _safe_exchange_identity(order_id):
         projected["data"] = {"ordId": order_id}
     return projected
+
+
+def _safe_exchange_identity(value: str) -> bool:
+    upper = value.upper()
+    return bool(
+        _SAFE_EXCHANGE_ID.fullmatch(value)
+        and not any(marker in upper for marker in _SENSITIVE_ID_MARKERS)
+    )
 
 
 def _load_json(value: str | None) -> dict[str, Any]:
@@ -949,12 +986,25 @@ def _attach_pre_submit_order_refs(
             request = load_validated_set_position_request(
                 original_request_json,
                 request_fingerprint=request_fingerprint,
+                authority_fingerprint=str(intent.authority_fingerprint),
             )
         except PositionMutationIntentError as exc:
             raise PositionMutationAuthorityError(
                 "position_mutation_intent_request_conflict"
             ) from exc
         request["_pre_submit_order_refs"] = list(order_refs)
+        original_authority_fingerprint = str(
+            intent.authority_fingerprint
+        )
+        bound_authority_fingerprint = (
+            bound_set_position_authority_fingerprint(
+                base_authority_fingerprint=str(
+                    request["_base_authority_fingerprint"]
+                ),
+                ledger_purpose=str(request["_ledger_purpose"]),
+                pre_submit_order_refs=list(order_refs),
+            )
+        )
         request_json = json.dumps(
             request,
             ensure_ascii=False,
@@ -968,10 +1018,14 @@ def _attach_pre_submit_order_refs(
                 PositionMutationIntent.status == "reserved",
                 PositionMutationIntent.request_json
                 == original_request_json,
+                PositionMutationIntent.authority_fingerprint
+                == original_authority_fingerprint,
             )
             .update(
                 {
                     PositionMutationIntent.request_json: request_json,
+                    PositionMutationIntent.authority_fingerprint:
+                    bound_authority_fingerprint,
                     PositionMutationIntent.updated_at: datetime.now(UTC),
                 },
                 synchronize_session=False,
@@ -1087,6 +1141,9 @@ def prepare_exact_position_sltp_intent(
         request={
             **final_payload,
             "_ledger_purpose": ledger_purpose or purpose,
+            "_base_authority_fingerprint": _authority_fingerprint(
+                authority
+            ),
         },
         reserved_at=now_provider(),
         venue=authority.venue,
@@ -1420,6 +1477,7 @@ def _reconcile_exact_set_intent_from_pending(
             request = load_validated_set_position_request(
                 intent.request_json,
                 request_fingerprint=str(intent.request_fingerprint),
+                authority_fingerprint=str(intent.authority_fingerprint),
                 require_baseline=True,
             )
         except PositionMutationIntentError:
@@ -1726,26 +1784,32 @@ def reconcile_submitted_position_mutation_intents(
         for intent in intents:
             request = _load_json(intent.request_json)
             baseline_refs: set[str] = set()
-            if (
-                intent.operation == "set_position_sltp"
-                and "_ledger_purpose" in request
-            ):
-                require_baseline = str(
+            if intent.operation == "set_position_sltp":
+                protected_identity = str(
                     intent.idempotency_key or ""
                 ).startswith("protected-entry:")
-                try:
-                    request = load_validated_set_position_request(
-                        intent.request_json,
-                        request_fingerprint=str(
-                            intent.request_fingerprint
-                        ),
-                        require_baseline=require_baseline,
-                    )
-                except PositionMutationIntentError:
-                    continue
-                baseline_refs = set(
-                    request.get("_pre_submit_order_refs") or []
+                strict_identity = (
+                    protected_identity
+                    or "_base_authority_fingerprint" in request
+                    or "_pre_submit_order_refs" in request
                 )
+                if strict_identity:
+                    try:
+                        request = load_validated_set_position_request(
+                            intent.request_json,
+                            request_fingerprint=str(
+                                intent.request_fingerprint
+                            ),
+                            authority_fingerprint=str(
+                                intent.authority_fingerprint
+                            ),
+                            require_baseline=protected_identity,
+                        )
+                    except PositionMutationIntentError:
+                        continue
+                    baseline_refs = set(
+                        request.get("_pre_submit_order_refs") or []
+                    )
             response = _load_json(intent.response_json)
             order_id = str(intent.order_id or "") or _response_order_id(
                 response

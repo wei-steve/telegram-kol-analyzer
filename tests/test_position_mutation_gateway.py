@@ -23,6 +23,7 @@ from telegram_kol_research.position_mutation_gateway import (
     submit_exact_position_sltp,
 )
 from telegram_kol_research.position_mutation_intents import (
+    PositionMutationIntentError,
     reserve_position_mutation_intent,
     transition_position_mutation_intent,
 )
@@ -846,7 +847,9 @@ def test_protected_entry_market_protection_readback_polls_bounded_without_repeat
     assert response["data"]["ordId"] == "ord-new-stop"
     assert len(client.set_position_sltp_calls) == 1
     assert client.readback_calls == 3
-    assert clock.sleeps == [0.5, 1.0]
+    # The first read captures the immutable pre-submit TPSL baseline; only the
+    # remaining two reads belong to the bounded post-submit poll.
+    assert clock.sleeps == [0.5]
 
 
 def test_protected_entry_readback_requires_complete_position_identity(
@@ -977,8 +980,10 @@ def test_protected_entry_get_only_recovery_does_not_reconcile_other_intents(
         assert recovered.status == "confirmed"
 
 
+@pytest.mark.parametrize("tamper_baseline", [False, True])
 def test_protected_entry_recovery_never_claims_preexisting_matching_stop(
     tmp_path,
+    tamper_baseline,
 ):
     class SimulatedCrash(BaseException):
         pass
@@ -1023,14 +1028,33 @@ def test_protected_entry_recovery_never_claims_preexisting_matching_stop(
 
     with pytest.raises(SimulatedCrash):
         submit_exact_position_sltp(**kwargs)
-    with pytest.raises(
-        DeepcoinRequestOutcomeUnknown,
-        match=(
-            "writer_outcome_unknown|position_sltp_pending_readback|"
-            "position_mutation_submitting"
-        ),
-    ):
-        submit_exact_position_sltp(**kwargs)
+    if tamper_baseline:
+        with session_factory() as session:
+            intent = session.query(PositionMutationIntent).one()
+            request = json.loads(intent.request_json)
+            request["_pre_submit_order_refs"] = []
+            intent.request_json = json.dumps(request, sort_keys=True)
+            session.commit()
+        assert reconcile_submitted_position_mutation_intents(
+            session_factory,
+            pending_trigger_orders=client.pending,
+            reconciled_at=NOW,
+        ) == 0
+    if tamper_baseline:
+        with pytest.raises(
+            PositionMutationIntentError,
+            match="position_mutation_intent_conflict",
+        ):
+            submit_exact_position_sltp(**kwargs)
+    else:
+        with pytest.raises(
+            DeepcoinRequestOutcomeUnknown,
+            match=(
+                "writer_outcome_unknown|position_sltp_pending_readback|"
+                "position_mutation_submitting"
+            ),
+        ):
+            submit_exact_position_sltp(**kwargs)
 
     assert len(client.set_position_sltp_calls) == 1
     with session_factory() as session:
@@ -1038,19 +1062,25 @@ def test_protected_entry_recovery_never_claims_preexisting_matching_stop(
         assert intent.status == "submitting"
         assert intent.order_id is None
         assert "preexisting-manual-stop" not in intent.request_json
-        baseline_refs = json.loads(intent.request_json)[
-            "_pre_submit_order_refs"
-        ]
-        assert len(baseline_refs) == 1
-        assert len(baseline_refs[0]) == 64
+        if not tamper_baseline:
+            baseline_refs = json.loads(intent.request_json)[
+                "_pre_submit_order_refs"
+            ]
+            assert len(baseline_refs) == 1
+            assert len(baseline_refs[0]) == 64
         assert session.query(PositionProtectionLedger).filter(
             PositionProtectionLedger.order_id
             == "preexisting-manual-stop"
         ).count() == 0
 
 
+@pytest.mark.parametrize(
+    "tamper_kind",
+    ["trigger", "purpose_removed", "purpose_changed"],
+)
 def test_protected_entry_recovery_rejects_tampered_request_before_writing_ledger(
     tmp_path,
+    tamper_kind,
 ):
     class SimulatedCrash(BaseException):
         pass
@@ -1091,15 +1121,22 @@ def test_protected_entry_recovery_rejects_tampered_request_before_writing_ledger
     with session_factory() as session:
         intent = session.query(PositionMutationIntent).one()
         request = json.loads(intent.request_json)
-        request["slTriggerPx"] = "63000"
+        if tamper_kind == "trigger":
+            request["slTriggerPx"] = "63000"
+        elif tamper_kind == "purpose_removed":
+            request.pop("_ledger_purpose")
+        else:
+            request["_ledger_purpose"] = "backup_stop"
         intent.request_json = json.dumps(request, sort_keys=True)
         session.commit()
     client.pending = [{
-        "ordId": "unrelated-63000",
+        "ordId": "unrelated-tampered",
         "instId": "BTC-USDT-SWAP",
         "posId": "pos-sister",
         "posSide": "long",
-        "slTriggerPx": "63000",
+        "slTriggerPx": (
+            "63000" if tamper_kind == "trigger" else "62000"
+        ),
         "sz": "0",
     }]
 
@@ -1118,7 +1155,7 @@ def test_protected_entry_recovery_rejects_tampered_request_before_writing_ledger
         assert intent.status == "submitting"
         assert intent.order_id is None
         assert session.query(PositionProtectionLedger).filter(
-            PositionProtectionLedger.order_id == "unrelated-63000"
+            PositionProtectionLedger.order_id == "unrelated-tampered"
         ).count() == 0
 
 
@@ -1209,6 +1246,52 @@ def test_protected_entry_persists_only_bounded_success_response(
         intent = session.query(PositionMutationIntent).one()
         assert "TOPSECRET" not in (intent.response_json or "")
         assert json.loads(intent.response_json) == response
+
+
+def test_protected_entry_rejects_credential_shaped_success_order_id(
+    tmp_path,
+):
+    session_factory, _, _, _, _ = _seed(tmp_path)
+
+    class HostileIdClient(FakeDeepcoinClient):
+        def __init__(self):
+            super().__init__()
+            self.pending = []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return list(self.pending)
+
+        def set_position_sltp(self, payload):
+            self.set_position_sltp_calls.append(dict(payload))
+            return {
+                "code": "0",
+                "data": {"ordId": "DC-ACCESS-KEY:TOPSECRET"},
+            }
+
+    client = HostileIdClient()
+    with pytest.raises(
+        DeepcoinRequestOutcomeUnknown,
+        match="position_sltp_response_missing_order_id",
+    ):
+        submit_exact_position_sltp(
+            session_factory=session_factory,
+            deepcoin_client=client,
+            pos_id="pos-sister",
+            payload={
+                "instId": "BTC-USDT-SWAP",
+                "slTriggerPx": "62000",
+                "sz": "0",
+            },
+            idempotency_key="protected-entry:hostile-success-id",
+            live_execution_gate=lambda: True,
+            now_provider=lambda: NOW,
+            require_readback=True,
+            require_complete_readback_identity=True,
+        )
+
+    with session_factory() as session:
+        intent = session.query(PositionMutationIntent).one()
+        assert "TOPSECRET" not in (intent.response_json or "")
 
 
 def test_require_readback_is_restart_idempotent_after_confirmation(tmp_path):

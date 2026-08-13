@@ -123,6 +123,15 @@ _SAFE_PERSISTED_FAILURE = re.compile(
 _SAFE_PROTECTED_EXCHANGE_ID = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$"
 )
+_SENSITIVE_PROTECTED_ID_MARKERS = (
+    "AUTHORIZATION",
+    "BEARER",
+    "DC-ACCESS-",
+    "API-KEY",
+    "API_KEY",
+    "SECRET",
+    "PASSPHRASE",
+)
 
 
 @dataclass(slots=True)
@@ -262,8 +271,8 @@ def _safe_protected_market_response(
     pos_id: str,
 ) -> dict[str, Any]:
     if (
-        not _SAFE_PROTECTED_EXCHANGE_ID.fullmatch(order_id)
-        or not _SAFE_PROTECTED_EXCHANGE_ID.fullmatch(pos_id)
+        not _safe_protected_exchange_identity(order_id)
+        or not _safe_protected_exchange_identity(pos_id)
     ):
         raise RecoveryLiveSubmitError(
             "protected_entry_exchange_identity_invalid"
@@ -279,6 +288,17 @@ def _safe_protected_market_response(
         ):
             projected["code"] = str(code)
     return projected
+
+
+def _safe_protected_exchange_identity(value: str) -> bool:
+    upper = value.upper()
+    return bool(
+        _SAFE_PROTECTED_EXCHANGE_ID.fullmatch(value)
+        and not any(
+            marker in upper
+            for marker in _SENSITIVE_PROTECTED_ID_MARKERS
+        )
+    )
 
 
 def _require_synchronized_finalized_entry_assembly(
@@ -2055,6 +2075,9 @@ def _confirmed_protection_response(
             request = load_validated_set_position_request(
                 intent.request_json,
                 request_fingerprint=request_fingerprint,
+                authority_fingerprint=str(
+                    intent.authority_fingerprint
+                ),
                 require_baseline=True,
             )
             response = json.loads(intent.response_json)
@@ -2790,6 +2813,10 @@ def _submit_recovery_signal_direct(
                     if len(protection_responses) == 1
                     else protection_responses
                 )
+                if protected_access == "readback_only":
+                    raise RecoveryLiveSubmitError(
+                        "protected_entry_readback_only"
+                    )
             except Exception as exc:  # pragma: no cover - defensive boundary
                 if protected_v1:
                     raise
@@ -2797,6 +2824,10 @@ def _submit_recovery_signal_direct(
                 protection_response = {"error": str(exc)}
                 warnings.append("position_protection_failed_after_entry_submitted")
         elif order_type == "limit":
+            if protected_access == "readback_only":
+                raise RecoveryLiveSubmitError(
+                    "protected_entry_readback_only"
+                )
             order_payload = build_deepcoin_trigger_order_payload(draft, leg)
             try:
                 with _entry_source_exchange_write_gate(
@@ -2843,6 +2874,10 @@ def _submit_recovery_signal_direct(
             protection_response = {"code": "0", "data": {"attached_on_trigger_order": True}}
             order_type = "trigger_limit"
         else:
+            if protected_access == "readback_only":
+                raise RecoveryLiveSubmitError(
+                    "protected_entry_readback_only"
+                )
             order_payload = build_deepcoin_trigger_order_payload(draft, leg)
             try:
                 with _entry_source_exchange_write_gate(
