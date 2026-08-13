@@ -70,7 +70,7 @@ def test_safe_get_status_is_retryable(status):
     fact = classify_http_failure(method="GET", status_code=status)
     assert fact.category in {"rate_limited", "http_retryable"}
     assert fact.retryable is True
-    assert fact.outcome_certainty == "not_sent"
+    assert fact.outcome_certainty == "unknown"
 
 
 def test_post_transport_failure_is_unknown_and_never_retryable():
@@ -135,6 +135,7 @@ class RequestProfile:
     per_minute: int
     background_per_second: int
     background_per_minute: int
+    min_interval_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,8 +148,13 @@ class FailureFact:
 ```
 
 Map documented 5/150, 10/300, 15/450, and strict 1/60 endpoints to
-4/120, 8/240, 12/360, and 1 per 1.25 seconds/48 per minute. Give background
-traffic at most half of each safe profile.
+4/120, 8/240, 12/360, and an explicit 1.25-second minimum interval/48 per
+minute. Give background traffic at most half of each safe profile.
+
+For safe reads, `outcome_certainty=unknown` means the requested exchange state
+was not obtained. Retry remains safe only because the method is GET. Reserve
+`not_sent` for a typed local failure proven to happen before network submission;
+never reuse either meaning to authorize a POST retry.
 
 Do not parse human exception messages to classify behavior. Classification
 accepts typed transport facts, HTTP status, and Deepcoin business code only.
