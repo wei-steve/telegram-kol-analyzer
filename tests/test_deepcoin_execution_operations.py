@@ -14,6 +14,7 @@ from telegram_kol_research.deepcoin_execution_operations import (
     DeepcoinEvidenceValidationError,
     DeepcoinOperationConflict,
     advance_account_write_generation,
+    contains_credential_marker,
     load_operation_bundle,
     record_request_attempt,
     record_snapshot_evidence,
@@ -37,6 +38,26 @@ NOW = datetime(2026, 8, 12, 12, 0, 0)
 REQUEST_FP = "a" * 64
 ECONOMICS_FP = "b" * 64
 UID_FP = "c" * 64
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "DC-ACCESS-KEY:VALUE",
+        "DC_ACCESS_KEY:VALUE",
+        "DCACCESSKEY:VALUE",
+        "PRIVATE_KEY:VALUE",
+        "TOKEN:VALUE",
+        "Authorization: Bearer VALUE",
+    ],
+)
+def test_credential_marker_detection_covers_separator_variants(value):
+    assert contains_credential_marker(value)
+
+
+def test_credential_marker_detection_allows_exchange_identifiers():
+    assert not contains_credential_marker("123456789012345678")
+    assert not contains_credential_marker("ord-safe_123")
 
 
 @pytest.fixture

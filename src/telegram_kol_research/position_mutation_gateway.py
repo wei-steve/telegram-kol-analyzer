@@ -18,6 +18,9 @@ from telegram_kol_research.deepcoin_client import (
     DeepcoinDefiniteRejection,
     DeepcoinRequestOutcomeUnknown,
 )
+from telegram_kol_research.deepcoin_execution_operations import (
+    contains_credential_marker,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
@@ -56,15 +59,6 @@ from telegram_kol_research.protection_ledger import (
 _SAFE_ERROR_CODE = re.compile(r"^[a-z0-9][a-z0-9_]{0,127}$")
 _SAFE_EXCHANGE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$")
 _SAFE_RESPONSE_CODE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
-_SENSITIVE_ID_MARKERS = (
-    "AUTHORIZATION",
-    "BEARER",
-    "DC-ACCESS-",
-    "API-KEY",
-    "API_KEY",
-    "SECRET",
-    "PASSPHRASE",
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -890,10 +884,9 @@ def _safe_mutation_success_response(
 
 
 def _safe_exchange_identity(value: str) -> bool:
-    upper = value.upper()
     return bool(
         _SAFE_EXCHANGE_ID.fullmatch(value)
-        and not any(marker in upper for marker in _SENSITIVE_ID_MARKERS)
+        and not contains_credential_marker(value)
     )
 
 
@@ -1240,7 +1233,7 @@ def submit_exact_position_sltp(
     if not require_readback:
         return response
     order_id = _response_order_id(response)
-    if not order_id:
+    if not order_id or not _safe_exchange_identity(order_id):
         raise DeepcoinRequestOutcomeUnknown(
             "position_sltp_response_missing_order_id"
         )
@@ -1526,6 +1519,7 @@ def _reconcile_exact_set_intent_from_pending(
                     or ""
                 )
             )
+            and _safe_exchange_identity(order_id)
             and _set_position_sltp_readback_matches(
                 [row],
                 order_id=order_id,
@@ -1887,6 +1881,7 @@ def reconcile_submitted_position_mutation_intents(
                             or ""
                         )
                     )
+                    and _safe_exchange_identity(candidate_id)
                     and _set_position_sltp_readback_matches(
                         [row],
                         order_id=candidate_id,
@@ -1901,7 +1896,7 @@ def reconcile_submitted_position_mutation_intents(
                 }
                 if len(matching_ids) == 1:
                     order_id = next(iter(matching_ids))
-            if not order_id:
+            if not order_id or not _safe_exchange_identity(order_id):
                 continue
             if intent.operation == "cancel_position_sltp":
                 if (
@@ -2081,6 +2076,10 @@ def _confirm_intent(
     order_id: str,
     reconciled_at: Any,
 ) -> None:
+    if not _safe_exchange_identity(order_id):
+        raise PositionMutationAuthorityError(
+            "position_mutation_exchange_identity_invalid"
+        )
     intent.order_id = order_id
     if not intent.response_json:
         intent.response_json = json.dumps(

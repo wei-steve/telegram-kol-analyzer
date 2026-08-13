@@ -18,6 +18,7 @@ from telegram_kol_research.position_mutation_authority import (
 )
 from telegram_kol_research.position_mutation_gateway import (
     PositionMutationGateway,
+    _reconcile_exact_set_intent_from_pending,
     position_authority_fingerprint,
     reconcile_submitted_position_mutation_intents,
     submit_exact_position_sltp,
@@ -1248,8 +1249,18 @@ def test_protected_entry_persists_only_bounded_success_response(
         assert json.loads(intent.response_json) == response
 
 
+@pytest.mark.parametrize(
+    "hostile_order_id",
+    [
+        "DC-ACCESS-KEY:TOPSECRET",
+        "DC_ACCESS_KEY:TOPVALUE",
+        "PRIVATE_KEY:TOPVALUE",
+        "TOKEN:TOPVALUE",
+    ],
+)
 def test_protected_entry_rejects_credential_shaped_success_order_id(
     tmp_path,
+    hostile_order_id,
 ):
     session_factory, _, _, _, _ = _seed(tmp_path)
 
@@ -1265,7 +1276,7 @@ def test_protected_entry_rejects_credential_shaped_success_order_id(
             self.set_position_sltp_calls.append(dict(payload))
             return {
                 "code": "0",
-                "data": {"ordId": "DC-ACCESS-KEY:TOPSECRET"},
+                "data": {"ordId": hostile_order_id},
             }
 
     client = HostileIdClient()
@@ -1289,9 +1300,37 @@ def test_protected_entry_rejects_credential_shaped_success_order_id(
             require_complete_readback_identity=True,
         )
 
+    hostile_pending = [{
+        "ordId": hostile_order_id,
+        "instId": "BTC-USDT-SWAP",
+        "posId": "pos-sister",
+        "posSide": "long",
+        "slTriggerPx": "62000",
+        "sz": "0",
+    }]
     with session_factory() as session:
         intent = session.query(PositionMutationIntent).one()
-        assert "TOPSECRET" not in (intent.response_json or "")
+        intent_id = int(intent.id)
+        assert hostile_order_id not in (intent.response_json or "")
+    assert not _reconcile_exact_set_intent_from_pending(
+        session_factory,
+        intent_id=intent_id,
+        pending_trigger_orders=hostile_pending,
+        reconciled_at=NOW,
+    )
+    assert reconcile_submitted_position_mutation_intents(
+        session_factory,
+        pending_trigger_orders=hostile_pending,
+        reconciled_at=NOW,
+    ) == 0
+    with session_factory() as session:
+        intent = session.get(PositionMutationIntent, intent_id)
+        assert intent.status == "submitted"
+        assert intent.order_id is None
+        assert hostile_order_id not in (intent.response_json or "")
+        assert session.query(PositionProtectionLedger).filter(
+            PositionProtectionLedger.order_id == hostile_order_id
+        ).count() == 0
 
 
 def test_require_readback_is_restart_idempotent_after_confirmation(tmp_path):

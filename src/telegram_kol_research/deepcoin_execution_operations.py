@@ -67,6 +67,26 @@ _SECRET_TEXT_MARKERS = (
     "private_key",
     "secret=",
 )
+_CREDENTIAL_TEXT_KEYS = frozenset(
+    {
+        "api_key",
+        "api_secret",
+        "authorization",
+        "bearer",
+        "credential",
+        "dc_access_key",
+        "dc_access_passphrase",
+        "dc_access_sign",
+        "password",
+        "passphrase",
+        "private_key",
+        "secret",
+        "token",
+    }
+)
+_CREDENTIAL_COMPACT_KEYS = frozenset(
+    key.replace("_", "") for key in _CREDENTIAL_TEXT_KEYS
+)
 _PHASES = frozenset(
     {
         "entry_preflight",
@@ -758,8 +778,40 @@ def _canonical_evidence_json(value: Mapping[str, Any]) -> str:
 
 def _reject_secret_text(value: str) -> None:
     lowered = value.lower()
-    if any(marker in lowered for marker in _SECRET_TEXT_MARKERS):
+    if (
+        any(marker in lowered for marker in _SECRET_TEXT_MARKERS)
+        or contains_credential_marker(value)
+    ):
         raise DeepcoinEvidenceValidationError("evidence_secret_forbidden")
+
+
+def contains_credential_marker(value: object) -> bool:
+    """Return true for credential labels in separated or compact forms."""
+
+    if not isinstance(value, str) or not value:
+        return False
+    normalized = re.sub(
+        r"[^a-z0-9]+", "_", value.strip().lower()
+    ).strip("_")
+    if not normalized:
+        return False
+    padded = f"_{normalized}_"
+    if any(
+        f"_{key}_" in padded
+        or normalized.startswith(f"{key}_")
+        for key in _CREDENTIAL_TEXT_KEYS
+    ):
+        return True
+    compact_tokens = {
+        token.replace("_", "")
+        for token in normalized.split("_")
+        if token
+    }
+    compact_value = normalized.replace("_", "")
+    return any(
+        key in compact_tokens or compact_value.startswith(key)
+        for key in _CREDENTIAL_COMPACT_KEYS
+    )
 
 
 def _fingerprint(value: Any, code: str) -> str:

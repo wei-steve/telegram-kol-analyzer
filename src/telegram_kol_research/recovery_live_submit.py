@@ -35,6 +35,7 @@ from telegram_kol_research.deepcoin_execution_operations import (
     DeepcoinOperationConflict,
     ExecutionOperationRecord,
     advance_account_write_generation,
+    contains_credential_marker,
     load_operation_bundle,
     record_request_attempt,
     reserve_execution_operation,
@@ -122,15 +123,6 @@ _SAFE_PERSISTED_FAILURE = re.compile(
 )
 _SAFE_PROTECTED_EXCHANGE_ID = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$"
-)
-_SENSITIVE_PROTECTED_ID_MARKERS = (
-    "AUTHORIZATION",
-    "BEARER",
-    "DC-ACCESS-",
-    "API-KEY",
-    "API_KEY",
-    "SECRET",
-    "PASSPHRASE",
 )
 
 
@@ -291,13 +283,9 @@ def _safe_protected_market_response(
 
 
 def _safe_protected_exchange_identity(value: str) -> bool:
-    upper = value.upper()
     return bool(
         _SAFE_PROTECTED_EXCHANGE_ID.fullmatch(value)
-        and not any(
-            marker in upper
-            for marker in _SENSITIVE_PROTECTED_ID_MARKERS
-        )
+        and not contains_credential_marker(value)
     )
 
 
