@@ -40,6 +40,71 @@ def test_context_resolution_schema_is_created(tmp_path):
     }
 
 
+def test_deepcoin_execution_schema_is_additive_idempotent_and_indexed(tmp_path):
+    database_path = tmp_path / "legacy-deepcoin-execution.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE legacy_rows (id INTEGER PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO legacy_rows (id, value) VALUES (1, 'preserved')"
+        )
+
+    first_factory = create_session_factory(database_path)
+    first_inspector = inspect(first_factory.kw["bind"])
+    first_tables = set(first_inspector.get_table_names())
+    required_tables = {
+        "deepcoin_execution_operations",
+        "deepcoin_request_attempts",
+        "deepcoin_snapshot_evidence",
+        "deepcoin_account_write_generations",
+    }
+    assert required_tables <= first_tables
+    first_indexes = {
+        table_name: {
+            index["name"]: bool(index.get("unique"))
+            for index in first_inspector.get_indexes(table_name)
+        }
+        for table_name in required_tables
+    }
+
+    second_factory = create_session_factory(database_path)
+    second_inspector = inspect(second_factory.kw["bind"])
+
+    assert set(second_inspector.get_table_names()) == first_tables
+    assert {
+        table_name: {
+            index["name"]: bool(index.get("unique"))
+            for index in second_inspector.get_indexes(table_name)
+        }
+        for table_name in first_indexes
+    } == first_indexes
+    assert first_indexes["deepcoin_execution_operations"][
+        "ix_deepcoin_execution_operations_operation_key"
+    ] is True
+    assert any(
+        constraint["column_names"]
+        == ["deepcoin_execution_operation_id", "ordinal"]
+        for constraint in first_inspector.get_unique_constraints(
+            "deepcoin_request_attempts"
+        )
+    )
+    assert any(
+        constraint["column_names"]
+        == ["deepcoin_execution_operation_id", "ordinal"]
+        for constraint in first_inspector.get_unique_constraints(
+            "deepcoin_snapshot_evidence"
+        )
+    )
+    assert first_indexes["deepcoin_account_write_generations"][
+        "ix_deepcoin_account_write_generations_uid_scope_hash"
+    ] is True
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT value FROM legacy_rows WHERE id = 1"
+        ).fetchone() == ("preserved",)
+
+
 def test_mimo_recognition_audit_schema_is_additive_and_indexed(tmp_path):
     database_path = tmp_path / "legacy-mimo-audit.db"
     with sqlite3.connect(database_path) as connection:

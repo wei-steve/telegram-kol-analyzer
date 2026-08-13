@@ -2734,6 +2734,340 @@ class TradeSignal(Base):
     processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
+class DeepcoinExecutionOperation(Base):
+    """Durable aggregate for one future-only protected Deepcoin operation."""
+
+    __tablename__ = "deepcoin_execution_operations"
+    __table_args__ = (
+        Index(
+            "ix_deepcoin_execution_operations_operation_key",
+            "operation_key",
+            unique=True,
+        ),
+        Index(
+            "ix_deepcoin_execution_operations_state_updated",
+            "state",
+            "updated_at",
+        ),
+        CheckConstraint(
+            "phase IN ('entry_preflight', 'entry_submit', 'entry_readback', "
+            "'protection_submit', 'protection_readback', 'next_leg_preflight', "
+            "'reconciliation', 'completed')",
+            name="ck_deepcoin_execution_operations_phase",
+        ),
+        CheckConstraint(
+            "state IN ('planned', 'entry_prepared', 'entry_submitting', "
+            "'entry_pending_readback', 'entry_unknown', 'entry_rejected', "
+            "'entry_confirmed', 'protection_prepared', "
+            "'protection_pending_readback', 'protection_unknown', 'protected', "
+            "'next_leg_preflight', 'pre_submit_deferred', 'completed', "
+            "'recovery_required', 'submission_failed_no_exposure')",
+            name="ck_deepcoin_execution_operations_state",
+        ),
+        CheckConstraint(
+            "outcome_certainty IN "
+            "('not_sent', 'accepted', 'rejected', 'unknown', 'confirmed')",
+            name="ck_deepcoin_execution_operations_certainty",
+        ),
+        CheckConstraint(
+            "error_category IS NULL OR error_category IN "
+            "('rate_limited', 'transport_timeout', 'http_retryable', "
+            "'auth_failed', 'business_rejected', 'snapshot_incomplete', "
+            "'schema_invalid', 'schema_incompatible', 'state_conflict')",
+            name="ck_deepcoin_execution_operations_error_category",
+        ),
+        CheckConstraint(
+            "reason_code IS NULL OR length(reason_code) <= 128",
+            name="ck_deepcoin_execution_operations_reason_bounded",
+        ),
+        CheckConstraint(
+            "length(operation_key) BETWEEN 1 AND 255",
+            name="ck_deepcoin_execution_operations_key_bounded",
+        ),
+        CheckConstraint(
+            "length(contract_version) BETWEEN 1 AND 64",
+            name="ck_deepcoin_execution_operations_contract_bounded",
+        ),
+        CheckConstraint(
+            "length(request_fingerprint) = 64",
+            name="ck_deepcoin_execution_operations_request_fingerprint",
+        ),
+        CheckConstraint(
+            "length(economics_fingerprint) = 64",
+            name="ck_deepcoin_execution_operations_economics_fingerprint",
+        ),
+        CheckConstraint(
+            "length(evidence_json) <= 4096",
+            name="ck_deepcoin_execution_operations_evidence_bounded",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_deepcoin_execution_operations_attempt_count",
+        ),
+        CheckConstraint(
+            "state_version >= 0",
+            name="ck_deepcoin_execution_operations_state_version",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    operation_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    trade_signal_id: Mapped[int] = mapped_column(
+        ForeignKey("trade_signals.id"), nullable=False, index=True
+    )
+    parent_operation_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("deepcoin_execution_operations.id"), nullable=True, index=True
+    )
+    execution_binding_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("execution_bindings.id"), nullable=True, index=True
+    )
+    execution_order_leg_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("execution_order_legs.id"), nullable=True, index=True
+    )
+    contract_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    phase: Mapped[str] = mapped_column(String(32), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    outcome_certainty: Mapped[str] = mapped_column(String(32), nullable=False)
+    error_category: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    reason_code: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    economics_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    deadline_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    writer_attempted_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sql_text("0")
+    )
+    state_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sql_text("0")
+    )
+    evidence_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}", server_default=sql_text("'{}'")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+
+class DeepcoinRequestAttempt(Base):
+    """Append-only, redacted transport fact for one request attempt."""
+
+    __tablename__ = "deepcoin_request_attempts"
+    __table_args__ = (
+        UniqueConstraint(
+            "deepcoin_execution_operation_id",
+            "ordinal",
+            name="uq_deepcoin_request_attempts_operation_ordinal",
+        ),
+        Index(
+            "ix_deepcoin_request_attempts_operation_created",
+            "deepcoin_execution_operation_id",
+            "created_at",
+        ),
+        CheckConstraint(
+            "method IN ('GET', 'POST')",
+            name="ck_deepcoin_request_attempts_method",
+        ),
+        CheckConstraint(
+            "priority IN ('critical', 'normal', 'background')",
+            name="ck_deepcoin_request_attempts_priority",
+        ),
+        CheckConstraint(
+            "phase IN ('entry_preflight', 'entry_submit', 'entry_readback', "
+            "'protection_submit', 'protection_readback', 'next_leg_preflight', "
+            "'reconciliation', 'completed')",
+            name="ck_deepcoin_request_attempts_phase",
+        ),
+        CheckConstraint(
+            "outcome_certainty IN "
+            "('not_sent', 'accepted', 'rejected', 'unknown', 'confirmed')",
+            name="ck_deepcoin_request_attempts_certainty",
+        ),
+        CheckConstraint(
+            "error_category IS NULL OR error_category IN "
+            "('rate_limited', 'transport_timeout', 'http_retryable', "
+            "'auth_failed', 'business_rejected', 'snapshot_incomplete', "
+            "'schema_invalid', 'schema_incompatible', 'state_conflict')",
+            name="ck_deepcoin_request_attempts_error_category",
+        ),
+        CheckConstraint(
+            "ordinal >= 1 AND governor_wait_ms >= 0 AND retry_delay_ms >= 0 "
+            "AND latency_ms >= 0",
+            name="ck_deepcoin_request_attempts_nonnegative_metrics",
+        ),
+        CheckConstraint(
+            "http_status IS NULL OR http_status BETWEEN 100 AND 599",
+            name="ck_deepcoin_request_attempts_http_status",
+        ),
+        CheckConstraint(
+            "length(normalized_path) BETWEEN 1 AND 512",
+            name="ck_deepcoin_request_attempts_path_bounded",
+        ),
+        CheckConstraint(
+            "length(safe_code) BETWEEN 1 AND 128",
+            name="ck_deepcoin_request_attempts_safe_code_bounded",
+        ),
+        CheckConstraint(
+            "business_code IS NULL OR length(business_code) <= 64",
+            name="ck_deepcoin_request_attempts_business_code_bounded",
+        ),
+        CheckConstraint(
+            "length(uid_scope_hash) = 64 AND length(request_fingerprint) = 64",
+            name="ck_deepcoin_request_attempts_required_hashes",
+        ),
+        CheckConstraint(
+            "correlation_id_hash IS NULL OR length(correlation_id_hash) = 64",
+            name="ck_deepcoin_request_attempts_correlation_hash",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    deepcoin_execution_operation_id: Mapped[int] = mapped_column(
+        ForeignKey("deepcoin_execution_operations.id"), nullable=False
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    method: Mapped[str] = mapped_column(String(8), nullable=False)
+    normalized_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    priority: Mapped[str] = mapped_column(String(16), nullable=False)
+    phase: Mapped[str] = mapped_column(String(32), nullable=False)
+    outcome_certainty: Mapped[str] = mapped_column(String(32), nullable=False)
+    error_category: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    safe_code: Mapped[str] = mapped_column(String(128), nullable=False)
+    http_status: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    business_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    governor_wait_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    retry_delay_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    uid_scope_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    correlation_id_hash: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    completed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+
+class DeepcoinSnapshotEvidence(Base):
+    """Immutable completeness proof for one exchange collection capture."""
+
+    __tablename__ = "deepcoin_snapshot_evidence"
+    __table_args__ = (
+        UniqueConstraint(
+            "deepcoin_execution_operation_id",
+            "ordinal",
+            name="uq_deepcoin_snapshot_evidence_operation_ordinal",
+        ),
+        Index(
+            "ix_deepcoin_snapshot_evidence_operation_created",
+            "deepcoin_execution_operation_id",
+            "created_at",
+        ),
+        CheckConstraint(
+            "snapshot_kind IN ('positions', 'position_history', 'open_orders', "
+            "'order_history', 'trade_fills', 'trigger_orders_pending', "
+            "'trigger_orders_history', 'account_composite', "
+            "'protection_pending', 'market_ticker', 'market_instruments')",
+            name="ck_deepcoin_snapshot_evidence_kind",
+        ),
+        CheckConstraint(
+            "ordinal >= 1 AND row_count >= 0 AND page_count >= 0",
+            name="ck_deepcoin_snapshot_evidence_nonnegative_counts",
+        ),
+        CheckConstraint(
+            "start_write_generation >= 0 AND end_write_generation >= 0",
+            name="ck_deepcoin_snapshot_evidence_nonnegative_generations",
+        ),
+        CheckConstraint(
+            "collection_fingerprint IS NULL OR length(collection_fingerprint) = 64",
+            name="ck_deepcoin_snapshot_evidence_collection_fingerprint",
+        ),
+        CheckConstraint(
+            "error_category IS NULL OR error_category IN "
+            "('rate_limited', 'transport_timeout', 'http_retryable', "
+            "'auth_failed', 'business_rejected', 'snapshot_incomplete', "
+            "'schema_invalid', 'schema_incompatible', 'state_conflict')",
+            name="ck_deepcoin_snapshot_evidence_error_category",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR length(error_code) <= 128",
+            name="ck_deepcoin_snapshot_evidence_error_code_bounded",
+        ),
+        CheckConstraint(
+            "length(evidence_json) <= 4096",
+            name="ck_deepcoin_snapshot_evidence_json_bounded",
+        ),
+        CheckConstraint(
+            "capture_ended_at >= capture_started_at",
+            name="ck_deepcoin_snapshot_evidence_capture_order",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    deepcoin_execution_operation_id: Mapped[int] = mapped_column(
+        ForeignKey("deepcoin_execution_operations.id"), nullable=False
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    snapshot_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    available: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    schema_valid: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    complete: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    row_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    page_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    collection_fingerprint: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
+    start_write_generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_write_generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    capture_started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    capture_ended_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    evidence_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}", server_default=sql_text("'{}'")
+    )
+    error_category: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    error_code: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+
+class DeepcoinAccountWriteGeneration(Base):
+    """Monotonic local writer boundary for one hashed Deepcoin UID scope."""
+
+    __tablename__ = "deepcoin_account_write_generations"
+    __table_args__ = (
+        Index(
+            "ix_deepcoin_account_write_generations_uid_scope_hash",
+            "uid_scope_hash",
+            unique=True,
+        ),
+        CheckConstraint(
+            "length(uid_scope_hash) = 64",
+            name="ck_deepcoin_account_write_generations_uid_hash",
+        ),
+        CheckConstraint(
+            "generation >= 0",
+            name="ck_deepcoin_account_write_generations_nonnegative",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    uid_scope_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sql_text("0")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+
 class InstructionExecutionContract(Base):
     """Current execution terminality for one authoritative instruction item."""
 

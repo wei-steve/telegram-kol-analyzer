@@ -1229,3 +1229,53 @@ def test_database_bootstrap_makes_legacy_assembly_preamble_nullable(tmp_path):
 
     assert columns["entry_preamble_id"][3] == 0
     assert rows == [(1, "legacy")]
+
+
+def test_deepcoin_execution_schema_has_closed_bounded_evidence_tables(tmp_path):
+    database_path = tmp_path / "deepcoin-execution.db"
+    create_session_factory(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        table_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        required_tables = {
+            "deepcoin_execution_operations",
+            "deepcoin_request_attempts",
+            "deepcoin_snapshot_evidence",
+            "deepcoin_account_write_generations",
+        }
+        assert required_tables <= table_names
+        table_sql = {
+            table_name: connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (table_name,),
+            ).fetchone()[0]
+            for table_name in required_tables
+        }
+
+    operation_sql = table_sql["deepcoin_execution_operations"]
+    assert "state IN" in operation_sql
+    assert "outcome_certainty IN" in operation_sql
+    assert "error_category IS NULL OR error_category IN" in operation_sql
+    assert "length(evidence_json) <= 4096" in operation_sql
+    assert "length(request_fingerprint) = 64" in operation_sql
+    assert "attempt_count >= 0" in operation_sql
+    assert "state_version >= 0" in operation_sql
+    attempt_sql = table_sql["deepcoin_request_attempts"]
+    assert "priority IN ('critical', 'normal', 'background')" in attempt_sql
+    assert "governor_wait_ms >= 0" in attempt_sql
+    assert "retry_delay_ms >= 0" in attempt_sql
+    assert "latency_ms >= 0" in attempt_sql
+    assert "request_body" not in attempt_sql
+    assert "response_body" not in attempt_sql
+    snapshot_sql = table_sql["deepcoin_snapshot_evidence"]
+    assert "row_count >= 0" in snapshot_sql
+    assert "page_count >= 0" in snapshot_sql
+    assert "length(evidence_json) <= 4096" in snapshot_sql
+    generation_sql = table_sql["deepcoin_account_write_generations"]
+    assert "generation >= 0" in generation_sql
+    assert "api_key" not in generation_sql
