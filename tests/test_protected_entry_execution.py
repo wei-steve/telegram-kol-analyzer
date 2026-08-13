@@ -63,6 +63,7 @@ def _facts(**overrides):
         "confirmed_protection_count": 0,
         "snapshot_complete": False,
         "operation_deadline_expired": False,
+        "preflight_attempts_exhausted": False,
     }
     values.update(overrides)
     return ProtectedEntryFacts(**values)
@@ -555,6 +556,32 @@ def test_next_leg_preflight_never_falls_back_to_first_leg_prepared_state():
     assert disappeared.allowed is False
     assert disappeared.next_state == "next_leg_preflight"
     assert disappeared.reason_code == "live_exposure_not_confirmed"
+
+
+def test_next_leg_preflight_attempt_budget_exhaustion_is_terminal_deferred():
+    transition = _decide(
+        "next_leg_preflight",
+        "next_leg_preflight_deferred",
+        live_exposure=True,
+        required_protection_count=1,
+        confirmed_protection_count=1,
+        preflight_attempts_exhausted=True,
+    )
+
+    assert transition.allowed is True
+    assert transition.next_state == "pre_submit_deferred"
+    assert transition.next_action == "defer"
+
+    repeated = _decide(
+        "pre_submit_deferred",
+        "next_leg_preflight_ready",
+        live_exposure=True,
+        required_protection_count=1,
+        confirmed_protection_count=1,
+        snapshot_complete=True,
+    )
+    assert repeated.allowed is False
+    assert repeated.next_state == "pre_submit_deferred"
 
 
 def test_partial_protection_after_deadline_requires_supervision_not_another_writer():

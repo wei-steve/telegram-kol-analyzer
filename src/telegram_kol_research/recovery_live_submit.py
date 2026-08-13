@@ -37,9 +37,17 @@ from telegram_kol_research.deepcoin_execution_operations import (
     advance_account_write_generation,
     contains_credential_marker,
     load_operation_bundle,
+    load_account_write_generation,
+    record_snapshot_evidence,
     record_request_attempt,
     reserve_execution_operation,
     transition_execution_operation,
+)
+from telegram_kol_research.deepcoin_snapshot_authority import (
+    DeepcoinSnapshotUnavailable,
+    ExchangeCollectionEvidence,
+    build_exchange_collection_evidence,
+    capture_account_snapshot,
 )
 from telegram_kol_research.deepcoin_request_policy import RequestPriority
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord
@@ -134,6 +142,17 @@ class _ProtectedEntryRuntime:
     sleep_fn: Any
     uid_scope_hash: str
     pre_submit_position_refs: frozenset[str]
+    latest_protection_capture: "_PendingTpslCapture | None" = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingTpslCapture:
+    collection: ExchangeCollectionEvidence
+    rows: tuple[Mapping[str, Any], ...]
+    start_write_generation: int
+    end_write_generation: int
+    capture_started_at: datetime
+    capture_ended_at: datetime
 
 
 @dataclass(slots=True)
@@ -1322,9 +1341,38 @@ def _protected_position_ref(pos_id: str) -> str:
 
 
 def _operation_evidence(operation: ExecutionOperationRecord) -> dict[str, Any]:
+    def reject_duplicate_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate_operation_evidence_key")
+            result[key] = value
+        return result
+
     try:
-        evidence = json.loads(operation.evidence_json)
-    except (json.JSONDecodeError, TypeError, RecursionError):
+        if (
+            not isinstance(operation.evidence_json, str)
+            or len(operation.evidence_json.encode("utf-8")) > 4096
+        ):
+            raise ValueError("operation_evidence_size_invalid")
+        evidence = json.loads(
+            operation.evidence_json,
+            object_pairs_hook=reject_duplicate_pairs,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError("operation_evidence_constant_invalid")
+            ),
+        )
+        if (
+            json.dumps(
+                evidence,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            != operation.evidence_json
+        ):
+            raise ValueError("operation_evidence_not_canonical")
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
         raise RecoveryLiveSubmitError(
             "protected_entry_operation_evidence_invalid"
         )
@@ -1379,6 +1427,195 @@ def _protected_client_clock(deepcoin_client: Any):
 def _protected_client_sleep(deepcoin_client: Any):
     sleeper = getattr(deepcoin_client, "_sleep_fn", None)
     return sleeper if callable(sleeper) else time.sleep
+
+
+def _current_write_generation(
+    session_factory: sessionmaker,
+    *,
+    uid_scope_hash: str,
+) -> int:
+    record = load_account_write_generation(
+        session_factory,
+        uid_scope_hash=uid_scope_hash,
+    )
+    return int(record.generation) if record is not None else 0
+
+
+def _raw_pending_tpsl_reader(
+    deepcoin_client: Any,
+    *,
+    inst_id: str,
+):
+    raw_reader = getattr(deepcoin_client, "read_trigger_orders_pending", None)
+    list_reader = getattr(deepcoin_client, "list_trigger_orders_pending", None)
+    if callable(raw_reader):
+        return raw_reader(inst_id=inst_id)
+    if callable(list_reader):
+        return list_reader(inst_id=inst_id)
+    raise DeepcoinSnapshotUnavailable("snapshot_reader_unavailable")
+
+
+def _record_pending_tpsl_snapshot(
+    session_factory: sessionmaker,
+    *,
+    operation: ExecutionOperationRecord,
+    capture: _PendingTpslCapture,
+    source: str,
+    reused: bool,
+) -> None:
+    collection = capture.collection
+    record_snapshot_evidence(
+        session_factory,
+        operation_id=operation.id,
+        expected_operation_key=operation.operation_key,
+        snapshot_kind="protection_pending",
+        available=collection.available,
+        schema_valid=collection.schema_valid,
+        complete=collection.complete,
+        row_count=collection.row_count,
+        page_count=collection.page_count,
+        collection_fingerprint=collection.fingerprint,
+        start_write_generation=capture.start_write_generation,
+        end_write_generation=capture.end_write_generation,
+        capture_started_at=capture.capture_started_at,
+        capture_ended_at=capture.capture_ended_at,
+        evidence={
+            "source": source,
+            "reused": reused,
+            "snapshot_ref": hashlib.sha256(
+                (
+                    "pending_tpsl:"
+                    + str(collection.fingerprint or "unavailable")
+                ).encode("utf-8")
+            ).hexdigest(),
+        },
+        error_category=(
+            None if collection.complete else "snapshot_incomplete"
+        ),
+        error_code=(
+            None
+            if collection.complete
+            else collection.reason_code or "snapshot_incomplete"
+        ),
+    )
+
+
+def _capture_pending_tpsl(
+    session_factory: sessionmaker,
+    *,
+    deepcoin_client: Any,
+    uid_scope_hash: str,
+    inst_id: str,
+) -> _PendingTpslCapture:
+    started_at = datetime.now(UTC)
+    snapshot = capture_account_snapshot(
+        session_factory,
+        uid_scope_hash=uid_scope_hash,
+        readers={
+            "pending_trigger_orders": lambda: _raw_pending_tpsl_reader(
+                deepcoin_client,
+                inst_id=inst_id,
+            )
+        },
+    )
+    ended_at = datetime.now(UTC)
+    collection = snapshot.collections[0]
+    return _PendingTpslCapture(
+        collection=collection,
+        rows=collection.rows,
+        start_write_generation=snapshot.start_write_generation,
+        end_write_generation=snapshot.end_write_generation,
+        capture_started_at=started_at,
+        capture_ended_at=ended_at,
+    )
+
+
+def _unavailable_pending_tpsl_capture(
+    session_factory: sessionmaker,
+    *,
+    uid_scope_hash: str,
+    reason_code: str,
+) -> _PendingTpslCapture:
+    captured_at = datetime.now(UTC)
+    generation = _current_write_generation(
+        session_factory,
+        uid_scope_hash=uid_scope_hash,
+    )
+    collection = build_exchange_collection_evidence(
+        endpoint="pending_trigger_orders",
+        response=None,
+        read_error=DeepcoinSnapshotUnavailable(reason_code),
+    )
+    return _PendingTpslCapture(
+        collection=collection,
+        rows=(),
+        start_write_generation=generation,
+        end_write_generation=generation,
+        capture_started_at=captured_at,
+        capture_ended_at=captured_at,
+    )
+
+
+class _PendingTpslRecordingClient:
+    """Record the last complete protection readback without changing writers."""
+
+    def __init__(
+        self,
+        *,
+        session_factory: sessionmaker,
+        deepcoin_client: Any,
+        uid_scope_hash: str,
+    ) -> None:
+        self._session_factory = session_factory
+        self._client = deepcoin_client
+        self._uid_scope_hash = uid_scope_hash
+        self.latest_capture: _PendingTpslCapture | None = None
+
+    def __getattr__(self, name: str):
+        return getattr(self._client, name)
+
+    @contextmanager
+    def request_scope(self, scope):
+        factory = getattr(self._client, "request_scope", None)
+        if not callable(factory):
+            yield self
+            return
+        with factory(scope):
+            yield self
+
+    def list_trigger_orders_pending(self, *, inst_id: str):
+        capture = _capture_pending_tpsl(
+            self._session_factory,
+            deepcoin_client=self._client,
+            uid_scope_hash=self._uid_scope_hash,
+            inst_id=inst_id,
+        )
+        self.latest_capture = capture
+        if not (
+            capture.collection.available
+            and capture.collection.schema_valid
+        ):
+            raise DeepcoinSnapshotUnavailable(
+                capture.collection.reason_code or "snapshot_incomplete"
+            )
+        return [dict(row) for row in capture.rows]
+
+    def read_trigger_orders_pending(self, *, inst_id: str):
+        capture = _capture_pending_tpsl(
+            self._session_factory,
+            deepcoin_client=self._client,
+            uid_scope_hash=self._uid_scope_hash,
+            inst_id=inst_id,
+        )
+        self.latest_capture = capture
+        if not (
+            capture.collection.available
+            and capture.collection.schema_valid
+        ):
+            raise DeepcoinSnapshotUnavailable(
+                capture.collection.reason_code or "snapshot_incomplete"
+            )
+        return {"data": [dict(row) for row in capture.rows]}
 
 
 def _attempt_recorder(
@@ -1608,6 +1845,83 @@ def _protected_entry_route_access(
     return access
 
 
+def _has_protected_entry_parent_operation(
+    session_factory: sessionmaker,
+    *,
+    trade_signal_id: int,
+) -> bool:
+    with session_factory() as session:
+        return (
+            session.query(DeepcoinExecutionOperation.id)
+            .filter(
+                DeepcoinExecutionOperation.trade_signal_id
+                == int(trade_signal_id),
+                DeepcoinExecutionOperation.parent_operation_id.is_(None),
+                DeepcoinExecutionOperation.contract_version
+                == PROTECTED_ENTRY_CONTRACT_VERSION,
+            )
+            .first()
+            is not None
+        )
+
+
+def _later_leg_readback_operation_exists(
+    session_factory: sessionmaker,
+    *,
+    trade_signal_id: int,
+    leg_index: int,
+) -> bool:
+    with session_factory() as session:
+        operation = (
+            session.query(DeepcoinExecutionOperation)
+            .filter(
+                DeepcoinExecutionOperation.operation_key
+                == _protected_entry_operation_key(
+                    trade_signal_id,
+                    leg_index,
+                )
+            )
+            .one_or_none()
+        )
+        return bool(
+            operation is not None
+            and operation.contract_version
+            == PROTECTED_ENTRY_CONTRACT_VERSION
+            and operation.writer_attempted_at is not None
+            and operation.state
+            in {"entry_submitting", "entry_pending_readback", "entry_unknown"}
+        )
+
+
+def _any_later_leg_readback_operation_exists(
+    session_factory: sessionmaker,
+    *,
+    trade_signal_id: int,
+) -> bool:
+    with session_factory() as session:
+        return (
+            session.query(DeepcoinExecutionOperation.id)
+            .filter(
+                DeepcoinExecutionOperation.trade_signal_id
+                == int(trade_signal_id),
+                DeepcoinExecutionOperation.parent_operation_id.is_not(None),
+                DeepcoinExecutionOperation.phase.in_(
+                    ("entry_submit", "entry_readback")
+                ),
+                DeepcoinExecutionOperation.writer_attempted_at.is_not(None),
+                DeepcoinExecutionOperation.state.in_(
+                    (
+                        "entry_submitting",
+                        "entry_pending_readback",
+                        "entry_unknown",
+                    )
+                ),
+            )
+            .first()
+            is not None
+        )
+
+
 def _submit_protected_market_entry(
     *,
     session_factory: sessionmaker,
@@ -1656,6 +1970,11 @@ def _submit_protected_market_entry(
         deadline_at=deadline_at,
         pre_submit_position_refs=current_position_refs,
     )
+    remaining_seconds = max(
+        0.0,
+        (operation.deadline_at - submitted_at.replace(tzinfo=None)).total_seconds(),
+    )
+    deadline_monotonic = float(clock()) + remaining_seconds
     pre_submit_position_refs = _baseline_position_refs(operation)
     runtime = _ProtectedEntryRuntime(
         operation=operation,
@@ -1665,6 +1984,43 @@ def _submit_protected_market_entry(
         uid_scope_hash=uid_scope_hash,
         pre_submit_position_refs=pre_submit_position_refs,
     )
+    if operation.state == "protected":
+        with session_factory() as session:
+            leg_row = (
+                session.query(ExecutionOrderLeg)
+                .filter(
+                    ExecutionOrderLeg.strategy_instance_id
+                    == str(
+                        draft.get("strategy_instance_id")
+                        or trade_signal.strategy_instance_id
+                        or ""
+                    ),
+                    ExecutionOrderLeg.leg_index == leg_index,
+                    ExecutionOrderLeg.purpose == "entry",
+                )
+                .one_or_none()
+            )
+            order_id = str(leg_row.order_id or "") if leg_row else ""
+            pos_id = str(leg_row.pos_id or "") if leg_row else ""
+        if not (
+            order_id
+            and pos_id
+            and _safe_protected_exchange_identity(order_id)
+            and _safe_protected_exchange_identity(pos_id)
+        ):
+            raise RecoveryLiveSubmitError(
+                "protected_entry_confirmed_identity_missing"
+            )
+        progress.record_confirmed_leg()
+        return (
+            {
+                "code": "0",
+                "data": {"ordId": order_id, "posId": pos_id},
+            },
+            order_id,
+            pos_id,
+            runtime,
+        )
     if operation.writer_attempted_at is None:
         if operation.state != "entry_prepared" or not _protected_entry_writer_allowed(
             session_factory,
@@ -2210,13 +2566,18 @@ def _submit_protected_entry_protections(
         raise RecoveryLiveSubmitError(
             "protected_entry_protection_state_conflict"
         )
+    recording_client = _PendingTpslRecordingClient(
+        session_factory=session_factory,
+        deepcoin_client=deepcoin_client,
+        uid_scope_hash=parent.uid_scope_hash,
+    )
     prepared_intents = []
     for protection_index, payload in enumerate(payloads):
         idempotency_key = (
             f"protected-entry:{trade_signal.id}:{leg_index}:"
             f"set:{protection_index}"
         )
-        with deepcoin_client.request_scope(
+        with recording_client.request_scope(
             _protected_request_scope(
                 session_factory,
                 runtime=parent,
@@ -2227,7 +2588,7 @@ def _submit_protected_entry_protections(
             prepared_intents.append(
                 prepare_exact_position_sltp_intent(
                     session_factory=session_factory,
-                    deepcoin_client=deepcoin_client,
+                    deepcoin_client=recording_client,
                     pos_id=pos_id,
                     payload=payload,
                     idempotency_key=idempotency_key,
@@ -2341,10 +2702,10 @@ def _submit_protected_entry_protections(
                 operation=child,
                 phase="protection_readback",
             )
-            with deepcoin_client.request_scope(submit_scope):
+            with recording_client.request_scope(submit_scope):
                 response = submit_exact_position_sltp(
                     session_factory=session_factory,
-                    deepcoin_client=deepcoin_client,
+                    deepcoin_client=recording_client,
                     pos_id=pos_id,
                     payload=payload,
                     idempotency_key=(
@@ -2499,7 +2860,136 @@ def _submit_protected_entry_protections(
             },
             changed_at=datetime.now(UTC),
         )
+    capture = recording_client.latest_capture
+    if capture is not None:
+        final_generation = _current_write_generation(
+            session_factory,
+            uid_scope_hash=parent.uid_scope_hash,
+        )
+        expected_local_writer_close = (
+            capture.start_write_generation % 2 == 1
+            and final_generation == capture.start_write_generation + 1
+        )
+        capture = _PendingTpslCapture(
+            collection=capture.collection,
+            rows=capture.rows,
+            start_write_generation=(
+                final_generation
+                if expected_local_writer_close
+                else capture.start_write_generation
+            ),
+            end_write_generation=final_generation,
+            capture_started_at=capture.capture_started_at,
+            capture_ended_at=datetime.now(UTC),
+        )
+        if (
+            capture.start_write_generation != capture.end_write_generation
+            or capture.end_write_generation % 2 != 0
+        ):
+            capture = _PendingTpslCapture(
+                collection=ExchangeCollectionEvidence(
+                    endpoint=capture.collection.endpoint,
+                    available=capture.collection.available,
+                    schema_valid=capture.collection.schema_valid,
+                    complete=False,
+                    rows=capture.collection.rows,
+                    row_count=capture.collection.row_count,
+                    page_count=capture.collection.page_count,
+                    fingerprint=capture.collection.fingerprint,
+                    reason_code="snapshot_write_generation_changed",
+                ),
+                rows=capture.rows,
+                start_write_generation=capture.start_write_generation,
+                end_write_generation=capture.end_write_generation,
+                capture_started_at=capture.capture_started_at,
+                capture_ended_at=capture.capture_ended_at,
+            )
+        parent.latest_protection_capture = capture
+        _record_pending_tpsl_snapshot(
+            session_factory,
+            operation=parent.operation,
+            capture=capture,
+            source="protection_readback",
+            reused=False,
+        )
     return responses
+
+
+def _load_confirmed_protection_responses(
+    session_factory: sessionmaker,
+    *,
+    parent: _ProtectedEntryRuntime,
+    expected_count: int,
+) -> list[Mapping[str, Any]]:
+    with session_factory() as session:
+        children = (
+            session.query(DeepcoinExecutionOperation)
+            .filter(
+                DeepcoinExecutionOperation.parent_operation_id
+                == parent.operation.id,
+                DeepcoinExecutionOperation.phase
+                == "protection_readback",
+            )
+            .order_by(DeepcoinExecutionOperation.id)
+            .all()
+        )
+        if (
+            len(children) != expected_count
+            or any(
+                child.state != "protected"
+                or child.outcome_certainty != "confirmed"
+                for child in children
+            )
+        ):
+            raise RecoveryLiveSubmitError(
+                "protected_entry_protection_evidence_conflict"
+            )
+        responses: list[Mapping[str, Any]] = []
+        for child in children:
+            child_record = load_operation_bundle(
+                session_factory,
+                operation_id=int(child.id),
+            ).operation
+            evidence = _operation_evidence(child_record)
+            intent_id = evidence.get("position_mutation_intent_id")
+            if type(intent_id) is not int:
+                raise RecoveryLiveSubmitError(
+                    "protected_entry_protection_evidence_conflict"
+                )
+            intent = session.get(PositionMutationIntent, intent_id)
+            order_id = str(intent.order_id or "") if intent else ""
+            if (
+                intent is None
+                or intent.status != "confirmed"
+                or intent.request_fingerprint
+                != child.request_fingerprint
+                or not order_id
+                or not _safe_protected_exchange_identity(order_id)
+            ):
+                raise RecoveryLiveSubmitError(
+                    "protected_entry_protection_evidence_conflict"
+                )
+            ledgers = (
+                session.query(PositionProtectionLedger)
+                .filter(
+                    PositionProtectionLedger.venue == "deepcoin",
+                    PositionProtectionLedger.order_id == order_id,
+                    PositionProtectionLedger.execution_binding_id
+                    == child.execution_binding_id,
+                    PositionProtectionLedger.execution_order_leg_id
+                    == child.execution_order_leg_id,
+                    PositionProtectionLedger.status == "verified",
+                )
+                .all()
+            )
+            if len(ledgers) != 1:
+                raise RecoveryLiveSubmitError(
+                    "protected_entry_protection_evidence_conflict"
+                )
+            responses.append(
+                {"code": "0", "data": {"ordId": order_id}}
+            )
+        return responses
 
 
 def _mark_parent_protection_recovery(
@@ -2542,6 +3032,20 @@ def _submit_recovery_signal_direct(
     submission_progress: EntrySubmissionProgress | None = None,
 ) -> dict[str, Any]:
     progress = submission_progress or EntrySubmissionProgress()
+    if (
+        validated_draft is None
+        and _has_protected_entry_parent_operation(
+            session_factory,
+            trade_signal_id=trade_signal.id,
+        )
+        and isinstance(trade_signal.payload, dict)
+        and isinstance(
+            trade_signal.payload.get("deepcoin_order_draft"), dict
+        )
+    ):
+        validated_draft = dict(
+            trade_signal.payload["deepcoin_order_draft"]
+        )
     if validated_draft is None:
         gate = validate_recovery_live_submit_gate(
             session_factory,
@@ -2762,17 +3266,26 @@ def _submit_recovery_signal_direct(
                         raise RecoveryLiveSubmitError(
                             "protected_entry_parent_operation_missing"
                         )
-                    protection_responses = _submit_protected_entry_protections(
-                        session_factory=session_factory,
-                        trade_signal=trade_signal,
-                        deepcoin_client=deepcoin_client,
-                        parent=protected_parent,
-                        binding_id=provisional_binding_id,
-                        leg_index=index,
-                        pos_id=str(pos_id),
-                        payloads=protection_payloads,
-                        submitted_at=now,
-                    )
+                    if protected_parent.operation.state == "protected":
+                        protection_responses = (
+                            _load_confirmed_protection_responses(
+                                session_factory,
+                                parent=protected_parent,
+                                expected_count=len(protection_payloads),
+                            )
+                        )
+                    else:
+                        protection_responses = _submit_protected_entry_protections(
+                            session_factory=session_factory,
+                            trade_signal=trade_signal,
+                            deepcoin_client=deepcoin_client,
+                            parent=protected_parent,
+                            binding_id=provisional_binding_id,
+                            leg_index=index,
+                            pos_id=str(pos_id),
+                            payloads=protection_payloads,
+                            submitted_at=now,
+                        )
                 else:
                     protection_responses = []
                     for protection_index, payload in enumerate(protection_payloads):
@@ -2801,7 +3314,13 @@ def _submit_recovery_signal_direct(
                     if len(protection_responses) == 1
                     else protection_responses
                 )
-                if protected_access == "readback_only":
+                if (
+                    protected_access == "readback_only"
+                    and not _any_later_leg_readback_operation_exists(
+                        session_factory,
+                        trade_signal_id=trade_signal.id,
+                    )
+                ):
                     raise RecoveryLiveSubmitError(
                         "protected_entry_readback_only"
                     )
@@ -2812,7 +3331,14 @@ def _submit_recovery_signal_direct(
                 protection_response = {"error": str(exc)}
                 warnings.append("position_protection_failed_after_entry_submitted")
         elif order_type == "limit":
-            if protected_access == "readback_only":
+            if (
+                protected_access == "readback_only"
+                and not _later_leg_readback_operation_exists(
+                    session_factory,
+                    trade_signal_id=trade_signal.id,
+                    leg_index=index,
+                )
+            ):
                 raise RecoveryLiveSubmitError(
                     "protected_entry_readback_only"
                 )
@@ -2839,6 +3365,7 @@ def _submit_recovery_signal_direct(
                             },
                             order_payload=order_payload,
                             submission_progress=progress,
+                            parent=protected_parent if protected_v1 else None,
                         )
                     else:
                         progress.record_attempt()
@@ -2951,15 +3478,16 @@ def _submit_recovery_signal_direct(
         submitted_orders=submitted_orders,
         created_at=now,
     )
-    _record_entry_protection_ledger_rows(
-        session_factory,
-        binding_id=binding_id,
-        draft=draft,
-        submitted_orders=submitted_orders,
-        side=side_key,
-        deepcoin_client=deepcoin_client,
-        seen_at=now,
-    )
+    if not protected_v1:
+        _record_entry_protection_ledger_rows(
+            session_factory,
+            binding_id=binding_id,
+            draft=draft,
+            submitted_orders=submitted_orders,
+            side=side_key,
+            deepcoin_client=deepcoin_client,
+            seen_at=now,
+        )
     _attach_lifecycle_binding(
         session_factory,
         chat_id=int(source.get("chat_id") or trade_signal.chat_id),
@@ -3089,6 +3617,488 @@ def _prepare_trigger_protection_intent(
     )
 
 
+def _reserve_next_leg_operation(
+    session_factory: sessionmaker,
+    *,
+    trade_signal: TradeSignalRecord,
+    parent: _ProtectedEntryRuntime,
+    execution_order_leg_id: int,
+    leg_index: int,
+    order_payload: Mapping[str, Any],
+) -> ExecutionOperationRecord:
+    with session_factory() as session:
+        entry_leg = session.get(ExecutionOrderLeg, execution_order_leg_id)
+        if entry_leg is None:
+            raise RecoveryLiveSubmitError("trigger_protection_entry_leg_missing")
+        binding_id = int(entry_leg.execution_binding_id)
+    return reserve_execution_operation(
+        session_factory,
+        operation_key=_protected_entry_operation_key(
+            trade_signal.id,
+            leg_index,
+        ),
+        trade_signal_id=trade_signal.id,
+        parent_operation_id=parent.operation.id,
+        execution_binding_id=binding_id,
+        execution_order_leg_id=execution_order_leg_id,
+        contract_version=PROTECTED_ENTRY_CONTRACT_VERSION,
+        phase="next_leg_preflight",
+        state="next_leg_preflight",
+        outcome_certainty="not_sent",
+        request_fingerprint=_trigger_protection_request_fingerprint(
+            dict(order_payload)
+        ),
+        economics_fingerprint=_canonical_fingerprint(
+            {
+                "instrument_id": order_payload.get("instId"),
+                "position_side": order_payload.get("posSide"),
+                "quantity": order_payload.get("sz"),
+                "price": order_payload.get("price"),
+                "trigger_price": order_payload.get("triggerPrice"),
+                "client_order_id": order_payload.get("clOrdId"),
+                "leg_index": leg_index,
+            }
+        ),
+        deadline_at=parent.operation.deadline_at,
+        evidence={
+            "leg_index": leg_index,
+            "parent_operation_ref": hashlib.sha256(
+                f"operation:{parent.operation.id}".encode("utf-8")
+            ).hexdigest(),
+            "writer_attempted": False,
+        },
+        created_at=parent.operation.created_at,
+    )
+
+
+def _normalized_pending_tpsl_rows(
+    rows: tuple[Mapping[str, Any], ...] | list[Mapping[str, Any]],
+) -> str:
+    normalized: list[dict[str, str | None]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise RecoveryLiveSubmitError(
+                "trigger_protection_baseline_malformed"
+            )
+        mutable = dict(row)
+        if str(mutable.get("triggerOrderType") or "").upper() != "TPSL":
+            continue
+        normalized_row = _normalized_tpsl_row(mutable)
+        order_id = normalized_row["ord_id"] or ""
+        instrument = normalized_row["instrument"] or ""
+        side = normalized_row["side"] or ""
+        if (
+            not _safe_protected_exchange_identity(order_id)
+            or not re.fullmatch(r"[A-Z0-9-]{1,64}", instrument)
+            or side not in {"long", "short"}
+        ):
+            raise RecoveryLiveSubmitError(
+                "trigger_protection_baseline_malformed"
+            )
+        for key in (
+            "size",
+            "take_profit_trigger_price",
+            "stop_loss_trigger_price",
+        ):
+            value = normalized_row[key]
+            if value is None:
+                continue
+            try:
+                decimal_value = Decimal(value)
+            except (InvalidOperation, ValueError):
+                raise RecoveryLiveSubmitError(
+                    "trigger_protection_baseline_malformed"
+                )
+            if not decimal_value.is_finite() or len(value) > 64:
+                raise RecoveryLiveSubmitError(
+                    "trigger_protection_baseline_malformed"
+                )
+        for key in ("exchange_created_at", "exchange_updated_at"):
+            value = normalized_row[key]
+            if value is not None and (
+                len(value) > 64 or contains_credential_marker(value)
+            ):
+                raise RecoveryLiveSubmitError(
+                    "trigger_protection_baseline_malformed"
+                )
+        normalized.append(normalized_row)
+    normalized.sort(
+        key=lambda row: (
+            row["ord_id"] or "",
+            row["exchange_created_at"] or "",
+        )
+    )
+    return json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _complete_reusable_protection_capture(
+    session_factory: sessionmaker,
+    *,
+    parent: _ProtectedEntryRuntime,
+) -> _PendingTpslCapture | None:
+    capture = parent.latest_protection_capture
+    if capture is None or not capture.collection.complete:
+        return None
+    if (
+        capture.end_write_generation % 2 != 0
+        or capture.end_write_generation
+        != _current_write_generation(
+            session_factory,
+            uid_scope_hash=parent.uid_scope_hash,
+        )
+        or capture.capture_ended_at.replace(tzinfo=None)
+        < parent.operation.updated_at
+    ):
+        return None
+    return capture
+
+
+def _capture_next_leg_baseline(
+    session_factory: sessionmaker,
+    *,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    parent: _ProtectedEntryRuntime,
+    operation: ExecutionOperationRecord,
+    inst_id: str,
+) -> tuple[str, _PendingTpslCapture]:
+    reusable = _complete_reusable_protection_capture(
+        session_factory,
+        parent=parent,
+    )
+    if reusable is not None:
+        _record_pending_tpsl_snapshot(
+            session_factory,
+            operation=operation,
+            capture=reusable,
+            source="post_protection_snapshot",
+            reused=True,
+        )
+        return _normalized_pending_tpsl_rows(reusable.rows), reusable
+
+    last_capture: _PendingTpslCapture | None = None
+    attempt_count = 0
+    for delay in (0.0, 0.5, 1.0, 2.0):
+        remaining = parent.deadline_monotonic - float(
+            parent.monotonic_factory()
+        )
+        if remaining <= 0 or delay >= remaining:
+            break
+        if delay:
+            parent.sleep_fn(delay)
+        attempt_count += 1
+        try:
+            with deepcoin_client.request_scope(
+                _protected_request_scope(
+                    session_factory,
+                    runtime=parent,
+                    operation=operation,
+                    phase="next_leg_preflight",
+                )
+            ):
+                last_capture = _capture_pending_tpsl(
+                    session_factory,
+                    deepcoin_client=deepcoin_client,
+                    uid_scope_hash=parent.uid_scope_hash,
+                    inst_id=inst_id,
+                )
+        except Exception:
+            last_capture = _unavailable_pending_tpsl_capture(
+                session_factory,
+                uid_scope_hash=parent.uid_scope_hash,
+                reason_code="snapshot_read_unavailable",
+            )
+        _record_pending_tpsl_snapshot(
+            session_factory,
+            operation=operation,
+            capture=last_capture,
+            source="next_leg_preflight",
+            reused=False,
+        )
+        if last_capture.collection.complete:
+            return (
+                _normalized_pending_tpsl_rows(last_capture.rows),
+                last_capture,
+            )
+
+    operation = _transition_protected_operation(
+        session_factory,
+        operation,
+        phase="next_leg_preflight",
+        state="pre_submit_deferred",
+        certainty="not_sent",
+        error_category="snapshot_incomplete",
+        reason_code="next_leg_preflight_deferred",
+        evidence={
+            "attempt_count": attempt_count,
+            "deadline_at": parent.operation.deadline_at.isoformat(),
+            "last_complete_snapshot_ref": None,
+            "writer_attempted": False,
+        },
+        changed_at=datetime.now(UTC),
+    )
+    raise RecoveryLiveSubmitError("protected_entry_pre_submit_deferred")
+
+
+def _require_next_leg_parent_authority(
+    session_factory: sessionmaker,
+    *,
+    parent: _ProtectedEntryRuntime,
+    capture: _PendingTpslCapture,
+) -> None:
+    current = load_operation_bundle(
+        session_factory,
+        operation_id=parent.operation.id,
+    ).operation
+    evidence = _operation_evidence(current)
+    required = evidence.get("required_protection_count")
+    confirmed = evidence.get("confirmed_protection_count")
+    if (
+        current.state != "protected"
+        or current.outcome_certainty != "confirmed"
+        or type(required) is not int
+        or required <= 0
+        or confirmed != required
+        or capture.end_write_generation % 2 != 0
+        or capture.end_write_generation
+        != _current_write_generation(
+            session_factory,
+            uid_scope_hash=parent.uid_scope_hash,
+        )
+    ):
+        raise RecoveryLiveSubmitError(
+            "protected_entry_next_leg_authority_changed"
+        )
+    parent.operation = current
+
+
+def _trigger_history_response(
+    deepcoin_client: Any,
+    *,
+    inst_id: str,
+):
+    raw_reader = getattr(deepcoin_client, "read_trigger_order_history", None)
+    list_reader = getattr(deepcoin_client, "list_trigger_order_history", None)
+    if callable(raw_reader):
+        return raw_reader(inst_id=inst_id)
+    if callable(list_reader):
+        return list_reader(inst_id=inst_id)
+    raise DeepcoinSnapshotUnavailable("snapshot_reader_unavailable")
+
+
+def _matching_later_trigger_order_id(
+    rows: tuple[Mapping[str, Any], ...],
+    *,
+    order_payload: Mapping[str, Any],
+) -> str | None:
+    matches: list[str] = []
+    for row in rows:
+        order_id = str(row.get("ordId") or row.get("orderId") or "")
+        state = str(row.get("state") or "").lower()
+        if (
+            not order_id
+            or not _safe_protected_exchange_identity(order_id)
+            or state
+            not in {
+                "live",
+                "effective",
+                "open",
+                "submitted",
+                "partially_filled",
+                "filled",
+            }
+            or str(row.get("triggerOrderType") or "").lower()
+            not in {"trigger", "conditional"}
+            or str(row.get("orderType") or "").lower()
+            not in {"limit", "trigger_limit"}
+            or str(row.get("clOrdId") or "")
+            != str(order_payload.get("clOrdId") or "")
+            or str(row.get("instId") or "").upper()
+            != str(order_payload.get("instId") or "").upper()
+            or str(row.get("posSide") or "").lower()
+            != str(order_payload.get("posSide") or "").lower()
+            or not _exact_decimal_equal(
+                row.get("sz"), order_payload.get("sz")
+            )
+            or not _exact_decimal_equal(
+                row.get("price"), order_payload.get("price")
+            )
+            or not _exact_decimal_equal(
+                row.get("triggerPrice"),
+                order_payload.get("triggerPrice"),
+            )
+        ):
+            continue
+        matches.append(order_id)
+    return matches[0] if len(set(matches)) == 1 else None
+
+
+def _readback_later_trigger(
+    session_factory: sessionmaker,
+    *,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    parent: _ProtectedEntryRuntime,
+    operation: ExecutionOperationRecord,
+    order_payload: Mapping[str, Any],
+) -> str | None:
+    inst_id = str(order_payload.get("instId") or "")
+    readers = (
+        (
+            "trigger_orders_history",
+            lambda: _trigger_history_response(
+                deepcoin_client,
+                inst_id=inst_id,
+            ),
+        ),
+        (
+            "pending_trigger_orders",
+            lambda: _raw_pending_tpsl_reader(
+                deepcoin_client,
+                inst_id=inst_id,
+            ),
+        ),
+    )
+    for endpoint, reader in readers:
+        try:
+            with deepcoin_client.request_scope(
+                _protected_request_scope(
+                    session_factory,
+                    runtime=parent,
+                    operation=operation,
+                    phase="entry_readback",
+                )
+            ):
+                response = reader()
+        except Exception:
+            continue
+        evidence = build_exchange_collection_evidence(
+            endpoint=endpoint,
+            response=response,
+        )
+        if not evidence.complete:
+            continue
+        order_id = _matching_later_trigger_order_id(
+            evidence.rows,
+            order_payload=order_payload,
+        )
+        if order_id is not None:
+            return order_id
+    return None
+
+
+def _persist_trigger_parent_confirmation(
+    session_factory: sessionmaker,
+    *,
+    execution_order_leg_id: int,
+    parent_order_id: str,
+) -> None:
+    with session_factory() as session:
+        intent = (
+            session.query(TriggerProtectionIntent)
+            .filter(TriggerProtectionIntent.venue == "deepcoin")
+            .filter(
+                TriggerProtectionIntent.execution_order_leg_id
+                == execution_order_leg_id
+            )
+            .one_or_none()
+        )
+        if intent is None:
+            raise RecoveryLiveSubmitError(
+                "trigger_protection_intent_missing"
+            )
+        if intent.parent_trigger_order_id not in (None, parent_order_id):
+            raise RecoveryLiveSubmitError(
+                "trigger_protection_parent_identity_conflict"
+            )
+        record_trigger_protection_parent(
+            session,
+            intent,
+            parent_trigger_order_id=parent_order_id,
+        )
+        for protection_leg in _protection_legs_for_entry(
+            session,
+            execution_order_leg_id=execution_order_leg_id,
+        ):
+            bind_parent_entry_order(
+                session,
+                protection_leg,
+                parent_entry_order_id=parent_order_id,
+            )
+        session.commit()
+
+
+def _require_later_trigger_intent_identity(
+    session_factory: sessionmaker,
+    *,
+    operation: ExecutionOperationRecord,
+    execution_order_leg_id: int,
+) -> TriggerProtectionIntent:
+    evidence = _operation_evidence(operation)
+    baseline_fingerprint = evidence.get("baseline_fingerprint")
+    if (
+        not isinstance(baseline_fingerprint, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", baseline_fingerprint)
+    ):
+        raise RecoveryLiveSubmitError(
+            "trigger_protection_intent_identity_conflict"
+        )
+    with session_factory() as session:
+        intent = (
+            session.query(TriggerProtectionIntent)
+            .filter(TriggerProtectionIntent.venue == "deepcoin")
+            .filter(
+                TriggerProtectionIntent.execution_order_leg_id
+                == execution_order_leg_id
+            )
+            .one_or_none()
+        )
+        if (
+            intent is None
+            or intent.request_fingerprint
+            != operation.request_fingerprint
+            or hashlib.sha256(
+                str(intent.pre_submit_tpsl_baseline_json).encode("utf-8")
+            ).hexdigest()
+            != baseline_fingerprint
+        ):
+            raise RecoveryLiveSubmitError(
+                "trigger_protection_intent_identity_conflict"
+            )
+        session.expunge(intent)
+        return intent
+
+
+def _load_confirmed_trigger_parent_id(
+    session_factory: sessionmaker,
+    *,
+    execution_order_leg_id: int,
+) -> str:
+    with session_factory() as session:
+        intent = (
+            session.query(TriggerProtectionIntent)
+            .filter(TriggerProtectionIntent.venue == "deepcoin")
+            .filter(
+                TriggerProtectionIntent.execution_order_leg_id
+                == execution_order_leg_id
+            )
+            .one_or_none()
+        )
+        order_id = (
+            str(intent.parent_trigger_order_id)
+            if intent is not None and intent.parent_trigger_order_id
+            else ""
+        )
+    if not order_id or not _safe_protected_exchange_identity(order_id):
+        raise RecoveryLiveSubmitError(
+            "trigger_protection_parent_identity_invalid"
+        )
+    return order_id
+
+
 def _submit_trigger_with_protection_intent(
     session_factory: sessionmaker,
     *,
@@ -3100,6 +4110,7 @@ def _submit_trigger_with_protection_intent(
     binding_context: dict[str, Any],
     order_payload: dict[str, Any],
     submission_progress: EntrySubmissionProgress,
+    parent: _ProtectedEntryRuntime | None = None,
 ) -> dict[str, Any]:
     """Snapshot, persist intent, submit parent, and bind its returned identity."""
 
@@ -3107,6 +4118,263 @@ def _submit_trigger_with_protection_intent(
     side = str(order_payload.get("posSide") or order_payload.get("side") or "").lower()
     if not inst_id or not side:
         raise RecoveryLiveSubmitError("missing_trigger_protection_identity")
+    if parent is not None:
+        execution_order_leg_id = _prepare_trigger_protection_intent(
+            session_factory,
+            trade_signal=trade_signal,
+            draft=draft,
+            leg=leg,
+            leg_index=leg_index,
+            binding_context=binding_context,
+            order_payload=order_payload,
+        )
+        operation = _reserve_next_leg_operation(
+            session_factory,
+            trade_signal=trade_signal,
+            parent=parent,
+            execution_order_leg_id=execution_order_leg_id,
+            leg_index=leg_index,
+            order_payload=order_payload,
+        )
+        if operation.state == "pre_submit_deferred":
+            raise RecoveryLiveSubmitError(
+                "protected_entry_pre_submit_deferred"
+            )
+        if operation.state == "completed":
+            _require_later_trigger_intent_identity(
+                session_factory,
+                operation=operation,
+                execution_order_leg_id=execution_order_leg_id,
+            )
+            order_id = _load_confirmed_trigger_parent_id(
+                session_factory,
+                execution_order_leg_id=execution_order_leg_id,
+            )
+            return {"code": "0", "data": {"ordId": order_id}}
+        if operation.state == "next_leg_preflight":
+            baseline_json, capture = _capture_next_leg_baseline(
+                session_factory,
+                deepcoin_client=deepcoin_client,
+                parent=parent,
+                operation=operation,
+                inst_id=inst_id,
+            )
+            correlation_id = f"trigger-protection:{execution_order_leg_id}"
+            baseline_fingerprint = hashlib.sha256(
+                baseline_json.encode("utf-8")
+            ).hexdigest()
+            with session_factory() as session:
+                create_or_get_trigger_protection_intent(
+                    session,
+                    venue="deepcoin",
+                    execution_order_leg_id=execution_order_leg_id,
+                    request_fingerprint=(
+                        _trigger_protection_request_fingerprint(order_payload)
+                    ),
+                    pre_submit_tpsl_baseline_json=baseline_json,
+                    correlation_id=correlation_id,
+                )
+                take_profit_legs = draft.get("take_profit_legs")
+                if isinstance(take_profit_legs, list) and take_profit_legs:
+                    create_or_get_trigger_take_profit_convergence(
+                        session,
+                        venue="deepcoin",
+                        execution_order_leg_id=execution_order_leg_id,
+                        desired_take_profits=take_profit_legs,
+                    )
+                _create_trigger_protection_leg_plan(
+                    session,
+                    execution_order_leg_id=execution_order_leg_id,
+                    order_payload=order_payload,
+                    draft=draft,
+                )
+                session.commit()
+            _require_next_leg_parent_authority(
+                session_factory,
+                parent=parent,
+                capture=capture,
+            )
+            if (
+                parent.deadline_monotonic
+                <= float(parent.monotonic_factory())
+                or not _protected_entry_writer_allowed(
+                    session_factory,
+                    trade_signal_id=trade_signal.id,
+                )
+            ):
+                operation = _transition_protected_operation(
+                    session_factory,
+                    operation,
+                    phase="next_leg_preflight",
+                    state="pre_submit_deferred",
+                    certainty="not_sent",
+                    error_category="snapshot_incomplete",
+                    reason_code="next_leg_preflight_deferred",
+                    evidence={
+                        "attempt_count": 1,
+                        "deadline_at": parent.operation.deadline_at.isoformat(),
+                        "last_complete_snapshot_ref": hashlib.sha256(
+                            (
+                                "pending_tpsl:"
+                                + str(capture.collection.fingerprint)
+                            ).encode("utf-8")
+                        ).hexdigest(),
+                        "writer_attempted": False,
+                    },
+                    changed_at=datetime.now(UTC),
+                )
+                raise RecoveryLiveSubmitError(
+                    "protected_entry_pre_submit_deferred"
+                )
+            attempted_at = datetime.now(UTC)
+            operation = _transition_protected_operation(
+                session_factory,
+                operation,
+                phase="entry_submit",
+                state="entry_submitting",
+                certainty="not_sent",
+                reason_code="next_leg_submit_authorized",
+                evidence={
+                    "leg_index": leg_index,
+                    "snapshot_ref": hashlib.sha256(
+                        (
+                            "pending_tpsl:"
+                            + str(capture.collection.fingerprint)
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                    "baseline_fingerprint": baseline_fingerprint,
+                    "writer_attempted": True,
+                },
+                changed_at=attempted_at,
+                writer_attempted_at=attempted_at,
+            )
+        if operation.state == "entry_submitting":
+            baseline_fingerprint = _operation_evidence(operation).get(
+                "baseline_fingerprint"
+            )
+            _require_later_trigger_intent_identity(
+                session_factory,
+                operation=operation,
+                execution_order_leg_id=execution_order_leg_id,
+            )
+            try:
+                advance_account_write_generation(
+                    session_factory,
+                    uid_scope_hash=parent.uid_scope_hash,
+                )
+                try:
+                    if not _protected_entry_writer_allowed(
+                        session_factory,
+                        trade_signal_id=trade_signal.id,
+                    ):
+                        raise RecoveryLiveSubmitError(
+                            "protected_entry_submit_not_authorized"
+                        )
+                    submission_progress.record_attempt()
+                    with deepcoin_client.request_scope(
+                        _protected_request_scope(
+                            session_factory,
+                            runtime=parent,
+                            operation=operation,
+                            phase="entry_submit",
+                        )
+                    ):
+                        response = deepcoin_client.trigger_order(order_payload)
+                finally:
+                    advance_account_write_generation(
+                        session_factory,
+                        uid_scope_hash=parent.uid_scope_hash,
+                    )
+            except DeepcoinDefiniteRejection:
+                _transition_protected_operation(
+                    session_factory,
+                    operation,
+                    phase="entry_readback",
+                    state="entry_rejected",
+                    certainty="rejected",
+                    error_category="business_rejected",
+                    reason_code="entry_submission_rejected",
+                    evidence={"leg_index": leg_index},
+                    changed_at=datetime.now(UTC),
+                )
+                raise
+            except Exception:
+                operation = _transition_protected_operation(
+                    session_factory,
+                    operation,
+                    phase="entry_readback",
+                    state="entry_unknown",
+                    certainty="unknown",
+                    reason_code="entry_submission_unknown",
+                    evidence={
+                        "leg_index": leg_index,
+                        "baseline_fingerprint": baseline_fingerprint,
+                    },
+                    changed_at=datetime.now(UTC),
+                )
+                response = {}
+            else:
+                operation = _transition_protected_operation(
+                    session_factory,
+                    operation,
+                    phase="entry_readback",
+                    state="entry_pending_readback",
+                    certainty="accepted",
+                    reason_code="entry_submission_accepted",
+                    evidence={
+                        "leg_index": leg_index,
+                        "baseline_fingerprint": baseline_fingerprint,
+                    },
+                    changed_at=datetime.now(UTC),
+                )
+        elif operation.state in {"entry_pending_readback", "entry_unknown"}:
+            baseline_fingerprint = _operation_evidence(operation).get(
+                "baseline_fingerprint"
+            )
+            _require_later_trigger_intent_identity(
+                session_factory,
+                operation=operation,
+                execution_order_leg_id=execution_order_leg_id,
+            )
+            response = {}
+        else:
+            raise RecoveryLiveSubmitError(
+                "protected_entry_next_leg_state_conflict"
+            )
+        order_id = _readback_later_trigger(
+            session_factory,
+            deepcoin_client=deepcoin_client,
+            parent=parent,
+            operation=operation,
+            order_payload=order_payload,
+        )
+        if order_id is None:
+            raise DeepcoinRequestOutcomeUnknown(
+                "protected_entry_later_leg_readback_pending"
+            )
+        _persist_trigger_parent_confirmation(
+            session_factory,
+            execution_order_leg_id=execution_order_leg_id,
+            parent_order_id=order_id,
+        )
+        _transition_protected_operation(
+            session_factory,
+            operation,
+            phase="completed",
+            state="completed",
+            certainty="confirmed",
+            reason_code="entry_sequence_completed",
+            evidence={
+                "leg_index": leg_index,
+                "order_ref": hashlib.sha256(
+                    f"order:{order_id}".encode("utf-8")
+                ).hexdigest(),
+                "baseline_fingerprint": baseline_fingerprint,
+            },
+            changed_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+        )
+        return {"code": "0", "data": {"ordId": order_id}}
     with _trigger_protection_submission_lock(
         deepcoin_client=deepcoin_client,
         venue="deepcoin",

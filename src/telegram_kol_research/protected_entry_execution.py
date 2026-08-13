@@ -82,6 +82,7 @@ class ProtectedEntryFacts:
     confirmed_protection_count: int
     snapshot_complete: bool
     operation_deadline_expired: bool
+    preflight_attempts_exhausted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,7 +394,10 @@ def _next_leg_preflight_deferred(
         return _refused(state, event, "entry_writer_already_attempted")
     if not _protection_counts_complete(facts):
         return _refused(state, event, "protection_not_fully_confirmed")
-    if not facts.operation_deadline_expired:
+    if not (
+        facts.operation_deadline_expired
+        or facts.preflight_attempts_exhausted
+    ):
         return _refused(state, event, "operation_deadline_active")
     return _allowed(
         state,
@@ -499,6 +503,7 @@ def _validate_facts(facts: ProtectedEntryFacts) -> None:
         "writer_attempted",
         "snapshot_complete",
         "operation_deadline_expired",
+        "preflight_attempts_exhausted",
     ):
         if type(getattr(facts, name)) is not bool:
             raise ProtectedEntryDecisionError(f"{name}_invalid")
