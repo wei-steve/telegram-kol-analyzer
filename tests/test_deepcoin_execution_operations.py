@@ -217,6 +217,63 @@ def test_transition_requires_exact_state_and_state_version(operation_store):
             )
 
 
+def test_snapshot_and_transition_cas_bind_immutable_request_identity(
+    operation_store,
+):
+    session_factory, signal_id, _ = operation_store
+    operation = reserve_execution_operation(
+        session_factory, **_reservation(signal_id)
+    )
+    with session_factory() as session:
+        row = session.get(DeepcoinExecutionOperation, operation.id)
+        row.request_fingerprint = "f" * 64
+        row.economics_fingerprint = "e" * 64
+        session.commit()
+
+    with pytest.raises(
+        DeepcoinOperationConflict, match="operation_identity_conflict"
+    ):
+        record_snapshot_evidence(
+            session_factory,
+            operation_id=operation.id,
+            expected_operation_key=operation.operation_key,
+            expected_request_fingerprint=operation.request_fingerprint,
+            snapshot_kind="account_composite",
+            available=True,
+            schema_valid=True,
+            complete=True,
+            row_count=0,
+            page_count=1,
+            collection_fingerprint="d" * 64,
+            start_write_generation=2,
+            end_write_generation=2,
+            capture_started_at=NOW,
+            capture_ended_at=NOW,
+            evidence={"source": "test"},
+        )
+    with pytest.raises(
+        DeepcoinOperationConflict, match="operation_identity_conflict"
+    ):
+        transition_execution_operation(
+            session_factory,
+            operation_id=operation.id,
+            expected_operation_key=operation.operation_key,
+            expected_request_fingerprint=operation.request_fingerprint,
+            expected_economics_fingerprint=operation.economics_fingerprint,
+            expected_state="planned",
+            expected_state_version=0,
+            phase="entry_submit",
+            state="entry_prepared",
+            outcome_certainty="not_sent",
+            evidence={"prepared": True},
+            updated_at=NOW + timedelta(milliseconds=1),
+        )
+    with session_factory() as session:
+        row = session.get(DeepcoinExecutionOperation, operation.id)
+        assert row.state == "planned"
+        assert session.query(DeepcoinSnapshotEvidence).count() == 0
+
+
 def test_json_is_canonical_bounded_finite_depth_limited_and_secret_free(
     operation_store,
 ):
@@ -392,3 +449,97 @@ def test_attempt_recorder_failure_never_looks_like_exchange_success(operation_st
         )
     with session_factory() as session:
         assert session.query(DeepcoinRequestAttempt).count() == 0
+
+
+def test_snapshot_and_transition_require_atomic_generation_and_economics_cas(
+    operation_store,
+):
+    session_factory, signal_id, _ = operation_store
+    operation = reserve_execution_operation(
+        session_factory, **_reservation(signal_id)
+    )
+    advance_account_write_generation(
+        session_factory, uid_scope_hash=UID_FP, updated_at=NOW
+    )
+    advance_account_write_generation(
+        session_factory,
+        uid_scope_hash=UID_FP,
+        updated_at=NOW + timedelta(milliseconds=1),
+    )
+
+    with pytest.raises(
+        DeepcoinOperationConflict, match="account_write_generation_conflict"
+    ):
+        record_snapshot_evidence(
+            session_factory,
+            operation_id=operation.id,
+            expected_operation_key=operation.operation_key,
+            expected_request_fingerprint=REQUEST_FP,
+            expected_economics_fingerprint=ECONOMICS_FP,
+            expected_uid_scope_hash=UID_FP,
+            expected_account_write_generation=0,
+            snapshot_kind="account_composite",
+            available=True,
+            schema_valid=True,
+            complete=True,
+            row_count=0,
+            page_count=1,
+            collection_fingerprint="d" * 64,
+            start_write_generation=0,
+            end_write_generation=0,
+            capture_started_at=NOW,
+            capture_ended_at=NOW + timedelta(milliseconds=1),
+            evidence={"source": "test"},
+        )
+    with pytest.raises(
+        DeepcoinOperationConflict, match="account_write_generation_conflict"
+    ):
+        transition_execution_operation(
+            session_factory,
+            operation_id=operation.id,
+            expected_operation_key=operation.operation_key,
+            expected_request_fingerprint=REQUEST_FP,
+            expected_economics_fingerprint=ECONOMICS_FP,
+            expected_uid_scope_hash=UID_FP,
+            expected_account_write_generation=0,
+            expected_state="planned",
+            expected_state_version=0,
+            phase="entry_preflight",
+            state="entry_prepared",
+            outcome_certainty="not_sent",
+            evidence={"writer_attempted": False},
+            updated_at=NOW + timedelta(seconds=1),
+        )
+    with session_factory() as session:
+        assert session.query(DeepcoinSnapshotEvidence).count() == 0
+        assert session.get(DeepcoinExecutionOperation, operation.id).state == (
+            "planned"
+        )
+
+    with session_factory() as session:
+        session.get(
+            DeepcoinExecutionOperation, operation.id
+        ).economics_fingerprint = "f" * 64
+        session.commit()
+    with pytest.raises(DeepcoinOperationConflict, match="operation_identity_conflict"):
+        record_snapshot_evidence(
+            session_factory,
+            operation_id=operation.id,
+            expected_operation_key=operation.operation_key,
+            expected_request_fingerprint=REQUEST_FP,
+            expected_economics_fingerprint=ECONOMICS_FP,
+            expected_uid_scope_hash=UID_FP,
+            expected_account_write_generation=2,
+            snapshot_kind="account_composite",
+            available=True,
+            schema_valid=True,
+            complete=True,
+            row_count=0,
+            page_count=1,
+            collection_fingerprint="d" * 64,
+            start_write_generation=2,
+            end_write_generation=2,
+            capture_started_at=NOW,
+            capture_ended_at=NOW + timedelta(milliseconds=1),
+            evidence={"source": "test"},
+        )

@@ -8,6 +8,9 @@ from sqlalchemy.exc import IntegrityError
 
 import telegram_kol_research.execution_bindings as execution_bindings_module
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.deepcoin_execution_operations import (
+    reserve_execution_operation,
+)
 from telegram_kol_research.execution_bindings import (
     ExecutionBindingRecord,
     ExecutionOrderLegRecord,
@@ -49,6 +52,7 @@ from telegram_kol_research.models import (
     StrategyManagementComponent,
     StrategyManagementLeg,
     TriggerProtectionIntent,
+    TradeSignal,
 )
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.deepcoin_contract_specs import StaticDeepcoinContractSpecProvider
@@ -60,6 +64,7 @@ from telegram_kol_research.trigger_backup_stop_executor import (
     submit_verified_trigger_backup_stops,
 )
 from telegram_kol_research.trading_settings import save_trading_settings
+from telegram_kol_research.trade_signals import enqueue_trade_signal
 
 
 def _binding(**overrides):
@@ -273,6 +278,34 @@ def test_production_reconcile_loader_applies_generation_fence(tmp_path):
     }
 
 
+def test_production_reconcile_loader_retains_shared_account_authority(tmp_path):
+    session_factory = create_session_factory(tmp_path / "shared-authority.db")
+
+    class CompleteClient:
+        uid_scope_hash = "c" * 64
+
+        def list_positions(self):
+            return []
+
+        def list_open_orders(self):
+            return []
+
+    snapshot = (
+        execution_bindings_module.load_deepcoin_reconciliation_snapshot_for_instruments_read_only(
+            session_factory,
+            client=CompleteClient(),
+            instruments=set(),
+        )
+    )
+
+    assert snapshot.errors == {}
+    assert snapshot.account_authority.uid_scope_hash == "c" * 64
+    assert snapshot.account_authority.complete is True
+    assert snapshot.account_authority.start_write_generation == 0
+    assert snapshot.account_authority.end_write_generation == 0
+    assert snapshot.capture_ended_at >= snapshot.capture_started_at
+
+
 def test_production_reconcile_loader_without_uid_scope_fails_closed_before_reads(
     tmp_path,
 ):
@@ -394,6 +427,7 @@ def test_live_reconcile_runs_due_stop_rescue_before_retry_rescheduling(
 ):
     import telegram_kol_research.strategy_management_reconciliation as management
     import telegram_kol_research.trigger_protection_rescue_worker as rescue_worker
+    import telegram_kol_research.protected_entry_reconciliation as protected
 
     session_factory = create_session_factory(tmp_path / "rescue-order.db")
     snapshot = execution_bindings_module._ReconcileSnapshot()
@@ -414,6 +448,14 @@ def test_live_reconcile_runs_due_stop_rescue_before_retry_rescheduling(
         "reconcile_strategy_management_batches",
         lambda *args, **kwargs: calls.append("management"),
     )
+    monkeypatch.setattr(
+        protected,
+        "reconcile_protected_entry_operations",
+        lambda *args, **kwargs: (
+            calls.append("protected")
+            or protected.ProtectedEntryReconciliationResult()
+        ),
+    )
 
     result = reconcile_deepcoin_execution_bindings(
         session_factory,
@@ -423,7 +465,124 @@ def test_live_reconcile_runs_due_stop_rescue_before_retry_rescheduling(
     )
 
     assert result is expected_result
-    assert calls == ["rescue", "reconcile", "management"]
+    assert calls == ["protected", "rescue", "reconcile", "management"]
+
+
+def test_snapshot_scope_includes_reconcilable_entry_without_binding(tmp_path):
+    session_factory = create_session_factory(tmp_path / "unknown-entry-scope.db")
+    signal = enqueue_trade_signal(
+        session_factory,
+        venue="deepcoin",
+        source_type="recovery",
+        kol_id="alice",
+        chat_id=100,
+        message_id=77,
+        symbol="BTC",
+        side="long",
+        action="open_position",
+        payload={},
+    )
+    reserve_execution_operation(
+        session_factory,
+        operation_key=f"protected-entry:v1:signal:{signal.id}:leg:1:entry",
+        trade_signal_id=signal.id,
+        contract_version="1",
+        phase="entry_readback",
+        state="entry_unknown",
+        outcome_certainty="unknown",
+        request_fingerprint="a" * 64,
+        economics_fingerprint="b" * 64,
+        deadline_at=datetime(2026, 8, 13, 12, 0) + timedelta(seconds=10),
+        writer_attempted_at=datetime(2026, 8, 13, 12, 0),
+        evidence={
+            "client_order_ref": "c" * 64,
+            "expected_entry_leg_indices": [1],
+            "leg_index": 1,
+            "pre_submit_position_refs": [],
+            "uid_scope_hash": "d" * 64,
+        },
+        created_at=datetime(2026, 8, 13, 12, 0),
+    )
+
+    class Client(_CompleteAuthorityClient):
+        calls = []
+
+        def list_positions(self):
+            return []
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            self.calls.append(("order_history", inst_id))
+            return []
+
+        def list_trade_fills(self, *, inst_id=None):
+            self.calls.append(("trade_fills", inst_id))
+            return []
+
+    client = Client()
+    snapshot = (
+        execution_bindings_module.load_deepcoin_execution_reconciliation_snapshot_read_only(
+            session_factory,
+            client=client,
+        )
+    )
+
+    assert snapshot.errors == {}
+    assert ("order_history", "BTC-USDT-SWAP") in client.calls
+    assert ("trade_fills", "BTC-USDT-SWAP") in client.calls
+    with session_factory() as session:
+        assert session.query(ExecutionBinding).count() == 0
+        assert session.get(TradeSignal, signal.id) is not None
+
+
+def test_live_reconcile_reuses_shared_snapshot_for_protected_operations(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.protected_entry_reconciliation as protected
+    import telegram_kol_research.strategy_management_reconciliation as management
+    import telegram_kol_research.trigger_protection_rescue_worker as rescue_worker
+
+    session_factory = create_session_factory(tmp_path / "protected-reuse.db")
+    snapshot = execution_bindings_module._ReconcileSnapshot()
+    received = []
+    monkeypatch.setattr(
+        rescue_worker,
+        "run_trigger_protection_rescue_tick",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        management,
+        "reconcile_strategy_management_batches",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        protected,
+        "reconcile_protected_entry_operations",
+        lambda session_factory, *, snapshot, reconciled_at: (
+            received.append(snapshot)
+            or protected.ProtectedEntryReconciliationResult(
+                checked=3,
+                confirmed=1,
+                unchanged=1,
+                conflicts=1,
+            )
+        ),
+    )
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=object(),
+        snapshot=snapshot,
+        recovered_at=datetime(2026, 8, 13, 12, 0),
+    )
+
+    assert received == [snapshot]
+    assert result.protected_entry_checked == 3
+    assert result.protected_entry_confirmed == 1
+    assert result.protected_entry_unchanged == 1
+    assert result.protected_entry_conflicts == 1
 
 
 def _seed_global_management_reconciliation_batch(

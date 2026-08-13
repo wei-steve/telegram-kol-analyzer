@@ -52,6 +52,7 @@ from telegram_kol_research.web_app import _run_auto_trade_executor
 from telegram_kol_research.web_app import _persisted_position_attribution
 from telegram_kol_research.group_config import load_group_config
 from telegram_kol_research.execution_bindings import reconcile_deepcoin_execution_bindings
+from telegram_kol_research.execution_bindings import ExecutionReconciliationResult
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
@@ -4251,6 +4252,41 @@ def test_execution_sync_api_marks_missing_deepcoin_position_closed(tmp_path):
 
         assert lifecycle.lifecycle_status == "exited"
         assert lifecycle.exit_reason == "manual"
+
+
+def test_execution_sync_api_reports_protected_entry_reconciliation_counts(
+    tmp_path, monkeypatch
+):
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return []
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+    monkeypatch.setattr(
+        web_app_module,
+        "reconcile_deepcoin_execution_bindings",
+        lambda *args, **kwargs: ExecutionReconciliationResult(
+            protected_entry_checked=4,
+            protected_entry_confirmed=1,
+            protected_entry_unchanged=2,
+            protected_entry_conflicts=1,
+        ),
+    )
+    app = create_web_app(
+        database_path=tmp_path / "protected-entry-sync.db",
+        deepcoin_client_factory=lambda: FakeDeepcoinClient(),
+        now_provider=lambda: datetime(2026, 8, 13, 12, 0),
+    )
+
+    response = TestClient(app).post("/api/execution/sync-deepcoin")
+
+    assert response.status_code == 200
+    assert response.json()["protected_entry_checked"] == 4
+    assert response.json()["protected_entry_confirmed"] == 1
+    assert response.json()["protected_entry_unchanged"] == 2
+    assert response.json()["protected_entry_conflicts"] == 1
 
 
 def test_execution_sync_api_delivers_cleanup_notification_outbox(

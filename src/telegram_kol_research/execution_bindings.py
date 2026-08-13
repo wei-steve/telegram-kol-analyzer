@@ -20,10 +20,12 @@ from telegram_kol_research.deepcoin_readonly import (
     DeepcoinReadOnlyClient,
 )
 from telegram_kol_research.deepcoin_snapshot_authority import (
+    AccountSnapshotEvidence,
     build_exchange_collection_evidence,
     capture_account_snapshot,
 )
 from telegram_kol_research.models import ExecutionBinding
+from telegram_kol_research.models import DeepcoinExecutionOperation
 from telegram_kol_research.models import BoundPositionCloseReservation
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
@@ -34,6 +36,7 @@ from telegram_kol_research.models import PositionMutationIntent
 from telegram_kol_research.models import StrategyManagementBatch
 from telegram_kol_research.models import StrategyManagementLeg
 from telegram_kol_research.models import TriggerProtectionIntent
+from telegram_kol_research.models import TradeSignal
 from telegram_kol_research.protection_snapshot import (
     observe_pending_tpsl,
     record_pending_tpsl_observation,
@@ -157,6 +160,10 @@ class ExecutionReconciliationResult:
     protection_adoption_conflicting: int = 0
     protection_adoption_refused: int = 0
     protection_snapshot_unavailable: int = 0
+    protected_entry_checked: int = 0
+    protected_entry_confirmed: int = 0
+    protected_entry_unchanged: int = 0
+    protected_entry_conflicts: int = 0
 
 
 @dataclass(slots=True)
@@ -178,6 +185,9 @@ class _ReconcileSnapshot:
     trigger_history: list[dict[str, Any]] = field(default_factory=list)
     pending_tpsl_observations: list[dict[str, Any]] = field(default_factory=list)
     errors: dict[str, str] = field(default_factory=dict)
+    account_authority: AccountSnapshotEvidence | None = None
+    capture_started_at: datetime | None = None
+    capture_ended_at: datetime | None = None
 
 
 def build_strategy_instance_id(
@@ -430,9 +440,22 @@ def reconcile_deepcoin_execution_bindings(
                 session_factory, client=client
             )
         if snapshot.errors:
-            return _apply_reconcile_snapshot(
+            result = _apply_reconcile_snapshot(
                 session_factory, snapshot=snapshot, recovered_at=now
             )
+            _reconcile_protected_entry_operations_from_shared_snapshot(
+                session_factory,
+                snapshot=snapshot,
+                reconciled_at=now,
+                result=result,
+            )
+            return result
+        protected = _reconcile_protected_entry_operations_from_shared_snapshot(
+            session_factory,
+            snapshot=snapshot,
+            reconciled_at=now,
+            result=None,
+        )
         from telegram_kol_research.trigger_protection_rescue_worker import (
             run_trigger_protection_rescue_tick,
         )
@@ -447,6 +470,7 @@ def reconcile_deepcoin_execution_bindings(
         result = _apply_reconcile_snapshot(
             session_factory, snapshot=snapshot, recovered_at=now
         )
+        _copy_protected_entry_result(result, protected)
         if contract_spec_provider is not None:
             from telegram_kol_research.trigger_backup_stop_executor import (
                 submit_verified_trigger_backup_stops,
@@ -484,6 +508,35 @@ def reconcile_deepcoin_execution_bindings(
             session_factory, snapshot=snapshot, reconciled_at=now
         )
         return result
+
+
+def _reconcile_protected_entry_operations_from_shared_snapshot(
+    session_factory: sessionmaker,
+    *,
+    snapshot: _ReconcileSnapshot,
+    reconciled_at: datetime,
+    result: Any,
+):
+    from telegram_kol_research.protected_entry_reconciliation import (
+        reconcile_protected_entry_operations,
+    )
+
+    protected = reconcile_protected_entry_operations(
+        session_factory,
+        snapshot=snapshot,
+        reconciled_at=reconciled_at,
+    )
+    _copy_protected_entry_result(result, protected)
+    return protected
+
+
+def _copy_protected_entry_result(result: Any, protected: Any) -> None:
+    if not isinstance(result, ExecutionReconciliationResult):
+        return
+    result.protected_entry_checked = int(protected.checked)
+    result.protected_entry_confirmed = int(protected.confirmed)
+    result.protected_entry_unchanged = int(protected.unchanged)
+    result.protected_entry_conflicts = int(protected.conflicts)
 
 
 def reconcile_deepcoin_execution_bindings_read_only(
@@ -543,6 +596,32 @@ def load_deepcoin_execution_reconciliation_snapshot_read_only(
             .all()
             if str(symbol or "").strip()
         }
+        operation_symbols = (
+            session.query(TradeSignal.symbol)
+            .join(
+                DeepcoinExecutionOperation,
+                DeepcoinExecutionOperation.trade_signal_id == TradeSignal.id,
+            )
+            .filter(
+                DeepcoinExecutionOperation.contract_version == "1",
+                DeepcoinExecutionOperation.state.in_(
+                    (
+                        "entry_pending_readback",
+                        "entry_unknown",
+                        "protection_pending_readback",
+                        "protection_unknown",
+                    )
+                ),
+                TradeSignal.venue == "deepcoin",
+                TradeSignal.action == "open_position",
+            )
+            .all()
+        )
+        instruments.update(
+            f"{str(symbol or '').upper()}-USDT-SWAP"
+            for (symbol,) in operation_symbols
+            if str(symbol or "").strip()
+        )
     return load_deepcoin_reconciliation_snapshot_for_instruments_read_only(
         session_factory,
         client=client,
@@ -574,6 +653,7 @@ def load_deepcoin_reconciliation_snapshot_for_instruments_read_only(
             errors={"account_composite": "snapshot_uid_scope_unavailable"}
         )
     captured: dict[str, _ReconcileSnapshot] = {}
+    capture_started_at = datetime.now(UTC)
 
     def read_account_composite() -> dict[str, list[dict[str, Any]]]:
         captured["snapshot"] = _load_reconcile_snapshot(
@@ -581,18 +661,44 @@ def load_deepcoin_reconciliation_snapshot_for_instruments_read_only(
         )
         if snapshot_enricher is not None:
             snapshot_enricher(captured["snapshot"])
-        return {"data": []}
+        return {
+            "data": [
+                {
+                    "collection_fingerprint": (
+                        _account_composite_fingerprint(captured["snapshot"])
+                    ),
+                    "collection_kinds": sorted(
+                        (
+                            "positions",
+                            "position_history",
+                            "open_orders",
+                            "pending_trigger_orders",
+                            "order_history",
+                            "trade_fills",
+                            "trigger_history",
+                        )
+                    ),
+                }
+            ]
+        }
 
     authority = capture_account_snapshot(
         session_factory,
         uid_scope_hash=uid_scope_hash,
         readers={"account_composite": read_account_composite},
     )
+    capture_ended_at = datetime.now(UTC)
     snapshot = captured.get("snapshot")
     if snapshot is None:
         return _ReconcileSnapshot(
-            errors={"account_composite": "snapshot_read_unavailable"}
+            errors={"account_composite": "snapshot_read_unavailable"},
+            account_authority=authority,
+            capture_started_at=capture_started_at,
+            capture_ended_at=capture_ended_at,
         )
+    snapshot.account_authority = authority
+    snapshot.capture_started_at = capture_started_at
+    snapshot.capture_ended_at = capture_ended_at
     if not authority.complete:
         snapshot.errors["account_composite"] = str(
             authority.reason_code or "snapshot_incomplete"
@@ -813,6 +919,40 @@ def _deduplicate_exchange_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any
         seen.add(fingerprint)
         result.append(row)
     return result
+
+
+def _account_composite_fingerprint(snapshot: _ReconcileSnapshot) -> str:
+    collections: dict[str, list[str]] = {}
+    for kind in (
+        "positions",
+        "position_history",
+        "open_orders",
+        "pending_trigger_orders",
+        "order_history",
+        "trade_fills",
+        "trigger_history",
+    ):
+        rows = getattr(snapshot, kind)
+        row_fingerprints = []
+        for row in rows:
+            encoded = json.dumps(
+                row,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            row_fingerprints.append(
+                hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            )
+        collections[kind] = sorted(row_fingerprints)
+    encoded_collections = json.dumps(
+        collections,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded_collections.encode("utf-8")).hexdigest()
 
 
 _RAW_SNAPSHOT_READERS = {

@@ -321,6 +321,10 @@ def transition_execution_operation(
     *,
     operation_id: int,
     expected_operation_key: str,
+    expected_request_fingerprint: str | None = None,
+    expected_economics_fingerprint: str | None = None,
+    expected_uid_scope_hash: str | None = None,
+    expected_account_write_generation: int | None = None,
     expected_state: str,
     expected_state_version: int,
     phase: str,
@@ -337,6 +341,26 @@ def transition_execution_operation(
 
     operation_pk = _positive_int(operation_id, code="operation_id_invalid")
     key = _bounded_text(expected_operation_key, 255, "operation_key_invalid")
+    request_fp = (
+        None
+        if expected_request_fingerprint is None
+        else _fingerprint(
+            expected_request_fingerprint,
+            "request_fingerprint_invalid",
+        )
+    )
+    economics_fp = (
+        None
+        if expected_economics_fingerprint is None
+        else _fingerprint(
+            expected_economics_fingerprint,
+            "economics_fingerprint_invalid",
+        )
+    )
+    generation_identity = _optional_generation_identity(
+        expected_uid_scope_hash,
+        expected_account_write_generation,
+    )
     prior_state = _bounded_text(expected_state, 32, "expected_state_invalid")
     prior_version = _nonnegative_int(
         expected_state_version, code="expected_state_version_invalid"
@@ -354,8 +378,20 @@ def transition_execution_operation(
     with session_factory() as session:
         _begin_immediate(session)
         row = session.get(DeepcoinExecutionOperation, operation_pk)
-        if row is None or row.operation_key != key:
+        if (
+            row is None
+            or row.operation_key != key
+            or (
+                request_fp is not None
+                and row.request_fingerprint != request_fp
+            )
+            or (
+                economics_fp is not None
+                and row.economics_fingerprint != economics_fp
+            )
+        ):
             raise DeepcoinOperationConflict("operation_identity_conflict")
+        _require_account_generation_locked(session, generation_identity)
         if row.state != prior_state or int(row.state_version) != prior_version:
             raise DeepcoinOperationConflict("operation_state_conflict")
         if writer_at is not None and row.writer_attempted_at is not None:
@@ -446,6 +482,10 @@ def record_snapshot_evidence(
     *,
     operation_id: int,
     expected_operation_key: str,
+    expected_request_fingerprint: str | None = None,
+    expected_economics_fingerprint: str | None = None,
+    expected_uid_scope_hash: str | None = None,
+    expected_account_write_generation: int | None = None,
     snapshot_kind: str,
     available: bool,
     schema_valid: bool,
@@ -465,6 +505,26 @@ def record_snapshot_evidence(
 
     operation_pk = _positive_int(operation_id, code="operation_id_invalid")
     key = _bounded_text(expected_operation_key, 255, "operation_key_invalid")
+    request_fp = (
+        None
+        if expected_request_fingerprint is None
+        else _fingerprint(
+            expected_request_fingerprint,
+            "request_fingerprint_invalid",
+        )
+    )
+    economics_fp = (
+        None
+        if expected_economics_fingerprint is None
+        else _fingerprint(
+            expected_economics_fingerprint,
+            "economics_fingerprint_invalid",
+        )
+    )
+    generation_identity = _optional_generation_identity(
+        expected_uid_scope_hash,
+        expected_account_write_generation,
+    )
     values = _validated_snapshot(
         snapshot_kind=snapshot_kind,
         available=available,
@@ -484,8 +544,20 @@ def record_snapshot_evidence(
     with session_factory() as session:
         _begin_immediate(session)
         operation = session.get(DeepcoinExecutionOperation, operation_pk)
-        if operation is None or operation.operation_key != key:
+        if (
+            operation is None
+            or operation.operation_key != key
+            or (
+                request_fp is not None
+                and operation.request_fingerprint != request_fp
+            )
+            or (
+                economics_fp is not None
+                and operation.economics_fingerprint != economics_fp
+            )
+        ):
             raise DeepcoinOperationConflict("operation_identity_conflict")
+        _require_account_generation_locked(session, generation_identity)
         ordinal = int(
             session.query(func.max(DeepcoinSnapshotEvidence.ordinal))
             .filter_by(deepcoin_execution_operation_id=operation_pk)
@@ -588,6 +660,41 @@ def load_operation_bundle(
 def _begin_immediate(session) -> None:
     if session.get_bind().dialect.name == "sqlite":
         session.execute(text("BEGIN IMMEDIATE"))
+
+
+def _optional_generation_identity(
+    uid_scope_hash: object,
+    generation: object,
+) -> tuple[str, int] | None:
+    if uid_scope_hash is None and generation is None:
+        return None
+    if uid_scope_hash is None or generation is None:
+        raise DeepcoinEvidenceValidationError(
+            "account_write_generation_identity_incomplete"
+        )
+    return (
+        _fingerprint(uid_scope_hash, "uid_scope_hash_invalid"),
+        _nonnegative_int(generation, code="account_write_generation_invalid"),
+    )
+
+
+def _require_account_generation_locked(
+    session,
+    identity: tuple[str, int] | None,
+) -> None:
+    if identity is None:
+        return
+    uid_scope_hash, expected_generation = identity
+    row = (
+        session.query(DeepcoinAccountWriteGeneration)
+        .filter_by(uid_scope_hash=uid_scope_hash)
+        .one_or_none()
+    )
+    current_generation = 0 if row is None else int(row.generation)
+    if current_generation != expected_generation:
+        raise DeepcoinOperationConflict(
+            "account_write_generation_conflict"
+        )
 
 
 def _validated_operation_reservation(**values: Any) -> dict[str, Any]:

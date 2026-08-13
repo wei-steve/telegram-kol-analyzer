@@ -6590,6 +6590,26 @@ def create_web_app(
             "reconciled_active": reconcile_result.active if reconcile_result else 0,
             "reconciled_open": reconcile_result.open if reconcile_result else 0,
             "reconciled_stale": reconcile_result.stale if reconcile_result else 0,
+            "protected_entry_checked": (
+                reconcile_result.protected_entry_checked
+                if reconcile_result
+                else 0
+            ),
+            "protected_entry_confirmed": (
+                reconcile_result.protected_entry_confirmed
+                if reconcile_result
+                else 0
+            ),
+            "protected_entry_unchanged": (
+                reconcile_result.protected_entry_unchanged
+                if reconcile_result
+                else 0
+            ),
+            "protected_entry_conflicts": (
+                reconcile_result.protected_entry_conflicts
+                if reconcile_result
+                else 0
+            ),
         }
 
     @app.post("/api/execution/close-bound-position")
