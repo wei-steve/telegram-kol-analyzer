@@ -5273,6 +5273,8 @@ def test_apply_position_absent_terminalizes_without_exchange_intent(tmp_path):
 
 
 class _Batch119RecoveryClient:
+    uid_scope_hash = "9" * 64
+
     def __init__(self, *, fail_close_readback_once: bool = False):
         self.current_size = "38"
         self.pending = [
@@ -5335,8 +5337,9 @@ class _Batch119RecoveryClient:
     def list_open_orders(self):
         return []
 
-    def list_position_history(self, *, inst_id, pos_id):
-        self.position_history_calls.append((inst_id, pos_id))
+    def list_position_history(self, *, inst_id, pos_id=None):
+        if pos_id is not None:
+            self.position_history_calls.append((inst_id, pos_id))
         return [dict(row) for row in self.position_history]
 
     def list_trigger_orders_pending(self, *, inst_id):
