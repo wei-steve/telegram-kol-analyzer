@@ -11,12 +11,16 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import DeepcoinDefiniteRejection
 from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
+from telegram_kol_research.deepcoin_client import RequestAttemptFact
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecLookup
 from telegram_kol_research.deepcoin_execution_operations import (
     DeepcoinOperationConflict,
+    record_request_attempt,
     reserve_execution_operation,
 )
+from telegram_kol_research.deepcoin_request_policy import OutcomeCertainty
+from telegram_kol_research.deepcoin_request_policy import RequestPriority
 from telegram_kol_research.entry_strategy_assembly import (
     finalize_adjacent_entry_assembly_draft,
 )
@@ -3252,7 +3256,7 @@ def test_protected_entry_market_persists_operations_and_blocks_later_leg_on_prot
         for operation in operations[1:]
     } == mutation_intent_ids
     assert lifecycle.lifecycle_status != "invalidated"
-    assert persisted_signal.status == "partial_submission_failed"
+    assert persisted_signal.status == "recovery_required"
     assert "TOPSECRET" not in (persisted_signal.last_error or "")
     with session_factory() as session:
         assert all(
@@ -3518,7 +3522,7 @@ def test_protected_entry_market_accepted_without_exact_readback_never_protects_o
         persisted_signal = session.get(TradeSignal, signal.id)
     assert operation.state == "entry_pending_readback"
     assert operation.writer_attempted_at is not None
-    assert persisted_signal.status == "unknown_exchange_outcome"
+    assert persisted_signal.status == "recovery_required"
     assert lifecycle.lifecycle_status != "invalidated"
 
 
@@ -3631,6 +3635,49 @@ def test_protected_entry_market_crash_after_post_resumes_readback_without_second
         "transition_execution_operation",
         original_transition,
     )
+    with session_factory() as session:
+        legacy_parent = session.query(DeepcoinExecutionOperation).filter(
+            DeepcoinExecutionOperation.parent_operation_id.is_(None)
+        ).one()
+        legacy_parent_id = legacy_parent.id
+        legacy_parent_key = legacy_parent.operation_key
+        legacy_parent_request_fingerprint = legacy_parent.request_fingerprint
+        legacy_evidence = json.loads(legacy_parent.evidence_json)
+        legacy_evidence.pop("expected_entry_leg_indices", None)
+        legacy_evidence.pop("uid_scope_hash", None)
+        legacy_evidence.pop("leg_index", None)
+        legacy_parent.evidence_json = json.dumps(
+            legacy_evidence,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        session.commit()
+    record_request_attempt(
+        session_factory,
+        operation_id=legacy_parent_id,
+        expected_operation_key=legacy_parent_key,
+        expected_request_fingerprint=legacy_parent_request_fingerprint,
+        uid_scope_hash="1" * 64,
+        fact=RequestAttemptFact(
+            ordinal=1,
+            method="POST",
+            normalized_path="/deepcoin/trade/order",
+            phase="entry_submit",
+            priority=RequestPriority.CRITICAL,
+            correlation_id="legacy-v1-entry",
+            outcome_certainty=OutcomeCertainty.ACCEPTED,
+            error_category=None,
+            safe_code="request_accepted",
+            http_status=200,
+            business_code="0",
+            governor_wait_ms=0,
+            retry_delay_ms=0,
+            latency_ms=1,
+        ),
+        started_at=submitted_at,
+        completed_at=submitted_at + timedelta(milliseconds=1),
+    )
     save_trading_settings(
         session_factory,
         {"protected_entry_execution_mode": "disabled"},
@@ -3656,6 +3703,9 @@ def test_protected_entry_market_crash_after_post_resumes_readback_without_second
             .one()
         )
     assert parent.state == "recovery_required"
+    parent_evidence = json.loads(parent.evidence_json)
+    assert parent_evidence["expected_entry_leg_indices"] == [1]
+    assert parent_evidence["uid_scope_hash"] == "1" * 64
 
 
 def test_protected_entry_market_crash_after_exact_readback_rebuilds_binding_and_protects(
@@ -4320,6 +4370,136 @@ def test_malformed_later_baseline_exhausts_global_attempt_budget_and_defers(
     assert later.state == "pre_submit_deferred"
     assert snapshot_count == 4
     assert client.trigger_payloads == []
+
+
+def test_active_protected_deferred_finalization_preserves_live_lifecycle(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(
+        tmp_path / "task11-protected-deferred.db"
+    )
+    signal = _task10_two_leg_signal(session_factory)
+    client = _Task10ProtectedClient(
+        session_factory,
+        malformed_later_baseline=True,
+    )
+    _task10_one_stop(monkeypatch)
+    monkeypatch.setattr(
+        "telegram_kol_research.recovery_live_submit."
+        "_complete_reusable_protection_capture",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="protected_entry_pre_submit_deferred",
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            processed_at=datetime(2026, 8, 13, 8, 0, tzinfo=UTC),
+        )
+
+    with session_factory() as session:
+        persisted_signal = session.get(TradeSignal, signal.id)
+        lifecycle = session.query(StrategyLifecycle).one()
+        parent = session.query(DeepcoinExecutionOperation).filter(
+            DeepcoinExecutionOperation.parent_operation_id.is_(None)
+        ).one()
+        later = session.query(DeepcoinExecutionOperation).filter(
+            DeepcoinExecutionOperation.operation_key.like("%:leg:2:entry")
+        ).one()
+    assert parent.state == "protected"
+    assert later.state == "pre_submit_deferred"
+    assert persisted_signal.status == "active_protected_deferred"
+    assert lifecycle.lifecycle_status != "invalidated"
+    assert client.trigger_payloads == []
+
+
+def test_missing_planned_later_leg_never_projects_submitted(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(
+        tmp_path / "task11-missing-later-reservation.db"
+    )
+    signal = _task10_two_leg_signal(session_factory)
+    client = _Task10ProtectedClient(session_factory)
+    _task10_one_stop(monkeypatch)
+
+    def fail_before_later_reservation(*args, **kwargs):
+        raise RecoveryLiveSubmitError("later_reservation_interrupted")
+
+    monkeypatch.setattr(
+        "telegram_kol_research.recovery_live_submit."
+        "_submit_trigger_with_protection_intent",
+        fail_before_later_reservation,
+    )
+
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="later_reservation_interrupted",
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            processed_at=datetime(2026, 8, 13, 8, 0, tzinfo=UTC),
+        )
+
+    with session_factory() as session:
+        persisted_signal = session.get(TradeSignal, signal.id)
+        lifecycle = session.query(StrategyLifecycle).one()
+        operations = session.query(DeepcoinExecutionOperation).all()
+    assert persisted_signal.status == "recovery_required"
+    assert persisted_signal.processed_at is None
+    assert lifecycle.lifecycle_status != "invalidated"
+    assert not any(operation.state == "completed" for operation in operations)
+    assert client.trigger_payloads == []
+
+
+def test_v1_failure_before_parent_reservation_freezes_without_lifecycle_close(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(
+        tmp_path / "task11-pre-parent-failure.db"
+    )
+    signal = _task10_two_leg_signal(session_factory)
+    client = _Task10ProtectedClient(session_factory)
+
+    def reject_before_parent(*args, **kwargs):
+        raise RecoveryLiveSubmitError("pre_parent_failure")
+
+    monkeypatch.setattr(
+        "telegram_kol_research.recovery_live_submit."
+        "_require_current_contract_spec_matches_queued",
+        reject_before_parent,
+    )
+
+    with pytest.raises(RecoveryLiveSubmitError, match="pre_parent_failure"):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            processed_at=datetime(2026, 8, 13, 8, 0, tzinfo=UTC),
+        )
+
+    with session_factory() as session:
+        persisted_signal = session.get(TradeSignal, signal.id)
+        lifecycle = session.query(StrategyLifecycle).one()
+        operation_count = session.query(DeepcoinExecutionOperation).count()
+    assert persisted_signal.status == "recovery_required"
+    assert lifecycle.lifecycle_status != "invalidated"
+    assert operation_count == 0
+    assert client.payloads == []
+    assert client.trigger_payloads == []
+    assert client.position_protection_payloads == []
 
 
 def test_later_baseline_attempt_budget_survives_crash_and_restart(

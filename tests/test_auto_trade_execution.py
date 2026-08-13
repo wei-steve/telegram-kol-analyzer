@@ -2321,6 +2321,71 @@ def test_partial_v2_entry_submission_is_quarantined_and_never_reenqueued(
         assert signal.payload_json == original_payload_json
 
 
+@pytest.mark.parametrize(
+    "projection_status",
+    [
+        "active_protection_pending",
+        "active_protected_deferred",
+        "recovery_required",
+        "submission_failed_no_exposure",
+    ],
+)
+def test_protected_entry_projection_statuses_are_never_claimed_as_retry_queue(
+    tmp_path,
+    projection_status,
+):
+    from telegram_kol_research.recovery_live_submit import process_trade_signal_live
+    from telegram_kol_research.trade_signals import load_or_create_trade_signal
+
+    session_factory = create_session_factory(
+        tmp_path / f"frozen-projection-{projection_status}.db"
+    )
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = load_or_create_trade_signal(
+        session_factory,
+        venue="deepcoin",
+        source_type="recovery",
+        kol_id="alice",
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        action="open_position",
+        payload={},
+    )
+    with session_factory() as session:
+        session.get(TradeSignal, signal.id).status = projection_status
+        session.commit()
+    reused = load_or_create_trade_signal(
+        session_factory,
+        venue="deepcoin",
+        source_type="recovery",
+        kol_id="alice",
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        action="open_position",
+        payload={"unsafe_retry": True},
+    )
+    client = _FakeDeepcoinClient()
+
+    assert reused.status == projection_status
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match=f"^trade_signal_claim_failed:{projection_status}$",
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+    assert client.orders == []
+    assert client.trigger_orders == []
+    assert client.protections == []
+
+
 def test_auto_market_draft_uses_immutable_signal_enqueue(tmp_path, monkeypatch):
     import telegram_kol_research.auto_trade_execution as auto_module
     from telegram_kol_research.trade_signals import load_or_create_trade_signal

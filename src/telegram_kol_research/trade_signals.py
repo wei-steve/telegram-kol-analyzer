@@ -3,20 +3,39 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy import text
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.deepcoin_execution_operations import (
+    contains_credential_marker,
+)
 from telegram_kol_research.execution_bindings import build_strategy_instance_id
+from telegram_kol_research.models import DeepcoinExecutionOperation
+from telegram_kol_research.models import DeepcoinAccountWriteGeneration
+from telegram_kol_research.models import DeepcoinRequestAttempt
+from telegram_kol_research.models import DeepcoinSnapshotEvidence
+from telegram_kol_research.models import ExecutionBinding
+from telegram_kol_research.models import ExecutionOrderLeg
+from telegram_kol_research.models import PositionMutationIntent
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.models import TradeIdea
 from telegram_kol_research.models import TradeSignal
+from telegram_kol_research.models import TriggerProtectionIntent
+from telegram_kol_research.protected_entry_projection import (
+    SUBMISSION_FAILED_NO_EXPOSURE,
+)
+from telegram_kol_research.protected_entry_projection import SUBMITTED
+from telegram_kol_research.protected_entry_projection import project_protected_entry_operation
+from telegram_kol_research.protected_entry_projection import projection_uid_scope_hash
 
 
 MANAGEMENT_TRADE_SIGNAL_ACTIONS = frozenset(
@@ -83,6 +102,9 @@ class TradeSignalClaimError(RuntimeError):
 
 class TradeSignalTransitionError(RuntimeError):
     """A claimed signal changed state before its terminal transition."""
+
+
+_SAFE_EXECUTION_PROJECTION_CODE = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,127}")
 
 
 def _normalized_assembly_fingerprint(value: Any, *, error_code: str) -> str:
@@ -615,6 +637,368 @@ def canonical_management_batch_id(payload: Any) -> int | None:
         normalized = int(batch_id)
         return normalized if normalized > 0 else None
     return None
+
+
+def finalize_trade_signal_from_execution_operation(
+    session_factory: sessionmaker,
+    *,
+    signal_id: int,
+    finalized_at: datetime | None = None,
+    expected_status: str = "processing",
+    safe_error_code: str | None = None,
+    result: Mapping[str, Any] | None = None,
+) -> str:
+    """Project one locked protected-entry aggregate into its compatibility row.
+
+    The execution operation remains authoritative.  This function never derives
+    control state from ``safe_error_code`` or another display string.
+    """
+
+    now = finalized_at or datetime.now(UTC)
+    if safe_error_code is not None and (
+        not isinstance(safe_error_code, str)
+        or _SAFE_EXECUTION_PROJECTION_CODE.fullmatch(safe_error_code) is None
+        or contains_credential_marker(safe_error_code)
+    ):
+        safe_error_code = "protected_entry_execution_failed"
+    result_json = _safe_projection_result_json(result)
+
+    with session_factory() as session:
+        if session.get_bind().dialect.name == "sqlite":
+            session.execute(text("BEGIN IMMEDIATE"))
+        row = session.get(TradeSignal, int(signal_id))
+        if (
+            row is None
+            or row.status != expected_status
+            or row.action != "open_position"
+        ):
+            session.rollback()
+            raise TradeSignalTransitionError(
+                "trade_signal_projection_transition_failed"
+            )
+        parents = (
+            session.query(DeepcoinExecutionOperation)
+            .filter(
+                DeepcoinExecutionOperation.trade_signal_id == int(signal_id),
+                DeepcoinExecutionOperation.parent_operation_id.is_(None),
+            )
+            .order_by(DeepcoinExecutionOperation.id)
+            .all()
+        )
+        if len(parents) != 1 or parents[0].contract_version != "1":
+            session.rollback()
+            raise TradeSignalTransitionError(
+                "trade_signal_projection_parent_conflict"
+            )
+        parent = parents[0]
+        children = (
+            session.query(DeepcoinExecutionOperation)
+            .filter(
+                DeepcoinExecutionOperation.parent_operation_id
+                == int(parent.id)
+            )
+            .order_by(DeepcoinExecutionOperation.id)
+            .all()
+        )
+        operation_ids = [int(parent.id), *(int(child.id) for child in children)]
+        attempts = (
+            session.query(DeepcoinRequestAttempt)
+            .filter(
+                DeepcoinRequestAttempt.deepcoin_execution_operation_id.in_(
+                    operation_ids
+                )
+            )
+            .order_by(
+                DeepcoinRequestAttempt.deepcoin_execution_operation_id,
+                DeepcoinRequestAttempt.ordinal,
+                DeepcoinRequestAttempt.id,
+            )
+            .all()
+        )
+        current_write_generation = None
+        parent_uid_scope_hash = projection_uid_scope_hash(parent)
+        if isinstance(parent_uid_scope_hash, str):
+            generation = (
+                session.query(DeepcoinAccountWriteGeneration)
+                .filter(
+                    DeepcoinAccountWriteGeneration.uid_scope_hash
+                    == parent_uid_scope_hash
+                )
+                .one_or_none()
+            )
+            if generation is not None:
+                current_write_generation = int(generation.generation)
+        snapshots = (
+            session.query(DeepcoinSnapshotEvidence)
+            .filter(
+                DeepcoinSnapshotEvidence.deepcoin_execution_operation_id.in_(
+                    operation_ids
+                )
+            )
+            .order_by(
+                DeepcoinSnapshotEvidence.deepcoin_execution_operation_id,
+                DeepcoinSnapshotEvidence.ordinal,
+                DeepcoinSnapshotEvidence.id,
+            )
+            .all()
+        )
+        projection = project_protected_entry_operation(
+            parent=parent,
+            children=children,
+            attempts=attempts,
+            snapshots=snapshots,
+            current_write_generation=current_write_generation,
+            verified_child_operation_ids=_locked_verified_child_operation_ids(
+                session,
+                trade_signal=row,
+                parent=parent,
+                children=children,
+            ),
+        )
+        row.status = projection
+        row.last_error = None if projection == SUBMITTED else safe_error_code
+        row.result_json = result_json if projection == SUBMITTED else None
+        row.attempts = int(row.attempts or 0) + (
+            0 if projection == SUBMITTED else 1
+        )
+        row.processed_at = now if projection in {
+            SUBMITTED,
+            SUBMISSION_FAILED_NO_EXPOSURE,
+        } else None
+        row.updated_at = now
+        if (
+            projection == SUBMISSION_FAILED_NO_EXPOSURE
+            and row.source_type != "strategy_revision"
+        ):
+            _mark_lifecycle_auto_trade_failed(session, row, now)
+        session.commit()
+        return projection
+
+
+def _locked_verified_child_operation_ids(
+    session,
+    *,
+    trade_signal: TradeSignal,
+    parent: DeepcoinExecutionOperation,
+    children: list[DeepcoinExecutionOperation],
+) -> frozenset[int]:
+    if not trade_signal.strategy_instance_id:
+        return frozenset()
+    verified: set[int] = set()
+    for child in children:
+        binding_id = child.execution_binding_id
+        leg_id = child.execution_order_leg_id
+        if type(binding_id) is not int or type(leg_id) is not int:
+            continue
+        binding = session.get(ExecutionBinding, binding_id)
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        evidence = _strict_projection_object(child.evidence_json)
+        if (
+            binding is None
+            or leg is None
+            or evidence is None
+            or binding.strategy_instance_id != trade_signal.strategy_instance_id
+            or leg.execution_binding_id != binding_id
+            or leg.strategy_instance_id != trade_signal.strategy_instance_id
+            or leg.venue != "deepcoin"
+            or leg.purpose != "entry"
+        ):
+            continue
+        if child.phase == "protection_readback":
+            intent_id = evidence.get("position_mutation_intent_id")
+            intent = (
+                session.get(PositionMutationIntent, intent_id)
+                if type(intent_id) is int
+                else None
+            )
+            if (
+                intent is None
+                or intent.venue != "deepcoin"
+                or intent.operation != "set_position_sltp"
+                or intent.strategy_instance_id
+                != trade_signal.strategy_instance_id
+                or intent.execution_binding_id != binding_id
+                or intent.execution_order_leg_id != leg_id
+                or intent.request_fingerprint != child.request_fingerprint
+                or intent.status != "confirmed"
+            ):
+                continue
+        else:
+            child_leg_index = evidence.get("leg_index")
+            intent = (
+                session.query(TriggerProtectionIntent)
+                .filter(
+                    TriggerProtectionIntent.venue == "deepcoin",
+                    TriggerProtectionIntent.execution_order_leg_id == leg_id,
+                )
+                .one_or_none()
+            )
+            if (
+                type(child_leg_index) is not int
+                or leg.leg_index != child_leg_index
+                or (
+                    child.state == "completed"
+                    and (
+                        intent is None
+                        or intent.execution_binding_id != binding_id
+                        or intent.request_fingerprint
+                        != child.request_fingerprint
+                        or not intent.parent_trigger_order_id
+                    )
+                )
+                or (child.state == "pre_submit_deferred" and intent is not None)
+            ):
+                continue
+        verified.add(int(child.id))
+    return frozenset(verified)
+
+
+def _strict_projection_object(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, str) or len(value.encode("utf-8")) > 4096:
+        return None
+
+    def reject_duplicates(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("duplicate_key")
+            result[key] = item
+        return result
+
+    try:
+        parsed = json.loads(
+            value,
+            object_pairs_hook=reject_duplicates,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ValueError(constant)
+            ),
+        )
+        if (
+            not isinstance(parsed, dict)
+            or json.dumps(
+                parsed,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            != value
+        ):
+            return None
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
+        return None
+    return parsed
+
+
+def _safe_projection_result_json(
+    result: Mapping[str, Any] | None,
+) -> str | None:
+    if result is None:
+        return None
+    seen: set[int] = set()
+    node_count = 0
+
+    def validate(value: Any, depth: int = 0) -> bool:
+        nonlocal node_count
+        node_count += 1
+        if depth > 12 or node_count > 1_024:
+            return False
+        if value is None or isinstance(value, bool):
+            return True
+        if isinstance(value, int):
+            return not isinstance(value, bool)
+        if isinstance(value, float):
+            return math.isfinite(value)
+        if isinstance(value, str):
+            return (
+                len(value.encode("utf-8")) <= 4_096
+                and not contains_credential_marker(value)
+            )
+        if isinstance(value, Mapping):
+            identity = id(value)
+            if identity in seen:
+                return False
+            seen.add(identity)
+            try:
+                return all(
+                    isinstance(key, str)
+                    and len(key.encode("utf-8")) <= 128
+                    and not contains_credential_marker(key)
+                    and validate(child, depth + 1)
+                    for key, child in value.items()
+                )
+            finally:
+                seen.remove(identity)
+        if isinstance(value, (list, tuple)):
+            identity = id(value)
+            if identity in seen:
+                return False
+            seen.add(identity)
+            try:
+                return all(validate(child, depth + 1) for child in value)
+            finally:
+                seen.remove(identity)
+        return False
+
+    if validate(result):
+        try:
+            serialized = json.dumps(
+                result,
+                ensure_ascii=False,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            if len(serialized.encode("utf-8")) <= 65_536:
+                return serialized
+        except (TypeError, ValueError, RecursionError):
+            pass
+    return json.dumps(
+        {"result_redacted": True, "status": "submitted"},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def freeze_trade_signal_for_protected_entry_recovery(
+    session_factory: sessionmaker,
+    *,
+    signal_id: int,
+    frozen_at: datetime | None = None,
+    expected_status: str = "processing",
+    safe_error_code: str | None = None,
+) -> None:
+    """Freeze a v1-admitted entry that failed before its parent reservation."""
+
+    now = frozen_at or datetime.now(UTC)
+    if safe_error_code is not None and (
+        not isinstance(safe_error_code, str)
+        or _SAFE_EXECUTION_PROJECTION_CODE.fullmatch(safe_error_code) is None
+        or contains_credential_marker(safe_error_code)
+    ):
+        safe_error_code = "protected_entry_execution_failed"
+    with session_factory() as session:
+        if session.get_bind().dialect.name == "sqlite":
+            session.execute(text("BEGIN IMMEDIATE"))
+        result = session.execute(
+            update(TradeSignal)
+            .where(
+                TradeSignal.id == int(signal_id),
+                TradeSignal.status == expected_status,
+                TradeSignal.action == "open_position",
+            )
+            .values(
+                status="recovery_required",
+                last_error=safe_error_code,
+                attempts=TradeSignal.attempts + 1,
+                processed_at=None,
+                updated_at=now,
+            )
+        )
+        if int(result.rowcount or 0) != 1:
+            session.rollback()
+            raise TradeSignalTransitionError(
+                "trade_signal_projection_transition_failed"
+            )
+        session.commit()
 
 
 def mark_trade_signal_submitted(

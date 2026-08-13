@@ -105,6 +105,12 @@ from telegram_kol_research.trade_signals import MANUAL_MANAGEMENT_SOURCE_TYPES
 from telegram_kol_research.trade_signals import MANAGEMENT_TRADE_SIGNAL_ACTIONS
 from telegram_kol_research.trade_signals import canonical_management_batch_id
 from telegram_kol_research.trade_signals import claim_pending_trade_signal
+from telegram_kol_research.trade_signals import (
+    finalize_trade_signal_from_execution_operation,
+)
+from telegram_kol_research.trade_signals import (
+    freeze_trade_signal_for_protected_entry_recovery,
+)
 from telegram_kol_research.trade_signals import list_pending_trade_signals
 from telegram_kol_research.trade_signals import load_or_create_trade_signal
 from telegram_kol_research.trade_signals import load_trade_signal
@@ -219,61 +225,20 @@ def _entry_submission_failure_status(
     return "unknown_exchange_outcome"
 
 
-def _protected_entry_writer_owns_signal(
-    session_factory: sessionmaker,
-    *,
-    signal_id: int,
-) -> bool:
-    with session_factory() as session:
-        return (
-            session.query(DeepcoinExecutionOperation.id)
-            .filter(
-                DeepcoinExecutionOperation.trade_signal_id == int(signal_id),
-                DeepcoinExecutionOperation.contract_version
-                == PROTECTED_ENTRY_CONTRACT_VERSION,
-                DeepcoinExecutionOperation.parent_operation_id.is_(None),
-                DeepcoinExecutionOperation.writer_attempted_at.is_not(None),
-            )
-            .first()
-            is not None
-        )
-
-
-def _mark_protected_entry_signal_blocked(
-    session_factory: sessionmaker,
-    *,
-    signal_id: int,
-    error: BaseException,
-    failed_at: datetime,
-    terminal_status: str,
-) -> None:
-    """Project a v1 live/unknown failure without invalidating its lifecycle."""
-
-    with session_factory() as session:
-        row = session.get(TradeSignal, int(signal_id))
-        if row is None or row.status != "processing":
-            raise RecoveryLiveSubmitError(
-                "protected_entry_signal_state_conflict"
-            )
-        row.status = terminal_status
-        row.last_error = _safe_protected_failure_code(error)
-        row.attempts = int(row.attempts or 0) + 1
-        row.updated_at = failed_at
-        session.commit()
-
-
 def _safe_protected_failure_code(error: BaseException) -> str:
     fact = getattr(error, "fact", None)
     safe_code = getattr(fact, "safe_code", None)
     if (
         isinstance(safe_code, str)
         and _SAFE_PERSISTED_FAILURE.fullmatch(safe_code)
+        and not contains_credential_marker(safe_code)
     ):
         return safe_code
     message = str(error)
     if (
         isinstance(error, RecoveryLiveSubmitError)
         and _SAFE_PERSISTED_FAILURE.fullmatch(message)
+        and not contains_credential_marker(message)
     ):
         return message
     return "protected_entry_execution_failed"
@@ -650,6 +615,14 @@ def submit_strategy_revision_replacement_live(
     except TradeSignalClaimError as exc:
         raise RecoveryLiveSubmitError(str(exc)) from exc
     submission_progress = EntrySubmissionProgress()
+    protected_entry_route_owned = (
+        trade_signal.action == "open_position"
+        and _protected_entry_route_access(
+            session_factory,
+            trade_signal_id=trade_signal.id,
+        )
+        in {"live", "readback_only"}
+    )
     try:
         result = _submit_recovery_signal_direct(
             session_factory,
@@ -665,27 +638,59 @@ def submit_strategy_revision_replacement_live(
         if isinstance(exc, EntrySubmissionProgressError):
             failure = exc.cause
             submission_progress = exc.progress
-        mark_trade_signal_failed(
+        if _has_protected_entry_parent_operation(
             session_factory,
-            signal_id=trade_signal.id,
-            error=str(failure),
-            failed_at=now,
-            expected_status="processing",
-            terminal_status=_entry_submission_failure_status(
-                failure,
-                progress=submission_progress,
-            ),
-        )
+            trade_signal_id=trade_signal.id,
+        ):
+            finalize_trade_signal_from_execution_operation(
+                session_factory,
+                signal_id=trade_signal.id,
+                finalized_at=now,
+                expected_status="processing",
+                safe_error_code=_safe_protected_failure_code(failure),
+            )
+        elif protected_entry_route_owned:
+            freeze_trade_signal_for_protected_entry_recovery(
+                session_factory,
+                signal_id=trade_signal.id,
+                frozen_at=now,
+                expected_status="processing",
+                safe_error_code=_safe_protected_failure_code(failure),
+            )
+        else:
+            mark_trade_signal_failed(
+                session_factory,
+                signal_id=trade_signal.id,
+                error=str(failure),
+                failed_at=now,
+                expected_status="processing",
+                terminal_status=_entry_submission_failure_status(
+                    failure,
+                    progress=submission_progress,
+                ),
+            )
         if failure is not exc:
             raise failure from exc
         raise
-    mark_trade_signal_submitted(
+    if _has_protected_entry_parent_operation(
         session_factory,
-        signal_id=trade_signal.id,
-        result=result,
-        processed_at=now,
-        expected_status="processing",
-    )
+        trade_signal_id=trade_signal.id,
+    ):
+        finalize_trade_signal_from_execution_operation(
+            session_factory,
+            signal_id=trade_signal.id,
+            result=result,
+            finalized_at=now,
+            expected_status="processing",
+        )
+    else:
+        mark_trade_signal_submitted(
+            session_factory,
+            signal_id=trade_signal.id,
+            result=result,
+            processed_at=now,
+            expected_status="processing",
+        )
     return {"status": "submitted", **result}
 
 
@@ -1078,6 +1083,14 @@ def process_trade_signal_live(
     verified_v2_assembly = False
     submission_progress = EntrySubmissionProgress()
     execution_boundary_at = now
+    protected_entry_route_owned = (
+        trade_signal.action == "open_position"
+        and _protected_entry_route_access(
+            session_factory,
+            trade_signal_id=trade_signal.id,
+        )
+        in {"live", "readback_only"}
+    )
     try:
         if trade_signal.action == "open_position":
             verified_v2_assembly = _require_synchronized_finalized_entry_assembly(
@@ -1126,16 +1139,24 @@ def process_trade_signal_live(
             failure,
             progress=submission_progress,
         )
-        if _protected_entry_writer_owns_signal(
+        if _has_protected_entry_parent_operation(
             session_factory,
-            signal_id=signal_id,
+            trade_signal_id=signal_id,
         ):
-            _mark_protected_entry_signal_blocked(
+            finalize_trade_signal_from_execution_operation(
                 session_factory,
                 signal_id=signal_id,
-                error=failure,
-                failed_at=execution_boundary_at,
-                terminal_status=terminal_status,
+                finalized_at=execution_boundary_at,
+                expected_status="processing",
+                safe_error_code=_safe_protected_failure_code(failure),
+            )
+        elif protected_entry_route_owned:
+            freeze_trade_signal_for_protected_entry_recovery(
+                session_factory,
+                signal_id=signal_id,
+                frozen_at=execution_boundary_at,
+                expected_status="processing",
+                safe_error_code=_safe_protected_failure_code(failure),
             )
         else:
             mark_trade_signal_failed(
@@ -1158,13 +1179,25 @@ def process_trade_signal_live(
         if failure is not exc:
             raise failure from exc
         raise
-    mark_trade_signal_submitted(
+    if _has_protected_entry_parent_operation(
         session_factory,
-        signal_id=signal_id,
-        result=result,
-        processed_at=execution_boundary_at,
-        expected_status="processing",
-    )
+        trade_signal_id=signal_id,
+    ):
+        finalize_trade_signal_from_execution_operation(
+            session_factory,
+            signal_id=signal_id,
+            result=result,
+            finalized_at=execution_boundary_at,
+            expected_status="processing",
+        )
+    else:
+        mark_trade_signal_submitted(
+            session_factory,
+            signal_id=signal_id,
+            result=result,
+            processed_at=execution_boundary_at,
+            expected_status="processing",
+        )
     _project_instruction_entry_submission(
         session_factory,
         trade_signal=trade_signal,
@@ -1695,6 +1728,21 @@ def _transition_protected_operation(
     completed_at: datetime | None = None,
     error_category: str | None = None,
 ) -> ExecutionOperationRecord:
+    prior_evidence = _operation_evidence(operation)
+    next_evidence = dict(evidence)
+    for immutable_key in (
+        "leg_index",
+        "expected_entry_leg_indices",
+        "uid_scope_hash",
+    ):
+        immutable_value = prior_evidence.get(immutable_key)
+        supplied_value = next_evidence.get(immutable_key, immutable_value)
+        if immutable_value is not None and supplied_value != immutable_value:
+            raise RecoveryLiveSubmitError(
+                "protected_entry_operation_evidence_conflict"
+            )
+        if immutable_value is not None:
+            next_evidence[immutable_key] = immutable_value
     return transition_execution_operation(
         session_factory,
         operation_id=operation.id,
@@ -1708,7 +1756,7 @@ def _transition_protected_operation(
         reason_code=reason_code,
         writer_attempted_at=writer_attempted_at,
         completed_at=completed_at,
-        evidence=dict(evidence),
+        evidence=next_evidence,
         updated_at=changed_at,
     )
 
@@ -1723,6 +1771,8 @@ def _reserve_protected_entry_parent(
     submitted_at: datetime,
     deadline_at: datetime,
     pre_submit_position_refs: frozenset[str],
+    expected_entry_leg_indices: tuple[int, ...],
+    uid_scope_hash: str,
 ) -> ExecutionOperationRecord:
     operation_key = _protected_entry_operation_key(
         trade_signal.id,
@@ -1760,7 +1810,54 @@ def _reserve_protected_entry_parent(
             or existing.economics_fingerprint != economics_fingerprint
         ):
             raise DeepcoinOperationConflict("operation_identity_conflict")
+        existing_evidence = _operation_evidence(existing)
         _baseline_position_refs(existing)
+        expected_indices_value = existing_evidence.get(
+            "expected_entry_leg_indices"
+        )
+        uid_scope_value = existing_evidence.get("uid_scope_hash")
+        if expected_indices_value is None and uid_scope_value is None:
+            existing_bundle = load_operation_bundle(
+                session_factory,
+                operation_id=existing.id,
+            )
+            durable_uid_scope_hashes = {
+                attempt.uid_scope_hash
+                for attempt in existing_bundle.attempts
+                if attempt.method == "POST"
+                and attempt.request_fingerprint
+                == existing.request_fingerprint
+            }
+            if (
+                existing.reason_code is None
+                or existing_evidence.get("leg_index") not in {None, leg_index}
+                or existing.writer_attempted_at is None
+                or durable_uid_scope_hashes != {uid_scope_hash}
+            ):
+                raise DeepcoinOperationConflict("operation_identity_conflict")
+            existing = _transition_protected_operation(
+                session_factory,
+                existing,
+                phase=existing.phase,
+                state=existing.state,
+                certainty=existing.outcome_certainty,
+                error_category=existing.error_category,
+                reason_code=existing.reason_code,
+                evidence={
+                    **existing_evidence,
+                    "leg_index": leg_index,
+                    "expected_entry_leg_indices": list(
+                        expected_entry_leg_indices
+                    ),
+                    "uid_scope_hash": uid_scope_hash,
+                },
+                changed_at=datetime.now(UTC),
+            )
+        elif (
+            expected_indices_value != list(expected_entry_leg_indices)
+            or uid_scope_value != uid_scope_hash
+        ):
+            raise DeepcoinOperationConflict("operation_identity_conflict")
         return existing
     operation = reserve_execution_operation(
         session_factory,
@@ -1776,6 +1873,8 @@ def _reserve_protected_entry_parent(
         evidence={
             "contract_version": PROTECTED_ENTRY_CONTRACT_VERSION,
             "leg_index": leg_index,
+            "expected_entry_leg_indices": list(expected_entry_leg_indices),
+            "uid_scope_hash": uid_scope_hash,
             "client_order_ref": hashlib.sha256(
                 str(order_payload.get("clOrdId") or "").encode("utf-8")
             ).hexdigest(),
@@ -1959,6 +2058,7 @@ def _submit_protected_market_entry(
     order_payload: Mapping[str, Any],
     progress: EntrySubmissionProgress,
     submitted_at: datetime,
+    expected_entry_leg_indices: tuple[int, ...],
 ) -> tuple[dict[str, Any], str, str, _ProtectedEntryRuntime]:
     clock = _protected_client_clock(deepcoin_client)
     sleeper = _protected_client_sleep(deepcoin_client)
@@ -2007,6 +2107,8 @@ def _submit_protected_market_entry(
         submitted_at=submitted_at,
         deadline_at=deadline_at,
         pre_submit_position_refs=current_position_refs,
+        expected_entry_leg_indices=expected_entry_leg_indices,
+        uid_scope_hash=uid_scope_hash,
     )
     if resuming_existing_operation:
         remaining_seconds = max(
@@ -3173,6 +3275,10 @@ def _submit_recovery_signal_direct(
             )
         _require_protected_entry_client(deepcoin_client)
     leg_index_offset = int(draft.get("_entry_leg_index_offset") or 0)
+    expected_entry_leg_indices = tuple(
+        leg_index_offset + int(source_index)
+        for source_index in submission_indices
+    )
     for source_index, leg in zip(
         submission_indices,
         submission_order_legs,
@@ -3217,6 +3323,7 @@ def _submit_recovery_signal_direct(
                     order_payload=order_payload,
                     progress=progress,
                     submitted_at=now,
+                    expected_entry_leg_indices=expected_entry_leg_indices,
                 )
             else:
                 pre_submit_position_ids = _load_matching_position_ids(
