@@ -12,6 +12,7 @@ from telegram_kol_research.deepcoin_client import DeepcoinRestClient
 from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.deepcoin_client import DeepcoinTpslWriteLimiter
 from telegram_kol_research.deepcoin_client import build_deepcoin_auth_headers
+from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
 from telegram_kol_research.deepcoin_client import load_deepcoin_credentials
 from telegram_kol_research.deepcoin_client import _raise_for_deepcoin_business_error
 from telegram_kol_research.deepcoin_request_governor import (
@@ -144,6 +145,54 @@ def test_load_deepcoin_credentials_reads_env_values():
     assert credentials.api_secret == "secret"
     assert credentials.passphrase == "pass"
     assert credentials.base_url == "https://example.test"
+
+
+def test_request_governor_mode_is_wired_only_from_environment(tmp_path):
+    state_directory = tmp_path / "governor"
+    state_directory.mkdir(mode=0o700)
+    state_directory.chmod(0o700)
+    client = build_deepcoin_client_from_env(
+        environ={
+            "DEEPCOIN_API_KEY": "key",
+            "DEEPCOIN_API_SECRET": "secret",
+            "DEEPCOIN_API_PASSPHRASE": "pass",
+            "DEEPCOIN_BASE_URL": "https://api.deepcoin.test",
+            "DEEPCOIN_REQUEST_GOVERNOR_MODE": "enforce_reads",
+            "DEEPCOIN_GOVERNOR_STATE_DIR": str(state_directory.resolve()),
+        },
+        env_file_paths=[],
+    )
+
+    assert client._request_governor is not None
+    assert client._request_governor.mode == GovernorMode.ENFORCE_READS
+    assert client._request_governor._state_directory == state_directory.resolve()
+
+
+@pytest.mark.parametrize(
+    "governor_environment",
+    [
+        {},
+        {"DEEPCOIN_REQUEST_GOVERNOR_MODE": "invalid"},
+        {"DEEPCOIN_REQUEST_GOVERNOR_MODE": "enforce_all"},
+    ],
+)
+def test_request_governor_mode_missing_or_invalid_stays_disabled(
+    tmp_path,
+    governor_environment,
+):
+    environment = {
+        "DEEPCOIN_API_KEY": "key",
+        "DEEPCOIN_API_SECRET": "secret",
+        "DEEPCOIN_API_PASSPHRASE": "pass",
+        **governor_environment,
+    }
+
+    client = build_deepcoin_client_from_env(
+        environ=environment,
+        env_file_paths=[],
+    )
+
+    assert client._request_governor is None
 
 
 def test_client_order_timeout_preserves_unknown_write_outcome():

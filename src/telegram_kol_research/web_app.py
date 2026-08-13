@@ -93,6 +93,7 @@ from telegram_kol_research.models import (
     RecognitionDecision,
     StrategyManagementBatch,
     StrategyManagementLeg,
+    TradeSignal,
 )
 from telegram_kol_research.models import RawMessage
 from telegram_kol_research.models import StrategyLifecycle
@@ -218,6 +219,7 @@ from telegram_kol_research.trading_settings import (
     load_trading_settings,
     save_trading_settings,
     trading_settings_from_payload,
+    validate_protected_entry_rollout_transition,
 )
 from telegram_kol_research.context_resolution import resolve_contextual_strategy
 from telegram_kol_research.context_resolution_worker import (
@@ -3840,6 +3842,16 @@ def _latest_raw_message_id_in_session(session) -> int:
     return int(latest or 0)
 
 
+def _latest_trade_signal_id(session_factory) -> int:
+    with session_factory() as session:
+        return _latest_trade_signal_id_in_session(session)
+
+
+def _latest_trade_signal_id_in_session(session) -> int:
+    latest = session.execute(select(func.max(TradeSignal.id))).scalar_one()
+    return int(latest or 0)
+
+
 def _mimo_circuit_datetime(value: datetime | None) -> str | None:
     if value is None:
         return None
@@ -3857,6 +3869,9 @@ def _build_web_trading_settings_payload(
     return {
         **settings.to_dict(),
         "mimo_v2_latest_raw_message_id": _latest_raw_message_id(
+            session_factory
+        ),
+        "protected_entry_latest_trade_signal_id": _latest_trade_signal_id(
             session_factory
         ),
         "mimo_contract_circuit": {
@@ -3891,6 +3906,33 @@ def _validate_mimo_rollout_settings_update(
         ),
         latest_raw_message_id=_latest_raw_message_id(session_factory),
     )
+
+
+def _validate_protected_entry_rollout_settings_update(
+    session_factory,
+    *,
+    payload: dict[str, Any],
+) -> None:
+    current = load_trading_settings(session_factory)
+    requested = trading_settings_from_payload(
+        {**current.to_dict(), **payload}
+    )
+    validate_protected_entry_rollout_transition(
+        current=current,
+        requested=requested,
+        watermark_provided=(
+            "protected_entry_execution_after_trade_signal_id" in payload
+        ),
+        latest_trade_signal_id=_latest_trade_signal_id(session_factory),
+    )
+
+
+def _reject_web_deepcoin_transport_settings(payload: dict[str, Any]) -> None:
+    if any(
+        isinstance(key, str) and key.startswith("DEEPCOIN_")
+        for key in payload
+    ):
+        raise ValueError("Deepcoin transport settings are environment-only")
 
 
 def _validate_mimo_rollout_transition(
@@ -6133,6 +6175,9 @@ def create_web_app(
                 "mimo_v2_latest_raw_message_id": _latest_raw_message_id(
                     app.state.session_factory
                 ),
+                "protected_entry_latest_trade_signal_id": (
+                    _latest_trade_signal_id(app.state.session_factory)
+                ),
             },
         )
 
@@ -6799,7 +6844,12 @@ def create_web_app(
     @app.post("/api/trading-settings")
     async def update_trading_settings(payload: dict[str, Any]):
         try:
+            _reject_web_deepcoin_transport_settings(payload)
             _validate_mimo_rollout_settings_update(
+                app.state.session_factory,
+                payload=payload,
+            )
+            _validate_protected_entry_rollout_settings_update(
                 app.state.session_factory,
                 payload=payload,
             )

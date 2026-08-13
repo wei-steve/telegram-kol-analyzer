@@ -15,11 +15,12 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
-from telegram_kol_research.models import TradingSetting
+from telegram_kol_research.models import TradeSignal, TradingSetting
 
 
 TRADING_SETTINGS_KEY = "global"
 ENTRY_REVISION_ACTIVATION_KEY = "entry_revision_v2_activation"
+PROTECTED_ENTRY_CONTRACT_VERSION = "1"
 MAX_FLOAT_DECIMAL = Decimal(str(sys.float_info.max))
 
 ENTRY_THRESHOLD_KEYS = (
@@ -89,6 +90,8 @@ class TradingSettings:
     deepcoin_contract_specs_mode: Literal["static", "shadow", "live"] = "static"
     mimo_contract_mode: Literal["v1", "v2_live_adapter"] = "v1"
     mimo_v2_activation_after_raw_message_id: int = 0
+    protected_entry_execution_mode: Literal["disabled", "live"] = "disabled"
+    protected_entry_execution_after_trade_signal_id: int = 0
     default_max_loss_usdt: float = 20.0
     daily_max_loss_usdt: float = 500.0
     max_concurrent_positions: int = 4
@@ -233,8 +236,14 @@ def save_trading_settings(
 ) -> TradingSettings:
     """Validate and persist global trading settings."""
 
+    protected_entry_fields_present = bool(
+        {
+            "protected_entry_execution_mode",
+            "protected_entry_execution_after_trade_signal_id",
+        }.intersection(payload)
+    )
     with session_factory() as session:
-        if locked_validator is not None:
+        if locked_validator is not None or protected_entry_fields_present:
             session.execute(text("BEGIN IMMEDIATE"))
         row = (
             session.query(TradingSetting)
@@ -257,6 +266,17 @@ def save_trading_settings(
             )
         except ValueError:
             current_settings = TradingSettings()
+        if protected_entry_fields_present:
+            validate_protected_entry_rollout_transition(
+                current=current_settings,
+                requested=settings,
+                watermark_provided=(
+                    "protected_entry_execution_after_trade_signal_id" in payload
+                ),
+                latest_trade_signal_id=_latest_trade_signal_id_in_session(
+                    session
+                ),
+            )
         if locked_validator is not None:
             locked_validator(session, current_settings, settings)
         prior_revision_mode = str(
@@ -419,6 +439,23 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         ),
         field_name="mimo_v2_activation_after_raw_message_id",
     )
+    protected_entry_execution_mode = _protected_entry_execution_mode(
+        raw.get(
+            "protected_entry_execution_mode",
+            defaults.protected_entry_execution_mode,
+        )
+    )
+    protected_entry_execution_after_trade_signal_id = (
+        _nonnegative_int_setting(
+            raw.get(
+                "protected_entry_execution_after_trade_signal_id",
+                defaults.protected_entry_execution_after_trade_signal_id,
+            ),
+            field_name=(
+                "protected_entry_execution_after_trade_signal_id"
+            ),
+        )
+    )
     return TradingSettings(
         auto_trade_enabled=_boolean_setting(
             raw,
@@ -452,6 +489,10 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         mimo_contract_mode=mimo_contract_mode,
         mimo_v2_activation_after_raw_message_id=(
             mimo_v2_activation_after_raw_message_id
+        ),
+        protected_entry_execution_mode=protected_entry_execution_mode,
+        protected_entry_execution_after_trade_signal_id=(
+            protected_entry_execution_after_trade_signal_id
         ),
         default_max_loss_usdt=_positive_float(
             raw.get("default_max_loss_usdt"),
@@ -602,6 +643,101 @@ def _mimo_contract_mode(
     if normalized not in {"v1", "v2_live_adapter"}:
         raise ValueError("mimo_contract_mode must be v1 or v2_live_adapter")
     return normalized
+
+
+def _protected_entry_execution_mode(
+    value: Any,
+) -> Literal["disabled", "live"]:
+    if not isinstance(value, str):
+        raise ValueError(
+            "protected_entry_execution_mode must be disabled or live"
+        )
+    normalized = value.strip().lower()
+    if normalized not in {"disabled", "live"}:
+        raise ValueError(
+            "protected_entry_execution_mode must be disabled or live"
+        )
+    return normalized
+
+
+def protected_entry_mode_for_signal(
+    settings: TradingSettings,
+    signal_id: object,
+) -> Literal["disabled", "live"]:
+    """Select the future-only contract without guessing invalid identities."""
+
+    if not isinstance(settings, TradingSettings) or type(signal_id) is not int:
+        return "disabled"
+    watermark = settings.protected_entry_execution_after_trade_signal_id
+    if (
+        settings.protected_entry_execution_mode != "live"
+        or type(watermark) is not int
+        or watermark < 0
+        or signal_id <= watermark
+    ):
+        return "disabled"
+    return "live"
+
+
+def protected_entry_operation_access(
+    settings: TradingSettings,
+    *,
+    signal_id: object,
+    contract_version: object,
+    writer_attempted: object,
+) -> Literal["stop", "live", "readback_only"]:
+    """Keep a pinned writer owned by v1 after the creation gate is disabled."""
+
+    if (
+        type(contract_version) is not str
+        or contract_version != PROTECTED_ENTRY_CONTRACT_VERSION
+        or type(writer_attempted) is not bool
+        or type(signal_id) is not int
+        or signal_id <= 0
+    ):
+        return "stop"
+    if protected_entry_mode_for_signal(settings, signal_id) == "live":
+        return "live"
+    return "readback_only" if writer_attempted else "stop"
+
+
+def validate_protected_entry_rollout_transition(
+    *,
+    current: TradingSettings,
+    requested: TradingSettings,
+    watermark_provided: bool,
+    latest_trade_signal_id: int,
+) -> None:
+    """Validate one locked future-only rollout transition."""
+
+    field_name = "protected_entry_execution_after_trade_signal_id"
+    current_watermark = current.protected_entry_execution_after_trade_signal_id
+    requested_watermark = (
+        requested.protected_entry_execution_after_trade_signal_id
+    )
+    if requested_watermark < current_watermark:
+        raise ValueError(f"{field_name} must not decrease")
+    if requested.protected_entry_execution_mode != "live":
+        return
+    if (
+        current.protected_entry_execution_mode != "live"
+        and not watermark_provided
+    ):
+        raise ValueError(f"{field_name} is required when enabling live")
+    activation_changed = (
+        current.protected_entry_execution_mode != "live"
+        or requested_watermark != current_watermark
+    )
+    if activation_changed and requested_watermark < latest_trade_signal_id:
+        raise ValueError(
+            f"{field_name} must be at least the current latest trade signal "
+            "id for future-only activation"
+        )
+
+
+def _latest_trade_signal_id_in_session(session: Session) -> int:
+    row = session.query(TradeSignal.id).order_by(TradeSignal.id.desc()).first()
+    return int(row[0]) if row is not None else 0
 
 
 def _entry_preamble_mode(

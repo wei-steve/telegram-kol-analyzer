@@ -28,6 +28,7 @@ from telegram_kol_research.deepcoin_request_governor import (
     DeepcoinGovernorDeadlineExceeded,
     DeepcoinGovernorError,
     DeepcoinGovernorStateError,
+    build_deepcoin_request_governor_from_environment,
 )
 from telegram_kol_research.deepcoin_request_policy import (
     ErrorCategory,
@@ -254,9 +255,10 @@ def load_deepcoin_credentials(
 ) -> DeepcoinCredentials:
     """Load Deepcoin API credentials from env vars or config env files."""
 
-    paths = [".env", "config/telegram.env"] if env_file_paths is None else env_file_paths
-    env = {} if paths == [] else dict(_load_env_file_values(paths))
-    env.update(os.environ if environ is None else environ)
+    env = _load_deepcoin_environment(
+        environ=environ,
+        env_file_paths=env_file_paths,
+    )
     api_key = env.get("DEEPCOIN_API_KEY", "")
     api_secret = env.get("DEEPCOIN_API_SECRET", "")
     passphrase = env.get("DEEPCOIN_API_PASSPHRASE", "")
@@ -1126,8 +1128,42 @@ def build_deepcoin_auth_headers(
     }
 
 
-def build_deepcoin_client_from_env() -> DeepcoinRestClient:
-    return DeepcoinRestClient(load_deepcoin_credentials())
+def build_deepcoin_client_from_env(
+    environ: dict[str, str] | None = None,
+    env_file_paths: list[str | Path] | None = None,
+) -> DeepcoinRestClient:
+    environment = _load_deepcoin_environment(
+        environ=environ,
+        env_file_paths=env_file_paths,
+    )
+    credentials = load_deepcoin_credentials(
+        environ=environment,
+        env_file_paths=[],
+    )
+    governor = build_deepcoin_request_governor_from_environment(
+        base_url=credentials.base_url,
+        api_key=credentials.api_key,
+        environ=environment,
+    )
+    return DeepcoinRestClient(
+        credentials,
+        request_governor=governor,
+    )
+
+
+def _load_deepcoin_environment(
+    *,
+    environ: dict[str, str] | None,
+    env_file_paths: list[str | Path] | None,
+) -> dict[str, str]:
+    paths = (
+        [".env", "config/telegram.env"]
+        if env_file_paths is None
+        else env_file_paths
+    )
+    environment = {} if paths == [] else dict(_load_env_file_values(paths))
+    environment.update(os.environ if environ is None else environ)
+    return environment
 
 
 def _raise_for_deepcoin_business_error(payload: dict[str, Any]) -> None:

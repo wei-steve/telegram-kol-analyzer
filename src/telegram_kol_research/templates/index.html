@@ -405,6 +405,27 @@
               v2 只处理 ID 严格大于此值的消息。当前最大消息 ID：{{ mimo_v2_latest_raw_message_id }}。
             </span>
           </label>
+          <label>
+            新信号保护入场执行
+            <select name="protected_entry_execution_mode">
+              <option value="disabled" {% if trading_settings.protected_entry_execution_mode == 'disabled' %}selected{% endif %}>关闭：保持当前入场路径</option>
+              <option value="live" {% if trading_settings.protected_entry_execution_mode == 'live' %}selected{% endif %}>实盘：仅水位线后的新 TradeSignal 使用 v1 保护入场合约</option>
+            </select>
+          </label>
+          <label>
+            保护入场未来 TradeSignal 水位线
+            <input
+              name="protected_entry_execution_after_trade_signal_id"
+              type="number"
+              min="0"
+              step="1"
+              value="{{ trading_settings.protected_entry_execution_after_trade_signal_id }}"
+              aria-describedby="protected-entry-watermark-help"
+            />
+            <span id="protected-entry-watermark-help" class="ai-helper-text">
+              仅 ID 严格大于此值的新信号生效。当前最大 TradeSignal ID：{{ protected_entry_latest_trade_signal_id }}。
+            </span>
+          </label>
           <div
             class="recognition-profile-section"
             data-mimo-contract-circuit

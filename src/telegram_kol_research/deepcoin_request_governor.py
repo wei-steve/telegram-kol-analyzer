@@ -9,7 +9,7 @@ import json
 import math
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -27,6 +27,12 @@ class GovernorMode(StrEnum):
     TELEMETRY = "telemetry"
     ENFORCE_READS = "enforce_reads"
     ENFORCE_ALL = "enforce_all"
+
+
+@dataclass(frozen=True, slots=True)
+class DeepcoinGovernorEnvironment:
+    mode: GovernorMode
+    state_directory: Path | None
 
 
 class DeepcoinGovernorError(RuntimeError):
@@ -57,6 +63,77 @@ class GovernorLease:
 _STATE_VERSION = 1
 _MAX_STATE_BYTES = 65_536
 _MAX_STARTS = 4_096
+
+
+def load_deepcoin_governor_environment(
+    environ: Mapping[str, str] | None = None,
+) -> DeepcoinGovernorEnvironment:
+    """Load the transport gate without guessing an enforcement directory."""
+
+    values = os.environ if environ is None else environ
+    raw_mode = values.get("DEEPCOIN_REQUEST_GOVERNOR_MODE", "disabled")
+    if not isinstance(raw_mode, str):
+        return _disabled_environment()
+    try:
+        mode = GovernorMode(raw_mode.strip().lower())
+    except ValueError:
+        return _disabled_environment()
+    if mode == GovernorMode.DISABLED:
+        return _disabled_environment()
+
+    raw_directory = values.get("DEEPCOIN_GOVERNOR_STATE_DIR")
+    if (
+        not isinstance(raw_directory, str)
+        or not raw_directory.strip()
+        or len(raw_directory) > 4_096
+    ):
+        return _disabled_environment()
+    directory = Path(raw_directory)
+    try:
+        if (
+            not directory.is_absolute()
+            or directory.is_symlink()
+            or not directory.is_dir()
+        ):
+            return _disabled_environment()
+        metadata = directory.stat()
+        permissions = metadata.st_mode & 0o777
+        if metadata.st_uid != os.getuid() or permissions != 0o700:
+            return _disabled_environment()
+        resolved = directory.resolve(strict=True)
+    except OSError:
+        return _disabled_environment()
+    return DeepcoinGovernorEnvironment(
+        mode=mode,
+        state_directory=resolved,
+    )
+
+
+def build_deepcoin_request_governor_from_environment(
+    *,
+    base_url: str,
+    api_key: str,
+    environ: Mapping[str, str] | None = None,
+) -> "DeepcoinRequestGovernor | None":
+    config = load_deepcoin_governor_environment(environ)
+    if (
+        config.mode == GovernorMode.DISABLED
+        or config.state_directory is None
+    ):
+        return None
+    return DeepcoinRequestGovernor(
+        base_url=base_url,
+        api_key=api_key,
+        mode=config.mode,
+        state_directory=config.state_directory,
+    )
+
+
+def _disabled_environment() -> DeepcoinGovernorEnvironment:
+    return DeepcoinGovernorEnvironment(
+        mode=GovernorMode.DISABLED,
+        state_directory=None,
+    )
 
 
 class DeepcoinRequestGovernor:

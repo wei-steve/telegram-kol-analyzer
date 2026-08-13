@@ -1188,6 +1188,150 @@ def test_trading_settings_api_returns_fresh_fixed_entry_defaults(tmp_path):
     }
 
 
+def test_trading_settings_protected_entry_rollout_is_future_only_and_round_trips(
+    tmp_path,
+):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    signal = enqueue_trade_signal(
+        app.state.session_factory,
+        venue="deepcoin",
+        source_type="telegram",
+        kol_id="group:77",
+        chat_id=77,
+        message_id=901,
+        symbol="BTC",
+        side="long",
+        action="open_position",
+        payload={},
+    )
+    client = TestClient(app)
+
+    initial = client.get("/api/trading-settings")
+    enabled = client.post(
+        "/api/trading-settings",
+        json={
+            "protected_entry_execution_mode": "live",
+            "protected_entry_execution_after_trade_signal_id": signal.id,
+        },
+    )
+    reloaded = client.get("/api/trading-settings")
+
+    assert initial.status_code == 200
+    assert initial.json()["protected_entry_execution_mode"] == "disabled"
+    assert initial.json()["protected_entry_latest_trade_signal_id"] == signal.id
+    assert enabled.status_code == 200
+    assert enabled.json()["protected_entry_execution_mode"] == "live"
+    assert (
+        enabled.json()["protected_entry_execution_after_trade_signal_id"]
+        == signal.id
+    )
+    assert reloaded.json()["protected_entry_execution_mode"] == "live"
+
+
+@pytest.mark.parametrize("watermark", [None, 0])
+def test_trading_settings_protected_entry_rollout_rejects_missing_or_stale_watermark(
+    tmp_path,
+    watermark,
+):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    enqueue_trade_signal(
+        app.state.session_factory,
+        venue="deepcoin",
+        source_type="telegram",
+        kol_id="group:77",
+        chat_id=77,
+        message_id=902,
+        symbol="ETH",
+        side="long",
+        action="open_position",
+        payload={},
+    )
+    payload = {"protected_entry_execution_mode": "live"}
+    if watermark is not None:
+        payload["protected_entry_execution_after_trade_signal_id"] = watermark
+
+    response = TestClient(app).post("/api/trading-settings", json=payload)
+
+    assert response.status_code == 422
+    assert "protected_entry_execution_after_trade_signal_id" in response.json()[
+        "detail"
+    ]
+
+
+def test_trading_settings_protected_entry_watermark_cannot_decrease(tmp_path):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    client = TestClient(app)
+    assert client.post(
+        "/api/trading-settings",
+        json={"protected_entry_execution_after_trade_signal_id": 42},
+    ).status_code == 200
+
+    response = client.post(
+        "/api/trading-settings",
+        json={"protected_entry_execution_after_trade_signal_id": 41},
+    )
+
+    assert response.status_code == 422
+    assert "must not decrease" in response.json()["detail"]
+    assert (
+        client.get("/api/trading-settings").json()[
+            "protected_entry_execution_after_trade_signal_id"
+        ]
+        == 42
+    )
+
+
+def test_trading_settings_protected_entry_ui_has_no_shadow_or_governor_override(
+    tmp_path,
+):
+    response = TestClient(
+        create_web_app(database_path=tmp_path / "research.db")
+    ).get("/more-panel")
+    html = response.text
+    mode_select = re.search(
+        r'<select name="protected_entry_execution_mode"[^>]*>(.*?)</select>',
+        html,
+        re.DOTALL,
+    )
+
+    assert response.status_code == 200
+    assert mode_select is not None
+    assert 'value="disabled"' in mode_select.group(1)
+    assert 'value="live"' in mode_select.group(1)
+    assert 'value="shadow"' not in mode_select.group(1)
+    assert 'name="protected_entry_execution_after_trade_signal_id"' in html
+    assert "DEEPCOIN_REQUEST_GOVERNOR_MODE" not in html
+    assert "DEEPCOIN_GOVERNOR_STATE_DIR" not in html
+
+
+@pytest.mark.parametrize(
+    "transport_payload",
+    [
+        {"DEEPCOIN_REQUEST_GOVERNOR_MODE": "enforce_all"},
+        {"DEEPCOIN_GOVERNOR_STATE_DIR": "/tmp/unsafe"},
+        {"DEEPCOIN_API_KEY": "must-not-enter-settings"},
+        {"DEEPCOIN_TIMEOUT_SECONDS": "999"},
+    ],
+)
+def test_trading_settings_api_rejects_environment_only_deepcoin_transport_settings(
+    tmp_path,
+    transport_payload,
+):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.post(
+        "/api/trading-settings",
+        json=transport_payload,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "Deepcoin transport settings are environment-only"
+    )
+    persisted = client.get("/api/trading-settings").json()
+    assert all(key not in persisted for key in transport_payload)
+
+
 def test_trading_settings_mimo_rollout_round_trips_current_future_watermark(
     tmp_path,
 ):
@@ -4146,6 +4290,8 @@ def test_execution_sync_api_delivers_cleanup_notification_outbox(
 
 def test_execution_sync_api_never_submits_position_protection_orders(tmp_path):
     class FakeDeepcoinClient:
+        uid_scope_hash = "d" * 64
+
         def __init__(self):
             self.protection_payloads = []
 
@@ -4188,7 +4334,13 @@ def test_execution_sync_api_never_submits_position_protection_orders(tmp_path):
         def list_trade_fills(self, *, inst_id=None):
             return []
 
+        def list_position_history(self, *, inst_id, pos_id=None):
+            return []
+
         def list_trigger_orders_pending(self, *, inst_id):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id):
             return []
 
         def set_position_sltp(self, payload):

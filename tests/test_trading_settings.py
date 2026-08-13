@@ -4,6 +4,8 @@ import json
 
 import pytest
 
+import telegram_kol_research.trading_settings as trading_settings_module
+
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.group_config import TrackedSenderConfig
@@ -15,7 +17,7 @@ from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.trading_settings import TradingSettings
 from telegram_kol_research.trading_settings import trading_settings_from_payload
 from telegram_kol_research.trading_settings import ENTRY_REVISION_ACTIVATION_KEY
-from telegram_kol_research.models import TradingSetting
+from telegram_kol_research.models import TradeSignal, TradingSetting
 
 
 def test_load_trading_settings_returns_safe_defaults(tmp_path):
@@ -56,7 +58,191 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     assert settings.deepcoin_contract_specs_mode == "static"
     assert settings.mimo_contract_mode == "v1"
     assert settings.mimo_v2_activation_after_raw_message_id == 0
+    assert settings.protected_entry_execution_mode == "disabled"
+    assert settings.protected_entry_execution_after_trade_signal_id == 0
     assert not hasattr(settings, "entry_preamble_live_chat_ids")
+
+
+@pytest.mark.parametrize("mode", ["disabled", "live"])
+def test_protected_entry_rollout_settings_round_trip_without_shadow(tmp_path, mode):
+    session_factory = create_session_factory(tmp_path / "protected-entry.db")
+
+    saved = save_trading_settings(
+        session_factory,
+        {
+            "protected_entry_execution_mode": mode,
+            "protected_entry_execution_after_trade_signal_id": 0,
+        },
+    )
+
+    assert saved.protected_entry_execution_mode == mode
+    assert saved.protected_entry_execution_after_trade_signal_id == 0
+    assert load_trading_settings(session_factory).to_dict() == saved.to_dict()
+
+
+@pytest.mark.parametrize("value", ["shadow", "unsafe", "", True, 1, [], None])
+def test_protected_entry_mode_fails_closed(value):
+    with pytest.raises(ValueError, match="protected_entry_execution_mode"):
+        trading_settings_from_payload({"protected_entry_execution_mode": value})
+
+
+@pytest.mark.parametrize("value", [-1, True, "42", 1.5, None])
+def test_protected_entry_watermark_fails_closed(value):
+    with pytest.raises(
+        ValueError,
+        match="protected_entry_execution_after_trade_signal_id",
+    ):
+        trading_settings_from_payload(
+            {"protected_entry_execution_after_trade_signal_id": value}
+        )
+
+
+def test_protected_entry_mode_for_signal_is_strictly_future_only():
+    settings = TradingSettings(
+        protected_entry_execution_mode="live",
+        protected_entry_execution_after_trade_signal_id=41,
+    )
+
+    assert trading_settings_module.protected_entry_mode_for_signal(settings, 41) == "disabled"
+    assert trading_settings_module.protected_entry_mode_for_signal(settings, 42) == "live"
+    assert trading_settings_module.protected_entry_mode_for_signal(settings, True) == "disabled"
+    settings.protected_entry_execution_mode = "disabled"
+    assert trading_settings_module.protected_entry_mode_for_signal(settings, 99) == "disabled"
+
+
+def test_protected_entry_contract_is_pinned_and_disable_preserves_only_readback():
+    settings = TradingSettings(
+        protected_entry_execution_mode="disabled",
+        protected_entry_execution_after_trade_signal_id=41,
+    )
+
+    assert trading_settings_module.PROTECTED_ENTRY_CONTRACT_VERSION == "1"
+    assert (
+        trading_settings_module.protected_entry_operation_access(
+            settings,
+            signal_id=42,
+            contract_version="1",
+            writer_attempted=False,
+        )
+        == "stop"
+    )
+
+    class ForgedVersion:
+        def __eq__(self, other):
+            return other == "1"
+
+    assert (
+        trading_settings_module.protected_entry_operation_access(
+            settings,
+            signal_id=42,
+            contract_version=ForgedVersion(),
+            writer_attempted=True,
+        )
+        == "stop"
+    )
+    assert (
+        trading_settings_module.protected_entry_operation_access(
+            settings,
+            signal_id=42,
+            contract_version="1",
+            writer_attempted=True,
+        )
+        == "readback_only"
+    )
+    assert (
+        trading_settings_module.protected_entry_operation_access(
+            settings,
+            signal_id=42,
+            contract_version="2",
+            writer_attempted=True,
+        )
+        == "stop"
+    )
+
+
+def test_protected_entry_save_rejects_decreasing_watermark(tmp_path):
+    session_factory = create_session_factory(tmp_path / "protected-entry.db")
+    save_trading_settings(
+        session_factory,
+        {"protected_entry_execution_after_trade_signal_id": 42},
+    )
+
+    with pytest.raises(ValueError, match="must not decrease"):
+        save_trading_settings(
+            session_factory,
+            {"protected_entry_execution_after_trade_signal_id": 41},
+        )
+
+    assert (
+        load_trading_settings(
+            session_factory
+        ).protected_entry_execution_after_trade_signal_id
+        == 42
+    )
+
+
+def test_protected_entry_live_save_requires_explicit_current_trade_signal_watermark(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "protected-entry.db")
+    with session_factory() as session:
+        session.add(
+            TradeSignal(
+                signal_uid="protected-entry-existing",
+                kol_id="group:1",
+                chat_id=1,
+                message_id=1,
+                symbol="BTC",
+                side="long",
+                action="open_position",
+                payload_json="{}",
+            )
+        )
+        session.commit()
+        latest_signal_id = session.query(TradeSignal.id).scalar()
+
+    with pytest.raises(ValueError, match="is required"):
+        save_trading_settings(
+            session_factory,
+            {"protected_entry_execution_mode": "live"},
+        )
+    with pytest.raises(ValueError, match="future-only activation"):
+        save_trading_settings(
+            session_factory,
+            {
+                "protected_entry_execution_mode": "live",
+                "protected_entry_execution_after_trade_signal_id": (
+                    latest_signal_id - 1
+                ),
+            },
+        )
+
+    saved = save_trading_settings(
+        session_factory,
+        {
+            "protected_entry_execution_mode": "live",
+            "protected_entry_execution_after_trade_signal_id": latest_signal_id,
+        },
+    )
+    assert saved.protected_entry_execution_mode == "live"
+
+
+def test_legacy_serialized_settings_load_protected_entry_as_disabled(tmp_path):
+    session_factory = create_session_factory(tmp_path / "legacy-settings.db")
+    with session_factory() as session:
+        session.add(
+            TradingSetting(
+                key="global",
+                value_json=json.dumps({"auto_trade_enabled": True}),
+            )
+        )
+        session.commit()
+
+    settings = load_trading_settings(session_factory)
+
+    assert settings.auto_trade_enabled is True
+    assert settings.protected_entry_execution_mode == "disabled"
+    assert settings.protected_entry_execution_after_trade_signal_id == 0
 
 
 def test_revision_target_min_confidence_round_trips_independently(tmp_path):

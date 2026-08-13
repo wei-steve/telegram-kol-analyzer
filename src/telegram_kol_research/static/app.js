@@ -3253,6 +3253,12 @@ function bindTradingSettingsForm() {
   const mimoWatermarkInput = form.querySelector(
     '[name="mimo_v2_activation_after_raw_message_id"]',
   );
+  const protectedEntryModeSelect = form.querySelector(
+    '[name="protected_entry_execution_mode"]',
+  );
+  const protectedEntryWatermarkInput = form.querySelector(
+    '[name="protected_entry_execution_after_trade_signal_id"]',
+  );
   const mimoRollbackButton = form.querySelector('[data-mimo-v2-rollback]');
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -3299,6 +3305,12 @@ function bindTradingSettingsForm() {
       mimo_v2_activation_after_raw_message_id: Number(
         formData.get('mimo_v2_activation_after_raw_message_id') || 0,
       ),
+      protected_entry_execution_mode: String(
+        formData.get('protected_entry_execution_mode') || 'disabled',
+      ),
+      protected_entry_execution_after_trade_signal_id: Number(
+        formData.get('protected_entry_execution_after_trade_signal_id') || 0,
+      ),
       default_max_loss_usdt: numericValue('default_max_loss_usdt', 20),
       daily_max_loss_usdt: numericValue('daily_max_loss_usdt', 500),
       max_concurrent_positions: numericValue('max_concurrent_positions', 4),
@@ -3340,6 +3352,14 @@ function bindTradingSettingsForm() {
       }
       if (mimoRollbackButton) {
         mimoRollbackButton.disabled = result.mimo_contract_mode === 'v1';
+      }
+      if (protectedEntryModeSelect) {
+        protectedEntryModeSelect.value = result.protected_entry_execution_mode;
+      }
+      if (protectedEntryWatermarkInput) {
+        protectedEntryWatermarkInput.value = String(
+          result.protected_entry_execution_after_trade_signal_id,
+        );
       }
     } catch {
       if (status) {

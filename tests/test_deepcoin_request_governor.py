@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+import telegram_kol_research.deepcoin_request_governor as governor_module
+
 from telegram_kol_research.deepcoin_request_governor import (
     DeepcoinGovernorDeadlineExceeded,
     DeepcoinGovernorStateError,
@@ -641,3 +643,83 @@ def test_governor_state_is_canonical_bounded_json(tmp_path):
     payload = json.loads(state_path.read_text(encoding="utf-8"))
     assert payload == {"starts": [0.0], "version": 1}
     assert state_path.stat().st_size < 65_536
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["telemetry", "enforce_reads", "enforce_all"],
+)
+def test_request_governor_mode_loads_only_from_valid_environment(
+    tmp_path, mode
+):
+    state_directory = tmp_path / "governor-state"
+    state_directory.mkdir(mode=0o700)
+    state_directory.chmod(0o700)
+
+    config = governor_module.load_deepcoin_governor_environment(
+        {
+            "DEEPCOIN_REQUEST_GOVERNOR_MODE": mode,
+            "DEEPCOIN_GOVERNOR_STATE_DIR": str(state_directory.resolve()),
+        }
+    )
+
+    assert config.mode == GovernorMode(mode)
+    assert config.state_directory == state_directory.resolve()
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        {},
+        {"DEEPCOIN_REQUEST_GOVERNOR_MODE": "unknown"},
+        {"DEEPCOIN_REQUEST_GOVERNOR_MODE": "enforce_all"},
+        {
+            "DEEPCOIN_REQUEST_GOVERNOR_MODE": "enforce_reads",
+            "DEEPCOIN_GOVERNOR_STATE_DIR": "relative/state",
+        },
+        {
+            "DEEPCOIN_REQUEST_GOVERNOR_MODE": "enforce_all",
+            "DEEPCOIN_GOVERNOR_STATE_DIR": "/tmp/invalid\0state",
+        },
+    ],
+)
+def test_request_governor_mode_invalid_environment_defaults_to_disabled(environment):
+    config = governor_module.load_deepcoin_governor_environment(environment)
+
+    assert config.mode == GovernorMode.DISABLED
+    assert config.state_directory is None
+
+
+def test_request_governor_mode_rejects_unprotected_or_symlink_state_directory(
+    tmp_path,
+):
+    unprotected = tmp_path / "unprotected"
+    unprotected.mkdir(mode=0o755)
+    unprotected.chmod(0o755)
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    target.chmod(0o700)
+    symlink = tmp_path / "linked"
+    symlink.symlink_to(target, target_is_directory=True)
+
+    for path in (unprotected, symlink):
+        config = governor_module.load_deepcoin_governor_environment(
+            {
+                "DEEPCOIN_REQUEST_GOVERNOR_MODE": "enforce_all",
+                "DEEPCOIN_GOVERNOR_STATE_DIR": str(path),
+            }
+        )
+        assert config.mode == GovernorMode.DISABLED
+        assert config.state_directory is None
+
+
+def test_request_governor_mode_disabled_never_guesses_a_state_directory(tmp_path):
+    config = governor_module.load_deepcoin_governor_environment(
+        {
+            "DEEPCOIN_REQUEST_GOVERNOR_MODE": "disabled",
+            "DEEPCOIN_GOVERNOR_STATE_DIR": str(tmp_path.resolve()),
+        }
+    )
+
+    assert config.mode == GovernorMode.DISABLED
+    assert config.state_directory is None
