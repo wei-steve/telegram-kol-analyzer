@@ -234,6 +234,7 @@ class DeepcoinRestClient:
         sleep_fn: Callable[[float], None] | None = None,
         position_history_min_interval_seconds: float = 1.05,
         tpsl_rate_limiter: "DeepcoinTpslWriteLimiter | None" = None,
+        request_governor: Any | None = None,
     ) -> None:
         self._credentials = credentials
         self._http_client = http_client
@@ -249,6 +250,7 @@ class DeepcoinRestClient:
             float(position_history_min_interval_seconds),
         )
         self._last_position_history_request_started_at: float | None = None
+        self._request_governor = request_governor
         if tpsl_rate_limiter is not None:
             self._tpsl_rate_limiter = tpsl_rate_limiter
         elif monotonic_factory is not None or sleep_fn is not None:
@@ -317,7 +319,8 @@ class DeepcoinRestClient:
     def _set_position_sltp_unchecked(
         self, protection_payload: dict[str, Any]
     ) -> dict[str, Any]:
-        self._tpsl_rate_limiter.acquire()
+        if self._request_governor is None:
+            self._tpsl_rate_limiter.acquire()
         return self._request("POST", DEEPCOIN_SET_POSITION_SLTP_PATH, protection_payload)
 
     def cancel_position_sltp(self, cancel_payload: dict[str, Any]) -> dict[str, Any]:
@@ -333,7 +336,8 @@ class DeepcoinRestClient:
                 "cancel-position-sltp requires instType, instId, and ordId"
             )
         payload = {key: cancel_payload[key] for key in ("instType", "instId", "ordId")}
-        self._tpsl_rate_limiter.acquire()
+        if self._request_governor is None:
+            self._tpsl_rate_limiter.acquire()
         return self._request("POST", DEEPCOIN_CANCEL_POSITION_SLTP_PATH, payload)
 
     def _place_position_close_unchecked(
@@ -572,6 +576,13 @@ class DeepcoinRestClient:
         request_path: str,
         body_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if self._request_governor is not None:
+            self._request_governor.acquire(
+                method=method,
+                request_path=request_path,
+                priority="normal",
+                deadline_monotonic=None,
+            )
         body = ""
         if body_payload is not None:
             body = json.dumps(body_payload, ensure_ascii=False, separators=(",", ":"))

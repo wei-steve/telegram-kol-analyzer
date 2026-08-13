@@ -797,6 +797,78 @@ def test_get_ticker_quote_returns_none_when_target_instrument_is_absent():
     assert client.get_ticker_price(inst_id="BTC-USDT-SWAP") is None
 
 
+class _RecordingRequestGovernor:
+    def __init__(self):
+        self.calls = []
+
+    def acquire(self, *, method, request_path, priority, deadline_monotonic):
+        self.calls.append(
+            {
+                "method": method,
+                "request_path": request_path,
+                "priority": priority,
+                "deadline_monotonic": deadline_monotonic,
+            }
+        )
+
+
+class _ForbiddenLegacyLimiter:
+    def acquire(self):
+        raise AssertionError("legacy TPSL limiter must not double-charge")
+
+
+def test_injected_governor_receives_every_get_request():
+    governor = _RecordingRequestGovernor()
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=_CapturingHttpClient({"code": "0", "data": []}),
+        request_governor=governor,
+    )
+
+    client.list_positions(inst_id="BTC-USDT-SWAP")
+
+    assert governor.calls == [
+        {
+            "method": "GET",
+            "request_path": (
+                "/deepcoin/account/positions?instType=SWAP&instId=BTC-USDT-SWAP"
+            ),
+            "priority": "normal",
+            "deadline_monotonic": None,
+        }
+    ]
+
+
+def test_governed_tpsl_writer_is_charged_once_without_legacy_limiter():
+    governor = _RecordingRequestGovernor()
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=_CapturingHttpClient(
+            {"code": "0", "data": [{"ordId": "stop-1", "sCode": "0"}]}
+        ),
+        request_governor=governor,
+        tpsl_rate_limiter=_ForbiddenLegacyLimiter(),
+    )
+
+    client.set_position_sltp(
+        {
+            "instType": "SWAP",
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-1",
+            "slTriggerPx": "62000",
+        }
+    )
+
+    assert governor.calls == [
+        {
+            "method": "POST",
+            "request_path": "/deepcoin/trade/set-position-sltp",
+            "priority": "normal",
+            "deadline_monotonic": None,
+        }
+    ]
+
+
 def test_deepcoin_client_finds_historical_orders_by_exchange_or_client_id():
     http_client = _CapturingHttpClient(
         {

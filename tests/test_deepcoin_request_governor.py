@@ -1,0 +1,417 @@
+import json
+import multiprocessing
+import time
+from pathlib import Path
+
+import pytest
+
+from telegram_kol_research.deepcoin_request_governor import (
+    DeepcoinGovernorDeadlineExceeded,
+    DeepcoinGovernorStateError,
+    DeepcoinRequestGovernor,
+    GovernorMode,
+)
+from telegram_kol_research.deepcoin_request_policy import (
+    RequestPriority,
+    RequestProfile,
+)
+
+
+class _FakeClock:
+    def __init__(self, now: float = 0.0):
+        self.now = float(now)
+        self.sleeps: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _fixed_profile(profile: RequestProfile):
+    return lambda method, path: profile
+
+
+def _governor(
+    tmp_path: Path,
+    *,
+    clock: _FakeClock | None = None,
+    api_key: str = "uid-key",
+    mode: GovernorMode = GovernorMode.ENFORCE_ALL,
+    profile: RequestProfile | None = None,
+) -> DeepcoinRequestGovernor:
+    active_clock = clock or _FakeClock()
+    return DeepcoinRequestGovernor(
+        base_url="https://api.deepcoin.test",
+        api_key=api_key,
+        mode=mode,
+        state_directory=tmp_path,
+        monotonic_factory=active_clock,
+        sleep_fn=active_clock.sleep,
+        profile_resolver=(_fixed_profile(profile) if profile else None),
+    )
+
+
+def test_first_request_does_not_wait(tmp_path):
+    clock = _FakeClock()
+    governor = _governor(tmp_path, clock=clock)
+
+    lease = governor.acquire(
+        method="GET",
+        request_path="/deepcoin/trade/trigger-orders-pending?limit=100",
+        priority=RequestPriority.CRITICAL,
+        deadline_monotonic=10,
+    )
+
+    assert lease.waited_ms == 0
+    assert lease.observed_delay_ms == 0
+    assert lease.state_error is None
+    assert clock.sleeps == []
+
+
+def test_fifth_request_waits_for_safe_four_per_second_window(tmp_path):
+    clock = _FakeClock()
+    governor = _governor(tmp_path, clock=clock)
+
+    for _ in range(5):
+        governor.acquire(
+            method="GET",
+            request_path="/deepcoin/trade/trigger-orders-pending?limit=100",
+            priority=RequestPriority.CRITICAL,
+            deadline_monotonic=10,
+        )
+
+    assert clock.sleeps == [pytest.approx(1.0)]
+
+
+def test_minute_window_is_enforced_independently(tmp_path):
+    clock = _FakeClock()
+    governor = _governor(
+        tmp_path,
+        clock=clock,
+        profile=RequestProfile(1000, 3, 1000, 3),
+    )
+
+    for _ in range(4):
+        governor.acquire(
+            method="GET",
+            request_path="/test/minute",
+            priority=RequestPriority.CRITICAL,
+            deadline_monotonic=61,
+        )
+
+    assert clock.sleeps == [pytest.approx(60.0)]
+
+
+def test_strict_profile_waits_explicit_one_point_two_five_seconds(tmp_path):
+    clock = _FakeClock()
+    governor = _governor(tmp_path, clock=clock)
+
+    for _ in range(2):
+        governor.acquire(
+            method="GET",
+            request_path="/deepcoin/account/positions-history?instType=SWAP",
+            priority=RequestPriority.CRITICAL,
+            deadline_monotonic=2,
+        )
+
+    assert clock.sleeps == [pytest.approx(1.25)]
+
+
+def test_query_variants_share_one_endpoint_budget(tmp_path):
+    clock = _FakeClock()
+    governor = _governor(tmp_path, clock=clock)
+
+    governor.acquire(
+        method="GET",
+        request_path="/deepcoin/account/positions-history?instId=BTC-USDT-SWAP",
+        priority=RequestPriority.CRITICAL,
+        deadline_monotonic=2,
+    )
+    governor.acquire(
+        method="GET",
+        request_path="/deepcoin/account/positions-history?instId=ETH-USDT-SWAP",
+        priority=RequestPriority.CRITICAL,
+        deadline_monotonic=2,
+    )
+
+    assert clock.sleeps == [pytest.approx(1.25)]
+
+
+def test_two_governor_instances_share_uid_state(tmp_path):
+    clock = _FakeClock()
+    first = _governor(tmp_path, clock=clock)
+    second = _governor(tmp_path, clock=clock)
+
+    first.acquire(
+        method="GET",
+        request_path="/deepcoin/account/positions-history",
+        priority=RequestPriority.CRITICAL,
+        deadline_monotonic=2,
+    )
+    second.acquire(
+        method="GET",
+        request_path="/deepcoin/account/positions-history",
+        priority=RequestPriority.CRITICAL,
+        deadline_monotonic=2,
+    )
+
+    assert first.uid_scope_hash == second.uid_scope_hash
+    assert clock.sleeps == [pytest.approx(1.25)]
+
+
+def test_distinct_uids_do_not_share_state(tmp_path):
+    clock = _FakeClock()
+    first = _governor(tmp_path, clock=clock, api_key="uid-a")
+    second = _governor(tmp_path, clock=clock, api_key="uid-b")
+
+    for governor in (first, second):
+        governor.acquire(
+            method="GET",
+            request_path="/deepcoin/account/positions-history",
+            priority=RequestPriority.CRITICAL,
+            deadline_monotonic=1,
+        )
+
+    assert first.uid_scope_hash != second.uid_scope_hash
+    assert clock.sleeps == []
+
+
+def test_background_sub_budget_reserves_capacity_for_critical_request(tmp_path):
+    clock = _FakeClock()
+    governor = _governor(
+        tmp_path,
+        clock=clock,
+        profile=RequestProfile(4, 120, 2, 60),
+    )
+
+    for _ in range(2):
+        governor.acquire(
+            method="GET",
+            request_path="/test/priority",
+            priority=RequestPriority.BACKGROUND,
+            deadline_monotonic=clock(),
+        )
+    with pytest.raises(DeepcoinGovernorDeadlineExceeded):
+        governor.acquire(
+            method="GET",
+            request_path="/test/priority",
+            priority=RequestPriority.BACKGROUND,
+            deadline_monotonic=clock(),
+        )
+
+    critical = governor.acquire(
+        method="GET",
+        request_path="/test/priority",
+        priority=RequestPriority.CRITICAL,
+        deadline_monotonic=clock(),
+    )
+
+    assert critical.waited_ms == 0
+    assert clock.sleeps == []
+
+
+def test_deadline_refuses_before_sleep_or_reservation(tmp_path):
+    clock = _FakeClock()
+    governor = _governor(tmp_path, clock=clock)
+    governor.acquire(
+        method="GET",
+        request_path="/deepcoin/account/positions-history",
+        priority=RequestPriority.CRITICAL,
+        deadline_monotonic=clock(),
+    )
+
+    with pytest.raises(DeepcoinGovernorDeadlineExceeded):
+        governor.acquire(
+            method="GET",
+            request_path="/deepcoin/account/positions-history",
+            priority=RequestPriority.CRITICAL,
+            deadline_monotonic=clock(),
+        )
+
+    assert clock.sleeps == []
+
+
+def test_telemetry_records_observed_delay_without_waiting(tmp_path):
+    clock = _FakeClock()
+    governor = _governor(
+        tmp_path,
+        clock=clock,
+        mode=GovernorMode.TELEMETRY,
+        profile=RequestProfile(1, 48, 1, 24, 1.25),
+    )
+
+    first = governor.acquire(
+        method="GET",
+        request_path="/test/telemetry",
+        priority=RequestPriority.NORMAL,
+        deadline_monotonic=clock(),
+    )
+    second = governor.acquire(
+        method="GET",
+        request_path="/test/telemetry",
+        priority=RequestPriority.NORMAL,
+        deadline_monotonic=clock(),
+    )
+
+    assert first.observed_delay_ms == 0
+    assert second.observed_delay_ms == 1250
+    assert second.waited_ms == 0
+    assert clock.sleeps == []
+
+
+def test_enforce_reads_observes_but_does_not_wait_for_post(tmp_path):
+    clock = _FakeClock()
+    governor = _governor(
+        tmp_path,
+        clock=clock,
+        mode=GovernorMode.ENFORCE_READS,
+        profile=RequestProfile(1, 48, 1, 24, 1.25),
+    )
+
+    governor.acquire(
+        method="POST",
+        request_path="/test/write",
+        priority=RequestPriority.NORMAL,
+        deadline_monotonic=clock(),
+    )
+    second = governor.acquire(
+        method="POST",
+        request_path="/test/write",
+        priority=RequestPriority.NORMAL,
+        deadline_monotonic=clock(),
+    )
+
+    assert second.observed_delay_ms == 1250
+    assert second.waited_ms == 0
+    assert clock.sleeps == []
+
+
+def test_disabled_mode_does_not_create_state_files(tmp_path):
+    clock = _FakeClock()
+    governor = _governor(
+        tmp_path,
+        clock=clock,
+        mode=GovernorMode.DISABLED,
+    )
+
+    lease = governor.acquire(
+        method="GET",
+        request_path="/deepcoin/account/positions-history",
+        priority=RequestPriority.CRITICAL,
+        deadline_monotonic=clock(),
+    )
+
+    assert lease.waited_ms == 0
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_state_paths_and_payload_do_not_contain_api_key(tmp_path):
+    secret_key = "secret-uid-key-do-not-store"
+    governor = _governor(tmp_path, api_key=secret_key)
+    governor.acquire(
+        method="GET",
+        request_path="/deepcoin/account/positions",
+        priority=RequestPriority.NORMAL,
+        deadline_monotonic=10,
+    )
+
+    for path in tmp_path.iterdir():
+        assert secret_key not in path.name
+        if path.is_file():
+            assert secret_key not in path.read_text(encoding="utf-8")
+
+
+def test_malformed_state_fails_closed_when_enforced(tmp_path):
+    governor = _governor(tmp_path)
+    state_path = governor.state_path_for(
+        method="GET",
+        request_path="/deepcoin/account/positions",
+    )
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{", encoding="utf-8")
+
+    with pytest.raises(DeepcoinGovernorStateError):
+        governor.acquire(
+            method="GET",
+            request_path="/deepcoin/account/positions",
+            priority=RequestPriority.NORMAL,
+            deadline_monotonic=10,
+        )
+
+
+def test_malformed_state_does_not_block_telemetry_mode(tmp_path):
+    governor = _governor(tmp_path, mode=GovernorMode.TELEMETRY)
+    state_path = governor.state_path_for(
+        method="GET",
+        request_path="/deepcoin/account/positions",
+    )
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{", encoding="utf-8")
+
+    lease = governor.acquire(
+        method="GET",
+        request_path="/deepcoin/account/positions",
+        priority=RequestPriority.NORMAL,
+        deadline_monotonic=10,
+    )
+
+    assert lease.state_error == "governor_state_invalid"
+    assert lease.waited_ms == 0
+
+
+def _reserve_strict_slot(state_directory: str, queue) -> None:
+    governor = DeepcoinRequestGovernor(
+        base_url="https://api.deepcoin.test",
+        api_key="process-shared-uid",
+        mode=GovernorMode.ENFORCE_ALL,
+        state_directory=Path(state_directory),
+    )
+    try:
+        governor.acquire(
+            method="GET",
+            request_path="/deepcoin/account/positions-history",
+            priority=RequestPriority.CRITICAL,
+            deadline_monotonic=time.monotonic(),
+        )
+    except DeepcoinGovernorDeadlineExceeded:
+        queue.put("deadline")
+    else:
+        queue.put("leased")
+
+
+def test_two_processes_cannot_reserve_the_same_strict_slot(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    queue = context.Queue()
+    processes = [
+        context.Process(target=_reserve_strict_slot, args=(str(tmp_path), queue))
+        for _ in range(2)
+    ]
+
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=5)
+        assert process.exitcode == 0
+
+    assert sorted(queue.get(timeout=1) for _ in processes) == ["deadline", "leased"]
+
+
+def test_governor_state_is_canonical_bounded_json(tmp_path):
+    governor = _governor(tmp_path)
+    governor.acquire(
+        method="GET",
+        request_path="/deepcoin/account/positions",
+        priority=RequestPriority.NORMAL,
+        deadline_monotonic=10,
+    )
+    state_path = governor.state_path_for(
+        method="GET",
+        request_path="/deepcoin/account/positions",
+    )
+
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert payload == {"starts": [0.0], "version": 1}
+    assert state_path.stat().st_size < 65_536
