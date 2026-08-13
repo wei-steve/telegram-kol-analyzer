@@ -167,6 +167,12 @@ class Batch119ExactRecoverySnapshot:
     )
     errors: dict[str, str] = field(default_factory=dict)
     account_authority: Any = field(default=None, repr=False)
+    collection_authority: tuple[Mapping[str, Any], ...] = field(
+        default_factory=tuple, repr=False
+    )
+    exact_scope: _Batch119ExactHistoryScope | None = field(
+        default=None, repr=False
+    )
     capture_started_at: datetime | None = None
     capture_ended_at: datetime | None = None
     scope_fingerprint: str | None = None
@@ -358,7 +364,8 @@ def load_composite_batch_recovery_snapshot_read_only(
         )
 
     snapshot = Batch119ExactRecoverySnapshot(
-        scope_fingerprint=scope.scope_fingerprint
+        scope_fingerprint=scope.scope_fingerprint,
+        exact_scope=scope,
     )
     inner_authority: list[dict[str, Any]] = []
 
@@ -447,7 +454,10 @@ def load_composite_batch_recovery_snapshot_read_only(
             ),
             destination=snapshot.position_history,
             identity_validator=lambda rows: _exact_position_rows_match_scope(
-                rows, position_id=scope.position_id
+                rows,
+                position_id=scope.position_id,
+                instrument_id=scope.instrument_id,
+                side=scope.side,
             ),
         )
         for purpose, order_id in scope.protection_orders:
@@ -464,7 +474,10 @@ def load_composite_batch_recovery_snapshot_read_only(
                 identity_validator=(
                     lambda rows, order_id=order_id: (
                         _exact_order_rows_match_scope(
-                            rows, order_id=order_id
+                            rows,
+                            order_id=order_id,
+                            instrument_id=scope.instrument_id,
+                            side=scope.side,
                         )
                     )
                 ),
@@ -503,6 +516,9 @@ def load_composite_batch_recovery_snapshot_read_only(
             "data": [
                 {
                     "scope_fingerprint": scope.scope_fingerprint,
+                    "snapshot_collections_fingerprint": (
+                        _batch119_snapshot_collections_fingerprint(snapshot)
+                    ),
                     "collections": sorted(
                         inner_authority,
                         key=lambda row: str(row["endpoint"]),
@@ -515,6 +531,9 @@ def load_composite_batch_recovery_snapshot_read_only(
         session_factory,
         uid_scope_hash=uid_scope_hash,
         readers={"batch119_exact_account_composite": read_exact_account_composite},
+    )
+    snapshot.collection_authority = tuple(
+        MappingProxyType(dict(row)) for row in inner_authority
     )
     snapshot.capture_started_at = capture_started_at
     snapshot.capture_ended_at = datetime.now(UTC)
@@ -539,6 +558,12 @@ def _build_batch119_exact_history_scope(
         raw = session.get(RawMessage, profile.raw_message_id)
         if batch is None or lifecycle is None or raw is None:
             raise CompositeBatchRecoveryRefusal("durable_identity_mismatch")
+        if (
+            int(batch.raw_message_id or 0) != profile.raw_message_id
+            or int(batch.target_lifecycle_id or 0) != profile.lifecycle_id
+            or int(batch.id) != profile.batch_id
+        ):
+            raise CompositeBatchRecoveryRefusal("incident_identity_mismatch")
         binding = session.get(ExecutionBinding, int(batch.execution_binding_id))
         legs = (
             session.query(StrategyManagementLeg)
@@ -578,14 +603,11 @@ def _build_batch119_exact_history_scope(
             .order_by(PositionProtectionLedger.id)
             .all()
         )
-        recovery_audit_exists = (
-            session.query(ExecutionEvent.id)
-            .filter(
-                ExecutionEvent.execution_binding_id == int(binding.id),
-                ExecutionEvent.action == _RECOVERY_AUDIT_ACTION,
+        canonical_recovery_audit_exists = (
+            _has_canonical_recovery_audit(
+                session,
+                execution_binding_id=int(binding.id),
             )
-            .first()
-            is not None
         )
         scoped: list[tuple[str, str]] = []
         for row in rows:
@@ -605,7 +627,7 @@ def _build_batch119_exact_history_scope(
                 continue
             order_id = str(row.order_id or "").strip()
             if (
-                recovery_audit_exists
+                canonical_recovery_audit_exists
                 and exact_owner
                 and str(row.status or "").lower() != "verified"
             ):
@@ -628,6 +650,16 @@ def _build_batch119_exact_history_scope(
                 raise CompositeBatchRecoveryRefusal(
                     "exact_history_scope_invalid"
                 )
+            try:
+                from telegram_kol_research.deepcoin_client import (
+                    _optional_exact_exchange_id,
+                )
+
+                _optional_exact_exchange_id(order_id)
+            except Exception:
+                raise CompositeBatchRecoveryRefusal(
+                    "exact_history_scope_invalid"
+                ) from None
             scoped.append((purpose, order_id))
     if (
         len(scoped) != 2
@@ -637,21 +669,60 @@ def _build_batch119_exact_history_scope(
     ):
         raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
     scoped.sort(key=lambda item: item[0])
-    scope_payload = {
-        "schema_version": 1,
-        "batch_id": profile.batch_id,
-        "position_ref": _redacted_ref("recovery_position", leg.pos_id),
-        "protection_refs": sorted(
-            _redacted_ref("protection_order", order_id)
-            for _, order_id in scoped
-        ),
-    }
     return _Batch119ExactHistoryScope(
         instrument_id=profile.instrument_id,
         side=profile.side,
         position_id=str(leg.pos_id),
         protection_orders=tuple(scoped),
-        scope_fingerprint=_fingerprint(scope_payload),
+        scope_fingerprint=_batch119_exact_scope_fingerprint(
+            position_id=str(leg.pos_id),
+            protection_orders=tuple(scoped),
+        ),
+    )
+
+
+def _has_canonical_recovery_audit(
+    session,
+    *,
+    execution_binding_id: int,
+) -> bool:
+    events = (
+        session.query(ExecutionEvent)
+        .filter(
+            ExecutionEvent.execution_binding_id == int(execution_binding_id),
+            ExecutionEvent.action == _RECOVERY_AUDIT_ACTION,
+        )
+        .all()
+    )
+    if len(events) != 1 or not _is_sha256(events[0].notification_fingerprint):
+        return False
+    try:
+        _validated_resume_audit_event(
+            events[0],
+            expected_fingerprint=str(events[0].notification_fingerprint),
+        )
+    except CompositeBatchRecoveryConflict:
+        return False
+    return True
+
+
+def _batch119_exact_scope_fingerprint(
+    *,
+    position_id: str,
+    protection_orders: Sequence[tuple[str, str]],
+) -> str:
+    return _fingerprint(
+        {
+            "schema_version": 1,
+            "batch_id": BATCH_119_RECOVERY.batch_id,
+            "position_ref": _redacted_ref(
+                "recovery_position", position_id
+            ),
+            "protection_refs": sorted(
+                _redacted_ref("protection_order", order_id)
+                for _, order_id in protection_orders
+            ),
+        }
     )
 
 
@@ -676,7 +747,11 @@ def _collection_authority_payload(evidence: Any) -> dict[str, Any]:
 
 
 def _exact_position_rows_match_scope(
-    rows: Sequence[Mapping[str, Any]], *, position_id: str
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    position_id: str,
+    instrument_id: str,
+    side: str,
 ) -> bool:
     for row in rows:
         identities = {
@@ -684,13 +759,27 @@ def _exact_position_rows_match_scope(
             for key in ("posId", "pos_id", "closePosId", "close_pos_id")
             if row.get(key) not in (None, "")
         }
-        if identities and identities != {position_id}:
+        instruments = {
+            str(row.get(key)).strip().upper()
+            for key in ("instId", "instrument_id", "instrumentId")
+            if row.get(key) not in (None, "")
+        }
+        sides = _exact_row_position_sides(row)
+        if (
+            identities != {position_id}
+            or instruments != {instrument_id.upper()}
+            or sides != {side.lower()}
+        ):
             return False
     return True
 
 
 def _exact_order_rows_match_scope(
-    rows: Sequence[Mapping[str, Any]], *, order_id: str
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    order_id: str,
+    instrument_id: str,
+    side: str,
 ) -> bool:
     for row in rows:
         identities = {
@@ -698,9 +787,31 @@ def _exact_order_rows_match_scope(
             for key in ("ordId", "orderId", "order_id")
             if row.get(key) not in (None, "")
         }
-        if identities and identities != {order_id}:
+        instruments = {
+            str(row.get(key)).strip().upper()
+            for key in ("instId", "instrument_id", "instrumentId")
+            if row.get(key) not in (None, "")
+        }
+        sides = _exact_row_position_sides(row)
+        if (
+            identities != {order_id}
+            or instruments != {instrument_id.upper()}
+            or sides != {side.lower()}
+        ):
             return False
     return True
+
+
+def _exact_row_position_sides(row: Mapping[str, Any]) -> set[str]:
+    position_sides = {
+        str(row.get(key)).strip().lower()
+        for key in ("posSide", "pos_side")
+        if row.get(key) not in (None, "")
+    }
+    if position_sides:
+        return position_sides
+    side = row.get("side")
+    return set() if side in (None, "") else {str(side).strip().lower()}
 
 
 def _deduplicate_exact_snapshot_rows(
@@ -714,6 +825,187 @@ def _deduplicate_exact_snapshot_rows(
             seen.add(canonical)
             result.append(dict(row))
     return result
+
+
+def _batch119_snapshot_collections_fingerprint(snapshot: Any) -> str:
+    return _fingerprint(
+        {
+            field_name: sorted(
+                _canonical_snapshot_row(row)
+                for row in getattr(snapshot, field_name)
+            )
+            for field_name in _REQUIRED_SNAPSHOT_FIELDS
+            if field_name != "errors"
+        }
+    )
+
+
+def _batch119_snapshot_authority_matches(
+    snapshot: Any,
+    *,
+    profile: CompositeBatchRecoveryProfile,
+) -> bool:
+    try:
+        return _batch119_snapshot_authority_matches_unchecked(
+            snapshot,
+            profile=profile,
+        )
+    except (
+        CompositeBatchRecoveryRefusal,
+        AttributeError,
+        KeyError,
+        RecursionError,
+        TypeError,
+        ValueError,
+        OverflowError,
+    ):
+        return False
+
+
+def _batch119_snapshot_authority_matches_unchecked(
+    snapshot: Any,
+    *,
+    profile: CompositeBatchRecoveryProfile,
+) -> bool:
+    from telegram_kol_research.deepcoin_snapshot_authority import (
+        build_exchange_collection_evidence,
+    )
+
+    scope = getattr(snapshot, "exact_scope", None)
+    if (
+        not isinstance(scope, _Batch119ExactHistoryScope)
+        or scope.instrument_id != profile.instrument_id
+        or scope.side != profile.side
+        or len(scope.protection_orders) != 2
+        or {purpose for purpose, _ in scope.protection_orders}
+        != {"stop_loss", "backup_stop"}
+        or len({order_id for _, order_id in scope.protection_orders}) != 2
+    ):
+        return False
+    expected_scope_fingerprint = _batch119_exact_scope_fingerprint(
+        position_id=scope.position_id,
+        protection_orders=scope.protection_orders,
+    )
+    if (
+        scope.scope_fingerprint != expected_scope_fingerprint
+        or snapshot.scope_fingerprint != expected_scope_fingerprint
+        or not _exact_position_rows_match_scope(
+            snapshot.position_history,
+            position_id=scope.position_id,
+            instrument_id=scope.instrument_id,
+            side=scope.side,
+        )
+    ):
+        return False
+
+    trigger_rows_by_order_id = {
+        order_id: [] for _, order_id in scope.protection_orders
+    }
+    for row in snapshot.trigger_history:
+        order_identity = _unique_exact_row_identity(
+            row,
+            keys=("ordId", "orderId", "order_id"),
+        )
+        if order_identity not in trigger_rows_by_order_id:
+            return False
+        trigger_rows_by_order_id[order_identity].append(row)
+    for _, order_id in scope.protection_orders:
+        if not _exact_order_rows_match_scope(
+            trigger_rows_by_order_id[order_id],
+            order_id=order_id,
+            instrument_id=scope.instrument_id,
+            side=scope.side,
+        ):
+            return False
+
+    rows_by_endpoint: dict[str, Sequence[Mapping[str, Any]]] = {
+        "positions": snapshot.positions,
+        "open_orders": snapshot.open_orders,
+        "pending_trigger_orders": snapshot.pending_trigger_orders,
+        "position_history": snapshot.position_history,
+        "order_history": snapshot.order_history,
+        "trade_fills": snapshot.trade_fills,
+    }
+    for purpose, order_id in scope.protection_orders:
+        rows_by_endpoint[f"trigger_history_{purpose}"] = (
+            trigger_rows_by_order_id[order_id]
+        )
+    expected_inner_authority = []
+    for endpoint, rows in rows_by_endpoint.items():
+        evidence = build_exchange_collection_evidence(
+            endpoint=endpoint,
+            response={"data": list(rows)},
+        )
+        expected_inner_authority.append(
+            {
+                "endpoint": endpoint,
+                "available": True,
+                "schema_valid": True,
+                "complete": True,
+                "row_count": len(rows),
+                "page_count": 1,
+                "fingerprint": evidence.fingerprint,
+                "reason_code": None,
+            }
+        )
+    expected_inner_authority.sort(key=lambda row: str(row["endpoint"]))
+    stored_inner_authority = getattr(snapshot, "collection_authority", None)
+    if not isinstance(stored_inner_authority, (list, tuple)):
+        return False
+    try:
+        normalized_stored_authority = sorted(
+            (dict(row) for row in stored_inner_authority),
+            key=lambda row: str(row.get("endpoint")),
+        )
+    except (TypeError, ValueError):
+        return False
+    if normalized_stored_authority != expected_inner_authority:
+        return False
+
+    authority = snapshot.account_authority
+    authority_collections = getattr(authority, "collections", None)
+    if not isinstance(authority_collections, (list, tuple)) or len(
+        authority_collections
+    ) != 1:
+        return False
+    expected_outer = build_exchange_collection_evidence(
+        endpoint="batch119_exact_account_composite",
+        response={
+            "data": [
+                {
+                    "scope_fingerprint": expected_scope_fingerprint,
+                    "snapshot_collections_fingerprint": (
+                        _batch119_snapshot_collections_fingerprint(snapshot)
+                    ),
+                    "collections": expected_inner_authority,
+                }
+            ]
+        },
+    )
+    actual_outer = authority_collections[0]
+    return bool(
+        actual_outer.endpoint == "batch119_exact_account_composite"
+        and actual_outer.available is True
+        and actual_outer.schema_valid is True
+        and actual_outer.complete is True
+        and actual_outer.row_count == 1
+        and actual_outer.page_count == 1
+        and actual_outer.reason_code is None
+        and actual_outer.fingerprint == expected_outer.fingerprint
+    )
+
+
+def _unique_exact_row_identity(
+    row: Mapping[str, Any],
+    *,
+    keys: Sequence[str],
+) -> str | None:
+    identities = {
+        str(row.get(key)).strip()
+        for key in keys
+        if row.get(key) not in (None, "")
+    }
+    return next(iter(identities)) if len(identities) == 1 else None
 
 
 def authorize_composite_batch_recovery_resume(
@@ -3279,6 +3571,10 @@ def _snapshot_is_complete(
         or capture_started_at.tzinfo is None
         or capture_ended_at.tzinfo is None
         or capture_started_at > capture_ended_at
+        or not _batch119_snapshot_authority_matches(
+            snapshot,
+            profile=profile,
+        )
     ):
         return False
     try:

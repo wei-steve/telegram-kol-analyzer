@@ -18,6 +18,7 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_snapshot_authority import (
     AccountSnapshotEvidence,
     ExchangeCollectionEvidence,
+    build_exchange_collection_evidence,
 )
 from telegram_kol_research.models import (
     ContextResolutionAttempt,
@@ -238,17 +239,6 @@ def test_classify_recovery_position_rejects_identity_or_exposure_drift(overrides
 
 
 def _snapshot(**overrides):
-    authority_collection = ExchangeCollectionEvidence(
-        endpoint="batch119_exact_account_composite",
-        available=True,
-        schema_valid=True,
-        complete=True,
-        rows=(),
-        row_count=1,
-        page_count=1,
-        fingerprint="6" * 64,
-        reason_code=None,
-    )
     values = {
         "positions": [
             {
@@ -289,20 +279,123 @@ def _snapshot(**overrides):
             {"instrument_id": "BTC-USDT-SWAP", "complete": True}
         ],
         "errors": {},
-        "account_authority": AccountSnapshotEvidence(
-            uid_scope_hash="5" * 64,
-            start_write_generation=0,
-            end_write_generation=0,
-            collections=(authority_collection,),
-            complete=True,
-            reason_code=None,
-        ),
         "capture_started_at": NOW,
         "capture_ended_at": NOW,
-        "scope_fingerprint": "4" * 64,
     }
     values.update(overrides)
-    return SimpleNamespace(**values)
+    module = _recovery_module()
+    protection_orders = (
+        ("backup_stop", BACKUP_ORDER_ID),
+        ("stop_loss", PRIMARY_ORDER_ID),
+    )
+    scope_fingerprint = module._batch119_exact_scope_fingerprint(
+        position_id=POS_ID,
+        protection_orders=protection_orders,
+    )
+    exact_scope = module._Batch119ExactHistoryScope(
+        instrument_id="BTC-USDT-SWAP",
+        side="long",
+        scope_fingerprint=scope_fingerprint,
+        position_id=POS_ID,
+        protection_orders=protection_orders,
+    )
+    trigger_by_id = {
+        PRIMARY_ORDER_ID: [],
+        BACKUP_ORDER_ID: [],
+    }
+    for row in values["trigger_history"]:
+        order_id = (
+            str(
+                row.get("ordId")
+                or row.get("orderId")
+                or row.get("order_id")
+                or ""
+            )
+            if isinstance(row, dict)
+            else ""
+        )
+        target = (
+            BACKUP_ORDER_ID
+            if order_id == BACKUP_ORDER_ID
+            else PRIMARY_ORDER_ID
+        )
+        trigger_by_id[target].append(row)
+    rows_by_endpoint = {
+        "positions": values["positions"],
+        "open_orders": values["open_orders"],
+        "pending_trigger_orders": values["pending_trigger_orders"],
+        "position_history": values["position_history"],
+        "trigger_history_backup_stop": trigger_by_id[BACKUP_ORDER_ID],
+        "trigger_history_stop_loss": trigger_by_id[PRIMARY_ORDER_ID],
+        "order_history": values["order_history"],
+        "trade_fills": values["trade_fills"],
+    }
+    inner_authority = []
+    for endpoint, rows in rows_by_endpoint.items():
+        evidence = build_exchange_collection_evidence(
+            endpoint=endpoint,
+            response={"data": rows},
+        )
+        inner_authority.append(
+            {
+                "endpoint": endpoint,
+                "available": True,
+                "schema_valid": True,
+                "complete": True,
+                "row_count": len(rows),
+                "page_count": 1,
+                "fingerprint": evidence.fingerprint,
+                "reason_code": None,
+            }
+        )
+    inner_authority.sort(key=lambda row: row["endpoint"])
+    values.update(
+        {
+            "scope_fingerprint": scope_fingerprint,
+            "exact_scope": exact_scope,
+            "collection_authority": tuple(inner_authority),
+        }
+    )
+    candidate = SimpleNamespace(**values)
+    try:
+        collections_fingerprint = (
+            module._batch119_snapshot_collections_fingerprint(candidate)
+        )
+    except Exception:
+        collections_fingerprint = "invalid_snapshot_collections"
+    outer_evidence = build_exchange_collection_evidence(
+        endpoint="batch119_exact_account_composite",
+        response={
+            "data": [
+                {
+                    "scope_fingerprint": scope_fingerprint,
+                    "snapshot_collections_fingerprint": collections_fingerprint,
+                    "collections": inner_authority,
+                }
+            ]
+        },
+    )
+    candidate.account_authority = AccountSnapshotEvidence(
+        uid_scope_hash="5" * 64,
+        start_write_generation=0,
+        end_write_generation=0,
+        collections=(
+            ExchangeCollectionEvidence(
+                endpoint="batch119_exact_account_composite",
+                available=True,
+                schema_valid=True,
+                complete=True,
+                rows=(),
+                row_count=1,
+                page_count=1,
+                fingerprint=outer_evidence.fingerprint,
+                reason_code=None,
+            ),
+        ),
+        complete=True,
+        reason_code=None,
+    )
+    return candidate
 
 
 def _seed_batch_119_false_submission(tmp_path):
@@ -2489,8 +2582,16 @@ def test_planner_refuses_unexpected_protection_ownership(tmp_path):
         ),
         (
             "position_history",
-            [{"posId": POS_ID, "state": "open", "closedSize": "0", "uTime": "1"}],
-            [{"posId": POS_ID, "state": "open", "closedSize": "0", "uTime": "2"}],
+            [{
+                "posId": POS_ID, "instId": "BTC-USDT-SWAP",
+                "posSide": "long", "state": "open", "closedSize": "0",
+                "uTime": "1",
+            }],
+            [{
+                "posId": POS_ID, "instId": "BTC-USDT-SWAP",
+                "posSide": "long", "state": "open", "closedSize": "0",
+                "uTime": "2",
+            }],
         ),
         (
             "open_orders",
@@ -2520,8 +2621,16 @@ def test_planner_refuses_unexpected_protection_ownership(tmp_path):
         ),
         (
             "trigger_history",
-            [{"posId": POS_ID, "state": "cancelled", "triggerPx": "60000"}],
-            [{"posId": POS_ID, "state": "cancelled", "triggerPx": "60001"}],
+            [{
+                "ordId": PRIMARY_ORDER_ID, "posId": POS_ID,
+                "instId": "BTC-USDT-SWAP", "posSide": "long",
+                "state": "cancelled", "triggerPx": "60000",
+            }],
+            [{
+                "ordId": PRIMARY_ORDER_ID, "posId": POS_ID,
+                "instId": "BTC-USDT-SWAP", "posSide": "long",
+                "state": "cancelled", "triggerPx": "60001",
+            }],
         ),
         (
             "pending_tpsl_observations",
@@ -2556,8 +2665,16 @@ def test_exchange_snapshot_fingerprint_is_stable_across_collection_reordering(
     first = _snapshot(
         pending_trigger_orders=list(_snapshot().pending_trigger_orders),
         trigger_history=[
-            {"posId": POS_ID, "state": "cancelled", "triggerPx": "60000"},
-            {"posId": POS_ID, "state": "filled", "triggerPx": "61000"},
+            {
+                "ordId": PRIMARY_ORDER_ID, "posId": POS_ID,
+                "instId": "BTC-USDT-SWAP", "posSide": "long",
+                "state": "cancelled", "triggerPx": "60000",
+            },
+            {
+                "ordId": BACKUP_ORDER_ID, "posId": POS_ID,
+                "instId": "BTC-USDT-SWAP", "posSide": "long",
+                "state": "cancelled", "triggerPx": "61000",
+            },
         ],
     )
     reordered = _snapshot(
@@ -2935,12 +3052,19 @@ def test_planner_operates_against_readonly_database_without_file_changes(tmp_pat
     [
         _snapshot(
             position_history=[
-                {"posId": POS_ID, "state": "closed", "closeSz": "19"}
+                {
+                    "posId": POS_ID,
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "state": "closed",
+                    "closeSz": "19",
+                }
             ]
         ),
         _snapshot(
             trigger_history=[
                 {
+                    "ordId": PRIMARY_ORDER_ID,
                     "posId": POS_ID,
                     "instId": "BTC-USDT-SWAP",
                     "posSide": "long",
@@ -3559,6 +3683,7 @@ def test_planner_refuses_cancelled_trigger_history_with_exact_close_position_id(
     snapshot = _snapshot(
         trigger_history=[
             {
+                "ordId": PRIMARY_ORDER_ID,
                 "closePosId": POS_ID,
                 "instId": "BTC-USDT-SWAP",
                 "posSide": "long",
@@ -3578,6 +3703,7 @@ def test_planner_allows_cancelled_nonclose_protection_trigger_history(tmp_path):
     snapshot = _snapshot(
         trigger_history=[
             {
+                "ordId": PRIMARY_ORDER_ID,
                 "posId": POS_ID,
                 "instId": "BTC-USDT-SWAP",
                 "posSide": "long",
@@ -4094,7 +4220,7 @@ def test_resume_authorization_accepts_only_audited_progressed_batch_state(
         tmp_path
     )
     plan = _plan(factory)
-    repair = module.apply_composite_batch_false_state_repair(
+    module.apply_composite_batch_false_state_repair(
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -4198,37 +4324,36 @@ def test_resume_authorization_accepts_only_audited_progressed_batch_state(
         )
         session.commit()
 
-    authorization = module.authorize_composite_batch_recovery_resume(
-        factory,
-        expected_fingerprint=plan.evidence_fingerprint,
-        snapshot=_snapshot(
-            positions=[
-                {
-                    "posId": POS_ID,
-                    "instId": "BTC-USDT-SWAP",
-                    "posSide": "long",
-                    "pos": "19",
-                }
-            ],
-            trigger_history=[
-                {
-                    "ordId": "terminal-first-tp",
-                    "posId": POS_ID,
-                    "instId": "BTC-USDT-SWAP",
-                    "posSide": "long",
-                    "triggerOrderType": "TPSL",
-                    "tpTriggerPx": "66000",
-                    "sz": "19",
-                    "state": "cancelled",
-                }
-            ],
-        ),
-    )
-
-    assert authorization.plan.evidence_fingerprint == plan.evidence_fingerprint
-    assert authorization.plan.position.disposition == "resume_to_target"
-    assert authorization.repair_result.status == "already_repaired"
-    assert authorization.repair_result.audit_event_id == repair.audit_event_id
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="resume_evidence_invalid",
+    ):
+        module.authorize_composite_batch_recovery_resume(
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=_snapshot(
+                positions=[
+                    {
+                        "posId": POS_ID,
+                        "instId": "BTC-USDT-SWAP",
+                        "posSide": "long",
+                        "pos": "19",
+                    }
+                ],
+                trigger_history=[
+                    {
+                        "ordId": "terminal-first-tp",
+                        "posId": POS_ID,
+                        "instId": "BTC-USDT-SWAP",
+                        "posSide": "long",
+                        "triggerOrderType": "TPSL",
+                        "tpTriggerPx": "66000",
+                        "sz": "19",
+                        "state": "cancelled",
+                    }
+                ],
+            ),
+        )
 
 
 @pytest.mark.parametrize(
@@ -4571,7 +4696,7 @@ def test_resume_authorization_rejects_shrunk_original_stop_set(tmp_path):
 
     with pytest.raises(
         module.CompositeBatchRecoveryConflict,
-        match="resume_component_conflict",
+        match="resume_evidence_invalid",
     ):
         module.authorize_composite_batch_recovery_resume(
             factory,
@@ -5783,6 +5908,201 @@ def test_batch119_exact_history_scope_rejects_duplicate_role_before_network(
     assert client.instrument_wide_history_calls == 0
 
 
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("raw_message_id", 10531),
+        ("target_lifecycle_id", 793),
+    ],
+)
+def test_batch119_exact_history_scope_rejects_batch_pointer_drift_before_network(
+    tmp_path,
+    field_name,
+    value,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        setattr(batch, field_name, value)
+        session.commit()
+    client = _Batch119ExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {"exact_scope": "incident_identity_mismatch"}
+    assert client.network_calls == 0
+
+
+def test_batch119_exact_history_scope_rejects_unsafe_order_id_before_network(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        row = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id=BACKUP_ORDER_ID)
+            .one()
+        )
+        row.order_id = "DC-ACCESS-KEY:private"
+        session.commit()
+    client = _Batch119ExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {"exact_scope": "exact_history_scope_invalid"}
+    assert client.network_calls == 0
+
+
+def test_batch119_unverified_stop_is_not_skipped_for_unvalidated_recovery_event(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    with factory() as session:
+        backup = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id=BACKUP_ORDER_ID)
+            .one()
+        )
+        backup.status = "superseded"
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                strategy_instance_id="deepcoin:incident:btc:long",
+                pos_id=POS_ID,
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id="replacement-backup-after-forged-audit",
+                purpose="backup_stop",
+                trigger_price="62000",
+                size_text="19",
+                status="verified",
+                evidence_source="composite_management_replacement",
+                evidence_json="{}",
+                first_seen_at=NOW,
+                last_seen_at=NOW,
+                last_verified_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.add(
+            ExecutionEvent(
+                execution_binding_id=binding_id,
+                action="composite_batch_false_state_repaired",
+                status="resolved",
+                notification_fingerprint="3" * 64,
+                before_json="{}",
+                after_json="{}",
+                created_at=NOW,
+            )
+        )
+        session.commit()
+    client = _Batch119ExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {"exact_scope": "exact_history_scope_invalid"}
+    assert client.network_calls == 0
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"instId": "BTC-USDT-SWAP", "posSide": "long", "state": "closed"},
+        {"posId": POS_ID, "posSide": "long", "state": "closed"},
+        {
+            "posId": POS_ID,
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "long",
+            "state": "closed",
+        },
+        {
+            "posId": POS_ID,
+            "instId": "BTC-USDT-SWAP",
+            "state": "closed",
+        },
+    ],
+)
+def test_batch119_exact_position_history_requires_complete_scope_identity(
+    tmp_path,
+    row,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    client = _Batch119ExactHistoryClient(
+        exact_position_response={"data": [row]}
+    )
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors["position_history"] == (
+        "exact_scope_identity_mismatch"
+    )
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"instId": "BTC-USDT-SWAP", "posSide": "long", "state": "cancelled"},
+        {"ordId": PRIMARY_ORDER_ID, "posSide": "long", "state": "cancelled"},
+        {
+            "ordId": PRIMARY_ORDER_ID,
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "long",
+            "state": "cancelled",
+        },
+        {
+            "ordId": PRIMARY_ORDER_ID,
+            "instId": "BTC-USDT-SWAP",
+            "state": "cancelled",
+        },
+    ],
+)
+def test_batch119_exact_trigger_history_requires_complete_scope_identity(
+    tmp_path,
+    row,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    client = _Batch119ExactHistoryClient()
+    original = client.read_trigger_order_history
+
+    def read_trigger_order_history(*, inst_id, order_id, limit):
+        if order_id == PRIMARY_ORDER_ID:
+            return {"data": [row]}
+        return original(inst_id=inst_id, order_id=order_id, limit=limit)
+
+    client.read_trigger_order_history = read_trigger_order_history
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors["trigger_history_stop_loss"] == (
+        "exact_scope_identity_mismatch"
+    )
+
+
 def test_batch119_scope_and_account_authority_bind_exchange_fingerprint(
     tmp_path,
 ):
@@ -5821,11 +6141,8 @@ def test_batch119_scope_and_account_authority_bind_exchange_fingerprint(
     )
 
     assert plan.status == "ready"
-    assert changed_plan.status == "ready"
-    assert (
-        plan.exchange_snapshot_fingerprint
-        != changed_plan.exchange_snapshot_fingerprint
-    )
+    assert changed_plan.status == "refused"
+    assert changed_plan.reason_code == "exchange_snapshot_incomplete"
     assert incomplete_plan.status == "refused"
     assert incomplete_plan.reason_code == "exchange_snapshot_incomplete"
     serialized = json.dumps(
@@ -5835,6 +6152,59 @@ def test_batch119_scope_and_account_authority_bind_exchange_fingerprint(
     assert POS_ID not in serialized
     assert PRIMARY_ORDER_ID not in serialized
     assert BACKUP_ORDER_ID not in serialized
+
+
+def test_batch119_snapshot_collection_mutation_breaks_account_authority(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=_Batch119ExactHistoryClient(
+            exact_position_response={"data": []}
+        ),
+    )
+    snapshot.positions[0]["pos"] = "19"
+
+    plan = module.build_composite_batch_recovery_plan(
+        factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=snapshot,
+        planned_at=NOW,
+    )
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "exchange_snapshot_incomplete"
+
+
+def test_batch119_snapshot_rejects_wrong_account_authority_endpoint(tmp_path):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=_Batch119ExactHistoryClient(
+            exact_position_response={"data": []}
+        ),
+    )
+    forged_collection = replace(
+        snapshot.account_authority.collections[0],
+        endpoint="forged_account_composite",
+    )
+    snapshot.account_authority = replace(
+        snapshot.account_authority,
+        collections=(forged_collection,),
+    )
+
+    plan = module.build_composite_batch_recovery_plan(
+        factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=snapshot,
+        planned_at=NOW,
+    )
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "exchange_snapshot_incomplete"
 
 
 def test_recovery_cli_position_absent_is_repeatable_without_exchange_writes(
