@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -63,6 +64,138 @@ class GovernorLease:
 _STATE_VERSION = 1
 _MAX_STATE_BYTES = 65_536
 _MAX_STARTS = 4_096
+
+
+@dataclass(frozen=True, slots=True)
+class _StateDirectoryIdentity:
+    device: int
+    inode: int
+    owner_uid: int
+
+
+def _state_directory_identity(directory: Path) -> _StateDirectoryIdentity:
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        metadata = os.lstat(directory)
+    except OSError as exc:
+        raise DeepcoinGovernorStateError(
+            "governor_state_directory_invalid"
+        ) from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise DeepcoinGovernorStateError("governor_state_directory_invalid")
+    return _StateDirectoryIdentity(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        owner_uid=metadata.st_uid,
+    )
+
+
+def _no_follow_flag() -> int:
+    value = getattr(os, "O_NOFOLLOW", None)
+    if not isinstance(value, int):
+        raise DeepcoinGovernorStateError("governor_state_platform_unsupported")
+    return value
+
+
+def _directory_flag() -> int:
+    value = getattr(os, "O_DIRECTORY", None)
+    if not isinstance(value, int):
+        raise DeepcoinGovernorStateError("governor_state_platform_unsupported")
+    return value
+
+
+def _close_on_exec_flag() -> int:
+    value = getattr(os, "O_CLOEXEC", 0)
+    return value if isinstance(value, int) else 0
+
+
+def _open_verified_state_directory(
+    directory: Path,
+    *,
+    expected: _StateDirectoryIdentity | None,
+) -> int:
+    if expected is None:
+        raise DeepcoinGovernorStateError("governor_state_directory_invalid")
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            directory,
+            os.O_RDONLY
+            | _directory_flag()
+            | _no_follow_flag()
+            | _close_on_exec_flag(),
+        )
+        metadata = os.fstat(descriptor)
+    except (OSError, DeepcoinGovernorStateError) as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise DeepcoinGovernorStateError(
+            "governor_state_directory_invalid"
+        ) from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_dev != expected.device
+        or metadata.st_ino != expected.inode
+        or metadata.st_uid != expected.owner_uid
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        os.close(descriptor)
+        raise DeepcoinGovernorStateError("governor_state_directory_invalid")
+    return descriptor
+
+
+def _verified_private_regular_file(
+    descriptor: int,
+    *,
+    error_code: str,
+) -> os.stat_result:
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError as exc:
+        raise DeepcoinGovernorStateError(error_code) from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+    ):
+        raise DeepcoinGovernorStateError(error_code)
+    return metadata
+
+
+def _open_or_create_private_file(
+    directory_descriptor: int,
+    name: str,
+    *,
+    error_code: str,
+) -> int:
+    common_flags = os.O_RDWR | _no_follow_flag() | _close_on_exec_flag()
+    for _ in range(3):
+        try:
+            return os.open(
+                name,
+                common_flags,
+                dir_fd=directory_descriptor,
+            )
+        except FileNotFoundError:
+            try:
+                return os.open(
+                    name,
+                    common_flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise DeepcoinGovernorStateError(error_code) from exc
+        except OSError as exc:
+            raise DeepcoinGovernorStateError(error_code) from exc
+    raise DeepcoinGovernorStateError(error_code)
 
 
 def load_deepcoin_governor_environment(
@@ -150,6 +283,11 @@ class DeepcoinRequestGovernor:
     ) -> None:
         self._mode = GovernorMode(mode)
         self._state_directory = Path(state_directory)
+        self._state_directory_identity = (
+            None
+            if self._mode == GovernorMode.DISABLED
+            else _state_directory_identity(self._state_directory)
+        )
         self._clock = monotonic_factory
         self._sleep = sleep_fn
         self._profile_resolver = profile_resolver or request_profile
@@ -215,7 +353,7 @@ class DeepcoinRequestGovernor:
                             "deepcoin_governor_deadline_exceeded"
                         )
                     waited_seconds += max(0.0, now - before_lock)
-                    starts = self._load_starts(locked.state_path, now=now)
+                    starts = self._load_starts(locked, now=now)
                     delay = _required_delay(
                         starts=starts,
                         now=now,
@@ -224,7 +362,7 @@ class DeepcoinRequestGovernor:
                     )
                     if not enforce:
                         starts.append(now)
-                        self._write_starts(locked.state_path, starts)
+                        self._write_starts(locked, starts)
                         return GovernorLease(
                             uid_scope_hash=self.uid_scope_hash,
                             normalized_path=normalized_path,
@@ -233,7 +371,7 @@ class DeepcoinRequestGovernor:
                         )
                     if delay <= 0:
                         starts.append(now)
-                        self._write_starts(locked.state_path, starts)
+                        self._write_starts(locked, starts)
                         return GovernorLease(
                             uid_scope_hash=self.uid_scope_hash,
                             normalized_path=normalized_path,
@@ -248,7 +386,7 @@ class DeepcoinRequestGovernor:
                     normalized_path=normalized_path,
                     waited_ms=0,
                     observed_delay_ms=0,
-                            state_error="governor_state_invalid",
+                    state_error="governor_state_invalid",
                 )
             except _DeepcoinGovernorLockBusy:
                 return GovernorLease(
@@ -259,10 +397,7 @@ class DeepcoinRequestGovernor:
                     state_error="governor_lock_busy",
                 )
 
-            if (
-                deadline is not None
-                and now + delay > deadline
-            ):
+            if deadline is not None and now + delay > deadline:
                 raise DeepcoinGovernorDeadlineExceeded(
                     "deepcoin_governor_deadline_exceeded"
                 )
@@ -291,19 +426,41 @@ class DeepcoinRequestGovernor:
         return _LockedEndpointState(
             self._state_directory,
             state_path,
+            expected_directory_identity=self._state_directory_identity,
             enforce=enforce,
             deadline_monotonic=deadline_monotonic,
             monotonic_factory=self._clock,
             sleep_fn=self._sleep,
         )
 
-    def _load_starts(self, state_path: Path, *, now: float) -> list[float]:
-        if not state_path.exists():
-            return []
+    def _load_starts(
+        self,
+        locked: "_LockedStatePaths",
+        *,
+        now: float,
+    ) -> list[float]:
+        descriptor: int | None = None
         try:
-            if state_path.stat().st_size > _MAX_STATE_BYTES:
+            try:
+                descriptor = os.open(
+                    locked.state_name,
+                    os.O_RDONLY | _no_follow_flag() | _close_on_exec_flag(),
+                    dir_fd=locked.directory_descriptor,
+                )
+            except FileNotFoundError:
+                return []
+            metadata = _verified_private_regular_file(
+                descriptor,
+                error_code="governor_state_invalid",
+            )
+            if metadata.st_size > _MAX_STATE_BYTES:
                 raise DeepcoinGovernorStateError("governor_state_too_large")
-            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            with os.fdopen(descriptor, "rb") as handle:
+                descriptor = None
+                raw_payload = handle.read(_MAX_STATE_BYTES + 1)
+            if len(raw_payload) > _MAX_STATE_BYTES:
+                raise DeepcoinGovernorStateError("governor_state_too_large")
+            payload = json.loads(raw_payload)
             if not isinstance(payload, dict) or payload.get("version") != _STATE_VERSION:
                 raise DeepcoinGovernorStateError("governor_state_invalid")
             raw_starts = payload.get("starts")
@@ -323,13 +480,20 @@ class DeepcoinRequestGovernor:
             json.JSONDecodeError,
         ) as exc:
             raise DeepcoinGovernorStateError("governor_state_invalid") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
         if starts != sorted(starts):
             raise DeepcoinGovernorStateError("governor_state_invalid")
         if starts and starts[-1] > now:
             return []
         return [started for started in starts if now - started < 60.0]
 
-    def _write_starts(self, state_path: Path, starts: list[float]) -> None:
+    def _write_starts(
+        self,
+        locked: "_LockedStatePaths",
+        starts: list[float],
+    ) -> None:
         bounded = starts[-_MAX_STARTS:]
         encoded = json.dumps(
             {"starts": bounded, "version": _STATE_VERSION},
@@ -338,34 +502,65 @@ class DeepcoinRequestGovernor:
         ).encode("utf-8")
         if len(encoded) > _MAX_STATE_BYTES:
             raise DeepcoinGovernorStateError("governor_state_too_large")
-        temporary = state_path.with_name(
-            f".{state_path.name}.{os.getpid()}.tmp"
-        )
+        temporary_name: str | None = None
+        descriptor: int | None = None
         try:
-            descriptor = os.open(
-                temporary,
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                0o600,
+            temporary_name = (
+                f".{locked.state_name}.{os.getpid()}."
+                f"{os.urandom(16).hex()}.tmp"
             )
+            descriptor = os.open(
+                temporary_name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | _no_follow_flag()
+                | _close_on_exec_flag(),
+                0o600,
+                dir_fd=locked.directory_descriptor,
+            )
+            _verified_private_regular_file(
+                descriptor,
+                error_code="governor_state_write_failed",
+            )
+            os.fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "wb") as handle:
+                descriptor = None
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, state_path)
-            os.chmod(state_path, 0o600)
+            os.replace(
+                temporary_name,
+                locked.state_name,
+                src_dir_fd=locked.directory_descriptor,
+                dst_dir_fd=locked.directory_descriptor,
+            )
+            os.fsync(locked.directory_descriptor)
+        except DeepcoinGovernorStateError:
+            raise
         except OSError as exc:
             raise DeepcoinGovernorStateError("governor_state_write_failed") from exc
         finally:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
+            if descriptor is not None:
+                os.close(descriptor)
+            if temporary_name is not None:
+                try:
+                    os.unlink(
+                        temporary_name,
+                        dir_fd=locked.directory_descriptor,
+                    )
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
 
 
 @dataclass(slots=True)
 class _LockedStatePaths:
     state_path: Path
     descriptor: int
+    directory_descriptor: int
+    state_name: str
 
 
 class _LockedEndpointState:
@@ -374,6 +569,7 @@ class _LockedEndpointState:
         directory: Path,
         state_path: Path,
         *,
+        expected_directory_identity: _StateDirectoryIdentity | None,
         enforce: bool,
         deadline_monotonic: float | None,
         monotonic_factory: Callable[[], float],
@@ -381,20 +577,33 @@ class _LockedEndpointState:
     ) -> None:
         self._directory = directory
         self._state_path = state_path
+        self._expected_directory_identity = expected_directory_identity
         self._enforce = enforce
         self._deadline = deadline_monotonic
         self._clock = monotonic_factory
         self._sleep = sleep_fn
         self._descriptor: int | None = None
+        self._directory_descriptor: int | None = None
 
     def __enter__(self) -> _LockedStatePaths:
         descriptor: int | None = None
+        directory_descriptor: int | None = None
         try:
-            self._directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-            os.chmod(self._directory, 0o700)
-            lock_path = self._state_path.with_suffix(".lock")
-            descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-            os.chmod(lock_path, 0o600)
+            directory_descriptor = _open_verified_state_directory(
+                self._directory,
+                expected=self._expected_directory_identity,
+            )
+            lock_name = self._state_path.with_suffix(".lock").name
+            descriptor = _open_or_create_private_file(
+                directory_descriptor,
+                lock_name,
+                error_code="governor_lock_failed",
+            )
+            _verified_private_regular_file(
+                descriptor,
+                error_code="governor_lock_failed",
+            )
+            os.fchmod(descriptor, 0o600)
             while True:
                 try:
                     fcntl.flock(
@@ -420,29 +629,46 @@ class _LockedEndpointState:
                     if self._deadline is not None:
                         delay = min(delay, max(0.0, self._deadline - now))
                     self._sleep(delay)
-        except (_DeepcoinGovernorLockBusy, DeepcoinGovernorDeadlineExceeded):
+        except (
+            _DeepcoinGovernorLockBusy,
+            DeepcoinGovernorDeadlineExceeded,
+            DeepcoinGovernorStateError,
+        ):
             if descriptor is not None:
                 os.close(descriptor)
+            if directory_descriptor is not None:
+                os.close(directory_descriptor)
             raise
         except OSError as exc:
             if descriptor is not None:
                 os.close(descriptor)
+            if directory_descriptor is not None:
+                os.close(directory_descriptor)
             raise DeepcoinGovernorStateError("governor_lock_failed") from exc
         self._descriptor = descriptor
+        self._directory_descriptor = directory_descriptor
         return _LockedStatePaths(
             state_path=self._state_path,
             descriptor=descriptor,
+            directory_descriptor=directory_descriptor,
+            state_name=self._state_path.name,
         )
 
     def __exit__(self, exc_type, exc, traceback) -> None:
         descriptor = self._descriptor
+        directory_descriptor = self._directory_descriptor
         self._descriptor = None
+        self._directory_descriptor = None
         if descriptor is None:
+            if directory_descriptor is not None:
+                os.close(directory_descriptor)
             return
         try:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
+            if directory_descriptor is not None:
+                os.close(directory_descriptor)
 
 
 def _required_delay(

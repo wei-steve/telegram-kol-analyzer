@@ -76,6 +76,26 @@ def test_first_request_does_not_wait(tmp_path):
     assert clock.sleeps == []
 
 
+def test_governor_creates_a_missing_private_state_directory(tmp_path):
+    state_directory = tmp_path / "new-governor-state"
+
+    governor = DeepcoinRequestGovernor(
+        base_url="https://api.deepcoin.test",
+        api_key="new-state-directory-uid",
+        mode=GovernorMode.ENFORCE_ALL,
+        state_directory=state_directory,
+    )
+    governor.acquire(
+        method="GET",
+        request_path="/deepcoin/account/positions",
+        priority=RequestPriority.NORMAL,
+        deadline_monotonic=time.monotonic() + 1,
+    )
+
+    assert state_directory.is_dir()
+    assert state_directory.stat().st_mode & 0o777 == 0o700
+
+
 def test_fifth_request_waits_for_safe_four_per_second_window(tmp_path):
     clock = _FakeClock()
     governor = _governor(tmp_path, clock=clock)
@@ -711,6 +731,126 @@ def test_request_governor_mode_rejects_unprotected_or_symlink_state_directory(
         )
         assert config.mode == GovernorMode.DISABLED
         assert config.state_directory is None
+
+
+def test_governor_refuses_replaced_state_directory_without_touching_symlink_target(
+    tmp_path,
+):
+    state_directory = tmp_path / "governor-state"
+    state_directory.mkdir(mode=0o700)
+    state_directory.chmod(0o700)
+    governor = DeepcoinRequestGovernor(
+        base_url="https://api.deepcoin.test",
+        api_key="directory-swap-uid",
+        mode=GovernorMode.ENFORCE_ALL,
+        state_directory=state_directory,
+    )
+    original_directory = tmp_path / "original-governor-state"
+    state_directory.rename(original_directory)
+    replacement_target = tmp_path / "replacement-target"
+    replacement_target.mkdir(mode=0o755)
+    replacement_target.chmod(0o755)
+    state_directory.symlink_to(replacement_target, target_is_directory=True)
+
+    with pytest.raises(
+        DeepcoinGovernorStateError,
+        match="governor_state_directory_invalid",
+    ):
+        governor.acquire(
+            method="POST",
+            request_path="/deepcoin/trade/order",
+            priority=RequestPriority.CRITICAL,
+            deadline_monotonic=time.monotonic() + 1,
+        )
+
+    assert replacement_target.stat().st_mode & 0o777 == 0o755
+    assert list(replacement_target.iterdir()) == []
+    assert list(original_directory.iterdir()) == []
+
+
+def test_governor_refuses_a_different_private_directory_at_the_same_path(tmp_path):
+    state_directory = tmp_path / "governor-state"
+    state_directory.mkdir(mode=0o700)
+    state_directory.chmod(0o700)
+    governor = DeepcoinRequestGovernor(
+        base_url="https://api.deepcoin.test",
+        api_key="directory-inode-swap-uid",
+        mode=GovernorMode.ENFORCE_ALL,
+        state_directory=state_directory,
+    )
+    original_directory = tmp_path / "original-governor-state"
+    state_directory.rename(original_directory)
+    state_directory.mkdir(mode=0o700)
+    state_directory.chmod(0o700)
+
+    with pytest.raises(
+        DeepcoinGovernorStateError,
+        match="governor_state_directory_invalid",
+    ):
+        governor.acquire(
+            method="POST",
+            request_path="/deepcoin/trade/order",
+            priority=RequestPriority.CRITICAL,
+            deadline_monotonic=time.monotonic() + 1,
+        )
+
+    assert list(state_directory.iterdir()) == []
+    assert list(original_directory.iterdir()) == []
+
+
+def test_governor_refuses_lock_symlink_without_touching_target(tmp_path):
+    governor = _governor(tmp_path)
+    state_path = governor.state_path_for(
+        method="POST",
+        request_path="/deepcoin/trade/order",
+    )
+    target = tmp_path.parent / f"{tmp_path.name}-lock-target"
+    target.write_text("unchanged", encoding="utf-8")
+    target.chmod(0o644)
+    state_path.with_suffix(".lock").symlink_to(target)
+
+    with pytest.raises(
+        DeepcoinGovernorStateError,
+        match="governor_lock_failed",
+    ):
+        governor.acquire(
+            method="POST",
+            request_path="/deepcoin/trade/order",
+            priority=RequestPriority.CRITICAL,
+            deadline_monotonic=10,
+        )
+
+    assert target.read_text(encoding="utf-8") == "unchanged"
+    assert target.stat().st_mode & 0o777 == 0o644
+
+
+def test_governor_refuses_state_symlink_without_touching_target(tmp_path):
+    governor = _governor(tmp_path)
+    state_path = governor.state_path_for(
+        method="POST",
+        request_path="/deepcoin/trade/order",
+    )
+    target = tmp_path.parent / f"{tmp_path.name}-state-target"
+    target.write_text(
+        '{"starts":[],"version":1}',
+        encoding="utf-8",
+    )
+    target.chmod(0o644)
+    state_path.symlink_to(target)
+
+    with pytest.raises(
+        DeepcoinGovernorStateError,
+        match="governor_state_invalid",
+    ):
+        governor.acquire(
+            method="POST",
+            request_path="/deepcoin/trade/order",
+            priority=RequestPriority.CRITICAL,
+            deadline_monotonic=10,
+        )
+
+    assert target.read_text(encoding="utf-8") == '{"starts":[],"version":1}'
+    assert target.stat().st_mode & 0o777 == 0o644
 
 
 def test_request_governor_mode_disabled_never_guesses_a_state_directory(tmp_path):
