@@ -9,6 +9,7 @@ import json
 import math
 import os
 import random
+import re
 import time
 import threading
 from collections import deque
@@ -75,6 +76,7 @@ _DEEPCOIN_LIST_READ_PATHS = frozenset(
         DEEPCOIN_MARKET_TICKERS_PATH,
     }
 )
+_SAFE_EXACT_EXCHANGE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$")
 
 
 class DeepcoinClientError(RuntimeError):
@@ -215,13 +217,25 @@ class DeepcoinTradingClientProtocol(Protocol):
     def list_order_history(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         """Return historical regular orders, optionally filtered by instrument."""
 
-    def read_order_history(self, *, inst_id: str | None = None) -> dict[str, Any]:
+    def read_order_history(
+        self,
+        *,
+        inst_id: str | None = None,
+        order_id: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
         """Return raw order-history response including pagination metadata."""
 
     def list_trade_fills(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         """Return recent trade fills, optionally filtered by instrument."""
 
-    def read_trade_fills(self, *, inst_id: str | None = None) -> dict[str, Any]:
+    def read_trade_fills(
+        self,
+        *,
+        inst_id: str | None = None,
+        order_id: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
         """Return raw fills response including pagination metadata."""
 
     def list_trigger_orders_pending(self, *, inst_id: str) -> list[dict[str, Any]]:
@@ -233,7 +247,13 @@ class DeepcoinTradingClientProtocol(Protocol):
     def list_trigger_order_history(self, *, inst_id: str) -> list[dict[str, Any]]:
         """Return historical trigger / TPSL orders for one instrument."""
 
-    def read_trigger_order_history(self, *, inst_id: str) -> dict[str, Any]:
+    def read_trigger_order_history(
+        self,
+        *,
+        inst_id: str,
+        order_id: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
         """Return raw trigger-history response including pagination metadata."""
 
     def get_ticker_price(self, *, inst_id: str) -> float | None:
@@ -583,12 +603,23 @@ class DeepcoinRestClient:
         payload = self.read_order_history(inst_id=inst_id)
         return _require_list_data(payload, endpoint=DEEPCOIN_ORDERS_HISTORY_PATH)
 
-    def read_order_history(self, *, inst_id: str | None = None) -> dict[str, Any]:
+    def read_order_history(
+        self,
+        *,
+        inst_id: str | None = None,
+        order_id: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
         return self._request(
             "GET",
             _path_with_query(
                 DEEPCOIN_ORDERS_HISTORY_PATH,
-                {"instType": "SWAP", "instId": inst_id},
+                {
+                    "instType": "SWAP",
+                    "instId": inst_id,
+                    "ordId": _optional_exact_exchange_id(order_id),
+                    "limit": _optional_history_limit(limit),
+                },
             ),
         )
 
@@ -596,12 +627,23 @@ class DeepcoinRestClient:
         payload = self.read_trade_fills(inst_id=inst_id)
         return _require_list_data(payload, endpoint=DEEPCOIN_TRADE_FILLS_PATH)
 
-    def read_trade_fills(self, *, inst_id: str | None = None) -> dict[str, Any]:
+    def read_trade_fills(
+        self,
+        *,
+        inst_id: str | None = None,
+        order_id: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
         return self._request(
             "GET",
             _path_with_query(
                 DEEPCOIN_TRADE_FILLS_PATH,
-                {"instType": "SWAP", "instId": inst_id},
+                {
+                    "instType": "SWAP",
+                    "instId": inst_id,
+                    "ordId": _optional_exact_exchange_id(order_id),
+                    "limit": _optional_history_limit(limit),
+                },
             ),
         )
 
@@ -639,12 +681,23 @@ class DeepcoinRestClient:
         payload = self.read_trigger_order_history(inst_id=inst_id)
         return _require_list_data(payload, endpoint=DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH)
 
-    def read_trigger_order_history(self, *, inst_id: str) -> dict[str, Any]:
+    def read_trigger_order_history(
+        self,
+        *,
+        inst_id: str,
+        order_id: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
         return self._request(
             "GET",
             _path_with_query(
                 DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH,
-                {"instType": "SWAP", "instId": inst_id},
+                {
+                    "instType": "SWAP",
+                    "instId": inst_id,
+                    "ordId": _optional_exact_exchange_id(order_id),
+                    "limit": _optional_history_limit(limit),
+                },
             ),
         )
 
@@ -1375,6 +1428,37 @@ def _path_with_query(path: str, params: dict[str, Any]) -> str:
     if not filtered:
         return path
     return f"{path}?{urlencode(filtered)}"
+
+
+def _optional_exact_exchange_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or _SAFE_EXACT_EXCHANGE_ID.fullmatch(value) is None:
+        raise DeepcoinClientError("invalid exact exchange order id")
+    normalized = re.sub(r"[^a-z0-9]", "", value.lower())
+    if any(
+        marker in normalized
+        for marker in (
+            "authorization",
+            "bearer",
+            "dcaccesskey",
+            "dcaccesspassphrase",
+            "dcaccesssign",
+            "privatekey",
+            "secret",
+            "token",
+        )
+    ):
+        raise DeepcoinClientError("invalid exact exchange order id")
+    return value
+
+
+def _optional_history_limit(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 100:
+        raise DeepcoinClientError("history limit must be an integer from 1 to 100")
+    return value
 
 
 def _find_order_by_ids(

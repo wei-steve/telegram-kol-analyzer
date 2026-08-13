@@ -501,6 +501,77 @@ def test_deepcoin_client_lists_order_and_trigger_history_with_swap_query():
     ]
 
 
+def test_exact_history_readers_send_ord_id_and_bounded_limit():
+    http_client = _CapturingHttpClient({"code": "0", "data": []})
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+    )
+
+    client.read_order_history(
+        inst_id="BTC-USDT-SWAP", order_id="owned-stop", limit=100
+    )
+    client.read_trade_fills(
+        inst_id="BTC-USDT-SWAP", order_id="owned-stop", limit=100
+    )
+    client.read_trigger_order_history(
+        inst_id="BTC-USDT-SWAP", order_id="owned-stop", limit=100
+    )
+
+    paths = [request["request_path"] for request in http_client.requests]
+    assert all("ordId=owned-stop" in path for path in paths)
+    assert all("limit=100" in path for path in paths)
+
+
+def test_exact_history_readers_reject_invalid_identity_before_http():
+    http_client = _CapturingHttpClient({"code": "0", "data": []})
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+    )
+    readers = (
+        client.read_order_history,
+        client.read_trade_fills,
+        client.read_trigger_order_history,
+    )
+
+    for reader in readers:
+        for invalid_order_id in ("   ", "owned/stop"):
+            with pytest.raises(DeepcoinClientError, match="order id"):
+                reader(
+                    inst_id="BTC-USDT-SWAP",
+                    order_id=invalid_order_id,
+                    limit=100,
+                )
+        for invalid_limit in (0, 101, True, "100"):
+            with pytest.raises(DeepcoinClientError, match="limit"):
+                reader(
+                    inst_id="BTC-USDT-SWAP",
+                    order_id="owned-stop",
+                    limit=invalid_limit,
+                )
+
+    assert http_client.requests == []
+
+
+def test_exact_history_readers_preserve_default_urls_without_filters():
+    http_client = _CapturingHttpClient({"code": "0", "data": []})
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+    )
+
+    client.read_order_history(inst_id="ETH-USDT-SWAP")
+    client.read_trade_fills(inst_id="ETH-USDT-SWAP")
+    client.read_trigger_order_history(inst_id="ETH-USDT-SWAP")
+
+    assert [request["request_path"] for request in http_client.requests] == [
+        "/deepcoin/trade/orders-history?instType=SWAP&instId=ETH-USDT-SWAP",
+        "/deepcoin/trade/fills?instType=SWAP&instId=ETH-USDT-SWAP",
+        "/deepcoin/trade/trigger-orders-history?instType=SWAP&instId=ETH-USDT-SWAP",
+    ]
+
+
 def test_raw_collection_reader_preserves_pagination_metadata_and_uid_scope_hash():
     payload = {
         "code": "0",
