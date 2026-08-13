@@ -70,8 +70,10 @@ Inside one account-generation capture, the loader reads:
 Every response still passes through the existing bounded collection authority.
 A response with 100 rows and no affirmative completion proof remains
 incomplete. All exact history collections, their scopes, row counts, canonical
-fingerprints, account generation, and capture times contribute to the recovery
-snapshot and final evidence fingerprint.
+fingerprints, and account generation contribute to the recovery snapshot and
+final evidence fingerprint. Capture times are validated for chronology and
+freshness but are not themselves fingerprint inputs, so two semantically
+identical fresh captures can produce the same reviewed fingerprint.
 
 The loader is called only by `recover-composite-management-batch` for the fixed
 batch-119 profile. Generic binding reconciliation, protected-entry
