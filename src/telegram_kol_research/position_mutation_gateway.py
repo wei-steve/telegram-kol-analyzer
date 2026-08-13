@@ -33,8 +33,15 @@ from telegram_kol_research.position_mutation_authority import (
     require_order_owned_by_authority,
 )
 from telegram_kol_research.position_mutation_intents import (
+    PositionMutationIntentError,
+    load_validated_set_position_request,
     reserve_position_mutation_intent,
     transition_position_mutation_intent,
+)
+from telegram_kol_research.deepcoin_snapshot_authority import (
+    DeepcoinSnapshotUnavailable,
+    build_exchange_collection_evidence,
+    require_complete_collection,
 )
 from telegram_kol_research.position_attribution import (
     PositionAttributionError,
@@ -46,6 +53,8 @@ from telegram_kol_research.protection_ledger import (
 
 
 _SAFE_ERROR_CODE = re.compile(r"^[a-z0-9][a-z0-9_]{0,127}$")
+_SAFE_EXCHANGE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$")
+_SAFE_RESPONSE_CODE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +231,7 @@ class PositionMutationGateway:
         before_exchange_submit: Callable[[int], None] | None = None,
         expected_intent_id: int | None = None,
         propagate_outcome_unknown: bool = False,
+        pre_submit_order_refs_provider: Callable[[], list[str]] | None = None,
     ) -> PositionMutationResult:
         trigger_field_by_purpose = {
             "stop_loss": "slTriggerPx",
@@ -272,6 +282,7 @@ class PositionMutationGateway:
             before_exchange_submit=before_exchange_submit,
             expected_intent_id=expected_intent_id,
             propagate_outcome_unknown=propagate_outcome_unknown,
+            pre_submit_order_refs_provider=pre_submit_order_refs_provider,
             submit=lambda: self._call_client_write(
                 "_set_position_sltp_unchecked",
                 "set_position_sltp",
@@ -350,6 +361,7 @@ class PositionMutationGateway:
         before_exchange_submit: Callable[[int], None] | None = None,
         expected_intent_id: int | None = None,
         propagate_outcome_unknown: bool = False,
+        pre_submit_order_refs_provider: Callable[[], list[str]] | None = None,
     ) -> PositionMutationResult:
         intent = reserve_position_mutation_intent(
             self._session_factory,
@@ -403,6 +415,13 @@ class PositionMutationGateway:
             return self._block(intent_id, "position_fingerprint_changed")
         if not self._live_execution_gate():
             return self._block(intent_id, "live_execution_disabled")
+        if pre_submit_order_refs_provider is not None:
+            _attach_pre_submit_order_refs(
+                self._session_factory,
+                intent_id=intent_id,
+                request_fingerprint=str(intent.request_fingerprint),
+                order_refs=pre_submit_order_refs_provider(),
+            )
         if not transition_position_mutation_intent(
             self._session_factory,
             intent_id,
@@ -445,6 +464,7 @@ class PositionMutationGateway:
                 "position_mutation_writer_failed",
             )
             raise
+        response = _safe_mutation_success_response(response)
         persisted = transition_position_mutation_intent(
             self._session_factory,
             intent_id,
@@ -823,6 +843,23 @@ def _safe_exchange_error_code(exc: BaseException, fallback: str) -> str:
     return fallback
 
 
+def _safe_mutation_success_response(
+    response: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(response, Mapping):
+        return {}
+    projected: dict[str, Any] = {}
+    code = response.get("code")
+    if code not in (None, ""):
+        code_text = str(code)
+        if _SAFE_RESPONSE_CODE.fullmatch(code_text):
+            projected["code"] = code_text
+    order_id = _response_order_id(response)
+    if order_id is not None and _SAFE_EXCHANGE_ID.fullmatch(order_id):
+        projected["data"] = {"ordId": order_id}
+    return projected
+
+
 def _load_json(value: str | None) -> dict[str, Any]:
     if not value:
         return {}
@@ -831,6 +868,127 @@ def _load_json(value: str | None) -> dict[str, Any]:
     except (TypeError, ValueError):
         return {}
     return loaded if isinstance(loaded, dict) else {}
+
+
+def _complete_pending_tpsl_order_refs(
+    deepcoin_client: Any,
+    *,
+    instrument_id: str,
+) -> list[str]:
+    raw_reader = getattr(
+        deepcoin_client, "read_trigger_orders_pending", None
+    )
+    list_reader = getattr(
+        deepcoin_client, "list_trigger_orders_pending", None
+    )
+    if callable(raw_reader):
+        response = raw_reader(inst_id=instrument_id)
+    elif callable(list_reader):
+        response = list_reader(inst_id=instrument_id)
+    else:
+        raise DeepcoinSnapshotUnavailable(
+            "snapshot_reader_unavailable"
+        )
+    evidence = build_exchange_collection_evidence(
+        endpoint="pending_trigger_orders",
+        response=response,
+    )
+    rows = require_complete_collection(evidence)
+    refs: set[str] = set()
+    for row in rows:
+        order_id = str(
+            row.get("ordId")
+            or row.get("orderId")
+            or row.get("order_id")
+            or ""
+        )
+        if not order_id or len(order_id) > 255:
+            raise DeepcoinSnapshotUnavailable(
+                "snapshot_order_identity_invalid"
+            )
+        refs.add(_protection_order_ref(order_id))
+    return sorted(refs)
+
+
+def _attach_pre_submit_order_refs(
+    session_factory: sessionmaker,
+    *,
+    intent_id: int,
+    request_fingerprint: str,
+    order_refs: object,
+) -> None:
+    if (
+        not isinstance(order_refs, list)
+        or order_refs != sorted(set(order_refs))
+        or any(
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in value
+            )
+            for value in order_refs
+        )
+    ):
+        raise PositionMutationAuthorityError(
+            "position_sltp_baseline_invalid"
+        )
+    with session_factory() as session:
+        intent = session.get(PositionMutationIntent, int(intent_id))
+        if (
+            intent is None
+            or intent.operation != "set_position_sltp"
+            or intent.status != "reserved"
+            or intent.request_fingerprint != request_fingerprint
+        ):
+            raise PositionMutationAuthorityError(
+                "position_mutation_intent_state_conflict"
+            )
+        original_request_json = intent.request_json
+        try:
+            request = load_validated_set_position_request(
+                original_request_json,
+                request_fingerprint=request_fingerprint,
+            )
+        except PositionMutationIntentError as exc:
+            raise PositionMutationAuthorityError(
+                "position_mutation_intent_request_conflict"
+            ) from exc
+        request["_pre_submit_order_refs"] = list(order_refs)
+        request_json = json.dumps(
+            request,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        updated = (
+            session.query(PositionMutationIntent)
+            .filter(
+                PositionMutationIntent.id == int(intent_id),
+                PositionMutationIntent.status == "reserved",
+                PositionMutationIntent.request_json
+                == original_request_json,
+            )
+            .update(
+                {
+                    PositionMutationIntent.request_json: request_json,
+                    PositionMutationIntent.updated_at: datetime.now(UTC),
+                },
+                synchronize_session=False,
+            )
+        )
+        if updated != 1:
+            session.rollback()
+            raise PositionMutationAuthorityError(
+                "position_mutation_intent_state_conflict"
+            )
+        session.commit()
+
+
+def _protection_order_ref(order_id: str) -> str:
+    return hashlib.sha256(
+        f"protection_order:{order_id}".encode("utf-8")
+    ).hexdigest()
 
 
 def _exact_position_sltp_payload(
@@ -995,6 +1153,16 @@ def submit_exact_position_sltp(
         before_exchange_submit=before_exchange_submit,
         expected_intent_id=expected_intent_id,
         propagate_outcome_unknown=True,
+        pre_submit_order_refs_provider=(
+            (
+                lambda: _complete_pending_tpsl_order_refs(
+                    deepcoin_client,
+                    instrument_id=authority.instrument_id,
+                )
+            )
+            if require_complete_readback_identity
+            else None
+        ),
     )
     if require_readback and result.status in {
         "submitting",
@@ -1248,7 +1416,15 @@ def _reconcile_exact_set_intent_from_pending(
             }
         ):
             return bool(intent is not None and intent.status == "confirmed")
-        request = _load_json(intent.request_json)
+        try:
+            request = load_validated_set_position_request(
+                intent.request_json,
+                request_fingerprint=str(intent.request_fingerprint),
+                require_baseline=True,
+            )
+        except PositionMutationIntentError:
+            return False
+        baseline_refs = set(request["_pre_submit_order_refs"])
         purpose = str(request.get("_ledger_purpose") or "") or (
             "stop_loss"
             if request.get("slTriggerPx") not in (None, "")
@@ -1301,6 +1477,7 @@ def _reconcile_exact_set_intent_from_pending(
                 size=(str(request["sz"]) if "sz" in request else None),
                 require_complete_identity=True,
             )
+            and _protection_order_ref(order_id) not in baseline_refs
         }
         if len(matching_ids) != 1:
             return False
@@ -1548,6 +1725,27 @@ def reconcile_submitted_position_mutation_intents(
         )
         for intent in intents:
             request = _load_json(intent.request_json)
+            baseline_refs: set[str] = set()
+            if (
+                intent.operation == "set_position_sltp"
+                and "_ledger_purpose" in request
+            ):
+                require_baseline = str(
+                    intent.idempotency_key or ""
+                ).startswith("protected-entry:")
+                try:
+                    request = load_validated_set_position_request(
+                        intent.request_json,
+                        request_fingerprint=str(
+                            intent.request_fingerprint
+                        ),
+                        require_baseline=require_baseline,
+                    )
+                except PositionMutationIntentError:
+                    continue
+                baseline_refs = set(
+                    request.get("_pre_submit_order_refs") or []
+                )
             response = _load_json(intent.response_json)
             order_id = str(intent.order_id or "") or _response_order_id(
                 response
@@ -1634,6 +1832,8 @@ def reconcile_submitted_position_mutation_intents(
                         size=(str(request["sz"]) if "sz" in request else None),
                         require_complete_identity=True,
                     )
+                    and _protection_order_ref(candidate_id)
+                    not in baseline_refs
                 }
                 if len(matching_ids) == 1:
                     order_id = next(iter(matching_ids))

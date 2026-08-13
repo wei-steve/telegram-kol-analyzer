@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime
 from typing import Any, Mapping
@@ -57,6 +58,15 @@ def reserve_position_mutation_intent(
         authority_fingerprint,
         request_fingerprint,
     )
+    strict_set_identity = (
+        operation == "set_position_sltp"
+        and "_ledger_purpose" in request
+    )
+    if strict_set_identity:
+        _require_set_position_request_identity(
+            request,
+            request_fingerprint=request_fingerprint,
+        )
     with session_factory() as session:
         existing = (
             session.query(PositionMutationIntent)
@@ -64,6 +74,12 @@ def reserve_position_mutation_intent(
             .one_or_none()
         )
         if existing is not None:
+            if strict_set_identity:
+                _require_existing_set_position_request_identity(
+                    existing,
+                    incoming_request=request,
+                    request_fingerprint=request_fingerprint,
+                )
             existing_identity = _intent_identity(existing)
             if (
                 existing.status == "confirmed"
@@ -150,6 +166,12 @@ def reserve_position_mutation_intent(
             )
             if existing is None:
                 raise
+            if strict_set_identity:
+                _require_existing_set_position_request_identity(
+                    existing,
+                    incoming_request=request,
+                    request_fingerprint=request_fingerprint,
+                )
             if _intent_identity(existing) != identity:
                 raise PositionMutationIntentError(
                     "position_mutation_intent_conflict"
@@ -217,3 +239,145 @@ def _intent_identity(row: PositionMutationIntent) -> tuple[object, ...]:
         row.authority_fingerprint,
         row.request_fingerprint,
     )
+
+
+def _require_existing_set_position_request_identity(
+    row: PositionMutationIntent,
+    *,
+    incoming_request: Mapping[str, Any],
+    request_fingerprint: str,
+) -> None:
+    existing = load_validated_set_position_request(
+        row.request_json,
+        request_fingerprint=request_fingerprint,
+    )
+    incoming = dict(incoming_request)
+    _require_set_position_request_identity(
+        incoming,
+        request_fingerprint=request_fingerprint,
+    )
+    if existing.get("_ledger_purpose") != incoming.get("_ledger_purpose"):
+        raise PositionMutationIntentError(
+            "position_mutation_intent_conflict"
+        )
+
+
+def load_validated_set_position_request(
+    raw: object,
+    *,
+    request_fingerprint: str,
+    require_baseline: bool = False,
+) -> dict[str, Any]:
+    request = _strict_request_object(raw)
+    _require_set_position_request_identity(
+        request,
+        request_fingerprint=request_fingerprint,
+    )
+    if require_baseline and not _valid_order_refs(
+        request.get("_pre_submit_order_refs")
+    ):
+        raise PositionMutationIntentError(
+            "position_mutation_intent_conflict"
+        )
+    return request
+
+
+def _require_set_position_request_identity(
+    request: Mapping[str, Any],
+    *,
+    request_fingerprint: str,
+) -> None:
+    if not isinstance(request, Mapping):
+        raise PositionMutationIntentError(
+            "position_mutation_intent_conflict"
+        )
+    payload = dict(request)
+    baseline = payload.pop("_pre_submit_order_refs", None)
+    ledger_purpose = payload.pop("_ledger_purpose", None)
+    try:
+        fingerprint_matches = (
+            _request_fingerprint(payload) == request_fingerprint
+        )
+    except (RecursionError, TypeError, ValueError):
+        fingerprint_matches = False
+    if (
+        ledger_purpose not in {"stop_loss", "backup_stop", "take_profit"}
+        or (
+            baseline is not None
+            and not _valid_order_refs(baseline)
+        )
+        or not fingerprint_matches
+    ):
+        raise PositionMutationIntentError(
+            "position_mutation_intent_conflict"
+        )
+
+
+def _strict_request_object(raw: object) -> dict[str, Any]:
+    try:
+        oversized = (
+            not isinstance(raw, str)
+            or len(raw.encode("utf-8")) > 4096
+        )
+    except UnicodeEncodeError:
+        oversized = True
+    if oversized:
+        raise PositionMutationIntentError(
+            "position_mutation_intent_conflict"
+        )
+
+    def reject_constant(_: str) -> None:
+        raise ValueError("invalid constant")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = value
+        return result
+
+    try:
+        loaded = json.loads(
+            raw,
+            parse_constant=reject_constant,
+            object_pairs_hook=unique_object,
+        )
+    except (
+        json.JSONDecodeError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise PositionMutationIntentError(
+            "position_mutation_intent_conflict"
+        ) from exc
+    if not isinstance(loaded, dict):
+        raise PositionMutationIntentError(
+            "position_mutation_intent_conflict"
+        )
+    return loaded
+
+
+def _valid_order_refs(value: object) -> bool:
+    return (
+        isinstance(value, list)
+        and value == sorted(set(value))
+        and all(
+            isinstance(item, str)
+            and len(item) == 64
+            and all(character in "0123456789abcdef" for character in item)
+            for item in value
+        )
+    )
+
+
+def _request_fingerprint(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        dict(payload),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

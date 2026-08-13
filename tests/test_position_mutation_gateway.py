@@ -923,6 +923,10 @@ def test_protected_entry_get_only_recovery_does_not_reconcile_other_intents(
     )
 
     class CrashClient(FakeDeepcoinClient):
+        def __init__(self):
+            super().__init__()
+            self.pending = []
+
         def set_position_sltp(self, payload):
             self.set_position_sltp_calls.append(dict(payload))
             if len(self.set_position_sltp_calls) == 1:
@@ -971,6 +975,240 @@ def test_protected_entry_get_only_recovery_does_not_reconcile_other_intents(
             PositionMutationIntent.id != unrelated.id
         ).one()
         assert recovered.status == "confirmed"
+
+
+def test_protected_entry_recovery_never_claims_preexisting_matching_stop(
+    tmp_path,
+):
+    class SimulatedCrash(BaseException):
+        pass
+
+    session_factory, _, _, _, _ = _seed(tmp_path)
+
+    class CrashBeforePostClient(FakeDeepcoinClient):
+        def __init__(self):
+            super().__init__()
+            self.pending = [{
+                "ordId": "preexisting-manual-stop",
+                "instId": "BTC-USDT-SWAP",
+                "posId": "pos-sister",
+                "posSide": "long",
+                "slTriggerPx": "62000",
+                "sz": "0",
+            }]
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return list(self.pending)
+
+        def set_position_sltp(self, payload):
+            self.set_position_sltp_calls.append(dict(payload))
+            raise SimulatedCrash()
+
+    client = CrashBeforePostClient()
+    kwargs = dict(
+        session_factory=session_factory,
+        deepcoin_client=client,
+        pos_id="pos-sister",
+        payload={
+            "instId": "BTC-USDT-SWAP",
+            "slTriggerPx": "62000",
+            "sz": "0",
+        },
+        idempotency_key="protected-entry:preexisting-stop",
+        live_execution_gate=lambda: True,
+        now_provider=lambda: NOW,
+        require_readback=True,
+        require_complete_readback_identity=True,
+    )
+
+    with pytest.raises(SimulatedCrash):
+        submit_exact_position_sltp(**kwargs)
+    with pytest.raises(
+        DeepcoinRequestOutcomeUnknown,
+        match=(
+            "writer_outcome_unknown|position_sltp_pending_readback|"
+            "position_mutation_submitting"
+        ),
+    ):
+        submit_exact_position_sltp(**kwargs)
+
+    assert len(client.set_position_sltp_calls) == 1
+    with session_factory() as session:
+        intent = session.query(PositionMutationIntent).one()
+        assert intent.status == "submitting"
+        assert intent.order_id is None
+        assert "preexisting-manual-stop" not in intent.request_json
+        baseline_refs = json.loads(intent.request_json)[
+            "_pre_submit_order_refs"
+        ]
+        assert len(baseline_refs) == 1
+        assert len(baseline_refs[0]) == 64
+        assert session.query(PositionProtectionLedger).filter(
+            PositionProtectionLedger.order_id
+            == "preexisting-manual-stop"
+        ).count() == 0
+
+
+def test_protected_entry_recovery_rejects_tampered_request_before_writing_ledger(
+    tmp_path,
+):
+    class SimulatedCrash(BaseException):
+        pass
+
+    session_factory, _, _, _, _ = _seed(tmp_path)
+
+    class TamperedReadbackClient(FakeDeepcoinClient):
+        def __init__(self):
+            super().__init__()
+            self.pending = []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return list(self.pending)
+
+        def set_position_sltp(self, payload):
+            self.set_position_sltp_calls.append(dict(payload))
+            raise SimulatedCrash()
+
+    client = TamperedReadbackClient()
+    kwargs = dict(
+        session_factory=session_factory,
+        deepcoin_client=client,
+        pos_id="pos-sister",
+        payload={
+            "instId": "BTC-USDT-SWAP",
+            "slTriggerPx": "62000",
+            "sz": "0",
+        },
+        idempotency_key="protected-entry:tampered-request",
+        live_execution_gate=lambda: True,
+        now_provider=lambda: NOW,
+        require_readback=True,
+        require_complete_readback_identity=True,
+    )
+
+    with pytest.raises(SimulatedCrash):
+        submit_exact_position_sltp(**kwargs)
+    with session_factory() as session:
+        intent = session.query(PositionMutationIntent).one()
+        request = json.loads(intent.request_json)
+        request["slTriggerPx"] = "63000"
+        intent.request_json = json.dumps(request, sort_keys=True)
+        session.commit()
+    client.pending = [{
+        "ordId": "unrelated-63000",
+        "instId": "BTC-USDT-SWAP",
+        "posId": "pos-sister",
+        "posSide": "long",
+        "slTriggerPx": "63000",
+        "sz": "0",
+    }]
+
+    assert reconcile_submitted_position_mutation_intents(
+        session_factory,
+        pending_trigger_orders=client.pending,
+        reconciled_at=NOW,
+    ) == 0
+
+    with pytest.raises(Exception):
+        submit_exact_position_sltp(**kwargs)
+
+    assert len(client.set_position_sltp_calls) == 1
+    with session_factory() as session:
+        intent = session.query(PositionMutationIntent).one()
+        assert intent.status == "submitting"
+        assert intent.order_id is None
+        assert session.query(PositionProtectionLedger).filter(
+            PositionProtectionLedger.order_id == "unrelated-63000"
+        ).count() == 0
+
+
+def test_protected_entry_refuses_incomplete_pre_submit_tpsl_baseline(
+    tmp_path,
+):
+    session_factory, _, _, _, _ = _seed(tmp_path)
+
+    class PaginatedBaselineClient(FakeDeepcoinClient):
+        def read_trigger_orders_pending(self, *, inst_id):
+            return {"data": [], "nextPageCursor": "page-2"}
+
+    client = PaginatedBaselineClient()
+    with pytest.raises(Exception, match="snapshot_pagination_incomplete"):
+        submit_exact_position_sltp(
+            session_factory=session_factory,
+            deepcoin_client=client,
+            pos_id="pos-sister",
+            payload={
+                "instId": "BTC-USDT-SWAP",
+                "slTriggerPx": "62000",
+                "sz": "0",
+            },
+            idempotency_key="protected-entry:paginated-baseline",
+            live_execution_gate=lambda: True,
+            now_provider=lambda: NOW,
+            require_readback=True,
+            require_complete_readback_identity=True,
+        )
+
+    assert client.set_position_sltp_calls == []
+    with session_factory() as session:
+        intent = session.query(PositionMutationIntent).one()
+        assert intent.status == "reserved"
+        assert "_pre_submit_order_refs" not in json.loads(
+            intent.request_json
+        )
+
+
+def test_protected_entry_persists_only_bounded_success_response(
+    tmp_path,
+):
+    session_factory, _, _, _, _ = _seed(tmp_path)
+
+    class SensitiveSuccessClient(FakeDeepcoinClient):
+        def __init__(self):
+            super().__init__()
+            self.pending = []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return list(self.pending)
+
+        def set_position_sltp(self, payload):
+            self.set_position_sltp_calls.append(dict(payload))
+            self.pending = [{
+                "ordId": "safe-stop-id",
+                "instId": payload["instId"],
+                "posId": payload["posId"],
+                "posSide": payload["posSide"],
+                "slTriggerPx": payload["slTriggerPx"],
+                "sz": payload.get("sz", "0"),
+            }]
+            return {
+                "code": "0",
+                "data": {"ordId": "safe-stop-id"},
+                "message": "Authorization: Bearer TOPSECRET",
+            }
+
+    client = SensitiveSuccessClient()
+    response = submit_exact_position_sltp(
+        session_factory=session_factory,
+        deepcoin_client=client,
+        pos_id="pos-sister",
+        payload={
+            "instId": "BTC-USDT-SWAP",
+            "slTriggerPx": "62000",
+            "sz": "0",
+        },
+        idempotency_key="protected-entry:safe-success",
+        live_execution_gate=lambda: True,
+        now_provider=lambda: NOW,
+        require_readback=True,
+        require_complete_readback_identity=True,
+    )
+
+    assert response == {"code": "0", "data": {"ordId": "safe-stop-id"}}
+    with session_factory() as session:
+        intent = session.query(PositionMutationIntent).one()
+        assert "TOPSECRET" not in (intent.response_json or "")
+        assert json.loads(intent.response_json) == response
 
 
 def test_require_readback_is_restart_idempotent_after_confirmation(tmp_path):

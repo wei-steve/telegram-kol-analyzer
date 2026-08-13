@@ -3100,6 +3100,7 @@ def test_protected_entry_market_persists_operations_and_blocks_later_leg_on_prot
                     "ordId": "protected-entry-1",
                     "posId": "pos-market-1",
                 },
+                "message": "Authorization: Bearer TOPSECRET",
             }
 
         def list_positions(self, *, inst_id=None):
@@ -3256,6 +3257,10 @@ def test_protected_entry_market_persists_operations_and_blocks_later_leg_on_prot
         assert all(
             "TOPSECRET" not in (intent.error_json or "")
             for intent in session.query(PositionMutationIntent).all()
+        )
+        assert all(
+            "TOPSECRET" not in (leg.response_json or "")
+            for leg in session.query(ExecutionOrderLeg).all()
         )
     assert write_generation.uid_scope_hash == "d" * 64
     assert write_generation.generation == 2 + (failure_index + 1) * 2
@@ -3625,16 +3630,20 @@ def test_protected_entry_market_crash_after_post_resumes_readback_without_second
         "transition_execution_operation",
         original_transition,
     )
-
-    result = _submit_recovery_signal_direct(
+    save_trading_settings(
         session_factory,
-        trade_signal=load_trade_signal(session_factory, signal.id),
-        deepcoin_client=client,
-        contract_spec_provider=_StaticContractSpecProvider(),
-        submitted_at=submitted_at,
+        {"protected_entry_execution_mode": "disabled"},
     )
 
-    assert result["submitted"] is True
+    with pytest.raises(Exception, match="protected_entry_readback_only"):
+        _submit_recovery_signal_direct(
+            session_factory,
+            trade_signal=load_trade_signal(session_factory, signal.id),
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            submitted_at=submitted_at,
+        )
+
     assert len(client.payloads) == 1
     with session_factory() as session:
         parent = (
@@ -3642,7 +3651,7 @@ def test_protected_entry_market_crash_after_post_resumes_readback_without_second
             .filter(DeepcoinExecutionOperation.parent_operation_id.is_(None))
             .one()
         )
-    assert parent.state == "protected"
+    assert parent.state == "recovery_required"
 
 
 def test_protected_entry_market_crash_after_exact_readback_rebuilds_binding_and_protects(
@@ -3881,6 +3890,10 @@ def test_protected_entry_protection_post_crash_resumes_get_only(
         gateway_module,
         "transition_position_mutation_intent",
         original_transition,
+    )
+    save_trading_settings(
+        session_factory,
+        {"protected_entry_execution_mode": "disabled"},
     )
     loaded_signal = load_trade_signal(session_factory, signal.id)
     result = _submit_recovery_signal_direct(

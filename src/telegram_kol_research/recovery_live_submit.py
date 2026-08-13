@@ -70,6 +70,10 @@ from telegram_kol_research.position_mutation_gateway import (
     prepare_exact_position_sltp_intent,
     submit_exact_position_sltp,
 )
+from telegram_kol_research.position_mutation_intents import (
+    PositionMutationIntentError,
+    load_validated_set_position_request,
+)
 from telegram_kol_research.protection_revisions import activate_protection_revision
 from telegram_kol_research.trigger_protection_intents import (
     create_or_get_trigger_protection_intent,
@@ -98,6 +102,7 @@ from telegram_kol_research.trading_settings import (
     PROTECTED_ENTRY_CONTRACT_VERSION,
     load_trading_settings,
     protected_entry_mode_for_signal,
+    protected_entry_operation_access,
 )
 from telegram_kol_research.source_message_deletion import (
     serialized_source_message_execution,
@@ -114,6 +119,9 @@ class RecoveryLiveSubmitError(RuntimeError):
 
 _SAFE_PERSISTED_FAILURE = re.compile(
     r"^[a-z0-9][a-z0-9_:,-]{0,255}$"
+)
+_SAFE_PROTECTED_EXCHANGE_ID = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$"
 )
 
 
@@ -245,6 +253,32 @@ def _safe_protected_failure_code(error: BaseException) -> str:
     ):
         return message
     return "protected_entry_execution_failed"
+
+
+def _safe_protected_market_response(
+    response: object,
+    *,
+    order_id: str,
+    pos_id: str,
+) -> dict[str, Any]:
+    if (
+        not _SAFE_PROTECTED_EXCHANGE_ID.fullmatch(order_id)
+        or not _SAFE_PROTECTED_EXCHANGE_ID.fullmatch(pos_id)
+    ):
+        raise RecoveryLiveSubmitError(
+            "protected_entry_exchange_identity_invalid"
+        )
+    projected: dict[str, Any] = {
+        "data": {"ordId": order_id, "posId": pos_id}
+    }
+    if isinstance(response, Mapping):
+        code = response.get("code")
+        if (
+            code not in (None, "")
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,32}", str(code))
+        ):
+            projected["code"] = str(code)
+    return projected
 
 
 def _require_synchronized_finalized_entry_assembly(
@@ -1518,6 +1552,54 @@ def _protected_entry_writer_allowed(
     )
 
 
+def _protected_entry_route_access(
+    session_factory: sessionmaker,
+    *,
+    trade_signal_id: int,
+) -> str:
+    """Pin an existing v1 writer to its contract after rollout disable."""
+
+    with session_factory() as session:
+        operations = (
+            session.query(DeepcoinExecutionOperation)
+            .filter(
+                DeepcoinExecutionOperation.trade_signal_id
+                == int(trade_signal_id),
+                DeepcoinExecutionOperation.parent_operation_id.is_(None),
+                DeepcoinExecutionOperation.operation_key.like(
+                    "protected-entry:%"
+                ),
+            )
+            .all()
+        )
+    settings = load_trading_settings(session_factory)
+    if not operations:
+        return (
+            "live"
+            if protected_entry_mode_for_signal(
+                settings, int(trade_signal_id)
+            )
+            == "live"
+            else "legacy"
+        )
+    if len(operations) != 1:
+        raise RecoveryLiveSubmitError(
+            "protected_entry_parent_operation_conflict"
+        )
+    operation = operations[0]
+    access = protected_entry_operation_access(
+        settings,
+        signal_id=int(trade_signal_id),
+        contract_version=operation.contract_version,
+        writer_attempted=operation.writer_attempted_at is not None,
+    )
+    if access == "stop":
+        raise RecoveryLiveSubmitError(
+            "protected_entry_operation_stopped"
+        )
+    return access
+
+
 def _submit_protected_market_entry(
     *,
     session_factory: sessionmaker,
@@ -1768,7 +1850,16 @@ def _submit_protected_market_entry(
             changed_at=datetime.now(UTC),
         )
     progress.record_confirmed_leg()
-    return dict(response), order_id, pos_id, runtime
+    return (
+        _safe_protected_market_response(
+            response,
+            order_id=order_id,
+            pos_id=pos_id,
+        ),
+        order_id,
+        pos_id,
+        runtime,
+    )
 
 
 def _poll_protected_market_entry_readback(
@@ -1961,15 +2052,16 @@ def _confirmed_protection_response(
                 or len(intent.response_json.encode("utf-8")) > 4096
             ):
                 return None
-            request = json.loads(intent.request_json)
+            request = load_validated_set_position_request(
+                intent.request_json,
+                request_fingerprint=request_fingerprint,
+                require_baseline=True,
+            )
             response = json.loads(intent.response_json)
             if not isinstance(request, dict) or not isinstance(response, dict):
                 return None
-            persisted_purpose = request.pop("_ledger_purpose", None)
-            if (
-                persisted_purpose != ledger_purpose
-                or _canonical_fingerprint(request) != request_fingerprint
-            ):
+            persisted_purpose = request.get("_ledger_purpose")
+            if persisted_purpose != ledger_purpose:
                 return None
             response_data = response.get("data")
             candidates = (
@@ -2027,6 +2119,7 @@ def _confirmed_protection_response(
         TypeError,
         ValueError,
         InvalidOperation,
+        PositionMutationIntentError,
     ):
         return None
 
@@ -2479,13 +2572,11 @@ def _submit_recovery_signal_direct(
     symbol_key = str(draft.get("symbol") or trade_signal.symbol).upper()
     side_key = trade_signal.side.lower()
     warnings = _protection_warnings(draft)
-    protected_v1 = (
-        protected_entry_mode_for_signal(
-            load_trading_settings(session_factory),
-            trade_signal.id,
-        )
-        == "live"
+    protected_access = _protected_entry_route_access(
+        session_factory,
+        trade_signal_id=trade_signal.id,
     )
+    protected_v1 = protected_access in {"live", "readback_only"}
     protected_parent: _ProtectedEntryRuntime | None = None
 
     revision_indices = draft.get("authorized_leg_indices")
@@ -2635,6 +2726,19 @@ def _submit_recovery_signal_direct(
                 ),
                 submitted_orders=[provisional_order],
             )
+            if (
+                protected_access == "readback_only"
+                and protected_parent is not None
+                and protected_parent.operation.state == "entry_confirmed"
+            ):
+                _mark_parent_protection_recovery(
+                    session_factory,
+                    parent=protected_parent,
+                    reason_code="protected_entry_rollout_disabled",
+                )
+                raise RecoveryLiveSubmitError(
+                    "protected_entry_readback_only"
+                )
             try:
                 protection_payloads = build_deepcoin_position_sltp_payloads(
                     draft,
