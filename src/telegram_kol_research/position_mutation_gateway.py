@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Mapping
@@ -59,11 +61,15 @@ class PositionMutationGateway:
         deepcoin_client: Any,
         live_execution_gate: Callable[[], bool],
         now_provider: Callable[[], Any],
+        before_exchange_write: Callable[[], None] | None = None,
+        after_exchange_write: Callable[[], None] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._client = deepcoin_client
         self._live_execution_gate = live_execution_gate
         self._now = now_provider
+        self._before_exchange_write = before_exchange_write
+        self._after_exchange_write = after_exchange_write
 
     def cancel_owned_position_sltp(
         self,
@@ -201,6 +207,8 @@ class PositionMutationGateway:
         size: str | None,
         idempotency_key: str,
         request_options: Mapping[str, Any] | None = None,
+        before_submit: Callable[[int], None] | None = None,
+        before_exchange_submit: Callable[[int], None] | None = None,
     ) -> PositionMutationResult:
         trigger_field_by_purpose = {
             "stop_loss": "slTriggerPx",
@@ -264,6 +272,8 @@ class PositionMutationGateway:
                 "_ledger_purpose": ledger_purpose or purpose,
             },
             idempotency_key=idempotency_key,
+            before_submit=before_submit,
+            before_exchange_submit=before_exchange_submit,
             submit=lambda: self._call_client_write(
                 "_set_position_sltp_unchecked",
                 "set_position_sltp",
@@ -339,6 +349,7 @@ class PositionMutationGateway:
         idempotency_key: str,
         submit: Callable[[], Mapping[str, Any]],
         before_submit: Callable[[int], None] | None = None,
+        before_exchange_submit: Callable[[int], None] | None = None,
     ) -> PositionMutationResult:
         intent = reserve_position_mutation_intent(
             self._session_factory,
@@ -394,7 +405,15 @@ class PositionMutationGateway:
         ):
             return self._intent_result(intent_id)
         try:
-            response = submit()
+            if self._before_exchange_write is not None:
+                self._before_exchange_write()
+            try:
+                if before_exchange_submit is not None:
+                    before_exchange_submit(intent_id)
+                response = submit()
+            finally:
+                if self._after_exchange_write is not None:
+                    self._after_exchange_write()
         except DeepcoinDefiniteRejection as exc:
             return self._finish_with_error(intent_id, "rejected", str(exc))
         except DeepcoinRequestOutcomeUnknown as exc:
@@ -796,6 +815,14 @@ def submit_exact_position_sltp(
     now_provider: Callable[[], Any],
     require_readback: bool = False,
     ledger_purpose: str | None = None,
+    before_submit: Callable[[int], None] | None = None,
+    before_exchange_submit: Callable[[int], None] | None = None,
+    readback_deadline_monotonic: float | None = None,
+    monotonic_factory: Callable[[], float] = time.monotonic,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    readback_scope: Any = None,
+    before_exchange_write: Callable[[], None] | None = None,
+    after_exchange_write: Callable[[], None] | None = None,
 ) -> Mapping[str, Any]:
     """Compatibility adapter that rebuilds authority before one exact TPSL set."""
 
@@ -816,6 +843,8 @@ def submit_exact_position_sltp(
         deepcoin_client=deepcoin_client,
         live_execution_gate=live_execution_gate,
         now_provider=now_provider,
+        before_exchange_write=before_exchange_write,
+        after_exchange_write=after_exchange_write,
     ).set_exact_position_sltp(
         authority=authority,
         purpose=purpose,
@@ -824,6 +853,8 @@ def submit_exact_position_sltp(
         size=(str(payload["sz"]) if "sz" in payload else None),
         idempotency_key=idempotency_key,
         request_options=payload,
+        before_submit=before_submit,
+        before_exchange_submit=before_exchange_submit,
     )
     response = _require_submitted_response(result)
     if not require_readback:
@@ -833,25 +864,18 @@ def submit_exact_position_sltp(
         raise DeepcoinRequestOutcomeUnknown(
             "position_sltp_response_missing_order_id"
         )
-    try:
-        pending = deepcoin_client.list_trigger_orders_pending(
-            inst_id=authority.instrument_id
-        )
-    except Exception as exc:
-        raise DeepcoinRequestOutcomeUnknown(
-            "position_sltp_readback_unavailable"
-        ) from exc
-    if not _set_position_sltp_readback_matches(
-        pending,
-        order_id=order_id,
+    _poll_position_sltp_readback(
+        deepcoin_client=deepcoin_client,
         authority=authority,
+        order_id=order_id,
         purpose=purpose,
         trigger_price=str(payload[trigger_field]),
         size=(str(payload["sz"]) if "sz" in payload else None),
-    ):
-        raise DeepcoinRequestOutcomeUnknown(
-            "position_sltp_pending_readback"
-        )
+        deadline_monotonic=readback_deadline_monotonic,
+        monotonic_factory=monotonic_factory,
+        sleep_fn=sleep_fn,
+        readback_scope=readback_scope,
+    )
     if result.status == "confirmed":
         with session_factory() as session:
             ledger = session.query(PositionProtectionLedger).filter(
@@ -931,6 +955,65 @@ def submit_exact_position_sltp(
             "position_sltp_readback_ledger_persistence_failed"
         ) from exc
     return response
+
+
+def _poll_position_sltp_readback(
+    *,
+    deepcoin_client: Any,
+    authority: PositionMutationAuthority,
+    order_id: str,
+    purpose: str,
+    trigger_price: str,
+    size: str | None,
+    deadline_monotonic: float | None,
+    monotonic_factory: Callable[[], float],
+    sleep_fn: Callable[[float], None],
+    readback_scope: Any,
+) -> None:
+    delays = (0.0, 0.5, 1.0, 2.0, 3.0) if deadline_monotonic is not None else (0.0,)
+    last_unavailable: Exception | None = None
+    attempted = False
+    for delay in delays:
+        now = float(monotonic_factory())
+        if deadline_monotonic is not None:
+            remaining = float(deadline_monotonic) - now
+            if remaining <= 0 or delay >= remaining:
+                break
+        if delay > 0:
+            sleep_fn(delay)
+        attempted = True
+        try:
+            scope_factory = getattr(deepcoin_client, "request_scope", None)
+            scope_context = (
+                scope_factory(readback_scope)
+                if readback_scope is not None and callable(scope_factory)
+                else nullcontext(deepcoin_client)
+            )
+            with scope_context:
+                pending = deepcoin_client.list_trigger_orders_pending(
+                    inst_id=authority.instrument_id
+                )
+        except Exception as exc:
+            last_unavailable = exc
+            continue
+        if _set_position_sltp_readback_matches(
+            pending,
+            order_id=order_id,
+            authority=authority,
+            purpose=purpose,
+            trigger_price=trigger_price,
+            size=size,
+        ):
+            return
+    if last_unavailable is not None and not attempted:
+        raise DeepcoinRequestOutcomeUnknown(
+            "position_sltp_readback_unavailable"
+        ) from last_unavailable
+    if last_unavailable is not None:
+        raise DeepcoinRequestOutcomeUnknown(
+            "position_sltp_readback_unavailable"
+        ) from last_unavailable
+    raise DeepcoinRequestOutcomeUnknown("position_sltp_pending_readback")
 
 
 def cancel_exact_position_sltp(

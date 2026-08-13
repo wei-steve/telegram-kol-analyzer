@@ -1,5 +1,6 @@
 import json
 import hashlib
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from threading import Barrier, Event, Thread
 from types import SimpleNamespace
@@ -12,16 +13,23 @@ from telegram_kol_research.deepcoin_client import DeepcoinDefiniteRejection
 from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecLookup
+from telegram_kol_research.deepcoin_execution_operations import (
+    DeepcoinOperationConflict,
+    reserve_execution_operation,
+)
 from telegram_kol_research.entry_strategy_assembly import (
     finalize_adjacent_entry_assembly_draft,
 )
 from telegram_kol_research.models import (
+    DeepcoinAccountWriteGeneration,
+    DeepcoinExecutionOperation,
     EntryStrategyAssembly,
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
     InstructionExecutionContract,
     MessageInstructionItem,
+    PositionMutationIntent,
     RawMessage,
     SignalCandidate,
     StrategyRevisionBatch,
@@ -32,6 +40,7 @@ from telegram_kol_research.models import TriggerProtectionIntent
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import persist_recovery_evaluations
 from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
+from telegram_kol_research.recovery_live_submit import EntrySubmissionProgressError
 from telegram_kol_research.recovery_live_submit import build_deepcoin_market_order_payload
 from telegram_kol_research.recovery_live_submit import build_deepcoin_place_order_payload
 from telegram_kol_research.recovery_live_submit import build_deepcoin_position_sltp_payload
@@ -45,6 +54,8 @@ from telegram_kol_research.recovery_live_submit import submit_entry_draft_revisi
 from telegram_kol_research.recovery_live_submit import load_entry_draft_revision_authority
 from telegram_kol_research.recovery_live_submit import submit_strategy_revision_replacement_live
 from telegram_kol_research.recovery_live_submit import _load_matching_position_ids
+from telegram_kol_research.recovery_live_submit import _protected_entry_operation_key
+from telegram_kol_research.recovery_live_submit import _submit_recovery_signal_direct
 from telegram_kol_research.deepcoin_execution_actions import _exact_exchange_order_id
 from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
 from telegram_kol_research.recovery_scan import RecoveryDecision
@@ -53,6 +64,7 @@ from telegram_kol_research.recovery_scan import RecoverySignal
 from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trade_signals import canonical_management_batch_id
+from telegram_kol_research.trade_signals import load_trade_signal
 from telegram_kol_research.source_message_deletion import record_source_message_deleted
 from telegram_kol_research.strategy_threads import create_strategy_thread_for_lifecycle
 
@@ -2955,6 +2967,665 @@ def test_market_submit_persists_binding_when_position_protection_fails(tmp_path)
     assert binding.last_exchange_status == "position_active_protection_failed"
     assert binding.order_id == "order-market-1"
     assert binding.pos_id == "pos-market-1"
+
+
+@pytest.mark.parametrize(
+    (
+        "protection_failure",
+        "failure_index",
+        "expected_exception",
+        "expected_child_states",
+        "expected_message",
+    ),
+    [
+        (
+            "unknown",
+            1,
+            DeepcoinRequestOutcomeUnknown,
+            ["protected", "protection_unknown"],
+            "protection_unknown",
+        ),
+        (
+            "rejected",
+            1,
+            DeepcoinDefiniteRejection,
+            ["protected", "recovery_required"],
+            "protection_rejected",
+        ),
+        (
+            "unknown",
+            0,
+            DeepcoinRequestOutcomeUnknown,
+            ["protection_unknown", "protection_prepared"],
+            "protection_unknown",
+        ),
+        (
+            "readback_missing",
+            0,
+            DeepcoinRequestOutcomeUnknown,
+            ["protection_pending_readback", "protection_prepared"],
+            "position_sltp_pending_readback",
+        ),
+    ],
+)
+def test_protected_entry_market_persists_operations_and_blocks_later_leg_on_protection_failure(
+    tmp_path,
+    monkeypatch,
+    protection_failure,
+    failure_index,
+    expected_exception,
+    expected_child_states,
+    expected_message,
+):
+    session_factory = create_session_factory(tmp_path / "protected-market.db")
+    _persist_ready_market_item(session_factory)
+    _persist_lifecycle(
+        session_factory,
+        chat_id=200,
+        message_id=66,
+        symbol="BTC",
+        side="short",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "protected_entry_execution_mode": "live",
+            "protected_entry_execution_after_trade_signal_id": 0,
+        },
+    )
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=200,
+        message_id=66,
+        symbol="BTC",
+        side="short",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    first_leg = signal.payload["deepcoin_order_draft"]["order_legs"][0]
+    _replace_queued_order_legs(
+        session_factory,
+        signal.id,
+        [
+            first_leg,
+            {
+                **first_leg,
+                "order_type": "limit",
+                "price": 59000.0,
+                "client_order_id": "protected-later-leg",
+            },
+        ],
+    )
+
+    class ProtectedClient(_FakeDeepcoinClient):
+        uid_scope_hash = "d" * 64
+
+        def __init__(self):
+            super().__init__()
+            self.active_scope = None
+            self.protection_child_count_at_first_post = None
+            self.now = 100.0
+            self._monotonic_factory = lambda: self.now
+            self._sleep_fn = lambda seconds: setattr(
+                self, "now", self.now + seconds
+            )
+
+        @contextmanager
+        def request_scope(self, scope):
+            previous = self.active_scope
+            self.active_scope = scope
+            try:
+                yield self
+            finally:
+                self.active_scope = previous
+
+        def place_order(self, payload):
+            with session_factory() as session:
+                operation = session.query(DeepcoinExecutionOperation).one()
+                assert operation.state == "entry_submitting"
+                assert operation.writer_attempted_at is not None
+            assert self.active_scope is not None
+            assert self.active_scope.phase == "entry_submit"
+            self.payloads.append(dict(payload))
+            return {
+                "code": "0",
+                "data": {
+                    "ordId": "protected-entry-1",
+                    "posId": "pos-market-1",
+                },
+            }
+
+        def list_positions(self, *, inst_id=None):
+            if not self.payloads:
+                return []
+            return [{
+                "posId": "pos-market-1",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "10",
+                "avgPx": "59800",
+                "mrgPosition": "split",
+                "mgnMode": "cross",
+            }]
+
+        def list_order_history(self, *, inst_id=None):
+            if not self.payloads:
+                return []
+            return [{
+                "ordId": "protected-entry-1",
+                "clOrdId": self.payloads[0]["clOrdId"],
+                "instId": "BTC-USDT-SWAP",
+                "posId": "pos-market-1",
+                "posSide": "short",
+                "state": "filled",
+            }]
+
+        def set_position_sltp(self, payload):
+            self.position_protection_payloads.append(dict(payload))
+            current_index = len(self.position_protection_payloads) - 1
+            if current_index == 0:
+                with session_factory() as session:
+                    self.protection_child_count_at_first_post = (
+                        session.query(DeepcoinExecutionOperation)
+                        .filter(
+                            DeepcoinExecutionOperation.parent_operation_id
+                            .is_not(None)
+                        )
+                        .count()
+                    )
+            if current_index == failure_index:
+                if protection_failure == "readback_missing":
+                    return {
+                        "code": "0",
+                        "data": {"ordId": "unread-protection"},
+                    }
+                if protection_failure == "rejected":
+                    raise DeepcoinDefiniteRejection(
+                        "protection_rejected"
+                    )
+                raise DeepcoinRequestOutcomeUnknown(
+                    "protection_unknown"
+                )
+            if current_index == 0:
+                self.pending_tpsl.append({
+                    "ordId": "protected-stop-1",
+                    "instId": "BTC-USDT-SWAP",
+                    "posId": "pos-market-1",
+                    "posSide": "short",
+                    "slTriggerPx": payload["slTriggerPx"],
+                    "sz": payload.get("sz", "0"),
+                })
+                return {
+                    "code": "0",
+                    "data": {"ordId": "protected-stop-1"},
+                }
+            raise AssertionError("unexpected protection write")
+
+    client = ProtectedClient()
+    monkeypatch.setattr(
+        "telegram_kol_research.recovery_live_submit."
+        "build_deepcoin_position_sltp_payloads",
+        lambda *args, **kwargs: [
+            {
+                "instId": "BTC-USDT-SWAP",
+                "posId": "pos-market-1",
+                "slTriggerPx": "61800",
+            },
+            {
+                "instId": "BTC-USDT-SWAP",
+                "posId": "pos-market-1",
+                "slTriggerPx": "61900",
+            },
+        ],
+    )
+
+    @contextmanager
+    def assert_parent_is_not_writer_attempted_before_final_source_gate(
+        *args, **kwargs
+    ):
+        with session_factory() as session:
+            parent = (
+                session.query(DeepcoinExecutionOperation)
+                .filter(
+                    DeepcoinExecutionOperation.parent_operation_id.is_(None)
+                )
+                .one()
+            )
+            assert parent.state == "entry_prepared"
+            assert parent.writer_attempted_at is None
+        yield
+
+    monkeypatch.setattr(
+        "telegram_kol_research.recovery_live_submit."
+        "_entry_source_exchange_write_gate",
+        assert_parent_is_not_writer_attempted_before_final_source_gate,
+    )
+
+    with pytest.raises(expected_exception, match=expected_message):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            processed_at=datetime(2026, 8, 13, 8, 0, tzinfo=UTC),
+        )
+
+    assert len(client.payloads) == 1
+    assert client.trigger_payloads == []
+    assert client.protection_child_count_at_first_post == 2
+    with session_factory() as session:
+        operations = (
+            session.query(DeepcoinExecutionOperation)
+            .order_by(DeepcoinExecutionOperation.id)
+            .all()
+        )
+        lifecycle = session.query(StrategyLifecycle).one()
+        persisted_signal = session.get(TradeSignal, signal.id)
+        mutation_intent_ids = {
+            intent.id for intent in session.query(PositionMutationIntent).all()
+        }
+        write_generation = session.query(
+            DeepcoinAccountWriteGeneration
+        ).one()
+    assert operations[0].contract_version == "1"
+    assert operations[0].state == "recovery_required"
+    assert [operation.state for operation in operations[1:]] == (
+        expected_child_states
+    )
+    assert all(operation.execution_order_leg_id for operation in operations[1:])
+    assert {
+        json.loads(operation.evidence_json)["position_mutation_intent_id"]
+        for operation in operations[1:]
+        if operation.writer_attempted_at is not None
+    } == mutation_intent_ids
+    assert lifecycle.lifecycle_status != "invalidated"
+    assert persisted_signal.status == "partial_submission_failed"
+    assert write_generation.uid_scope_hash == "d" * 64
+    assert write_generation.generation == 2 + (failure_index + 1) * 2
+    retry_signal = load_trade_signal(session_factory, signal.id)
+    with pytest.raises(
+        EntrySubmissionProgressError,
+        match="protected_entry_operation_state_conflict",
+    ):
+        _submit_recovery_signal_direct(
+            session_factory,
+            trade_signal=retry_signal,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            submitted_at=datetime(2026, 8, 13, 8, 0, tzinfo=UTC),
+            validated_draft=retry_signal.payload[
+                "deepcoin_order_draft"
+            ],
+        )
+    assert len(client.payloads) == 1
+    assert len(client.position_protection_payloads) == failure_index + 1
+
+
+def test_protected_entry_market_request_identity_conflict_sends_zero_posts(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "protected-conflict.db")
+    _persist_ready_market_item(session_factory)
+    _persist_lifecycle(
+        session_factory,
+        chat_id=200,
+        message_id=66,
+        symbol="BTC",
+        side="short",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "protected_entry_execution_mode": "live",
+            "protected_entry_execution_after_trade_signal_id": 0,
+        },
+    )
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=200,
+        message_id=66,
+        symbol="BTC",
+        side="short",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    reserve_execution_operation(
+        session_factory,
+        operation_key=_protected_entry_operation_key(signal.id, 1),
+        trade_signal_id=signal.id,
+        contract_version="1",
+        phase="entry_preflight",
+        state="planned",
+        outcome_certainty="not_sent",
+        request_fingerprint="a" * 64,
+        economics_fingerprint="b" * 64,
+        deadline_at=datetime(2026, 8, 13, 8, 0, 10, tzinfo=UTC),
+        evidence={"forged": True},
+        created_at=datetime(2026, 8, 13, 8, 0, tzinfo=UTC),
+    )
+
+    class ConflictClient(_FakeDeepcoinClient):
+        uid_scope_hash = "e" * 64
+
+        @contextmanager
+        def request_scope(self, scope):
+            yield self
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+    client = ConflictClient()
+
+    with pytest.raises(
+        DeepcoinOperationConflict,
+        match="operation_identity_conflict",
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            processed_at=datetime(2026, 8, 13, 8, 0, tzinfo=UTC),
+        )
+
+    assert client.payloads == []
+    assert client.trigger_payloads == []
+    assert client.position_protection_payloads == []
+    with session_factory() as session:
+        assert session.query(DeepcoinExecutionOperation).count() == 1
+
+
+def test_protected_entry_market_rechecks_live_mode_at_writer_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(
+        tmp_path / "protected-writer-gate.db"
+    )
+    _persist_ready_market_item(session_factory)
+    _persist_lifecycle(
+        session_factory,
+        chat_id=200,
+        message_id=66,
+        symbol="BTC",
+        side="short",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "protected_entry_execution_mode": "live",
+            "protected_entry_execution_after_trade_signal_id": 0,
+        },
+    )
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=200,
+        message_id=66,
+        symbol="BTC",
+        side="short",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+
+    class BoundaryClient(_FakeDeepcoinClient):
+        uid_scope_hash = "4" * 64
+        _monotonic_factory = staticmethod(lambda: 100.0)
+        _sleep_fn = staticmethod(lambda seconds: None)
+
+        @contextmanager
+        def request_scope(self, scope):
+            yield self
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+    client = BoundaryClient()
+
+    @contextmanager
+    def disable_after_source_gate(*args, **kwargs):
+        save_trading_settings(
+            session_factory,
+            {"protected_entry_execution_mode": "disabled"},
+        )
+        yield
+
+    monkeypatch.setattr(
+        "telegram_kol_research.recovery_live_submit."
+        "_entry_source_exchange_write_gate",
+        disable_after_source_gate,
+    )
+    loaded_signal = load_trade_signal(session_factory, signal.id)
+
+    with pytest.raises(
+        EntrySubmissionProgressError,
+        match="protected_entry_submit_not_authorized",
+    ):
+        _submit_recovery_signal_direct(
+            session_factory,
+            trade_signal=loaded_signal,
+            deepcoin_client=client,
+            submitted_at=datetime(2026, 8, 13, 8, 0, tzinfo=UTC),
+            validated_draft=loaded_signal.payload[
+                "deepcoin_order_draft"
+            ],
+        )
+
+    assert client.payloads == []
+    with session_factory() as session:
+        operation = session.query(DeepcoinExecutionOperation).one()
+    assert operation.state == "entry_prepared"
+    assert operation.writer_attempted_at is None
+
+
+def test_protected_entry_market_accepted_without_exact_readback_never_protects_or_advances(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "protected-pending.db")
+    _persist_ready_market_item(session_factory)
+    _persist_lifecycle(
+        session_factory,
+        chat_id=200,
+        message_id=66,
+        symbol="BTC",
+        side="short",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "protected_entry_execution_mode": "live",
+            "protected_entry_execution_after_trade_signal_id": 0,
+        },
+    )
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=200,
+        message_id=66,
+        symbol="BTC",
+        side="short",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+
+    class PendingClient(_FakeDeepcoinClient):
+        uid_scope_hash = "f" * 64
+
+        def __init__(self):
+            super().__init__()
+            self.now = 100.0
+            self._monotonic_factory = lambda: self.now
+            self._sleep_fn = self._sleep
+
+        def _sleep(self, seconds):
+            self.now += seconds
+
+        @contextmanager
+        def request_scope(self, scope):
+            yield self
+
+        def place_order(self, payload):
+            self.payloads.append(dict(payload))
+            return {"code": "0", "data": {"ordId": "pending-order-1"}}
+
+        def list_positions(self, *, inst_id=None):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+    client = PendingClient()
+
+    with pytest.raises(
+        DeepcoinRequestOutcomeUnknown,
+        match="protected_entry_readback_pending",
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            processed_at=datetime(2026, 8, 13, 8, 0, tzinfo=UTC),
+        )
+
+    assert len(client.payloads) == 1
+    assert client.position_protection_payloads == []
+    assert client.trigger_payloads == []
+    with session_factory() as session:
+        operation = session.query(DeepcoinExecutionOperation).one()
+        lifecycle = session.query(StrategyLifecycle).one()
+        persisted_signal = session.get(TradeSignal, signal.id)
+    assert operation.state == "entry_pending_readback"
+    assert operation.writer_attempted_at is not None
+    assert persisted_signal.status == "unknown_exchange_outcome"
+    assert lifecycle.lifecycle_status != "invalidated"
+
+
+def test_protected_entry_market_crash_after_post_resumes_readback_without_second_post(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.recovery_live_submit as submitter
+
+    session_factory = create_session_factory(tmp_path / "protected-resume.db")
+    _persist_ready_market_item(session_factory)
+    _persist_lifecycle(
+        session_factory,
+        chat_id=200,
+        message_id=66,
+        symbol="BTC",
+        side="short",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "protected_entry_execution_mode": "live",
+            "protected_entry_execution_after_trade_signal_id": 0,
+        },
+    )
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=200,
+        message_id=66,
+        symbol="BTC",
+        side="short",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+
+    class ResumeClient(_FakeDeepcoinClient):
+        uid_scope_hash = "1" * 64
+
+        def __init__(self):
+            super().__init__()
+            self.now = 100.0
+            self._monotonic_factory = lambda: self.now
+            self._sleep_fn = lambda seconds: setattr(
+                self, "now", self.now + seconds
+            )
+
+        @contextmanager
+        def request_scope(self, scope):
+            yield self
+
+        def place_order(self, payload):
+            self.payloads.append(dict(payload))
+            return {
+                "code": "0",
+                "data": {"ordId": "resume-order-1", "posId": "resume-pos-1"},
+            }
+
+        def list_positions(self, *, inst_id=None):
+            if not self.payloads:
+                return []
+            return [{
+                "posId": "resume-pos-1",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "pos": "10",
+                "avgPx": "59800",
+                "mrgPosition": "split",
+                "mgnMode": "cross",
+            }]
+
+        def list_order_history(self, *, inst_id=None):
+            if not self.payloads:
+                return []
+            return [{
+                "ordId": "resume-order-1",
+                "clOrdId": self.payloads[0]["clOrdId"],
+                "instId": "BTC-USDT-SWAP",
+                "posId": "resume-pos-1",
+                "posSide": "short",
+                "state": "filled",
+            }]
+
+    client = ResumeClient()
+    original_transition = submitter.transition_execution_operation
+    crashed = False
+
+    def crash_after_post(*args, **kwargs):
+        nonlocal crashed
+        if kwargs.get("state") == "entry_pending_readback" and not crashed:
+            crashed = True
+            raise RuntimeError("crash_after_market_post")
+        return original_transition(*args, **kwargs)
+
+    monkeypatch.setattr(
+        submitter,
+        "transition_execution_operation",
+        crash_after_post,
+    )
+    submitted_at = datetime(2026, 8, 13, 8, 0, tzinfo=UTC)
+    with pytest.raises(RuntimeError, match="crash_after_market_post"):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            processed_at=submitted_at,
+        )
+    monkeypatch.setattr(
+        submitter,
+        "transition_execution_operation",
+        original_transition,
+    )
+
+    result = _submit_recovery_signal_direct(
+        session_factory,
+        trade_signal=load_trade_signal(session_factory, signal.id),
+        deepcoin_client=client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        submitted_at=submitted_at,
+    )
+
+    assert result["submitted"] is True
+    assert len(client.payloads) == 1
+    with session_factory() as session:
+        parent = (
+            session.query(DeepcoinExecutionOperation)
+            .filter(DeepcoinExecutionOperation.parent_operation_id.is_(None))
+            .one()
+        )
+    assert parent.state == "protected"
 
 
 def test_market_submit_defers_take_profit_until_verified_backup_stop(tmp_path):

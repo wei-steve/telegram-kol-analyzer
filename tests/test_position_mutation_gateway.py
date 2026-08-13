@@ -580,6 +580,39 @@ def test_set_sltp_uses_exact_position_and_verified_binding_modes(tmp_path):
     ]
 
 
+def test_protected_entry_writer_boundary_runs_only_after_final_gate(tmp_path):
+    session_factory, binding_id, leg_id, _, _ = _seed(tmp_path)
+    client = FakeDeepcoinClient()
+    boundary_calls = []
+    gateway = PositionMutationGateway(
+        session_factory=session_factory,
+        deepcoin_client=client,
+        live_execution_gate=lambda: False,
+        now_provider=lambda: NOW,
+    )
+
+    result = gateway.set_exact_position_sltp(
+        authority=_authority(
+            binding_id=binding_id,
+            leg_id=leg_id,
+            position=SISTER_POSITION,
+            strategy="strategy-sister",
+        ),
+        purpose="stop_loss",
+        trigger_price="62000",
+        size="0",
+        idempotency_key="protected-entry:writer-boundary",
+        before_exchange_submit=lambda intent_id: boundary_calls.append(
+            intent_id
+        ),
+    )
+
+    assert result.status == "blocked"
+    assert result.reason == "live_execution_disabled"
+    assert boundary_calls == []
+    assert client.set_position_sltp_calls == []
+
+
 def test_submitted_set_intent_is_confirmed_only_by_exact_pending_readback(
     tmp_path,
 ):
@@ -747,6 +780,68 @@ def test_require_readback_confirms_intent_and_ledger_atomically(tmp_path):
         assert ledger.execution_binding_id == binding_id
         assert ledger.execution_order_leg_id == leg_id
         assert ledger.status == "verified"
+
+
+def test_protected_entry_market_protection_readback_polls_bounded_without_repeating_writer(
+    tmp_path,
+):
+    session_factory, _, _, _, _ = _seed(tmp_path)
+
+    class Clock:
+        def __init__(self):
+            self.now = 100.0
+            self.sleeps = []
+
+        def __call__(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.sleeps.append(seconds)
+            self.now += seconds
+
+    class DelayedReadbackClient(FakeDeepcoinClient):
+        def __init__(self):
+            super().__init__()
+            self.readback_calls = 0
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            self.readback_calls += 1
+            if self.readback_calls < 3:
+                return []
+            return [{
+                "ordId": "ord-new-stop",
+                "instId": inst_id,
+                "posId": "pos-sister",
+                "posSide": "long",
+                "slTriggerPx": "62000",
+                "sz": "0",
+            }]
+
+    clock = Clock()
+    client = DelayedReadbackClient()
+
+    response = submit_exact_position_sltp(
+        session_factory=session_factory,
+        deepcoin_client=client,
+        pos_id="pos-sister",
+        payload={
+            "instId": "BTC-USDT-SWAP",
+            "slTriggerPx": "62000",
+            "sz": "0",
+        },
+        idempotency_key="protected-entry:readback:bounded",
+        live_execution_gate=lambda: True,
+        now_provider=lambda: NOW,
+        require_readback=True,
+        readback_deadline_monotonic=110.0,
+        monotonic_factory=clock,
+        sleep_fn=clock.sleep,
+    )
+
+    assert response["data"]["ordId"] == "ord-new-stop"
+    assert len(client.set_position_sltp_calls) == 1
+    assert client.readback_calls == 3
+    assert clock.sleeps == [0.5, 1.0]
 
 
 def test_require_readback_is_restart_idempotent_after_confirmation(tmp_path):

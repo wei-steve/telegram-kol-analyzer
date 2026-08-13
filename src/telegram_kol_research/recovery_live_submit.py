@@ -10,7 +10,7 @@ from copy import deepcopy
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import wraps
 from threading import RLock
 from typing import Any
@@ -18,6 +18,7 @@ from typing import Any
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
+from telegram_kol_research.deepcoin_client import DeepcoinRequestScope
 from telegram_kol_research.deepcoin_client import DeepcoinDefiniteRejection
 from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
@@ -28,6 +29,16 @@ from telegram_kol_research.entry_strategy_assembly import (
     canonical_entry_assembly_fingerprint,
 )
 from telegram_kol_research.deepcoin_execution_actions import execute_deepcoin_management_signal
+from telegram_kol_research.deepcoin_execution_operations import (
+    DeepcoinOperationConflict,
+    ExecutionOperationRecord,
+    advance_account_write_generation,
+    load_operation_bundle,
+    record_request_attempt,
+    reserve_execution_operation,
+    transition_execution_operation,
+)
+from telegram_kol_research.deepcoin_request_policy import RequestPriority
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord
 from telegram_kol_research.execution_bindings import ExecutionOrderLegRecord
 from telegram_kol_research.execution_bindings import upsert_execution_binding
@@ -35,14 +46,17 @@ from telegram_kol_research.execution_bindings import upsert_execution_order_leg
 from telegram_kol_research.execution_events import ExecutionEventRecord
 from telegram_kol_research.execution_events import record_execution_event
 from telegram_kol_research.models import EntryStrategyAssembly
+from telegram_kol_research.models import DeepcoinExecutionOperation
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
+from telegram_kol_research.models import PositionMutationIntent
 from telegram_kol_research.models import InstructionExecutionContract
 from telegram_kol_research.models import StrategyRevisionBatch
 from telegram_kol_research.models import StrategyRevisionLeg
 from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.models import TriggerProtectionIntent
+from telegram_kol_research.models import TradeSignal
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 from telegram_kol_research.position_protection_legs import (
     bind_parent_entry_order,
@@ -76,7 +90,11 @@ from telegram_kol_research.trade_signals import load_or_create_trade_signal
 from telegram_kol_research.trade_signals import load_trade_signal
 from telegram_kol_research.trade_signals import mark_trade_signal_failed
 from telegram_kol_research.trade_signals import mark_trade_signal_submitted
-from telegram_kol_research.trading_settings import load_trading_settings
+from telegram_kol_research.trading_settings import (
+    PROTECTED_ENTRY_CONTRACT_VERSION,
+    load_trading_settings,
+    protected_entry_mode_for_signal,
+)
 from telegram_kol_research.source_message_deletion import (
     serialized_source_message_execution,
     source_identity_execution_barrier,
@@ -88,6 +106,16 @@ from telegram_kol_research.take_profit_plan import build_take_profit_plan
 
 class RecoveryLiveSubmitError(RuntimeError):
     """Raised when a live recovery order cannot be submitted safely."""
+
+
+@dataclass(slots=True)
+class _ProtectedEntryRuntime:
+    operation: ExecutionOperationRecord
+    deadline_monotonic: float
+    monotonic_factory: Any
+    sleep_fn: Any
+    uid_scope_hash: str
+    pre_submit_position_refs: frozenset[str]
 
 
 @dataclass(slots=True)
@@ -148,6 +176,49 @@ def _entry_submission_failure_status(
     if isinstance(exc, DeepcoinDefiniteRejection):
         return "failed"
     return "unknown_exchange_outcome"
+
+
+def _protected_entry_writer_owns_signal(
+    session_factory: sessionmaker,
+    *,
+    signal_id: int,
+) -> bool:
+    with session_factory() as session:
+        return (
+            session.query(DeepcoinExecutionOperation.id)
+            .filter(
+                DeepcoinExecutionOperation.trade_signal_id == int(signal_id),
+                DeepcoinExecutionOperation.contract_version
+                == PROTECTED_ENTRY_CONTRACT_VERSION,
+                DeepcoinExecutionOperation.parent_operation_id.is_(None),
+                DeepcoinExecutionOperation.writer_attempted_at.is_not(None),
+            )
+            .first()
+            is not None
+        )
+
+
+def _mark_protected_entry_signal_blocked(
+    session_factory: sessionmaker,
+    *,
+    signal_id: int,
+    error: str,
+    failed_at: datetime,
+    terminal_status: str,
+) -> None:
+    """Project a v1 live/unknown failure without invalidating its lifecycle."""
+
+    with session_factory() as session:
+        row = session.get(TradeSignal, int(signal_id))
+        if row is None or row.status != "processing":
+            raise RecoveryLiveSubmitError(
+                "protected_entry_signal_state_conflict"
+            )
+        row.status = terminal_status
+        row.last_error = str(error)[:4096]
+        row.attempts = int(row.attempts or 0) + 1
+        row.updated_at = failed_at
+        session.commit()
 
 
 def _require_synchronized_finalized_entry_assembly(
@@ -960,17 +1031,30 @@ def process_trade_signal_live(
         if isinstance(exc, EntrySubmissionProgressError):
             failure = exc.cause
             submission_progress = exc.progress
-        mark_trade_signal_failed(
+        terminal_status = _entry_submission_failure_status(
+            failure,
+            progress=submission_progress,
+        )
+        if _protected_entry_writer_owns_signal(
             session_factory,
             signal_id=signal_id,
-            error=str(failure),
-            failed_at=execution_boundary_at,
-            expected_status="processing",
-            terminal_status=_entry_submission_failure_status(
-                failure,
-                progress=submission_progress,
-            ),
-        )
+        ):
+            _mark_protected_entry_signal_blocked(
+                session_factory,
+                signal_id=signal_id,
+                error=str(failure),
+                failed_at=execution_boundary_at,
+                terminal_status=terminal_status,
+            )
+        else:
+            mark_trade_signal_failed(
+                session_factory,
+                signal_id=signal_id,
+                error=str(failure),
+                failed_at=execution_boundary_at,
+                expected_status="processing",
+                terminal_status=terminal_status,
+            )
         _project_instruction_entry_submission(
             session_factory,
             trade_signal=trade_signal,
@@ -1137,6 +1221,972 @@ def _require_current_contract_spec_matches_queued(
         raise RecoveryLiveSubmitError("queued_contract_spec_snapshot_mismatch")
 
 
+def _protected_entry_operation_key(
+    trade_signal_id: int,
+    leg_index: int,
+    *,
+    protection_index: int | None = None,
+) -> str:
+    suffix = (
+        f"protection:{protection_index}"
+        if protection_index is not None
+        else "entry"
+    )
+    return (
+        f"protected-entry:v1:signal:{int(trade_signal_id)}:"
+        f"leg:{int(leg_index)}:{suffix}"
+    )
+
+
+def _canonical_fingerprint(value: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        dict(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _protected_position_ref(pos_id: str) -> str:
+    return hashlib.sha256(f"position:{pos_id}".encode("utf-8")).hexdigest()
+
+
+def _operation_evidence(operation: ExecutionOperationRecord) -> dict[str, Any]:
+    try:
+        evidence = json.loads(operation.evidence_json)
+    except (json.JSONDecodeError, TypeError, RecursionError):
+        raise RecoveryLiveSubmitError(
+            "protected_entry_operation_evidence_invalid"
+        )
+    if not isinstance(evidence, dict):
+        raise RecoveryLiveSubmitError(
+            "protected_entry_operation_evidence_invalid"
+        )
+    return evidence
+
+
+def _baseline_position_refs(
+    operation: ExecutionOperationRecord,
+) -> frozenset[str]:
+    values = _operation_evidence(operation).get("pre_submit_position_refs")
+    if (
+        not isinstance(values, list)
+        or any(
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in values
+        )
+        or values != sorted(set(values))
+    ):
+        raise RecoveryLiveSubmitError(
+            "protected_entry_baseline_evidence_invalid"
+        )
+    return frozenset(values)
+
+
+def _require_protected_entry_client(
+    deepcoin_client: DeepcoinTradingClientProtocol,
+) -> None:
+    uid_scope_hash = getattr(deepcoin_client, "uid_scope_hash", None)
+    if (
+        not isinstance(uid_scope_hash, str)
+        or len(uid_scope_hash) != 64
+        or any(character not in "0123456789abcdef" for character in uid_scope_hash)
+        or not callable(getattr(deepcoin_client, "request_scope", None))
+        or not callable(getattr(deepcoin_client, "list_order_history", None))
+    ):
+        raise RecoveryLiveSubmitError(
+            "protected_entry_client_contract_unavailable"
+        )
+
+
+def _protected_client_clock(deepcoin_client: Any):
+    clock = getattr(deepcoin_client, "_monotonic_factory", None)
+    return clock if callable(clock) else time.monotonic
+
+
+def _protected_client_sleep(deepcoin_client: Any):
+    sleeper = getattr(deepcoin_client, "_sleep_fn", None)
+    return sleeper if callable(sleeper) else time.sleep
+
+
+def _attempt_recorder(
+    session_factory: sessionmaker,
+    *,
+    operation: ExecutionOperationRecord,
+    uid_scope_hash: str,
+):
+    def record(fact) -> None:
+        completed_at = datetime.now(UTC)
+        started_at = completed_at - timedelta(
+            milliseconds=max(0, int(fact.latency_ms))
+        )
+        record_request_attempt(
+            session_factory,
+            operation_id=operation.id,
+            expected_operation_key=operation.operation_key,
+            expected_request_fingerprint=operation.request_fingerprint,
+            uid_scope_hash=uid_scope_hash,
+            fact=fact,
+            started_at=started_at,
+            completed_at=completed_at,
+        )
+
+    return record
+
+
+def _protected_request_scope(
+    session_factory: sessionmaker,
+    *,
+    runtime: _ProtectedEntryRuntime,
+    operation: ExecutionOperationRecord,
+    phase: str,
+) -> DeepcoinRequestScope:
+    return DeepcoinRequestScope(
+        phase=phase,
+        priority=RequestPriority.CRITICAL,
+        deadline_monotonic=runtime.deadline_monotonic,
+        correlation_id=operation.operation_key,
+        attempt_recorder=_attempt_recorder(
+            session_factory,
+            operation=operation,
+            uid_scope_hash=runtime.uid_scope_hash,
+        ),
+    )
+
+
+def _transition_protected_operation(
+    session_factory: sessionmaker,
+    operation: ExecutionOperationRecord,
+    *,
+    phase: str,
+    state: str,
+    certainty: str,
+    reason_code: str,
+    evidence: Mapping[str, Any],
+    changed_at: datetime,
+    writer_attempted_at: datetime | None = None,
+    completed_at: datetime | None = None,
+    error_category: str | None = None,
+) -> ExecutionOperationRecord:
+    return transition_execution_operation(
+        session_factory,
+        operation_id=operation.id,
+        expected_operation_key=operation.operation_key,
+        expected_state=operation.state,
+        expected_state_version=operation.state_version,
+        phase=phase,
+        state=state,
+        outcome_certainty=certainty,
+        error_category=error_category,
+        reason_code=reason_code,
+        writer_attempted_at=writer_attempted_at,
+        completed_at=completed_at,
+        evidence=dict(evidence),
+        updated_at=changed_at,
+    )
+
+
+def _reserve_protected_entry_parent(
+    session_factory: sessionmaker,
+    *,
+    trade_signal: TradeSignalRecord,
+    leg: Mapping[str, Any],
+    leg_index: int,
+    order_payload: Mapping[str, Any],
+    submitted_at: datetime,
+    deadline_at: datetime,
+    pre_submit_position_refs: frozenset[str],
+) -> ExecutionOperationRecord:
+    operation_key = _protected_entry_operation_key(
+        trade_signal.id,
+        leg_index,
+    )
+    request_fingerprint = _canonical_fingerprint(order_payload)
+    economics_fingerprint = _canonical_fingerprint(
+        {
+            "instrument_id": order_payload.get("instId"),
+            "side": order_payload.get("side"),
+            "position_side": order_payload.get("posSide"),
+            "quantity": order_payload.get("sz"),
+            "client_order_id": order_payload.get("clOrdId"),
+            "leg_index": leg_index,
+        }
+    )
+    with session_factory() as session:
+        existing_id = (
+            session.query(DeepcoinExecutionOperation.id)
+            .filter(
+                DeepcoinExecutionOperation.operation_key == operation_key
+            )
+            .scalar()
+        )
+    if existing_id is not None:
+        existing = load_operation_bundle(
+            session_factory,
+            operation_id=int(existing_id),
+        ).operation
+        if (
+            existing.trade_signal_id != trade_signal.id
+            or existing.parent_operation_id is not None
+            or existing.contract_version != PROTECTED_ENTRY_CONTRACT_VERSION
+            or existing.request_fingerprint != request_fingerprint
+            or existing.economics_fingerprint != economics_fingerprint
+        ):
+            raise DeepcoinOperationConflict("operation_identity_conflict")
+        _baseline_position_refs(existing)
+        return existing
+    operation = reserve_execution_operation(
+        session_factory,
+        operation_key=operation_key,
+        trade_signal_id=trade_signal.id,
+        contract_version=PROTECTED_ENTRY_CONTRACT_VERSION,
+        phase="entry_preflight",
+        state="planned",
+        outcome_certainty="not_sent",
+        request_fingerprint=request_fingerprint,
+        economics_fingerprint=economics_fingerprint,
+        deadline_at=deadline_at,
+        evidence={
+            "contract_version": PROTECTED_ENTRY_CONTRACT_VERSION,
+            "leg_index": leg_index,
+            "client_order_ref": hashlib.sha256(
+                str(order_payload.get("clOrdId") or "").encode("utf-8")
+            ).hexdigest(),
+            "pre_submit_position_refs": sorted(pre_submit_position_refs),
+        },
+        created_at=submitted_at,
+    )
+    if operation.state == "planned":
+        operation = _transition_protected_operation(
+            session_factory,
+            operation,
+            phase="entry_preflight",
+            state="entry_prepared",
+            certainty="not_sent",
+            reason_code="entry_intent_prepared",
+            evidence={
+                "leg_index": leg_index,
+                "writer_attempted": False,
+                "pre_submit_position_refs": sorted(
+                    pre_submit_position_refs
+                ),
+            },
+            changed_at=submitted_at,
+        )
+    return operation
+
+
+def _protected_entry_writer_allowed(
+    session_factory: sessionmaker,
+    *,
+    trade_signal_id: int,
+) -> bool:
+    settings = load_trading_settings(session_factory)
+    return (
+        protected_entry_mode_for_signal(settings, int(trade_signal_id))
+        == "live"
+    )
+
+
+def _submit_protected_market_entry(
+    *,
+    session_factory: sessionmaker,
+    trade_signal: TradeSignalRecord,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    draft: dict[str, Any],
+    leg: Mapping[str, Any],
+    leg_index: int,
+    side: str,
+    source: Mapping[str, Any],
+    order_payload: Mapping[str, Any],
+    progress: EntrySubmissionProgress,
+    submitted_at: datetime,
+) -> tuple[dict[str, Any], str, str, _ProtectedEntryRuntime]:
+    clock = _protected_client_clock(deepcoin_client)
+    sleeper = _protected_client_sleep(deepcoin_client)
+    deadline_monotonic = float(clock()) + 10.0
+    deadline_at = submitted_at + timedelta(seconds=10)
+    uid_scope_hash = str(getattr(deepcoin_client, "uid_scope_hash"))
+    preflight_scope = DeepcoinRequestScope(
+        phase="entry_preflight",
+        priority=RequestPriority.CRITICAL,
+        deadline_monotonic=deadline_monotonic,
+        correlation_id=(
+            f"protected-entry:v1:signal:{trade_signal.id}:"
+            f"leg:{leg_index}:preflight"
+        ),
+    )
+    with deepcoin_client.request_scope(preflight_scope):
+        pre_submit_position_ids = _load_matching_position_ids(
+            deepcoin_client,
+            draft=draft,
+            side=side,
+        )
+    current_position_refs = frozenset(
+        _protected_position_ref(pos_id)
+        for pos_id in pre_submit_position_ids
+    )
+    operation = _reserve_protected_entry_parent(
+        session_factory,
+        trade_signal=trade_signal,
+        leg=leg,
+        leg_index=leg_index,
+        order_payload=order_payload,
+        submitted_at=submitted_at,
+        deadline_at=deadline_at,
+        pre_submit_position_refs=current_position_refs,
+    )
+    pre_submit_position_refs = _baseline_position_refs(operation)
+    runtime = _ProtectedEntryRuntime(
+        operation=operation,
+        deadline_monotonic=deadline_monotonic,
+        monotonic_factory=clock,
+        sleep_fn=sleeper,
+        uid_scope_hash=uid_scope_hash,
+        pre_submit_position_refs=pre_submit_position_refs,
+    )
+    if operation.writer_attempted_at is None:
+        if operation.state != "entry_prepared" or not _protected_entry_writer_allowed(
+            session_factory,
+            trade_signal_id=trade_signal.id,
+        ):
+            raise RecoveryLiveSubmitError(
+                "protected_entry_submit_not_authorized"
+            )
+        try:
+            with _entry_source_exchange_write_gate(
+                session_factory,
+                trade_signal=trade_signal,
+                source=dict(source),
+            ):
+                advance_account_write_generation(
+                    session_factory,
+                    uid_scope_hash=uid_scope_hash,
+                )
+                try:
+                    if not _protected_entry_writer_allowed(
+                        session_factory,
+                        trade_signal_id=trade_signal.id,
+                    ):
+                        raise RecoveryLiveSubmitError(
+                            "protected_entry_submit_not_authorized"
+                        )
+                    attempted_at = datetime.now(UTC)
+                    operation = _transition_protected_operation(
+                        session_factory,
+                        operation,
+                        phase="entry_submit",
+                        state="entry_submitting",
+                        certainty="not_sent",
+                        reason_code="entry_submit_authorized",
+                        evidence={
+                            "leg_index": leg_index,
+                            "writer_attempted": True,
+                            "pre_submit_position_refs": sorted(
+                                pre_submit_position_refs
+                            ),
+                        },
+                        changed_at=attempted_at,
+                        writer_attempted_at=attempted_at,
+                    )
+                    runtime.operation = operation
+                    progress.record_attempt()
+                    with deepcoin_client.request_scope(
+                        _protected_request_scope(
+                            session_factory,
+                            runtime=runtime,
+                            operation=operation,
+                            phase="entry_submit",
+                        )
+                    ):
+                        response = deepcoin_client.place_order(dict(order_payload))
+                finally:
+                    advance_account_write_generation(
+                        session_factory,
+                        uid_scope_hash=uid_scope_hash,
+                    )
+        except DeepcoinDefiniteRejection:
+            if runtime.operation.writer_attempted_at is None:
+                raise
+            runtime.operation = _transition_protected_operation(
+                session_factory,
+                runtime.operation,
+                phase="entry_submit",
+                state="entry_rejected",
+                certainty="rejected",
+                error_category="business_rejected",
+                reason_code="entry_submission_rejected",
+                evidence={
+                    "leg_index": leg_index,
+                    "pre_submit_position_refs": sorted(
+                        pre_submit_position_refs
+                    ),
+                },
+                changed_at=datetime.now(UTC),
+            )
+            raise
+        except DeepcoinRequestOutcomeUnknown:
+            if runtime.operation.writer_attempted_at is None:
+                raise
+            runtime.operation = _transition_protected_operation(
+                session_factory,
+                runtime.operation,
+                phase="entry_readback",
+                state="entry_unknown",
+                certainty="unknown",
+                reason_code="entry_submission_unknown",
+                evidence={
+                    "leg_index": leg_index,
+                    "pre_submit_position_refs": sorted(
+                        pre_submit_position_refs
+                    ),
+                },
+                changed_at=datetime.now(UTC),
+            )
+            raise
+        except Exception as exc:
+            if runtime.operation.writer_attempted_at is None:
+                raise
+            runtime.operation = _transition_protected_operation(
+                session_factory,
+                runtime.operation,
+                phase="entry_readback",
+                state="entry_unknown",
+                certainty="unknown",
+                reason_code="entry_submission_unknown",
+                evidence={
+                    "leg_index": leg_index,
+                    "pre_submit_position_refs": sorted(
+                        pre_submit_position_refs
+                    ),
+                },
+                changed_at=datetime.now(UTC),
+            )
+            raise DeepcoinRequestOutcomeUnknown(
+                "protected_entry_writer_outcome_unknown"
+            ) from exc
+        operation = _transition_protected_operation(
+            session_factory,
+            runtime.operation,
+            phase="entry_readback",
+            state="entry_pending_readback",
+            certainty="accepted",
+            reason_code="entry_submission_accepted",
+            evidence={
+                "leg_index": leg_index,
+                "pre_submit_position_refs": sorted(
+                    pre_submit_position_refs
+                ),
+            },
+            changed_at=datetime.now(UTC),
+        )
+        runtime.operation = operation
+    else:
+        response = {}
+        if operation.state not in {
+            "entry_submitting",
+            "entry_pending_readback",
+            "entry_unknown",
+        }:
+            raise RecoveryLiveSubmitError(
+                "protected_entry_operation_state_conflict"
+            )
+
+    readback = _poll_protected_market_entry_readback(
+        session_factory=session_factory,
+        deepcoin_client=deepcoin_client,
+        runtime=runtime,
+        operation=runtime.operation,
+        draft=draft,
+        side=side,
+        order_payload=order_payload,
+        response=response,
+        exclude_position_refs=pre_submit_position_refs,
+    )
+    if readback is None:
+        raise DeepcoinRequestOutcomeUnknown(
+            "protected_entry_readback_pending"
+        )
+    order_id, pos_id = readback
+    runtime.operation = _transition_protected_operation(
+        session_factory,
+        runtime.operation,
+        phase="entry_readback",
+        state="entry_confirmed",
+        certainty="confirmed",
+        reason_code="entry_readback_confirmed",
+        evidence={
+            "leg_index": leg_index,
+            "order_ref": hashlib.sha256(
+                f"order:{order_id}".encode("utf-8")
+            ).hexdigest(),
+            "position_ref": hashlib.sha256(
+                f"position:{pos_id}".encode("utf-8")
+            ).hexdigest(),
+            "pre_submit_position_refs": sorted(
+                pre_submit_position_refs
+            ),
+        },
+        changed_at=datetime.now(UTC),
+    )
+    progress.record_confirmed_leg()
+    return dict(response), order_id, pos_id, runtime
+
+
+def _poll_protected_market_entry_readback(
+    *,
+    session_factory: sessionmaker,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    runtime: _ProtectedEntryRuntime,
+    operation: ExecutionOperationRecord,
+    draft: dict[str, Any],
+    side: str,
+    order_payload: Mapping[str, Any],
+    response: Mapping[str, Any],
+    exclude_position_refs: frozenset[str],
+) -> tuple[str, str] | None:
+    response_order_id = _extract_exact_market_order_id(dict(response))
+    response_pos_id = _extract_position_id(dict(response))
+    client_order_id = str(order_payload.get("clOrdId") or "")
+    for delay in (0.0, 0.5, 1.0, 2.0, 3.0):
+        remaining = runtime.deadline_monotonic - float(
+            runtime.monotonic_factory()
+        )
+        if remaining <= 0 or delay >= remaining:
+            break
+        if delay:
+            runtime.sleep_fn(delay)
+        try:
+            with deepcoin_client.request_scope(
+                _protected_request_scope(
+                    session_factory,
+                    runtime=runtime,
+                    operation=operation,
+                    phase="entry_readback",
+                )
+            ):
+                history = deepcoin_client.list_order_history(
+                    inst_id=str(draft["instrument_id"])
+                )
+                positions = deepcoin_client.list_positions(
+                    inst_id=str(draft["instrument_id"])
+                )
+        except Exception:
+            continue
+        matching_orders = [
+            row
+            for row in history
+            if isinstance(row, Mapping)
+            and _protected_entry_order_matches(
+                row,
+                instrument_id=str(draft["instrument_id"]),
+                side=side,
+                order_id=response_order_id,
+                client_order_id=client_order_id,
+            )
+        ]
+        if len(matching_orders) != 1:
+            continue
+        order_row = matching_orders[0]
+        order_id = str(order_row.get("ordId") or "")
+        preferred_pos_id = str(
+            order_row.get("posId") or response_pos_id or ""
+        )
+        if not order_id or not preferred_pos_id:
+            continue
+        candidate_positions = [
+            position
+            for position in positions
+            if (
+                position_id := _first_payload_string(
+                    position, "posId", "pos_id", "id"
+                )
+            )
+            and _protected_position_ref(position_id)
+            not in exclude_position_refs
+        ]
+        position = _select_matching_position(
+            candidate_positions,
+            draft=draft,
+            side=side,
+            preferred_pos_id=preferred_pos_id,
+        )
+        pos_id = (
+            _first_payload_string(position, "posId", "pos_id", "id")
+            if position is not None
+            else None
+        )
+        if pos_id == preferred_pos_id:
+            return order_id, pos_id
+    return None
+
+
+def _protected_entry_order_matches(
+    row: Mapping[str, Any],
+    *,
+    instrument_id: str,
+    side: str,
+    order_id: str | None,
+    client_order_id: str,
+) -> bool:
+    row_order_id = str(row.get("ordId") or "")
+    row_client_id = str(row.get("clOrdId") or "")
+    row_side = str(row.get("posSide") or "").lower()
+    status = str(row.get("state") or row.get("status") or "").lower()
+    return (
+        bool(row_order_id)
+        and bool(client_order_id)
+        and row_client_id == client_order_id
+        and (order_id is None or row_order_id == order_id)
+        and str(row.get("instId") or "").upper() == instrument_id.upper()
+        and row_side == side.lower()
+        and status not in {"cancelled", "canceled", "rejected", "failed"}
+    )
+
+
+def _load_protected_entry_leg_id(
+    session_factory: sessionmaker,
+    *,
+    binding_id: int,
+    leg_index: int,
+    pos_id: str,
+) -> int:
+    with session_factory() as session:
+        rows = (
+            session.query(ExecutionOrderLeg)
+            .filter(
+                ExecutionOrderLeg.execution_binding_id == int(binding_id),
+                ExecutionOrderLeg.leg_index == int(leg_index),
+                ExecutionOrderLeg.purpose == "entry",
+                ExecutionOrderLeg.pos_id == str(pos_id),
+            )
+            .all()
+        )
+        if len(rows) != 1:
+            raise RecoveryLiveSubmitError(
+                "protected_entry_execution_leg_missing"
+            )
+        return int(rows[0].id)
+
+
+def _position_mutation_intent_status(
+    session_factory: sessionmaker,
+    intent_id: int | None,
+) -> str | None:
+    if type(intent_id) is not int or intent_id <= 0:
+        return None
+    with session_factory() as session:
+        return session.query(PositionMutationIntent.status).filter(
+            PositionMutationIntent.id == intent_id
+        ).scalar()
+
+
+def _submit_protected_entry_protections(
+    *,
+    session_factory: sessionmaker,
+    trade_signal: TradeSignalRecord,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    parent: _ProtectedEntryRuntime,
+    binding_id: int,
+    leg_index: int,
+    pos_id: str,
+    payloads: list[dict[str, Any]],
+    submitted_at: datetime,
+) -> list[Mapping[str, Any]]:
+    if not payloads:
+        raise RecoveryLiveSubmitError(
+            "protected_entry_protection_requirements_missing"
+        )
+    execution_leg_id = _load_protected_entry_leg_id(
+        session_factory,
+        binding_id=binding_id,
+        leg_index=leg_index,
+        pos_id=pos_id,
+    )
+    parent.operation = _transition_protected_operation(
+        session_factory,
+        parent.operation,
+        phase="protection_submit",
+        state="protection_prepared",
+        certainty="confirmed",
+        reason_code="protection_intents_prepared",
+        evidence={
+            "required_protection_count": len(payloads),
+            "confirmed_protection_count": 0,
+            "pre_submit_position_refs": sorted(
+                parent.pre_submit_position_refs
+            ),
+        },
+        changed_at=datetime.now(UTC),
+    )
+    children = []
+    for protection_index, payload in enumerate(payloads):
+        children.append(
+            reserve_execution_operation(
+                session_factory,
+                operation_key=_protected_entry_operation_key(
+                    trade_signal.id,
+                    leg_index,
+                    protection_index=protection_index,
+                ),
+                trade_signal_id=trade_signal.id,
+                parent_operation_id=parent.operation.id,
+                execution_binding_id=binding_id,
+                execution_order_leg_id=execution_leg_id,
+                contract_version=PROTECTED_ENTRY_CONTRACT_VERSION,
+                phase="protection_submit",
+                state="protection_prepared",
+                outcome_certainty="not_sent",
+                request_fingerprint=_canonical_fingerprint(payload),
+                economics_fingerprint=_canonical_fingerprint(
+                    {
+                        "purpose": (
+                            "stop_loss"
+                            if protection_index == 0
+                            else "backup_stop"
+                        ),
+                        "trigger_price": payload.get("slTriggerPx")
+                        or payload.get("tpTriggerPx"),
+                        "size": payload.get("sz"),
+                        "pos_id": pos_id,
+                    }
+                ),
+                deadline_at=parent.operation.deadline_at,
+                evidence={
+                    "protection_index": protection_index,
+                    "required_protection_count": len(payloads),
+                },
+                created_at=submitted_at,
+            )
+        )
+    responses: list[Mapping[str, Any]] = []
+    for protection_index, (payload, child) in enumerate(
+        zip(payloads, children, strict=True)
+    ):
+        child_holder = {"operation": child, "intent_id": None}
+
+        def before_exchange_submit(intent_id: int) -> None:
+            operation = child_holder["operation"]
+            child_holder["intent_id"] = int(intent_id)
+            child_holder["operation"] = _transition_protected_operation(
+                session_factory,
+                operation,
+                phase="protection_submit",
+                state="protection_prepared",
+                certainty="not_sent",
+                reason_code="protection_submit_authorized",
+                evidence={
+                    "protection_index": protection_index,
+                    "position_mutation_intent_id": int(intent_id),
+                },
+                changed_at=datetime.now(UTC),
+                writer_attempted_at=datetime.now(UTC),
+            )
+
+        try:
+            submit_scope = _protected_request_scope(
+                session_factory,
+                runtime=parent,
+                operation=child,
+                phase="protection_submit",
+            )
+            readback_scope = _protected_request_scope(
+                session_factory,
+                runtime=parent,
+                operation=child,
+                phase="protection_readback",
+            )
+            with deepcoin_client.request_scope(submit_scope):
+                response = submit_exact_position_sltp(
+                    session_factory=session_factory,
+                    deepcoin_client=deepcoin_client,
+                    pos_id=pos_id,
+                    payload=payload,
+                    idempotency_key=(
+                        f"protected-entry:{trade_signal.id}:{leg_index}:"
+                        f"set:{protection_index}"
+                    ),
+                    live_execution_gate=lambda: (
+                        _protected_entry_writer_allowed(
+                            session_factory,
+                            trade_signal_id=trade_signal.id,
+                        )
+                        and exact_position_write_gate(
+                            session_factory,
+                            pos_id=pos_id,
+                        )
+                    ),
+                    now_provider=lambda: submitted_at,
+                    require_readback=True,
+                    ledger_purpose=(
+                        "stop_loss"
+                        if protection_index == 0
+                        else "backup_stop"
+                    ),
+                    before_exchange_submit=before_exchange_submit,
+                    readback_deadline_monotonic=parent.deadline_monotonic,
+                    monotonic_factory=parent.monotonic_factory,
+                    sleep_fn=parent.sleep_fn,
+                    readback_scope=readback_scope,
+                    before_exchange_write=lambda: (
+                        advance_account_write_generation(
+                            session_factory,
+                            uid_scope_hash=parent.uid_scope_hash,
+                        )
+                    ),
+                    after_exchange_write=lambda: (
+                        advance_account_write_generation(
+                            session_factory,
+                            uid_scope_hash=parent.uid_scope_hash,
+                        )
+                    ),
+                )
+            child = child_holder["operation"]
+            child = _transition_protected_operation(
+                session_factory,
+                child,
+                phase="protection_readback",
+                state="protection_pending_readback",
+                certainty="accepted",
+                reason_code="protection_submission_accepted",
+                evidence={
+                    "protection_index": protection_index,
+                    "position_mutation_intent_id": child_holder[
+                        "intent_id"
+                    ],
+                },
+                changed_at=datetime.now(UTC),
+            )
+            child = _transition_protected_operation(
+                session_factory,
+                child,
+                phase="protection_readback",
+                state="protected",
+                certainty="confirmed",
+                reason_code="protection_fully_confirmed",
+                evidence={
+                    "protection_index": protection_index,
+                    "position_mutation_intent_id": child_holder[
+                        "intent_id"
+                    ],
+                },
+                changed_at=datetime.now(UTC),
+                completed_at=datetime.now(UTC),
+            )
+            children[protection_index] = child
+            responses.append(response)
+        except DeepcoinDefiniteRejection:
+            child = child_holder["operation"]
+            if child.writer_attempted_at is not None:
+                children[protection_index] = _transition_protected_operation(
+                    session_factory,
+                    child,
+                    phase="protection_readback",
+                    state="recovery_required",
+                    certainty="rejected",
+                    error_category="business_rejected",
+                    reason_code="protection_submission_rejected",
+                    evidence={
+                        "protection_index": protection_index,
+                        "position_mutation_intent_id": child_holder[
+                            "intent_id"
+                        ],
+                    },
+                    changed_at=datetime.now(UTC),
+                )
+            _mark_parent_protection_recovery(
+                session_factory,
+                parent=parent,
+                reason_code="protection_submission_rejected",
+            )
+            raise
+        except Exception:
+            child = child_holder["operation"]
+            if child.writer_attempted_at is not None:
+                accepted_pending = (
+                    _position_mutation_intent_status(
+                        session_factory,
+                        child_holder["intent_id"],
+                    )
+                    == "submitted"
+                )
+                children[protection_index] = _transition_protected_operation(
+                    session_factory,
+                    child,
+                    phase="protection_readback",
+                    state=(
+                        "protection_pending_readback"
+                        if accepted_pending
+                        else "protection_unknown"
+                    ),
+                    certainty="accepted" if accepted_pending else "unknown",
+                    reason_code=(
+                        "protection_readback_pending"
+                        if accepted_pending
+                        else "protection_submission_unknown"
+                    ),
+                    evidence={
+                        "protection_index": protection_index,
+                        "position_mutation_intent_id": child_holder[
+                            "intent_id"
+                        ],
+                    },
+                    changed_at=datetime.now(UTC),
+                )
+            _mark_parent_protection_recovery(
+                session_factory,
+                parent=parent,
+                reason_code="protection_incomplete",
+            )
+            raise
+    parent.operation = _transition_protected_operation(
+        session_factory,
+        parent.operation,
+        phase="protection_readback",
+        state="protected",
+        certainty="confirmed",
+        reason_code="protection_fully_confirmed",
+        evidence={
+            "required_protection_count": len(children),
+            "confirmed_protection_count": len(children),
+            "pre_submit_position_refs": sorted(
+                parent.pre_submit_position_refs
+            ),
+        },
+        changed_at=datetime.now(UTC),
+    )
+    return responses
+
+
+def _mark_parent_protection_recovery(
+    session_factory: sessionmaker,
+    *,
+    parent: _ProtectedEntryRuntime,
+    reason_code: str,
+) -> None:
+    if parent.operation.state == "recovery_required":
+        return
+    parent.operation = _transition_protected_operation(
+        session_factory,
+        parent.operation,
+        phase="protection_readback",
+        state="recovery_required",
+        certainty="unknown",
+        reason_code=reason_code,
+        evidence={
+            "next_action": "supervision_only",
+            "pre_submit_position_refs": sorted(
+                parent.pre_submit_position_refs
+            ),
+        },
+        changed_at=datetime.now(UTC),
+    )
+
+
 @serialized_source_message_execution
 @_report_entry_submission_progress
 def _submit_recovery_signal_direct(
@@ -1193,6 +2243,14 @@ def _submit_recovery_signal_direct(
     symbol_key = str(draft.get("symbol") or trade_signal.symbol).upper()
     side_key = trade_signal.side.lower()
     warnings = _protection_warnings(draft)
+    protected_v1 = (
+        protected_entry_mode_for_signal(
+            load_trading_settings(session_factory),
+            trade_signal.id,
+        )
+        == "live"
+    )
+    protected_parent: _ProtectedEntryRuntime | None = None
 
     revision_indices = draft.get("authorized_leg_indices")
     if isinstance(revision_indices, list):
@@ -1220,6 +2278,16 @@ def _submit_recovery_signal_direct(
         selected_indices=selected_indices,
         submission_order_legs=submission_order_legs,
     )
+    if protected_v1:
+        first_leg = submission_order_legs[0]
+        if (
+            not isinstance(first_leg, Mapping)
+            or str(first_leg.get("order_type") or "").lower() != "market"
+        ):
+            raise RecoveryLiveSubmitError(
+                "protected_entry_market_first_leg_required"
+            )
+        _require_protected_entry_client(deepcoin_client)
     leg_index_offset = int(draft.get("_entry_leg_index_offset") or 0)
     for source_index, leg in zip(
         submission_indices,
@@ -1229,39 +2297,78 @@ def _submit_recovery_signal_direct(
         index = leg_index_offset + int(source_index)
         if not isinstance(leg, dict):
             raise RecoveryLiveSubmitError("invalid_order_leg")
+        if (
+            protected_v1
+            and source_index != submission_indices[0]
+            and (
+                protected_parent is None
+                or protected_parent.operation.state != "protected"
+            )
+        ):
+            raise RecoveryLiveSubmitError(
+                "protected_entry_protection_gate_closed"
+            )
         order_type = str(leg.get("order_type") or "").lower()
         if order_type == "market":
-            pre_submit_position_ids = _load_matching_position_ids(
-                deepcoin_client,
-                draft=draft,
-                side=side_key,
-            )
             order_payload = build_deepcoin_market_order_payload(draft, leg)
-            try:
-                with _entry_source_exchange_write_gate(
-                    session_factory,
+            if protected_v1:
+                if protected_parent is not None:
+                    raise RecoveryLiveSubmitError(
+                        "protected_entry_later_market_leg_requires_preflight"
+                    )
+                (
+                    response,
+                    order_id,
+                    pos_id,
+                    protected_parent,
+                ) = _submit_protected_market_entry(
+                    session_factory=session_factory,
                     trade_signal=trade_signal,
+                    deepcoin_client=deepcoin_client,
+                    draft=draft,
+                    leg=leg,
+                    leg_index=index,
+                    side=side_key,
                     source=source,
-                ):
-                    progress.record_attempt()
-                    response = deepcoin_client.place_order(order_payload)
-            except DeepcoinClientError:
-                raise
-            except Exception as exc:  # pragma: no cover - defensive boundary
-                raise DeepcoinClientError(f"Deepcoin client failed: {exc}") from exc
-
-            order_id = _extract_exact_market_order_id(response)
-            if not order_id:
-                raise DeepcoinRequestOutcomeUnknown(
-                    "market order response missing exact order id"
+                    order_payload=order_payload,
+                    progress=progress,
+                    submitted_at=now,
                 )
-            progress.record_confirmed_leg()
-            client_order_id = str(leg.get("client_order_id") or order_payload.get("clOrdId") or "")
-            pos_id = _extract_position_id(response) or _find_open_position_id(
-                deepcoin_client,
-                draft=draft,
-                side=side_key,
-                exclude_pos_ids=pre_submit_position_ids,
+            else:
+                pre_submit_position_ids = _load_matching_position_ids(
+                    deepcoin_client,
+                    draft=draft,
+                    side=side_key,
+                )
+                try:
+                    with _entry_source_exchange_write_gate(
+                        session_factory,
+                        trade_signal=trade_signal,
+                        source=source,
+                    ):
+                        progress.record_attempt()
+                        response = deepcoin_client.place_order(order_payload)
+                except DeepcoinClientError:
+                    raise
+                except Exception as exc:  # pragma: no cover - defensive boundary
+                    raise DeepcoinClientError(f"Deepcoin client failed: {exc}") from exc
+
+                order_id = _extract_exact_market_order_id(response)
+                if not order_id:
+                    raise DeepcoinRequestOutcomeUnknown(
+                        "market order response missing exact order id"
+                    )
+                progress.record_confirmed_leg()
+                pos_id = _extract_position_id(response) or _find_open_position_id(
+                    deepcoin_client,
+                    draft=draft,
+                    side=side_key,
+                    exclude_pos_ids=pre_submit_position_ids,
+                )
+            client_order_id = str(
+                leg.get("client_order_id")
+                or order_payload.get("clOrdId")
+                or ""
             )
             provisional_order = {
                 "leg_index": index,
@@ -1299,25 +2406,42 @@ def _submit_recovery_signal_direct(
                     position_size=float(leg.get("quantity") or 0),
                     include_take_profit=False,
                 )
-                protection_responses = []
-                for protection_index, payload in enumerate(protection_payloads):
-                    protection_responses.append(
-                        submit_exact_position_sltp(
-                            session_factory=session_factory,
-                            deepcoin_client=deepcoin_client,
-                            pos_id=str(pos_id),
-                            payload=payload,
-                            idempotency_key=(
-                                f"recovery:{trade_signal.id}:{index}:set:"
-                                f"{protection_index}"
-                            ),
-                            live_execution_gate=lambda: exact_position_write_gate(
-                                session_factory, pos_id=str(pos_id)
-                            ),
-                            now_provider=lambda: now,
-                            require_readback=True,
+                if protected_v1:
+                    if protected_parent is None:
+                        raise RecoveryLiveSubmitError(
+                            "protected_entry_parent_operation_missing"
                         )
+                    protection_responses = _submit_protected_entry_protections(
+                        session_factory=session_factory,
+                        trade_signal=trade_signal,
+                        deepcoin_client=deepcoin_client,
+                        parent=protected_parent,
+                        binding_id=provisional_binding_id,
+                        leg_index=index,
+                        pos_id=str(pos_id),
+                        payloads=protection_payloads,
+                        submitted_at=now,
                     )
+                else:
+                    protection_responses = []
+                    for protection_index, payload in enumerate(protection_payloads):
+                        protection_responses.append(
+                            submit_exact_position_sltp(
+                                session_factory=session_factory,
+                                deepcoin_client=deepcoin_client,
+                                pos_id=str(pos_id),
+                                payload=payload,
+                                idempotency_key=(
+                                    f"recovery:{trade_signal.id}:{index}:set:"
+                                    f"{protection_index}"
+                                ),
+                                live_execution_gate=lambda: exact_position_write_gate(
+                                    session_factory, pos_id=str(pos_id)
+                                ),
+                                now_provider=lambda: now,
+                                require_readback=True,
+                            )
+                        )
                 protection_payload = (
                     protection_payloads[0] if len(protection_payloads) == 1 else protection_payloads
                 )
@@ -1327,6 +2451,8 @@ def _submit_recovery_signal_direct(
                     else protection_responses
                 )
             except Exception as exc:  # pragma: no cover - defensive boundary
+                if protected_v1:
+                    raise
                 protection_payload = locals().get("protection_payloads") or locals().get("protection_payload")
                 protection_response = {"error": str(exc)}
                 warnings.append("position_protection_failed_after_entry_submitted")
