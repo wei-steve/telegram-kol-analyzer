@@ -22,11 +22,28 @@ def test_reconcile_cannot_cross_exchange_mutation_authority_boundary(tmp_path):
         assert release_mutation.wait(timeout=2)
 
     class FakeClient:
+        uid_scope_hash = "5" * 64
+
         def list_positions(self):
             reconcile_read_exchange.set()
             return []
 
         def list_open_orders(self):
+            return []
+
+        def list_position_history(self, *, inst_id, pos_id=None):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return []
+
+        def list_order_history(self, *, inst_id):
+            return []
+
+        def list_trade_fills(self, *, inst_id):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id):
             return []
 
     mutation_thread = Thread(target=simulated_exchange_mutation)

@@ -126,12 +126,19 @@ def test_contract_spec_refresh_publishes_and_prints_non_sensitive_summary(
     secret = "never-print-this-api-secret"
 
     class _Client:
+        closed = False
+
         def list_swap_instruments(self):
             return ROWS
 
+        def close(self):
+            self.closed = True
+
+    client = _Client()
+
     monkeypatch.setattr(
         "telegram_kol_research.cli.build_deepcoin_client_from_env",
-        lambda: _Client(),
+        lambda: client,
     )
     monkeypatch.setenv("DEEPCOIN_API_SECRET", secret)
 
@@ -161,6 +168,7 @@ def test_contract_spec_refresh_publishes_and_prints_non_sensitive_summary(
         cache_path,
         now=datetime.now(timezone.utc),
     ).source_digest_sha256 == payload["digest_sha256"]
+    assert client.closed is True
 
 
 def test_contract_spec_refresh_fails_nonzero_without_replacing_valid_cache(
@@ -172,12 +180,19 @@ def test_contract_spec_refresh_fails_nonzero_without_replacing_valid_cache(
     secret = "signed-request-secret"
 
     class _Client:
+        closed = False
+
         def list_swap_instruments(self):
             raise RuntimeError(f"upstream rejected {secret}")
 
+        def close(self):
+            self.closed = True
+
+    client = _Client()
+
     monkeypatch.setattr(
         "telegram_kol_research.cli.build_deepcoin_client_from_env",
-        lambda: _Client(),
+        lambda: client,
     )
 
     result = CliRunner().invoke(
@@ -203,6 +218,7 @@ def test_contract_spec_refresh_fails_nonzero_without_replacing_valid_cache(
         cache_path,
         now=datetime.now(timezone.utc),
     ) == previous
+    assert client.closed is True
 
 
 def test_contract_spec_refresh_rejects_non_positive_ttl_without_creating_cache(

@@ -1159,6 +1159,8 @@ def test_ready_claim_with_deterministic_pre_submit_failure_is_persistently_block
     result = run_strategy_management_worker_tick(
         session_factory,
         deepcoin_client_factory=lambda: object(),
+        snapshot_loader=lambda *_args, **_kwargs: object(),
+        restart_validator=lambda *_args, **_kwargs: None,
         executor=lambda *_args, **_kwargs: (_ for _ in ()).throw(
             ManagementBatchExecutionError("batch_binding_not_active_or_exact")
         ),

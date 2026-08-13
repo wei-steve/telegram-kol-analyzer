@@ -279,6 +279,8 @@ def _sol_position(pos_id="pos-b", *, size="10", side="short"):
 
 
 class _ReadOnlyDeepcoin:
+    uid_scope_hash = "f" * 64
+
     def __init__(self, positions, *, tpsl_orders=None):
         self.positions = list(positions)
         self.tpsl_orders = list(tpsl_orders or [])
@@ -296,6 +298,21 @@ class _ReadOnlyDeepcoin:
     def list_trigger_orders_pending(self, *, inst_id):
         self.tpsl_reads.append(inst_id)
         return [row for row in self.tpsl_orders if row.get("instId") == inst_id]
+
+    def list_open_orders(self, *, inst_id=None):
+        return []
+
+    def list_position_history(self, *, inst_id=None):
+        return []
+
+    def list_order_history(self, *, inst_id=None):
+        return []
+
+    def list_trade_fills(self, *, inst_id=None):
+        return []
+
+    def list_trigger_order_history(self, *, inst_id=None):
+        return []
 
     def get_ticker_quote(self, *, inst_id):
         self.ticker_reads.append(inst_id)

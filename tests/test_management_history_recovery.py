@@ -682,7 +682,7 @@ def test_read_only_reconciliation_snapshot_loader_does_not_persist_observations(
 
     result = load_deepcoin_execution_reconciliation_snapshot_read_only(
         session_factory,
-        client=object(),
+        client=SimpleNamespace(uid_scope_hash="4" * 64),
     )
 
     assert result is expected

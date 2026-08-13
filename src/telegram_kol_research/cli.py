@@ -402,6 +402,19 @@ def deepcoin_contract_specs_status(
     _echo_contract_spec_summary(summary)
 
 
+def _load_deepcoin_swap_instruments_once() -> list[dict[str, object]]:
+    client = build_deepcoin_client_from_env()
+    try:
+        return client.list_swap_instruments()
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+
 @deepcoin_contract_specs_app.command("refresh")
 def deepcoin_contract_specs_refresh(
     cache_path: Path = typer.Option(
@@ -420,9 +433,7 @@ def deepcoin_contract_specs_refresh(
 
     provider = RefreshableDeepcoinContractSpecProvider(
         cache_path=cache_path,
-        instrument_loader=lambda: (
-            build_deepcoin_client_from_env().list_swap_instruments()
-        ),
+        instrument_loader=_load_deepcoin_swap_instruments_once,
         ttl=timedelta(hours=ttl_hours),
     )
     previous_snapshot = provider.snapshot
@@ -5989,9 +6000,7 @@ def web(
     settings_session_factory = create_session_factory(database_path)
     authoritative_contract_spec_provider = RefreshableDeepcoinContractSpecProvider(
         cache_path=deepcoin_contract_specs_cache_path,
-        instrument_loader=lambda: (
-            build_deepcoin_client_from_env().list_swap_instruments()
-        ),
+        instrument_loader=_load_deepcoin_swap_instruments_once,
         ttl=timedelta(hours=deepcoin_contract_specs_ttl_hours),
     )
     deepcoin_contract_spec_provider = RolloutDeepcoinContractSpecProvider(

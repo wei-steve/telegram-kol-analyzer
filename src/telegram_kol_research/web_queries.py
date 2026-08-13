@@ -68,6 +68,15 @@ STRATEGY_TIME_DISPLAY_FIELDS = (
     "latest_event_at",
 )
 MAX_MEDIA_ASSETS_PER_MESSAGE = 3
+MAX_DEEPCOIN_TRADE_SIGNALS_PER_GROUP_PAGE = 256
+MAX_DEEPCOIN_EXECUTION_OPERATIONS_PER_GROUP_PAGE = 512
+MAX_DEEPCOIN_REQUEST_ATTEMPTS_PER_GROUP_PAGE = 64
+
+_DEEPCOIN_V1_OPERATION_KEY = re.compile(
+    r"protected-entry:v1:signal:(?P<signal_id>[1-9][0-9]*):"
+    r"leg:(?P<leg_index>[1-9][0-9]*):"
+    r"(?P<kind>entry|protection:(?P<protection_index>0|[1-9][0-9]*))"
+)
 
 MIMO_INTENT_LABELS = {
     "new_strategy": "新策略",
@@ -160,7 +169,65 @@ DEEPCOIN_EXECUTION_ERROR_LABELS = {
     "schema_incompatible": "返回结构不兼容",
     "state_conflict": "持久状态冲突",
 }
-_SAFE_DEEPCOIN_DISPLAY_CODE = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,127}")
+_SAFE_DEEPCOIN_DISPLAY_CODE = re.compile(
+    r"(?=.{1,128}\Z)[a-z][a-z0-9]*(?:_[a-z0-9]+)+"
+)
+_SAFE_DEEPCOIN_HTTP_CODE = re.compile(r"http_[1-5][0-9]{2}")
+_SAFE_DEEPCOIN_DISPLAY_CODES = frozenset(
+    {
+        "attempt_evidence_unavailable",
+        "auth_failed",
+        "background_reconcile_busy",
+        "business_rejected",
+        "circuit_open",
+        "connect_timeout",
+        "entry_intent_prepared",
+        "entry_readback_confirmed",
+        "entry_sequence_completed",
+        "entry_submission_accepted",
+        "entry_submission_rejected",
+        "entry_submission_unknown",
+        "entry_submit_authorized",
+        "execution_evidence_limit_exceeded",
+        "governor_deadline_exceeded",
+        "governor_state_unavailable",
+        "governor_unavailable",
+        "http_retryable",
+        "malformed_execution_metrics",
+        "multiple_root_operations",
+        "next_leg_preflight_deferred",
+        "next_leg_submit_authorized",
+        "primary_leg_protected",
+        "pool_timeout",
+        "protected_entry_reconciliation_identity_conflict",
+        "protected_entry_reconciliation_scope_conflict",
+        "protected_entry_rollout_disabled",
+        "protection_fully_confirmed",
+        "protection_incomplete",
+        "protection_intents_prepared",
+        "protection_submission_accepted",
+        "protection_submission_rejected",
+        "protection_submit_authorized",
+        "rate_limited",
+        "read_timeout",
+        "request_accepted",
+        "request_deadline_exceeded",
+        "safe_entry_pending_readback",
+        "safe_entry_rejected",
+        "safe_entry_unknown",
+        "safe_pre_submit_deferred",
+        "safe_submission_failed_no_exposure",
+        "schema_incompatible",
+        "schema_invalid",
+        "snapshot_incomplete",
+        "snapshot_read_unavailable",
+        "snapshot_write_generation_changed",
+        "state_conflict",
+        "transport_failure",
+        "transport_timeout",
+        "write_timeout",
+    }
+)
 DEEPCOIN_EXECUTION_DISPLAY_PRIORITY = {
     "protection_unknown": 120,
     "entry_unknown": 115,
@@ -232,6 +299,10 @@ def _safe_deepcoin_display_code(value: object) -> str | None:
         normalized != value
         or _SAFE_DEEPCOIN_DISPLAY_CODE.fullmatch(normalized) is None
         or contains_credential_marker(normalized)
+        or (
+            normalized not in _SAFE_DEEPCOIN_DISPLAY_CODES
+            and _SAFE_DEEPCOIN_HTTP_CODE.fullmatch(normalized) is None
+        )
     ):
         return None
     return normalized
@@ -258,6 +329,8 @@ def _deepcoin_projection_datetime(
         parsed = datetime.fromisoformat(value)
     except ValueError:
         return None, True
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(UTC).replace(tzinfo=None)
     return parsed, False
 
 
@@ -273,6 +346,63 @@ def _deepcoin_operation_tuple_valid(
         and allowed_certainties is not None
         and certainty in allowed_certainties
     )
+
+
+def _deepcoin_bundle_identity_valid(
+    *,
+    root: object,
+    operations: list[object],
+) -> bool:
+    try:
+        root_id = int(root.id)
+        signal_id = int(root.trade_signal_id)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    root_match = _DEEPCOIN_V1_OPERATION_KEY.fullmatch(
+        str(getattr(root, "operation_key", ""))
+    )
+    if (
+        str(getattr(root, "contract_version", "")) != "1"
+        or getattr(root, "parent_operation_id", None) is not None
+        or root_match is None
+        or root_match.group("kind") != "entry"
+        or int(root_match.group("signal_id")) != signal_id
+    ):
+        return False
+    root_leg_index = int(root_match.group("leg_index"))
+    for operation in operations:
+        match = _DEEPCOIN_V1_OPERATION_KEY.fullmatch(
+            str(getattr(operation, "operation_key", ""))
+        )
+        if (
+            str(getattr(operation, "contract_version", "")) != "1"
+            or match is None
+            or int(match.group("signal_id")) != signal_id
+        ):
+            return False
+        try:
+            operation_id = int(operation.id)
+            operation_signal_id = int(operation.trade_signal_id)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if operation_signal_id != signal_id:
+            return False
+        parent_operation_id = getattr(operation, "parent_operation_id", None)
+        if operation_id == root_id:
+            if parent_operation_id is not None or match.group("kind") != "entry":
+                return False
+            continue
+        try:
+            if int(parent_operation_id) != root_id:
+                return False
+        except (TypeError, ValueError):
+            return False
+        if (
+            match.group("kind").startswith("protection:")
+            and int(match.group("leg_index")) != root_leg_index
+        ):
+            return False
+    return True
 
 
 def _deepcoin_execution_next_action(state: str) -> str:
@@ -329,8 +459,9 @@ def _serialize_deepcoin_execution(
     attempts_by_operation_id: dict[int, list[DeepcoinRequestAttempt]],
     snapshots_by_operation_id: dict[int, list[DeepcoinSnapshotEvidence]],
     identity_conflict: bool = False,
+    evidence_overflow: bool = False,
 ) -> dict[str, object]:
-    malformed_evidence = any(
+    malformed_evidence = evidence_overflow or any(
         getattr(operation, "_display_malformed", False)
         or not _deepcoin_operation_tuple_valid(operation)
         for operation in operations
@@ -489,7 +620,11 @@ def _serialize_deepcoin_execution(
                 "reason_code": (
                     "multiple_root_operations"
                     if identity_conflict
-                    else "malformed_execution_metrics"
+                    else (
+                        "execution_evidence_limit_exceeded"
+                        if evidence_overflow
+                        else "malformed_execution_metrics"
+                    )
                 ),
                 "error_category": "state_conflict",
                 "error_category_label": DEEPCOIN_EXECUTION_ERROR_LABELS[
@@ -499,6 +634,30 @@ def _serialize_deepcoin_execution(
             }
         )
     return result
+
+
+def _deepcoin_projection_overflow_conflict() -> dict[str, object]:
+    return {
+        "state": "evidence_conflict",
+        "state_label": DEEPCOIN_EXECUTION_STATE_LABELS["evidence_conflict"],
+        "phase_label": "未知阶段",
+        "certainty_label": "规范证据无效",
+        "tone": "attention",
+        "attempt_count": None,
+        "deadline_at": None,
+        "reason_code": "execution_evidence_limit_exceeded",
+        "error_category": "state_conflict",
+        "error_category_label": DEEPCOIN_EXECUTION_ERROR_LABELS[
+            "state_conflict"
+        ],
+        "latest_complete_snapshot_at": None,
+        "governor_wait_ms": None,
+        "retry_delay_ms": None,
+        "latency_ms": None,
+        "readback_latency_ms": 0,
+        "next_action": "需要人工核实",
+        "attempts": [],
+    }
 
 
 def _serialize_entry_preamble_binding(
@@ -958,7 +1117,7 @@ def _serialize_raw_messages(
         management_batch_by_msg_id.setdefault(batch.raw_message_id, batch)
 
     message_keys = {(int(row.chat_id), int(row.message_id)) for row in raw_messages}
-    trade_signal_rows = (
+    trade_signal_rows_with_sentinel = (
         session.query(TradeSignal)
         .filter(
             TradeSignal.venue == "deepcoin",
@@ -972,16 +1131,26 @@ def _serialize_raw_messages(
             ),
         )
         .order_by(TradeSignal.id.desc())
+        .limit(MAX_DEEPCOIN_TRADE_SIGNALS_PER_GROUP_PAGE + 1)
         .all()
         if message_keys
         else []
     )
+    deepcoin_signal_overflow = (
+        len(trade_signal_rows_with_sentinel)
+        > MAX_DEEPCOIN_TRADE_SIGNALS_PER_GROUP_PAGE
+    )
+    trade_signal_rows = trade_signal_rows_with_sentinel[
+        :MAX_DEEPCOIN_TRADE_SIGNALS_PER_GROUP_PAGE
+    ]
     trade_signal_ids = [int(row.id) for row in trade_signal_rows]
-    deepcoin_operation_db_rows = (
+    deepcoin_operation_db_rows_with_sentinel = (
         session.query(
             DeepcoinExecutionOperation.id,
             DeepcoinExecutionOperation.trade_signal_id,
             DeepcoinExecutionOperation.parent_operation_id,
+            DeepcoinExecutionOperation.operation_key,
+            DeepcoinExecutionOperation.contract_version,
             DeepcoinExecutionOperation.phase,
             DeepcoinExecutionOperation.state,
             DeepcoinExecutionOperation.outcome_certainty,
@@ -1009,10 +1178,18 @@ def _serialize_raw_messages(
             DeepcoinExecutionOperation.trade_signal_id.asc(),
             DeepcoinExecutionOperation.id.asc(),
         )
+        .limit(MAX_DEEPCOIN_EXECUTION_OPERATIONS_PER_GROUP_PAGE + 1)
         .all()
         if trade_signal_ids
         else []
     )
+    deepcoin_operation_overflow = (
+        len(deepcoin_operation_db_rows_with_sentinel)
+        > MAX_DEEPCOIN_EXECUTION_OPERATIONS_PER_GROUP_PAGE
+    )
+    deepcoin_operation_db_rows = deepcoin_operation_db_rows_with_sentinel[
+        :MAX_DEEPCOIN_EXECUTION_OPERATIONS_PER_GROUP_PAGE
+    ]
     deepcoin_operation_rows: list[SimpleNamespace] = []
     for row in deepcoin_operation_db_rows:
         deadline_at, deadline_invalid = _deepcoin_projection_datetime(
@@ -1035,6 +1212,8 @@ def _serialize_raw_messages(
                 id=row.id,
                 trade_signal_id=row.trade_signal_id,
                 parent_operation_id=row.parent_operation_id,
+                operation_key=row.operation_key,
+                contract_version=row.contract_version,
                 phase=row.phase,
                 state=row.state,
                 outcome_certainty=row.outcome_certainty,
@@ -1067,7 +1246,7 @@ def _serialize_raw_messages(
         if operation.parent_operation_id is None:
             deepcoin_roots_by_signal_id.setdefault(signal_id, []).append(operation)
     deepcoin_operation_ids = [int(row.id) for row in deepcoin_operation_rows]
-    deepcoin_attempt_db_rows = (
+    deepcoin_attempt_db_rows_with_sentinel = (
         session.query(
             DeepcoinRequestAttempt.id,
             DeepcoinRequestAttempt.deepcoin_execution_operation_id,
@@ -1099,9 +1278,24 @@ def _serialize_raw_messages(
             DeepcoinRequestAttempt.deepcoin_execution_operation_id.asc(),
             DeepcoinRequestAttempt.ordinal.asc(),
         )
+        .limit(MAX_DEEPCOIN_REQUEST_ATTEMPTS_PER_GROUP_PAGE + 1)
         .all()
         if deepcoin_operation_ids
         else []
+    )
+    deepcoin_attempt_overflow = (
+        len(deepcoin_attempt_db_rows_with_sentinel)
+        > MAX_DEEPCOIN_REQUEST_ATTEMPTS_PER_GROUP_PAGE
+    )
+    deepcoin_attempt_db_rows = deepcoin_attempt_db_rows_with_sentinel[
+        :MAX_DEEPCOIN_REQUEST_ATTEMPTS_PER_GROUP_PAGE
+    ]
+    deepcoin_evidence_overflow = any(
+        (
+            deepcoin_signal_overflow,
+            deepcoin_operation_overflow,
+            deepcoin_attempt_overflow,
+        )
     )
     deepcoin_attempt_rows: list[SimpleNamespace] = []
     for row in deepcoin_attempt_db_rows:
@@ -1246,7 +1440,10 @@ def _serialize_raw_messages(
             continue
         root = max(roots, key=lambda operation: int(operation.id))
         bundle = deepcoin_operations_by_signal_id.get(signal_id, [])
-        identity_conflict = len(roots) != 1
+        identity_conflict = len(roots) != 1 or not _deepcoin_bundle_identity_valid(
+            root=root,
+            operations=bundle,
+        )
         displayed_operation = _select_deepcoin_display_operation(
             root=root,
             operations=bundle,
@@ -1257,6 +1454,7 @@ def _serialize_raw_messages(
             attempts_by_operation_id=deepcoin_attempts_by_operation_id,
             snapshots_by_operation_id=deepcoin_snapshots_by_operation_id,
             identity_conflict=identity_conflict,
+            evidence_overflow=deepcoin_evidence_overflow,
         )
         priority = (
             130
@@ -1276,6 +1474,11 @@ def _serialize_raw_messages(
             continue
         deepcoin_execution_priority_by_message_key[message_key] = priority
         deepcoin_execution_by_message_key[message_key] = serialized_execution
+    if deepcoin_evidence_overflow:
+        for message_key in message_keys:
+            deepcoin_execution_by_message_key[message_key] = (
+                _deepcoin_projection_overflow_conflict()
+            )
     binding_rows = (
         session.query(ExecutionBinding)
         .filter(

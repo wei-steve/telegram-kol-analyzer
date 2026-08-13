@@ -2525,7 +2525,10 @@ def test_bound_position_market_close_keeps_reservation_after_exchange_error(tmp_
     _binding(session_factory, pos_id="pos-1", status="active")
     client = FailingClient()
 
-    with pytest.raises(RuntimeError, match="connection lost"):
+    with pytest.raises(
+        DeepcoinRequestOutcomeUnknown,
+        match="position_mutation_writer_failed",
+    ):
         close_bound_position_market(
             session_factory,
             pos_id="pos-1",

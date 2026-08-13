@@ -45,6 +45,8 @@ class _ContractSpecs:
 
 
 class _ShuqinExchange:
+    uid_scope_hash = "7" * 64
+
     def __init__(self):
         self.pending = {
             "old-entry-1828": {
@@ -92,6 +94,9 @@ class _ShuqinExchange:
                 "fillSz": "3",
             }
         ]
+
+    def list_position_history(self, *, inst_id, pos_id=None):
+        return []
 
     def list_positions(self, *, inst_id=None):
         if self.orders:

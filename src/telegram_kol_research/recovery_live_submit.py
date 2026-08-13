@@ -2405,11 +2405,19 @@ def _poll_protected_market_entry_readback(
                     phase="entry_readback",
                 )
             ):
-                history = deepcoin_client.list_order_history(
-                    inst_id=str(draft["instrument_id"])
+                history = _complete_exchange_collection_rows(
+                    deepcoin_client,
+                    endpoint="order_history",
+                    raw_reader_name="read_order_history",
+                    list_reader_name="list_order_history",
+                    inst_id=str(draft["instrument_id"]),
                 )
-                positions = deepcoin_client.list_positions(
-                    inst_id=str(draft["instrument_id"])
+                positions = _complete_exchange_collection_rows(
+                    deepcoin_client,
+                    endpoint="positions",
+                    raw_reader_name="read_positions",
+                    list_reader_name="list_positions",
+                    inst_id=str(draft["instrument_id"]),
                 )
         except Exception:
             continue
@@ -6094,7 +6102,13 @@ def _load_matching_position_ids(
     side: str,
 ) -> set[str]:
     try:
-        positions = deepcoin_client.list_positions(inst_id=str(draft["instrument_id"]))
+        positions = _complete_exchange_collection_rows(
+            deepcoin_client,
+            endpoint="positions",
+            raw_reader_name="read_positions",
+            list_reader_name="list_positions",
+            inst_id=str(draft["instrument_id"]),
+        )
     except Exception as exc:
         # A market entry may share symbol and side with an older position.  Without
         # a successful pre-submit snapshot, a later lookup cannot prove which
@@ -6108,6 +6122,33 @@ def _load_matching_position_ids(
         if pos_id:
             result.add(pos_id)
     return result
+
+
+def _complete_exchange_collection_rows(
+    deepcoin_client: Any,
+    *,
+    endpoint: str,
+    raw_reader_name: str,
+    list_reader_name: str,
+    inst_id: str,
+) -> tuple[Mapping[str, Any], ...]:
+    raw_reader = getattr(deepcoin_client, raw_reader_name, None)
+    list_reader = getattr(deepcoin_client, list_reader_name, None)
+    if callable(raw_reader):
+        response = raw_reader(inst_id=inst_id)
+    elif callable(list_reader):
+        response = list_reader(inst_id=inst_id)
+    else:
+        raise DeepcoinSnapshotUnavailable("snapshot_reader_unavailable")
+    collection = build_exchange_collection_evidence(
+        endpoint=endpoint,
+        response=response,
+    )
+    if not collection.complete:
+        raise DeepcoinSnapshotUnavailable(
+            collection.reason_code or "snapshot_incomplete"
+        )
+    return collection.rows
 
 
 def _select_matching_position(

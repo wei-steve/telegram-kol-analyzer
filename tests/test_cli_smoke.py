@@ -1361,8 +1361,10 @@ def test_audit_protection_incidents_cli_is_read_only_and_has_no_apply(
         cli_module,
         "build_deepcoin_client_from_env",
         lambda: SimpleNamespace(
+            uid_scope_hash="2" * 64,
             list_positions=lambda: [],
             list_open_orders=lambda: [],
+            list_position_history=lambda **_kwargs: [],
             list_trigger_orders_pending=lambda **_kwargs: [],
             list_order_history=lambda **_kwargs: [],
             list_trade_fills=lambda **_kwargs: [],

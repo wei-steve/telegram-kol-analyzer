@@ -4240,6 +4240,72 @@ class _Task10ProtectedClient(_FakeDeepcoinClient):
         }
 
 
+class _PaginatedFirstLegSnapshotClient(_Task10ProtectedClient):
+    def __init__(
+        self,
+        session_factory,
+        *,
+        paginate_preflight_positions=False,
+        paginate_entry_readback=False,
+    ):
+        super().__init__(session_factory)
+        self.paginate_preflight_positions = paginate_preflight_positions
+        self.paginate_entry_readback = paginate_entry_readback
+
+    @staticmethod
+    def _unrelated_positions(count):
+        return [
+            {
+                "posId": f"unrelated-position-{index}",
+                "instId": "ETH-USDT-SWAP",
+                "posSide": "long",
+                "pos": "1",
+                "mrgPosition": "split",
+                "mgnMode": "cross",
+            }
+            for index in range(count)
+        ]
+
+    @staticmethod
+    def _unrelated_orders(count):
+        return [
+            {
+                "ordId": f"unrelated-order-{index}",
+                "clOrdId": f"unrelated-client-{index}",
+                "instId": "ETH-USDT-SWAP",
+                "posId": f"unrelated-position-{index}",
+                "posSide": "long",
+                "state": "filled",
+            }
+            for index in range(count)
+        ]
+
+    def list_positions(self, *, inst_id=None):
+        if self.paginate_preflight_positions and not self.payloads:
+            return self._unrelated_positions(100)
+        return super().list_positions(inst_id=inst_id)
+
+    def read_positions(self, *, inst_id=None):
+        rows = self.list_positions(inst_id=inst_id)
+        response = {"data": rows}
+        if self.paginate_preflight_positions and not self.payloads:
+            response.update({"hasMore": True, "nextCursor": "page-2"})
+        return response
+
+    def list_order_history(self, *, inst_id=None):
+        rows = super().list_order_history(inst_id=inst_id)
+        if self.paginate_entry_readback and rows:
+            rows.extend(self._unrelated_orders(99))
+        return rows
+
+    def read_order_history(self, *, inst_id=None):
+        rows = self.list_order_history(inst_id=inst_id)
+        response = {"data": rows}
+        if self.paginate_entry_readback and rows:
+            response.update({"hasMore": True, "nextCursor": "page-2"})
+        return response
+
+
 def _task10_one_stop(monkeypatch):
     monkeypatch.setattr(
         "telegram_kol_research.recovery_live_submit."
@@ -4861,6 +4927,71 @@ def test_paginated_protection_baseline_fails_before_protection_post(
     assert len(client.payloads) == 1
     assert client.position_protection_payloads == []
     assert client.trigger_payloads == []
+
+
+def test_paginated_first_leg_position_baseline_fails_before_market_post(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(
+        tmp_path / "task16-paginated-entry-baseline.db"
+    )
+    signal = _task10_two_leg_signal(session_factory)
+    client = _PaginatedFirstLegSnapshotClient(
+        session_factory,
+        paginate_preflight_positions=True,
+    )
+    _task10_one_stop(monkeypatch)
+
+    with pytest.raises(
+        EntrySubmissionProgressError,
+        match="pre_submit_position_snapshot_unavailable",
+    ):
+        _submit_recovery_signal_direct(
+            session_factory,
+            trade_signal=load_trade_signal(session_factory, signal.id),
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            submitted_at=datetime(2026, 8, 13, 8, 0, tzinfo=UTC),
+        )
+
+    assert client.payloads == []
+    assert client.position_protection_payloads == []
+
+
+def test_paginated_first_leg_readback_never_confirms_visible_partial_page(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(
+        tmp_path / "task16-paginated-entry-readback.db"
+    )
+    signal = _task10_two_leg_signal(session_factory)
+    client = _PaginatedFirstLegSnapshotClient(
+        session_factory,
+        paginate_entry_readback=True,
+    )
+    _task10_one_stop(monkeypatch)
+
+    with pytest.raises(
+        EntrySubmissionProgressError,
+        match="protected_entry_readback_pending",
+    ):
+        _submit_recovery_signal_direct(
+            session_factory,
+            trade_signal=load_trade_signal(session_factory, signal.id),
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            submitted_at=datetime(2026, 8, 13, 8, 0, tzinfo=UTC),
+        )
+
+    with session_factory() as session:
+        parent = session.query(DeepcoinExecutionOperation).filter(
+            DeepcoinExecutionOperation.parent_operation_id.is_(None)
+        ).one()
+    assert len(client.payloads) == 1
+    assert parent.state in {"entry_pending_readback", "entry_unknown"}
+    assert client.position_protection_payloads == []
 
 
 def test_list_only_page_limit_protection_baseline_fails_before_post(

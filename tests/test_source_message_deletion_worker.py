@@ -380,6 +380,8 @@ class _ContractSpecs:
 
 
 class _ExactCancelClient:
+    uid_scope_hash = "6" * 64
+
     def __init__(self, order_ids, *, unknown=False, partial_fill=False):
         self.pending = {
             order_id: {
@@ -397,6 +399,12 @@ class _ExactCancelClient:
         return list(self.pending.values())
 
     def list_open_orders(self, *, inst_id=None):
+        return []
+
+    def list_positions(self, *, inst_id=None):
+        return []
+
+    def list_position_history(self, *, inst_id, pos_id=None):
         return []
 
     def cancel_trigger_order(self, payload):

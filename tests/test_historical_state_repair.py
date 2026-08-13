@@ -271,6 +271,8 @@ def _seed_restorable_authority_candidate(
 
 
 class _ReadOnlyHistoryClient:
+    uid_scope_hash = "3" * 64
+
     def __init__(self, history_response):
         self.history_response = history_response
         self.history_calls = []
@@ -293,11 +295,21 @@ class _ReadOnlyHistoryClient:
     def list_trigger_order_history(self, *, inst_id):
         return []
 
-    def list_position_history(self, *, inst_id, pos_id):
+    def list_position_history(self, *, inst_id, pos_id=None):
+        if pos_id is None:
+            return []
         self.history_calls.append((inst_id, pos_id))
         if isinstance(self.history_response, Exception):
             raise self.history_response
         return self.history_response
+
+    def read_position_history(self, *, inst_id, pos_id=None):
+        if pos_id is None:
+            return {"data": []}
+        self.history_calls.append((inst_id, pos_id))
+        if isinstance(self.history_response, Exception):
+            raise self.history_response
+        return {"data": self.history_response}
 
     def submit_order(self, *_args, **_kwargs):
         raise AssertionError("historical repair snapshot must remain read-only")

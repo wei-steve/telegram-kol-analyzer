@@ -3,6 +3,7 @@ import json
 import re
 
 from fastapi.testclient import TestClient
+import pytest
 from sqlalchemy import event, text
 
 from telegram_kol_research.db import create_session_factory
@@ -26,6 +27,17 @@ from telegram_kol_research.models import (
 )
 from telegram_kol_research.web_app import create_web_app
 from telegram_kol_research.web_queries import load_group_messages
+from telegram_kol_research.web_queries import _safe_deepcoin_display_code
+
+
+@pytest.mark.parametrize(
+    "safe_code",
+    ("connect_timeout", "write_timeout", "pool_timeout"),
+)
+def test_group_messages_projection_preserves_known_transport_safe_codes(
+    safe_code,
+):
+    assert _safe_deepcoin_display_code(safe_code) == safe_code
 
 
 def test_group_messages_route_returns_partial_for_selected_group(tmp_path):
@@ -664,6 +676,303 @@ def test_group_messages_route_projects_canonical_deepcoin_execution_operation(
     assert "raw-attempt" not in response.text
     assert "strategy_revision_collision" not in response.text
     assert "newer_no_exposure_collision" not in response.text
+
+
+def _persist_bounded_deepcoin_projection_fixture(
+    session_factory,
+    *,
+    operation_key: str | None = None,
+    contract_version: str = "1",
+    attempt_count: int = 1,
+):
+    now = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
+    with session_factory() as session:
+        session.add(
+            RawMessage(
+                chat_id=188,
+                message_id=1,
+                posted_at=now,
+                text="bounded canonical execution",
+            )
+        )
+        signal = TradeSignal(
+            signal_uid="bounded-canonical-signal",
+            strategy_instance_id="bounded-canonical-strategy",
+            source_type="message_instruction",
+            venue="deepcoin",
+            kol_id="alice",
+            chat_id=188,
+            message_id=1,
+            symbol="BTC",
+            side="long",
+            action="open_position",
+            status="submitted",
+            payload_json="{}",
+        )
+        session.add(signal)
+        session.flush()
+        root = DeepcoinExecutionOperation(
+            operation_key=(
+                operation_key
+                or f"protected-entry:v1:signal:{signal.id}:leg:1:entry"
+            ),
+            trade_signal_id=signal.id,
+            contract_version=contract_version,
+            phase="completed",
+            state="completed",
+            outcome_certainty="confirmed",
+            reason_code="canonical_complete",
+            request_fingerprint="a" * 64,
+            economics_fingerprint="b" * 64,
+            deadline_at=now + timedelta(seconds=10),
+            writer_attempted_at=now,
+            completed_at=now + timedelta(seconds=1),
+            attempt_count=attempt_count,
+            state_version=1,
+            evidence_json="{}",
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(root)
+        session.flush()
+        session.commit()
+        return int(root.id), int(signal.id)
+
+
+def test_group_messages_projection_bounds_attempt_rows_and_fails_closed(tmp_path):
+    database_path = tmp_path / "bounded-execution-attempts.db"
+    session_factory = create_session_factory(database_path)
+    operation_id, _signal_id = _persist_bounded_deepcoin_projection_fixture(
+        session_factory,
+        attempt_count=65,
+    )
+    now = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
+    with session_factory() as session:
+        session.add_all(
+            [
+                DeepcoinRequestAttempt(
+                    deepcoin_execution_operation_id=operation_id,
+                    ordinal=ordinal,
+                    method="GET",
+                    normalized_path="/deepcoin/account/positions",
+                    priority="critical",
+                    phase="completed",
+                    outcome_certainty="confirmed",
+                    safe_code="complete",
+                    http_status=200,
+                    business_code="0",
+                    governor_wait_ms=0,
+                    retry_delay_ms=0,
+                    latency_ms=1,
+                    uid_scope_hash="c" * 64,
+                    request_fingerprint="a" * 64,
+                    started_at=now + timedelta(milliseconds=ordinal),
+                    completed_at=now + timedelta(milliseconds=ordinal + 1),
+                )
+                for ordinal in range(1, 66)
+            ]
+        )
+        session.commit()
+
+    projection = load_group_messages(
+        session_factory,
+        chat_id=188,
+        limit=1,
+    )[0]["deepcoin_execution"]
+
+    assert projection["state"] == "evidence_conflict"
+    assert projection["next_action"] == "需要人工核实"
+    assert len(projection["attempts"]) <= 64
+
+
+def test_group_messages_projection_rejects_unpinned_operation_version_and_key(
+    tmp_path,
+):
+    database_path = tmp_path / "unpinned-execution-operation.db"
+    session_factory = create_session_factory(database_path)
+    _persist_bounded_deepcoin_projection_fixture(
+        session_factory,
+        operation_key="unrelated:v2:operation",
+        contract_version="2",
+    )
+
+    projection = load_group_messages(
+        session_factory,
+        chat_id=188,
+        limit=1,
+    )[0]["deepcoin_execution"]
+
+    assert projection["state"] == "identity_conflict"
+    assert projection["next_action"] == "需要人工核实"
+
+
+def test_group_messages_projection_normalizes_timezone_aware_sqlite_times(
+    tmp_path,
+):
+    database_path = tmp_path / "aware-execution-time.db"
+    session_factory = create_session_factory(database_path)
+    root_id, signal_id = _persist_bounded_deepcoin_projection_fixture(
+        session_factory,
+    )
+    now = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
+    with session_factory() as session:
+        child = DeepcoinExecutionOperation(
+            operation_key=(
+                f"protected-entry:v1:signal:{signal_id}:leg:1:protection:0"
+            ),
+            trade_signal_id=signal_id,
+            parent_operation_id=root_id,
+            contract_version="1",
+            phase="completed",
+            state="completed",
+            outcome_certainty="confirmed",
+            reason_code="canonical_child_complete",
+            request_fingerprint="d" * 64,
+            economics_fingerprint="e" * 64,
+            deadline_at=now + timedelta(seconds=10),
+            writer_attempted_at=now,
+            completed_at=now + timedelta(seconds=1),
+            attempt_count=0,
+            state_version=1,
+            evidence_json="{}",
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(child)
+        session.flush()
+        child_id = int(child.id)
+        session.commit()
+    engine = session_factory.kw["bind"]
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE deepcoin_execution_operations "
+                "SET updated_at = '2026-08-13T12:00:01+00:00' "
+                "WHERE id = :operation_id"
+            ),
+            {"operation_id": child_id},
+        )
+
+    projection = load_group_messages(
+        session_factory,
+        chat_id=188,
+        limit=1,
+    )[0]["deepcoin_execution"]
+
+    assert projection["state"] == "completed"
+    assert projection["next_action"] == "已完成，无需操作"
+
+
+def test_group_messages_signal_overflow_fails_closed_for_every_page_message(
+    tmp_path,
+):
+    database_path = tmp_path / "overflowing-execution-signals.db"
+    session_factory = create_session_factory(database_path)
+    root_id, signal_id = _persist_bounded_deepcoin_projection_fixture(
+        session_factory,
+    )
+    assert root_id > 0
+    assert signal_id > 0
+    now = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
+    with session_factory() as session:
+        session.add(
+            RawMessage(
+                chat_id=188,
+                message_id=2,
+                posted_at=now + timedelta(minutes=1),
+                text="overflowing related signals",
+            )
+        )
+        session.add_all(
+            [
+                TradeSignal(
+                    signal_uid=f"overflow-signal-{index}",
+                    strategy_instance_id=f"overflow-strategy-{index}",
+                    source_type="message_instruction",
+                    venue="deepcoin",
+                    kol_id="alice",
+                    chat_id=188,
+                    message_id=2,
+                    symbol=f"X{index}",
+                    side="long",
+                    action="open_position",
+                    status="recovery_required",
+                    payload_json="{}",
+                )
+                for index in range(256)
+            ]
+        )
+        session.commit()
+
+    rows = load_group_messages(session_factory, chat_id=188, limit=2)
+
+    assert {row["message_id"] for row in rows} == {1, 2}
+    assert all(
+        row["deepcoin_execution"]["state"] == "evidence_conflict"
+        for row in rows
+    )
+
+
+@pytest.mark.parametrize(
+    "exchange_identity",
+    (
+        "123456789012345678",
+        "550e8400-e29b-41d4-a716-446655440000",
+        "a" * 64,
+        "order_123456789012345678",
+        "pos_123456789012345678",
+        "clord_abcdef0123456789",
+    ),
+)
+def test_group_messages_projection_never_renders_exchange_identity(
+    tmp_path,
+    exchange_identity,
+):
+    database_path = tmp_path / "numeric-exchange-identity.db"
+    session_factory = create_session_factory(database_path)
+    operation_id, _signal_id = _persist_bounded_deepcoin_projection_fixture(
+        session_factory,
+    )
+    now = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
+    with session_factory() as session:
+        operation = session.get(DeepcoinExecutionOperation, operation_id)
+        operation.reason_code = exchange_identity
+        session.add(
+            DeepcoinRequestAttempt(
+                deepcoin_execution_operation_id=operation_id,
+                ordinal=1,
+                method="GET",
+                normalized_path="/deepcoin/account/positions",
+                priority="critical",
+                phase="completed",
+                outcome_certainty="confirmed",
+                safe_code=exchange_identity,
+                http_status=200,
+                business_code="0",
+                governor_wait_ms=0,
+                retry_delay_ms=0,
+                latency_ms=1,
+                uid_scope_hash="c" * 64,
+                request_fingerprint="a" * 64,
+                started_at=now,
+                completed_at=now + timedelta(milliseconds=1),
+            )
+        )
+        session.commit()
+
+    projection = load_group_messages(
+        session_factory,
+        chat_id=188,
+        limit=1,
+    )[0]["deepcoin_execution"]
+
+    assert projection["reason_code"] is None
+    assert projection["attempts"][0]["safe_code"] is None
+    response = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/188/messages"
+    )
+    assert response.status_code == 200
+    assert exchange_identity not in response.text
 
 
 def test_group_messages_route_renders_decision_card_before_model_analysis(tmp_path):

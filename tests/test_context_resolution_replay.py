@@ -403,6 +403,8 @@ def test_replay_executes_revision_cancel_and_late_fill_recovery_path(tmp_path):
         session.commit()
 
     class RemediationClient:
+        uid_scope_hash = "1" * 64
+
         def list_positions(self):
             return [
                 {
@@ -428,6 +430,9 @@ def test_replay_executes_revision_cancel_and_late_fill_recovery_path(tmp_path):
             return []
 
         def list_trigger_order_history(self, *, inst_id):
+            return []
+
+        def list_position_history(self, *, inst_id, pos_id=None):
             return []
 
     remediation = build_position_management_remediation_plan(
