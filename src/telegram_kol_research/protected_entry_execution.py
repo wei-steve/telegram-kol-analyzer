@@ -202,6 +202,8 @@ def _prepare_protection(
 ) -> EntryTransition:
     if not facts.writer_attempted:
         return _refused(state, event, "entry_writer_not_attempted")
+    if facts.operation_deadline_expired:
+        return _refused(state, event, "operation_deadline_expired")
     refusal = _protection_base_refusal(facts, require_complete_snapshot=True)
     if refusal is not None:
         return _refused(state, event, refusal)
@@ -277,6 +279,14 @@ def _protection_readback_confirmed(
             event,
             "protected",
             "protection_fully_confirmed",
+        )
+    if facts.operation_deadline_expired:
+        return _allowed(
+            state,
+            event,
+            "recovery_required",
+            "protection_deadline_expired",
+            next_action="supervision_only",
         )
     if state == "protection_unknown":
         return _allowed(

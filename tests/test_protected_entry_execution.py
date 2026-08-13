@@ -422,6 +422,40 @@ def test_entry_confirmed_without_writer_fact_cannot_authorize_protection_submit(
     assert transition.next_action == "none"
 
 
+def test_expired_operation_cannot_start_a_new_protection_writer():
+    transition = _decide(
+        "entry_confirmed",
+        "prepare_protection",
+        writer_attempted=True,
+        live_exposure=True,
+        required_protection_count=2,
+        snapshot_complete=True,
+        operation_deadline_expired=True,
+    )
+
+    assert transition.allowed is False
+    assert transition.reason_code == "operation_deadline_expired"
+    assert transition.next_action == "none"
+
+
+def test_partial_protection_after_deadline_requires_supervision_not_another_writer():
+    transition = _decide(
+        "protection_pending_readback",
+        "protection_readback_confirmed",
+        writer_attempted=True,
+        live_exposure=True,
+        required_protection_count=2,
+        confirmed_protection_count=1,
+        snapshot_complete=True,
+        operation_deadline_expired=True,
+    )
+
+    assert transition.allowed is True
+    assert transition.next_state == "recovery_required"
+    assert transition.reason_code == "protection_deadline_expired"
+    assert transition.next_action == "supervision_only"
+
+
 @pytest.mark.parametrize(
     ("state", "event", "facts", "reason_code"),
     [
