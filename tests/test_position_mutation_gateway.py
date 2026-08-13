@@ -1,6 +1,11 @@
 from datetime import UTC, datetime
 import json
 
+import pytest
+
+from telegram_kol_research.deepcoin_client import (
+    DeepcoinRequestOutcomeUnknown,
+)
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -842,6 +847,130 @@ def test_protected_entry_market_protection_readback_polls_bounded_without_repeat
     assert len(client.set_position_sltp_calls) == 1
     assert client.readback_calls == 3
     assert clock.sleeps == [0.5, 1.0]
+
+
+def test_protected_entry_readback_requires_complete_position_identity(
+    tmp_path,
+):
+    session_factory, _, _, _, _ = _seed(tmp_path)
+
+    class IncompleteReadbackClient(FakeDeepcoinClient):
+        def list_trigger_orders_pending(self, *, inst_id):
+            return [{
+                "ordId": "ord-new-stop",
+                "slTriggerPx": "62000",
+                "sz": "0",
+            }]
+
+    client = IncompleteReadbackClient()
+
+    with pytest.raises(
+        DeepcoinRequestOutcomeUnknown,
+        match="position_sltp_pending_readback",
+    ):
+        submit_exact_position_sltp(
+            session_factory=session_factory,
+            deepcoin_client=client,
+            pos_id="pos-sister",
+            payload={
+                "instId": "BTC-USDT-SWAP",
+                "slTriggerPx": "62000",
+                "sz": "0",
+            },
+            idempotency_key="protected-entry:strict-readback",
+            live_execution_gate=lambda: True,
+            now_provider=lambda: NOW,
+            require_readback=True,
+            require_complete_readback_identity=True,
+        )
+
+    assert len(client.set_position_sltp_calls) == 1
+
+
+def test_protected_entry_get_only_recovery_does_not_reconcile_other_intents(
+    tmp_path,
+):
+    class SimulatedCrash(BaseException):
+        pass
+
+    session_factory, binding_id, leg_id, other_binding_id, other_leg_id = (
+        _seed(tmp_path)
+    )
+    unrelated = reserve_position_mutation_intent(
+        session_factory,
+        idempotency_key="unrelated-cancel-submitting",
+        operation="cancel_position_sltp",
+        strategy_instance_id="strategy-other",
+        execution_binding_id=other_binding_id,
+        execution_order_leg_id=other_leg_id,
+        pos_id="pos-other",
+        order_id="unrelated-stop",
+        authority_fingerprint="a" * 64,
+        request_fingerprint="b" * 64,
+        request={
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-other",
+            "ordId": "unrelated-stop",
+        },
+        reserved_at=NOW,
+    )
+    transition_position_mutation_intent(
+        session_factory,
+        unrelated.id,
+        expected_statuses={"reserved"},
+        new_status="submitting",
+        transitioned_at=NOW,
+    )
+
+    class CrashClient(FakeDeepcoinClient):
+        def set_position_sltp(self, payload):
+            self.set_position_sltp_calls.append(dict(payload))
+            if len(self.set_position_sltp_calls) == 1:
+                self.pending = [{
+                    "ordId": "recovered-stop",
+                    "instId": payload["instId"],
+                    "posId": payload["posId"],
+                    "posSide": payload["posSide"],
+                    "slTriggerPx": payload["slTriggerPx"],
+                    "sz": payload.get("sz", "0"),
+                }]
+                raise SimulatedCrash()
+            raise AssertionError("protection writer repeated")
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return list(self.pending)
+
+    client = CrashClient()
+    kwargs = dict(
+        session_factory=session_factory,
+        deepcoin_client=client,
+        pos_id="pos-sister",
+        payload={
+            "instId": "BTC-USDT-SWAP",
+            "slTriggerPx": "62000",
+            "sz": "0",
+        },
+        idempotency_key="protected-entry:single-intent-recovery",
+        live_execution_gate=lambda: True,
+        now_provider=lambda: NOW,
+        require_readback=True,
+        require_complete_readback_identity=True,
+    )
+
+    with pytest.raises(SimulatedCrash):
+        submit_exact_position_sltp(**kwargs)
+    response = submit_exact_position_sltp(**kwargs)
+
+    assert response["data"]["ordId"] == "recovered-stop"
+    assert len(client.set_position_sltp_calls) == 1
+    with session_factory() as session:
+        assert session.get(PositionMutationIntent, unrelated.id).status == (
+            "submitting"
+        )
+        recovered = session.query(PositionMutationIntent).filter(
+            PositionMutationIntent.id != unrelated.id
+        ).one()
+        assert recovered.status == "confirmed"
 
 
 def test_require_readback_is_restart_idempotent_after_confirmation(tmp_path):

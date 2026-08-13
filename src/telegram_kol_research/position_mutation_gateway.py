@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Mapping
 
@@ -43,12 +45,21 @@ from telegram_kol_research.protection_ledger import (
 )
 
 
+_SAFE_ERROR_CODE = re.compile(r"^[a-z0-9][a-z0-9_]{0,127}$")
+
+
 @dataclass(frozen=True, slots=True)
 class PositionMutationResult:
     status: str
     reason: str | None
     intent_id: int
     response: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedPositionSltpIntent:
+    intent_id: int
+    request_fingerprint: str
 
 
 class PositionMutationGateway:
@@ -209,6 +220,8 @@ class PositionMutationGateway:
         request_options: Mapping[str, Any] | None = None,
         before_submit: Callable[[int], None] | None = None,
         before_exchange_submit: Callable[[int], None] | None = None,
+        expected_intent_id: int | None = None,
+        propagate_outcome_unknown: bool = False,
     ) -> PositionMutationResult:
         trigger_field_by_purpose = {
             "stop_loss": "slTriggerPx",
@@ -237,30 +250,13 @@ class PositionMutationGateway:
                 idempotency_key=idempotency_key,
                 reason=reason or "execution_binding_missing",
             )
-        trigger_field = trigger_field_by_purpose[purpose]
-        payload = {
-            "instType": "SWAP",
-            "instId": authority.instrument_id,
-            "posSide": authority.side.lower(),
-            "mrgPosition": str(binding.position_mode).lower(),
-            "posId": authority.pos_id,
-            "tdMode": str(binding.margin_mode).lower(),
-            trigger_field: str(trigger_price),
-        }
-        if size is not None:
-            payload["sz"] = str(size)
-        allowed_options = {
-            "tpTriggerPxType",
-            "tpOrdPx",
-            "slTriggerPxType",
-            "slOrdPx",
-        }
-        payload.update(
-            {
-                key: value
-                for key, value in dict(request_options or {}).items()
-                if key in allowed_options and value not in (None, "")
-            }
+        payload = _exact_position_sltp_payload(
+            authority=authority,
+            binding=binding,
+            purpose=purpose,
+            trigger_price=trigger_price,
+            size=size,
+            request_options=request_options,
         )
         return self._submit_exact_position_write(
             authority=authority,
@@ -274,6 +270,8 @@ class PositionMutationGateway:
             idempotency_key=idempotency_key,
             before_submit=before_submit,
             before_exchange_submit=before_exchange_submit,
+            expected_intent_id=expected_intent_id,
+            propagate_outcome_unknown=propagate_outcome_unknown,
             submit=lambda: self._call_client_write(
                 "_set_position_sltp_unchecked",
                 "set_position_sltp",
@@ -350,6 +348,8 @@ class PositionMutationGateway:
         submit: Callable[[], Mapping[str, Any]],
         before_submit: Callable[[int], None] | None = None,
         before_exchange_submit: Callable[[int], None] | None = None,
+        expected_intent_id: int | None = None,
+        propagate_outcome_unknown: bool = False,
     ) -> PositionMutationResult:
         intent = reserve_position_mutation_intent(
             self._session_factory,
@@ -367,6 +367,13 @@ class PositionMutationGateway:
             venue=authority.venue,
         )
         intent_id = int(intent.id)
+        if (
+            expected_intent_id is not None
+            and intent_id != int(expected_intent_id)
+        ):
+            raise PositionMutationAuthorityError(
+                "position_mutation_intent_identity_changed"
+            )
         current = self._intent_result(intent_id)
         if current.status != "reserved":
             return current
@@ -415,15 +422,29 @@ class PositionMutationGateway:
                 if self._after_exchange_write is not None:
                     self._after_exchange_write()
         except DeepcoinDefiniteRejection as exc:
-            return self._finish_with_error(intent_id, "rejected", str(exc))
+            return self._finish_with_error(
+                intent_id,
+                "rejected",
+                _safe_exchange_error_code(exc, "business_rejected"),
+            )
         except DeepcoinRequestOutcomeUnknown as exc:
-            return self._finish_with_error(
-                intent_id, "recovery_required", str(exc)
+            result = self._finish_with_error(
+                intent_id,
+                "recovery_required",
+                _safe_exchange_error_code(exc, "writer_outcome_unknown"),
             )
-        except Exception as exc:
-            return self._finish_with_error(
-                intent_id, "recovery_required", str(exc)
+            if propagate_outcome_unknown:
+                raise DeepcoinRequestOutcomeUnknown(
+                    result.reason or "writer_outcome_unknown"
+                ) from None
+            return result
+        except Exception:
+            self._finish_with_error(
+                intent_id,
+                "recovery_required",
+                "position_mutation_writer_failed",
             )
+            raise
         persisted = transition_position_mutation_intent(
             self._session_factory,
             intent_id,
@@ -794,6 +815,14 @@ def _fingerprint(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _safe_exchange_error_code(exc: BaseException, fallback: str) -> str:
+    fact = getattr(exc, "fact", None)
+    safe_code = getattr(fact, "safe_code", None)
+    if isinstance(safe_code, str) and _SAFE_ERROR_CODE.fullmatch(safe_code):
+        return safe_code
+    return fallback
+
+
 def _load_json(value: str | None) -> dict[str, Any]:
     if not value:
         return {}
@@ -802,6 +831,112 @@ def _load_json(value: str | None) -> dict[str, Any]:
     except (TypeError, ValueError):
         return {}
     return loaded if isinstance(loaded, dict) else {}
+
+
+def _exact_position_sltp_payload(
+    *,
+    authority: PositionMutationAuthority,
+    binding: ExecutionBinding,
+    purpose: str,
+    trigger_price: str,
+    size: str | None,
+    request_options: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    trigger_field = {
+        "stop_loss": "slTriggerPx",
+        "take_profit": "tpTriggerPx",
+    }.get(purpose)
+    if trigger_field is None:
+        raise ValueError("position_sltp_purpose_invalid")
+    payload: dict[str, Any] = {
+        "instType": "SWAP",
+        "instId": authority.instrument_id,
+        "posSide": authority.side.lower(),
+        "mrgPosition": str(binding.position_mode).lower(),
+        "posId": authority.pos_id,
+        "tdMode": str(binding.margin_mode).lower(),
+        trigger_field: str(trigger_price),
+    }
+    if size is not None:
+        payload["sz"] = str(size)
+    allowed_options = {
+        "tpTriggerPxType",
+        "tpOrdPx",
+        "slTriggerPxType",
+        "slOrdPx",
+    }
+    payload.update(
+        {
+            key: value
+            for key, value in dict(request_options or {}).items()
+            if key in allowed_options and value not in (None, "")
+        }
+    )
+    return payload
+
+
+def prepare_exact_position_sltp_intent(
+    *,
+    session_factory: sessionmaker,
+    deepcoin_client: Any,
+    pos_id: str,
+    payload: Mapping[str, Any],
+    idempotency_key: str,
+    now_provider: Callable[[], Any],
+    ledger_purpose: str | None = None,
+) -> PreparedPositionSltpIntent:
+    """Reserve the exact final HTTP identity without making a writer call."""
+
+    authority = _build_fresh_authority(
+        session_factory=session_factory,
+        deepcoin_client=deepcoin_client,
+        pos_id=pos_id,
+        instrument_id=str(payload.get("instId") or ""),
+    )
+    if payload.get("slTriggerPx") not in (None, ""):
+        purpose, trigger_field = "stop_loss", "slTriggerPx"
+    elif payload.get("tpTriggerPx") not in (None, ""):
+        purpose, trigger_field = "take_profit", "tpTriggerPx"
+    else:
+        raise PositionMutationAuthorityError("position_sltp_trigger_missing")
+    with session_factory() as session:
+        binding = session.get(
+            ExecutionBinding, int(authority.execution_binding_id)
+        )
+        if binding is None:
+            raise PositionMutationAuthorityError(
+                "execution_binding_missing"
+            )
+        final_payload = _exact_position_sltp_payload(
+            authority=authority,
+            binding=binding,
+            purpose=purpose,
+            trigger_price=str(payload[trigger_field]),
+            size=(str(payload["sz"]) if "sz" in payload else None),
+            request_options=payload,
+        )
+    intent = reserve_position_mutation_intent(
+        session_factory,
+        idempotency_key=idempotency_key,
+        operation="set_position_sltp",
+        strategy_instance_id=authority.strategy_instance_id,
+        execution_binding_id=authority.execution_binding_id,
+        execution_order_leg_id=authority.execution_order_leg_id,
+        pos_id=authority.pos_id,
+        order_id=None,
+        authority_fingerprint=_authority_fingerprint(authority),
+        request_fingerprint=_fingerprint(final_payload),
+        request={
+            **final_payload,
+            "_ledger_purpose": ledger_purpose or purpose,
+        },
+        reserved_at=now_provider(),
+        venue=authority.venue,
+    )
+    return PreparedPositionSltpIntent(
+        intent_id=int(intent.id),
+        request_fingerprint=str(intent.request_fingerprint),
+    )
 
 
 def submit_exact_position_sltp(
@@ -823,6 +958,8 @@ def submit_exact_position_sltp(
     readback_scope: Any = None,
     before_exchange_write: Callable[[], None] | None = None,
     after_exchange_write: Callable[[], None] | None = None,
+    expected_intent_id: int | None = None,
+    require_complete_readback_identity: bool = False,
 ) -> Mapping[str, Any]:
     """Compatibility adapter that rebuilds authority before one exact TPSL set."""
 
@@ -838,14 +975,15 @@ def submit_exact_position_sltp(
         purpose, trigger_field = "take_profit", "tpTriggerPx"
     else:
         raise PositionMutationAuthorityError("position_sltp_trigger_missing")
-    result = PositionMutationGateway(
+    gateway = PositionMutationGateway(
         session_factory=session_factory,
         deepcoin_client=deepcoin_client,
         live_execution_gate=live_execution_gate,
         now_provider=now_provider,
         before_exchange_write=before_exchange_write,
         after_exchange_write=after_exchange_write,
-    ).set_exact_position_sltp(
+    )
+    result = gateway.set_exact_position_sltp(
         authority=authority,
         purpose=purpose,
         ledger_purpose=ledger_purpose or purpose,
@@ -855,7 +993,24 @@ def submit_exact_position_sltp(
         request_options=payload,
         before_submit=before_submit,
         before_exchange_submit=before_exchange_submit,
+        expected_intent_id=expected_intent_id,
+        propagate_outcome_unknown=True,
     )
+    if require_readback and result.status in {
+        "submitting",
+        "recovery_required",
+    }:
+        result = _poll_unidentified_position_sltp_readback(
+            session_factory=session_factory,
+            gateway=gateway,
+            deepcoin_client=deepcoin_client,
+            intent_id=result.intent_id,
+            deadline_monotonic=readback_deadline_monotonic,
+            monotonic_factory=monotonic_factory,
+            sleep_fn=sleep_fn,
+            readback_scope=readback_scope,
+            instrument_id=authority.instrument_id,
+        )
     response = _require_submitted_response(result)
     if not require_readback:
         return response
@@ -875,6 +1030,7 @@ def submit_exact_position_sltp(
         monotonic_factory=monotonic_factory,
         sleep_fn=sleep_fn,
         readback_scope=readback_scope,
+        require_complete_identity=require_complete_readback_identity,
     )
     if result.status == "confirmed":
         with session_factory() as session:
@@ -969,6 +1125,7 @@ def _poll_position_sltp_readback(
     monotonic_factory: Callable[[], float],
     sleep_fn: Callable[[float], None],
     readback_scope: Any,
+    require_complete_identity: bool,
 ) -> None:
     delays = (0.0, 0.5, 1.0, 2.0, 3.0) if deadline_monotonic is not None else (0.0,)
     last_unavailable: Exception | None = None
@@ -1003,6 +1160,7 @@ def _poll_position_sltp_readback(
             purpose=purpose,
             trigger_price=trigger_price,
             size=size,
+            require_complete_identity=require_complete_identity,
         ):
             return
     if last_unavailable is not None and not attempted:
@@ -1014,6 +1172,169 @@ def _poll_position_sltp_readback(
             "position_sltp_readback_unavailable"
         ) from last_unavailable
     raise DeepcoinRequestOutcomeUnknown("position_sltp_pending_readback")
+
+
+def _poll_unidentified_position_sltp_readback(
+    *,
+    session_factory: sessionmaker,
+    gateway: PositionMutationGateway,
+    deepcoin_client: Any,
+    intent_id: int,
+    deadline_monotonic: float | None,
+    monotonic_factory: Callable[[], float],
+    sleep_fn: Callable[[float], None],
+    readback_scope: Any,
+    instrument_id: str,
+) -> PositionMutationResult:
+    delays = (
+        (0.0, 0.5, 1.0, 2.0, 3.0)
+        if deadline_monotonic is not None
+        else (0.0,)
+    )
+    for delay in delays:
+        now = float(monotonic_factory())
+        if deadline_monotonic is not None:
+            remaining = float(deadline_monotonic) - now
+            if remaining <= 0 or delay >= remaining:
+                break
+        if delay:
+            sleep_fn(delay)
+        try:
+            scope_factory = getattr(deepcoin_client, "request_scope", None)
+            scope_context = (
+                scope_factory(readback_scope)
+                if readback_scope is not None and callable(scope_factory)
+                else nullcontext(deepcoin_client)
+            )
+            with scope_context:
+                pending = deepcoin_client.list_trigger_orders_pending(
+                    inst_id=instrument_id
+                )
+        except Exception:
+            continue
+        _reconcile_exact_set_intent_from_pending(
+            session_factory,
+            intent_id=intent_id,
+            pending_trigger_orders=pending,
+            reconciled_at=datetime.now(UTC),
+        )
+        result = gateway._intent_result(intent_id)
+        if result.status == "confirmed":
+            return result
+    return gateway._intent_result(intent_id)
+
+
+def _reconcile_exact_set_intent_from_pending(
+    session_factory: sessionmaker,
+    *,
+    intent_id: int,
+    pending_trigger_orders: Any,
+    reconciled_at: datetime,
+) -> bool:
+    rows = [
+        row
+        for row in pending_trigger_orders
+        if isinstance(row, Mapping)
+    ] if isinstance(pending_trigger_orders, list) else []
+    with session_factory() as session:
+        intent = session.get(PositionMutationIntent, int(intent_id))
+        if (
+            intent is None
+            or intent.operation != "set_position_sltp"
+            or intent.status not in {
+                "submitting",
+                "submitted",
+                "recovery_required",
+            }
+        ):
+            return bool(intent is not None and intent.status == "confirmed")
+        request = _load_json(intent.request_json)
+        purpose = str(request.get("_ledger_purpose") or "") or (
+            "stop_loss"
+            if request.get("slTriggerPx") not in (None, "")
+            else "take_profit"
+            if request.get("tpTriggerPx") not in (None, "")
+            else ""
+        )
+        exchange_purpose = (
+            "stop_loss"
+            if purpose in {"stop_loss", "backup_stop"}
+            else "take_profit"
+            if purpose == "take_profit"
+            else ""
+        )
+        trigger_field = (
+            "slTriggerPx"
+            if exchange_purpose == "stop_loss"
+            else "tpTriggerPx"
+        )
+        if not exchange_purpose or request.get(trigger_field) in (None, ""):
+            return False
+        authority = PositionMutationAuthority(
+            venue=str(intent.venue),
+            strategy_instance_id=str(intent.strategy_instance_id),
+            execution_binding_id=int(intent.execution_binding_id),
+            execution_order_leg_id=int(intent.execution_order_leg_id),
+            pos_id=str(intent.pos_id),
+            instrument_id=str(request.get("instId") or ""),
+            side=str(request.get("posSide") or ""),
+            position_fingerprint="readback-only",
+            protection_fingerprint=None,
+        )
+        matching_ids = {
+            order_id
+            for row in rows
+            if (
+                order_id := str(
+                    row.get("ordId")
+                    or row.get("orderId")
+                    or row.get("order_id")
+                    or ""
+                )
+            )
+            and _set_position_sltp_readback_matches(
+                [row],
+                order_id=order_id,
+                authority=authority,
+                purpose=exchange_purpose,
+                trigger_price=str(request[trigger_field]),
+                size=(str(request["sz"]) if "sz" in request else None),
+                require_complete_identity=True,
+            )
+        }
+        if len(matching_ids) != 1:
+            return False
+        binding = session.get(
+            ExecutionBinding, int(intent.execution_binding_id)
+        )
+        if binding is None:
+            return False
+        order_id = next(iter(matching_ids))
+        _confirm_intent(
+            intent,
+            order_id=order_id,
+            reconciled_at=reconciled_at,
+        )
+        upsert_protection_ledger_row(
+            session,
+            venue=str(intent.venue),
+            execution_binding_id=int(intent.execution_binding_id),
+            execution_order_leg_id=int(intent.execution_order_leg_id),
+            strategy_instance_id=str(intent.strategy_instance_id),
+            pos_id=str(intent.pos_id),
+            instrument_id=str(request.get("instId") or ""),
+            side=str(request.get("posSide") or binding.side),
+            order_id=order_id,
+            purpose=purpose,
+            trigger_price=str(request[trigger_field]),
+            size_text=(str(request["sz"]) if "sz" in request else None),
+            status="verified",
+            evidence_source="position_mutation_intent_readback",
+            evidence={"intent_id": int(intent.id)},
+            seen_at=reconciled_at,
+        )
+        session.commit()
+        return True
 
 
 def cancel_exact_position_sltp(
@@ -1311,6 +1632,7 @@ def reconcile_submitted_position_mutation_intents(
                         purpose=exchange_purpose,
                         trigger_price=str(request.get(trigger_field) or ""),
                         size=(str(request["sz"]) if "sz" in request else None),
+                        require_complete_identity=True,
                     )
                 }
                 if len(matching_ids) == 1:
@@ -1451,6 +1773,7 @@ def reconcile_submitted_position_mutation_intents(
                 purpose=exchange_purpose,
                 trigger_price=trigger_price,
                 size=(str(request["sz"]) if "sz" in request else None),
+                require_complete_identity=True,
             ):
                 continue
             binding = session.get(
@@ -1535,6 +1858,7 @@ def _set_position_sltp_readback_matches(
     purpose: str,
     trigger_price: str,
     size: str | None = None,
+    require_complete_identity: bool = False,
 ) -> bool:
     trigger_keys = (
         ("slTriggerPx", "slTriggerPrice", "triggerPrice")
@@ -1552,13 +1876,25 @@ def _set_position_sltp_readback_matches(
         ) != order_id:
             continue
         instrument = str(row.get("instId") or "").upper()
-        if instrument and instrument != authority.instrument_id.upper():
+        if (
+            (require_complete_identity and not instrument)
+            or (
+                instrument
+                and instrument != authority.instrument_id.upper()
+            )
+        ):
             continue
         side = str(row.get("posSide") or "").lower()
-        if side and side != authority.side.lower():
+        if (
+            (require_complete_identity and not side)
+            or (side and side != authority.side.lower())
+        ):
             continue
         row_pos_id = str(row.get("posId") or row.get("pos_id") or "")
-        if row_pos_id and row_pos_id != authority.pos_id:
+        if (
+            (require_complete_identity and not row_pos_id)
+            or (row_pos_id and row_pos_id != authority.pos_id)
+        ):
             continue
         observed_trigger = next(
             (

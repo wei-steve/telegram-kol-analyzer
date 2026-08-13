@@ -6,10 +6,12 @@ import math
 import time
 import hashlib
 import json
+import re
 from copy import deepcopy
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from threading import RLock
@@ -51,6 +53,7 @@ from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import PositionMutationIntent
+from telegram_kol_research.models import PositionProtectionLedger
 from telegram_kol_research.models import InstructionExecutionContract
 from telegram_kol_research.models import StrategyRevisionBatch
 from telegram_kol_research.models import StrategyRevisionLeg
@@ -64,6 +67,7 @@ from telegram_kol_research.position_protection_legs import (
 )
 from telegram_kol_research.position_mutation_gateway import (
     exact_position_write_gate,
+    prepare_exact_position_sltp_intent,
     submit_exact_position_sltp,
 )
 from telegram_kol_research.protection_revisions import activate_protection_revision
@@ -106,6 +110,11 @@ from telegram_kol_research.take_profit_plan import build_take_profit_plan
 
 class RecoveryLiveSubmitError(RuntimeError):
     """Raised when a live recovery order cannot be submitted safely."""
+
+
+_SAFE_PERSISTED_FAILURE = re.compile(
+    r"^[a-z0-9][a-z0-9_:,-]{0,255}$"
+)
 
 
 @dataclass(slots=True)
@@ -202,7 +211,7 @@ def _mark_protected_entry_signal_blocked(
     session_factory: sessionmaker,
     *,
     signal_id: int,
-    error: str,
+    error: BaseException,
     failed_at: datetime,
     terminal_status: str,
 ) -> None:
@@ -215,10 +224,27 @@ def _mark_protected_entry_signal_blocked(
                 "protected_entry_signal_state_conflict"
             )
         row.status = terminal_status
-        row.last_error = str(error)[:4096]
+        row.last_error = _safe_protected_failure_code(error)
         row.attempts = int(row.attempts or 0) + 1
         row.updated_at = failed_at
         session.commit()
+
+
+def _safe_protected_failure_code(error: BaseException) -> str:
+    fact = getattr(error, "fact", None)
+    safe_code = getattr(fact, "safe_code", None)
+    if (
+        isinstance(safe_code, str)
+        and _SAFE_PERSISTED_FAILURE.fullmatch(safe_code)
+    ):
+        return safe_code
+    message = str(error)
+    if (
+        isinstance(error, RecoveryLiveSubmitError)
+        and _SAFE_PERSISTED_FAILURE.fullmatch(message)
+    ):
+        return message
+    return "protected_entry_execution_failed"
 
 
 def _require_synchronized_finalized_entry_assembly(
@@ -1042,7 +1068,7 @@ def process_trade_signal_live(
             _mark_protected_entry_signal_blocked(
                 session_factory,
                 signal_id=signal_id,
-                error=str(failure),
+                error=failure,
                 failed_at=execution_boundary_at,
                 terminal_status=terminal_status,
             )
@@ -1691,6 +1717,9 @@ def _submit_protected_market_entry(
             "entry_submitting",
             "entry_pending_readback",
             "entry_unknown",
+            "entry_confirmed",
+            "protection_prepared",
+            "protected",
         }:
             raise RecoveryLiveSubmitError(
                 "protected_entry_operation_state_conflict"
@@ -1712,27 +1741,32 @@ def _submit_protected_market_entry(
             "protected_entry_readback_pending"
         )
     order_id, pos_id = readback
-    runtime.operation = _transition_protected_operation(
-        session_factory,
-        runtime.operation,
-        phase="entry_readback",
-        state="entry_confirmed",
-        certainty="confirmed",
-        reason_code="entry_readback_confirmed",
-        evidence={
-            "leg_index": leg_index,
-            "order_ref": hashlib.sha256(
-                f"order:{order_id}".encode("utf-8")
-            ).hexdigest(),
-            "position_ref": hashlib.sha256(
-                f"position:{pos_id}".encode("utf-8")
-            ).hexdigest(),
-            "pre_submit_position_refs": sorted(
-                pre_submit_position_refs
-            ),
-        },
-        changed_at=datetime.now(UTC),
-    )
+    if runtime.operation.state in {
+        "entry_submitting",
+        "entry_pending_readback",
+        "entry_unknown",
+    }:
+        runtime.operation = _transition_protected_operation(
+            session_factory,
+            runtime.operation,
+            phase="entry_readback",
+            state="entry_confirmed",
+            certainty="confirmed",
+            reason_code="entry_readback_confirmed",
+            evidence={
+                "leg_index": leg_index,
+                "order_ref": hashlib.sha256(
+                    f"order:{order_id}".encode("utf-8")
+                ).hexdigest(),
+                "position_ref": hashlib.sha256(
+                    f"position:{pos_id}".encode("utf-8")
+                ).hexdigest(),
+                "pre_submit_position_refs": sorted(
+                    pre_submit_position_refs
+                ),
+            },
+            changed_at=datetime.now(UTC),
+        )
     progress.record_confirmed_leg()
     return dict(response), order_id, pos_id, runtime
 
@@ -1885,6 +1919,136 @@ def _position_mutation_intent_status(
         ).scalar()
 
 
+def _confirmed_protection_response(
+    session_factory: sessionmaker,
+    *,
+    child: ExecutionOperationRecord,
+    intent_id: int,
+    request_fingerprint: str,
+    execution_binding_id: int,
+    execution_order_leg_id: int,
+    pos_id: str,
+    payload: Mapping[str, Any],
+    ledger_purpose: str,
+) -> Mapping[str, Any] | None:
+    """Return durable confirmed evidence for one completed protection child."""
+
+    if (
+        child.state != "protected"
+        or child.outcome_certainty != "confirmed"
+        or child.completed_at is None
+        or child.request_fingerprint != request_fingerprint
+    ):
+        return None
+    evidence = _operation_evidence(child)
+    if evidence.get("position_mutation_intent_id") != intent_id:
+        return None
+    try:
+        with session_factory() as session:
+            intent = session.get(PositionMutationIntent, intent_id)
+            if (
+                intent is None
+                or intent.operation != "set_position_sltp"
+                or intent.status != "confirmed"
+                or intent.confirmed_at is None
+                or intent.execution_binding_id != execution_binding_id
+                or intent.execution_order_leg_id != execution_order_leg_id
+                or intent.pos_id != pos_id
+                or intent.request_fingerprint != request_fingerprint
+                or not isinstance(intent.request_json, str)
+                or not isinstance(intent.response_json, str)
+                or len(intent.request_json.encode("utf-8")) > 4096
+                or len(intent.response_json.encode("utf-8")) > 4096
+            ):
+                return None
+            request = json.loads(intent.request_json)
+            response = json.loads(intent.response_json)
+            if not isinstance(request, dict) or not isinstance(response, dict):
+                return None
+            persisted_purpose = request.pop("_ledger_purpose", None)
+            if (
+                persisted_purpose != ledger_purpose
+                or _canonical_fingerprint(request) != request_fingerprint
+            ):
+                return None
+            response_data = response.get("data")
+            candidates = (
+                [*response_data, response]
+                if isinstance(response_data, list)
+                else [response_data, response]
+            )
+            order_ids = {
+                str(candidate.get(key))
+                for candidate in candidates
+                if isinstance(candidate, Mapping)
+                for key in ("ordId", "orderId", "order_id", "orderSysID")
+                if candidate.get(key) not in (None, "")
+            }
+            if len(order_ids) != 1:
+                return None
+            order_id = next(iter(order_ids))
+            ledger = (
+                session.query(PositionProtectionLedger)
+                .filter(
+                    PositionProtectionLedger.venue == str(intent.venue).lower(),
+                    PositionProtectionLedger.order_id == order_id,
+                )
+                .one_or_none()
+            )
+            trigger_field = (
+                "slTriggerPx"
+                if payload.get("slTriggerPx") not in (None, "")
+                else "tpTriggerPx"
+            )
+            if (
+                ledger is None
+                or ledger.status != "verified"
+                or ledger.execution_binding_id != execution_binding_id
+                or ledger.execution_order_leg_id != execution_order_leg_id
+                or ledger.pos_id != pos_id
+                or ledger.purpose != ledger_purpose
+                or ledger.instrument_id.upper()
+                != str(request.get("instId") or "").upper()
+                or ledger.side.lower()
+                != str(request.get("posSide") or "").lower()
+                or not _exact_decimal_equal(
+                    ledger.trigger_price, request.get(trigger_field)
+                )
+                or not _optional_decimal_equal(
+                    ledger.size_text, request.get("sz")
+                )
+            ):
+                return None
+            return response
+    except (
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        RecursionError,
+        TypeError,
+        ValueError,
+        InvalidOperation,
+    ):
+        return None
+
+
+def _exact_decimal_equal(left: Any, right: Any) -> bool:
+    if left in (None, "") or right in (None, ""):
+        return False
+    left_value = Decimal(str(left))
+    right_value = Decimal(str(right))
+    return (
+        left_value.is_finite()
+        and right_value.is_finite()
+        and left_value == right_value
+    )
+
+
+def _optional_decimal_equal(left: Any, right: Any) -> bool:
+    if left in (None, "") and right in (None, ""):
+        return True
+    return _exact_decimal_equal(left, right)
+
+
 def _submit_protected_entry_protections(
     *,
     session_factory: sessionmaker,
@@ -1907,24 +2071,74 @@ def _submit_protected_entry_protections(
         leg_index=leg_index,
         pos_id=pos_id,
     )
-    parent.operation = _transition_protected_operation(
-        session_factory,
-        parent.operation,
-        phase="protection_submit",
-        state="protection_prepared",
-        certainty="confirmed",
-        reason_code="protection_intents_prepared",
-        evidence={
-            "required_protection_count": len(payloads),
-            "confirmed_protection_count": 0,
-            "pre_submit_position_refs": sorted(
-                parent.pre_submit_position_refs
-            ),
-        },
-        changed_at=datetime.now(UTC),
-    )
-    children = []
+    if parent.operation.state == "entry_confirmed":
+        parent.operation = _transition_protected_operation(
+            session_factory,
+            parent.operation,
+            phase="protection_submit",
+            state="protection_prepared",
+            certainty="confirmed",
+            reason_code="protection_intents_prepared",
+            evidence={
+                "required_protection_count": len(payloads),
+                "confirmed_protection_count": 0,
+                "pre_submit_position_refs": sorted(
+                    parent.pre_submit_position_refs
+                ),
+            },
+            changed_at=datetime.now(UTC),
+        )
+    elif parent.operation.state == "protected":
+        parent_evidence = _operation_evidence(parent.operation)
+        if (
+            parent.operation.outcome_certainty != "confirmed"
+            or parent_evidence.get("required_protection_count")
+            != len(payloads)
+            or parent_evidence.get("confirmed_protection_count")
+            != len(payloads)
+            or parent_evidence.get("pre_submit_position_refs")
+            != sorted(parent.pre_submit_position_refs)
+        ):
+            raise RecoveryLiveSubmitError(
+                "protected_entry_parent_evidence_conflict"
+            )
+    elif parent.operation.state != "protection_prepared":
+        raise RecoveryLiveSubmitError(
+            "protected_entry_protection_state_conflict"
+        )
+    prepared_intents = []
     for protection_index, payload in enumerate(payloads):
+        idempotency_key = (
+            f"protected-entry:{trade_signal.id}:{leg_index}:"
+            f"set:{protection_index}"
+        )
+        with deepcoin_client.request_scope(
+            _protected_request_scope(
+                session_factory,
+                runtime=parent,
+                operation=parent.operation,
+                phase="protection_submit",
+            )
+        ):
+            prepared_intents.append(
+                prepare_exact_position_sltp_intent(
+                    session_factory=session_factory,
+                    deepcoin_client=deepcoin_client,
+                    pos_id=pos_id,
+                    payload=payload,
+                    idempotency_key=idempotency_key,
+                    now_provider=lambda: submitted_at,
+                    ledger_purpose=(
+                        "stop_loss"
+                        if protection_index == 0
+                        else "backup_stop"
+                    ),
+                )
+            )
+    children = []
+    for protection_index, (payload, prepared_intent) in enumerate(
+        zip(payloads, prepared_intents, strict=True)
+    ):
         children.append(
             reserve_execution_operation(
                 session_factory,
@@ -1941,7 +2155,7 @@ def _submit_protected_entry_protections(
                 phase="protection_submit",
                 state="protection_prepared",
                 outcome_certainty="not_sent",
-                request_fingerprint=_canonical_fingerprint(payload),
+                request_fingerprint=prepared_intent.request_fingerprint,
                 economics_fingerprint=_canonical_fingerprint(
                     {
                         "purpose": (
@@ -1959,15 +2173,38 @@ def _submit_protected_entry_protections(
                 evidence={
                     "protection_index": protection_index,
                     "required_protection_count": len(payloads),
+                    "position_mutation_intent_id": (
+                        prepared_intent.intent_id
+                    ),
                 },
                 created_at=submitted_at,
             )
         )
     responses: list[Mapping[str, Any]] = []
-    for protection_index, (payload, child) in enumerate(
-        zip(payloads, children, strict=True)
+    for protection_index, (payload, child, prepared_intent) in enumerate(
+        zip(payloads, children, prepared_intents, strict=True)
     ):
-        child_holder = {"operation": child, "intent_id": None}
+        ledger_purpose = (
+            "stop_loss" if protection_index == 0 else "backup_stop"
+        )
+        confirmed_response = _confirmed_protection_response(
+            session_factory,
+            child=child,
+            intent_id=prepared_intent.intent_id,
+            request_fingerprint=prepared_intent.request_fingerprint,
+            execution_binding_id=binding_id,
+            execution_order_leg_id=execution_leg_id,
+            pos_id=pos_id,
+            payload=payload,
+            ledger_purpose=ledger_purpose,
+        )
+        if confirmed_response is not None:
+            responses.append(confirmed_response)
+            continue
+        child_holder = {
+            "operation": child,
+            "intent_id": prepared_intent.intent_id,
+        }
 
         def before_exchange_submit(intent_id: int) -> None:
             operation = child_holder["operation"]
@@ -2010,6 +2247,7 @@ def _submit_protected_entry_protections(
                         f"protected-entry:{trade_signal.id}:{leg_index}:"
                         f"set:{protection_index}"
                     ),
+                    expected_intent_id=prepared_intent.intent_id,
                     live_execution_gate=lambda: (
                         _protected_entry_writer_allowed(
                             session_factory,
@@ -2022,11 +2260,7 @@ def _submit_protected_entry_protections(
                     ),
                     now_provider=lambda: submitted_at,
                     require_readback=True,
-                    ledger_purpose=(
-                        "stop_loss"
-                        if protection_index == 0
-                        else "backup_stop"
-                    ),
+                        ledger_purpose=ledger_purpose,
                     before_exchange_submit=before_exchange_submit,
                     readback_deadline_monotonic=parent.deadline_monotonic,
                     monotonic_factory=parent.monotonic_factory,
@@ -2044,6 +2278,7 @@ def _submit_protected_entry_protections(
                             uid_scope_hash=parent.uid_scope_hash,
                         )
                     ),
+                    require_complete_readback_identity=True,
                 )
             child = child_holder["operation"]
             child = _transition_protected_operation(
@@ -2143,22 +2378,23 @@ def _submit_protected_entry_protections(
                 reason_code="protection_incomplete",
             )
             raise
-    parent.operation = _transition_protected_operation(
-        session_factory,
-        parent.operation,
-        phase="protection_readback",
-        state="protected",
-        certainty="confirmed",
-        reason_code="protection_fully_confirmed",
-        evidence={
-            "required_protection_count": len(children),
-            "confirmed_protection_count": len(children),
-            "pre_submit_position_refs": sorted(
-                parent.pre_submit_position_refs
-            ),
-        },
-        changed_at=datetime.now(UTC),
-    )
+    if parent.operation.state != "protected":
+        parent.operation = _transition_protected_operation(
+            session_factory,
+            parent.operation,
+            phase="protection_readback",
+            state="protected",
+            certainty="confirmed",
+            reason_code="protection_fully_confirmed",
+            evidence={
+                "required_protection_count": len(children),
+                "confirmed_protection_count": len(children),
+                "pre_submit_position_refs": sorted(
+                    parent.pre_submit_position_refs
+                ),
+            },
+            changed_at=datetime.now(UTC),
+        )
     return responses
 
 

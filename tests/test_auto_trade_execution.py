@@ -23,7 +23,7 @@ from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecLo
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.message_instruction_items import create_message_instruction_items_in_session
-from telegram_kol_research.models import DeepcoinExecutionOperation, EntryPreamble, EntryStrategyAssembly, EntryStrategyFragment, ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, InstructionExecutionContract, MediaAsset, MessageEvidenceExtractionClaim, MessageEvidenceVersion, MessageInstructionItem, PositionProtectionLeg, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal, TriggerProtectionIntent, TriggerTakeProfitConvergence
+from telegram_kol_research.models import DeepcoinExecutionOperation, EntryPreamble, EntryStrategyAssembly, EntryStrategyFragment, ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, InstructionExecutionContract, MediaAsset, MessageEvidenceExtractionClaim, MessageEvidenceVersion, MessageInstructionItem, PositionMutationIntent, PositionProtectionLeg, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal, TriggerProtectionIntent, TriggerTakeProfitConvergence
 from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
 from telegram_kol_research.recovery_live_submit import _trigger_protection_lock_key
 from telegram_kol_research.recovery_live_submit import _trigger_protection_request_fingerprint
@@ -3270,6 +3270,11 @@ def test_auto_trade_future_protected_entry_uses_canonical_parent_and_child_opera
             .order_by(DeepcoinExecutionOperation.id)
             .all()
         )
+        intents = (
+            session.query(PositionMutationIntent)
+            .order_by(PositionMutationIntent.id)
+            .all()
+        )
     assert [operation.state for operation in operations] == [
         "protected",
         "protected",
@@ -3279,6 +3284,15 @@ def test_auto_trade_future_protected_entry_uses_canonical_parent_and_child_opera
         operation.parent_operation_id for operation in operations[1:]
     } == {operations[0].id}
     assert operations[0].contract_version == "1"
+    assert [operation.request_fingerprint for operation in operations[1:]] == [
+        intent.request_fingerprint for intent in intents
+    ]
+    assert [
+        json.loads(operation.evidence_json)[
+            "position_mutation_intent_id"
+        ]
+        for operation in operations[1:]
+    ] == [intent.id for intent in intents]
 
 
 def test_auto_process_message_trade_signal_records_entry_protection_ledger(tmp_path):
