@@ -7,6 +7,9 @@ import time
 import hashlib
 import json
 import re
+import base64
+import binascii
+import zlib
 from copy import deepcopy
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -153,6 +156,7 @@ class _PendingTpslCapture:
     end_write_generation: int
     capture_started_at: datetime
     capture_ended_at: datetime
+    normalized_baseline_json: str | None = None
 
 
 @dataclass(slots=True)
@@ -1464,6 +1468,35 @@ def _record_pending_tpsl_snapshot(
     reused: bool,
 ) -> None:
     collection = capture.collection
+    baseline_json = capture.normalized_baseline_json
+    if baseline_json is None and collection.complete:
+        try:
+            baseline_json = _normalized_pending_tpsl_rows(capture.rows)
+        except RecoveryLiveSubmitError:
+            baseline_json = None
+    durable_evidence: dict[str, Any] = {
+        "source": source,
+        "reused": reused,
+        "snapshot_ref": hashlib.sha256(
+            (
+                "pending_tpsl:"
+                + str(collection.fingerprint or "unavailable")
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+    if baseline_json is not None:
+        compressed = base64.b64encode(
+            zlib.compress(baseline_json.encode("utf-8"), level=9)
+        ).decode("ascii")
+        if len(compressed) <= 3000:
+            durable_evidence.update(
+                {
+                    "baseline_deflate_b64": compressed,
+                    "baseline_fingerprint": hashlib.sha256(
+                        baseline_json.encode("utf-8")
+                    ).hexdigest(),
+                }
+            )
     record_snapshot_evidence(
         session_factory,
         operation_id=operation.id,
@@ -1479,16 +1512,7 @@ def _record_pending_tpsl_snapshot(
         end_write_generation=capture.end_write_generation,
         capture_started_at=capture.capture_started_at,
         capture_ended_at=capture.capture_ended_at,
-        evidence={
-            "source": source,
-            "reused": reused,
-            "snapshot_ref": hashlib.sha256(
-                (
-                    "pending_tpsl:"
-                    + str(collection.fingerprint or "unavailable")
-                ).encode("utf-8")
-            ).hexdigest(),
-        },
+        evidence=durable_evidence,
         error_category=(
             None if collection.complete else "snapshot_incomplete"
         ),
@@ -1591,10 +1615,7 @@ class _PendingTpslRecordingClient:
             inst_id=inst_id,
         )
         self.latest_capture = capture
-        if not (
-            capture.collection.available
-            and capture.collection.schema_valid
-        ):
+        if not capture.collection.complete:
             raise DeepcoinSnapshotUnavailable(
                 capture.collection.reason_code or "snapshot_incomplete"
             )
@@ -1608,10 +1629,7 @@ class _PendingTpslRecordingClient:
             inst_id=inst_id,
         )
         self.latest_capture = capture
-        if not (
-            capture.collection.available
-            and capture.collection.schema_valid
-        ):
+        if not capture.collection.complete:
             raise DeepcoinSnapshotUnavailable(
                 capture.collection.reason_code or "snapshot_incomplete"
             )
@@ -1889,7 +1907,12 @@ def _later_leg_readback_operation_exists(
             == PROTECTED_ENTRY_CONTRACT_VERSION
             and operation.writer_attempted_at is not None
             and operation.state
-            in {"entry_submitting", "entry_pending_readback", "entry_unknown"}
+            in {
+                "entry_submitting",
+                "entry_pending_readback",
+                "entry_unknown",
+                "completed",
+            }
         )
 
 
@@ -1906,7 +1929,7 @@ def _any_later_leg_readback_operation_exists(
                 == int(trade_signal_id),
                 DeepcoinExecutionOperation.parent_operation_id.is_not(None),
                 DeepcoinExecutionOperation.phase.in_(
-                    ("entry_submit", "entry_readback")
+                    ("entry_submit", "entry_readback", "completed")
                 ),
                 DeepcoinExecutionOperation.writer_attempted_at.is_not(None),
                 DeepcoinExecutionOperation.state.in_(
@@ -1914,6 +1937,7 @@ def _any_later_leg_readback_operation_exists(
                         "entry_submitting",
                         "entry_pending_readback",
                         "entry_unknown",
+                        "completed",
                     )
                 ),
             )
@@ -1940,6 +1964,20 @@ def _submit_protected_market_entry(
     sleeper = _protected_client_sleep(deepcoin_client)
     deadline_monotonic = float(clock()) + 10.0
     deadline_at = submitted_at + timedelta(seconds=10)
+    parent_operation_key = _protected_entry_operation_key(
+        trade_signal.id,
+        leg_index,
+    )
+    with session_factory() as session:
+        resuming_existing_operation = (
+            session.query(DeepcoinExecutionOperation.id)
+            .filter(
+                DeepcoinExecutionOperation.operation_key
+                == parent_operation_key
+            )
+            .first()
+            is not None
+        )
     uid_scope_hash = str(getattr(deepcoin_client, "uid_scope_hash"))
     preflight_scope = DeepcoinRequestScope(
         phase="entry_preflight",
@@ -1970,11 +2008,15 @@ def _submit_protected_market_entry(
         deadline_at=deadline_at,
         pre_submit_position_refs=current_position_refs,
     )
-    remaining_seconds = max(
-        0.0,
-        (operation.deadline_at - submitted_at.replace(tzinfo=None)).total_seconds(),
-    )
-    deadline_monotonic = float(clock()) + remaining_seconds
+    if resuming_existing_operation:
+        remaining_seconds = max(
+            0.0,
+            (
+                operation.deadline_at
+                - submitted_at.replace(tzinfo=None)
+            ).total_seconds(),
+        )
+        deadline_monotonic = float(clock()) + remaining_seconds
     pre_submit_position_refs = _baseline_position_refs(operation)
     runtime = _ProtectedEntryRuntime(
         operation=operation,
@@ -3742,6 +3784,52 @@ def _complete_reusable_protection_capture(
     parent: _ProtectedEntryRuntime,
 ) -> _PendingTpslCapture | None:
     capture = parent.latest_protection_capture
+    if capture is None:
+        bundle = load_operation_bundle(
+            session_factory,
+            operation_id=parent.operation.id,
+        )
+        current_generation = _current_write_generation(
+            session_factory,
+            uid_scope_hash=parent.uid_scope_hash,
+        )
+        for snapshot in reversed(bundle.snapshots):
+            if (
+                snapshot.snapshot_kind != "protection_pending"
+                or not snapshot.complete
+                or snapshot.collection_fingerprint is None
+                or snapshot.start_write_generation
+                != snapshot.end_write_generation
+                or snapshot.end_write_generation != current_generation
+                or snapshot.end_write_generation % 2 != 0
+            ):
+                continue
+            baseline_json = _snapshot_baseline_json(
+                snapshot.evidence_json
+            )
+            if baseline_json is None:
+                continue
+            collection = ExchangeCollectionEvidence(
+                endpoint="pending_trigger_orders",
+                available=snapshot.available,
+                schema_valid=snapshot.schema_valid,
+                complete=snapshot.complete,
+                rows=(),
+                row_count=snapshot.row_count,
+                page_count=snapshot.page_count,
+                fingerprint=snapshot.collection_fingerprint,
+                reason_code=None,
+            )
+            capture = _PendingTpslCapture(
+                collection=collection,
+                rows=(),
+                start_write_generation=snapshot.start_write_generation,
+                end_write_generation=snapshot.end_write_generation,
+                capture_started_at=snapshot.capture_started_at,
+                capture_ended_at=snapshot.capture_ended_at,
+                normalized_baseline_json=baseline_json,
+            )
+            break
     if capture is None or not capture.collection.complete:
         return None
     if (
@@ -3758,6 +3846,57 @@ def _complete_reusable_protection_capture(
     return capture
 
 
+def _snapshot_baseline_json(evidence_json: str) -> str | None:
+    try:
+        if not isinstance(evidence_json, str) or len(evidence_json) > 4096:
+            return None
+        evidence = json.loads(evidence_json)
+        if not isinstance(evidence, dict):
+            return None
+        encoded = evidence.get("baseline_deflate_b64")
+        expected = evidence.get("baseline_fingerprint")
+        if (
+            not isinstance(encoded, str)
+            or len(encoded) > 3000
+            or not isinstance(expected, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected)
+        ):
+            return None
+        compressed = base64.b64decode(encoded, validate=True)
+        decompressor = zlib.decompressobj()
+        decoded = decompressor.decompress(compressed, 65_537)
+        if (
+            len(decoded) > 65_536
+            or not decompressor.eof
+            or decompressor.unused_data
+        ):
+            return None
+        baseline_json = decoded.decode("utf-8")
+        if hashlib.sha256(decoded).hexdigest() != expected:
+            return None
+        parsed = json.loads(baseline_json)
+        if (
+            not isinstance(parsed, list)
+            or json.dumps(
+                parsed,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            != baseline_json
+        ):
+            return None
+        return baseline_json
+    except (
+        binascii.Error,
+        UnicodeDecodeError,
+        ValueError,
+        zlib.error,
+        RecursionError,
+    ):
+        return None
+
+
 def _capture_next_leg_baseline(
     session_factory: sessionmaker,
     *,
@@ -3766,11 +3905,18 @@ def _capture_next_leg_baseline(
     operation: ExecutionOperationRecord,
     inst_id: str,
 ) -> tuple[str, _PendingTpslCapture]:
+    prior_attempt_count = len(
+        load_operation_bundle(
+            session_factory,
+            operation_id=operation.id,
+        ).snapshots
+    )
+    max_attempts = 4
     reusable = _complete_reusable_protection_capture(
         session_factory,
         parent=parent,
     )
-    if reusable is not None:
+    if reusable is not None and prior_attempt_count < max_attempts:
         _record_pending_tpsl_snapshot(
             session_factory,
             operation=operation,
@@ -3778,11 +3924,21 @@ def _capture_next_leg_baseline(
             source="post_protection_snapshot",
             reused=True,
         )
-        return _normalized_pending_tpsl_rows(reusable.rows), reusable
+        prior_attempt_count += 1
+        try:
+            return (
+                reusable.normalized_baseline_json
+                or _normalized_pending_tpsl_rows(reusable.rows),
+                reusable,
+            )
+        except RecoveryLiveSubmitError:
+            pass
 
     last_capture: _PendingTpslCapture | None = None
-    attempt_count = 0
-    for delay in (0.0, 0.5, 1.0, 2.0):
+    delays = (0.0, 0.5, 1.0, 2.0)
+    attempt_count = prior_attempt_count
+    for attempt_index in range(prior_attempt_count, max_attempts):
+        delay = delays[attempt_index]
         remaining = parent.deadline_monotonic - float(
             parent.monotonic_factory()
         )
@@ -3820,10 +3976,13 @@ def _capture_next_leg_baseline(
             reused=False,
         )
         if last_capture.collection.complete:
-            return (
-                _normalized_pending_tpsl_rows(last_capture.rows),
-                last_capture,
-            )
+            try:
+                return (
+                    _normalized_pending_tpsl_rows(last_capture.rows),
+                    last_capture,
+                )
+            except RecoveryLiveSubmitError:
+                continue
 
     operation = _transition_protected_operation(
         session_factory,
@@ -3836,7 +3995,18 @@ def _capture_next_leg_baseline(
         evidence={
             "attempt_count": attempt_count,
             "deadline_at": parent.operation.deadline_at.isoformat(),
-            "last_complete_snapshot_ref": None,
+            "last_complete_snapshot_ref": (
+                hashlib.sha256(
+                    (
+                        "pending_tpsl:"
+                        + str(last_capture.collection.fingerprint)
+                    ).encode("utf-8")
+                ).hexdigest()
+                if last_capture is not None
+                and last_capture.collection.complete
+                and last_capture.collection.fingerprint is not None
+                else None
+            ),
             "writer_attempted": False,
         },
         changed_at=datetime.now(UTC),
@@ -4151,6 +4321,7 @@ def _submit_trigger_with_protection_intent(
                 execution_order_leg_id=execution_order_leg_id,
             )
             return {"code": "0", "data": {"ordId": order_id}}
+        won_entry_submit = False
         if operation.state == "next_leg_preflight":
             baseline_json, capture = _capture_next_leg_baseline(
                 session_factory,
@@ -4202,6 +4373,12 @@ def _submit_trigger_with_protection_intent(
                     trade_signal_id=trade_signal.id,
                 )
             ):
+                durable_attempt_count = len(
+                    load_operation_bundle(
+                        session_factory,
+                        operation_id=operation.id,
+                    ).snapshots
+                )
                 operation = _transition_protected_operation(
                     session_factory,
                     operation,
@@ -4211,7 +4388,7 @@ def _submit_trigger_with_protection_intent(
                     error_category="snapshot_incomplete",
                     reason_code="next_leg_preflight_deferred",
                     evidence={
-                        "attempt_count": 1,
+                        "attempt_count": durable_attempt_count,
                         "deadline_at": parent.operation.deadline_at.isoformat(),
                         "last_complete_snapshot_ref": hashlib.sha256(
                             (
@@ -4248,7 +4425,8 @@ def _submit_trigger_with_protection_intent(
                 changed_at=attempted_at,
                 writer_attempted_at=attempted_at,
             )
-        if operation.state == "entry_submitting":
+            won_entry_submit = True
+        if operation.state == "entry_submitting" and won_entry_submit:
             baseline_fingerprint = _operation_evidence(operation).get(
                 "baseline_fingerprint"
             )
@@ -4327,6 +4505,29 @@ def _submit_trigger_with_protection_intent(
                     },
                     changed_at=datetime.now(UTC),
                 )
+        elif operation.state == "entry_submitting":
+            baseline_fingerprint = _operation_evidence(operation).get(
+                "baseline_fingerprint"
+            )
+            _require_later_trigger_intent_identity(
+                session_factory,
+                operation=operation,
+                execution_order_leg_id=execution_order_leg_id,
+            )
+            operation = _transition_protected_operation(
+                session_factory,
+                operation,
+                phase="entry_readback",
+                state="entry_unknown",
+                certainty="unknown",
+                reason_code="entry_submission_unknown",
+                evidence={
+                    "leg_index": leg_index,
+                    "baseline_fingerprint": baseline_fingerprint,
+                },
+                changed_at=datetime.now(UTC),
+            )
+            response = {}
         elif operation.state in {"entry_pending_readback", "entry_unknown"}:
             baseline_fingerprint = _operation_evidence(operation).get(
                 "baseline_fingerprint"

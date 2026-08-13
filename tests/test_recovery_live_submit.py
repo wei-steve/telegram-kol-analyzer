@@ -3996,6 +3996,10 @@ class _Task10ProtectedClient(_FakeDeepcoinClient):
         make_protection_capture_incomplete=False,
         later_baseline_failures=0,
         later_writer_unknown=False,
+        raw_pending_pagination=False,
+        list_only_page_limit=False,
+        first_preflight_delay=0.0,
+        malformed_later_baseline=False,
     ):
         super().__init__()
         self.session_factory = session_factory
@@ -4009,15 +4013,39 @@ class _Task10ProtectedClient(_FakeDeepcoinClient):
         )
         self.later_baseline_failures = later_baseline_failures
         self.later_writer_unknown = later_writer_unknown
+        self.raw_pending_pagination = raw_pending_pagination
+        self.list_only_page_limit = list_only_page_limit
+        self.first_preflight_delay = first_preflight_delay
+        self.malformed_later_baseline = malformed_later_baseline
         self.later_trigger_visible = False
         self.later_trigger_state = "live"
+        self.crash_later_before_post = False
+        self.scopes = []
+        self.crash_on_retry_sleep = False
 
     def _sleep(self, seconds):
+        if self.crash_on_retry_sleep and seconds > 0:
+            self.crash_on_retry_sleep = False
+            raise _Task10CrashBeforePost()
         self.sleep_times.append(seconds)
         self.now += seconds
 
     @contextmanager
     def request_scope(self, scope):
+        self.scopes.append((scope.phase, scope.deadline_monotonic, self.now))
+        if (
+            scope.phase == "entry_preflight"
+            and self.first_preflight_delay
+        ):
+            self.now += self.first_preflight_delay
+            self.first_preflight_delay = 0.0
+        if (
+            self.crash_later_before_post
+            and scope.phase == "entry_submit"
+            and ":leg:2:entry" in scope.correlation_id
+        ):
+            self.crash_later_before_post = False
+            raise _Task10CrashBeforePost()
         yield self
 
     def place_order(self, payload):
@@ -4091,6 +4119,16 @@ class _Task10ProtectedClient(_FakeDeepcoinClient):
                 self.later_baseline_failures -= 1
                 raise TimeoutError("transient pending TPSL read")
         rows = [dict(row) for row in self.pending_tpsl]
+        if self.list_only_page_limit:
+            rows.extend(
+                {
+                    "ordId": f"list-only-filler-{index}",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "short",
+                    "triggerOrderType": "TPSL",
+                }
+                for index in range(100)
+            )
         if self.pending_reads == 2 and self.make_protection_capture_incomplete:
             rows.extend(
                 {
@@ -4103,7 +4141,20 @@ class _Task10ProtectedClient(_FakeDeepcoinClient):
             )
         if self.later_trigger_visible:
             rows.append(self._later_trigger_row())
+        if (
+            self.malformed_later_baseline
+            and self.pending_reads >= 3
+            and rows
+        ):
+            rows[0]["posSide"] = "corrupt"
         return rows
+
+    def read_trigger_orders_pending(self, *, inst_id):
+        rows = self.list_trigger_orders_pending(inst_id=inst_id)
+        response = {"data": rows}
+        if self.raw_pending_pagination:
+            response.update({"hasMore": True, "nextCursor": "page-2"})
+        return response
 
     def list_trigger_order_history(self, *, inst_id):
         return [self._later_trigger_row()] if self.later_trigger_visible else []
@@ -4151,6 +4202,10 @@ def _task10_one_stop(monkeypatch):
     )
 
 
+class _Task10CrashBeforePost(BaseException):
+    pass
+
+
 def test_next_leg_reuses_post_protection_snapshot_without_redundant_get(
     tmp_path,
     monkeypatch,
@@ -4188,6 +4243,149 @@ def test_next_leg_reuses_post_protection_snapshot_without_redundant_get(
     assert any(item.deepcoin_execution_operation_id == later.id for item in snapshots)
 
 
+def test_slow_first_preflight_does_not_extend_original_next_leg_deadline(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(
+        tmp_path / "task10-original-deadline.db"
+    )
+    signal = _task10_two_leg_signal(session_factory)
+    client = _Task10ProtectedClient(
+        session_factory,
+        first_preflight_delay=4.0,
+    )
+    _task10_one_stop(monkeypatch)
+    monkeypatch.setattr(
+        "telegram_kol_research.recovery_live_submit."
+        "_complete_reusable_protection_capture",
+        lambda *args, **kwargs: None,
+    )
+
+    result = process_trade_signal_live(
+        session_factory,
+        signal_id=signal.id,
+        deepcoin_client=client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 8, 13, 8, 0, tzinfo=UTC),
+    )
+
+    assert result["submitted"] is True
+    later_scopes = [
+        item for item in client.scopes if item[0] == "next_leg_preflight"
+    ]
+    assert later_scopes
+    assert all(item[1] == 110.0 for item in later_scopes)
+    assert all(item[2] < 110.0 for item in later_scopes)
+
+
+def test_malformed_later_baseline_exhausts_global_attempt_budget_and_defers(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(
+        tmp_path / "task10-malformed-baseline.db"
+    )
+    signal = _task10_two_leg_signal(session_factory)
+    client = _Task10ProtectedClient(
+        session_factory,
+        malformed_later_baseline=True,
+    )
+    _task10_one_stop(monkeypatch)
+    monkeypatch.setattr(
+        "telegram_kol_research.recovery_live_submit."
+        "_complete_reusable_protection_capture",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(
+        EntrySubmissionProgressError,
+        match="protected_entry_pre_submit_deferred",
+    ):
+        _submit_recovery_signal_direct(
+            session_factory,
+            trade_signal=load_trade_signal(session_factory, signal.id),
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            submitted_at=datetime(2026, 8, 13, 8, 0, tzinfo=UTC),
+        )
+    with session_factory() as session:
+        later = session.query(DeepcoinExecutionOperation).filter(
+            DeepcoinExecutionOperation.operation_key.like("%:leg:2:entry")
+        ).one()
+        snapshot_count = session.query(DeepcoinSnapshotEvidence).filter(
+            DeepcoinSnapshotEvidence.deepcoin_execution_operation_id
+            == later.id
+        ).count()
+    assert later.state == "pre_submit_deferred"
+    assert snapshot_count == 4
+    assert client.trigger_payloads == []
+
+
+def test_later_baseline_attempt_budget_survives_crash_and_restart(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(
+        tmp_path / "task10-baseline-budget-restart.db"
+    )
+    signal = _task10_two_leg_signal(session_factory)
+    client = _Task10ProtectedClient(
+        session_factory,
+        malformed_later_baseline=True,
+    )
+    client.crash_on_retry_sleep = True
+    _task10_one_stop(monkeypatch)
+    monkeypatch.setattr(
+        "telegram_kol_research.recovery_live_submit."
+        "_complete_reusable_protection_capture",
+        lambda *args, **kwargs: None,
+    )
+    submitted_at = datetime(2026, 8, 13, 8, 0, tzinfo=UTC)
+
+    with pytest.raises(_Task10CrashBeforePost):
+        _submit_recovery_signal_direct(
+            session_factory,
+            trade_signal=load_trade_signal(session_factory, signal.id),
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            submitted_at=submitted_at,
+        )
+    with session_factory() as session:
+        later = session.query(DeepcoinExecutionOperation).filter(
+            DeepcoinExecutionOperation.operation_key.like("%:leg:2:entry")
+        ).one()
+        first_snapshot_count = session.query(DeepcoinSnapshotEvidence).filter(
+            DeepcoinSnapshotEvidence.deepcoin_execution_operation_id
+            == later.id
+        ).count()
+    assert later.state == "next_leg_preflight"
+    assert first_snapshot_count == 1
+
+    with pytest.raises(
+        EntrySubmissionProgressError,
+        match="protected_entry_pre_submit_deferred",
+    ):
+        _submit_recovery_signal_direct(
+            session_factory,
+            trade_signal=load_trade_signal(session_factory, signal.id),
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            submitted_at=submitted_at + timedelta(seconds=1),
+        )
+    with session_factory() as session:
+        later = session.query(DeepcoinExecutionOperation).filter(
+            DeepcoinExecutionOperation.operation_key.like("%:leg:2:entry")
+        ).one()
+        final_snapshot_count = session.query(DeepcoinSnapshotEvidence).filter(
+            DeepcoinSnapshotEvidence.deepcoin_execution_operation_id
+            == later.id
+        ).count()
+    assert later.state == "pre_submit_deferred"
+    assert final_snapshot_count == 4
+    assert client.trigger_payloads == []
+
+
 def test_next_leg_transient_baseline_retries_inside_original_deadline(
     tmp_path,
     monkeypatch,
@@ -4196,10 +4394,14 @@ def test_next_leg_transient_baseline_retries_inside_original_deadline(
     signal = _task10_two_leg_signal(session_factory)
     client = _Task10ProtectedClient(
         session_factory,
-        make_protection_capture_incomplete=True,
         later_baseline_failures=1,
     )
     _task10_one_stop(monkeypatch)
+    monkeypatch.setattr(
+        "telegram_kol_research.recovery_live_submit."
+        "_complete_reusable_protection_capture",
+        lambda *args, **kwargs: None,
+    )
 
     process_trade_signal_live(
         session_factory,
@@ -4232,10 +4434,14 @@ def test_next_leg_preflight_exhaustion_is_durable_and_never_timer_submitted(
     signal = _task10_two_leg_signal(session_factory)
     client = _Task10ProtectedClient(
         session_factory,
-        make_protection_capture_incomplete=True,
         later_baseline_failures=4,
     )
     _task10_one_stop(monkeypatch)
+    monkeypatch.setattr(
+        "telegram_kol_research.recovery_live_submit."
+        "_complete_reusable_protection_capture",
+        lambda *args, **kwargs: None,
+    )
     submitted_at = datetime(2026, 8, 13, 8, 0, tzinfo=UTC)
 
     with pytest.raises(
@@ -4398,6 +4604,231 @@ def test_next_leg_unknown_readback_rejects_tampered_baseline_without_new_post(
             DeepcoinExecutionOperation.operation_key.like("%:leg:2:entry")
         ).one()
     assert later.state == "entry_unknown"
+    assert len(client.trigger_payloads) == 1
+
+
+def test_next_leg_crash_after_writer_boundary_restarts_get_only_without_post(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(
+        tmp_path / "task10-writer-boundary-crash.db"
+    )
+    signal = _task10_two_leg_signal(session_factory)
+    client = _Task10ProtectedClient(session_factory)
+    client.crash_later_before_post = True
+    _task10_one_stop(monkeypatch)
+    submitted_at = datetime(2026, 8, 13, 8, 0, tzinfo=UTC)
+
+    with pytest.raises(_Task10CrashBeforePost):
+        _submit_recovery_signal_direct(
+            session_factory,
+            trade_signal=load_trade_signal(session_factory, signal.id),
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            submitted_at=submitted_at,
+        )
+    with session_factory() as session:
+        later = session.query(DeepcoinExecutionOperation).filter(
+            DeepcoinExecutionOperation.operation_key.like("%:leg:2:entry")
+        ).one()
+    assert later.state == "entry_submitting"
+    assert later.writer_attempted_at is not None
+    assert client.trigger_payloads == []
+
+    with pytest.raises(
+        EntrySubmissionProgressError,
+        match="protected_entry_later_leg_readback_pending",
+    ):
+        _submit_recovery_signal_direct(
+            session_factory,
+            trade_signal=load_trade_signal(session_factory, signal.id),
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            submitted_at=submitted_at + timedelta(seconds=2),
+        )
+    with session_factory() as session:
+        later = session.query(DeepcoinExecutionOperation).filter(
+            DeepcoinExecutionOperation.operation_key.like("%:leg:2:entry")
+        ).one()
+    assert later.state == "entry_unknown"
+    assert client.trigger_payloads == []
+
+
+def test_paginated_protection_baseline_fails_before_protection_post(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(
+        tmp_path / "task10-paginated-protection-baseline.db"
+    )
+    signal = _task10_two_leg_signal(session_factory)
+    client = _Task10ProtectedClient(
+        session_factory,
+        raw_pending_pagination=True,
+    )
+    _task10_one_stop(monkeypatch)
+
+    with pytest.raises(EntrySubmissionProgressError):
+        _submit_recovery_signal_direct(
+            session_factory,
+            trade_signal=load_trade_signal(session_factory, signal.id),
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            submitted_at=datetime(2026, 8, 13, 8, 0, tzinfo=UTC),
+        )
+
+    assert len(client.payloads) == 1
+    assert client.position_protection_payloads == []
+    assert client.trigger_payloads == []
+
+
+def test_list_only_page_limit_protection_baseline_fails_before_post(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(
+        tmp_path / "task10-list-limit-protection-baseline.db"
+    )
+    signal = _task10_two_leg_signal(session_factory)
+    client = _Task10ProtectedClient(
+        session_factory,
+        list_only_page_limit=True,
+    )
+    client.read_trigger_orders_pending = None
+    _task10_one_stop(monkeypatch)
+
+    with pytest.raises(EntrySubmissionProgressError):
+        _submit_recovery_signal_direct(
+            session_factory,
+            trade_signal=load_trade_signal(session_factory, signal.id),
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            submitted_at=datetime(2026, 8, 13, 8, 0, tzinfo=UTC),
+        )
+
+    assert len(client.payloads) == 1
+    assert client.position_protection_payloads == []
+    assert client.trigger_payloads == []
+
+
+def test_completed_later_child_replays_after_rollout_disable_without_post(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.recovery_live_submit as submitter
+
+    session_factory = create_session_factory(
+        tmp_path / "task10-completed-child-replay.db"
+    )
+    signal = _task10_two_leg_signal(session_factory)
+    client = _Task10ProtectedClient(session_factory)
+    _task10_one_stop(monkeypatch)
+    submitted_at = datetime(2026, 8, 13, 8, 0, tzinfo=UTC)
+    original = submitter._submit_trigger_with_protection_intent
+    crashed = {"value": False}
+
+    def crash_after_completed(*args, **kwargs):
+        response = original(*args, **kwargs)
+        if not crashed["value"]:
+            crashed["value"] = True
+            raise _Task10CrashBeforePost()
+        return response
+
+    monkeypatch.setattr(
+        submitter,
+        "_submit_trigger_with_protection_intent",
+        crash_after_completed,
+    )
+    with pytest.raises(_Task10CrashBeforePost):
+        _submit_recovery_signal_direct(
+            session_factory,
+            trade_signal=load_trade_signal(session_factory, signal.id),
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            submitted_at=submitted_at,
+        )
+    with session_factory() as session:
+        later = session.query(DeepcoinExecutionOperation).filter(
+            DeepcoinExecutionOperation.operation_key.like("%:leg:2:entry")
+        ).one()
+    assert later.state == "completed"
+    assert len(client.trigger_payloads) == 1
+
+    save_trading_settings(
+        session_factory,
+        {"protected_entry_execution_mode": "disabled"},
+    )
+    result = _submit_recovery_signal_direct(
+        session_factory,
+        trade_signal=load_trade_signal(session_factory, signal.id),
+        deepcoin_client=client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        submitted_at=submitted_at + timedelta(seconds=5),
+    )
+
+    assert result["submitted"] is True
+    assert len(client.trigger_payloads) == 1
+
+
+def test_restart_reuses_durable_post_protection_snapshot_without_third_get(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.recovery_live_submit as submitter
+
+    session_factory = create_session_factory(
+        tmp_path / "task10-durable-protection-snapshot.db"
+    )
+    signal = _task10_two_leg_signal(session_factory)
+    client = _Task10ProtectedClient(session_factory)
+    _task10_one_stop(monkeypatch)
+    submitted_at = datetime(2026, 8, 13, 8, 0, tzinfo=UTC)
+    original = submitter._submit_protected_entry_protections
+    crashed = {"value": False}
+
+    def crash_after_protection_snapshot(*args, **kwargs):
+        responses = original(*args, **kwargs)
+        if not crashed["value"]:
+            crashed["value"] = True
+            raise _Task10CrashBeforePost()
+        return responses
+
+    monkeypatch.setattr(
+        submitter,
+        "_submit_protected_entry_protections",
+        crash_after_protection_snapshot,
+    )
+    with pytest.raises(_Task10CrashBeforePost):
+        _submit_recovery_signal_direct(
+            session_factory,
+            trade_signal=load_trade_signal(session_factory, signal.id),
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            submitted_at=submitted_at,
+        )
+    with session_factory() as session:
+        parent = session.query(DeepcoinExecutionOperation).filter(
+            DeepcoinExecutionOperation.parent_operation_id.is_(None)
+        ).one()
+        parent_snapshots = session.query(DeepcoinSnapshotEvidence).filter(
+            DeepcoinSnapshotEvidence.deepcoin_execution_operation_id
+            == parent.id
+        ).count()
+    assert parent.state == "protected"
+    assert parent_snapshots == 1
+    assert client.pending_reads == 2
+
+    result = _submit_recovery_signal_direct(
+        session_factory,
+        trade_signal=load_trade_signal(session_factory, signal.id),
+        deepcoin_client=client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        submitted_at=submitted_at + timedelta(seconds=1),
+    )
+
+    assert result["submitted"] is True
+    assert client.pending_reads == 2
     assert len(client.trigger_payloads) == 1
 
 
