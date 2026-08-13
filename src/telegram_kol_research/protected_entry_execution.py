@@ -35,6 +35,7 @@ PROTECTED_ENTRY_EVENTS = frozenset(
         "entry_submission_unknown",
         "entry_readback_confirmed",
         "prepare_protection",
+        "request_protection_submit",
         "protection_submission_accepted",
         "protection_submission_rejected",
         "protection_submission_unknown",
@@ -68,6 +69,13 @@ class ProtectedEntryDecisionError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class ProtectedEntryFacts:
+    """Closed facts for the operation phase handling the current event.
+
+    ``writer_attempted`` is phase-local.  A caller entering a newly prepared
+    child operation must load that child's durable writer fact instead of
+    inheriting the parent entry or protection attempt.
+    """
+
     live_exposure: bool
     writer_attempted: bool
     required_protection_count: int
@@ -128,8 +136,8 @@ def _request_entry_submit(
         return _refused(state, event, "entry_writer_already_attempted")
     if facts.operation_deadline_expired:
         return _refused(state, event, "operation_deadline_expired")
-    if facts.live_exposure and not _fully_protected(facts):
-        return _refused(state, event, "protection_not_fully_confirmed")
+    if facts.live_exposure:
+        return _refused(state, event, "unexpected_live_exposure")
     return _allowed(
         state,
         event,
@@ -202,8 +210,16 @@ def _prepare_protection(
 ) -> EntryTransition:
     if not facts.writer_attempted:
         return _refused(state, event, "entry_writer_not_attempted")
+    if not facts.live_exposure:
+        return _refused(state, event, "live_exposure_not_confirmed")
     if facts.operation_deadline_expired:
-        return _refused(state, event, "operation_deadline_expired")
+        return _allowed(
+            state,
+            event,
+            "recovery_required",
+            "protection_deadline_expired",
+            next_action="supervision_only",
+        )
     refusal = _protection_base_refusal(facts, require_complete_snapshot=True)
     if refusal is not None:
         return _refused(state, event, refusal)
@@ -214,6 +230,34 @@ def _prepare_protection(
         event,
         "protection_prepared",
         "protection_intents_prepared",
+    )
+
+
+def _request_protection_submit(
+    state: str, event: str, facts: ProtectedEntryFacts
+) -> EntryTransition:
+    if facts.writer_attempted:
+        return _refused(state, event, "protection_writer_already_attempted")
+    if not facts.live_exposure:
+        return _refused(state, event, "live_exposure_not_confirmed")
+    if facts.operation_deadline_expired:
+        return _allowed(
+            state,
+            event,
+            "recovery_required",
+            "protection_deadline_expired",
+            next_action="supervision_only",
+        )
+    refusal = _protection_base_refusal(facts, require_complete_snapshot=True)
+    if refusal is not None:
+        return _refused(state, event, refusal)
+    if facts.confirmed_protection_count >= facts.required_protection_count:
+        return _refused(state, event, "protection_already_confirmed")
+    return _allowed(
+        state,
+        event,
+        "protection_prepared",
+        "protection_submit_authorized",
         next_action="submit",
     )
 
@@ -301,7 +345,6 @@ def _protection_readback_confirmed(
         event,
         "protection_prepared",
         "protection_partially_confirmed",
-        next_action="submit",
     )
 
 
@@ -328,13 +371,16 @@ def _next_leg_preflight_ready(
     refusal = _protected_action_refusal(facts)
     if refusal is not None:
         return _refused(state, event, refusal)
+    if facts.writer_attempted:
+        return _refused(state, event, "entry_writer_already_attempted")
     if facts.operation_deadline_expired:
         return _refused(state, event, "operation_deadline_expired")
     return _allowed(
         state,
         event,
-        "entry_prepared",
-        "next_leg_preflight_ready",
+        "entry_submitting",
+        "next_leg_submit_authorized",
+        next_action="submit",
     )
 
 
@@ -343,6 +389,8 @@ def _next_leg_preflight_deferred(
 ) -> EntryTransition:
     if not facts.live_exposure:
         return _refused(state, event, "live_exposure_not_confirmed")
+    if facts.writer_attempted:
+        return _refused(state, event, "entry_writer_already_attempted")
     if not _protection_counts_complete(facts):
         return _refused(state, event, "protection_not_fully_confirmed")
     if not facts.operation_deadline_expired:
@@ -436,10 +484,6 @@ def _protected_action_refusal(facts: ProtectedEntryFacts) -> str | None:
     return None
 
 
-def _fully_protected(facts: ProtectedEntryFacts) -> bool:
-    return facts.snapshot_complete and _protection_counts_complete(facts)
-
-
 def _protection_counts_complete(facts: ProtectedEntryFacts) -> bool:
     return (
         facts.required_protection_count > 0
@@ -519,6 +563,9 @@ _TRANSITION_HANDLERS = {
         _confirm_submission_failed_no_exposure
     ),
     ("entry_confirmed", "prepare_protection"): _prepare_protection,
+    ("protection_prepared", "request_protection_submit"): (
+        _request_protection_submit
+    ),
     ("protection_prepared", "protection_submission_accepted"): (
         _protection_submission_accepted
     ),

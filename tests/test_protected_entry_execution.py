@@ -1,4 +1,5 @@
 from dataclasses import FrozenInstanceError
+from itertools import product
 
 import pytest
 
@@ -40,6 +41,7 @@ EVENTS = {
     "entry_submission_unknown",
     "entry_readback_confirmed",
     "prepare_protection",
+    "request_protection_submit",
     "protection_submission_accepted",
     "protection_submission_rejected",
     "protection_submission_unknown",
@@ -183,8 +185,20 @@ def test_facts_and_transition_results_are_immutable():
                 "snapshot_complete": True,
             },
             "protection_prepared",
-            "submit",
+            "none",
             "protection_intents_prepared",
+        ),
+        (
+            "protection_prepared",
+            "request_protection_submit",
+            {
+                "live_exposure": True,
+                "required_protection_count": 2,
+                "snapshot_complete": True,
+            },
+            "protection_prepared",
+            "submit",
+            "protection_submit_authorized",
         ),
         (
             "protection_prepared",
@@ -269,21 +283,19 @@ def test_facts_and_transition_results_are_immutable():
             "next_leg_preflight",
             "next_leg_preflight_ready",
             {
-                "writer_attempted": True,
                 "live_exposure": True,
                 "required_protection_count": 2,
                 "confirmed_protection_count": 2,
                 "snapshot_complete": True,
             },
-            "entry_prepared",
-            "none",
-            "next_leg_preflight_ready",
+            "entry_submitting",
+            "submit",
+            "next_leg_submit_authorized",
         ),
         (
             "next_leg_preflight",
             "next_leg_preflight_deferred",
             {
-                "writer_attempted": True,
                 "live_exposure": True,
                 "required_protection_count": 2,
                 "confirmed_protection_count": 2,
@@ -361,7 +373,7 @@ def test_one_of_two_confirmed_protections_does_not_make_aggregate_protected():
 
     assert transition.allowed is True
     assert transition.next_state == "protection_prepared"
-    assert transition.next_action == "submit"
+    assert transition.next_action == "none"
     assert transition.reason_code == "protection_partially_confirmed"
 
 
@@ -384,16 +396,16 @@ def test_partial_confirmation_after_unknown_writer_remains_readback_only():
 
 def test_later_leg_submit_requires_current_complete_protection_and_fresh_writer():
     allowed = _decide(
-        "entry_prepared",
-        "request_entry_submit",
+        "next_leg_preflight",
+        "next_leg_preflight_ready",
         live_exposure=True,
         required_protection_count=2,
         confirmed_protection_count=2,
         snapshot_complete=True,
     )
     incomplete = _decide(
-        "entry_prepared",
-        "request_entry_submit",
+        "next_leg_preflight",
+        "next_leg_preflight_ready",
         live_exposure=True,
         required_protection_count=2,
         confirmed_protection_count=2,
@@ -404,7 +416,7 @@ def test_later_leg_submit_requires_current_complete_protection_and_fresh_writer(
     assert allowed.next_state == "entry_submitting"
     assert allowed.next_action == "submit"
     assert incomplete.allowed is False
-    assert incomplete.reason_code == "protection_not_fully_confirmed"
+    assert incomplete.reason_code == "snapshot_incomplete"
 
 
 def test_entry_confirmed_without_writer_fact_cannot_authorize_protection_submit():
@@ -433,9 +445,116 @@ def test_expired_operation_cannot_start_a_new_protection_writer():
         operation_deadline_expired=True,
     )
 
+    assert transition.allowed is True
+    assert transition.next_state == "recovery_required"
+    assert transition.reason_code == "protection_deadline_expired"
+    assert transition.next_action == "supervision_only"
+
+
+def test_crash_before_protection_post_cannot_report_a_writer_outcome():
+    transitions = [
+        _decide(
+            "protection_prepared",
+            event,
+            writer_attempted=False,
+            live_exposure=True,
+            required_protection_count=2,
+        )
+        for event in (
+            "protection_submission_accepted",
+            "protection_submission_rejected",
+            "protection_submission_unknown",
+        )
+    ]
+
+    for transition in transitions:
+        assert transition.allowed is False
+        assert transition.reason_code == "protection_writer_not_attempted"
+        assert transition.next_action == "none"
+
+
+def test_expired_protection_child_operation_requires_supervision_without_post():
+    transition = _decide(
+        "protection_prepared",
+        "request_protection_submit",
+        live_exposure=True,
+        required_protection_count=2,
+        snapshot_complete=True,
+        operation_deadline_expired=True,
+    )
+
+    assert transition.allowed is True
+    assert transition.next_state == "recovery_required"
+    assert transition.reason_code == "protection_deadline_expired"
+    assert transition.next_action == "supervision_only"
+
+
+def test_first_leg_prepared_state_cannot_authorize_submit_with_live_exposure():
+    transition = _decide(
+        "entry_prepared",
+        "request_entry_submit",
+        live_exposure=True,
+        required_protection_count=2,
+        confirmed_protection_count=2,
+        snapshot_complete=True,
+    )
+
     assert transition.allowed is False
-    assert transition.reason_code == "operation_deadline_expired"
+    assert transition.reason_code == "unexpected_live_exposure"
     assert transition.next_action == "none"
+
+
+@pytest.mark.parametrize(
+    ("state", "event"),
+    [
+        ("protection_prepared", "request_protection_submit"),
+        ("next_leg_preflight", "next_leg_preflight_ready"),
+        ("next_leg_preflight", "next_leg_preflight_deferred"),
+    ],
+)
+def test_new_child_operation_cannot_reuse_a_parent_writer_fact(state, event):
+    transition = _decide(
+        state,
+        event,
+        writer_attempted=True,
+        live_exposure=True,
+        required_protection_count=2,
+        confirmed_protection_count=2 if state == "next_leg_preflight" else 0,
+        snapshot_complete=True,
+        operation_deadline_expired=event == "next_leg_preflight_deferred",
+    )
+
+    assert transition.allowed is False
+    assert transition.reason_code in {
+        "entry_writer_already_attempted",
+        "protection_writer_already_attempted",
+    }
+    assert transition.next_action == "none"
+
+
+def test_next_leg_preflight_never_falls_back_to_first_leg_prepared_state():
+    ready = _decide(
+        "next_leg_preflight",
+        "next_leg_preflight_ready",
+        live_exposure=True,
+        required_protection_count=2,
+        confirmed_protection_count=2,
+        snapshot_complete=True,
+    )
+    disappeared = _decide(
+        "next_leg_preflight",
+        "next_leg_preflight_ready",
+        live_exposure=False,
+        required_protection_count=0,
+        confirmed_protection_count=0,
+        snapshot_complete=True,
+    )
+
+    assert ready.next_state == "entry_submitting"
+    assert ready.next_action == "submit"
+    assert disappeared.allowed is False
+    assert disappeared.next_state == "next_leg_preflight"
+    assert disappeared.reason_code == "live_exposure_not_confirmed"
 
 
 def test_partial_protection_after_deadline_requires_supervision_not_another_writer():
@@ -544,6 +663,7 @@ VALID_SOURCE_EVENTS = {
     ("entry_unknown", "entry_readback_confirmed"),
     ("entry_rejected", "confirm_submission_failed_no_exposure"),
     ("entry_confirmed", "prepare_protection"),
+    ("protection_prepared", "request_protection_submit"),
     ("protection_prepared", "protection_submission_accepted"),
     ("protection_prepared", "protection_submission_rejected"),
     ("protection_prepared", "protection_submission_unknown"),
@@ -660,3 +780,56 @@ def test_terminal_states_cannot_be_reactivated_by_any_event(state):
         assert transition.next_state == state
         assert transition.next_action == "none"
         assert transition.reason_code == "illegal_transition"
+
+
+def test_exhaustive_fact_matrix_never_authorizes_a_stale_or_unsafe_submit():
+    for (
+        state,
+        event,
+        live_exposure,
+        writer_attempted,
+        snapshot_complete,
+        deadline_expired,
+        required,
+    ) in product(
+        sorted(STATES),
+        sorted(EVENTS),
+        (False, True),
+        (False, True),
+        (False, True),
+        (False, True),
+        (0, 1, 2),
+    ):
+        for confirmed in range(required + 1):
+            transition = _decide(
+                state,
+                event,
+                live_exposure=live_exposure,
+                writer_attempted=writer_attempted,
+                required_protection_count=required,
+                confirmed_protection_count=confirmed,
+                snapshot_complete=snapshot_complete,
+                operation_deadline_expired=deadline_expired,
+            )
+            if transition.next_action != "submit":
+                continue
+
+            assert transition.allowed is True
+            assert writer_attempted is False
+            assert deadline_expired is False
+            if event == "request_entry_submit":
+                assert state == "entry_prepared"
+                assert live_exposure is False
+            elif event == "request_protection_submit":
+                assert state == "protection_prepared"
+                assert live_exposure is True
+                assert snapshot_complete is True
+                assert required > 0
+                assert confirmed < required
+            else:
+                assert event == "next_leg_preflight_ready"
+                assert state == "next_leg_preflight"
+                assert live_exposure is True
+                assert snapshot_complete is True
+                assert required > 0
+                assert confirmed == required
