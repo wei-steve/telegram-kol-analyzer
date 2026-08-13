@@ -3874,6 +3874,61 @@ body {
 }
 .message-execution-outcome small { color: inherit; opacity: 0.78; }
 
+.message-deepcoin-execution {
+  display: grid;
+  gap: 6px;
+  border: 1px solid rgba(56, 189, 248, 0.28);
+  border-left: 4px solid #38bdf8;
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: rgba(12, 74, 110, 0.14);
+  color: #dbeafe;
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+.message-deepcoin-execution.is-confirmed {
+  border-color: rgba(34, 197, 94, 0.3);
+  border-left-color: #22c55e;
+  background: rgba(20, 83, 45, 0.15);
+}
+.message-deepcoin-execution.is-deferred {
+  border-color: rgba(245, 158, 11, 0.34);
+  border-left-color: #f59e0b;
+  background: rgba(120, 53, 15, 0.16);
+}
+.message-deepcoin-execution.is-attention {
+  border-color: rgba(239, 68, 68, 0.34);
+  border-left-color: #ef4444;
+  background: rgba(127, 29, 29, 0.15);
+}
+.message-deepcoin-execution-heading,
+.message-deepcoin-execution-facts,
+.message-deepcoin-execution-diagnostic {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 10px;
+  align-items: baseline;
+}
+.message-deepcoin-execution-heading strong { color: #f8fafc; font-size: 0.84rem; }
+.message-deepcoin-execution-facts,
+.message-deepcoin-execution-diagnostic { color: #a5b4fc; }
+.message-deepcoin-execution-action {
+  color: #e2e8f0;
+}
+.message-deepcoin-execution-action strong { color: #fef3c7; }
+.message-deepcoin-execution-attempts summary {
+  width: fit-content;
+  cursor: pointer;
+  color: #bae6fd;
+  font-weight: 700;
+}
+.message-deepcoin-execution-attempts > div {
+  display: grid;
+  gap: 3px;
+  margin-top: 5px;
+  color: #cbd5e1;
+}
+
 .semantic-review {
   border: 1px solid rgba(148, 163, 184, 0.24);
   border-left-width: 4px;

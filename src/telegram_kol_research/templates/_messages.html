@@ -85,6 +85,7 @@
       {% set comparison = message.recognition_comparison %}
       {% set semantic_review = message.semantic_review %}
       {% set execution_outcome = message.execution_outcome %}
+      {% set deepcoin_execution = message.deepcoin_execution %}
       {% set decision_card = message.decision_card %}
       {% set mimo_analysis = message.mimo_analysis %}
       {% set system_acceptance = message.system_acceptance %}
@@ -425,6 +426,81 @@
               <span>自动交易结果：</span>
               <strong>{{ execution_outcome.label }}</strong>
               {% if execution_outcome.detail %}<small>{{ execution_outcome.detail }}</small>{% endif %}
+            </section>
+          {% endif %}
+          {% if deepcoin_execution %}
+            <section
+              class="message-deepcoin-execution is-{{ deepcoin_execution.tone }}"
+              data-deepcoin-execution="canonical"
+              aria-label="Deepcoin 规范执行状态"
+            >
+              <div class="message-deepcoin-execution-heading">
+                <span>规范执行状态：</span>
+                <strong>{{ deepcoin_execution.state_label }}</strong>
+                <span>{{ deepcoin_execution.phase_label }}</span>
+                <span>{{ deepcoin_execution.certainty_label }}</span>
+              </div>
+              <div class="message-deepcoin-execution-facts">
+                {% if deepcoin_execution.attempt_count is not none %}
+                  <span>尝试 {{ deepcoin_execution.attempt_count }} 次</span>
+                {% else %}
+                  <span>尝试次数不可用</span>
+                {% endif %}
+                {% if deepcoin_execution.deadline_at %}
+                  <span>截止 {{ deepcoin_execution.deadline_at }}</span>
+                {% else %}
+                  <span>截止时间不可用</span>
+                {% endif %}
+                {% if deepcoin_execution.latest_complete_snapshot_at %}
+                  <span>最近完整快照 {{ deepcoin_execution.latest_complete_snapshot_at }}</span>
+                {% endif %}
+                {% if deepcoin_execution.governor_wait_ms is not none %}
+                  <span>限流等待 {{ deepcoin_execution.governor_wait_ms }} ms</span>
+                {% endif %}
+                {% if deepcoin_execution.latency_ms is not none %}
+                  <span>请求耗时 {{ deepcoin_execution.latency_ms }} ms</span>
+                {% endif %}
+                {% if deepcoin_execution.readback_latency_ms %}
+                  <span>读回耗时 {{ deepcoin_execution.readback_latency_ms }} ms</span>
+                {% endif %}
+                {% if deepcoin_execution.retry_delay_ms %}
+                  <span>重试等待 {{ deepcoin_execution.retry_delay_ms }} ms</span>
+                {% endif %}
+              </div>
+              {% if deepcoin_execution.reason_code or deepcoin_execution.error_category %}
+                <div class="message-deepcoin-execution-diagnostic">
+                  {% if deepcoin_execution.reason_code %}
+                    <span>安全原因 {{ deepcoin_execution.reason_code }}</span>
+                  {% endif %}
+                  {% if deepcoin_execution.error_category %}
+                    <span>
+                      {{ deepcoin_execution.error_category_label or '错误分类' }}
+                      · {{ deepcoin_execution.error_category }}
+                    </span>
+                  {% endif %}
+                </div>
+              {% endif %}
+              <div class="message-deepcoin-execution-action">
+                允许的下一步：<strong>{{ deepcoin_execution.next_action }}</strong>
+              </div>
+              {% if deepcoin_execution.attempts %}
+                <details class="message-deepcoin-execution-attempts">
+                  <summary>展开规范请求尝试</summary>
+                  <div>
+                    {% for attempt in deepcoin_execution.attempts %}
+                      <span>
+                        #{{ attempt.ordinal if attempt.ordinal is not none else '?' }} {{ attempt.method }}
+                        · {{ attempt.phase_label }}
+                        · {{ attempt.certainty_label }}
+                        {% if attempt.safe_code %}· {{ attempt.safe_code }}{% endif %}
+                        {% if attempt.error_category %}· {{ attempt.error_category_label or attempt.error_category }}{% endif %}
+                        {% if attempt.governor_wait_ms is not none %}· 限流 {{ attempt.governor_wait_ms }} ms{% endif %}
+                        {% if attempt.latency_ms is not none %}· 耗时 {{ attempt.latency_ms }} ms{% endif %}
+                      </span>
+                    {% endfor %}
+                  </div>
+                </details>
+              {% endif %}
             </section>
           {% endif %}
           {% if semantic_review %}

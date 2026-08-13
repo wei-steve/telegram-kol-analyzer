@@ -5,13 +5,20 @@ from __future__ import annotations
 import json
 import re
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Iterable
 
-from sqlalchemy import func, or_
+from sqlalchemy import String, cast, func, or_
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.deepcoin_execution_operations import (
+    contains_credential_marker,
+)
 from telegram_kol_research.models import (
     ContextResolutionAttempt,
+    DeepcoinExecutionOperation,
+    DeepcoinRequestAttempt,
+    DeepcoinSnapshotEvidence,
     ExecutionBinding,
     ExecutionOrderLeg,
     ExecutionEvent,
@@ -34,6 +41,7 @@ from telegram_kol_research.models import (
     StrategyManagementBatch,
     StrategyRevisionBatch,
     StrategyRevisionLeg,
+    TradeSignal,
     TriggerProtectionIntent,
     TriggerProtectionStopRescue,
     utc_now,
@@ -104,6 +112,92 @@ MIMO_IMAGE_QUALITY_LABELS = {
     "unreadable": "无法读取",
 }
 
+DEEPCOIN_EXECUTION_STATE_LABELS = {
+    "planned": "已计划",
+    "entry_prepared": "入场已准备",
+    "entry_submitting": "入场提交中",
+    "entry_pending_readback": "等待入场读回",
+    "entry_unknown": "入场结果未知",
+    "entry_rejected": "入场已拒绝",
+    "entry_confirmed": "入场已确认",
+    "protection_prepared": "保护单已准备",
+    "protection_pending_readback": "等待保护单读回",
+    "protection_unknown": "保护单结果未知",
+    "protected": "保护已确认",
+    "next_leg_preflight": "后续腿提交前检查",
+    "pre_submit_deferred": "已延期",
+    "completed": "已完成",
+    "recovery_required": "需要恢复核实",
+    "submission_failed_no_exposure": "确认未产生敞口",
+    "identity_conflict": "操作身份冲突",
+    "evidence_conflict": "状态证据异常",
+}
+DEEPCOIN_EXECUTION_PHASE_LABELS = {
+    "entry_preflight": "入场前检查",
+    "entry_submit": "入场提交",
+    "entry_readback": "入场读回核实",
+    "protection_submit": "保护单提交",
+    "protection_readback": "保护单读回核实",
+    "next_leg_preflight": "后续腿提交前检查",
+    "reconciliation": "交易所对账",
+    "completed": "已完成",
+}
+DEEPCOIN_EXECUTION_CERTAINTY_LABELS = {
+    "not_sent": "未发送",
+    "accepted": "已接收，待核实",
+    "rejected": "明确拒绝",
+    "unknown": "结果未知",
+    "confirmed": "已确认",
+}
+DEEPCOIN_EXECUTION_ERROR_LABELS = {
+    "rate_limited": "频率限制",
+    "transport_timeout": "传输超时",
+    "http_retryable": "可重试 HTTP 错误",
+    "auth_failed": "鉴权失败",
+    "business_rejected": "交易所业务拒绝",
+    "snapshot_incomplete": "快照不完整",
+    "schema_invalid": "返回结构无效",
+    "schema_incompatible": "返回结构不兼容",
+    "state_conflict": "持久状态冲突",
+}
+_SAFE_DEEPCOIN_DISPLAY_CODE = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,127}")
+DEEPCOIN_EXECUTION_DISPLAY_PRIORITY = {
+    "protection_unknown": 120,
+    "entry_unknown": 115,
+    "recovery_required": 110,
+    "protection_pending_readback": 105,
+    "entry_pending_readback": 100,
+    "entry_submitting": 95,
+    "pre_submit_deferred": 80,
+    "entry_rejected": 75,
+    "submission_failed_no_exposure": 70,
+    "planned": 60,
+    "entry_prepared": 60,
+    "next_leg_preflight": 60,
+    "entry_confirmed": 50,
+    "protection_prepared": 50,
+    "protected": 20,
+    "completed": 10,
+}
+DEEPCOIN_EXECUTION_STATE_CERTAINTIES = {
+    "planned": {"not_sent"},
+    "entry_prepared": {"not_sent"},
+    "entry_submitting": {"not_sent"},
+    "entry_pending_readback": {"accepted"},
+    "entry_unknown": {"unknown"},
+    "entry_rejected": {"rejected"},
+    "entry_confirmed": {"confirmed"},
+    "protection_prepared": {"not_sent", "confirmed"},
+    "protection_pending_readback": {"accepted"},
+    "protection_unknown": {"unknown"},
+    "protected": {"confirmed"},
+    "next_leg_preflight": {"not_sent"},
+    "pre_submit_deferred": {"not_sent"},
+    "completed": {"confirmed"},
+    "recovery_required": set(DEEPCOIN_EXECUTION_CERTAINTY_LABELS),
+    "submission_failed_no_exposure": {"confirmed"},
+}
+
 
 def load_runtime_agent_metrics(
     session_factory,
@@ -128,6 +222,283 @@ def _safe_json_dict(value: str | None) -> dict[str, object]:
     except (TypeError, ValueError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _safe_deepcoin_display_code(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if (
+        normalized != value
+        or _SAFE_DEEPCOIN_DISPLAY_CODE.fullmatch(normalized) is None
+        or contains_credential_marker(normalized)
+    ):
+        return None
+    return normalized
+
+
+def _safe_nonnegative_display_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _deepcoin_projection_datetime(
+    value: object,
+    *,
+    required: bool,
+) -> tuple[datetime | None, bool]:
+    if value is None:
+        return None, required
+    if isinstance(value, datetime):
+        return value, False
+    if not isinstance(value, str) or len(value) > 64:
+        return None, True
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None, True
+    return parsed, False
+
+
+def _deepcoin_operation_tuple_valid(
+    operation: object,
+) -> bool:
+    state = str(operation.state)
+    phase = str(operation.phase)
+    certainty = str(operation.outcome_certainty)
+    allowed_certainties = DEEPCOIN_EXECUTION_STATE_CERTAINTIES.get(state)
+    return (
+        phase in DEEPCOIN_EXECUTION_PHASE_LABELS
+        and allowed_certainties is not None
+        and certainty in allowed_certainties
+    )
+
+
+def _deepcoin_execution_next_action(state: str) -> str:
+    if state in {
+        "entry_submitting",
+        "entry_pending_readback",
+        "entry_unknown",
+        "protection_pending_readback",
+        "protection_unknown",
+    }:
+        return "自动读取核实"
+    if state == "pre_submit_deferred":
+        return "已延期，禁止自动追单"
+    if state in {"protected", "completed"}:
+        return "已完成，无需操作"
+    return "需要人工核实"
+
+
+def _deepcoin_execution_tone(state: str) -> str:
+    if state in {"protected", "completed"}:
+        return "confirmed"
+    if state in {
+        "entry_pending_readback",
+        "entry_unknown",
+        "protection_pending_readback",
+        "protection_unknown",
+    }:
+        return "pending"
+    if state == "pre_submit_deferred":
+        return "deferred"
+    return "attention"
+
+
+def _select_deepcoin_display_operation(
+    *,
+    root: DeepcoinExecutionOperation,
+    operations: list[DeepcoinExecutionOperation],
+) -> DeepcoinExecutionOperation:
+    return max(
+        operations,
+        key=lambda operation: (
+            DEEPCOIN_EXECUTION_DISPLAY_PRIORITY.get(str(operation.state), 100),
+            operation.updated_at,
+            int(operation.id),
+        ),
+        default=root,
+    )
+
+
+def _serialize_deepcoin_execution(
+    *,
+    root: DeepcoinExecutionOperation,
+    operations: list[DeepcoinExecutionOperation],
+    attempts_by_operation_id: dict[int, list[DeepcoinRequestAttempt]],
+    snapshots_by_operation_id: dict[int, list[DeepcoinSnapshotEvidence]],
+    identity_conflict: bool = False,
+) -> dict[str, object]:
+    malformed_evidence = any(
+        getattr(operation, "_display_malformed", False)
+        or not _deepcoin_operation_tuple_valid(operation)
+        for operation in operations
+    )
+    displayed_operation = _select_deepcoin_display_operation(
+        root=root,
+        operations=operations,
+    )
+    bundle_operation_ids = {int(operation.id) for operation in operations}
+    attempts = sorted(
+        (
+            attempt
+            for operation_id in bundle_operation_ids
+            for attempt in attempts_by_operation_id.get(operation_id, [])
+        ),
+        key=lambda row: (
+            row.started_at is None,
+            row.started_at or datetime.min,
+            int(row.deepcoin_execution_operation_id),
+            _safe_nonnegative_display_int(row.ordinal) or 0,
+        ),
+    )
+    complete_snapshots = [
+        snapshot
+        for operation_id in bundle_operation_ids
+        for snapshot in snapshots_by_operation_id.get(operation_id, [])
+        if snapshot.available and snapshot.schema_valid and snapshot.complete
+    ]
+    if any(
+        getattr(snapshot, "_display_malformed", False)
+        for snapshot in complete_snapshots
+    ):
+        malformed_evidence = True
+    latest_snapshot = max(
+        complete_snapshots,
+        key=lambda row: (row.capture_ended_at, int(row.id)),
+        default=None,
+    )
+    state = str(displayed_operation.state)
+    phase = str(displayed_operation.phase)
+    certainty = str(displayed_operation.outcome_certainty)
+    error_category = _safe_deepcoin_display_code(
+        displayed_operation.error_category
+    )
+    reason_code = _safe_deepcoin_display_code(displayed_operation.reason_code)
+    attempt_rows = []
+    for attempt in attempts:
+        if getattr(attempt, "_display_malformed", False):
+            malformed_evidence = True
+        ordinal = _safe_nonnegative_display_int(attempt.ordinal)
+        governor_wait_ms = _safe_nonnegative_display_int(
+            attempt.governor_wait_ms
+        )
+        retry_delay_ms = _safe_nonnegative_display_int(attempt.retry_delay_ms)
+        latency_ms = _safe_nonnegative_display_int(attempt.latency_ms)
+        method = str(attempt.method)
+        if (
+            ordinal is None
+            or governor_wait_ms is None
+            or retry_delay_ms is None
+            or latency_ms is None
+            or method not in {"GET", "POST"}
+        ):
+            malformed_evidence = True
+        attempt_error_category = _safe_deepcoin_display_code(
+            attempt.error_category
+        )
+        attempt_rows.append(
+            {
+                "ordinal": ordinal,
+                "method": method if method in {"GET", "POST"} else "UNKNOWN",
+                "phase_label": DEEPCOIN_EXECUTION_PHASE_LABELS.get(
+                    str(attempt.phase), "未知阶段"
+                ),
+                "certainty_label": DEEPCOIN_EXECUTION_CERTAINTY_LABELS.get(
+                    str(attempt.outcome_certainty), "未知结果"
+                ),
+                "safe_code": _safe_deepcoin_display_code(attempt.safe_code),
+                "error_category": attempt_error_category,
+                "error_category_label": DEEPCOIN_EXECUTION_ERROR_LABELS.get(
+                    attempt_error_category or ""
+                ),
+                "governor_wait_ms": governor_wait_ms,
+                "retry_delay_ms": retry_delay_ms,
+                "latency_ms": latency_ms,
+                "started_at": utc_naive_to_local(attempt.started_at),
+            }
+        )
+    operation_attempt_counts = [
+        _safe_nonnegative_display_int(operation.attempt_count)
+        for operation in operations
+    ]
+    if any(value is None for value in operation_attempt_counts):
+        malformed_evidence = True
+    governor_wait_values = [row["governor_wait_ms"] for row in attempt_rows]
+    retry_delay_values = [row["retry_delay_ms"] for row in attempt_rows]
+    latency_values = [row["latency_ms"] for row in attempt_rows]
+    result = {
+        "state": state,
+        "state_label": DEEPCOIN_EXECUTION_STATE_LABELS.get(state, "状态需要核实"),
+        "phase_label": DEEPCOIN_EXECUTION_PHASE_LABELS.get(phase, "未知阶段"),
+        "certainty_label": DEEPCOIN_EXECUTION_CERTAINTY_LABELS.get(
+            certainty, "未知结果"
+        ),
+        "tone": _deepcoin_execution_tone(state),
+        "attempt_count": (
+            sum(operation_attempt_counts)
+            if all(value is not None for value in operation_attempt_counts)
+            else None
+        ),
+        "deadline_at": utc_naive_to_local(displayed_operation.deadline_at),
+        "reason_code": reason_code,
+        "error_category": error_category,
+        "error_category_label": DEEPCOIN_EXECUTION_ERROR_LABELS.get(
+            error_category or ""
+        ),
+        "latest_complete_snapshot_at": (
+            utc_naive_to_local(latest_snapshot.capture_ended_at)
+            if latest_snapshot is not None
+            and not getattr(latest_snapshot, "_display_malformed", False)
+            else None
+        ),
+        "governor_wait_ms": (
+            sum(governor_wait_values)
+            if all(value is not None for value in governor_wait_values)
+            else None
+        ),
+        "retry_delay_ms": (
+            sum(retry_delay_values)
+            if all(value is not None for value in retry_delay_values)
+            else None
+        ),
+        "latency_ms": (
+            sum(latency_values)
+            if all(value is not None for value in latency_values)
+            else None
+        ),
+        "readback_latency_ms": sum(
+            row["latency_ms"]
+            for row in attempt_rows
+            if row["method"] == "GET" and row["latency_ms"] is not None
+        ),
+        "next_action": _deepcoin_execution_next_action(state),
+        "attempts": attempt_rows,
+    }
+    if identity_conflict or malformed_evidence:
+        conflict_state = (
+            "identity_conflict" if identity_conflict else "evidence_conflict"
+        )
+        result.update(
+            {
+                "state": conflict_state,
+                "state_label": DEEPCOIN_EXECUTION_STATE_LABELS[conflict_state],
+                "certainty_label": "规范证据无效",
+                "tone": "attention",
+                "reason_code": (
+                    "multiple_root_operations"
+                    if identity_conflict
+                    else "malformed_execution_metrics"
+                ),
+                "error_category": "state_conflict",
+                "error_category_label": DEEPCOIN_EXECUTION_ERROR_LABELS[
+                    "state_conflict"
+                ],
+                "next_action": "需要人工核实",
+            }
+        )
+    return result
 
 
 def _serialize_entry_preamble_binding(
@@ -587,6 +958,324 @@ def _serialize_raw_messages(
         management_batch_by_msg_id.setdefault(batch.raw_message_id, batch)
 
     message_keys = {(int(row.chat_id), int(row.message_id)) for row in raw_messages}
+    trade_signal_rows = (
+        session.query(TradeSignal)
+        .filter(
+            TradeSignal.venue == "deepcoin",
+            TradeSignal.source_type != "strategy_revision",
+            or_(
+                *[
+                    (TradeSignal.chat_id == chat_id)
+                    & (TradeSignal.message_id == message_id)
+                    for chat_id, message_id in message_keys
+                ]
+            ),
+        )
+        .order_by(TradeSignal.id.desc())
+        .all()
+        if message_keys
+        else []
+    )
+    trade_signal_ids = [int(row.id) for row in trade_signal_rows]
+    deepcoin_operation_db_rows = (
+        session.query(
+            DeepcoinExecutionOperation.id,
+            DeepcoinExecutionOperation.trade_signal_id,
+            DeepcoinExecutionOperation.parent_operation_id,
+            DeepcoinExecutionOperation.phase,
+            DeepcoinExecutionOperation.state,
+            DeepcoinExecutionOperation.outcome_certainty,
+            DeepcoinExecutionOperation.error_category,
+            DeepcoinExecutionOperation.reason_code,
+            DeepcoinExecutionOperation.attempt_count,
+            cast(DeepcoinExecutionOperation.deadline_at, String).label(
+                "deadline_at_text"
+            ),
+            cast(DeepcoinExecutionOperation.writer_attempted_at, String).label(
+                "writer_attempted_at_text"
+            ),
+            cast(DeepcoinExecutionOperation.completed_at, String).label(
+                "completed_at_text"
+            ),
+            cast(DeepcoinExecutionOperation.created_at, String).label(
+                "created_at_text"
+            ),
+            cast(DeepcoinExecutionOperation.updated_at, String).label(
+                "updated_at_text"
+            ),
+        )
+        .filter(DeepcoinExecutionOperation.trade_signal_id.in_(trade_signal_ids))
+        .order_by(
+            DeepcoinExecutionOperation.trade_signal_id.asc(),
+            DeepcoinExecutionOperation.id.asc(),
+        )
+        .all()
+        if trade_signal_ids
+        else []
+    )
+    deepcoin_operation_rows: list[SimpleNamespace] = []
+    for row in deepcoin_operation_db_rows:
+        deadline_at, deadline_invalid = _deepcoin_projection_datetime(
+            row.deadline_at_text, required=True
+        )
+        writer_attempted_at, writer_invalid = _deepcoin_projection_datetime(
+            row.writer_attempted_at_text, required=False
+        )
+        completed_at, completed_invalid = _deepcoin_projection_datetime(
+            row.completed_at_text, required=False
+        )
+        created_at, created_invalid = _deepcoin_projection_datetime(
+            row.created_at_text, required=True
+        )
+        updated_at, updated_invalid = _deepcoin_projection_datetime(
+            row.updated_at_text, required=True
+        )
+        deepcoin_operation_rows.append(
+            SimpleNamespace(
+                id=row.id,
+                trade_signal_id=row.trade_signal_id,
+                parent_operation_id=row.parent_operation_id,
+                phase=row.phase,
+                state=row.state,
+                outcome_certainty=row.outcome_certainty,
+                error_category=row.error_category,
+                reason_code=row.reason_code,
+                attempt_count=row.attempt_count,
+                deadline_at=deadline_at,
+                writer_attempted_at=writer_attempted_at,
+                completed_at=completed_at,
+                created_at=created_at,
+                updated_at=updated_at or datetime.min,
+                _display_malformed=any(
+                    (
+                        deadline_invalid,
+                        writer_invalid,
+                        completed_invalid,
+                        created_invalid,
+                        updated_invalid,
+                    )
+                ),
+            )
+        )
+    deepcoin_operations_by_signal_id: dict[
+        int, list[DeepcoinExecutionOperation]
+    ] = {}
+    deepcoin_roots_by_signal_id: dict[int, list[DeepcoinExecutionOperation]] = {}
+    for operation in deepcoin_operation_rows:
+        signal_id = int(operation.trade_signal_id)
+        deepcoin_operations_by_signal_id.setdefault(signal_id, []).append(operation)
+        if operation.parent_operation_id is None:
+            deepcoin_roots_by_signal_id.setdefault(signal_id, []).append(operation)
+    deepcoin_operation_ids = [int(row.id) for row in deepcoin_operation_rows]
+    deepcoin_attempt_db_rows = (
+        session.query(
+            DeepcoinRequestAttempt.id,
+            DeepcoinRequestAttempt.deepcoin_execution_operation_id,
+            DeepcoinRequestAttempt.ordinal,
+            DeepcoinRequestAttempt.method,
+            DeepcoinRequestAttempt.phase,
+            DeepcoinRequestAttempt.outcome_certainty,
+            DeepcoinRequestAttempt.error_category,
+            DeepcoinRequestAttempt.safe_code,
+            DeepcoinRequestAttempt.governor_wait_ms,
+            DeepcoinRequestAttempt.retry_delay_ms,
+            DeepcoinRequestAttempt.latency_ms,
+            cast(DeepcoinRequestAttempt.started_at, String).label(
+                "started_at_text"
+            ),
+            cast(DeepcoinRequestAttempt.completed_at, String).label(
+                "completed_at_text"
+            ),
+            cast(DeepcoinRequestAttempt.created_at, String).label(
+                "created_at_text"
+            ),
+        )
+        .filter(
+            DeepcoinRequestAttempt.deepcoin_execution_operation_id.in_(
+                deepcoin_operation_ids
+            )
+        )
+        .order_by(
+            DeepcoinRequestAttempt.deepcoin_execution_operation_id.asc(),
+            DeepcoinRequestAttempt.ordinal.asc(),
+        )
+        .all()
+        if deepcoin_operation_ids
+        else []
+    )
+    deepcoin_attempt_rows: list[SimpleNamespace] = []
+    for row in deepcoin_attempt_db_rows:
+        started_at, started_invalid = _deepcoin_projection_datetime(
+            row.started_at_text, required=True
+        )
+        completed_at, completed_invalid = _deepcoin_projection_datetime(
+            row.completed_at_text, required=True
+        )
+        created_at, created_invalid = _deepcoin_projection_datetime(
+            row.created_at_text, required=True
+        )
+        deepcoin_attempt_rows.append(
+            SimpleNamespace(
+                id=row.id,
+                deepcoin_execution_operation_id=(
+                    row.deepcoin_execution_operation_id
+                ),
+                ordinal=row.ordinal,
+                method=row.method,
+                phase=row.phase,
+                outcome_certainty=row.outcome_certainty,
+                error_category=row.error_category,
+                safe_code=row.safe_code,
+                governor_wait_ms=row.governor_wait_ms,
+                retry_delay_ms=row.retry_delay_ms,
+                latency_ms=row.latency_ms,
+                started_at=started_at,
+                completed_at=completed_at,
+                created_at=created_at,
+                _display_malformed=any(
+                    (started_invalid, completed_invalid, created_invalid)
+                ),
+            )
+        )
+    deepcoin_attempts_by_operation_id: dict[int, list[DeepcoinRequestAttempt]] = {}
+    for attempt in deepcoin_attempt_rows:
+        deepcoin_attempts_by_operation_id.setdefault(
+            int(attempt.deepcoin_execution_operation_id), []
+        ).append(attempt)
+    ranked_deepcoin_snapshots = (
+        session.query(
+            DeepcoinSnapshotEvidence.id.label("id"),
+            func.row_number()
+            .over(
+                partition_by=(
+                    DeepcoinSnapshotEvidence.deepcoin_execution_operation_id
+                ),
+                order_by=(
+                    DeepcoinSnapshotEvidence.capture_ended_at.desc(),
+                    DeepcoinSnapshotEvidence.id.desc(),
+                ),
+            )
+            .label("rn"),
+        )
+        .filter(
+            DeepcoinSnapshotEvidence.deepcoin_execution_operation_id.in_(
+                deepcoin_operation_ids
+            ),
+            DeepcoinSnapshotEvidence.available.is_(True),
+            DeepcoinSnapshotEvidence.schema_valid.is_(True),
+            DeepcoinSnapshotEvidence.complete.is_(True),
+        )
+        .subquery()
+        if deepcoin_operation_ids
+        else None
+    )
+    deepcoin_snapshot_db_rows = (
+        session.query(
+            DeepcoinSnapshotEvidence.id,
+            DeepcoinSnapshotEvidence.deepcoin_execution_operation_id,
+            cast(DeepcoinSnapshotEvidence.capture_started_at, String).label(
+                "capture_started_at_text"
+            ),
+            cast(DeepcoinSnapshotEvidence.capture_ended_at, String).label(
+                "capture_ended_at_text"
+            ),
+            cast(DeepcoinSnapshotEvidence.created_at, String).label(
+                "created_at_text"
+            ),
+        )
+        .join(
+            ranked_deepcoin_snapshots,
+            DeepcoinSnapshotEvidence.id == ranked_deepcoin_snapshots.c.id,
+        )
+        .filter(ranked_deepcoin_snapshots.c.rn == 1)
+        .order_by(
+            DeepcoinSnapshotEvidence.deepcoin_execution_operation_id.asc()
+        )
+        .all()
+        if ranked_deepcoin_snapshots is not None
+        else []
+    )
+    deepcoin_snapshot_rows: list[SimpleNamespace] = []
+    for row in deepcoin_snapshot_db_rows:
+        capture_started_at, capture_started_invalid = (
+            _deepcoin_projection_datetime(
+                row.capture_started_at_text, required=True
+            )
+        )
+        capture_ended_at, capture_ended_invalid = _deepcoin_projection_datetime(
+            row.capture_ended_at_text, required=True
+        )
+        created_at, created_invalid = _deepcoin_projection_datetime(
+            row.created_at_text, required=True
+        )
+        deepcoin_snapshot_rows.append(
+            SimpleNamespace(
+                id=row.id,
+                deepcoin_execution_operation_id=(
+                    row.deepcoin_execution_operation_id
+                ),
+                available=True,
+                schema_valid=True,
+                complete=True,
+                capture_started_at=capture_started_at,
+                capture_ended_at=capture_ended_at or datetime.min,
+                created_at=created_at,
+                _display_malformed=any(
+                    (
+                        capture_started_invalid,
+                        capture_ended_invalid,
+                        created_invalid,
+                    )
+                ),
+            )
+        )
+    deepcoin_snapshots_by_operation_id: dict[int, list[DeepcoinSnapshotEvidence]] = {}
+    for snapshot in deepcoin_snapshot_rows:
+        deepcoin_snapshots_by_operation_id.setdefault(
+            int(snapshot.deepcoin_execution_operation_id), []
+        ).append(snapshot)
+    deepcoin_execution_by_message_key: dict[tuple[int, int], dict[str, object]] = {}
+    deepcoin_execution_priority_by_message_key: dict[
+        tuple[int, int], tuple[int, datetime, int]
+    ] = {}
+    for signal in trade_signal_rows:
+        signal_id = int(signal.id)
+        roots = deepcoin_roots_by_signal_id.get(signal_id, [])
+        message_key = (int(signal.chat_id), int(signal.message_id))
+        if not roots:
+            continue
+        root = max(roots, key=lambda operation: int(operation.id))
+        bundle = deepcoin_operations_by_signal_id.get(signal_id, [])
+        identity_conflict = len(roots) != 1
+        displayed_operation = _select_deepcoin_display_operation(
+            root=root,
+            operations=bundle,
+        )
+        serialized_execution = _serialize_deepcoin_execution(
+            root=root,
+            operations=bundle,
+            attempts_by_operation_id=deepcoin_attempts_by_operation_id,
+            snapshots_by_operation_id=deepcoin_snapshots_by_operation_id,
+            identity_conflict=identity_conflict,
+        )
+        priority = (
+            130
+            if serialized_execution["state"] in {
+                "identity_conflict",
+                "evidence_conflict",
+            }
+            else DEEPCOIN_EXECUTION_DISPLAY_PRIORITY.get(
+                str(displayed_operation.state), 125
+            ),
+            displayed_operation.updated_at,
+            int(displayed_operation.id),
+        )
+        if priority <= deepcoin_execution_priority_by_message_key.get(
+            message_key, (-1, datetime.min, -1)
+        ):
+            continue
+        deepcoin_execution_priority_by_message_key[message_key] = priority
+        deepcoin_execution_by_message_key[message_key] = serialized_execution
     binding_rows = (
         session.query(ExecutionBinding)
         .filter(
@@ -900,6 +1589,9 @@ def _serialize_raw_messages(
                 "execution_outcome": _serialize_execution_outcome(
                     decision,
                     management_batch_by_msg_id.get(raw_message.id),
+                ),
+                "deepcoin_execution": deepcoin_execution_by_message_key.get(
+                    (int(raw_message.chat_id), int(raw_message.message_id))
                 ),
                 "entry_preamble_assembly": entry_preamble_assembly,
                 "entry_revision": entry_revision,

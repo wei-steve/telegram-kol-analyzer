@@ -1,12 +1,16 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import re
 
 from fastapi.testclient import TestClient
+from sqlalchemy import event, text
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ContextResolutionAttempt,
+    DeepcoinExecutionOperation,
+    DeepcoinRequestAttempt,
+    DeepcoinSnapshotEvidence,
     ExecutionBinding,
     MediaAsset,
     MessageEvidenceVersion,
@@ -18,8 +22,10 @@ from telegram_kol_research.models import (
     RecognitionExperiment,
     SignalCandidate,
     StrategyLifecycle,
+    TradeSignal,
 )
 from telegram_kol_research.web_app import create_web_app
+from telegram_kol_research.web_queries import load_group_messages
 
 
 def test_group_messages_route_returns_partial_for_selected_group(tmp_path):
@@ -50,6 +56,614 @@ def test_group_messages_route_returns_partial_for_selected_group(tmp_path):
     assert response.status_code == 200
     assert "group 88" in response.text
     assert "group 77" not in response.text
+
+
+def test_group_messages_route_projects_canonical_deepcoin_execution_operation(
+    tmp_path,
+):
+    database_path = tmp_path / "canonical-execution.db"
+    session_factory = create_session_factory(database_path)
+    now = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
+    states = (
+        ("protected", "completed", "confirmed", "保护已确认"),
+        ("pre_submit_deferred", "next_leg_preflight", "not_sent", "已延期"),
+        (
+            "entry_pending_readback",
+            "entry_readback",
+            "accepted",
+            "等待入场读回",
+        ),
+        ("entry_unknown", "entry_readback", "unknown", "入场结果未知"),
+        ("entry_rejected", "entry_readback", "rejected", "入场已拒绝"),
+        (
+            "submission_failed_no_exposure",
+            "completed",
+            "confirmed",
+            "确认未产生敞口",
+        ),
+    )
+    with session_factory() as session:
+        for ordinal, (state, phase, certainty, _label) in enumerate(states, start=1):
+            session.add(
+                RawMessage(
+                    chat_id=88,
+                    message_id=ordinal,
+                    posted_at=now + timedelta(minutes=ordinal),
+                    text=f"canonical execution {state}",
+                )
+            )
+            signal = TradeSignal(
+                signal_uid=f"canonical-signal-{ordinal}",
+                strategy_instance_id=f"strategy-{ordinal}",
+                source_type=(
+                    "message_instruction" if ordinal == 3 else "recovery"
+                ),
+                venue="deepcoin",
+                kol_id="alice",
+                chat_id=88,
+                message_id=ordinal,
+                symbol="BTC",
+                side="long",
+                action="open_position",
+                status="recovery_required",
+                payload_json=(
+                    '{"request_body":"DC-ACCESS-KEY=RAW-KEY",'
+                    '"passphrase":"RAW-PASSPHRASE"}'
+                ),
+                result_json='{"response_body":"RAW-RESPONSE"}',
+                last_error="Authorization: Bearer HOSTILE-ERROR",
+            )
+            session.add(signal)
+            session.flush()
+            root_operation = DeepcoinExecutionOperation(
+                operation_key=f"protected-entry:v1:signal:{signal.id}:leg:1:entry",
+                trade_signal_id=signal.id,
+                contract_version="1",
+                phase="completed" if ordinal == 2 else phase,
+                state="protected" if ordinal == 2 else state,
+                outcome_certainty="confirmed" if ordinal == 2 else certainty,
+                error_category=(
+                    "business_rejected"
+                    if state == "entry_rejected" and ordinal != 2
+                    else None
+                ),
+                reason_code=(
+                    "dc-access-key:raw-reason"
+                    if ordinal == 1
+                    else "primary_leg_protected"
+                    if ordinal == 2
+                    else f"safe_{state}"
+                ),
+                request_fingerprint="a" * 64,
+                economics_fingerprint="b" * 64,
+                deadline_at=now + timedelta(seconds=10 + ordinal),
+                writer_attempted_at=(
+                    None if state == "pre_submit_deferred" and ordinal != 2 else now
+                ),
+                completed_at=(
+                    now + timedelta(seconds=2)
+                    if ordinal == 2
+                    or state in {"protected", "submission_failed_no_exposure"}
+                    else None
+                ),
+                attempt_count=0 if ordinal == 2 else 1,
+                state_version=ordinal,
+                evidence_json=(
+                    '{"order_id":"RAW-ORDER-ID",'
+                    '"pos_id":"RAW-POS-ID",'
+                    '"private_key":"RAW-PRIVATE-KEY"}'
+                ),
+                created_at=now,
+                updated_at=now + timedelta(seconds=ordinal),
+            )
+            session.add(root_operation)
+            session.flush()
+            operation = root_operation
+            if ordinal == 2:
+                operation = DeepcoinExecutionOperation(
+                    operation_key=(
+                        f"protected-entry:v1:signal:{signal.id}:leg:2:entry"
+                    ),
+                    trade_signal_id=signal.id,
+                    parent_operation_id=root_operation.id,
+                    contract_version="1",
+                    phase=phase,
+                    state=state,
+                    outcome_certainty=certainty,
+                    reason_code=f"safe_{state}",
+                    request_fingerprint="a" * 64,
+                    economics_fingerprint="b" * 64,
+                    deadline_at=now + timedelta(seconds=10 + ordinal),
+                    writer_attempted_at=None,
+                    attempt_count=1,
+                    state_version=ordinal,
+                    evidence_json="{}",
+                    created_at=now,
+                    updated_at=now + timedelta(seconds=ordinal + 1),
+                )
+                session.add(operation)
+                session.flush()
+            session.add(
+                DeepcoinRequestAttempt(
+                    deepcoin_execution_operation_id=operation.id,
+                    ordinal=1,
+                    method="GET" if "readback" in phase else "POST",
+                    normalized_path="/deepcoin/trade/order",
+                    priority="critical",
+                    phase=phase,
+                    outcome_certainty=certainty,
+                    error_category=(
+                        "business_rejected"
+                        if state == "entry_rejected"
+                        else None
+                    ),
+                    safe_code=(
+                        "dc_access_key:raw-attempt"
+                        if ordinal == 1
+                        else f"safe_attempt_{ordinal}"
+                    ),
+                    http_status=400 if state == "entry_rejected" else 200,
+                    business_code="1001" if state == "entry_rejected" else "0",
+                    governor_wait_ms=ordinal * 10,
+                    retry_delay_ms=ordinal * 20,
+                    latency_ms=ordinal * 30,
+                    uid_scope_hash="c" * 64,
+                    request_fingerprint="a" * 64,
+                    started_at=now,
+                    completed_at=now + timedelta(milliseconds=ordinal * 30),
+                )
+            )
+            session.add(
+                DeepcoinSnapshotEvidence(
+                    deepcoin_execution_operation_id=operation.id,
+                    ordinal=1,
+                    snapshot_kind="account_composite",
+                    available=True,
+                    schema_valid=True,
+                    complete=True,
+                    row_count=ordinal,
+                    page_count=1,
+                    collection_fingerprint="d" * 64,
+                    start_write_generation=2,
+                    end_write_generation=2,
+                    capture_started_at=now + timedelta(seconds=3),
+                    capture_ended_at=now + timedelta(seconds=4),
+                    evidence_json='{"response_body":"RAW-SNAPSHOT"}',
+                )
+            )
+        revision_signal = TradeSignal(
+            signal_uid="unrelated-strategy-revision",
+            strategy_instance_id="unrelated-strategy",
+            source_type="strategy_revision",
+            venue="deepcoin",
+            kol_id="system",
+            chat_id=88,
+            message_id=1,
+            symbol="BTC",
+            side="long",
+            action="open_position",
+            status="recovery_required",
+            payload_json="{}",
+        )
+        session.add(revision_signal)
+        session.flush()
+        session.add(
+            DeepcoinExecutionOperation(
+                operation_key=(
+                    f"protected-entry:v1:signal:{revision_signal.id}:leg:1:entry"
+                ),
+                trade_signal_id=revision_signal.id,
+                contract_version="1",
+                phase="entry_readback",
+                state="entry_rejected",
+                outcome_certainty="rejected",
+                error_category="business_rejected",
+                reason_code="strategy_revision_collision",
+                request_fingerprint="e" * 64,
+                economics_fingerprint="f" * 64,
+                deadline_at=now + timedelta(seconds=30),
+                writer_attempted_at=now,
+                attempt_count=1,
+                evidence_json="{}",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        no_exposure_collision_signal = TradeSignal(
+            signal_uid="newer-no-exposure-signal",
+            strategy_instance_id="newer-no-exposure-strategy",
+            source_type="recovery",
+            venue="deepcoin",
+            kol_id="alice",
+            chat_id=88,
+            message_id=4,
+            symbol="ETH",
+            side="long",
+            action="open_position",
+            status="submitted",
+            payload_json="{}",
+        )
+        session.add(no_exposure_collision_signal)
+        session.flush()
+        session.add(
+            DeepcoinExecutionOperation(
+                operation_key=(
+                    "protected-entry:v1:signal:"
+                    f"{no_exposure_collision_signal.id}:leg:1:entry"
+                ),
+                trade_signal_id=no_exposure_collision_signal.id,
+                contract_version="1",
+                phase="completed",
+                state="submission_failed_no_exposure",
+                outcome_certainty="confirmed",
+                reason_code="newer_no_exposure_collision",
+                request_fingerprint="1" * 64,
+                economics_fingerprint="2" * 64,
+                deadline_at=now + timedelta(seconds=30),
+                writer_attempted_at=now,
+                completed_at=now + timedelta(seconds=1),
+                attempt_count=1,
+                evidence_json="{}",
+                created_at=now,
+                updated_at=now + timedelta(minutes=1),
+            )
+        )
+        session.add(
+            RawMessage(
+                chat_id=88,
+                message_id=7,
+                posted_at=now + timedelta(minutes=7),
+                text="duplicate canonical roots",
+            )
+        )
+        duplicate_root_signal = TradeSignal(
+            signal_uid="duplicate-root-signal",
+            strategy_instance_id="duplicate-root-strategy",
+            source_type="message_instruction",
+            venue="deepcoin",
+            kol_id="alice",
+            chat_id=88,
+            message_id=7,
+            symbol="BTC",
+            side="long",
+            action="open_position",
+            status="recovery_required",
+            payload_json="{}",
+        )
+        session.add(duplicate_root_signal)
+        session.flush()
+        for leg_index, root_state in ((1, "completed"), (2, "protected")):
+            session.add(
+                DeepcoinExecutionOperation(
+                    operation_key=(
+                        "protected-entry:v1:signal:"
+                        f"{duplicate_root_signal.id}:leg:{leg_index}:entry"
+                    ),
+                    trade_signal_id=duplicate_root_signal.id,
+                    contract_version="1",
+                    phase="completed",
+                    state=root_state,
+                    outcome_certainty="confirmed",
+                    reason_code=f"duplicate_root_{root_state}",
+                    request_fingerprint=str(leg_index) * 64,
+                    economics_fingerprint=str(leg_index + 2) * 64,
+                    deadline_at=now + timedelta(seconds=40),
+                    completed_at=now + timedelta(seconds=3),
+                    attempt_count=0,
+                    evidence_json="{}",
+                    created_at=now,
+                    updated_at=now + timedelta(seconds=leg_index),
+                )
+            )
+        session.add(
+            RawMessage(
+                chat_id=88,
+                message_id=8,
+                posted_at=now + timedelta(minutes=8),
+                text="malformed durable metrics",
+            )
+        )
+        malformed_signal = TradeSignal(
+            signal_uid="malformed-metrics-signal",
+            strategy_instance_id="malformed-metrics-strategy",
+            source_type="recovery",
+            venue="deepcoin",
+            kol_id="alice",
+            chat_id=88,
+            message_id=8,
+            symbol="BTC",
+            side="long",
+            action="open_position",
+            status="recovery_required",
+            payload_json="{}",
+        )
+        session.add(malformed_signal)
+        session.flush()
+        malformed_operation = DeepcoinExecutionOperation(
+            operation_key=(
+                f"protected-entry:v1:signal:{malformed_signal.id}:leg:1:entry"
+            ),
+            trade_signal_id=malformed_signal.id,
+            contract_version="1",
+            phase="completed",
+            state="completed",
+            outcome_certainty="confirmed",
+            reason_code="malformed_metric_fixture",
+            request_fingerprint="7" * 64,
+            economics_fingerprint="8" * 64,
+            deadline_at=now + timedelta(seconds=50),
+            completed_at=now + timedelta(seconds=4),
+            attempt_count=1,
+            evidence_json="{}",
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(malformed_operation)
+        session.flush()
+        malformed_attempt = DeepcoinRequestAttempt(
+            deepcoin_execution_operation_id=malformed_operation.id,
+            ordinal=1,
+            method="GET",
+            normalized_path="/deepcoin/account/positions",
+            priority="critical",
+            phase="completed",
+            outcome_certainty="confirmed",
+            safe_code="complete",
+            http_status=200,
+            business_code="0",
+            governor_wait_ms=1,
+            retry_delay_ms=0,
+            latency_ms=2,
+            uid_scope_hash="9" * 64,
+            request_fingerprint="7" * 64,
+            started_at=now,
+            completed_at=now + timedelta(milliseconds=2),
+        )
+        session.add(malformed_attempt)
+        session.flush()
+        malformed_snapshot = DeepcoinSnapshotEvidence(
+            deepcoin_execution_operation_id=malformed_operation.id,
+            ordinal=1,
+            snapshot_kind="account_composite",
+            available=True,
+            schema_valid=True,
+            complete=True,
+            row_count=0,
+            page_count=1,
+            collection_fingerprint="0" * 64,
+            start_write_generation=2,
+            end_write_generation=2,
+            capture_started_at=now,
+            capture_ended_at=now + timedelta(seconds=1),
+            evidence_json="{}",
+        )
+        session.add(malformed_snapshot)
+        session.flush()
+        malformed_operation_id = int(malformed_operation.id)
+        malformed_attempt_id = int(malformed_attempt.id)
+        malformed_snapshot_id = int(malformed_snapshot.id)
+        session.add(
+            RawMessage(
+                chat_id=88,
+                message_id=9,
+                posted_at=now + timedelta(minutes=9),
+                text="incoherent protected certainty",
+            )
+        )
+        incoherent_signal = TradeSignal(
+            signal_uid="incoherent-operation-signal",
+            strategy_instance_id="incoherent-operation-strategy",
+            source_type="recovery",
+            venue="deepcoin",
+            kol_id="alice",
+            chat_id=88,
+            message_id=9,
+            symbol="BTC",
+            side="long",
+            action="open_position",
+            status="recovery_required",
+            payload_json="{}",
+        )
+        session.add(incoherent_signal)
+        session.flush()
+        session.add(
+            DeepcoinExecutionOperation(
+                operation_key=(
+                    f"protected-entry:v1:signal:{incoherent_signal.id}:leg:1:entry"
+                ),
+                trade_signal_id=incoherent_signal.id,
+                contract_version="1",
+                phase="completed",
+                state="protected",
+                outcome_certainty="unknown",
+                reason_code="unsafe_protected_unknown",
+                request_fingerprint="3" * 64,
+                economics_fingerprint="4" * 64,
+                deadline_at=now + timedelta(seconds=60),
+                writer_attempted_at=now,
+                attempt_count=1,
+                evidence_json="{}",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        session.add(
+            RawMessage(
+                chat_id=88,
+                message_id=10,
+                posted_at=now + timedelta(minutes=10),
+                text="entry confirmed protection prepared",
+            )
+        )
+        prepared_signal = TradeSignal(
+            signal_uid="protection-prepared-signal",
+            strategy_instance_id="protection-prepared-strategy",
+            source_type="message_instruction",
+            venue="deepcoin",
+            kol_id="alice",
+            chat_id=88,
+            message_id=10,
+            symbol="BTC",
+            side="long",
+            action="open_position",
+            status="active_protection_pending",
+            payload_json="{}",
+        )
+        session.add(prepared_signal)
+        session.flush()
+        prepared_parent = DeepcoinExecutionOperation(
+            operation_key=(
+                f"protected-entry:v1:signal:{prepared_signal.id}:leg:1:entry"
+            ),
+            trade_signal_id=prepared_signal.id,
+            contract_version="1",
+            phase="protection_submit",
+            state="protection_prepared",
+            outcome_certainty="confirmed",
+            reason_code="protection_intents_prepared",
+            request_fingerprint="5" * 64,
+            economics_fingerprint="6" * 64,
+            deadline_at=now + timedelta(seconds=70),
+            writer_attempted_at=now,
+            attempt_count=1,
+            evidence_json="{}",
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(prepared_parent)
+        session.flush()
+        session.add(
+            DeepcoinExecutionOperation(
+                operation_key=(
+                    "protected-entry:v1:signal:"
+                    f"{prepared_signal.id}:leg:1:protection:0"
+                ),
+                trade_signal_id=prepared_signal.id,
+                parent_operation_id=prepared_parent.id,
+                contract_version="1",
+                phase="protection_submit",
+                state="protection_prepared",
+                outcome_certainty="not_sent",
+                reason_code="protection_submit_authorized",
+                request_fingerprint="5" * 64,
+                economics_fingerprint="6" * 64,
+                deadline_at=now + timedelta(seconds=70),
+                attempt_count=0,
+                evidence_json="{}",
+                created_at=now,
+                updated_at=now + timedelta(seconds=1),
+            )
+        )
+        session.commit()
+
+    engine = session_factory.kw["bind"]
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE deepcoin_execution_operations "
+                "SET attempt_count = 'oops', deadline_at = 'oops' "
+                "WHERE id = :operation_id"
+            ),
+            {"operation_id": malformed_operation_id},
+        )
+        connection.execute(
+            text(
+                "UPDATE deepcoin_request_attempts "
+                "SET governor_wait_ms = 'oops', started_at = 'oops' "
+                "WHERE id = :attempt_id"
+            ),
+            {"attempt_id": malformed_attempt_id},
+        )
+        connection.execute(
+            text(
+                "UPDATE deepcoin_snapshot_evidence "
+                "SET capture_started_at = 'oops', capture_ended_at = 'oops' "
+                "WHERE id = :snapshot_id"
+            ),
+            {"snapshot_id": malformed_snapshot_id},
+        )
+
+    statements: list[str] = []
+
+    def track_execution_queries(
+        _conn, _cursor, statement, _parameters, _context, _many
+    ):
+        statements.append(statement.lower())
+
+    event.listen(engine, "before_cursor_execute", track_execution_queries)
+    try:
+        projected_rows = load_group_messages(
+            session_factory, chat_id=88, limit=20
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", track_execution_queries)
+
+    assert len(projected_rows) == 10
+    incoherent_projection = next(
+        row["deepcoin_execution"]
+        for row in projected_rows
+        if row["message_id"] == 9
+    )
+    assert incoherent_projection["state"] == "evidence_conflict"
+    assert incoherent_projection["next_action"] == "需要人工核实"
+    malformed_projection = next(
+        row["deepcoin_execution"]
+        for row in projected_rows
+        if row["message_id"] == 8
+    )
+    assert malformed_projection["state"] == "evidence_conflict"
+    assert malformed_projection["next_action"] == "需要人工核实"
+    assert malformed_projection["deadline_at"] is None
+    assert malformed_projection["latest_complete_snapshot_at"] is None
+    prepared_projection = next(
+        row["deepcoin_execution"]
+        for row in projected_rows
+        if row["message_id"] == 10
+    )
+    assert prepared_projection["state"] == "protection_prepared"
+    assert prepared_projection["state_label"] == "保护单已准备"
+    for table_name in (
+        "trade_signals",
+        "deepcoin_execution_operations",
+        "deepcoin_request_attempts",
+        "deepcoin_snapshot_evidence",
+    ):
+        assert sum(table_name in statement for statement in statements) == 1
+
+    response = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/88/messages"
+    )
+
+    assert response.status_code == 200
+    assert response.text.count('data-deepcoin-execution="canonical"') == 10
+    for _state, _phase, _certainty, label in states:
+        assert label in response.text
+    assert "入场读回核实" in response.text
+    assert "结果未知" in response.text
+    assert "尝试 1 次" in response.text
+    assert "截止 2026-08-13" in response.text
+    assert "最近完整快照 2026-08-13" in response.text
+    assert "限流等待 60 ms" in response.text
+    assert "请求耗时 180 ms" in response.text
+    assert "读回耗时 150 ms" in response.text
+    assert "自动读取核实" in response.text
+    assert "已延期，禁止自动追单" in response.text
+    assert "需要人工核实" in response.text
+    assert "操作身份冲突" in response.text
+    assert "状态证据异常" in response.text
+    assert "safe_entry_rejected" in response.text
+    assert "business_rejected" in response.text
+    assert "RAW-KEY" not in response.text
+    assert "RAW-PASSPHRASE" not in response.text
+    assert "RAW-RESPONSE" not in response.text
+    assert "RAW-ORDER-ID" not in response.text
+    assert "RAW-POS-ID" not in response.text
+    assert "HOSTILE-ERROR" not in response.text
+    assert "RAW-SNAPSHOT" not in response.text
+    assert "raw-reason" not in response.text
+    assert "raw-attempt" not in response.text
+    assert "strategy_revision_collision" not in response.text
+    assert "newer_no_exposure_collision" not in response.text
 
 
 def test_group_messages_route_renders_decision_card_before_model_analysis(tmp_path):
