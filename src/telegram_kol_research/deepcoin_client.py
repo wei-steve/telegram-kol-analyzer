@@ -319,7 +319,7 @@ class DeepcoinRestClient:
     def _set_position_sltp_unchecked(
         self, protection_payload: dict[str, Any]
     ) -> dict[str, Any]:
-        if self._request_governor is None:
+        if not self._request_governor_enforces("POST"):
             self._tpsl_rate_limiter.acquire()
         return self._request("POST", DEEPCOIN_SET_POSITION_SLTP_PATH, protection_payload)
 
@@ -336,9 +336,18 @@ class DeepcoinRestClient:
                 "cancel-position-sltp requires instType, instId, and ordId"
             )
         payload = {key: cancel_payload[key] for key in ("instType", "instId", "ordId")}
-        if self._request_governor is None:
+        if not self._request_governor_enforces("POST"):
             self._tpsl_rate_limiter.acquire()
         return self._request("POST", DEEPCOIN_CANCEL_POSITION_SLTP_PATH, payload)
+
+    def _request_governor_enforces(self, method: str) -> bool:
+        governor = self._request_governor
+        if governor is None:
+            return False
+        predicate = getattr(governor, "enforces", None)
+        if not callable(predicate):
+            return False
+        return bool(predicate(method))
 
     def _place_position_close_unchecked(
         self, close_payload: dict[str, Any]

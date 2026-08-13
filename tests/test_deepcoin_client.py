@@ -14,6 +14,10 @@ from telegram_kol_research.deepcoin_client import DeepcoinTpslWriteLimiter
 from telegram_kol_research.deepcoin_client import build_deepcoin_auth_headers
 from telegram_kol_research.deepcoin_client import load_deepcoin_credentials
 from telegram_kol_research.deepcoin_client import _raise_for_deepcoin_business_error
+from telegram_kol_research.deepcoin_request_governor import (
+    DeepcoinRequestGovernor,
+    GovernorMode,
+)
 
 
 class _FakeResponse:
@@ -798,8 +802,12 @@ def test_get_ticker_quote_returns_none_when_target_instrument_is_absent():
 
 
 class _RecordingRequestGovernor:
-    def __init__(self):
+    def __init__(self, *, enforces_requests=True):
         self.calls = []
+        self.enforces_requests = enforces_requests
+
+    def enforces(self, method):
+        return self.enforces_requests
 
     def acquire(self, *, method, request_path, priority, deadline_monotonic):
         self.calls.append(
@@ -815,6 +823,14 @@ class _RecordingRequestGovernor:
 class _ForbiddenLegacyLimiter:
     def acquire(self):
         raise AssertionError("legacy TPSL limiter must not double-charge")
+
+
+class _RecordingLegacyLimiter:
+    def __init__(self):
+        self.acquire_calls = 0
+
+    def acquire(self):
+        self.acquire_calls += 1
 
 
 def test_injected_governor_receives_every_get_request():
@@ -867,6 +883,43 @@ def test_governed_tpsl_writer_is_charged_once_without_legacy_limiter():
             "deadline_monotonic": None,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        GovernorMode.DISABLED,
+        GovernorMode.TELEMETRY,
+        GovernorMode.ENFORCE_READS,
+    ],
+)
+def test_non_post_enforcing_governor_keeps_legacy_tpsl_limiter(tmp_path, mode):
+    governor = DeepcoinRequestGovernor(
+        base_url="https://api.deepcoin.test",
+        api_key=f"uid-{mode}",
+        mode=mode,
+        state_directory=tmp_path,
+    )
+    legacy_limiter = _RecordingLegacyLimiter()
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=_CapturingHttpClient(
+            {"code": "0", "data": [{"ordId": "stop-1", "sCode": "0"}]}
+        ),
+        request_governor=governor,
+        tpsl_rate_limiter=legacy_limiter,
+    )
+
+    client.set_position_sltp(
+        {
+            "instType": "SWAP",
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-1",
+            "slTriggerPx": "62000",
+        }
+    )
+
+    assert legacy_limiter.acquire_calls == 1
 
 
 def test_deepcoin_client_finds_historical_orders_by_exchange_or_client_id():

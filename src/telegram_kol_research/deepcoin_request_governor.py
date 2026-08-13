@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import errno
 import hashlib
 import json
 import math
@@ -38,6 +39,10 @@ class DeepcoinGovernorDeadlineExceeded(DeepcoinGovernorError):
 
 class DeepcoinGovernorStateError(DeepcoinGovernorError):
     """Shared governor state is malformed and cannot safely be enforced."""
+
+
+class _DeepcoinGovernorLockBusy(DeepcoinGovernorError):
+    """Telemetry could not inspect shared state without blocking the request."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +81,17 @@ class DeepcoinRequestGovernor:
         )
         self.uid_scope_hash = hashlib.sha256(scope_source).hexdigest()
 
+    @property
+    def mode(self) -> GovernorMode:
+        return self._mode
+
+    def enforces(self, method: str) -> bool:
+        normalized_method = str(method or "").strip().upper()
+        return self._mode == GovernorMode.ENFORCE_ALL or (
+            self._mode == GovernorMode.ENFORCE_READS
+            and normalized_method == "GET"
+        )
+
     def acquire(
         self,
         *,
@@ -96,18 +112,32 @@ class DeepcoinRequestGovernor:
             )
 
         profile = self._profile_resolver(normalized_method, normalized_path)
-        enforce = self._mode == GovernorMode.ENFORCE_ALL or (
-            self._mode == GovernorMode.ENFORCE_READS
-            and normalized_method == "GET"
-        )
+        enforce = self.enforces(normalized_method)
+        deadline = _normalize_deadline(deadline_monotonic)
         waited_seconds = 0.0
         while True:
-            now = _finite_nonnegative(self._clock(), field="monotonic clock")
+            before_lock = _finite_nonnegative(
+                self._clock(), field="monotonic clock"
+            )
+            if enforce and deadline is not None and before_lock > deadline:
+                raise DeepcoinGovernorDeadlineExceeded(
+                    "deepcoin_governor_deadline_exceeded"
+                )
             try:
                 with self._locked_endpoint_state(
                     method=normalized_method,
                     request_path=normalized_path,
+                    enforce=enforce,
+                    deadline_monotonic=deadline,
                 ) as locked:
+                    now = _finite_nonnegative(
+                        self._clock(), field="monotonic clock"
+                    )
+                    if enforce and deadline is not None and now > deadline:
+                        raise DeepcoinGovernorDeadlineExceeded(
+                            "deepcoin_governor_deadline_exceeded"
+                        )
+                    waited_seconds += max(0.0, now - before_lock)
                     starts = self._load_starts(locked.state_path, now=now)
                     delay = _required_delay(
                         starts=starts,
@@ -141,12 +171,20 @@ class DeepcoinRequestGovernor:
                     normalized_path=normalized_path,
                     waited_ms=0,
                     observed_delay_ms=0,
-                    state_error="governor_state_invalid",
+                            state_error="governor_state_invalid",
+                )
+            except _DeepcoinGovernorLockBusy:
+                return GovernorLease(
+                    uid_scope_hash=self.uid_scope_hash,
+                    normalized_path=normalized_path,
+                    waited_ms=0,
+                    observed_delay_ms=0,
+                    state_error="governor_lock_busy",
                 )
 
             if (
-                deadline_monotonic is not None
-                and now + delay > float(deadline_monotonic)
+                deadline is not None
+                and now + delay > deadline
             ):
                 raise DeepcoinGovernorDeadlineExceeded(
                     "deepcoin_governor_deadline_exceeded"
@@ -164,9 +202,23 @@ class DeepcoinRequestGovernor:
             f"{self.uid_scope_hash}-{endpoint_hash}.json"
         )
 
-    def _locked_endpoint_state(self, *, method: str, request_path: str):
+    def _locked_endpoint_state(
+        self,
+        *,
+        method: str,
+        request_path: str,
+        enforce: bool,
+        deadline_monotonic: float | None,
+    ):
         state_path = self.state_path_for(method=method, request_path=request_path)
-        return _LockedEndpointState(self._state_directory, state_path)
+        return _LockedEndpointState(
+            self._state_directory,
+            state_path,
+            enforce=enforce,
+            deadline_monotonic=deadline_monotonic,
+            monotonic_factory=self._clock,
+            sleep_fn=self._sleep,
+        )
 
     def _load_starts(self, state_path: Path, *, now: float) -> list[float]:
         if not state_path.exists():
@@ -186,7 +238,13 @@ class DeepcoinRequestGovernor:
             ]
         except DeepcoinGovernorStateError:
             raise
-        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        except (
+            OSError,
+            RecursionError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
             raise DeepcoinGovernorStateError("governor_state_invalid") from exc
         if starts != sorted(starts):
             raise DeepcoinGovernorStateError("governor_state_invalid")
@@ -234,20 +292,64 @@ class _LockedStatePaths:
 
 
 class _LockedEndpointState:
-    def __init__(self, directory: Path, state_path: Path) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        state_path: Path,
+        *,
+        enforce: bool,
+        deadline_monotonic: float | None,
+        monotonic_factory: Callable[[], float],
+        sleep_fn: Callable[[float], None],
+    ) -> None:
         self._directory = directory
         self._state_path = state_path
+        self._enforce = enforce
+        self._deadline = deadline_monotonic
+        self._clock = monotonic_factory
+        self._sleep = sleep_fn
         self._descriptor: int | None = None
 
     def __enter__(self) -> _LockedStatePaths:
+        descriptor: int | None = None
         try:
             self._directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             os.chmod(self._directory, 0o700)
             lock_path = self._state_path.with_suffix(".lock")
             descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
             os.chmod(lock_path, 0o600)
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            while True:
+                try:
+                    fcntl.flock(
+                        descriptor,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                    break
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                        raise
+                    if not self._enforce:
+                        raise _DeepcoinGovernorLockBusy(
+                            "governor_lock_busy"
+                        ) from exc
+                    now = _finite_nonnegative(
+                        self._clock(), field="monotonic clock"
+                    )
+                    if self._deadline is not None and now >= self._deadline:
+                        raise DeepcoinGovernorDeadlineExceeded(
+                            "deepcoin_governor_deadline_exceeded"
+                        ) from exc
+                    delay = 0.01
+                    if self._deadline is not None:
+                        delay = min(delay, max(0.0, self._deadline - now))
+                    self._sleep(delay)
+        except (_DeepcoinGovernorLockBusy, DeepcoinGovernorDeadlineExceeded):
+            if descriptor is not None:
+                os.close(descriptor)
+            raise
         except OSError as exc:
+            if descriptor is not None:
+                os.close(descriptor)
             raise DeepcoinGovernorStateError("governor_lock_failed") from exc
         self._descriptor = descriptor
         return _LockedStatePaths(
@@ -302,6 +404,22 @@ def _finite_nonnegative(value: object, *, field: str) -> float:
     if not math.isfinite(parsed) or parsed < 0:
         raise DeepcoinGovernorStateError(f"{field} is invalid")
     return parsed
+
+
+def _normalize_deadline(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        deadline = float(value)
+    except (TypeError, ValueError) as exc:
+        raise DeepcoinGovernorDeadlineExceeded(
+            "deepcoin_governor_deadline_invalid"
+        ) from exc
+    if not math.isfinite(deadline) or deadline < 0:
+        raise DeepcoinGovernorDeadlineExceeded(
+            "deepcoin_governor_deadline_invalid"
+        )
+    return deadline
 
 
 def _milliseconds(seconds: float) -> int:
