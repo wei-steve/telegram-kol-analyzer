@@ -24,6 +24,7 @@ from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import DeepcoinRequestScope
+from telegram_kol_research.deepcoin_client import DeepcoinPreSendUnavailable
 from telegram_kol_research.deepcoin_client import DeepcoinDefiniteRejection
 from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
@@ -39,6 +40,7 @@ from telegram_kol_research.deepcoin_execution_operations import (
     ExecutionOperationRecord,
     advance_account_write_generation,
     contains_credential_marker,
+    defer_execution_operation_after_not_sent,
     load_operation_bundle,
     load_account_write_generation,
     record_snapshot_evidence,
@@ -52,6 +54,7 @@ from telegram_kol_research.deepcoin_snapshot_authority import (
     build_exchange_collection_evidence,
     capture_account_snapshot,
 )
+from telegram_kol_research.deepcoin_request_policy import OutcomeCertainty
 from telegram_kol_research.deepcoin_request_policy import RequestPriority
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord
 from telegram_kol_research.execution_bindings import ExecutionOrderLegRecord
@@ -4583,6 +4586,36 @@ def _submit_trigger_with_protection_intent(
                     changed_at=datetime.now(UTC),
                 )
                 raise
+            except DeepcoinPreSendUnavailable as exc:
+                if exc.fact.outcome_certainty != OutcomeCertainty.NOT_SENT:
+                    raise RecoveryLiveSubmitError(
+                        "protected_entry_pre_send_fact_conflict"
+                    ) from None
+                prior_evidence = _operation_evidence(operation)
+                operation = defer_execution_operation_after_not_sent(
+                    session_factory,
+                    operation_id=operation.id,
+                    expected_operation_key=operation.operation_key,
+                    expected_request_fingerprint=operation.request_fingerprint,
+                    expected_economics_fingerprint=operation.economics_fingerprint,
+                    expected_state_version=operation.state_version,
+                    evidence={
+                        "baseline_fingerprint": baseline_fingerprint,
+                        "deadline_at": parent.operation.deadline_at.isoformat(),
+                        "last_complete_snapshot_ref": prior_evidence.get(
+                            "snapshot_ref"
+                        ),
+                        "leg_index": leg_index,
+                        "reason_code": str(exc.fact.safe_code),
+                        "writer_attempted": False,
+                    },
+                    error_category=exc.fact.category,
+                    reason_code="next_leg_preflight_deferred",
+                    updated_at=datetime.now(UTC),
+                )
+                raise RecoveryLiveSubmitError(
+                    "protected_entry_pre_submit_deferred"
+                ) from None
             except Exception:
                 operation = _transition_protected_operation(
                     session_factory,

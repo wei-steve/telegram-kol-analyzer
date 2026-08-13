@@ -429,6 +429,99 @@ def transition_execution_operation(
         return record
 
 
+def defer_execution_operation_after_not_sent(
+    session_factory: sessionmaker,
+    *,
+    operation_id: int,
+    expected_operation_key: str,
+    expected_request_fingerprint: str,
+    expected_economics_fingerprint: str,
+    expected_state_version: int,
+    evidence: Mapping[str, Any],
+    error_category: str | ErrorCategory,
+    reason_code: str,
+    updated_at: datetime | None = None,
+) -> ExecutionOperationRecord:
+    """Clear a provisional writer boundary after typed NOT_SENT proof.
+
+    This transition is deliberately narrower than the general operation CAS:
+    it only accepts an entry-submitting operation whose durable POST facts are
+    all explicitly NOT_SENT.  It cannot erase an accepted, rejected, or
+    unknown exchange attempt.
+    """
+
+    operation_pk = _positive_int(operation_id, code="operation_id_invalid")
+    key = _bounded_text(expected_operation_key, 255, "operation_key_invalid")
+    request_fp = _fingerprint(
+        expected_request_fingerprint,
+        "request_fingerprint_invalid",
+    )
+    economics_fp = _fingerprint(
+        expected_economics_fingerprint,
+        "economics_fingerprint_invalid",
+    )
+    prior_version = _nonnegative_int(
+        expected_state_version,
+        code="expected_state_version_invalid",
+    )
+    canonical_evidence = _canonical_evidence_json(evidence)
+    category = _enum_text(error_category, ErrorCategory, "error_category_invalid")
+    safe_reason = _safe_code(reason_code, "reason_code_invalid")
+    changed_at = _normalize_datetime(
+        updated_at or datetime.now(UTC),
+        "updated_at_invalid",
+    )
+
+    with session_factory() as session:
+        _begin_immediate(session)
+        row = session.get(DeepcoinExecutionOperation, operation_pk)
+        if (
+            row is None
+            or row.operation_key != key
+            or row.request_fingerprint != request_fp
+            or row.economics_fingerprint != economics_fp
+        ):
+            raise DeepcoinOperationConflict("operation_identity_conflict")
+        if (
+            row.state != "entry_submitting"
+            or row.phase != "entry_submit"
+            or row.outcome_certainty != OutcomeCertainty.NOT_SENT.value
+            or int(row.state_version) != prior_version
+            or row.writer_attempted_at is None
+            or row.completed_at is not None
+        ):
+            raise DeepcoinOperationConflict("operation_state_conflict")
+        conflicting_post = (
+            session.query(DeepcoinRequestAttempt.id)
+            .filter(
+                DeepcoinRequestAttempt.deepcoin_execution_operation_id
+                == operation_pk,
+                DeepcoinRequestAttempt.method == "POST",
+                DeepcoinRequestAttempt.outcome_certainty
+                != OutcomeCertainty.NOT_SENT.value,
+            )
+            .first()
+        )
+        if conflicting_post is not None:
+            raise DeepcoinOperationConflict("writer_outcome_conflict")
+        if changed_at < _normalize_datetime(row.updated_at, "updated_at_invalid"):
+            raise DeepcoinOperationConflict("operation_time_conflict")
+        row.phase = "next_leg_preflight"
+        row.state = "pre_submit_deferred"
+        row.outcome_certainty = OutcomeCertainty.NOT_SENT.value
+        row.error_category = category
+        row.reason_code = safe_reason
+        row.writer_attempted_at = None
+        row.completed_at = None
+        row.evidence_json = canonical_evidence
+        row.state_version = prior_version + 1
+        row.updated_at = changed_at
+        session.flush()
+        record = _operation_record(row)
+        session.commit()
+        return record
+
+
 def record_request_attempt(
     session_factory: sessionmaker,
     *,

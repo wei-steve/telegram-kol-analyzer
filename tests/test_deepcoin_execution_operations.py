@@ -15,6 +15,7 @@ from telegram_kol_research.deepcoin_execution_operations import (
     DeepcoinOperationConflict,
     advance_account_write_generation,
     contains_credential_marker,
+    defer_execution_operation_after_not_sent,
     load_operation_bundle,
     record_request_attempt,
     record_snapshot_evidence,
@@ -215,6 +216,119 @@ def test_transition_requires_exact_state_and_state_version(operation_store):
                 evidence={},
                 updated_at=NOW + timedelta(milliseconds=2),
             )
+
+
+def test_not_sent_defer_requires_immutable_economics_identity(operation_store):
+    session_factory, signal_id, _ = operation_store
+    operation = reserve_execution_operation(
+        session_factory, **_reservation(signal_id)
+    )
+    submitting = transition_execution_operation(
+        session_factory,
+        operation_id=operation.id,
+        expected_operation_key=operation.operation_key,
+        expected_request_fingerprint=REQUEST_FP,
+        expected_economics_fingerprint=ECONOMICS_FP,
+        expected_state="planned",
+        expected_state_version=0,
+        phase="entry_submit",
+        state="entry_submitting",
+        outcome_certainty="not_sent",
+        writer_attempted_at=NOW + timedelta(milliseconds=1),
+        evidence={"leg_index": 2},
+        updated_at=NOW + timedelta(milliseconds=1),
+    )
+    with session_factory() as session:
+        row = session.get(DeepcoinExecutionOperation, operation.id)
+        row.economics_fingerprint = "d" * 64
+        session.commit()
+
+    with pytest.raises(
+        DeepcoinOperationConflict, match="operation_identity_conflict"
+    ):
+        defer_execution_operation_after_not_sent(
+            session_factory,
+            operation_id=submitting.id,
+            expected_operation_key=submitting.operation_key,
+            expected_request_fingerprint=REQUEST_FP,
+            expected_economics_fingerprint=ECONOMICS_FP,
+            expected_state_version=submitting.state_version,
+            evidence={"leg_index": 2},
+            error_category=ErrorCategory.TRANSPORT_TIMEOUT,
+            reason_code="next_leg_preflight_deferred",
+            updated_at=NOW + timedelta(milliseconds=2),
+        )
+
+    with session_factory() as session:
+        row = session.get(DeepcoinExecutionOperation, operation.id)
+        assert row.state == "entry_submitting"
+        assert row.writer_attempted_at is not None
+
+
+def test_not_sent_defer_never_erases_unknown_post_attempt(operation_store):
+    session_factory, signal_id, _ = operation_store
+    operation = reserve_execution_operation(
+        session_factory, **_reservation(signal_id)
+    )
+    submitting = transition_execution_operation(
+        session_factory,
+        operation_id=operation.id,
+        expected_operation_key=operation.operation_key,
+        expected_request_fingerprint=REQUEST_FP,
+        expected_economics_fingerprint=ECONOMICS_FP,
+        expected_state="planned",
+        expected_state_version=0,
+        phase="entry_submit",
+        state="entry_submitting",
+        outcome_certainty="not_sent",
+        writer_attempted_at=NOW + timedelta(milliseconds=1),
+        evidence={"leg_index": 2},
+        updated_at=NOW + timedelta(milliseconds=1),
+    )
+    record_request_attempt(
+        session_factory,
+        operation_id=submitting.id,
+        expected_operation_key=submitting.operation_key,
+        expected_request_fingerprint=REQUEST_FP,
+        uid_scope_hash=UID_FP,
+        fact=RequestAttemptFact(
+            ordinal=1,
+            method="POST",
+            normalized_path="/deepcoin/trade/trigger-order",
+            phase="entry_submit",
+            priority=RequestPriority.CRITICAL,
+            correlation_id=submitting.operation_key,
+            outcome_certainty=OutcomeCertainty.UNKNOWN,
+            error_category=ErrorCategory.TRANSPORT_TIMEOUT,
+            safe_code="transport_timeout",
+            http_status=None,
+            business_code=None,
+            governor_wait_ms=0,
+            retry_delay_ms=0,
+            latency_ms=1,
+        ),
+        started_at=NOW + timedelta(milliseconds=1),
+        completed_at=NOW + timedelta(milliseconds=2),
+    )
+
+    with pytest.raises(DeepcoinOperationConflict, match="writer_outcome_conflict"):
+        defer_execution_operation_after_not_sent(
+            session_factory,
+            operation_id=submitting.id,
+            expected_operation_key=submitting.operation_key,
+            expected_request_fingerprint=REQUEST_FP,
+            expected_economics_fingerprint=ECONOMICS_FP,
+            expected_state_version=submitting.state_version,
+            evidence={"leg_index": 2},
+            error_category=ErrorCategory.TRANSPORT_TIMEOUT,
+            reason_code="next_leg_preflight_deferred",
+            updated_at=NOW + timedelta(milliseconds=3),
+        )
+
+    with session_factory() as session:
+        row = session.get(DeepcoinExecutionOperation, operation.id)
+        assert row.state == "entry_submitting"
+        assert row.writer_attempted_at is not None
 
 
 def test_snapshot_and_transition_cas_bind_immutable_request_identity(

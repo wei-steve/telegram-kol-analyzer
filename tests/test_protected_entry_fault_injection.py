@@ -25,9 +25,13 @@ from telegram_kol_research.deepcoin_request_governor import (
 from telegram_kol_research.deepcoin_request_policy import RequestPriority
 from telegram_kol_research.deepcoin_request_policy import (
     ErrorCategory,
+    FailureFact,
     OutcomeCertainty,
 )
-from telegram_kol_research.deepcoin_client import RequestAttemptFact
+from telegram_kol_research.deepcoin_client import (
+    DeepcoinPreSendUnavailable,
+    RequestAttemptFact,
+)
 from telegram_kol_research.deepcoin_execution_operations import (
     record_request_attempt,
     reserve_execution_operation,
@@ -79,6 +83,7 @@ from test_protected_entry_reconciliation import (
     as test_fault_read_unavailable_never_becomes_absence_proof,
 )
 from test_recovery_live_submit import (
+    EntrySubmissionProgressError,
     _StaticContractSpecProvider,
     _Task10CrashBeforePost,
     _Task10ProtectedClient,
@@ -101,6 +106,8 @@ from test_recovery_live_submit import (
     as test_fault_after_response_before_operation_state_persistence,
     test_restart_reuses_durable_post_protection_snapshot_without_third_get
     as test_fault_after_all_protections_before_later_leg_baseline,
+    test_v1_failure_before_parent_reservation_freezes_without_lifecycle_close
+    as test_fault_real_before_operation_commit_preserves_lifecycle,
     test_completed_later_child_replays_after_rollout_disable_without_post
     as test_fault_after_later_leg_post_before_result_persistence,
 )
@@ -703,7 +710,13 @@ def test_concurrent_real_protected_entry_has_one_logical_writer_per_operation(
     assert len(client.payloads) == 1, outcomes
     assert len(client.position_protection_payloads) == 1
     assert len(client.trigger_payloads) == 1
+    allowed_outcomes = {"DeepcoinOperationConflict", "RecoveryLiveSubmitError"}
+    assert len(outcomes) == 2
     assert any(isinstance(item, dict) for item in outcomes)
+    assert all(
+        isinstance(item, dict) or item in allowed_outcomes
+        for item in outcomes
+    )
     with session_factory() as session:
         operations = session.query(DeepcoinExecutionOperation).all()
         lifecycle = session.query(StrategyLifecycle).one()
@@ -711,6 +724,97 @@ def test_concurrent_real_protected_entry_has_one_logical_writer_per_operation(
         operations
     )
     assert lifecycle.lifecycle_status != "invalidated"
+
+
+def test_real_later_leg_typed_pre_send_deadline_defers_without_unknown_or_post(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "later-not-sent.db")
+    signal = _task10_two_leg_signal(session_factory)
+
+    class PreSendClient(_Task10ProtectedClient):
+        def trigger_order(self, payload):
+            if self.payloads:
+                raise DeepcoinPreSendUnavailable(
+                    "request_deadline_exceeded",
+                    fact=FailureFact(
+                        category=ErrorCategory.TRANSPORT_TIMEOUT,
+                        outcome_certainty=OutcomeCertainty.NOT_SENT,
+                        retryable=False,
+                        safe_code="request_deadline_exceeded",
+                    ),
+                )
+            return super().trigger_order(payload)
+
+    client = PreSendClient(session_factory)
+    _task10_one_stop(monkeypatch)
+    submitted_at = datetime(2026, 8, 13, 8, 0, tzinfo=UTC)
+
+    with pytest.raises(
+        EntrySubmissionProgressError,
+        match="protected_entry_pre_submit_deferred",
+    ):
+        _submit_recovery_signal_direct(
+            session_factory,
+            trade_signal=load_trade_signal(session_factory, signal.id),
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            submitted_at=submitted_at,
+        )
+
+    with session_factory() as session:
+        later = session.query(DeepcoinExecutionOperation).filter(
+            DeepcoinExecutionOperation.operation_key.like("%:leg:2:entry")
+        ).one()
+        lifecycle = session.query(StrategyLifecycle).one()
+    assert later.state == "pre_submit_deferred"
+    assert later.outcome_certainty == "not_sent"
+    assert later.writer_attempted_at is None
+    assert client.trigger_payloads == []
+    assert lifecycle.lifecycle_status != "invalidated"
+
+
+def test_pre_send_exception_with_non_not_sent_fact_cannot_clear_writer_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "later-invalid-fact.db")
+    signal = _task10_two_leg_signal(session_factory)
+
+    class InvalidPreSendClient(_Task10ProtectedClient):
+        def trigger_order(self, payload):
+            if self.payloads:
+                raise DeepcoinPreSendUnavailable(
+                    "invalid_pre_send_fact",
+                    fact=FailureFact(
+                        category=ErrorCategory.TRANSPORT_TIMEOUT,
+                        outcome_certainty=OutcomeCertainty.UNKNOWN,
+                        retryable=False,
+                        safe_code="invalid_pre_send_fact",
+                    ),
+                )
+            return super().trigger_order(payload)
+
+    client = InvalidPreSendClient(session_factory)
+    _task10_one_stop(monkeypatch)
+
+    with pytest.raises(EntrySubmissionProgressError):
+        _submit_recovery_signal_direct(
+            session_factory,
+            trade_signal=load_trade_signal(session_factory, signal.id),
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+            submitted_at=datetime(2026, 8, 13, 8, 0, tzinfo=UTC),
+        )
+
+    with session_factory() as session:
+        later = session.query(DeepcoinExecutionOperation).filter(
+            DeepcoinExecutionOperation.operation_key.like("%:leg:2:entry")
+        ).one()
+    assert later.state == "entry_submitting"
+    assert later.writer_attempted_at is not None
+    assert client.trigger_payloads == []
 
 
 def test_synthetic_incident_fixture_is_sanitized_and_has_expected_shape():
