@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -13,7 +13,7 @@ import sqlite3
 from types import MappingProxyType
 from typing import Any, Literal, Mapping, Sequence
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, or_, text
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
@@ -138,6 +138,38 @@ class CompositeBatchRecoveryApplyResult:
 class CompositeBatchRecoveryResumeAuthorization:
     plan: CompositeBatchRecoveryPlan
     repair_result: CompositeBatchRecoveryApplyResult
+
+
+@dataclass(frozen=True, slots=True)
+class _Batch119ExactHistoryScope:
+    instrument_id: str
+    side: str
+    scope_fingerprint: str
+    position_id: str = field(repr=False)
+    protection_orders: tuple[tuple[str, str], ...] = field(repr=False)
+
+
+@dataclass(slots=True)
+class Batch119ExactRecoverySnapshot:
+    positions: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    position_history: list[dict[str, Any]] = field(
+        default_factory=list, repr=False
+    )
+    open_orders: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    pending_trigger_orders: list[dict[str, Any]] = field(
+        default_factory=list, repr=False
+    )
+    order_history: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    trade_fills: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    trigger_history: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    pending_tpsl_observations: list[dict[str, Any]] = field(
+        default_factory=list, repr=False
+    )
+    errors: dict[str, str] = field(default_factory=dict)
+    account_authority: Any = field(default=None, repr=False)
+    capture_started_at: datetime | None = None
+    capture_ended_at: datetime | None = None
+    scope_fingerprint: str | None = None
 
 
 def build_composite_batch_recovery_status_summary(
@@ -304,35 +336,384 @@ def load_composite_batch_recovery_snapshot_read_only(
     *,
     client: Any,
 ):
-    """Load the generic snapshot plus exact batch-119 position history."""
+    """Capture only the immutable exact-ID scope approved for batch 119."""
 
-    from telegram_kol_research.execution_bindings import (
-        load_deepcoin_execution_reconciliation_snapshot_read_only,
+    from telegram_kol_research.deepcoin_snapshot_authority import (
+        build_exchange_collection_evidence,
+        capture_account_snapshot,
     )
+    from telegram_kol_research.protection_snapshot import observe_pending_tpsl
 
-    snapshot = load_deepcoin_execution_reconciliation_snapshot_read_only(
-        session_factory,
-        client=client,
-    )
-    history_reader = getattr(client, "list_position_history", None)
-    if history_reader is None:
-        snapshot.errors["position_history"] = "unavailable"
-        return snapshot
     try:
-        rows = history_reader(
-            inst_id=BATCH_119_RECOVERY.instrument_id,
-            pos_id=_batch_119_position_id(session_factory),
+        scope = _build_batch119_exact_history_scope(session_factory)
+    except CompositeBatchRecoveryRefusal as exc:
+        return Batch119ExactRecoverySnapshot(
+            errors={"exact_scope": exc.reason_code}
         )
-    except Exception:
-        snapshot.errors["position_history"] = "unavailable"
-        return snapshot
-    if not isinstance(rows, list) or not all(
-        isinstance(row, dict) for row in rows
-    ):
-        snapshot.errors["position_history"] = "invalid_schema"
-        return snapshot
-    snapshot.position_history = rows
+    uid_scope_hash = getattr(client, "uid_scope_hash", None)
+    if not _is_sha256(uid_scope_hash):
+        return Batch119ExactRecoverySnapshot(
+            errors={"account_composite": "snapshot_uid_scope_unavailable"},
+            scope_fingerprint=scope.scope_fingerprint,
+        )
+
+    snapshot = Batch119ExactRecoverySnapshot(
+        scope_fingerprint=scope.scope_fingerprint
+    )
+    inner_authority: list[dict[str, Any]] = []
+
+    def capture_collection(
+        *,
+        endpoint: str,
+        reader,
+        destination: list[dict[str, Any]],
+        identity_validator=None,
+    ) -> object:
+        response = None
+        try:
+            response = reader()
+        except Exception as exc:
+            evidence = build_exchange_collection_evidence(
+                endpoint=endpoint,
+                response=None,
+                read_error=exc,
+            )
+        else:
+            evidence = build_exchange_collection_evidence(
+                endpoint=endpoint,
+                response=response,
+            )
+        inner_authority.append(_collection_authority_payload(evidence))
+        if not evidence.schema_valid or not evidence.complete:
+            snapshot.errors[endpoint] = str(
+                evidence.reason_code or "snapshot_incomplete"
+            )
+            return response
+        rows = [dict(row) for row in evidence.rows]
+        if identity_validator is not None and not identity_validator(rows):
+            snapshot.errors[endpoint] = "exact_scope_identity_mismatch"
+            return response
+        destination.extend(rows)
+        return response
+
+    capture_started_at = datetime.now(UTC)
+
+    def read_exact_account_composite() -> dict[str, Any]:
+        capture_collection(
+            endpoint="positions",
+            reader=lambda: _required_exact_reader(
+                client, "read_positions"
+            )(inst_id=scope.instrument_id),
+            destination=snapshot.positions,
+        )
+        capture_collection(
+            endpoint="open_orders",
+            reader=lambda: _required_exact_reader(
+                client, "read_open_orders"
+            )(inst_id=scope.instrument_id),
+            destination=snapshot.open_orders,
+        )
+        pending_response = capture_collection(
+            endpoint="pending_trigger_orders",
+            reader=lambda: _required_exact_reader(
+                client, "read_trigger_orders_pending"
+            )(inst_id=scope.instrument_id),
+            destination=snapshot.pending_trigger_orders,
+        )
+        if isinstance(pending_response, dict):
+            observation = observe_pending_tpsl(
+                instrument_id=scope.instrument_id,
+                response=pending_response,
+            )
+        else:
+            observation = {
+                "instrument_id": scope.instrument_id,
+                "complete": False,
+                "reason": "pending_tpsl_read_error",
+                "order_ids": [],
+            }
+        snapshot.pending_tpsl_observations.append(observation)
+        if observation.get("complete") is not True:
+            snapshot.errors["pending_trigger_orders"] = str(
+                observation.get("reason") or "snapshot_incomplete"
+            )
+        capture_collection(
+            endpoint="position_history",
+            reader=lambda: _required_exact_reader(
+                client, "read_position_history"
+            )(
+                inst_id=scope.instrument_id,
+                pos_id=scope.position_id,
+            ),
+            destination=snapshot.position_history,
+            identity_validator=lambda rows: _exact_position_rows_match_scope(
+                rows, position_id=scope.position_id
+            ),
+        )
+        for purpose, order_id in scope.protection_orders:
+            capture_collection(
+                endpoint=f"trigger_history_{purpose}",
+                reader=lambda order_id=order_id: _required_exact_reader(
+                    client, "read_trigger_order_history"
+                )(
+                    inst_id=scope.instrument_id,
+                    order_id=order_id,
+                    limit=100,
+                ),
+                destination=snapshot.trigger_history,
+                identity_validator=(
+                    lambda rows, order_id=order_id: (
+                        _exact_order_rows_match_scope(
+                            rows, order_id=order_id
+                        )
+                    )
+                ),
+            )
+        # The approved false-submission state contains no durable regular-order
+        # identity. Empty exact scopes are authoritative and require no broad
+        # history request.
+        capture_collection(
+            endpoint="order_history",
+            reader=lambda: {"data": []},
+            destination=snapshot.order_history,
+        )
+        capture_collection(
+            endpoint="trade_fills",
+            reader=lambda: {"data": []},
+            destination=snapshot.trade_fills,
+        )
+        snapshot.positions = _deduplicate_exact_snapshot_rows(
+            snapshot.positions
+        )
+        snapshot.open_orders = _deduplicate_exact_snapshot_rows(
+            snapshot.open_orders
+        )
+        snapshot.pending_trigger_orders = _deduplicate_exact_snapshot_rows(
+            snapshot.pending_trigger_orders
+        )
+        snapshot.position_history = _deduplicate_exact_snapshot_rows(
+            snapshot.position_history
+        )
+        snapshot.trigger_history = _deduplicate_exact_snapshot_rows(
+            snapshot.trigger_history
+        )
+        if snapshot.errors:
+            raise CompositeBatchRecoveryRefusal("snapshot_incomplete")
+        return {
+            "data": [
+                {
+                    "scope_fingerprint": scope.scope_fingerprint,
+                    "collections": sorted(
+                        inner_authority,
+                        key=lambda row: str(row["endpoint"]),
+                    ),
+                }
+            ]
+        }
+
+    snapshot.account_authority = capture_account_snapshot(
+        session_factory,
+        uid_scope_hash=uid_scope_hash,
+        readers={"batch119_exact_account_composite": read_exact_account_composite},
+    )
+    snapshot.capture_started_at = capture_started_at
+    snapshot.capture_ended_at = datetime.now(UTC)
+    if not snapshot.account_authority.complete:
+        snapshot.errors.setdefault(
+            "account_composite",
+            str(
+                snapshot.account_authority.reason_code
+                or "snapshot_incomplete"
+            ),
+        )
     return snapshot
+
+
+def _build_batch119_exact_history_scope(
+    session_factory,
+) -> _Batch119ExactHistoryScope:
+    profile = BATCH_119_RECOVERY
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, profile.batch_id)
+        lifecycle = session.get(StrategyLifecycle, profile.lifecycle_id)
+        raw = session.get(RawMessage, profile.raw_message_id)
+        if batch is None or lifecycle is None or raw is None:
+            raise CompositeBatchRecoveryRefusal("durable_identity_mismatch")
+        binding = session.get(ExecutionBinding, int(batch.execution_binding_id))
+        legs = (
+            session.query(StrategyManagementLeg)
+            .filter_by(management_batch_id=profile.batch_id)
+            .order_by(StrategyManagementLeg.leg_index, StrategyManagementLeg.id)
+            .all()
+        )
+        if binding is None or len(legs) != 1:
+            raise CompositeBatchRecoveryRefusal("durable_identity_mismatch")
+        leg = legs[0]
+        entry = session.get(ExecutionOrderLeg, int(leg.execution_order_leg_id))
+        if entry is None:
+            raise CompositeBatchRecoveryRefusal("durable_identity_mismatch")
+        identity_reason = _durable_identity_refusal(
+            session=session,
+            batch=batch,
+            raw=raw,
+            lifecycle=lifecycle,
+            binding=binding,
+            entry=entry,
+            leg=leg,
+            profile=profile,
+        )
+        if identity_reason is not None:
+            raise CompositeBatchRecoveryRefusal(identity_reason)
+        rows = (
+            session.query(PositionProtectionLedger)
+            .filter(
+                or_(
+                    PositionProtectionLedger.execution_binding_id
+                    == int(binding.id),
+                    PositionProtectionLedger.execution_order_leg_id
+                    == int(entry.id),
+                    PositionProtectionLedger.pos_id == str(leg.pos_id),
+                )
+            )
+            .order_by(PositionProtectionLedger.id)
+            .all()
+        )
+        recovery_audit_exists = (
+            session.query(ExecutionEvent.id)
+            .filter(
+                ExecutionEvent.execution_binding_id == int(binding.id),
+                ExecutionEvent.action == _RECOVERY_AUDIT_ACTION,
+            )
+            .first()
+            is not None
+        )
+        scoped: list[tuple[str, str]] = []
+        for row in rows:
+            purpose = str(row.purpose or "").lower()
+            exact_owner = (
+                int(row.execution_binding_id) == int(binding.id)
+                and int(row.execution_order_leg_id) == int(entry.id)
+                and str(row.pos_id or "") == str(leg.pos_id)
+            )
+            if purpose == "take_profit" and exact_owner:
+                continue
+            if purpose not in {"stop_loss", "backup_stop"}:
+                if exact_owner:
+                    raise CompositeBatchRecoveryRefusal(
+                        "exact_history_scope_invalid"
+                    )
+                continue
+            order_id = str(row.order_id or "").strip()
+            if (
+                recovery_audit_exists
+                and exact_owner
+                and str(row.status or "").lower() != "verified"
+            ):
+                # A resumed, separately audited repair may have superseded the
+                # original pair and installed a new verified pair. The audit is
+                # validated later by the resume authorizer; no unverified order
+                # is admitted to this query scope.
+                continue
+            if (
+                not exact_owner
+                or str(row.venue or "").lower() != "deepcoin"
+                or str(row.strategy_instance_id or "")
+                != str(batch.strategy_instance_id)
+                or str(row.instrument_id or "").upper()
+                != profile.instrument_id.upper()
+                or str(row.side or "").lower() != profile.side.lower()
+                or str(row.status or "").lower() != "verified"
+                or not order_id
+            ):
+                raise CompositeBatchRecoveryRefusal(
+                    "exact_history_scope_invalid"
+                )
+            scoped.append((purpose, order_id))
+    if (
+        len(scoped) != 2
+        or {purpose for purpose, _ in scoped}
+        != {"stop_loss", "backup_stop"}
+        or len({order_id for _, order_id in scoped}) != 2
+    ):
+        raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
+    scoped.sort(key=lambda item: item[0])
+    scope_payload = {
+        "schema_version": 1,
+        "batch_id": profile.batch_id,
+        "position_ref": _redacted_ref("recovery_position", leg.pos_id),
+        "protection_refs": sorted(
+            _redacted_ref("protection_order", order_id)
+            for _, order_id in scoped
+        ),
+    }
+    return _Batch119ExactHistoryScope(
+        instrument_id=profile.instrument_id,
+        side=profile.side,
+        position_id=str(leg.pos_id),
+        protection_orders=tuple(scoped),
+        scope_fingerprint=_fingerprint(scope_payload),
+    )
+
+
+def _required_exact_reader(client: Any, name: str):
+    reader = getattr(client, name, None)
+    if not callable(reader):
+        raise CompositeBatchRecoveryRefusal("snapshot_reader_unavailable")
+    return reader
+
+
+def _collection_authority_payload(evidence: Any) -> dict[str, Any]:
+    return {
+        "endpoint": str(evidence.endpoint),
+        "available": bool(evidence.available),
+        "schema_valid": bool(evidence.schema_valid),
+        "complete": bool(evidence.complete),
+        "row_count": int(evidence.row_count),
+        "page_count": int(evidence.page_count),
+        "fingerprint": evidence.fingerprint,
+        "reason_code": evidence.reason_code,
+    }
+
+
+def _exact_position_rows_match_scope(
+    rows: Sequence[Mapping[str, Any]], *, position_id: str
+) -> bool:
+    for row in rows:
+        identities = {
+            str(row.get(key)).strip()
+            for key in ("posId", "pos_id", "closePosId", "close_pos_id")
+            if row.get(key) not in (None, "")
+        }
+        if identities and identities != {position_id}:
+            return False
+    return True
+
+
+def _exact_order_rows_match_scope(
+    rows: Sequence[Mapping[str, Any]], *, order_id: str
+) -> bool:
+    for row in rows:
+        identities = {
+            str(row.get(key)).strip()
+            for key in ("ordId", "orderId", "order_id")
+            if row.get(key) not in (None, "")
+        }
+        if identities and identities != {order_id}:
+            return False
+    return True
+
+
+def _deduplicate_exact_snapshot_rows(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        canonical = _canonical_json(dict(row))
+        if canonical not in seen:
+            seen.add(canonical)
+            result.append(dict(row))
+    return result
 
 
 def authorize_composite_batch_recovery_resume(
@@ -498,18 +879,6 @@ def authorize_composite_batch_recovery_resume(
             audit_event_id=audit_event_id,
         ),
     )
-
-
-def _batch_119_position_id(session_factory) -> str:
-    with session_factory() as session:
-        legs = (
-            session.query(StrategyManagementLeg)
-            .filter_by(management_batch_id=BATCH_119_RECOVERY.batch_id)
-            .all()
-        )
-    if len(legs) != 1 or not str(legs[0].pos_id or ""):
-        raise CompositeBatchRecoveryRefusal("management_leg_identity_mismatch")
-    return str(legs[0].pos_id)
 
 
 def _validated_resume_audit_event(
@@ -2882,6 +3251,36 @@ def _snapshot_is_complete(
     errors = getattr(snapshot, "errors", None)
     if not isinstance(errors, Mapping) or errors:
         return False
+    scope_fingerprint = getattr(snapshot, "scope_fingerprint", None)
+    authority = getattr(snapshot, "account_authority", None)
+    capture_started_at = getattr(snapshot, "capture_started_at", None)
+    capture_ended_at = getattr(snapshot, "capture_ended_at", None)
+    authority_collections = getattr(authority, "collections", None)
+    start_generation = getattr(authority, "start_write_generation", None)
+    end_generation = getattr(authority, "end_write_generation", None)
+    if (
+        not _is_sha256(scope_fingerprint)
+        or authority is None
+        or getattr(authority, "complete", None) is not True
+        or not _is_sha256(getattr(authority, "uid_scope_hash", None))
+        or not isinstance(start_generation, int)
+        or not isinstance(end_generation, int)
+        or start_generation != end_generation
+        or start_generation % 2 != 0
+        or not isinstance(authority_collections, (list, tuple))
+        or not authority_collections
+        or any(
+            getattr(collection, "complete", None) is not True
+            or not _is_sha256(getattr(collection, "fingerprint", None))
+            for collection in authority_collections
+        )
+        or not isinstance(capture_started_at, datetime)
+        or not isinstance(capture_ended_at, datetime)
+        or capture_started_at.tzinfo is None
+        or capture_ended_at.tzinfo is None
+        or capture_started_at > capture_ended_at
+    ):
+        return False
     try:
         for field in _REQUIRED_SNAPSHOT_FIELDS:
             if field == "errors":
@@ -4556,12 +4955,39 @@ def _exchange_evidence_payload(
         "schema_version": 1,
         "instrument_id": profile.instrument_id,
         "side": profile.side,
+        "scope_fingerprint": str(snapshot.scope_fingerprint),
+        "account_authority": _account_authority_evidence_payload(
+            snapshot.account_authority
+        ),
         "position": _serialize_position(position),
         "collections": collection_digests,
         "owned_protection_refs": owned_order_refs,
         "pending_protection_refs": exact_pending_refs,
         "regular_close_evidence_count": 0,
         "snapshot_complete": True,
+    }
+
+
+def _account_authority_evidence_payload(authority: Any) -> dict[str, Any]:
+    return {
+        "uid_scope_hash": str(authority.uid_scope_hash),
+        "start_write_generation": int(authority.start_write_generation),
+        "end_write_generation": int(authority.end_write_generation),
+        "complete": bool(authority.complete),
+        "reason_code": authority.reason_code,
+        "collections": [
+            {
+                "endpoint": str(collection.endpoint),
+                "available": bool(collection.available),
+                "schema_valid": bool(collection.schema_valid),
+                "complete": bool(collection.complete),
+                "row_count": int(collection.row_count),
+                "page_count": int(collection.page_count),
+                "fingerprint": collection.fingerprint,
+                "reason_code": collection.reason_code,
+            }
+            for collection in authority.collections
+        ],
     }
 
 

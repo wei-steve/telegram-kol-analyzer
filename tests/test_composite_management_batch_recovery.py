@@ -15,6 +15,10 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.deepcoin_snapshot_authority import (
+    AccountSnapshotEvidence,
+    ExchangeCollectionEvidence,
+)
 from telegram_kol_research.models import (
     ContextResolutionAttempt,
     ExecutionBinding,
@@ -234,6 +238,17 @@ def test_classify_recovery_position_rejects_identity_or_exposure_drift(overrides
 
 
 def _snapshot(**overrides):
+    authority_collection = ExchangeCollectionEvidence(
+        endpoint="batch119_exact_account_composite",
+        available=True,
+        schema_valid=True,
+        complete=True,
+        rows=(),
+        row_count=1,
+        page_count=1,
+        fingerprint="6" * 64,
+        reason_code=None,
+    )
     values = {
         "positions": [
             {
@@ -274,6 +289,17 @@ def _snapshot(**overrides):
             {"instrument_id": "BTC-USDT-SWAP", "complete": True}
         ],
         "errors": {},
+        "account_authority": AccountSnapshotEvidence(
+            uid_scope_hash="5" * 64,
+            start_write_generation=0,
+            end_write_generation=0,
+            collections=(authority_collection,),
+            complete=True,
+            reason_code=None,
+        ),
+        "capture_started_at": NOW,
+        "capture_ended_at": NOW,
+        "scope_fingerprint": "4" * 64,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -5334,22 +5360,50 @@ class _Batch119RecoveryClient:
             }
         ]
 
+    def read_positions(self, *, inst_id=None):
+        return {"data": self.list_positions(inst_id=inst_id)}
+
     def list_open_orders(self):
         return []
+
+    def read_open_orders(self, *, inst_id=None):
+        return {"data": self.list_open_orders()}
 
     def list_position_history(self, *, inst_id, pos_id=None):
         if pos_id is not None:
             self.position_history_calls.append((inst_id, pos_id))
         return [dict(row) for row in self.position_history]
 
+    def read_position_history(self, *, inst_id, pos_id):
+        return {
+            "data": self.list_position_history(
+                inst_id=inst_id,
+                pos_id=pos_id,
+            )
+        }
+
     def list_trigger_orders_pending(self, *, inst_id):
         return [dict(row) for row in self.pending]
+
+    def read_trigger_orders_pending(self, *, inst_id):
+        return {"data": self.list_trigger_orders_pending(inst_id=inst_id)}
 
     def list_trigger_orders_history(self, *, inst_id):
         return [dict(row) for row in self.trigger_history]
 
     def list_trigger_order_history(self, *, inst_id):
         return [dict(row) for row in self.trigger_history]
+
+    def read_trigger_order_history(self, *, inst_id, order_id, limit):
+        assert limit == 100
+        return {
+            "data": [
+                dict(row)
+                for row in self.trigger_history
+                if str(row.get("ordId") or row.get("orderId") or "")
+                == order_id
+            ]
+        }
 
     def list_order_history(self, *, inst_id):
         if self.close_submitted and self.fail_close_readback_once:
@@ -5450,7 +5504,7 @@ def test_recovery_snapshot_marks_position_history_failure_incomplete(tmp_path):
     def fail_position_history(*, inst_id, pos_id):
         raise RuntimeError("private provider detail")
 
-    client.list_position_history = fail_position_history
+    client.read_position_history = fail_position_history
 
     snapshot = module.load_composite_batch_recovery_snapshot_read_only(
         factory,
@@ -5464,9 +5518,323 @@ def test_recovery_snapshot_marks_position_history_failure_incomplete(tmp_path):
     )
 
     assert snapshot.position_history == []
-    assert snapshot.errors["position_history"] == "unavailable"
+    assert snapshot.errors["position_history"] == "snapshot_read_unavailable"
     assert plan.status == "refused"
     assert plan.reason_code == "exchange_snapshot_incomplete"
+
+
+class _Batch119ExactHistoryClient:
+    uid_scope_hash = "8" * 64
+
+    def __init__(self, *, exact_position_response=None):
+        self.instrument_wide_history_calls = 0
+        self.exact_position_ids = []
+        self.exact_order_ids = []
+        self.network_calls = 0
+        self.exact_position_response = exact_position_response or {
+            "data": [
+                {
+                    "posId": POS_ID,
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "state": "closed",
+                }
+            ]
+        }
+
+    @staticmethod
+    def _wide_rows(kind):
+        return [
+            {
+                "ordId": f"wide-{kind}-{index}",
+                "instId": "BTC-USDT-SWAP",
+            }
+            for index in range(100)
+        ]
+
+    def read_positions(self, *, inst_id=None):
+        self.network_calls += 1
+        return {
+            "data": [
+                {
+                    "posId": POS_ID,
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "pos": "38",
+                }
+            ]
+        }
+
+    def list_positions(self, *, inst_id=None):
+        return list(self.read_positions(inst_id=inst_id)["data"])
+
+    def read_open_orders(self, *, inst_id=None):
+        self.network_calls += 1
+        return {"data": []}
+
+    def list_open_orders(self, *, inst_id=None):
+        return list(self.read_open_orders(inst_id=inst_id)["data"])
+
+    def read_trigger_orders_pending(self, *, inst_id):
+        self.network_calls += 1
+        return {
+            "data": [
+                {
+                    "ordId": PRIMARY_ORDER_ID,
+                    "posId": POS_ID,
+                    "instId": inst_id,
+                    "posSide": "long",
+                    "triggerOrderType": "TPSL",
+                    "slTriggerPx": "64000",
+                    "sz": "38",
+                    "state": "live",
+                },
+                {
+                    "ordId": BACKUP_ORDER_ID,
+                    "posId": POS_ID,
+                    "instId": inst_id,
+                    "posSide": "long",
+                    "triggerOrderType": "TPSL",
+                    "slTriggerPx": "63000",
+                    "sz": "38",
+                    "state": "live",
+                },
+            ]
+        }
+
+    def list_trigger_orders_pending(self, *, inst_id):
+        return list(self.read_trigger_orders_pending(inst_id=inst_id)["data"])
+
+    def read_position_history(self, *, inst_id, pos_id):
+        self.network_calls += 1
+        self.exact_position_ids.append(pos_id)
+        return self.exact_position_response
+
+    def list_position_history(self, *, inst_id, pos_id=None):
+        if pos_id is not None:
+            return list(
+                self.read_position_history(inst_id=inst_id, pos_id=pos_id)[
+                    "data"
+                ]
+            )
+        self.instrument_wide_history_calls += 1
+        return self._wide_rows("positions")
+
+    def read_trigger_order_history(self, *, inst_id, order_id, limit):
+        self.network_calls += 1
+        assert limit == 100
+        self.exact_order_ids.append(order_id)
+        return {
+            "data": [
+                {
+                    "ordId": order_id,
+                    "posId": POS_ID,
+                    "instId": inst_id,
+                    "posSide": "long",
+                    "state": "cancelled",
+                }
+            ]
+        }
+
+    def list_trigger_order_history(self, *, inst_id):
+        self.instrument_wide_history_calls += 1
+        return self._wide_rows("triggers")
+
+    def list_order_history(self, *, inst_id):
+        self.instrument_wide_history_calls += 1
+        return self._wide_rows("orders")
+
+    def list_trade_fills(self, *, inst_id):
+        self.instrument_wide_history_calls += 1
+        return self._wide_rows("fills")
+
+
+def test_batch119_snapshot_uses_only_exact_history_scope(tmp_path):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    client = _Batch119ExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {}
+    assert client.instrument_wide_history_calls == 0
+    assert client.exact_position_ids == [POS_ID]
+    assert set(client.exact_order_ids) == {
+        PRIMARY_ORDER_ID,
+        BACKUP_ORDER_ID,
+    }
+    assert len(client.exact_order_ids) == 2
+    assert client.network_calls == 6
+    assert snapshot.account_authority.complete is True
+    assert len(snapshot.scope_fingerprint) == 64
+    assert POS_ID not in repr(snapshot)
+    assert PRIMARY_ORDER_ID not in repr(snapshot)
+    assert BACKUP_ORDER_ID not in repr(snapshot)
+
+
+def test_batch119_exact_history_page_limit_without_completion_is_incomplete(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    client = _Batch119ExactHistoryClient(
+        exact_position_response={
+            "data": [
+                {
+                    "posId": POS_ID,
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "state": "closed",
+                    "row": index,
+                }
+                for index in range(100)
+            ]
+        }
+    )
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert "snapshot_page_limit_ambiguous" in snapshot.errors.values()
+    assert client.instrument_wide_history_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("status", "pending"),
+        ("purpose", "unsupported_stop"),
+        ("strategy_instance_id", "deepcoin:wrong-owner"),
+    ],
+)
+def test_batch119_exact_history_scope_rejects_invalid_ledger_before_network(
+    tmp_path,
+    field_name,
+    value,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        row = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id=BACKUP_ORDER_ID)
+            .one()
+        )
+        setattr(row, field_name, value)
+        session.commit()
+    client = _Batch119ExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {"exact_scope": "exact_history_scope_invalid"}
+    assert client.network_calls == 0
+    assert client.instrument_wide_history_calls == 0
+
+
+def test_batch119_exact_history_scope_rejects_duplicate_role_before_network(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    with factory() as session:
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                strategy_instance_id="deepcoin:incident:btc:long",
+                pos_id=POS_ID,
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id="sensitive-duplicate-stop",
+                purpose="stop_loss",
+                trigger_price="62000",
+                size_text="38",
+                status="verified",
+                evidence_source="entry_protection_response",
+                evidence_json="{}",
+                first_seen_at=NOW,
+                last_seen_at=NOW,
+                last_verified_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+    client = _Batch119ExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {"exact_scope": "exact_history_scope_invalid"}
+    assert client.network_calls == 0
+    assert client.instrument_wide_history_calls == 0
+
+
+def test_batch119_scope_and_account_authority_bind_exchange_fingerprint(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=_Batch119ExactHistoryClient(
+            exact_position_response={"data": []}
+        ),
+    )
+
+    plan = module.build_composite_batch_recovery_plan(
+        factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=snapshot,
+        planned_at=NOW,
+    )
+    changed_scope = replace(snapshot, scope_fingerprint="7" * 64)
+    changed_plan = module.build_composite_batch_recovery_plan(
+        factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=changed_scope,
+        planned_at=NOW,
+    )
+    incomplete_authority = replace(
+        snapshot.account_authority,
+        complete=False,
+        reason_code="snapshot_write_generation_changed",
+    )
+    incomplete_plan = module.build_composite_batch_recovery_plan(
+        factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=replace(snapshot, account_authority=incomplete_authority),
+        planned_at=NOW,
+    )
+
+    assert plan.status == "ready"
+    assert changed_plan.status == "ready"
+    assert (
+        plan.exchange_snapshot_fingerprint
+        != changed_plan.exchange_snapshot_fingerprint
+    )
+    assert incomplete_plan.status == "refused"
+    assert incomplete_plan.reason_code == "exchange_snapshot_incomplete"
+    serialized = json.dumps(
+        module.serialize_composite_batch_recovery_plan(plan),
+        sort_keys=True,
+    )
+    assert POS_ID not in serialized
+    assert PRIMARY_ORDER_ID not in serialized
+    assert BACKUP_ORDER_ID not in serialized
 
 
 def test_recovery_cli_position_absent_is_repeatable_without_exchange_writes(
