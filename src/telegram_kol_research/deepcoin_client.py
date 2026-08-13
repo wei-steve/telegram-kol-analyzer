@@ -6,11 +6,15 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import os
+import random
 import time
 import threading
 from collections import deque
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from datetime import UTC, datetime
@@ -20,6 +24,22 @@ from urllib.parse import urlencode
 
 import httpx
 
+from telegram_kol_research.deepcoin_request_governor import (
+    DeepcoinGovernorDeadlineExceeded,
+    DeepcoinGovernorError,
+    DeepcoinGovernorStateError,
+)
+from telegram_kol_research.deepcoin_request_policy import (
+    ErrorCategory,
+    FailureFact,
+    OutcomeCertainty,
+    RequestPriority,
+    classify_business_failure,
+    classify_http_failure,
+    classify_schema_failure,
+    classify_transport_failure,
+    normalize_request_path,
+)
 from telegram_kol_research.telegram_client import _load_env_file_values
 
 
@@ -41,6 +61,20 @@ DEEPCOIN_ACCOUNT_POSITIONS_HISTORY_PATH = "/deepcoin/account/positions-history"
 DEEPCOIN_MARKET_INSTRUMENTS_PATH = "/deepcoin/market/instruments"
 DEEPCOIN_MARKET_TICKERS_PATH = "/deepcoin/market/tickers"
 
+_DEEPCOIN_LIST_READ_PATHS = frozenset(
+    {
+        DEEPCOIN_ORDERS_PENDING_PATH,
+        DEEPCOIN_ORDERS_HISTORY_PATH,
+        DEEPCOIN_TRADE_FILLS_PATH,
+        DEEPCOIN_TRIGGER_ORDERS_PENDING_PATH,
+        DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH,
+        DEEPCOIN_ACCOUNT_POSITIONS_PATH,
+        DEEPCOIN_ACCOUNT_POSITIONS_HISTORY_PATH,
+        DEEPCOIN_MARKET_INSTRUMENTS_PATH,
+        DEEPCOIN_MARKET_TICKERS_PATH,
+    }
+)
+
 
 class DeepcoinClientError(RuntimeError):
     """Raised when Deepcoin credentials or API responses are invalid."""
@@ -49,9 +83,67 @@ class DeepcoinClientError(RuntimeError):
 class DeepcoinRequestOutcomeUnknown(DeepcoinClientError):
     """Raised when a write may have reached Deepcoin but no result was received."""
 
+    def __init__(self, message: str, *, fact: FailureFact | None = None) -> None:
+        self.fact = fact or classify_transport_failure(
+            method="POST",
+            sent=True,
+            code="writer_outcome_unknown",
+        )
+        super().__init__(message)
+
 
 class DeepcoinDefiniteRejection(DeepcoinClientError):
     """Raised only when Deepcoin explicitly rejects a validated request."""
+
+    def __init__(self, message: str, *, fact: FailureFact | None = None) -> None:
+        self.fact = fact or classify_business_failure(
+            method="POST",
+            exchange_code="unspecified",
+        )
+        super().__init__(message)
+
+
+class DeepcoinReadUnavailable(DeepcoinClientError):
+    """A safe read did not produce authoritative exchange state."""
+
+    def __init__(self, message: str, *, fact: FailureFact) -> None:
+        self.fact = fact
+        super().__init__(message)
+
+
+class DeepcoinPreSendUnavailable(DeepcoinClientError):
+    """A typed local refusal proved that no exchange request was submitted."""
+
+    def __init__(self, message: str, *, fact: FailureFact) -> None:
+        self.fact = fact
+        super().__init__(message)
+
+
+@dataclass(frozen=True, slots=True)
+class RequestAttemptFact:
+    ordinal: int
+    method: str
+    normalized_path: str
+    phase: str
+    priority: RequestPriority
+    correlation_id: str | None
+    outcome_certainty: OutcomeCertainty
+    error_category: ErrorCategory | None
+    safe_code: str
+    http_status: int | None
+    business_code: str | None
+    governor_wait_ms: int
+    retry_delay_ms: int
+    latency_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class DeepcoinRequestScope:
+    phase: str
+    priority: RequestPriority
+    deadline_monotonic: float | None
+    correlation_id: str | None = None
+    attempt_recorder: Callable[[RequestAttemptFact], None] | None = None
 
 
 def _require_list_data(payload: dict[str, Any], *, endpoint: str) -> list[dict[str, Any]]:
@@ -235,16 +327,22 @@ class DeepcoinRestClient:
         position_history_min_interval_seconds: float = 1.05,
         tpsl_rate_limiter: "DeepcoinTpslWriteLimiter | None" = None,
         request_governor: Any | None = None,
+        retry_jitter_fn: Callable[[], float] | None = None,
     ) -> None:
         self._credentials = credentials
         self._http_client = http_client
         self._owns_http_client = http_client is None
         self._http_client_lock = threading.Lock()
         self._closed = False
-        self._reuse_http_client = False
         self._timestamp_factory = timestamp_factory or _utc_timestamp_ms
         self._monotonic_factory = monotonic_factory or time.monotonic
         self._sleep_fn = sleep_fn or time.sleep
+        self._retry_jitter_fn = retry_jitter_fn or (
+            lambda: random.uniform(0.0, 0.25)
+        )
+        self._request_scope_context: ContextVar[DeepcoinRequestScope | None] = (
+            ContextVar(f"deepcoin_request_scope_{id(self)}", default=None)
+        )
         self._position_history_min_interval_seconds = max(
             0.0,
             float(position_history_min_interval_seconds),
@@ -283,11 +381,15 @@ class DeepcoinRestClient:
         with self._http_client_lock:
             if self._closed:
                 raise DeepcoinClientError("Deepcoin client is closed")
-            self._reuse_http_client = True
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
-        self.close()
+        try:
+            self.close()
+        except DeepcoinClientError:
+            # Context-manager cleanup must not replace a parsed exchange result
+            # or the caller's original exception. Explicit close still reports.
+            return None
 
     def __del__(self) -> None:
         try:
@@ -305,6 +407,18 @@ class DeepcoinRestClient:
                     timeout=self._credentials.timeout_seconds,
                 )
             return self._http_client
+
+    @contextmanager
+    def request_scope(self, scope: DeepcoinRequestScope):
+        if not isinstance(scope, DeepcoinRequestScope):
+            raise TypeError("scope must be DeepcoinRequestScope")
+        RequestPriority(scope.priority)
+        _bounded_optional_deadline(scope.deadline_monotonic)
+        token = self._request_scope_context.set(scope)
+        try:
+            yield self
+        finally:
+            self._request_scope_context.reset(token)
 
     def place_order(self, order_payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", DEEPCOIN_PLACE_ORDER_PATH, order_payload)
@@ -585,76 +699,359 @@ class DeepcoinRestClient:
         request_path: str,
         body_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if self._request_governor is not None:
-            self._request_governor.acquire(
-                method=method,
-                request_path=request_path,
-                priority="normal",
-                deadline_monotonic=None,
-            )
+        normalized_method = str(method or "").strip().upper()
+        normalized_path = normalize_request_path(request_path)
         body = ""
         if body_payload is not None:
             body = json.dumps(body_payload, ensure_ascii=False, separators=(",", ":"))
-        timestamp = self._timestamp_factory()
-        headers = build_deepcoin_auth_headers(
-            credentials=self._credentials,
-            timestamp=timestamp,
-            method=method,
-            request_path=request_path,
-            body=body,
+        scope = self._request_scope_context.get()
+        if scope is None:
+            priority = RequestPriority.NORMAL
+            deadline = self._safe_monotonic() + 10.0
+            phase = "legacy_unscoped"
+            correlation_id = None
+            recorder = None
+        else:
+            priority = RequestPriority(scope.priority)
+            deadline = _bounded_optional_deadline(scope.deadline_monotonic)
+            phase = _bounded_label(scope.phase, fallback="unspecified_phase")
+            correlation_id = _bounded_optional_label(scope.correlation_id)
+            recorder = scope.attempt_recorder
+        max_attempts = (
+            1
+            if normalized_method != "GET"
+            else (2 if priority == RequestPriority.BACKGROUND else 4)
         )
-        headers["Content-Type"] = "application/json"
-
-        owns_request_client = self._owns_http_client and not self._reuse_http_client
-        client = (
-            httpx.Client(
-                base_url=self._credentials.base_url,
-                timeout=self._credentials.timeout_seconds,
-            )
-            if owns_request_client
-            else self._get_http_client()
-        )
-        try:
-            response = client.request(method, request_path, content=body, headers=headers)
-            response.raise_for_status()
-            payload = response.json()
-        except httpx.RequestError as exc:
-            if method.upper() == "POST":
-                raise DeepcoinRequestOutcomeUnknown(
-                    f"Deepcoin request outcome unknown: {exc}"
-                ) from exc
-            raise DeepcoinClientError(f"Deepcoin request failed: {exc}") from exc
-        except httpx.HTTPStatusError as exc:
-            if method.upper() == "POST":
-                raise DeepcoinRequestOutcomeUnknown(
-                    f"Deepcoin request outcome unknown after HTTP status: {exc}"
-                ) from exc
-            raise DeepcoinClientError(f"Deepcoin request failed: {exc}") from exc
-        except json.JSONDecodeError as exc:
-            if method.upper() == "POST":
-                raise DeepcoinRequestOutcomeUnknown(
-                    "Deepcoin write response was not JSON"
-                ) from exc
-            raise DeepcoinClientError("Deepcoin response was not JSON") from exc
-        finally:
-            if owns_request_client:
+        schema_occurrences = 0
+        client = self._get_http_client()
+        for ordinal in range(1, max_attempts + 1):
+            attempt_started = self._safe_monotonic()
+            governor_wait_ms = 0
+            if self._request_governor is not None:
                 try:
-                    client.close()
-                except Exception as exc:
-                    if method.upper() == "POST":
-                        raise DeepcoinRequestOutcomeUnknown(
-                            f"Deepcoin request outcome unknown during cleanup: {exc}"
-                        ) from exc
-                    raise DeepcoinClientError(
-                        f"Deepcoin client cleanup failed: {exc}"
-                    ) from exc
+                    lease = self._request_governor.acquire(
+                        method=normalized_method,
+                        request_path=request_path,
+                        priority=priority,
+                        deadline_monotonic=deadline,
+                    )
+                    governor_wait_ms = max(
+                        0,
+                        int(getattr(lease, "waited_ms", 0)),
+                    )
+                except DeepcoinGovernorError as exc:
+                    fact = _governor_failure_fact(exc)
+                    self._record_attempt(
+                        recorder=recorder,
+                        fact=_attempt_fact(
+                            ordinal=ordinal,
+                            method=normalized_method,
+                            normalized_path=normalized_path,
+                            phase=phase,
+                            priority=priority,
+                            correlation_id=correlation_id,
+                            failure=fact,
+                            governor_wait_ms=0,
+                            retry_delay_ms=0,
+                            latency_ms=0,
+                        ),
+                    )
+                    if normalized_method == "POST":
+                        raise DeepcoinPreSendUnavailable(
+                            fact.safe_code,
+                            fact=fact,
+                        ) from None
+                    raise DeepcoinReadUnavailable(
+                        fact.safe_code,
+                        fact=fact,
+                    ) from None
 
-        if str(payload.get("code", "0")) not in {"0", ""}:
-            raise DeepcoinDefiniteRejection(
-                f"Deepcoin API error {payload.get('code')}: {payload.get('msg')}"
+            remaining = _remaining_seconds(deadline, self._safe_monotonic())
+            if remaining is not None and remaining <= 0:
+                fact = _request_deadline_exhausted_fact()
+                self._record_attempt(
+                    recorder=recorder,
+                    fact=_attempt_fact(
+                        ordinal=ordinal,
+                        method=normalized_method,
+                        normalized_path=normalized_path,
+                        phase=phase,
+                        priority=priority,
+                        correlation_id=correlation_id,
+                        failure=fact,
+                        governor_wait_ms=governor_wait_ms,
+                        retry_delay_ms=0,
+                        latency_ms=0,
+                    ),
+                )
+                if normalized_method == "POST":
+                    raise DeepcoinPreSendUnavailable(
+                        fact.safe_code,
+                        fact=fact,
+                    )
+                raise DeepcoinReadUnavailable(fact.safe_code, fact=fact)
+
+            timestamp = self._timestamp_factory()
+            headers = build_deepcoin_auth_headers(
+                credentials=self._credentials,
+                timestamp=timestamp,
+                method=normalized_method,
+                request_path=request_path,
+                body=body,
             )
-        _raise_for_deepcoin_business_error(payload)
-        return payload
+            headers["Content-Type"] = "application/json"
+            remaining = _remaining_seconds(deadline, self._safe_monotonic())
+            if remaining is not None and remaining <= 0:
+                fact = _request_deadline_exhausted_fact()
+                self._record_attempt(
+                    recorder=recorder,
+                    fact=_attempt_fact(
+                        ordinal=ordinal,
+                        method=normalized_method,
+                        normalized_path=normalized_path,
+                        phase=phase,
+                        priority=priority,
+                        correlation_id=correlation_id,
+                        failure=fact,
+                        governor_wait_ms=governor_wait_ms,
+                        retry_delay_ms=0,
+                        latency_ms=_elapsed_ms(
+                            attempt_started,
+                            self._safe_monotonic(),
+                        ),
+                    ),
+                )
+                if normalized_method == "POST":
+                    raise DeepcoinPreSendUnavailable(
+                        fact.safe_code,
+                        fact=fact,
+                    )
+                raise DeepcoinReadUnavailable(fact.safe_code, fact=fact)
+            timeout_seconds = self._credentials.timeout_seconds
+            if remaining is not None:
+                timeout_seconds = min(timeout_seconds, remaining)
+            failure: FailureFact | None = None
+            business_code: str | None = None
+            retry_after: float | None = None
+            cause: BaseException | None = None
+            try:
+                response = client.request(
+                    normalized_method,
+                    request_path,
+                    content=body,
+                    headers=headers,
+                    timeout=timeout_seconds,
+                )
+                if response.status_code >= 400:
+                    failure = classify_http_failure(
+                        method=normalized_method,
+                        status_code=response.status_code,
+                    )
+                    retry_after = _bounded_retry_after(
+                        response.headers.get("Retry-After")
+                    )
+                else:
+                    try:
+                        payload = response.json()
+                    except (
+                        json.JSONDecodeError,
+                        RecursionError,
+                        UnicodeDecodeError,
+                        ValueError,
+                    ) as exc:
+                        schema_occurrences += 1
+                        failure = classify_schema_failure(
+                            method=normalized_method,
+                            occurrence=schema_occurrences,
+                        )
+                        cause = exc
+                    else:
+                        if not isinstance(payload, dict):
+                            schema_occurrences += 1
+                            failure = classify_schema_failure(
+                                method=normalized_method,
+                                occurrence=schema_occurrences,
+                            )
+                        else:
+                            try:
+                                business_code = _payload_business_code(payload)
+                            except ValueError as exc:
+                                schema_occurrences += 1
+                                failure = classify_schema_failure(
+                                    method=normalized_method,
+                                    occurrence=schema_occurrences,
+                                )
+                                cause = exc
+                            if failure is not None:
+                                pass
+                            elif business_code is not None:
+                                failure = classify_business_failure(
+                                    method=normalized_method,
+                                    exchange_code=business_code,
+                                )
+                            elif not _response_schema_valid(
+                                method=normalized_method,
+                                normalized_path=normalized_path,
+                                payload=payload,
+                            ):
+                                schema_occurrences += 1
+                                failure = classify_schema_failure(
+                                    method=normalized_method,
+                                    occurrence=schema_occurrences,
+                                )
+                            else:
+                                self._record_attempt(
+                                    recorder=recorder,
+                                    fact=RequestAttemptFact(
+                                        ordinal=ordinal,
+                                        method=normalized_method,
+                                        normalized_path=normalized_path,
+                                        phase=phase,
+                                        priority=priority,
+                                        correlation_id=correlation_id,
+                                        outcome_certainty=OutcomeCertainty.ACCEPTED,
+                                        error_category=None,
+                                        safe_code="request_accepted",
+                                        http_status=response.status_code,
+                                        business_code=None,
+                                        governor_wait_ms=governor_wait_ms,
+                                        retry_delay_ms=0,
+                                        latency_ms=_elapsed_ms(
+                                            attempt_started,
+                                            self._safe_monotonic(),
+                                        ),
+                                    ),
+                                )
+                                return payload
+            except httpx.RequestError as exc:
+                failure = classify_transport_failure(
+                    method=normalized_method,
+                    sent=True,
+                    code=_transport_safe_code(exc),
+                )
+                cause = exc
+
+            assert failure is not None
+            remaining = _remaining_seconds(deadline, self._safe_monotonic())
+            retry_candidate = (
+                normalized_method == "GET"
+                and failure.retryable
+                and ordinal < max_attempts
+            )
+            delay = 0.0
+            if retry_candidate:
+                try:
+                    delay = self._retry_delay(
+                        failure=failure,
+                        retry_after=retry_after,
+                        ordinal=ordinal,
+                    )
+                except Exception:
+                    retry_candidate = False
+            retry_permitted = retry_candidate and (
+                remaining is None or delay < remaining
+            )
+            self._record_attempt(
+                recorder=recorder,
+                fact=_attempt_fact(
+                    ordinal=ordinal,
+                    method=normalized_method,
+                    normalized_path=normalized_path,
+                    phase=phase,
+                    priority=priority,
+                    correlation_id=correlation_id,
+                    failure=failure,
+                    business_code=business_code,
+                    governor_wait_ms=governor_wait_ms,
+                    retry_delay_ms=(_milliseconds(delay) if retry_permitted else 0),
+                    latency_ms=_elapsed_ms(
+                        attempt_started,
+                        self._safe_monotonic(),
+                    ),
+                ),
+            )
+            if retry_permitted:
+                self._sleep_fn(delay)
+                continue
+            if failure.outcome_certainty == OutcomeCertainty.REJECTED:
+                rejection_code = business_code or failure.safe_code
+                raise DeepcoinDefiniteRejection(
+                    f"Deepcoin request rejected: {rejection_code}",
+                    fact=failure,
+                ) from cause
+            if normalized_method == "POST":
+                raise DeepcoinRequestOutcomeUnknown(
+                    "Deepcoin request outcome unknown",
+                    fact=failure,
+                ) from cause
+            raise DeepcoinReadUnavailable(
+                failure.safe_code,
+                fact=failure,
+            ) from cause
+        raise AssertionError("unreachable request attempt loop")
+
+    def _safe_monotonic(self) -> float:
+        value = float(self._monotonic_factory())
+        if not math.isfinite(value) or value < 0:
+            raise DeepcoinClientError("invalid monotonic clock")
+        return value
+
+    def _retry_delay(
+        self,
+        *,
+        failure: FailureFact,
+        retry_after: float | None,
+        ordinal: int,
+    ) -> float:
+        if failure.category == ErrorCategory.RATE_LIMITED and retry_after is not None:
+            return retry_after
+        base = (0.5, 1.0, 2.0)[min(max(ordinal - 1, 0), 2)]
+        try:
+            jitter = float(self._retry_jitter_fn())
+        except (TypeError, ValueError) as exc:
+            raise DeepcoinClientError("invalid retry jitter") from exc
+        if not math.isfinite(jitter):
+            raise DeepcoinClientError("invalid retry jitter")
+        return min(2.25, max(0.0, base + min(0.25, max(0.0, jitter))))
+
+    @staticmethod
+    def _record_attempt(
+        *,
+        recorder: Callable[[RequestAttemptFact], None] | None,
+        fact: RequestAttemptFact,
+    ) -> None:
+        if recorder is None:
+            return
+        try:
+            recorder(fact)
+        except Exception as exc:
+            sent = not (
+                fact.outcome_certainty == OutcomeCertainty.NOT_SENT
+            )
+            evidence_failure = FailureFact(
+                category=ErrorCategory.STATE_CONFLICT,
+                outcome_certainty=(
+                    OutcomeCertainty.UNKNOWN
+                    if sent
+                    else OutcomeCertainty.NOT_SENT
+                ),
+                retryable=False,
+                safe_code="attempt_evidence_unavailable",
+            )
+            if fact.method == "POST":
+                if sent:
+                    raise DeepcoinRequestOutcomeUnknown(
+                        "Deepcoin request outcome unknown",
+                        fact=evidence_failure,
+                    ) from None
+                raise DeepcoinPreSendUnavailable(
+                    evidence_failure.safe_code,
+                    fact=evidence_failure,
+                ) from None
+            raise DeepcoinReadUnavailable(
+                evidence_failure.safe_code,
+                fact=evidence_failure,
+            ) from None
 
 
 def build_deepcoin_auth_headers(
@@ -691,6 +1088,169 @@ def _raise_for_deepcoin_business_error(payload: dict[str, Any]) -> None:
             raise DeepcoinDefiniteRejection(
                 f"Deepcoin API error {s_code}: {item.get('sMsg') or item.get('msg')}"
             )
+
+
+def _payload_business_code(payload: dict[str, Any]) -> str | None:
+    code = _validated_business_code(payload.get("code", "0"))
+    if code not in {"0", ""}:
+        return code
+    for item in _iter_deepcoin_payload_items(payload.get("data")):
+        s_code = _validated_business_code(item.get("sCode", "0"))
+        if s_code not in {"0", ""}:
+            return s_code
+    return None
+
+
+def _governor_failure_fact(exc: DeepcoinGovernorError) -> FailureFact:
+    if isinstance(exc, DeepcoinGovernorDeadlineExceeded):
+        return FailureFact(
+            category=ErrorCategory.TRANSPORT_TIMEOUT,
+            outcome_certainty=OutcomeCertainty.NOT_SENT,
+            retryable=False,
+            safe_code="governor_deadline_exceeded",
+        )
+    if isinstance(exc, DeepcoinGovernorStateError):
+        return FailureFact(
+            category=ErrorCategory.STATE_CONFLICT,
+            outcome_certainty=OutcomeCertainty.NOT_SENT,
+            retryable=False,
+            safe_code="governor_state_unavailable",
+        )
+    return FailureFact(
+        category=ErrorCategory.STATE_CONFLICT,
+        outcome_certainty=OutcomeCertainty.NOT_SENT,
+        retryable=False,
+        safe_code="governor_unavailable",
+    )
+
+
+def _request_deadline_exhausted_fact() -> FailureFact:
+    return FailureFact(
+        category=ErrorCategory.TRANSPORT_TIMEOUT,
+        outcome_certainty=OutcomeCertainty.NOT_SENT,
+        retryable=False,
+        safe_code="request_deadline_exceeded",
+    )
+
+
+def _validated_business_code(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError("business code schema invalid")
+    code = str(value).strip()
+    if len(code) > 64 or any(
+        not (character.isascii() and (character.isalnum() or character in {"_", "-"}))
+        for character in code
+    ):
+        raise ValueError("business code schema invalid")
+    return code
+
+
+def _response_schema_valid(
+    *,
+    method: str,
+    normalized_path: str,
+    payload: dict[str, Any],
+) -> bool:
+    if method != "GET" or normalized_path not in _DEEPCOIN_LIST_READ_PATHS:
+        return True
+    data = payload.get("data")
+    return isinstance(data, list) and all(isinstance(row, dict) for row in data)
+
+
+def _transport_safe_code(exc: httpx.RequestError) -> str:
+    if isinstance(exc, httpx.ConnectTimeout):
+        return "connect_timeout"
+    if isinstance(exc, httpx.ReadTimeout):
+        return "read_timeout"
+    if isinstance(exc, httpx.WriteTimeout):
+        return "write_timeout"
+    if isinstance(exc, httpx.PoolTimeout):
+        return "pool_timeout"
+    return "transport_failure"
+
+
+def _bounded_optional_deadline(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise DeepcoinClientError("invalid request deadline") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise DeepcoinClientError("invalid request deadline")
+    return parsed
+
+
+def _remaining_seconds(deadline: float | None, now: float) -> float | None:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - now)
+
+
+def _bounded_retry_after(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0:
+        return None
+    return min(60.0, parsed)
+
+
+def _bounded_label(value: object, *, fallback: str) -> str:
+    normalized = "".join(
+        character if character.isalnum() or character in {"_", "-"} else "_"
+        for character in str(value or "").strip().lower()
+    ).strip("_")
+    return (normalized or fallback)[:128]
+
+
+def _bounded_optional_label(value: object) -> str | None:
+    if value is None:
+        return None
+    return _bounded_label(value, fallback="unspecified")
+
+
+def _elapsed_ms(started: float, finished: float) -> int:
+    return _milliseconds(max(0.0, finished - started))
+
+
+def _milliseconds(seconds: float) -> int:
+    return max(0, round(float(seconds) * 1000))
+
+
+def _attempt_fact(
+    *,
+    ordinal: int,
+    method: str,
+    normalized_path: str,
+    phase: str,
+    priority: RequestPriority,
+    correlation_id: str | None,
+    failure: FailureFact,
+    governor_wait_ms: int,
+    retry_delay_ms: int,
+    latency_ms: int,
+    business_code: str | None = None,
+) -> RequestAttemptFact:
+    return RequestAttemptFact(
+        ordinal=ordinal,
+        method=method,
+        normalized_path=normalized_path,
+        phase=phase,
+        priority=priority,
+        correlation_id=correlation_id,
+        outcome_certainty=failure.outcome_certainty,
+        error_category=failure.category,
+        safe_code=failure.safe_code,
+        http_status=failure.http_status,
+        business_code=business_code,
+        governor_wait_ms=max(0, int(governor_wait_ms)),
+        retry_delay_ms=max(0, int(retry_delay_ms)),
+        latency_ms=max(0, int(latency_ms)),
+    )
 
 
 def _iter_deepcoin_payload_items(value: Any):

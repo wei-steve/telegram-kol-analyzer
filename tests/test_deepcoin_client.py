@@ -23,6 +23,8 @@ from telegram_kol_research.deepcoin_request_governor import (
 class _FakeResponse:
     def __init__(self, payload):
         self._payload = payload
+        self.status_code = 200
+        self.headers = {}
 
     def raise_for_status(self):
         return None
@@ -37,7 +39,7 @@ class _CapturingHttpClient:
         self.requests = []
         self.close_calls = 0
 
-    def request(self, method, request_path, content="", headers=None):
+    def request(self, method, request_path, content="", headers=None, timeout=None):
         self.requests.append(
             {
                 "method": method,
@@ -53,7 +55,7 @@ class _CapturingHttpClient:
 
 
 class _FailingHttpClient:
-    def request(self, method, request_path, content="", headers=None):
+    def request(self, method, request_path, content="", headers=None, timeout=None):
         request = httpx.Request(method, f"https://api.deepcoin.test{request_path}")
         raise httpx.ReadTimeout("lost response", request=request)
 
@@ -62,7 +64,7 @@ class _HttpStatusClient:
     def __init__(self, status_code):
         self.status_code = status_code
 
-    def request(self, method, request_path, content="", headers=None):
+    def request(self, method, request_path, content="", headers=None, timeout=None):
         request = httpx.Request(method, f"https://api.deepcoin.test{request_path}")
         return httpx.Response(
             self.status_code,
@@ -365,7 +367,7 @@ def test_deepcoin_client_reuses_owned_http_connection_and_closes_once(monkeypatc
     assert created_clients[0].close_calls == 1
 
 
-def test_deepcoin_client_closes_owned_http_connection_after_unscoped_request(
+def test_deepcoin_client_reuses_owned_connection_until_explicit_close(
     monkeypatch,
 ):
     created_clients = []
@@ -385,9 +387,10 @@ def test_deepcoin_client_closes_owned_http_connection_after_unscoped_request(
 
     client.list_positions()
     client.list_open_orders()
+    client.close()
 
-    assert len(created_clients) == 2
-    assert [item.close_calls for item in created_clients] == [1, 1]
+    assert len(created_clients) == 1
+    assert created_clients[0].close_calls == 1
 
 
 def test_deepcoin_client_does_not_close_injected_http_client():
@@ -498,7 +501,7 @@ def test_list_position_history_queries_exact_split_position():
     ]
 
     http_client.payload = {"code": "0", "data": {"posId": "position-1"}}
-    with pytest.raises(DeepcoinClientError, match="invalid list response schema"):
+    with pytest.raises(DeepcoinClientError, match="schema_incompatible"):
         client.list_position_history(
             inst_id="BTC-USDT-SWAP",
             pos_id="position-1",
@@ -585,7 +588,7 @@ def test_deepcoin_list_endpoint_rejects_non_list_data():
         http_client=http_client,
     )
 
-    with pytest.raises(DeepcoinClientError, match="invalid list response schema"):
+    with pytest.raises(DeepcoinClientError, match="schema_incompatible"):
         client.list_positions()
 
 
@@ -650,7 +653,7 @@ def test_deepcoin_client_list_swap_instruments_rejects_non_list_data():
         ),
     )
 
-    with pytest.raises(DeepcoinClientError, match="invalid list response schema"):
+    with pytest.raises(DeepcoinClientError, match="schema_incompatible"):
         client.list_swap_instruments()
 
 
@@ -664,7 +667,7 @@ def test_deepcoin_client_list_swap_instruments_rejects_api_error():
 
     with pytest.raises(
         DeepcoinClientError,
-        match="Deepcoin API error 50011: instrument service unavailable",
+        match="Deepcoin request rejected: 50011",
     ):
         client.list_swap_instruments()
 
@@ -835,10 +838,13 @@ class _RecordingLegacyLimiter:
 
 def test_injected_governor_receives_every_get_request():
     governor = _RecordingRequestGovernor()
+    clock = _FakeMonotonicClock()
     client = DeepcoinRestClient(
         DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
         http_client=_CapturingHttpClient({"code": "0", "data": []}),
         request_governor=governor,
+        monotonic_factory=clock,
+        sleep_fn=clock.sleep,
     )
 
     client.list_positions(inst_id="BTC-USDT-SWAP")
@@ -850,13 +856,14 @@ def test_injected_governor_receives_every_get_request():
                 "/deepcoin/account/positions?instType=SWAP&instId=BTC-USDT-SWAP"
             ),
             "priority": "normal",
-            "deadline_monotonic": None,
+            "deadline_monotonic": 110.0,
         }
     ]
 
 
 def test_governed_tpsl_writer_is_charged_once_without_legacy_limiter():
     governor = _RecordingRequestGovernor()
+    clock = _FakeMonotonicClock()
     client = DeepcoinRestClient(
         DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
         http_client=_CapturingHttpClient(
@@ -864,6 +871,8 @@ def test_governed_tpsl_writer_is_charged_once_without_legacy_limiter():
         ),
         request_governor=governor,
         tpsl_rate_limiter=_ForbiddenLegacyLimiter(),
+        monotonic_factory=clock,
+        sleep_fn=clock.sleep,
     )
 
     client.set_position_sltp(
@@ -880,7 +889,7 @@ def test_governed_tpsl_writer_is_charged_once_without_legacy_limiter():
             "method": "POST",
             "request_path": "/deepcoin/trade/set-position-sltp",
             "priority": "normal",
-            "deadline_monotonic": None,
+            "deadline_monotonic": 110.0,
         }
     ]
 
