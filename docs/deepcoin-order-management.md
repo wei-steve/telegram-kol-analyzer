@@ -130,6 +130,65 @@ The project now has an append-only local execution-event ledger in `execution_ev
 
 This gives us a complete timeline for questions like "which TP was active before this KOL update?", "did the old stop-loss actually get cancelled?", and "which partial take-profit closed part of the position?".
 
+## Request governance and protected multi-leg entry
+
+Deepcoin transport now has one UID-aware governor below all REST calls. The UID
+scope is a SHA-256 of the API base URL and credential identity; neither the API
+key nor credentials are written to governor filenames, durable request facts,
+metrics, logs, or Web output. Endpoint paths are normalized before applying the
+documented safe profiles. Background traffic has a smaller sub-budget so it
+cannot consume the critical reserve.
+
+The environment-only modes are `disabled`, `telemetry`, `enforce_reads`, and
+`enforce_all`. Missing or invalid configuration resolves to `disabled`.
+Telemetry records the delay that would have applied but never sleeps and never
+creates simulated orders. Enforcement additionally requires an absolute,
+service-owned, non-symlink state directory with mode `0700`; otherwise the
+governor fails closed to the disabled environment rather than guessing a path.
+
+The enforced profiles deliberately stay below Deepcoin's documented endpoint
+ceilings:
+
+| Endpoint class | Documented ceiling | Enforced total | Background reserve |
+| --- | --- | --- | --- |
+| order/fill/trigger history and pending TPSL GET | 5/s, 150/min | 4/s, 120/min | 2/s, 60/min |
+| positions and pending regular orders GET | 10/s, 300/min | 8/s, 240/min | 4/s, 120/min |
+| order/trigger/TPSL POST writers | 15/s, 450/min | 12/s, 360/min | 6/s, 180/min |
+| position history and unknown paths | 1/s, 60/min | 1 every 1.25s, 48/min | 1 every 1.25s, 24/min |
+
+Query-string variants share the same normalized endpoint budget, and processes
+using the same Deepcoin UID hash share the same locked window.
+
+Safe GET retries are bounded by phase deadline and attempt budget. A failed,
+incomplete, malformed, or ambiguously paginated read remains unavailable; it is
+never converted into `[]`. POST transport/HTTP/JSON ambiguity is `unknown` and
+is never retried. Only a typed local pre-send fact with certainty `not_sent`
+may become retryable, and exact operation/request/economics/state-version CAS
+must still succeed.
+
+Future-only protected entry is independently gated by
+`protected_entry_execution_mode` and
+`protected_entry_execution_after_trade_signal_id`. Defaults are disabled.
+When live is separately approved, only `TradeSignal.id > watermark` can create
+the version-1 operation contract. The parent market leg must be read back,
+every required protection child must be durably reserved and exactly confirmed,
+and only then may a later leg submit. The parent decision deadline is ten
+seconds and survives restart. An exhausted later preflight becomes
+`pre_submit_deferred`; it is not a timer retry queue.
+
+`deepcoin_execution_operations`, `deepcoin_request_attempts`, and
+`deepcoin_snapshot_evidence` are the canonical execution audit for the new
+path. TradeSignal/Web state is only a projection. If a versioned writer was
+attempted, disabling the creation gate leaves the operation on version-1
+GET-only readback. It must never fall back to legacy or send a second logical
+POST. Live exposure with incomplete protection remains visible and does not
+invalidate the lifecycle as a no-exposure failure.
+
+The staged deployment and rollback procedure is in
+`docs/deepcoin-request-governance-runbook.md`. Code publication does not enable
+any stage. The known frozen two-leg incident and batch 119 remain outside this
+generic rollout and receive no recovery authority from it.
+
 ## Verification
 
 Focused offline tests cover:

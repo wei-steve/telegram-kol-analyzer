@@ -916,6 +916,42 @@ Server deployment, corpus selection, replay, and any live activation remain
 pending. Live activation requires a separate explicit approval after the
 deployed v1 service is healthy and the isolated replay artifact is reviewed.
 
+## Deepcoin request governance and protected-entry handoff
+
+The reviewed request-governance/protected-entry candidate is additive and
+dormant by default. `DEEPCOIN_REQUEST_GOVERNOR_MODE` defaults to `disabled`;
+`protected_entry_execution_mode` defaults to `disabled`. Publishing the branch
+does not authorize a server pull, package reinstall, restart, setting change,
+or live writer verification.
+
+Rollout is six separately approved stages: dormant foundation, telemetry,
+background/Web then critical read enforcement, future-only protected entry,
+all-request enforcement for new-version writers, and eventual legacy
+retirement only after every old operation is terminal. Telemetry observes real
+requests without delay and without shadow orders. Future activation requires a
+watermark at least equal to the stopped database's latest `TradeSignal.id`; only
+strictly newer signals use the pinned version-1 contract.
+
+Every server stage requires the exact reviewed SHA, stopped-service active and
+unknown writer query, validated private database backup, complete
+same-generation exchange snapshot, exact protection proof for all live
+positions, post-restart PID/HTTP/log/database/metrics/exchange checks, and its
+own approval. The known frozen two-leg incident can be excluded from a
+deployment hold only by its separately reviewed exact durable identity and
+SHA-256 fingerprint plus unchanged current position/protection evidence. That
+exception grants no replay, repair, lifecycle mutation, or exchange authority.
+
+Before any versioned writer attempt, a stage may be rolled back under a new
+quiet-window proof. After any writer attempt, do not restore the database and
+do not hand the operation to legacy. Disable creation of new operations and
+retain the version-1 GET-only reconciler until exchange truth converges.
+Unknown POST outcomes are never retried; `pre_submit_deferred` is never
+timer-submitted; live exposure is never terminalized as no exposure.
+
+Batch 119 remains a separate dedicated recovery and cannot run in the same
+deployment operation. Exact commands, stage evidence, configuration boundaries,
+and rollback rules are in `docs/deepcoin-request-governance-runbook.md`.
+
 ## Multi-instruction recognition handoff
 
 Authoritative recognition now has a bounded per-action `instructions` contract.
