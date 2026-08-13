@@ -17,11 +17,14 @@ from telegram_kol_research.db import (
 from telegram_kol_research.execution_bindings import (
     _exchange_row_matches_leg,
     _leg_evidence,
-    _load_reconcile_snapshot,
+    load_deepcoin_reconciliation_snapshot_for_instruments_read_only,
     _post_entry_protection_mutated_binding_ids,
     build_position_evidence,
     _snapshot_fill_evidence,
     _successful_fill_leg_ids,
+)
+from telegram_kol_research.deepcoin_snapshot_authority import (
+    build_exchange_collection_evidence,
 )
 from telegram_kol_research.historical_attribution_cleanup import (
     HistoricalCleanupAction,
@@ -178,29 +181,36 @@ def _historical_position_candidates(bindings_by_id, legs):
 
 
 def _load_historical_position_evidence(snapshot, deepcoin_client, candidates) -> None:
-    method = getattr(deepcoin_client, "list_position_history", None)
+    raw_method = getattr(deepcoin_client, "read_position_history", None)
+    list_method = getattr(deepcoin_client, "list_position_history", None)
+    method = raw_method if callable(raw_method) else list_method
     for instrument, identifier in sorted(candidates):
         source = f"position_history:{instrument}:{identifier}"
-        if method is None:
-            snapshot.errors[source] = "list_position_history unavailable"
+        if not callable(method):
+            snapshot.errors[source] = "position_history_reader_unavailable"
             continue
         try:
-            rows = method(inst_id=instrument, pos_id=identifier)
-        except Exception as exc:
-            snapshot.errors[source] = str(exc)
+            response = method(inst_id=instrument, pos_id=identifier)
+        except Exception:
+            snapshot.errors[source] = "position_history_read_unavailable"
             continue
-        if not isinstance(rows, list) or not all(
-            isinstance(row, dict) for row in rows
-        ):
-            snapshot.errors[source] = "invalid list response schema"
+        evidence = build_exchange_collection_evidence(
+            endpoint="position_history",
+            response=response,
+        )
+        if not evidence.schema_valid:
+            snapshot.errors[source] = "position_history_schema_invalid"
             continue
+        if not evidence.complete:
+            snapshot.errors[source] = (
+                evidence.reason_code or "position_history_incomplete"
+            )
+            continue
+        rows = [dict(row) for row in evidence.rows]
         if any(
             str(row.get("posId") or "").strip() != identifier for row in rows
         ):
-            snapshot.errors[source] = (
-                "position history response posId mismatch: "
-                f"expected {identifier}"
-            )
+            snapshot.errors[source] = "position_history_identity_mismatch"
             continue
         snapshot.position_history.extend(rows)
 
@@ -227,14 +237,18 @@ def build_position_attribution_repair_plan(
         instruments = {
             f"{str(binding.symbol).upper()}-USDT-SWAP" for binding in bindings
         }
-        snapshot = _load_reconcile_snapshot(
-            deepcoin_client,
-            instruments=instruments,
+        historical_candidates = _historical_position_candidates(
+            bindings_by_id, legs
         )
-        _load_historical_position_evidence(
-            snapshot,
-            deepcoin_client,
-            _historical_position_candidates(bindings_by_id, legs),
+        snapshot = load_deepcoin_reconciliation_snapshot_for_instruments_read_only(
+            session_factory,
+            client=deepcoin_client,
+            instruments=instruments,
+            snapshot_enricher=lambda captured: _load_historical_position_evidence(
+                captured,
+                deepcoin_client,
+                historical_candidates,
+            ),
         )
         if snapshot.errors:
             unresolved = [{"evidence_source_errors": dict(sorted(snapshot.errors.items()))}]

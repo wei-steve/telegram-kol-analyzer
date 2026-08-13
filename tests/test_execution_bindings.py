@@ -81,6 +81,27 @@ def _binding(**overrides):
     return ExecutionBindingRecord(**values)
 
 
+class _CompleteAuthorityClient:
+    """Default complete empty authority endpoints for focused fake clients."""
+
+    uid_scope_hash = "d" * 64
+
+    def list_position_history(self, *, inst_id, pos_id=None):
+        return []
+
+    def list_trigger_orders_pending(self, *, inst_id):
+        return []
+
+    def list_order_history(self, *, inst_id=None):
+        return []
+
+    def list_trade_fills(self, *, inst_id=None):
+        return []
+
+    def list_trigger_order_history(self, *, inst_id=None):
+        return []
+
+
 def test_read_only_reconcile_surfaces_incomplete_snapshot_after_local_apply(
     tmp_path, monkeypatch
 ):
@@ -110,6 +131,262 @@ def test_read_only_reconcile_surfaces_incomplete_snapshot_after_local_apply(
         )
 
     assert applied == [snapshot]
+
+
+def test_snapshot_loader_retains_safe_trigger_error_instead_of_false_absence():
+    class Client:
+        def list_positions(self):
+            return []
+
+        def list_open_orders(self):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            raise RuntimeError("DC-ACCESS-SIGN sensitive-signature")
+
+    snapshot = execution_bindings_module._load_reconcile_snapshot(
+        Client(), instruments={"BTC-USDT-SWAP"}
+    )
+
+    assert snapshot.pending_trigger_orders == []
+    assert snapshot.pending_tpsl_observations == [
+        {
+            "instrument_id": "BTC-USDT-SWAP",
+            "complete": False,
+            "reason": "pending_tpsl_read_error",
+            "order_ids": [],
+        }
+    ]
+    assert snapshot.errors == {
+        "order_history": "snapshot_reader_unavailable",
+        "pending_trigger_orders:BTC-USDT-SWAP": "snapshot_read_unavailable",
+        "position_history": "snapshot_reader_unavailable",
+        "trade_fills": "snapshot_reader_unavailable",
+        "trigger_history": "snapshot_reader_unavailable",
+    }
+
+
+def test_snapshot_loader_reads_position_history_and_marks_missing_reader_unavailable():
+    calls = []
+
+    class CompleteClient:
+        def list_positions(self):
+            return []
+
+        def list_open_orders(self):
+            return []
+
+        def list_position_history(self, *, inst_id):
+            calls.append(("position_history", inst_id))
+            return [{"instId": inst_id, "posId": "closed-1"}]
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return []
+
+        def list_order_history(self, *, inst_id):
+            return []
+
+        def list_trade_fills(self, *, inst_id):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id):
+            return []
+
+    snapshot = execution_bindings_module._load_reconcile_snapshot(
+        CompleteClient(), instruments={"BTC-USDT-SWAP"}
+    )
+
+    assert calls == [("position_history", "BTC-USDT-SWAP")]
+    assert snapshot.position_history == [
+        {"instId": "BTC-USDT-SWAP", "posId": "closed-1"}
+    ]
+    assert snapshot.errors == {}
+
+
+def test_missing_authority_readers_are_errors_not_false_empty():
+    class PartialClient:
+        def list_positions(self):
+            return []
+
+        def list_open_orders(self):
+            return []
+
+    snapshot = execution_bindings_module._load_reconcile_snapshot(
+        PartialClient(), instruments={"BTC-USDT-SWAP"}
+    )
+
+    assert snapshot.pending_trigger_orders == []
+    assert snapshot.position_history == []
+    assert snapshot.errors == {
+        "order_history": "snapshot_reader_unavailable",
+        "pending_trigger_orders:BTC-USDT-SWAP": "snapshot_reader_unavailable",
+        "position_history": "snapshot_reader_unavailable",
+        "trade_fills": "snapshot_reader_unavailable",
+        "trigger_history": "snapshot_reader_unavailable",
+    }
+
+
+def test_production_reconcile_loader_applies_generation_fence(tmp_path):
+    from telegram_kol_research.deepcoin_execution_operations import (
+        advance_account_write_generation,
+    )
+
+    session_factory = create_session_factory(tmp_path / "production-generation-fence.db")
+
+    class RacingClient:
+        uid_scope_hash = "c" * 64
+
+        def list_positions(self):
+            advance_account_write_generation(
+                session_factory, uid_scope_hash=self.uid_scope_hash
+            )
+            advance_account_write_generation(
+                session_factory, uid_scope_hash=self.uid_scope_hash
+            )
+            return []
+
+        def list_open_orders(self):
+            return []
+
+        def list_position_history(self, *, inst_id):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return []
+
+        def list_order_history(self, *, inst_id):
+            return []
+
+        def list_trade_fills(self, *, inst_id):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id):
+            return []
+
+    snapshot = execution_bindings_module.load_deepcoin_execution_reconciliation_snapshot_read_only(
+        session_factory,
+        client=RacingClient(),
+    )
+
+    assert snapshot.errors == {
+        "account_composite": "snapshot_write_generation_changed"
+    }
+
+
+def test_production_reconcile_loader_without_uid_scope_fails_closed_before_reads(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "missing-uid-fence.db")
+    calls = []
+
+    class MissingUidClient:
+        def list_positions(self):
+            calls.append("positions")
+            return []
+
+    snapshot = (
+        execution_bindings_module.load_deepcoin_reconciliation_snapshot_for_instruments_read_only(
+            session_factory,
+            client=MissingUidClient(),
+            instruments={"BTC-USDT-SWAP"},
+        )
+    )
+
+    assert snapshot.errors == {
+        "account_composite": "snapshot_uid_scope_unavailable"
+    }
+    assert calls == []
+
+
+def test_pending_trigger_schema_invalid_row_is_not_retained():
+    deep = {"leaf": "ok"}
+    for _ in range(20):
+        deep = {"nested": deep}
+
+    class InvalidTriggerClient:
+        def read_trigger_orders_pending(self, *, inst_id):
+            return {"data": [deep]}
+
+    snapshot = execution_bindings_module._ReconcileSnapshot()
+    rows = execution_bindings_module._read_pending_trigger_snapshot_rows(
+        InvalidTriggerClient(),
+        source="pending_trigger_orders",
+        instruments={"BTC-USDT-SWAP"},
+        errors=snapshot.errors,
+        observations=snapshot.pending_tpsl_observations,
+    )
+
+    assert rows == []
+    assert snapshot.errors == {
+        "pending_trigger_orders:BTC-USDT-SWAP": "invalid_pending_tpsl_schema"
+    }
+
+
+def test_deep_invalid_exchange_row_is_bounded_schema_error_not_traceback():
+    deep = {"leaf": "ok"}
+    for _ in range(20_000):
+        deep = {"nested": deep}
+
+    class DeepClient:
+        def list_positions(self):
+            return [deep]
+
+        def list_open_orders(self):
+            return []
+
+    snapshot = execution_bindings_module._load_reconcile_snapshot(
+        DeepClient(), instruments=set()
+    )
+
+    assert snapshot.positions == []
+    assert snapshot.errors["positions"] == "snapshot_schema_invalid"
+
+
+def test_reconcile_snapshot_marks_full_page_without_completion_proof_incomplete():
+    class FullPageClient:
+        def list_positions(self):
+            return [{"posId": f"pos-{index}"} for index in range(100)]
+
+        def list_open_orders(self):
+            return []
+
+    snapshot = execution_bindings_module._load_reconcile_snapshot(
+        FullPageClient(), instruments=set()
+    )
+
+    assert len(snapshot.positions) == 100
+    assert snapshot.errors == {"positions": "snapshot_page_limit_ambiguous"}
+
+
+def test_incomplete_snapshot_never_runs_exchange_mutation_workers(tmp_path, monkeypatch):
+    import telegram_kol_research.trigger_protection_rescue_worker as rescue_worker
+
+    session_factory = create_session_factory(tmp_path / "incomplete-no-writer.db")
+    snapshot = execution_bindings_module._ReconcileSnapshot(
+        errors={"positions": "snapshot_read_unavailable"}
+    )
+    calls = []
+    expected_result = object()
+    monkeypatch.setattr(
+        rescue_worker,
+        "run_trigger_protection_rescue_tick",
+        lambda *args, **kwargs: calls.append("rescue"),
+    )
+    monkeypatch.setattr(
+        execution_bindings_module,
+        "_apply_reconcile_snapshot",
+        lambda *args, **kwargs: (calls.append("reconcile"), expected_result)[1],
+    )
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=object(),
+        snapshot=snapshot,
+        recovered_at=datetime(2026, 8, 7, 14, 0),
+    )
+
+    assert result is expected_result
+    assert calls == ["reconcile"]
 
 
 def test_live_reconcile_runs_due_stop_rescue_before_retry_rescheduling(
@@ -522,6 +799,8 @@ def _save_trigger_protection_intent(session_factory, *, recovery_state="pending"
 
 
 class _ProtectionAdoptionReconciliationClient:
+    uid_scope_hash = "d" * 64
+
     def __init__(
         self,
         pending_rows=None,
@@ -556,6 +835,9 @@ class _ProtectionAdoptionReconciliationClient:
     def list_open_orders(self):
         return []
 
+    def list_position_history(self, *, inst_id, pos_id=None):
+        return []
+
     def list_trigger_orders_pending(self, *, inst_id):
         assert inst_id == "ETH-USDT-SWAP"
         self.pending_calls += 1
@@ -588,6 +870,8 @@ class _ProtectionAdoptionReconciliationClient:
 
 
 class _BackupStopSubmissionClient:
+    uid_scope_hash = "d" * 64
+
     def __init__(self, positions, *, responses=None):
         self.positions = [
             {
@@ -611,6 +895,21 @@ class _BackupStopSubmissionClient:
         if inst_id is None:
             return self.positions
         return [row for row in self.positions if row.get("instId") == inst_id]
+
+    def list_open_orders(self):
+        return []
+
+    def list_position_history(self, *, inst_id, pos_id=None):
+        return []
+
+    def list_order_history(self, *, inst_id=None):
+        return []
+
+    def list_trade_fills(self, *, inst_id=None):
+        return []
+
+    def list_trigger_order_history(self, *, inst_id=None):
+        return []
 
     def set_position_sltp(self, payload):
         self.sltp_payloads.append(payload)
@@ -729,7 +1028,9 @@ def test_reconcile_persists_raw_pending_tpsl_completeness_evidence(tmp_path):
         observation = session.query(PendingTpslSnapshotObservation).one()
     assert observation.instrument_id == "ETH-USDT-SWAP"
     assert observation.response_count == 1
-    assert observation.order_ids_json == '["tp-raw"]'
+    assert observation.order_ids_json == json.dumps(
+        [hashlib.sha256(b"deepcoin_order:tp-raw").hexdigest()]
+    )
     assert observation.complete is False
     assert observation.reason == "pagination_metadata_unsupported"
 
@@ -2942,7 +3243,7 @@ def test_reconcile_never_reopens_terminal_entry_leg_from_old_signal(
         ),
     )
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -2998,7 +3299,7 @@ def test_reconcile_marks_leg_exchange_cancelled_from_recorded_cancel_event(tmp_p
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return []
 
@@ -3052,7 +3353,7 @@ def test_reconcile_global_attribution_is_independent_of_binding_creation_order(t
                 ),
             )
 
-        class FakeClient:
+        class FakeClient(_CompleteAuthorityClient):
             def list_positions(self):
                 return [
                     {
@@ -3144,7 +3445,7 @@ def test_reconcile_does_not_claim_single_position_without_entry_evidence(tmp_pat
         ),
     )
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -3190,7 +3491,7 @@ def test_reconcile_api_failure_preserves_position_and_deduplicates_audit(tmp_pat
         ),
     )
 
-    class FailingClient:
+    class FailingClient(_CompleteAuthorityClient):
         def list_positions(self):
             raise RuntimeError("positions temporarily unavailable")
 
@@ -3209,7 +3510,13 @@ def test_reconcile_api_failure_preserves_position_and_deduplicates_audit(tmp_pat
     assert leg.pos_id == "pos-verified"
     assert leg.attribution_status == "evidence_unavailable"
     assert len(audits) == 1
-    assert "positions temporarily unavailable" in audits[0].evidence_json
+    audit_errors = json.loads(audits[0].evidence_json)["errors"]
+    assert audit_errors["positions"] == "snapshot_read_unavailable"
+    assert set(audit_errors.values()) <= {
+        "snapshot_read_unavailable",
+        "snapshot_reader_unavailable",
+    }
+    assert "temporarily unavailable" not in audits[0].evidence_json
     assert audits[0].notification_status == "pending"
 
     class DifferentFailingClient(FailingClient):
@@ -3223,8 +3530,7 @@ def test_reconcile_api_failure_preserves_position_and_deduplicates_audit(tmp_pat
         audits = session.query(PositionAttributionAudit).order_by(
             PositionAttributionAudit.id
         ).all()
-    assert len(audits) == 2
-    assert audits[0].fingerprint != audits[1].fingerprint
+    assert len(audits) == 1
     assert all(row.notification_status == "pending" for row in audits)
 
 
@@ -3263,7 +3569,7 @@ def test_reconcile_restores_prior_authority_after_outage_and_position_close(tmp_
         )
         session.commit()
 
-    class FailingClient:
+    class FailingClient(_CompleteAuthorityClient):
         def list_positions(self):
             raise RuntimeError("positions temporarily unavailable")
 
@@ -3280,7 +3586,7 @@ def test_reconcile_restores_prior_authority_after_outage_and_position_close(tmp_
             "evidence_unavailable"
         )
 
-    class CompleteEmptyClient:
+    class CompleteEmptyClient(_CompleteAuthorityClient):
         def list_positions(self):
             return []
 
@@ -3363,7 +3669,7 @@ def test_reconcile_does_not_restore_prior_authority_over_current_identity_confli
         ),
     )
 
-    class ConflictingClient:
+    class ConflictingClient(_CompleteAuthorityClient):
         def list_positions(self):
             return []
 
@@ -3440,7 +3746,7 @@ def test_reconcile_does_not_restore_prior_authority_over_local_position_owner_co
         )
         session.commit()
 
-    class CompleteEmptyClient:
+    class CompleteEmptyClient(_CompleteAuthorityClient):
         def list_positions(self):
             return []
 
@@ -3625,7 +3931,7 @@ def test_build_deepcoin_account_state_uses_persisted_bindings(tmp_path):
         _binding(order_id="order-1", pos_id="pos-1", status="active"),
     )
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -3719,7 +4025,7 @@ def test_reconcile_deepcoin_execution_bindings_marks_restart_state(tmp_path):
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return []
 
@@ -3773,7 +4079,7 @@ def test_reconcile_deepcoin_execution_bindings_keeps_trigger_pending_order_open(
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return []
 
@@ -3825,7 +4131,7 @@ def test_reconcile_does_not_recover_position_from_uniqueness_alone(tmp_path):
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -3883,7 +4189,7 @@ def test_reconcile_keeps_bound_live_position_active_even_when_signal_is_old(tmp_
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -3958,7 +4264,7 @@ def test_reconcile_revives_exited_lifecycle_when_bound_position_is_active(tmp_pa
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -4008,7 +4314,7 @@ def test_reconcile_uses_order_history_to_pick_position_when_symbol_side_ambiguou
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -4096,7 +4402,7 @@ def test_reconcile_updates_matching_order_leg_with_recovered_position_id(tmp_pat
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -4160,7 +4466,7 @@ def test_reconcile_does_not_grandfather_legacy_weak_verified_position(tmp_path):
         ),
     )
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -4213,7 +4519,7 @@ def test_reconcile_preserves_verified_position_after_partial_close_size_drift(tm
         },
     )
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -4294,7 +4600,7 @@ def test_reconcile_recovers_prior_verified_position_after_old_conflict(tmp_path)
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -4384,7 +4690,7 @@ def test_reconcile_maps_multiple_current_policy_positions_back_to_matching_order
             leg.status = "active"
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -4444,7 +4750,7 @@ def test_reconcile_uses_trigger_history_to_pick_position_after_trigger_entry_fil
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -4568,7 +4874,7 @@ def test_reconcile_links_delayed_live_position_through_trigger_child_order_histo
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -4678,7 +4984,7 @@ def test_reconcile_does_not_link_trigger_child_when_order_history_is_ambiguous(
         },
     )
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -4806,7 +5112,7 @@ def test_reconcile_appends_filled_second_leg_position_id(tmp_path):
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -4904,7 +5210,7 @@ def test_reconcile_recovers_each_trigger_leg_despite_fill_slippage(tmp_path):
     )
     repair_execution_order_legs_from_binding_payloads(session_factory)
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -5031,7 +5337,7 @@ def test_reconcile_marks_conflict_instead_of_reassigning_existing_position(tmp_p
         wrong_leg.attribution_status = "unassigned"
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -5162,7 +5468,7 @@ def test_reconcile_does_not_reopen_manually_exited_strategy_when_old_leg_fills(t
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -5252,7 +5558,7 @@ def test_reconcile_manual_lifecycle_terminalizes_legacy_backfilled_closed_leg(tm
         )
         session.commit()
 
-    class EmptySnapshotClient:
+    class EmptySnapshotClient(_CompleteAuthorityClient):
         def list_positions(self):
             return []
 
@@ -5327,7 +5633,7 @@ def test_reconcile_recovers_second_leg_when_first_leg_is_no_longer_active(tmp_pa
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -5421,7 +5727,7 @@ def test_reconcile_does_not_revive_cancelled_legs_when_similar_positions_appear(
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -5529,7 +5835,7 @@ def test_reconcile_reopens_legacy_kol_exit_while_bound_position_is_still_active(
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -5601,7 +5907,7 @@ def test_reconcile_revives_expired_keep_order_when_position_fills_later(tmp_path
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -5670,7 +5976,7 @@ def test_reconcile_does_not_guess_position_id_when_ambiguous(tmp_path):
         ),
     )
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -5777,7 +6083,7 @@ def test_reconcile_does_not_use_submitted_order_payload_as_ownership_proof(tmp_p
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -5857,7 +6163,7 @@ def test_reconcile_keeps_pending_leg_open_without_fill_evidence_for_live_positio
         ),
     )
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -5919,7 +6225,7 @@ def test_sync_manual_closed_positions_closes_missing_bound_position(tmp_path, bi
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return []
 
@@ -5991,7 +6297,7 @@ def test_sync_manual_closed_positions_keeps_supported_live_position_aliases(
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [live_position]
 
@@ -6063,7 +6369,7 @@ def test_sync_missing_position_attributes_verified_take_profit_close(
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return []
 
@@ -6177,7 +6483,7 @@ def test_reconcile_then_sync_closes_a_previously_verified_missing_position(tmp_p
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return []
 
@@ -6239,7 +6545,7 @@ def test_confirmed_close_mutation_converges_reservation_without_closing_live_sib
         ))
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [{"posId": "pos-live", "pos": "2"}]
 
@@ -6294,7 +6600,7 @@ def test_reconcile_records_complete_owned_position_observation(tmp_path):
         attribution_status="verified",
     )
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [{
                 "posId": "pos-observed",
@@ -6391,7 +6697,7 @@ def test_sync_missing_position_cleans_pending_entry_before_lifecycle_exit(tmp_pa
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def __init__(self):
             self.trigger_orders = [
                 {
@@ -6598,7 +6904,7 @@ def test_sync_manual_closed_positions_terminalizes_only_missing_verified_leg(tmp
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -6681,7 +6987,7 @@ def test_sync_manual_closed_positions_skips_weak_verified_missing_leg(tmp_path):
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return [
                 {
@@ -6775,7 +7081,7 @@ def test_sync_manual_closed_positions_terminalizes_exited_conflict_legs_with_exa
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return []
 
@@ -6833,7 +7139,7 @@ def test_sync_manual_closed_positions_keeps_unknown_legacy_binding_without_entry
         _binding(pos_id="legacy-pos", status="unknown"),
     )
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return []
 
@@ -6900,7 +7206,7 @@ def test_sync_repairs_terminal_lifecycle_with_pending_entry_leg_exactly_once(tmp
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def __init__(self):
             self.trigger_orders = [
                 {
@@ -7123,7 +7429,7 @@ def test_sync_closed_position_finalizes_pending_kol_exit_exactly_once(tmp_path):
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return []
 
@@ -7190,7 +7496,7 @@ def test_sync_manual_closed_positions_keeps_binding_open_for_unfilled_entry_leg(
         )
         session.commit()
 
-    class FakeClient:
+    class FakeClient(_CompleteAuthorityClient):
         def list_positions(self):
             return []
 

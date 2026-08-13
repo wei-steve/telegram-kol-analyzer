@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
 from telegram_kol_research.models import PendingTpslSnapshotObservation
+from telegram_kol_research.deepcoin_snapshot_authority import (
+    build_exchange_collection_evidence,
+)
 from telegram_kol_research.native_tpsl import (
     NativeTpslExpectation,
     match_native_tpsl_order,
@@ -16,7 +20,6 @@ from telegram_kol_research.native_tpsl import (
 from telegram_kol_research.protection_ledger import AccountProtectionOwnership
 
 
-_PAGINATION_KEYS = frozenset({"cursor", "nextcursor", "page", "total", "hasmore"})
 _CURRENT_LEDGER_STATUSES = frozenset({"active", "pending_readback", "protected", "verified"})
 _CURRENT_BACKUP_STATUSES = frozenset(
     {"active", "pending_readback", "submitting", "unknown_exchange_outcome"}
@@ -485,10 +488,16 @@ def observe_pending_tpsl(
 ) -> dict[str, Any]:
     """Return safe evidence; never infer that an incomplete list means absent TPSL."""
 
-    normalized_keys = {str(key).lower() for key in response}
-    unknown_pagination = bool(normalized_keys.intersection(_PAGINATION_KEYS))
-    data = response.get("data")
-    if not isinstance(data, list) or not all(isinstance(row, dict) for row in data):
+    evidence = build_exchange_collection_evidence(
+        endpoint="trigger_orders_pending",
+        response=response,
+        expected_order_ids={
+            str(value).strip()
+            for value in expected_order_ids
+            if str(value).strip()
+        },
+    )
+    if not evidence.schema_valid:
         return {
             "instrument_id": str(instrument_id).upper(),
             "complete": False,
@@ -496,15 +505,23 @@ def observe_pending_tpsl(
             "order_ids": [],
             "expected_order_ids_visible": False,
         }
-    order_ids = sorted({str(row.get("ordId") or row.get("orderId") or "").strip() for row in data} - {""})
-    expected = {str(value).strip() for value in expected_order_ids if str(value).strip()}
+    order_ids = sorted(
+        {
+            str(row.get("ordId") or row.get("orderId") or "").strip()
+            for row in evidence.rows
+        }
+        - {""}
+    )
+    reason = evidence.reason_code
+    if reason == "snapshot_pagination_incomplete":
+        reason = "pagination_metadata_unsupported"
     return {
         "instrument_id": str(instrument_id).upper(),
-        "complete": not unknown_pagination,
-        "reason": "pagination_metadata_unsupported" if unknown_pagination else None,
-        "response_count": len(data),
+        "complete": evidence.complete,
+        "reason": reason,
+        "response_count": evidence.row_count,
         "order_ids": order_ids,
-        "expected_order_ids_visible": expected.issubset(set(order_ids)) and not unknown_pagination,
+        "expected_order_ids_visible": evidence.expected_order_ids_visible,
     }
 
 
@@ -519,19 +536,50 @@ def record_pending_tpsl_observation(
     order_ids = observation.get("order_ids")
     if not isinstance(order_ids, list):
         order_ids = []
+    order_id_refs = sorted(
+        {
+            hashlib.sha256(
+                f"deepcoin_order:{str(value)}".encode("utf-8")
+            ).hexdigest()
+            for value in order_ids[:100]
+            if isinstance(value, str) and value
+        }
+    )
     response_count = observation.get("response_count")
+    reason = _safe_snapshot_reason(
+        observation.get("reason"),
+        complete=observation.get("complete") is True,
+    )
     with session_factory() as session:
         row = PendingTpslSnapshotObservation(
             venue=str(venue).lower(),
             instrument_id=str(observation.get("instrument_id") or "").upper(),
             response_count=(int(response_count) if isinstance(response_count, int) else None),
             order_ids_json=json.dumps(
-                sorted({str(value) for value in order_ids if str(value)}),
-                ensure_ascii=False,
+                order_id_refs,
+                ensure_ascii=True,
             ),
             complete=bool(observation.get("complete")),
-            reason=(str(observation["reason"]) if observation.get("reason") else None),
+            reason=reason,
         )
         session.add(row)
         session.commit()
         return int(row.id)
+
+
+def _safe_snapshot_reason(value: object, *, complete: bool) -> str | None:
+    if value in (None, ""):
+        return None if complete else "snapshot_incomplete"
+    if not isinstance(value, str):
+        return "snapshot_incomplete"
+    normalized = value.strip().lower()
+    if (
+        not normalized
+        or len(normalized) > 128
+        or any(
+            character not in "abcdefghijklmnopqrstuvwxyz0123456789_"
+            for character in normalized
+        )
+    ):
+        return "snapshot_incomplete"
+    return normalized

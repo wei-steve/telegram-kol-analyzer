@@ -559,6 +559,8 @@ def test_legacy_protection_recovery_never_mutates_component_marked_batch(
 
 
 class _Client:
+    uid_scope_hash = "d" * 64
+
     def __init__(self, *, positions, orders=None):
         self.positions = list(positions)
         self.orders = list(
@@ -579,12 +581,21 @@ class _Client:
         self.calls["open"] += 1
         return list(self.orders)
 
+    def list_position_history(self, *, inst_id, pos_id=None):
+        return []
+
+    def list_trigger_orders_pending(self, *, inst_id):
+        return []
+
     def list_order_history(self, *, inst_id):
         self.calls["history"] += 1
         return list(self.orders)
 
     def list_trade_fills(self, *, inst_id):
         self.calls["fills"] += 1
+        return []
+
+    def list_trigger_order_history(self, *, inst_id):
         return []
 
 

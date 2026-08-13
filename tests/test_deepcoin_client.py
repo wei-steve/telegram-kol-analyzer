@@ -452,6 +452,30 @@ def test_deepcoin_client_lists_order_and_trigger_history_with_swap_query():
     ]
 
 
+def test_raw_collection_reader_preserves_pagination_metadata_and_uid_scope_hash():
+    payload = {
+        "code": "0",
+        "data": [],
+        "nextPageCursor": "page-2",
+    }
+    credentials = DeepcoinCredentials(
+        api_key="key",
+        api_secret="secret",
+        passphrase="pass",
+    )
+    client = DeepcoinRestClient(
+        credentials,
+        http_client=_CapturingHttpClient(payload),
+        timestamp_factory=lambda: "2026-06-30T00:00:00.000Z",
+    )
+
+    assert client.read_open_orders(inst_id="ETH-USDT-SWAP") == payload
+    assert client.uid_scope_hash == hashlib.sha256(
+        f"{credentials.base_url.rstrip('/')}\0{credentials.api_key}".encode()
+    ).hexdigest()
+    assert credentials.api_key not in client.uid_scope_hash
+
+
 def test_list_position_history_queries_exact_split_position():
     http_client = _CapturingHttpClient(
         {

@@ -26,7 +26,9 @@ from telegram_kol_research.execution_events import (
     ExecutionEventRecord,
     record_execution_event,
 )
-from telegram_kol_research.execution_bindings import _load_reconcile_snapshot
+from telegram_kol_research.execution_bindings import (
+    load_deepcoin_reconciliation_snapshot_for_instruments_read_only,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
@@ -1275,6 +1277,7 @@ def execute_management_batch(
         try:
             _require_remediation_live_gate(session_factory, batch=batch)
             _require_remediation_confirmation_snapshot(
+                session_factory,
                 batch=batch,
                 deepcoin_client=deepcoin_client,
             )
@@ -2844,6 +2847,7 @@ def _require_remediation_live_gate(
 
 
 def _require_remediation_confirmation_snapshot(
+    session_factory: sessionmaker,
     *,
     batch: ManagementBatchRecord,
     deepcoin_client: DeepcoinTradingClientProtocol,
@@ -2873,8 +2877,9 @@ def _require_remediation_confirmation_snapshot(
         raise ManagementBatchExecutionError(
             "remediation_confirmation_marker_invalid"
         )
-    snapshot = _load_reconcile_snapshot(
-        deepcoin_client,
+    snapshot = load_deepcoin_reconciliation_snapshot_for_instruments_read_only(
+        session_factory,
+        client=deepcoin_client,
         instruments=instruments,
     )
     if snapshot.errors or any(

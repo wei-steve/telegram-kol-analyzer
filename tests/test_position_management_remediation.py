@@ -116,6 +116,8 @@ def test_confirmed_remediation_requires_same_current_health_evidence():
 
 
 class _ReadOnlyClient:
+    uid_scope_hash = "d" * 64
+
     def __init__(self):
         self.size = "10"
         self.pending = []
@@ -135,6 +137,9 @@ class _ReadOnlyClient:
         ]
 
     def list_open_orders(self):
+        return []
+
+    def list_position_history(self, *, inst_id):
         return []
 
     def list_trigger_orders_pending(self, *, inst_id):
@@ -1449,6 +1454,7 @@ def test_final_snapshot_gate_rejects_tpsl_change(tmp_path):
 
     with pytest.raises(ValueError, match="snapshot changed"):
         _require_exchange_snapshot_fingerprint(
+            session_factory,
             deepcoin_client=client,
             action=plan.actions[0],
         )

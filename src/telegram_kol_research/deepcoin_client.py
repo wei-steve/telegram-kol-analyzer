@@ -189,6 +189,9 @@ class DeepcoinTradingClientProtocol(Protocol):
     def list_positions(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         """Return account positions, optionally filtered by instrument."""
 
+    def read_positions(self, *, inst_id: str | None = None) -> dict[str, Any]:
+        """Return raw positions response including pagination metadata."""
+
     def list_position_history(
         self,
         *,
@@ -197,14 +200,28 @@ class DeepcoinTradingClientProtocol(Protocol):
     ) -> list[dict[str, Any]]:
         """Return historical records for one exact split position."""
 
+    def read_position_history(
+        self, *, inst_id: str, pos_id: str | None = None
+    ) -> dict[str, Any]:
+        """Return raw position-history response including pagination metadata."""
+
     def list_open_orders(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         """Return pending regular orders, optionally filtered by instrument."""
+
+    def read_open_orders(self, *, inst_id: str | None = None) -> dict[str, Any]:
+        """Return raw pending-order response including pagination metadata."""
 
     def list_order_history(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         """Return historical regular orders, optionally filtered by instrument."""
 
+    def read_order_history(self, *, inst_id: str | None = None) -> dict[str, Any]:
+        """Return raw order-history response including pagination metadata."""
+
     def list_trade_fills(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         """Return recent trade fills, optionally filtered by instrument."""
+
+    def read_trade_fills(self, *, inst_id: str | None = None) -> dict[str, Any]:
+        """Return raw fills response including pagination metadata."""
 
     def list_trigger_orders_pending(self, *, inst_id: str) -> list[dict[str, Any]]:
         """Return pending trigger / TPSL orders for one instrument."""
@@ -214,6 +231,9 @@ class DeepcoinTradingClientProtocol(Protocol):
 
     def list_trigger_order_history(self, *, inst_id: str) -> list[dict[str, Any]]:
         """Return historical trigger / TPSL orders for one instrument."""
+
+    def read_trigger_order_history(self, *, inst_id: str) -> dict[str, Any]:
+        """Return raw trigger-history response including pagination metadata."""
 
     def get_ticker_price(self, *, inst_id: str) -> float | None:
         """Return the latest ticker price for one instrument."""
@@ -349,6 +369,12 @@ class DeepcoinRestClient:
         )
         self._last_position_history_request_started_at: float | None = None
         self._request_governor = request_governor
+        scope_source = (
+            f"{str(credentials.base_url).rstrip('/')}\0{str(credentials.api_key)}".encode(
+                "utf-8"
+            )
+        )
+        self.uid_scope_hash = hashlib.sha256(scope_source).hexdigest()
         if tpsl_rate_limiter is not None:
             self._tpsl_rate_limiter = tpsl_rate_limiter
         elif monotonic_factory is not None or sleep_fn is not None:
@@ -483,14 +509,17 @@ class DeepcoinRestClient:
         return self._request("POST", DEEPCOIN_CANCEL_TRIGGER_ORDER_PATH, cancel_payload)
 
     def list_positions(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
-        payload = self._request(
+        payload = self.read_positions(inst_id=inst_id)
+        return _require_list_data(payload, endpoint=DEEPCOIN_ACCOUNT_POSITIONS_PATH)
+
+    def read_positions(self, *, inst_id: str | None = None) -> dict[str, Any]:
+        return self._request(
             "GET",
             _path_with_query(
                 DEEPCOIN_ACCOUNT_POSITIONS_PATH,
                 {"instType": "SWAP", "instId": inst_id},
             ),
         )
-        return _require_list_data(payload, endpoint=DEEPCOIN_ACCOUNT_POSITIONS_PATH)
 
     def list_position_history(
         self,
@@ -498,8 +527,20 @@ class DeepcoinRestClient:
         inst_id: str,
         pos_id: str | None = None,
     ) -> list[dict[str, Any]]:
+        payload = self.read_position_history(inst_id=inst_id, pos_id=pos_id)
+        return _require_list_data(
+            payload,
+            endpoint=DEEPCOIN_ACCOUNT_POSITIONS_HISTORY_PATH,
+        )
+
+    def read_position_history(
+        self,
+        *,
+        inst_id: str,
+        pos_id: str | None = None,
+    ) -> dict[str, Any]:
         self._pace_position_history_request()
-        payload = self._request(
+        return self._request(
             "GET",
             _path_with_query(
                 DEEPCOIN_ACCOUNT_POSITIONS_HISTORY_PATH,
@@ -511,10 +552,6 @@ class DeepcoinRestClient:
                     "limit": 100,
                 },
             ),
-        )
-        return _require_list_data(
-            payload,
-            endpoint=DEEPCOIN_ACCOUNT_POSITIONS_HISTORY_PATH,
         )
 
     def _pace_position_history_request(self) -> None:
@@ -528,34 +565,43 @@ class DeepcoinRestClient:
         self._last_position_history_request_started_at = now
 
     def list_open_orders(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
-        payload = self._request(
+        payload = self.read_open_orders(inst_id=inst_id)
+        return _require_list_data(payload, endpoint=DEEPCOIN_ORDERS_PENDING_PATH)
+
+    def read_open_orders(self, *, inst_id: str | None = None) -> dict[str, Any]:
+        return self._request(
             "GET",
             _path_with_query(
                 DEEPCOIN_ORDERS_PENDING_PATH,
                 {"instType": "SWAP", "instId": inst_id},
             ),
         )
-        return _require_list_data(payload, endpoint=DEEPCOIN_ORDERS_PENDING_PATH)
 
     def list_order_history(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
-        payload = self._request(
+        payload = self.read_order_history(inst_id=inst_id)
+        return _require_list_data(payload, endpoint=DEEPCOIN_ORDERS_HISTORY_PATH)
+
+    def read_order_history(self, *, inst_id: str | None = None) -> dict[str, Any]:
+        return self._request(
             "GET",
             _path_with_query(
                 DEEPCOIN_ORDERS_HISTORY_PATH,
                 {"instType": "SWAP", "instId": inst_id},
             ),
         )
-        return _require_list_data(payload, endpoint=DEEPCOIN_ORDERS_HISTORY_PATH)
 
     def list_trade_fills(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
-        payload = self._request(
+        payload = self.read_trade_fills(inst_id=inst_id)
+        return _require_list_data(payload, endpoint=DEEPCOIN_TRADE_FILLS_PATH)
+
+    def read_trade_fills(self, *, inst_id: str | None = None) -> dict[str, Any]:
+        return self._request(
             "GET",
             _path_with_query(
                 DEEPCOIN_TRADE_FILLS_PATH,
                 {"instType": "SWAP", "instId": inst_id},
             ),
         )
-        return _require_list_data(payload, endpoint=DEEPCOIN_TRADE_FILLS_PATH)
 
     def get_order_history_by_id(
         self,
@@ -588,14 +634,17 @@ class DeepcoinRestClient:
         )
 
     def list_trigger_order_history(self, *, inst_id: str) -> list[dict[str, Any]]:
-        payload = self._request(
+        payload = self.read_trigger_order_history(inst_id=inst_id)
+        return _require_list_data(payload, endpoint=DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH)
+
+    def read_trigger_order_history(self, *, inst_id: str) -> dict[str, Any]:
+        return self._request(
             "GET",
             _path_with_query(
                 DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH,
                 {"instType": "SWAP", "instId": inst_id},
             ),
         )
-        return _require_list_data(payload, endpoint=DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH)
 
     def get_trigger_order_history_by_id(
         self,

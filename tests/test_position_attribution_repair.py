@@ -28,6 +28,8 @@ import telegram_kol_research.position_attribution_repair as repair_module
 
 
 class _HistoricalCleanupClient:
+    uid_scope_hash = "d" * 64
+
     def __init__(self, *, live_position_ids=()):
         self.positions = [
             {
@@ -59,7 +61,9 @@ class _HistoricalCleanupClient:
     def list_trigger_order_history(self, *, inst_id):
         return []
 
-    def list_position_history(self, *, inst_id, pos_id):
+    def list_position_history(self, *, inst_id, pos_id=None):
+        if pos_id is None:
+            return []
         self.position_history_calls.append((inst_id, pos_id))
         return self.position_history.get((inst_id, pos_id), [])
 
@@ -268,6 +272,8 @@ def _seed_exact_history_candidates(session_factory):
 
 
 class _RepairClient:
+    uid_scope_hash = "d" * 64
+
     def __init__(self):
         self.positions = [
             {
@@ -329,7 +335,9 @@ class _RepairClient:
             },
         ]
 
-    def list_position_history(self, *, inst_id, pos_id):
+    def list_position_history(self, *, inst_id, pos_id=None):
+        if pos_id is None:
+            return []
         self.position_history_calls.append((inst_id, pos_id))
         return self.position_history.get((inst_id, pos_id), [])
 
@@ -441,7 +449,9 @@ def test_repair_plan_exact_history_failure_is_source_error_and_blocks_actions(tm
     _seed_exact_history_candidates(session_factory)
     client = _HistoricalCleanupClient()
 
-    def fail_one_request(*, inst_id, pos_id):
+    def fail_one_request(*, inst_id, pos_id=None):
+        if pos_id is None:
+            return []
         client.position_history_calls.append((inst_id, pos_id))
         if pos_id == "stale-pos":
             raise RuntimeError("history unavailable")
@@ -460,10 +470,50 @@ def test_repair_plan_exact_history_failure_is_source_error_and_blocks_actions(tm
     assert plan.unresolved_conflicts == [
         {
             "evidence_source_errors": {
-                "position_history:BTC-USDT-SWAP:stale-pos": "history unavailable"
+                "position_history:BTC-USDT-SWAP:stale-pos": (
+                    "position_history_read_unavailable"
+                )
             }
         }
     ]
+
+
+def test_exact_history_read_stays_inside_generation_fence_and_redacts_failure(
+    tmp_path,
+):
+    from telegram_kol_research.deepcoin_execution_operations import (
+        advance_account_write_generation,
+    )
+
+    session_factory = create_session_factory(tmp_path / "exact-history-fence.db")
+    _seed_exact_history_candidates(session_factory)
+    client = _HistoricalCleanupClient()
+
+    def race_and_fail(*, inst_id, pos_id=None):
+        if pos_id is None:
+            return {"data": []}
+        advance_account_write_generation(
+            session_factory, uid_scope_hash=client.uid_scope_hash
+        )
+        advance_account_write_generation(
+            session_factory, uid_scope_hash=client.uid_scope_hash
+        )
+        raise RuntimeError("Authorization: Bearer TOPSECRET")
+
+    client.read_position_history = race_and_fail
+    plan = build_position_attribution_repair_plan(
+        session_factory,
+        deepcoin_client=client,
+        now=datetime(2026, 7, 15, 12, 0, tzinfo=UTC),
+    )
+
+    errors = plan.unresolved_conflicts[0]["evidence_source_errors"]
+    assert errors["account_composite"] == "snapshot_write_generation_changed"
+    assert set(errors.values()) <= {
+        "position_history_read_unavailable",
+        "snapshot_write_generation_changed",
+    }
+    assert "TOPSECRET" not in repr(plan)
 
 
 def test_repair_plan_rejects_position_history_row_for_different_requested_id(
@@ -495,8 +545,7 @@ def test_repair_plan_rejects_position_history_row_for_different_requested_id(
         {
             "evidence_source_errors": {
                 "position_history:BTC-USDT-SWAP:actual-order-pos": (
-                    "position history response posId mismatch: "
-                    "expected actual-order-pos"
+                    "position_history_identity_mismatch"
                 )
             }
         }
@@ -533,7 +582,7 @@ def test_repair_plan_rejects_invalid_position_history_response_schema(
         {
             "evidence_source_errors": {
                 "position_history:BTC-USDT-SWAP:actual-order-pos": (
-                    "invalid list response schema"
+                    "position_history_schema_invalid"
                 )
             }
         }
@@ -1150,7 +1199,7 @@ def test_miya_repair_api_error_remains_unresolved_and_unapplied(tmp_path):
 
     assert plan.actions == ()
     assert plan.unresolved_conflicts == [
-        {"evidence_source_errors": {"positions": "positions unavailable"}}
+        {"evidence_source_errors": {"positions": "snapshot_read_unavailable"}}
     ]
     with pytest.raises(PositionAttributionRepairError, match="unresolved"):
         apply_position_attribution_repair_plan(

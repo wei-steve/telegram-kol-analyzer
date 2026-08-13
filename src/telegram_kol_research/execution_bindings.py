@@ -8,7 +8,7 @@ import hashlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
@@ -18,6 +18,10 @@ from telegram_kol_research.deepcoin_readonly import (
     DeepcoinOrderBinding,
     DeepcoinReadOnlyAccountState,
     DeepcoinReadOnlyClient,
+)
+from telegram_kol_research.deepcoin_snapshot_authority import (
+    build_exchange_collection_evidence,
+    capture_account_snapshot,
 )
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import BoundPositionCloseReservation
@@ -425,6 +429,10 @@ def reconcile_deepcoin_execution_bindings(
             snapshot = load_deepcoin_execution_reconciliation_snapshot(
                 session_factory, client=client
             )
+        if snapshot.errors:
+            return _apply_reconcile_snapshot(
+                session_factory, snapshot=snapshot, recovered_at=now
+            )
         from telegram_kol_research.trigger_protection_rescue_worker import (
             run_trigger_protection_rescue_tick,
         )
@@ -535,7 +543,61 @@ def load_deepcoin_execution_reconciliation_snapshot_read_only(
             .all()
             if str(symbol or "").strip()
         }
-    return _load_reconcile_snapshot(client, instruments=instruments)
+    return load_deepcoin_reconciliation_snapshot_for_instruments_read_only(
+        session_factory,
+        client=client,
+        instruments=instruments,
+    )
+
+
+def load_deepcoin_reconciliation_snapshot_for_instruments_read_only(
+    session_factory: sessionmaker,
+    *,
+    client: DeepcoinReadOnlyClient,
+    instruments: set[str],
+    snapshot_enricher: Callable[[_ReconcileSnapshot], None] | None = None,
+) -> _ReconcileSnapshot:
+    """Capture an explicit instrument scope behind the local writer fence."""
+
+    normalized_instruments = {
+        str(value).strip().upper()
+        for value in instruments
+        if isinstance(value, str) and value.strip()
+    }
+    uid_scope_hash = getattr(client, "uid_scope_hash", None)
+    if not (
+        isinstance(uid_scope_hash, str)
+        and len(uid_scope_hash) == 64
+        and all(character in "0123456789abcdef" for character in uid_scope_hash)
+    ):
+        return _ReconcileSnapshot(
+            errors={"account_composite": "snapshot_uid_scope_unavailable"}
+        )
+    captured: dict[str, _ReconcileSnapshot] = {}
+
+    def read_account_composite() -> dict[str, list[dict[str, Any]]]:
+        captured["snapshot"] = _load_reconcile_snapshot(
+            client, instruments=normalized_instruments
+        )
+        if snapshot_enricher is not None:
+            snapshot_enricher(captured["snapshot"])
+        return {"data": []}
+
+    authority = capture_account_snapshot(
+        session_factory,
+        uid_scope_hash=uid_scope_hash,
+        readers={"account_composite": read_account_composite},
+    )
+    snapshot = captured.get("snapshot")
+    if snapshot is None:
+        return _ReconcileSnapshot(
+            errors={"account_composite": "snapshot_read_unavailable"}
+        )
+    if not authority.complete:
+        snapshot.errors["account_composite"] = str(
+            authority.reason_code or "snapshot_incomplete"
+        )[:128]
+    return snapshot
 
 
 def _load_reconcile_snapshot(
@@ -549,6 +611,13 @@ def _load_reconcile_snapshot(
     )
     snapshot.open_orders = _read_snapshot_rows(
         client, method_name="list_open_orders", source="open_orders", errors=snapshot.errors
+    )
+    snapshot.position_history = _read_instrument_snapshot_rows(
+        client,
+        method_name="list_position_history",
+        source="position_history",
+        instruments=instruments,
+        errors=snapshot.errors,
     )
     snapshot.pending_trigger_orders = _read_pending_trigger_snapshot_rows(
         client,
@@ -588,18 +657,25 @@ def _read_snapshot_rows(
     source: str,
     errors: dict[str, str],
 ) -> list[dict[str, Any]]:
-    method = getattr(client, method_name, None)
+    method = _snapshot_reader(client, method_name)
     if method is None:
+        errors[source] = "snapshot_reader_unavailable"
         return []
     try:
-        rows = method()
-    except Exception as exc:
-        errors[source] = str(exc)
+        response = method()
+    except Exception:
+        errors[source] = "snapshot_read_unavailable"
         return []
-    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
-        errors[source] = "invalid list response schema"
+    evidence = build_exchange_collection_evidence(
+        endpoint=source,
+        response=response,
+    )
+    if not evidence.schema_valid:
+        errors[source] = "snapshot_schema_invalid"
         return []
-    return rows
+    if not evidence.complete:
+        errors[source] = evidence.reason_code or "snapshot_incomplete"
+    return [dict(row) for row in evidence.rows]
 
 
 def _read_instrument_snapshot_rows(
@@ -610,30 +686,40 @@ def _read_instrument_snapshot_rows(
     instruments: set[str],
     errors: dict[str, str],
 ) -> list[dict[str, Any]]:
-    method = getattr(client, method_name, None)
+    method = _snapshot_reader(client, method_name)
     if method is None:
+        if instruments:
+            errors[source] = "snapshot_reader_unavailable"
         return []
     result: list[dict[str, Any]] = []
     called_without_instrument = False
     for instrument_id in sorted(instruments):
         try:
-            rows = method(inst_id=instrument_id)
+            response = method(inst_id=instrument_id)
         except TypeError:
             if called_without_instrument:
                 continue
             called_without_instrument = True
             try:
-                rows = method()
-            except Exception as exc:
-                errors[source] = str(exc)
+                response = method()
+            except Exception:
+                errors[source] = "snapshot_read_unavailable"
                 return result
-        except Exception as exc:
-            errors[f"{source}:{instrument_id}"] = str(exc)
+        except Exception:
+            errors[f"{source}:{instrument_id}"] = "snapshot_read_unavailable"
             continue
-        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
-            errors[f"{source}:{instrument_id}"] = "invalid list response schema"
+        evidence = build_exchange_collection_evidence(
+            endpoint=source,
+            response=response,
+        )
+        if not evidence.schema_valid:
+            errors[f"{source}:{instrument_id}"] = "snapshot_schema_invalid"
         else:
-            result.extend(rows)
+            if not evidence.complete:
+                errors[f"{source}:{instrument_id}"] = (
+                    evidence.reason_code or "snapshot_incomplete"
+                )
+            result.extend(dict(row) for row in evidence.rows)
         if called_without_instrument:
             break
     return _deduplicate_exchange_rows(result)
@@ -652,6 +738,18 @@ def _read_pending_trigger_snapshot_rows(
     raw_reader = getattr(client, "read_trigger_orders_pending", None)
     list_reader = getattr(client, "list_trigger_orders_pending", None)
     result: list[dict[str, Any]] = []
+    if raw_reader is None and list_reader is None:
+        for instrument_id in sorted(instruments):
+            errors[f"{source}:{instrument_id}"] = "snapshot_reader_unavailable"
+            observations.append(
+                {
+                    "instrument_id": instrument_id,
+                    "complete": False,
+                    "reason": "pending_tpsl_read_error",
+                    "order_ids": [],
+                }
+            )
+        return result
     for instrument_id in sorted(instruments):
         try:
             if raw_reader is not None:
@@ -663,8 +761,8 @@ def _read_pending_trigger_snapshot_rows(
                 response = {"data": rows}
             else:
                 continue
-        except Exception as exc:
-            errors[f"{source}:{instrument_id}"] = str(exc)
+        except Exception:
+            errors[f"{source}:{instrument_id}"] = "snapshot_read_unavailable"
             observations.append(
                 {
                     "instrument_id": instrument_id,
@@ -679,11 +777,20 @@ def _read_pending_trigger_snapshot_rows(
             response=response,
         )
         observations.append(observation)
-        rows = response.get("data")
-        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
-            errors[f"{source}:{instrument_id}"] = "invalid list response schema"
+        if observation.get("complete") is not True:
+            errors[f"{source}:{instrument_id}"] = str(
+                observation.get("reason") or "snapshot_incomplete"
+            )[:128]
+        evidence = build_exchange_collection_evidence(
+            endpoint=source,
+            response=response,
+        )
+        if not evidence.schema_valid:
+            errors[f"{source}:{instrument_id}"] = (
+                str(observation.get("reason") or "snapshot_schema_invalid")[:128]
+            )
             continue
-        result.extend(rows)
+        result.extend(dict(row) for row in evidence.rows)
     return _deduplicate_exchange_rows(result)
 
 
@@ -691,12 +798,40 @@ def _deduplicate_exchange_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any
     result: list[dict[str, Any]] = []
     seen: set[str] = set()
     for row in rows:
-        fingerprint = json.dumps(row, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        try:
+            fingerprint = json.dumps(
+                row,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+                allow_nan=False,
+            )
+        except (RecursionError, TypeError, ValueError):
+            continue
         if fingerprint in seen:
             continue
         seen.add(fingerprint)
         result.append(row)
     return result
+
+
+_RAW_SNAPSHOT_READERS = {
+    "list_positions": "read_positions",
+    "list_position_history": "read_position_history",
+    "list_open_orders": "read_open_orders",
+    "list_order_history": "read_order_history",
+    "list_trade_fills": "read_trade_fills",
+    "list_trigger_order_history": "read_trigger_order_history",
+}
+
+
+def _snapshot_reader(client: object, method_name: str):
+    raw_name = _RAW_SNAPSHOT_READERS.get(method_name)
+    raw_method = getattr(client, raw_name, None) if raw_name else None
+    if callable(raw_method):
+        return raw_method
+    method = getattr(client, method_name, None)
+    return method if callable(method) else None
 
 
 def _confirm_visible_management_protection_revisions(

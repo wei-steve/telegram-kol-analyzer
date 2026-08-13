@@ -10,7 +10,9 @@ from typing import Any
 
 from sqlalchemy.orm import sessionmaker
 
-from telegram_kol_research.execution_bindings import _load_reconcile_snapshot
+from telegram_kol_research.execution_bindings import (
+    load_deepcoin_reconciliation_snapshot_for_instruments_read_only,
+)
 from telegram_kol_research.management_directives import resolve_management_directive
 from telegram_kol_research.management_scope import (
     ManagementScopeError,
@@ -120,8 +122,9 @@ def build_position_management_remediation_plan(
             .all()
             if str(symbol or "").strip()
         }
-    snapshot = _load_reconcile_snapshot(
-        deepcoin_client,
+    snapshot = load_deepcoin_reconciliation_snapshot_for_instruments_read_only(
+        session_factory,
+        client=deepcoin_client,
         instruments=instruments,
     )
     snapshot_payload = _snapshot_payload(snapshot)
@@ -978,6 +981,7 @@ def apply_position_management_remediation_action(
     ).live_management_execution_enabled:
         raise ValueError("live management execution was disabled before write")
     _require_exchange_snapshot_fingerprint(
+        session_factory,
         deepcoin_client=deepcoin_client,
         action=action,
     )
@@ -1246,14 +1250,17 @@ def _require_batch_health_matches_confirmed_action(*, action, batch) -> None:
         raise ValueError("remediation protection health changed before promotion")
 
 
-def _require_exchange_snapshot_fingerprint(*, deepcoin_client, action) -> None:
+def _require_exchange_snapshot_fingerprint(
+    session_factory: sessionmaker, *, deepcoin_client, action
+) -> None:
     instruments = {
         str(value).upper()
         for value in action.evidence.get("instrument_scope", [])
         if str(value or "").strip()
     }
-    snapshot = _load_reconcile_snapshot(
-        deepcoin_client,
+    snapshot = load_deepcoin_reconciliation_snapshot_for_instruments_read_only(
+        session_factory,
+        client=deepcoin_client,
         instruments=instruments,
     )
     if snapshot.errors or any(

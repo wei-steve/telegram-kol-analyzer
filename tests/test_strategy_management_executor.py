@@ -421,6 +421,8 @@ def _persist_market_break_even_batch(session_factory):
 
 
 class _FakeClient:
+    uid_scope_hash = "d" * 64
+
     def __init__(self, session_factory, outcomes=None):
         self.session_factory = session_factory
         self.outcomes = list(outcomes or [
@@ -477,6 +479,18 @@ class _FakeClient:
     def list_open_orders(self, *, inst_id=None):
         return list(self.open_orders)
 
+    def list_position_history(self, *, inst_id):
+        return []
+
+    def list_order_history(self, *, inst_id):
+        return []
+
+    def list_trade_fills(self, *, inst_id):
+        return []
+
+    def list_trigger_order_history(self, *, inst_id):
+        return []
+
     def cancel_trigger_order(self, payload):
         request = dict(payload)
         self.cancel_trigger_calls.append(request)
@@ -496,6 +510,8 @@ class _FakeClient:
 
 
 class _ProtectionClient:
+    uid_scope_hash = "d" * 64
+
     def __init__(
         self,
         session_factory,
@@ -559,6 +575,18 @@ class _ProtectionClient:
 
     def list_open_orders(self, *, inst_id=None):
         return [dict(row) for row in self.open_orders]
+
+    def list_position_history(self, *, inst_id):
+        return []
+
+    def list_order_history(self, *, inst_id):
+        return []
+
+    def list_trade_fills(self, *, inst_id):
+        return []
+
+    def list_trigger_order_history(self, *, inst_id):
+        return []
 
     def cancel_trigger_order(self, payload):
         self.cancel_trigger_calls.append(dict(payload))
@@ -5768,6 +5796,8 @@ def _persist_composite_consumption_component(session_factory):
 
 
 class _CompositeConsumptionClient:
+    uid_scope_hash = "d" * 64
+
     def __init__(self, outcome="success"):
         self.outcomes = [outcome]
         self.pending = [
@@ -5799,6 +5829,15 @@ class _CompositeConsumptionClient:
                 "mrgPosition": "split",
             }
         ]
+
+    def list_open_orders(self, *, inst_id=None):
+        return []
+
+    def list_position_history(self, *, inst_id):
+        return []
+
+    def list_trigger_order_history(self, *, inst_id):
+        return list(self.history)
 
     def list_trigger_orders_pending(self, *, inst_id):
         return list(self.pending)

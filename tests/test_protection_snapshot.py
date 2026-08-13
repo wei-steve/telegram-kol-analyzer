@@ -1,3 +1,5 @@
+import hashlib
+import json
 from datetime import UTC, datetime
 
 from telegram_kol_research.db import create_session_factory
@@ -34,6 +36,21 @@ def test_observation_proves_expected_exact_order_ids_visible():
     assert observation["expected_order_ids_visible"] is True
 
 
+def test_observation_at_response_limit_is_incomplete_without_affirmative_end():
+    rows = [{"ordId": f"tp-{index}"} for index in range(100)]
+
+    observation = observe_pending_tpsl(
+        instrument_id="BTC-USDT-SWAP",
+        response={"code": "0", "data": rows},
+        expected_order_ids={"tp-99"},
+    )
+
+    assert observation["response_count"] == 100
+    assert observation["complete"] is False
+    assert observation["reason"] == "snapshot_page_limit_ambiguous"
+    assert observation["expected_order_ids_visible"] is False
+
+
 def test_observation_is_persisted_append_only(tmp_path):
     session_factory = create_session_factory(tmp_path / "snapshot-observation.db")
     observation = observe_pending_tpsl(
@@ -49,8 +66,48 @@ def test_observation_is_persisted_append_only(tmp_path):
     assert len(rows) == 2
     assert rows[0].instrument_id == "BTC-USDT-SWAP"
     assert rows[0].response_count == 1
-    assert rows[0].order_ids_json == '["tp-1"]'
+    assert rows[0].order_ids_json == json.dumps(
+        [hashlib.sha256(b"deepcoin_order:tp-1").hexdigest()]
+    )
     assert rows[0].complete is True
+
+
+def test_persisted_observation_hashes_hostile_order_ids_and_bounds_them(tmp_path):
+    session_factory = create_session_factory(tmp_path / "snapshot-redaction.db")
+    hostile = "Authorization: Bearer TOPSECRET" + ("x" * 10_000)
+    observation = observe_pending_tpsl(
+        instrument_id="BTC-USDT-SWAP",
+        response={"data": [{"ordId": hostile}]},
+    )
+
+    record_pending_tpsl_observation(session_factory, observation=observation)
+
+    with session_factory() as session:
+        row = session.query(PendingTpslSnapshotObservation).one()
+    assert row.order_ids_json == json.dumps(
+        [hashlib.sha256(f"deepcoin_order:{hostile}".encode()).hexdigest()]
+    )
+    assert "TOPSECRET" not in row.order_ids_json
+    assert len(row.order_ids_json) < 100
+
+
+def test_persisted_observation_rejects_unbounded_or_secret_reason(tmp_path):
+    session_factory = create_session_factory(tmp_path / "snapshot-reason-redaction.db")
+
+    record_pending_tpsl_observation(
+        session_factory,
+        observation={
+            "instrument_id": "BTC-USDT-SWAP",
+            "complete": False,
+            "reason": "Authorization: Bearer TOPSECRET" + ("x" * 1_000),
+            "order_ids": [],
+        },
+    )
+
+    with session_factory() as session:
+        row = session.query(PendingTpslSnapshotObservation).one()
+    assert row.reason == "snapshot_incomplete"
+    assert "TOPSECRET" not in row.reason
 
 
 def test_position_audit_distinguishes_native_protection_manual_and_submit_response():

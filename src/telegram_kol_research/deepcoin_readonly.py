@@ -7,10 +7,15 @@ perform authentication, network requests, or trading actions.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 
 from telegram_kol_research.recovery_scan import OpenOrder
 from telegram_kol_research.trading_decision import ActivePosition
+from telegram_kol_research.deepcoin_snapshot_authority import (
+    DeepcoinSnapshotUnavailable,
+    build_exchange_collection_evidence,
+    require_complete_collection,
+)
 
 
 @dataclass(slots=True)
@@ -47,7 +52,13 @@ class DeepcoinReadOnlyAccountState:
 
     def load_active_positions(self) -> list[ActivePosition]:
         return map_deepcoin_positions(
-            self._client.list_positions(),
+            list(
+                _load_complete_collection(
+                    self._client,
+                    method_name="list_positions",
+                    endpoint="positions",
+                )
+            ),
             bindings=self._bindings,
         )
 
@@ -63,9 +74,25 @@ def _load_all_open_orders(
     *,
     bindings: list[DeepcoinOrderBinding],
 ) -> list[dict[str, Any]]:
-    orders = list(client.list_open_orders())
-    trigger_method = getattr(client, "list_trigger_orders_pending", None)
+    orders = list(
+        _load_complete_collection(
+            client,
+            method_name="list_open_orders",
+            endpoint="open_orders",
+        )
+    )
+    trigger_method = getattr(client, "read_trigger_orders_pending", None)
+    if not callable(trigger_method):
+        trigger_method = getattr(client, "list_trigger_orders_pending", None)
     if trigger_method is None:
+        if instruments := {
+            f"{binding.symbol.upper()}-USDT-SWAP"
+            for binding in bindings
+            if binding.symbol
+        }:
+            raise DeepcoinSnapshotUnavailable(
+                "trigger_orders_pending_unavailable"
+            )
         return orders
     instruments = {
         f"{binding.symbol.upper()}-USDT-SWAP"
@@ -83,14 +110,27 @@ def _load_all_open_orders(
         try:
             trigger_orders = trigger_method(inst_id=instrument_id)
         except TypeError:
-            trigger_orders = trigger_method()
+            try:
+                trigger_orders = trigger_method()
+            except Exception:
+                raise DeepcoinSnapshotUnavailable(
+                    "trigger_orders_pending_unavailable"
+                ) from None
         except Exception:
-            trigger_orders = []
-        if not isinstance(trigger_orders, list):
-            continue
-        for order in trigger_orders:
-            if not isinstance(order, dict):
-                continue
+            raise DeepcoinSnapshotUnavailable(
+                "trigger_orders_pending_unavailable"
+            ) from None
+        evidence = build_exchange_collection_evidence(
+            endpoint="trigger_orders_pending",
+            response=trigger_orders,
+        )
+        try:
+            complete_rows = require_complete_collection(evidence)
+        except DeepcoinSnapshotUnavailable:
+            raise DeepcoinSnapshotUnavailable(
+                "trigger_orders_pending_unavailable"
+            ) from None
+        for order in complete_rows:
             identity = (
                 _first_string(order, "ordId", "orderId", "order_id", "id") or "",
                 _first_string(order, "clOrdId", "clientOrderId", "client_order_id") or "",
@@ -100,6 +140,36 @@ def _load_all_open_orders(
             seen.add(identity)
             orders.append(order)
     return orders
+
+
+def _load_complete_collection(
+    client: object,
+    *,
+    method_name: str,
+    endpoint: str,
+) -> tuple[Mapping[str, Any], ...]:
+    raw_method_names = {
+        "list_positions": "read_positions",
+        "list_open_orders": "read_open_orders",
+    }
+    raw_method_name = raw_method_names.get(method_name)
+    method = getattr(client, raw_method_name, None) if raw_method_name else None
+    if not callable(method):
+        method = getattr(client, method_name, None)
+    if not callable(method):
+        raise DeepcoinSnapshotUnavailable(f"{endpoint}_unavailable")
+    try:
+        response = method()
+    except Exception:
+        raise DeepcoinSnapshotUnavailable(f"{endpoint}_unavailable") from None
+    evidence = build_exchange_collection_evidence(
+        endpoint=endpoint,
+        response=response,
+    )
+    try:
+        return require_complete_collection(evidence)
+    except DeepcoinSnapshotUnavailable:
+        raise DeepcoinSnapshotUnavailable(f"{endpoint}_unavailable") from None
 
 
 def map_deepcoin_positions(
