@@ -211,6 +211,8 @@ from telegram_kol_research.trading_settings import save_trading_settings
 
 
 class _FakeDeepcoinClient:
+    uid_scope_hash = "d" * 64
+
     def __init__(self):
         self.positions = [
             {
@@ -268,7 +270,7 @@ class _FakeDeepcoinClient:
     def list_open_orders(self, *, inst_id=None):
         return self.open_orders
 
-    def list_position_history(self, *, inst_id, pos_id):
+    def list_position_history(self, *, inst_id, pos_id=None):
         return []
 
     def list_order_history(self, *, inst_id=None):
