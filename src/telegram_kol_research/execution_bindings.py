@@ -430,6 +430,7 @@ def reconcile_deepcoin_execution_bindings(
     recovered_at: datetime | None = None,
     snapshot: _ReconcileSnapshot | None = None,
     contract_spec_provider: Any | None = None,
+    run_exchange_mutation_workers: bool = True,
 ) -> ExecutionReconciliationResult:
     """Reconcile one coherent exchange snapshot through global leg attribution."""
 
@@ -462,16 +463,17 @@ def reconcile_deepcoin_execution_bindings(
 
         # Rescue an already-attributed due intent before reconciliation can
         # reschedule that same intent and make it invisible to the due query.
-        run_trigger_protection_rescue_tick(
-            session_factory,
-            deepcoin_client=client,
-            processed_at=now,
-        )
+        if run_exchange_mutation_workers:
+            run_trigger_protection_rescue_tick(
+                session_factory,
+                deepcoin_client=client,
+                processed_at=now,
+            )
         result = _apply_reconcile_snapshot(
             session_factory, snapshot=snapshot, recovered_at=now
         )
         _copy_protected_entry_result(result, protected)
-        if contract_spec_provider is not None:
+        if run_exchange_mutation_workers and contract_spec_provider is not None:
             from telegram_kol_research.trigger_backup_stop_executor import (
                 submit_verified_trigger_backup_stops,
             )

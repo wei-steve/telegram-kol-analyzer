@@ -1,11 +1,22 @@
 import hashlib
 import json
 import sqlite3
+import concurrent.futures
+import threading
 from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy.exc import IntegrityError
 
+from telegram_kol_research.deepcoin_client import (
+    DeepcoinPreSendUnavailable,
+    DeepcoinReadUnavailable,
+)
+from telegram_kol_research.deepcoin_request_policy import (
+    ErrorCategory,
+    FailureFact,
+    OutcomeCertainty,
+)
 import telegram_kol_research.execution_bindings as execution_bindings_module
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_execution_operations import (
@@ -1847,6 +1858,229 @@ def test_backup_submission_creates_stop_for_verified_market_entry(tmp_path):
     with session_factory() as session:
         row = session.query(PositionBackupStopOrder).one()
     assert (row.pos_id, row.order_id, row.status) == ("pos-1", "backup-1", "active")
+
+
+@pytest.mark.parametrize(
+    "failure_type",
+    [DeepcoinReadUnavailable, DeepcoinPreSendUnavailable],
+)
+def test_backup_submission_not_sent_rearms_same_outer_row_and_intent(
+    tmp_path, failure_type
+):
+    session_factory = create_session_factory(tmp_path / "backup-not-sent.db")
+    _seed_exact_backup_candidate(session_factory, order_kind="market")
+
+    class DeadlineClient(_BackupStopSubmissionClient):
+        def __init__(self):
+            super().__init__([{
+                "instId": "ETH-USDT-SWAP",
+                "posId": "pos-1",
+                "posSide": "short",
+                "pos": "4.4",
+                "liqPx": "2000",
+                "mrgPosition": "split",
+            }])
+            self.failure_pending = True
+            self.authority_reads_after_reservation = 0
+
+        def list_positions(self, *, inst_id=None):
+            if (
+                failure_type is DeepcoinReadUnavailable
+                and self.failure_pending
+                and self.sltp_payloads == []
+                and self.authority_reads_after_reservation >= 2
+            ):
+                self.failure_pending = False
+                raise failure_type(
+                    "request_deadline_exceeded",
+                    fact=FailureFact(
+                        category=ErrorCategory.TRANSPORT_TIMEOUT,
+                        outcome_certainty=OutcomeCertainty.NOT_SENT,
+                        retryable=False,
+                        safe_code="request_deadline_exceeded",
+                    ),
+                )
+            self.authority_reads_after_reservation += 1
+            return super().list_positions(inst_id=inst_id)
+
+        def set_position_sltp(self, payload):
+            if failure_type is DeepcoinPreSendUnavailable and self.failure_pending:
+                self.failure_pending = False
+                raise failure_type(
+                    "governor_deadline_exceeded",
+                    fact=FailureFact(
+                        category=ErrorCategory.TRANSPORT_TIMEOUT,
+                        outcome_certainty=OutcomeCertainty.NOT_SENT,
+                        retryable=False,
+                        safe_code="governor_deadline_exceeded",
+                    ),
+                )
+            return super().set_position_sltp(payload)
+
+    client = DeadlineClient()
+    with pytest.raises(failure_type):
+        submit_verified_trigger_backup_stops(
+            session_factory,
+            client=client,
+            contract_spec_provider=_backup_stop_provider(),
+            submitted_at=datetime(2026, 7, 20, 8, 5),
+        )
+
+    with session_factory() as session:
+        outer = session.query(PositionBackupStopOrder).one()
+        mutation = session.query(PositionMutationIntent).one_or_none()
+        outer_id = int(outer.id)
+        mutation_id = int(mutation.id) if mutation is not None else None
+        assert outer.status == "not_sent"
+        if failure_type is DeepcoinPreSendUnavailable:
+            assert mutation.status == "not_sent"
+        else:
+            assert mutation is None or mutation.status == "not_sent"
+    assert client.sltp_payloads == []
+
+    assert submit_verified_trigger_backup_stops(
+        session_factory,
+        client=client,
+        contract_spec_provider=_backup_stop_provider(),
+        submitted_at=datetime(2026, 7, 20, 8, 6),
+    ) == 1
+    assert len(client.sltp_payloads) == 1
+    with session_factory() as session:
+        outer = session.query(PositionBackupStopOrder).one()
+        assert int(outer.id) == outer_id
+        assert outer.status == "active"
+        mutations = session.query(PositionMutationIntent).all()
+        assert len(mutations) == 1
+        if mutation_id is not None:
+            assert int(mutations[0].id) == mutation_id
+
+
+def test_backup_not_sent_request_drift_stays_blocked_without_unknown_or_post(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "backup-drift.db")
+    _seed_exact_backup_candidate(session_factory, order_kind="market")
+
+    class PreSendDeadlineClient(_BackupStopSubmissionClient):
+        def __init__(self):
+            super().__init__([{
+                "instId": "ETH-USDT-SWAP",
+                "posId": "pos-1",
+                "posSide": "short",
+                "pos": "4.4",
+                "liqPx": "2000",
+                "mrgPosition": "split",
+            }])
+            self.failure_pending = True
+
+        def set_position_sltp(self, payload):
+            if self.failure_pending:
+                self.failure_pending = False
+                raise DeepcoinPreSendUnavailable(
+                    "governor_deadline_exceeded",
+                    fact=FailureFact(
+                        category=ErrorCategory.TRANSPORT_TIMEOUT,
+                        outcome_certainty=OutcomeCertainty.NOT_SENT,
+                        retryable=False,
+                        safe_code="governor_deadline_exceeded",
+                    ),
+                )
+            return super().set_position_sltp(payload)
+
+    client = PreSendDeadlineClient()
+    with pytest.raises(DeepcoinPreSendUnavailable):
+        submit_verified_trigger_backup_stops(
+            session_factory,
+            client=client,
+            contract_spec_provider=_backup_stop_provider(),
+            submitted_at=datetime(2026, 7, 20, 8, 5),
+        )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+            "position_management_liveness_v2_mode": "live",
+            "trigger_backup_stop_buffer_bps": 250,
+        },
+    )
+
+    assert submit_verified_trigger_backup_stops(
+        session_factory,
+        client=client,
+        contract_spec_provider=_backup_stop_provider(),
+        submitted_at=datetime(2026, 7, 20, 8, 6),
+    ) == 0
+    assert client.sltp_payloads == []
+    with session_factory() as session:
+        outer = session.query(PositionBackupStopOrder).one()
+        mutation = session.query(PositionMutationIntent).one()
+        assert outer.status == "not_sent"
+        assert mutation.status == "not_sent"
+
+
+def test_backup_not_sent_concurrent_rearm_has_one_writer(tmp_path):
+    session_factory = create_session_factory(tmp_path / "backup-concurrent.db")
+    _seed_exact_backup_candidate(session_factory, order_kind="market")
+
+    class OneDeadlineClient(_BackupStopSubmissionClient):
+        def __init__(self):
+            super().__init__([{
+                "instId": "ETH-USDT-SWAP",
+                "posId": "pos-1",
+                "posSide": "short",
+                "pos": "4.4",
+                "liqPx": "2000",
+                "mrgPosition": "split",
+            }])
+            self.failure_pending = True
+            self._write_lock = threading.Lock()
+
+        def set_position_sltp(self, payload):
+            with self._write_lock:
+                if self.failure_pending:
+                    self.failure_pending = False
+                    raise DeepcoinPreSendUnavailable(
+                        "governor_deadline_exceeded",
+                        fact=FailureFact(
+                            category=ErrorCategory.TRANSPORT_TIMEOUT,
+                            outcome_certainty=OutcomeCertainty.NOT_SENT,
+                            retryable=False,
+                            safe_code="governor_deadline_exceeded",
+                        ),
+                    )
+                return super().set_position_sltp(payload)
+
+    client = OneDeadlineClient()
+    with pytest.raises(DeepcoinPreSendUnavailable):
+        submit_verified_trigger_backup_stops(
+            session_factory,
+            client=client,
+            contract_spec_provider=_backup_stop_provider(),
+            submitted_at=datetime(2026, 7, 20, 8, 5),
+        )
+
+    barrier = threading.Barrier(2)
+
+    def retry(minute):
+        barrier.wait(timeout=2)
+        return submit_verified_trigger_backup_stops(
+            session_factory,
+            client=client,
+            contract_spec_provider=_backup_stop_provider(),
+            submitted_at=datetime(2026, 7, 20, 8, minute),
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(retry, (6, 7)))
+
+    assert sorted(results) == [0, 1]
+    assert len(client.sltp_payloads) == 1
+    with session_factory() as session:
+        outer = session.query(PositionBackupStopOrder).one()
+        mutation = session.query(PositionMutationIntent).one()
+        assert outer.status == "active"
+        assert mutation.status == "submitted"
 
 
 def test_backup_submission_refuses_success_when_native_backup_replaces_primary_stop(tmp_path):

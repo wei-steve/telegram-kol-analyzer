@@ -8,8 +8,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.deepcoin_client import (
+    DeepcoinPreSendUnavailable,
+    DeepcoinReadUnavailable,
+)
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
 from telegram_kol_research.execution_bindings import build_client_order_id
 from telegram_kol_research.models import ExecutionBinding
@@ -49,6 +54,14 @@ class BackupStopPlan:
     payload: dict[str, str] | None = None
     position: dict[str, Any] | None = None
     open_positions: tuple[dict[str, Any], ...] = ()
+
+
+class _BackupStopReservationBusy(RuntimeError):
+    """Another worker owns the same exact backup-stop rearm."""
+
+
+class _BackupStopIdentityConflict(RuntimeError):
+    """A not-sent durable request no longer matches the exact plan."""
 
 
 def submit_verified_trigger_backup_stops(
@@ -109,7 +122,13 @@ def submit_verified_trigger_backup_stops(
                 )
                 session.commit()
                 continue
-            row = _reserve_submission(session, plan=plan, submitted_at=submitted_at)
+            try:
+                row = _reserve_submission(
+                    session, plan=plan, submitted_at=submitted_at
+                )
+            except (_BackupStopReservationBusy, _BackupStopIdentityConflict):
+                session.rollback()
+                continue
             row_id = int(row.id)
             session.commit()
         try:
@@ -128,6 +147,20 @@ def submit_verified_trigger_backup_stops(
                 now_provider=lambda: submitted_at,
             )
             order_id = _response_order_id(response)
+        except (DeepcoinReadUnavailable, DeepcoinPreSendUnavailable):
+            with session_factory() as session:
+                row = session.get(PositionBackupStopOrder, row_id)
+                if row is None or row.status != "submitting":
+                    raise RuntimeError("backup_stop_state_conflict") from None
+                row.status = "not_sent"
+                row.error_json = json.dumps(
+                    {"error": "backup_stop_not_sent"},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                row.updated_at = submitted_at
+                session.commit()
+            raise
         except Exception as exc:
             with session_factory() as session:
                 row = session.get(PositionBackupStopOrder, row_id)
@@ -331,7 +364,13 @@ def _plan_submission(
         .filter(PositionBackupStopOrder.pos_id == pos_id)
         .filter(
             PositionBackupStopOrder.status.in_(
-                ("submitting", "pending_readback", "active", "unknown_exchange_outcome")
+                (
+                    "submitting",
+                    "pending_readback",
+                    "active",
+                    "unknown_exchange_outcome",
+                    "not_sent",
+                )
             )
         )
         .first()
@@ -419,6 +458,22 @@ def _plan_submission(
         )
     except BackupStopError:
         return _blocked_plan(binding_id, leg_id, pos_id, "backup_stop_unsafe")
+    if (
+        existing is not None
+        and str(existing.status) == "not_sent"
+        and not _not_sent_backup_request_matches(
+            existing,
+            binding=binding,
+            leg=leg,
+            payload=payload,
+        )
+    ):
+        return _blocked_plan(
+            binding_id,
+            leg_id,
+            pos_id,
+            "backup_stop_not_sent_identity_conflict",
+        )
     try:
         from telegram_kol_research.position_protection_legs import (
             materialize_verified_position_protection,
@@ -435,7 +490,7 @@ def _plan_submission(
         )
     except ValueError:
         return _blocked_plan(binding_id, leg_id, pos_id, "protection_leg_conflict")
-    if existing is not None:
+    if existing is not None and str(existing.status) != "not_sent":
         try:
             pending = _read_pending_trigger_orders(client, instrument_id=instrument_id)
         except Exception:
@@ -490,6 +545,78 @@ def _reserve_submission(session, *, plan: BackupStopPlan, submitted_at: datetime
     binding = session.get(ExecutionBinding, plan.binding_id)
     if binding is None:
         raise ValueError("backup stop binding disappeared before reservation")
+    expected_request_json = json.dumps(
+        plan.payload,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    expected_client_order_id = build_client_order_id(
+        strategy_instance_id=str(binding.strategy_instance_id),
+        leg_index=int(session.get(ExecutionOrderLeg, plan.leg_id).leg_index),
+        purpose="backup_stop",
+    )
+    rearmed = (
+        session.query(PositionBackupStopOrder)
+        .filter(
+            PositionBackupStopOrder.venue == "deepcoin",
+            PositionBackupStopOrder.pos_id == plan.pos_id,
+            PositionBackupStopOrder.status == "not_sent",
+            PositionBackupStopOrder.execution_binding_id == plan.binding_id,
+            PositionBackupStopOrder.execution_order_leg_id == plan.leg_id,
+            PositionBackupStopOrder.instrument_id == plan.payload["instId"],
+            PositionBackupStopOrder.side == str(binding.side).lower(),
+            PositionBackupStopOrder.trigger_price
+            == str(plan.payload["slTriggerPx"]),
+            PositionBackupStopOrder.client_order_id
+            == expected_client_order_id,
+            PositionBackupStopOrder.request_json == expected_request_json,
+        )
+        .update(
+            {
+                PositionBackupStopOrder.status: "submitting",
+                PositionBackupStopOrder.error_json: None,
+                PositionBackupStopOrder.updated_at: submitted_at,
+            },
+            synchronize_session=False,
+        )
+    )
+    if rearmed == 1:
+        session.flush()
+        return (
+            session.query(PositionBackupStopOrder)
+            .filter(
+                PositionBackupStopOrder.venue == "deepcoin",
+                PositionBackupStopOrder.pos_id == plan.pos_id,
+                PositionBackupStopOrder.status == "submitting",
+            )
+            .one()
+        )
+    remaining_not_sent = (
+        session.query(PositionBackupStopOrder.id)
+        .filter(
+            PositionBackupStopOrder.venue == "deepcoin",
+            PositionBackupStopOrder.pos_id == plan.pos_id,
+            PositionBackupStopOrder.status == "not_sent",
+        )
+        .first()
+    )
+    if remaining_not_sent is not None:
+        raise _BackupStopIdentityConflict(
+            "backup_stop_not_sent_identity_conflict"
+        )
+    active_reservation = (
+        session.query(PositionBackupStopOrder.id)
+        .filter(
+            PositionBackupStopOrder.venue == "deepcoin",
+            PositionBackupStopOrder.pos_id == plan.pos_id,
+            PositionBackupStopOrder.status.in_(
+                ("submitting", "active", "unknown_exchange_outcome")
+            ),
+        )
+        .first()
+    )
+    if active_reservation is not None:
+        raise _BackupStopReservationBusy("backup_stop_rearm_lost")
     row = PositionBackupStopOrder(
         venue="deepcoin", execution_binding_id=plan.binding_id, execution_order_leg_id=plan.leg_id,
         pos_id=plan.pos_id, instrument_id=plan.payload["instId"], side=str(binding.side).lower(),
@@ -504,8 +631,37 @@ def _reserve_submission(session, *, plan: BackupStopPlan, submitted_at: datetime
         created_at=submitted_at, updated_at=submitted_at,
     )
     session.add(row)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError:
+        session.rollback()
+        raise _BackupStopReservationBusy("backup_stop_reservation_lost") from None
     return row
+
+
+def _not_sent_backup_request_matches(
+    row: PositionBackupStopOrder,
+    *,
+    binding: ExecutionBinding,
+    leg: ExecutionOrderLeg,
+    payload: dict[str, str],
+) -> bool:
+    return (
+        int(row.execution_binding_id) == int(binding.id)
+        and int(row.execution_order_leg_id) == int(leg.id)
+        and str(row.pos_id) == str(leg.pos_id)
+        and str(row.instrument_id) == str(payload["instId"])
+        and str(row.side).lower() == str(binding.side).lower()
+        and str(row.trigger_price) == str(payload["slTriggerPx"])
+        and str(row.client_order_id)
+        == build_client_order_id(
+            strategy_instance_id=str(binding.strategy_instance_id),
+            leg_index=int(leg.leg_index),
+            purpose="backup_stop",
+        )
+        and str(row.request_json)
+        == json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    )
 
 
 def _submission_still_reserved(

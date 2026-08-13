@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import nullcontext
 import json
 import re
 import sqlite3
@@ -9,6 +10,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+import httpx
 import pytest
 
 import telegram_kol_research.web_app as web_app_module
@@ -20,6 +22,21 @@ from telegram_kol_research.config import (
     RuntimeIncidentConfig,
 )
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
+from telegram_kol_research.deepcoin_client import (
+    DeepcoinClientError,
+    DeepcoinPreSendUnavailable,
+    DeepcoinReadUnavailable,
+    DeepcoinRequestScope,
+)
+from telegram_kol_research.deepcoin_request_metrics import (
+    DeepcoinRequestMetricsIncomplete,
+)
+from telegram_kol_research.deepcoin_request_policy import (
+    ErrorCategory,
+    FailureFact,
+    OutcomeCertainty,
+    RequestPriority,
+)
 from telegram_kol_research.deepcoin_contract_specs import (
     RefreshableDeepcoinContractSpecProvider,
 )
@@ -47,6 +64,7 @@ from telegram_kol_research.recovery_live_submit import enqueue_recovery_trade_si
 from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.web_app import create_web_app
+from telegram_kol_research.web_app import run_deepcoin_execution_reconcile_loop
 from telegram_kol_research.web_app import _extract_reply_evidence
 from telegram_kol_research.web_app import _run_auto_trade_executor
 from telegram_kol_research.web_app import _persisted_position_attribution
@@ -74,6 +92,15 @@ from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
 from telegram_kol_research.telegram_bot_commands import (
     _log_system_operator_callback_processed,
 )
+
+
+class _BackgroundScopedFakeDeepcoinClient:
+    def request_scope(self, scope):
+        assert scope.priority == RequestPriority.BACKGROUND
+        return nullcontext(self)
+
+    def close(self):
+        return None
 
 
 def test_web_app_does_not_install_v1_message_recognizer(tmp_path):
@@ -4209,7 +4236,7 @@ def test_bound_position_close_api_submits_exact_live_position_and_keeps_lifecycl
 
 
 def test_execution_sync_api_marks_missing_deepcoin_position_closed(tmp_path):
-    class FakeDeepcoinClient:
+    class FakeDeepcoinClient(_BackgroundScopedFakeDeepcoinClient):
         def list_positions(self):
             return []
 
@@ -4254,10 +4281,735 @@ def test_execution_sync_api_marks_missing_deepcoin_position_closed(tmp_path):
         assert lifecycle.exit_reason == "manual"
 
 
+def test_execution_sync_reconcile_does_not_block_event_loop_and_uses_background_scope(
+    tmp_path, monkeypatch
+):
+    entered = threading.Event()
+    worker_thread_ids: list[int] = []
+    observed_scopes: list[DeepcoinRequestScope] = []
+    mutation_worker_flags: list[bool] = []
+    closed = threading.Event()
+
+    class ScopeContext:
+        def __init__(self, scope):
+            self.scope = scope
+
+        def __enter__(self):
+            observed_scopes.append(self.scope)
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeDeepcoinClient(_BackgroundScopedFakeDeepcoinClient):
+        def request_scope(self, scope):
+            return ScopeContext(scope)
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def close(self):
+            closed.set()
+
+    def blocking_reconcile(*args, **kwargs):
+        worker_thread_ids.append(threading.get_ident())
+        mutation_worker_flags.append(kwargs["run_exchange_mutation_workers"])
+        entered.set()
+        time.sleep(0.15)
+        return ExecutionReconciliationResult()
+
+    monkeypatch.setattr(
+        web_app_module,
+        "reconcile_deepcoin_execution_bindings",
+        blocking_reconcile,
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "sync_manual_closed_deepcoin_positions",
+        lambda *args, **kwargs: SimpleNamespace(
+            checked=0,
+            manually_closed=0,
+            skipped_without_pos_id=0,
+        ),
+    )
+    app = create_web_app(
+        database_path=tmp_path / "event-loop-sync.db",
+        deepcoin_client_factory=FakeDeepcoinClient,
+        now_provider=lambda: datetime(2026, 8, 13, 12, 0, tzinfo=UTC),
+    )
+
+    async def exercise():
+        main_thread_id = threading.get_ident()
+        stop = asyncio.Event()
+        heartbeat_count = 0
+
+        async def heartbeat():
+            nonlocal heartbeat_count
+            while not stop.is_set():
+                heartbeat_count += 1
+                await asyncio.sleep(0.01)
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            heartbeat_task = asyncio.create_task(heartbeat())
+            response = await client.post("/api/execution/sync-deepcoin")
+            stop.set()
+            await heartbeat_task
+        return response, heartbeat_count, main_thread_id
+
+    deadline_lower_bound = time.monotonic() + 2.0
+    response, heartbeat_count, main_thread_id = asyncio.run(exercise())
+    deadline_upper_bound = time.monotonic() + 2.0
+
+    assert response.status_code == 200
+    assert entered.is_set()
+    assert heartbeat_count >= 5
+    assert worker_thread_ids and worker_thread_ids[0] != main_thread_id
+    assert mutation_worker_flags == [False]
+    assert len(observed_scopes) == 1
+    assert observed_scopes[0].priority == RequestPriority.BACKGROUND
+    assert observed_scopes[0].phase == "reconciliation"
+    assert (
+        deadline_lower_bound
+        <= observed_scopes[0].deadline_monotonic
+        <= deadline_upper_bound
+    )
+    assert closed.is_set()
+
+
+def test_background_reconcile_loop_does_not_block_event_loop_and_uses_background_scope(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "background-loop.db")
+    entered = threading.Event()
+    critical_entered = threading.Event()
+    worker_thread_ids: list[int] = []
+    protection_thread_ids: list[int] = []
+    observed_scopes: list[DeepcoinRequestScope] = []
+    observed_scope_times: list[float] = []
+    rescue_calls = 0
+    backup_calls = 0
+
+    class ScopeContext:
+        def __init__(self, scope):
+            self.scope = scope
+
+        def __enter__(self):
+            observed_scopes.append(self.scope)
+            observed_scope_times.append(time.monotonic())
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeDeepcoinClient:
+        def request_scope(self, scope):
+            return ScopeContext(scope)
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+    def blocking_reconcile(*args, **kwargs):
+        worker_thread_ids.append(threading.get_ident())
+        assert kwargs["run_exchange_mutation_workers"] is False
+        entered.set()
+        time.sleep(0.15)
+        return ExecutionReconciliationResult()
+
+    def run_rescue(*args, **kwargs):
+        nonlocal rescue_calls
+        rescue_calls += 1
+        protection_thread_ids.append(threading.get_ident())
+        critical_entered.set()
+
+    def run_backup(*args, **kwargs):
+        nonlocal backup_calls
+        backup_calls += 1
+        assert threading.get_ident() == protection_thread_ids[0]
+        return 0
+
+    monkeypatch.setattr(
+        web_app_module,
+        "reconcile_deepcoin_execution_bindings",
+        blocking_reconcile,
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "sync_manual_closed_deepcoin_positions",
+        lambda *args, **kwargs: SimpleNamespace(
+            checked=0,
+            manually_closed=0,
+            skipped_without_pos_id=0,
+        ),
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "run_trigger_protection_rescue_tick",
+        run_rescue,
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "submit_verified_trigger_backup_stops",
+        run_backup,
+    )
+
+    async def exercise():
+        main_thread_id = threading.get_ident()
+        heartbeat_count = 0
+        task = asyncio.create_task(
+            run_deepcoin_execution_reconcile_loop(
+                session_factory=session_factory,
+                deepcoin_client_factory=FakeDeepcoinClient,
+                interval_seconds=3600,
+                contract_spec_provider=object(),
+            )
+        )
+        while not entered.is_set():
+            heartbeat_count += 1
+            await asyncio.sleep(0.01)
+        while not critical_entered.is_set() or heartbeat_count < 8:
+            heartbeat_count += 1
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return heartbeat_count, main_thread_id
+
+    heartbeat_count, main_thread_id = asyncio.run(exercise())
+
+    assert heartbeat_count >= 8
+    assert worker_thread_ids and worker_thread_ids[0] != main_thread_id
+    assert protection_thread_ids
+    assert protection_thread_ids[0] != main_thread_id
+    assert worker_thread_ids[0] != protection_thread_ids[0]
+    assert rescue_calls == 1
+    assert backup_calls == 1
+    assert len(observed_scopes) == 2
+    assert observed_scopes[0].priority == RequestPriority.BACKGROUND
+    assert observed_scopes[0].phase == "reconciliation"
+    assert observed_scopes[0].deadline_monotonic == pytest.approx(
+        observed_scope_times[0] + 2.0,
+        abs=0.1,
+    )
+    assert observed_scopes[1].priority == RequestPriority.CRITICAL
+    assert observed_scopes[1].phase == "protection_submit"
+    assert observed_scopes[1].deadline_monotonic == pytest.approx(
+        observed_scope_times[1] + 10.0,
+        abs=0.1,
+    )
+
+
+def test_background_reconcile_cancellation_waits_for_worker_cleanup(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "background-cancel.db")
+    entered = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+
+    class ScopeContext:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeDeepcoinClient:
+        def request_scope(self, scope):
+            return ScopeContext()
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+        def close(self):
+            closed.set()
+
+    def blocking_reconcile(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=2)
+        return ExecutionReconciliationResult()
+
+    monkeypatch.setattr(
+        web_app_module,
+        "reconcile_deepcoin_execution_bindings",
+        blocking_reconcile,
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "sync_manual_closed_deepcoin_positions",
+        lambda *args, **kwargs: SimpleNamespace(
+            checked=0,
+            manually_closed=0,
+            skipped_without_pos_id=0,
+        ),
+    )
+
+    async def exercise():
+        task = asyncio.create_task(
+            run_deepcoin_execution_reconcile_loop(
+                session_factory=session_factory,
+                deepcoin_client_factory=FakeDeepcoinClient,
+                interval_seconds=3600,
+            )
+        )
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        assert not closed.is_set()
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        assert not closed.is_set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+    assert closed.is_set()
+
+
+def test_protection_liveness_cancellation_waits_for_critical_worker_cleanup(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "protection-cancel.db")
+    entered = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+
+    class FakeDeepcoinClient:
+        def request_scope(self, scope):
+            assert scope.priority == RequestPriority.CRITICAL
+            assert scope.phase == "protection_submit"
+            return nullcontext(self)
+
+        def close(self):
+            closed.set()
+
+    def blocking_rescue(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=2)
+
+    monkeypatch.setattr(
+        web_app_module,
+        "run_trigger_protection_rescue_tick",
+        blocking_rescue,
+    )
+
+    async def exercise():
+        task = asyncio.create_task(
+            web_app_module._await_deepcoin_protection_liveness(
+                session_factory=session_factory,
+                deepcoin_client_factory=FakeDeepcoinClient,
+                now_provider=None,
+                contract_spec_provider=None,
+            )
+        )
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        assert not closed.is_set()
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        assert not closed.is_set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+    assert closed.is_set()
+
+
+def test_background_reconcile_is_single_flight_on_dedicated_executor(
+    tmp_path, monkeypatch
+):
+    entered = threading.Event()
+    release = threading.Event()
+    reconcile_calls = 0
+
+    class FakeDeepcoinClient(_BackgroundScopedFakeDeepcoinClient):
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+    def blocking_reconcile(*args, **kwargs):
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        assert threading.current_thread().name.startswith("deepcoin-background")
+        entered.set()
+        assert release.wait(timeout=2)
+        return ExecutionReconciliationResult()
+
+    monkeypatch.setattr(
+        web_app_module,
+        "reconcile_deepcoin_execution_bindings",
+        blocking_reconcile,
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "sync_manual_closed_deepcoin_positions",
+        lambda *args, **kwargs: SimpleNamespace(
+            checked=0,
+            manually_closed=0,
+            skipped_without_pos_id=0,
+        ),
+    )
+    app = create_web_app(
+        database_path=tmp_path / "background-single-flight.db",
+        deepcoin_client_factory=FakeDeepcoinClient,
+    )
+
+    async def exercise():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            first = asyncio.create_task(
+                client.post("/api/execution/sync-deepcoin")
+            )
+            while not entered.is_set():
+                await asyncio.sleep(0.01)
+            second = await client.post("/api/execution/sync-deepcoin")
+            release.set()
+            return await first, second
+
+    first, second = asyncio.run(exercise())
+
+    assert first.status_code == 200
+    assert second.status_code == 503
+    assert second.json() == {"detail": "background_reconcile_deferred"}
+    assert reconcile_calls == 1
+
+
+def test_background_reconcile_refuses_client_without_request_scope(
+    tmp_path, monkeypatch
+):
+    reconcile_calls = 0
+
+    class FakeDeepcoinClient:
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+    def reconcile(*args, **kwargs):
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        return ExecutionReconciliationResult()
+
+    monkeypatch.setattr(
+        web_app_module,
+        "reconcile_deepcoin_execution_bindings",
+        reconcile,
+    )
+    app = create_web_app(
+        database_path=tmp_path / "background-scope-required.db",
+        deepcoin_client_factory=FakeDeepcoinClient,
+    )
+
+    response = TestClient(app).post("/api/execution/sync-deepcoin")
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "background_request_scope_unavailable"}
+    assert reconcile_calls == 0
+
+
+def test_background_reconcile_closes_client_when_clock_fails(tmp_path):
+    closed = threading.Event()
+
+    class FakeDeepcoinClient(_BackgroundScopedFakeDeepcoinClient):
+        def close(self):
+            closed.set()
+
+    app = create_web_app(
+        database_path=tmp_path / "background-clock-failure.db",
+        deepcoin_client_factory=FakeDeepcoinClient,
+        now_provider=lambda: (_ for _ in ()).throw(RuntimeError("clock failed")),
+    )
+
+    response = TestClient(app).post("/api/execution/sync-deepcoin")
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "clock failed"}
+    assert closed.is_set()
+
+
+def test_execution_sync_and_background_loop_defer_after_background_deadline(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "background-deferred.db")
+    observed_scopes: list[DeepcoinRequestScope] = []
+    reconcile_calls = 0
+    manual_sync_calls = 0
+    rescue_calls = 0
+
+    class ScopeContext:
+        def __init__(self, scope):
+            self.scope = scope
+
+        def __enter__(self):
+            observed_scopes.append(self.scope)
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeDeepcoinClient:
+        def request_scope(self, scope):
+            return ScopeContext(scope)
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+    def deadline_reconcile(*args, **kwargs):
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        raise DeepcoinReadUnavailable(
+            "governor_deadline_exceeded",
+            fact=FailureFact(
+                category=ErrorCategory.RATE_LIMITED,
+                outcome_certainty=OutcomeCertainty.NOT_SENT,
+                retryable=False,
+                safe_code="governor_deadline_exceeded",
+            ),
+        )
+
+    def manual_sync(*args, **kwargs):
+        nonlocal manual_sync_calls
+        manual_sync_calls += 1
+        return SimpleNamespace(
+            checked=0,
+            manually_closed=0,
+            skipped_without_pos_id=0,
+        )
+
+    def run_rescue(*args, **kwargs):
+        nonlocal rescue_calls
+        rescue_calls += 1
+
+    monkeypatch.setattr(
+        web_app_module,
+        "reconcile_deepcoin_execution_bindings",
+        deadline_reconcile,
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "sync_manual_closed_deepcoin_positions",
+        manual_sync,
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "run_trigger_protection_rescue_tick",
+        run_rescue,
+    )
+    app = create_web_app(
+        database_path=tmp_path / "background-deferred-route.db",
+        deepcoin_client_factory=FakeDeepcoinClient,
+    )
+
+    route_response = TestClient(app).post("/api/execution/sync-deepcoin")
+
+    assert route_response.status_code == 503
+    assert route_response.json() == {"detail": "background_reconcile_deferred"}
+    assert manual_sync_calls == 0
+
+    async def exercise_loop():
+        task = asyncio.create_task(
+            run_deepcoin_execution_reconcile_loop(
+                session_factory=session_factory,
+                deepcoin_client_factory=FakeDeepcoinClient,
+                interval_seconds=3600,
+            )
+        )
+        while rescue_calls < 1:
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise_loop())
+
+    assert manual_sync_calls == 0
+    assert rescue_calls == 1
+    assert len(observed_scopes) == 3
+    assert all(
+        scope.priority == RequestPriority.BACKGROUND
+        and scope.deadline_monotonic is not None
+        for scope in observed_scopes[:2]
+    )
+    assert observed_scopes[2].priority == RequestPriority.CRITICAL
+    assert observed_scopes[2].phase == "protection_submit"
+
+
+def test_execution_sync_defers_typed_pre_send_deadline_without_writer(
+    tmp_path, monkeypatch
+):
+    writer_calls = 0
+
+    class FakeDeepcoinClient(_BackgroundScopedFakeDeepcoinClient):
+        def request_scope(self, scope):
+            return nullcontext(self)
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+    def deadline_reconcile(*args, **kwargs):
+        nonlocal writer_calls
+        raise DeepcoinPreSendUnavailable(
+            "governor_deadline_exceeded",
+            fact=FailureFact(
+                category=ErrorCategory.TRANSPORT_TIMEOUT,
+                outcome_certainty=OutcomeCertainty.NOT_SENT,
+                retryable=False,
+                safe_code="governor_deadline_exceeded",
+            ),
+        )
+
+    monkeypatch.setattr(
+        web_app_module,
+        "reconcile_deepcoin_execution_bindings",
+        deadline_reconcile,
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "sync_manual_closed_deepcoin_positions",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("manual sync must not run after deadline")
+        ),
+    )
+    app = create_web_app(
+        database_path=tmp_path / "background-pre-send-deadline.db",
+        deepcoin_client_factory=FakeDeepcoinClient,
+    )
+
+    response = TestClient(app).post("/api/execution/sync-deepcoin")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "background_reconcile_deferred"}
+    assert writer_calls == 0
+
+
+def test_deepcoin_request_health_api_is_read_only_bounded_and_redacted(
+    tmp_path, monkeypatch
+):
+    fixed_now = datetime(2026, 8, 13, 12, 15, tzinfo=UTC)
+    app = create_web_app(
+        database_path=tmp_path / "request-health.db",
+        now_provider=lambda: fixed_now,
+    )
+
+    response = TestClient(app).get(
+        "/api/execution/deepcoin-request-health?window_minutes=15"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["complete"] is True
+    assert payload["request_count"] == 0
+    assert payload["window"]["minutes"] == 15
+    assert "operation_id" not in response.text
+    assert "order_id" not in response.text
+    assert "pos_id" not in response.text
+    assert "request_fingerprint" not in response.text
+
+    monkeypatch.setattr(
+        web_app_module,
+        "project_deepcoin_request_health",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            DeepcoinRequestMetricsIncomplete("metric_attempt_scan_truncated")
+        ),
+    )
+    truncated = TestClient(app).get(
+        "/api/execution/deepcoin-request-health?window_minutes=15"
+    )
+    assert truncated.status_code == 503
+    assert truncated.json() == {"detail": "deepcoin_request_metrics_incomplete"}
+
+
+def test_background_reconcile_cycle_logs_bounded_request_health_warnings(
+    tmp_path, monkeypatch, caplog
+):
+    session_factory = create_session_factory(tmp_path / "background-health.db")
+    projection_calls = 0
+
+    class FakeDeepcoinClient(_BackgroundScopedFakeDeepcoinClient):
+        def request_scope(self, scope):
+            return nullcontext(self)
+
+        def list_open_orders(self, *, inst_id=None):
+            return []
+
+    monkeypatch.setattr(
+        web_app_module,
+        "reconcile_deepcoin_execution_bindings",
+        lambda *args, **kwargs: ExecutionReconciliationResult(),
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "sync_manual_closed_deepcoin_positions",
+        lambda *args, **kwargs: SimpleNamespace(
+            checked=0,
+            manually_closed=0,
+            skipped_without_pos_id=0,
+        ),
+    )
+
+    def project_health(*args, **kwargs):
+        nonlocal projection_calls
+        projection_calls += 1
+        return {
+            "unknown_writer_count": 9_999,
+            "auth_failure_count": 1,
+            "schema_incompatible_count": 2,
+            "live_unprotected": {"count": 3},
+        }
+
+    monkeypatch.setattr(
+        web_app_module,
+        "project_deepcoin_request_health",
+        project_health,
+    )
+
+    async def exercise():
+        task = asyncio.create_task(
+            run_deepcoin_execution_reconcile_loop(
+                session_factory=session_factory,
+                deepcoin_client_factory=FakeDeepcoinClient,
+                interval_seconds=3600,
+                now_provider=lambda: datetime(2026, 8, 13, 12, 15, tzinfo=UTC),
+            )
+        )
+        for _ in range(100):
+            if projection_calls > 0:
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert projection_calls == 1
+
+    web_app_module.logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level("WARNING", logger=web_app_module.logger.name):
+            asyncio.run(exercise())
+    finally:
+        web_app_module.logger.removeHandler(caplog.handler)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert "deepcoin_request_health warning=unknown_writer count=4096" in messages
+    assert "deepcoin_request_health warning=auth_failure count=1" in messages
+    assert "deepcoin_request_health warning=schema_incompatible count=2" in messages
+    assert "deepcoin_request_health warning=live_unprotected count=3" in messages
+    assert "operation_id" not in repr(messages)
+    assert "order_id" not in repr(messages)
+    assert "pos_id" not in repr(messages)
+
+
 def test_execution_sync_api_reports_protected_entry_reconciliation_counts(
     tmp_path, monkeypatch
 ):
-    class FakeDeepcoinClient:
+    class FakeDeepcoinClient(_BackgroundScopedFakeDeepcoinClient):
         def list_positions(self, *, inst_id=None):
             return []
 
@@ -4292,7 +5044,7 @@ def test_execution_sync_api_reports_protected_entry_reconciliation_counts(
 def test_execution_sync_api_delivers_cleanup_notification_outbox(
     tmp_path, monkeypatch
 ):
-    class FakeDeepcoinClient:
+    class FakeDeepcoinClient(_BackgroundScopedFakeDeepcoinClient):
         def list_positions(self):
             return []
 
@@ -4325,7 +5077,7 @@ def test_execution_sync_api_delivers_cleanup_notification_outbox(
 
 
 def test_execution_sync_api_never_submits_position_protection_orders(tmp_path):
-    class FakeDeepcoinClient:
+    class FakeDeepcoinClient(_BackgroundScopedFakeDeepcoinClient):
         uid_scope_hash = "d" * 64
 
         def __init__(self):
@@ -4466,7 +5218,7 @@ def test_execution_sync_api_never_submits_position_protection_orders(tmp_path):
 
 
 def test_execution_sync_api_keeps_payload_only_position_unassigned(tmp_path):
-    class FakeDeepcoinClient:
+    class FakeDeepcoinClient(_BackgroundScopedFakeDeepcoinClient):
         def list_positions(self, *, inst_id=None):
             return [
                 {

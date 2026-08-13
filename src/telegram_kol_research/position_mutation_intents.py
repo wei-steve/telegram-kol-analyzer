@@ -16,6 +16,7 @@ from telegram_kol_research.models import PositionMutationIntent
 POSITION_MUTATION_INTENT_STATUSES = frozenset(
     {
         "reserved",
+        "not_sent",
         "submitting",
         "submitted",
         "confirmed",
@@ -106,6 +107,20 @@ def reserve_position_mutation_intent(
                 raise PositionMutationIntentError(
                     "position_mutation_intent_conflict"
                 )
+            if existing.status == "not_sent":
+                rearmed = transition_position_mutation_intent(
+                    session_factory,
+                    int(existing.id),
+                    expected_statuses={"not_sent"},
+                    new_status="reserved",
+                    transitioned_at=reserved_at,
+                    error={},
+                )
+                if rearmed:
+                    with session_factory() as reloaded_session:
+                        return reloaded_session.get(
+                            PositionMutationIntent, int(existing.id)
+                        )
             return existing
         if order_id:
             existing_write = (
@@ -230,11 +245,15 @@ def transition_position_mutation_intent(
             separators=(",", ":"),
         )
     if error is not None:
-        values[PositionMutationIntent.error_json] = json.dumps(
-            dict(error),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
+        values[PositionMutationIntent.error_json] = (
+            json.dumps(
+                dict(error),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            if error
+            else None
         )
     with session_factory() as session:
         count = (

@@ -15,6 +15,8 @@ from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.deepcoin_client import (
     DeepcoinDefiniteRejection,
+    DeepcoinPreSendUnavailable,
+    DeepcoinReadUnavailable,
     DeepcoinTradingClientProtocol,
 )
 from telegram_kol_research.deepcoin_normalization import (
@@ -363,6 +365,19 @@ def execute_trigger_protection_stop_rescue(
             now_provider=lambda: now,
             require_readback=True,
         )
+    except (DeepcoinReadUnavailable, DeepcoinPreSendUnavailable):
+        with session_factory() as session:
+            rescue = session.get(TriggerProtectionStopRescue, int(rescue_id))
+            if rescue is None or rescue.status != "reserved":
+                raise ManagementBatchExecutionError(
+                    "trigger_protection_rescue_state_conflict"
+                ) from None
+            rescue.status = "ready"
+            rescue.reason_code = "rescue_submission_not_sent"
+            rescue.completed_at = None
+            rescue.updated_at = now
+            session.commit()
+        raise
     except DeepcoinDefiniteRejection as exc:
         return _complete_trigger_protection_rescue_failure(
             session_factory, rescue_id=int(rescue_id), now=now,

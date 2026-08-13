@@ -16,6 +16,8 @@ from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.deepcoin_client import (
     DeepcoinDefiniteRejection,
+    DeepcoinPreSendUnavailable,
+    DeepcoinReadUnavailable,
     DeepcoinRequestOutcomeUnknown,
 )
 from telegram_kol_research.deepcoin_execution_operations import (
@@ -423,28 +425,50 @@ class PositionMutationGateway:
         if before_submit is not None:
             before_submit(intent_id)
 
-        _, reason = self._load_verified_binding(authority)
-        if reason is not None:
-            return self._block(intent_id, reason)
-        positions = self._client.list_positions(inst_id=authority.instrument_id)
-        matches = [
-            row
-            for row in positions
-            if str(row.get("posId") or "") == authority.pos_id
-        ]
-        if len(matches) != 1:
-            return self._block(intent_id, "position_not_unique")
-        if position_authority_fingerprint(matches[0]) != authority.position_fingerprint:
-            return self._block(intent_id, "position_fingerprint_changed")
-        if not self._live_execution_gate():
-            return self._block(intent_id, "live_execution_disabled")
-        if pre_submit_order_refs_provider is not None:
-            _attach_pre_submit_order_refs(
+        try:
+            _, reason = self._load_verified_binding(authority)
+            if reason is not None:
+                return self._block(intent_id, reason)
+            positions = self._client.list_positions(inst_id=authority.instrument_id)
+            matches = [
+                row
+                for row in positions
+                if str(row.get("posId") or "") == authority.pos_id
+            ]
+            if len(matches) != 1:
+                return self._block(intent_id, "position_not_unique")
+            if (
+                position_authority_fingerprint(matches[0])
+                != authority.position_fingerprint
+            ):
+                return self._block(intent_id, "position_fingerprint_changed")
+            if not self._live_execution_gate():
+                return self._block(intent_id, "live_execution_disabled")
+            if pre_submit_order_refs_provider is not None:
+                _attach_pre_submit_order_refs(
+                    self._session_factory,
+                    intent_id=intent_id,
+                    request_fingerprint=str(intent.request_fingerprint),
+                    order_refs=pre_submit_order_refs_provider(),
+                )
+        except DeepcoinReadUnavailable as exc:
+            transitioned = transition_position_mutation_intent(
                 self._session_factory,
-                intent_id=intent_id,
-                request_fingerprint=str(intent.request_fingerprint),
-                order_refs=pre_submit_order_refs_provider(),
+                intent_id,
+                expected_statuses={"reserved"},
+                new_status="not_sent",
+                transitioned_at=self._now(),
+                error={
+                    "safe_code": _safe_exchange_error_code(
+                        exc, "position_mutation_not_sent"
+                    )
+                },
             )
+            if not transitioned:
+                raise PositionMutationAuthorityError(
+                    "position_mutation_intent_state_conflict"
+                ) from None
+            raise
         if not transition_position_mutation_intent(
             self._session_factory,
             intent_id,
@@ -463,6 +487,24 @@ class PositionMutationGateway:
             finally:
                 if self._after_exchange_write is not None:
                     self._after_exchange_write()
+        except DeepcoinPreSendUnavailable as exc:
+            transitioned = transition_position_mutation_intent(
+                self._session_factory,
+                intent_id,
+                expected_statuses={"submitting"},
+                new_status="not_sent",
+                transitioned_at=self._now(),
+                error={
+                    "safe_code": _safe_exchange_error_code(
+                        exc, "position_mutation_not_sent"
+                    )
+                },
+            )
+            if not transitioned:
+                raise PositionMutationAuthorityError(
+                    "position_mutation_intent_state_conflict"
+                ) from None
+            raise
         except DeepcoinDefiniteRejection as exc:
             return self._finish_with_error(
                 intent_id,
@@ -486,7 +528,9 @@ class PositionMutationGateway:
                 "recovery_required",
                 "position_mutation_writer_failed",
             )
-            raise
+            raise DeepcoinRequestOutcomeUnknown(
+                "position_mutation_writer_failed"
+            ) from None
         response = _safe_mutation_success_response(response)
         persisted = transition_position_mutation_intent(
             self._session_factory,

@@ -62,8 +62,23 @@ from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecPr
 from telegram_kol_research.deepcoin_contract_spec_cache import (
     DeepcoinContractSpecRefreshOrchestrator,
 )
-from telegram_kol_research.deepcoin_client import DeepcoinClientError
+from telegram_kol_research.deepcoin_client import (
+    DeepcoinClientError,
+    DeepcoinPreSendUnavailable,
+    DeepcoinReadUnavailable,
+    DeepcoinRequestScope,
+)
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
+from telegram_kol_research.deepcoin_request_metrics import (
+    DeepcoinRequestMetricsIncomplete,
+    project_deepcoin_request_health,
+)
+from telegram_kol_research.deepcoin_request_policy import (
+    ErrorCategory,
+    FailureFact,
+    OutcomeCertainty,
+    RequestPriority,
+)
 from telegram_kol_research.deepcoin_execution_actions import DeepcoinExecutionActionError
 from telegram_kol_research.deepcoin_execution_actions import close_bound_position_market
 from telegram_kol_research.runtime_agent_production_audit import (
@@ -140,6 +155,7 @@ from telegram_kol_research.execution_bindings import sync_manual_closed_deepcoin
 from telegram_kol_research.position_attribution import PositionAttributionError
 from telegram_kol_research.position_attribution import has_authoritative_persisted_position
 from telegram_kol_research.position_attribution import require_manual_position_attribution_allowed
+from telegram_kol_research.position_authority_lock import position_authority_lock
 from telegram_kol_research.protection_attribution import match_position_protection
 from telegram_kol_research.protection_ledger import (
     build_account_protection_ownership,
@@ -161,6 +177,12 @@ from telegram_kol_research.runtime_agent_exchange_snapshot import (
 from telegram_kol_research.semantic_disagreement_review import run_semantic_review_loop
 from telegram_kol_research.strategy_management_worker import (
     run_strategy_management_worker_loop,
+)
+from telegram_kol_research.trigger_backup_stop_executor import (
+    submit_verified_trigger_backup_stops,
+)
+from telegram_kol_research.trigger_protection_rescue_worker import (
+    run_trigger_protection_rescue_tick,
 )
 from telegram_kol_research.break_even_convergence_worker import (
     run_break_even_convergence_worker_loop,
@@ -3966,6 +3988,243 @@ def _validate_mimo_rollout_transition(
         )
 
 
+_BACKGROUND_DEEPCOIN_DEADLINE_SECONDS = 2.0
+_PROTECTION_WRITER_DEADLINE_SECONDS = 10.0
+_BACKGROUND_DEEPCOIN_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="deepcoin-background",
+)
+_BACKGROUND_DEEPCOIN_SINGLE_FLIGHT = threading.Lock()
+_PROTECTION_LIVENESS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="deepcoin-protection",
+)
+_PROTECTION_LIVENESS_SINGLE_FLIGHT = threading.Lock()
+
+
+@dataclass(frozen=True, slots=True)
+class _DeepcoinBackgroundSyncResult:
+    reconciled: object | None
+    manually_synced: object
+    synced_at: datetime
+
+
+def _run_deepcoin_background_sync(
+    *,
+    session_factory,
+    deepcoin_client_factory,
+    now_provider,
+    contract_spec_provider,
+) -> _DeepcoinBackgroundSyncResult:
+    """Run one network-heavy read cycle wholly inside its worker thread."""
+
+    client = deepcoin_client_factory()
+    try:
+        synced_at = now_provider() if now_provider is not None else datetime.now(UTC)
+        scope = DeepcoinRequestScope(
+            phase="reconciliation",
+            priority=RequestPriority.BACKGROUND,
+            deadline_monotonic=(
+                time.monotonic() + _BACKGROUND_DEEPCOIN_DEADLINE_SECONDS
+            ),
+        )
+        scope_factory = getattr(client, "request_scope", None)
+        if not callable(scope_factory):
+            raise DeepcoinClientError("background_request_scope_unavailable")
+        with scope_factory(scope):
+            reconcile_result = (
+                reconcile_deepcoin_execution_bindings(
+                    session_factory,
+                    client=client,
+                    recovered_at=synced_at,
+                    contract_spec_provider=contract_spec_provider,
+                    run_exchange_mutation_workers=False,
+                )
+                if hasattr(client, "list_open_orders")
+                else None
+            )
+            manual_result = sync_manual_closed_deepcoin_positions(
+                session_factory,
+                client=client,
+                synced_at=synced_at,
+            )
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.warning("Deepcoin background client cleanup failed")
+    try:
+        health_until = (
+            now_provider() if now_provider is not None else datetime.now(UTC)
+        )
+        health = project_deepcoin_request_health(
+            session_factory,
+            since=health_until - timedelta(minutes=15),
+            until=health_until,
+        )
+    except DeepcoinRequestMetricsIncomplete:
+        logger.warning(
+            "deepcoin_request_health warning=metrics_incomplete count=1"
+        )
+    except Exception:
+        logger.warning(
+            "deepcoin_request_health warning=metrics_projection_failed count=1"
+        )
+    else:
+        _log_deepcoin_request_health_warnings(health)
+    return _DeepcoinBackgroundSyncResult(
+        reconciled=reconcile_result,
+        manually_synced=manual_result,
+        synced_at=synced_at,
+    )
+
+
+async def _await_deepcoin_background_sync(**kwargs) -> _DeepcoinBackgroundSyncResult:
+    """Do not abandon a worker that still owns a client or SQLite session."""
+
+    if not _BACKGROUND_DEEPCOIN_SINGLE_FLIGHT.acquire(blocking=False):
+        raise DeepcoinReadUnavailable(
+            "background_reconcile_busy",
+            fact=FailureFact(
+                category=ErrorCategory.STATE_CONFLICT,
+                outcome_certainty=OutcomeCertainty.NOT_SENT,
+                retryable=False,
+                safe_code="background_reconcile_busy",
+            ),
+        )
+    concurrent_worker = _BACKGROUND_DEEPCOIN_EXECUTOR.submit(
+        _run_deepcoin_background_sync,
+        **kwargs,
+    )
+    concurrent_worker.add_done_callback(
+        lambda _future: _BACKGROUND_DEEPCOIN_SINGLE_FLIGHT.release()
+    )
+    worker = asyncio.wrap_future(concurrent_worker)
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        raise
+
+
+def _run_deepcoin_protection_liveness_cycle(
+    *,
+    session_factory,
+    deepcoin_client_factory,
+    now_provider,
+    contract_spec_provider,
+) -> None:
+    """Run protection writers outside the bounded background read cycle."""
+
+    client = deepcoin_client_factory()
+    try:
+        processed_at = (
+            now_provider() if now_provider is not None else datetime.now(UTC)
+        )
+        scope_factory = getattr(client, "request_scope", None)
+        if not callable(scope_factory):
+            raise DeepcoinClientError("critical_request_scope_unavailable")
+        with scope_factory(
+            DeepcoinRequestScope(
+                phase="protection_submit",
+                priority=RequestPriority.CRITICAL,
+                deadline_monotonic=(
+                    time.monotonic() + _PROTECTION_WRITER_DEADLINE_SECONDS
+                ),
+            )
+        ):
+            run_trigger_protection_rescue_tick(
+                session_factory,
+                deepcoin_client=client,
+                processed_at=processed_at,
+            )
+            if contract_spec_provider is not None:
+                with position_authority_lock():
+                    submit_verified_trigger_backup_stops(
+                        session_factory,
+                        client=client,
+                        contract_spec_provider=contract_spec_provider,
+                        submitted_at=processed_at,
+                    )
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.warning("Deepcoin protection client cleanup failed")
+
+
+async def _await_deepcoin_protection_liveness(**kwargs) -> None:
+    if not _PROTECTION_LIVENESS_SINGLE_FLIGHT.acquire(blocking=False):
+        return
+    concurrent_worker = _PROTECTION_LIVENESS_EXECUTOR.submit(
+        _run_deepcoin_protection_liveness_cycle,
+        **kwargs,
+    )
+    concurrent_worker.add_done_callback(
+        lambda _future: _PROTECTION_LIVENESS_SINGLE_FLIGHT.release()
+    )
+    worker = asyncio.wrap_future(concurrent_worker)
+    try:
+        await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        raise
+
+
+def _is_background_reconcile_deferred(exc: DeepcoinClientError) -> bool:
+    return (
+        isinstance(exc, (DeepcoinReadUnavailable, DeepcoinPreSendUnavailable))
+        and getattr(getattr(exc, "fact", None), "safe_code", None)
+        in {"governor_deadline_exceeded", "request_deadline_exceeded"}
+        or getattr(getattr(exc, "fact", None), "safe_code", None)
+        == "background_reconcile_busy"
+    )
+
+
+def _log_deepcoin_request_health_warnings(
+    health: dict[str, object],
+) -> None:
+    live_unprotected = health.get("live_unprotected")
+    warning_counts = {
+        "unknown_writer": health.get("unknown_writer_count", 0),
+        "auth_failure": health.get("auth_failure_count", 0),
+        "schema_incompatible": health.get("schema_incompatible_count", 0),
+        "live_unprotected": (
+            live_unprotected.get("count", 0)
+            if isinstance(live_unprotected, dict)
+            else 0
+        ),
+    }
+    for warning, raw_count in warning_counts.items():
+        count = (
+            raw_count
+            if isinstance(raw_count, int) and not isinstance(raw_count, bool)
+            else 0
+        )
+        if count > 0:
+            logger.warning(
+                "deepcoin_request_health warning=%s count=%s",
+                warning,
+                min(count, 4096),
+            )
+
+
 def create_web_app(
     database_path: str | Path,
     media_root: str | Path | None = None,
@@ -6542,32 +6801,24 @@ def create_web_app(
     @app.post("/api/execution/sync-deepcoin")
     async def sync_deepcoin_execution_state():
         try:
-            client = app.state.deepcoin_client_factory()
-            reconcile_result = (
-                reconcile_deepcoin_execution_bindings(
-                    app.state.session_factory,
-                    client=client,
-                    recovered_at=app.state.now_provider(),
-                    contract_spec_provider=app.state.deepcoin_contract_spec_provider,
-                )
-                if hasattr(client, "list_open_orders")
-                else None
+            cycle = await _await_deepcoin_background_sync(
+                session_factory=app.state.session_factory,
+                deepcoin_client_factory=app.state.deepcoin_client_factory,
+                now_provider=app.state.now_provider,
+                contract_spec_provider=app.state.deepcoin_contract_spec_provider,
             )
-            result = sync_manual_closed_deepcoin_positions(
-                app.state.session_factory,
-                client=client,
-                synced_at=app.state.now_provider(),
-            )
+            reconcile_result = cycle.reconciled
+            result = cycle.manually_synced
             if isinstance(app.state.notification_bot_config, SystemOperatorBotConfig):
                 await deliver_pending_position_attribution_incidents(
                     app.state.session_factory,
                     config=app.state.notification_bot_config,
-                    delivered_at=app.state.now_provider(),
+                    delivered_at=cycle.synced_at,
                 )
                 await deliver_pending_position_protection_incidents(
                     app.state.session_factory,
                     config=app.state.notification_bot_config,
-                    delivered_at=app.state.now_provider(),
+                    delivered_at=cycle.synced_at,
                 )
             if isinstance(
                 app.state.system_operator_bot_config,
@@ -6576,9 +6827,14 @@ def create_web_app(
                 await deliver_terminal_entry_cleanup_notifications(
                     app.state.session_factory,
                     config=app.state.system_operator_bot_config,
-                    delivered_at=app.state.now_provider(),
+                    delivered_at=cycle.synced_at,
                 )
         except DeepcoinClientError as exc:
+            if _is_background_reconcile_deferred(exc):
+                raise HTTPException(
+                    status_code=503,
+                    detail="background_reconcile_deferred",
+                ) from None
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         except Exception as exc:
             logger.exception("Deepcoin execution sync failed")
@@ -6611,6 +6867,26 @@ def create_web_app(
                 else 0
             ),
         }
+
+    @app.get("/api/execution/deepcoin-request-health")
+    def deepcoin_request_health(window_minutes: int = 15):
+        if isinstance(window_minutes, bool) or not 1 <= window_minutes <= 1440:
+            raise HTTPException(status_code=400, detail="invalid_window_minutes")
+        until = app.state.now_provider()
+        since = until - timedelta(minutes=window_minutes)
+        try:
+            health = project_deepcoin_request_health(
+                app.state.session_factory,
+                since=since,
+                until=until,
+            )
+        except DeepcoinRequestMetricsIncomplete:
+            raise HTTPException(
+                status_code=503,
+                detail="deepcoin_request_metrics_incomplete",
+            ) from None
+        _log_deepcoin_request_health_warnings(health)
+        return health
 
     @app.post("/api/execution/close-bound-position")
     async def close_bound_position(payload: dict[str, Any] | None = None):
@@ -7860,15 +8136,14 @@ async def run_deepcoin_execution_reconcile_loop(
 ) -> None:
     while True:
         try:
-            client = deepcoin_client_factory()
-            synced_at = now_provider() if now_provider is not None else datetime.now(UTC)
-            if hasattr(client, "list_open_orders"):
-                reconcile_deepcoin_execution_bindings(
-                    session_factory,
-                    client=client,
-                    recovered_at=synced_at,
-                    contract_spec_provider=contract_spec_provider,
-                )
+            cycle = await _await_deepcoin_background_sync(
+                session_factory=session_factory,
+                deepcoin_client_factory=deepcoin_client_factory,
+                now_provider=now_provider,
+                contract_spec_provider=contract_spec_provider,
+            )
+            synced_at = cycle.synced_at
+            if cycle.reconciled is not None:
                 if system_operator_bot_enabled(system_operator_bot_config):
                     await deliver_pending_position_attribution_incidents(
                         session_factory,
@@ -7879,11 +8154,6 @@ async def run_deepcoin_execution_reconcile_loop(
                         session_factory, config=system_operator_bot_config,
                         delivered_at=synced_at,
                     )
-            sync_manual_closed_deepcoin_positions(
-                session_factory,
-                client=client,
-                synced_at=synced_at,
-            )
             if system_operator_bot_enabled(terminal_entry_cleanup_bot_config):
                 await deliver_terminal_entry_cleanup_notifications(
                     session_factory,
@@ -7891,9 +8161,32 @@ async def run_deepcoin_execution_reconcile_loop(
                     delivered_at=synced_at,
                 )
         except DeepcoinClientError as exc:
-            logger.warning("Deepcoin execution reconcile skipped: %s", exc)
+            if _is_background_reconcile_deferred(exc):
+                logger.info(
+                    "Deepcoin background reconcile deferred: "
+                    "background_reconcile_deferred"
+                )
+            else:
+                logger.warning("Deepcoin execution reconcile skipped: %s", exc)
         except Exception:
             logger.exception("Deepcoin execution reconcile failed")
+        try:
+            await _await_deepcoin_protection_liveness(
+                session_factory=session_factory,
+                deepcoin_client_factory=deepcoin_client_factory,
+                now_provider=now_provider,
+                contract_spec_provider=contract_spec_provider,
+            )
+        except DeepcoinClientError:
+            logger.warning(
+                "Deepcoin protection liveness skipped: "
+                "protection_liveness_unavailable"
+            )
+        except Exception:
+            logger.error(
+                "Deepcoin protection liveness failed: "
+                "protection_liveness_unexpected_error"
+            )
         await asyncio.sleep(interval_seconds)
 
 

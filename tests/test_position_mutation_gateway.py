@@ -4,7 +4,13 @@ import json
 import pytest
 
 from telegram_kol_research.deepcoin_client import (
+    DeepcoinReadUnavailable,
     DeepcoinRequestOutcomeUnknown,
+)
+from telegram_kol_research.deepcoin_request_policy import (
+    ErrorCategory,
+    FailureFact,
+    OutcomeCertainty,
 )
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
@@ -1363,6 +1369,60 @@ def test_require_readback_is_restart_idempotent_after_confirmation(tmp_path):
 
     assert first == second
     assert len(client.set_position_sltp_calls) == 1
+
+
+def test_pre_writer_read_deadline_rearms_same_mutation_intent(tmp_path):
+    session_factory, _, _, _, _ = _seed(tmp_path)
+
+    class DeadlineClient(FakeDeepcoinClient):
+        def __init__(self):
+            super().__init__()
+            self.position_reads = 0
+
+        def list_positions(self, *, inst_id=None):
+            self.position_reads += 1
+            if self.position_reads == 2:
+                raise DeepcoinReadUnavailable(
+                    "request_deadline_exceeded",
+                    fact=FailureFact(
+                        category=ErrorCategory.TRANSPORT_TIMEOUT,
+                        outcome_certainty=OutcomeCertainty.NOT_SENT,
+                        retryable=False,
+                        safe_code="request_deadline_exceeded",
+                    ),
+                )
+            return super().list_positions(inst_id=inst_id)
+
+    client = DeadlineClient()
+    kwargs = dict(
+        session_factory=session_factory,
+        deepcoin_client=client,
+        pos_id="pos-sister",
+        payload={
+            "instId": "BTC-USDT-SWAP",
+            "slTriggerPx": "62000",
+            "sz": "0",
+        },
+        idempotency_key="management:not-sent:pre-writer-read",
+        live_execution_gate=lambda: True,
+        now_provider=lambda: NOW,
+    )
+
+    with pytest.raises(DeepcoinReadUnavailable):
+        submit_exact_position_sltp(**kwargs)
+    with session_factory() as session:
+        intent = session.query(PositionMutationIntent).one()
+        intent_id = int(intent.id)
+        assert intent.status == "not_sent"
+    assert client.set_position_sltp_calls == []
+
+    response = submit_exact_position_sltp(**kwargs)
+    assert response["data"]["ordId"] == "ord-new-stop"
+    assert len(client.set_position_sltp_calls) == 1
+    with session_factory() as session:
+        intent = session.query(PositionMutationIntent).one()
+        assert int(intent.id) == intent_id
+        assert intent.status == "submitted"
 
 
 def test_close_uses_exact_close_position_id(tmp_path):

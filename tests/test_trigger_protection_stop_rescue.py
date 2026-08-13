@@ -6,6 +6,15 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy import create_engine, inspect, text
 
+from telegram_kol_research.deepcoin_client import (
+    DeepcoinPreSendUnavailable,
+    DeepcoinReadUnavailable,
+)
+from telegram_kol_research.deepcoin_request_policy import (
+    ErrorCategory,
+    FailureFact,
+    OutcomeCertainty,
+)
 from telegram_kol_research.db import create_session_factory, init_db
 from telegram_kol_research.execution_events import ExecutionEventRecord, record_execution_event
 from telegram_kol_research.models import (
@@ -20,6 +29,7 @@ from telegram_kol_research.models import (
     PositionProtectionLeg,
     PositionAttributionAudit,
     BoundPositionCloseReservation,
+    PositionMutationIntent,
 )
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 from telegram_kol_research.position_protection_legs import create_or_get_protection_leg
@@ -145,6 +155,85 @@ def test_rescue_submits_stop_only_and_persists_exact_order_before_retry(tmp_path
     assert primary.pos_id == "pos-1"
     assert primary.exchange_order_id == "rescue-sl-1"
     assert rescue.status == "verified"
+
+
+def test_rescue_pre_send_deadline_rearms_exact_same_intent(tmp_path):
+    from telegram_kol_research.strategy_management_planner import (
+        plan_trigger_protection_stop_rescue,
+    )
+    from telegram_kol_research.strategy_management_executor import (
+        execute_trigger_protection_stop_rescue,
+    )
+
+    session_factory = create_session_factory(tmp_path / "not-sent-rescue.db")
+    intent_id = _saved_deferred_intent(session_factory)
+    with session_factory() as session:
+        intent = session.get(TriggerProtectionIntent, intent_id)
+        create_or_get_protection_leg(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=int(intent.execution_order_leg_id),
+            role="primary_stop",
+            leg_index=1,
+            planned_trigger_price="65000",
+            planned_size=None,
+        )
+        session.commit()
+
+    class DeadlineClient(_Client):
+        def __init__(self):
+            super().__init__()
+            self.failure_pending = True
+            self.post_calls = 0
+
+        def list_positions(self, *, inst_id=None):
+            return super().list_positions(inst_id=inst_id)
+
+        def set_position_sltp(self, payload):
+            if self.failure_pending:
+                self.failure_pending = False
+                raise DeepcoinPreSendUnavailable(
+                    "governor_deadline_exceeded",
+                    fact=FailureFact(
+                        category=ErrorCategory.TRANSPORT_TIMEOUT,
+                        outcome_certainty=OutcomeCertainty.NOT_SENT,
+                        retryable=False,
+                        safe_code="governor_deadline_exceeded",
+                    ),
+                )
+            self.post_calls += 1
+            return super().set_position_sltp(payload)
+
+    client = DeadlineClient()
+    plan = plan_trigger_protection_stop_rescue(
+        session_factory,
+        intent_id=intent_id,
+        deepcoin_client=client,
+        planned_at=NOW,
+    )
+    with pytest.raises(DeepcoinPreSendUnavailable):
+        execute_trigger_protection_stop_rescue(
+            session_factory,
+            rescue_id=plan.rescue_id,
+            deepcoin_client=client,
+            executed_at=NOW,
+        )
+
+    with session_factory() as session:
+        rescue = session.get(TriggerProtectionStopRescue, plan.rescue_id)
+        mutation = session.query(PositionMutationIntent).one_or_none()
+        assert rescue.status == "ready"
+        assert mutation.status == "not_sent"
+    assert client.post_calls == 0
+
+    retry = execute_trigger_protection_stop_rescue(
+        session_factory,
+        rescue_id=plan.rescue_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+    assert retry["status"] == "verified"
+    assert client.post_calls == 1
 
 
 def test_rescue_refuses_unverified_legacy_position_without_exchange_write(tmp_path):
@@ -336,7 +425,8 @@ def test_rescue_persists_bounded_failure_diagnostics(tmp_path):
         rescue = session.get(TriggerProtectionStopRescue, planned.rescue_id)
         diagnostics = json.loads(rescue.error_json)
     assert diagnostics["type"] == "DeepcoinRequestOutcomeUnknown"
-    assert len(diagnostics["message"]) == 512
+    assert diagnostics["message"] == "position_mutation_writer_failed"
+    assert "x" * 32 not in rescue.error_json
 
 
 @pytest.mark.parametrize(
