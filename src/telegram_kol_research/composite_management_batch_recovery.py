@@ -365,11 +365,13 @@ def _load_composite_batch_recovery_snapshot_read_only_impl(
     session_factory,
     *,
     client: Any,
+    generation_session_factory=None,
     _finalize_capture: Callable[[Batch119ExactRecoverySnapshot], Any],
 ):
     """Capture only the immutable exact-ID scope approved for batch 119."""
 
     from telegram_kol_research.deepcoin_snapshot_authority import (
+        AccountSnapshotEvidence,
         build_exchange_collection_evidence,
         capture_account_snapshot,
     )
@@ -557,17 +559,41 @@ def _load_composite_batch_recovery_snapshot_read_only_impl(
             ]
         }
 
-    snapshot.account_authority = capture_account_snapshot(
-        session_factory,
-        uid_scope_hash=uid_scope_hash,
-        readers={"batch119_exact_account_composite": read_exact_account_composite},
-    )
+    try:
+        authority_session_factory = (
+            session_factory
+            if generation_session_factory is None
+            else generation_session_factory
+        )
+        snapshot.account_authority = capture_account_snapshot(
+            authority_session_factory,
+            uid_scope_hash=uid_scope_hash,
+            readers={
+                "batch119_exact_account_composite": read_exact_account_composite
+            },
+        )
+    except Exception:
+        snapshot.account_authority = AccountSnapshotEvidence(
+            uid_scope_hash=uid_scope_hash,
+            start_write_generation=0,
+            end_write_generation=0,
+            collections=(),
+            complete=False,
+            reason_code="snapshot_generation_unavailable",
+        )
+        snapshot.errors.setdefault(
+            "account_composite",
+            "snapshot_generation_unavailable",
+        )
     snapshot.collection_authority = tuple(
         MappingProxyType(dict(row)) for row in inner_authority
     )
     if snapshot.capture_ended_at is None:
         snapshot.capture_ended_at = datetime.now(UTC)
-    if not snapshot.account_authority.complete:
+    if (
+        snapshot.account_authority is not None
+        and not snapshot.account_authority.complete
+    ):
         snapshot.errors.setdefault(
             "account_composite",
             str(
@@ -617,10 +643,16 @@ def _build_batch119_capture_capability(loader_impl):
         issued[snapshot_id] = (reference, seal)
         return snapshot
 
-    def loader(session_factory, *, client: Any):
+    def loader(
+        session_factory,
+        *,
+        client: Any,
+        generation_session_factory=None,
+    ):
         return loader_impl(
             session_factory,
             client=client,
+            generation_session_factory=generation_session_factory,
             _finalize_capture=finalize,
         )
 
@@ -7092,6 +7124,13 @@ def _validated_natural_stop_proof(
         owned_by_id[order_id] = (purpose, row)
     if set(owned_by_id) != set(scoped_orders.values()):
         return "natural_stop_proof_identity_invalid"
+    if not _natural_stop_owned_orders_absent_from_pending(
+        snapshot.pending_trigger_orders,
+        owned_order_ids=frozenset(owned_by_id),
+        pos_id=str(pos_id),
+        profile=profile,
+    ):
+        return "natural_stop_proof_pending_conflict"
 
     position_rows = list(snapshot.position_history)
     if len(position_rows) != 1:
@@ -7200,6 +7239,7 @@ def _validated_natural_stop_proof(
     if not _natural_stop_position_close_matches_owned_ledger(
         position_row,
         ledger_row=owned_by_id[order_id][1],
+        successful_order_id=order_id,
     ):
         return "natural_stop_proof_position_invalid"
     if _natural_stop_has_residual_close_evidence(snapshot, pos_id=str(pos_id)):
@@ -7237,6 +7277,81 @@ def _optional_consistent_decimal(
     if any(value != first for value in values[1:]):
         return False, None
     return True, first
+
+
+_EXCHANGE_ORDER_REFERENCE_KEYS = (
+    "ordId",
+    "orderId",
+    "order_id",
+    "clientOrderId",
+    "client_order_id",
+    "clOrdId",
+    "closeOrderId",
+    "close_order_id",
+    "closeOrdId",
+)
+
+
+def _strict_explicit_reference_values(
+    row: Mapping[str, Any],
+    *,
+    keys: Sequence[str],
+) -> tuple[bool, frozenset[str]]:
+    values: set[str] = set()
+    for key in keys:
+        raw = row.get(key)
+        if raw in (None, ""):
+            continue
+        if type(raw) is not str:
+            return False, frozenset()
+        value = raw.strip()
+        if not value or len(value.encode("utf-8")) > 512:
+            return False, frozenset()
+        values.add(value)
+    return True, frozenset(values)
+
+
+def _natural_stop_owned_orders_absent_from_pending(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    owned_order_ids: frozenset[str],
+    pos_id: str,
+    profile: CompositeBatchRecoveryProfile,
+) -> bool:
+    for row in rows:
+        if not isinstance(row, Mapping):
+            return False
+        valid_refs, references = _strict_explicit_reference_values(
+            row,
+            keys=_EXCHANGE_ORDER_REFERENCE_KEYS,
+        )
+        if not valid_refs:
+            return False
+        matched_owned = references.intersection(owned_order_ids)
+        if not matched_owned:
+            continue
+        position_ids = {
+            str(row[key]).strip()
+            for key in ("posId", "pos_id", "closePosId", "close_pos_id")
+            if row.get(key) not in (None, "")
+        }
+        instruments = {
+            str(row[key]).strip().upper()
+            for key in ("instId", "instrument_id", "instrumentId")
+            if row.get(key) not in (None, "")
+        }
+        sides = _exact_row_position_sides(row)
+        if (
+            len(matched_owned) != 1
+            or position_ids != {pos_id}
+            or (instruments and instruments != {profile.instrument_id.upper()})
+            or (sides and sides != {profile.side.lower()})
+        ):
+            return False
+        # A current pending collection claiming either owned stop contradicts
+        # a terminal natural-stop proof, even if the sibling stop is the row.
+        return False
+    return True
 
 
 def _natural_stop_trigger_matches_owned_ledger(
@@ -7288,7 +7403,16 @@ def _natural_stop_position_close_matches_owned_ledger(
     row: Mapping[str, Any],
     *,
     ledger_row: Any,
+    successful_order_id: str,
 ) -> bool:
+    valid_order_refs, order_refs = _strict_explicit_reference_values(
+        row,
+        keys=_EXCHANGE_ORDER_REFERENCE_KEYS,
+    )
+    if not valid_order_refs or (
+        order_refs and order_refs != {str(successful_order_id)}
+    ):
+        return False
     valid_position, position_size = _optional_consistent_decimal(
         row,
         "pos",
@@ -7305,14 +7429,22 @@ def _natural_stop_position_close_matches_owned_ledger(
     )
     if not valid_position or not valid_close:
         return False
+    expected_size = _decimal_or_none(getattr(ledger_row, "size_text", None))
+    if expected_size is None:
+        return False
+    if expected_size == 0:
+        return bool(
+            position_size is not None
+            and close_size is not None
+            and position_size > 0
+            and position_size == close_size
+        )
     if position_size is None and close_size is None:
         return True
     if position_size is None or close_size is None:
         return False
-    expected_size = _decimal_or_none(getattr(ledger_row, "size_text", None))
     return bool(
-        expected_size is not None
-        and position_size > 0
+        position_size > 0
         and position_size == close_size == expected_size
     )
 

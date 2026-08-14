@@ -2877,6 +2877,7 @@ def test_recover_composite_management_batch_help_requires_exact_inputs():
 
     assert result.exit_code == 0, result.stdout
     assert "--database-path" in result.stdout
+    assert "--generation-database-path" in result.stdout
     assert "--batch-id" in result.stdout
     assert "--deepcoin-contract-specs-path" in result.stdout
     assert "--apply" in result.stdout
@@ -2890,6 +2891,137 @@ def _recover_composite_management_batch_paths(tmp_path: Path) -> tuple[Path, Pat
     specs_path = tmp_path / "deepcoin-contract-specs.yaml"
     specs_path.write_text("contracts: []\n", encoding="utf-8")
     return database_path, specs_path
+
+
+def test_recover_composite_management_batch_apply_requires_same_generation_database_before_client(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+
+    database_path, specs_path = _recover_composite_management_batch_paths(
+        tmp_path
+    )
+    generation_path = tmp_path / "generation.db"
+    sqlite3.connect(generation_path).close()
+    client_calls = []
+    monkeypatch.setattr(
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: client_calls.append(True),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "recover-composite-management-batch",
+            "--database-path",
+            str(database_path),
+            "--generation-database-path",
+            str(generation_path),
+            "--batch-id",
+            "119",
+            "--deepcoin-contract-specs-path",
+            str(specs_path),
+            "--apply",
+            "--expected-fingerprint",
+            "a" * 64,
+            "--authorization",
+            "I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout)["reason_code"] == (
+        "generation_database_must_match_apply_database"
+    )
+    assert client_calls == []
+
+
+def test_recover_composite_management_batch_dry_run_passes_independent_generation_factory(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.composite_management_batch_recovery import (
+        CompositeBatchRecoveryPlan,
+        CompositeRecoveryPosition,
+    )
+
+    database_path, specs_path = _recover_composite_management_batch_paths(
+        tmp_path
+    )
+    generation_path = tmp_path / "generation.db"
+    sqlite3.connect(generation_path).close()
+    factories = {}
+    loader_calls = []
+    plan = CompositeBatchRecoveryPlan(
+        batch_id=119,
+        status="ready",
+        reason_code="false_legacy_submission_proven",
+        position=CompositeRecoveryPosition(
+            disposition="position_absent",
+            current_size="0",
+            close_delta="0",
+            effective_remaining_size="0",
+        ),
+        source_fingerprint="a" * 64,
+        exchange_snapshot_fingerprint="b" * 64,
+        evidence_fingerprint="c" * 64,
+        evidence={"schema_version": 1},
+    )
+
+    def open_read_only(path):
+        factory = object()
+        factories[Path(path)] = factory
+        return factory
+
+    monkeypatch.setattr(
+        cli_module,
+        "create_composite_recovery_read_only_session_factory",
+        open_read_only,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_composite_batch_recovery_snapshot_read_only",
+        lambda factory, *, client, generation_session_factory: (
+            loader_calls.append((factory, generation_session_factory))
+            or object()
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_composite_batch_recovery_plan",
+        lambda *args, **kwargs: plan,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "recover-composite-management-batch",
+            "--database-path",
+            str(database_path),
+            "--generation-database-path",
+            str(generation_path),
+            "--batch-id",
+            "119",
+            "--deepcoin-contract-specs-path",
+            str(specs_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert loader_calls == [
+        (
+            factories[database_path.resolve()],
+            factories[generation_path.resolve()],
+        )
+    ]
 
 
 def test_recover_composite_management_batch_rejects_other_batch_before_client(
@@ -2925,6 +3057,8 @@ def test_recover_composite_management_batch_rejects_other_batch_before_client(
         [
             "recover-composite-management-batch",
             "--database-path",
+            str(database_path),
+            "--generation-database-path",
             str(database_path),
             "--batch-id",
             "120",
@@ -2989,6 +3123,8 @@ def test_recover_composite_management_batch_apply_requires_exact_gates_before_cl
             "recover-composite-management-batch",
             "--database-path",
             str(database_path),
+            "--generation-database-path",
+            str(database_path),
             "--batch-id",
             "119",
             "--deepcoin-contract-specs-path",
@@ -3032,6 +3168,8 @@ def test_recover_composite_management_batch_rejects_malformed_fingerprint_before
         [
             "recover-composite-management-batch",
             "--database-path",
+            str(database_path),
+            "--generation-database-path",
             str(database_path),
             "--batch-id",
             "119",
@@ -3110,7 +3248,7 @@ def test_recover_composite_management_batch_default_is_compact_read_only_dry_run
     monkeypatch.setattr(
         cli_module,
         "load_composite_batch_recovery_snapshot_read_only",
-        lambda factory, *, client: snapshot,
+        lambda factory, *, client, generation_session_factory: snapshot,
     )
     monkeypatch.setattr(
         cli_module,
@@ -3125,6 +3263,8 @@ def test_recover_composite_management_batch_default_is_compact_read_only_dry_run
             "recover-composite-management-batch",
             "--database-path",
             str(database_path),
+            "--generation-database-path",
+            str(database_path),
             "--batch-id",
             "119",
             "--deepcoin-contract-specs-path",
@@ -3134,7 +3274,7 @@ def test_recover_composite_management_batch_default_is_compact_read_only_dry_run
 
     assert result.exit_code == 0, result.stdout
     assert database_path.read_bytes() == before
-    assert read_only_calls == [database_path.resolve()]
+    assert read_only_calls == [database_path.resolve(), database_path.resolve()]
     assert result.stdout == json.dumps(
         {
             "mode": "dry_run",
@@ -3185,7 +3325,7 @@ def test_recover_composite_management_batch_refused_dry_run_exits_two(
     monkeypatch.setattr(
         cli_module,
         "load_composite_batch_recovery_snapshot_read_only",
-        lambda factory, *, client: object(),
+        lambda factory, *, client, generation_session_factory: object(),
     )
     monkeypatch.setattr(
         cli_module,
@@ -3198,6 +3338,8 @@ def test_recover_composite_management_batch_refused_dry_run_exits_two(
         [
             "recover-composite-management-batch",
             "--database-path",
+            str(database_path),
+            "--generation-database-path",
             str(database_path),
             "--batch-id",
             "119",
@@ -3240,6 +3382,8 @@ def test_recover_composite_management_batch_redacts_evidence_exception(
         [
             "recover-composite-management-batch",
             "--database-path",
+            str(database_path),
+            "--generation-database-path",
             str(database_path),
             "--batch-id",
             "119",
@@ -3304,7 +3448,7 @@ def test_recover_composite_management_batch_stale_fingerprint_stops_before_repai
     monkeypatch.setattr(
         cli_module,
         "load_composite_batch_recovery_snapshot_read_only",
-        lambda session_factory, *, client: object(),
+        lambda session_factory, *, client, generation_session_factory: object(),
     )
     monkeypatch.setattr(
         cli_module,
@@ -3323,6 +3467,8 @@ def test_recover_composite_management_batch_stale_fingerprint_stops_before_repai
         [
             "recover-composite-management-batch",
             "--database-path",
+            str(database_path),
+            "--generation-database-path",
             str(database_path),
             "--batch-id",
             "119",
@@ -3415,7 +3561,7 @@ def test_recover_composite_management_batch_apply_repairs_then_executes_once(
     monkeypatch.setattr(
         cli_module,
         "load_composite_batch_recovery_snapshot_read_only",
-        lambda session_factory, *, client: object(),
+        lambda session_factory, *, client, generation_session_factory: object(),
     )
     monkeypatch.setattr(
         cli_module,
@@ -3483,6 +3629,8 @@ def test_recover_composite_management_batch_apply_repairs_then_executes_once(
         [
             "recover-composite-management-batch",
             "--database-path",
+            str(database_path),
+            "--generation-database-path",
             str(database_path),
             "--batch-id",
             "119",
@@ -3582,6 +3730,8 @@ def test_recover_composite_management_batch_invalid_specs_stop_before_repair(
         [
             "recover-composite-management-batch",
             "--database-path",
+            str(database_path),
+            "--generation-database-path",
             str(database_path),
             "--batch-id",
             "119",
@@ -3697,6 +3847,8 @@ def test_recover_composite_management_batch_checks_writer_account_after_repair(
             "recover-composite-management-batch",
             "--database-path",
             str(database_path),
+            "--generation-database-path",
+            str(database_path),
             "--batch-id",
             "119",
             "--deepcoin-contract-specs-path",
@@ -3772,7 +3924,7 @@ def test_recover_composite_management_batch_position_absent_never_builds_writer(
     monkeypatch.setattr(
         cli_module,
         "load_composite_batch_recovery_snapshot_read_only",
-        lambda factory, *, client: (
+        lambda factory, *, client, generation_session_factory: (
             object()
             if client is read_client
             else (_ for _ in ()).throw(
@@ -3830,6 +3982,8 @@ def test_recover_composite_management_batch_position_absent_never_builds_writer(
         [
             "recover-composite-management-batch",
             "--database-path",
+            str(database_path),
+            "--generation-database-path",
             str(database_path),
             "--batch-id",
             "119",
@@ -3979,6 +4133,8 @@ def test_recover_composite_management_batch_resumes_audited_progress_without_rep
         [
             "recover-composite-management-batch",
             "--database-path",
+            str(database_path),
+            "--generation-database-path",
             str(database_path),
             "--batch-id",
             "119",

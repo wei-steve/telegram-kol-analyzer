@@ -1550,6 +1550,7 @@ PRODUCTION_ROOT=/opt/telegram-kol-analyzer
 PRODUCTION_DB="$PRODUCTION_ROOT/data/research.db"
 DEEPCOIN_CONTRACT_SPECS="$PRODUCTION_ROOT/config/deepcoin_contract_specs.yaml"
 REVIEWED_SHA='<exact-reviewed-sha>'
+APPROVED_REF='refs/remotes/origin/codex/deepcoin-auto-trading-v1'
 RUNTIME_PYTHON="$PRODUCTION_ROOT/.venv/bin/python"
 RECOVERY_TMP="$(mktemp -d /tmp/batch119-recovery.XXXXXX)"
 chmod 0700 "$RECOVERY_TMP"
@@ -1575,8 +1576,11 @@ trap cleanup_batch119_dry_run EXIT
 
 git -C "$PRODUCTION_ROOT" fetch --no-tags origin codex/deepcoin-auto-trading-v1
 git -C "$PRODUCTION_ROOT" cat-file -e "${REVIEWED_SHA}^{commit}"
-git -C "$PRODUCTION_ROOT" worktree add --detach "$CANDIDATE_ROOT" "$REVIEWED_SHA"
-test "$(git -C "$CANDIDATE_ROOT" rev-parse HEAD)" = "$REVIEWED_SHA"
+REMOTE_SHA="$(git -C "$PRODUCTION_ROOT" rev-parse "$APPROVED_REF")"
+test "$REMOTE_SHA" = "$REVIEWED_SHA"
+printf 'batch119 reviewed candidate: %s\n' "$REMOTE_SHA"
+git -C "$PRODUCTION_ROOT" worktree add --detach "$CANDIDATE_ROOT" "$REMOTE_SHA"
+test "$(git -C "$CANDIDATE_ROOT" rev-parse HEAD)" = "$REMOTE_SHA"
 test -z "$(git -C "$CANDIDATE_ROOT" status --porcelain)"
 
 for ATTEMPT in 1 2; do
@@ -1599,6 +1603,7 @@ PY
   PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
     telegram_kol_research.cli recover-composite-management-batch \
     --database-path "$RECOVERY_DB_COPY" \
+    --generation-database-path "$PRODUCTION_DB" \
     --batch-id 119 \
     --deepcoin-contract-specs-path "$DEEPCOIN_CONTRACT_SPECS" \
     > "$RESULT"
@@ -1608,7 +1613,9 @@ done
 
 上述命令需要已批准的只读 Deepcoin secret injection，但不得打印、复制或将凭据写入
 operator record。SQLite `.backup` 在原服务保持运行时创建一致副本；candidate bootstrap 只能改该
-0600 副本。两次结果都保留在 0700 目录中供当次脱敏比较；退出 shell 时 trap 移除
+0600 副本。`--generation-database-path` 只以 OS 只读方式查询生产库的账户写代数，
+用于识别 6 次 GET 窗口中的真实 writer drift；严禁对生产库执行 bootstrap。两次结果都保留在
+0700 目录中供当次脱敏比较；退出 shell 时 trap 移除
 detached worktree 和全部私有副本。清理前先验证 `RECOVERY_TMP` 仍精确匹配专用 `/tmp` 前缀。
 
 输出外层只有 `mode=dry_run` 和 `plan`；`plan` 只允许包含 `batch_id`、`status`、

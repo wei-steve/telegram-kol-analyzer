@@ -4616,6 +4616,9 @@ def recover_management_history(
 @app.command("recover-composite-management-batch")
 def recover_composite_management_batch(
     database_path: Path = typer.Option(..., "--database-path"),
+    generation_database_path: Path = typer.Option(
+        ..., "--generation-database-path"
+    ),
     batch_id: int = typer.Option(..., "--batch-id", min=1),
     deepcoin_contract_specs_path: Path = typer.Option(
         ..., "--deepcoin-contract-specs-path"
@@ -4652,6 +4655,11 @@ def recover_composite_management_batch(
     resolved_database_path = database_path.expanduser().resolve()
     if not resolved_database_path.is_file():
         refuse("database_path_not_existing_file")
+    resolved_generation_database_path = (
+        generation_database_path.expanduser().resolve()
+    )
+    if not resolved_generation_database_path.is_file():
+        refuse("generation_database_path_not_existing_file")
     resolved_specs_path = deepcoin_contract_specs_path.expanduser().resolve()
     if not resolved_specs_path.is_file():
         refuse("contract_specs_path_not_existing_file")
@@ -4661,6 +4669,8 @@ def recover_composite_management_batch(
         or authorization != BATCH_119_RECOVERY_AUTHORIZATION
     ):
         refuse("apply_authorization_incomplete")
+    if apply and resolved_generation_database_path != resolved_database_path:
+        refuse("generation_database_must_match_apply_database")
 
     try:
         planning_session_factory = (
@@ -4671,10 +4681,19 @@ def recover_composite_management_batch(
     except Exception:
         refuse("database_open_unavailable")
     try:
+        generation_session_factory = (
+            create_composite_recovery_read_only_session_factory(
+                resolved_generation_database_path
+            )
+        )
+    except Exception:
+        refuse("generation_database_open_unavailable")
+    try:
         read_client = _build_batch119_recovery_read_client()
         snapshot = load_composite_batch_recovery_snapshot_read_only(
             planning_session_factory,
             client=read_client,
+            generation_session_factory=generation_session_factory,
         )
         plan = build_composite_batch_recovery_plan(
             planning_session_factory,

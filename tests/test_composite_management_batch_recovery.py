@@ -24,6 +24,9 @@ from telegram_kol_research.deepcoin_snapshot_authority import (
     ExchangeCollectionEvidence,
     build_exchange_collection_evidence,
 )
+from telegram_kol_research.deepcoin_execution_operations import (
+    advance_account_write_generation,
+)
 from telegram_kol_research.models import (
     ContextResolutionAttempt,
     ExecutionBinding,
@@ -2498,6 +2501,60 @@ def _assert_natural_stop_refusal(plan, reason_code):
     assert plan.exchange_calls == 0
 
 
+def _assert_natural_stop_snapshot_refused_on_path(
+    tmp_path,
+    *,
+    invalid_snapshot_factory,
+    path,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    valid_snapshot = _natural_stop_snapshot()
+    invalid_snapshot = invalid_snapshot_factory()
+    valid_plan = _plan(factory, valid_snapshot)
+    assert valid_plan.status == "ready"
+
+    if path == "plan":
+        invalid_plan = _plan(factory, invalid_snapshot)
+        assert invalid_plan.status == "refused"
+        assert invalid_plan.production_writes == 0
+        assert invalid_plan.exchange_calls == 0
+        return
+
+    if path == "apply":
+        with pytest.raises(module.CompositeBatchRecoveryConflict):
+            _apply_recovery(
+                module,
+                factory,
+                plan=valid_plan,
+                snapshot=invalid_snapshot,
+                expected_fingerprint=valid_plan.evidence_fingerprint,
+                authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+                applied_at=NOW,
+            )
+        with factory() as session:
+            assert session.query(ExecutionEvent).count() == 0
+        return
+
+    assert path == "resume"
+    _apply_recovery(
+        module,
+        factory,
+        plan=valid_plan,
+        snapshot=valid_snapshot,
+        expected_fingerprint=valid_plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with pytest.raises(module.CompositeBatchRecoveryConflict):
+        _authorize_recovery(
+            module,
+            factory,
+            expected_fingerprint=valid_plan.evidence_fingerprint,
+            snapshot=invalid_snapshot,
+        )
+
+
 def test_natural_stop_refuses_manual_or_unowned_trigger(tmp_path):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     snapshot = _natural_stop_snapshot(
@@ -2509,6 +2566,166 @@ def test_natural_stop_refuses_manual_or_unowned_trigger(tmp_path):
     plan = _plan(factory, snapshot)
 
     _assert_natural_stop_refusal(plan, "natural_stop_proof_trigger_invalid")
+
+
+@pytest.mark.parametrize("path", ["plan", "apply", "resume"])
+@pytest.mark.parametrize(
+    "position_order_refs",
+    [
+        {"ordId": "manual-close-order"},
+        {"orderId": BACKUP_ORDER_ID},
+        {
+            "ordId": PRIMARY_ORDER_ID,
+            "clientOrderId": "conflicting-client-order",
+        },
+        {"clOrdId": 12345},
+    ],
+    ids=["manual", "other_owned_stop", "conflicting_aliases", "non_text"],
+)
+def test_natural_stop_refuses_explicit_position_close_order_conflict_on_all_paths(
+    tmp_path,
+    path,
+    position_order_refs,
+):
+    _assert_natural_stop_snapshot_refused_on_path(
+        tmp_path,
+        invalid_snapshot_factory=lambda: _natural_stop_snapshot(
+            position_history=[
+                _closed_position_history_row(**position_order_refs)
+            ]
+        ),
+        path=path,
+    )
+
+
+def test_natural_stop_accepts_matching_explicit_position_close_order(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+
+    plan = _plan(
+        factory,
+        _natural_stop_snapshot(
+            position_history=[
+                _closed_position_history_row(ordId=PRIMARY_ORDER_ID)
+            ]
+        ),
+    )
+
+    assert plan.status == "ready"
+    assert plan.position.disposition == "position_absent"
+
+
+@pytest.mark.parametrize("path", ["plan", "apply", "resume"])
+@pytest.mark.parametrize(
+    "pending_rows",
+    [
+        [
+            {
+                "ordId": PRIMARY_ORDER_ID,
+                "posId": "wrong-position",
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "state": "live",
+            }
+        ],
+        [
+            {
+                "ordId": PRIMARY_ORDER_ID,
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "state": "live",
+            }
+        ],
+        [
+            {
+                "ordId": PRIMARY_ORDER_ID,
+                "posId": POS_ID,
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "state": "live",
+            },
+            {
+                "ordId": BACKUP_ORDER_ID,
+                "posId": POS_ID,
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "state": "live",
+            },
+        ],
+        [
+            {
+                "ordId": PRIMARY_ORDER_ID,
+                "orderId": "conflicting-order",
+                "posId": POS_ID,
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "state": "live",
+            }
+        ],
+    ],
+    ids=["wrong_position", "missing_position", "both_owned_live", "alias_conflict"],
+)
+def test_natural_stop_refuses_owned_stop_still_pending_on_all_paths(
+    tmp_path,
+    path,
+    pending_rows,
+):
+    _assert_natural_stop_snapshot_refused_on_path(
+        tmp_path,
+        invalid_snapshot_factory=lambda: _natural_stop_snapshot(
+            pending_trigger_orders=pending_rows,
+        ),
+        path=path,
+    )
+
+
+@pytest.mark.parametrize("path", ["plan", "apply", "resume"])
+@pytest.mark.parametrize(
+    "invalid_order_reference",
+    [123, True, b"123"],
+    ids=["numeric", "bool", "bytes"],
+)
+def test_natural_stop_refuses_non_text_pending_order_reference_on_all_paths(
+    tmp_path,
+    path,
+    invalid_order_reference,
+):
+    _assert_natural_stop_snapshot_refused_on_path(
+        tmp_path,
+        invalid_snapshot_factory=lambda: _natural_stop_snapshot(
+            pending_trigger_orders=[
+                {
+                    "ordId": invalid_order_reference,
+                    "posId": POS_ID,
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "state": "live",
+                }
+            ],
+        ),
+        path=path,
+    )
+
+
+@pytest.mark.parametrize("invalid_order_reference", [123, True, b"123"])
+def test_pending_owned_order_classifier_fails_closed_for_non_text_reference(
+    invalid_order_reference,
+):
+    module = _recovery_module()
+
+    assert module._natural_stop_owned_orders_absent_from_pending(
+        [
+            {
+                "ordId": invalid_order_reference,
+                "posId": POS_ID,
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "state": "live",
+            }
+        ],
+        owned_order_ids=frozenset({str(invalid_order_reference)}),
+        pos_id=POS_ID,
+        profile=module.BATCH_119_RECOVERY,
+    ) is False
 
 
 @pytest.mark.parametrize(
@@ -2618,6 +2835,131 @@ def test_natural_stop_refuses_explicit_incomplete_position_close_economics(
     )
 
     _assert_natural_stop_refusal(plan, "natural_stop_proof_position_invalid")
+
+
+def _set_natural_stop_ledger_size(factory, size_text):
+    with factory() as session:
+        rows = (
+            session.query(PositionProtectionLedger)
+            .filter(
+                PositionProtectionLedger.order_id.in_(
+                    [PRIMARY_ORDER_ID, BACKUP_ORDER_ID]
+                )
+            )
+            .all()
+        )
+        assert len(rows) == 2
+        for row in rows:
+            row.size_text = size_text
+        session.commit()
+
+
+def test_natural_stop_accepts_zero_size_whole_position_full_close(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _set_natural_stop_ledger_size(factory, "0")
+
+    plan = _plan(
+        factory,
+        _natural_stop_snapshot(
+            trigger_history=[_successful_stop_trigger_row(sz="0")],
+        ),
+    )
+
+    assert plan.status == "ready"
+    assert plan.position.disposition == "position_absent"
+
+
+@pytest.mark.parametrize(
+    ("trigger_size", "position_close"),
+    [
+        ("0", "1"),
+        ("38", "38"),
+    ],
+    ids=["partial_close", "trigger_size_not_canonical"],
+)
+def test_natural_stop_refuses_invalid_zero_size_whole_position_economics(
+    tmp_path,
+    trigger_size,
+    position_close,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _set_natural_stop_ledger_size(factory, "0")
+
+    plan = _plan(
+        factory,
+        _natural_stop_snapshot(
+            trigger_history=[
+                _successful_stop_trigger_row(sz=trigger_size)
+            ],
+            position_history=[
+                _closed_position_history_row(closePos=position_close)
+            ],
+        ),
+    )
+
+    assert plan.status == "refused"
+    assert plan.production_writes == 0
+    assert plan.exchange_calls == 0
+
+
+@pytest.mark.parametrize("path", ["plan", "apply", "resume"])
+def test_natural_stop_zero_size_requires_explicit_full_close_on_all_paths(
+    tmp_path,
+    path,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _set_natural_stop_ledger_size(factory, "0")
+    valid_snapshot = _natural_stop_snapshot(
+        trigger_history=[_successful_stop_trigger_row(sz="0")],
+    )
+    invalid_snapshot = _natural_stop_snapshot(
+        trigger_history=[_successful_stop_trigger_row(sz="0")],
+        position_history=[
+            _closed_position_history_row(pos=None, closePos=None)
+        ],
+    )
+    valid_plan = _plan(factory, valid_snapshot)
+    assert valid_plan.status == "ready"
+
+    if path == "plan":
+        invalid_plan = _plan(factory, invalid_snapshot)
+        assert invalid_plan.status == "refused"
+        assert invalid_plan.production_writes == 0
+        assert invalid_plan.exchange_calls == 0
+        return
+
+    if path == "apply":
+        with pytest.raises(module.CompositeBatchRecoveryConflict):
+            _apply_recovery(
+                module,
+                factory,
+                plan=valid_plan,
+                snapshot=invalid_snapshot,
+                expected_fingerprint=valid_plan.evidence_fingerprint,
+                authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+                applied_at=NOW,
+            )
+        with factory() as session:
+            assert session.query(ExecutionEvent).count() == 0
+        return
+
+    _apply_recovery(
+        module,
+        factory,
+        plan=valid_plan,
+        snapshot=valid_snapshot,
+        expected_fingerprint=valid_plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with pytest.raises(module.CompositeBatchRecoveryConflict):
+        _authorize_recovery(
+            module,
+            factory,
+            expected_fingerprint=valid_plan.evidence_fingerprint,
+            snapshot=invalid_snapshot,
+        )
 
 
 def test_natural_stop_refuses_two_owned_stops_claiming_trigger(tmp_path):
@@ -10108,6 +10450,126 @@ def test_batch119_snapshot_uses_only_exact_history_scope(tmp_path):
     assert BACKUP_ORDER_ID not in repr(snapshot)
 
 
+def test_batch119_exact_loader_uses_live_generation_factory_not_copy_generation(
+    tmp_path,
+):
+    module = _recovery_module()
+    copy_factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    generation_path = tmp_path / "live-generation.db"
+    generation_factory = create_session_factory(generation_path)
+
+    class GenerationDriftClient(_Batch119ExactHistoryClient):
+        def read_open_orders(self, *, inst_id=None):
+            advance_account_write_generation(
+                generation_factory,
+                uid_scope_hash=self.uid_scope_hash,
+            )
+            advance_account_write_generation(
+                generation_factory,
+                uid_scope_hash=self.uid_scope_hash,
+            )
+            return super().read_open_orders(inst_id=inst_id)
+
+    client = GenerationDriftClient()
+    copy_before = (tmp_path / "batch-119.db").read_bytes()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        copy_factory,
+        generation_session_factory=generation_factory,
+        client=client,
+    )
+
+    assert snapshot.account_authority.start_write_generation == 0
+    assert snapshot.account_authority.end_write_generation == 2
+    assert snapshot.account_authority.complete is False
+    assert snapshot.account_authority.reason_code == (
+        "snapshot_write_generation_changed"
+    )
+    assert snapshot.errors["account_composite"] == (
+        "snapshot_write_generation_changed"
+    )
+    assert client.network_calls == 6
+    assert (tmp_path / "batch-119.db").read_bytes() == copy_before
+
+
+@pytest.mark.parametrize(
+    ("initial_advances", "during_capture_advances", "reason_code"),
+    [
+        (0, 1, "snapshot_write_generation_changed"),
+        (1, 0, "snapshot_write_in_progress"),
+        (2, 0, None),
+    ],
+    ids=["zero_to_one", "stable_odd", "stable_even"],
+)
+def test_batch119_exact_loader_generation_authority_states(
+    tmp_path,
+    initial_advances,
+    during_capture_advances,
+    reason_code,
+):
+    module = _recovery_module()
+    copy_factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    generation_path = tmp_path / "generation-authority.db"
+    generation_factory = create_session_factory(generation_path)
+    for _ in range(initial_advances):
+        advance_account_write_generation(
+            generation_factory,
+            uid_scope_hash="8" * 64,
+        )
+
+    class GenerationClient(_Batch119ExactHistoryClient):
+        def read_open_orders(self, *, inst_id=None):
+            for _ in range(during_capture_advances):
+                advance_account_write_generation(
+                    generation_factory,
+                    uid_scope_hash=self.uid_scope_hash,
+                )
+            return super().read_open_orders(inst_id=inst_id)
+
+    before = generation_path.read_bytes()
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        copy_factory,
+        generation_session_factory=generation_factory,
+        client=GenerationClient(),
+    )
+
+    if reason_code is None:
+        assert snapshot.errors == {}
+        assert snapshot.account_authority.complete is True
+        assert snapshot.account_authority.start_write_generation == 2
+        assert snapshot.account_authority.end_write_generation == 2
+        assert generation_path.read_bytes() == before
+    else:
+        assert snapshot.account_authority.complete is False
+        assert snapshot.account_authority.reason_code == reason_code
+
+
+def test_batch119_exact_loader_generation_query_error_is_safe_refusal(tmp_path):
+    module = _recovery_module()
+    copy_factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+
+    def broken_generation_factory():
+        raise OperationalError("SELECT generation", {}, RuntimeError("private"))
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        copy_factory,
+        generation_session_factory=broken_generation_factory,
+        client=_Batch119ExactHistoryClient(),
+    )
+    plan = module.build_composite_batch_recovery_plan(
+        copy_factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=snapshot,
+        planned_at=NOW,
+    )
+
+    assert snapshot.errors == {
+        "account_composite": "snapshot_generation_unavailable"
+    }
+    assert plan.status == "refused"
+    assert plan.reason_code == "exchange_snapshot_incomplete"
+
+
 def test_batch119_exact_history_call_bound_has_six_gets_and_no_write_reachability(
     tmp_path,
 ):
@@ -11516,6 +11978,8 @@ def test_recovery_cli_position_absent_is_repeatable_without_exchange_writes(
         "recover-composite-management-batch",
         "--database-path",
         str(database_path),
+        "--generation-database-path",
+        str(database_path),
         "--batch-id",
         "119",
         "--deepcoin-contract-specs-path",
@@ -11649,6 +12113,8 @@ def test_recovery_cli_position_absent_apply_rejects_new_durable_close(
         "recover-composite-management-batch",
         "--database-path",
         str(database_path),
+        "--generation-database-path",
+        str(database_path),
         "--batch-id",
         "119",
         "--deepcoin-contract-specs-path",
@@ -11767,6 +12233,8 @@ def test_recovery_cli_position_absent_refuses_non_v1_without_database_write(
         "recover-composite-management-batch",
         "--database-path",
         str(database_path),
+        "--generation-database-path",
+        str(database_path),
         "--batch-id",
         "119",
         "--deepcoin-contract-specs-path",
@@ -11845,6 +12313,8 @@ def test_recovery_cli_position_absent_rechecks_mimo_v1_inside_apply_lock(
     common = [
         "recover-composite-management-batch",
         "--database-path",
+        str(database_path),
+        "--generation-database-path",
         str(database_path),
         "--batch-id",
         "119",
@@ -11939,6 +12409,8 @@ def test_recovery_cli_non_absent_builds_writer_only_after_locked_mimo_gate(
     common = [
         "recover-composite-management-batch",
         "--database-path",
+        str(database_path),
+        "--generation-database-path",
         str(database_path),
         "--batch-id",
         "119",
@@ -12064,6 +12536,8 @@ def test_recovery_cli_dry_run_then_apply_closes_exactly_once_and_preserves_setti
     common = [
         "recover-composite-management-batch",
         "--database-path",
+        str(database_path),
+        "--generation-database-path",
         str(database_path),
         "--batch-id",
         "119",

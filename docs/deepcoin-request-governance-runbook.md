@@ -73,7 +73,9 @@ new private consistent database copy. Follow the complete candidate worktree,
 SQLite backup, copy-only bootstrap, and cleanup block in `docs/runbook.md`.
 That block must:
 
-- resolve the separately approved SHA after fetching the reviewed branch;
+- resolve the separately approved SHA after fetching the reviewed branch,
+  require the approved remote ref to equal that full SHA, and record that
+  non-sensitive SHA before creating the worktree;
 - create a detached candidate worktree inside a mode-0700 temporary directory;
 - create each database copy with SQLite `.backup`, set mode 0600, and pass
   `PRAGMA quick_check`;
@@ -89,11 +91,15 @@ current CLI signature:
 PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
   telegram_kol_research.cli recover-composite-management-batch \
   --database-path "$RECOVERY_DB_COPY" \
+  --generation-database-path "$PRODUCTION_DB" \
   --batch-id 119 \
   --deepcoin-contract-specs-path "$DEEPCOIN_CONTRACT_SPECS"
 ```
 
-Both results must be `ready`, report `production_writes=0` and
+The generation database is opened OS read-only and is used only to read the
+live account-write generation before and after the six GET capture. Additive
+bootstrap remains restricted to the private copy. Both results must be
+`ready`, report `production_writes=0` and
 `exchange_calls=0`, and retain identical source population, exact scope,
 collection digests, natural-stop ownership, source fingerprint, and evidence
 fingerprint. Fresh capture timestamps are required but are not semantic
