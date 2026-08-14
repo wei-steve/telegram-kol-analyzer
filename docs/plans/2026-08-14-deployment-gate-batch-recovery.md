@@ -156,6 +156,33 @@ Expected: all commands succeed. Do not convert environmental or logic failures i
 
 Review `2274d90..HEAD` for correctness, security, recovery isolation, no credential serialization, no accidental live default, and missing tests. Resolve every Critical or Important finding before continuing. Commit review-driven changes separately and repeat Steps 1–4.
 
+The 2026-08-14 local review identified five Important findings. Resolve them
+under TDD before Task 3:
+
+1. Add `deepcoin_execution_operations` to the deterministic deployment
+   preflight. Treat every state except `pre_submit_deferred`, `completed`, and
+   `submission_failed_no_exposure` as active; classify `entry_unknown`,
+   `protection_unknown`, and `recovery_required` as unknown. Add the exact
+   candidate-table prior-schema shape without accepting arbitrary missing
+   tables.
+2. Add a failing runbook regression proving the diagnostic writer query handles
+   the known pre-candidate absence of `deepcoin_execution_operations`, and that
+   `entry_confirmed` is not accepted as terminal.
+3. Add a failing recovery regression proving a stopped-service capture can run
+   when `deepcoin_account_write_generations` is absent, but only with the exact
+   batch-119 stopped-capture authorization, identical resolved database paths,
+   bounded authority evidence, and no generic snapshot change.
+4. Add a failing runbook regression proving the diagnostic fetches
+   `codex/deployment-gate-batch-recovery-plan` before validating its exact
+   remote-tracking ref.
+5. Update the apply commands and runbook to require
+   `I_APPROVE_BATCH119_ALL_DB_UNITS_STOPPED_APPLY_CAPTURE`; do not bootstrap the
+   production database.
+
+Run each new test before implementation and observe the intended failure. After
+GREEN, rerun Steps 1–4 and repeat the complete review until there are zero
+Critical and zero Important findings.
+
 ### Task 3: Push an independent reviewed recovery candidate
 
 **Files:**
@@ -244,6 +271,7 @@ Do not infer authorization from Task 4. The operator must approve a new stopped-
 
 ```text
 I_AUTHORIZE_BATCH_119_TO_REMAINING_19
+I_APPROVE_BATCH119_ALL_DB_UNITS_STOPPED_APPLY_CAPTURE
 ```
 
 **Step 2: Stop all database/writer units and create a verified backup**
@@ -270,6 +298,8 @@ PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
   --database-path /opt/telegram-kol-analyzer/data/research.db \
   --generation-database-path /opt/telegram-kol-analyzer/data/research.db \
   --batch-id 119 \
+  --stopped-service-capture-authorization \
+    I_APPROVE_BATCH119_ALL_DB_UNITS_STOPPED_APPLY_CAPTURE \
   --deepcoin-contract-specs-path \
     /opt/telegram-kol-analyzer/config/deepcoin_contract_specs.yaml
 ```
@@ -284,6 +314,8 @@ PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
   --database-path /opt/telegram-kol-analyzer/data/research.db \
   --generation-database-path /opt/telegram-kol-analyzer/data/research.db \
   --batch-id 119 \
+  --stopped-service-capture-authorization \
+    I_APPROVE_BATCH119_ALL_DB_UNITS_STOPPED_APPLY_CAPTURE \
   --deepcoin-contract-specs-path \
     /opt/telegram-kol-analyzer/config/deepcoin_contract_specs.yaml \
   --apply \

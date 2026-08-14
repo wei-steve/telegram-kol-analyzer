@@ -161,6 +161,40 @@ safe rebuild, the remaining MiMo work is verification, isolated replay, and
 later activation—not redeploying the old isolated tree. MiMo remains `v1`
 through every recovery and deployment step.
 
+### 7. Pre-deployment schema and stopped-capture authority
+
+The local review found that the recovery candidate adds durable Deepcoin
+execution operations before the ordinary deployment preflight knows how to
+classify them. The preflight must therefore treat every nonterminal protected
+entry operation as active work and treat `entry_unknown`, `protection_unknown`,
+and `recovery_required` as unknown outcomes. A recent `entry_confirmed` row is
+not terminal: it still owns the transition into protection submission. The
+candidate's additive operation table is an exact recognized prior-schema
+addition for `schema_compatible` deployment; arbitrary missing tables remain a
+refusal.
+
+The stopped-service diagnostic runs before those candidate tables necessarily
+exist in production. Its durable-writer query must first inspect
+`sqlite_master`. Absence of `deepcoin_execution_operations` is accepted only as
+the known pre-candidate schema fact; if the table exists, every state except
+`pre_submit_deferred`, `completed`, and
+`submission_failed_no_exposure` blocks the capture. The legacy mutation,
+close-reservation, and backup-stop tables are always queried. The runbook must
+fetch the independent recovery branch that owns the reviewed SHA, not the
+production branch.
+
+The apply window also precedes ordinary schema deployment, so it cannot depend
+on the candidate write-generation table and may not bootstrap production. Add
+one batch-119-only stopped-service capture authority. It requires the planning
+and generation paths to resolve to the same production database plus the fixed
+authorization
+`I_APPROVE_BATCH119_ALL_DB_UNITS_STOPPED_APPLY_CAPTURE`. The CLI and runbook
+accept it only after the separately approved apply window has stopped and
+verified every listed database/writer unit. The issued snapshot records and
+fingerprints `all_db_units_stopped` as its capture authority. Without this
+authorization the existing write-generation capture remains unchanged; no
+generic Deepcoin snapshot or writer path receives the exception.
+
 ## Failure Handling
 
 - Any service unit with an initial state other than exactly `active` or
@@ -171,6 +205,11 @@ through every recovery and deployment step.
   state.
 - Any failed cleanup, worktree removal, service restoration, or SHA verification
   makes the operation fail.
+- Any unknown or nonterminal durable Deepcoin execution operation blocks the
+  diagnostic and ordinary deployment preflight.
+- A missing or invalid stopped-service capture authorization refuses before a
+  production database mutation. It never falls back after a generation or
+  database error.
 - Before a possible exchange write, the verified database backup may be used for
   rollback. After a request might reach Deepcoin, never restore an older
   database; reconcile from exchange truth.
