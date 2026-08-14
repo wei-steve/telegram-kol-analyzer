@@ -1234,9 +1234,13 @@ def _batch119_protection_scope_evidence_fingerprint(
                 "purpose": str(purpose),
                 "order_ref": _redacted_ref("protection_order", order_id),
                 "trigger_price": _batch119_scope_decimal_marker(
-                    row.trigger_price
+                    row.trigger_price,
+                    value_kind="trigger_price",
                 ),
-                "size": _batch119_scope_decimal_marker(row.size_text),
+                "size": _batch119_scope_decimal_marker(
+                    row.size_text,
+                    value_kind="size",
+                ),
                 "status": str(row.status or "").lower(),
                 "evidence_source_ref": _redacted_ref(
                     "protection_evidence_source", evidence_source
@@ -1258,9 +1262,13 @@ def _batch119_protection_scope_evidence_fingerprint(
         ) from None
 
 
-def _batch119_scope_decimal_marker(value: Any) -> Mapping[str, str]:
-    if value is None:
-        return MappingProxyType({"kind": "none"})
+def _batch119_scope_decimal_marker(
+    value: Any,
+    *,
+    value_kind: Literal["trigger_price", "size"],
+) -> Mapping[str, str]:
+    if value_kind not in {"trigger_price", "size"} or value is None:
+        raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
     if isinstance(value, bool):
         raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
     try:
@@ -1285,6 +1293,11 @@ def _batch119_scope_decimal_marker(value: Any) -> Mapping[str, str]:
         or not isinstance(decimal_tuple.exponent, int)
         or abs(decimal_tuple.exponent) > 128
         or abs(decimal_value.adjusted()) > 128
+    ):
+        raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
+    if (
+        (value_kind == "trigger_price" and decimal_value <= 0)
+        or (value_kind == "size" and decimal_value < 0)
     ):
         raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
     try:

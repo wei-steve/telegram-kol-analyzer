@@ -6302,6 +6302,104 @@ def test_batch119_exact_scope_rejects_huge_decimal_before_network(
     assert client.network_calls == 0
 
 
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("trigger_price", None),
+        ("trigger_price", "0"),
+        ("trigger_price", "-0"),
+        ("trigger_price", "-1"),
+        ("size_text", None),
+        ("size_text", "-1"),
+    ],
+)
+@pytest.mark.parametrize("order_id", [PRIMARY_ORDER_ID, BACKUP_ORDER_ID])
+def test_batch119_exact_scope_rejects_invalid_protection_economics_before_network(
+    tmp_path,
+    field_name,
+    value,
+    order_id,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        backup = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id=order_id)
+            .one()
+        )
+        setattr(backup, field_name, value)
+        session.commit()
+    client = _Batch119ExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {"exact_scope": "exact_history_scope_invalid"}
+    assert client.network_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("trigger_price", "NaN"),
+        ("trigger_price", "Infinity"),
+        ("size_text", "-Infinity"),
+    ],
+)
+@pytest.mark.parametrize("order_id", [PRIMARY_ORDER_ID, BACKUP_ORDER_ID])
+def test_batch119_exact_scope_rejects_nonfinite_economics_before_network(
+    tmp_path,
+    field_name,
+    value,
+    order_id,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        backup = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id=order_id)
+            .one()
+        )
+        setattr(backup, field_name, value)
+        session.commit()
+    client = _Batch119ExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {"exact_scope": "exact_history_scope_invalid"}
+    assert client.network_calls == 0
+
+
+def test_batch119_exact_scope_decimal_markers_are_canonical_and_economic():
+    module = _recovery_module()
+
+    assert module._batch119_scope_decimal_marker(
+        "1",
+        value_kind="trigger_price",
+    ) == module._batch119_scope_decimal_marker(
+        "1.0",
+        value_kind="trigger_price",
+    )
+    assert module._batch119_scope_decimal_marker(
+        "1",
+        value_kind="trigger_price",
+    ) == module._batch119_scope_decimal_marker(
+        "1e0",
+        value_kind="trigger_price",
+    )
+    assert module._batch119_scope_decimal_marker(
+        "0",
+        value_kind="size",
+    ) == {"kind": "decimal", "value": "0"}
+
+
 def test_batch119_unverified_stop_is_not_skipped_for_unvalidated_recovery_event(
     tmp_path,
 ):
@@ -6443,8 +6541,35 @@ def test_batch119_canonical_audit_replay_does_not_authorize_unverified_stop_skip
     assert client.network_calls == 0
 
 
+@pytest.mark.parametrize(
+    (
+        "replacement_trigger",
+        "replacement_size",
+        "expected_errors",
+        "expected_network_calls",
+    ),
+    [
+        ("62000", "19", {}, 6),
+        (
+            None,
+            "19",
+            {"exact_scope": "exact_history_scope_invalid"},
+            0,
+        ),
+        (
+            "62000",
+            "-1",
+            {"exact_scope": "exact_history_scope_invalid"},
+            0,
+        ),
+    ],
+)
 def test_batch119_canonical_audit_skips_superseded_stop_for_exact_after_state(
     tmp_path,
+    replacement_trigger,
+    replacement_size,
+    expected_errors,
+    expected_network_calls,
 ):
     module = _recovery_module()
     factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
@@ -6479,8 +6604,8 @@ def test_batch119_canonical_audit_skips_superseded_stop_for_exact_after_state(
                 side="long",
                 order_id=replacement_order_id,
                 purpose="backup_stop",
-                trigger_price="62000",
-                size_text="19",
+                trigger_price=replacement_trigger,
+                size_text=replacement_size,
                 status="verified",
                 evidence_source="composite_management_replacement",
                 evidence_json="{}",
@@ -6499,12 +6624,13 @@ def test_batch119_canonical_audit_skips_superseded_stop_for_exact_after_state(
         client=client,
     )
 
-    assert snapshot.errors == {}
-    assert client.network_calls == 6
-    assert set(client.exact_order_ids) == {
-        PRIMARY_ORDER_ID,
-        replacement_order_id,
-    }
+    assert snapshot.errors == expected_errors
+    assert client.network_calls == expected_network_calls
+    if not expected_errors:
+        assert set(client.exact_order_ids) == {
+            PRIMARY_ORDER_ID,
+            replacement_order_id,
+        }
 
 
 def test_batch119_canonical_audit_does_not_hide_original_stop_source_drift(
