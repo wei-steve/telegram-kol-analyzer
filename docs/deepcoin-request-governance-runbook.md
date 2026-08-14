@@ -1,6 +1,6 @@
 # Deepcoin Request Governance and Protected Entry Rollout Runbook
 
-Last reviewed: 2026-08-13.
+Last reviewed: 2026-08-14.
 
 This runbook deploys the request governor and protected-entry operation model
 in separately approved stages. It is not an activation approval. Task 16 only
@@ -35,6 +35,58 @@ service, change a production setting, or send an exchange request.
   protection proof. The exception grants no recovery or writer authority.
 - Batch 119 remains a separate, dedicated recovery. Never run its planner,
   apply command, or runbook in the same deployment operation or quiet window.
+
+## Batch 119 exact-read isolation
+
+Batch 119 is not a request-governance stage and grants no exception to a Stage
+1 active-work gate. Its allowlisted CLI dry-run uses a dedicated exact scope:
+current positions, open orders, and pending TPSL; one position-history GET with
+the durable `posId`; and one trigger-history GET with `limit=100` for each of
+the two verified owned stop `ordId` values. With no durable regular-close
+reference this is exactly six GETs and zero instrument-wide history reads. An
+exact response at 100 rows without independent completion evidence remains
+`snapshot_page_limit_ambiguous`; exact identity is not pagination authority.
+
+Only one verified `stop_loss` or `backup_stop` may prove a natural stop. The
+position history must prove the same position closed after that trigger. A
+manual or unowned trigger, two stops claiming the close, any identity, owner,
+purpose, or time mismatch, a remaining current position, or any durable close
+request, response, client/exchange ID, mutation, or event stops the recovery.
+The plan emits only bounded states and hashed references, never raw position or
+order IDs, provider text, exchange JSON, or credentials.
+
+The loader issues a process-local, non-serializable capture capability. It is
+valid only for the exact snapshot object issued in the same CLI invocation; it
+is not written to JSON, the database, or an operator record and cannot be
+carried from dry-run into a later process. Every later invocation captures
+again. Before any database mutation or idempotent return, the locked
+transaction rebuilds source, exact scope, durable-close, exchange, and CAS
+evidence. All dispositions require MiMo contract v1. Any path that could need a
+writer also requires effective live settings in that same locked session and
+an exact three-way match between capture, planning read-client expected, and
+writer UID scope.
+`position_absent` builds no writer and has zero POST, cancel, close, or TPSL
+reachability.
+
+The currently authorized stop point is two read-only dry-runs, each against a
+new private consistent database copy. The command signature is:
+
+```bash
+.venv/bin/python -m telegram_kol_research.cli recover-composite-management-batch \
+  --database-path "$RECOVERY_DB_COPY" \
+  --batch-id 119 \
+  --deepcoin-contract-specs-path "$DEEPCOIN_CONTRACT_SPECS"
+```
+
+Both results must be `ready`, report `production_writes=0` and
+`exchange_calls=0`, and retain identical source population, exact scope,
+collection digests, natural-stop ownership, source fingerprint, and evidence
+fingerprint. Fresh capture timestamps are required but are not semantic
+fingerprint input. Stop after the second result. Do not add `--apply`, deploy,
+restart a service, bootstrap the production database, or change a setting.
+Apply would require a separate approval and all of `--apply`,
+`--expected-fingerprint`, and `--authorization`. Batch 119 recovery and Stage 1
+must never share a deployment operation or quiet window.
 
 ## Stage record
 
