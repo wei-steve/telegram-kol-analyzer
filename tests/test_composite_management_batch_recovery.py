@@ -6021,6 +6021,213 @@ def test_batch119_unverified_stop_is_not_skipped_for_unvalidated_recovery_event(
     assert client.network_calls == 0
 
 
+def test_batch119_canonical_audit_replay_does_not_authorize_unverified_stop_skip(
+    tmp_path,
+):
+    module = _recovery_module()
+    donor_path = tmp_path / "donor"
+    donor_path.mkdir()
+    donor_factory, _, _, _, _ = _seed_batch_119_false_submission(donor_path)
+    donor_plan = _plan(donor_factory)
+    module.apply_composite_batch_false_state_repair(
+        donor_factory,
+        plan=donor_plan,
+        expected_fingerprint=donor_plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with donor_factory() as session:
+        donor_event = session.query(ExecutionEvent).one()
+        copied_audit = {
+            "venue": donor_event.venue,
+            "action": donor_event.action,
+            "status": donor_event.status,
+            "reason": donor_event.reason,
+            "before_json": donor_event.before_json,
+            "after_json": donor_event.after_json,
+            "notification_fingerprint": donor_event.notification_fingerprint,
+            "created_at": donor_event.created_at,
+        }
+
+    target_path = tmp_path / "target"
+    target_path.mkdir()
+    target_factory, _, binding_id, entry_id, _ = (
+        _seed_batch_119_false_submission(target_path)
+    )
+    with target_factory() as session:
+        backup = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id=BACKUP_ORDER_ID)
+            .one()
+        )
+        backup.status = "superseded"
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                strategy_instance_id="deepcoin:incident:btc:long",
+                pos_id=POS_ID,
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id="replacement-backup-after-canonical-audit-replay",
+                purpose="backup_stop",
+                trigger_price="62000",
+                size_text="19",
+                status="verified",
+                evidence_source="composite_management_replacement",
+                evidence_json="{}",
+                first_seen_at=NOW,
+                last_seen_at=NOW,
+                last_verified_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.add(
+            ExecutionEvent(
+                execution_binding_id=binding_id,
+                **copied_audit,
+            )
+        )
+        session.commit()
+    client = _Batch119ExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        target_factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {"exact_scope": "exact_history_scope_invalid"}
+    assert client.network_calls == 0
+
+
+def test_batch119_canonical_audit_skips_superseded_stop_for_exact_after_state(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    plan = _plan(factory)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    replacement_order_id = "replacement-backup-after-matching-audit"
+    replacement_at = NOW.replace(second=1)
+    with factory() as session:
+        backup = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id=BACKUP_ORDER_ID)
+            .one()
+        )
+        backup.status = "superseded"
+        backup.updated_at = replacement_at
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                strategy_instance_id="deepcoin:incident:btc:long",
+                pos_id=POS_ID,
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id=replacement_order_id,
+                purpose="backup_stop",
+                trigger_price="62000",
+                size_text="19",
+                status="verified",
+                evidence_source="composite_management_replacement",
+                evidence_json="{}",
+                first_seen_at=replacement_at,
+                last_seen_at=replacement_at,
+                last_verified_at=replacement_at,
+                created_at=replacement_at,
+                updated_at=replacement_at,
+            )
+        )
+        session.commit()
+    client = _Batch119ExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {}
+    assert client.network_calls == 6
+    assert set(client.exact_order_ids) == {
+        PRIMARY_ORDER_ID,
+        replacement_order_id,
+    }
+
+
+def test_batch119_canonical_audit_does_not_hide_original_stop_source_drift(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    plan = _plan(factory)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    replacement_at = NOW.replace(second=1)
+    with factory() as session:
+        backup = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id=BACKUP_ORDER_ID)
+            .one()
+        )
+        backup.status = "superseded"
+        backup.trigger_price = "1"
+        backup.size_text = "1"
+        backup.evidence_json = '{"drift":"not-the-audited-source"}'
+        backup.updated_at = replacement_at
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                strategy_instance_id="deepcoin:incident:btc:long",
+                pos_id=POS_ID,
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id="replacement-backup-after-source-drift",
+                purpose="backup_stop",
+                trigger_price="62000",
+                size_text="19",
+                status="verified",
+                evidence_source="composite_management_replacement",
+                evidence_json="{}",
+                first_seen_at=replacement_at,
+                last_seen_at=replacement_at,
+                last_verified_at=replacement_at,
+                created_at=replacement_at,
+                updated_at=replacement_at,
+            )
+        )
+        session.commit()
+    client = _Batch119ExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {"exact_scope": "exact_history_scope_invalid"}
+    assert client.network_calls == 0
+
+
 @pytest.mark.parametrize(
     "row",
     [
@@ -6555,7 +6762,7 @@ def test_recovery_cli_dry_run_then_apply_closes_exactly_once_and_preserves_setti
     )
     assert unsafe_repeat.exit_code == 2
     assert json.loads(unsafe_repeat.stdout)["reason_code"] == (
-        "resume_component_conflict"
+        "resume_evidence_invalid"
     )
     assert len(client.close_calls) == 1
     assert len(client.set_calls) == 2
@@ -6576,5 +6783,8 @@ def test_recovery_cli_dry_run_then_apply_closes_exactly_once_and_preserves_setti
         ],
     )
 
-    assert repeated.exit_code == 0, repeated.stdout
+    assert repeated.exit_code == 2
+    assert json.loads(repeated.stdout)["reason_code"] == (
+        "resume_evidence_invalid"
+    )
     assert len(client.close_calls) == 1
