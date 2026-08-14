@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
@@ -312,6 +312,7 @@ _APPROVED_BATCH_119_PENDING_RESIDUE_IDENTITY_DIGESTS = frozenset(
 )
 _RECOVERY_AUDIT_ACTION = "composite_batch_false_state_repaired"
 _RECOVERY_REASON = "composite_recovery_false_submission_repaired"
+_MAX_FUTURE_CLOCK_SKEW = timedelta(minutes=1)
 
 
 def create_composite_recovery_read_only_session_factory(
@@ -1641,14 +1642,12 @@ def authorize_composite_batch_recovery_resume(
     *,
     expected_fingerprint: str,
     snapshot: Any,
-    observed_at: datetime | None = None,
 ) -> CompositeBatchRecoveryResumeAuthorization:
     """Authorize only a progressed state descended from the exact repair audit."""
 
     if not _is_sha256(expected_fingerprint) or not _snapshot_is_complete(
         snapshot,
         profile=BATCH_119_RECOVERY,
-        observed_at=observed_at or datetime.now(UTC),
     ):
         raise CompositeBatchRecoveryConflict("resume_evidence_invalid")
     with session_factory() as session:
@@ -1716,6 +1715,15 @@ def authorize_composite_batch_recovery_resume(
         if isinstance(contract, str) or isinstance(target, str):
             raise CompositeBatchRecoveryConflict("resume_source_state_conflict")
         disposition = str(after["position_disposition"])
+        if disposition == "position_absent" and _has_durable_close_submission(
+            session,
+            batch=batch,
+            leg=leg,
+            entry=entry,
+        ):
+            raise CompositeBatchRecoveryConflict(
+                "resume_source_state_conflict"
+            )
         original_owned_stop_refs = (
             []
             if disposition == "position_absent"
@@ -1806,6 +1814,7 @@ def authorize_composite_batch_recovery_resume(
             session,
             snapshot=snapshot,
             batch=batch,
+            raw=raw,
             leg=leg,
             entry=entry,
             components=components,
@@ -2922,6 +2931,7 @@ def _resume_exchange_close_evidence_is_owned(
     *,
     snapshot: Any,
     batch,
+    raw,
     leg,
     entry,
     components,
@@ -2953,6 +2963,7 @@ def _resume_exchange_close_evidence_is_owned(
                 not_before_ms=_incident_not_before_ms(
                     batch=batch,
                     leg=leg,
+                    raw=raw,
                 ),
             ),
             str,
@@ -3305,11 +3316,8 @@ def _build_composite_batch_recovery_plan(
         return _refusal(
             _refusal_batch_id(profile), "incident_profile_not_allowlisted"
         )
-    if not _snapshot_is_complete(
-        snapshot,
-        profile=profile,
-        observed_at=planned_at,
-    ):
+    _ = planned_at
+    if not _snapshot_is_complete(snapshot, profile=profile):
         return _refusal(profile.batch_id, "exchange_snapshot_incomplete")
 
     with session_factory() as session:
@@ -3464,6 +3472,7 @@ def _build_composite_batch_recovery_plan(
                 not_before_ms = _incident_not_before_ms(
                     batch=batch,
                     leg=leg,
+                    raw=raw,
                 )
             except CompositeBatchRecoveryRefusal as exc:
                 return _refusal(profile.batch_id, exc.reason_code)
@@ -4282,7 +4291,6 @@ def _snapshot_is_complete(
     snapshot: Any,
     *,
     profile: CompositeBatchRecoveryProfile,
-    observed_at: Any,
 ) -> bool:
     if any(not hasattr(snapshot, field) for field in _REQUIRED_SNAPSHOT_FIELDS):
         return False
@@ -4301,7 +4309,7 @@ def _snapshot_is_complete(
     capture_ended_at = getattr(snapshot, "capture_ended_at", None)
     normalized_started_at = _normalize_aware_utc_datetime(capture_started_at)
     normalized_ended_at = _normalize_aware_utc_datetime(capture_ended_at)
-    normalized_observed_at = _normalize_aware_utc_datetime(observed_at)
+    normalized_wall_clock = _normalize_aware_utc_datetime(_utc_wall_clock())
     authority_collections = getattr(authority, "collections", None)
     start_generation = getattr(authority, "start_write_generation", None)
     end_generation = getattr(authority, "end_write_generation", None)
@@ -4323,9 +4331,10 @@ def _snapshot_is_complete(
         )
         or normalized_started_at is None
         or normalized_ended_at is None
-        or normalized_observed_at is None
+        or normalized_wall_clock is None
         or normalized_started_at > normalized_ended_at
-        or normalized_ended_at > normalized_observed_at
+        or normalized_ended_at
+        > normalized_wall_clock + _MAX_FUTURE_CLOCK_SKEW
         or not _batch119_snapshot_authority_matches(
             snapshot,
             profile=profile,
@@ -4687,8 +4696,6 @@ def _has_durable_close_submission(session, *, batch, leg, entry) -> bool:
             PositionMutationIntent.execution_binding_id
             == int(batch.execution_binding_id),
             PositionMutationIntent.execution_order_leg_id == int(entry.id),
-            PositionMutationIntent.strategy_instance_id
-            == str(batch.strategy_instance_id),
             PositionMutationIntent.operation == "close_position",
         )
         .first()
@@ -4704,15 +4711,11 @@ def _has_durable_close_submission(session, *, batch, leg, entry) -> bool:
         .all()
     )
     return any(
-        (
-            event.strategy_instance_id in (None, "")
-            or str(event.strategy_instance_id)
-            == str(batch.strategy_instance_id)
-        )
-        and _is_durable_close_event_action(event.action)
+        _is_durable_close_event_action(event.action)
         and not _event_targets_other_management_entry(
             session,
             event=event,
+            batch=batch,
             leg=leg,
             entry=entry,
         )
@@ -4725,8 +4728,16 @@ def _is_durable_close_event_action(value: object) -> bool:
     return action == "strategy_management_close_submit" or "close" in action
 
 
-def _event_targets_other_management_entry(session, *, event, leg, entry) -> bool:
+def _event_targets_other_management_entry(
+    session,
+    *,
+    event,
+    batch,
+    leg,
+    entry,
+) -> bool:
     management_leg_refs: set[int] = set()
+    management_batch_refs: set[int] = set()
     for field_name in (
         "before_json",
         "after_json",
@@ -4742,27 +4753,61 @@ def _event_targets_other_management_entry(session, *, event, leg, entry) -> bool
             return False
         if not isinstance(payload, Mapping):
             return False
-        raw_refs = [
-            payload[key]
-            for key in ("management_leg_id", "managementLegId")
-            if payload.get(key) not in (None, "")
-        ]
-        for raw_ref in raw_refs:
-            if isinstance(raw_ref, bool):
-                return False
-            try:
-                management_leg_refs.add(int(str(raw_ref)))
-            except (TypeError, ValueError):
-                return False
-    if len(management_leg_refs) != 1 or int(leg.id) in management_leg_refs:
+        for keys, destination in (
+            (("management_leg_id", "managementLegId"), management_leg_refs),
+            (
+                ("management_batch_id", "managementBatchId"),
+                management_batch_refs,
+            ),
+        ):
+            for key in keys:
+                raw_ref = payload.get(key)
+                if raw_ref in (None, ""):
+                    continue
+                if isinstance(raw_ref, bool):
+                    return False
+                try:
+                    destination.add(int(str(raw_ref)))
+                except (TypeError, ValueError):
+                    return False
+    if (
+        len(management_leg_refs) != 1
+        or len(management_batch_refs) != 1
+        or int(leg.id) in management_leg_refs
+        or int(batch.id) in management_batch_refs
+    ):
         return False
     referenced_leg = session.get(
         StrategyManagementLeg,
         next(iter(management_leg_refs)),
     )
+    referenced_batch = session.get(
+        StrategyManagementBatch,
+        next(iter(management_batch_refs)),
+    )
+    if referenced_leg is None or referenced_batch is None:
+        return False
+    referenced_entry = session.get(
+        ExecutionOrderLeg,
+        int(referenced_leg.execution_order_leg_id),
+    )
     return (
-        referenced_leg is not None
-        and int(referenced_leg.execution_order_leg_id) != int(entry.id)
+        referenced_entry is not None
+        and int(referenced_leg.management_batch_id) == int(referenced_batch.id)
+        and int(referenced_leg.execution_order_leg_id) == int(referenced_entry.id)
+        and int(referenced_entry.id) != int(entry.id)
+        and int(referenced_batch.execution_binding_id)
+        == int(event.execution_binding_id)
+        and int(referenced_entry.execution_binding_id)
+        == int(event.execution_binding_id)
+        and str(event.strategy_instance_id or "")
+        == str(referenced_batch.strategy_instance_id)
+        == str(referenced_entry.strategy_instance_id or "")
+        and str(event.pos_id or "")
+        == str(referenced_leg.pos_id or "")
+        == str(referenced_entry.pos_id or "")
+        and str(referenced_batch.status)
+        in _SAFE_TERMINAL_MANAGEMENT_STATUSES
     )
 
 
@@ -5936,8 +5981,16 @@ def _normalize_aware_utc_datetime(value: Any) -> datetime | None:
     return value.astimezone(UTC)
 
 
-def _incident_not_before_ms(*, batch: Any, leg: Any) -> int:
+def _utc_wall_clock() -> datetime:
+    return datetime.now(UTC)
+
+
+def _incident_not_before_ms(*, batch: Any, leg: Any, raw: Any) -> int:
+    # Dedicated batch-119 authority: the exact allowlisted raw message is the
+    # immutable incident anchor; mutable planner/leg timestamps may only move
+    # the lower bound later, never before that source message.
     candidates = [
+        _normalize_utc_datetime(getattr(raw, "posted_at", None)),
         _normalize_utc_datetime(getattr(batch, "planned_at", None)),
         _normalize_utc_datetime(getattr(batch, "started_at", None)),
         _normalize_utc_datetime(getattr(leg, "created_at", None)),
@@ -5946,15 +5999,30 @@ def _incident_not_before_ms(*, batch: Any, leg: Any) -> int:
         raise CompositeBatchRecoveryRefusal(
             "natural_stop_time_authority_invalid"
         )
+    raw_posted_at = candidates[0]
+    wall_clock = _normalize_aware_utc_datetime(_utc_wall_clock())
+    if (
+        wall_clock is None
+        or any(value < raw_posted_at for value in candidates[1:])
+        or any(
+            value > wall_clock + _MAX_FUTURE_CLOCK_SKEW
+            for value in candidates
+        )
+    ):
+        raise CompositeBatchRecoveryRefusal(
+            "natural_stop_time_authority_invalid"
+        )
     return max(int(value.timestamp() * 1000) for value in candidates)
 
 
-def _incident_time_authority_payload(*, batch: Any, leg: Any) -> dict[str, Any]:
-    not_before_ms = _incident_not_before_ms(batch=batch, leg=leg)
+def _incident_time_authority_payload(
+    *, batch: Any, leg: Any, raw: Any
+) -> dict[str, Any]:
+    not_before_ms = _incident_not_before_ms(batch=batch, leg=leg, raw=raw)
     return {
         "schema_version": 1,
-        "basis": "batch_planned_started_management_leg_created",
-        "basis_count": 3,
+        "basis": "batch119_raw_posted_plus_durable_management_times",
+        "basis_count": 4,
         "not_before_ref": _redacted_ref(
             "natural_stop_not_before_ms", not_before_ms
         ),
@@ -6228,6 +6296,7 @@ def _source_evidence_payload(
         "natural_stop_time_authority": _incident_time_authority_payload(
             batch=batch,
             leg=leg,
+            raw=raw,
         ),
         "components": [
             {

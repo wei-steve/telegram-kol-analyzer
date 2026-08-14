@@ -480,7 +480,7 @@ def _seed_batch_119_false_submission(tmp_path):
             message_id=9001,
             text=SOURCE_TEXT,
             raw_payload=json.dumps({"credential": "secret-api-key"}),
-            posted_at=NOW,
+            posted_at=INCIDENT_STARTED,
         )
         decision = RecognitionDecision(
             raw_message_id=10532,
@@ -2755,6 +2755,44 @@ def test_natural_stop_refuses_owned_close_mutation_with_wrong_position(tmp_path)
     )
 
 
+@pytest.mark.parametrize("strategy_instance_id", ["wrong-strategy", ""])
+def test_natural_stop_refuses_owned_close_mutation_with_strategy_conflict(
+    tmp_path,
+    strategy_instance_id,
+):
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    with factory() as session:
+        session.add(
+            PositionMutationIntent(
+                idempotency_key=f"owned-close-strategy-{strategy_instance_id}",
+                operation="close_position",
+                strategy_instance_id=strategy_instance_id,
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                pos_id=POS_ID,
+                authority_fingerprint="a" * 64,
+                request_fingerprint="r" * 64,
+                status="confirmed",
+                request_json="{}",
+                response_json="{}",
+                reserved_at=NOW,
+                submitted_at=NOW,
+                confirmed_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    _assert_natural_stop_refusal(
+        plan, "durable_close_submission_evidence_present"
+    )
+
+
 @pytest.mark.parametrize("pos_id", [None, "wrong-position"])
 def test_natural_stop_refuses_owned_close_event_without_exact_position(
     tmp_path, pos_id
@@ -2768,6 +2806,32 @@ def test_natural_stop_refuses_owned_close_event_without_exact_position(
                 action="strategy_management_close_submit",
                 status="submitted",
                 pos_id=pos_id,
+                created_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    _assert_natural_stop_refusal(
+        plan, "durable_close_submission_evidence_present"
+    )
+
+
+@pytest.mark.parametrize("strategy_instance_id", [None, "wrong-strategy"])
+def test_natural_stop_refuses_same_binding_close_event_owner_conflict(
+    tmp_path,
+    strategy_instance_id,
+):
+    factory, _, binding_id, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        session.add(
+            ExecutionEvent(
+                execution_binding_id=binding_id,
+                strategy_instance_id=strategy_instance_id,
+                action="strategy_management_close_submit",
+                status="submitted",
+                pos_id=POS_ID,
                 created_at=NOW,
             )
         )
@@ -2969,6 +3033,80 @@ def test_natural_stop_does_not_claim_other_entry_management_close_event(
     assert plan.status == "ready"
 
 
+@pytest.mark.parametrize("conflict_kind", ["target_position", "target_batch"])
+def test_natural_stop_refuses_inconsistent_other_leg_event_owner_claim(
+    tmp_path,
+    conflict_kind,
+):
+    factory, _, binding_id, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        batch119 = session.get(StrategyManagementBatch, 119)
+        other_entry = ExecutionOrderLeg(
+            execution_binding_id=binding_id,
+            strategy_instance_id=batch119.strategy_instance_id,
+            leg_index=1,
+            purpose="entry",
+            order_kind="market",
+            order_id=f"conflicting-other-entry-{conflict_kind}",
+            pos_id="conflicting-other-position",
+            venue="deepcoin",
+            attribution_status="verified",
+            attribution_evidence_json='{"policy_version":2}',
+            status="active",
+        )
+        session.add(other_entry)
+        session.flush()
+        other_batch = _add_other_terminal_batch(
+            session,
+            binding_id=binding_id,
+            batch119=batch119,
+        )
+        other_batch.strategy_instance_id = batch119.strategy_instance_id
+        other_leg = StrategyManagementLeg(
+            management_batch_id=other_batch.id,
+            execution_order_leg_id=other_entry.id,
+            pos_id="conflicting-other-position",
+            leg_index=0,
+            status="succeeded",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(other_leg)
+        session.flush()
+        session.add(
+            ExecutionEvent(
+                execution_binding_id=binding_id,
+                strategy_instance_id=batch119.strategy_instance_id,
+                action="strategy_management_close_submit",
+                status="submitted",
+                pos_id=(
+                    POS_ID
+                    if conflict_kind == "target_position"
+                    else other_leg.pos_id
+                ),
+                before_json=json.dumps(
+                    {
+                        "management_batch_id": (
+                            119
+                            if conflict_kind == "target_batch"
+                            else other_batch.id
+                        ),
+                        "management_leg_id": other_leg.id,
+                    },
+                    sort_keys=True,
+                ),
+                created_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    _assert_natural_stop_refusal(
+        plan, "durable_close_submission_evidence_present"
+    )
+
+
 def test_natural_stop_refuses_residual_unowned_regular_close(tmp_path):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     residual = {
@@ -3002,8 +3140,12 @@ def test_exact_snapshot_authority_binds_capture_window(tmp_path):
     _assert_natural_stop_refusal(plan, "exchange_snapshot_incomplete")
 
 
-def test_exact_snapshot_refuses_capture_window_after_planner_clock(tmp_path):
+def test_exact_snapshot_refuses_capture_window_after_private_wall_clock(
+    tmp_path,
+    monkeypatch,
+):
     module = _recovery_module()
+    monkeypatch.setattr(module, "_utc_wall_clock", lambda: NOW, raising=False)
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     future = datetime(2036, 1, 1, tzinfo=UTC)
     snapshot = _snapshot(
@@ -3015,7 +3157,7 @@ def test_exact_snapshot_refuses_capture_window_after_planner_clock(tmp_path):
         factory,
         profile=module.BATCH_119_RECOVERY,
         snapshot=snapshot,
-        planned_at=NOW,
+        planned_at=future,
     )
 
     _assert_natural_stop_refusal(plan, "exchange_snapshot_incomplete")
@@ -3040,6 +3182,22 @@ def _move_incident_time_boundary(session, value):
     leg.created_at = value
 
 
+def test_natural_stop_planner_refuses_three_mutable_times_moved_before_raw_anchor(
+    tmp_path,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        _move_incident_time_boundary(
+            session,
+            datetime(2001, 1, 1, tzinfo=UTC),
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    _assert_natural_stop_refusal(plan, "natural_stop_time_authority_invalid")
+
+
 def test_natural_stop_apply_cas_binds_durable_incident_time_boundary(tmp_path):
     module = _recovery_module()
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
@@ -3054,7 +3212,7 @@ def test_natural_stop_apply_cas_binds_durable_incident_time_boundary(tmp_path):
 
     with pytest.raises(
         module.CompositeBatchRecoveryConflict,
-        match="source_fingerprint_conflict",
+        match="source_state_conflict",
     ):
         module.apply_composite_batch_false_state_repair(
             factory,
@@ -3096,6 +3254,92 @@ def test_natural_stop_resume_rebuilds_same_incident_time_authority(tmp_path):
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=snapshot,
         )
+
+
+@pytest.mark.parametrize("evidence_kind", ["mutation", "event"])
+def test_natural_stop_resume_refuses_new_exact_durable_close_evidence(
+    tmp_path,
+    evidence_kind,
+):
+    module = _recovery_module()
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    snapshot = _natural_stop_snapshot()
+    plan = _plan(factory, snapshot)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with factory() as session:
+        if evidence_kind == "mutation":
+            session.add(
+                PositionMutationIntent(
+                    idempotency_key="post-repair-exact-close",
+                    operation="close_position",
+                    strategy_instance_id="deepcoin:incident:btc:long",
+                    execution_binding_id=binding_id,
+                    execution_order_leg_id=entry_id,
+                    pos_id=POS_ID,
+                    authority_fingerprint="a" * 64,
+                    request_fingerprint="r" * 64,
+                    status="confirmed",
+                    request_json="{}",
+                    response_json="{}",
+                    reserved_at=NOW,
+                    submitted_at=NOW,
+                    confirmed_at=NOW,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+        else:
+            session.add(
+                ExecutionEvent(
+                    execution_binding_id=binding_id,
+                    strategy_instance_id="deepcoin:incident:btc:long",
+                    action="strategy_management_close_submit",
+                    status="confirmed",
+                    pos_id=POS_ID,
+                    created_at=NOW,
+                )
+            )
+        session.commit()
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="resume_source_state_conflict",
+    ):
+        module.authorize_composite_batch_recovery_resume(
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=snapshot,
+        )
+
+
+def test_natural_stop_resume_without_new_close_evidence_is_repeatable(tmp_path):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    snapshot = _natural_stop_snapshot()
+    plan = _plan(factory, snapshot)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+
+    resumed = module.authorize_composite_batch_recovery_resume(
+        factory,
+        expected_fingerprint=plan.evidence_fingerprint,
+        snapshot=snapshot,
+    )
+
+    assert resumed.repair_result.status == "already_repaired"
 
 
 def test_natural_stop_serialization_contains_no_raw_time_authority(tmp_path):
