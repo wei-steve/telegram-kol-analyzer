@@ -204,6 +204,7 @@ class Batch119ExactRecoverySnapshot:
     capture_started_at: datetime | None = None
     capture_ended_at: datetime | None = None
     scope_fingerprint: str | None = None
+    capture_authority: str = "write_generation"
 
 
 def build_composite_batch_recovery_status_summary(
@@ -330,6 +331,9 @@ _SAFE_TERMINAL_COMPONENT_STATUSES = frozenset(
 BATCH_119_RECOVERY_AUTHORIZATION = (
     "I_AUTHORIZE_BATCH_119_TO_REMAINING_19"
 )
+BATCH_119_STOPPED_SERVICE_CAPTURE_AUTHORIZATION = (
+    "I_APPROVE_BATCH119_ALL_DB_UNITS_STOPPED_APPLY_CAPTURE"
+)
 _RECOVERY_AUTHORIZATION = BATCH_119_RECOVERY_AUTHORIZATION
 
 # Exact SHA-256 identities from the approved read-only production baseline.
@@ -380,6 +384,7 @@ def _load_composite_batch_recovery_snapshot_read_only_impl(
     *,
     client: Any,
     generation_session_factory=None,
+    stopped_service_capture_authorized: bool = False,
     _finalize_capture: Callable[[Batch119ExactRecoverySnapshot], Any],
 ):
     """Capture only the immutable exact-ID scope approved for batch 119."""
@@ -418,6 +423,11 @@ def _load_composite_batch_recovery_snapshot_read_only_impl(
     snapshot = Batch119ExactRecoverySnapshot(
         scope_fingerprint=scope.scope_fingerprint,
         exact_scope=scope,
+        capture_authority=(
+            "all_db_units_stopped"
+            if stopped_service_capture_authorized
+            else "write_generation"
+        ),
     )
     inner_authority: list[dict[str, Any]] = []
 
@@ -569,6 +579,7 @@ def _load_composite_batch_recovery_snapshot_read_only_impl(
         return {
             "data": [
                 {
+                    "capture_authority": snapshot.capture_authority,
                     "scope_fingerprint": scope.scope_fingerprint,
                     "capture_window_fingerprint": (
                         _batch119_capture_window_fingerprint(snapshot)
@@ -585,18 +596,43 @@ def _load_composite_batch_recovery_snapshot_read_only_impl(
         }
 
     try:
-        authority_session_factory = (
-            session_factory
-            if generation_session_factory is None
-            else generation_session_factory
-        )
-        snapshot.account_authority = capture_account_snapshot(
-            authority_session_factory,
-            uid_scope_hash=uid_scope_hash,
-            readers={
-                "batch119_exact_account_composite": read_exact_account_composite
-            },
-        )
+        if stopped_service_capture_authorized:
+            try:
+                composite_response = read_exact_account_composite()
+            except Exception as exc:
+                composite_evidence = build_exchange_collection_evidence(
+                    endpoint="batch119_exact_account_composite",
+                    response=None,
+                    read_error=exc,
+                )
+            else:
+                composite_evidence = build_exchange_collection_evidence(
+                    endpoint="batch119_exact_account_composite",
+                    response=composite_response,
+                )
+            snapshot.account_authority = AccountSnapshotEvidence(
+                uid_scope_hash=uid_scope_hash,
+                start_write_generation=0,
+                end_write_generation=0,
+                collections=(composite_evidence,),
+                complete=composite_evidence.complete,
+                reason_code=composite_evidence.reason_code,
+            )
+        else:
+            authority_session_factory = (
+                session_factory
+                if generation_session_factory is None
+                else generation_session_factory
+            )
+            snapshot.account_authority = capture_account_snapshot(
+                authority_session_factory,
+                uid_scope_hash=uid_scope_hash,
+                readers={
+                    "batch119_exact_account_composite": (
+                        read_exact_account_composite
+                    )
+                },
+            )
     except Exception:
         snapshot.account_authority = AccountSnapshotEvidence(
             uid_scope_hash=uid_scope_hash,
@@ -673,11 +709,25 @@ def _build_batch119_capture_capability(loader_impl):
         *,
         client: Any,
         generation_session_factory=None,
+        stopped_service_capture_authorization: str | None = None,
     ):
+        stopped_service_capture_authorized = False
+        if stopped_service_capture_authorization is not None:
+            if not hmac.compare_digest(
+                stopped_service_capture_authorization,
+                BATCH_119_STOPPED_SERVICE_CAPTURE_AUTHORIZATION,
+            ):
+                raise ValueError(
+                    "stopped_service_capture_authorization_invalid"
+                )
+            stopped_service_capture_authorized = True
         return loader_impl(
             session_factory,
             client=client,
             generation_session_factory=generation_session_factory,
+            stopped_service_capture_authorized=(
+                stopped_service_capture_authorized
+            ),
             _finalize_capture=finalize,
         )
 
@@ -2779,6 +2829,7 @@ def _batch119_snapshot_authority_matches_unchecked(
         response={
             "data": [
                 {
+                    "capture_authority": snapshot.capture_authority,
                     "scope_fingerprint": expected_scope_fingerprint,
                     "capture_window_fingerprint": (
                         _batch119_capture_window_fingerprint(snapshot)
@@ -5280,6 +5331,7 @@ def _build_composite_batch_recovery_plan(
             },
             "exchange": {
                 "snapshot_complete": True,
+                "capture_authority": str(snapshot.capture_authority),
                 "exact_position_count": 0 if position.current_size is None else 1,
                 "regular_close_evidence_count": 0,
                 "owned_protection_count": len(ledger),
@@ -5852,6 +5904,7 @@ def _validate_recovery_plan_consistency(plan: CompositeBatchRecoveryPlan) -> Non
         raise CompositeBatchRecoveryConflict("plan_evidence_inconsistent")
     expected_exchange = {
         "snapshot_complete": True,
+        "capture_authority": exchange.get("capture_authority"),
         "exact_position_count": (
             0 if plan.position.disposition == "position_absent" else 1
         ),
@@ -5859,6 +5912,7 @@ def _validate_recovery_plan_consistency(plan: CompositeBatchRecoveryPlan) -> Non
         "owned_protection_count": exchange.get("owned_protection_count"),
     }
     owned_protection_count = exchange.get("owned_protection_count")
+    capture_authority = exchange.get("capture_authority")
     if (
         evidence.get("schema_version") != 1
         or evidence.get("batch_id") != BATCH_119_RECOVERY.batch_id
@@ -5877,6 +5931,8 @@ def _validate_recovery_plan_consistency(plan: CompositeBatchRecoveryPlan) -> Non
         or durable != expected_durable
         or not isinstance(owned_protection_count, int)
         or isinstance(owned_protection_count, bool)
+        or capture_authority
+        not in {"write_generation", "all_db_units_stopped"}
         or (
             position_absent
             and owned_protection_count != 2
@@ -6080,6 +6136,7 @@ def _batch119_capture_seal_payload(snapshot: Any) -> dict[str, Any]:
         raise TypeError("batch119 capture window invalid")
     return {
         "schema_version": 1,
+        "capture_authority": snapshot.capture_authority,
         "collections": {
             field_name: [
                 _plain_json_value(row)
@@ -6170,6 +6227,7 @@ def _batch119_capture_preflight_is_bounded(snapshot: Any) -> bool:
     authority = getattr(snapshot, "account_authority", None)
     authority_collections = getattr(authority, "collections", None)
     scope = getattr(snapshot, "exact_scope", None)
+    capture_authority = getattr(snapshot, "capture_authority", None)
     if (
         total_rows > 800
         or type(errors) is not dict
@@ -6179,6 +6237,8 @@ def _batch119_capture_preflight_is_bounded(snapshot: Any) -> bool:
         or type(authority_collections) not in (list, tuple)
         or len(authority_collections) > 16
         or not isinstance(scope, _Batch119ExactHistoryScope)
+        or capture_authority
+        not in {"write_generation", "all_db_units_stopped"}
         or _normalize_aware_utc_datetime(snapshot.capture_started_at) is None
         or _normalize_aware_utc_datetime(snapshot.capture_ended_at) is None
     ):
@@ -6198,6 +6258,7 @@ def _batch119_capture_preflight_is_bounded(snapshot: Any) -> bool:
         scope.protection_orders,
         scope.protection_evidence_fingerprints,
         snapshot.scope_fingerprint,
+        capture_authority,
         getattr(authority, "uid_scope_hash", None),
         getattr(authority, "start_write_generation", None),
         getattr(authority, "end_write_generation", None),
@@ -6306,6 +6367,7 @@ def _snapshot_is_complete(
     authority_collections = getattr(authority, "collections", None)
     start_generation = getattr(authority, "start_write_generation", None)
     end_generation = getattr(authority, "end_write_generation", None)
+    capture_authority = getattr(snapshot, "capture_authority", None)
     if (
         not _is_sha256(scope_fingerprint)
         or authority is None
@@ -6315,6 +6377,12 @@ def _snapshot_is_complete(
         or not isinstance(end_generation, int)
         or start_generation != end_generation
         or start_generation % 2 != 0
+        or capture_authority
+        not in {"write_generation", "all_db_units_stopped"}
+        or (
+            capture_authority == "all_db_units_stopped"
+            and (start_generation != 0 or end_generation != 0)
+        )
         or not isinstance(authority_collections, (list, tuple))
         or not authority_collections
         or any(
@@ -9105,6 +9173,7 @@ def _exchange_evidence_payload(
     }
     payload = {
         "schema_version": 1,
+        "capture_authority": str(snapshot.capture_authority),
         "instrument_id": profile.instrument_id,
         "side": profile.side,
         "scope_fingerprint": str(snapshot.scope_fingerprint),

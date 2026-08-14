@@ -1555,7 +1555,7 @@ PRODUCTION_ROOT=/opt/telegram-kol-analyzer
 PRODUCTION_DB="$PRODUCTION_ROOT/data/research.db"
 DEEPCOIN_CONTRACT_SPECS="$PRODUCTION_ROOT/config/deepcoin_contract_specs.yaml"
 REVIEWED_SHA='<exact-reviewed-sha>'
-APPROVED_REF='refs/remotes/origin/codex/deepcoin-auto-trading-v1'
+APPROVED_REF='refs/remotes/origin/codex/deployment-gate-batch-recovery-plan'
 RUNTIME_PYTHON="$PRODUCTION_ROOT/.venv/bin/python"
 RECOVERY_TMP="$(mktemp -d /tmp/batch119-recovery.XXXXXX)"
 chmod 0700 "$RECOVERY_TMP"
@@ -1643,7 +1643,7 @@ for UNIT in "${QUIESCE_UNITS[@]}"; do
   esac
 done
 
-git -C "$PRODUCTION_ROOT" fetch --no-tags origin codex/deepcoin-auto-trading-v1
+git -C "$PRODUCTION_ROOT" fetch --no-tags origin codex/deployment-gate-batch-recovery-plan
 git -C "$PRODUCTION_ROOT" cat-file -e "${REVIEWED_SHA}^{commit}"
 REMOTE_SHA="$(git -C "$PRODUCTION_ROOT" rev-parse "$APPROVED_REF")"
 test "$REMOTE_SHA" = "$REVIEWED_SHA"
@@ -1668,15 +1668,25 @@ if pgrep -f '[t]elegram_kol_research|[t]elegram-kol' >/dev/null; then
 fi
 
 # 任何 durable active/unknown writer 事实都使诊断拒绝。只读查询失败也必须拒绝。
+DEEPCOIN_OPERATION_TABLE_PRESENT="$(sqlite3 -readonly "$PRODUCTION_DB" \
+  "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='deepcoin_execution_operations';")"
+DEEPCOIN_OPERATION_ACTIVE_COUNT=0
+case "$DEEPCOIN_OPERATION_TABLE_PRESENT" in
+  0) ;;
+  1)
+    DEEPCOIN_OPERATION_ACTIVE_COUNT="$(sqlite3 -readonly "$PRODUCTION_DB" <<'SQL'
+SELECT COUNT(*) FROM deepcoin_execution_operations
+ WHERE state IS NULL OR state NOT IN (
+   'pre_submit_deferred','completed','submission_failed_no_exposure'
+ );
+SQL
+)"
+    ;;
+  *) exit 1 ;;
+esac
 ACTIVE_OR_UNKNOWN_WRITERS="$(sqlite3 -readonly "$PRODUCTION_DB" <<'SQL'
 SELECT SUM(n) FROM (
-  SELECT COUNT(*) AS n FROM deepcoin_execution_operations
-   WHERE state NOT IN (
-     'entry_rejected','entry_confirmed','protected','pre_submit_deferred',
-     'completed','submission_failed_no_exposure'
-   )
-  UNION ALL
-  SELECT COUNT(*) FROM position_mutation_intents
+  SELECT COUNT(*) AS n FROM position_mutation_intents
    WHERE status IN ('reserved','submitting','submitted','recovery_required')
   UNION ALL
   SELECT COUNT(*) FROM bound_position_close_reservations
@@ -1690,6 +1700,7 @@ SELECT SUM(n) FROM (
 );
 SQL
 )"
+test "$DEEPCOIN_OPERATION_ACTIVE_COUNT" = 0
 test "$ACTIVE_OR_UNKNOWN_WRITERS" = 0
 
 for ATTEMPT in 1 2; do
@@ -1778,8 +1789,12 @@ management component、mutation intent、recovery 或交易所对账；每个开
 `--apply`，也不得部署、安装、bootstrap 生产数据库或更改交易设置。将来如获得单独 apply 批准，
 必须重新进入停服窗口、在停服后直接对生产库做最后一次新 capture，不得复用本次诊断副本、fingerprint 或
 停服 permit。CLI 仍必须
-同时提供 `--generation-database-path`、`--apply`、`--expected-fingerprint` 和
-`--authorization`。apply 时，`--generation-database-path` 与 `--database-path` 经路径解析后必须
+同时提供 `--generation-database-path`、`--apply`、`--expected-fingerprint`、
+`--authorization` 和固定值
+`--stopped-service-capture-authorization I_APPROVE_BATCH119_ALL_DB_UNITS_STOPPED_APPLY_CAPTURE`。
+该额外授权只表示本次 Batch 119 直接生产 capture 依据为所有已列举数据库写单元均已停止；
+不得用于通用 snapshot，也不允许 bootstrap 生产库。apply 时，
+`--generation-database-path` 与 `--database-path` 经路径解析后必须
 完全相同，否则 CLI 拒绝继续。当前阶段仍禁止任何 apply，该授权不属于当前步骤。
 
 停服脚本只接受每个列举单元的初始状态为精确 `active` 或 `inactive`；

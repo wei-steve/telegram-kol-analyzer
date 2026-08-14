@@ -11269,6 +11269,65 @@ def test_batch119_exact_loader_generation_query_error_is_safe_refusal(tmp_path):
     assert plan.reason_code == "exchange_snapshot_incomplete"
 
 
+def test_batch119_stopped_service_capture_does_not_require_generation_table(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(
+        tmp_path,
+        native_sl_backup=True,
+    )
+    with factory() as session:
+        session.execute(text("DROP TABLE deepcoin_account_write_generations"))
+        session.commit()
+    factory.kw["bind"].dispose()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        generation_session_factory=factory,
+        client=_Batch119AbsentExactHistoryClient(),
+        stopped_service_capture_authorization=(
+            "I_APPROVE_BATCH119_ALL_DB_UNITS_STOPPED_APPLY_CAPTURE"
+        ),
+    )
+    plan = module.build_composite_batch_recovery_plan(
+        factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=snapshot,
+        planned_at=NOW,
+    )
+
+    assert snapshot.errors == {}
+    assert snapshot.capture_authority == "all_db_units_stopped"
+    assert snapshot.account_authority.start_write_generation == 0
+    assert snapshot.account_authority.end_write_generation == 0
+    assert plan.status == "ready"
+    assert plan.position.disposition == "position_absent"
+    assert plan.evidence["exchange"]["capture_authority"] == (
+        "all_db_units_stopped"
+    )
+    assert plan.production_writes == 0
+    assert plan.exchange_calls == 0
+
+
+def test_batch119_stopped_service_capture_rejects_wrong_authorization(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+
+    with pytest.raises(
+        ValueError,
+        match="stopped_service_capture_authorization_invalid",
+    ):
+        module.load_composite_batch_recovery_snapshot_read_only(
+            factory,
+            generation_session_factory=factory,
+            client=_Batch119AbsentExactHistoryClient(),
+            stopped_service_capture_authorization="wrong",
+        )
+
+
 def test_batch119_exact_history_call_bound_has_six_gets_and_no_write_reachability(
     tmp_path,
 ):

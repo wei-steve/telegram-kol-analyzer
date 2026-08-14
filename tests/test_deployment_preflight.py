@@ -404,6 +404,9 @@ def _create_preflight_database(path: Path) -> None:
             id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
         );
         CREATE TABLE execution_events (id INTEGER PRIMARY KEY);
+        CREATE TABLE deepcoin_execution_operations (
+            id INTEGER PRIMARY KEY, state TEXT, updated_at TEXT
+        );
         CREATE TABLE execution_order_legs (
             id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
         );
@@ -1024,6 +1027,42 @@ def test_schema_change_accepts_known_prior_schema_after_dry_run(tmp_path):
     assert facts.schema_migration_dry_run_valid is True
 
 
+def test_schema_change_accepts_prior_execution_operation_schema(tmp_path):
+    import sqlite3
+
+    database = tmp_path / "prior.db"
+    backup = tmp_path / "prior.backup.db"
+    dry_run = tmp_path / "prior.dry-run.db"
+    create_session_factory(database)
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE deepcoin_execution_operations")
+    connection.commit()
+    connection.close()
+    source = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    target = sqlite3.connect(backup)
+    source.backup(target)
+    target.close()
+    source.close()
+    source = sqlite3.connect(f"file:{backup}?mode=ro", uri=True)
+    target = sqlite3.connect(dry_run)
+    source.backup(target)
+    target.close()
+    source.close()
+    create_session_factory(dry_run)
+
+    facts = collect_deployment_preflight_facts(
+        database_path=database,
+        change_class="schema_compatible",
+        schema_backup_path=backup,
+        schema_migration_dry_run_path=dry_run,
+        now=NOW,
+    )
+
+    assert facts.prior_schema_missing_table_count == 1
+    assert facts.schema_backup_valid is True
+    assert facts.schema_migration_dry_run_valid is True
+
+
 def test_schema_change_rejects_unrecognized_missing_table_set(tmp_path):
     import sqlite3
 
@@ -1247,3 +1286,174 @@ def test_collector_accepts_current_application_schema(tmp_path):
         "trade_signal_max_id": 0,
         "execution_event_max_id": 0,
     }
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "planned",
+        "entry_prepared",
+        "entry_submitting",
+        "entry_pending_readback",
+        "entry_unknown",
+        "entry_rejected",
+        "entry_confirmed",
+        "protection_prepared",
+        "protection_pending_readback",
+        "protection_unknown",
+        "protected",
+        "next_leg_preflight",
+        "recovery_required",
+    ],
+)
+def test_collector_blocks_every_nonterminal_deepcoin_execution_operation(
+    tmp_path,
+    state,
+):
+    import sqlite3
+
+    database = tmp_path / f"operation-{state}.db"
+    create_session_factory(database)
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "INSERT INTO deepcoin_execution_operations ("
+        "operation_key, trade_signal_id, contract_version, phase, state, "
+        "outcome_certainty, request_fingerprint, economics_fingerprint, "
+        "deadline_at, attempt_count, state_version, evidence_json, "
+        "created_at, updated_at) VALUES (?, 1, '1', 'reconciliation', ?, "
+        "'confirmed', ?, ?, ?, 0, 0, '{}', ?, ?)",
+        (
+            f"preflight-{state}",
+            state,
+            "a" * 64,
+            "b" * 64,
+            (NOW + timedelta(minutes=5)).replace(tzinfo=None).isoformat(" "),
+            NOW.replace(tzinfo=None).isoformat(" "),
+            NOW.replace(tzinfo=None).isoformat(" "),
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    facts = collect_deployment_preflight_facts(
+        database_path=database,
+        change_class="code",
+        now=NOW,
+    )
+
+    assert facts.fresh_active_work["deepcoin_execution_operations"] == 1
+
+
+@pytest.mark.parametrize("state", ["entry_confirmed", "future_state"])
+def test_collector_blocks_old_nonterminal_deepcoin_operation(
+    tmp_path,
+    state,
+):
+    import sqlite3
+
+    database = tmp_path / f"operation-old-{state}.db"
+    _create_preflight_database(database)
+    connection = sqlite3.connect(database)
+    old = (NOW - timedelta(days=1)).replace(tzinfo=None).isoformat(" ")
+    connection.execute("DELETE FROM trade_signals")
+    connection.execute(
+        "UPDATE instruction_execution_contracts SET state = 'completed'"
+    )
+    connection.execute(
+        "INSERT INTO deepcoin_execution_operations VALUES (1, ?, ?)",
+        (state, old),
+    )
+    connection.commit()
+    connection.close()
+
+    facts = collect_deployment_preflight_facts(
+        database_path=database,
+        change_class="code",
+        now=NOW,
+    )
+
+    artifact = _build("code", facts)
+
+    assert facts.fresh_active_work["deepcoin_execution_operations"] == 1
+    assert artifact["decision"] == "BLOCK"
+    assert "fresh_active_exchange_work" in artifact["reason_codes"]
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["entry_unknown", "protection_unknown", "recovery_required"],
+)
+def test_collector_counts_historical_deepcoin_unknown_outcomes(tmp_path, state):
+    import sqlite3
+
+    database = tmp_path / f"historical-{state}.db"
+    create_session_factory(database)
+    connection = sqlite3.connect(database)
+    old = (NOW - timedelta(days=1)).replace(tzinfo=None).isoformat(" ")
+    connection.execute(
+        "INSERT INTO deepcoin_execution_operations ("
+        "operation_key, trade_signal_id, contract_version, phase, state, "
+        "outcome_certainty, request_fingerprint, economics_fingerprint, "
+        "deadline_at, attempt_count, state_version, evidence_json, "
+        "created_at, updated_at) VALUES (?, 1, '1', 'reconciliation', ?, "
+        "'unknown', ?, ?, ?, 0, 0, '{}', ?, ?)",
+        (
+            f"historical-{state}",
+            state,
+            "a" * 64,
+            "b" * 64,
+            old,
+            old,
+            old,
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    facts = collect_deployment_preflight_facts(
+        database_path=database,
+        change_class="code",
+        now=NOW,
+    )
+
+    assert facts.historical_unknown_outcome_count == 1
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["pre_submit_deferred", "completed", "submission_failed_no_exposure"],
+)
+def test_collector_ignores_terminal_deepcoin_execution_operations(tmp_path, state):
+    import sqlite3
+
+    database = tmp_path / f"terminal-{state}.db"
+    create_session_factory(database)
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "INSERT INTO deepcoin_execution_operations ("
+        "operation_key, trade_signal_id, contract_version, phase, state, "
+        "outcome_certainty, request_fingerprint, economics_fingerprint, "
+        "deadline_at, attempt_count, state_version, evidence_json, "
+        "created_at, updated_at) VALUES (?, 1, '1', 'completed', ?, "
+        "'confirmed', ?, ?, ?, 0, 0, '{}', ?, ?)",
+        (
+            f"terminal-{state}",
+            state,
+            "a" * 64,
+            "b" * 64,
+            NOW.replace(tzinfo=None).isoformat(" "),
+            NOW.replace(tzinfo=None).isoformat(" "),
+            NOW.replace(tzinfo=None).isoformat(" "),
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    facts = collect_deployment_preflight_facts(
+        database_path=database,
+        change_class="code",
+        now=NOW,
+    )
+
+    assert facts.fresh_active_work == {}
+    assert facts.historical_unknown_outcome_count == 0

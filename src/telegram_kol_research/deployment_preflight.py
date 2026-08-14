@@ -73,6 +73,7 @@ _KNOWN_PRIOR_SCHEMA_MISSING_TABLE_SETS = frozenset(
                 "strategy_break_even_convergence_legs",
             }
         ),
+        frozenset({"deepcoin_execution_operations"}),
     }
 )
 
@@ -179,10 +180,29 @@ class _TableWorkSpec:
     state_column: str
     active_states: tuple[str, ...]
     unknown_states: tuple[str, ...] = ()
+    terminal_states: tuple[str, ...] = ()
+    block_regardless_of_age: bool = False
     time_column: str = "updated_at"
 
 
 _WORK_SPECS = (
+    _TableWorkSpec(
+        "deepcoin_execution_operations",
+        "deepcoin_execution_operations",
+        "state",
+        (),
+        unknown_states=(
+            "entry_unknown",
+            "protection_unknown",
+            "recovery_required",
+        ),
+        terminal_states=(
+            "pre_submit_deferred",
+            "completed",
+            "submission_failed_no_exposure",
+        ),
+        block_regardless_of_age=True,
+    ),
     _TableWorkSpec(
         "execution_order_legs",
         "execution_order_legs",
@@ -656,30 +676,54 @@ def collect_deployment_preflight_facts(
                     raise DeploymentPreflightInputError(
                         "database_schema_incomplete"
                     )
-                active_placeholders = ",".join("?" for _ in spec.active_states)
-                base = (
-                    f"FROM {_safe_identifier(spec.table)} "
-                    f"WHERE {_safe_identifier(spec.state_column)} "
-                    f"IN ({active_placeholders})"
-                )
-                current = int(
-                    connection.execute(
-                        "SELECT COUNT(*) "
-                        + base
-                        + f" AND {_safe_identifier(spec.time_column)} >= ?",
-                        (*spec.active_states, cutoff),
-                    ).fetchone()[0]
-                )
+                if spec.terminal_states:
+                    terminal_placeholders = ",".join(
+                        "?" for _ in spec.terminal_states
+                    )
+                    base = (
+                        f"FROM {_safe_identifier(spec.table)} "
+                        f"WHERE ({_safe_identifier(spec.state_column)} "
+                        f"IS NULL OR {_safe_identifier(spec.state_column)} "
+                        f"NOT IN ({terminal_placeholders}))"
+                    )
+                    active_parameters = spec.terminal_states
+                else:
+                    active_placeholders = ",".join(
+                        "?" for _ in spec.active_states
+                    )
+                    base = (
+                        f"FROM {_safe_identifier(spec.table)} "
+                        f"WHERE {_safe_identifier(spec.state_column)} "
+                        f"IN ({active_placeholders})"
+                    )
+                    active_parameters = spec.active_states
+                if spec.block_regardless_of_age:
+                    current = int(
+                        connection.execute(
+                            "SELECT COUNT(*) " + base,
+                            active_parameters,
+                        ).fetchone()[0]
+                    )
+                else:
+                    current = int(
+                        connection.execute(
+                            "SELECT COUNT(*) "
+                            + base
+                            + f" AND {_safe_identifier(spec.time_column)} >= ?",
+                            (*active_parameters, cutoff),
+                        ).fetchone()[0]
+                    )
                 if current:
                     fresh[spec.output_name] = current
-                historical_active += int(
-                    connection.execute(
-                        "SELECT COUNT(*) "
-                        + base
-                        + f" AND {_safe_identifier(spec.time_column)} < ?",
-                        (*spec.active_states, cutoff),
-                    ).fetchone()[0]
-                )
+                if not spec.block_regardless_of_age:
+                    historical_active += int(
+                        connection.execute(
+                            "SELECT COUNT(*) "
+                            + base
+                            + f" AND {_safe_identifier(spec.time_column)} < ?",
+                            (*active_parameters, cutoff),
+                        ).fetchone()[0]
+                    )
                 if spec.unknown_states:
                     unknown_placeholders = ",".join(
                         "?" for _ in spec.unknown_states

@@ -318,6 +318,7 @@ def _validate_evidence(plan: dict[str, Any]) -> None:
     exchange = evidence.get("exchange")
     if not isinstance(exchange, dict) or set(exchange) != {
         "snapshot_complete",
+        "capture_authority",
         "exact_position_count",
         "regular_close_evidence_count",
         "owned_protection_count",
@@ -326,6 +327,7 @@ def _validate_evidence(plan: dict[str, Any]) -> None:
     owned_count = exchange.get("owned_protection_count")
     if not (
         exchange.get("snapshot_complete") is True
+        and exchange.get("capture_authority") == "write_generation"
         and exchange.get("exact_position_count") == 0
         and not isinstance(exchange.get("exact_position_count"), bool)
         and exchange.get("regular_close_evidence_count") == 0

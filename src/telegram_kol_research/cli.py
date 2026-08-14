@@ -49,6 +49,7 @@ from telegram_kol_research.config import (
 from telegram_kol_research.composite_management_batch_recovery import (
     BATCH_119_RECOVERY,
     BATCH_119_RECOVERY_AUTHORIZATION,
+    BATCH_119_STOPPED_SERVICE_CAPTURE_AUTHORIZATION,
     CompositeBatchRecoveryConflict,
     apply_composite_batch_false_state_repair,
     authorize_composite_batch_recovery_resume,
@@ -4628,6 +4629,10 @@ def recover_composite_management_batch(
         None, "--expected-fingerprint"
     ),
     authorization: str | None = typer.Option(None, "--authorization"),
+    stopped_service_capture_authorization: str | None = typer.Option(
+        None,
+        "--stopped-service-capture-authorization",
+    ),
 ) -> None:
     """Dry-run or explicitly apply the exact batch-119 recovery."""
 
@@ -4663,6 +4668,20 @@ def recover_composite_management_batch(
     resolved_specs_path = deepcoin_contract_specs_path.expanduser().resolve()
     if not resolved_specs_path.is_file():
         refuse("contract_specs_path_not_existing_file")
+    stopped_service_capture_requested = (
+        stopped_service_capture_authorization is not None
+    )
+    if (
+        stopped_service_capture_requested
+        and stopped_service_capture_authorization
+        != BATCH_119_STOPPED_SERVICE_CAPTURE_AUTHORIZATION
+    ):
+        refuse("stopped_service_capture_authorization_invalid")
+    if (
+        stopped_service_capture_requested
+        and resolved_generation_database_path != resolved_database_path
+    ):
+        refuse("stopped_service_capture_database_mismatch")
     if apply and (
         not expected_fingerprint
         or re.fullmatch(r"[0-9a-f]{64}", expected_fingerprint) is None
@@ -4690,10 +4709,17 @@ def recover_composite_management_batch(
         refuse("generation_database_open_unavailable")
     try:
         read_client = _build_batch119_recovery_read_client()
+        snapshot_kwargs = {
+            "client": read_client,
+            "generation_session_factory": generation_session_factory,
+        }
+        if stopped_service_capture_requested:
+            snapshot_kwargs["stopped_service_capture_authorization"] = (
+                stopped_service_capture_authorization
+            )
         snapshot = load_composite_batch_recovery_snapshot_read_only(
             planning_session_factory,
-            client=read_client,
-            generation_session_factory=generation_session_factory,
+            **snapshot_kwargs,
         )
         plan = build_composite_batch_recovery_plan(
             planning_session_factory,

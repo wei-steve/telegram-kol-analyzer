@@ -62,6 +62,7 @@ def _valid_dry_run() -> dict[str, object]:
         },
         "exchange": {
             "snapshot_complete": True,
+            "capture_authority": "write_generation",
             "exact_position_count": 0,
             "regular_close_evidence_count": 0,
             "owned_protection_count": 2,
@@ -215,6 +216,29 @@ def test_batch119_runbook_requires_all_units_inactive_and_cleanup_failure_nonzer
     )
 
     assert result.returncode == 7
+
+
+def test_batch119_runbook_handles_prior_schema_and_fetches_reviewed_branch():
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    diagnostic = runbook.split(
+        "# 任何 durable active/unknown writer 事实都使诊断拒绝。",
+        1,
+    )[1].split("for ATTEMPT in 1 2; do", 1)[0]
+
+    assert "sqlite_master" in diagnostic
+    assert "deepcoin_execution_operations" in diagnostic
+    assert "entry_confirmed" not in diagnostic
+    assert "state IS NULL" in diagnostic
+    assert "pre_submit_deferred" in diagnostic
+    assert "submission_failed_no_exposure" in diagnostic
+    assert (
+        "git -C \"$PRODUCTION_ROOT\" fetch --no-tags origin "
+        "codex/deployment-gate-batch-recovery-plan"
+    ) in runbook
+    assert (
+        "APPROVED_REF='refs/remotes/origin/"
+        "codex/deployment-gate-batch-recovery-plan'"
+    ) in runbook
 
 
 def test_batch119_dry_run_comparator_rejects_identical_nonabsent_empty_evidence(

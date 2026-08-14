@@ -339,6 +339,7 @@ def test_deployment_preflight_cli_writes_verifiable_json(tmp_path):
             instrument_id TEXT, side TEXT, purpose TEXT, status TEXT
         );
         CREATE TABLE source_message_deletion_exits (id INTEGER PRIMARY KEY, state TEXT, updated_at TEXT);
+        CREATE TABLE deepcoin_execution_operations (id INTEGER PRIMARY KEY, state TEXT, updated_at TEXT);
         """
     )
     connection.execute(
@@ -2879,6 +2880,7 @@ def test_recover_composite_management_batch_help_requires_exact_inputs():
     assert "--database-path" in result.stdout
     assert "--generation-database-path" in result.stdout
     assert "--batch-id" in result.stdout
+    assert "--stopped-service-capture-authorization" in result.stdout
     assert "--deepcoin-contract-specs-path" in result.stdout
     assert "--apply" in result.stdout
     assert "--expected-fingerprint" in result.stdout
@@ -2934,6 +2936,88 @@ def test_recover_composite_management_batch_apply_requires_same_generation_datab
     assert result.exit_code == 2
     assert json.loads(result.stdout)["reason_code"] == (
         "generation_database_must_match_apply_database"
+    )
+    assert client_calls == []
+
+
+def test_recover_composite_management_batch_rejects_invalid_stopped_capture_before_client(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+
+    database_path, specs_path = _recover_composite_management_batch_paths(
+        tmp_path
+    )
+    client_calls = []
+    monkeypatch.setattr(
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: client_calls.append(True),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "recover-composite-management-batch",
+            "--database-path",
+            str(database_path),
+            "--generation-database-path",
+            str(database_path),
+            "--batch-id",
+            "119",
+            "--stopped-service-capture-authorization",
+            "wrong",
+            "--deepcoin-contract-specs-path",
+            str(specs_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout)["reason_code"] == (
+        "stopped_service_capture_authorization_invalid"
+    )
+    assert client_calls == []
+
+
+def test_recover_composite_management_batch_stopped_capture_requires_same_database(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+
+    database_path, specs_path = _recover_composite_management_batch_paths(
+        tmp_path
+    )
+    generation_path = tmp_path / "generation.db"
+    sqlite3.connect(generation_path).close()
+    client_calls = []
+    monkeypatch.setattr(
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: client_calls.append(True),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "recover-composite-management-batch",
+            "--database-path",
+            str(database_path),
+            "--generation-database-path",
+            str(generation_path),
+            "--batch-id",
+            "119",
+            "--stopped-service-capture-authorization",
+            "I_APPROVE_BATCH119_ALL_DB_UNITS_STOPPED_APPLY_CAPTURE",
+            "--deepcoin-contract-specs-path",
+            str(specs_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout)["reason_code"] == (
+        "stopped_service_capture_database_mismatch"
     )
     assert client_calls == []
 
