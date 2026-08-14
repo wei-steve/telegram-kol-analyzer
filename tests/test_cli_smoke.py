@@ -2902,10 +2902,22 @@ def test_recover_composite_management_batch_rejects_other_batch_before_client(
         tmp_path
     )
     client_calls = []
+    exact_loader_calls = []
+    monkeypatch.setattr(
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: client_calls.append("read"),
+        raising=False,
+    )
     monkeypatch.setattr(
         cli_module,
         "build_deepcoin_client_from_env",
-        lambda: client_calls.append(True),
+        lambda: client_calls.append("writer"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_composite_batch_recovery_snapshot_read_only",
+        lambda *args, **kwargs: exact_loader_calls.append(True),
     )
 
     result = CliRunner().invoke(
@@ -2924,6 +2936,35 @@ def test_recover_composite_management_batch_rejects_other_batch_before_client(
     assert result.exit_code == 2
     assert "incident_batch_not_allowlisted" in result.stdout
     assert client_calls == []
+    assert exact_loader_calls == []
+
+
+def test_batch119_recovery_read_capability_exposes_no_writer_methods():
+    import telegram_kol_research.cli as cli_module
+
+    transport = SimpleNamespace(
+        uid_scope_hash="a" * 64,
+        read_positions=lambda **kwargs: {},
+        read_open_orders=lambda **kwargs: {},
+        read_trigger_orders_pending=lambda **kwargs: {},
+        read_position_history=lambda **kwargs: {},
+        read_trigger_order_history=lambda **kwargs: {},
+        place_order=lambda payload: {"code": "0"},
+        cancel_position_sltp=lambda payload: {"code": "0"},
+        set_position_sltp=lambda payload: {"code": "0"},
+    )
+
+    client = cli_module._Batch119RecoveryReadClient(transport)
+
+    assert client.uid_scope_hash == "a" * 64
+    for method_name in (
+        "place_order",
+        "cancel_order",
+        "cancel_position_sltp",
+        "set_position_sltp",
+        "trigger_order",
+    ):
+        assert not hasattr(client, method_name)
 
 
 def test_recover_composite_management_batch_apply_requires_exact_gates_before_client(
@@ -2959,6 +3000,55 @@ def test_recover_composite_management_batch_apply_requires_exact_gates_before_cl
     assert result.exit_code == 2
     assert "apply_authorization_incomplete" in result.stdout
     assert client_calls == []
+
+
+def test_recover_composite_management_batch_rejects_malformed_fingerprint_before_db(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+
+    database_path, specs_path = _recover_composite_management_batch_paths(
+        tmp_path
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "create_existing_session_factory",
+        lambda path: (_ for _ in ()).throw(
+            AssertionError("invalid fingerprint must stop before DB")
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("invalid fingerprint must stop before client")
+        ),
+        raising=False,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "recover-composite-management-batch",
+            "--database-path",
+            str(database_path),
+            "--batch-id",
+            "119",
+            "--deepcoin-contract-specs-path",
+            str(specs_path),
+            "--apply",
+            "--expected-fingerprint",
+            "not-a-sha256",
+            "--authorization",
+            "I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout)["reason_code"] == (
+        "apply_authorization_incomplete"
+    )
 
 
 def test_recover_composite_management_batch_default_is_compact_read_only_dry_run(
@@ -3010,6 +3100,12 @@ def test_recover_composite_management_batch_default_is_compact_read_only_dry_run
     )
     monkeypatch.setattr(
         cli_module, "build_deepcoin_client_from_env", lambda: client
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: client,
+        raising=False,
     )
     monkeypatch.setattr(
         cli_module,
@@ -3082,6 +3178,12 @@ def test_recover_composite_management_batch_refused_dry_run_exits_two(
     )
     monkeypatch.setattr(
         cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: object(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli_module,
         "load_composite_batch_recovery_snapshot_read_only",
         lambda factory, *, client: object(),
     )
@@ -3108,6 +3210,53 @@ def test_recover_composite_management_batch_refused_dry_run_exits_two(
     assert json.loads(result.stdout)["plan"]["reason_code"] == (
         "exchange_snapshot_incomplete"
     )
+
+
+def test_recover_composite_management_batch_redacts_evidence_exception(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+
+    database_path, specs_path = _recover_composite_management_batch_paths(
+        tmp_path
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "create_composite_recovery_read_only_session_factory",
+        lambda path: object(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: (_ for _ in ()).throw(
+            RuntimeError("private-provider-id private-position-id")
+        ),
+        raising=False,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "recover-composite-management-batch",
+            "--database-path",
+            str(database_path),
+            "--batch-id",
+            "119",
+            "--deepcoin-contract-specs-path",
+            str(specs_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "batch_id": 119,
+        "mode": "dry_run",
+        "reason_code": "recovery_evidence_unavailable",
+        "status": "refused",
+    }
+    assert "private" not in result.stdout
+    assert len(result.stdout) < 256
 
 
 def test_recover_composite_management_batch_stale_fingerprint_stops_before_repair(
@@ -3145,6 +3294,12 @@ def test_recover_composite_management_batch_stale_fingerprint_stops_before_repai
     )
     monkeypatch.setattr(
         cli_module, "build_deepcoin_client_from_env", lambda: object()
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: object(),
+        raising=False,
     )
     monkeypatch.setattr(
         cli_module,
@@ -3209,7 +3364,8 @@ def test_recover_composite_management_batch_apply_repairs_then_executes_once(
         tmp_path
     )
     factory = object()
-    client = object()
+    client = SimpleNamespace(uid_scope_hash="a" * 64)
+    read_client = SimpleNamespace(uid_scope_hash="a" * 64)
     provider = object()
     plan = CompositeBatchRecoveryPlan(
         batch_id=119,
@@ -3248,6 +3404,12 @@ def test_recover_composite_management_batch_apply_repairs_then_executes_once(
     )
     monkeypatch.setattr(
         cli_module, "build_deepcoin_client_from_env", lambda: client
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: read_client,
+        raising=False,
     )
     monkeypatch.setattr(
         cli_module,
@@ -3379,6 +3541,12 @@ def test_recover_composite_management_batch_invalid_specs_stop_before_repair(
     )
     monkeypatch.setattr(
         cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: object(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli_module,
         "load_composite_batch_recovery_snapshot_read_only",
         lambda *args, **kwargs: object(),
     )
@@ -3431,6 +3599,118 @@ def test_recover_composite_management_batch_invalid_specs_stop_before_repair(
     assert repair_calls == []
 
 
+def test_recover_composite_management_batch_rejects_writer_account_drift_before_db(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.composite_management_batch_recovery import (
+        CompositeBatchRecoveryPlan,
+        CompositeRecoveryPosition,
+    )
+
+    database_path, specs_path = _recover_composite_management_batch_paths(
+        tmp_path
+    )
+    plan = CompositeBatchRecoveryPlan(
+        batch_id=119,
+        status="ready",
+        reason_code="false_legacy_submission_proven",
+        position=CompositeRecoveryPosition(
+            disposition="resume_to_target",
+            current_size="38",
+            close_delta="19",
+            effective_remaining_size="19",
+        ),
+        source_fingerprint="a" * 64,
+        exchange_snapshot_fingerprint="b" * 64,
+        evidence_fingerprint="c" * 64,
+        evidence={"schema_version": 1},
+    )
+    writable_factory_calls = []
+    monkeypatch.setattr(
+        cli_module,
+        "create_composite_recovery_read_only_session_factory",
+        lambda path: object(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "create_existing_session_factory",
+        lambda path: writable_factory_calls.append(path),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: SimpleNamespace(uid_scope_hash="a" * 64),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_deepcoin_client_from_env",
+        lambda: SimpleNamespace(uid_scope_hash="b" * 64),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_composite_batch_recovery_snapshot_read_only",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_composite_batch_recovery_plan",
+        lambda *args, **kwargs: plan,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_trading_settings",
+        lambda factory: SimpleNamespace(
+            effective_composite_management_v2_mode="live",
+            mimo_contract_mode="v1",
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_deepcoin_contract_specs",
+        lambda path: object(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "apply_composite_batch_false_state_repair",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("account drift must stop before repair")
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "execute_composite_management_batch",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("account drift must stop before executor")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "recover-composite-management-batch",
+            "--database-path",
+            str(database_path),
+            "--batch-id",
+            "119",
+            "--deepcoin-contract-specs-path",
+            str(specs_path),
+            "--apply",
+            "--expected-fingerprint",
+            plan.evidence_fingerprint,
+            "--authorization",
+            "I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout)["reason_code"] == (
+        "exchange_account_scope_mismatch"
+    )
+    assert writable_factory_calls == []
+
+
 def test_recover_composite_management_batch_position_absent_never_builds_writer(
     tmp_path,
     monkeypatch,
@@ -3470,13 +3750,30 @@ def test_recover_composite_management_batch_position_absent_never_builds_writer(
     monkeypatch.setattr(
         cli_module, "create_existing_session_factory", lambda path: factory
     )
+    read_client = object()
     monkeypatch.setattr(
-        cli_module, "build_deepcoin_client_from_env", lambda: object()
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: read_client,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_deepcoin_client_from_env",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("position-absent must not build a writer client")
+        ),
     )
     monkeypatch.setattr(
         cli_module,
         "load_composite_batch_recovery_snapshot_read_only",
-        lambda *args, **kwargs: object(),
+        lambda factory, *, client: (
+            object()
+            if client is read_client
+            else (_ for _ in ()).throw(
+                AssertionError("snapshot must receive read-only client")
+            )
+        ),
     )
     monkeypatch.setattr(
         cli_module,
@@ -3596,7 +3893,8 @@ def test_recover_composite_management_batch_resumes_audited_progress_without_rep
         ),
     )
     factory = object()
-    client = object()
+    client = SimpleNamespace(uid_scope_hash="a" * 64)
+    read_client = SimpleNamespace(uid_scope_hash="a" * 64)
     snapshot = object()
     order = []
     monkeypatch.setattr(
@@ -3604,6 +3902,12 @@ def test_recover_composite_management_batch_resumes_audited_progress_without_rep
     )
     monkeypatch.setattr(
         cli_module, "build_deepcoin_client_from_env", lambda: client
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: read_client,
+        raising=False,
     )
     monkeypatch.setattr(
         cli_module,

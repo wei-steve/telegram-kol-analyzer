@@ -70,7 +70,10 @@ from telegram_kol_research.deepcoin_contract_specs import (
 from telegram_kol_research.deepcoin_contract_spec_cache import (
     load_deepcoin_contract_spec_snapshot,
 )
-from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
+from telegram_kol_research.deepcoin_client import (
+    build_deepcoin_client_from_env,
+    build_deepcoin_read_only_client_from_env,
+)
 from telegram_kol_research.deepcoin_order_builder import (
     deepcoin_order_draft_fingerprint,
 )
@@ -4626,12 +4629,15 @@ def recover_composite_management_batch(
     """Dry-run or explicitly apply the exact batch-119 recovery."""
 
     def refuse(reason_code: str) -> None:
+        safe_reason_code = str(reason_code)
+        if re.fullmatch(r"[a-z0-9_]{1,96}", safe_reason_code) is None:
+            safe_reason_code = "recovery_refused"
         typer.echo(
             json.dumps(
                 {
                     "batch_id": int(batch_id),
                     "mode": "apply" if apply else "dry_run",
-                    "reason_code": str(reason_code),
+                    "reason_code": safe_reason_code,
                     "status": "refused",
                 },
                 ensure_ascii=True,
@@ -4651,35 +4657,41 @@ def recover_composite_management_batch(
         refuse("contract_specs_path_not_existing_file")
     if apply and (
         not expected_fingerprint
+        or re.fullmatch(r"[0-9a-f]{64}", expected_fingerprint) is None
         or authorization != BATCH_119_RECOVERY_AUTHORIZATION
     ):
         refuse("apply_authorization_incomplete")
 
-    session_factory = (
-        create_existing_session_factory(resolved_database_path)
-        if apply
-        else create_composite_recovery_read_only_session_factory(
-            resolved_database_path
+    try:
+        planning_session_factory = (
+            create_composite_recovery_read_only_session_factory(
+                resolved_database_path
+            )
         )
-    )
-    client = build_deepcoin_client_from_env()
-    snapshot = load_composite_batch_recovery_snapshot_read_only(
-        session_factory,
-        client=client,
-    )
-    plan = build_composite_batch_recovery_plan(
-        session_factory,
-        profile=BATCH_119_RECOVERY,
-        snapshot=snapshot,
-        planned_at=datetime.now(UTC),
-    )
+    except Exception:
+        refuse("database_open_unavailable")
+    try:
+        read_client = _build_batch119_recovery_read_client()
+        snapshot = load_composite_batch_recovery_snapshot_read_only(
+            planning_session_factory,
+            client=read_client,
+        )
+        plan = build_composite_batch_recovery_plan(
+            planning_session_factory,
+            profile=BATCH_119_RECOVERY,
+            snapshot=snapshot,
+            planned_at=datetime.now(UTC),
+        )
+    except Exception:
+        refuse("recovery_evidence_unavailable")
     if not apply:
+        try:
+            serialized_plan = serialize_composite_batch_recovery_plan(plan)
+        except Exception:
+            refuse("recovery_evidence_unavailable")
         typer.echo(
             json.dumps(
-                {
-                    "mode": "dry_run",
-                    "plan": serialize_composite_batch_recovery_plan(plan),
-                },
+                {"mode": "dry_run", "plan": serialized_plan},
                 ensure_ascii=True,
                 separators=(",", ":"),
                 sort_keys=True,
@@ -4693,18 +4705,24 @@ def recover_composite_management_batch(
     if plan.status != "ready":
         try:
             resume_authorization = authorize_composite_batch_recovery_resume(
-                session_factory,
+                planning_session_factory,
                 expected_fingerprint=expected_fingerprint,
                 snapshot=snapshot,
             )
         except CompositeBatchRecoveryConflict as exc:
             refuse(exc.reason_code)
+        except Exception:
+            refuse("recovery_authorization_unavailable")
         plan = resume_authorization.plan
     if expected_fingerprint != plan.evidence_fingerprint:
         refuse("evidence_fingerprint_mismatch")
 
     contract_spec_provider = None
-    settings = load_trading_settings(session_factory)
+    writer_client = None
+    try:
+        settings = load_trading_settings(planning_session_factory)
+    except Exception:
+        refuse("trading_settings_unavailable")
     if settings.mimo_contract_mode != "v1":
         refuse("mimo_contract_mode_not_v1")
     if (
@@ -4719,6 +4737,27 @@ def recover_composite_management_batch(
             refuse("contract_specs_invalid")
         if settings.effective_composite_management_v2_mode != "live":
             refuse("composite_management_live_gate_closed")
+        try:
+            writer_client = build_deepcoin_client_from_env()
+        except Exception:
+            refuse("exchange_writer_client_unavailable")
+        read_uid_scope_hash = getattr(read_client, "uid_scope_hash", None)
+        writer_uid_scope_hash = getattr(
+            writer_client, "uid_scope_hash", None
+        )
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", str(read_uid_scope_hash or ""))
+            is None
+            or writer_uid_scope_hash != read_uid_scope_hash
+        ):
+            refuse("exchange_account_scope_mismatch")
+
+    try:
+        session_factory = create_existing_session_factory(
+            resolved_database_path
+        )
+    except Exception:
+        refuse("database_open_unavailable")
 
     def live_recovery_execution_gate() -> bool:
         current = load_trading_settings(session_factory)
@@ -4738,6 +4777,8 @@ def recover_composite_management_batch(
             )
         except CompositeBatchRecoveryConflict as exc:
             refuse(exc.reason_code)
+        except Exception:
+            refuse("recovery_apply_unavailable")
     else:
         repair_result = resume_authorization.repair_result
 
@@ -4747,31 +4788,38 @@ def recover_composite_management_batch(
         and plan.position.disposition != "position_absent"
     ):
         assert contract_spec_provider is not None
-        if resume_authorization is not None:
-            reconcile_composite_management_components(
+        assert writer_client is not None
+        try:
+            if resume_authorization is not None:
+                reconcile_composite_management_components(
+                    session_factory,
+                    deepcoin_client=writer_client,
+                    reconciled_at=datetime.now(UTC),
+                    allow_new_writes=False,
+                )
+            execute_composite_management_batch(
                 session_factory,
-                deepcoin_client=client,
-                reconciled_at=datetime.now(UTC),
-                allow_new_writes=False,
+                batch_id=BATCH_119_RECOVERY.batch_id,
+                deepcoin_client=writer_client,
+                contract_spec_provider=contract_spec_provider,
+                live_execution_gate=live_recovery_execution_gate,
+                now_provider=lambda: datetime.now(UTC),
+                backup_buffer_bps=str(
+                    settings.trigger_backup_stop_buffer_bps
+                ),
             )
-        execute_composite_management_batch(
-            session_factory,
-            batch_id=BATCH_119_RECOVERY.batch_id,
-            deepcoin_client=client,
-            contract_spec_provider=contract_spec_provider,
-            live_execution_gate=live_recovery_execution_gate,
-            now_provider=lambda: datetime.now(UTC),
-            backup_buffer_bps=str(
-                settings.trigger_backup_stop_buffer_bps
-            ),
-        )
+        except Exception:
+            refuse("recovery_execution_unavailable")
         executor_calls = 1
-    summary = build_composite_batch_recovery_status_summary(
-        session_factory,
-        plan=plan,
-        repair_result=repair_result,
-        executor_calls=executor_calls,
-    )
+    try:
+        summary = build_composite_batch_recovery_status_summary(
+            session_factory,
+            plan=plan,
+            repair_result=repair_result,
+            executor_calls=executor_calls,
+        )
+    except Exception:
+        refuse("recovery_status_unavailable")
     typer.echo(
         json.dumps(
             {"mode": "apply", "result": summary},
@@ -4779,6 +4827,52 @@ def recover_composite_management_batch(
             separators=(",", ":"),
             sort_keys=True,
         )
+    )
+
+
+class _Batch119RecoveryReadClient:
+    """Expose only the exact GET capabilities used by the batch-119 loader."""
+
+    __slots__ = ("__transport", "uid_scope_hash")
+
+    def __init__(self, transport: Any) -> None:
+        self.__transport = transport
+        self.uid_scope_hash = getattr(transport, "uid_scope_hash", None)
+
+    def read_positions(self, *, inst_id: str | None = None) -> Any:
+        return self.__transport.read_positions(inst_id=inst_id)
+
+    def read_open_orders(self, *, inst_id: str | None = None) -> Any:
+        return self.__transport.read_open_orders(inst_id=inst_id)
+
+    def read_trigger_orders_pending(self, *, inst_id: str) -> Any:
+        return self.__transport.read_trigger_orders_pending(inst_id=inst_id)
+
+    def read_position_history(self, *, inst_id: str, pos_id: str) -> Any:
+        return self.__transport.read_position_history(
+            inst_id=inst_id,
+            pos_id=pos_id,
+        )
+
+    def read_trigger_order_history(
+        self,
+        *,
+        inst_id: str,
+        order_id: str,
+        limit: int,
+    ) -> Any:
+        return self.__transport.read_trigger_order_history(
+            inst_id=inst_id,
+            order_id=order_id,
+            limit=limit,
+        )
+
+
+def _build_batch119_recovery_read_client() -> _Batch119RecoveryReadClient:
+    """Build a capability-limited account reader, never an executor input."""
+
+    return _Batch119RecoveryReadClient(
+        build_deepcoin_read_only_client_from_env()
     )
 
 

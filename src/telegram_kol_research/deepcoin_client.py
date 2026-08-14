@@ -370,12 +370,14 @@ class DeepcoinRestClient:
         tpsl_rate_limiter: "DeepcoinTpslWriteLimiter | None" = None,
         request_governor: Any | None = None,
         retry_jitter_fn: Callable[[], float] | None = None,
+        read_only: bool = False,
     ) -> None:
         self._credentials = credentials
         self._http_client = http_client
         self._owns_http_client = http_client is None
         self._http_client_lock = threading.Lock()
         self._closed = False
+        self._read_only = bool(read_only)
         self._timestamp_factory = timestamp_factory or _utc_timestamp_ms
         self._monotonic_factory = monotonic_factory or time.monotonic
         self._sleep_fn = sleep_fn or time.sleep
@@ -804,6 +806,8 @@ class DeepcoinRestClient:
         body_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_method = str(method or "").strip().upper()
+        if self._read_only and normalized_method != "GET":
+            raise DeepcoinClientError("read-only Deepcoin client forbids writes")
         normalized_path = normalize_request_path(request_path)
         body = ""
         if body_payload is not None:
@@ -1201,6 +1205,32 @@ def build_deepcoin_client_from_env(
     return DeepcoinRestClient(
         credentials,
         request_governor=governor,
+    )
+
+
+def build_deepcoin_read_only_client_from_env(
+    environ: dict[str, str] | None = None,
+    env_file_paths: list[str | Path] | None = None,
+) -> DeepcoinRestClient:
+    """Build an authenticated client whose transport refuses every write."""
+
+    environment = _load_deepcoin_environment(
+        environ=environ,
+        env_file_paths=env_file_paths,
+    )
+    credentials = load_deepcoin_credentials(
+        environ=environment,
+        env_file_paths=[],
+    )
+    governor = build_deepcoin_request_governor_from_environment(
+        base_url=credentials.base_url,
+        api_key=credentials.api_key,
+        environ=environment,
+    )
+    return DeepcoinRestClient(
+        credentials,
+        request_governor=governor,
+        read_only=True,
     )
 
 

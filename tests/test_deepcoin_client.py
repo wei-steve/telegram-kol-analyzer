@@ -90,6 +90,30 @@ class _FakeMonotonicClock:
         self.current += seconds
 
 
+def test_read_only_deepcoin_client_refuses_write_before_http():
+    http_client = _CapturingHttpClient({"code": "0", "data": []})
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(
+            api_key="key",
+            api_secret="secret",
+            passphrase="pass",
+            base_url="https://api.deepcoin.test",
+        ),
+        http_client=http_client,
+        read_only=True,
+    )
+
+    with pytest.raises(DeepcoinClientError, match="read-only"):
+        client.place_order({"instId": "BTC-USDT-SWAP"})
+
+    assert http_client.requests == []
+    assert client.read_positions(inst_id="BTC-USDT-SWAP") == {
+        "code": "0",
+        "data": [],
+    }
+    assert [request["method"] for request in http_client.requests] == ["GET"]
+
+
 def test_build_deepcoin_auth_headers_signs_timestamp_method_path_and_body():
     credentials = DeepcoinCredentials(
         api_key="key",

@@ -7053,6 +7053,42 @@ def test_apply_rejects_invalid_authority_or_plan_envelope(
             applied_at=NOW,
         )
 
+
+@pytest.mark.parametrize(
+    "forged_fingerprint",
+    ["source", "scope", "evidence"],
+)
+def test_apply_rejects_forged_fingerprint_before_opening_db(
+    tmp_path,
+    forged_fingerprint,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    plan = _plan(factory)
+    expected = plan.evidence_fingerprint
+    if forged_fingerprint == "source":
+        plan = replace(plan, source_fingerprint="0" * 64)
+    elif forged_fingerprint == "scope":
+        plan = replace(plan, exchange_snapshot_fingerprint="1" * 64)
+    else:
+        expected = "2" * 64
+    db_calls = []
+
+    def forbidden_factory():
+        db_calls.append(True)
+        raise AssertionError("stale fingerprint opened DB")
+
+    with pytest.raises(module.CompositeBatchRecoveryConflict):
+        module.apply_composite_batch_false_state_repair(
+            forbidden_factory,
+            plan=plan,
+            expected_fingerprint=expected,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+    assert db_calls == []
+
     with factory() as session:
         assert session.get(StrategyManagementBatch, 119).status == "reconciling"
         assert session.query(ExecutionEvent).count() == 0
@@ -10101,13 +10137,27 @@ def test_recovery_cli_position_absent_is_repeatable_without_exchange_writes(
         "    price_tick: 0.1\n",
         encoding="utf-8",
     )
-    client = _Batch119RecoveryClient()
-    client.pending = []
-    client.position_history = [_closed_position_history_row()]
-    client.trigger_history = [_successful_stop_trigger_row()]
-    client.list_positions = lambda *, inst_id=None: []
+    client = _Batch119AbsentExactHistoryClient()
+    read_client_builds = []
     monkeypatch.setattr(
-        cli_module, "build_deepcoin_client_from_env", lambda: client
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: read_client_builds.append(True) or client,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_deepcoin_client_from_env",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("position-absent must not build a writer client")
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "execute_composite_management_batch",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("position-absent must not enter the executor")
+        ),
     )
     common = [
         "recover-composite-management-batch",
@@ -10124,6 +10174,11 @@ def test_recovery_cli_position_absent_is_repeatable_without_exchange_writes(
     assert dry_run.exit_code == 0, dry_run.stdout
     dry_payload = json.loads(dry_run.stdout)
     assert dry_payload["plan"]["position"]["disposition"] == "position_absent"
+    serialized = json.dumps(dry_payload, sort_keys=True)
+    assert POS_ID not in serialized
+    assert PRIMARY_ORDER_ID not in serialized
+    assert BACKUP_ORDER_ID not in serialized
+    assert "wide-" not in serialized
     fingerprint = dry_payload["plan"]["evidence_fingerprint"]
     apply_args = [
         *common,
@@ -10134,14 +10189,61 @@ def test_recovery_cli_position_absent_is_repeatable_without_exchange_writes(
         "I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
     ]
 
+    scope_drift_client = _Batch119AbsentExactHistoryClient()
+    scope_drift_client.uid_scope_hash = "7" * 64
+    writable_factory_calls = []
+    original_writable_factory = cli_module.create_existing_session_factory
+    monkeypatch.setattr(
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: scope_drift_client,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "create_existing_session_factory",
+        lambda path: writable_factory_calls.append(path),
+    )
+    stale_scope = runner.invoke(app, apply_args)
+    assert stale_scope.exit_code == 2
+    assert json.loads(stale_scope.stdout)["reason_code"] in {
+        "evidence_fingerprint_mismatch",
+        "resume_evidence_invalid",
+        "resume_snapshot_scope_conflict",
+    }
+    assert writable_factory_calls == []
+    monkeypatch.setattr(
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: read_client_builds.append(True) or client,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "create_existing_session_factory",
+        original_writable_factory,
+    )
+
     applied = runner.invoke(app, apply_args)
     repeated = runner.invoke(app, apply_args)
 
     assert applied.exit_code == 0, applied.stdout
     assert repeated.exit_code == 0, repeated.stdout
-    assert client.cancel_calls == []
-    assert client.close_calls == []
-    assert client.set_calls == []
+    assert read_client_builds == [True, True, True]
+    assert client.instrument_wide_history_calls == 0
+    save_trading_settings(
+        factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+            "composite_management_v2_mode": "live",
+            "mimo_contract_mode": "v2_live_adapter",
+        },
+        updated_at=NOW + timedelta(seconds=1),
+    )
+    setting_changed = runner.invoke(app, apply_args)
+    assert setting_changed.exit_code == 2
+    assert json.loads(setting_changed.stdout)["reason_code"] == (
+        "mimo_contract_mode_not_v1"
+    )
     with factory() as session:
         event = (
             session.query(ExecutionEvent)
@@ -10149,6 +10251,112 @@ def test_recovery_cli_position_absent_is_repeatable_without_exchange_writes(
             .one()
         )
         assert json.loads(event.after_json)["original_owned_stop_refs"] == []
+
+
+def test_recovery_cli_position_absent_apply_rejects_new_durable_close(
+    tmp_path,
+    monkeypatch,
+):
+    from typer.testing import CliRunner
+
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.cli import app
+    from telegram_kol_research.trading_settings import save_trading_settings
+
+    factory, database_path, binding_id, entry_id, _ = (
+        _seed_batch_119_false_submission(tmp_path)
+    )
+    save_trading_settings(
+        factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+            "composite_management_v2_mode": "live",
+            "mimo_contract_mode": "v1",
+        },
+        updated_at=NOW,
+    )
+    specs_path = tmp_path / "deepcoin-contract-specs.yaml"
+    specs_path.write_text("contracts: []\n", encoding="utf-8")
+    client = _Batch119AbsentExactHistoryClient()
+    monkeypatch.setattr(
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: client,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_deepcoin_client_from_env",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("position-absent must not build a writer client")
+        ),
+    )
+    common = [
+        "recover-composite-management-batch",
+        "--database-path",
+        str(database_path),
+        "--batch-id",
+        "119",
+        "--deepcoin-contract-specs-path",
+        str(specs_path),
+    ]
+    dry_run = CliRunner().invoke(app, common)
+    assert dry_run.exit_code == 0, dry_run.stdout
+    fingerprint = json.loads(dry_run.stdout)["plan"]["evidence_fingerprint"]
+
+    with factory() as session:
+        session.add(
+            PositionMutationIntent(
+                idempotency_key="cli-late-natural-stop-close",
+                operation="close_position",
+                strategy_instance_id="deepcoin:incident:btc:long",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                pos_id=POS_ID,
+                authority_fingerprint="a" * 64,
+                request_fingerprint="r" * 64,
+                status="confirmed",
+                request_json='{"private":"request"}',
+                response_json='{"private":"response"}',
+                reserved_at=NOW,
+                submitted_at=NOW,
+                confirmed_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+    writable_factory_calls = []
+    monkeypatch.setattr(
+        cli_module,
+        "create_existing_session_factory",
+        lambda path: writable_factory_calls.append(path),
+    )
+
+    applied = CliRunner().invoke(
+        app,
+        [
+            *common,
+            "--apply",
+            "--expected-fingerprint",
+            fingerprint,
+            "--authorization",
+            "I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        ],
+    )
+
+    assert applied.exit_code == 2
+    payload = json.loads(applied.stdout)
+    assert payload["reason_code"] in {
+        "durable_close_submission_evidence_present",
+        "resume_audit_missing",
+        "resume_evidence_invalid",
+    }
+    assert "private" not in applied.stdout
+    assert writable_factory_calls == []
+    with factory() as session:
+        assert session.query(ExecutionEvent).count() == 0
 
 
 def test_recovery_cli_position_absent_refuses_non_v1_without_database_write(
@@ -10190,7 +10398,17 @@ def test_recovery_cli_position_absent_refuses_non_v1_without_database_write(
     client.trigger_history = [_successful_stop_trigger_row()]
     client.list_positions = lambda *, inst_id=None: []
     monkeypatch.setattr(
-        cli_module, "build_deepcoin_client_from_env", lambda: client
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: client,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_deepcoin_client_from_env",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("non-v1 must not build a writer client")
+        ),
     )
     common = [
         "recover-composite-management-batch",
@@ -10302,6 +10520,12 @@ def test_recovery_cli_dry_run_then_apply_closes_exactly_once_and_preserves_setti
     )
     monkeypatch.setattr(
         cli_module, "build_deepcoin_client_from_env", lambda: client
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: client,
+        raising=False,
     )
     common = [
         "recover-composite-management-batch",
