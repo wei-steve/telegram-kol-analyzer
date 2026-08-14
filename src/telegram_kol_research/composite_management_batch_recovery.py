@@ -2894,6 +2894,33 @@ def _resume_exchange_close_evidence_is_owned(
     entry,
     components,
 ) -> bool:
+    if (
+        str(batch.status) == "resolved"
+        and str(leg.status) == "failed"
+        and [str(row.status) for row in components]
+        == ["safely_skipped", "safely_skipped", "safely_skipped"]
+    ):
+        ledger = (
+            session.query(PositionProtectionLedger)
+            .filter(
+                PositionProtectionLedger.execution_binding_id
+                == int(batch.execution_binding_id),
+                PositionProtectionLedger.execution_order_leg_id
+                == int(entry.id),
+                PositionProtectionLedger.pos_id == str(leg.pos_id),
+            )
+            .order_by(PositionProtectionLedger.id)
+            .all()
+        )
+        return not isinstance(
+            _validated_natural_stop_proof(
+                snapshot=snapshot,
+                ledger=ledger,
+                pos_id=str(leg.pos_id),
+                profile=BATCH_119_RECOVERY,
+            ),
+            str,
+        )
     close_rows = _exchange_close_rows(snapshot, pos_id=str(leg.pos_id))
     if not close_rows:
         return True
@@ -3381,10 +3408,6 @@ def _build_composite_batch_recovery_plan(
             )
         except CompositeBatchRecoveryRefusal as exc:
             return _refusal(profile.batch_id, exc.reason_code)
-        if _has_exchange_close_submission(snapshot, pos_id=str(leg.pos_id)):
-            return _refusal(
-                profile.batch_id, "exchange_close_submission_evidence_present"
-            )
 
         ledger = (
             session.query(PositionProtectionLedger)
@@ -3396,6 +3419,24 @@ def _build_composite_batch_recovery_plan(
             .order_by(PositionProtectionLedger.id)
             .all()
         )
+        natural_stop_proof: Mapping[str, Any] | None = None
+        if position.disposition == "position_absent":
+            proof_result = _validated_natural_stop_proof(
+                snapshot=snapshot,
+                ledger=ledger,
+                pos_id=str(leg.pos_id),
+                profile=profile,
+            )
+            if isinstance(proof_result, str):
+                return _refusal(profile.batch_id, proof_result)
+            natural_stop_proof = proof_result
+        elif _has_exchange_close_submission(
+            snapshot, pos_id=str(leg.pos_id)
+        ):
+            return _refusal(
+                profile.batch_id, "exchange_close_submission_evidence_present"
+            )
+
         protection_reason = _protection_ownership_refusal(
             snapshot.pending_trigger_orders,
             batch=batch,
@@ -3432,6 +3473,7 @@ def _build_composite_batch_recovery_plan(
             pos_id=str(leg.pos_id),
             ledger=ledger,
             profile=profile,
+            natural_stop_proof=natural_stop_proof,
         )
         exchange_fingerprint = _fingerprint(exchange_payload)
         evidence = {
@@ -3471,6 +3513,8 @@ def _build_composite_batch_recovery_plan(
             },
             "proposed_transition": _proposed_transition(position),
         }
+        if natural_stop_proof is not None:
+            evidence["natural_stop"] = dict(natural_stop_proof)
         evidence_fingerprint = _fingerprint(evidence)
         return CompositeBatchRecoveryPlan(
             batch_id=profile.batch_id,
@@ -3935,6 +3979,12 @@ def _validate_recovery_plan_consistency(plan: CompositeBatchRecoveryPlan) -> Non
         "exchange",
         "proposed_transition",
     }
+    position_absent = (
+        isinstance(plan.position, CompositeRecoveryPosition)
+        and plan.position.disposition == "position_absent"
+    )
+    if position_absent:
+        expected_evidence_keys.add("natural_stop")
     immutable_target = evidence.get("immutable_target")
     durable = evidence.get("durable")
     exchange = evidence.get("exchange")
@@ -4012,9 +4062,7 @@ def _validate_recovery_plan_consistency(plan: CompositeBatchRecoveryPlan) -> Non
         "owned_protection_count": exchange.get("owned_protection_count"),
     }
     owned_protection_count = exchange.get("owned_protection_count")
-    minimum_owned_protection = (
-        0 if plan.position.disposition == "position_absent" else 2
-    )
+    minimum_owned_protection = 2
     if (
         evidence.get("schema_version") != 1
         or evidence.get("batch_id") != BATCH_119_RECOVERY.batch_id
@@ -4031,6 +4079,12 @@ def _validate_recovery_plan_consistency(plan: CompositeBatchRecoveryPlan) -> Non
         or exchange != expected_exchange
         or evidence.get("position") != _serialize_position(plan.position)
         or evidence.get("proposed_transition") != _proposed_transition(plan.position)
+        or (
+            position_absent
+            and not _natural_stop_proof_payload_is_valid(
+                evidence.get("natural_stop")
+            )
+        )
         or not all(
             _is_sha256(value)
             for value in (
@@ -4041,6 +4095,33 @@ def _validate_recovery_plan_consistency(plan: CompositeBatchRecoveryPlan) -> Non
         )
     ):
         raise CompositeBatchRecoveryConflict("plan_evidence_inconsistent")
+
+
+def _natural_stop_proof_payload_is_valid(value: Any) -> bool:
+    return bool(
+        isinstance(value, Mapping)
+        and set(value)
+        == {
+            "purpose",
+            "trigger_status",
+            "position_status",
+            "time_relation",
+            "trigger_count",
+            "closed_position_count",
+            "order_ref",
+            "position_ref",
+        }
+        and value.get("purpose") in {"stop_loss", "backup_stop"}
+        and value.get("trigger_status") == "successful_terminal"
+        and value.get("position_status") == "closed"
+        and value.get("time_relation") == "trigger_not_after_close"
+        and value.get("trigger_count") == 1
+        and not isinstance(value.get("trigger_count"), bool)
+        and value.get("closed_position_count") == 1
+        and not isinstance(value.get("closed_position_count"), bool)
+        and _is_sha256(value.get("order_ref"))
+        and _is_sha256(value.get("position_ref"))
+    )
 
 
 def _component_attempt_counts_from_plan(
@@ -5551,6 +5632,220 @@ def _has_additional_active_database_work(session, *, batch_id: int) -> bool:
     return False
 
 
+def _validated_natural_stop_proof(
+    *,
+    snapshot: Any,
+    ledger: Sequence[Any],
+    pos_id: str,
+    profile: CompositeBatchRecoveryProfile,
+) -> Mapping[str, Any] | str:
+    """Prove one exact owned natural stop without retaining raw evidence."""
+
+    scope = getattr(snapshot, "exact_scope", None)
+    if (
+        not isinstance(scope, _Batch119ExactHistoryScope)
+        or str(scope.position_id) != str(pos_id)
+        or str(scope.instrument_id).upper() != profile.instrument_id.upper()
+        or str(scope.side).lower() != profile.side.lower()
+    ):
+        return "natural_stop_proof_identity_invalid"
+    if any(
+        isinstance(row, Mapping)
+        and _row_matches_position(row, pos_id=str(pos_id))
+        for row in snapshot.positions
+    ):
+        return "natural_stop_proof_position_invalid"
+
+    scoped_orders = dict(scope.protection_orders)
+    if (
+        len(scoped_orders) != 2
+        or set(scoped_orders) != {"stop_loss", "backup_stop"}
+        or len(set(scoped_orders.values())) != 2
+    ):
+        return "natural_stop_proof_identity_invalid"
+    owned_by_id: dict[str, tuple[str, Any]] = {}
+    for row in ledger:
+        purpose = str(getattr(row, "purpose", "") or "").lower()
+        order_id = str(getattr(row, "order_id", "") or "").strip()
+        if (
+            purpose not in scoped_orders
+            or scoped_orders[purpose] != order_id
+            or order_id in owned_by_id
+            or str(getattr(row, "status", "") or "").lower() != "verified"
+            or str(getattr(row, "venue", "") or "").lower() != "deepcoin"
+            or str(getattr(row, "pos_id", "") or "") != str(pos_id)
+            or str(getattr(row, "instrument_id", "") or "").upper()
+            != profile.instrument_id.upper()
+            or str(getattr(row, "side", "") or "").lower()
+            != profile.side.lower()
+        ):
+            return "natural_stop_proof_identity_invalid"
+        owned_by_id[order_id] = (purpose, row)
+    if set(owned_by_id) != set(scoped_orders.values()):
+        return "natural_stop_proof_identity_invalid"
+
+    position_rows = list(snapshot.position_history)
+    if len(position_rows) != 1:
+        return "natural_stop_proof_position_invalid"
+    position_row = position_rows[0]
+    if not isinstance(position_row, Mapping) or not (
+        _exact_position_rows_match_scope(
+            [position_row],
+            position_id=str(pos_id),
+            instrument_id=profile.instrument_id,
+            side=profile.side,
+        )
+    ):
+        return "natural_stop_proof_position_invalid"
+    position_state = _one_exact_text(position_row, "state", "status")
+    if position_state is None or position_state.lower() not in {
+        "closed",
+        "filled",
+        "completed",
+        "exited",
+    }:
+        return "natural_stop_proof_position_invalid"
+    close_times = _bounded_epoch_ms_values(
+        position_row,
+        "uTime",
+        "closeTime",
+        "updateTime",
+        "updatedAt",
+        "updated_at",
+    )
+    if close_times is None or not close_times:
+        return "natural_stop_proof_time_invalid"
+
+    capture_ended_at = getattr(snapshot, "capture_ended_at", None)
+    if (
+        not isinstance(capture_ended_at, datetime)
+        or capture_ended_at.tzinfo is None
+    ):
+        return "natural_stop_proof_time_invalid"
+    capture_ended_ms = int(capture_ended_at.timestamp() * 1000)
+    if any(value > capture_ended_ms for value in close_times):
+        return "natural_stop_proof_time_invalid"
+
+    successful: list[tuple[str, str, int]] = []
+    seen_trigger_order_ids: set[str] = set()
+    for row in snapshot.trigger_history:
+        if not isinstance(row, Mapping):
+            return "natural_stop_proof_trigger_invalid"
+        order_id = _unique_exact_row_identity(
+            row, keys=("ordId", "orderId", "order_id")
+        )
+        if (
+            order_id not in owned_by_id
+            or order_id in seen_trigger_order_ids
+            or not _exact_order_rows_match_scope(
+                [row],
+                order_id=str(order_id or ""),
+                instrument_id=profile.instrument_id,
+                side=profile.side,
+            )
+        ):
+            return "natural_stop_proof_trigger_invalid"
+        seen_trigger_order_ids.add(order_id)
+        state = _one_exact_text(row, "state", "status")
+        if state is None:
+            return "natural_stop_proof_trigger_invalid"
+        normalized_state = state.lower()
+        if normalized_state in {"filled", "triggered", "completed", "closed"}:
+            if _one_exact_text(row, "errorCode") != "0":
+                return "natural_stop_proof_trigger_invalid"
+            trigger_times = _bounded_epoch_ms_values(row, "triggerTime")
+            if trigger_times is None or len(trigger_times) != 1:
+                return "natural_stop_proof_time_invalid"
+            purpose = owned_by_id[order_id][0]
+            successful.append((purpose, order_id, trigger_times[0]))
+        elif normalized_state not in {
+            "cancelled",
+            "canceled",
+            "failed",
+            "rejected",
+            "expired",
+        }:
+            return "natural_stop_proof_trigger_invalid"
+
+    if len(successful) > 1:
+        return "natural_stop_proof_ambiguous"
+    if len(successful) != 1:
+        return "natural_stop_proof_trigger_invalid"
+    purpose, order_id, trigger_time = successful[0]
+    if (
+        trigger_time > capture_ended_ms
+        or any(close_time < trigger_time for close_time in close_times)
+    ):
+        return "natural_stop_proof_time_invalid"
+    if _natural_stop_has_residual_close_evidence(snapshot, pos_id=str(pos_id)):
+        return "natural_stop_proof_residual_close_evidence"
+
+    return MappingProxyType(
+        {
+            "purpose": purpose,
+            "trigger_status": "successful_terminal",
+            "position_status": "closed",
+            "time_relation": "trigger_not_after_close",
+            "trigger_count": 1,
+            "closed_position_count": 1,
+            "order_ref": _redacted_ref("natural_stop_order", order_id),
+            "position_ref": _redacted_ref("natural_stop_position", pos_id),
+        }
+    )
+
+
+def _one_exact_text(row: Mapping[str, Any], *keys: str) -> str | None:
+    values = {
+        str(row[key]).strip()
+        for key in keys
+        if row.get(key) not in (None, "")
+    }
+    return next(iter(values)) if len(values) == 1 else None
+
+
+def _bounded_epoch_ms_values(
+    row: Mapping[str, Any], *keys: str
+) -> list[int] | None:
+    values: list[int] = []
+    for key in keys:
+        if row.get(key) in (None, ""):
+            continue
+        raw = row[key]
+        if isinstance(raw, bool):
+            return None
+        text_value = str(raw).strip()
+        if not text_value.isdigit():
+            return None
+        parsed = int(text_value)
+        if str(parsed) != text_value or not (
+            1_000_000_000_000 <= parsed <= 9_999_999_999_999
+        ):
+            return None
+        values.append(parsed)
+    return values
+
+
+def _natural_stop_has_residual_close_evidence(
+    snapshot: Any, *, pos_id: str
+) -> bool:
+    for field in ("open_orders", "order_history", "trade_fills"):
+        for row in getattr(snapshot, field):
+            if not isinstance(row, Mapping) or not _row_matches_position(
+                row, pos_id=pos_id
+            ):
+                continue
+            reduce_only = str(
+                row.get("reduceOnly") or row.get("reduce_only") or ""
+            ).lower() in {"true", "1", "yes"}
+            if (
+                _row_matches_close_position(row, pos_id=pos_id)
+                or reduce_only
+                or str(row.get("side") or "").lower() == "sell"
+            ):
+                return True
+    return False
+
+
 def _has_exchange_close_submission(snapshot: Any, *, pos_id: str) -> bool:
     for row in snapshot.position_history:
         if not isinstance(row, Mapping):
@@ -5838,7 +6133,13 @@ def _source_evidence_payload(
 
 
 def _exchange_evidence_payload(
-    snapshot, *, position, pos_id: str, ledger, profile
+    snapshot,
+    *,
+    position,
+    pos_id: str,
+    ledger,
+    profile,
+    natural_stop_proof: Mapping[str, Any] | None = None,
 ):
     owned_order_refs = sorted(
         _redacted_ref("protection_order", row.order_id) for row in ledger
@@ -5873,7 +6174,7 @@ def _exchange_evidence_payload(
             "pending_tpsl_observations",
         )
     }
-    return {
+    payload = {
         "schema_version": 1,
         "instrument_id": profile.instrument_id,
         "side": profile.side,
@@ -5888,6 +6189,9 @@ def _exchange_evidence_payload(
         "regular_close_evidence_count": 0,
         "snapshot_complete": True,
     }
+    if natural_stop_proof is not None:
+        payload["natural_stop"] = dict(natural_stop_proof)
+    return payload
 
 
 def _account_authority_evidence_payload(authority: Any) -> dict[str, Any]:
