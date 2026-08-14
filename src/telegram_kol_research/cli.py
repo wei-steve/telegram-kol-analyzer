@@ -4708,6 +4708,7 @@ def recover_composite_management_batch(
                 planning_session_factory,
                 expected_fingerprint=expected_fingerprint,
                 snapshot=snapshot,
+                require_mimo_v1=True,
             )
         except CompositeBatchRecoveryConflict as exc:
             refuse(exc.reason_code)
@@ -4774,6 +4775,8 @@ def recover_composite_management_batch(
                 expected_fingerprint=expected_fingerprint,
                 authorization=authorization,
                 applied_at=datetime.now(UTC),
+                snapshot=snapshot,
+                require_mimo_v1=True,
             )
         except CompositeBatchRecoveryConflict as exc:
             refuse(exc.reason_code)

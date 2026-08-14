@@ -2975,6 +2975,7 @@ def test_natural_stop_resume_refuses_late_normalized_close_operation(tmp_path):
     module.apply_composite_batch_false_state_repair(
         factory,
         plan=plan,
+        snapshot=snapshot,
         expected_fingerprint=plan.evidence_fingerprint,
         authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
         applied_at=NOW,
@@ -3150,6 +3151,7 @@ def test_natural_stop_resume_refuses_late_target_non_string_operation(
     module.apply_composite_batch_false_state_repair(
         factory,
         plan=plan,
+        snapshot=snapshot,
         expected_fingerprint=plan.evidence_fingerprint,
         authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
         applied_at=NOW,
@@ -3485,6 +3487,7 @@ def test_natural_stop_resume_refuses_late_partially_linked_target_event(
     module.apply_composite_batch_false_state_repair(
         factory,
         plan=plan,
+        snapshot=snapshot,
         expected_fingerprint=plan.evidence_fingerprint,
         authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
         applied_at=NOW,
@@ -3610,6 +3613,7 @@ def test_natural_stop_resume_refuses_late_whitespace_payload_target_event(
     module.apply_composite_batch_false_state_repair(
         factory,
         plan=plan,
+        snapshot=snapshot,
         expected_fingerprint=plan.evidence_fingerprint,
         authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
         applied_at=NOW,
@@ -3690,6 +3694,7 @@ def test_natural_stop_resume_refuses_late_escaped_key_target_event(tmp_path):
     module.apply_composite_batch_false_state_repair(
         factory,
         plan=plan,
+        snapshot=snapshot,
         expected_fingerprint=plan.evidence_fingerprint,
         authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
         applied_at=NOW,
@@ -4243,6 +4248,7 @@ def test_natural_stop_query_operational_error_fails_closed_without_writes(
         module.apply_composite_batch_false_state_repair(
             factory,
             plan=plan,
+            snapshot=snapshot,
             expected_fingerprint=plan.evidence_fingerprint,
             authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
             applied_at=NOW,
@@ -4382,6 +4388,7 @@ def test_natural_stop_db_evidence_window_blocks_external_close_writer(
         module.apply_composite_batch_false_state_repair(
             factory,
             plan=plan,
+            snapshot=snapshot,
             expected_fingerprint=plan.evidence_fingerprint,
             authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
             applied_at=NOW,
@@ -4557,6 +4564,7 @@ def test_natural_stop_resume_refuses_late_suspicious_incomplete_other_owner(
     module.apply_composite_batch_false_state_repair(
         factory,
         plan=plan,
+        snapshot=snapshot,
         expected_fingerprint=plan.evidence_fingerprint,
         authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
         applied_at=NOW,
@@ -4783,6 +4791,7 @@ def test_natural_stop_resume_refuses_late_double_encoded_target_event(tmp_path):
     module.apply_composite_batch_false_state_repair(
         factory,
         plan=plan,
+        snapshot=snapshot,
         expected_fingerprint=plan.evidence_fingerprint,
         authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
         applied_at=NOW,
@@ -5044,6 +5053,7 @@ def test_natural_stop_resume_rebuilds_same_incident_time_authority(tmp_path):
     module.apply_composite_batch_false_state_repair(
         factory,
         plan=plan,
+        snapshot=snapshot,
         expected_fingerprint=plan.evidence_fingerprint,
         authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
         applied_at=NOW,
@@ -5080,6 +5090,7 @@ def test_natural_stop_resume_refuses_new_exact_durable_close_evidence(
     module.apply_composite_batch_false_state_repair(
         factory,
         plan=plan,
+        snapshot=snapshot,
         expected_fingerprint=plan.evidence_fingerprint,
         authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
         applied_at=NOW,
@@ -5138,6 +5149,7 @@ def test_natural_stop_resume_without_new_close_evidence_is_repeatable(tmp_path):
     module.apply_composite_batch_false_state_repair(
         factory,
         plan=plan,
+        snapshot=snapshot,
         expected_fingerprint=plan.evidence_fingerprint,
         authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
         applied_at=NOW,
@@ -8371,10 +8383,8 @@ def test_under_target_attestation_cannot_authorize_increased_position(tmp_path):
 def test_apply_position_absent_terminalizes_without_exchange_intent(tmp_path):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     module = _recovery_module()
-    plan = _plan(
-        factory,
-        _natural_stop_snapshot(),
-    )
+    snapshot = _natural_stop_snapshot()
+    plan = _plan(factory, snapshot)
     assert plan.position.disposition == "position_absent"
     with factory() as session:
         desired = [
@@ -8387,6 +8397,7 @@ def test_apply_position_absent_terminalizes_without_exchange_intent(tmp_path):
     result = module.apply_composite_batch_false_state_repair(
         factory,
         plan=plan,
+        snapshot=snapshot,
         expected_fingerprint=plan.evidence_fingerprint,
         authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
         applied_at=NOW,
@@ -8452,11 +8463,34 @@ def test_apply_position_absent_terminalizes_without_exchange_intent(tmp_path):
     repeated = module.apply_composite_batch_false_state_repair(
         factory,
         plan=plan,
+        snapshot=snapshot,
         expected_fingerprint=plan.evidence_fingerprint,
         authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
         applied_at=NOW,
     )
     assert repeated.status == "already_repaired"
+
+    from telegram_kol_research.trading_settings import save_trading_settings
+
+    save_trading_settings(
+        factory,
+        {"mimo_contract_mode": "v2_live_adapter"},
+        updated_at=NOW + timedelta(seconds=1),
+    )
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="mimo_contract_mode_not_v1",
+    ):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            snapshot=snapshot,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+    with factory() as session:
+        assert session.query(ExecutionEvent).count() == 1
 
     from telegram_kol_research.strategy_management_composite_executor import (
         execute_composite_management_batch,
@@ -8471,6 +8505,269 @@ def test_apply_position_absent_terminalizes_without_exchange_intent(tmp_path):
             live_execution_gate=lambda: True,
             now_provider=lambda: NOW,
         )
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    ["natural_stop_ref", "exchange_scope", "snapshot_authority"],
+)
+def test_position_absent_apply_rejects_resigned_snapshot_envelope_forgery(
+    tmp_path,
+    forgery,
+):
+    from telegram_kol_research.trading_settings import save_trading_settings
+
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    snapshot = _natural_stop_snapshot()
+    plan = _plan(factory, snapshot)
+    save_trading_settings(
+        factory,
+        {"mimo_contract_mode": "v1"},
+        updated_at=NOW,
+    )
+    evidence = module.serialize_composite_batch_recovery_plan(plan)["evidence"]
+    if forgery == "natural_stop_ref":
+        evidence["natural_stop"]["order_ref"] = "f" * 64
+        forged = replace(plan, evidence=evidence)
+    elif forgery == "exchange_scope":
+        evidence["exchange_snapshot_fingerprint"] = "e" * 64
+        forged = replace(
+            plan,
+            exchange_snapshot_fingerprint="e" * 64,
+            evidence=evidence,
+        )
+    else:
+        snapshot.scope_fingerprint = "e" * 64
+        forged = replace(plan, evidence=evidence)
+    resigned_fingerprint = sha256(
+        json.dumps(
+            evidence,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    forged = replace(forged, evidence_fingerprint=resigned_fingerprint)
+
+    with pytest.raises(module.CompositeBatchRecoveryConflict):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=forged,
+            expected_fingerprint=resigned_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+            snapshot=snapshot,
+            require_mimo_v1=True,
+        )
+
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+def test_position_absent_apply_rejects_fully_resigned_durable_scope_forgery(
+    tmp_path,
+):
+    from telegram_kol_research.trading_settings import save_trading_settings
+
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    plan = _plan(factory, _natural_stop_snapshot())
+    forged_snapshot = _natural_stop_snapshot(
+        scope_protection_overrides={
+            "backup_stop": {"trigger_price": "1"},
+        }
+    )
+    evidence = module.serialize_composite_batch_recovery_plan(plan)["evidence"]
+    with factory() as session:
+        ledger = (
+            session.query(PositionProtectionLedger)
+            .order_by(PositionProtectionLedger.id)
+            .all()
+        )
+    forged_exchange = module._fingerprint(
+        module._exchange_evidence_payload(
+            forged_snapshot,
+            position=plan.position,
+            pos_id=POS_ID,
+            ledger=ledger,
+            profile=module.BATCH_119_RECOVERY,
+            natural_stop_proof=evidence["natural_stop"],
+        )
+    )
+    evidence["exchange_snapshot_fingerprint"] = forged_exchange
+    forged_fingerprint = module._fingerprint(evidence)
+    forged = replace(
+        plan,
+        exchange_snapshot_fingerprint=forged_exchange,
+        evidence_fingerprint=forged_fingerprint,
+        evidence=evidence,
+    )
+    save_trading_settings(
+        factory,
+        {"mimo_contract_mode": "v1"},
+        updated_at=NOW,
+    )
+
+    with pytest.raises(module.CompositeBatchRecoveryConflict):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=forged,
+            snapshot=forged_snapshot,
+            expected_fingerprint=forged_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+def test_non_absent_apply_rechecks_mimo_v1_inside_locked_transaction(tmp_path):
+    from telegram_kol_research.trading_settings import save_trading_settings
+
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    plan = _plan(factory)
+    assert plan.position.disposition == "resume_to_target"
+    save_trading_settings(
+        factory,
+        {"mimo_contract_mode": "v2_live_adapter"},
+        updated_at=NOW,
+    )
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="mimo_contract_mode_not_v1",
+    ):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+            require_mimo_v1=True,
+        )
+
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+def test_non_absent_repeat_and_resume_recheck_locked_mimo_v1(tmp_path):
+    from telegram_kol_research.trading_settings import save_trading_settings
+
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    snapshot = _snapshot()
+    plan = _plan(factory, snapshot)
+    save_trading_settings(
+        factory,
+        {"mimo_contract_mode": "v1"},
+        updated_at=NOW,
+    )
+    repaired = module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    assert repaired.status == "repaired"
+    save_trading_settings(
+        factory,
+        {"mimo_contract_mode": "v2_live_adapter"},
+        updated_at=NOW + timedelta(seconds=1),
+    )
+
+    for action in ("repeat", "resume"):
+        with pytest.raises(
+            module.CompositeBatchRecoveryConflict,
+            match="mimo_contract_mode_not_v1",
+        ):
+            if action == "repeat":
+                module.apply_composite_batch_false_state_repair(
+                    factory,
+                    plan=plan,
+                    expected_fingerprint=plan.evidence_fingerprint,
+                    authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+                    applied_at=NOW,
+                )
+            else:
+                module.authorize_composite_batch_recovery_resume(
+                    factory,
+                    expected_fingerprint=plan.evidence_fingerprint,
+                    snapshot=snapshot,
+                    require_mimo_v1=True,
+                )
+
+    with factory() as session:
+        assert session.query(ExecutionEvent).count() == 1
+
+
+def test_position_absent_mimo_gate_query_error_rolls_back_and_releases_lock(
+    tmp_path,
+    monkeypatch,
+):
+    from telegram_kol_research.trading_settings import save_trading_settings
+
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    snapshot = _natural_stop_snapshot()
+    plan = _plan(factory, snapshot)
+    save_trading_settings(
+        factory,
+        {"mimo_contract_mode": "v1"},
+        updated_at=NOW,
+    )
+    original_all = Query.all
+
+    def fail_setting_query(query):
+        entities = {
+            item.get("entity") for item in query.column_descriptions
+        }
+        if module.TradingSetting in entities:
+            raise OperationalError(
+                "forced locked setting query failure",
+                {},
+                RuntimeError("forced setting query failure"),
+            )
+        return original_all(query)
+
+    with monkeypatch.context() as gate_patch:
+        gate_patch.setattr(Query, "all", fail_setting_query)
+        with pytest.raises(
+            module.CompositeBatchRecoveryConflict,
+            match="mimo_contract_mode_not_v1",
+        ):
+            module.apply_composite_batch_false_state_repair(
+                factory,
+                plan=plan,
+                snapshot=snapshot,
+                expected_fingerprint=plan.evidence_fingerprint,
+                authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+                applied_at=NOW,
+            )
+
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+    save_trading_settings(
+        factory,
+        {"mimo_contract_mode": "v1"},
+        updated_at=NOW + timedelta(seconds=1),
+    )
+    repaired = module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        snapshot=snapshot,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    assert repaired.status == "repaired"
 
 
 class _Batch119RecoveryClient:
@@ -9008,6 +9305,7 @@ def test_batch119_resume_rejects_durable_scope_drift_after_exact_capture(
     module.apply_composite_batch_false_state_repair(
         factory,
         plan=plan,
+        snapshot=snapshot,
         expected_fingerprint=plan.evidence_fingerprint,
         authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
         applied_at=NOW,
@@ -9061,6 +9359,7 @@ def test_batch119_resume_rejects_protection_evidence_drift_after_capture(
     module.apply_composite_batch_false_state_repair(
         factory,
         plan=plan,
+        snapshot=snapshot,
         expected_fingerprint=plan.evidence_fingerprint,
         authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
         applied_at=NOW,
@@ -10446,6 +10745,96 @@ def test_recovery_cli_position_absent_refuses_non_v1_without_database_write(
     assert client.cancel_calls == []
     assert client.close_calls == []
     assert client.set_calls == []
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+def test_recovery_cli_position_absent_rechecks_mimo_v1_inside_apply_lock(
+    tmp_path,
+    monkeypatch,
+):
+    from typer.testing import CliRunner
+
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.cli import app
+    from telegram_kol_research.trading_settings import (
+        load_trading_settings,
+        save_trading_settings,
+    )
+
+    factory, database_path, _, _, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    v1_settings = {
+        "auto_trade_enabled": True,
+        "management_execution_mode": "live",
+        "composite_management_v2_mode": "live",
+        "mimo_contract_mode": "v1",
+    }
+    save_trading_settings(factory, v1_settings, updated_at=NOW)
+    specs_path = tmp_path / "deepcoin-contract-specs.yaml"
+    specs_path.write_text("contracts: []\n", encoding="utf-8")
+    client = _Batch119AbsentExactHistoryClient()
+    monkeypatch.setattr(
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: client,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_deepcoin_client_from_env",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("position-absent must not build writer")
+        ),
+    )
+    common = [
+        "recover-composite-management-batch",
+        "--database-path",
+        str(database_path),
+        "--batch-id",
+        "119",
+        "--deepcoin-contract-specs-path",
+        str(specs_path),
+    ]
+    dry_run = CliRunner().invoke(app, common)
+    assert dry_run.exit_code == 0, dry_run.stdout
+    fingerprint = json.loads(dry_run.stdout)["plan"]["evidence_fingerprint"]
+    original_writable_factory = cli_module.create_existing_session_factory
+    setting_switched = []
+
+    def switch_setting_before_apply(path):
+        save_trading_settings(
+            factory,
+            {**v1_settings, "mimo_contract_mode": "v2_live_adapter"},
+            updated_at=NOW + timedelta(seconds=1),
+        )
+        setting_switched.append(True)
+        return original_writable_factory(path)
+
+    monkeypatch.setattr(
+        cli_module,
+        "create_existing_session_factory",
+        switch_setting_before_apply,
+    )
+    applied = CliRunner().invoke(
+        app,
+        [
+            *common,
+            "--apply",
+            "--expected-fingerprint",
+            fingerprint,
+            "--authorization",
+            "I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        ],
+    )
+
+    assert setting_switched == [True]
+    assert applied.exit_code == 2
+    assert json.loads(applied.stdout)["reason_code"] == (
+        "mimo_contract_mode_not_v1"
+    )
+    assert load_trading_settings(factory).mimo_contract_mode == "v2_live_adapter"
     with factory() as session:
         assert session.get(StrategyManagementBatch, 119).status == "reconciling"
         assert session.query(ExecutionEvent).count() == 0

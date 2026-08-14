@@ -45,6 +45,7 @@ from telegram_kol_research.models import (
     StrategyManagementLeg,
     StrategyRevisionBatch,
     TradeSignal,
+    TradingSetting,
 )
 from telegram_kol_research.strategy_management_contracts import (
     management_contract_fingerprint,
@@ -1654,6 +1655,7 @@ def authorize_composite_batch_recovery_resume(
     *,
     expected_fingerprint: str,
     snapshot: Any,
+    require_mimo_v1: bool = True,
 ) -> CompositeBatchRecoveryResumeAuthorization:
     """Authorize only a progressed state descended from the exact repair audit."""
 
@@ -1679,6 +1681,11 @@ def authorize_composite_batch_recovery_resume(
             event,
             expected_fingerprint=expected_fingerprint,
         )
+        if not require_mimo_v1:
+            raise CompositeBatchRecoveryConflict(
+                "mimo_contract_gate_missing"
+            )
+        _require_locked_mimo_v1(session)
         batch = session.get(
             StrategyManagementBatch,
             BATCH_119_RECOVERY.batch_id,
@@ -1822,7 +1829,8 @@ def authorize_composite_batch_recovery_resume(
                 "resume_source_state_conflict"
             ) from exc
         if (
-            durable_scope.scope_fingerprint
+            snapshot.exact_scope != durable_scope
+            or durable_scope.scope_fingerprint
             != str(snapshot.scope_fingerprint)
         ):
             raise CompositeBatchRecoveryConflict(
@@ -1840,15 +1848,24 @@ def authorize_composite_batch_recovery_resume(
             raise CompositeBatchRecoveryConflict(
                 "resume_exchange_close_unowned"
             )
+        position = _resume_position(
+            disposition=disposition,
+            current_size=after["current_size"],
+        )
+        if disposition == "position_absent":
+            _validate_locked_position_absent_snapshot(
+                session,
+                snapshot=snapshot,
+                expected_position=position,
+                expected_exchange_fingerprint=str(
+                    after["exchange_snapshot_fingerprint"]
+                ),
+                expected_natural_stop=None,
+            )
         audit_event_id = int(event.id)
         source_fingerprint = str(after["source_fingerprint"])
         exchange_fingerprint = str(after["exchange_snapshot_fingerprint"])
-        current_size = after["current_size"]
 
-    position = _resume_position(
-        disposition=disposition,
-        current_size=current_size,
-    )
     plan = CompositeBatchRecoveryPlan(
         batch_id=BATCH_119_RECOVERY.batch_id,
         status="ready",
@@ -3138,6 +3155,196 @@ def _resume_position(
     )
 
 
+def _require_locked_mimo_v1(session) -> None:
+    """Require the persisted MiMo gate from the already locked transaction."""
+
+    try:
+        rows = (
+            session.query(TradingSetting)
+            .filter(TradingSetting.key == "global")
+            .all()
+        )
+        if len(rows) > 1:
+            raise CompositeBatchRecoveryConflict(
+                "mimo_contract_mode_not_v1"
+            )
+        if not rows:
+            mode = "v1"
+        else:
+            payload = json.loads(rows[0].value_json)
+            if not isinstance(payload, Mapping):
+                raise ValueError("settings payload must be an object")
+            mode = payload.get("mimo_contract_mode", "v1")
+    except CompositeBatchRecoveryConflict:
+        raise
+    except (SQLAlchemyError, TypeError, ValueError, RecursionError) as exc:
+        raise CompositeBatchRecoveryConflict(
+            "mimo_contract_mode_not_v1"
+        ) from exc
+    if mode != "v1":
+        raise CompositeBatchRecoveryConflict("mimo_contract_mode_not_v1")
+
+
+def _validate_locked_position_absent_snapshot(
+    session,
+    *,
+    snapshot: Any,
+    expected_position: CompositeRecoveryPosition,
+    expected_exchange_fingerprint: str,
+    expected_natural_stop: Mapping[str, Any] | None,
+) -> None:
+    """Rebuild the absent-position authority from locked DB and captured GETs."""
+
+    if not _snapshot_is_complete(
+        snapshot,
+        profile=BATCH_119_RECOVERY,
+    ):
+        raise CompositeBatchRecoveryConflict(
+            "position_absent_snapshot_invalid"
+        )
+    batch = session.get(
+        StrategyManagementBatch,
+        BATCH_119_RECOVERY.batch_id,
+    )
+    lifecycle = session.get(
+        StrategyLifecycle,
+        BATCH_119_RECOVERY.lifecycle_id,
+    )
+    raw = session.get(RawMessage, BATCH_119_RECOVERY.raw_message_id)
+    if batch is None or lifecycle is None or raw is None:
+        raise CompositeBatchRecoveryConflict("source_state_conflict")
+    binding = session.get(ExecutionBinding, int(batch.execution_binding_id))
+    legs = (
+        session.query(StrategyManagementLeg)
+        .filter_by(management_batch_id=BATCH_119_RECOVERY.batch_id)
+        .all()
+    )
+    if binding is None or len(legs) != 1:
+        raise CompositeBatchRecoveryConflict("source_state_conflict")
+    leg = legs[0]
+    entry = session.get(ExecutionOrderLeg, int(leg.execution_order_leg_id))
+    if entry is None or _durable_identity_refusal(
+        session=session,
+        batch=batch,
+        raw=raw,
+        lifecycle=lifecycle,
+        binding=binding,
+        entry=entry,
+        leg=leg,
+        profile=BATCH_119_RECOVERY,
+    ) is not None:
+        raise CompositeBatchRecoveryConflict("source_state_conflict")
+    target = _validated_target_snapshot(
+        batch,
+        binding=binding,
+        leg=leg,
+        entry=entry,
+        profile=BATCH_119_RECOVERY,
+    )
+    if isinstance(target, str) or _has_durable_close_submission(
+        session,
+        batch=batch,
+        leg=leg,
+        entry=entry,
+    ):
+        raise CompositeBatchRecoveryConflict("source_state_conflict")
+    try:
+        position = classify_recovery_position(
+            profile=BATCH_119_RECOVERY,
+            positions=list(snapshot.positions),
+            expected_pos_id=str(leg.pos_id),
+            instrument_id=BATCH_119_RECOVERY.instrument_id,
+            side=BATCH_119_RECOVERY.side,
+            quantity_step=str(target["quantity_step"]),
+            min_quantity=str(target["min_quantity"]),
+        )
+    except CompositeBatchRecoveryRefusal as exc:
+        raise CompositeBatchRecoveryConflict(
+            "position_absent_snapshot_invalid"
+        ) from exc
+    if (
+        position.disposition != "position_absent"
+        or position != expected_position
+    ):
+        raise CompositeBatchRecoveryConflict(
+            "position_absent_snapshot_invalid"
+        )
+    ledger = (
+        session.query(PositionProtectionLedger)
+        .filter(
+            PositionProtectionLedger.execution_binding_id == binding.id,
+            PositionProtectionLedger.execution_order_leg_id == entry.id,
+            PositionProtectionLedger.pos_id == str(leg.pos_id),
+        )
+        .order_by(PositionProtectionLedger.id)
+        .all()
+    )
+    try:
+        durable_scope = _build_batch119_exact_history_scope_in_session(
+            session
+        )
+    except CompositeBatchRecoveryRefusal as exc:
+        raise CompositeBatchRecoveryConflict(
+            "position_absent_snapshot_conflict"
+        ) from exc
+    if (
+        snapshot.exact_scope != durable_scope
+        or str(snapshot.scope_fingerprint)
+        != durable_scope.scope_fingerprint
+    ):
+        raise CompositeBatchRecoveryConflict(
+            "position_absent_snapshot_conflict"
+        )
+    proof = _validated_natural_stop_proof(
+        snapshot=snapshot,
+        ledger=ledger,
+        pos_id=str(leg.pos_id),
+        profile=BATCH_119_RECOVERY,
+        not_before_ms=_incident_not_before_ms(
+            batch=batch,
+            leg=leg,
+            raw=raw,
+        ),
+    )
+    if isinstance(proof, str):
+        raise CompositeBatchRecoveryConflict(
+            "position_absent_snapshot_invalid"
+        )
+    protection_reason = _protection_ownership_refusal(
+        snapshot.pending_trigger_orders,
+        batch=batch,
+        binding=binding,
+        entry=entry,
+        ledger=ledger,
+        pos_id=str(leg.pos_id),
+        position=position,
+        profile=BATCH_119_RECOVERY,
+    )
+    if protection_reason is not None:
+        raise CompositeBatchRecoveryConflict(
+            "position_absent_snapshot_invalid"
+        )
+    exchange_payload = _exchange_evidence_payload(
+        snapshot,
+        position=position,
+        pos_id=str(leg.pos_id),
+        ledger=ledger,
+        profile=BATCH_119_RECOVERY,
+        natural_stop_proof=proof,
+    )
+    exchange_fingerprint = _fingerprint(exchange_payload)
+    if (
+        exchange_fingerprint != expected_exchange_fingerprint
+        or (
+            expected_natural_stop is not None
+            and _plain_json_value(expected_natural_stop) != dict(proof)
+        )
+    ):
+        raise CompositeBatchRecoveryConflict(
+            "position_absent_snapshot_conflict"
+        )
+
+
 def apply_composite_batch_false_state_repair(
     session_factory,
     *,
@@ -3145,6 +3352,8 @@ def apply_composite_batch_false_state_repair(
     expected_fingerprint: str,
     authorization: str,
     applied_at: datetime | None = None,
+    snapshot: Any = None,
+    require_mimo_v1: bool = True,
 ) -> CompositeBatchRecoveryApplyResult:
     """Atomically repair only the proven batch-119 legacy false state."""
 
@@ -3172,10 +3381,29 @@ def apply_composite_batch_false_state_repair(
     applied = applied_at or datetime.now(UTC)
     with session_factory() as session:
         _acquire_recovery_write_lock(session)
+        position_absent = (
+            plan.position is not None
+            and plan.position.disposition == "position_absent"
+        )
+        if not require_mimo_v1:
+            raise CompositeBatchRecoveryConflict(
+                "mimo_contract_gate_missing"
+            )
+        _require_locked_mimo_v1(session)
         existing = _load_recovery_audit_event(
             session, evidence_fingerprint=plan.evidence_fingerprint
         )
         if existing is not None:
+            if position_absent:
+                _validate_locked_position_absent_snapshot(
+                    session,
+                    snapshot=snapshot,
+                    expected_position=plan.position,
+                    expected_exchange_fingerprint=(
+                        plan.exchange_snapshot_fingerprint
+                    ),
+                    expected_natural_stop=plan.evidence.get("natural_stop"),
+                )
             if _repaired_state_and_event_match(session, event=existing, plan=plan):
                 return CompositeBatchRecoveryApplyResult(
                     batch_id=BATCH_119_RECOVERY.batch_id,
@@ -3198,6 +3426,16 @@ def apply_composite_batch_false_state_repair(
         ) = source
         if source_fingerprint != plan.source_fingerprint:
             raise CompositeBatchRecoveryConflict("source_fingerprint_conflict")
+        if position_absent:
+            _validate_locked_position_absent_snapshot(
+                session,
+                snapshot=snapshot,
+                expected_position=plan.position,
+                expected_exchange_fingerprint=(
+                    plan.exchange_snapshot_fingerprint
+                ),
+                expected_natural_stop=plan.evidence.get("natural_stop"),
+            )
         evidence = _plain_json_value(plan.evidence)
         if (
             evidence["durable"]["component_attempt_counts"]
