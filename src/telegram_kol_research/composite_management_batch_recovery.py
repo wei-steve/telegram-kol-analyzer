@@ -14,8 +14,9 @@ import re
 import secrets
 import sqlite3
 from types import MappingProxyType
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 import unicodedata
+import weakref
 
 from sqlalchemy import String, cast, create_engine, or_, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -138,6 +139,7 @@ class CompositeBatchRecoveryApplyResult:
     status: Literal["repaired", "already_repaired"]
     evidence_fingerprint: str
     audit_event_id: int
+    prepared_writer: Any = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,10 +187,6 @@ class Batch119ExactRecoverySnapshot:
     capture_started_at: datetime | None = None
     capture_ended_at: datetime | None = None
     scope_fingerprint: str | None = None
-    _capture_seal: str | None = field(default=None, repr=False)
-
-
-_BATCH119_CAPTURE_HMAC_KEY = secrets.token_bytes(32)
 
 
 def build_composite_batch_recovery_status_summary(
@@ -360,10 +358,11 @@ def create_composite_recovery_read_only_session_factory(
     )
 
 
-def load_composite_batch_recovery_snapshot_read_only(
+def _load_composite_batch_recovery_snapshot_read_only_impl(
     session_factory,
     *,
     client: Any,
+    _finalize_capture: Callable[[Batch119ExactRecoverySnapshot], Any],
 ):
     """Capture only the immutable exact-ID scope approved for batch 119."""
 
@@ -572,12 +571,83 @@ def load_composite_batch_recovery_snapshot_read_only(
                 or "snapshot_incomplete"
             ),
         )
-    try:
-        return _seal_batch119_recovery_snapshot(snapshot)
-    except (AttributeError, TypeError, ValueError, RecursionError, OverflowError):
-        snapshot._capture_seal = None
-        snapshot.errors.setdefault("capture_seal", "snapshot_seal_unavailable")
+    return _finalize_capture(snapshot)
+
+
+def _build_batch119_capture_capability(loader_impl):
+    """Bind issuance to this loader instance without exporting a signer."""
+
+    key = secrets.token_bytes(32)
+    issued: dict[int, tuple[weakref.ReferenceType[Any], str]] = {}
+
+    def finalize(snapshot: Batch119ExactRecoverySnapshot):
+        if not _batch119_capture_preflight_is_bounded(snapshot):
+            snapshot.errors.setdefault(
+                "capture_capability",
+                "snapshot_capture_unbounded",
+            )
+            return snapshot
+        try:
+            seal = _batch119_capture_digest(snapshot, key=key)
+        except (
+            AttributeError,
+            MemoryError,
+            TypeError,
+            ValueError,
+            RecursionError,
+            OverflowError,
+        ):
+            snapshot.errors.setdefault(
+                "capture_capability",
+                "snapshot_capture_unavailable",
+            )
+            return snapshot
+        snapshot_id = id(snapshot)
+
+        def discard(reference, *, expected_id=snapshot_id):
+            current = issued.get(expected_id)
+            if current is not None and current[0] is reference:
+                issued.pop(expected_id, None)
+
+        reference = weakref.ref(snapshot, discard)
+        issued[snapshot_id] = (reference, seal)
         return snapshot
+
+    def loader(session_factory, *, client: Any):
+        return loader_impl(
+            session_factory,
+            client=client,
+            _finalize_capture=finalize,
+        )
+
+    def verify(snapshot: Any) -> bool:
+        if not _batch119_capture_preflight_is_bounded(snapshot):
+            return False
+        issued_capture = issued.get(id(snapshot))
+        if issued_capture is None or issued_capture[0]() is not snapshot:
+            return False
+        try:
+            expected = _batch119_capture_digest(snapshot, key=key)
+        except (
+            AttributeError,
+            MemoryError,
+            TypeError,
+            ValueError,
+            RecursionError,
+            OverflowError,
+        ):
+            return False
+        return hmac.compare_digest(issued_capture[1], expected)
+
+    return loader, verify
+
+
+(
+    load_composite_batch_recovery_snapshot_read_only,
+    _verify_batch119_capture_capability,
+) = _build_batch119_capture_capability(
+    _load_composite_batch_recovery_snapshot_read_only_impl
+)
 
 
 def _build_batch119_exact_history_scope(
@@ -1437,10 +1507,15 @@ def _deduplicate_exact_snapshot_rows(
     result: list[dict[str, Any]] = []
     seen: set[str] = set()
     for row in rows:
-        canonical = _canonical_json(dict(row))
+        plain_row = _plain_json_value(row)
+        if not isinstance(plain_row, dict):
+            raise CompositeBatchRecoveryRefusal(
+                "exchange_snapshot_row_invalid"
+            )
+        canonical = _canonical_json(plain_row)
         if canonical not in seen:
             seen.add(canonical)
-            result.append(dict(row))
+            result.append(plain_row)
     return result
 
 
@@ -1667,6 +1742,8 @@ def authorize_composite_batch_recovery_resume(
     expected_fingerprint: str,
     snapshot: Any,
     require_mimo_v1: bool = True,
+    prepare_writer: Callable[[], Any] | None = None,
+    expected_uid_scope_hash: str | None = None,
 ) -> CompositeBatchRecoveryResumeAuthorization:
     """Authorize only a progressed state descended from the exact repair audit."""
 
@@ -1696,7 +1773,6 @@ def authorize_composite_batch_recovery_resume(
             raise CompositeBatchRecoveryConflict(
                 "mimo_contract_gate_missing"
             )
-        _require_locked_mimo_v1(session)
         batch = session.get(
             StrategyManagementBatch,
             BATCH_119_RECOVERY.batch_id,
@@ -1751,6 +1827,10 @@ def authorize_composite_batch_recovery_resume(
         if isinstance(contract, str) or isinstance(target, str):
             raise CompositeBatchRecoveryConflict("resume_source_state_conflict")
         disposition = str(after["position_disposition"])
+        _require_locked_recovery_settings(
+            session,
+            require_live=disposition != "position_absent",
+        )
         if disposition == "position_absent" and _has_durable_close_submission(
             session,
             batch=batch,
@@ -1859,23 +1939,37 @@ def authorize_composite_batch_recovery_resume(
             raise CompositeBatchRecoveryConflict(
                 "resume_exchange_close_unowned"
             )
-        position = _resume_position(
+        audited_position = _resume_position(
             disposition=disposition,
             current_size=after["current_size"],
         )
-        if disposition == "position_absent":
-            _validate_locked_exact_snapshot(
-                session,
-                snapshot=snapshot,
-                expected_position=position,
-                expected_exchange_fingerprint=str(
-                    after["exchange_snapshot_fingerprint"]
+        position, exchange_fingerprint = _validated_locked_resume_exchange(
+            session,
+            snapshot=snapshot,
+            audited_position=audited_position,
+            audited_exchange_fingerprint=str(
+                after["exchange_snapshot_fingerprint"]
+            ),
+            batch=batch,
+            binding=binding,
+            entry=entry,
+            leg=leg,
+            components=components,
+            target=target,
+        )
+        prepared_writer = (
+            None
+            if disposition == "position_absent"
+            else _prepare_locked_recovery_writer(
+                prepare_writer=prepare_writer,
+                expected_uid_scope_hash=expected_uid_scope_hash,
+                snapshot_uid_scope_hash=(
+                    snapshot.account_authority.uid_scope_hash
                 ),
-                expected_natural_stop=None,
             )
+        )
         audit_event_id = int(event.id)
         source_fingerprint = str(after["source_fingerprint"])
-        exchange_fingerprint = str(after["exchange_snapshot_fingerprint"])
 
     plan = CompositeBatchRecoveryPlan(
         batch_id=BATCH_119_RECOVERY.batch_id,
@@ -1894,6 +1988,7 @@ def authorize_composite_batch_recovery_resume(
             status="already_repaired",
             evidence_fingerprint=expected_fingerprint,
             audit_event_id=audit_event_id,
+            prepared_writer=prepared_writer,
         ),
     )
 
@@ -3166,8 +3261,137 @@ def _resume_position(
     )
 
 
-def _require_locked_mimo_v1(session) -> None:
-    """Require the persisted MiMo gate from the already locked transaction."""
+def _validated_locked_resume_exchange(
+    session,
+    *,
+    snapshot: Any,
+    audited_position: CompositeRecoveryPosition,
+    audited_exchange_fingerprint: str,
+    batch,
+    binding,
+    entry,
+    leg,
+    components,
+    target: Mapping[str, Any],
+) -> tuple[CompositeRecoveryPosition, str]:
+    """Accept only the audited capture or exact owned partial-close progress."""
+
+    try:
+        observed = classify_recovery_position(
+            profile=BATCH_119_RECOVERY,
+            positions=list(snapshot.positions),
+            expected_pos_id=str(leg.pos_id),
+            instrument_id=BATCH_119_RECOVERY.instrument_id,
+            side=BATCH_119_RECOVERY.side,
+            quantity_step=str(target["quantity_step"]),
+            min_quantity=str(target["min_quantity"]),
+        )
+    except (CompositeBatchRecoveryRefusal, TypeError, ValueError) as exc:
+        raise CompositeBatchRecoveryConflict(
+            "position_absent_snapshot_invalid"
+        ) from exc
+    exact_audited_after_state = (
+        str(batch.status) in {"ready", "resolved"}
+        and [str(row.status) for row in components]
+        == (
+            ["safely_skipped", "safely_skipped", "safely_skipped"]
+            if audited_position.disposition == "position_absent"
+            else ["recovery_required", "pending", "pending"]
+        )
+    )
+    if exact_audited_after_state:
+        _validate_locked_exact_snapshot(
+            session,
+            snapshot=snapshot,
+            expected_position=audited_position,
+            expected_exchange_fingerprint=audited_exchange_fingerprint,
+            expected_natural_stop=None,
+        )
+        return observed, audited_exchange_fingerprint
+    if (
+        observed.disposition == "position_absent"
+        or (
+            observed != audited_position
+            and (
+                audited_position.disposition != "resume_to_target"
+                or observed.disposition != "protection_only_at_target"
+                or observed.current_size
+                != str(target.get("target_remaining_size"))
+            )
+        )
+    ):
+        raise CompositeBatchRecoveryConflict(
+            "position_absent_snapshot_invalid"
+        )
+    if observed != audited_position:
+        close_components = [
+            row
+            for row in components
+            if str(row.component_kind) == "converge_partial_close"
+        ]
+        if len(close_components) != 1:
+            raise CompositeBatchRecoveryConflict("resume_component_conflict")
+        close_component = close_components[0]
+        desired = _safe_json_value(close_component.desired_json)
+        execution = (
+            desired.get("partial_close_execution")
+            if isinstance(desired, Mapping)
+            else None
+        )
+        intent_id = (
+            execution.get("intent_id")
+            if isinstance(execution, Mapping)
+            else None
+        )
+        intent = (
+            session.get(PositionMutationIntent, int(intent_id))
+            if isinstance(intent_id, int) and not isinstance(intent_id, bool)
+            else None
+        )
+        if (
+            str(close_component.status)
+            not in {"submitting", "awaiting_exchange", "confirmed"}
+            or intent is None
+            or str(intent.status)
+            not in {"submitted", "submit_unknown", "confirmed"}
+            or str(intent.operation) != "close_position"
+            or int(intent.execution_binding_id or 0) != int(binding.id)
+            or int(intent.execution_order_leg_id or 0) != int(entry.id)
+            or str(intent.pos_id or "") != str(leg.pos_id)
+            or not str(intent.idempotency_key or "").startswith(
+                f"{int(close_component.id)}:close:attempt:"
+            )
+        ):
+            raise CompositeBatchRecoveryConflict("resume_component_conflict")
+    ledger = (
+        session.query(PositionProtectionLedger)
+        .filter(
+            PositionProtectionLedger.execution_binding_id == binding.id,
+            PositionProtectionLedger.execution_order_leg_id == entry.id,
+            PositionProtectionLedger.pos_id == str(leg.pos_id),
+        )
+        .order_by(PositionProtectionLedger.id)
+        .all()
+    )
+    exchange_fingerprint = _fingerprint(
+        _exchange_evidence_payload(
+            snapshot,
+            position=observed,
+            pos_id=str(leg.pos_id),
+            ledger=ledger,
+            profile=BATCH_119_RECOVERY,
+            natural_stop_proof=None,
+        )
+    )
+    return observed, exchange_fingerprint
+
+
+def _require_locked_recovery_settings(
+    session,
+    *,
+    require_live: bool,
+) -> None:
+    """Require persisted recovery gates from the already locked transaction."""
 
     try:
         rows = (
@@ -3181,11 +3405,13 @@ def _require_locked_mimo_v1(session) -> None:
             )
         if not rows:
             mode = "v1"
+            composite_mode = None
         else:
             payload = json.loads(rows[0].value_json)
             if not isinstance(payload, Mapping):
                 raise ValueError("settings payload must be an object")
             mode = payload.get("mimo_contract_mode", "v1")
+            composite_mode = payload.get("composite_management_v2_mode")
     except CompositeBatchRecoveryConflict:
         raise
     except (SQLAlchemyError, TypeError, ValueError, RecursionError) as exc:
@@ -3194,6 +3420,35 @@ def _require_locked_mimo_v1(session) -> None:
         ) from exc
     if mode != "v1":
         raise CompositeBatchRecoveryConflict("mimo_contract_mode_not_v1")
+    if require_live and composite_mode != "live":
+        raise CompositeBatchRecoveryConflict(
+            "composite_management_live_gate_closed"
+        )
+
+
+def _prepare_locked_recovery_writer(
+    *,
+    prepare_writer: Callable[[], Any] | None,
+    expected_uid_scope_hash: str | None,
+    snapshot_uid_scope_hash: str | None,
+) -> Any:
+    if (
+        not callable(prepare_writer)
+        or not _is_sha256(expected_uid_scope_hash)
+        or not _is_sha256(snapshot_uid_scope_hash)
+    ):
+        raise CompositeBatchRecoveryConflict("writer_prepare_capability_missing")
+    if snapshot_uid_scope_hash != expected_uid_scope_hash:
+        raise CompositeBatchRecoveryConflict("exchange_account_scope_mismatch")
+    try:
+        writer = prepare_writer()
+    except Exception as exc:
+        raise CompositeBatchRecoveryConflict(
+            "exchange_writer_client_unavailable"
+        ) from exc
+    if getattr(writer, "uid_scope_hash", None) != expected_uid_scope_hash:
+        raise CompositeBatchRecoveryConflict("exchange_account_scope_mismatch")
+    return writer
 
 
 def _validate_locked_exact_snapshot(
@@ -3370,6 +3625,8 @@ def apply_composite_batch_false_state_repair(
     applied_at: datetime | None = None,
     snapshot: Any = None,
     require_mimo_v1: bool = True,
+    prepare_writer: Callable[[], Any] | None = None,
+    expected_uid_scope_hash: str | None = None,
 ) -> CompositeBatchRecoveryApplyResult:
     """Atomically repair only the proven batch-119 legacy false state."""
 
@@ -3406,7 +3663,25 @@ def apply_composite_batch_false_state_repair(
             raise CompositeBatchRecoveryConflict(
                 "mimo_contract_gate_missing"
             )
-        _require_locked_mimo_v1(session)
+        requires_writer = (
+            plan.position is not None
+            and plan.position.disposition != "position_absent"
+        )
+        _require_locked_recovery_settings(
+            session,
+            require_live=requires_writer,
+        )
+        prepared_writer = (
+            _prepare_locked_recovery_writer(
+                prepare_writer=prepare_writer,
+                expected_uid_scope_hash=expected_uid_scope_hash,
+                snapshot_uid_scope_hash=(
+                    snapshot.account_authority.uid_scope_hash
+                ),
+            )
+            if requires_writer
+            else None
+        )
         existing = _load_recovery_audit_event(
             session, evidence_fingerprint=plan.evidence_fingerprint
         )
@@ -3426,6 +3701,7 @@ def apply_composite_batch_false_state_repair(
                     status="already_repaired",
                     evidence_fingerprint=plan.evidence_fingerprint,
                     audit_event_id=int(existing.id),
+                    prepared_writer=prepared_writer,
                 )
             raise CompositeBatchRecoveryConflict("recovery_audit_conflict")
         source = _load_locked_recovery_source(session)
@@ -3549,6 +3825,7 @@ def apply_composite_batch_false_state_repair(
             status="repaired",
             evidence_fingerprint=plan.evidence_fingerprint,
             audit_event_id=int(event.id),
+            prepared_writer=prepared_writer,
         )
 
 
@@ -4650,35 +4927,141 @@ def _batch119_capture_seal_payload(snapshot: Any) -> dict[str, Any]:
     }
 
 
-def _batch119_capture_seal(snapshot: Any) -> str:
-    payload = _canonical_json(_batch119_capture_seal_payload(snapshot)).encode(
-        "utf-8"
-    )
+def _batch119_capture_digest(snapshot: Any, *, key: bytes) -> str:
+    payload = json.dumps(
+        _batch119_capture_seal_payload(snapshot),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
     return hmac.new(
-        _BATCH119_CAPTURE_HMAC_KEY,
+        key,
         payload,
         hashlib.sha256,
     ).hexdigest()
 
 
-def _seal_batch119_recovery_snapshot(
-    snapshot: Batch119ExactRecoverySnapshot,
-) -> Batch119ExactRecoverySnapshot:
-    snapshot._capture_seal = _batch119_capture_seal(snapshot)
-    return snapshot
-
-
-def _batch119_capture_seal_is_valid(snapshot: Any) -> bool:
+def _batch119_capture_preflight_is_bounded(snapshot: Any) -> bool:
     if not isinstance(snapshot, Batch119ExactRecoverySnapshot):
         return False
-    seal = snapshot._capture_seal
-    if not isinstance(seal, str) or not _is_sha256(seal):
+    collections = []
+    total_rows = 0
+    for field_name in _REQUIRED_SNAPSHOT_FIELDS:
+        if field_name == "errors":
+            continue
+        value = getattr(snapshot, field_name, None)
+        if type(value) not in (list, tuple) or len(value) > 100:
+            return False
+        total_rows += len(value)
+        collections.append(value)
+    errors = getattr(snapshot, "errors", None)
+    collection_authority = getattr(snapshot, "collection_authority", None)
+    authority = getattr(snapshot, "account_authority", None)
+    authority_collections = getattr(authority, "collections", None)
+    scope = getattr(snapshot, "exact_scope", None)
+    if (
+        total_rows > 800
+        or type(errors) is not dict
+        or len(errors) > 32
+        or type(collection_authority) not in (list, tuple)
+        or len(collection_authority) > 16
+        or type(authority_collections) not in (list, tuple)
+        or len(authority_collections) > 16
+        or not isinstance(scope, _Batch119ExactHistoryScope)
+        or _normalize_aware_utc_datetime(snapshot.capture_started_at) is None
+        or _normalize_aware_utc_datetime(snapshot.capture_ended_at) is None
+    ):
         return False
+    raw_values: list[Any] = [
+        *collections,
+        errors,
+        collection_authority,
+        scope.instrument_id,
+        scope.side,
+        scope.scope_fingerprint,
+        scope.position_id,
+        scope.protection_orders,
+        scope.protection_evidence_fingerprints,
+        snapshot.scope_fingerprint,
+        getattr(authority, "uid_scope_hash", None),
+        getattr(authority, "start_write_generation", None),
+        getattr(authority, "end_write_generation", None),
+        getattr(authority, "complete", None),
+        getattr(authority, "reason_code", None),
+    ]
+    for collection in authority_collections:
+        rows = getattr(collection, "rows", None)
+        if type(rows) not in (list, tuple) or len(rows) > 100:
+            return False
+        raw_values.extend(
+            [
+                getattr(collection, "endpoint", None),
+                getattr(collection, "available", None),
+                getattr(collection, "schema_valid", None),
+                getattr(collection, "complete", None),
+                rows,
+                getattr(collection, "row_count", None),
+                getattr(collection, "page_count", None),
+                getattr(collection, "fingerprint", None),
+                getattr(collection, "reason_code", None),
+                getattr(collection, "expected_order_ids_visible", False),
+            ]
+        )
+    return _capture_values_are_bounded(raw_values)
+
+
+def _capture_values_are_bounded(values: Sequence[Any]) -> bool:
+    stack = [(value, 0) for value in values]
+    nodes = 0
+    total_string_bytes = 0
+    seen: set[int] = set()
     try:
-        expected = _batch119_capture_seal(snapshot)
-    except (AttributeError, TypeError, ValueError, RecursionError, OverflowError):
+        while stack:
+            value, depth = stack.pop()
+            nodes += 1
+            if nodes > 20_000 or depth > 64:
+                return False
+            if value is None or type(value) in (bool, int):
+                continue
+            if type(value) is float:
+                if not math.isfinite(value):
+                    return False
+                continue
+            if type(value) is str:
+                encoded_size = len(value.encode("utf-8"))
+                if encoded_size > 16_384:
+                    return False
+                total_string_bytes += encoded_size
+                if total_string_bytes > 1_048_576:
+                    return False
+                continue
+            if type(value) in (dict, MappingProxyType):
+                identity = id(value)
+                if identity in seen:
+                    return False
+                seen.add(identity)
+                if len(value) > 256:
+                    return False
+                for key, item in value.items():
+                    if type(key) is not str:
+                        return False
+                    stack.append((key, depth + 1))
+                    stack.append((item, depth + 1))
+                continue
+            if type(value) in (list, tuple):
+                identity = id(value)
+                if identity in seen:
+                    return False
+                seen.add(identity)
+                if len(value) > 800:
+                    return False
+                stack.extend((item, depth + 1) for item in value)
+                continue
+            return False
+    except (MemoryError, RecursionError, TypeError, ValueError, OverflowError):
         return False
-    return hmac.compare_digest(seal, expected)
+    return True
 
 
 def _snapshot_is_complete(
@@ -4686,7 +5069,7 @@ def _snapshot_is_complete(
     *,
     profile: CompositeBatchRecoveryProfile,
 ) -> bool:
-    if not _batch119_capture_seal_is_valid(snapshot):
+    if not _verify_batch119_capture_capability(snapshot):
         return False
     if any(not hasattr(snapshot, field) for field in _REQUIRED_SNAPSHOT_FIELDS):
         return False
@@ -7401,7 +7784,7 @@ def _canonical_snapshot_row(row: object) -> str:
 
     if not isinstance(row, Mapping):
         raise CompositeBatchRecoveryRefusal("exchange_snapshot_row_invalid")
-    return _fingerprint(dict(row))
+    return _fingerprint(_plain_json_value(row))
 
 
 def _optional_json_fingerprint(value: str | None) -> str:

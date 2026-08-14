@@ -3387,6 +3387,7 @@ def test_recover_composite_management_batch_apply_repairs_then_executes_once(
         status="repaired",
         evidence_fingerprint=plan.evidence_fingerprint,
         audit_event_id=7,
+        prepared_writer=client,
     )
     execution = SimpleNamespace(
         id=119,
@@ -3606,6 +3607,7 @@ def test_recover_composite_management_batch_checks_writer_account_after_repair(
     import telegram_kol_research.cli as cli_module
     from telegram_kol_research.composite_management_batch_recovery import (
         CompositeBatchRecoveryApplyResult,
+        CompositeBatchRecoveryConflict,
         CompositeBatchRecoveryPlan,
         CompositeRecoveryPosition,
     )
@@ -3677,11 +3679,8 @@ def test_recover_composite_management_batch_checks_writer_account_after_repair(
         cli_module,
         "apply_composite_batch_false_state_repair",
         lambda *args, **kwargs: call_order.append("repair")
-        or CompositeBatchRecoveryApplyResult(
-            batch_id=119,
-            status="repaired",
-            evidence_fingerprint=plan.evidence_fingerprint,
-            audit_event_id=1,
+        or (_ for _ in ()).throw(
+            CompositeBatchRecoveryConflict("exchange_account_scope_mismatch")
         ),
     )
     monkeypatch.setattr(
@@ -3714,7 +3713,7 @@ def test_recover_composite_management_batch_checks_writer_account_after_repair(
     assert json.loads(result.stdout)["reason_code"] == (
         "exchange_account_scope_mismatch"
     )
-    assert call_order == ["factory", "repair", "writer"]
+    assert call_order == ["factory", "repair"]
 
 
 def test_recover_composite_management_batch_position_absent_never_builds_writer(
@@ -3889,6 +3888,7 @@ def test_recover_composite_management_batch_resumes_audited_progress_without_rep
         evidence_fingerprint=fingerprint,
         evidence={},
     )
+    client = SimpleNamespace(uid_scope_hash="a" * 64)
     authorization = CompositeBatchRecoveryResumeAuthorization(
         plan=resume_plan,
         repair_result=CompositeBatchRecoveryApplyResult(
@@ -3896,10 +3896,10 @@ def test_recover_composite_management_batch_resumes_audited_progress_without_rep
             status="already_repaired",
             evidence_fingerprint=fingerprint,
             audit_event_id=7,
+            prepared_writer=client,
         ),
     )
     factory = object()
-    client = SimpleNamespace(uid_scope_hash="a" * 64)
     read_client = SimpleNamespace(uid_scope_hash="a" * 64)
     snapshot = object()
     order = []

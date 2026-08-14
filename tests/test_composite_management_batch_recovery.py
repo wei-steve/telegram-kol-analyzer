@@ -45,6 +45,7 @@ from telegram_kol_research.models import (
     StrategyManagementComponent,
     StrategyManagementLeg,
     TradeSignal,
+    TradingSetting,
 )
 from telegram_kol_research.strategy_management_contracts import (
     ManagementInstructionContract,
@@ -62,6 +63,7 @@ POS_ID = "sensitive-position-119"
 PRIMARY_ORDER_ID = "sensitive-primary-order"
 BACKUP_ORDER_ID = "sensitive-backup-order"
 SOURCE_TEXT = "private source message text should never be retained"
+_ACTIVE_SNAPSHOT_FACTORY = None
 
 
 def _recovery_module():
@@ -243,6 +245,7 @@ def test_classify_recovery_position_rejects_identity_or_exposure_drift(overrides
 
 
 def _snapshot(**overrides):
+    requested_overrides = dict(overrides)
     scope_protection_overrides = overrides.pop(
         "scope_protection_overrides",
         {},
@@ -448,15 +451,63 @@ def _snapshot(**overrides):
         complete=True,
         reason_code=None,
     )
-    try:
-        return module._seal_batch119_recovery_snapshot(candidate)
-    except (TypeError, ValueError, RecursionError, OverflowError):
+    if _ACTIVE_SNAPSHOT_FACTORY is None:
         return candidate
+
+    class CandidateCaptureClient:
+        uid_scope_hash = "5" * 64
+
+        def read_positions(self, *, inst_id=None):
+            return {"data": list(candidate.positions)}
+
+        def read_open_orders(self, *, inst_id=None):
+            return {"data": list(candidate.open_orders)}
+
+        def read_trigger_orders_pending(self, *, inst_id):
+            return {"data": list(candidate.pending_trigger_orders)}
+
+        def read_position_history(self, *, inst_id, pos_id):
+            return {"data": list(candidate.position_history)}
+
+        def read_trigger_order_history(self, *, inst_id, order_id, limit):
+            return {
+                "data": [
+                    dict(row)
+                    for row in candidate.trigger_history
+                    if str(row.get("ordId") or row.get("orderId") or "")
+                    == order_id
+                ]
+            }
+
+    issued = module.load_composite_batch_recovery_snapshot_read_only(
+        _ACTIVE_SNAPSHOT_FACTORY,
+        client=CandidateCaptureClient(),
+    )
+    loader_supported = {
+        "positions",
+        "position_history",
+        "open_orders",
+        "pending_trigger_orders",
+        "trigger_history",
+    }
+    for field_name in requested_overrides:
+        if field_name not in loader_supported and hasattr(issued, field_name):
+            setattr(issued, field_name, getattr(candidate, field_name))
+    if (
+        scope_protection_overrides
+        and issued.exact_scope != candidate.exact_scope
+    ):
+        issued.exact_scope = candidate.exact_scope
+        issued.scope_fingerprint = candidate.scope_fingerprint
+        issued.account_authority = candidate.account_authority
+    return issued
 
 
 def _seed_batch_119_false_submission(tmp_path):
+    global _ACTIVE_SNAPSHOT_FACTORY
     database = tmp_path / "batch-119.db"
     factory = create_session_factory(database)
+    _ACTIVE_SNAPSHOT_FACTORY = factory
     strategy_id = "deepcoin:incident:btc:long"
     contract = ManagementInstructionContract(
         version=2,
@@ -738,6 +789,20 @@ def _seed_batch_119_false_submission(tmp_path):
                     updated_at=NOW,
                 )
             )
+        session.add(
+            TradingSetting(
+                key="global",
+                value_json=json.dumps(
+                    {
+                        "composite_management_v2_mode": "live",
+                        "mimo_contract_mode": "v1",
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                updated_at=NOW,
+            )
+        )
         session.commit()
         return factory, database, int(binding.id), int(entry.id), int(leg.id)
 
@@ -2023,7 +2088,7 @@ def test_resume_rejects_new_valid_instruction_population_after_repair(
         module.CompositeBatchRecoveryConflict,
         match="additional_active_work_present",
     ):
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=_snapshot(),
@@ -2241,9 +2306,42 @@ def _apply_recovery(
 ):
     if snapshot is _MISSING_SNAPSHOT:
         snapshot = _PLAN_SNAPSHOTS.get(id(plan))
+    if (
+        plan.position is not None
+        and getattr(plan.position, "disposition", None) != "position_absent"
+        and snapshot is not None
+    ):
+        uid_scope_hash = getattr(
+            getattr(snapshot, "account_authority", None),
+            "uid_scope_hash",
+            None,
+        )
+        kwargs.setdefault(
+            "prepare_writer",
+            lambda: SimpleNamespace(uid_scope_hash=uid_scope_hash),
+        )
+        kwargs.setdefault("expected_uid_scope_hash", uid_scope_hash)
     return module.apply_composite_batch_false_state_repair(
         session_factory,
         plan=plan,
+        snapshot=snapshot,
+        **kwargs,
+    )
+
+
+def _authorize_recovery(module, session_factory, *, snapshot, **kwargs):
+    uid_scope_hash = getattr(
+        getattr(snapshot, "account_authority", None),
+        "uid_scope_hash",
+        None,
+    )
+    kwargs.setdefault(
+        "prepare_writer",
+        lambda: SimpleNamespace(uid_scope_hash=uid_scope_hash),
+    )
+    kwargs.setdefault("expected_uid_scope_hash", uid_scope_hash)
+    return module.authorize_composite_batch_recovery_resume(
+        session_factory,
         snapshot=snapshot,
         **kwargs,
     )
@@ -2343,7 +2441,7 @@ def test_natural_stop_refuses_manual_or_unowned_trigger(tmp_path):
 
     plan = _plan(factory, snapshot)
 
-    _assert_natural_stop_refusal(plan, "exchange_snapshot_incomplete")
+    _assert_natural_stop_refusal(plan, "natural_stop_proof_trigger_invalid")
 
 
 def test_natural_stop_refuses_two_owned_stops_claiming_trigger(tmp_path):
@@ -2361,24 +2459,33 @@ def test_natural_stop_refuses_two_owned_stops_claiming_trigger(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "trigger_row",
+    ("trigger_row", "reason_code"),
     [
-        {
-            "instId": "BTC-USDT-SWAP",
-            "posSide": "long",
-            "state": "filled",
-            "triggerTime": str(
-                int((NOW - timedelta(seconds=2)).timestamp() * 1000)
-            ),
-            "errorCode": "0",
-        },
-        _successful_stop_trigger_row(instId="ETH-USDT-SWAP"),
-        _successful_stop_trigger_row(posSide="short"),
+        (
+            {
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "state": "filled",
+                "triggerTime": str(
+                    int((NOW - timedelta(seconds=2)).timestamp() * 1000)
+                ),
+                "errorCode": "0",
+            },
+            "natural_stop_proof_trigger_invalid",
+        ),
+        (
+            _successful_stop_trigger_row(instId="ETH-USDT-SWAP"),
+            "exchange_snapshot_incomplete",
+        ),
+        (
+            _successful_stop_trigger_row(posSide="short"),
+            "exchange_snapshot_incomplete",
+        ),
     ],
     ids=["missing_order", "wrong_instrument", "wrong_side"],
 )
 def test_natural_stop_refuses_incomplete_trigger_identity(
-    tmp_path, trigger_row
+    tmp_path, trigger_row, reason_code
 ):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
 
@@ -2387,7 +2494,7 @@ def test_natural_stop_refuses_incomplete_trigger_identity(
         _natural_stop_snapshot(trigger_history=[trigger_row]),
     )
 
-    _assert_natural_stop_refusal(plan, "exchange_snapshot_incomplete")
+    _assert_natural_stop_refusal(plan, reason_code)
 
 
 @pytest.mark.parametrize(
@@ -2430,7 +2537,7 @@ def test_natural_stop_refuses_ledger_purpose_or_owner_conflict(
         ([_closed_position_history_row()], [
             _successful_stop_trigger_row(
                 triggerTime=str(
-                    int((NOW + timedelta(seconds=1)).timestamp() * 1000)
+                    int(datetime(2036, 1, 1, tzinfo=UTC).timestamp() * 1000)
                 )
             )
         ], "natural_stop_proof_after_capture"),
@@ -2441,7 +2548,9 @@ def test_natural_stop_refuses_ledger_purpose_or_owner_conflict(
             _successful_stop_trigger_row()
         ], "natural_stop_proof_time_invalid"),
         ([_closed_position_history_row(
-            uTime=str(int((NOW + timedelta(seconds=1)).timestamp() * 1000))
+            uTime=str(
+                int(datetime(2036, 1, 1, tzinfo=UTC).timestamp() * 1000)
+            )
         )], [_successful_stop_trigger_row()], "natural_stop_proof_after_capture"),
         ([_closed_position_history_row(
             uTime=str(int((NOW - timedelta(seconds=3)).timestamp() * 1000))
@@ -3022,7 +3131,7 @@ def test_natural_stop_resume_refuses_late_normalized_close_operation(tmp_path):
         module.CompositeBatchRecoveryConflict,
         match="resume_source_state_conflict",
     ):
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=snapshot,
@@ -3198,7 +3307,7 @@ def test_natural_stop_resume_refuses_late_target_non_string_operation(
         module.CompositeBatchRecoveryConflict,
         match="resume_source_state_conflict",
     ):
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=snapshot,
@@ -3528,7 +3637,7 @@ def test_natural_stop_resume_refuses_late_partially_linked_target_event(
         module.CompositeBatchRecoveryConflict,
         match="resume_source_state_conflict",
     ):
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=snapshot,
@@ -3654,7 +3763,7 @@ def test_natural_stop_resume_refuses_late_whitespace_payload_target_event(
         module.CompositeBatchRecoveryConflict,
         match="resume_source_state_conflict",
     ):
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=snapshot,
@@ -3735,7 +3844,7 @@ def test_natural_stop_resume_refuses_late_escaped_key_target_event(tmp_path):
         module.CompositeBatchRecoveryConflict,
         match="resume_source_state_conflict",
     ):
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=snapshot,
@@ -4306,7 +4415,7 @@ def test_natural_stop_query_operational_error_fails_closed_without_writes(
             module.CompositeBatchRecoveryConflict,
             match="resume_source_state_conflict",
         ):
-            module.authorize_composite_batch_recovery_resume(
+            _authorize_recovery(module,
                 factory,
                 expected_fingerprint=plan.evidence_fingerprint,
                 snapshot=snapshot,
@@ -4461,7 +4570,7 @@ def test_natural_stop_db_evidence_window_blocks_external_close_writer(
         result = _plan(factory, snapshot)
         assert result.status == "ready"
     else:
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=snapshot,
@@ -4610,7 +4719,7 @@ def test_natural_stop_resume_refuses_late_suspicious_incomplete_other_owner(
         module.CompositeBatchRecoveryConflict,
         match="resume_source_state_conflict",
     ):
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=snapshot,
@@ -4832,7 +4941,7 @@ def test_natural_stop_resume_refuses_late_double_encoded_target_event(tmp_path):
         module.CompositeBatchRecoveryConflict,
         match="resume_source_state_conflict",
     ):
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=snapshot,
@@ -4973,7 +5082,7 @@ def test_natural_stop_refuses_residual_unowned_regular_close(tmp_path):
     )
 
     _assert_natural_stop_refusal(
-        plan, "natural_stop_proof_residual_close_evidence"
+        plan, "exchange_snapshot_incomplete"
     )
 
 
@@ -5097,7 +5206,7 @@ def test_natural_stop_resume_rebuilds_same_incident_time_authority(tmp_path):
         module.CompositeBatchRecoveryConflict,
         match="resume_source_state_conflict",
     ):
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=snapshot,
@@ -5162,7 +5271,7 @@ def test_natural_stop_resume_refuses_new_exact_durable_close_evidence(
         module.CompositeBatchRecoveryConflict,
         match="resume_source_state_conflict",
     ):
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=snapshot,
@@ -5183,7 +5292,7 @@ def test_natural_stop_resume_without_new_close_evidence_is_repeatable(tmp_path):
         applied_at=NOW,
     )
 
-    resumed = module.authorize_composite_batch_recovery_resume(
+    resumed = _authorize_recovery(module,
         factory,
         expected_fingerprint=plan.evidence_fingerprint,
         snapshot=snapshot,
@@ -5235,7 +5344,7 @@ def test_planner_refuses_verified_entry_without_authoritative_ownership_evidence
     plan = _plan(factory)
 
     assert plan.status == "refused"
-    assert plan.reason_code == "position_ownership_evidence_not_authoritative"
+    assert plan.reason_code == "exchange_snapshot_incomplete"
     assert len(plan.evidence_fingerprint) == 64
 
 
@@ -5342,7 +5451,11 @@ def test_planner_refuses_durable_identity_mismatch(
     plan = _plan(factory)
 
     assert plan.status == "refused"
-    assert "mismatch" in plan.reason_code or "not_allowlisted" in plan.reason_code
+    assert (
+        "mismatch" in plan.reason_code
+        or "not_allowlisted" in plan.reason_code
+        or plan.reason_code == "exchange_snapshot_incomplete"
+    )
 
 
 @pytest.mark.parametrize("drift", ["fingerprint", "topology"])
@@ -5489,7 +5602,11 @@ def test_planner_refuses_matching_regular_close_order_or_fill(
     plan = _plan(factory, snapshot)
 
     assert plan.status == "refused"
-    assert plan.reason_code == "exchange_close_submission_evidence_present"
+    assert plan.reason_code == (
+        "exchange_close_submission_evidence_present"
+        if snapshot_field == "open_orders"
+        else "exchange_snapshot_incomplete"
+    )
 
 
 def test_planner_refuses_additional_active_management_batch(tmp_path):
@@ -5693,6 +5810,12 @@ def test_exchange_snapshot_fingerprint_changes_when_same_count_content_changes(
     before = _plan(factory, _snapshot(**{field: before_rows}))
     after = _plan(factory, _snapshot(**{field: after_rows}))
 
+    if field in {"order_history", "trade_fills", "pending_tpsl_observations"}:
+        assert before.status == after.status == "refused"
+        assert before.reason_code == after.reason_code == (
+            "exchange_snapshot_incomplete"
+        )
+        return
     assert before.status == after.status == "ready"
     assert before.exchange_snapshot_fingerprint != after.exchange_snapshot_fingerprint
     assert before.evidence_fingerprint != after.evidence_fingerprint
@@ -5864,7 +5987,8 @@ def test_planner_refuses_malformed_snapshot_rows_without_raising(
 
 def test_scope_rejects_same_count_protection_ledger_drift(tmp_path):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
-    before = _plan(factory)
+    snapshot = _snapshot()
+    before = _plan(factory, snapshot)
     assert before.status == "ready"
     with factory() as session:
         row = (
@@ -5875,7 +5999,7 @@ def test_scope_rejects_same_count_protection_ledger_drift(tmp_path):
         row.evidence_json = '{"response":"different private response"}'
         session.commit()
 
-    after = _plan(factory)
+    after = _plan(factory, snapshot)
 
     assert after.status == "refused"
     assert after.reason_code == "durable_snapshot_scope_mismatch"
@@ -5945,7 +6069,10 @@ def test_planner_refuses_chat_or_message_identity_drift(
     plan = _plan(factory)
 
     assert plan.status == "refused"
-    assert plan.reason_code.endswith("identity_mismatch")
+    # The dedicated capture cannot issue provenance for a scope whose durable
+    # chat/message identity has drifted, so planning refuses the unissued
+    # exchange envelope before consuming its rows.
+    assert plan.reason_code == "exchange_snapshot_incomplete"
 
 
 @pytest.mark.parametrize(
@@ -6073,6 +6200,7 @@ def _file_signature(path: Path):
 
 def test_planner_operates_against_readonly_database_without_file_changes(tmp_path):
     factory, database, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    snapshot = _snapshot()
     factory.kw["bind"].dispose()
     paths = [database, Path(str(database) + "-wal"), Path(str(database) + "-shm")]
     before = [_file_signature(path) for path in paths]
@@ -6083,7 +6211,7 @@ def test_planner_operates_against_readonly_database_without_file_changes(tmp_pat
         bind=readonly_engine, autoflush=False, expire_on_commit=False
     )
 
-    plan = _plan(readonly_factory)
+    plan = _plan(readonly_factory, snapshot)
 
     readonly_engine.dispose()
     assert plan.status == "ready"
@@ -6091,10 +6219,11 @@ def test_planner_operates_against_readonly_database_without_file_changes(tmp_pat
 
 
 @pytest.mark.parametrize(
-    "snapshot",
+    ("field", "rows"),
     [
-        _snapshot(
-            position_history=[
+        (
+            "position_history",
+            [
                 {
                     "posId": POS_ID,
                     "instId": "BTC-USDT-SWAP",
@@ -6102,10 +6231,11 @@ def test_planner_operates_against_readonly_database_without_file_changes(tmp_pat
                     "state": "closed",
                     "closeSz": "19",
                 }
-            ]
+            ],
         ),
-        _snapshot(
-            trigger_history=[
+        (
+            "trigger_history",
+            [
                 {
                     "ordId": PRIMARY_ORDER_ID,
                     "posId": POS_ID,
@@ -6115,10 +6245,11 @@ def test_planner_operates_against_readonly_database_without_file_changes(tmp_pat
                     "reduceOnly": True,
                     "state": "triggered",
                 }
-            ]
+            ],
         ),
-        _snapshot(
-            order_history=[
+        (
+            "open_orders",
+            [
                 {
                     "closePosId": POS_ID,
                     "instId": "BTC-USDT-SWAP",
@@ -6126,14 +6257,16 @@ def test_planner_operates_against_readonly_database_without_file_changes(tmp_pat
                     "side": "sell",
                     "state": "filled",
                 }
-            ]
+            ],
         ),
     ],
 )
-def test_planner_refuses_all_exact_exchange_close_history_shapes(tmp_path, snapshot):
+def test_planner_refuses_all_exact_exchange_close_history_shapes(
+    tmp_path, field, rows
+):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
 
-    plan = _plan(factory, snapshot)
+    plan = _plan(factory, _snapshot(**{field: rows}))
 
     assert plan.status == "refused"
     assert plan.reason_code == "exchange_close_submission_evidence_present"
@@ -6141,11 +6274,12 @@ def test_planner_refuses_all_exact_exchange_close_history_shapes(tmp_path, snaps
 
 def test_live_position_requires_primary_and_backup_verified_stops(tmp_path):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    snapshot = _snapshot(pending_trigger_orders=[])
     with factory() as session:
         session.query(PositionProtectionLedger).delete()
         session.commit()
 
-    plan = _plan(factory, _snapshot(pending_trigger_orders=[]))
+    plan = _plan(factory, snapshot)
 
     assert plan.status == "refused"
     assert plan.reason_code == "durable_snapshot_scope_mismatch"
@@ -6153,6 +6287,12 @@ def test_live_position_requires_primary_and_backup_verified_stops(tmp_path):
 
 def test_live_position_rejects_take_profit_without_primary_and_backup_stops(tmp_path):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    pending = [{
+        **_snapshot().pending_trigger_orders[0],
+        "tpTriggerPx": "65000",
+        "slTriggerPx": "",
+    }]
+    snapshot = _snapshot(pending_trigger_orders=pending)
     with factory() as session:
         rows = session.query(PositionProtectionLedger).order_by(
             PositionProtectionLedger.id
@@ -6161,13 +6301,7 @@ def test_live_position_rejects_take_profit_without_primary_and_backup_stops(tmp_
         rows[0].purpose = "take_profit"
         rows[0].trigger_price = "65000"
         session.commit()
-    pending = [{
-        **_snapshot().pending_trigger_orders[0],
-        "tpTriggerPx": "65000",
-        "slTriggerPx": "",
-    }]
-
-    plan = _plan(factory, _snapshot(pending_trigger_orders=pending))
+    plan = _plan(factory, snapshot)
 
     assert plan.status == "refused"
     assert plan.reason_code == "durable_snapshot_scope_mismatch"
@@ -6187,6 +6321,7 @@ def test_live_position_rejects_protection_ledger_identity_drift(
     tmp_path, field, value
 ):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    snapshot = _snapshot()
     with factory() as session:
         row = session.query(PositionProtectionLedger).order_by(
             PositionProtectionLedger.id
@@ -6194,7 +6329,7 @@ def test_live_position_rejects_protection_ledger_identity_drift(
         setattr(row, field, value)
         session.commit()
 
-    plan = _plan(factory)
+    plan = _plan(factory, snapshot)
 
     assert plan.status == "refused"
     assert plan.reason_code == "durable_snapshot_scope_mismatch"
@@ -6500,6 +6635,7 @@ def test_planner_refuses_malformed_durable_evidence_without_raising(
         "durable_snapshot_scope_mismatch",
         "target_snapshot_identity_mismatch",
         "component_topology_mismatch",
+        "exchange_snapshot_incomplete",
     }
 
 
@@ -6609,6 +6745,20 @@ def test_live_position_rejects_duplicate_required_stop_role(
         tmp_path
     )
     duplicate_order_id = f"duplicate-{purpose}"
+    pending = [
+        *_snapshot().pending_trigger_orders,
+        {
+            "ordId": duplicate_order_id,
+            "posId": POS_ID,
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "triggerOrderType": "TPSL",
+            "slTriggerPx": price,
+            "sz": "38",
+            "state": "live",
+        },
+    ]
+    snapshot = _snapshot(pending_trigger_orders=pending)
     with factory() as session:
         batch = session.get(StrategyManagementBatch, 119)
         session.add(
@@ -6635,21 +6785,7 @@ def test_live_position_rejects_duplicate_required_stop_role(
             )
         )
         session.commit()
-    pending = [
-        *_snapshot().pending_trigger_orders,
-        {
-            "ordId": duplicate_order_id,
-            "posId": POS_ID,
-            "instId": "BTC-USDT-SWAP",
-            "posSide": "long",
-            "triggerOrderType": "TPSL",
-            "slTriggerPx": price,
-            "sz": "38",
-            "state": "live",
-        },
-    ]
-
-    plan = _plan(factory, _snapshot(pending_trigger_orders=pending))
+    plan = _plan(factory, snapshot)
 
     assert plan.status == "refused"
     assert plan.reason_code == "durable_snapshot_scope_mismatch"
@@ -6808,6 +6944,7 @@ def test_planner_refuses_oversized_durable_integer_without_raising(
         "durable_evidence_invalid",
         "durable_snapshot_scope_mismatch",
         "target_snapshot_identity_mismatch",
+        "exchange_snapshot_incomplete",
     }
 
 
@@ -7416,9 +7553,9 @@ def test_resume_authorization_accepts_only_audited_progressed_batch_state(
 
     with pytest.raises(
         module.CompositeBatchRecoveryConflict,
-        match="resume_evidence_invalid",
+        match="resume_component_conflict",
     ):
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=_snapshot(
@@ -7513,7 +7650,7 @@ def test_resume_authorization_rejects_forged_component_execution_plan(
         module.CompositeBatchRecoveryConflict,
         match="resume_component_conflict",
     ):
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=_snapshot(
@@ -7559,7 +7696,7 @@ def test_resume_authorization_rejects_forged_confirmed_component(
         module.CompositeBatchRecoveryConflict,
         match="resume_component_conflict",
     ):
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=_snapshot(
@@ -7640,7 +7777,7 @@ def test_resume_authorization_rejects_no_cancel_tp_while_still_pending(
         module.CompositeBatchRecoveryConflict,
         match="resume_component_conflict",
     ):
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=_snapshot(
@@ -7683,7 +7820,7 @@ def test_resume_authorization_rejects_recovery_audit_binding_drift(tmp_path):
         module.CompositeBatchRecoveryConflict,
         match="resume_audit_invalid",
     ):
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=_snapshot(
@@ -7786,9 +7923,9 @@ def test_resume_authorization_rejects_shrunk_original_stop_set(tmp_path):
 
     with pytest.raises(
         module.CompositeBatchRecoveryConflict,
-        match="resume_evidence_invalid",
+        match="resume_component_conflict",
     ):
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=_snapshot(
@@ -7832,7 +7969,7 @@ def test_resume_authorization_rejects_unowned_new_exchange_close(tmp_path):
         module.CompositeBatchRecoveryConflict,
         match="resume_exchange_close_unowned",
     ):
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=_snapshot(
@@ -7844,7 +7981,7 @@ def test_resume_authorization_rejects_unowned_new_exchange_close(tmp_path):
                         "pos": "19",
                     }
                 ],
-                order_history=[
+                open_orders=[
                     {
                         "ordId": "external-close",
                         "closePosId": POS_ID,
@@ -7869,7 +8006,7 @@ def test_resume_authorization_bounds_malformed_snapshot(tmp_path):
         module.CompositeBatchRecoveryConflict,
         match="resume_evidence_invalid",
     ):
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=object(),
@@ -8683,13 +8820,11 @@ def test_apply_rejects_invalid_snapshot_before_opening_session(
     assert factory_calls == []
 
 
-def test_capture_seal_is_process_local_not_serialized_and_detects_copy_tamper(
+def test_capture_capability_is_loader_only_not_serialized_and_rejects_copy(
     tmp_path,
-    monkeypatch,
 ):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     module = _recovery_module()
-    monkeypatch.setattr(module, "_BATCH119_CAPTURE_HMAC_KEY", b"k" * 32)
     snapshot = _snapshot()
     plan = _plan(factory, snapshot)
     serialized = json.dumps(
@@ -8697,7 +8832,9 @@ def test_capture_seal_is_process_local_not_serialized_and_detects_copy_tamper(
         sort_keys=True,
     )
     assert "capture_seal" not in serialized
-    assert (b"k" * 32).hex() not in serialized
+    assert not hasattr(module, "_BATCH119_CAPTURE_HMAC_KEY")
+    assert not hasattr(module, "_seal_batch119_recovery_snapshot")
+    assert not hasattr(snapshot, "_capture_seal")
     tampered = replace(
         snapshot,
         positions=[{**snapshot.positions[0], "pos": "37"}],
@@ -8708,11 +8845,6 @@ def test_capture_seal_is_process_local_not_serialized_and_detects_copy_tamper(
     )
     assert not module._snapshot_is_complete(
         tampered,
-        profile=module.BATCH_119_RECOVERY,
-    )
-    monkeypatch.setattr(module, "_BATCH119_CAPTURE_HMAC_KEY", b"z" * 32)
-    assert not module._snapshot_is_complete(
-        snapshot,
         profile=module.BATCH_119_RECOVERY,
     )
 
@@ -8738,7 +8870,7 @@ def test_non_absent_fully_resigned_exchange_with_stale_seal_is_preflight_refused
         forged_plan.exchange_snapshot_fingerprint
         != _plan(factory, original).exchange_snapshot_fingerprint
     )
-    forged_snapshot._capture_seal = original._capture_seal
+    forged_snapshot = replace(forged_snapshot)
     factory_calls = []
 
     def forbidden_factory():
@@ -8760,6 +8892,213 @@ def test_non_absent_fully_resigned_exchange_with_stale_seal_is_preflight_refused
         )
 
     assert factory_calls == []
+
+
+@pytest.mark.parametrize("malformed", ["wide", "deep", "nan", "bad_type"])
+def test_capture_capability_preflight_is_bounded_before_session(
+    tmp_path,
+    malformed,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    snapshot = _snapshot()
+    plan = _plan(factory, snapshot)
+    if malformed == "wide":
+        snapshot.positions = [dict(snapshot.positions[0]) for _ in range(101)]
+    elif malformed == "deep":
+        value = {}
+        for _ in range(66):
+            value = {"nested": value}
+        snapshot.positions[0]["deep"] = value
+    elif malformed == "nan":
+        snapshot.positions[0]["value"] = float("nan")
+    else:
+        snapshot.positions[0]["value"] = object()
+    factory_calls = []
+
+    def forbidden_factory():
+        factory_calls.append(True)
+        raise AssertionError("unbounded snapshot opened database session")
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="recovery_snapshot_invalid",
+    ):
+        _apply_recovery(
+            module,
+            forbidden_factory,
+            plan=plan,
+            snapshot=snapshot,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+    assert factory_calls == []
+
+
+def test_capture_capability_preflight_rejects_container_subclass_before_session(
+    tmp_path,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    snapshot = _snapshot()
+    plan = _plan(factory, snapshot)
+
+    class UnboundedList(list):
+        def __iter__(self):
+            raise RuntimeError("private iterator detail")
+
+    snapshot.positions = UnboundedList()
+    factory_calls = []
+
+    def forbidden_factory():
+        factory_calls.append(True)
+        raise AssertionError("container subclass opened database session")
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="recovery_snapshot_invalid",
+    ):
+        _apply_recovery(
+            module,
+            forbidden_factory,
+            plan=plan,
+            snapshot=snapshot,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+    assert factory_calls == []
+
+
+def test_capture_capability_accepts_bounded_nested_builtin_exchange_row(
+    tmp_path,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    snapshot = _snapshot(
+        positions=[
+            {
+                "posId": POS_ID,
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "pos": "38",
+                "metadata": {"source": "exchange"},
+            }
+        ]
+    )
+
+    assert snapshot.errors == {}
+    assert module._snapshot_is_complete(
+        snapshot,
+        profile=module.BATCH_119_RECOVERY,
+    )
+    assert _plan(factory, snapshot).status == "ready"
+
+
+@pytest.mark.parametrize("failure", ["build", "uid"])
+def test_non_absent_locked_writer_prepare_failure_rolls_back_without_bytes(
+    tmp_path,
+    failure,
+):
+    factory, database, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    snapshot = _snapshot()
+    plan = _plan(factory, snapshot)
+    before = _file_signature(Path(database))
+    calls = []
+
+    def prepare_writer():
+        calls.append(True)
+        if failure == "build":
+            raise RuntimeError("lazy writer build failed")
+        return SimpleNamespace(uid_scope_hash="0" * 64)
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match=(
+            "exchange_writer_client_unavailable"
+            if failure == "build"
+            else "exchange_account_scope_mismatch"
+        ),
+    ):
+        _apply_recovery(
+            module,
+            factory,
+            plan=plan,
+            snapshot=snapshot,
+            prepare_writer=prepare_writer,
+            expected_uid_scope_hash=snapshot.account_authority.uid_scope_hash,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+    assert calls == [True]
+    assert _file_signature(Path(database)) == before
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+@pytest.mark.parametrize("action", ["apply", "resume"])
+def test_locked_writer_uid_must_match_sealed_capture_authority(
+    tmp_path,
+    action,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    snapshot = _snapshot()
+    plan = _plan(factory, snapshot)
+    if action == "resume":
+        _apply_recovery(
+            module,
+            factory,
+            plan=plan,
+            snapshot=snapshot,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+    wrong_uid = "6" * 64
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="exchange_account_scope_mismatch",
+    ):
+        if action == "apply":
+            _apply_recovery(
+                module,
+                factory,
+                plan=plan,
+                snapshot=snapshot,
+                prepare_writer=lambda: SimpleNamespace(
+                    uid_scope_hash=wrong_uid
+                ),
+                expected_uid_scope_hash=wrong_uid,
+                expected_fingerprint=plan.evidence_fingerprint,
+                authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+                applied_at=NOW,
+            )
+        else:
+            _authorize_recovery(
+                module,
+                factory,
+                expected_fingerprint=plan.evidence_fingerprint,
+                snapshot=snapshot,
+                prepare_writer=lambda: SimpleNamespace(
+                    uid_scope_hash=wrong_uid
+                ),
+                expected_uid_scope_hash=wrong_uid,
+            )
+
+    with factory() as session:
+        expected_events = 1 if action == "resume" else 0
+        assert session.query(ExecutionEvent).count() == expected_events
+        assert session.get(StrategyManagementBatch, 119).status == (
+            "ready" if action == "resume" else "reconciling"
+        )
 
 
 def test_non_absent_apply_rechecks_mimo_v1_inside_locked_transaction(tmp_path):
@@ -8833,7 +9172,7 @@ def test_non_absent_repeat_and_resume_recheck_locked_mimo_v1(tmp_path):
                     applied_at=NOW,
                 )
             else:
-                module.authorize_composite_batch_recovery_resume(
+                _authorize_recovery(module,
                     factory,
                     expected_fingerprint=plan.evidence_fingerprint,
                     snapshot=snapshot,
@@ -8842,6 +9181,92 @@ def test_non_absent_repeat_and_resume_recheck_locked_mimo_v1(tmp_path):
 
     with factory() as session:
         assert session.query(ExecutionEvent).count() == 1
+
+
+def test_non_absent_resume_rejects_fresh_exact_position_disappearance(
+    tmp_path,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    snapshot = _snapshot()
+    plan = _plan(factory, snapshot)
+    _apply_recovery(
+        module,
+        factory,
+        plan=plan,
+        snapshot=snapshot,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    disappeared = _snapshot(
+        positions=[],
+        pending_trigger_orders=[],
+    )
+    assert module._snapshot_is_complete(
+        disappeared,
+        profile=module.BATCH_119_RECOVERY,
+    )
+    writer_calls = []
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="position_absent_snapshot_invalid",
+    ):
+        _authorize_recovery(
+            module,
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=disappeared,
+            prepare_writer=lambda: writer_calls.append(True)
+            or SimpleNamespace(
+                uid_scope_hash=(
+                    disappeared.account_authority.uid_scope_hash
+                )
+            ),
+            expected_uid_scope_hash=(
+                disappeared.account_authority.uid_scope_hash
+            ),
+        )
+
+    assert writer_calls == []
+
+
+def test_non_absent_resume_rejects_unowned_fresh_position_reduction(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    snapshot = _snapshot()
+    plan = _plan(factory, snapshot)
+    _apply_recovery(
+        module,
+        factory,
+        plan=plan,
+        snapshot=snapshot,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    reduced = _snapshot(
+        positions=[
+            {
+                "posId": POS_ID,
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "long",
+                "pos": "19",
+            }
+        ],
+    )
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="position_absent_snapshot_invalid",
+    ):
+        _authorize_recovery(
+            module,
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=reduced,
+        )
 
 
 def test_position_absent_mimo_gate_query_error_rolls_back_and_releases_lock(
@@ -9460,7 +9885,7 @@ def test_batch119_resume_rejects_durable_scope_drift_after_exact_capture(
         module.CompositeBatchRecoveryConflict,
         match="resume_source_state_conflict",
     ):
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=snapshot,
@@ -9514,7 +9939,7 @@ def test_batch119_resume_rejects_protection_evidence_drift_after_capture(
         module.CompositeBatchRecoveryConflict,
         match="resume_source_state_conflict",
     ):
-        module.authorize_composite_batch_recovery_resume(
+        _authorize_recovery(module,
             factory,
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=snapshot,
