@@ -9,11 +9,13 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import sqlite3
 from types import MappingProxyType
 from typing import Any, Literal, Mapping, Sequence
+import unicodedata
 
-from sqlalchemy import create_engine, func, or_, text
+from sqlalchemy import and_, create_engine, func, or_, text
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
@@ -291,11 +293,13 @@ _MAX_INSTRUCTION_PAYLOAD_DEPTH = 64
 _MAX_INSTRUCTION_PAYLOAD_NODES = 2048
 _MAX_DURABLE_CLOSE_CANDIDATES = 256
 _MAX_MANAGEMENT_ENCODED_JSON_LAYERS = 8
-_MUTATION_OPERATION_EDGE_WHITESPACE = (
-    " \t\n\r\v\f\x1c\x1d\x1e\x1f\x85\xa0\u1680"
-    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
-    "\u2028\u2029\u202f\u205f\u3000"
+_MANAGEMENT_OWNER_KEYS = (
+    "management_batch_id",
+    "managementBatchId",
+    "management_leg_id",
+    "managementLegId",
 )
+_JSON_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
 _TERMINAL_MUTATION_STATUSES = frozenset({"confirmed", "rejected", "blocked"})
 _SAFE_TERMINAL_COMPONENT_STATUSES = frozenset(
     {"confirmed", "operator_required", "safely_skipped"}
@@ -4701,13 +4705,6 @@ def _has_durable_close_submission(session, *, batch, leg, entry) -> bool:
     mutation_candidates = (
         session.query(PositionMutationIntent)
         .filter(
-            func.lower(
-                func.trim(
-                    PositionMutationIntent.operation,
-                    _MUTATION_OPERATION_EDGE_WHITESPACE,
-                )
-            )
-            == "close_position",
             or_(
                 PositionMutationIntent.execution_binding_id
                 == int(batch.execution_binding_id),
@@ -4724,6 +4721,13 @@ def _has_durable_close_submission(session, *, batch, leg, entry) -> bool:
                     )
                     for pattern in payload_filters
                 ),
+                and_(
+                    func.lower(PositionMutationIntent.operation).like("%close%"),
+                    func.lower(PositionMutationIntent.operation).like(
+                        "%position%"
+                    ),
+                ),
+                PositionMutationIntent.operation.op("GLOB")("*[^ -~]*"),
             ),
         )
         .order_by(PositionMutationIntent.id)
@@ -4732,17 +4736,17 @@ def _has_durable_close_submission(session, *, batch, leg, entry) -> bool:
     )
     if len(mutation_candidates) > _MAX_DURABLE_CLOSE_CANDIDATES:
         return True
-    if any(
-        not _mutation_targets_complete_other_owner(
+    for row in mutation_candidates:
+        if not _mutation_operation_is_close_looking(row.operation):
+            continue
+        if not _mutation_targets_complete_other_owner(
             session,
             mutation=row,
             batch=batch,
             leg=leg,
             entry=entry,
-        )
-        for row in mutation_candidates
-    ):
-        return True
+        ):
+            return True
     event_candidates = (
         session.query(ExecutionEvent)
         .filter(
@@ -4787,12 +4791,7 @@ def _has_durable_close_submission(session, *, batch, leg, entry) -> bool:
 def _management_payload_key_filters() -> tuple[str, ...]:
     exact_key_filters = tuple(
         f'%"{key}"%'
-        for key in (
-            "management_batch_id",
-            "managementBatchId",
-            "management_leg_id",
-            "managementLegId",
-        )
+        for key in _MANAGEMENT_OWNER_KEYS
     )
     return (*exact_key_filters, "%management%", "%\\u%")
 
@@ -4827,18 +4826,24 @@ class _ManagementPayloadBudget:
     nodes_used: int = 0
 
 
-def _management_text_requires_decode(value: str) -> bool:
+def _management_text_is_json_looking(value: str) -> bool:
     stripped = value.lstrip()
-    return bool(
-        "management" in value.lower()
-        or "\\u" in value.lower()
-        or (stripped and stripped[0] in '{["')
-    )
+    return bool(stripped and stripped[0] in '{["')
 
 
-def _management_text_has_candidate_token(value: str) -> bool:
-    lowered = value.lower()
-    return "management" in lowered or "\\u" in lowered
+def _management_text_has_exact_owner_key(value: str) -> bool:
+    probe = value
+    for _ in range(_MAX_MANAGEMENT_ENCODED_JSON_LAYERS + 1):
+        if any(key in probe for key in _MANAGEMENT_OWNER_KEYS):
+            return True
+        decoded = _JSON_UNICODE_ESCAPE_RE.sub(
+            lambda match: chr(int(match.group(1), 16)),
+            probe,
+        ).replace("\\\\", "\\")
+        if decoded == probe:
+            break
+        probe = decoded
+    return False
 
 
 def _scan_management_payload_text(
@@ -4852,7 +4857,9 @@ def _scan_management_payload_text(
 ) -> bool:
     if not isinstance(value, str):
         return False
-    if not _management_text_requires_decode(value):
+    json_looking = _management_text_is_json_looking(value)
+    has_exact_owner_key = _management_text_has_exact_owner_key(value)
+    if not json_looking and not has_exact_owner_key:
         return True
     encoded_size = len(value.encode("utf-8"))
     budget.bytes_used += encoded_size
@@ -4868,7 +4875,9 @@ def _scan_management_payload_text(
             parse_constant=_reject_instruction_json_constant,
         )
     except (TypeError, ValueError, RecursionError, OverflowError):
-        return not _management_text_has_candidate_token(value)
+        return not has_exact_owner_key
+    if not isinstance(payload, (Mapping, list, str)):
+        return not has_exact_owner_key
     return _collect_management_owner_refs(
         payload,
         budget=budget,
@@ -4932,7 +4941,10 @@ def _collect_management_owner_refs(
             )
             for child in value
         )
-    if isinstance(value, str) and _management_text_requires_decode(value):
+    if isinstance(value, str) and (
+        _management_text_is_json_looking(value)
+        or _management_text_has_exact_owner_key(value)
+    ):
         if encoded_layers >= _MAX_MANAGEMENT_ENCODED_JSON_LAYERS:
             return False
         return _scan_management_payload_text(
@@ -4948,6 +4960,43 @@ def _collect_management_owner_refs(
     if value is not None and not isinstance(value, (bool, int, float, str)):
         return False
     return True
+
+
+def _operation_codepoint_is_ignorable(value: str) -> bool:
+    codepoint = ord(value)
+    return bool(
+        value.isspace()
+        or unicodedata.category(value) == "Cf"
+        or codepoint == 0x034F
+        or 0x115F <= codepoint <= 0x1160
+        or 0x17B4 <= codepoint <= 0x17B5
+        or 0x180B <= codepoint <= 0x180D
+        or codepoint == 0x3164
+        or 0xFE00 <= codepoint <= 0xFE0F
+        or codepoint == 0xFFA0
+        or 0x1BCA0 <= codepoint <= 0x1BCA3
+        or 0x1D173 <= codepoint <= 0x1D17A
+        or 0xE0000 <= codepoint <= 0xE0FFF
+    )
+
+
+def _mutation_operation_is_close_looking(value: object) -> bool:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    start = 0
+    end = len(normalized)
+    while start < end and _operation_codepoint_is_ignorable(normalized[start]):
+        start += 1
+    while end > start and _operation_codepoint_is_ignorable(normalized[end - 1]):
+        end -= 1
+    edge_stripped = normalized[start:end]
+    if edge_stripped == "close_position":
+        return True
+    compact = "".join(
+        character
+        for character in edge_stripped
+        if not _operation_codepoint_is_ignorable(character)
+    )
+    return "close" in compact and "position" in compact
 
 
 def _mutation_targets_complete_other_owner(

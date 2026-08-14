@@ -2885,7 +2885,17 @@ def _add_target_close_mutation_with_operation(
 
 @pytest.mark.parametrize(
     "operation",
-    ["CLOSE_POSITION", " close_position ", "\tCLOSE_POSITION\n"],
+    [
+        "CLOSE_POSITION",
+        " close_position ",
+        "\tCLOSE_POSITION\n",
+        "\u200bCLOSE_POSITION\u200b",
+        "\ufeffCLOSE_POSITION\ufeff",
+        "\u2060CLOSE_POSITION\u2060",
+        "\u200b\ufeff\u2060CLOSE_POSITION\u2060\ufeff\u200b",
+        "close\u200b_position",
+        "ＣＬＯＳＥ＿ＰＯＳＩＴＩＯＮ",
+    ],
 )
 def test_natural_stop_refuses_normalized_target_close_mutation_operation(
     tmp_path,
@@ -2924,7 +2934,7 @@ def test_natural_stop_apply_cas_refuses_late_normalized_close_operation(
             session,
             binding_id=binding_id,
             entry_id=entry_id,
-            operation="\tCLOSE_POSITION\n",
+            operation="\u200b\ufeffCLOSE_POSITION\u2060",
             idempotency_key="late-uppercase-close-operation",
         )
         session.commit()
@@ -2961,7 +2971,7 @@ def test_natural_stop_resume_refuses_late_normalized_close_operation(tmp_path):
             session,
             binding_id=binding_id,
             entry_id=entry_id,
-            operation="\n close_position \t",
+            operation="close\u2060_position",
             idempotency_key="late-spaced-close-operation",
         )
         session.commit()
@@ -2975,6 +2985,25 @@ def test_natural_stop_resume_refuses_late_normalized_close_operation(tmp_path):
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=snapshot,
         )
+
+
+def test_natural_stop_allows_target_mutation_with_unrelated_operation(tmp_path):
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    with factory() as session:
+        _add_target_close_mutation_with_operation(
+            session,
+            binding_id=binding_id,
+            entry_id=entry_id,
+            operation="adjust_position_margin",
+            idempotency_key="unrelated-target-mutation-operation",
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    assert plan.status == "ready"
 
 
 @pytest.mark.parametrize("strategy_instance_id", ["wrong-strategy", ""])
@@ -3670,6 +3699,141 @@ def _add_complete_other_close_event(
             created_at=NOW,
         )
     )
+    return other_binding, other_entry
+
+
+def _add_other_fullwidth_close_mutation(
+    session,
+    *,
+    batch119,
+    suffix,
+    complete_owner=False,
+):
+    other_binding, other_entry = _add_complete_other_close_event(
+        session,
+        batch119=batch119,
+        suffix=f"fullwidth-{suffix}",
+        response_json=None,
+    )
+    session.add(
+        PositionMutationIntent(
+            idempotency_key=f"incomplete-other-fullwidth-{suffix}",
+            operation="ＣＬＯＳＥ＿ＰＯＳＩＴＩＯＮ",
+            strategy_instance_id=(
+                other_binding.strategy_instance_id
+                if complete_owner
+                else "conflicting-incomplete-other-owner"
+            ),
+            execution_binding_id=other_binding.id,
+            execution_order_leg_id=other_entry.id,
+            pos_id=other_binding.pos_id,
+            authority_fingerprint="a" * 64,
+            request_fingerprint="r" * 64,
+            status="confirmed",
+            request_json="{}",
+            response_json="{}",
+            reserved_at=NOW,
+            submitted_at=NOW,
+            confirmed_at=NOW,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+    )
+
+
+def test_natural_stop_allows_fullwidth_close_with_complete_other_owner(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        _add_other_fullwidth_close_mutation(
+            session,
+            batch119=session.get(StrategyManagementBatch, 119),
+            suffix="complete-owner",
+            complete_owner=True,
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    assert plan.status == "ready"
+
+
+def test_natural_stop_refuses_fullwidth_close_with_incomplete_other_owner(
+    tmp_path,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        _add_other_fullwidth_close_mutation(
+            session,
+            batch119=session.get(StrategyManagementBatch, 119),
+            suffix="plan",
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    _assert_natural_stop_refusal(
+        plan, "durable_close_submission_evidence_present"
+    )
+
+
+def test_natural_stop_apply_refuses_late_fullwidth_incomplete_other_owner(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    plan = _plan(factory, _natural_stop_snapshot())
+    with factory() as session:
+        _add_other_fullwidth_close_mutation(
+            session,
+            batch119=session.get(StrategyManagementBatch, 119),
+            suffix="apply",
+        )
+        session.commit()
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="source_state_conflict",
+    ):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+
+def test_natural_stop_resume_refuses_late_fullwidth_incomplete_other_owner(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    snapshot = _natural_stop_snapshot()
+    plan = _plan(factory, snapshot)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with factory() as session:
+        _add_other_fullwidth_close_mutation(
+            session,
+            batch119=session.get(StrategyManagementBatch, 119),
+            suffix="resume",
+        )
+        session.commit()
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="resume_source_state_conflict",
+    ):
+        module.authorize_composite_batch_recovery_resume(
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=snapshot,
+        )
 
 
 def test_natural_stop_complete_other_owner_allows_unrelated_plain_text(tmp_path):
@@ -3686,6 +3850,53 @@ def test_natural_stop_complete_other_owner_allows_unrelated_plain_text(tmp_path)
     plan = _plan(factory, _natural_stop_snapshot())
 
     assert plan.status == "ready"
+
+
+@pytest.mark.parametrize(
+    "response_json",
+    [
+        "ordinary risk management note",
+        json.dumps({"note": "ordinary risk management note"}),
+        r"ordinary literal \u sequence",
+    ],
+)
+def test_natural_stop_complete_other_owner_allows_non_owner_management_text(
+    tmp_path,
+    response_json,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        _add_complete_other_close_event(
+            session,
+            batch119=session.get(StrategyManagementBatch, 119),
+            suffix=sha256(response_json.encode()).hexdigest()[:10],
+            response_json=response_json,
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    assert plan.status == "ready"
+
+
+def test_natural_stop_refuses_malformed_exact_management_owner_key_text(
+    tmp_path,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        _add_complete_other_close_event(
+            session,
+            batch119=session.get(StrategyManagementBatch, 119),
+            suffix="malformed-exact-key",
+            response_json="management_batch_id: 119",
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    _assert_natural_stop_refusal(
+        plan, "durable_close_submission_evidence_present"
+    )
 
 
 def test_natural_stop_encoded_target_string_overrides_complete_other_event(
