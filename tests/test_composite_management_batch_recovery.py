@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import sqlite3
 import sys
 import threading
 import unicodedata
@@ -4101,13 +4102,8 @@ def _patch_recovery_query_operational_error(monkeypatch, *, query_kind):
         statement = str(query.statement)
         is_mutation = PositionMutationIntent in entities
         should_fail = (
-            query_kind == "mutation_stage1"
+            query_kind == "mutation"
             and is_mutation
-            and len(query.column_descriptions) == 2
-        ) or (
-            query_kind == "mutation_stage2"
-            and is_mutation
-            and len(query.column_descriptions) > 2
         ) or (
             query_kind == "event"
             and ExecutionEvent in entities
@@ -4126,7 +4122,7 @@ def _patch_recovery_query_operational_error(monkeypatch, *, query_kind):
 
 @pytest.mark.parametrize(
     "query_kind",
-    ["mutation_stage1", "mutation_stage2", "event"],
+    ["mutation", "event"],
 )
 @pytest.mark.parametrize("phase", ["plan", "apply", "resume"])
 def test_natural_stop_query_operational_error_fails_closed_without_writes(
@@ -4138,16 +4134,6 @@ def test_natural_stop_query_operational_error_fails_closed_without_writes(
     module = _recovery_module()
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     snapshot = _natural_stop_snapshot()
-    if query_kind == "mutation_stage2":
-        with factory() as session:
-            _add_other_suspicious_close_mutation(
-                session,
-                batch119=session.get(StrategyManagementBatch, 119),
-                suffix=f"query-error-{phase}",
-                complete_owner=True,
-                operation="close_position",
-            )
-            session.commit()
     plan = None
     if phase in {"apply", "resume"}:
         plan = _plan(factory, snapshot)
@@ -4192,6 +4178,172 @@ def test_natural_stop_query_operational_error_fails_closed_without_writes(
             )
 
     assert _recovery_write_state(factory) == before
+
+
+def _concurrent_close_writer_statement(
+    factory,
+    *,
+    scenario,
+    binding_id,
+    entry_id,
+):
+    if scenario == "operation":
+        with factory() as session:
+            _add_target_close_mutation_with_operation(
+                session,
+                binding_id=binding_id,
+                entry_id=entry_id,
+                operation="adjust_position_margin",
+                idempotency_key="concurrent-operation-close",
+            )
+            session.commit()
+        return (
+            "UPDATE position_mutation_intents SET operation = 'close_position' "
+            "WHERE idempotency_key = 'concurrent-operation-close'",
+            (),
+        )
+    if scenario == "owner":
+        with factory() as session:
+            _add_other_suspicious_close_mutation(
+                session,
+                batch119=session.get(StrategyManagementBatch, 119),
+                suffix="concurrent-owner",
+                complete_owner=True,
+                operation="close_position",
+            )
+            session.commit()
+        return (
+            "UPDATE position_mutation_intents "
+            "SET strategy_instance_id = ?, execution_binding_id = ?, "
+            "execution_order_leg_id = ?, pos_id = ? "
+            "WHERE idempotency_key = "
+            "'incomplete-other-fullwidth-concurrent-owner'",
+            (
+                "deepcoin:incident:btc:long",
+                binding_id,
+                entry_id,
+                POS_ID,
+            ),
+        )
+    timestamp = NOW.isoformat(sep=" ")
+    return (
+        "INSERT INTO position_mutation_intents ("
+        "idempotency_key, venue, operation, strategy_instance_id, "
+        "execution_binding_id, execution_order_leg_id, pos_id, "
+        "authority_fingerprint, request_fingerprint, status, request_json, "
+        "response_json, reserved_at, submitted_at, confirmed_at, created_at, "
+        "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "concurrent-insert-close",
+            "deepcoin",
+            "close_position",
+            "deepcoin:incident:btc:long",
+            binding_id,
+            entry_id,
+            POS_ID,
+            "a" * 64,
+            "r" * 64,
+            "confirmed",
+            "{}",
+            "{}",
+            timestamp,
+            timestamp,
+            timestamp,
+            timestamp,
+            timestamp,
+        ),
+    )
+
+
+@pytest.mark.parametrize("phase", ["plan", "resume"])
+@pytest.mark.parametrize("scenario", ["operation", "owner", "insert"])
+def test_natural_stop_db_evidence_window_blocks_external_close_writer(
+    tmp_path,
+    monkeypatch,
+    phase,
+    scenario,
+):
+    module = _recovery_module()
+    factory, database, binding_id, entry_id, _ = (
+        _seed_batch_119_false_submission(tmp_path)
+    )
+    statement, parameters = _concurrent_close_writer_statement(
+        factory,
+        scenario=scenario,
+        binding_id=binding_id,
+        entry_id=entry_id,
+    )
+    snapshot = _natural_stop_snapshot()
+    plan = None
+    if phase == "resume":
+        plan = _plan(factory, snapshot)
+        assert plan.status == "ready"
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+    writer_done = threading.Event()
+    writer_committed = threading.Event()
+    writer_errors = []
+
+    def external_writer():
+        connection = sqlite3.connect(str(database), timeout=0.05)
+        try:
+            connection.execute(statement, parameters)
+            connection.commit()
+            writer_committed.set()
+        except sqlite3.OperationalError as exc:
+            writer_errors.append(str(exc))
+            connection.rollback()
+        finally:
+            connection.close()
+            writer_done.set()
+
+    original = module._has_durable_close_submission
+    invoked = False
+
+    def interleave_after_evidence_read(*args, **kwargs):
+        nonlocal invoked
+        result = original(*args, **kwargs)
+        if not invoked:
+            invoked = True
+            writer = threading.Thread(target=external_writer, daemon=True)
+            writer.start()
+            assert writer_done.wait(2)
+        return result
+
+    monkeypatch.setattr(
+        module,
+        "_has_durable_close_submission",
+        interleave_after_evidence_read,
+    )
+
+    if phase == "plan":
+        result = _plan(factory, snapshot)
+        assert result.status == "ready"
+    else:
+        module.authorize_composite_batch_recovery_resume(
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=snapshot,
+        )
+
+    assert invoked is True
+    assert writer_committed.is_set() is False
+    assert writer_errors and "locked" in writer_errors[0].lower()
+
+
+def test_natural_stop_planner_lock_is_dry_run_database_byte_identical(tmp_path):
+    factory, database, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    before = Path(database).read_bytes()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    assert plan.status == "ready"
+    assert Path(database).read_bytes() == before
 
 
 @pytest.mark.parametrize(

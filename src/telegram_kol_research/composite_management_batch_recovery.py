@@ -1663,6 +1663,12 @@ def authorize_composite_batch_recovery_resume(
     ):
         raise CompositeBatchRecoveryConflict("resume_evidence_invalid")
     with session_factory() as session:
+        try:
+            _acquire_recovery_write_lock(session)
+        except SQLAlchemyError as exc:
+            raise CompositeBatchRecoveryConflict(
+                "resume_source_state_conflict"
+            ) from exc
         event = _load_recovery_audit_event(
             session,
             evidence_fingerprint=expected_fingerprint,
@@ -3333,6 +3339,10 @@ def _build_composite_batch_recovery_plan(
         return _refusal(profile.batch_id, "exchange_snapshot_incomplete")
 
     with session_factory() as session:
+        try:
+            _acquire_recovery_write_lock(session)
+        except SQLAlchemyError:
+            return _refusal(profile.batch_id, "durable_evidence_invalid")
         batch = session.get(StrategyManagementBatch, profile.batch_id)
         if batch is None:
             return _refusal(profile.batch_id, "management_batch_missing")
@@ -4708,6 +4718,36 @@ def _has_durable_close_submission(session, *, batch, leg, entry) -> bool:
             session.query(
                 PositionMutationIntent.id.label("id"),
                 PositionMutationIntent.operation.label("operation"),
+                PositionMutationIntent.strategy_instance_id.label(
+                    "strategy_instance_id"
+                ),
+                PositionMutationIntent.execution_binding_id.label(
+                    "execution_binding_id"
+                ),
+                PositionMutationIntent.execution_order_leg_id.label(
+                    "execution_order_leg_id"
+                ),
+                PositionMutationIntent.pos_id.label("pos_id"),
+                PositionMutationIntent.venue.label("venue"),
+                PositionMutationIntent.status.label("status"),
+                PositionMutationIntent.request_json.label("request_json"),
+                PositionMutationIntent.response_json.label("response_json"),
+                PositionMutationIntent.error_json.label("error_json"),
+                cast(PositionMutationIntent.reserved_at, String).label(
+                    "reserved_at_raw"
+                ),
+                cast(PositionMutationIntent.submitted_at, String).label(
+                    "submitted_at_raw"
+                ),
+                cast(PositionMutationIntent.confirmed_at, String).label(
+                    "confirmed_at_raw"
+                ),
+                cast(PositionMutationIntent.created_at, String).label(
+                    "created_at_raw"
+                ),
+                cast(PositionMutationIntent.updated_at, String).label(
+                    "updated_at_raw"
+                ),
             )
             .order_by(PositionMutationIntent.id)
             .limit(_MAX_DURABLE_CLOSE_CANDIDATES + 1)
@@ -4717,81 +4757,27 @@ def _has_durable_close_submission(session, *, batch, leg, entry) -> bool:
         return True
     if len(mutation_candidates) > _MAX_DURABLE_CLOSE_CANDIDATES:
         return True
-    close_operations: dict[int, str] = {}
     for row in mutation_candidates:
         if type(row.id) is not int or int(row.id) <= 0:
             return True
         if not isinstance(row.operation, str):
             return True
-        if _mutation_operation_is_close_looking(row.operation):
-            close_operations[int(row.id)] = row.operation
-    if close_operations:
+        if not _mutation_operation_is_close_looking(row.operation):
+            continue
+        if not _mutation_close_projection_is_valid(row):
+            return True
         try:
-            close_candidates = (
-                session.query(
-                    PositionMutationIntent.id.label("id"),
-                    PositionMutationIntent.operation.label("operation"),
-                    PositionMutationIntent.strategy_instance_id.label(
-                        "strategy_instance_id"
-                    ),
-                    PositionMutationIntent.execution_binding_id.label(
-                        "execution_binding_id"
-                    ),
-                    PositionMutationIntent.execution_order_leg_id.label(
-                        "execution_order_leg_id"
-                    ),
-                    PositionMutationIntent.pos_id.label("pos_id"),
-                    PositionMutationIntent.venue.label("venue"),
-                    PositionMutationIntent.status.label("status"),
-                    PositionMutationIntent.request_json.label("request_json"),
-                    PositionMutationIntent.response_json.label("response_json"),
-                    PositionMutationIntent.error_json.label("error_json"),
-                    cast(PositionMutationIntent.reserved_at, String).label(
-                        "reserved_at_raw"
-                    ),
-                    cast(PositionMutationIntent.submitted_at, String).label(
-                        "submitted_at_raw"
-                    ),
-                    cast(PositionMutationIntent.confirmed_at, String).label(
-                        "confirmed_at_raw"
-                    ),
-                    cast(PositionMutationIntent.created_at, String).label(
-                        "created_at_raw"
-                    ),
-                    cast(PositionMutationIntent.updated_at, String).label(
-                        "updated_at_raw"
-                    ),
-                )
-                .filter(PositionMutationIntent.id.in_(tuple(close_operations)))
-                .order_by(PositionMutationIntent.id)
-                .limit(_MAX_DURABLE_CLOSE_CANDIDATES + 1)
-                .all()
+            targets_complete_other = _mutation_targets_complete_other_owner(
+                session,
+                mutation=row,
+                batch=batch,
+                leg=leg,
+                entry=entry,
             )
         except (SQLAlchemyError, TypeError, ValueError, OverflowError):
             return True
-        if (
-            len(close_candidates) != len(close_operations)
-            or {row.id for row in close_candidates} != set(close_operations)
-        ):
+        if not targets_complete_other:
             return True
-        for row in close_candidates:
-            if (
-                row.operation != close_operations[int(row.id)]
-                or not _mutation_close_projection_is_valid(row)
-            ):
-                return True
-            try:
-                targets_complete_other = _mutation_targets_complete_other_owner(
-                    session,
-                    mutation=row,
-                    batch=batch,
-                    leg=leg,
-                    entry=entry,
-                )
-            except (SQLAlchemyError, TypeError, ValueError, OverflowError):
-                return True
-            if not targets_complete_other:
-                return True
     try:
         event_candidates = (
             session.query(ExecutionEvent)
