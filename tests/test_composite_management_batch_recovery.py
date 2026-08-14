@@ -38,7 +38,9 @@ from telegram_kol_research.models import (
     MessageInstructionItem,
     MimoRecognitionAttempt,
     MimoRecognitionRun,
+    PositionBackupStopOrder,
     PositionMutationIntent,
+    PositionProtectionLeg,
     PositionProtectionLedger,
     RawMessage,
     RecognitionDecision,
@@ -50,6 +52,7 @@ from telegram_kol_research.models import (
     StrategyManagementLeg,
     TradeSignal,
     TradingSetting,
+    TriggerProtectionIntent,
 )
 from telegram_kol_research.strategy_management_contracts import (
     ManagementInstructionContract,
@@ -564,7 +567,170 @@ def _snapshot(**overrides):
     return issued
 
 
-def _seed_batch_119_false_submission(tmp_path):
+def _seed_native_sl_role_authority(
+    session,
+    *,
+    binding: ExecutionBinding,
+    entry: ExecutionOrderLeg,
+    strategy_id: str,
+) -> None:
+    primary = (
+        session.query(PositionProtectionLedger)
+        .filter_by(order_id=PRIMARY_ORDER_ID)
+        .one()
+    )
+    backup = (
+        session.query(PositionProtectionLedger)
+        .filter_by(order_id=BACKUP_ORDER_ID)
+        .one()
+    )
+    trigger_intent = TriggerProtectionIntent(
+        venue="deepcoin",
+        execution_binding_id=binding.id,
+        execution_order_leg_id=entry.id,
+        request_fingerprint="1" * 64,
+        pre_submit_tpsl_baseline_json="[]",
+        correlation_id="batch119-primary-authority",
+        parent_trigger_order_id="synthetic-parent-trigger",
+        recovery_state="adopted",
+        adopted_order_id=PRIMARY_ORDER_ID,
+        retry_attempts=0,
+        created_at=INCIDENT_STARTED,
+        updated_at=NOW,
+    )
+    session.add(trigger_intent)
+    session.flush()
+    primary.evidence_source = "reconciliation_trigger_protection_intent"
+    primary.evidence_json = json.dumps(
+        {"intent_id": trigger_intent.id},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    payload = {
+        "instType": "SWAP",
+        "instId": "BTC-USDT-SWAP",
+        "posSide": "long",
+        "mrgPosition": "split",
+        "tdMode": "cross",
+        "posId": POS_ID,
+        "slTriggerPx": "63000",
+        "slTriggerPxType": "last",
+        "slOrdPx": "-1",
+    }
+    base_authority = "2" * 64
+    request = {
+        **payload,
+        "_ledger_purpose": "stop_loss",
+    }
+    request_fingerprint = sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    mutation = PositionMutationIntent(
+        idempotency_key=(
+            f"trigger-backup-stop:{binding.id}:{entry.id}:{POS_ID}:set"
+        ),
+        venue="deepcoin",
+        operation="set_position_sltp",
+        strategy_instance_id=strategy_id,
+        execution_binding_id=binding.id,
+        execution_order_leg_id=entry.id,
+        pos_id=POS_ID,
+        order_id=BACKUP_ORDER_ID,
+        authority_fingerprint=base_authority,
+        request_fingerprint=request_fingerprint,
+        status="confirmed",
+        request_json=json.dumps(
+            request,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        response_json=json.dumps(
+            {"code": "0", "data": [{"ordId": BACKUP_ORDER_ID}]},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        reserved_at=INCIDENT_STARTED,
+        submitted_at=INCIDENT_STARTED,
+        confirmed_at=NOW,
+        created_at=INCIDENT_STARTED,
+        updated_at=NOW,
+    )
+    session.add(mutation)
+    session.flush()
+    backup.purpose = "stop_loss"
+    backup.size_text = None
+    backup.evidence_source = "position_mutation_intent_readback"
+    backup.evidence_json = json.dumps(
+        {"intent_id": mutation.id},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    session.add_all(
+        [
+            PositionBackupStopOrder(
+                venue="deepcoin",
+                execution_binding_id=binding.id,
+                execution_order_leg_id=entry.id,
+                pos_id=POS_ID,
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                trigger_price="63000",
+                order_id=BACKUP_ORDER_ID,
+                client_order_id="synthetic-backup-client",
+                status="active",
+                request_json=json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                response_json=mutation.response_json,
+                submitted_at=INCIDENT_STARTED,
+                completed_at=NOW,
+                created_at=INCIDENT_STARTED,
+                updated_at=NOW,
+            ),
+            PositionProtectionLeg(
+                protection_leg_id="batch119-primary-leg",
+                venue="deepcoin",
+                execution_binding_id=binding.id,
+                execution_order_leg_id=entry.id,
+                role="primary_stop",
+                leg_index=1,
+                planned_trigger_price="64000",
+                planned_size="38",
+                pos_id=POS_ID,
+                exchange_order_id=PRIMARY_ORDER_ID,
+                status="verified",
+                created_at=INCIDENT_STARTED,
+                updated_at=NOW,
+            ),
+            PositionProtectionLeg(
+                protection_leg_id="batch119-backup-leg",
+                venue="deepcoin",
+                execution_binding_id=binding.id,
+                execution_order_leg_id=entry.id,
+                role="backup_stop",
+                leg_index=1,
+                planned_trigger_price="63000",
+                planned_size="0",
+                pos_id=POS_ID,
+                exchange_order_id=BACKUP_ORDER_ID,
+                status="verified",
+                created_at=INCIDENT_STARTED,
+                updated_at=NOW,
+            ),
+        ]
+    )
+
+
+def _seed_batch_119_false_submission(tmp_path, *, native_sl_backup=False):
     global _ACTIVE_SNAPSHOT_FACTORY
     database = tmp_path / "batch-119.db"
     factory = create_session_factory(database)
@@ -849,6 +1015,14 @@ def _seed_batch_119_false_submission(tmp_path):
                     created_at=NOW,
                     updated_at=NOW,
                 )
+            )
+        if native_sl_backup:
+            session.flush()
+            _seed_native_sl_role_authority(
+                session,
+                binding=binding,
+                entry=entry,
+                strategy_id=strategy_id,
             )
         session.add(
             TradingSetting(
@@ -10448,6 +10622,32 @@ def test_batch119_snapshot_uses_only_exact_history_scope(tmp_path):
     assert POS_ID not in repr(snapshot)
     assert PRIMARY_ORDER_ID not in repr(snapshot)
     assert BACKUP_ORDER_ID not in repr(snapshot)
+
+
+def test_batch119_exact_scope_resolves_native_sl_backup_from_closed_authority(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(
+        tmp_path,
+        native_sl_backup=True,
+    )
+    database_path = tmp_path / "batch-119.db"
+    before = database_path.read_bytes()
+    client = _Batch119AbsentExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {}
+    assert snapshot.exact_scope.protection_orders == (
+        ("backup_stop", BACKUP_ORDER_ID),
+        ("stop_loss", PRIMARY_ORDER_ID),
+    )
+    assert client.network_calls == 6
+    assert database_path.read_bytes() == before
 
 
 def test_batch119_exact_loader_uses_live_generation_factory_not_copy_generation(
