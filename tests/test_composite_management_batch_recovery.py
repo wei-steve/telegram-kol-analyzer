@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib
 import json
+import sys
 import threading
+import unicodedata
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -2895,6 +2897,13 @@ def _add_target_close_mutation_with_operation(
         "\u200b\ufeff\u2060CLOSE_POSITION\u2060\ufeff\u200b",
         "close\u200b_position",
         "ＣＬＯＳＥ＿ＰＯＳＩＴＩＯＮ",
+        "cl\u2065ose_position",
+        "cl\u0378ose_position",
+        "cl\x00ose_position",
+        "cl\bose_position",
+        "cl\x7fose_position",
+        "cl!ose_position",
+        *(f"close_pos{chr(codepoint)}ition" for codepoint in range(0xFFF0, 0xFFF9)),
     ],
 )
 def test_natural_stop_refuses_normalized_target_close_mutation_operation(
@@ -2910,7 +2919,10 @@ def test_natural_stop_refuses_normalized_target_close_mutation_operation(
             binding_id=binding_id,
             entry_id=entry_id,
             operation=operation,
-            idempotency_key=f"normalized-operation-{operation}",
+            idempotency_key=(
+                "normalized-operation-"
+                + sha256(operation.encode()).hexdigest()[:16]
+            ),
         )
         session.commit()
 
@@ -2934,7 +2946,7 @@ def test_natural_stop_apply_cas_refuses_late_normalized_close_operation(
             session,
             binding_id=binding_id,
             entry_id=entry_id,
-            operation="\u200b\ufeffCLOSE_POSITION\u2060",
+            operation="cl\x00\u2065ose_pos\ufff8ition",
             idempotency_key="late-uppercase-close-operation",
         )
         session.commit()
@@ -2971,7 +2983,7 @@ def test_natural_stop_resume_refuses_late_normalized_close_operation(tmp_path):
             session,
             binding_id=binding_id,
             entry_id=entry_id,
-            operation="close\u2060_position",
+            operation="cl\b!\x7fose_position",
             idempotency_key="late-spaced-close-operation",
         )
         session.commit()
@@ -3004,6 +3016,32 @@ def test_natural_stop_allows_target_mutation_with_unrelated_operation(tmp_path):
     plan = _plan(factory, _natural_stop_snapshot())
 
     assert plan.status == "ready"
+
+
+def test_close_operation_ascii_skeleton_never_misses_single_codepoint():
+    module = _recovery_module()
+    missed = []
+    for codepoint in range(sys.maxunicode + 1):
+        operation = f"cl{chr(codepoint)}ose_position"
+        normalized = unicodedata.normalize("NFKC", operation).casefold()
+        skeleton = "".join(
+            character
+            for character in normalized
+            if (
+                "a" <= character <= "z"
+                or "0" <= character <= "9"
+                or character == "_"
+            )
+        )
+        if (
+            skeleton == "close_position"
+            and not module._mutation_operation_is_close_looking(operation)
+        ):
+            missed.append(codepoint)
+            if len(missed) == 10:
+                break
+
+    assert missed == []
 
 
 @pytest.mark.parametrize("strategy_instance_id", ["wrong-strategy", ""])
@@ -3702,12 +3740,13 @@ def _add_complete_other_close_event(
     return other_binding, other_entry
 
 
-def _add_other_fullwidth_close_mutation(
+def _add_other_suspicious_close_mutation(
     session,
     *,
     batch119,
     suffix,
     complete_owner=False,
+    operation="ＣＬＯＳＥ＿ＰＯＳＩＴＩＯＮ",
 ):
     other_binding, other_entry = _add_complete_other_close_event(
         session,
@@ -3718,7 +3757,7 @@ def _add_other_fullwidth_close_mutation(
     session.add(
         PositionMutationIntent(
             idempotency_key=f"incomplete-other-fullwidth-{suffix}",
-            operation="ＣＬＯＳＥ＿ＰＯＳＩＴＩＯＮ",
+            operation=operation,
             strategy_instance_id=(
                 other_binding.strategy_instance_id
                 if complete_owner
@@ -3741,14 +3780,22 @@ def _add_other_fullwidth_close_mutation(
     )
 
 
-def test_natural_stop_allows_fullwidth_close_with_complete_other_owner(tmp_path):
+@pytest.mark.parametrize(
+    "operation",
+    ["cl\x00ose_position", "cl\u2065!\x00ose_position"],
+)
+def test_natural_stop_allows_suspicious_close_with_complete_other_owner(
+    tmp_path,
+    operation,
+):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     with factory() as session:
-        _add_other_fullwidth_close_mutation(
+        _add_other_suspicious_close_mutation(
             session,
             batch119=session.get(StrategyManagementBatch, 119),
             suffix="complete-owner",
             complete_owner=True,
+            operation=operation,
         )
         session.commit()
 
@@ -3757,15 +3804,21 @@ def test_natural_stop_allows_fullwidth_close_with_complete_other_owner(tmp_path)
     assert plan.status == "ready"
 
 
-def test_natural_stop_refuses_fullwidth_close_with_incomplete_other_owner(
+@pytest.mark.parametrize(
+    "operation",
+    ["ＣＬＯＳＥ＿ＰＯＳＩＴＩＯＮ", "cl\x00ose_position"],
+)
+def test_natural_stop_refuses_suspicious_close_with_incomplete_other_owner(
     tmp_path,
+    operation,
 ):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     with factory() as session:
-        _add_other_fullwidth_close_mutation(
+        _add_other_suspicious_close_mutation(
             session,
             batch119=session.get(StrategyManagementBatch, 119),
             suffix="plan",
+            operation=operation,
         )
         session.commit()
 
@@ -3776,17 +3829,23 @@ def test_natural_stop_refuses_fullwidth_close_with_incomplete_other_owner(
     )
 
 
-def test_natural_stop_apply_refuses_late_fullwidth_incomplete_other_owner(
+@pytest.mark.parametrize(
+    "operation",
+    ["ＣＬＯＳＥ＿ＰＯＳＩＴＩＯＮ", "cl\x00ose_position"],
+)
+def test_natural_stop_apply_refuses_late_suspicious_incomplete_other_owner(
     tmp_path,
+    operation,
 ):
     module = _recovery_module()
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     plan = _plan(factory, _natural_stop_snapshot())
     with factory() as session:
-        _add_other_fullwidth_close_mutation(
+        _add_other_suspicious_close_mutation(
             session,
             batch119=session.get(StrategyManagementBatch, 119),
             suffix="apply",
+            operation=operation,
         )
         session.commit()
 
@@ -3803,8 +3862,13 @@ def test_natural_stop_apply_refuses_late_fullwidth_incomplete_other_owner(
         )
 
 
-def test_natural_stop_resume_refuses_late_fullwidth_incomplete_other_owner(
+@pytest.mark.parametrize(
+    "operation",
+    ["ＣＬＯＳＥ＿ＰＯＳＩＴＩＯＮ", "cl\x00ose_position"],
+)
+def test_natural_stop_resume_refuses_late_suspicious_incomplete_other_owner(
     tmp_path,
+    operation,
 ):
     module = _recovery_module()
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
@@ -3818,10 +3882,11 @@ def test_natural_stop_resume_refuses_late_fullwidth_incomplete_other_owner(
         applied_at=NOW,
     )
     with factory() as session:
-        _add_other_fullwidth_close_mutation(
+        _add_other_suspicious_close_mutation(
             session,
             batch119=session.get(StrategyManagementBatch, 119),
             suffix="resume",
+            operation=operation,
         )
         session.commit()
 

@@ -4728,6 +4728,7 @@ def _has_durable_close_submission(session, *, batch, leg, entry) -> bool:
                     ),
                 ),
                 PositionMutationIntent.operation.op("GLOB")("*[^ -~]*"),
+                func.instr(PositionMutationIntent.operation, "\x00") > 0,
             ),
         )
         .order_by(PositionMutationIntent.id)
@@ -4962,41 +4963,27 @@ def _collect_management_owner_refs(
     return True
 
 
-def _operation_codepoint_is_ignorable(value: str) -> bool:
-    codepoint = ord(value)
-    return bool(
-        value.isspace()
-        or unicodedata.category(value) == "Cf"
-        or codepoint == 0x034F
-        or 0x115F <= codepoint <= 0x1160
-        or 0x17B4 <= codepoint <= 0x17B5
-        or 0x180B <= codepoint <= 0x180D
-        or codepoint == 0x3164
-        or 0xFE00 <= codepoint <= 0xFE0F
-        or codepoint == 0xFFA0
-        or 0x1BCA0 <= codepoint <= 0x1BCA3
-        or 0x1D173 <= codepoint <= 0x1D17A
-        or 0xE0000 <= codepoint <= 0xE0FFF
-    )
-
-
 def _mutation_operation_is_close_looking(value: object) -> bool:
     normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
     start = 0
     end = len(normalized)
-    while start < end and _operation_codepoint_is_ignorable(normalized[start]):
+    while start < end and normalized[start].isspace():
         start += 1
-    while end > start and _operation_codepoint_is_ignorable(normalized[end - 1]):
+    while end > start and normalized[end - 1].isspace():
         end -= 1
     edge_stripped = normalized[start:end]
     if edge_stripped == "close_position":
         return True
-    compact = "".join(
+    ascii_skeleton = "".join(
         character
         for character in edge_stripped
-        if not _operation_codepoint_is_ignorable(character)
+        if (
+            "a" <= character <= "z"
+            or "0" <= character <= "9"
+            or character == "_"
+        )
     )
-    return "close" in compact and "position" in compact
+    return ascii_skeleton == "close_position"
 
 
 def _mutation_targets_complete_other_owner(
