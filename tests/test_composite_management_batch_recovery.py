@@ -3262,6 +3262,49 @@ def test_natural_stop_allows_nonclose_mutation_with_malformed_unread_fields(
     assert plan.status == "ready"
 
 
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "reserved_at",
+        "submitted_at",
+        "confirmed_at",
+        "created_at",
+        "updated_at",
+        "request_json",
+        "response_json",
+        "error_json",
+    ],
+)
+def test_natural_stop_nonclose_blob_in_unread_field_is_ignored(
+    tmp_path,
+    field_name,
+):
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    with factory() as session:
+        _add_target_close_mutation_with_operation(
+            session,
+            binding_id=binding_id,
+            entry_id=entry_id,
+            operation="adjust_position_margin",
+            idempotency_key=f"nonclose-unread-blob-{field_name}",
+        )
+        session.flush()
+        session.execute(
+            text(
+                f"UPDATE position_mutation_intents SET {field_name} = x'ff' "
+                "WHERE idempotency_key = :key"
+            ),
+            {"key": f"nonclose-unread-blob-{field_name}"},
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    assert plan.status == "ready"
+
+
 def test_close_operation_ascii_skeleton_never_misses_single_codepoint():
     module = _recovery_module()
     missed = []
@@ -4077,6 +4120,49 @@ def test_natural_stop_refuses_complete_other_close_with_malformed_time(
     )
 
 
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "reserved_at",
+        "submitted_at",
+        "confirmed_at",
+        "created_at",
+        "updated_at",
+        "request_json",
+        "response_json",
+        "error_json",
+    ],
+)
+def test_natural_stop_close_blob_in_required_field_fails_closed(
+    tmp_path,
+    field_name,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        _add_other_suspicious_close_mutation(
+            session,
+            batch119=session.get(StrategyManagementBatch, 119),
+            suffix=f"close-blob-{field_name}",
+            complete_owner=True,
+            operation="close_position",
+        )
+        session.flush()
+        session.execute(
+            text(
+                f"UPDATE position_mutation_intents SET {field_name} = x'ff' "
+                "WHERE idempotency_key = :key"
+            ),
+            {"key": f"incomplete-other-fullwidth-close-blob-{field_name}"},
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    _assert_natural_stop_refusal(
+        plan, "durable_close_submission_evidence_present"
+    )
+
+
 def _recovery_write_state(factory):
     with factory() as session:
         batch = session.get(StrategyManagementBatch, 119)
@@ -4102,8 +4188,13 @@ def _patch_recovery_query_operational_error(monkeypatch, *, query_kind):
         statement = str(query.statement)
         is_mutation = PositionMutationIntent in entities
         should_fail = (
-            query_kind == "mutation"
+            query_kind == "mutation_stage1"
             and is_mutation
+            and len(query.column_descriptions) == 2
+        ) or (
+            query_kind == "mutation_stage2"
+            and is_mutation
+            and len(query.column_descriptions) > 2
         ) or (
             query_kind == "event"
             and ExecutionEvent in entities
@@ -4122,7 +4213,7 @@ def _patch_recovery_query_operational_error(monkeypatch, *, query_kind):
 
 @pytest.mark.parametrize(
     "query_kind",
-    ["mutation", "event"],
+    ["mutation_stage1", "mutation_stage2", "event"],
 )
 @pytest.mark.parametrize("phase", ["plan", "apply", "resume"])
 def test_natural_stop_query_operational_error_fails_closed_without_writes(
@@ -4134,6 +4225,16 @@ def test_natural_stop_query_operational_error_fails_closed_without_writes(
     module = _recovery_module()
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     snapshot = _natural_stop_snapshot()
+    if query_kind == "mutation_stage2":
+        with factory() as session:
+            _add_other_suspicious_close_mutation(
+                session,
+                batch119=session.get(StrategyManagementBatch, 119),
+                suffix=f"query-error-{phase}",
+                complete_owner=True,
+                operation="close_position",
+            )
+            session.commit()
     plan = None
     if phase in {"apply", "resume"}:
         plan = _plan(factory, snapshot)
@@ -4336,14 +4437,39 @@ def test_natural_stop_db_evidence_window_blocks_external_close_writer(
     assert writer_errors and "locked" in writer_errors[0].lower()
 
 
-def test_natural_stop_planner_lock_is_dry_run_database_byte_identical(tmp_path):
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+def test_natural_stop_planner_lock_is_dry_run_database_byte_identical(
+    tmp_path,
+    journal_mode,
+):
     factory, database, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    engine = factory.kw["bind"]
+    engine.dispose()
+    with sqlite3.connect(str(database)) as connection:
+        actual_mode = connection.execute(
+            f"PRAGMA journal_mode = {journal_mode}"
+        ).fetchone()[0]
+    assert str(actual_mode).upper() == journal_mode
     before = Path(database).read_bytes()
+    sidecars = [
+        Path(f"{database}-journal"),
+        Path(f"{database}-wal"),
+        Path(f"{database}-shm"),
+    ]
+    before_sidecars = {
+        path.name: path.read_bytes() if path.exists() else None
+        for path in sidecars
+    }
 
     plan = _plan(factory, _natural_stop_snapshot())
+    engine.dispose()
 
     assert plan.status == "ready"
     assert Path(database).read_bytes() == before
+    assert {
+        path.name: path.read_bytes() if path.exists() else None
+        for path in sidecars
+    } == before_sidecars
 
 
 @pytest.mark.parametrize(
