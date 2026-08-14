@@ -178,6 +178,14 @@ def test_batch119_exact_loader_is_only_called_from_allowlisted_cli_command():
         owner = parents[owner]
     assert owner.name == "recover_composite_management_batch"
 
+    resolver_name = "_resolve_batch119_native_stop_roles"
+    resolver_mentions = {
+        path.relative_to(package_root).as_posix()
+        for path in package_root.rglob("*.py")
+        if resolver_name in path.read_text(encoding="utf-8")
+    }
+    assert resolver_mentions == {"composite_management_batch_recovery.py"}
+
 
 def test_recovery_read_only_session_factory_cannot_write_or_change_file(tmp_path):
     module = _recovery_module()
@@ -10885,7 +10893,10 @@ def test_batch119_exact_history_call_bound_has_six_gets_and_no_write_reachabilit
     tmp_path,
 ):
     module = _recovery_module()
-    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    factory, _, _, _, _ = _seed_batch_119_false_submission(
+        tmp_path,
+        native_sl_backup=True,
+    )
 
     class StrictCallBoundClient(_Batch119ExactHistoryClient):
         def __init__(self):
@@ -11472,7 +11483,10 @@ def test_batch119_exact_history_page_limit_without_completion_is_incomplete(
     tmp_path,
 ):
     module = _recovery_module()
-    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    factory, _, _, _, _ = _seed_batch_119_false_submission(
+        tmp_path,
+        native_sl_backup=True,
+    )
     client = _Batch119ExactHistoryClient(
         exact_position_response={
             "data": [

@@ -15,6 +15,7 @@ from telegram_kol_research.models import (
     BoundPositionCloseReservation,
     ExecutionOrderLeg,
     PositionBackupStopOrder,
+    PositionProtectionLeg,
     PositionProtectionLedger,
 )
 from telegram_kol_research.trading_settings import save_trading_settings
@@ -511,7 +512,21 @@ def test_background_submission_verifies_returned_unscoped_native_tpsl_with_two_s
 
     assert submitted == 1
     with session_factory() as session:
-        assert session.query(PositionBackupStopOrder).one().status == "active"
+        backup = session.query(PositionBackupStopOrder).one()
+        protection_leg = (
+            session.query(PositionProtectionLeg)
+            .filter_by(role="backup_stop")
+            .one()
+        )
+        ledger = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id=backup.order_id)
+            .one()
+        )
+        assert backup.status == "active"
+        assert protection_leg.status == "verified"
+        assert protection_leg.exchange_order_id == backup.order_id
+        assert ledger.purpose == "stop_loss"
 
 
 def test_background_submission_does_not_activate_fallback_without_response_order_id(tmp_path):
