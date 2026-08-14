@@ -1554,6 +1554,25 @@ def _batch119_unique_response_order_id(raw: object) -> str:
     return next(iter(order_ids))
 
 
+def _batch119_response_is_success(raw: object) -> bool:
+    response = _batch119_strict_json_object(raw)
+    code = response.get("code")
+    return bool(
+        not isinstance(code, bool)
+        and isinstance(code, (str, int))
+        and str(code).strip() == "0"
+    )
+
+
+def _batch119_error_fact_is_empty(raw: object) -> bool:
+    if raw in (None, ""):
+        return True
+    try:
+        return _batch119_strict_json_value(raw) == {}
+    except CompositeBatchRecoveryRefusal:
+        return False
+
+
 def _batch119_timestamp_chain(*values: object) -> bool:
     normalized: list[datetime] = []
     for value in values:
@@ -1624,7 +1643,10 @@ def _batch119_primary_role_authority_fingerprint(
     leg,
 ) -> str:
     order_id = str(row.order_id or "")
-    intent_id = _batch119_evidence_intent_id(row.evidence_json)
+    ledger_evidence = _batch119_strict_json_object(row.evidence_json)
+    intent_id = _exact_int(ledger_evidence.get("intent_id"))
+    if intent_id is None or intent_id <= 0:
+        raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
     intent = session.get(TriggerProtectionIntent, intent_id)
     protection_leg = _batch119_exact_protection_leg(
         session,
@@ -1641,6 +1663,8 @@ def _batch119_primary_role_authority_fingerprint(
         and int(intent.execution_order_leg_id) == int(entry.id)
         and str(intent.recovery_state or "").lower() == "adopted"
         and str(intent.adopted_order_id or "") == order_id
+        and str(intent.parent_trigger_order_id or "")
+        == str(ledger_evidence.get("parent_trigger_order_id") or "")
         and _is_sha256(str(intent.request_fingerprint or ""))
         and _batch119_timestamp_chain(intent.created_at, intent.updated_at)
         and _batch119_decimal_equal(
@@ -1781,6 +1805,8 @@ def _batch119_backup_role_authority_fingerprint(
         )
         and _batch119_unique_response_order_id(intent.response_json)
         == order_id
+        and _batch119_response_is_success(intent.response_json)
+        and _batch119_error_fact_is_empty(intent.error_json)
     ):
         raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
     request = _batch119_strict_json_object(intent.request_json)
@@ -1831,9 +1857,11 @@ def _batch119_backup_role_authority_fingerprint(
         and str(backup.side or "").lower()
         == BATCH_119_RECOVERY.side.lower()
         and str(backup.status or "").lower() == "active"
+        and _batch119_error_fact_is_empty(backup.error_json)
         and backup_request == payload
         and _batch119_unique_response_order_id(backup.response_json)
         == order_id
+        and _batch119_response_is_success(backup.response_json)
         and _batch119_timestamp_chain(
             backup.created_at,
             backup.submitted_at,

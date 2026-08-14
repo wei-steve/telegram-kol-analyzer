@@ -602,7 +602,10 @@ def _seed_native_sl_role_authority(
     session.flush()
     primary.evidence_source = "reconciliation_trigger_protection_intent"
     primary.evidence_json = json.dumps(
-        {"intent_id": trigger_intent.id},
+        {
+            "intent_id": trigger_intent.id,
+            "parent_trigger_order_id": "synthetic-parent-trigger",
+        },
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -10648,6 +10651,114 @@ def test_batch119_exact_scope_resolves_native_sl_backup_from_closed_authority(
     )
     assert client.network_calls == 6
     assert database_path.read_bytes() == before
+
+
+def _mutate_native_sl_role_authority(session, mutation):
+    primary_intent = session.query(TriggerProtectionIntent).one()
+    position_intent = session.query(PositionMutationIntent).one()
+    backup = session.query(PositionBackupStopOrder).one()
+    backup_leg = (
+        session.query(PositionProtectionLeg)
+        .filter_by(role="backup_stop")
+        .one()
+    )
+    backup_ledger = (
+        session.query(PositionProtectionLedger)
+        .filter_by(evidence_source="position_mutation_intent_readback")
+        .one()
+    )
+    if mutation == "missing_primary_intent":
+        session.delete(primary_intent)
+    elif mutation == "primary_parent_mismatch":
+        primary_intent.parent_trigger_order_id = "different-parent-trigger"
+    elif mutation == "missing_mutation_intent":
+        session.delete(position_intent)
+    elif mutation == "mutation_wrong_owner":
+        position_intent.execution_binding_id += 999
+    elif mutation == "mutation_error":
+        position_intent.error_json = '{"error":"unexpected"}'
+    elif mutation == "mutation_business_failure":
+        response = json.loads(position_intent.response_json)
+        response["code"] = "500"
+        position_intent.response_json = json.dumps(response, sort_keys=True)
+    elif mutation == "backup_error":
+        backup.error_json = '{"error":"unexpected"}'
+    elif mutation == "missing_backup_row":
+        session.delete(backup)
+    elif mutation == "backup_business_failure":
+        response = json.loads(backup.response_json)
+        response["code"] = "500"
+        backup.response_json = json.dumps(response, sort_keys=True)
+    elif mutation == "backup_size_not_whole":
+        backup_leg.planned_size = "1"
+    elif mutation == "missing_backup_leg":
+        session.delete(backup_leg)
+    elif mutation == "ledger_duplicate_json":
+        intent_id = position_intent.id
+        backup_ledger.evidence_json = (
+            f'{{"intent_id":{intent_id},"intent_id":{intent_id}}}'
+        )
+    elif mutation == "multiple_response_orders":
+        response = json.loads(position_intent.response_json)
+        response["data"].append({"ordId": "different-safe-order"})
+        position_intent.response_json = json.dumps(response, sort_keys=True)
+    elif mutation == "duplicate_request_key":
+        position_intent.request_json = (
+            position_intent.request_json[:-1]
+            + ',"_ledger_purpose":"stop_loss"}'
+        )
+    elif mutation == "wrong_operation":
+        position_intent.operation = "cancel_position_sltp"
+    elif mutation == "backup_not_active":
+        backup.status = "pending_readback"
+    else:  # pragma: no cover - test helper misuse
+        raise AssertionError(mutation)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_primary_intent",
+        "primary_parent_mismatch",
+        "missing_mutation_intent",
+        "mutation_wrong_owner",
+        "mutation_error",
+        "mutation_business_failure",
+        "missing_backup_row",
+        "backup_error",
+        "backup_business_failure",
+        "backup_size_not_whole",
+        "missing_backup_leg",
+        "ledger_duplicate_json",
+        "multiple_response_orders",
+        "duplicate_request_key",
+        "wrong_operation",
+        "backup_not_active",
+    ],
+)
+def test_batch119_native_stop_role_authority_fails_closed_before_network(
+    tmp_path,
+    mutation,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(
+        tmp_path,
+        native_sl_backup=True,
+    )
+    with factory() as session:
+        _mutate_native_sl_role_authority(session, mutation)
+        session.commit()
+    client = _Batch119AbsentExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {
+        "exact_scope": "exact_history_scope_invalid"
+    }
+    assert client.network_calls == 0
 
 
 def test_batch119_exact_loader_uses_live_generation_factory_not_copy_generation(
