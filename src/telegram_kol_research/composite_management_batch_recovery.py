@@ -406,7 +406,7 @@ def load_composite_batch_recovery_snapshot_read_only(
         destination.extend(rows)
         return response
 
-    capture_started_at = datetime.now(UTC)
+    snapshot.capture_started_at = datetime.now(UTC)
 
     def read_exact_account_composite() -> dict[str, Any]:
         capture_collection(
@@ -513,12 +513,16 @@ def load_composite_batch_recovery_snapshot_read_only(
         snapshot.trigger_history = _deduplicate_exact_snapshot_rows(
             snapshot.trigger_history
         )
+        snapshot.capture_ended_at = datetime.now(UTC)
         if snapshot.errors:
             raise CompositeBatchRecoveryRefusal("snapshot_incomplete")
         return {
             "data": [
                 {
                     "scope_fingerprint": scope.scope_fingerprint,
+                    "capture_window_fingerprint": (
+                        _batch119_capture_window_fingerprint(snapshot)
+                    ),
                     "snapshot_collections_fingerprint": (
                         _batch119_snapshot_collections_fingerprint(snapshot)
                     ),
@@ -538,8 +542,8 @@ def load_composite_batch_recovery_snapshot_read_only(
     snapshot.collection_authority = tuple(
         MappingProxyType(dict(row)) for row in inner_authority
     )
-    snapshot.capture_started_at = capture_started_at
-    snapshot.capture_ended_at = datetime.now(UTC)
+    if snapshot.capture_ended_at is None:
+        snapshot.capture_ended_at = datetime.now(UTC)
     if not snapshot.account_authority.complete:
         snapshot.errors.setdefault(
             "account_composite",
@@ -1418,12 +1422,35 @@ def _deduplicate_exact_snapshot_rows(
 def _batch119_snapshot_collections_fingerprint(snapshot: Any) -> str:
     return _fingerprint(
         {
-            field_name: sorted(
-                _canonical_snapshot_row(row)
-                for row in getattr(snapshot, field_name)
-            )
-            for field_name in _REQUIRED_SNAPSHOT_FIELDS
-            if field_name != "errors"
+            "capture_window_fingerprint": (
+                _batch119_capture_window_fingerprint(snapshot)
+            ),
+            "collections": {
+                field_name: sorted(
+                    _canonical_snapshot_row(row)
+                    for row in getattr(snapshot, field_name)
+                )
+                for field_name in _REQUIRED_SNAPSHOT_FIELDS
+                if field_name != "errors"
+            },
+        }
+    )
+
+
+def _batch119_capture_window_fingerprint(snapshot: Any) -> str:
+    started_at = _normalize_aware_utc_datetime(
+        getattr(snapshot, "capture_started_at", None)
+    )
+    ended_at = _normalize_aware_utc_datetime(
+        getattr(snapshot, "capture_ended_at", None)
+    )
+    if started_at is None or ended_at is None or started_at > ended_at:
+        raise CompositeBatchRecoveryRefusal("snapshot_capture_window_invalid")
+    return _fingerprint(
+        {
+            "schema_version": 1,
+            "started_at": started_at.isoformat(),
+            "ended_at": ended_at.isoformat(),
         }
     )
 
@@ -1572,6 +1599,9 @@ def _batch119_snapshot_authority_matches_unchecked(
             "data": [
                 {
                     "scope_fingerprint": expected_scope_fingerprint,
+                    "capture_window_fingerprint": (
+                        _batch119_capture_window_fingerprint(snapshot)
+                    ),
                     "snapshot_collections_fingerprint": (
                         _batch119_snapshot_collections_fingerprint(snapshot)
                     ),
@@ -1611,12 +1641,14 @@ def authorize_composite_batch_recovery_resume(
     *,
     expected_fingerprint: str,
     snapshot: Any,
+    observed_at: datetime | None = None,
 ) -> CompositeBatchRecoveryResumeAuthorization:
     """Authorize only a progressed state descended from the exact repair audit."""
 
     if not _is_sha256(expected_fingerprint) or not _snapshot_is_complete(
         snapshot,
         profile=BATCH_119_RECOVERY,
+        observed_at=observed_at or datetime.now(UTC),
     ):
         raise CompositeBatchRecoveryConflict("resume_evidence_invalid")
     with session_factory() as session:
@@ -2918,6 +2950,10 @@ def _resume_exchange_close_evidence_is_owned(
                 ledger=ledger,
                 pos_id=str(leg.pos_id),
                 profile=BATCH_119_RECOVERY,
+                not_before_ms=_incident_not_before_ms(
+                    batch=batch,
+                    leg=leg,
+                ),
             ),
             str,
         )
@@ -3265,12 +3301,15 @@ def _build_composite_batch_recovery_plan(
 ) -> CompositeBatchRecoveryPlan:
     """Prove the single approved incident without writes or exchange access."""
 
-    _ = planned_at
     if profile != BATCH_119_RECOVERY:
         return _refusal(
             _refusal_batch_id(profile), "incident_profile_not_allowlisted"
         )
-    if not _snapshot_is_complete(snapshot, profile=profile):
+    if not _snapshot_is_complete(
+        snapshot,
+        profile=profile,
+        observed_at=planned_at,
+    ):
         return _refusal(profile.batch_id, "exchange_snapshot_incomplete")
 
     with session_factory() as session:
@@ -3421,11 +3460,19 @@ def _build_composite_batch_recovery_plan(
         )
         natural_stop_proof: Mapping[str, Any] | None = None
         if position.disposition == "position_absent":
+            try:
+                not_before_ms = _incident_not_before_ms(
+                    batch=batch,
+                    leg=leg,
+                )
+            except CompositeBatchRecoveryRefusal as exc:
+                return _refusal(profile.batch_id, exc.reason_code)
             proof_result = _validated_natural_stop_proof(
                 snapshot=snapshot,
                 ledger=ledger,
                 pos_id=str(leg.pos_id),
                 profile=profile,
+                not_before_ms=not_before_ms,
             )
             if isinstance(proof_result, str):
                 return _refusal(profile.batch_id, proof_result)
@@ -4232,7 +4279,10 @@ def serialize_composite_batch_recovery_plan(
 
 
 def _snapshot_is_complete(
-    snapshot: Any, *, profile: CompositeBatchRecoveryProfile
+    snapshot: Any,
+    *,
+    profile: CompositeBatchRecoveryProfile,
+    observed_at: Any,
 ) -> bool:
     if any(not hasattr(snapshot, field) for field in _REQUIRED_SNAPSHOT_FIELDS):
         return False
@@ -4249,6 +4299,9 @@ def _snapshot_is_complete(
     authority = getattr(snapshot, "account_authority", None)
     capture_started_at = getattr(snapshot, "capture_started_at", None)
     capture_ended_at = getattr(snapshot, "capture_ended_at", None)
+    normalized_started_at = _normalize_aware_utc_datetime(capture_started_at)
+    normalized_ended_at = _normalize_aware_utc_datetime(capture_ended_at)
+    normalized_observed_at = _normalize_aware_utc_datetime(observed_at)
     authority_collections = getattr(authority, "collections", None)
     start_generation = getattr(authority, "start_write_generation", None)
     end_generation = getattr(authority, "end_write_generation", None)
@@ -4268,11 +4321,11 @@ def _snapshot_is_complete(
             or not _is_sha256(getattr(collection, "fingerprint", None))
             for collection in authority_collections
         )
-        or not isinstance(capture_started_at, datetime)
-        or not isinstance(capture_ended_at, datetime)
-        or capture_started_at.tzinfo is None
-        or capture_ended_at.tzinfo is None
-        or capture_started_at > capture_ended_at
+        or normalized_started_at is None
+        or normalized_ended_at is None
+        or normalized_observed_at is None
+        or normalized_started_at > normalized_ended_at
+        or normalized_ended_at > normalized_observed_at
         or not _batch119_snapshot_authority_matches(
             snapshot,
             profile=profile,
@@ -4634,7 +4687,8 @@ def _has_durable_close_submission(session, *, batch, leg, entry) -> bool:
             PositionMutationIntent.execution_binding_id
             == int(batch.execution_binding_id),
             PositionMutationIntent.execution_order_leg_id == int(entry.id),
-            PositionMutationIntent.pos_id == str(leg.pos_id),
+            PositionMutationIntent.strategy_instance_id
+            == str(batch.strategy_instance_id),
             PositionMutationIntent.operation == "close_position",
         )
         .first()
@@ -4646,11 +4700,70 @@ def _has_durable_close_submission(session, *, batch, leg, entry) -> bool:
         .filter(
             ExecutionEvent.execution_binding_id
             == int(batch.execution_binding_id),
-            ExecutionEvent.pos_id == str(leg.pos_id),
         )
         .all()
     )
-    return any("close" in str(event.action or "").lower() for event in events)
+    return any(
+        (
+            event.strategy_instance_id in (None, "")
+            or str(event.strategy_instance_id)
+            == str(batch.strategy_instance_id)
+        )
+        and _is_durable_close_event_action(event.action)
+        and not _event_targets_other_management_entry(
+            session,
+            event=event,
+            leg=leg,
+            entry=entry,
+        )
+        for event in events
+    )
+
+
+def _is_durable_close_event_action(value: object) -> bool:
+    action = str(value or "").strip().lower()
+    return action == "strategy_management_close_submit" or "close" in action
+
+
+def _event_targets_other_management_entry(session, *, event, leg, entry) -> bool:
+    management_leg_refs: set[int] = set()
+    for field_name in (
+        "before_json",
+        "after_json",
+        "request_json",
+        "response_json",
+    ):
+        raw = getattr(event, field_name, None)
+        if raw in (None, ""):
+            continue
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(payload, Mapping):
+            return False
+        raw_refs = [
+            payload[key]
+            for key in ("management_leg_id", "managementLegId")
+            if payload.get(key) not in (None, "")
+        ]
+        for raw_ref in raw_refs:
+            if isinstance(raw_ref, bool):
+                return False
+            try:
+                management_leg_refs.add(int(str(raw_ref)))
+            except (TypeError, ValueError):
+                return False
+    if len(management_leg_refs) != 1 or int(leg.id) in management_leg_refs:
+        return False
+    referenced_leg = session.get(
+        StrategyManagementLeg,
+        next(iter(management_leg_refs)),
+    )
+    return (
+        referenced_leg is not None
+        and int(referenced_leg.execution_order_leg_id) != int(entry.id)
+    )
 
 
 def _instruction_population_payload(
@@ -5638,6 +5751,7 @@ def _validated_natural_stop_proof(
     ledger: Sequence[Any],
     pos_id: str,
     profile: CompositeBatchRecoveryProfile,
+    not_before_ms: int,
 ) -> Mapping[str, Any] | str:
     """Prove one exact owned natural stop without retaining raw evidence."""
 
@@ -5723,8 +5837,10 @@ def _validated_natural_stop_proof(
     ):
         return "natural_stop_proof_time_invalid"
     capture_ended_ms = int(capture_ended_at.timestamp() * 1000)
+    if any(value < not_before_ms for value in close_times):
+        return "natural_stop_proof_before_incident"
     if any(value > capture_ended_ms for value in close_times):
-        return "natural_stop_proof_time_invalid"
+        return "natural_stop_proof_after_capture"
 
     successful: list[tuple[str, str, int]] = []
     seen_trigger_order_ids: set[str] = set()
@@ -5772,10 +5888,13 @@ def _validated_natural_stop_proof(
     if len(successful) != 1:
         return "natural_stop_proof_trigger_invalid"
     purpose, order_id, trigger_time = successful[0]
+    if trigger_time < not_before_ms:
+        return "natural_stop_proof_before_incident"
     if (
         trigger_time > capture_ended_ms
-        or any(close_time < trigger_time for close_time in close_times)
     ):
+        return "natural_stop_proof_after_capture"
+    if any(close_time < trigger_time for close_time in close_times):
         return "natural_stop_proof_time_invalid"
     if _natural_stop_has_residual_close_evidence(snapshot, pos_id=str(pos_id)):
         return "natural_stop_proof_residual_close_evidence"
@@ -5803,6 +5922,45 @@ def _one_exact_text(row: Mapping[str, Any], *keys: str) -> str | None:
     return next(iter(values)) if len(values) == 1 else None
 
 
+def _normalize_utc_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _normalize_aware_utc_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        return None
+    return value.astimezone(UTC)
+
+
+def _incident_not_before_ms(*, batch: Any, leg: Any) -> int:
+    candidates = [
+        _normalize_utc_datetime(getattr(batch, "planned_at", None)),
+        _normalize_utc_datetime(getattr(batch, "started_at", None)),
+        _normalize_utc_datetime(getattr(leg, "created_at", None)),
+    ]
+    if any(value is None for value in candidates):
+        raise CompositeBatchRecoveryRefusal(
+            "natural_stop_time_authority_invalid"
+        )
+    return max(int(value.timestamp() * 1000) for value in candidates)
+
+
+def _incident_time_authority_payload(*, batch: Any, leg: Any) -> dict[str, Any]:
+    not_before_ms = _incident_not_before_ms(batch=batch, leg=leg)
+    return {
+        "schema_version": 1,
+        "basis": "batch_planned_started_management_leg_created",
+        "basis_count": 3,
+        "not_before_ref": _redacted_ref(
+            "natural_stop_not_before_ms", not_before_ms
+        ),
+    }
+
+
 def _bounded_epoch_ms_values(
     row: Mapping[str, Any], *keys: str
 ) -> list[int] | None:
@@ -5816,10 +5974,13 @@ def _bounded_epoch_ms_values(
         text_value = str(raw).strip()
         if not text_value.isdigit():
             return None
-        parsed = int(text_value)
-        if str(parsed) != text_value or not (
-            1_000_000_000_000 <= parsed <= 9_999_999_999_999
-        ):
+        if len(text_value) > 20:
+            return None
+        try:
+            parsed = int(text_value)
+        except ValueError:
+            return None
+        if parsed <= 0 or str(parsed) != text_value:
             return None
         values.append(parsed)
     return values
@@ -6064,6 +6225,10 @@ def _source_evidence_payload(
         "leg_last_error_fingerprint": _optional_json_fingerprint(
             leg.last_error
         ),
+        "natural_stop_time_authority": _incident_time_authority_payload(
+            batch=batch,
+            leg=leg,
+        ),
         "components": [
             {
                 "component_ref": _redacted_ref("component", row.id),
@@ -6179,6 +6344,10 @@ def _exchange_evidence_payload(
         "instrument_id": profile.instrument_id,
         "side": profile.side,
         "scope_fingerprint": str(snapshot.scope_fingerprint),
+        "capture_window": {
+            "status": "valid",
+            "time_relation": "started_not_after_ended_not_after_observed",
+        },
         "account_authority": _account_authority_evidence_payload(
             snapshot.account_authority
         ),
@@ -6209,7 +6378,6 @@ def _account_authority_evidence_payload(authority: Any) -> dict[str, Any]:
                 "complete": bool(collection.complete),
                 "row_count": int(collection.row_count),
                 "page_count": int(collection.page_count),
-                "fingerprint": collection.fingerprint,
                 "reason_code": collection.reason_code,
             }
             for collection in authority.collections
@@ -6423,6 +6591,22 @@ def _decimal_or_none(value: object) -> Decimal | None:
     return result if result.is_finite() else None
 
 
+def _consistent_nonnegative_position_size(
+    row: Mapping[str, object],
+) -> Decimal | None:
+    values: list[Decimal] = []
+    for key in ("pos", "size", "sz", "positionSize", "position_size"):
+        if row.get(key) in (None, ""):
+            continue
+        value = _decimal_or_none(row[key])
+        if value is None or value < 0:
+            return None
+        values.append(value)
+    if not values or any(value != values[0] for value in values[1:]):
+        return None
+    return values[0]
+
+
 def classify_recovery_position(
     *,
     profile: CompositeBatchRecoveryProfile,
@@ -6448,13 +6632,51 @@ def classify_recovery_position(
         if not _is_step_aligned(value, step):
             raise CompositeBatchRecoveryRefusal(reason)
 
-    matches = [
-        row
-        for row in positions
-        if isinstance(row, Mapping)
-        and str(row.get("posId") or row.get("pos_id") or "")
-        == str(expected_pos_id)
-    ]
+    matches: list[Mapping[str, object]] = []
+    for row in positions:
+        if not isinstance(row, Mapping):
+            raise CompositeBatchRecoveryRefusal(
+                "exact_position_snapshot_invalid"
+            )
+        instruments = {
+            str(row[key]).strip().upper()
+            for key in ("instId", "instrument_id", "instrumentId")
+            if row.get(key) not in (None, "")
+        }
+        sides = _exact_row_position_sides(row)
+        size = _consistent_nonnegative_position_size(row)
+        if (
+            instruments != {str(instrument_id).upper()}
+            or len(sides) != 1
+            or size is None
+        ):
+            raise CompositeBatchRecoveryRefusal(
+                "exact_position_snapshot_invalid"
+            )
+        identities = {
+            str(row[key]).strip()
+            for key in ("posId", "pos_id")
+            if row.get(key) not in (None, "")
+        }
+        if sides != {str(side).lower()}:
+            if (
+                size > 0
+                and (
+                    len(identities) != 1
+                    or str(expected_pos_id) in identities
+                )
+            ):
+                raise CompositeBatchRecoveryRefusal(
+                    "exact_position_snapshot_invalid"
+                )
+            continue
+        if size == 0:
+            continue
+        if identities != {str(expected_pos_id)}:
+            raise CompositeBatchRecoveryRefusal(
+                "exact_position_identity_conflict"
+            )
+        matches.append(row)
     if len(matches) > 1:
         raise CompositeBatchRecoveryRefusal("exact_position_ambiguous")
     if not matches:

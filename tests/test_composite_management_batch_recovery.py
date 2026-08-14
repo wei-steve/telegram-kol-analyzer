@@ -54,6 +54,7 @@ from telegram_kol_research.strategy_management_planner import (
 
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
+INCIDENT_STARTED = NOW - timedelta(seconds=10)
 POS_ID = "sensitive-position-119"
 PRIMARY_ORDER_ID = "sensitive-primary-order"
 BACKUP_ORDER_ID = "sensitive-backup-order"
@@ -167,7 +168,7 @@ def test_classify_recovery_position(
     assert result.effective_remaining_size == effective_remaining
 
 
-@pytest.mark.parametrize("current", ["0", "-1", "NaN", "Infinity"])
+@pytest.mark.parametrize("current", ["-1", "NaN", "Infinity"])
 def test_classify_recovery_position_rejects_invalid_live_size(current):
     module = _recovery_module()
     with pytest.raises(module.CompositeBatchRecoveryRefusal):
@@ -415,6 +416,9 @@ def _snapshot(**overrides):
             "data": [
                 {
                     "scope_fingerprint": scope_fingerprint,
+                    "capture_window_fingerprint": (
+                        module._batch119_capture_window_fingerprint(candidate)
+                    ),
                     "snapshot_collections_fingerprint": collections_fingerprint,
                     "collections": inner_authority,
                 }
@@ -583,8 +587,8 @@ def _seed_batch_119_false_submission(tmp_path):
                 sort_keys=True,
                 separators=(",", ":"),
             ),
-            planned_at=NOW,
-            started_at=NOW,
+            planned_at=INCIDENT_STARTED,
+            started_at=INCIDENT_STARTED,
             created_at=NOW,
             updated_at=NOW,
         )
@@ -657,7 +661,7 @@ def _seed_batch_119_false_submission(tmp_path):
                 sort_keys=True,
                 separators=(",", ":"),
             ),
-            created_at=NOW,
+            created_at=INCIDENT_STARTED,
             updated_at=NOW,
         )
         session.add(leg)
@@ -2384,33 +2388,33 @@ def test_natural_stop_refuses_ledger_purpose_or_owner_conflict(
 
 
 @pytest.mark.parametrize(
-    ("position_history", "trigger_history"),
+    ("position_history", "trigger_history", "reason_code"),
     [
         ([_closed_position_history_row()], [
             _successful_stop_trigger_row(triggerTime=None)
-        ]),
+        ], "natural_stop_proof_time_invalid"),
         ([_closed_position_history_row()], [
             _successful_stop_trigger_row(triggerTime="malformed")
-        ]),
+        ], "natural_stop_proof_time_invalid"),
         ([_closed_position_history_row()], [
             _successful_stop_trigger_row(
                 triggerTime=str(
                     int((NOW + timedelta(seconds=1)).timestamp() * 1000)
                 )
             )
-        ]),
+        ], "natural_stop_proof_after_capture"),
         ([_closed_position_history_row(uTime=None)], [
             _successful_stop_trigger_row()
-        ]),
+        ], "natural_stop_proof_time_invalid"),
         ([_closed_position_history_row(uTime="malformed")], [
             _successful_stop_trigger_row()
-        ]),
+        ], "natural_stop_proof_time_invalid"),
         ([_closed_position_history_row(
             uTime=str(int((NOW + timedelta(seconds=1)).timestamp() * 1000))
-        )], [_successful_stop_trigger_row()]),
+        )], [_successful_stop_trigger_row()], "natural_stop_proof_after_capture"),
         ([_closed_position_history_row(
             uTime=str(int((NOW - timedelta(seconds=3)).timestamp() * 1000))
-        )], [_successful_stop_trigger_row()]),
+        )], [_successful_stop_trigger_row()], "natural_stop_proof_time_invalid"),
     ],
     ids=[
         "missing_trigger_time",
@@ -2423,7 +2427,7 @@ def test_natural_stop_refuses_ledger_purpose_or_owner_conflict(
     ],
 )
 def test_natural_stop_refuses_invalid_or_reversed_time_relation(
-    tmp_path, position_history, trigger_history
+    tmp_path, position_history, trigger_history, reason_code
 ):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
 
@@ -2435,7 +2439,53 @@ def test_natural_stop_refuses_invalid_or_reversed_time_relation(
         ),
     )
 
-    _assert_natural_stop_refusal(plan, "natural_stop_proof_time_invalid")
+    _assert_natural_stop_refusal(plan, reason_code)
+
+
+def test_natural_stop_refuses_2001_history_before_incident_boundary(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    stale_trigger_ms = str(
+        int(datetime(2001, 1, 1, tzinfo=UTC).timestamp() * 1000)
+    )
+    stale_close_ms = str(
+        int(datetime(2001, 1, 1, 0, 0, 1, tzinfo=UTC).timestamp() * 1000)
+    )
+
+    plan = _plan(
+        factory,
+        _natural_stop_snapshot(
+            position_history=[_closed_position_history_row(uTime=stale_close_ms)],
+            trigger_history=[
+                _successful_stop_trigger_row(triggerTime=stale_trigger_ms)
+            ],
+        ),
+    )
+
+    _assert_natural_stop_refusal(
+        plan, "natural_stop_proof_before_incident"
+    )
+
+
+def test_natural_stop_refuses_2036_history_after_capture_boundary(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    future_trigger_ms = str(
+        int(datetime(2036, 1, 1, tzinfo=UTC).timestamp() * 1000)
+    )
+    future_close_ms = str(
+        int(datetime(2036, 1, 1, 0, 0, 1, tzinfo=UTC).timestamp() * 1000)
+    )
+
+    plan = _plan(
+        factory,
+        _natural_stop_snapshot(
+            position_history=[_closed_position_history_row(uTime=future_close_ms)],
+            trigger_history=[
+                _successful_stop_trigger_row(triggerTime=future_trigger_ms)
+            ],
+        ),
+    )
+
+    _assert_natural_stop_refusal(plan, "natural_stop_proof_after_capture")
 
 
 @pytest.mark.parametrize(
@@ -2474,6 +2524,115 @@ def test_natural_stop_refuses_when_current_position_still_exists(tmp_path):
     _assert_natural_stop_refusal(
         plan, "exchange_close_submission_evidence_present"
     )
+
+
+@pytest.mark.parametrize(
+    "position_row",
+    [
+        {
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "pos": "1",
+        },
+        {
+            "posId": "different-live-position",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "pos": "1",
+        },
+    ],
+    ids=["missing_pos_id", "wrong_pos_id"],
+)
+def test_natural_stop_refuses_nonzero_position_identity_conflict_before_apply(
+    tmp_path, position_row
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    plan = _plan(
+        factory,
+        _natural_stop_snapshot(positions=[position_row]),
+    )
+
+    _assert_natural_stop_refusal(plan, "exact_position_identity_conflict")
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="plan_not_actionable",
+    ):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+def test_natural_stop_ignores_valid_zero_position_row(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    plan = _plan(
+        factory,
+        _natural_stop_snapshot(
+            positions=[
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "pos": "0",
+                }
+            ]
+        ),
+    )
+
+    assert plan.status == "ready"
+    assert plan.position.disposition == "position_absent"
+
+
+def test_natural_stop_ignores_valid_opposite_side_position_row(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    plan = _plan(
+        factory,
+        _natural_stop_snapshot(
+            positions=[
+                {
+                    "posId": "unrelated-short-position",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "short",
+                    "pos": "2",
+                },
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "pos": "0",
+                },
+            ]
+        ),
+    )
+
+    assert plan.status == "ready"
+    assert plan.position.disposition == "position_absent"
+
+
+@pytest.mark.parametrize(
+    "position_row",
+    [
+        {"instId": "BTC-USDT-SWAP", "posSide": "long", "pos": "NaN"},
+        {"instId": "BTC-USDT-SWAP", "pos": "0"},
+        {"posSide": "long", "pos": "0"},
+    ],
+    ids=["malformed_size", "missing_side", "missing_instrument"],
+)
+def test_natural_stop_refuses_malformed_zero_or_unknown_position_row(
+    tmp_path, position_row
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    plan = _plan(
+        factory,
+        _natural_stop_snapshot(positions=[position_row]),
+    )
+
+    _assert_natural_stop_refusal(plan, "exact_position_snapshot_invalid")
 
 
 @pytest.mark.parametrize(
@@ -2562,6 +2721,254 @@ def test_natural_stop_refuses_new_durable_close_event(tmp_path):
     )
 
 
+def test_natural_stop_refuses_owned_close_mutation_with_wrong_position(tmp_path):
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    with factory() as session:
+        session.add(
+            PositionMutationIntent(
+                idempotency_key="owned-close-wrong-position",
+                operation="close_position",
+                strategy_instance_id="deepcoin:incident:btc:long",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                pos_id="wrong-position",
+                authority_fingerprint="a" * 64,
+                request_fingerprint="r" * 64,
+                status="confirmed",
+                request_json="{}",
+                response_json="{}",
+                reserved_at=NOW,
+                submitted_at=NOW,
+                confirmed_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    _assert_natural_stop_refusal(
+        plan, "durable_close_submission_evidence_present"
+    )
+
+
+@pytest.mark.parametrize("pos_id", [None, "wrong-position"])
+def test_natural_stop_refuses_owned_close_event_without_exact_position(
+    tmp_path, pos_id
+):
+    factory, _, binding_id, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        session.add(
+            ExecutionEvent(
+                execution_binding_id=binding_id,
+                strategy_instance_id="deepcoin:incident:btc:long",
+                action="strategy_management_close_submit",
+                status="submitted",
+                pos_id=pos_id,
+                created_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    _assert_natural_stop_refusal(
+        plan, "durable_close_submission_evidence_present"
+    )
+
+
+def test_natural_stop_apply_cas_rejects_late_wrong_position_close_mutation(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    plan = _plan(factory, _natural_stop_snapshot())
+    assert plan.status == "ready"
+    with factory() as session:
+        session.add(
+            PositionMutationIntent(
+                idempotency_key="late-owned-close-wrong-position",
+                operation="close_position",
+                strategy_instance_id="deepcoin:incident:btc:long",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                pos_id="late-wrong-position",
+                authority_fingerprint="a" * 64,
+                request_fingerprint="r" * 64,
+                status="confirmed",
+                request_json="{}",
+                response_json="{}",
+                reserved_at=NOW,
+                submitted_at=NOW,
+                confirmed_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="source_state_conflict",
+    ):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+def test_natural_stop_does_not_claim_other_entry_close_mutation(tmp_path):
+    factory, _, binding_id, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        other_entry = ExecutionOrderLeg(
+            execution_binding_id=binding_id,
+            strategy_instance_id="deepcoin:incident:btc:long",
+            leg_index=1,
+            purpose="entry",
+            order_kind="market",
+            order_id="other-entry-order",
+            pos_id="other-entry-position",
+            venue="deepcoin",
+            attribution_status="verified",
+            attribution_evidence_json='{"policy_version":2}',
+            status="active",
+        )
+        session.add(other_entry)
+        session.flush()
+        session.add(
+            PositionMutationIntent(
+                idempotency_key="other-entry-close",
+                operation="close_position",
+                strategy_instance_id="deepcoin:incident:btc:long",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=other_entry.id,
+                pos_id="other-entry-position",
+                authority_fingerprint="a" * 64,
+                request_fingerprint="r" * 64,
+                status="confirmed",
+                request_json="{}",
+                response_json="{}",
+                reserved_at=NOW,
+                submitted_at=NOW,
+                confirmed_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    assert plan.status == "ready"
+
+
+def test_natural_stop_does_not_claim_other_binding_close_event(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        other_binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:other:btc:long",
+            kol_id="other-source",
+            chat_id=999,
+            message_id=999,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            pos_id="other-binding-position",
+            margin_mode="cross",
+            position_mode="split",
+            status="active",
+        )
+        session.add(other_binding)
+        session.flush()
+        session.add(
+            ExecutionEvent(
+                execution_binding_id=other_binding.id,
+                strategy_instance_id=other_binding.strategy_instance_id,
+                action="strategy_management_close_submit",
+                status="submitted",
+                pos_id=None,
+                created_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    assert plan.status == "ready"
+
+
+def test_natural_stop_does_not_claim_other_entry_management_close_event(
+    tmp_path,
+):
+    factory, _, binding_id, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        batch119 = session.get(StrategyManagementBatch, 119)
+        other_entry = ExecutionOrderLeg(
+            execution_binding_id=binding_id,
+            strategy_instance_id=batch119.strategy_instance_id,
+            leg_index=1,
+            purpose="entry",
+            order_kind="market",
+            order_id="other-event-entry-order",
+            pos_id="other-event-position",
+            venue="deepcoin",
+            attribution_status="verified",
+            attribution_evidence_json='{"policy_version":2}',
+            status="active",
+        )
+        session.add(other_entry)
+        session.flush()
+        other_batch = _add_other_terminal_batch(
+            session,
+            binding_id=binding_id,
+            batch119=batch119,
+        )
+        other_batch.strategy_instance_id = batch119.strategy_instance_id
+        other_leg = StrategyManagementLeg(
+            management_batch_id=other_batch.id,
+            execution_order_leg_id=other_entry.id,
+            pos_id="other-event-position",
+            leg_index=0,
+            status="succeeded",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(other_leg)
+        session.flush()
+        event_link = json.dumps(
+            {"management_batch_id": other_batch.id, "management_leg_id": other_leg.id},
+            sort_keys=True,
+        )
+        session.add(
+            ExecutionEvent(
+                execution_binding_id=binding_id,
+                strategy_instance_id=batch119.strategy_instance_id,
+                action="strategy_management_close_submit",
+                status="submitted",
+                pos_id="other-event-position",
+                before_json=event_link,
+                after_json=event_link,
+                created_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    assert plan.status == "ready"
+
+
 def test_natural_stop_refuses_residual_unowned_regular_close(tmp_path):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     residual = {
@@ -2583,6 +2990,128 @@ def test_natural_stop_refuses_residual_unowned_regular_close(tmp_path):
     _assert_natural_stop_refusal(
         plan, "natural_stop_proof_residual_close_evidence"
     )
+
+
+def test_exact_snapshot_authority_binds_capture_window(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    snapshot = _snapshot()
+    snapshot.capture_started_at = NOW - timedelta(seconds=1)
+
+    plan = _plan(factory, snapshot)
+
+    _assert_natural_stop_refusal(plan, "exchange_snapshot_incomplete")
+
+
+def test_exact_snapshot_refuses_capture_window_after_planner_clock(tmp_path):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    future = datetime(2036, 1, 1, tzinfo=UTC)
+    snapshot = _snapshot(
+        capture_started_at=future,
+        capture_ended_at=future,
+    )
+
+    plan = module.build_composite_batch_recovery_plan(
+        factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=snapshot,
+        planned_at=NOW,
+    )
+
+    _assert_natural_stop_refusal(plan, "exchange_snapshot_incomplete")
+
+
+@pytest.mark.parametrize("field_name", ["capture_started_at", "capture_ended_at"])
+def test_exact_snapshot_refuses_naive_capture_window_time(tmp_path, field_name):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    snapshot = _snapshot()
+    setattr(snapshot, field_name, NOW.replace(tzinfo=None))
+
+    plan = _plan(factory, snapshot)
+
+    _assert_natural_stop_refusal(plan, "exchange_snapshot_incomplete")
+
+
+def _move_incident_time_boundary(session, value):
+    batch = session.get(StrategyManagementBatch, 119)
+    leg = session.query(StrategyManagementLeg).one()
+    batch.planned_at = value
+    batch.started_at = value
+    leg.created_at = value
+
+
+def test_natural_stop_apply_cas_binds_durable_incident_time_boundary(tmp_path):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    plan = _plan(factory, _natural_stop_snapshot())
+    assert plan.status == "ready"
+    with factory() as session:
+        _move_incident_time_boundary(
+            session,
+            datetime(2001, 1, 1, tzinfo=UTC),
+        )
+        session.commit()
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="source_fingerprint_conflict",
+    ):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+def test_natural_stop_resume_rebuilds_same_incident_time_authority(tmp_path):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    snapshot = _natural_stop_snapshot()
+    plan = _plan(factory, snapshot)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with factory() as session:
+        _move_incident_time_boundary(
+            session,
+            datetime(2001, 1, 1, tzinfo=UTC),
+        )
+        session.commit()
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="resume_source_state_conflict",
+    ):
+        module.authorize_composite_batch_recovery_resume(
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=snapshot,
+        )
+
+
+def test_natural_stop_serialization_contains_no_raw_time_authority(tmp_path):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    serialized = json.dumps(
+        module.serialize_composite_batch_recovery_plan(plan),
+        sort_keys=True,
+    )
+
+    assert INCIDENT_STARTED.isoformat() not in serialized
+    assert str(int(INCIDENT_STARTED.timestamp() * 1000)) not in serialized
+    assert NOW.isoformat() not in serialized
+    assert str(int(NOW.timestamp() * 1000)) not in serialized
 
 
 def test_batch_119_false_submission_is_ready_for_repair(tmp_path):
@@ -6041,7 +6570,7 @@ def test_recovery_snapshot_loads_exact_position_history_and_blocks_prior_close(
         factory,
         profile=module.BATCH_119_RECOVERY,
         snapshot=snapshot,
-        planned_at=NOW,
+        planned_at=snapshot.capture_ended_at,
     )
 
     assert client.position_history_calls == [
@@ -6070,7 +6599,7 @@ def test_recovery_snapshot_marks_position_history_failure_incomplete(tmp_path):
         factory,
         profile=module.BATCH_119_RECOVERY,
         snapshot=snapshot,
-        planned_at=NOW,
+        planned_at=snapshot.capture_ended_at,
     )
 
     assert snapshot.position_history == []
@@ -6287,7 +6816,7 @@ def test_batch119_planner_rejects_durable_scope_drift_after_exact_capture(
         factory,
         profile=module.BATCH_119_RECOVERY,
         snapshot=snapshot,
-        planned_at=NOW,
+        planned_at=snapshot.capture_ended_at,
     )
 
     assert plan.status == "refused"
@@ -6322,7 +6851,7 @@ def test_batch119_planner_rejects_purpose_mapping_drift_after_exact_capture(
         factory,
         profile=module.BATCH_119_RECOVERY,
         snapshot=snapshot,
-        planned_at=NOW,
+        planned_at=snapshot.capture_ended_at,
     )
 
     assert plan.status == "refused"
@@ -6362,7 +6891,7 @@ def test_batch119_planner_rejects_protection_evidence_drift_after_capture(
         factory,
         profile=module.BATCH_119_RECOVERY,
         snapshot=snapshot,
-        planned_at=NOW,
+        planned_at=snapshot.capture_ended_at,
     )
 
     assert plan.status == "refused"
@@ -6382,7 +6911,7 @@ def test_batch119_resume_rejects_durable_scope_drift_after_exact_capture(
         factory,
         profile=module.BATCH_119_RECOVERY,
         snapshot=snapshot,
-        planned_at=NOW,
+        planned_at=snapshot.capture_ended_at,
     )
     assert plan.status == "ready"
     assert plan.position.disposition == "position_absent"
@@ -6437,7 +6966,7 @@ def test_batch119_resume_rejects_protection_evidence_drift_after_capture(
         factory,
         profile=module.BATCH_119_RECOVERY,
         snapshot=snapshot,
-        planned_at=NOW,
+        planned_at=snapshot.capture_ended_at,
     )
     module.apply_composite_batch_false_state_repair(
         factory,
@@ -7397,14 +7926,14 @@ def test_batch119_scope_and_account_authority_bind_exchange_fingerprint(
         factory,
         profile=module.BATCH_119_RECOVERY,
         snapshot=snapshot,
-        planned_at=NOW,
+        planned_at=snapshot.capture_ended_at,
     )
     changed_scope = replace(snapshot, scope_fingerprint="7" * 64)
     changed_plan = module.build_composite_batch_recovery_plan(
         factory,
         profile=module.BATCH_119_RECOVERY,
         snapshot=changed_scope,
-        planned_at=NOW,
+        planned_at=snapshot.capture_ended_at,
     )
     incomplete_authority = replace(
         snapshot.account_authority,
@@ -7415,7 +7944,7 @@ def test_batch119_scope_and_account_authority_bind_exchange_fingerprint(
         factory,
         profile=module.BATCH_119_RECOVERY,
         snapshot=replace(snapshot, account_authority=incomplete_authority),
-        planned_at=NOW,
+        planned_at=snapshot.capture_ended_at,
     )
 
     assert plan.status == "ready"
@@ -7449,7 +7978,7 @@ def test_batch119_snapshot_collection_mutation_breaks_account_authority(
         factory,
         profile=module.BATCH_119_RECOVERY,
         snapshot=snapshot,
-        planned_at=NOW,
+        planned_at=snapshot.capture_ended_at,
     )
 
     assert plan.status == "refused"
@@ -7478,7 +8007,7 @@ def test_batch119_snapshot_rejects_wrong_account_authority_endpoint(tmp_path):
         factory,
         profile=module.BATCH_119_RECOVERY,
         snapshot=snapshot,
-        planned_at=NOW,
+        planned_at=snapshot.capture_ended_at,
     )
 
     assert plan.status == "refused"
