@@ -1596,11 +1596,24 @@ cleanup_batch119_dry_run() {
         elif ! timeout 30 systemctl is-active --quiet "$UNIT"; then
           cleanup_status=1
         fi
-      elif systemctl is-active --quiet "$UNIT"; then
+      elif [ "${ORIGINAL_UNIT_STATE[$UNIT]}" = inactive ]; then
         if ! sudo systemctl stop "$UNIT"; then
           cleanup_status=1
+        elif [ "$(systemctl is-active "$UNIT" || true)" != inactive ]; then
+          cleanup_status=1
         fi
+      else
+        cleanup_status=1
       fi
+    done
+    for VERIFY_PASS in 1 2 3; do
+      sleep 1
+      for UNIT in "${QUIESCE_UNITS[@]}"; do
+        if [ "$(systemctl is-active "$UNIT" || true)" != \
+          "${ORIGINAL_UNIT_STATE[$UNIT]}" ]; then
+          cleanup_status=1
+        fi
+      done
     done
   fi
   if [ "$(git -C "$PRODUCTION_ROOT" rev-parse HEAD)" != "$ORIGINAL_SHA" ]; then
@@ -1611,7 +1624,24 @@ cleanup_batch119_dry_run() {
   fi
   return "$cleanup_status"
 }
-trap cleanup_batch119_dry_run EXIT
+finish_batch119_dry_run() {
+  local original_status=$?
+  local cleanup_status=0
+  trap - EXIT
+  cleanup_batch119_dry_run || cleanup_status=$?
+  if [ "$cleanup_status" -ne 0 ]; then
+    exit "$cleanup_status"
+  fi
+  exit "$original_status"
+}
+trap finish_batch119_dry_run EXIT
+
+for UNIT in "${QUIESCE_UNITS[@]}"; do
+  case "${ORIGINAL_UNIT_STATE[$UNIT]}" in
+    active|inactive) ;;
+    *) exit 1 ;;
+  esac
+done
 
 git -C "$PRODUCTION_ROOT" fetch --no-tags origin codex/deepcoin-auto-trading-v1
 git -C "$PRODUCTION_ROOT" cat-file -e "${REVIEWED_SHA}^{commit}"
@@ -1626,13 +1656,9 @@ test "${BATCH119_STOP_APPROVAL:-}" = \
   'I_APPROVE_BATCH119_ALL_DB_UNITS_STOPPED_READ_ONLY_DOUBLE_CAPTURE'
 
 QUIESCE_ATTEMPTED=1
+sudo systemctl stop "${QUIESCE_UNITS[@]}"
 for UNIT in "${QUIESCE_UNITS[@]}"; do
-  if [ "${ORIGINAL_UNIT_STATE[$UNIT]}" = active ]; then
-    sudo systemctl stop "$UNIT"
-  fi
-done
-for UNIT in "${QUIESCE_UNITS[@]}"; do
-  test "$(systemctl is-active "$UNIT" || true)" != active
+  test "$(systemctl is-active "$UNIT" || true)" = inactive
 done
 
 # 已记录并静止 main、Runtime Agent、scanner、monitor timer/worker；不允许
@@ -1755,6 +1781,13 @@ management component、mutation intent、recovery 或交易所对账；每个开
 同时提供 `--generation-database-path`、`--apply`、`--expected-fingerprint` 和
 `--authorization`。apply 时，`--generation-database-path` 与 `--database-path` 经路径解析后必须
 完全相同，否则 CLI 拒绝继续。当前阶段仍禁止任何 apply，该授权不属于当前步骤。
+
+停服脚本只接受每个列举单元的初始状态为精确 `active` 或 `inactive`；
+`activating`、`deactivating`、`reloading`、`failed`、`unknown` 等一律在备份前拒绝。
+无论初始状态如何，所有列举单元都执行 stop，并逐个证明精确 `inactive`
+后才允许创建副本。EXIT handler 会保留原命令失败码；若任一服务恢复、
+active/inactive 状态复原、SHA 校验、worktree 或临时目录清理失败，则最终
+退出码必须为非零，不能把比较成功误报为整段流程成功。
 
 Batch 119 recovery 与 Deepcoin request-governance Stage 1 deployment 绝对不得共用同一
 deployment operation 或 quiet window。整个流程保持 `mimo_contract_mode=v1`，不启用 MiMo v2、

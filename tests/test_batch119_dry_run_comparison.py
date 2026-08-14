@@ -9,6 +9,7 @@ import pytest
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "compare_batch119_dry_runs.py"
+RUNBOOK = Path(__file__).parents[1] / "docs" / "runbook.md"
 
 
 def _valid_dry_run() -> dict[str, object]:
@@ -39,7 +40,11 @@ def _valid_dry_run() -> dict[str, object]:
         "durable": {
             "batch_status": "reconciling",
             "leg_status": "submitted",
-            "component_statuses": ["pending", "pending", "pending"],
+            "batch_row_fingerprint": "1" * 64,
+            "management_leg_row_fingerprint": "2" * 64,
+            "batch_stable_authority_fingerprint": "3" * 64,
+            "management_leg_stable_authority_fingerprint": "4" * 64,
+            "component_statuses": ["recovery_required", "pending", "pending"],
             "component_attempt_counts": [0, 0, 0],
             "component_count": 3,
             "close_submission_evidence_count": 0,
@@ -59,7 +64,7 @@ def _valid_dry_run() -> dict[str, object]:
             "snapshot_complete": True,
             "exact_position_count": 0,
             "regular_close_evidence_count": 0,
-            "owned_protection_count": 3,
+            "owned_protection_count": 2,
         },
         "proposed_transition": {
             "batch_status": "resolved",
@@ -128,6 +133,47 @@ def _run_compare(tmp_path: Path, left: object, right: object):
     )
 
 
+def _resign_evidence(document: dict[str, object]) -> None:
+    evidence = document["plan"]["evidence"]
+    document["plan"]["evidence_fingerprint"] = sha256(
+        json.dumps(
+            evidence,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["durable_statuses", "owned_protection_count"],
+)
+def test_batch119_dry_run_comparator_rejects_identical_resigned_false_semantics(
+    tmp_path,
+    mutation,
+):
+    document = _valid_dry_run()
+    if mutation == "durable_statuses":
+        durable = document["plan"]["evidence"]["durable"]
+        durable["batch_status"] = "ready"
+        durable["leg_status"] = "planned"
+        durable["component_statuses"] = ["pending", "pending", "pending"]
+    else:
+        document["plan"]["evidence"]["exchange"][
+            "owned_protection_count"
+        ] = 99
+    _resign_evidence(document)
+
+    result = _run_compare(tmp_path, document, deepcopy(document))
+
+    assert result.returncode != 0
+    assert json.loads(result.stdout) == {
+        "reason_code": "dry_run_comparison_refused",
+        "status": "refused",
+    }
+
+
 def test_batch119_dry_run_comparator_accepts_only_identical_safe_ready_plans(
     tmp_path,
 ):
@@ -138,6 +184,37 @@ def test_batch119_dry_run_comparator_accepts_only_identical_safe_ready_plans(
     assert result.returncode == 0
     assert json.loads(result.stdout) == {"status": "stable"}
     assert result.stderr == ""
+
+
+def test_batch119_runbook_requires_all_units_inactive_and_cleanup_failure_nonzero():
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+
+    assert 'active|inactive) ;;' in runbook
+    assert 'sudo systemctl stop "${QUIESCE_UNITS[@]}"' in runbook
+    assert 'test "$(systemctl is-active "$UNIT" || true)" = inactive' in runbook
+    assert "trap - EXIT" in runbook
+    assert 'if [ "$cleanup_status" -ne 0 ]; then' in runbook
+    assert 'exit "$cleanup_status"' in runbook
+    assert runbook.count(
+        '"${ORIGINAL_UNIT_STATE[$UNIT]}"'
+    ) >= 4
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            "cleanup() { return 7; }; "
+            "finish() { local original=$?; local cleaned=0; trap - EXIT; "
+            "cleanup || cleaned=$?; "
+            "if [ \"$cleaned\" -ne 0 ]; then exit \"$cleaned\"; fi; "
+            "exit \"$original\"; }; trap finish EXIT; true",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 7
 
 
 def test_batch119_dry_run_comparator_rejects_identical_nonabsent_empty_evidence(

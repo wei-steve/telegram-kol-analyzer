@@ -413,6 +413,10 @@ def _snapshot(**overrides):
         for purpose, order_id in protection_orders
     )
     scope_fingerprint = module._batch119_exact_scope_fingerprint(
+        batch_row_fingerprint="1" * 64,
+        management_leg_row_fingerprint="2" * 64,
+        batch_stable_authority_fingerprint="3" * 64,
+        management_leg_stable_authority_fingerprint="4" * 64,
         position_id=POS_ID,
         protection_orders=protection_orders,
         protection_evidence_fingerprints=protection_evidence_fingerprints,
@@ -421,6 +425,10 @@ def _snapshot(**overrides):
         instrument_id="BTC-USDT-SWAP",
         side="long",
         scope_fingerprint=scope_fingerprint,
+        batch_row_fingerprint="1" * 64,
+        management_leg_row_fingerprint="2" * 64,
+        batch_stable_authority_fingerprint="3" * 64,
+        management_leg_stable_authority_fingerprint="4" * 64,
         position_id=POS_ID,
         protection_orders=protection_orders,
         protection_evidence_fingerprints=protection_evidence_fingerprints,
@@ -566,12 +574,38 @@ def _snapshot(**overrides):
     for field_name in requested_overrides:
         if field_name not in loader_supported and hasattr(issued, field_name):
             setattr(issued, field_name, getattr(candidate, field_name))
-    if (
-        scope_protection_overrides
-        and issued.exact_scope != candidate.exact_scope
+    if scope_protection_overrides and (
+        issued.exact_scope.protection_evidence_fingerprints
+        != candidate.exact_scope.protection_evidence_fingerprints
     ):
-        issued.exact_scope = candidate.exact_scope
-        issued.scope_fingerprint = candidate.scope_fingerprint
+        forged_scope_fingerprint = module._batch119_exact_scope_fingerprint(
+            batch_row_fingerprint=(
+                issued.exact_scope.batch_row_fingerprint
+            ),
+            management_leg_row_fingerprint=(
+                issued.exact_scope.management_leg_row_fingerprint
+            ),
+            batch_stable_authority_fingerprint=(
+                issued.exact_scope.batch_stable_authority_fingerprint
+            ),
+            management_leg_stable_authority_fingerprint=(
+                issued.exact_scope.management_leg_stable_authority_fingerprint
+            ),
+            position_id=issued.exact_scope.position_id,
+            protection_orders=candidate.exact_scope.protection_orders,
+            protection_evidence_fingerprints=(
+                candidate.exact_scope.protection_evidence_fingerprints
+            ),
+        )
+        issued.exact_scope = replace(
+            issued.exact_scope,
+            protection_orders=candidate.exact_scope.protection_orders,
+            protection_evidence_fingerprints=(
+                candidate.exact_scope.protection_evidence_fingerprints
+            ),
+            scope_fingerprint=forged_scope_fingerprint,
+        )
+        issued.scope_fingerprint = forged_scope_fingerprint
         issued.account_authority = candidate.account_authority
     return issued
 
@@ -3499,9 +3533,7 @@ def test_natural_stop_refuses_new_durable_management_submission_field(
 
     plan = _plan(factory, snapshot)
 
-    _assert_natural_stop_refusal(
-        plan, "durable_close_submission_evidence_present"
-    )
+    _assert_natural_stop_refusal(plan, "durable_snapshot_scope_mismatch")
 
 
 def test_natural_stop_refuses_new_durable_close_mutation(tmp_path):
@@ -10953,6 +10985,117 @@ def test_batch119_native_role_malformed_sqlite_is_safely_refused_before_network(
     assert hostile_text not in repr(snapshot)
 
 
+@pytest.mark.parametrize(
+    ("table_name", "column_name", "where_clause"),
+    [
+        (
+            "strategy_management_batches",
+            "updated_at",
+            "id = 119",
+        ),
+        (
+            "strategy_management_batches",
+            "last_progress_at",
+            "id = 119",
+        ),
+        (
+            "strategy_management_legs",
+            "updated_at",
+            "management_batch_id = 119",
+        ),
+    ],
+)
+def test_batch119_native_role_malformed_sqlite_datetime_is_safely_refused(
+    tmp_path,
+    table_name,
+    column_name,
+    where_clause,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(
+        tmp_path,
+        native_sl_backup=True,
+    )
+    with factory() as session:
+        session.execute(
+            text(
+                f"UPDATE {table_name} SET {column_name} = "
+                f"'hostile-not-a-time' WHERE {where_clause}"
+            )
+        )
+        session.commit()
+    client = _Batch119AbsentExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {
+        "exact_scope": "exact_history_scope_invalid"
+    }
+    assert client.network_calls == 0
+    assert "hostile-not-a-time" not in repr(snapshot)
+
+
+@pytest.mark.parametrize(
+    ("table_name", "column_name", "where_clause"),
+    [
+        (
+            "strategy_management_legs",
+            "old_tpsl_json",
+            "management_batch_id = 119",
+        ),
+        (
+            "strategy_management_batches",
+            "notification_state",
+            "id = 119",
+        ),
+        (
+            "strategy_management_batches",
+            "notification_fingerprint",
+            "id = 119",
+        ),
+        (
+            "strategy_management_batches",
+            "visibility_retry_attempts",
+            "id = 119",
+        ),
+    ],
+)
+def test_batch119_native_role_malformed_sqlite_blob_is_safely_refused(
+    tmp_path,
+    table_name,
+    column_name,
+    where_clause,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(
+        tmp_path,
+        native_sl_backup=True,
+    )
+    with factory() as session:
+        session.execute(
+            text(
+                f"UPDATE {table_name} SET {column_name} = x'00ff' "
+                f"WHERE {where_clause}"
+            )
+        )
+        session.commit()
+    client = _Batch119AbsentExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {
+        "exact_scope": "exact_history_scope_invalid"
+    }
+    assert client.network_calls == 0
+    assert "00ff" not in repr(snapshot).lower()
+
+
 def test_batch119_comparator_accepts_two_real_serialized_absent_plans(
     tmp_path,
 ):
@@ -11515,6 +11658,27 @@ def _drift_batch119_native_role_authority(session, mutation):
         session.query(ExecutionBinding).one().status = "open"
     elif mutation == "entry_status":
         session.query(ExecutionOrderLeg).one().status = "filled"
+    elif mutation == "batch_requested_fraction":
+        session.query(StrategyManagementBatch).one().requested_fraction = "0.25"
+    elif mutation == "batch_effective_fraction":
+        session.query(StrategyManagementBatch).one().effective_fraction = "0.25"
+    elif mutation == "management_leg_old_tpsl":
+        session.query(StrategyManagementLeg).one().old_tpsl_json = "[]"
+    elif mutation == "management_leg_planned_tpsl":
+        session.query(StrategyManagementLeg).one().planned_tpsl_json = "[]"
+    elif mutation == "batch_last_progress_at":
+        session.query(StrategyManagementBatch).one().last_progress_at = (
+            NOW + timedelta(seconds=1)
+        )
+    elif mutation == "batch_updated_at":
+        session.query(StrategyManagementBatch).one().updated_at = (
+            NOW + timedelta(seconds=1)
+        )
+    elif mutation == "management_leg_last_error":
+        session.query(StrategyManagementLeg).one().last_error = json.dumps(
+            {"reason": "management_close_order_not_found"},
+            sort_keys=True,
+        )
     elif mutation == "conflicting_authority":
         original = (
             session.query(PositionProtectionLeg)
@@ -11557,8 +11721,83 @@ _NATIVE_ROLE_POST_CAPTURE_DRIFTS = (
     "primary_correlation_id",
     "binding_status",
     "entry_status",
+    "batch_requested_fraction",
+    "batch_effective_fraction",
+    "management_leg_old_tpsl",
+    "management_leg_planned_tpsl",
+    "batch_last_progress_at",
+    "batch_updated_at",
+    "management_leg_last_error",
     "conflicting_authority",
 )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "fingerprint_key"),
+    [
+        ("batch_requested_fraction", "batch_row_fingerprint"),
+        ("management_leg_planned_tpsl", "management_leg_row_fingerprint"),
+    ],
+)
+def test_batch119_repair_audit_cannot_self_sign_management_row_drift(
+    tmp_path,
+    mutation,
+    fingerprint_key,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(
+        tmp_path,
+        native_sl_backup=True,
+    )
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=_Batch119AbsentExactHistoryClient(),
+    )
+    plan = module.build_composite_batch_recovery_plan(
+        factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=snapshot,
+        planned_at=snapshot.capture_ended_at,
+    )
+    _apply_recovery(
+        module,
+        factory,
+        plan=plan,
+        snapshot=snapshot,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with factory() as session:
+        _drift_batch119_native_role_authority(session, mutation)
+        batch = session.get(StrategyManagementBatch, 119)
+        leg = session.query(StrategyManagementLeg).one()
+        event = session.query(ExecutionEvent).one()
+        after = json.loads(event.after_json)
+        after[fingerprint_key] = (
+            module._batch119_management_authority_fingerprint(
+                batch if fingerprint_key == "batch_row_fingerprint" else leg
+            )
+        )
+        event.after_json = module._canonical_json(after)
+        session.commit()
+
+    fresh = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=_Batch119AbsentExactHistoryClient(),
+    )
+
+    assert fresh.errors == {"exact_scope": "exact_history_scope_invalid"}
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="resume_(audit_invalid|source_state_conflict)",
+    ):
+        _authorize_recovery(
+            module,
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=snapshot,
+        )
 
 
 @pytest.mark.parametrize("mutation", _NATIVE_ROLE_POST_CAPTURE_DRIFTS)

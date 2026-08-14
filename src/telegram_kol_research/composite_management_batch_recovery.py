@@ -159,6 +159,10 @@ class _Batch119ExactHistoryScope:
     instrument_id: str
     side: str
     scope_fingerprint: str
+    batch_row_fingerprint: str = field(repr=False)
+    management_leg_row_fingerprint: str = field(repr=False)
+    batch_stable_authority_fingerprint: str = field(repr=False)
+    management_leg_stable_authority_fingerprint: str = field(repr=False)
     position_id: str = field(repr=False)
     protection_orders: tuple[tuple[str, str], ...] = field(repr=False)
     protection_evidence_fingerprints: tuple[tuple[str, str], ...] = field(
@@ -392,6 +396,17 @@ def _load_composite_batch_recovery_snapshot_read_only_impl(
     except CompositeBatchRecoveryRefusal as exc:
         return Batch119ExactRecoverySnapshot(
             errors={"exact_scope": exc.reason_code}
+        )
+    except (
+        SQLAlchemyError,
+        TypeError,
+        ValueError,
+        UnicodeEncodeError,
+        RecursionError,
+        OverflowError,
+    ):
+        return Batch119ExactRecoverySnapshot(
+            errors={"exact_scope": "exact_history_scope_invalid"}
         )
     uid_scope_hash = getattr(client, "uid_scope_hash", None)
     if not _is_sha256(uid_scope_hash):
@@ -759,8 +774,13 @@ def _build_batch119_exact_history_scope_in_session(
         .order_by(PositionProtectionLedger.id)
         .all()
     )
+    pre_repair_authority = None
     if allowed_unverified_order_refs is None:
-        invalid_audit, allowed_unverified_order_refs = (
+        (
+            invalid_audit,
+            allowed_unverified_order_refs,
+            pre_repair_authority,
+        ) = (
             _canonical_recovery_audit_order_refs(
                 session,
                 batch=batch,
@@ -781,6 +801,13 @@ def _build_batch119_exact_history_scope_in_session(
         leg=leg,
         entry=entry,
     )
+    if pre_repair_authority is None:
+        pre_repair_authority = (
+            _batch119_durable_authority_fingerprint(batch),
+            _batch119_durable_authority_fingerprint(leg),
+            _batch119_management_authority_fingerprint(batch),
+            _batch119_management_authority_fingerprint(leg),
+        )
     return _batch119_exact_history_scope_from_rows(
         rows,
         batch=batch,
@@ -789,6 +816,12 @@ def _build_batch119_exact_history_scope_in_session(
         entry=entry,
         allowed_unverified_order_refs=allowed_unverified_order_refs,
         resolved_roles=resolved_roles,
+        batch_row_fingerprint=pre_repair_authority[0],
+        management_leg_row_fingerprint=pre_repair_authority[1],
+        batch_stable_authority_fingerprint=pre_repair_authority[2],
+        management_leg_stable_authority_fingerprint=(
+            pre_repair_authority[3]
+        ),
     )
 
 
@@ -887,6 +920,10 @@ def _batch119_exact_history_scope_from_rows(
     entry,
     allowed_unverified_order_refs: frozenset[str] | None,
     resolved_roles: tuple[_Batch119ResolvedStopRole, ...] = (),
+    batch_row_fingerprint: str,
+    management_leg_row_fingerprint: str,
+    batch_stable_authority_fingerprint: str,
+    management_leg_stable_authority_fingerprint: str,
 ) -> _Batch119ExactHistoryScope:
     profile = BATCH_119_RECOVERY
     scoped: list[tuple[str, str]] = []
@@ -973,10 +1010,26 @@ def _batch119_exact_history_scope_from_rows(
     return _Batch119ExactHistoryScope(
         instrument_id=profile.instrument_id,
         side=profile.side,
+        batch_row_fingerprint=batch_row_fingerprint,
+        management_leg_row_fingerprint=management_leg_row_fingerprint,
+        batch_stable_authority_fingerprint=(
+            batch_stable_authority_fingerprint
+        ),
+        management_leg_stable_authority_fingerprint=(
+            management_leg_stable_authority_fingerprint
+        ),
         position_id=str(leg.pos_id),
         protection_orders=protection_orders,
         protection_evidence_fingerprints=protection_evidence_fingerprints,
         scope_fingerprint=_batch119_exact_scope_fingerprint(
+            batch_row_fingerprint=batch_row_fingerprint,
+            management_leg_row_fingerprint=management_leg_row_fingerprint,
+            batch_stable_authority_fingerprint=(
+                batch_stable_authority_fingerprint
+            ),
+            management_leg_stable_authority_fingerprint=(
+                management_leg_stable_authority_fingerprint
+            ),
             position_id=str(leg.pos_id),
             protection_orders=protection_orders,
             protection_evidence_fingerprints=(
@@ -1005,7 +1058,11 @@ def _canonical_recovery_audit_order_refs(
     binding,
     leg,
     entry,
-) -> tuple[bool, frozenset[str] | None]:
+) -> tuple[
+    bool,
+    frozenset[str] | None,
+    tuple[str, str, str, str] | None,
+]:
     events = (
         session.query(ExecutionEvent)
         .filter(
@@ -1015,9 +1072,9 @@ def _canonical_recovery_audit_order_refs(
         .all()
     )
     if not events:
-        return False, None
+        return False, None, None
     if len(events) != 1 or not _is_sha256(events[0].notification_fingerprint):
-        return True, None
+        return True, None, None
     try:
         after = _validated_resume_audit_event(
             events[0],
@@ -1038,7 +1095,7 @@ def _canonical_recovery_audit_order_refs(
             profile=BATCH_119_RECOVERY,
         )
         if isinstance(contract, str) or isinstance(target, str):
-            return True, None
+            return True, None, None
         if not _recovery_audit_matches_current_durable_state(
             session,
             event=events[0],
@@ -1059,9 +1116,18 @@ def _canonical_recovery_audit_order_refs(
                 leg=leg,
                 entry=entry,
             ):
-                return False, None
-            return True, None
-        return False, frozenset(after["original_owned_stop_refs"])
+                return False, None, None
+            return True, None, None
+        return (
+            False,
+            frozenset(after["original_owned_stop_refs"]),
+            (
+                str(after["batch_row_fingerprint"]),
+                str(after["management_leg_row_fingerprint"]),
+                str(after["batch_stable_authority_fingerprint"]),
+                str(after["management_leg_stable_authority_fingerprint"]),
+            ),
+        )
     except (
         CompositeBatchRecoveryConflict,
         CompositeBatchRecoveryRefusal,
@@ -1070,7 +1136,7 @@ def _canonical_recovery_audit_order_refs(
         RecursionError,
         OverflowError,
     ):
-        return True, None
+        return True, None, None
 
 
 def _canonical_audit_original_rows_still_owned(
@@ -1181,7 +1247,18 @@ def _recovery_audit_matches_current_durable_state(
         current_component_attempt_counts = [
             int(row.attempt_count) for row in components
         ]
-    except (TypeError, ValueError, OverflowError):
+        current_batch_fingerprint = _batch119_management_authority_fingerprint(
+            batch
+        )
+        current_leg_fingerprint = _batch119_management_authority_fingerprint(
+            leg
+        )
+    except (
+        CompositeBatchRecoveryRefusal,
+        TypeError,
+        ValueError,
+        OverflowError,
+    ):
         return False
     if (
         int(event.execution_binding_id or 0) != int(binding.id)
@@ -1192,6 +1269,8 @@ def _recovery_audit_matches_current_durable_state(
         or not isinstance(component_attempt_counts, list)
         or current_component_attempt_counts != component_attempt_counts
         or str(batch.status) != expected_batch_status
+        or current_batch_fingerprint
+        != after.get("batch_stable_authority_fingerprint")
         or str(batch.reason_code) != recovery_reason
         or batch.last_progress_at != event.created_at
         or batch.updated_at != event.created_at
@@ -1200,6 +1279,8 @@ def _recovery_audit_matches_current_durable_state(
         or batch.completed_at
         != (event.created_at if position_absent else None)
         or str(leg.status) != expected_leg_status
+        or current_leg_fingerprint
+        != after.get("management_leg_stable_authority_fingerprint")
         or leg.updated_at != event.created_at
         or _safe_json_value(leg.last_error)
         != {
@@ -1350,6 +1431,10 @@ def _canonical_pre_repair_source_fingerprint_matches(
         before = _safe_json_value(event.before_json)
         if not isinstance(before, Mapping):
             return False
+        payload["batch_row_fingerprint"] = after["batch_row_fingerprint"]
+        payload["management_leg_row_fingerprint"] = after[
+            "management_leg_row_fingerprint"
+        ]
         payload["batch_status"] = before["batch_status"]
         payload["batch_reason_code"] = (
             "management_close_pending_exchange_confirmation"
@@ -1652,6 +1737,51 @@ def _batch119_exact_protection_leg(
 def _batch119_durable_authority_fingerprint(row: Any) -> str:
     try:
         return _durable_row_fingerprint(row)
+    except (
+        TypeError,
+        ValueError,
+        UnicodeEncodeError,
+        RecursionError,
+        OverflowError,
+    ):
+        raise CompositeBatchRecoveryRefusal(
+            "exact_history_scope_invalid"
+        ) from None
+
+
+def _batch119_management_authority_fingerprint(row: Any) -> str:
+    excluded_by_table = {
+        StrategyManagementBatch.__tablename__: {
+            "status",
+            "reason_code",
+            "last_progress_at",
+            "reconciled_at",
+            "completed_at",
+            "updated_at",
+        },
+        StrategyManagementLeg.__tablename__: {
+            "status",
+            "last_error",
+            "updated_at",
+        },
+    }
+    table = getattr(row, "__table__", None)
+    table_name = getattr(table, "name", None)
+    columns = getattr(table, "columns", None)
+    excluded = excluded_by_table.get(table_name)
+    if columns is None or excluded is None:
+        raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
+    try:
+        return _fingerprint(
+            {
+                str(column.name): _durable_column_scalar(
+                    column,
+                    getattr(row, column.name),
+                )
+                for column in columns
+                if str(column.name) not in excluded
+            }
+        )
     except (
         TypeError,
         ValueError,
@@ -2168,13 +2298,21 @@ def _batch119_backup_role_authority_fingerprint(
 
 def _batch119_exact_scope_fingerprint(
     *,
+    batch_row_fingerprint: str,
+    management_leg_row_fingerprint: str,
+    batch_stable_authority_fingerprint: str,
+    management_leg_stable_authority_fingerprint: str,
     position_id: str,
     protection_orders: Sequence[tuple[str, str]],
     protection_evidence_fingerprints: Sequence[tuple[str, str]],
 ) -> str:
     evidence_by_purpose = dict(protection_evidence_fingerprints)
     if (
-        len(evidence_by_purpose) != len(protection_evidence_fingerprints)
+        not _is_sha256(batch_row_fingerprint)
+        or not _is_sha256(management_leg_row_fingerprint)
+        or not _is_sha256(batch_stable_authority_fingerprint)
+        or not _is_sha256(management_leg_stable_authority_fingerprint)
+        or len(evidence_by_purpose) != len(protection_evidence_fingerprints)
         or set(evidence_by_purpose)
         != {purpose for purpose, _ in protection_orders}
         or not all(_is_sha256(value) for value in evidence_by_purpose.values())
@@ -2182,8 +2320,18 @@ def _batch119_exact_scope_fingerprint(
         raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
     return _fingerprint(
         {
-            "schema_version": 4,
+            "schema_version": 6,
             "batch_id": BATCH_119_RECOVERY.batch_id,
+            "batch_row_fingerprint": batch_row_fingerprint,
+            "management_leg_row_fingerprint": (
+                management_leg_row_fingerprint
+            ),
+            "batch_stable_authority_fingerprint": (
+                batch_stable_authority_fingerprint
+            ),
+            "management_leg_stable_authority_fingerprint": (
+                management_leg_stable_authority_fingerprint
+            ),
             "position_ref": _redacted_ref(
                 "recovery_position", position_id
             ),
@@ -2513,6 +2661,12 @@ def _batch119_snapshot_authority_matches_unchecked(
         != {"stop_loss", "backup_stop"}
         or len({order_id for _, order_id in scope.protection_orders}) != 2
         or len(scope.protection_evidence_fingerprints) != 2
+        or not _is_sha256(scope.batch_row_fingerprint)
+        or not _is_sha256(scope.management_leg_row_fingerprint)
+        or not _is_sha256(scope.batch_stable_authority_fingerprint)
+        or not _is_sha256(
+            scope.management_leg_stable_authority_fingerprint
+        )
         or {purpose for purpose, _ in scope.protection_evidence_fingerprints}
         != {"stop_loss", "backup_stop"}
         or not all(
@@ -2522,6 +2676,16 @@ def _batch119_snapshot_authority_matches_unchecked(
     ):
         return False
     expected_scope_fingerprint = _batch119_exact_scope_fingerprint(
+        batch_row_fingerprint=scope.batch_row_fingerprint,
+        management_leg_row_fingerprint=(
+            scope.management_leg_row_fingerprint
+        ),
+        batch_stable_authority_fingerprint=(
+            scope.batch_stable_authority_fingerprint
+        ),
+        management_leg_stable_authority_fingerprint=(
+            scope.management_leg_stable_authority_fingerprint
+        ),
         position_id=scope.position_id,
         protection_orders=scope.protection_orders,
         protection_evidence_fingerprints=(
@@ -2932,6 +3096,11 @@ def _validated_resume_audit_event(
         "exchange_call_possible",
         "original_owned_stop_refs",
         "instruction_population",
+        "batch_row_fingerprint",
+        "management_leg_row_fingerprint",
+        "batch_stable_authority_fingerprint",
+        "management_leg_stable_authority_fingerprint",
+        "plan_evidence",
     }
     expected_before_keys = {
         "batch_id",
@@ -2940,6 +3109,27 @@ def _validated_resume_audit_event(
         "component_statuses",
         "component_attempt_counts",
     }
+    plan_evidence = after.get("plan_evidence") if isinstance(after, Mapping) else None
+    try:
+        plan_evidence_fingerprint = _fingerprint(plan_evidence)
+    except (
+        TypeError,
+        ValueError,
+        UnicodeEncodeError,
+        RecursionError,
+        OverflowError,
+    ):
+        raise CompositeBatchRecoveryConflict("resume_audit_invalid") from None
+    plan_durable = (
+        plan_evidence.get("durable")
+        if isinstance(plan_evidence, Mapping)
+        else None
+    )
+    plan_position = (
+        plan_evidence.get("position")
+        if isinstance(plan_evidence, Mapping)
+        else None
+    )
     if (
         not isinstance(before, Mapping)
         or not isinstance(after, Mapping)
@@ -2959,6 +3149,34 @@ def _validated_resume_audit_event(
         or after.get("exchange_call_possible") is not False
         or not _is_sha256(after.get("source_fingerprint"))
         or not _is_sha256(after.get("exchange_snapshot_fingerprint"))
+        or not _is_sha256(after.get("batch_row_fingerprint"))
+        or not _is_sha256(after.get("management_leg_row_fingerprint"))
+        or not _is_sha256(after.get("batch_stable_authority_fingerprint"))
+        or not _is_sha256(
+            after.get("management_leg_stable_authority_fingerprint")
+        )
+        or not isinstance(plan_evidence, Mapping)
+        or plan_evidence_fingerprint != expected_fingerprint
+        or plan_evidence.get("source_fingerprint")
+        != after.get("source_fingerprint")
+        or plan_evidence.get("exchange_snapshot_fingerprint")
+        != after.get("exchange_snapshot_fingerprint")
+        or not isinstance(plan_durable, Mapping)
+        or plan_durable.get("batch_row_fingerprint")
+        != after.get("batch_row_fingerprint")
+        or plan_durable.get("management_leg_row_fingerprint")
+        != after.get("management_leg_row_fingerprint")
+        or plan_durable.get("batch_stable_authority_fingerprint")
+        != after.get("batch_stable_authority_fingerprint")
+        or plan_durable.get("management_leg_stable_authority_fingerprint")
+        != after.get("management_leg_stable_authority_fingerprint")
+        or not isinstance(plan_position, Mapping)
+        or plan_position.get("disposition")
+        != after.get("position_disposition")
+        or plan_position.get("current_size")
+        != after.get("current_size")
+        or plan_durable.get("instruction_population")
+        != after.get("instruction_population")
         or not _instruction_population_summary_is_valid(
             after.get("instruction_population")
         )
@@ -5038,6 +5256,18 @@ def _build_composite_batch_recovery_plan(
             "durable": {
                 "batch_status": str(batch.status),
                 "leg_status": str(leg.status),
+                "batch_row_fingerprint": (
+                    _batch119_durable_authority_fingerprint(batch)
+                ),
+                "management_leg_row_fingerprint": (
+                    _batch119_durable_authority_fingerprint(leg)
+                ),
+                "batch_stable_authority_fingerprint": (
+                    _batch119_management_authority_fingerprint(batch)
+                ),
+                "management_leg_stable_authority_fingerprint": (
+                    _batch119_management_authority_fingerprint(leg)
+                ),
                 "component_statuses": [str(row.status) for row in components],
                 "component_attempt_counts": [
                     int(row.attempt_count) for row in components
@@ -5213,6 +5443,9 @@ def _recovery_audit_after(
     component_statuses: list[str],
     original_owned_stop_refs: list[str],
 ) -> dict[str, Any]:
+    durable = _plain_json_value(plan.evidence).get("durable")
+    if not isinstance(durable, Mapping):
+        raise CompositeBatchRecoveryConflict("plan_evidence_inconsistent")
     return {
         "batch_id": BATCH_119_RECOVERY.batch_id,
         "batch_status": str(batch_status),
@@ -5228,6 +5461,17 @@ def _recovery_audit_after(
         "exchange_call_possible": False,
         "original_owned_stop_refs": list(original_owned_stop_refs),
         "instruction_population": _instruction_population_from_plan(plan),
+        "batch_row_fingerprint": durable.get("batch_row_fingerprint"),
+        "management_leg_row_fingerprint": durable.get(
+            "management_leg_row_fingerprint"
+        ),
+        "batch_stable_authority_fingerprint": durable.get(
+            "batch_stable_authority_fingerprint"
+        ),
+        "management_leg_stable_authority_fingerprint": durable.get(
+            "management_leg_stable_authority_fingerprint"
+        ),
+        "plan_evidence": _plain_json_value(plan.evidence),
     }
 
 
@@ -5551,6 +5795,16 @@ def _validate_recovery_plan_consistency(plan: CompositeBatchRecoveryPlan) -> Non
     expected_durable = {
         "batch_status": "reconciling",
         "leg_status": "submitted",
+        "batch_row_fingerprint": durable.get("batch_row_fingerprint"),
+        "management_leg_row_fingerprint": durable.get(
+            "management_leg_row_fingerprint"
+        ),
+        "batch_stable_authority_fingerprint": durable.get(
+            "batch_stable_authority_fingerprint"
+        ),
+        "management_leg_stable_authority_fingerprint": durable.get(
+            "management_leg_stable_authority_fingerprint"
+        ),
         "component_statuses": ["recovery_required", "pending", "pending"],
         "component_attempt_counts": attempt_counts,
         "component_count": len(_EXPECTED_COMPONENTS),
@@ -5605,7 +5859,6 @@ def _validate_recovery_plan_consistency(plan: CompositeBatchRecoveryPlan) -> Non
         "owned_protection_count": exchange.get("owned_protection_count"),
     }
     owned_protection_count = exchange.get("owned_protection_count")
-    minimum_owned_protection = 2
     if (
         evidence.get("schema_version") != 1
         or evidence.get("batch_id") != BATCH_119_RECOVERY.batch_id
@@ -5615,10 +5868,23 @@ def _validate_recovery_plan_consistency(plan: CompositeBatchRecoveryPlan) -> Non
         or evidence.get("exchange_snapshot_fingerprint")
         != plan.exchange_snapshot_fingerprint
         or evidence.get("immutable_target") != expected_target
+        or not _is_sha256(durable.get("batch_row_fingerprint"))
+        or not _is_sha256(durable.get("management_leg_row_fingerprint"))
+        or not _is_sha256(durable.get("batch_stable_authority_fingerprint"))
+        or not _is_sha256(
+            durable.get("management_leg_stable_authority_fingerprint")
+        )
         or durable != expected_durable
         or not isinstance(owned_protection_count, int)
         or isinstance(owned_protection_count, bool)
-        or owned_protection_count < minimum_owned_protection
+        or (
+            position_absent
+            and owned_protection_count != 2
+        )
+        or (
+            not position_absent
+            and not 2 <= owned_protection_count <= 100
+        )
         or exchange != expected_exchange
         or evidence.get("position") != _serialize_position(plan.position)
         or evidence.get("proposed_transition") != _proposed_transition(plan.position)
@@ -5830,6 +6096,16 @@ def _batch119_capture_seal_payload(snapshot: Any) -> dict[str, Any]:
             "instrument_id": scope.instrument_id,
             "side": scope.side,
             "scope_fingerprint": scope.scope_fingerprint,
+            "batch_row_fingerprint": scope.batch_row_fingerprint,
+            "management_leg_row_fingerprint": (
+                scope.management_leg_row_fingerprint
+            ),
+            "batch_stable_authority_fingerprint": (
+                scope.batch_stable_authority_fingerprint
+            ),
+            "management_leg_stable_authority_fingerprint": (
+                scope.management_leg_stable_authority_fingerprint
+            ),
             "position_id": scope.position_id,
             "protection_orders": [list(row) for row in scope.protection_orders],
             "protection_evidence_fingerprints": [
@@ -5914,6 +6190,10 @@ def _batch119_capture_preflight_is_bounded(snapshot: Any) -> bool:
         scope.instrument_id,
         scope.side,
         scope.scope_fingerprint,
+        scope.batch_row_fingerprint,
+        scope.management_leg_row_fingerprint,
+        scope.batch_stable_authority_fingerprint,
+        scope.management_leg_stable_authority_fingerprint,
         scope.position_id,
         scope.protection_orders,
         scope.protection_evidence_fingerprints,
@@ -7719,15 +7999,59 @@ def _durable_row_fingerprint(row: Any) -> str:
         raise TypeError("durable ORM row required")
     return _fingerprint(
         {
-            str(column.name): _durable_scalar(getattr(row, column.name))
+            str(column.name): _durable_column_scalar(
+                column,
+                getattr(row, column.name),
+            )
             for column in columns
         }
     )
 
 
+def _durable_column_scalar(column: Any, value: Any) -> Any:
+    if value is None:
+        if not bool(getattr(column, "nullable", False)):
+            raise TypeError("null durable non-nullable scalar")
+        return None
+    try:
+        expected_type = column.type.python_type
+    except (AttributeError, NotImplementedError):
+        raise TypeError("unsupported durable column type") from None
+    if expected_type is int:
+        valid = type(value) is int
+    elif expected_type is bool:
+        valid = type(value) is bool
+    elif expected_type is float:
+        valid = type(value) is float
+    elif expected_type is str:
+        valid = type(value) is str
+    elif expected_type is bytes:
+        valid = type(value) is bytes
+    elif expected_type is datetime:
+        valid = isinstance(value, datetime)
+    elif expected_type is Decimal:
+        valid = isinstance(value, Decimal)
+    else:
+        try:
+            valid = isinstance(value, expected_type)
+        except TypeError:
+            raise TypeError("unsupported durable column type") from None
+    if not valid:
+        raise TypeError("durable scalar type mismatch")
+    return _durable_scalar(value)
+
+
 def _durable_scalar(value: Any) -> Any:
     if isinstance(value, datetime):
-        return value.isoformat()
+        try:
+            normalized = (
+                value.replace(tzinfo=UTC)
+                if value.tzinfo is None
+                else value.astimezone(UTC)
+            )
+        except (OverflowError, ValueError):
+            raise ValueError("invalid durable datetime") from None
+        return normalized.replace(tzinfo=None).isoformat()
     if isinstance(value, Decimal):
         return str(value)
     if isinstance(value, bytes):
@@ -8584,6 +8908,12 @@ def _source_evidence_payload(
     return {
         "schema_version": 1,
         "batch_id": int(batch.id),
+        "batch_row_fingerprint": (
+            _batch119_durable_authority_fingerprint(batch)
+        ),
+        "management_leg_row_fingerprint": (
+            _batch119_durable_authority_fingerprint(leg)
+        ),
         "raw_message_id": int(batch.raw_message_id),
         "raw_chat_ref": _redacted_ref("raw_chat", raw.chat_id),
         "lifecycle_id": int(lifecycle.id),

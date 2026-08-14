@@ -273,6 +273,10 @@ def _validate_evidence(plan: dict[str, Any]) -> None:
     if not isinstance(durable, dict) or set(durable) != {
         "batch_status",
         "leg_status",
+        "batch_row_fingerprint",
+        "management_leg_row_fingerprint",
+        "batch_stable_authority_fingerprint",
+        "management_leg_stable_authority_fingerprint",
         "component_statuses",
         "component_attempt_counts",
         "component_count",
@@ -283,17 +287,16 @@ def _validate_evidence(plan: dict[str, Any]) -> None:
     statuses = durable.get("component_statuses")
     attempts = durable.get("component_attempt_counts")
     if not (
-        isinstance(durable.get("batch_status"), str)
-        and SAFE_CODE_RE.fullmatch(durable["batch_status"]) is not None
-        and isinstance(durable.get("leg_status"), str)
-        and SAFE_CODE_RE.fullmatch(durable["leg_status"]) is not None
-        and isinstance(statuses, list)
-        and len(statuses) == 3
-        and all(
-            isinstance(status, str)
-            and SAFE_CODE_RE.fullmatch(status) is not None
-            for status in statuses
+        durable.get("batch_status") == "reconciling"
+        and durable.get("leg_status") == "submitted"
+        and _is_sha256(durable.get("batch_row_fingerprint"))
+        and _is_sha256(durable.get("management_leg_row_fingerprint"))
+        and _is_sha256(durable.get("batch_stable_authority_fingerprint"))
+        and _is_sha256(
+            durable.get("management_leg_stable_authority_fingerprint")
         )
+        and isinstance(statuses, list)
+        and statuses == ["recovery_required", "pending", "pending"]
         and isinstance(attempts, list)
         and len(attempts) == 3
         and all(
@@ -329,9 +332,8 @@ def _validate_evidence(plan: dict[str, Any]) -> None:
         and not isinstance(
             exchange.get("regular_close_evidence_count"), bool
         )
-        and isinstance(owned_count, int)
+        and owned_count == 2
         and not isinstance(owned_count, bool)
-        and 2 <= owned_count <= 100
     ):
         raise ComparisonRefused("invalid exchange evidence")
 
