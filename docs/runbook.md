@@ -1587,7 +1587,7 @@ for ATTEMPT in 1 2; do
   RECOVERY_DB_COPY="$RECOVERY_TMP/research-copy-${ATTEMPT}.db"
   sqlite3 "$PRODUCTION_DB" ".backup '$RECOVERY_DB_COPY'"
   chmod 0600 "$RECOVERY_DB_COPY"
-  test "$(sqlite3 -readonly "$RECOVERY_DB_COPY" 'PRAGMA quick_check;')" = OK
+  test "$(sqlite3 -readonly "$RECOVERY_DB_COPY" 'PRAGMA quick_check;')" = ok
 
   # Additive bootstrap is allowed only on this private copy.
   PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" - \
