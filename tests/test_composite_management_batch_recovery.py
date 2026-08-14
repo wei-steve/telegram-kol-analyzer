@@ -239,6 +239,10 @@ def test_classify_recovery_position_rejects_identity_or_exposure_drift(overrides
 
 
 def _snapshot(**overrides):
+    scope_protection_overrides = overrides.pop(
+        "scope_protection_overrides",
+        {},
+    )
     values = {
         "positions": [
             {
@@ -288,9 +292,50 @@ def _snapshot(**overrides):
         ("backup_stop", BACKUP_ORDER_ID),
         ("stop_loss", PRIMARY_ORDER_ID),
     )
+    protection_evidence_fingerprints = tuple(
+        (
+            purpose,
+            module._batch119_protection_scope_evidence_fingerprint(
+                row=SimpleNamespace(
+                    venue="deepcoin",
+                    strategy_instance_id="deepcoin:incident:btc:long",
+                    pos_id=POS_ID,
+                    instrument_id="BTC-USDT-SWAP",
+                    side="long",
+                    trigger_price=scope_protection_overrides.get(
+                        purpose,
+                        {},
+                    ).get(
+                        "trigger_price",
+                        "63000" if purpose == "backup_stop" else "64000",
+                    ),
+                    size_text=scope_protection_overrides.get(
+                        purpose,
+                        {},
+                    ).get("size_text", "38"),
+                    status="verified",
+                    evidence_source=scope_protection_overrides.get(
+                        purpose,
+                        {},
+                    ).get("evidence_source", "entry_protection_response"),
+                    evidence_json=scope_protection_overrides.get(
+                        purpose,
+                        {},
+                    ).get(
+                        "evidence_json",
+                        '{"response":"private provider response"}',
+                    ),
+                ),
+                purpose=purpose,
+                order_id=order_id,
+            ),
+        )
+        for purpose, order_id in protection_orders
+    )
     scope_fingerprint = module._batch119_exact_scope_fingerprint(
         position_id=POS_ID,
         protection_orders=protection_orders,
+        protection_evidence_fingerprints=protection_evidence_fingerprints,
     )
     exact_scope = module._Batch119ExactHistoryScope(
         instrument_id="BTC-USDT-SWAP",
@@ -298,6 +343,7 @@ def _snapshot(**overrides):
         scope_fingerprint=scope_fingerprint,
         position_id=POS_ID,
         protection_orders=protection_orders,
+        protection_evidence_fingerprints=protection_evidence_fingerprints,
     )
     trigger_by_id = {
         PRIMARY_ORDER_ID: [],
@@ -2822,7 +2868,7 @@ def test_planner_refuses_malformed_snapshot_rows_without_raising(
     assert plan.reason_code == "exchange_snapshot_incomplete"
 
 
-def test_source_fingerprint_covers_same_count_protection_ledger_drift(tmp_path):
+def test_scope_rejects_same_count_protection_ledger_drift(tmp_path):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     before = _plan(factory)
     assert before.status == "ready"
@@ -2837,8 +2883,8 @@ def test_source_fingerprint_covers_same_count_protection_ledger_drift(tmp_path):
 
     after = _plan(factory)
 
-    assert after.status == "ready"
-    assert after.source_fingerprint != before.source_fingerprint
+    assert after.status == "refused"
+    assert after.reason_code == "durable_snapshot_scope_mismatch"
 
 
 @pytest.mark.parametrize(
@@ -3154,11 +3200,7 @@ def test_live_position_rejects_protection_ledger_identity_drift(
     plan = _plan(factory)
 
     assert plan.status == "refused"
-    assert plan.reason_code == (
-        "unexpected_protection_ownership"
-        if field == "size_text"
-        else "durable_snapshot_scope_mismatch"
-    )
+    assert plan.reason_code == "durable_snapshot_scope_mismatch"
 
 
 @pytest.mark.parametrize(
@@ -3458,6 +3500,7 @@ def test_planner_refuses_malformed_durable_evidence_without_raising(
     assert plan.status == "refused"
     assert plan.reason_code in {
         "durable_evidence_invalid",
+        "durable_snapshot_scope_mismatch",
         "target_snapshot_identity_mismatch",
         "component_topology_mismatch",
     }
@@ -3675,7 +3718,16 @@ def test_live_position_allows_matching_whole_position_zero_size_semantics(tmp_pa
         {**row, "sz": "0"} for row in _snapshot().pending_trigger_orders
     ]
 
-    plan = _plan(factory, _snapshot(pending_trigger_orders=pending))
+    plan = _plan(
+        factory,
+        _snapshot(
+            pending_trigger_orders=pending,
+            scope_protection_overrides={
+                "backup_stop": {"size_text": "0"},
+                "stop_loss": {"size_text": "0"},
+            },
+        ),
+    )
 
     assert plan.status == "ready"
 
@@ -3757,6 +3809,7 @@ def test_planner_refuses_oversized_durable_integer_without_raising(
     assert plan.status == "refused"
     assert plan.reason_code in {
         "durable_evidence_invalid",
+        "durable_snapshot_scope_mismatch",
         "target_snapshot_identity_mismatch",
     }
 
@@ -5887,6 +5940,48 @@ def test_batch119_planner_rejects_purpose_mapping_drift_after_exact_capture(
     assert plan.reason_code == "durable_snapshot_scope_mismatch"
 
 
+@pytest.mark.parametrize(
+    ("field_name", "drifted_value"),
+    [
+        ("trigger_price", "1"),
+        ("size_text", "1"),
+        ("evidence_json", '{"drift":"after-capture"}'),
+        ("evidence_source", "drifted_after_exact_capture"),
+    ],
+)
+def test_batch119_planner_rejects_protection_evidence_drift_after_capture(
+    tmp_path,
+    field_name,
+    drifted_value,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=_Batch119AbsentExactHistoryClient(
+            exact_position_response={"data": []}
+        ),
+    )
+    with factory() as session:
+        backup = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id=BACKUP_ORDER_ID)
+            .one()
+        )
+        setattr(backup, field_name, drifted_value)
+        session.commit()
+
+    plan = module.build_composite_batch_recovery_plan(
+        factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=snapshot,
+        planned_at=NOW,
+    )
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "durable_snapshot_scope_mismatch"
+
+
 def test_batch119_resume_rejects_durable_scope_drift_after_exact_capture(
     tmp_path,
 ):
@@ -5933,8 +6028,19 @@ def test_batch119_resume_rejects_durable_scope_drift_after_exact_capture(
         )
 
 
-def test_batch119_resume_rejects_original_stop_source_drift_after_capture(
+@pytest.mark.parametrize(
+    ("field_name", "drifted_value"),
+    [
+        ("trigger_price", "1"),
+        ("size_text", "1"),
+        ("evidence_json", '{"drift":"after-capture"}'),
+        ("evidence_source", "drifted_after_exact_capture"),
+    ],
+)
+def test_batch119_resume_rejects_protection_evidence_drift_after_capture(
     tmp_path,
+    field_name,
+    drifted_value,
 ):
     module = _recovery_module()
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
@@ -5963,7 +6069,7 @@ def test_batch119_resume_rejects_original_stop_source_drift_after_capture(
             .filter_by(order_id=BACKUP_ORDER_ID)
             .one()
         )
-        backup.evidence_source = "drifted_after_exact_capture"
+        setattr(backup, field_name, drifted_value)
         session.commit()
 
     with pytest.raises(
@@ -6126,6 +6232,64 @@ def test_batch119_exact_history_scope_rejects_unsafe_order_id_before_network(
             .one()
         )
         row.order_id = "DC-ACCESS-KEY:private"
+        session.commit()
+    client = _Batch119ExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {"exact_scope": "exact_history_scope_invalid"}
+    assert client.network_calls == 0
+
+
+@pytest.mark.parametrize(
+    "evidence_json",
+    [
+        "{",
+        "[" * 1100 + "0" + "]" * 1100,
+    ],
+)
+def test_batch119_exact_scope_rejects_invalid_evidence_json_before_network(
+    tmp_path,
+    evidence_json,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        backup = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id=BACKUP_ORDER_ID)
+            .one()
+        )
+        backup.evidence_json = evidence_json
+        session.commit()
+    client = _Batch119ExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {"exact_scope": "exact_history_scope_invalid"}
+    assert client.network_calls == 0
+
+
+@pytest.mark.parametrize("field_name", ["trigger_price", "size_text"])
+def test_batch119_exact_scope_rejects_huge_decimal_before_network(
+    tmp_path,
+    field_name,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        backup = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id=BACKUP_ORDER_ID)
+            .one()
+        )
+        setattr(backup, field_name, "1e1000000000")
         session.commit()
     client = _Batch119ExactHistoryClient()
 

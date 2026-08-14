@@ -147,6 +147,9 @@ class _Batch119ExactHistoryScope:
     scope_fingerprint: str
     position_id: str = field(repr=False)
     protection_orders: tuple[tuple[str, str], ...] = field(repr=False)
+    protection_evidence_fingerprints: tuple[tuple[str, str], ...] = field(
+        repr=False
+    )
 
 
 @dataclass(slots=True)
@@ -646,6 +649,7 @@ def _batch119_exact_history_scope_from_rows(
 ) -> _Batch119ExactHistoryScope:
     profile = BATCH_119_RECOVERY
     scoped: list[tuple[str, str]] = []
+    scoped_evidence: list[tuple[str, str]] = []
     for row in rows:
         purpose = str(row.purpose or "").lower()
         exact_owner = (
@@ -689,6 +693,16 @@ def _batch119_exact_history_scope_from_rows(
         if not immutable_scope_matches:
             raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
         scoped.append((purpose, order_id))
+        scoped_evidence.append(
+            (
+                purpose,
+                _batch119_protection_scope_evidence_fingerprint(
+                    row=row,
+                    purpose=purpose,
+                    order_id=order_id,
+                ),
+            )
+        )
     if (
         len(scoped) != 2
         or {purpose for purpose, _ in scoped}
@@ -697,15 +711,21 @@ def _batch119_exact_history_scope_from_rows(
     ):
         raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
     scoped.sort(key=lambda item: item[0])
+    scoped_evidence.sort(key=lambda item: item[0])
     protection_orders = tuple(scoped)
+    protection_evidence_fingerprints = tuple(scoped_evidence)
     return _Batch119ExactHistoryScope(
         instrument_id=profile.instrument_id,
         side=profile.side,
         position_id=str(leg.pos_id),
         protection_orders=protection_orders,
+        protection_evidence_fingerprints=protection_evidence_fingerprints,
         scope_fingerprint=_batch119_exact_scope_fingerprint(
             position_id=str(leg.pos_id),
             protection_orders=protection_orders,
+            protection_evidence_fingerprints=(
+                protection_evidence_fingerprints
+            ),
         ),
     )
 
@@ -1145,10 +1165,19 @@ def _batch119_exact_scope_fingerprint(
     *,
     position_id: str,
     protection_orders: Sequence[tuple[str, str]],
+    protection_evidence_fingerprints: Sequence[tuple[str, str]],
 ) -> str:
+    evidence_by_purpose = dict(protection_evidence_fingerprints)
+    if (
+        len(evidence_by_purpose) != len(protection_evidence_fingerprints)
+        or set(evidence_by_purpose)
+        != {purpose for purpose, _ in protection_orders}
+        or not all(_is_sha256(value) for value in evidence_by_purpose.values())
+    ):
+        raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
     return _fingerprint(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "batch_id": BATCH_119_RECOVERY.batch_id,
             "position_ref": _redacted_ref(
                 "recovery_position", position_id
@@ -1160,11 +1189,114 @@ def _batch119_exact_scope_fingerprint(
                         "order_ref": _redacted_ref(
                             "protection_order", order_id
                         ),
+                        "evidence_fingerprint": evidence_by_purpose[purpose],
                     }
                     for purpose, order_id in protection_orders
                 ),
                 key=lambda row: (row["purpose"], row["order_ref"]),
             ),
+        }
+    )
+
+
+def _batch119_protection_scope_evidence_fingerprint(
+    *,
+    row,
+    purpose: str,
+    order_id: str,
+) -> str:
+    evidence_source = str(row.evidence_source or "")
+    if (
+        not evidence_source
+        or len(evidence_source) > 64
+        or any(
+            not (
+                character.isascii()
+                and (character.isalnum() or character in {"_", "-", ":"})
+            )
+            for character in evidence_source
+        )
+    ):
+        raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
+    try:
+        return _fingerprint(
+            {
+                "schema_version": 1,
+                "venue": str(row.venue or "").lower(),
+                "strategy_ref": _redacted_ref(
+                    "protection_strategy", row.strategy_instance_id
+                ),
+                "position_ref": _redacted_ref(
+                    "protection_position", row.pos_id
+                ),
+                "instrument_id": str(row.instrument_id or "").upper(),
+                "side": str(row.side or "").lower(),
+                "purpose": str(purpose),
+                "order_ref": _redacted_ref("protection_order", order_id),
+                "trigger_price": _batch119_scope_decimal_marker(
+                    row.trigger_price
+                ),
+                "size": _batch119_scope_decimal_marker(row.size_text),
+                "status": str(row.status or "").lower(),
+                "evidence_source_ref": _redacted_ref(
+                    "protection_evidence_source", evidence_source
+                ),
+                "evidence_fingerprint": _optional_json_fingerprint(
+                    row.evidence_json
+                ),
+            }
+        )
+    except (
+        CompositeBatchRecoveryRefusal,
+        TypeError,
+        ValueError,
+        RecursionError,
+        OverflowError,
+    ):
+        raise CompositeBatchRecoveryRefusal(
+            "exact_history_scope_invalid"
+        ) from None
+
+
+def _batch119_scope_decimal_marker(value: Any) -> Mapping[str, str]:
+    if value is None:
+        return MappingProxyType({"kind": "none"})
+    if isinstance(value, bool):
+        raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
+    try:
+        raw_text = str(value)
+    except (TypeError, ValueError, RecursionError):
+        raise CompositeBatchRecoveryRefusal(
+            "exact_history_scope_invalid"
+        ) from None
+    if (
+        not raw_text
+        or len(raw_text) > 64
+        or not raw_text.isascii()
+        or any(character not in "0123456789+-.eE" for character in raw_text)
+    ):
+        raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
+    decimal_value = _decimal_or_none(value)
+    if decimal_value is None:
+        raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
+    decimal_tuple = decimal_value.as_tuple()
+    if (
+        len(decimal_tuple.digits) > 64
+        or not isinstance(decimal_tuple.exponent, int)
+        or abs(decimal_tuple.exponent) > 128
+        or abs(decimal_value.adjusted()) > 128
+    ):
+        raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
+    try:
+        normalized = _decimal_text(decimal_value)
+    except (ArithmeticError, TypeError, ValueError):
+        raise CompositeBatchRecoveryRefusal(
+            "exact_history_scope_invalid"
+        ) from None
+    return MappingProxyType(
+        {
+            "kind": "decimal",
+            "value": normalized,
         }
     )
 
@@ -1323,11 +1455,21 @@ def _batch119_snapshot_authority_matches_unchecked(
         or {purpose for purpose, _ in scope.protection_orders}
         != {"stop_loss", "backup_stop"}
         or len({order_id for _, order_id in scope.protection_orders}) != 2
+        or len(scope.protection_evidence_fingerprints) != 2
+        or {purpose for purpose, _ in scope.protection_evidence_fingerprints}
+        != {"stop_loss", "backup_stop"}
+        or not all(
+            _is_sha256(fingerprint)
+            for _, fingerprint in scope.protection_evidence_fingerprints
+        )
     ):
         return False
     expected_scope_fingerprint = _batch119_exact_scope_fingerprint(
         position_id=scope.position_id,
         protection_orders=scope.protection_orders,
+        protection_evidence_fingerprints=(
+            scope.protection_evidence_fingerprints
+        ),
     )
     if (
         scope.scope_fingerprint != expected_scope_fingerprint
