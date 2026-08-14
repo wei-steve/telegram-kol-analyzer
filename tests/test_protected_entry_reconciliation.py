@@ -1504,7 +1504,19 @@ def test_tampered_client_reference_cannot_bypass_economics_identity(tmp_path):
     )
 
 
-def test_shared_snapshot_capture_and_reconcile_never_exposes_writer_api(tmp_path):
+def test_shared_snapshot_capture_and_reconcile_never_exposes_writer_api(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.composite_management_batch_recovery as recovery
+
+    monkeypatch.setattr(
+        recovery,
+        "load_composite_batch_recovery_snapshot_read_only",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("protected-entry must not use batch119 exact loader")
+        ),
+    )
     session_factory = create_session_factory(tmp_path / "read-only-client.db")
     signal = _signal(session_factory)
     operation = _entry_operation(session_factory, signal_id=signal.id)
@@ -1587,6 +1599,8 @@ def test_shared_snapshot_capture_and_reconcile_never_exposes_writer_api(tmp_path
     )
 
     assert result.confirmed == 1
+    assert snapshot.errors == {}
+    assert snapshot.account_authority.complete is True
     assert set(client.reads) == {
         "positions",
         "open_orders",

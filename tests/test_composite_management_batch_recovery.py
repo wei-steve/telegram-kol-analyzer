@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib
 import json
 import sqlite3
@@ -113,6 +114,63 @@ def test_batch_119_pending_residue_allowlist_is_exactly_five_sha256_identities()
         and all(character in "0123456789abcdef" for character in value)
         for value in identities
     )
+
+
+def test_batch119_exact_loader_is_only_called_from_allowlisted_cli_command():
+    module = _recovery_module()
+    package_root = Path(module.__file__).resolve().parent
+    helper_name = "load_composite_batch_recovery_snapshot_read_only"
+    production_mentions = {
+        path.relative_to(package_root).as_posix()
+        for path in package_root.rglob("*.py")
+        if helper_name in path.read_text(encoding="utf-8")
+    }
+
+    assert production_mentions == {
+        "cli.py",
+        "composite_management_batch_recovery.py",
+    }
+
+    cli_tree = ast.parse((package_root / "cli.py").read_text(encoding="utf-8"))
+    parents = {
+        child: parent
+        for parent in ast.walk(cli_tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+    imports = [
+        alias
+        for node in ast.walk(cli_tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+        if alias.name == helper_name
+    ]
+    references = [
+        node
+        for node in ast.walk(cli_tree)
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id == helper_name
+        )
+        or (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, ast.Load)
+            and node.attr == helper_name
+        )
+    ]
+
+    assert [(alias.name, alias.asname) for alias in imports] == [
+        (helper_name, None)
+    ]
+    assert len(references) == 1
+    reference = references[0]
+    call = parents[reference]
+    assert isinstance(call, ast.Call)
+    assert call.func is reference
+    owner = parents[call]
+    while not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        owner = parents[owner]
+    assert owner.name == "recover_composite_management_batch"
 
 
 def test_recovery_read_only_session_factory_cannot_write_or_change_file(tmp_path):
@@ -9932,6 +9990,128 @@ def test_batch119_snapshot_uses_only_exact_history_scope(tmp_path):
     assert POS_ID not in repr(snapshot)
     assert PRIMARY_ORDER_ID not in repr(snapshot)
     assert BACKUP_ORDER_ID not in repr(snapshot)
+
+
+def test_batch119_exact_history_call_bound_has_six_gets_and_no_write_reachability(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+
+    class StrictCallBoundClient(_Batch119ExactHistoryClient):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def read_positions(self, *, inst_id=None):
+            self.calls.append(("read_positions", {"inst_id": inst_id}))
+            return super().read_positions(inst_id=inst_id)
+
+        def read_open_orders(self, *, inst_id=None):
+            self.calls.append(("read_open_orders", {"inst_id": inst_id}))
+            return super().read_open_orders(inst_id=inst_id)
+
+        def read_trigger_orders_pending(self, *, inst_id):
+            self.calls.append(
+                ("read_trigger_orders_pending", {"inst_id": inst_id})
+            )
+            return super().read_trigger_orders_pending(inst_id=inst_id)
+
+        def read_position_history(self, *, inst_id, pos_id):
+            self.calls.append(
+                (
+                    "read_position_history",
+                    {"inst_id": inst_id, "pos_id": pos_id},
+                )
+            )
+            self.network_calls += 1
+            self.exact_position_ids.append(pos_id)
+            return self.exact_position_response
+
+        def read_trigger_order_history(self, *, inst_id, order_id, limit):
+            self.calls.append(
+                (
+                    "read_trigger_order_history",
+                    {
+                        "inst_id": inst_id,
+                        "order_id": order_id,
+                        "limit": limit,
+                    },
+                )
+            )
+            return super().read_trigger_order_history(
+                inst_id=inst_id,
+                order_id=order_id,
+                limit=limit,
+            )
+
+        def read_order_history(self, **kwargs):
+            raise AssertionError("regular-order history is not in batch119 scope")
+
+        def read_trade_fills(self, **kwargs):
+            raise AssertionError("trade fills are not in batch119 scope")
+
+        def list_position_history(self, **kwargs):
+            raise AssertionError("instrument-wide position history is forbidden")
+
+        def list_trigger_order_history(self, **kwargs):
+            raise AssertionError("instrument-wide trigger history is forbidden")
+
+        def list_order_history(self, **kwargs):
+            raise AssertionError("instrument-wide order history is forbidden")
+
+        def list_trade_fills(self, **kwargs):
+            raise AssertionError("instrument-wide fills are forbidden")
+
+        def place_order(self, payload):
+            raise AssertionError("POST is unreachable from exact dry-run")
+
+        def cancel_position_sltp(self, payload):
+            raise AssertionError("cancel is unreachable from exact dry-run")
+
+        def close_position(self, payload):
+            raise AssertionError("close is unreachable from exact dry-run")
+
+        def set_position_sltp(self, payload):
+            raise AssertionError("TPSL write is unreachable from exact dry-run")
+
+    client = StrictCallBoundClient()
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {}
+    assert client.calls == [
+        ("read_positions", {"inst_id": "BTC-USDT-SWAP"}),
+        ("read_open_orders", {"inst_id": "BTC-USDT-SWAP"}),
+        (
+            "read_trigger_orders_pending",
+            {"inst_id": "BTC-USDT-SWAP"},
+        ),
+        (
+            "read_position_history",
+            {"inst_id": "BTC-USDT-SWAP", "pos_id": POS_ID},
+        ),
+        (
+            "read_trigger_order_history",
+            {
+                "inst_id": "BTC-USDT-SWAP",
+                "order_id": BACKUP_ORDER_ID,
+                "limit": 100,
+            },
+        ),
+        (
+            "read_trigger_order_history",
+            {
+                "inst_id": "BTC-USDT-SWAP",
+                "order_id": PRIMARY_ORDER_ID,
+                "limit": 100,
+            },
+        ),
+    ]
+    assert client.network_calls == 6
+    assert client.instrument_wide_history_calls == 0
 
 
 def test_batch119_planner_rejects_durable_scope_drift_after_exact_capture(

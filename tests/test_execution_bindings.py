@@ -402,6 +402,85 @@ def test_reconcile_snapshot_marks_full_page_without_completion_proof_incomplete(
     assert snapshot.errors == {"positions": "snapshot_page_limit_ambiguous"}
 
 
+def test_generic_reconciliation_instrument_wide_history_page_limit_refuses_without_exact_filter(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "generic-wide-history.db")
+
+    class InstrumentedGenericClient:
+        uid_scope_hash = "c" * 64
+
+        def __init__(self):
+            self.calls = []
+
+        def read_positions(self):
+            self.calls.append(("positions", {}))
+            return {"data": []}
+
+        def read_open_orders(self):
+            self.calls.append(("open_orders", {}))
+            return {"data": []}
+
+        def read_position_history(self, *, inst_id, **exact_filters):
+            self.calls.append(("position_history", dict(exact_filters)))
+            assert exact_filters == {}
+            return {
+                "data": [
+                    {
+                        "instId": inst_id,
+                        "posId": f"wide-history-{index}",
+                    }
+                    for index in range(100)
+                ]
+            }
+
+        def read_trigger_orders_pending(self, *, inst_id, **exact_filters):
+            self.calls.append(("pending_trigger_orders", dict(exact_filters)))
+            assert exact_filters == {}
+            return {"data": []}
+
+        def read_order_history(self, *, inst_id, **exact_filters):
+            self.calls.append(("order_history", dict(exact_filters)))
+            assert exact_filters == {}
+            return {"data": []}
+
+        def read_trade_fills(self, *, inst_id, **exact_filters):
+            self.calls.append(("trade_fills", dict(exact_filters)))
+            assert exact_filters == {}
+            return {"data": []}
+
+        def read_trigger_order_history(self, *, inst_id, **exact_filters):
+            self.calls.append(("trigger_history", dict(exact_filters)))
+            assert exact_filters == {}
+            return {"data": []}
+
+    client = InstrumentedGenericClient()
+    snapshot = (
+        execution_bindings_module.load_deepcoin_reconciliation_snapshot_for_instruments_read_only(
+            session_factory,
+            client=client,
+            instruments={"BTC-USDT-SWAP"},
+        )
+    )
+
+    assert snapshot.positions == []
+    assert len(snapshot.position_history) == 100
+    assert snapshot.errors == {
+        "position_history:BTC-USDT-SWAP": "snapshot_page_limit_ambiguous"
+    }
+    assert snapshot.account_authority.complete is True
+    assert [name for name, _ in client.calls] == [
+        "positions",
+        "open_orders",
+        "position_history",
+        "pending_trigger_orders",
+        "order_history",
+        "trade_fills",
+        "trigger_history",
+    ]
+    assert all(filters == {} for _, filters in client.calls)
+
+
 def test_incomplete_snapshot_never_runs_exchange_mutation_workers(tmp_path, monkeypatch):
     import telegram_kol_research.trigger_protection_rescue_worker as rescue_worker
 
