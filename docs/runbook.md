@@ -1537,15 +1537,79 @@ close 或 TPSL 写路径。
 
 ### 当前操作停点：只做两次 dry-run
 
-本阶段不授权 apply、部署、服务重启、设置修改或任何交易所写。每次 dry-run 使用新的
-私有一致数据库副本，候选代码只读打开该副本，并在命令前由 operator 设置两个非敏感路径变量：
+本阶段不授权 apply、部署、服务重启、设置修改或任何交易所写。先将已审阅且已
+push 的精确 commit 检出到临时 detached worktree；生产 checkout 不切换、不 pull、不安装。
+实际 SHA 必须由本次审批提供，不得把下面的 placeholder 原样执行。命令使用生产环境已安装的
+Python 依赖，但通过精确 candidate `PYTHONPATH` 加载已审阅源码：
 
 ```bash
-.venv/bin/python -m telegram_kol_research.cli recover-composite-management-batch \
-  --database-path "$RECOVERY_DB_COPY" \
-  --batch-id 119 \
-  --deepcoin-contract-specs-path "$DEEPCOIN_CONTRACT_SPECS"
+set -euo pipefail
+umask 077
+
+PRODUCTION_ROOT=/opt/telegram-kol-analyzer
+PRODUCTION_DB="$PRODUCTION_ROOT/data/research.db"
+DEEPCOIN_CONTRACT_SPECS="$PRODUCTION_ROOT/config/deepcoin_contract_specs.yaml"
+REVIEWED_SHA='<exact-reviewed-sha>'
+RUNTIME_PYTHON="$PRODUCTION_ROOT/.venv/bin/python"
+RECOVERY_TMP="$(mktemp -d /tmp/batch119-recovery.XXXXXX)"
+chmod 0700 "$RECOVERY_TMP"
+CANDIDATE_ROOT="$RECOVERY_TMP/candidate"
+
+cleanup_batch119_dry_run() {
+  local cleanup_status=0
+  case "$RECOVERY_TMP" in
+    /tmp/batch119-recovery.*) ;;
+    *) return 1 ;;
+  esac
+  if [ -d "$CANDIDATE_ROOT" ]; then
+    if ! git -C "$PRODUCTION_ROOT" worktree remove --force "$CANDIDATE_ROOT"; then
+      cleanup_status=1
+    fi
+  fi
+  if ! rm -rf -- "$RECOVERY_TMP"; then
+    cleanup_status=1
+  fi
+  return "$cleanup_status"
+}
+trap cleanup_batch119_dry_run EXIT
+
+git -C "$PRODUCTION_ROOT" fetch --no-tags origin codex/deepcoin-auto-trading-v1
+git -C "$PRODUCTION_ROOT" cat-file -e "${REVIEWED_SHA}^{commit}"
+git -C "$PRODUCTION_ROOT" worktree add --detach "$CANDIDATE_ROOT" "$REVIEWED_SHA"
+test "$(git -C "$CANDIDATE_ROOT" rev-parse HEAD)" = "$REVIEWED_SHA"
+test -z "$(git -C "$CANDIDATE_ROOT" status --porcelain)"
+
+for ATTEMPT in 1 2; do
+  RECOVERY_DB_COPY="$RECOVERY_TMP/research-copy-${ATTEMPT}.db"
+  sqlite3 "$PRODUCTION_DB" ".backup '$RECOVERY_DB_COPY'"
+  chmod 0600 "$RECOVERY_DB_COPY"
+  test "$(sqlite3 -readonly "$RECOVERY_DB_COPY" 'PRAGMA quick_check;')" = OK
+
+  # Additive bootstrap is allowed only on this private copy.
+  PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" - \
+    "$RECOVERY_DB_COPY" <<'PY'
+import sys
+from telegram_kol_research.db import create_session_factory
+
+factory = create_session_factory(sys.argv[1])
+factory.kw["bind"].dispose()
+PY
+
+  RESULT="$RECOVERY_TMP/dry-run-${ATTEMPT}.json"
+  PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
+    telegram_kol_research.cli recover-composite-management-batch \
+    --database-path "$RECOVERY_DB_COPY" \
+    --batch-id 119 \
+    --deepcoin-contract-specs-path "$DEEPCOIN_CONTRACT_SPECS" \
+    > "$RESULT"
+  chmod 0600 "$RESULT"
+done
 ```
+
+上述命令需要已批准的只读 Deepcoin secret injection，但不得打印、复制或将凭据写入
+operator record。SQLite `.backup` 在原服务保持运行时创建一致副本；candidate bootstrap 只能改该
+0600 副本。两次结果都保留在 0700 目录中供当次脱敏比较；退出 shell 时 trap 移除
+detached worktree 和全部私有副本。清理前先验证 `RECOVERY_TMP` 仍精确匹配专用 `/tmp` 前缀。
 
 输出外层只有 `mode=dry_run` 和 `plan`；`plan` 只允许包含 `batch_id`、`status`、
 `reason_code`、`position`、`source_fingerprint`、`exchange_snapshot_fingerprint`、

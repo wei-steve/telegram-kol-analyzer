@@ -501,6 +501,7 @@ def _load_composite_batch_recovery_snapshot_read_only_impl(
                         _exact_order_rows_match_scope(
                             rows,
                             order_id=order_id,
+                            position_id=scope.position_id,
                             instrument_id=scope.instrument_id,
                             side=scope.side,
                         )
@@ -1468,6 +1469,7 @@ def _exact_order_rows_match_scope(
     rows: Sequence[Mapping[str, Any]],
     *,
     order_id: str,
+    position_id: str | None = None,
     instrument_id: str,
     side: str,
 ) -> bool:
@@ -1483,10 +1485,20 @@ def _exact_order_rows_match_scope(
             if row.get(key) not in (None, "")
         }
         sides = _exact_row_position_sides(row)
+        position_identities = {
+            str(row.get(key)).strip()
+            for key in ("posId", "pos_id", "closePosId", "close_pos_id")
+            if row.get(key) not in (None, "")
+        }
         if (
             identities != {order_id}
             or instruments != {instrument_id.upper()}
             or sides != {side.lower()}
+            or (
+                position_id is not None
+                and position_identities
+                and position_identities != {str(position_id)}
+            )
         ):
             return False
     return True
@@ -7139,12 +7151,18 @@ def _validated_natural_stop_proof(
             or not _exact_order_rows_match_scope(
                 [row],
                 order_id=str(order_id or ""),
+                position_id=str(pos_id),
                 instrument_id=profile.instrument_id,
                 side=profile.side,
             )
         ):
             return "natural_stop_proof_trigger_invalid"
         seen_trigger_order_ids.add(order_id)
+        if not _natural_stop_trigger_matches_owned_ledger(
+            row,
+            ledger_row=owned_by_id[order_id][1],
+        ):
+            return "natural_stop_proof_trigger_invalid"
         state = _one_exact_text(row, "state", "status")
         if state is None:
             return "natural_stop_proof_trigger_invalid"
@@ -7179,6 +7197,11 @@ def _validated_natural_stop_proof(
         return "natural_stop_proof_after_capture"
     if any(close_time < trigger_time for close_time in close_times):
         return "natural_stop_proof_time_invalid"
+    if not _natural_stop_position_close_matches_owned_ledger(
+        position_row,
+        ledger_row=owned_by_id[order_id][1],
+    ):
+        return "natural_stop_proof_position_invalid"
     if _natural_stop_has_residual_close_evidence(snapshot, pos_id=str(pos_id)):
         return "natural_stop_proof_residual_close_evidence"
 
@@ -7193,6 +7216,104 @@ def _validated_natural_stop_proof(
             "order_ref": _redacted_ref("natural_stop_order", order_id),
             "position_ref": _redacted_ref("natural_stop_position", pos_id),
         }
+    )
+
+
+def _optional_consistent_decimal(
+    row: Mapping[str, Any],
+    *keys: str,
+) -> tuple[bool, Decimal | None]:
+    raw_values = [
+        row[key]
+        for key in keys
+        if row.get(key) not in (None, "")
+    ]
+    if not raw_values:
+        return True, None
+    values = [_decimal_or_none(value) for value in raw_values]
+    if any(value is None for value in values):
+        return False, None
+    first = values[0]
+    if any(value != first for value in values[1:]):
+        return False, None
+    return True, first
+
+
+def _natural_stop_trigger_matches_owned_ledger(
+    row: Mapping[str, Any],
+    *,
+    ledger_row: Any,
+) -> bool:
+    trigger_types = {
+        str(row[key]).strip().lower()
+        for key in ("triggerOrderType", "trigger_order_type")
+        if row.get(key) not in (None, "")
+    }
+    if trigger_types and trigger_types != {"tpsl"}:
+        return False
+    valid_tp, take_profit_price = _optional_consistent_decimal(
+        row,
+        "tpTriggerPx",
+        "tpTriggerPrice",
+        "closeTPTriggerPrice",
+    )
+    if not valid_tp or take_profit_price is not None:
+        return False
+    valid_stop, stop_price = _optional_consistent_decimal(
+        row,
+        "slTriggerPx",
+        "slTriggerPrice",
+        "closeSLTriggerPrice",
+    )
+    valid_size, size = _optional_consistent_decimal(
+        row,
+        "sz",
+        "size",
+        "orderSize",
+    )
+    if not valid_stop or not valid_size:
+        return False
+    expected_stop = _decimal_or_none(getattr(ledger_row, "trigger_price", None))
+    expected_size = _decimal_or_none(getattr(ledger_row, "size_text", None))
+    if stop_price is not None and (
+        expected_stop is None or stop_price != expected_stop
+    ):
+        return False
+    if size is not None and (expected_size is None or size != expected_size):
+        return False
+    return True
+
+
+def _natural_stop_position_close_matches_owned_ledger(
+    row: Mapping[str, Any],
+    *,
+    ledger_row: Any,
+) -> bool:
+    valid_position, position_size = _optional_consistent_decimal(
+        row,
+        "pos",
+        "size",
+        "sz",
+        "positionSize",
+        "position_size",
+    )
+    valid_close, close_size = _optional_consistent_decimal(
+        row,
+        "closePos",
+        "closedSize",
+        "close_size",
+    )
+    if not valid_position or not valid_close:
+        return False
+    if position_size is None and close_size is None:
+        return True
+    if position_size is None or close_size is None:
+        return False
+    expected_size = _decimal_or_none(getattr(ledger_row, "size_text", None))
+    return bool(
+        expected_size is not None
+        and position_size > 0
+        and position_size == close_size == expected_size
     )
 
 

@@ -2413,6 +2413,8 @@ def _closed_position_history_row(**overrides):
         "instId": "BTC-USDT-SWAP",
         "posSide": "long",
         "state": "closed",
+        "pos": "38",
+        "closePos": "38",
         "uTime": str(int((NOW - timedelta(seconds=1)).timestamp() * 1000)),
         **overrides,
     }
@@ -2426,6 +2428,11 @@ def _successful_stop_trigger_row(
         "instId": "BTC-USDT-SWAP",
         "posSide": "long",
         "state": "filled",
+        "triggerOrderType": "TPSL",
+        "slTriggerPx": (
+            "63000" if order_id == BACKUP_ORDER_ID else "64000"
+        ),
+        "sz": "38",
         "triggerTime": str(
             int((NOW - timedelta(seconds=2)).timestamp() * 1000)
         ),
@@ -2502,6 +2509,115 @@ def test_natural_stop_refuses_manual_or_unowned_trigger(tmp_path):
     plan = _plan(factory, snapshot)
 
     _assert_natural_stop_refusal(plan, "natural_stop_proof_trigger_invalid")
+
+
+@pytest.mark.parametrize(
+    ("trigger_overrides", "reason_code"),
+    [
+        ({"posId": "different-position"}, "exchange_snapshot_incomplete"),
+        (
+            {"closePosId": "different-position"},
+            "exchange_snapshot_incomplete",
+        ),
+        (
+            {"posId": POS_ID, "closePosId": "different-position"},
+            "exchange_snapshot_incomplete",
+        ),
+        (
+            {"slTriggerPx": None, "tpTriggerPx": "64000"},
+            "natural_stop_proof_trigger_invalid",
+        ),
+        ({"slTriggerPx": "63999"}, "natural_stop_proof_trigger_invalid"),
+        ({"sz": "1"}, "natural_stop_proof_trigger_invalid"),
+        (
+            {"triggerOrderType": "conditional"},
+            "natural_stop_proof_trigger_invalid",
+        ),
+    ],
+    ids=[
+        "wrong_pos_id",
+        "wrong_close_pos_id",
+        "conflicting_position_ids",
+        "take_profit_shaped",
+        "wrong_stop_price",
+        "wrong_size",
+        "wrong_trigger_type",
+    ],
+)
+def test_natural_stop_refuses_explicit_trigger_identity_or_economics_conflict(
+    tmp_path,
+    trigger_overrides,
+    reason_code,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+
+    plan = _plan(
+        factory,
+        _natural_stop_snapshot(
+            trigger_history=[
+                _successful_stop_trigger_row(**trigger_overrides)
+            ]
+        ),
+    )
+
+    _assert_natural_stop_refusal(plan, reason_code)
+
+
+def test_natural_stop_allows_trigger_without_optional_position_or_economics(
+    tmp_path,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+
+    plan = _plan(
+        factory,
+        _natural_stop_snapshot(
+            trigger_history=[
+                _successful_stop_trigger_row(
+                    triggerOrderType=None,
+                    slTriggerPx=None,
+                    sz=None,
+                )
+            ]
+        ),
+    )
+
+    assert plan.status == "ready"
+    assert plan.position.disposition == "position_absent"
+
+
+@pytest.mark.parametrize(
+    "position_overrides",
+    [
+        {"pos": "38", "closePos": "1"},
+        {"pos": "38", "closePos": "0"},
+        {"pos": "19", "closePos": "19"},
+        {"pos": None, "closePos": "38"},
+        {"pos": "38", "closePos": None},
+    ],
+    ids=[
+        "partial_close",
+        "zero_close",
+        "wrong_owned_size",
+        "missing_position_size",
+        "missing_closed_size",
+    ],
+)
+def test_natural_stop_refuses_explicit_incomplete_position_close_economics(
+    tmp_path,
+    position_overrides,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+
+    plan = _plan(
+        factory,
+        _natural_stop_snapshot(
+            position_history=[
+                _closed_position_history_row(**position_overrides)
+            ]
+        ),
+    )
+
+    _assert_natural_stop_refusal(plan, "natural_stop_proof_position_invalid")
 
 
 def test_natural_stop_refuses_two_owned_stops_claiming_trigger(tmp_path):

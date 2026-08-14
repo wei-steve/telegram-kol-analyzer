@@ -69,10 +69,25 @@ writer UID scope.
 reachability.
 
 The currently authorized stop point is two read-only dry-runs, each against a
-new private consistent database copy. The command signature is:
+new private consistent database copy. Follow the complete candidate worktree,
+SQLite backup, copy-only bootstrap, and cleanup block in `docs/runbook.md`.
+That block must:
+
+- resolve the separately approved SHA after fetching the reviewed branch;
+- create a detached candidate worktree inside a mode-0700 temporary directory;
+- create each database copy with SQLite `.backup`, set mode 0600, and pass
+  `PRAGMA quick_check`;
+- run additive bootstrap only on each copy through candidate `PYTHONPATH`;
+- keep the production checkout, database, service, and settings unchanged; and
+- remove the detached worktree, results, and database copies through the
+  validated temporary-directory cleanup trap.
+
+The dry-run itself must remain bound to that candidate source and use the
+current CLI signature:
 
 ```bash
-.venv/bin/python -m telegram_kol_research.cli recover-composite-management-batch \
+PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
+  telegram_kol_research.cli recover-composite-management-batch \
   --database-path "$RECOVERY_DB_COPY" \
   --batch-id 119 \
   --deepcoin-contract-specs-path "$DEEPCOIN_CONTRACT_SPECS"
