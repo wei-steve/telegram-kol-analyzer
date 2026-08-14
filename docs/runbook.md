@@ -1535,11 +1535,16 @@ sealed capture UID、planning read-client expected UID 和 writer UID 必须三�
 `production_writes=0`、`exchange_calls=0`，不构造 writer，不进入 executor，不可达 POST、cancel、
 close 或 TPSL 写路径。
 
-### 当前操作停点：只做两次 dry-run
+### 当前操作停点：另行审批的停服双 dry-run
 
-本阶段不授权 apply、部署、服务重启、设置修改或任何交易所写。先将已审阅且已
-push 的精确 commit 检出到临时 detached worktree；生产 checkout 不切换、不 pull、不安装。
-实际 SHA 必须由本次审批提供，不得把下面的 placeholder 原样执行。命令使用生产环境已安装的
+旧已部署服务不会为这个 candidate 维护完整的账户 write generation；生产库中空的
+generation 表不是安全 fence。因此禁止原“服务运行时 `.backup`，再用生产库作
+`--generation-database-path`”的流程。本阶段仍不授权 apply、部署、安装、设置修改、
+生产库 bootstrap 或任何交易所写。停止 `telegram-kol.service` 也必须在另一次明确
+操作员审批之后才能执行；当前代码实施轮次不执行下面命令。
+
+已单独批准停服诊断窗口后，先验证远端分支的完整 reviewed SHA，记录未改动的生产
+SHA 和原始 service 状态，再使用 detached candidate worktree。命令使用生产环境已安装的
 Python 依赖，但通过精确 candidate `PYTHONPATH` 加载已审阅源码：
 
 ```bash
@@ -1555,6 +1560,10 @@ RUNTIME_PYTHON="$PRODUCTION_ROOT/.venv/bin/python"
 RECOVERY_TMP="$(mktemp -d /tmp/batch119-recovery.XXXXXX)"
 chmod 0700 "$RECOVERY_TMP"
 CANDIDATE_ROOT="$RECOVERY_TMP/candidate"
+SERVICE_NAME=telegram-kol.service
+SERVICE_STOP_ATTEMPTED=0
+ORIGINAL_SHA="$(git -C "$PRODUCTION_ROOT" rev-parse HEAD)"
+ORIGINAL_SERVICE_STATE="$(systemctl is-active "$SERVICE_NAME" || true)"
 
 cleanup_batch119_dry_run() {
   local cleanup_status=0
@@ -1566,6 +1575,16 @@ cleanup_batch119_dry_run() {
     if ! git -C "$PRODUCTION_ROOT" worktree remove --force "$CANDIDATE_ROOT"; then
       cleanup_status=1
     fi
+  fi
+  if [ "$SERVICE_STOP_ATTEMPTED" = 1 ] && [ "$ORIGINAL_SERVICE_STATE" = active ]; then
+    if ! sudo systemctl start "$SERVICE_NAME"; then
+      cleanup_status=1
+    elif ! timeout 30 systemctl is-active --quiet "$SERVICE_NAME"; then
+      cleanup_status=1
+    fi
+  fi
+  if [ "$(git -C "$PRODUCTION_ROOT" rev-parse HEAD)" != "$ORIGINAL_SHA" ]; then
+    cleanup_status=1
   fi
   if ! rm -rf -- "$RECOVERY_TMP"; then
     cleanup_status=1
@@ -1582,6 +1601,43 @@ printf 'batch119 reviewed candidate: %s\n' "$REMOTE_SHA"
 git -C "$PRODUCTION_ROOT" worktree add --detach "$CANDIDATE_ROOT" "$REMOTE_SHA"
 test "$(git -C "$CANDIDATE_ROOT" rev-parse HEAD)" = "$REMOTE_SHA"
 test -z "$(git -C "$CANDIDATE_ROOT" status --porcelain)"
+test "$ORIGINAL_SERVICE_STATE" = active
+test "${BATCH119_STOP_APPROVAL:-}" = \
+  'I_APPROVE_BATCH119_STOPPED_READ_ONLY_DOUBLE_CAPTURE'
+
+SERVICE_STOP_ATTEMPTED=1
+sudo systemctl stop "$SERVICE_NAME"
+test "$(systemctl is-active "$SERVICE_NAME" || true)" = inactive
+
+# 不允许另一个本地 Telegram/Deepcoin worker 在停服窗口内存活。
+if pgrep -f '[t]elegram_kol_research|[t]elegram-kol' >/dev/null; then
+  exit 1
+fi
+
+# 任何 durable active/unknown writer 事实都使诊断拒绝。只读查询失败也必须拒绝。
+ACTIVE_OR_UNKNOWN_WRITERS="$(sqlite3 -readonly "$PRODUCTION_DB" <<'SQL'
+SELECT SUM(n) FROM (
+  SELECT COUNT(*) AS n FROM deepcoin_execution_operations
+   WHERE state NOT IN (
+     'entry_rejected','entry_confirmed','protected','pre_submit_deferred',
+     'completed','submission_failed_no_exposure'
+   )
+  UNION ALL
+  SELECT COUNT(*) FROM position_mutation_intents
+   WHERE status IN ('reserved','submitting','submitted','recovery_required')
+  UNION ALL
+  SELECT COUNT(*) FROM bound_position_close_reservations
+   WHERE status IN (
+     'reserved','submitted','submit_unknown','unknown_exchange_outcome',
+     'recovery_required'
+   )
+  UNION ALL
+  SELECT COUNT(*) FROM position_backup_stop_orders
+   WHERE status IN ('submitting','pending_readback','unknown_exchange_outcome')
+);
+SQL
+)"
+test "$ACTIVE_OR_UNKNOWN_WRITERS" = 0
 
 for ATTEMPT in 1 2; do
   RECOVERY_DB_COPY="$RECOVERY_TMP/research-copy-${ATTEMPT}.db"
@@ -1603,7 +1659,7 @@ PY
   PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
     telegram_kol_research.cli recover-composite-management-batch \
     --database-path "$RECOVERY_DB_COPY" \
-    --generation-database-path "$PRODUCTION_DB" \
+    --generation-database-path "$RECOVERY_DB_COPY" \
     --batch-id 119 \
     --deepcoin-contract-specs-path "$DEEPCOIN_CONTRACT_SPECS" \
     > "$RESULT"
@@ -1612,11 +1668,13 @@ done
 ```
 
 上述命令需要已批准的只读 Deepcoin secret injection，但不得打印、复制或将凭据写入
-operator record。SQLite `.backup` 在原服务保持运行时创建一致副本；candidate bootstrap 只能改该
-0600 副本。`--generation-database-path` 只以 OS 只读方式查询生产库的账户写代数，
-用于识别 6 次 GET 窗口中的真实 writer drift；严禁对生产库执行 bootstrap。两次结果都保留在
+operator record。只能在服务已证明 inactive、本地无其他 writer 进程、durable writer 计数为零之后
+创建 SQLite `.backup`。candidate bootstrap 只能改当次新建的 0600 副本，不得读写式打开生产库。
+每次 dry-run 的 `--database-path` 与 `--generation-database-path` 必须指向同一个当次副本；不得把空的
+生产 generation 表当作运行服务的 fence。两次结果都保留在
 0700 目录中供当次脱敏比较；退出 shell 时 trap 移除
-detached worktree 和全部私有副本。清理前先验证 `RECOVERY_TMP` 仍精确匹配专用 `/tmp` 前缀。
+detached worktree 和全部私有副本，并在任何拒绝或中断路径恢复原始 active 服务。清理前先验证
+`RECOVERY_TMP` 仍精确匹配专用 `/tmp` 前缀；生产 checkout SHA 必须与窗口开始时一致。
 
 输出外层只有 `mode=dry_run` 和 `plan`；`plan` 只允许包含 `batch_id`、`status`、
 `reason_code`、`position`、`source_fingerprint`、`exchange_snapshot_fingerprint`、
@@ -1632,7 +1690,7 @@ detached worktree 和全部私有副本。清理前先验证 `RECOVERY_TMP` 仍�
 - `protection_only_below_target`：当前数量大于零但小于 `19`，不加仓、不再平仓，只保护实际数量。
 - `position_absent`：精确仓位已不存在，本地安全终态化，不构造交易所 writer。
 
-使用第二个新建的一致副本和新 capture window 立即重复同一条 dry-run 命令。两次都必须
+服务保持 inactive 时，使用第二个新建副本和新 capture window 立即重复同一条 dry-run 命令。两次都必须
 证明相同 source population、exact scope、collection digests、natural-stop ownership、
 source fingerprint 和 evidence fingerprint；capture 时间必须新鲜，但不得影响语义指纹。不能直接把
 instruction 的
@@ -1652,8 +1710,10 @@ executor 本身无法 claim 它们。任何 `executing`、未分类、
 management component、mutation intent、recovery 或交易所对账；每个开放仓位还必须具有
 已验证保护。不能用时间流逝将真实操作认定为历史行，必须保持原服务并停止恢复。
 
-第二次 dry-run 通过后立即停止并交回脱敏计划。不得在同一轮运行 `--apply`，也不得部署、
-停止或重启服务、bootstrap 生产数据库或更改交易设置。将来如获得单独 apply 批准，CLI 仍必须
+第二次 dry-run 通过后立即停止并交回脱敏计划；trap 必须恢复未改动的原服务。不得在同一轮运行
+`--apply`，也不得部署、安装、bootstrap 生产数据库或更改交易设置。将来如获得单独 apply 批准，
+必须重新进入停服窗口、在停服后直接对生产库做最后一次新 capture，不得复用本次诊断副本、fingerprint 或
+停服 permit。CLI 仍必须
 同时提供 `--generation-database-path`、`--apply`、`--expected-fingerprint` 和
 `--authorization`。apply 时，`--generation-database-path` 与 `--database-path` 经路径解析后必须
 完全相同，否则 CLI 拒绝继续。当前阶段仍禁止任何 apply，该授权不属于当前步骤。

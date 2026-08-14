@@ -457,6 +457,15 @@ Document that the batch-119 dry-run uses exact `posId` and verified protection
 rule, a 100-row exact response still refuses, and apply remains separately
 approved and zero-writer for `position_absent`.
 
+The deployed service does not maintain the candidate's write-generation
+authority, so an empty generation table cannot fence a running-service
+capture. Replace that procedure with a separately approved stopped-service
+window: record the original SHA/service state, prove the service inactive and
+no durable/local writer remains, create two fresh private copies only after the
+stop, bootstrap only each copy, and pass the same copy to both database CLI
+arguments. A trap must restore the unchanged original service on success,
+refusal, interruption, or cleanup failure.
+
 Keep the explicit rule that batch 119 and Stage-1 deployment cannot share a
 quiet window.
 
@@ -527,18 +536,27 @@ Expected: complete suite PASS, compile/diff checks exit 0, worktree clean.
 Push the exact reviewed HEAD to `codex/deepcoin-auto-trading-v1`. Do not deploy,
 restart, change settings, or run apply.
 
-**Step 2: Create a private consistent database copy on the server**
+**Step 2: Enter a separately approved stopped-service diagnostic window**
 
-Keep `telegram-kol.service` running. Create a mode-0700 temporary directory,
-use SQLite `.backup` to make a mode-0600 copy, and run only candidate additive
-schema bootstrap on the copy. Never bootstrap the production database in this
-step.
+Record the original production SHA and active service state. Require a new,
+explicit operator approval before stopping `telegram-kol.service`; prove it is
+inactive, reject any other local Telegram/Deepcoin worker, and fail closed if
+any durable active/unknown writer operation exists. Install nothing and do not
+change the production checkout, settings, database, or service definition.
+
+Create a mode-0700 temporary directory only for this diagnostic. After the
+stop, use SQLite `.backup` to make a fresh mode-0600 copy and run candidate
+additive schema bootstrap only on that copy. Never bootstrap the production
+database. A bounded cleanup trap must restore the original active service and
+verify the production SHA remains unchanged on every exit path.
 
 **Step 3: Run the candidate dry-run against the private copy**
 
 Run the allowlisted command with candidate `PYTHONPATH`, production read-only
-Deepcoin credentials, and the temporary database path. Capture only the bounded
-JSON plan; securely delete the temporary copy afterward.
+Deepcoin credentials, and the temporary database path. Use that same private
+copy for both `--database-path` and `--generation-database-path`; never use an
+empty production generation table as a running-service fence. Capture only the
+bounded JSON plan and keep the service inactive until both captures finish.
 
 Expected:
 
@@ -553,13 +571,17 @@ If any condition fails, stop and report. Do not apply or deploy.
 
 **Step 4: Repeat one fresh dry-run for stability**
 
-Create a new consistent copy and repeat. Require identical source population,
-scope, collection digests, natural-stop ownership, and stable source/evidence
-fingerprints. Capture timestamps must be freshly valid but are excluded from
-the fingerprint. Any semantic drift stops the operation.
+While the service remains inactive, create a second new copy and repeat with a
+new capture window. Require identical source population, logical role evidence,
+exact-scope and collection digests, natural-stop ownership, and stable
+source/evidence fingerprints. Capture timestamps must be freshly valid but are
+excluded from the semantic comparison. Any refusal or semantic drift stops the
+operation and invokes the service-restoring cleanup path.
 
 **Step 5: Present the redacted plan for separate approval**
 
-Return control to the user. Do not run `--apply` in the same turn. The next turn
-must repeat the stopped-service backup/final-dry-run gate before consuming the
-new exact fingerprint.
+Restore the unchanged original service, then return control to the user. Do not
+run `--apply` in the same turn. A later apply requires separate approval, a new
+stopped-service final capture, and the production database as both database
+arguments. It must not reuse the diagnostic copy, reviewed fingerprint, or
+stopped-service permit.
