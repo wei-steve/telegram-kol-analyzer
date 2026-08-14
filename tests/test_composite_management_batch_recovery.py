@@ -4,6 +4,7 @@ import ast
 import importlib
 import json
 import sqlite3
+import subprocess
 import sys
 import threading
 import unicodedata
@@ -10950,6 +10951,59 @@ def test_batch119_native_role_malformed_sqlite_is_safely_refused_before_network(
     }
     assert client.network_calls == 0
     assert hostile_text not in repr(snapshot)
+
+
+def test_batch119_comparator_accepts_two_real_serialized_absent_plans(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(
+        tmp_path,
+        native_sl_backup=True,
+    )
+    documents = []
+    for attempt in (1, 2):
+        snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+            factory,
+            client=_Batch119AbsentExactHistoryClient(),
+        )
+        plan = module.build_composite_batch_recovery_plan(
+            factory,
+            profile=module.BATCH_119_RECOVERY,
+            snapshot=snapshot,
+            planned_at=snapshot.capture_ended_at,
+        )
+        assert plan.status == "ready"
+        assert plan.position.current_size is None
+        document = {
+            "mode": "dry_run",
+            "plan": module.serialize_composite_batch_recovery_plan(plan),
+        }
+        path = tmp_path / f"real-dry-run-{attempt}.json"
+        path.write_text(
+            json.dumps(document, ensure_ascii=True, sort_keys=True),
+            encoding="utf-8",
+        )
+        documents.append(path)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(
+                Path(__file__).parents[1]
+                / "scripts"
+                / "compare_batch119_dry_runs.py"
+            ),
+            *(str(path) for path in documents),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {"status": "stable"}
+    assert result.stderr == ""
 
 
 def test_batch119_exact_loader_uses_live_generation_factory_not_copy_generation(
