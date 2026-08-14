@@ -105,9 +105,12 @@ collection digests, natural-stop ownership, source fingerprint, and evidence
 fingerprint. Fresh capture timestamps are required but are not semantic
 fingerprint input. Stop after the second result. Do not add `--apply`, deploy,
 restart a service, bootstrap the production database, or change a setting.
-Apply would require a separate approval and all of `--apply`,
-`--expected-fingerprint`, and `--authorization`. Batch 119 recovery and Stage 1
-must never share a deployment operation or quiet window.
+Any future apply would require a separate approval and all of
+`--generation-database-path`, `--apply`, `--expected-fingerprint`, and
+`--authorization`. For apply, the resolved `--generation-database-path` must be
+exactly the same as the resolved `--database-path`; otherwise the CLI refuses to
+continue. Apply remains prohibited in the current stage. Batch 119 recovery and
+Stage 1 must never share a deployment operation or quiet window.
 
 ## Stage record
 

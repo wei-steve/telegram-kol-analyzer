@@ -1653,8 +1653,10 @@ management component、mutation intent、recovery 或交易所对账；每个开
 已验证保护。不能用时间流逝将真实操作认定为历史行，必须保持原服务并停止恢复。
 
 第二次 dry-run 通过后立即停止并交回脱敏计划。不得在同一轮运行 `--apply`，也不得部署、
-停止或重启服务、bootstrap 生产数据库或更改交易设置。将来如获得单独 apply 批准，CLI 仍要求
-`--apply`、`--expected-fingerprint` 和 `--authorization` 三个选项，但该授权不属于当前步骤。
+停止或重启服务、bootstrap 生产数据库或更改交易设置。将来如获得单独 apply 批准，CLI 仍必须
+同时提供 `--generation-database-path`、`--apply`、`--expected-fingerprint` 和
+`--authorization`。apply 时，`--generation-database-path` 与 `--database-path` 经路径解析后必须
+完全相同，否则 CLI 拒绝继续。当前阶段仍禁止任何 apply，该授权不属于当前步骤。
 
 Batch 119 recovery 与 Deepcoin request-governance Stage 1 deployment 绝对不得共用同一
 deployment operation 或 quiet window。整个流程保持 `mimo_contract_mode=v1`，不启用 MiMo v2、
