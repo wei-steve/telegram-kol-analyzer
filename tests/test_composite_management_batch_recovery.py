@@ -10850,6 +10850,11 @@ def test_batch119_native_backup_requires_exact_canonical_payload_before_network(
     ("malformed_kind", "hostile_text"),
     [
         ("leg_index", "hostile-leg-index"),
+        ("trigger_owner", "hostile-trigger-owner"),
+        ("mutation_owner", "hostile-mutation-owner"),
+        ("backup_owner", "hostile-backup-owner"),
+        ("primary_evidence_extra", "hostile-primary-evidence"),
+        ("backup_evidence_extra", "hostile-backup-evidence"),
         ("json_surrogate", "\\ud800"),
     ],
 )
@@ -10872,6 +10877,54 @@ def test_batch119_native_role_malformed_sqlite_is_safely_refused_before_network(
                 ),
                 {"value": hostile_text},
             )
+        elif malformed_kind == "trigger_owner":
+            session.execute(
+                text(
+                    "UPDATE trigger_protection_intents "
+                    "SET execution_binding_id = :value"
+                ),
+                {"value": hostile_text},
+            )
+        elif malformed_kind == "mutation_owner":
+            session.execute(
+                text(
+                    "UPDATE position_mutation_intents "
+                    "SET execution_order_leg_id = :value"
+                ),
+                {"value": hostile_text},
+            )
+        elif malformed_kind == "backup_owner":
+            session.execute(
+                text(
+                    "UPDATE position_backup_stop_orders "
+                    "SET execution_binding_id = :value"
+                ),
+                {"value": hostile_text},
+            )
+        elif malformed_kind == "primary_evidence_extra":
+            row = (
+                session.query(PositionProtectionLedger)
+                .filter_by(
+                    evidence_source=(
+                        "reconciliation_trigger_protection_intent"
+                    )
+                )
+                .one()
+            )
+            evidence = json.loads(row.evidence_json)
+            evidence["unsafe"] = hostile_text
+            row.evidence_json = json.dumps(evidence, sort_keys=True)
+        elif malformed_kind == "backup_evidence_extra":
+            row = (
+                session.query(PositionProtectionLedger)
+                .filter_by(
+                    evidence_source="position_mutation_intent_readback"
+                )
+                .one()
+            )
+            evidence = json.loads(row.evidence_json)
+            evidence["unsafe"] = hostile_text
+            row.evidence_json = json.dumps(evidence, sort_keys=True)
         else:
             ledger = (
                 session.query(PositionProtectionLedger)
@@ -11404,6 +11457,10 @@ def _drift_batch119_native_role_authority(session, mutation):
         session.query(TriggerProtectionIntent).one().correlation_id = (
             "safe-drifted-primary-correlation"
         )
+    elif mutation == "binding_status":
+        session.query(ExecutionBinding).one().status = "open"
+    elif mutation == "entry_status":
+        session.query(ExecutionOrderLeg).one().status = "filled"
     elif mutation == "conflicting_authority":
         original = (
             session.query(PositionProtectionLeg)
@@ -11444,6 +11501,8 @@ _NATIVE_ROLE_POST_CAPTURE_DRIFTS = (
     "mutation_authority_fingerprint",
     "backup_client_order_id",
     "primary_correlation_id",
+    "binding_status",
+    "entry_status",
     "conflicting_authority",
 )
 

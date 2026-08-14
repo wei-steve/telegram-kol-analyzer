@@ -1560,10 +1560,21 @@ RUNTIME_PYTHON="$PRODUCTION_ROOT/.venv/bin/python"
 RECOVERY_TMP="$(mktemp -d /tmp/batch119-recovery.XXXXXX)"
 chmod 0700 "$RECOVERY_TMP"
 CANDIDATE_ROOT="$RECOVERY_TMP/candidate"
-SERVICE_NAME=telegram-kol.service
-SERVICE_STOP_ATTEMPTED=0
+QUIESCE_UNITS=(
+  telegram-kol-monitor.timer
+  telegram-kol-monitor.service
+  telegram-kol-monitor-diagnostic.service
+  telegram-kol-monitor-test-notification.service
+  telegram-kol-runtime-scanner.service
+  telegram-kol-runtime-agent.service
+  telegram-kol.service
+)
+declare -A ORIGINAL_UNIT_STATE
+QUIESCE_ATTEMPTED=0
 ORIGINAL_SHA="$(git -C "$PRODUCTION_ROOT" rev-parse HEAD)"
-ORIGINAL_SERVICE_STATE="$(systemctl is-active "$SERVICE_NAME" || true)"
+for UNIT in "${QUIESCE_UNITS[@]}"; do
+  ORIGINAL_UNIT_STATE["$UNIT"]="$(systemctl is-active "$UNIT" || true)"
+done
 
 cleanup_batch119_dry_run() {
   local cleanup_status=0
@@ -1576,12 +1587,21 @@ cleanup_batch119_dry_run() {
       cleanup_status=1
     fi
   fi
-  if [ "$SERVICE_STOP_ATTEMPTED" = 1 ] && [ "$ORIGINAL_SERVICE_STATE" = active ]; then
-    if ! sudo systemctl start "$SERVICE_NAME"; then
-      cleanup_status=1
-    elif ! timeout 30 systemctl is-active --quiet "$SERVICE_NAME"; then
-      cleanup_status=1
-    fi
+  if [ "$QUIESCE_ATTEMPTED" = 1 ]; then
+    for ((INDEX=${#QUIESCE_UNITS[@]}-1; INDEX>=0; INDEX--)); do
+      UNIT="${QUIESCE_UNITS[$INDEX]}"
+      if [ "${ORIGINAL_UNIT_STATE[$UNIT]}" = active ]; then
+        if ! sudo systemctl start "$UNIT"; then
+          cleanup_status=1
+        elif ! timeout 30 systemctl is-active --quiet "$UNIT"; then
+          cleanup_status=1
+        fi
+      elif systemctl is-active --quiet "$UNIT"; then
+        if ! sudo systemctl stop "$UNIT"; then
+          cleanup_status=1
+        fi
+      fi
+    done
   fi
   if [ "$(git -C "$PRODUCTION_ROOT" rev-parse HEAD)" != "$ORIGINAL_SHA" ]; then
     cleanup_status=1
@@ -1601,15 +1621,22 @@ printf 'batch119 reviewed candidate: %s\n' "$REMOTE_SHA"
 git -C "$PRODUCTION_ROOT" worktree add --detach "$CANDIDATE_ROOT" "$REMOTE_SHA"
 test "$(git -C "$CANDIDATE_ROOT" rev-parse HEAD)" = "$REMOTE_SHA"
 test -z "$(git -C "$CANDIDATE_ROOT" status --porcelain)"
-test "$ORIGINAL_SERVICE_STATE" = active
+test "${ORIGINAL_UNIT_STATE[telegram-kol.service]}" = active
 test "${BATCH119_STOP_APPROVAL:-}" = \
-  'I_APPROVE_BATCH119_STOPPED_READ_ONLY_DOUBLE_CAPTURE'
+  'I_APPROVE_BATCH119_ALL_DB_UNITS_STOPPED_READ_ONLY_DOUBLE_CAPTURE'
 
-SERVICE_STOP_ATTEMPTED=1
-sudo systemctl stop "$SERVICE_NAME"
-test "$(systemctl is-active "$SERVICE_NAME" || true)" = inactive
+QUIESCE_ATTEMPTED=1
+for UNIT in "${QUIESCE_UNITS[@]}"; do
+  if [ "${ORIGINAL_UNIT_STATE[$UNIT]}" = active ]; then
+    sudo systemctl stop "$UNIT"
+  fi
+done
+for UNIT in "${QUIESCE_UNITS[@]}"; do
+  test "$(systemctl is-active "$UNIT" || true)" != active
+done
 
-# 不允许另一个本地 Telegram/Deepcoin worker 在停服窗口内存活。
+# 已记录并静止 main、Runtime Agent、scanner、monitor timer/worker；不允许
+# 另一个本地 Telegram/Deepcoin worker 在停服窗口内存活。
 if pgrep -f '[t]elegram_kol_research|[t]elegram-kol' >/dev/null; then
   exit 1
 fi

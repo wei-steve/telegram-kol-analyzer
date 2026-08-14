@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
+from hashlib import sha256
 import json
 from pathlib import Path
 import re
@@ -36,6 +37,26 @@ POSITION_KEYS = {
     "current_size",
     "close_delta",
     "effective_remaining_size",
+}
+EVIDENCE_KEYS = {
+    "schema_version",
+    "batch_id",
+    "decision",
+    "reason_code",
+    "source_fingerprint",
+    "exchange_snapshot_fingerprint",
+    "immutable_target",
+    "position",
+    "durable",
+    "exchange",
+    "proposed_transition",
+    "natural_stop",
+}
+INSTRUCTION_DISPOSITIONS = {
+    "approved_historical_pending_frozen",
+    "historical_unknown_frozen",
+    "target_incident_frozen",
+    "verified_terminal_mirror",
 }
 
 
@@ -125,27 +146,210 @@ def _strict_decimal(value: Any) -> Decimal:
 def _validate_position(position: Any) -> None:
     if not isinstance(position, dict) or set(position) != POSITION_KEYS:
         raise ComparisonRefused("invalid position")
-    disposition = position.get("disposition")
-    current = _strict_decimal(position.get("current_size"))
+    if position.get("disposition") != "position_absent":
+        raise ComparisonRefused("invalid disposition")
+    if position.get("current_size") is not None:
+        raise ComparisonRefused("invalid absent size")
     close = _strict_decimal(position.get("close_delta"))
     remaining = _strict_decimal(position.get("effective_remaining_size"))
-    target = Decimal("19")
-    valid = {
-        "position_absent": current == close == remaining == 0,
-        "resume_to_target": (
-            current > target
-            and close == current - target
-            and remaining == target
-        ),
-        "protection_only_at_target": (
-            current == target and close == 0 and remaining == target
-        ),
-        "protection_only_below_target": (
-            0 < current < target and close == 0 and remaining == current
-        ),
+    if close != 0 or remaining != 0:
+        raise ComparisonRefused("invalid absent economics")
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and SHA256_RE.fullmatch(value) is not None
+
+
+def _canonical_fingerprint(value: Any) -> str:
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError, RecursionError, OverflowError):
+        raise ComparisonRefused("invalid fingerprint payload") from None
+    return sha256(encoded).hexdigest()
+
+
+def _validate_natural_stop(value: Any) -> None:
+    expected_keys = {
+        "purpose",
+        "trigger_status",
+        "position_status",
+        "time_relation",
+        "trigger_count",
+        "closed_position_count",
+        "order_ref",
+        "position_ref",
     }
-    if disposition not in valid or not valid[disposition]:
-        raise ComparisonRefused("invalid disposition")
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise ComparisonRefused("invalid natural stop")
+    if not (
+        value.get("purpose") in {"stop_loss", "backup_stop"}
+        and value.get("trigger_status") == "successful_terminal"
+        and value.get("position_status") == "closed"
+        and value.get("time_relation") == "trigger_not_after_close"
+        and value.get("trigger_count") == 1
+        and not isinstance(value.get("trigger_count"), bool)
+        and value.get("closed_position_count") == 1
+        and not isinstance(value.get("closed_position_count"), bool)
+        and _is_sha256(value.get("order_ref"))
+        and _is_sha256(value.get("position_ref"))
+    ):
+        raise ComparisonRefused("invalid natural stop")
+
+
+def _validate_instruction_population(value: Any) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "total_count",
+        "counts",
+        "digest",
+    }:
+        raise ComparisonRefused("invalid instruction population")
+    total = value.get("total_count")
+    counts = value.get("counts")
+    if not (
+        value.get("schema_version") == 1
+        and isinstance(total, int)
+        and not isinstance(total, bool)
+        and 1 <= total <= 4_096
+        and isinstance(counts, dict)
+        and set(counts) == INSTRUCTION_DISPOSITIONS
+        and all(
+            isinstance(count, int)
+            and not isinstance(count, bool)
+            and count >= 0
+            for count in counts.values()
+        )
+        and sum(counts.values()) == total
+        and counts.get("target_incident_frozen") == 1
+        and _is_sha256(value.get("digest"))
+    ):
+        raise ComparisonRefused("invalid instruction population")
+
+
+def _validate_evidence(plan: dict[str, Any]) -> None:
+    evidence = plan.get("evidence")
+    if not isinstance(evidence, dict) or set(evidence) != EVIDENCE_KEYS:
+        raise ComparisonRefused("invalid evidence keys")
+    if not (
+        evidence.get("schema_version") == 1
+        and evidence.get("batch_id") == 119
+        and evidence.get("decision") == "repair_false_legacy_submission"
+        and evidence.get("reason_code") == "false_legacy_submission_proven"
+        and evidence.get("source_fingerprint")
+        == plan.get("source_fingerprint")
+        and evidence.get("exchange_snapshot_fingerprint")
+        == plan.get("exchange_snapshot_fingerprint")
+        and evidence.get("position") == plan.get("position")
+    ):
+        raise ComparisonRefused("evidence identity mismatch")
+
+    target = evidence.get("immutable_target")
+    if not isinstance(target, dict) or set(target) != {
+        "instrument_id",
+        "side",
+        "trusted_start_size",
+        "target_remaining_size",
+        "quantity_step",
+        "min_quantity",
+    }:
+        raise ComparisonRefused("invalid immutable target")
+    if not (
+        target.get("instrument_id") == "BTC-USDT-SWAP"
+        and target.get("side") == "long"
+        and target.get("trusted_start_size") == "38"
+        and target.get("target_remaining_size") == "19"
+        and _strict_decimal(target.get("quantity_step")) > 0
+        and _strict_decimal(target.get("min_quantity")) > 0
+    ):
+        raise ComparisonRefused("invalid immutable target")
+
+    durable = evidence.get("durable")
+    if not isinstance(durable, dict) or set(durable) != {
+        "batch_status",
+        "leg_status",
+        "component_statuses",
+        "component_attempt_counts",
+        "component_count",
+        "close_submission_evidence_count",
+        "instruction_population",
+    }:
+        raise ComparisonRefused("invalid durable evidence")
+    statuses = durable.get("component_statuses")
+    attempts = durable.get("component_attempt_counts")
+    if not (
+        isinstance(durable.get("batch_status"), str)
+        and SAFE_CODE_RE.fullmatch(durable["batch_status"]) is not None
+        and isinstance(durable.get("leg_status"), str)
+        and SAFE_CODE_RE.fullmatch(durable["leg_status"]) is not None
+        and isinstance(statuses, list)
+        and len(statuses) == 3
+        and all(
+            isinstance(status, str)
+            and SAFE_CODE_RE.fullmatch(status) is not None
+            for status in statuses
+        )
+        and isinstance(attempts, list)
+        and len(attempts) == 3
+        and all(
+            isinstance(attempt, int)
+            and not isinstance(attempt, bool)
+            and attempt >= 0
+            for attempt in attempts
+        )
+        and durable.get("component_count") == 3
+        and not isinstance(durable.get("component_count"), bool)
+        and durable.get("close_submission_evidence_count") == 0
+        and not isinstance(
+            durable.get("close_submission_evidence_count"), bool
+        )
+    ):
+        raise ComparisonRefused("invalid durable evidence")
+    _validate_instruction_population(durable.get("instruction_population"))
+
+    exchange = evidence.get("exchange")
+    if not isinstance(exchange, dict) or set(exchange) != {
+        "snapshot_complete",
+        "exact_position_count",
+        "regular_close_evidence_count",
+        "owned_protection_count",
+    }:
+        raise ComparisonRefused("invalid exchange evidence")
+    owned_count = exchange.get("owned_protection_count")
+    if not (
+        exchange.get("snapshot_complete") is True
+        and exchange.get("exact_position_count") == 0
+        and not isinstance(exchange.get("exact_position_count"), bool)
+        and exchange.get("regular_close_evidence_count") == 0
+        and not isinstance(
+            exchange.get("regular_close_evidence_count"), bool
+        )
+        and isinstance(owned_count, int)
+        and not isinstance(owned_count, bool)
+        and 2 <= owned_count <= 100
+    ):
+        raise ComparisonRefused("invalid exchange evidence")
+
+    if evidence.get("proposed_transition") != {
+        "batch_status": "resolved",
+        "batch_reason_code": "composite_recovery_exact_position_absent",
+        "leg_status": "failed",
+        "component_statuses": [
+            "safely_skipped",
+            "safely_skipped",
+            "safely_skipped",
+        ],
+        "exchange_call_possible": False,
+    }:
+        raise ComparisonRefused("invalid transition")
+    _validate_natural_stop(evidence.get("natural_stop"))
+    if _canonical_fingerprint(evidence) != plan.get("evidence_fingerprint"):
+        raise ComparisonRefused("evidence fingerprint mismatch")
 
 
 def _validate_document(document: dict[str, Any]) -> None:
@@ -158,13 +362,11 @@ def _validate_document(document: dict[str, Any]) -> None:
         plan.get("batch_id") != 119
         or isinstance(plan.get("batch_id"), bool)
         or plan.get("status") != "ready"
-        or not isinstance(plan.get("reason_code"), str)
-        or SAFE_CODE_RE.fullmatch(plan["reason_code"]) is None
+        or plan.get("reason_code") != "false_legacy_submission_proven"
         or plan.get("production_writes") != 0
         or isinstance(plan.get("production_writes"), bool)
         or plan.get("exchange_calls") != 0
         or isinstance(plan.get("exchange_calls"), bool)
-        or not isinstance(plan.get("evidence"), dict)
     ):
         raise ComparisonRefused("unsafe plan")
     for key in (
@@ -177,6 +379,7 @@ def _validate_document(document: dict[str, Any]) -> None:
         ) is None:
             raise ComparisonRefused("invalid fingerprint")
     _validate_position(plan.get("position"))
+    _validate_evidence(plan)
 
 
 def _emit(payload: dict[str, str]) -> None:

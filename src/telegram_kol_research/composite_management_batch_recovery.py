@@ -1531,6 +1531,8 @@ def _batch119_strict_json_object(raw: object) -> dict[str, Any]:
 
 def _batch119_evidence_intent_id(raw: object) -> int:
     evidence = _batch119_strict_json_object(raw)
+    if set(evidence) != {"intent_id"}:
+        raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
     intent_id = _exact_int(evidence.get("intent_id"))
     if intent_id is None or intent_id <= 0:
         raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
@@ -1791,6 +1793,11 @@ def _batch119_primary_role_authority_fingerprint(
 ) -> str:
     order_id = str(row.order_id or "")
     ledger_evidence = _batch119_strict_json_object(row.evidence_json)
+    if set(ledger_evidence) != {
+        "intent_id",
+        "parent_trigger_order_id",
+    }:
+        raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
     intent_id = _exact_int(ledger_evidence.get("intent_id"))
     if intent_id is None or intent_id <= 0:
         raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
@@ -1806,8 +1813,8 @@ def _batch119_primary_role_authority_fingerprint(
     if not (
         intent is not None
         and str(intent.venue or "").lower() == "deepcoin"
-        and int(intent.execution_binding_id) == int(binding.id)
-        and int(intent.execution_order_leg_id) == int(entry.id)
+        and _exact_int(intent.execution_binding_id) == int(binding.id)
+        and _exact_int(intent.execution_order_leg_id) == int(entry.id)
         and str(intent.recovery_state or "").lower() == "adopted"
         and str(intent.adopted_order_id or "") == order_id
         and str(intent.parent_trigger_order_id or "")
@@ -1840,6 +1847,12 @@ def _batch119_primary_role_authority_fingerprint(
                 binding=binding,
                 entry=entry,
                 leg=leg,
+            ),
+            "binding_row_fingerprint": (
+                _batch119_durable_authority_fingerprint(binding)
+            ),
+            "entry_row_fingerprint": (
+                _batch119_durable_authority_fingerprint(entry)
             ),
             "ledger_row_fingerprint": (
                 _batch119_durable_authority_fingerprint(row)
@@ -1952,8 +1965,8 @@ def _batch119_backup_role_authority_fingerprint(
         and str(intent.idempotency_key or "") == expected_idempotency_key
         and str(intent.strategy_instance_id or "")
         == str(batch.strategy_instance_id)
-        and int(intent.execution_binding_id) == int(binding.id)
-        and int(intent.execution_order_leg_id) == int(entry.id)
+        and _exact_int(intent.execution_binding_id) == int(binding.id)
+        and _exact_int(intent.execution_order_leg_id) == int(entry.id)
         and str(intent.pos_id or "") == str(leg.pos_id)
         and str(intent.order_id or "") == order_id
         and _is_sha256(str(intent.authority_fingerprint or ""))
@@ -2027,8 +2040,8 @@ def _batch119_backup_role_authority_fingerprint(
     )
     backup_request = _batch119_strict_json_object(backup.request_json)
     if not (
-        int(backup.execution_binding_id) == int(binding.id)
-        and int(backup.execution_order_leg_id) == int(entry.id)
+        _exact_int(backup.execution_binding_id) == int(binding.id)
+        and _exact_int(backup.execution_order_leg_id) == int(entry.id)
         and str(backup.pos_id or "") == str(leg.pos_id)
         and str(backup.instrument_id or "").upper()
         == BATCH_119_RECOVERY.instrument_id.upper()
@@ -2105,6 +2118,12 @@ def _batch119_backup_role_authority_fingerprint(
                 binding=binding,
                 entry=entry,
                 leg=leg,
+            ),
+            "binding_row_fingerprint": (
+                _batch119_durable_authority_fingerprint(binding)
+            ),
+            "entry_row_fingerprint": (
+                _batch119_durable_authority_fingerprint(entry)
             ),
             "ledger_row_fingerprint": (
                 _batch119_durable_authority_fingerprint(row)

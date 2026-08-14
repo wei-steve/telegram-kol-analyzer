@@ -544,6 +544,11 @@ inactive, reject any other local Telegram/Deepcoin worker, and fail closed if
 any durable active/unknown writer operation exists. Install nothing and do not
 change the production checkout, settings, database, or service definition.
 
+The same approval and cleanup boundary must record, quiesce, verify inactive,
+and restore the Runtime Agent, runtime scanner, monitor timer, and any active
+monitor worker units because their `telegram-kol-research` processes touch the
+same production database. Recording/stopping only the main unit is invalid.
+
 Create a mode-0700 temporary directory only for this diagnostic. After the
 stop, use SQLite `.backup` to make a fresh mode-0600 copy and run candidate
 additive schema bootstrap only on that copy. Never bootstrap the production
