@@ -15,7 +15,8 @@ from types import MappingProxyType
 from typing import Any, Literal, Mapping, Sequence
 import unicodedata
 
-from sqlalchemy import create_engine, or_, text
+from sqlalchemy import String, cast, create_engine, or_, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
@@ -4704,69 +4705,135 @@ def _has_durable_close_submission(session, *, batch, leg, entry) -> bool:
     payload_filters = _management_payload_key_filters()
     try:
         mutation_candidates = (
-            session.query(PositionMutationIntent)
+            session.query(
+                PositionMutationIntent.id.label("id"),
+                PositionMutationIntent.operation.label("operation"),
+            )
             .order_by(PositionMutationIntent.id)
             .limit(_MAX_DURABLE_CLOSE_CANDIDATES + 1)
             .all()
         )
-    except (TypeError, ValueError, OverflowError):
+    except (SQLAlchemyError, TypeError, ValueError, OverflowError):
         return True
     if len(mutation_candidates) > _MAX_DURABLE_CLOSE_CANDIDATES:
         return True
+    close_operations: dict[int, str] = {}
     for row in mutation_candidates:
-        if not isinstance(row.created_at, datetime):
+        if type(row.id) is not int or int(row.id) <= 0:
             return True
         if not isinstance(row.operation, str):
             return True
-        if not _mutation_operation_is_close_looking(row.operation):
-            continue
-        if not _mutation_targets_complete_other_owner(
-            session,
-            mutation=row,
-            batch=batch,
-            leg=leg,
-            entry=entry,
+        if _mutation_operation_is_close_looking(row.operation):
+            close_operations[int(row.id)] = row.operation
+    if close_operations:
+        try:
+            close_candidates = (
+                session.query(
+                    PositionMutationIntent.id.label("id"),
+                    PositionMutationIntent.operation.label("operation"),
+                    PositionMutationIntent.strategy_instance_id.label(
+                        "strategy_instance_id"
+                    ),
+                    PositionMutationIntent.execution_binding_id.label(
+                        "execution_binding_id"
+                    ),
+                    PositionMutationIntent.execution_order_leg_id.label(
+                        "execution_order_leg_id"
+                    ),
+                    PositionMutationIntent.pos_id.label("pos_id"),
+                    PositionMutationIntent.venue.label("venue"),
+                    PositionMutationIntent.status.label("status"),
+                    PositionMutationIntent.request_json.label("request_json"),
+                    PositionMutationIntent.response_json.label("response_json"),
+                    PositionMutationIntent.error_json.label("error_json"),
+                    cast(PositionMutationIntent.reserved_at, String).label(
+                        "reserved_at_raw"
+                    ),
+                    cast(PositionMutationIntent.submitted_at, String).label(
+                        "submitted_at_raw"
+                    ),
+                    cast(PositionMutationIntent.confirmed_at, String).label(
+                        "confirmed_at_raw"
+                    ),
+                    cast(PositionMutationIntent.created_at, String).label(
+                        "created_at_raw"
+                    ),
+                    cast(PositionMutationIntent.updated_at, String).label(
+                        "updated_at_raw"
+                    ),
+                )
+                .filter(PositionMutationIntent.id.in_(tuple(close_operations)))
+                .order_by(PositionMutationIntent.id)
+                .limit(_MAX_DURABLE_CLOSE_CANDIDATES + 1)
+                .all()
+            )
+        except (SQLAlchemyError, TypeError, ValueError, OverflowError):
+            return True
+        if (
+            len(close_candidates) != len(close_operations)
+            or {row.id for row in close_candidates} != set(close_operations)
         ):
             return True
-    event_candidates = (
-        session.query(ExecutionEvent)
-        .filter(
-            ExecutionEvent.action.like("%close%"),
-            or_(
-                ExecutionEvent.execution_binding_id
-                == int(batch.execution_binding_id),
-                ExecutionEvent.strategy_instance_id
-                == str(batch.strategy_instance_id),
-                ExecutionEvent.pos_id == str(leg.pos_id),
-                *(
-                    column.like(pattern)
-                    for column in (
-                        ExecutionEvent.before_json,
-                        ExecutionEvent.after_json,
-                        ExecutionEvent.request_json,
-                        ExecutionEvent.response_json,
-                    )
-                    for pattern in payload_filters
+        for row in close_candidates:
+            if (
+                row.operation != close_operations[int(row.id)]
+                or not _mutation_close_projection_is_valid(row)
+            ):
+                return True
+            try:
+                targets_complete_other = _mutation_targets_complete_other_owner(
+                    session,
+                    mutation=row,
+                    batch=batch,
+                    leg=leg,
+                    entry=entry,
+                )
+            except (SQLAlchemyError, TypeError, ValueError, OverflowError):
+                return True
+            if not targets_complete_other:
+                return True
+    try:
+        event_candidates = (
+            session.query(ExecutionEvent)
+            .filter(
+                ExecutionEvent.action.like("%close%"),
+                or_(
+                    ExecutionEvent.execution_binding_id
+                    == int(batch.execution_binding_id),
+                    ExecutionEvent.strategy_instance_id
+                    == str(batch.strategy_instance_id),
+                    ExecutionEvent.pos_id == str(leg.pos_id),
+                    *(
+                        column.like(pattern)
+                        for column in (
+                            ExecutionEvent.before_json,
+                            ExecutionEvent.after_json,
+                            ExecutionEvent.request_json,
+                            ExecutionEvent.response_json,
+                        )
+                        for pattern in payload_filters
+                    ),
                 ),
-            ),
+            )
+            .order_by(ExecutionEvent.id)
+            .limit(_MAX_DURABLE_CLOSE_CANDIDATES + 1)
+            .all()
         )
-        .order_by(ExecutionEvent.id)
-        .limit(_MAX_DURABLE_CLOSE_CANDIDATES + 1)
-        .all()
-    )
-    if len(event_candidates) > _MAX_DURABLE_CLOSE_CANDIDATES:
+        if len(event_candidates) > _MAX_DURABLE_CLOSE_CANDIDATES:
+            return True
+        return any(
+            _is_durable_close_event_action(event.action)
+            and not _event_targets_other_management_entry(
+                session,
+                event=event,
+                batch=batch,
+                leg=leg,
+                entry=entry,
+            )
+            for event in event_candidates
+        )
+    except (SQLAlchemyError, TypeError, ValueError, OverflowError):
         return True
-    return any(
-        _is_durable_close_event_action(event.action)
-        and not _event_targets_other_management_entry(
-            session,
-            event=event,
-            batch=batch,
-            leg=leg,
-            entry=entry,
-        )
-        for event in event_candidates
-    )
 
 
 def _management_payload_key_filters() -> tuple[str, ...]:
@@ -4944,6 +5011,8 @@ def _collect_management_owner_refs(
 
 
 def _mutation_operation_is_close_looking(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
     normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
     start = 0
     end = len(normalized)
@@ -4964,6 +5033,86 @@ def _mutation_operation_is_close_looking(value: object) -> bool:
         )
     )
     return ascii_skeleton == "close_position"
+
+
+def _raw_mutation_datetime(
+    value: object,
+    *,
+    required: bool,
+) -> tuple[bool, datetime | None]:
+    if value is None:
+        return (not required), None
+    if not isinstance(value, str) or not value.strip():
+        return False, None
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except (TypeError, ValueError, OverflowError):
+        return False, None
+    normalized = _normalize_utc_datetime(parsed)
+    return (normalized is not None), normalized
+
+
+def _mutation_close_projection_is_valid(mutation: Any) -> bool:
+    if (
+        type(mutation.id) is not int
+        or int(mutation.id) <= 0
+        or not isinstance(mutation.operation, str)
+        or not _mutation_operation_is_close_looking(mutation.operation)
+        or type(mutation.execution_binding_id) is not int
+        or int(mutation.execution_binding_id) <= 0
+        or type(mutation.execution_order_leg_id) is not int
+        or int(mutation.execution_order_leg_id) <= 0
+    ):
+        return False
+    if any(
+        not isinstance(value, str) or not value.strip()
+        for value in (
+            mutation.strategy_instance_id,
+            mutation.pos_id,
+            mutation.venue,
+            mutation.status,
+            mutation.request_json,
+        )
+    ):
+        return False
+    if any(
+        value is not None and not isinstance(value, str)
+        for value in (mutation.response_json, mutation.error_json)
+    ):
+        return False
+    time_values: dict[str, datetime | None] = {}
+    for field_name, required in (
+        ("reserved_at", True),
+        ("submitted_at", False),
+        ("confirmed_at", False),
+        ("created_at", True),
+        ("updated_at", True),
+    ):
+        valid, normalized = _raw_mutation_datetime(
+            getattr(mutation, f"{field_name}_raw", None),
+            required=required,
+        )
+        if not valid:
+            return False
+        time_values[field_name] = normalized
+    reserved_at = time_values["reserved_at"]
+    submitted_at = time_values["submitted_at"]
+    confirmed_at = time_values["confirmed_at"]
+    created_at = time_values["created_at"]
+    updated_at = time_values["updated_at"]
+    if created_at > updated_at:
+        return False
+    if submitted_at is not None and submitted_at < reserved_at:
+        return False
+    if confirmed_at is not None and confirmed_at < reserved_at:
+        return False
+    if (
+        submitted_at is not None
+        and confirmed_at is not None
+        and confirmed_at < submitted_at
+    ):
+        return False
+    return True
 
 
 def _mutation_targets_complete_other_owner(

@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Query, sessionmaker
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_snapshot_authority import (
@@ -3227,7 +3227,9 @@ def test_natural_stop_allows_early_unrelated_mutation_history(tmp_path):
     assert plan.status == "ready"
 
 
-def test_natural_stop_refuses_malformed_mutation_created_at(tmp_path):
+def test_natural_stop_allows_nonclose_mutation_with_malformed_unread_fields(
+    tmp_path,
+):
     factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
         tmp_path
     )
@@ -3242,7 +3244,13 @@ def test_natural_stop_refuses_malformed_mutation_created_at(tmp_path):
         session.flush()
         session.execute(
             text(
-                "UPDATE position_mutation_intents SET created_at = 'not-a-time' "
+                "UPDATE position_mutation_intents "
+                "SET reserved_at = 'bad-reserved', "
+                "submitted_at = 'bad-submitted', "
+                "confirmed_at = 'bad-confirmed', "
+                "updated_at = 'bad-updated', "
+                "request_json = x'ff', response_json = x'00', "
+                "error_json = 'malformed payload' "
                 "WHERE idempotency_key = 'malformed-mutation-created-at'"
             )
         )
@@ -3250,9 +3258,7 @@ def test_natural_stop_refuses_malformed_mutation_created_at(tmp_path):
 
     plan = _plan(factory, _natural_stop_snapshot())
 
-    _assert_natural_stop_refusal(
-        plan, "durable_close_submission_evidence_present"
-    )
+    assert plan.status == "ready"
 
 
 def test_close_operation_ascii_skeleton_never_misses_single_codepoint():
@@ -4039,6 +4045,153 @@ def test_natural_stop_allows_suspicious_close_with_complete_other_owner(
     plan = _plan(factory, _natural_stop_snapshot())
 
     assert plan.status == "ready"
+
+
+def test_natural_stop_refuses_complete_other_close_with_malformed_time(
+    tmp_path,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        _add_other_suspicious_close_mutation(
+            session,
+            batch119=session.get(StrategyManagementBatch, 119),
+            suffix="malformed-time",
+            complete_owner=True,
+            operation="close_position",
+        )
+        session.flush()
+        session.execute(
+            text(
+                "UPDATE position_mutation_intents SET reserved_at = 'bad-time' "
+                "WHERE idempotency_key = "
+                "'incomplete-other-fullwidth-malformed-time'"
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    _assert_natural_stop_refusal(
+        plan, "durable_close_submission_evidence_present"
+    )
+
+
+def _recovery_write_state(factory):
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        return (
+            batch.status,
+            batch.updated_at,
+            batch.target_snapshot_json,
+            batch.reason_code,
+            batch.completed_at,
+            session.query(ExecutionEvent).count(),
+            session.query(StrategyManagementComponent).count(),
+        )
+
+
+def _patch_recovery_query_operational_error(monkeypatch, *, query_kind):
+    original_all = Query.all
+
+    def fail_selected_query(query):
+        entities = {
+            description.get("entity")
+            for description in query.column_descriptions
+        }
+        statement = str(query.statement)
+        is_mutation = PositionMutationIntent in entities
+        should_fail = (
+            query_kind == "mutation_stage1"
+            and is_mutation
+            and len(query.column_descriptions) == 2
+        ) or (
+            query_kind == "mutation_stage2"
+            and is_mutation
+            and len(query.column_descriptions) > 2
+        ) or (
+            query_kind == "event"
+            and ExecutionEvent in entities
+            and "execution_events.action LIKE" in statement
+        )
+        if should_fail:
+            raise OperationalError(
+                "forced bounded recovery query failure",
+                {},
+                RuntimeError("forced query failure"),
+            )
+        return original_all(query)
+
+    monkeypatch.setattr(Query, "all", fail_selected_query)
+
+
+@pytest.mark.parametrize(
+    "query_kind",
+    ["mutation_stage1", "mutation_stage2", "event"],
+)
+@pytest.mark.parametrize("phase", ["plan", "apply", "resume"])
+def test_natural_stop_query_operational_error_fails_closed_without_writes(
+    tmp_path,
+    monkeypatch,
+    query_kind,
+    phase,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    snapshot = _natural_stop_snapshot()
+    if query_kind == "mutation_stage2":
+        with factory() as session:
+            _add_other_suspicious_close_mutation(
+                session,
+                batch119=session.get(StrategyManagementBatch, 119),
+                suffix=f"query-error-{phase}",
+                complete_owner=True,
+                operation="close_position",
+            )
+            session.commit()
+    plan = None
+    if phase in {"apply", "resume"}:
+        plan = _plan(factory, snapshot)
+        assert plan.status == "ready"
+    if phase == "resume":
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+    before = _recovery_write_state(factory)
+    _patch_recovery_query_operational_error(monkeypatch, query_kind=query_kind)
+
+    if phase == "plan":
+        refused = _plan(factory, snapshot)
+        _assert_natural_stop_refusal(
+            refused, "durable_close_submission_evidence_present"
+        )
+    elif phase == "apply":
+        with pytest.raises(
+            module.CompositeBatchRecoveryConflict,
+            match="source_state_conflict",
+        ):
+            module.apply_composite_batch_false_state_repair(
+                factory,
+                plan=plan,
+                expected_fingerprint=plan.evidence_fingerprint,
+                authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+                applied_at=NOW,
+            )
+    else:
+        with pytest.raises(
+            module.CompositeBatchRecoveryConflict,
+            match="resume_source_state_conflict",
+        ):
+            module.authorize_composite_batch_recovery_resume(
+                factory,
+                expected_fingerprint=plan.evidence_fingerprint,
+                snapshot=snapshot,
+            )
+
+    assert _recovery_write_state(factory) == before
 
 
 @pytest.mark.parametrize(
