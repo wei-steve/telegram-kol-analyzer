@@ -66,6 +66,9 @@ from telegram_kol_research.strategy_management_take_profit_consumption import (
 from telegram_kol_research.position_attribution import (
     has_authoritative_persisted_position,
 )
+from telegram_kol_research.trading_settings import (
+    trading_settings_from_payload,
+)
 
 
 class CompositeBatchRecoveryRefusal(ValueError):
@@ -1827,10 +1830,6 @@ def authorize_composite_batch_recovery_resume(
         if isinstance(contract, str) or isinstance(target, str):
             raise CompositeBatchRecoveryConflict("resume_source_state_conflict")
         disposition = str(after["position_disposition"])
-        _require_locked_recovery_settings(
-            session,
-            require_live=disposition != "position_absent",
-        )
         if disposition == "position_absent" and _has_durable_close_submission(
             session,
             batch=batch,
@@ -1956,6 +1955,10 @@ def authorize_composite_batch_recovery_resume(
             leg=leg,
             components=components,
             target=target,
+        )
+        _require_locked_recovery_settings(
+            session,
+            require_live=disposition != "position_absent",
         )
         prepared_writer = (
             None
@@ -3404,23 +3407,24 @@ def _require_locked_recovery_settings(
                 "mimo_contract_mode_not_v1"
             )
         if not rows:
-            mode = "v1"
-            composite_mode = None
+            payload = {}
         else:
             payload = json.loads(rows[0].value_json)
-            if not isinstance(payload, Mapping):
+            if type(payload) is not dict:
                 raise ValueError("settings payload must be an object")
-            mode = payload.get("mimo_contract_mode", "v1")
-            composite_mode = payload.get("composite_management_v2_mode")
+        settings = trading_settings_from_payload(payload)
     except CompositeBatchRecoveryConflict:
         raise
     except (SQLAlchemyError, TypeError, ValueError, RecursionError) as exc:
         raise CompositeBatchRecoveryConflict(
             "mimo_contract_mode_not_v1"
         ) from exc
-    if mode != "v1":
+    if settings.mimo_contract_mode != "v1":
         raise CompositeBatchRecoveryConflict("mimo_contract_mode_not_v1")
-    if require_live and composite_mode != "live":
+    if (
+        require_live
+        and settings.effective_composite_management_v2_mode != "live"
+    ):
         raise CompositeBatchRecoveryConflict(
             "composite_management_live_gate_closed"
         )
@@ -3667,21 +3671,6 @@ def apply_composite_batch_false_state_repair(
             plan.position is not None
             and plan.position.disposition != "position_absent"
         )
-        _require_locked_recovery_settings(
-            session,
-            require_live=requires_writer,
-        )
-        prepared_writer = (
-            _prepare_locked_recovery_writer(
-                prepare_writer=prepare_writer,
-                expected_uid_scope_hash=expected_uid_scope_hash,
-                snapshot_uid_scope_hash=(
-                    snapshot.account_authority.uid_scope_hash
-                ),
-            )
-            if requires_writer
-            else None
-        )
         existing = _load_recovery_audit_event(
             session, evidence_fingerprint=plan.evidence_fingerprint
         )
@@ -3696,6 +3685,21 @@ def apply_composite_batch_false_state_repair(
                 expected_natural_stop=plan.evidence.get("natural_stop"),
             )
             if _repaired_state_and_event_match(session, event=existing, plan=plan):
+                _require_locked_recovery_settings(
+                    session,
+                    require_live=requires_writer,
+                )
+                prepared_writer = (
+                    _prepare_locked_recovery_writer(
+                        prepare_writer=prepare_writer,
+                        expected_uid_scope_hash=expected_uid_scope_hash,
+                        snapshot_uid_scope_hash=(
+                            snapshot.account_authority.uid_scope_hash
+                        ),
+                    )
+                    if requires_writer
+                    else None
+                )
                 return CompositeBatchRecoveryApplyResult(
                     batch_id=BATCH_119_RECOVERY.batch_id,
                     status="already_repaired",
@@ -3741,6 +3745,22 @@ def apply_composite_batch_false_state_repair(
             "position_absent",
         }:
             raise CompositeBatchRecoveryConflict("plan_disposition_not_supported")
+
+        _require_locked_recovery_settings(
+            session,
+            require_live=requires_writer,
+        )
+        prepared_writer = (
+            _prepare_locked_recovery_writer(
+                prepare_writer=prepare_writer,
+                expected_uid_scope_hash=expected_uid_scope_hash,
+                snapshot_uid_scope_hash=(
+                    snapshot.account_authority.uid_scope_hash
+                ),
+            )
+            if requires_writer
+            else None
+        )
 
         before = {
             "batch_id": int(batch.id),

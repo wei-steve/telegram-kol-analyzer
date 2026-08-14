@@ -794,6 +794,8 @@ def _seed_batch_119_false_submission(tmp_path):
                 key="global",
                 value_json=json.dumps(
                     {
+                        "auto_trade_enabled": True,
+                        "management_execution_mode": "live",
                         "composite_management_v2_mode": "live",
                         "mimo_contract_mode": "v1",
                     },
@@ -7303,16 +7305,27 @@ def test_apply_rejects_durable_state_drift_and_rolls_back(
     with factory() as session:
         mutate(session)
         session.commit()
+    writer_calls = []
 
     with pytest.raises(module.CompositeBatchRecoveryConflict):
         _apply_recovery(module,
             factory,
             plan=plan,
+            prepare_writer=lambda: writer_calls.append(True)
+            or SimpleNamespace(
+                uid_scope_hash=(
+                    _PLAN_SNAPSHOTS[id(plan)].account_authority.uid_scope_hash
+                )
+            ),
+            expected_uid_scope_hash=(
+                _PLAN_SNAPSHOTS[id(plan)].account_authority.uid_scope_hash
+            ),
             expected_fingerprint=plan.evidence_fingerprint,
             authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
             applied_at=NOW,
         )
 
+    assert writer_calls == []
     with factory() as session:
         assert session.query(ExecutionEvent).count() == 0
         if mutation == "batch_status":
@@ -8240,16 +8253,27 @@ def test_repeated_apply_rejects_tampered_audit_or_after_state(tmp_path, tamper):
                     )
                 )
         session.commit()
+    writer_calls = []
 
     with pytest.raises(module.CompositeBatchRecoveryConflict):
         _apply_recovery(module,
             factory,
             plan=plan,
+            prepare_writer=lambda: writer_calls.append(True)
+            or SimpleNamespace(
+                uid_scope_hash=(
+                    _PLAN_SNAPSHOTS[id(plan)].account_authority.uid_scope_hash
+                )
+            ),
+            expected_uid_scope_hash=(
+                _PLAN_SNAPSHOTS[id(plan)].account_authority.uid_scope_hash
+            ),
             expected_fingerprint=plan.evidence_fingerprint,
             authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
             applied_at=NOW,
         )
 
+    assert writer_calls == []
     with factory() as session:
         assert (
             session.query(ExecutionEvent)
@@ -9132,6 +9156,107 @@ def test_non_absent_apply_rechecks_mimo_v1_inside_locked_transaction(tmp_path):
         assert session.query(ExecutionEvent).count() == 0
 
 
+@pytest.mark.parametrize("action", ["first", "repeat", "resume"])
+@pytest.mark.parametrize(
+    ("setting_patch", "malformed"),
+    [
+        ({"auto_trade_enabled": False}, False),
+        ({"management_execution_mode": "disabled"}, False),
+        ({"management_execution_mode": "shadow"}, False),
+        ({"composite_management_v2_mode": "disabled"}, False),
+        ({"auto_trade_enabled": "true"}, True),
+    ],
+)
+def test_non_absent_locked_gate_uses_effective_live_settings_without_writer(
+    tmp_path,
+    action,
+    setting_patch,
+    malformed,
+):
+    from telegram_kol_research.trading_settings import save_trading_settings
+
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    snapshot = _snapshot()
+    plan = _plan(factory, snapshot)
+    if action != "first":
+        _apply_recovery(
+            module,
+            factory,
+            plan=plan,
+            snapshot=snapshot,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+    if malformed:
+        with factory() as session:
+            row = session.query(TradingSetting).filter_by(key="global").one()
+            payload = json.loads(row.value_json)
+            payload.update(setting_patch)
+            row.value_json = json.dumps(payload, sort_keys=True)
+            session.commit()
+    else:
+        save_trading_settings(factory, setting_patch, updated_at=NOW)
+    with factory() as session:
+        before = (
+            session.get(StrategyManagementBatch, 119).status,
+            session.query(ExecutionEvent).count(),
+            session.query(TradingSetting).filter_by(key="global").one().value_json,
+        )
+    writer_calls = []
+    expected_reason = (
+        "mimo_contract_mode_not_v1"
+        if malformed
+        else "composite_management_live_gate_closed"
+    )
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match=expected_reason,
+    ):
+        if action in {"first", "repeat"}:
+            _apply_recovery(
+                module,
+                factory,
+                plan=plan,
+                snapshot=snapshot,
+                prepare_writer=lambda: writer_calls.append(True)
+                or SimpleNamespace(
+                    uid_scope_hash=snapshot.account_authority.uid_scope_hash
+                ),
+                expected_uid_scope_hash=(
+                    snapshot.account_authority.uid_scope_hash
+                ),
+                expected_fingerprint=plan.evidence_fingerprint,
+                authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+                applied_at=NOW,
+            )
+        else:
+            _authorize_recovery(
+                module,
+                factory,
+                expected_fingerprint=plan.evidence_fingerprint,
+                snapshot=snapshot,
+                prepare_writer=lambda: writer_calls.append(True)
+                or SimpleNamespace(
+                    uid_scope_hash=snapshot.account_authority.uid_scope_hash
+                ),
+                expected_uid_scope_hash=(
+                    snapshot.account_authority.uid_scope_hash
+                ),
+            )
+
+    assert writer_calls == []
+    with factory() as session:
+        after = (
+            session.get(StrategyManagementBatch, 119).status,
+            session.query(ExecutionEvent).count(),
+            session.query(TradingSetting).filter_by(key="global").one().value_json,
+        )
+    assert after == before
+
+
 def test_non_absent_repeat_and_resume_recheck_locked_mimo_v1(tmp_path):
     from telegram_kol_research.trading_settings import save_trading_settings
 
@@ -9267,6 +9392,77 @@ def test_non_absent_resume_rejects_unowned_fresh_position_reduction(tmp_path):
             expected_fingerprint=plan.evidence_fingerprint,
             snapshot=reduced,
         )
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ["raw", "lifecycle", "ledger", "audit", "event", "snapshot"],
+)
+def test_non_absent_resume_validates_all_locked_evidence_before_writer(
+    tmp_path,
+    drift,
+):
+    factory, _, binding_id, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    snapshot = _snapshot()
+    plan = _plan(factory, snapshot)
+    _apply_recovery(
+        module,
+        factory,
+        plan=plan,
+        snapshot=snapshot,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    if drift == "snapshot":
+        snapshot = replace(snapshot)
+    else:
+        with factory() as session:
+            if drift == "raw":
+                session.get(RawMessage, 10532).chat_id = 999
+            elif drift == "lifecycle":
+                session.get(StrategyLifecycle, 794).lifecycle_status = "exited"
+            elif drift == "ledger":
+                session.query(PositionProtectionLedger).first().trigger_price = "1"
+            elif drift == "audit":
+                session.query(ExecutionEvent).one().action = "unrelated_action"
+            else:
+                session.add(
+                    ExecutionEvent(
+                        execution_binding_id=binding_id,
+                        strategy_instance_id="deepcoin:incident:btc:long",
+                        action="strategy_management_close_submit",
+                        status="confirmed",
+                        pos_id=POS_ID,
+                        created_at=NOW,
+                    )
+                )
+            session.commit()
+    with factory() as session:
+        before = (
+            session.get(StrategyManagementBatch, 119).status,
+            session.query(ExecutionEvent).count(),
+        )
+    writer_calls = []
+
+    with pytest.raises(module.CompositeBatchRecoveryConflict):
+        _authorize_recovery(
+            module,
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=snapshot,
+            prepare_writer=lambda: writer_calls.append(True)
+            or SimpleNamespace(uid_scope_hash="5" * 64),
+            expected_uid_scope_hash="5" * 64,
+        )
+
+    assert writer_calls == []
+    with factory() as session:
+        assert (
+            session.get(StrategyManagementBatch, 119).status,
+            session.query(ExecutionEvent).count(),
+        ) == before
 
 
 def test_position_absent_mimo_gate_query_error_rolls_back_and_releases_lock(
