@@ -15,7 +15,7 @@ from types import MappingProxyType
 from typing import Any, Literal, Mapping, Sequence
 import unicodedata
 
-from sqlalchemy import and_, create_engine, func, or_, text
+from sqlalchemy import create_engine, or_, text
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
@@ -4702,42 +4702,22 @@ def _legacy_false_exchange_snapshot_refusal(leg, *, profile) -> str | None:
 
 def _has_durable_close_submission(session, *, batch, leg, entry) -> bool:
     payload_filters = _management_payload_key_filters()
-    mutation_candidates = (
-        session.query(PositionMutationIntent)
-        .filter(
-            or_(
-                PositionMutationIntent.execution_binding_id
-                == int(batch.execution_binding_id),
-                PositionMutationIntent.execution_order_leg_id == int(entry.id),
-                PositionMutationIntent.strategy_instance_id
-                == str(batch.strategy_instance_id),
-                PositionMutationIntent.pos_id == str(leg.pos_id),
-                *(
-                    column.like(pattern)
-                    for column in (
-                        PositionMutationIntent.request_json,
-                        PositionMutationIntent.response_json,
-                        PositionMutationIntent.error_json,
-                    )
-                    for pattern in payload_filters
-                ),
-                and_(
-                    func.lower(PositionMutationIntent.operation).like("%close%"),
-                    func.lower(PositionMutationIntent.operation).like(
-                        "%position%"
-                    ),
-                ),
-                PositionMutationIntent.operation.op("GLOB")("*[^ -~]*"),
-                func.instr(PositionMutationIntent.operation, "\x00") > 0,
-            ),
+    try:
+        mutation_candidates = (
+            session.query(PositionMutationIntent)
+            .order_by(PositionMutationIntent.id)
+            .limit(_MAX_DURABLE_CLOSE_CANDIDATES + 1)
+            .all()
         )
-        .order_by(PositionMutationIntent.id)
-        .limit(_MAX_DURABLE_CLOSE_CANDIDATES + 1)
-        .all()
-    )
+    except (TypeError, ValueError, OverflowError):
+        return True
     if len(mutation_candidates) > _MAX_DURABLE_CLOSE_CANDIDATES:
         return True
     for row in mutation_candidates:
+        if not isinstance(row.created_at, datetime):
+            return True
+        if not isinstance(row.operation, str):
+            return True
         if not _mutation_operation_is_close_looking(row.operation):
             continue
         if not _mutation_targets_complete_other_owner(

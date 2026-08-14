@@ -3018,6 +3018,243 @@ def test_natural_stop_allows_target_mutation_with_unrelated_operation(tmp_path):
     assert plan.status == "ready"
 
 
+def _add_target_mutation_with_stored_operation(
+    session,
+    *,
+    binding_id,
+    entry_id,
+    stored_operation,
+    idempotency_key,
+):
+    _add_target_close_mutation_with_operation(
+        session,
+        binding_id=binding_id,
+        entry_id=entry_id,
+        operation="temporary_operation_placeholder",
+        idempotency_key=idempotency_key,
+    )
+    session.flush()
+    if stored_operation is None:
+        connection = session.connection()
+        schema_sql = connection.exec_driver_sql(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'position_mutation_intents'"
+        ).scalar_one()
+        nullable_schema_sql = schema_sql.replace(
+            "operation VARCHAR(64) NOT NULL",
+            "operation VARCHAR(64)",
+        )
+        assert nullable_schema_sql != schema_sql
+        connection.exec_driver_sql("PRAGMA writable_schema = ON")
+        connection.exec_driver_sql(
+            "UPDATE sqlite_master SET sql = ? "
+            "WHERE type = 'table' AND name = 'position_mutation_intents'",
+            (nullable_schema_sql,),
+        )
+        schema_version = connection.exec_driver_sql(
+            "PRAGMA schema_version"
+        ).scalar_one()
+        connection.exec_driver_sql(f"PRAGMA schema_version = {schema_version + 1}")
+        connection.exec_driver_sql("PRAGMA writable_schema = OFF")
+    session.execute(
+        text(
+            "UPDATE position_mutation_intents "
+            "SET operation = :operation WHERE idempotency_key = :key"
+        ),
+        {"operation": stored_operation, "key": idempotency_key},
+    )
+
+
+@pytest.mark.parametrize(
+    "stored_operation",
+    [b"close_position", memoryview(b"close_position"), None],
+    ids=["bytes", "memoryview", "null"],
+)
+def test_natural_stop_refuses_target_non_string_mutation_operation(
+    tmp_path,
+    stored_operation,
+):
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    with factory() as session:
+        _add_target_mutation_with_stored_operation(
+            session,
+            binding_id=binding_id,
+            entry_id=entry_id,
+            stored_operation=stored_operation,
+            idempotency_key="target-non-string-plan",
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    _assert_natural_stop_refusal(
+        plan, "durable_close_submission_evidence_present"
+    )
+
+
+@pytest.mark.parametrize(
+    "stored_operation",
+    [b"close_position", None],
+    ids=["bytes", "null"],
+)
+def test_natural_stop_apply_refuses_late_target_non_string_operation(
+    tmp_path,
+    stored_operation,
+):
+    module = _recovery_module()
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    plan = _plan(factory, _natural_stop_snapshot())
+    with factory() as session:
+        _add_target_mutation_with_stored_operation(
+            session,
+            binding_id=binding_id,
+            entry_id=entry_id,
+            stored_operation=stored_operation,
+            idempotency_key="target-non-string-apply",
+        )
+        session.commit()
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="source_state_conflict",
+    ):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+
+@pytest.mark.parametrize(
+    "stored_operation",
+    [memoryview(b"close_position"), None],
+    ids=["memoryview", "null"],
+)
+def test_natural_stop_resume_refuses_late_target_non_string_operation(
+    tmp_path,
+    stored_operation,
+):
+    module = _recovery_module()
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    snapshot = _natural_stop_snapshot()
+    plan = _plan(factory, snapshot)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with factory() as session:
+        _add_target_mutation_with_stored_operation(
+            session,
+            binding_id=binding_id,
+            entry_id=entry_id,
+            stored_operation=stored_operation,
+            idempotency_key="target-non-string-resume",
+        )
+        session.commit()
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="resume_source_state_conflict",
+    ):
+        module.authorize_composite_batch_recovery_resume(
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=snapshot,
+        )
+
+
+@pytest.mark.parametrize("population", [256, 257])
+def test_natural_stop_bounds_all_mutation_candidates(tmp_path, population):
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    with factory() as session:
+        for index in range(population):
+            _add_target_close_mutation_with_operation(
+                session,
+                binding_id=binding_id,
+                entry_id=entry_id,
+                operation="adjust_position_margin",
+                idempotency_key=f"bounded-unrelated-mutation-{index}",
+            )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    if population == 256:
+        assert plan.status == "ready"
+    else:
+        _assert_natural_stop_refusal(
+            plan, "durable_close_submission_evidence_present"
+        )
+
+
+def test_natural_stop_allows_early_unrelated_mutation_history(tmp_path):
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    with factory() as session:
+        _add_target_close_mutation_with_operation(
+            session,
+            binding_id=binding_id,
+            entry_id=entry_id,
+            operation="adjust_position_margin",
+            idempotency_key="early-unrelated-mutation-history",
+        )
+        session.flush()
+        mutation = (
+            session.query(PositionMutationIntent)
+            .filter_by(idempotency_key="early-unrelated-mutation-history")
+            .one()
+        )
+        mutation.created_at = datetime(2001, 1, 1, tzinfo=UTC)
+        mutation.updated_at = datetime(2001, 1, 1, tzinfo=UTC)
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    assert plan.status == "ready"
+
+
+def test_natural_stop_refuses_malformed_mutation_created_at(tmp_path):
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    with factory() as session:
+        _add_target_close_mutation_with_operation(
+            session,
+            binding_id=binding_id,
+            entry_id=entry_id,
+            operation="adjust_position_margin",
+            idempotency_key="malformed-mutation-created-at",
+        )
+        session.flush()
+        session.execute(
+            text(
+                "UPDATE position_mutation_intents SET created_at = 'not-a-time' "
+                "WHERE idempotency_key = 'malformed-mutation-created-at'"
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    _assert_natural_stop_refusal(
+        plan, "durable_close_submission_evidence_present"
+    )
+
+
 def test_close_operation_ascii_skeleton_never_misses_single_codepoint():
     module = _recovery_module()
     missed = []
@@ -3806,7 +4043,11 @@ def test_natural_stop_allows_suspicious_close_with_complete_other_owner(
 
 @pytest.mark.parametrize(
     "operation",
-    ["ＣＬＯＳＥ＿ＰＯＳＩＴＩＯＮ", "cl\x00ose_position"],
+    [
+        "ＣＬＯＳＥ＿ＰＯＳＩＴＩＯＮ",
+        "cl\x00ose_position",
+        "cl!<>ose_pos[]ition",
+    ],
 )
 def test_natural_stop_refuses_suspicious_close_with_incomplete_other_owner(
     tmp_path,
@@ -3831,7 +4072,11 @@ def test_natural_stop_refuses_suspicious_close_with_incomplete_other_owner(
 
 @pytest.mark.parametrize(
     "operation",
-    ["ＣＬＯＳＥ＿ＰＯＳＩＴＩＯＮ", "cl\x00ose_position"],
+    [
+        "ＣＬＯＳＥ＿ＰＯＳＩＴＩＯＮ",
+        "cl\x00ose_position",
+        "cl!<>ose_pos[]ition",
+    ],
 )
 def test_natural_stop_apply_refuses_late_suspicious_incomplete_other_owner(
     tmp_path,
@@ -3864,7 +4109,11 @@ def test_natural_stop_apply_refuses_late_suspicious_incomplete_other_owner(
 
 @pytest.mark.parametrize(
     "operation",
-    ["ＣＬＯＳＥ＿ＰＯＳＩＴＩＯＮ", "cl\x00ose_position"],
+    [
+        "ＣＬＯＳＥ＿ＰＯＳＩＴＩＯＮ",
+        "cl\x00ose_position",
+        "cl!<>ose_pos[]ition",
+    ],
 )
 def test_natural_stop_resume_refuses_late_suspicious_incomplete_other_owner(
     tmp_path,
