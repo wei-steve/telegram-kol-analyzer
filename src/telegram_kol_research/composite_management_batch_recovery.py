@@ -7761,11 +7761,15 @@ def _validated_natural_stop_proof(
         return "natural_stop_proof_identity_invalid"
     owned_by_id: dict[str, tuple[str, Any]] = {}
     for row in ledger:
-        purpose = str(getattr(row, "purpose", "") or "").lower()
         order_id = str(getattr(row, "order_id", "") or "").strip()
+        logical_roles = [
+            role
+            for role, scoped_order_id in scoped_orders.items()
+            if scoped_order_id == order_id
+        ]
+        purpose = logical_roles[0] if len(logical_roles) == 1 else ""
         if (
             purpose not in scoped_orders
-            or scoped_orders[purpose] != order_id
             or order_id in owned_by_id
             or str(getattr(row, "status", "") or "").lower() != "verified"
             or str(getattr(row, "venue", "") or "").lower() != "deepcoin"

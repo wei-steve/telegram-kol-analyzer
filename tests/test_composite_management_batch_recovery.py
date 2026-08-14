@@ -11211,6 +11211,263 @@ def test_batch119_resume_rejects_protection_evidence_drift_after_capture(
         )
 
 
+def _drift_batch119_native_role_authority(session, mutation):
+    if mutation == "primary_intent":
+        session.delete(session.query(TriggerProtectionIntent).one())
+    elif mutation == "primary_leg":
+        session.delete(
+            session.query(PositionProtectionLeg)
+            .filter_by(role="primary_stop")
+            .one()
+        )
+    elif mutation == "backup_intent":
+        session.delete(session.query(PositionMutationIntent).one())
+    elif mutation == "backup_row":
+        session.delete(session.query(PositionBackupStopOrder).one())
+    elif mutation == "backup_leg":
+        session.delete(
+            session.query(PositionProtectionLeg)
+            .filter_by(role="backup_stop")
+            .one()
+        )
+    elif mutation == "ledger_economics":
+        row = (
+            session.query(PositionProtectionLedger)
+            .filter_by(evidence_source="position_mutation_intent_readback")
+            .one()
+        )
+        row.trigger_price = "1"
+    elif mutation == "ledger_source":
+        row = (
+            session.query(PositionProtectionLedger)
+            .filter_by(evidence_source="position_mutation_intent_readback")
+            .one()
+        )
+        row.evidence_source = "safe-drifted-source"
+    elif mutation == "ledger_evidence":
+        row = (
+            session.query(PositionProtectionLedger)
+            .filter_by(evidence_source="position_mutation_intent_readback")
+            .one()
+        )
+        row.evidence_json = '{"intent_id":999999}'
+    elif mutation == "conflicting_authority":
+        original = (
+            session.query(PositionProtectionLeg)
+            .filter_by(role="backup_stop")
+            .one()
+        )
+        session.add(
+            PositionProtectionLeg(
+                protection_leg_id="batch119-conflicting-backup-leg",
+                venue=original.venue,
+                execution_binding_id=original.execution_binding_id,
+                execution_order_leg_id=original.execution_order_leg_id,
+                role="backup_stop",
+                leg_index=2,
+                planned_trigger_price=original.planned_trigger_price,
+                planned_size=original.planned_size,
+                pos_id=original.pos_id,
+                exchange_order_id=original.exchange_order_id,
+                status="verified",
+                created_at=original.created_at,
+                updated_at=original.updated_at,
+            )
+        )
+    else:  # pragma: no cover - test helper misuse
+        raise AssertionError(mutation)
+    session.commit()
+
+
+_NATIVE_ROLE_POST_CAPTURE_DRIFTS = (
+    "primary_intent",
+    "primary_leg",
+    "backup_intent",
+    "backup_row",
+    "backup_leg",
+    "ledger_economics",
+    "ledger_source",
+    "ledger_evidence",
+    "conflicting_authority",
+)
+
+
+@pytest.mark.parametrize("mutation", _NATIVE_ROLE_POST_CAPTURE_DRIFTS)
+def test_batch119_native_sl_backup_role_planner_rejects_post_capture_drift(
+    tmp_path,
+    mutation,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(
+        tmp_path,
+        native_sl_backup=True,
+    )
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=_Batch119AbsentExactHistoryClient(),
+    )
+    with factory() as session:
+        _drift_batch119_native_role_authority(session, mutation)
+
+    plan = module.build_composite_batch_recovery_plan(
+        factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=snapshot,
+        planned_at=snapshot.capture_ended_at,
+    )
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "durable_snapshot_scope_mismatch"
+
+
+@pytest.mark.parametrize("mutation", _NATIVE_ROLE_POST_CAPTURE_DRIFTS)
+def test_batch119_native_sl_backup_role_apply_rejects_post_capture_drift_before_writer(
+    tmp_path,
+    mutation,
+):
+    module = _recovery_module()
+    factory, database, _, _, _ = _seed_batch_119_false_submission(
+        tmp_path,
+        native_sl_backup=True,
+    )
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=_Batch119AbsentExactHistoryClient(),
+    )
+    plan = module.build_composite_batch_recovery_plan(
+        factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=snapshot,
+        planned_at=snapshot.capture_ended_at,
+    )
+    assert plan.status == "ready"
+    with factory() as session:
+        _drift_batch119_native_role_authority(session, mutation)
+    before = _file_signature(database)
+    writer_calls = []
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match=(
+            "source_fingerprint_conflict|position_absent_snapshot_conflict"
+        ),
+    ):
+        _apply_recovery(
+            module,
+            factory,
+            plan=plan,
+            snapshot=snapshot,
+            prepare_writer=lambda: writer_calls.append(True),
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+    assert writer_calls == []
+    assert _file_signature(database) == before
+
+
+@pytest.mark.parametrize("mutation", _NATIVE_ROLE_POST_CAPTURE_DRIFTS)
+def test_batch119_native_sl_backup_role_repeat_apply_rejects_drift_before_writer(
+    tmp_path,
+    mutation,
+):
+    module = _recovery_module()
+    factory, database, _, _, _ = _seed_batch_119_false_submission(
+        tmp_path,
+        native_sl_backup=True,
+    )
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=_Batch119AbsentExactHistoryClient(),
+    )
+    plan = module.build_composite_batch_recovery_plan(
+        factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=snapshot,
+        planned_at=snapshot.capture_ended_at,
+    )
+    _apply_recovery(
+        module,
+        factory,
+        plan=plan,
+        snapshot=snapshot,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with factory() as session:
+        _drift_batch119_native_role_authority(session, mutation)
+    before = _file_signature(database)
+    writer_calls = []
+
+    with pytest.raises(module.CompositeBatchRecoveryConflict):
+        _apply_recovery(
+            module,
+            factory,
+            plan=plan,
+            snapshot=snapshot,
+            prepare_writer=lambda: writer_calls.append(True),
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+    assert writer_calls == []
+    assert _file_signature(database) == before
+
+
+@pytest.mark.parametrize("mutation", _NATIVE_ROLE_POST_CAPTURE_DRIFTS)
+def test_batch119_native_sl_backup_role_resume_rejects_post_capture_drift_before_writer(
+    tmp_path,
+    mutation,
+):
+    module = _recovery_module()
+    factory, database, _, _, _ = _seed_batch_119_false_submission(
+        tmp_path,
+        native_sl_backup=True,
+    )
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=_Batch119AbsentExactHistoryClient(),
+    )
+    plan = module.build_composite_batch_recovery_plan(
+        factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=snapshot,
+        planned_at=snapshot.capture_ended_at,
+    )
+    assert plan.status == "ready"
+    _apply_recovery(
+        module,
+        factory,
+        plan=plan,
+        snapshot=snapshot,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with factory() as session:
+        _drift_batch119_native_role_authority(session, mutation)
+    before = _file_signature(database)
+    writer_calls = []
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="resume_source_state_conflict",
+    ):
+        _authorize_recovery(
+            module,
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=snapshot,
+            prepare_writer=lambda: writer_calls.append(True),
+        )
+
+    assert writer_calls == []
+    assert _file_signature(database) == before
+
+
 def test_batch119_exact_history_page_limit_without_completion_is_incomplete(
     tmp_path,
 ):
