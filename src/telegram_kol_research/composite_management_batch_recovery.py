@@ -289,6 +289,7 @@ _MAX_INSTRUCTION_POPULATION = 4096
 _MAX_INSTRUCTION_PAYLOAD_BYTES = 16_384
 _MAX_INSTRUCTION_PAYLOAD_DEPTH = 64
 _MAX_INSTRUCTION_PAYLOAD_NODES = 2048
+_MAX_DURABLE_CLOSE_CANDIDATES = 256
 _TERMINAL_MUTATION_STATUSES = frozenset({"confirmed", "rejected", "blocked"})
 _SAFE_TERMINAL_COMPONENT_STATUSES = frozenset(
     {"confirmed", "operator_required", "safely_skipped"}
@@ -4690,26 +4691,74 @@ def _legacy_false_exchange_snapshot_refusal(leg, *, profile) -> str | None:
 
 
 def _has_durable_close_submission(session, *, batch, leg, entry) -> bool:
-    if (
+    payload_filters = _management_payload_key_filters()
+    mutation_candidates = (
         session.query(PositionMutationIntent)
         .filter(
-            PositionMutationIntent.execution_binding_id
-            == int(batch.execution_binding_id),
-            PositionMutationIntent.execution_order_leg_id == int(entry.id),
             PositionMutationIntent.operation == "close_position",
+            or_(
+                PositionMutationIntent.execution_binding_id
+                == int(batch.execution_binding_id),
+                PositionMutationIntent.execution_order_leg_id == int(entry.id),
+                PositionMutationIntent.strategy_instance_id
+                == str(batch.strategy_instance_id),
+                PositionMutationIntent.pos_id == str(leg.pos_id),
+                *(
+                    column.like(pattern)
+                    for column in (
+                        PositionMutationIntent.request_json,
+                        PositionMutationIntent.response_json,
+                        PositionMutationIntent.error_json,
+                    )
+                    for pattern in payload_filters
+                ),
+            ),
         )
-        .first()
-        is not None
-    ):
-        return True
-    events = (
-        session.query(ExecutionEvent)
-        .filter(
-            ExecutionEvent.execution_binding_id
-            == int(batch.execution_binding_id),
-        )
+        .order_by(PositionMutationIntent.id)
+        .limit(_MAX_DURABLE_CLOSE_CANDIDATES + 1)
         .all()
     )
+    if len(mutation_candidates) > _MAX_DURABLE_CLOSE_CANDIDATES:
+        return True
+    if any(
+        not _mutation_targets_complete_other_owner(
+            session,
+            mutation=row,
+            batch=batch,
+            leg=leg,
+            entry=entry,
+        )
+        for row in mutation_candidates
+    ):
+        return True
+    event_candidates = (
+        session.query(ExecutionEvent)
+        .filter(
+            ExecutionEvent.action.like("%close%"),
+            or_(
+                ExecutionEvent.execution_binding_id
+                == int(batch.execution_binding_id),
+                ExecutionEvent.strategy_instance_id
+                == str(batch.strategy_instance_id),
+                ExecutionEvent.pos_id == str(leg.pos_id),
+                *(
+                    column.like(pattern)
+                    for column in (
+                        ExecutionEvent.before_json,
+                        ExecutionEvent.after_json,
+                        ExecutionEvent.request_json,
+                        ExecutionEvent.response_json,
+                    )
+                    for pattern in payload_filters
+                ),
+            ),
+        )
+        .order_by(ExecutionEvent.id)
+        .limit(_MAX_DURABLE_CLOSE_CANDIDATES + 1)
+        .all()
+    )
+    if len(event_candidates) > _MAX_DURABLE_CLOSE_CANDIDATES:
+        return True
     return any(
         _is_durable_close_event_action(event.action)
         and not _event_targets_other_management_entry(
@@ -4719,7 +4768,158 @@ def _has_durable_close_submission(session, *, batch, leg, entry) -> bool:
             leg=leg,
             entry=entry,
         )
-        for event in events
+        for event in event_candidates
+    )
+
+
+def _management_payload_key_filters() -> tuple[str, ...]:
+    exact_key_filters = tuple(
+        f'%"{key}"%'
+        for key in (
+            "management_batch_id",
+            "managementBatchId",
+            "management_leg_id",
+            "managementLegId",
+        )
+    )
+    return (*exact_key_filters, "%management%", "%\\u%")
+
+
+def _management_owner_payload_refs(
+    row: Any,
+    *,
+    field_names: Sequence[str],
+) -> tuple[set[int], set[int]] | None:
+    management_leg_refs: set[int] = set()
+    management_batch_refs: set[int] = set()
+    for field_name in field_names:
+        raw = getattr(row, field_name, None)
+        if raw in (None, ""):
+            continue
+        payload = _bounded_instruction_json(raw)
+        if not isinstance(payload, Mapping):
+            return None
+        if not _collect_management_owner_refs(
+            payload,
+            management_leg_refs=management_leg_refs,
+            management_batch_refs=management_batch_refs,
+        ):
+            return None
+    return management_leg_refs, management_batch_refs
+
+
+def _collect_management_owner_refs(
+    value: Any,
+    *,
+    management_leg_refs: set[int],
+    management_batch_refs: set[int],
+) -> bool:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            destination = (
+                management_leg_refs
+                if key in {"management_leg_id", "managementLegId"}
+                else management_batch_refs
+                if key in {"management_batch_id", "managementBatchId"}
+                else None
+            )
+            if destination is not None and child not in (None, ""):
+                if isinstance(child, bool):
+                    return False
+                try:
+                    destination.add(int(str(child)))
+                except (TypeError, ValueError):
+                    return False
+            if not _collect_management_owner_refs(
+                child,
+                management_leg_refs=management_leg_refs,
+                management_batch_refs=management_batch_refs,
+            ):
+                return False
+        return True
+    if isinstance(value, list):
+        return all(
+            _collect_management_owner_refs(
+                child,
+                management_leg_refs=management_leg_refs,
+                management_batch_refs=management_batch_refs,
+            )
+            for child in value
+        )
+    return True
+
+
+def _mutation_targets_complete_other_owner(
+    session,
+    *,
+    mutation,
+    batch,
+    leg,
+    entry,
+) -> bool:
+    if (
+        int(mutation.execution_binding_id) == int(batch.execution_binding_id)
+        or int(mutation.execution_order_leg_id) == int(entry.id)
+        or str(mutation.strategy_instance_id) == str(batch.strategy_instance_id)
+        or str(mutation.pos_id) == str(leg.pos_id)
+    ):
+        return False
+    referenced_binding = session.get(
+        ExecutionBinding,
+        int(mutation.execution_binding_id),
+    )
+    referenced_entry = session.get(
+        ExecutionOrderLeg,
+        int(mutation.execution_order_leg_id),
+    )
+    if referenced_binding is None or referenced_entry is None:
+        return False
+    if not (
+        str(mutation.strategy_instance_id or "")
+        and str(mutation.pos_id or "")
+        and int(referenced_entry.execution_binding_id)
+        == int(referenced_binding.id)
+        and str(referenced_binding.strategy_instance_id)
+        == str(referenced_entry.strategy_instance_id or "")
+        == str(mutation.strategy_instance_id)
+        and str(referenced_binding.pos_id or "")
+        == str(referenced_entry.pos_id or "")
+        == str(mutation.pos_id)
+        and str(referenced_binding.venue) == str(mutation.venue)
+        == str(referenced_entry.venue)
+    ):
+        return False
+    refs = _management_owner_payload_refs(
+        mutation,
+        field_names=("request_json", "response_json", "error_json"),
+    )
+    if refs is None:
+        return False
+    management_leg_refs, management_batch_refs = refs
+    if int(batch.id) in management_batch_refs or int(leg.id) in management_leg_refs:
+        return False
+    if not management_leg_refs and not management_batch_refs:
+        return True
+    if len(management_leg_refs) != 1 or len(management_batch_refs) != 1:
+        return False
+    referenced_leg = session.get(
+        StrategyManagementLeg,
+        next(iter(management_leg_refs)),
+    )
+    referenced_batch = session.get(
+        StrategyManagementBatch,
+        next(iter(management_batch_refs)),
+    )
+    return bool(
+        referenced_leg is not None
+        and referenced_batch is not None
+        and int(referenced_leg.management_batch_id) == int(referenced_batch.id)
+        and int(referenced_leg.execution_order_leg_id) == int(referenced_entry.id)
+        and str(referenced_leg.pos_id) == str(mutation.pos_id)
+        and int(referenced_batch.execution_binding_id)
+        == int(referenced_binding.id)
+        and str(referenced_batch.strategy_instance_id)
+        == str(mutation.strategy_instance_id)
     )
 
 
@@ -4736,43 +4936,26 @@ def _event_targets_other_management_entry(
     leg,
     entry,
 ) -> bool:
-    management_leg_refs: set[int] = set()
-    management_batch_refs: set[int] = set()
-    for field_name in (
-        "before_json",
-        "after_json",
-        "request_json",
-        "response_json",
-    ):
-        raw = getattr(event, field_name, None)
-        if raw in (None, ""):
-            continue
-        try:
-            payload = json.loads(raw)
-        except (TypeError, ValueError):
-            return False
-        if not isinstance(payload, Mapping):
-            return False
-        for keys, destination in (
-            (("management_leg_id", "managementLegId"), management_leg_refs),
-            (
-                ("management_batch_id", "managementBatchId"),
-                management_batch_refs,
-            ),
-        ):
-            for key in keys:
-                raw_ref = payload.get(key)
-                if raw_ref in (None, ""):
-                    continue
-                if isinstance(raw_ref, bool):
-                    return False
-                try:
-                    destination.add(int(str(raw_ref)))
-                except (TypeError, ValueError):
-                    return False
+    refs = _management_owner_payload_refs(
+        event,
+        field_names=(
+            "before_json",
+            "after_json",
+            "request_json",
+            "response_json",
+        ),
+    )
+    if refs is None:
+        return False
+    management_leg_refs, management_batch_refs = refs
     if (
         len(management_leg_refs) != 1
         or len(management_batch_refs) != 1
+        or int(event.execution_binding_id or 0)
+        == int(batch.execution_binding_id)
+        or str(event.strategy_instance_id or "")
+        == str(batch.strategy_instance_id)
+        or str(event.pos_id or "") == str(leg.pos_id)
         or int(leg.id) in management_leg_refs
         or int(batch.id) in management_batch_refs
     ):
@@ -4793,6 +4976,8 @@ def _event_targets_other_management_entry(
     )
     return (
         referenced_entry is not None
+        and bool(str(event.strategy_instance_id or ""))
+        and bool(str(event.pos_id or ""))
         and int(referenced_leg.management_batch_id) == int(referenced_batch.id)
         and int(referenced_leg.execution_order_leg_id) == int(referenced_entry.id)
         and int(referenced_entry.id) != int(entry.id)
