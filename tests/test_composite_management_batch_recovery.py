@@ -2853,6 +2853,130 @@ def test_natural_stop_refuses_target_binding_and_position_other_entry_mutation(
     )
 
 
+def _add_target_close_mutation_with_operation(
+    session,
+    *,
+    binding_id,
+    entry_id,
+    operation,
+    idempotency_key,
+):
+    session.add(
+        PositionMutationIntent(
+            idempotency_key=idempotency_key,
+            operation=operation,
+            strategy_instance_id="deepcoin:incident:btc:long",
+            execution_binding_id=binding_id,
+            execution_order_leg_id=entry_id,
+            pos_id=POS_ID,
+            authority_fingerprint="a" * 64,
+            request_fingerprint="r" * 64,
+            status="confirmed",
+            request_json="{}",
+            response_json="{}",
+            reserved_at=NOW,
+            submitted_at=NOW,
+            confirmed_at=NOW,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["CLOSE_POSITION", " close_position ", "\tCLOSE_POSITION\n"],
+)
+def test_natural_stop_refuses_normalized_target_close_mutation_operation(
+    tmp_path,
+    operation,
+):
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    with factory() as session:
+        _add_target_close_mutation_with_operation(
+            session,
+            binding_id=binding_id,
+            entry_id=entry_id,
+            operation=operation,
+            idempotency_key=f"normalized-operation-{operation}",
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    _assert_natural_stop_refusal(
+        plan, "durable_close_submission_evidence_present"
+    )
+
+
+def test_natural_stop_apply_cas_refuses_late_normalized_close_operation(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    plan = _plan(factory, _natural_stop_snapshot())
+    with factory() as session:
+        _add_target_close_mutation_with_operation(
+            session,
+            binding_id=binding_id,
+            entry_id=entry_id,
+            operation="\tCLOSE_POSITION\n",
+            idempotency_key="late-uppercase-close-operation",
+        )
+        session.commit()
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="source_state_conflict",
+    ):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+
+def test_natural_stop_resume_refuses_late_normalized_close_operation(tmp_path):
+    module = _recovery_module()
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    snapshot = _natural_stop_snapshot()
+    plan = _plan(factory, snapshot)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with factory() as session:
+        _add_target_close_mutation_with_operation(
+            session,
+            binding_id=binding_id,
+            entry_id=entry_id,
+            operation="\n close_position \t",
+            idempotency_key="late-spaced-close-operation",
+        )
+        session.commit()
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="resume_source_state_conflict",
+    ):
+        module.authorize_composite_batch_recovery_resume(
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=snapshot,
+        )
+
+
 @pytest.mark.parametrize("strategy_instance_id", ["wrong-strategy", ""])
 def test_natural_stop_refuses_owned_close_mutation_with_strategy_conflict(
     tmp_path,
@@ -3471,6 +3595,296 @@ def test_natural_stop_does_not_claim_other_entry_management_close_event(
     plan = _plan(factory, _natural_stop_snapshot())
 
     assert plan.status == "ready"
+
+
+def _add_complete_other_close_event(
+    session,
+    *,
+    batch119,
+    suffix,
+    response_json,
+):
+    other_binding = ExecutionBinding(
+        strategy_instance_id=f"deepcoin:encoded-other-{suffix}:btc:long",
+        kol_id=f"encoded-other-{suffix}",
+        chat_id=995,
+        message_id=995,
+        symbol="BTC",
+        side="long",
+        venue="deepcoin",
+        pos_id=f"encoded-other-position-{suffix}",
+        margin_mode="cross",
+        position_mode="split",
+        status="active",
+    )
+    session.add(other_binding)
+    session.flush()
+    other_entry = ExecutionOrderLeg(
+        execution_binding_id=other_binding.id,
+        strategy_instance_id=other_binding.strategy_instance_id,
+        leg_index=1,
+        purpose="entry",
+        order_kind="market",
+        order_id=f"encoded-other-entry-{suffix}",
+        pos_id=other_binding.pos_id,
+        venue="deepcoin",
+        attribution_status="verified",
+        attribution_evidence_json='{"policy_version":2}',
+        status="active",
+    )
+    session.add(other_entry)
+    session.flush()
+    other_batch = _add_other_terminal_batch(
+        session,
+        binding_id=other_binding.id,
+        batch119=batch119,
+    )
+    other_batch.strategy_instance_id = other_binding.strategy_instance_id
+    other_leg = StrategyManagementLeg(
+        management_batch_id=other_batch.id,
+        execution_order_leg_id=other_entry.id,
+        pos_id=other_binding.pos_id,
+        leg_index=0,
+        status="succeeded",
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    session.add(other_leg)
+    session.flush()
+    owner_json = json.dumps(
+        {
+            "management_batch_id": other_batch.id,
+            "management_leg_id": other_leg.id,
+        },
+        sort_keys=True,
+    )
+    session.add(
+        ExecutionEvent(
+            execution_binding_id=other_binding.id,
+            strategy_instance_id=other_binding.strategy_instance_id,
+            action="strategy_management_close_submit",
+            status="submitted",
+            pos_id=other_binding.pos_id,
+            before_json=owner_json,
+            response_json=response_json,
+            created_at=NOW,
+        )
+    )
+
+
+def test_natural_stop_complete_other_owner_allows_unrelated_plain_text(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        _add_complete_other_close_event(
+            session,
+            batch119=session.get(StrategyManagementBatch, 119),
+            suffix="plain",
+            response_json="ordinary unrelated provider text",
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    assert plan.status == "ready"
+
+
+def test_natural_stop_encoded_target_string_overrides_complete_other_event(
+    tmp_path,
+):
+    factory, _, _, _, leg_id = _seed_batch_119_false_submission(tmp_path)
+    encoded_target = json.dumps(
+        {"management_batch_id": 119, "management_leg_id": leg_id},
+        sort_keys=True,
+    )
+    with factory() as session:
+        _add_complete_other_close_event(
+            session,
+            batch119=session.get(StrategyManagementBatch, 119),
+            suffix="encoded-target",
+            response_json=json.dumps({"encoded": encoded_target}),
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    _assert_natural_stop_refusal(
+        plan, "durable_close_submission_evidence_present"
+    )
+
+
+def test_natural_stop_encoded_target_string_overrides_complete_other_mutation(
+    tmp_path,
+):
+    factory, _, _, _, target_leg_id = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        _add_complete_other_close_event(
+            session,
+            batch119=session.get(StrategyManagementBatch, 119),
+            suffix="mutation-encoded-target",
+            response_json=None,
+        )
+        session.flush()
+        owner_event = (
+            session.query(ExecutionEvent)
+            .filter_by(kol_id=None)
+            .order_by(ExecutionEvent.id.desc())
+            .first()
+        )
+        owner_refs = json.loads(owner_event.before_json)
+        owner_leg = session.get(
+            StrategyManagementLeg,
+            int(owner_refs["management_leg_id"]),
+        )
+        owner_entry = session.get(
+            ExecutionOrderLeg,
+            int(owner_leg.execution_order_leg_id),
+        )
+        session.add(
+            PositionMutationIntent(
+                idempotency_key="complete-other-mutation-encoded-target",
+                operation="close_position",
+                strategy_instance_id=owner_event.strategy_instance_id,
+                execution_binding_id=owner_event.execution_binding_id,
+                execution_order_leg_id=owner_entry.id,
+                pos_id=owner_event.pos_id,
+                authority_fingerprint="a" * 64,
+                request_fingerprint="r" * 64,
+                status="confirmed",
+                request_json=owner_event.before_json,
+                response_json="{}",
+                error_json=json.dumps(
+                    {
+                        "encoded": json.dumps(
+                            {
+                                "management_batch_id": 119,
+                                "management_leg_id": target_leg_id,
+                            }
+                        )
+                    }
+                ),
+                reserved_at=NOW,
+                submitted_at=NOW,
+                confirmed_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    _assert_natural_stop_refusal(
+        plan, "durable_close_submission_evidence_present"
+    )
+
+
+def _add_double_encoded_payload_only_target_event(session, *, leg_id):
+    target_owner = json.dumps(
+        {"management_batch_id": 119, "management_leg_id": leg_id},
+        sort_keys=True,
+    )
+    session.add(
+        ExecutionEvent(
+            execution_binding_id=None,
+            strategy_instance_id=None,
+            action="strategy_management_close_submit",
+            status="submitted",
+            pos_id=None,
+            before_json=json.dumps(json.dumps(target_owner)),
+            created_at=NOW,
+        )
+    )
+
+
+def test_natural_stop_apply_cas_refuses_late_double_encoded_target_event(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, _, _, leg_id = _seed_batch_119_false_submission(tmp_path)
+    plan = _plan(factory, _natural_stop_snapshot())
+    with factory() as session:
+        _add_double_encoded_payload_only_target_event(session, leg_id=leg_id)
+        session.commit()
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="source_state_conflict",
+    ):
+        module.apply_composite_batch_false_state_repair(
+            factory,
+            plan=plan,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+
+def test_natural_stop_resume_refuses_late_double_encoded_target_event(tmp_path):
+    module = _recovery_module()
+    factory, _, _, _, leg_id = _seed_batch_119_false_submission(tmp_path)
+    snapshot = _natural_stop_snapshot()
+    plan = _plan(factory, snapshot)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with factory() as session:
+        _add_double_encoded_payload_only_target_event(session, leg_id=leg_id)
+        session.commit()
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="resume_source_state_conflict",
+    ):
+        module.authorize_composite_batch_recovery_resume(
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=snapshot,
+        )
+
+
+@pytest.mark.parametrize("encoded_kind", ["cumulative_bytes", "deep", "duplicate"])
+def test_natural_stop_refuses_unsafe_encoded_management_string(
+    tmp_path,
+    encoded_kind,
+):
+    factory, _, _, _, leg_id = _seed_batch_119_false_submission(tmp_path)
+    if encoded_kind == "cumulative_bytes":
+        encoded_value = json.dumps(
+            {
+                "management_batch_id": 119,
+                "management_leg_id": leg_id,
+                "padding": "x" * 8_500,
+            }
+        )
+    elif encoded_kind == "deep":
+        encoded_value = json.dumps(
+            {"management_batch_id": 119, "management_leg_id": leg_id}
+        )
+        for _ in range(12):
+            encoded_value = json.dumps(encoded_value)
+    else:
+        encoded_value = (
+            '{"management_batch_id":119,"management_batch_id":120,'
+            f'"management_leg_id":{leg_id}}}'
+        )
+    with factory() as session:
+        _add_complete_other_close_event(
+            session,
+            batch119=session.get(StrategyManagementBatch, 119),
+            suffix=encoded_kind,
+            response_json=json.dumps({"encoded": encoded_value}),
+        )
+        session.commit()
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    _assert_natural_stop_refusal(
+        plan, "durable_close_submission_evidence_present"
+    )
 
 
 @pytest.mark.parametrize("conflict_kind", ["target_position", "target_batch"])

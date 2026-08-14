@@ -13,7 +13,7 @@ import sqlite3
 from types import MappingProxyType
 from typing import Any, Literal, Mapping, Sequence
 
-from sqlalchemy import create_engine, or_, text
+from sqlalchemy import create_engine, func, or_, text
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
@@ -290,6 +290,12 @@ _MAX_INSTRUCTION_PAYLOAD_BYTES = 16_384
 _MAX_INSTRUCTION_PAYLOAD_DEPTH = 64
 _MAX_INSTRUCTION_PAYLOAD_NODES = 2048
 _MAX_DURABLE_CLOSE_CANDIDATES = 256
+_MAX_MANAGEMENT_ENCODED_JSON_LAYERS = 8
+_MUTATION_OPERATION_EDGE_WHITESPACE = (
+    " \t\n\r\v\f\x1c\x1d\x1e\x1f\x85\xa0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
+)
 _TERMINAL_MUTATION_STATUSES = frozenset({"confirmed", "rejected", "blocked"})
 _SAFE_TERMINAL_COMPONENT_STATUSES = frozenset(
     {"confirmed", "operator_required", "safely_skipped"}
@@ -4695,7 +4701,13 @@ def _has_durable_close_submission(session, *, batch, leg, entry) -> bool:
     mutation_candidates = (
         session.query(PositionMutationIntent)
         .filter(
-            PositionMutationIntent.operation == "close_position",
+            func.lower(
+                func.trim(
+                    PositionMutationIntent.operation,
+                    _MUTATION_OPERATION_EDGE_WHITESPACE,
+                )
+            )
+            == "close_position",
             or_(
                 PositionMutationIntent.execution_binding_id
                 == int(batch.execution_binding_id),
@@ -4792,28 +4804,96 @@ def _management_owner_payload_refs(
 ) -> tuple[set[int], set[int]] | None:
     management_leg_refs: set[int] = set()
     management_batch_refs: set[int] = set()
+    budget = _ManagementPayloadBudget()
     for field_name in field_names:
         raw = getattr(row, field_name, None)
         if raw in (None, ""):
             continue
-        payload = _bounded_instruction_json(raw)
-        if not isinstance(payload, Mapping):
-            return None
-        if not _collect_management_owner_refs(
-            payload,
+        if not _scan_management_payload_text(
+            raw,
+            budget=budget,
             management_leg_refs=management_leg_refs,
             management_batch_refs=management_batch_refs,
+            depth=1,
+            encoded_layers=0,
         ):
             return None
     return management_leg_refs, management_batch_refs
 
 
+@dataclass(slots=True)
+class _ManagementPayloadBudget:
+    bytes_used: int = 0
+    nodes_used: int = 0
+
+
+def _management_text_requires_decode(value: str) -> bool:
+    stripped = value.lstrip()
+    return bool(
+        "management" in value.lower()
+        or "\\u" in value.lower()
+        or (stripped and stripped[0] in '{["')
+    )
+
+
+def _management_text_has_candidate_token(value: str) -> bool:
+    lowered = value.lower()
+    return "management" in lowered or "\\u" in lowered
+
+
+def _scan_management_payload_text(
+    value: Any,
+    *,
+    budget: _ManagementPayloadBudget,
+    management_leg_refs: set[int],
+    management_batch_refs: set[int],
+    depth: int,
+    encoded_layers: int,
+) -> bool:
+    if not isinstance(value, str):
+        return False
+    if not _management_text_requires_decode(value):
+        return True
+    encoded_size = len(value.encode("utf-8"))
+    budget.bytes_used += encoded_size
+    if (
+        budget.bytes_used > _MAX_INSTRUCTION_PAYLOAD_BYTES
+        or encoded_layers > _MAX_MANAGEMENT_ENCODED_JSON_LAYERS
+    ):
+        return False
+    try:
+        payload = json.loads(
+            value,
+            object_pairs_hook=_instruction_json_object,
+            parse_constant=_reject_instruction_json_constant,
+        )
+    except (TypeError, ValueError, RecursionError, OverflowError):
+        return not _management_text_has_candidate_token(value)
+    return _collect_management_owner_refs(
+        payload,
+        budget=budget,
+        management_leg_refs=management_leg_refs,
+        management_batch_refs=management_batch_refs,
+        depth=depth,
+        encoded_layers=encoded_layers,
+    )
+
+
 def _collect_management_owner_refs(
     value: Any,
     *,
+    budget: _ManagementPayloadBudget,
     management_leg_refs: set[int],
     management_batch_refs: set[int],
+    depth: int,
+    encoded_layers: int,
 ) -> bool:
+    budget.nodes_used += 1
+    if (
+        budget.nodes_used > _MAX_INSTRUCTION_PAYLOAD_NODES
+        or depth > _MAX_INSTRUCTION_PAYLOAD_DEPTH
+    ):
+        return False
     if isinstance(value, Mapping):
         for key, child in value.items():
             destination = (
@@ -4832,8 +4912,11 @@ def _collect_management_owner_refs(
                     return False
             if not _collect_management_owner_refs(
                 child,
+                budget=budget,
                 management_leg_refs=management_leg_refs,
                 management_batch_refs=management_batch_refs,
+                depth=depth + 1,
+                encoded_layers=encoded_layers,
             ):
                 return False
         return True
@@ -4841,11 +4924,29 @@ def _collect_management_owner_refs(
         return all(
             _collect_management_owner_refs(
                 child,
+                budget=budget,
                 management_leg_refs=management_leg_refs,
                 management_batch_refs=management_batch_refs,
+                depth=depth + 1,
+                encoded_layers=encoded_layers,
             )
             for child in value
         )
+    if isinstance(value, str) and _management_text_requires_decode(value):
+        if encoded_layers >= _MAX_MANAGEMENT_ENCODED_JSON_LAYERS:
+            return False
+        return _scan_management_payload_text(
+            value,
+            budget=budget,
+            management_leg_refs=management_leg_refs,
+            management_batch_refs=management_batch_refs,
+            depth=depth + 1,
+            encoded_layers=encoded_layers + 1,
+        )
+    if isinstance(value, float) and not math.isfinite(value):
+        return False
+    if value is not None and not isinstance(value, (bool, int, float, str)):
+        return False
     return True
 
 
