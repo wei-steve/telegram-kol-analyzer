@@ -551,60 +551,69 @@ def load_composite_batch_recovery_snapshot_read_only(
 def _build_batch119_exact_history_scope(
     session_factory,
 ) -> _Batch119ExactHistoryScope:
-    profile = BATCH_119_RECOVERY
     with session_factory() as session:
-        batch = session.get(StrategyManagementBatch, profile.batch_id)
-        lifecycle = session.get(StrategyLifecycle, profile.lifecycle_id)
-        raw = session.get(RawMessage, profile.raw_message_id)
-        if batch is None or lifecycle is None or raw is None:
-            raise CompositeBatchRecoveryRefusal("durable_identity_mismatch")
-        if (
-            int(batch.raw_message_id or 0) != profile.raw_message_id
-            or int(batch.target_lifecycle_id or 0) != profile.lifecycle_id
-            or int(batch.id) != profile.batch_id
-        ):
-            raise CompositeBatchRecoveryRefusal("incident_identity_mismatch")
-        binding = session.get(ExecutionBinding, int(batch.execution_binding_id))
-        legs = (
-            session.query(StrategyManagementLeg)
-            .filter_by(management_batch_id=profile.batch_id)
-            .order_by(StrategyManagementLeg.leg_index, StrategyManagementLeg.id)
-            .all()
-        )
-        if binding is None or len(legs) != 1:
-            raise CompositeBatchRecoveryRefusal("durable_identity_mismatch")
-        leg = legs[0]
-        entry = session.get(ExecutionOrderLeg, int(leg.execution_order_leg_id))
-        if entry is None:
-            raise CompositeBatchRecoveryRefusal("durable_identity_mismatch")
-        identity_reason = _durable_identity_refusal(
-            session=session,
-            batch=batch,
-            raw=raw,
-            lifecycle=lifecycle,
-            binding=binding,
-            entry=entry,
-            leg=leg,
-            profile=profile,
-        )
-        if identity_reason is not None:
-            raise CompositeBatchRecoveryRefusal(identity_reason)
-        rows = (
-            session.query(PositionProtectionLedger)
-            .filter(
-                or_(
-                    PositionProtectionLedger.execution_binding_id
-                    == int(binding.id),
-                    PositionProtectionLedger.execution_order_leg_id
-                    == int(entry.id),
-                    PositionProtectionLedger.pos_id == str(leg.pos_id),
-                )
+        return _build_batch119_exact_history_scope_in_session(session)
+
+
+def _build_batch119_exact_history_scope_in_session(
+    session,
+    *,
+    allowed_unverified_order_refs: frozenset[str] | None = None,
+) -> _Batch119ExactHistoryScope:
+    profile = BATCH_119_RECOVERY
+    batch = session.get(StrategyManagementBatch, profile.batch_id)
+    lifecycle = session.get(StrategyLifecycle, profile.lifecycle_id)
+    raw = session.get(RawMessage, profile.raw_message_id)
+    if batch is None or lifecycle is None or raw is None:
+        raise CompositeBatchRecoveryRefusal("durable_identity_mismatch")
+    if (
+        int(batch.raw_message_id or 0) != profile.raw_message_id
+        or int(batch.target_lifecycle_id or 0) != profile.lifecycle_id
+        or int(batch.id) != profile.batch_id
+    ):
+        raise CompositeBatchRecoveryRefusal("incident_identity_mismatch")
+    binding = session.get(ExecutionBinding, int(batch.execution_binding_id))
+    legs = (
+        session.query(StrategyManagementLeg)
+        .filter_by(management_batch_id=profile.batch_id)
+        .order_by(StrategyManagementLeg.leg_index, StrategyManagementLeg.id)
+        .all()
+    )
+    if binding is None or len(legs) != 1:
+        raise CompositeBatchRecoveryRefusal("durable_identity_mismatch")
+    leg = legs[0]
+    entry = session.get(ExecutionOrderLeg, int(leg.execution_order_leg_id))
+    if entry is None:
+        raise CompositeBatchRecoveryRefusal("durable_identity_mismatch")
+    identity_reason = _durable_identity_refusal(
+        session=session,
+        batch=batch,
+        raw=raw,
+        lifecycle=lifecycle,
+        binding=binding,
+        entry=entry,
+        leg=leg,
+        profile=profile,
+    )
+    if identity_reason is not None:
+        raise CompositeBatchRecoveryRefusal(identity_reason)
+    rows = (
+        session.query(PositionProtectionLedger)
+        .filter(
+            or_(
+                PositionProtectionLedger.execution_binding_id
+                == int(binding.id),
+                PositionProtectionLedger.execution_order_leg_id
+                == int(entry.id),
+                PositionProtectionLedger.pos_id == str(leg.pos_id),
             )
-            .order_by(PositionProtectionLedger.id)
-            .all()
         )
-        canonical_recovery_audit_exists = (
-            _has_canonical_recovery_audit(
+        .order_by(PositionProtectionLedger.id)
+        .all()
+    )
+    if allowed_unverified_order_refs is None:
+        invalid_audit, allowed_unverified_order_refs = (
+            _canonical_recovery_audit_order_refs(
                 session,
                 batch=batch,
                 binding=binding,
@@ -612,58 +621,74 @@ def _build_batch119_exact_history_scope(
                 entry=entry,
             )
         )
-        scoped: list[tuple[str, str]] = []
-        for row in rows:
-            purpose = str(row.purpose or "").lower()
-            exact_owner = (
-                int(row.execution_binding_id) == int(binding.id)
-                and int(row.execution_order_leg_id) == int(entry.id)
-                and str(row.pos_id or "") == str(leg.pos_id)
+        if invalid_audit:
+            raise CompositeBatchRecoveryRefusal(
+                "exact_history_scope_invalid"
             )
-            if purpose == "take_profit" and exact_owner:
-                continue
-            if purpose not in {"stop_loss", "backup_stop"}:
-                if exact_owner:
-                    raise CompositeBatchRecoveryRefusal(
-                        "exact_history_scope_invalid"
-                    )
-                continue
-            order_id = str(row.order_id or "").strip()
-            if (
-                canonical_recovery_audit_exists
-                and exact_owner
-                and str(row.status or "").lower() != "verified"
-            ):
-                # An exact durable after-state may have superseded the original
-                # pair and installed a new verified pair. The canonical audit,
-                # its source fingerprint, and the after-state are all validated
-                # in this same session before any unverified row is skipped.
-                continue
-            if (
-                not exact_owner
-                or str(row.venue or "").lower() != "deepcoin"
-                or str(row.strategy_instance_id or "")
-                != str(batch.strategy_instance_id)
-                or str(row.instrument_id or "").upper()
-                != profile.instrument_id.upper()
-                or str(row.side or "").lower() != profile.side.lower()
-                or str(row.status or "").lower() != "verified"
-                or not order_id
-            ):
-                raise CompositeBatchRecoveryRefusal(
-                    "exact_history_scope_invalid"
-                )
-            try:
-                from telegram_kol_research.deepcoin_client import (
-                    _optional_exact_exchange_id,
-                )
+    return _batch119_exact_history_scope_from_rows(
+        rows,
+        batch=batch,
+        binding=binding,
+        leg=leg,
+        entry=entry,
+        allowed_unverified_order_refs=allowed_unverified_order_refs,
+    )
 
-                _optional_exact_exchange_id(order_id)
-            except Exception:
+
+def _batch119_exact_history_scope_from_rows(
+    rows,
+    *,
+    batch,
+    binding,
+    leg,
+    entry,
+    allowed_unverified_order_refs: frozenset[str] | None,
+) -> _Batch119ExactHistoryScope:
+    profile = BATCH_119_RECOVERY
+    scoped: list[tuple[str, str]] = []
+    for row in rows:
+        purpose = str(row.purpose or "").lower()
+        exact_owner = (
+            _exact_int(row.execution_binding_id) == int(binding.id)
+            and _exact_int(row.execution_order_leg_id) == int(entry.id)
+            and str(row.pos_id or "") == str(leg.pos_id)
+        )
+        if purpose == "take_profit" and exact_owner:
+            continue
+        if purpose not in {"stop_loss", "backup_stop"}:
+            if exact_owner:
                 raise CompositeBatchRecoveryRefusal(
                     "exact_history_scope_invalid"
-                ) from None
-            scoped.append((purpose, order_id))
+                )
+            continue
+        order_id = str(row.order_id or "").strip()
+        immutable_scope_matches = (
+            exact_owner
+            and str(row.venue or "").lower() == "deepcoin"
+            and str(row.strategy_instance_id or "")
+            == str(batch.strategy_instance_id)
+            and str(row.instrument_id or "").upper()
+            == profile.instrument_id.upper()
+            and str(row.side or "").lower() == profile.side.lower()
+            and _safe_exact_history_order_id(order_id)
+        )
+        if str(row.status or "").lower() != "verified":
+            if not (
+                allowed_unverified_order_refs is not None
+                and str(row.status or "").lower() == "superseded"
+                and immutable_scope_matches
+                and str(row.evidence_source or "")
+                == "entry_protection_response"
+                and _redacted_ref("protection_order", order_id)
+                in allowed_unverified_order_refs
+            ):
+                raise CompositeBatchRecoveryRefusal(
+                    "exact_history_scope_invalid"
+                )
+            continue
+        if not immutable_scope_matches:
+            raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
+        scoped.append((purpose, order_id))
     if (
         len(scoped) != 2
         or {purpose for purpose, _ in scoped}
@@ -672,26 +697,39 @@ def _build_batch119_exact_history_scope(
     ):
         raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
     scoped.sort(key=lambda item: item[0])
+    protection_orders = tuple(scoped)
     return _Batch119ExactHistoryScope(
         instrument_id=profile.instrument_id,
         side=profile.side,
         position_id=str(leg.pos_id),
-        protection_orders=tuple(scoped),
+        protection_orders=protection_orders,
         scope_fingerprint=_batch119_exact_scope_fingerprint(
             position_id=str(leg.pos_id),
-            protection_orders=tuple(scoped),
+            protection_orders=protection_orders,
         ),
     )
 
 
-def _has_canonical_recovery_audit(
+def _safe_exact_history_order_id(order_id: str) -> bool:
+    try:
+        from telegram_kol_research.deepcoin_client import (
+            _optional_exact_exchange_id,
+        )
+
+        _optional_exact_exchange_id(order_id)
+    except Exception:
+        return False
+    return True
+
+
+def _canonical_recovery_audit_order_refs(
     session,
     *,
     batch,
     binding,
     leg,
     entry,
-) -> bool:
+) -> tuple[bool, frozenset[str] | None]:
     events = (
         session.query(ExecutionEvent)
         .filter(
@@ -700,8 +738,10 @@ def _has_canonical_recovery_audit(
         )
         .all()
     )
+    if not events:
+        return False, None
     if len(events) != 1 or not _is_sha256(events[0].notification_fingerprint):
-        return False
+        return True, None
     try:
         after = _validated_resume_audit_event(
             events[0],
@@ -722,8 +762,8 @@ def _has_canonical_recovery_audit(
             profile=BATCH_119_RECOVERY,
         )
         if isinstance(contract, str) or isinstance(target, str):
-            return False
-        return _recovery_audit_matches_current_durable_state(
+            return True, None
+        if not _recovery_audit_matches_current_durable_state(
             session,
             event=events[0],
             after=after,
@@ -734,7 +774,18 @@ def _has_canonical_recovery_audit(
             components=components,
             contract=contract,
             target=target,
-        )
+        ):
+            if _canonical_audit_original_rows_still_owned(
+                session,
+                after=after,
+                batch=batch,
+                binding=binding,
+                leg=leg,
+                entry=entry,
+            ):
+                return False, None
+            return True, None
+        return False, frozenset(after["original_owned_stop_refs"])
     except (
         CompositeBatchRecoveryConflict,
         CompositeBatchRecoveryRefusal,
@@ -743,7 +794,55 @@ def _has_canonical_recovery_audit(
         RecursionError,
         OverflowError,
     ):
+        return True, None
+
+
+def _canonical_audit_original_rows_still_owned(
+    session,
+    *,
+    after: Mapping[str, Any],
+    batch,
+    binding,
+    leg,
+    entry,
+) -> bool:
+    original_refs = after.get("original_owned_stop_refs")
+    if not isinstance(original_refs, list) or not original_refs:
         return False
+    matches: dict[str, Any] = {}
+    for row in session.query(PositionProtectionLedger).all():
+        order_id = str(row.order_id or "").strip()
+        if not _safe_exact_history_order_id(order_id):
+            continue
+        order_ref = _redacted_ref("protection_order", order_id)
+        if order_ref not in original_refs:
+            continue
+        if order_ref in matches:
+            return False
+        matches[order_ref] = row
+    if set(matches) != set(original_refs):
+        return False
+    for row in matches.values():
+        if (
+            _exact_int(row.execution_binding_id) != int(binding.id)
+            or _exact_int(row.execution_order_leg_id) != int(entry.id)
+            or str(row.pos_id or "") != str(leg.pos_id)
+            or str(row.venue or "").lower() != "deepcoin"
+            or str(row.strategy_instance_id or "")
+            != str(batch.strategy_instance_id)
+            or str(row.instrument_id or "").upper()
+            != BATCH_119_RECOVERY.instrument_id.upper()
+            or str(row.side or "").lower()
+            != BATCH_119_RECOVERY.side.lower()
+            or str(row.purpose or "").lower()
+            not in {"stop_loss", "backup_stop"}
+            or str(row.status or "").lower()
+            not in {"verified", "superseded"}
+            or str(row.evidence_source or "")
+            != "entry_protection_response"
+        ):
+            return False
+    return True
 
 
 def _recovery_audit_matches_current_durable_state(
@@ -1049,14 +1148,22 @@ def _batch119_exact_scope_fingerprint(
 ) -> str:
     return _fingerprint(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "batch_id": BATCH_119_RECOVERY.batch_id,
             "position_ref": _redacted_ref(
                 "recovery_position", position_id
             ),
-            "protection_refs": sorted(
-                _redacted_ref("protection_order", order_id)
-                for _, order_id in protection_orders
+            "protection_scope": sorted(
+                (
+                    {
+                        "purpose": str(purpose),
+                        "order_ref": _redacted_ref(
+                            "protection_order", order_id
+                        ),
+                    }
+                    for purpose, order_id in protection_orders
+                ),
+                key=lambda row: (row["purpose"], row["order_ref"]),
             ),
         }
     )
@@ -1454,6 +1561,31 @@ def authorize_composite_batch_recovery_resume(
             raise CompositeBatchRecoveryConflict(
                 "additional_active_work_present"
             )
+        exact_audited_after_state = (
+            str(batch.status) == str(after["batch_status"])
+            and str(leg.status) == str(after["leg_status"])
+            and [str(row.status) for row in components]
+            == list(after["component_statuses"])
+            and [int(row.attempt_count) for row in components]
+            == list(after["component_attempt_counts"])
+        )
+        if exact_audited_after_state and not (
+            _recovery_audit_matches_current_durable_state(
+                session,
+                event=event,
+                after=after,
+                batch=batch,
+                binding=binding,
+                leg=leg,
+                entry=entry,
+                components=components,
+                contract=contract,
+                target=target,
+            )
+        ):
+            raise CompositeBatchRecoveryConflict(
+                "resume_source_state_conflict"
+            )
         _validate_progressed_recovery_state(
             session,
             batch=batch,
@@ -1468,6 +1600,21 @@ def authorize_composite_batch_recovery_resume(
             approved_current_size=after["current_size"],
             original_owned_stop_refs=original_owned_stop_refs,
         )
+        try:
+            durable_scope = _build_batch119_exact_history_scope_in_session(
+                session
+            )
+        except CompositeBatchRecoveryRefusal as exc:
+            raise CompositeBatchRecoveryConflict(
+                "resume_source_state_conflict"
+            ) from exc
+        if (
+            durable_scope.scope_fingerprint
+            != str(snapshot.scope_fingerprint)
+        ):
+            raise CompositeBatchRecoveryConflict(
+                "resume_source_state_conflict"
+            )
         if not _resume_exchange_close_evidence_is_owned(
             session,
             snapshot=snapshot,
@@ -2990,6 +3137,24 @@ def _build_composite_batch_recovery_plan(
         )
         if identity_reason is not None:
             return _refusal(profile.batch_id, identity_reason)
+
+        try:
+            durable_scope = _build_batch119_exact_history_scope_in_session(
+                session
+            )
+        except CompositeBatchRecoveryRefusal:
+            return _refusal(
+                profile.batch_id,
+                "durable_snapshot_scope_mismatch",
+            )
+        if (
+            durable_scope.scope_fingerprint
+            != str(snapshot.scope_fingerprint)
+        ):
+            return _refusal(
+                profile.batch_id,
+                "durable_snapshot_scope_mismatch",
+            )
 
         contract_result = _validated_contract(batch, profile=profile)
         if isinstance(contract_result, str):
@@ -5492,6 +5657,10 @@ def _source_evidence_payload(
                 "entry_leg_ref": _redacted_ref(
                     "protection_entry_leg", row.execution_order_leg_id
                 ),
+                "venue": str(row.venue),
+                "strategy_ref": _redacted_ref(
+                    "protection_strategy", row.strategy_instance_id
+                ),
                 "position_ref": _redacted_ref("protection_position", row.pos_id),
                 "order_ref": _redacted_ref("protection_order", row.order_id),
                 "instrument_id": str(row.instrument_id),
@@ -5500,6 +5669,7 @@ def _source_evidence_payload(
                 "size": str(row.size_text),
                 "trigger_price": str(row.trigger_price),
                 "status": str(row.status),
+                "evidence_source": str(row.evidence_source),
                 "evidence_fingerprint": _optional_json_fingerprint(
                     row.evidence_json
                 ),

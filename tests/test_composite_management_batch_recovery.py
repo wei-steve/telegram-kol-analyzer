@@ -3105,7 +3105,7 @@ def test_live_position_requires_primary_and_backup_verified_stops(tmp_path):
     plan = _plan(factory, _snapshot(pending_trigger_orders=[]))
 
     assert plan.status == "refused"
-    assert plan.reason_code == "unexpected_protection_ownership"
+    assert plan.reason_code == "durable_snapshot_scope_mismatch"
 
 
 def test_live_position_rejects_take_profit_without_primary_and_backup_stops(tmp_path):
@@ -3127,7 +3127,7 @@ def test_live_position_rejects_take_profit_without_primary_and_backup_stops(tmp_
     plan = _plan(factory, _snapshot(pending_trigger_orders=pending))
 
     assert plan.status == "refused"
-    assert plan.reason_code == "unexpected_protection_ownership"
+    assert plan.reason_code == "durable_snapshot_scope_mismatch"
 
 
 @pytest.mark.parametrize(
@@ -3154,7 +3154,11 @@ def test_live_position_rejects_protection_ledger_identity_drift(
     plan = _plan(factory)
 
     assert plan.status == "refused"
-    assert plan.reason_code == "unexpected_protection_ownership"
+    assert plan.reason_code == (
+        "unexpected_protection_ownership"
+        if field == "size_text"
+        else "durable_snapshot_scope_mismatch"
+    )
 
 
 @pytest.mark.parametrize(
@@ -3608,7 +3612,7 @@ def test_live_position_rejects_duplicate_required_stop_role(
     plan = _plan(factory, _snapshot(pending_trigger_orders=pending))
 
     assert plan.status == "refused"
-    assert plan.reason_code == "unexpected_protection_ownership"
+    assert plan.reason_code == "durable_snapshot_scope_mismatch"
 
 
 def test_live_position_allows_verified_additional_take_profit(tmp_path):
@@ -5774,6 +5778,16 @@ class _Batch119ExactHistoryClient:
         return self._wide_rows("fills")
 
 
+class _Batch119AbsentExactHistoryClient(_Batch119ExactHistoryClient):
+    def read_positions(self, *, inst_id=None):
+        self.network_calls += 1
+        return {"data": []}
+
+    def read_trigger_orders_pending(self, *, inst_id):
+        self.network_calls += 1
+        return {"data": []}
+
+
 def test_batch119_snapshot_uses_only_exact_history_scope(tmp_path):
     module = _recovery_module()
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
@@ -5798,6 +5812,169 @@ def test_batch119_snapshot_uses_only_exact_history_scope(tmp_path):
     assert POS_ID not in repr(snapshot)
     assert PRIMARY_ORDER_ID not in repr(snapshot)
     assert BACKUP_ORDER_ID not in repr(snapshot)
+
+
+def test_batch119_planner_rejects_durable_scope_drift_after_exact_capture(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=_Batch119AbsentExactHistoryClient(
+            exact_position_response={"data": []}
+        ),
+    )
+    assert snapshot.errors == {}
+    assert snapshot.exact_scope.protection_orders == (
+        ("backup_stop", BACKUP_ORDER_ID),
+        ("stop_loss", PRIMARY_ORDER_ID),
+    )
+    with factory() as session:
+        backup = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id=BACKUP_ORDER_ID)
+            .one()
+        )
+        backup.order_id = "safe-backup-after-exact-capture"
+        session.commit()
+
+    plan = module.build_composite_batch_recovery_plan(
+        factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=snapshot,
+        planned_at=NOW,
+    )
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "durable_snapshot_scope_mismatch"
+
+
+def test_batch119_planner_rejects_purpose_mapping_drift_after_exact_capture(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=_Batch119AbsentExactHistoryClient(
+            exact_position_response={"data": []}
+        ),
+    )
+    with factory() as session:
+        primary = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id=PRIMARY_ORDER_ID)
+            .one()
+        )
+        backup = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id=BACKUP_ORDER_ID)
+            .one()
+        )
+        primary.purpose = "backup_stop"
+        backup.purpose = "stop_loss"
+        session.commit()
+
+    plan = module.build_composite_batch_recovery_plan(
+        factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=snapshot,
+        planned_at=NOW,
+    )
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "durable_snapshot_scope_mismatch"
+
+
+def test_batch119_resume_rejects_durable_scope_drift_after_exact_capture(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=_Batch119AbsentExactHistoryClient(
+            exact_position_response={"data": []}
+        ),
+    )
+    plan = module.build_composite_batch_recovery_plan(
+        factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=snapshot,
+        planned_at=NOW,
+    )
+    assert plan.status == "ready"
+    assert plan.position.disposition == "position_absent"
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with factory() as session:
+        backup = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id=BACKUP_ORDER_ID)
+            .one()
+        )
+        backup.order_id = "safe-backup-after-exact-resume-capture"
+        session.commit()
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="resume_source_state_conflict",
+    ):
+        module.authorize_composite_batch_recovery_resume(
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=snapshot,
+        )
+
+
+def test_batch119_resume_rejects_original_stop_source_drift_after_capture(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=_Batch119AbsentExactHistoryClient(
+            exact_position_response={"data": []}
+        ),
+    )
+    plan = module.build_composite_batch_recovery_plan(
+        factory,
+        profile=module.BATCH_119_RECOVERY,
+        snapshot=snapshot,
+        planned_at=NOW,
+    )
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    with factory() as session:
+        backup = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id=BACKUP_ORDER_ID)
+            .one()
+        )
+        backup.evidence_source = "drifted_after_exact_capture"
+        session.commit()
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="resume_source_state_conflict",
+    ):
+        module.authorize_composite_batch_recovery_resume(
+            factory,
+            expected_fingerprint=plan.evidence_fingerprint,
+            snapshot=snapshot,
+        )
 
 
 def test_batch119_exact_history_page_limit_without_completion_is_incomplete(
@@ -6203,6 +6380,227 @@ def test_batch119_canonical_audit_does_not_hide_original_stop_source_drift(
                 instrument_id="BTC-USDT-SWAP",
                 side="long",
                 order_id="replacement-backup-after-source-drift",
+                purpose="backup_stop",
+                trigger_price="62000",
+                size_text="19",
+                status="verified",
+                evidence_source="composite_management_replacement",
+                evidence_json="{}",
+                first_seen_at=replacement_at,
+                last_seen_at=replacement_at,
+                last_verified_at=replacement_at,
+                created_at=replacement_at,
+                updated_at=replacement_at,
+            )
+        )
+        session.commit()
+    client = _Batch119ExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {"exact_scope": "exact_history_scope_invalid"}
+    assert client.network_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("field_name", "drifted_value"),
+    [
+        ("evidence_source", "forged_recovery_source"),
+        ("venue", "forged-venue"),
+        ("strategy_instance_id", "deepcoin:incident:other"),
+    ],
+)
+def test_batch119_canonical_audit_does_not_hide_original_stop_identity_drift(
+    tmp_path,
+    field_name,
+    drifted_value,
+):
+    module = _recovery_module()
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    plan = _plan(factory)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    replacement_at = NOW.replace(second=1)
+    with factory() as session:
+        backup = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id=BACKUP_ORDER_ID)
+            .one()
+        )
+        backup.status = "superseded"
+        setattr(backup, field_name, drifted_value)
+        backup.updated_at = replacement_at
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                strategy_instance_id="deepcoin:incident:btc:long",
+                pos_id=POS_ID,
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id=f"replacement-backup-after-{field_name}-drift",
+                purpose="backup_stop",
+                trigger_price="62000",
+                size_text="19",
+                status="verified",
+                evidence_source="composite_management_replacement",
+                evidence_json="{}",
+                first_seen_at=replacement_at,
+                last_seen_at=replacement_at,
+                last_verified_at=replacement_at,
+                created_at=replacement_at,
+                updated_at=replacement_at,
+            )
+        )
+        session.commit()
+    client = _Batch119ExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {"exact_scope": "exact_history_scope_invalid"}
+    assert client.network_calls == 0
+
+
+def test_batch119_invalid_audit_cannot_hide_stop_that_escaped_owner_query(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    plan = _plan(factory)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    replacement_at = NOW.replace(second=1)
+    with factory() as session:
+        escaped_binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:escaped:btc:long",
+            kol_id="escaped-source",
+            chat_id=999,
+            message_id=999,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            pos_id="escaped-position",
+            margin_mode="cross",
+            position_mode="split",
+            status="active",
+        )
+        session.add(escaped_binding)
+        session.flush()
+        escaped_entry = ExecutionOrderLeg(
+            execution_binding_id=escaped_binding.id,
+            strategy_instance_id=escaped_binding.strategy_instance_id,
+            leg_index=0,
+            purpose="entry",
+            order_kind="market",
+            order_id="escaped-entry-order",
+            pos_id="escaped-position",
+            venue="deepcoin",
+            attribution_status="verified",
+            attribution_evidence_json='{"policy_version":2}',
+            status="active",
+        )
+        session.add(escaped_entry)
+        session.flush()
+        backup = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id=BACKUP_ORDER_ID)
+            .one()
+        )
+        backup.status = "superseded"
+        backup.execution_binding_id = escaped_binding.id
+        backup.execution_order_leg_id = escaped_entry.id
+        backup.pos_id = "escaped-position"
+        backup.updated_at = replacement_at
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                strategy_instance_id="deepcoin:incident:btc:long",
+                pos_id=POS_ID,
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id="replacement-after-owner-query-escape",
+                purpose="backup_stop",
+                trigger_price="62000",
+                size_text="19",
+                status="verified",
+                evidence_source="composite_management_replacement",
+                evidence_json="{}",
+                first_seen_at=replacement_at,
+                last_seen_at=replacement_at,
+                last_verified_at=replacement_at,
+                created_at=replacement_at,
+                updated_at=replacement_at,
+            )
+        )
+        session.commit()
+    client = _Batch119ExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {"exact_scope": "exact_history_scope_invalid"}
+    assert client.network_calls == 0
+
+
+def test_batch119_canonical_audit_only_allows_superseded_original_stop(
+    tmp_path,
+):
+    module = _recovery_module()
+    factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    plan = _plan(factory)
+    module.apply_composite_batch_false_state_repair(
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+    replacement_at = NOW.replace(second=1)
+    with factory() as session:
+        backup = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id=BACKUP_ORDER_ID)
+            .one()
+        )
+        backup.status = "cancelled"
+        backup.updated_at = replacement_at
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=entry_id,
+                strategy_instance_id="deepcoin:incident:btc:long",
+                pos_id=POS_ID,
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id="replacement-after-cancelled-original",
                 purpose="backup_stop",
                 trigger_price="62000",
                 size_text="19",
