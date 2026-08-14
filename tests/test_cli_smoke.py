@@ -3599,12 +3599,13 @@ def test_recover_composite_management_batch_invalid_specs_stop_before_repair(
     assert repair_calls == []
 
 
-def test_recover_composite_management_batch_rejects_writer_account_drift_before_db(
+def test_recover_composite_management_batch_checks_writer_account_after_repair(
     tmp_path,
     monkeypatch,
 ):
     import telegram_kol_research.cli as cli_module
     from telegram_kol_research.composite_management_batch_recovery import (
+        CompositeBatchRecoveryApplyResult,
         CompositeBatchRecoveryPlan,
         CompositeRecoveryPosition,
     )
@@ -3627,7 +3628,7 @@ def test_recover_composite_management_batch_rejects_writer_account_drift_before_
         evidence_fingerprint="c" * 64,
         evidence={"schema_version": 1},
     )
-    writable_factory_calls = []
+    call_order = []
     monkeypatch.setattr(
         cli_module,
         "create_composite_recovery_read_only_session_factory",
@@ -3636,7 +3637,7 @@ def test_recover_composite_management_batch_rejects_writer_account_drift_before_
     monkeypatch.setattr(
         cli_module,
         "create_existing_session_factory",
-        lambda path: writable_factory_calls.append(path),
+        lambda path: call_order.append("factory") or object(),
     )
     monkeypatch.setattr(
         cli_module,
@@ -3646,7 +3647,8 @@ def test_recover_composite_management_batch_rejects_writer_account_drift_before_
     monkeypatch.setattr(
         cli_module,
         "build_deepcoin_client_from_env",
-        lambda: SimpleNamespace(uid_scope_hash="b" * 64),
+        lambda: call_order.append("writer")
+        or SimpleNamespace(uid_scope_hash="b" * 64),
     )
     monkeypatch.setattr(
         cli_module,
@@ -3674,8 +3676,12 @@ def test_recover_composite_management_batch_rejects_writer_account_drift_before_
     monkeypatch.setattr(
         cli_module,
         "apply_composite_batch_false_state_repair",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("account drift must stop before repair")
+        lambda *args, **kwargs: call_order.append("repair")
+        or CompositeBatchRecoveryApplyResult(
+            batch_id=119,
+            status="repaired",
+            evidence_fingerprint=plan.evidence_fingerprint,
+            audit_event_id=1,
         ),
     )
     monkeypatch.setattr(
@@ -3708,7 +3714,7 @@ def test_recover_composite_management_batch_rejects_writer_account_drift_before_
     assert json.loads(result.stdout)["reason_code"] == (
         "exchange_account_scope_mismatch"
     )
-    assert writable_factory_calls == []
+    assert call_order == ["factory", "repair", "writer"]
 
 
 def test_recover_composite_management_batch_position_absent_never_builds_writer(

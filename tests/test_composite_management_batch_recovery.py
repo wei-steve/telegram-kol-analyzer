@@ -406,7 +406,7 @@ def _snapshot(**overrides):
             "collection_authority": tuple(inner_authority),
         }
     )
-    candidate = SimpleNamespace(**values)
+    candidate = module.Batch119ExactRecoverySnapshot(**values)
     try:
         collections_fingerprint = (
             module._batch119_snapshot_collections_fingerprint(candidate)
@@ -448,7 +448,10 @@ def _snapshot(**overrides):
         complete=True,
         reason_code=None,
     )
-    return candidate
+    try:
+        return module._seal_batch119_recovery_snapshot(candidate)
+    except (TypeError, ValueError, RecursionError, OverflowError):
+        return candidate
 
 
 def _seed_batch_119_false_submission(tmp_path):
@@ -1691,7 +1694,7 @@ def test_target_workflow_marker_drift_conflicts_under_lock_without_writes(
         module.CompositeBatchRecoveryConflict,
         match="source_state_conflict",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=plan.evidence_fingerprint,
@@ -1725,7 +1728,7 @@ def test_unknown_workflow_marker_drift_conflicts_under_lock_without_writes(
         module.CompositeBatchRecoveryConflict,
         match="source_state_conflict",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=plan.evidence_fingerprint,
@@ -1770,7 +1773,7 @@ def test_approved_pending_execution_semantics_drift_conflicts_without_writes(
         module.CompositeBatchRecoveryConflict,
         match="source_state_conflict",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=plan.evidence_fingerprint,
@@ -1881,7 +1884,7 @@ def test_approved_pending_running_mimo_run_conflicts_without_writes(
         module.CompositeBatchRecoveryConflict,
         match="source_state_conflict",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=before,
             expected_fingerprint=before.evidence_fingerprint,
@@ -1923,7 +1926,7 @@ def test_approved_pending_extraction_claim_conflicts_without_writes(
         module.CompositeBatchRecoveryConflict,
         match="source_state_conflict",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=before,
             expected_fingerprint=before.evidence_fingerprint,
@@ -2006,7 +2009,7 @@ def test_resume_rejects_new_valid_instruction_population_after_repair(
     module = _recovery_module()
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     plan = _plan(factory)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -2060,7 +2063,7 @@ def test_entry_terminal_mirror_binding_drift_changes_fingerprint_and_cas(
         module.CompositeBatchRecoveryConflict,
         match="source_fingerprint_conflict",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=before,
             expected_fingerprint=before.evidence_fingerprint,
@@ -2092,7 +2095,7 @@ def test_unknown_lifecycle_full_row_drift_changes_fingerprint_and_cas(
         module.CompositeBatchRecoveryConflict,
         match="source_fingerprint_conflict",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=before,
             expected_fingerprint=before.evidence_fingerprint,
@@ -2128,7 +2131,7 @@ def test_verified_entry_binding_full_row_drift_changes_fingerprint_and_cas(
         module.CompositeBatchRecoveryConflict,
         match="source_fingerprint_conflict",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=before,
             expected_fingerprint=before.evidence_fingerprint,
@@ -2175,7 +2178,7 @@ def test_verified_management_binding_full_row_drift_changes_fingerprint_and_cas(
         module.CompositeBatchRecoveryConflict,
         match="source_fingerprint_conflict",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=before,
             expected_fingerprint=before.evidence_fingerprint,
@@ -2211,13 +2214,38 @@ def test_verified_management_binding_identity_drift_is_refused(
     assert plan.reason_code == "additional_active_work_present"
 
 
+_PLAN_SNAPSHOTS = {}
+_MISSING_SNAPSHOT = object()
+
+
 def _plan(factory, snapshot=None):
     module = _recovery_module()
-    return module.build_composite_batch_recovery_plan(
+    captured = snapshot or _snapshot()
+    plan = module.build_composite_batch_recovery_plan(
         factory,
         profile=module.BATCH_119_RECOVERY,
-        snapshot=snapshot or _snapshot(),
+        snapshot=captured,
         planned_at=NOW,
+    )
+    _PLAN_SNAPSHOTS[id(plan)] = captured
+    return plan
+
+
+def _apply_recovery(
+    module,
+    session_factory,
+    *,
+    plan,
+    snapshot=_MISSING_SNAPSHOT,
+    **kwargs,
+):
+    if snapshot is _MISSING_SNAPSHOT:
+        snapshot = _PLAN_SNAPSHOTS.get(id(plan))
+    return module.apply_composite_batch_false_state_repair(
+        session_factory,
+        plan=plan,
+        snapshot=snapshot,
+        **kwargs,
     )
 
 
@@ -2561,7 +2589,7 @@ def test_natural_stop_refuses_nonzero_position_identity_conflict_before_apply(
         module.CompositeBatchRecoveryConflict,
         match="plan_not_actionable",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=plan.evidence_fingerprint,
@@ -2956,7 +2984,7 @@ def test_natural_stop_apply_cas_refuses_late_normalized_close_operation(
         module.CompositeBatchRecoveryConflict,
         match="source_state_conflict",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=plan.evidence_fingerprint,
@@ -2972,7 +3000,7 @@ def test_natural_stop_resume_refuses_late_normalized_close_operation(tmp_path):
     )
     snapshot = _natural_stop_snapshot()
     plan = _plan(factory, snapshot)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         snapshot=snapshot,
@@ -3124,7 +3152,7 @@ def test_natural_stop_apply_refuses_late_target_non_string_operation(
         module.CompositeBatchRecoveryConflict,
         match="source_state_conflict",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=plan.evidence_fingerprint,
@@ -3148,7 +3176,7 @@ def test_natural_stop_resume_refuses_late_target_non_string_operation(
     )
     snapshot = _natural_stop_snapshot()
     plan = _plan(factory, snapshot)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         snapshot=snapshot,
@@ -3468,7 +3496,7 @@ def test_natural_stop_apply_cas_refuses_late_partially_linked_target_event(
         module.CompositeBatchRecoveryConflict,
         match="source_state_conflict",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=plan.evidence_fingerprint,
@@ -3484,7 +3512,7 @@ def test_natural_stop_resume_refuses_late_partially_linked_target_event(
     factory, _, _, _, leg_id = _seed_batch_119_false_submission(tmp_path)
     snapshot = _natural_stop_snapshot()
     plan = _plan(factory, snapshot)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         snapshot=snapshot,
@@ -3594,7 +3622,7 @@ def test_natural_stop_apply_cas_refuses_late_whitespace_payload_target_event(
         module.CompositeBatchRecoveryConflict,
         match="source_state_conflict",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=plan.evidence_fingerprint,
@@ -3610,7 +3638,7 @@ def test_natural_stop_resume_refuses_late_whitespace_payload_target_event(
     factory, _, _, _, leg_id = _seed_batch_119_false_submission(tmp_path)
     snapshot = _natural_stop_snapshot()
     plan = _plan(factory, snapshot)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         snapshot=snapshot,
@@ -3677,7 +3705,7 @@ def test_natural_stop_apply_cas_refuses_late_escaped_key_target_event(
         module.CompositeBatchRecoveryConflict,
         match="source_state_conflict",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=plan.evidence_fingerprint,
@@ -3691,7 +3719,7 @@ def test_natural_stop_resume_refuses_late_escaped_key_target_event(tmp_path):
     factory, _, _, _, leg_id = _seed_batch_119_false_submission(tmp_path)
     snapshot = _natural_stop_snapshot()
     plan = _plan(factory, snapshot)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         snapshot=snapshot,
@@ -3750,7 +3778,7 @@ def test_natural_stop_apply_cas_rejects_late_wrong_position_close_mutation(
         module.CompositeBatchRecoveryConflict,
         match="source_state_conflict",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=plan.evidence_fingerprint,
@@ -4245,7 +4273,7 @@ def test_natural_stop_query_operational_error_fails_closed_without_writes(
         plan = _plan(factory, snapshot)
         assert plan.status == "ready"
     if phase == "resume":
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             snapshot=snapshot,
@@ -4266,7 +4294,7 @@ def test_natural_stop_query_operational_error_fails_closed_without_writes(
             module.CompositeBatchRecoveryConflict,
             match="source_state_conflict",
         ):
-            module.apply_composite_batch_false_state_repair(
+            _apply_recovery(module,
                 factory,
                 plan=plan,
                 expected_fingerprint=plan.evidence_fingerprint,
@@ -4385,7 +4413,7 @@ def test_natural_stop_db_evidence_window_blocks_external_close_writer(
     if phase == "resume":
         plan = _plan(factory, snapshot)
         assert plan.status == "ready"
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             snapshot=snapshot,
@@ -4536,7 +4564,7 @@ def test_natural_stop_apply_refuses_late_suspicious_incomplete_other_owner(
         module.CompositeBatchRecoveryConflict,
         match="source_state_conflict",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=plan.evidence_fingerprint,
@@ -4561,7 +4589,7 @@ def test_natural_stop_resume_refuses_late_suspicious_incomplete_other_owner(
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     snapshot = _natural_stop_snapshot()
     plan = _plan(factory, snapshot)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         snapshot=snapshot,
@@ -4774,7 +4802,7 @@ def test_natural_stop_apply_cas_refuses_late_double_encoded_target_event(
         module.CompositeBatchRecoveryConflict,
         match="source_state_conflict",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=plan.evidence_fingerprint,
@@ -4788,7 +4816,7 @@ def test_natural_stop_resume_refuses_late_double_encoded_target_event(tmp_path):
     factory, _, _, _, leg_id = _seed_batch_119_false_submission(tmp_path)
     snapshot = _natural_stop_snapshot()
     plan = _plan(factory, snapshot)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         snapshot=snapshot,
@@ -5033,7 +5061,7 @@ def test_natural_stop_apply_cas_binds_durable_incident_time_boundary(tmp_path):
         module.CompositeBatchRecoveryConflict,
         match="source_state_conflict",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=plan.evidence_fingerprint,
@@ -5050,7 +5078,7 @@ def test_natural_stop_resume_rebuilds_same_incident_time_authority(tmp_path):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     snapshot = _natural_stop_snapshot()
     plan = _plan(factory, snapshot)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         snapshot=snapshot,
@@ -5087,7 +5115,7 @@ def test_natural_stop_resume_refuses_new_exact_durable_close_evidence(
     )
     snapshot = _natural_stop_snapshot()
     plan = _plan(factory, snapshot)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         snapshot=snapshot,
@@ -5146,7 +5174,7 @@ def test_natural_stop_resume_without_new_close_evidence_is_repeatable(tmp_path):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     snapshot = _natural_stop_snapshot()
     plan = _plan(factory, snapshot)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         snapshot=snapshot,
@@ -6844,7 +6872,7 @@ def test_apply_repairs_only_false_legacy_state_in_one_transaction(tmp_path):
     module = _recovery_module()
     plan = _plan(factory)
 
-    result = module.apply_composite_batch_false_state_repair(
+    result = _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -6931,7 +6959,7 @@ def test_recovery_status_summary_counts_only_component_owned_mutations(tmp_path)
         tmp_path
     )
     plan = _plan(factory)
-    repair = module.apply_composite_batch_false_state_repair(
+    repair = _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -7014,7 +7042,7 @@ def test_apply_rejects_internally_forged_plan_without_writes(tmp_path, tamper):
         forged = replace(plan, evidence=evidence)
 
     with pytest.raises(module.CompositeBatchRecoveryConflict):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=forged,
             expected_fingerprint=forged.evidence_fingerprint,
@@ -7057,7 +7085,7 @@ def test_apply_rejects_invalid_authority_or_plan_envelope(
     with pytest.raises(
         module.CompositeBatchRecoveryConflict, match=reason_code
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=expected,
@@ -7091,7 +7119,7 @@ def test_apply_rejects_forged_fingerprint_before_opening_db(
         raise AssertionError("stale fingerprint opened DB")
 
     with pytest.raises(module.CompositeBatchRecoveryConflict):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             forbidden_factory,
             plan=plan,
             expected_fingerprint=expected,
@@ -7140,7 +7168,7 @@ def test_apply_rejects_durable_state_drift_and_rolls_back(
         session.commit()
 
     with pytest.raises(module.CompositeBatchRecoveryConflict):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=plan.evidence_fingerprint,
@@ -7181,7 +7209,7 @@ def test_apply_rejects_new_close_intent_after_plan_and_writes_nothing(tmp_path):
         session.commit()
 
     with pytest.raises(module.CompositeBatchRecoveryConflict):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=plan.evidence_fingerprint,
@@ -7209,7 +7237,7 @@ def test_apply_acquires_immediate_lock_before_first_read(tmp_path):
 
     event.listen(engine, "before_cursor_execute", record_statement)
     try:
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=plan.evidence_fingerprint,
@@ -7239,7 +7267,7 @@ def test_concurrent_apply_creates_one_audit_and_returns_already_repaired(tmp_pat
         try:
             barrier.wait()
             results.append(
-                module.apply_composite_batch_false_state_repair(
+                _apply_recovery(module,
                     factory,
                     plan=plan,
                     expected_fingerprint=plan.evidence_fingerprint,
@@ -7282,7 +7310,7 @@ def test_resume_authorization_accepts_only_audited_progressed_batch_state(
         tmp_path
     )
     plan = _plan(factory)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -7462,7 +7490,7 @@ def test_resume_authorization_rejects_forged_component_execution_plan(
     module = _recovery_module()
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     plan = _plan(factory)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -7509,7 +7537,7 @@ def test_resume_authorization_rejects_forged_confirmed_component(
     module = _recovery_module()
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     plan = _plan(factory)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -7555,7 +7583,7 @@ def test_resume_authorization_rejects_no_cancel_tp_while_still_pending(
         tmp_path
     )
     plan = _plan(factory)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -7637,7 +7665,7 @@ def test_resume_authorization_rejects_recovery_audit_binding_drift(tmp_path):
     module = _recovery_module()
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     plan = _plan(factory)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -7675,7 +7703,7 @@ def test_resume_authorization_rejects_shrunk_original_stop_set(tmp_path):
     module = _recovery_module()
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     plan = _plan(factory)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -7792,7 +7820,7 @@ def test_resume_authorization_rejects_unowned_new_exchange_close(tmp_path):
     module = _recovery_module()
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     plan = _plan(factory)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -7927,7 +7955,7 @@ def test_apply_rejects_new_additional_active_work_after_plan(tmp_path, kind):
         session.commit()
 
     with pytest.raises(module.CompositeBatchRecoveryConflict):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=plan.evidence_fingerprint,
@@ -7944,7 +7972,7 @@ def test_repeated_apply_requires_exact_audit_and_after_state(tmp_path):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     module = _recovery_module()
     plan = _plan(factory)
-    repaired = module.apply_composite_batch_false_state_repair(
+    repaired = _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -7952,7 +7980,7 @@ def test_repeated_apply_requires_exact_audit_and_after_state(tmp_path):
         applied_at=NOW,
     )
 
-    repeated = module.apply_composite_batch_false_state_repair(
+    repeated = _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -8001,7 +8029,7 @@ def test_repeated_apply_rejects_tampered_audit_or_after_state(tmp_path, tamper):
     )
     module = _recovery_module()
     plan = _plan(factory)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -8077,7 +8105,7 @@ def test_repeated_apply_rejects_tampered_audit_or_after_state(tmp_path, tamper):
         session.commit()
 
     with pytest.raises(module.CompositeBatchRecoveryConflict):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=plan.evidence_fingerprint,
@@ -8107,7 +8135,7 @@ def test_repeated_apply_rejects_new_additional_active_work(tmp_path, kind):
     )
     module = _recovery_module()
     plan = _plan(factory)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -8181,7 +8209,7 @@ def test_repeated_apply_rejects_new_additional_active_work(tmp_path, kind):
         session.commit()
 
     with pytest.raises(module.CompositeBatchRecoveryConflict):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=plan.evidence_fingerprint,
@@ -8210,7 +8238,7 @@ def test_apply_rejects_deep_forged_plan_as_bounded_conflict(tmp_path):
     forged = replace(plan, evidence=evidence)
 
     with pytest.raises(module.CompositeBatchRecoveryConflict):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=forged,
             expected_fingerprint=forged.evidence_fingerprint,
@@ -8248,7 +8276,7 @@ def test_apply_binds_plan_counts_to_locked_durable_rows(tmp_path, field):
     )
 
     with pytest.raises(module.CompositeBatchRecoveryConflict):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=forged,
             expected_fingerprint=forged.evidence_fingerprint,
@@ -8268,7 +8296,7 @@ def test_apply_rejects_malformed_position_as_bounded_conflict(tmp_path):
     forged = replace(plan, position=object())
 
     with pytest.raises(module.CompositeBatchRecoveryConflict):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=forged,
             expected_fingerprint=forged.evidence_fingerprint,
@@ -8299,7 +8327,7 @@ def test_apply_under_target_appends_bounded_attestation_without_identity_drift(
             (row.id, row.idempotency_key, row.desired_json) for row in components
         ]
 
-    result = module.apply_composite_batch_false_state_repair(
+    result = _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -8367,7 +8395,7 @@ def test_under_target_attestation_cannot_authorize_increased_position(tmp_path):
     )
 
     with pytest.raises(module.CompositeBatchRecoveryConflict):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=forged,
             expected_fingerprint=forged.evidence_fingerprint,
@@ -8394,7 +8422,7 @@ def test_apply_position_absent_terminalizes_without_exchange_intent(tmp_path):
             .all()
         ]
 
-    result = module.apply_composite_batch_false_state_repair(
+    result = _apply_recovery(module,
         factory,
         plan=plan,
         snapshot=snapshot,
@@ -8460,7 +8488,7 @@ def test_apply_position_absent_terminalizes_without_exchange_intent(tmp_path):
         assert after["exchange_call_possible"] is False
         assert after["original_owned_stop_refs"] == []
 
-    repeated = module.apply_composite_batch_false_state_repair(
+    repeated = _apply_recovery(module,
         factory,
         plan=plan,
         snapshot=snapshot,
@@ -8481,7 +8509,7 @@ def test_apply_position_absent_terminalizes_without_exchange_intent(tmp_path):
         module.CompositeBatchRecoveryConflict,
         match="mimo_contract_mode_not_v1",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             snapshot=snapshot,
@@ -8551,7 +8579,7 @@ def test_position_absent_apply_rejects_resigned_snapshot_envelope_forgery(
     forged = replace(forged, evidence_fingerprint=resigned_fingerprint)
 
     with pytest.raises(module.CompositeBatchRecoveryConflict):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=forged,
             expected_fingerprint=resigned_fingerprint,
@@ -8611,7 +8639,7 @@ def test_position_absent_apply_rejects_fully_resigned_durable_scope_forgery(
     )
 
     with pytest.raises(module.CompositeBatchRecoveryConflict):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=forged,
             snapshot=forged_snapshot,
@@ -8623,6 +8651,115 @@ def test_position_absent_apply_rejects_fully_resigned_durable_scope_forgery(
     with factory() as session:
         assert session.get(StrategyManagementBatch, 119).status == "reconciling"
         assert session.query(ExecutionEvent).count() == 0
+
+
+@pytest.mark.parametrize("invalid_snapshot", [None, object()])
+def test_apply_rejects_invalid_snapshot_before_opening_session(
+    tmp_path,
+    invalid_snapshot,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    plan = _plan(factory)
+    factory_calls = []
+
+    def forbidden_factory():
+        factory_calls.append(True)
+        raise AssertionError("invalid snapshot opened database session")
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="recovery_snapshot_invalid",
+    ):
+        _apply_recovery(module,
+            forbidden_factory,
+            plan=plan,
+            snapshot=invalid_snapshot,
+            expected_fingerprint=plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+    assert factory_calls == []
+
+
+def test_capture_seal_is_process_local_not_serialized_and_detects_copy_tamper(
+    tmp_path,
+    monkeypatch,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    monkeypatch.setattr(module, "_BATCH119_CAPTURE_HMAC_KEY", b"k" * 32)
+    snapshot = _snapshot()
+    plan = _plan(factory, snapshot)
+    serialized = json.dumps(
+        module.serialize_composite_batch_recovery_plan(plan),
+        sort_keys=True,
+    )
+    assert "capture_seal" not in serialized
+    assert (b"k" * 32).hex() not in serialized
+    tampered = replace(
+        snapshot,
+        positions=[{**snapshot.positions[0], "pos": "37"}],
+    )
+    assert module._snapshot_is_complete(
+        snapshot,
+        profile=module.BATCH_119_RECOVERY,
+    )
+    assert not module._snapshot_is_complete(
+        tampered,
+        profile=module.BATCH_119_RECOVERY,
+    )
+    monkeypatch.setattr(module, "_BATCH119_CAPTURE_HMAC_KEY", b"z" * 32)
+    assert not module._snapshot_is_complete(
+        snapshot,
+        profile=module.BATCH_119_RECOVERY,
+    )
+
+
+def test_non_absent_fully_resigned_exchange_with_stale_seal_is_preflight_refused(
+    tmp_path,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    original = _snapshot()
+    forged_snapshot = _snapshot(
+        open_orders=[
+            {
+                "ordId": "unrelated-open-order",
+                "instId": "ETH-USDT-SWAP",
+                "state": "live",
+            }
+        ],
+    )
+    forged_plan = _plan(factory, forged_snapshot)
+    assert forged_plan.status == "ready"
+    assert (
+        forged_plan.exchange_snapshot_fingerprint
+        != _plan(factory, original).exchange_snapshot_fingerprint
+    )
+    forged_snapshot._capture_seal = original._capture_seal
+    factory_calls = []
+
+    def forbidden_factory():
+        factory_calls.append(True)
+        raise AssertionError("stale capture seal opened database session")
+
+    with pytest.raises(
+        module.CompositeBatchRecoveryConflict,
+        match="recovery_snapshot_invalid",
+    ):
+        _apply_recovery(
+            module,
+            forbidden_factory,
+            plan=forged_plan,
+            snapshot=forged_snapshot,
+            expected_fingerprint=forged_plan.evidence_fingerprint,
+            authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+            applied_at=NOW,
+        )
+
+    assert factory_calls == []
 
 
 def test_non_absent_apply_rechecks_mimo_v1_inside_locked_transaction(tmp_path):
@@ -8642,7 +8779,7 @@ def test_non_absent_apply_rechecks_mimo_v1_inside_locked_transaction(tmp_path):
         module.CompositeBatchRecoveryConflict,
         match="mimo_contract_mode_not_v1",
     ):
-        module.apply_composite_batch_false_state_repair(
+        _apply_recovery(module,
             factory,
             plan=plan,
             expected_fingerprint=plan.evidence_fingerprint,
@@ -8668,7 +8805,7 @@ def test_non_absent_repeat_and_resume_recheck_locked_mimo_v1(tmp_path):
         {"mimo_contract_mode": "v1"},
         updated_at=NOW,
     )
-    repaired = module.apply_composite_batch_false_state_repair(
+    repaired = _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -8688,7 +8825,7 @@ def test_non_absent_repeat_and_resume_recheck_locked_mimo_v1(tmp_path):
             match="mimo_contract_mode_not_v1",
         ):
             if action == "repeat":
-                module.apply_composite_batch_false_state_repair(
+                _apply_recovery(module,
                     factory,
                     plan=plan,
                     expected_fingerprint=plan.evidence_fingerprint,
@@ -8742,7 +8879,7 @@ def test_position_absent_mimo_gate_query_error_rolls_back_and_releases_lock(
             module.CompositeBatchRecoveryConflict,
             match="mimo_contract_mode_not_v1",
         ):
-            module.apply_composite_batch_false_state_repair(
+            _apply_recovery(module,
                 factory,
                 plan=plan,
                 snapshot=snapshot,
@@ -8759,7 +8896,7 @@ def test_position_absent_mimo_gate_query_error_rolls_back_and_releases_lock(
         {"mimo_contract_mode": "v1"},
         updated_at=NOW + timedelta(seconds=1),
     )
-    repaired = module.apply_composite_batch_false_state_repair(
+    repaired = _apply_recovery(module,
         factory,
         plan=plan,
         snapshot=snapshot,
@@ -9302,7 +9439,7 @@ def test_batch119_resume_rejects_durable_scope_drift_after_exact_capture(
     )
     assert plan.status == "ready"
     assert plan.position.disposition == "position_absent"
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         snapshot=snapshot,
@@ -9356,7 +9493,7 @@ def test_batch119_resume_rejects_protection_evidence_drift_after_capture(
         snapshot=snapshot,
         planned_at=snapshot.capture_ended_at,
     )
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         snapshot=snapshot,
@@ -9769,7 +9906,7 @@ def test_batch119_canonical_audit_replay_does_not_authorize_unverified_stop_skip
     donor_path.mkdir()
     donor_factory, _, _, _, _ = _seed_batch_119_false_submission(donor_path)
     donor_plan = _plan(donor_factory)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         donor_factory,
         plan=donor_plan,
         expected_fingerprint=donor_plan.evidence_fingerprint,
@@ -9877,7 +10014,7 @@ def test_batch119_canonical_audit_skips_superseded_stop_for_exact_after_state(
         tmp_path
     )
     plan = _plan(factory)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -9942,7 +10079,7 @@ def test_batch119_canonical_audit_does_not_hide_original_stop_source_drift(
         tmp_path
     )
     plan = _plan(factory)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -10014,7 +10151,7 @@ def test_batch119_canonical_audit_does_not_hide_original_stop_identity_drift(
         tmp_path
     )
     plan = _plan(factory)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -10074,7 +10211,7 @@ def test_batch119_invalid_audit_cannot_hide_stop_that_escaped_owner_query(
         tmp_path
     )
     plan = _plan(factory)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -10166,7 +10303,7 @@ def test_batch119_canonical_audit_only_allows_superseded_original_stop(
         tmp_path
     )
     plan = _plan(factory)
-    module.apply_composite_batch_false_state_repair(
+    _apply_recovery(module,
         factory,
         plan=plan,
         expected_fingerprint=plan.evidence_fingerprint,
@@ -10835,6 +10972,97 @@ def test_recovery_cli_position_absent_rechecks_mimo_v1_inside_apply_lock(
         "mimo_contract_mode_not_v1"
     )
     assert load_trading_settings(factory).mimo_contract_mode == "v2_live_adapter"
+    with factory() as session:
+        assert session.get(StrategyManagementBatch, 119).status == "reconciling"
+        assert session.query(ExecutionEvent).count() == 0
+
+
+def test_recovery_cli_non_absent_builds_writer_only_after_locked_mimo_gate(
+    tmp_path,
+    monkeypatch,
+):
+    from typer.testing import CliRunner
+
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.cli import app
+    from telegram_kol_research.trading_settings import save_trading_settings
+
+    factory, database_path, _, _, _ = _seed_batch_119_false_submission(
+        tmp_path
+    )
+    v1_settings = {
+        "auto_trade_enabled": True,
+        "management_execution_mode": "live",
+        "composite_management_v2_mode": "live",
+        "mimo_contract_mode": "v1",
+    }
+    save_trading_settings(factory, v1_settings, updated_at=NOW)
+    specs_path = tmp_path / "deepcoin-contract-specs.yaml"
+    specs_path.write_text(
+        "contracts:\n"
+        "  - instrument_id: BTC-USDT-SWAP\n"
+        "    contract_value: 1\n"
+        "    quantity_step: 1\n"
+        "    min_quantity: 1\n"
+        "    price_tick: 0.1\n",
+        encoding="utf-8",
+    )
+    client = _Batch119ExactHistoryClient(exact_position_response={"data": []})
+    writer_calls = []
+    monkeypatch.setattr(
+        cli_module,
+        "_build_batch119_recovery_read_client",
+        lambda: client,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_deepcoin_client_from_env",
+        lambda: writer_calls.append(True) or client,
+    )
+    common = [
+        "recover-composite-management-batch",
+        "--database-path",
+        str(database_path),
+        "--batch-id",
+        "119",
+        "--deepcoin-contract-specs-path",
+        str(specs_path),
+    ]
+    dry_run = CliRunner().invoke(app, common)
+    assert dry_run.exit_code == 0, dry_run.stdout
+    fingerprint = json.loads(dry_run.stdout)["plan"]["evidence_fingerprint"]
+    original_writable_factory = cli_module.create_existing_session_factory
+
+    def switch_setting_before_apply(path):
+        save_trading_settings(
+            factory,
+            {**v1_settings, "mimo_contract_mode": "v2_live_adapter"},
+            updated_at=NOW + timedelta(seconds=1),
+        )
+        return original_writable_factory(path)
+
+    monkeypatch.setattr(
+        cli_module,
+        "create_existing_session_factory",
+        switch_setting_before_apply,
+    )
+    applied = CliRunner().invoke(
+        app,
+        [
+            *common,
+            "--apply",
+            "--expected-fingerprint",
+            fingerprint,
+            "--authorization",
+            "I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        ],
+    )
+
+    assert applied.exit_code == 2
+    assert json.loads(applied.stdout)["reason_code"] == (
+        "mimo_contract_mode_not_v1"
+    )
+    assert writer_calls == []
     with factory() as session:
         assert session.get(StrategyManagementBatch, 119).status == "reconciling"
         assert session.query(ExecutionEvent).count() == 0

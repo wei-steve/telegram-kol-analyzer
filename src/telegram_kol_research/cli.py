@@ -4738,20 +4738,6 @@ def recover_composite_management_batch(
             refuse("contract_specs_invalid")
         if settings.effective_composite_management_v2_mode != "live":
             refuse("composite_management_live_gate_closed")
-        try:
-            writer_client = build_deepcoin_client_from_env()
-        except Exception:
-            refuse("exchange_writer_client_unavailable")
-        read_uid_scope_hash = getattr(read_client, "uid_scope_hash", None)
-        writer_uid_scope_hash = getattr(
-            writer_client, "uid_scope_hash", None
-        )
-        if (
-            re.fullmatch(r"[0-9a-f]{64}", str(read_uid_scope_hash or ""))
-            is None
-            or writer_uid_scope_hash != read_uid_scope_hash
-        ):
-            refuse("exchange_account_scope_mismatch")
 
     try:
         session_factory = create_existing_session_factory(
@@ -4791,7 +4777,20 @@ def recover_composite_management_batch(
         and plan.position.disposition != "position_absent"
     ):
         assert contract_spec_provider is not None
-        assert writer_client is not None
+        try:
+            writer_client = build_deepcoin_client_from_env()
+        except Exception:
+            refuse("exchange_writer_client_unavailable")
+        read_uid_scope_hash = getattr(read_client, "uid_scope_hash", None)
+        writer_uid_scope_hash = getattr(
+            writer_client, "uid_scope_hash", None
+        )
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", str(read_uid_scope_hash or ""))
+            is None
+            or writer_uid_scope_hash != read_uid_scope_hash
+        ):
+            refuse("exchange_account_scope_mismatch")
         try:
             if resume_authorization is not None:
                 reconcile_composite_management_components(

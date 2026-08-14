@@ -6,10 +6,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import hashlib
+import hmac
 import json
 import math
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 from types import MappingProxyType
 from typing import Any, Literal, Mapping, Sequence
@@ -156,7 +158,7 @@ class _Batch119ExactHistoryScope:
     )
 
 
-@dataclass(slots=True)
+@dataclass
 class Batch119ExactRecoverySnapshot:
     positions: list[dict[str, Any]] = field(default_factory=list, repr=False)
     position_history: list[dict[str, Any]] = field(
@@ -183,6 +185,10 @@ class Batch119ExactRecoverySnapshot:
     capture_started_at: datetime | None = None
     capture_ended_at: datetime | None = None
     scope_fingerprint: str | None = None
+    _capture_seal: str | None = field(default=None, repr=False)
+
+
+_BATCH119_CAPTURE_HMAC_KEY = secrets.token_bytes(32)
 
 
 def build_composite_batch_recovery_status_summary(
@@ -566,7 +572,12 @@ def load_composite_batch_recovery_snapshot_read_only(
                 or "snapshot_incomplete"
             ),
         )
-    return snapshot
+    try:
+        return _seal_batch119_recovery_snapshot(snapshot)
+    except (AttributeError, TypeError, ValueError, RecursionError, OverflowError):
+        snapshot._capture_seal = None
+        snapshot.errors.setdefault("capture_seal", "snapshot_seal_unavailable")
+        return snapshot
 
 
 def _build_batch119_exact_history_scope(
@@ -1853,7 +1864,7 @@ def authorize_composite_batch_recovery_resume(
             current_size=after["current_size"],
         )
         if disposition == "position_absent":
-            _validate_locked_position_absent_snapshot(
+            _validate_locked_exact_snapshot(
                 session,
                 snapshot=snapshot,
                 expected_position=position,
@@ -3185,7 +3196,7 @@ def _require_locked_mimo_v1(session) -> None:
         raise CompositeBatchRecoveryConflict("mimo_contract_mode_not_v1")
 
 
-def _validate_locked_position_absent_snapshot(
+def _validate_locked_exact_snapshot(
     session,
     *,
     snapshot: Any,
@@ -3193,7 +3204,7 @@ def _validate_locked_position_absent_snapshot(
     expected_exchange_fingerprint: str,
     expected_natural_stop: Mapping[str, Any] | None,
 ) -> None:
-    """Rebuild the absent-position authority from locked DB and captured GETs."""
+    """Rebuild exact exchange authority from locked DB and captured GETs."""
 
     if not _snapshot_is_complete(
         snapshot,
@@ -3262,10 +3273,7 @@ def _validate_locked_position_absent_snapshot(
         raise CompositeBatchRecoveryConflict(
             "position_absent_snapshot_invalid"
         ) from exc
-    if (
-        position.disposition != "position_absent"
-        or position != expected_position
-    ):
+    if position != expected_position:
         raise CompositeBatchRecoveryConflict(
             "position_absent_snapshot_invalid"
         )
@@ -3295,21 +3303,26 @@ def _validate_locked_position_absent_snapshot(
         raise CompositeBatchRecoveryConflict(
             "position_absent_snapshot_conflict"
         )
-    proof = _validated_natural_stop_proof(
-        snapshot=snapshot,
-        ledger=ledger,
-        pos_id=str(leg.pos_id),
-        profile=BATCH_119_RECOVERY,
-        not_before_ms=_incident_not_before_ms(
-            batch=batch,
-            leg=leg,
-            raw=raw,
-        ),
-    )
-    if isinstance(proof, str):
-        raise CompositeBatchRecoveryConflict(
-            "position_absent_snapshot_invalid"
+    proof: Mapping[str, Any] | None = None
+    if position.disposition == "position_absent":
+        proof_result = _validated_natural_stop_proof(
+            snapshot=snapshot,
+            ledger=ledger,
+            pos_id=str(leg.pos_id),
+            profile=BATCH_119_RECOVERY,
+            not_before_ms=_incident_not_before_ms(
+                batch=batch,
+                leg=leg,
+                raw=raw,
+            ),
         )
+        if isinstance(proof_result, str):
+            raise CompositeBatchRecoveryConflict(
+                "position_absent_snapshot_invalid"
+            )
+        proof = proof_result
+    elif _has_exchange_close_submission(snapshot, pos_id=str(leg.pos_id)):
+        raise CompositeBatchRecoveryConflict("recovery_snapshot_invalid")
     protection_reason = _protection_ownership_refusal(
         snapshot.pending_trigger_orders,
         batch=batch,
@@ -3337,7 +3350,10 @@ def _validate_locked_position_absent_snapshot(
         exchange_fingerprint != expected_exchange_fingerprint
         or (
             expected_natural_stop is not None
-            and _plain_json_value(expected_natural_stop) != dict(proof)
+            and (
+                proof is None
+                or _plain_json_value(expected_natural_stop) != dict(proof)
+            )
         )
     ):
         raise CompositeBatchRecoveryConflict(
@@ -3378,13 +3394,14 @@ def apply_composite_batch_false_state_repair(
         raise
     except (TypeError, ValueError, RecursionError, OverflowError) as exc:
         raise CompositeBatchRecoveryConflict("plan_evidence_invalid") from exc
+    if not _snapshot_is_complete(
+        snapshot,
+        profile=BATCH_119_RECOVERY,
+    ):
+        raise CompositeBatchRecoveryConflict("recovery_snapshot_invalid")
     applied = applied_at or datetime.now(UTC)
     with session_factory() as session:
         _acquire_recovery_write_lock(session)
-        position_absent = (
-            plan.position is not None
-            and plan.position.disposition == "position_absent"
-        )
         if not require_mimo_v1:
             raise CompositeBatchRecoveryConflict(
                 "mimo_contract_gate_missing"
@@ -3394,16 +3411,15 @@ def apply_composite_batch_false_state_repair(
             session, evidence_fingerprint=plan.evidence_fingerprint
         )
         if existing is not None:
-            if position_absent:
-                _validate_locked_position_absent_snapshot(
-                    session,
-                    snapshot=snapshot,
-                    expected_position=plan.position,
-                    expected_exchange_fingerprint=(
-                        plan.exchange_snapshot_fingerprint
-                    ),
-                    expected_natural_stop=plan.evidence.get("natural_stop"),
-                )
+            _validate_locked_exact_snapshot(
+                session,
+                snapshot=snapshot,
+                expected_position=plan.position,
+                expected_exchange_fingerprint=(
+                    plan.exchange_snapshot_fingerprint
+                ),
+                expected_natural_stop=plan.evidence.get("natural_stop"),
+            )
             if _repaired_state_and_event_match(session, event=existing, plan=plan):
                 return CompositeBatchRecoveryApplyResult(
                     batch_id=BATCH_119_RECOVERY.batch_id,
@@ -3426,16 +3442,15 @@ def apply_composite_batch_false_state_repair(
         ) = source
         if source_fingerprint != plan.source_fingerprint:
             raise CompositeBatchRecoveryConflict("source_fingerprint_conflict")
-        if position_absent:
-            _validate_locked_position_absent_snapshot(
-                session,
-                snapshot=snapshot,
-                expected_position=plan.position,
-                expected_exchange_fingerprint=(
-                    plan.exchange_snapshot_fingerprint
-                ),
-                expected_natural_stop=plan.evidence.get("natural_stop"),
-            )
+        _validate_locked_exact_snapshot(
+            session,
+            snapshot=snapshot,
+            expected_position=plan.position,
+            expected_exchange_fingerprint=(
+                plan.exchange_snapshot_fingerprint
+            ),
+            expected_natural_stop=plan.evidence.get("natural_stop"),
+        )
         evidence = _plain_json_value(plan.evidence)
         if (
             evidence["durable"]["component_attempt_counts"]
@@ -3637,7 +3652,8 @@ def _build_composite_batch_recovery_plan(
                 "durable_snapshot_scope_mismatch",
             )
         if (
-            durable_scope.scope_fingerprint
+            snapshot.exact_scope != durable_scope
+            or durable_scope.scope_fingerprint
             != str(snapshot.scope_fingerprint)
         ):
             return _refusal(
@@ -4547,11 +4563,131 @@ def serialize_composite_batch_recovery_plan(
     }
 
 
+def _capture_collection_seal_payload(collection: Any) -> dict[str, Any]:
+    rows = getattr(collection, "rows", None)
+    if not isinstance(rows, (list, tuple)):
+        raise TypeError("capture collection rows invalid")
+    return {
+        "endpoint": getattr(collection, "endpoint", None),
+        "available": getattr(collection, "available", None),
+        "schema_valid": getattr(collection, "schema_valid", None),
+        "complete": getattr(collection, "complete", None),
+        "rows": [_plain_json_value(row) for row in rows],
+        "row_count": getattr(collection, "row_count", None),
+        "page_count": getattr(collection, "page_count", None),
+        "fingerprint": getattr(collection, "fingerprint", None),
+        "reason_code": getattr(collection, "reason_code", None),
+        "expected_order_ids_visible": getattr(
+            collection,
+            "expected_order_ids_visible",
+            False,
+        ),
+    }
+
+
+def _batch119_capture_seal_payload(snapshot: Any) -> dict[str, Any]:
+    if not isinstance(snapshot, Batch119ExactRecoverySnapshot):
+        raise TypeError("batch119 exact snapshot required")
+    authority = snapshot.account_authority
+    authority_collections = getattr(authority, "collections", None)
+    scope = snapshot.exact_scope
+    if (
+        authority is None
+        or not isinstance(authority_collections, (list, tuple))
+        or not isinstance(scope, _Batch119ExactHistoryScope)
+    ):
+        raise TypeError("batch119 capture authority invalid")
+    started = _normalize_aware_utc_datetime(snapshot.capture_started_at)
+    ended = _normalize_aware_utc_datetime(snapshot.capture_ended_at)
+    if started is None or ended is None:
+        raise TypeError("batch119 capture window invalid")
+    return {
+        "schema_version": 1,
+        "collections": {
+            field_name: [
+                _plain_json_value(row)
+                for row in getattr(snapshot, field_name)
+            ]
+            for field_name in _REQUIRED_SNAPSHOT_FIELDS
+            if field_name != "errors"
+        },
+        "errors": _plain_json_value(snapshot.errors),
+        "capture_started_at": started.isoformat(),
+        "capture_ended_at": ended.isoformat(),
+        "scope_fingerprint": snapshot.scope_fingerprint,
+        "exact_scope": {
+            "instrument_id": scope.instrument_id,
+            "side": scope.side,
+            "scope_fingerprint": scope.scope_fingerprint,
+            "position_id": scope.position_id,
+            "protection_orders": [list(row) for row in scope.protection_orders],
+            "protection_evidence_fingerprints": [
+                list(row) for row in scope.protection_evidence_fingerprints
+            ],
+        },
+        "collection_authority": [
+            _plain_json_value(row) for row in snapshot.collection_authority
+        ],
+        "account_authority": {
+            "uid_scope_hash": getattr(authority, "uid_scope_hash", None),
+            "start_write_generation": getattr(
+                authority,
+                "start_write_generation",
+                None,
+            ),
+            "end_write_generation": getattr(
+                authority,
+                "end_write_generation",
+                None,
+            ),
+            "complete": getattr(authority, "complete", None),
+            "reason_code": getattr(authority, "reason_code", None),
+            "collections": [
+                _capture_collection_seal_payload(collection)
+                for collection in authority_collections
+            ],
+        },
+    }
+
+
+def _batch119_capture_seal(snapshot: Any) -> str:
+    payload = _canonical_json(_batch119_capture_seal_payload(snapshot)).encode(
+        "utf-8"
+    )
+    return hmac.new(
+        _BATCH119_CAPTURE_HMAC_KEY,
+        payload,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _seal_batch119_recovery_snapshot(
+    snapshot: Batch119ExactRecoverySnapshot,
+) -> Batch119ExactRecoverySnapshot:
+    snapshot._capture_seal = _batch119_capture_seal(snapshot)
+    return snapshot
+
+
+def _batch119_capture_seal_is_valid(snapshot: Any) -> bool:
+    if not isinstance(snapshot, Batch119ExactRecoverySnapshot):
+        return False
+    seal = snapshot._capture_seal
+    if not isinstance(seal, str) or not _is_sha256(seal):
+        return False
+    try:
+        expected = _batch119_capture_seal(snapshot)
+    except (AttributeError, TypeError, ValueError, RecursionError, OverflowError):
+        return False
+    return hmac.compare_digest(seal, expected)
+
+
 def _snapshot_is_complete(
     snapshot: Any,
     *,
     profile: CompositeBatchRecoveryProfile,
 ) -> bool:
+    if not _batch119_capture_seal_is_valid(snapshot):
+        return False
     if any(not hasattr(snapshot, field) for field in _REQUIRED_SNAPSHOT_FIELDS):
         return False
     if any(
