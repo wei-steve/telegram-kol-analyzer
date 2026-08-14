@@ -10769,6 +10769,136 @@ def test_batch119_native_stop_role_authority_fails_closed_before_network(
     assert client.network_calls == 0
 
 
+@pytest.mark.parametrize(
+    "payload_mutation",
+    [
+        "merged_position",
+        "isolated_margin",
+        "mark_trigger",
+        "missing_market_order",
+        "take_profit_extra",
+    ],
+)
+def test_batch119_native_backup_requires_exact_canonical_payload_before_network(
+    tmp_path,
+    payload_mutation,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(
+        tmp_path,
+        native_sl_backup=True,
+    )
+    with factory() as session:
+        intent = session.query(PositionMutationIntent).one()
+        backup = session.query(PositionBackupStopOrder).one()
+        request = json.loads(intent.request_json)
+        payload = {
+            key: value
+            for key, value in request.items()
+            if not key.startswith("_")
+        }
+        if payload_mutation == "merged_position":
+            payload["mrgPosition"] = "merged"
+        elif payload_mutation == "isolated_margin":
+            payload["tdMode"] = "isolated"
+        elif payload_mutation == "mark_trigger":
+            payload["slTriggerPxType"] = "mark"
+        elif payload_mutation == "missing_market_order":
+            payload.pop("slOrdPx")
+        elif payload_mutation == "take_profit_extra":
+            payload["tpOrdPx"] = "-1"
+        else:  # pragma: no cover - test helper misuse
+            raise AssertionError(payload_mutation)
+        intent.request_fingerprint = sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        intent.request_json = json.dumps(
+            {**payload, "_ledger_purpose": "stop_loss"},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        backup.request_json = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        session.commit()
+    client = _Batch119AbsentExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {
+        "exact_scope": "exact_history_scope_invalid"
+    }
+    assert client.network_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("malformed_kind", "hostile_text"),
+    [
+        ("leg_index", "hostile-leg-index"),
+        ("json_surrogate", "\\ud800"),
+    ],
+)
+def test_batch119_native_role_malformed_sqlite_is_safely_refused_before_network(
+    tmp_path,
+    malformed_kind,
+    hostile_text,
+):
+    module = _recovery_module()
+    factory, _, _, _, _ = _seed_batch_119_false_submission(
+        tmp_path,
+        native_sl_backup=True,
+    )
+    with factory() as session:
+        if malformed_kind == "leg_index":
+            session.execute(
+                text(
+                    "UPDATE position_protection_legs "
+                    "SET leg_index = :value WHERE role = 'backup_stop'"
+                ),
+                {"value": hostile_text},
+            )
+        else:
+            ledger = (
+                session.query(PositionProtectionLedger)
+                .filter_by(
+                    evidence_source="position_mutation_intent_readback"
+                )
+                .one()
+            )
+            intent_id = json.loads(ledger.evidence_json)["intent_id"]
+            ledger.evidence_json = (
+                f'{{"intent_id":{intent_id},"unsafe":"\\ud800"}}'
+            )
+        session.commit()
+    client = _Batch119AbsentExactHistoryClient()
+
+    snapshot = module.load_composite_batch_recovery_snapshot_read_only(
+        factory,
+        client=client,
+    )
+
+    assert snapshot.errors == {
+        "exact_scope": "exact_history_scope_invalid"
+    }
+    assert client.network_calls == 0
+    assert hostile_text not in repr(snapshot)
+
+
 def test_batch119_exact_loader_uses_live_generation_factory_not_copy_generation(
     tmp_path,
 ):
@@ -11262,6 +11392,18 @@ def _drift_batch119_native_role_authority(session, mutation):
             .one()
         )
         row.evidence_json = '{"intent_id":999999}'
+    elif mutation == "mutation_authority_fingerprint":
+        session.query(PositionMutationIntent).one().authority_fingerprint = (
+            "3" * 64
+        )
+    elif mutation == "backup_client_order_id":
+        session.query(PositionBackupStopOrder).one().client_order_id = (
+            "safe-drifted-backup-client"
+        )
+    elif mutation == "primary_correlation_id":
+        session.query(TriggerProtectionIntent).one().correlation_id = (
+            "safe-drifted-primary-correlation"
+        )
     elif mutation == "conflicting_authority":
         original = (
             session.query(PositionProtectionLeg)
@@ -11279,7 +11421,7 @@ def _drift_batch119_native_role_authority(session, mutation):
                 planned_trigger_price=original.planned_trigger_price,
                 planned_size=original.planned_size,
                 pos_id=original.pos_id,
-                exchange_order_id=original.exchange_order_id,
+                exchange_order_id="safe-conflicting-native-backup",
                 status="verified",
                 created_at=original.created_at,
                 updated_at=original.updated_at,
@@ -11299,6 +11441,9 @@ _NATIVE_ROLE_POST_CAPTURE_DRIFTS = (
     "ledger_economics",
     "ledger_source",
     "ledger_evidence",
+    "mutation_authority_fingerprint",
+    "backup_client_order_id",
+    "primary_correlation_id",
     "conflicting_authority",
 )
 

@@ -578,6 +578,20 @@ source/evidence fingerprints. Capture timestamps must be freshly valid but are
 excluded from the semantic comparison. Any refusal or semantic drift stops the
 operation and invokes the service-restoring cleanup path.
 
+Before human review, run the candidate SHA's bounded executable comparator:
+
+```bash
+PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
+  "$CANDIDATE_ROOT/scripts/compare_batch119_dry_runs.py" \
+  "$RECOVERY_TMP/dry-run-1.json" \
+  "$RECOVERY_TMP/dry-run-2.json"
+```
+
+It must enforce the exact outer/plan/position key allowlists, `status=ready`, a
+valid closed disposition, zero production writes and exchange calls, valid
+SHA-256 semantic fingerprints, bounded strict JSON, and complete plan equality.
+It prints only a fixed stable/refused result and never echoes input evidence.
+
 **Step 5: Present the redacted plan for separate approval**
 
 Restore the unchanged original service, then return control to the user. Do not

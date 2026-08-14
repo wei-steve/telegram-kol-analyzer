@@ -840,6 +840,14 @@ def _resolve_batch119_native_stop_roles(
     backup = backup_candidates[0]
     if str(primary.order_id) == str(backup.order_id):
         raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
+    _batch119_require_exact_native_role_population(
+        session,
+        primary_order_id=str(primary.order_id),
+        backup_order_id=str(backup.order_id),
+        binding=binding,
+        entry=entry,
+        leg=leg,
+    )
     primary_fingerprint = _batch119_primary_role_authority_fingerprint(
         session,
         row=primary,
@@ -1490,7 +1498,13 @@ def _batch119_strict_json_value(
         elif isinstance(current, list):
             stack.extend((item, depth + 1) for item in current)
         elif isinstance(current, str):
-            if len(current.encode("utf-8")) > 4_096:
+            try:
+                current_size = len(current.encode("utf-8"))
+            except UnicodeEncodeError:
+                raise CompositeBatchRecoveryRefusal(
+                    "exact_history_scope_invalid"
+                ) from None
+            if current_size > 4_096:
                 raise CompositeBatchRecoveryRefusal(
                     "exact_history_scope_invalid"
                 )
@@ -1623,14 +1637,147 @@ def _batch119_exact_protection_leg(
     row = candidates[0]
     if not (
         row.role == role
-        and int(row.leg_index) == 1
+        and _exact_int(row.leg_index) == 1
         and str(row.status or "").lower() == "verified"
-        and int(row.execution_binding_id) == int(binding.id)
-        and int(row.execution_order_leg_id) == int(entry.id)
+        and _exact_int(row.execution_binding_id) == int(binding.id)
+        and _exact_int(row.execution_order_leg_id) == int(entry.id)
         and str(row.pos_id or "") == str(leg.pos_id)
     ):
         raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
     return row
+
+
+def _batch119_durable_authority_fingerprint(row: Any) -> str:
+    try:
+        return _durable_row_fingerprint(row)
+    except (
+        TypeError,
+        ValueError,
+        UnicodeEncodeError,
+        RecursionError,
+        OverflowError,
+    ):
+        raise CompositeBatchRecoveryRefusal(
+            "exact_history_scope_invalid"
+        ) from None
+
+
+def _batch119_role_owner_fingerprint(*, batch, binding, entry, leg) -> str:
+    try:
+        return _fingerprint(
+            {
+                "schema_version": 1,
+                "strategy_ref": _redacted_ref(
+                    "role_strategy", batch.strategy_instance_id
+                ),
+                "binding_ref": _redacted_ref("role_binding", binding.id),
+                "entry_ref": _redacted_ref("role_entry", entry.id),
+                "management_leg_ref": _redacted_ref(
+                    "role_management_leg", leg.id
+                ),
+                "position_ref": _redacted_ref("role_position", leg.pos_id),
+                "instrument_id": str(binding.symbol or "").upper(),
+                "side": str(binding.side or "").lower(),
+                "margin_mode": str(binding.margin_mode or "").lower(),
+                "position_mode": str(binding.position_mode or "").lower(),
+            }
+        )
+    except (TypeError, ValueError, UnicodeEncodeError, OverflowError):
+        raise CompositeBatchRecoveryRefusal(
+            "exact_history_scope_invalid"
+        ) from None
+
+
+def _batch119_require_exact_native_role_population(
+    session,
+    *,
+    primary_order_id: str,
+    backup_order_id: str,
+    binding,
+    entry,
+    leg,
+) -> None:
+    owner_filter = or_(
+        PositionProtectionLeg.execution_binding_id == int(binding.id),
+        PositionProtectionLeg.execution_order_leg_id == int(entry.id),
+        PositionProtectionLeg.pos_id == str(leg.pos_id),
+    )
+    protection_legs = (
+        session.query(PositionProtectionLeg)
+        .filter(PositionProtectionLeg.venue == "deepcoin")
+        .filter(PositionProtectionLeg.role.in_(("primary_stop", "backup_stop")))
+        .filter(PositionProtectionLeg.status == "verified")
+        .filter(owner_filter)
+        .order_by(PositionProtectionLeg.id)
+        .all()
+    )
+    expected_legs = {
+        ("primary_stop", 1, primary_order_id),
+        ("backup_stop", 1, backup_order_id),
+    }
+    actual_legs = {
+        (
+            str(row.role or ""),
+            _exact_int(row.leg_index),
+            str(row.exchange_order_id or ""),
+        )
+        for row in protection_legs
+        if _exact_int(row.execution_binding_id) == int(binding.id)
+        and _exact_int(row.execution_order_leg_id) == int(entry.id)
+        and str(row.pos_id or "") == str(leg.pos_id)
+    }
+    if len(protection_legs) != 2 or actual_legs != expected_legs:
+        raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
+
+    trigger_intents = (
+        session.query(TriggerProtectionIntent)
+        .filter(TriggerProtectionIntent.venue == "deepcoin")
+        .filter(
+            or_(
+                TriggerProtectionIntent.execution_binding_id
+                == int(binding.id),
+                TriggerProtectionIntent.execution_order_leg_id
+                == int(entry.id),
+            )
+        )
+        .all()
+    )
+    mutation_intents = (
+        session.query(PositionMutationIntent)
+        .filter(PositionMutationIntent.venue == "deepcoin")
+        .filter(PositionMutationIntent.operation == "set_position_sltp")
+        .filter(
+            or_(
+                PositionMutationIntent.execution_binding_id
+                == int(binding.id),
+                PositionMutationIntent.execution_order_leg_id
+                == int(entry.id),
+                PositionMutationIntent.pos_id == str(leg.pos_id),
+            )
+        )
+        .all()
+    )
+    backup_rows = (
+        session.query(PositionBackupStopOrder)
+        .filter(PositionBackupStopOrder.venue == "deepcoin")
+        .filter(PositionBackupStopOrder.status == "active")
+        .filter(
+            or_(
+                PositionBackupStopOrder.execution_binding_id
+                == int(binding.id),
+                PositionBackupStopOrder.execution_order_leg_id
+                == int(entry.id),
+                PositionBackupStopOrder.pos_id == str(leg.pos_id),
+            )
+        )
+        .all()
+    )
+    if not (
+        len(trigger_intents) == 1
+        and len(mutation_intents) == 1
+        and len(backup_rows) == 1
+    ):
+        raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
 
 
 def _batch119_primary_role_authority_fingerprint(
@@ -1686,8 +1833,23 @@ def _batch119_primary_role_authority_fingerprint(
         raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
     return _fingerprint(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "logical_role": "stop_loss",
+            "owner_authority": _batch119_role_owner_fingerprint(
+                batch=batch,
+                binding=binding,
+                entry=entry,
+                leg=leg,
+            ),
+            "ledger_row_fingerprint": (
+                _batch119_durable_authority_fingerprint(row)
+            ),
+            "intent_row_fingerprint": (
+                _batch119_durable_authority_fingerprint(intent)
+            ),
+            "protection_leg_row_fingerprint": (
+                _batch119_durable_authority_fingerprint(protection_leg)
+            ),
             "ledger": _batch119_protection_scope_evidence_fingerprint(
                 row=row,
                 purpose="stop_loss",
@@ -1814,10 +1976,22 @@ def _batch119_backup_role_authority_fingerprint(
     ledger_purpose = payload.pop("_ledger_purpose", None)
     base_authority = payload.pop("_base_authority_fingerprint", None)
     baseline = payload.pop("_pre_submit_order_refs", None)
+    expected_payload_keys = {
+        "instType",
+        "instId",
+        "posSide",
+        "mrgPosition",
+        "tdMode",
+        "posId",
+        "slTriggerPx",
+        "slTriggerPxType",
+        "slOrdPx",
+    }
     if not (
         ledger_purpose == "stop_loss"
         and base_authority is None
         and baseline is None
+        and set(payload) == expected_payload_keys
         and _fingerprint(payload) == str(intent.request_fingerprint)
         and str(payload.get("instType") or "").upper() == "SWAP"
         and str(payload.get("instId") or "").upper()
@@ -1825,8 +1999,12 @@ def _batch119_backup_role_authority_fingerprint(
         and str(payload.get("posSide") or "").lower()
         == BATCH_119_RECOVERY.side.lower()
         and str(payload.get("posId") or "") == str(leg.pos_id)
+        and str(payload.get("mrgPosition") or "").lower() == "split"
+        and str(payload.get("tdMode") or "").lower()
+        == str(binding.margin_mode or "").lower()
         and payload.get("slTriggerPx") not in (None, "")
-        and payload.get("tpTriggerPx") in (None, "")
+        and str(payload.get("slTriggerPxType") or "").lower() == "last"
+        and str(payload.get("slOrdPx") or "") == "-1"
     ):
         raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
 
@@ -1920,8 +2098,26 @@ def _batch119_backup_role_authority_fingerprint(
         )
     return _fingerprint(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "logical_role": "backup_stop",
+            "owner_authority": _batch119_role_owner_fingerprint(
+                batch=batch,
+                binding=binding,
+                entry=entry,
+                leg=leg,
+            ),
+            "ledger_row_fingerprint": (
+                _batch119_durable_authority_fingerprint(row)
+            ),
+            "mutation_row_fingerprint": (
+                _batch119_durable_authority_fingerprint(intent)
+            ),
+            "backup_row_fingerprint": (
+                _batch119_durable_authority_fingerprint(backup)
+            ),
+            "protection_leg_row_fingerprint": (
+                _batch119_durable_authority_fingerprint(protection_leg)
+            ),
             "ledger": _batch119_native_backup_ledger_fingerprint(
                 row=row,
                 order_id=order_id,
@@ -1967,7 +2163,7 @@ def _batch119_exact_scope_fingerprint(
         raise CompositeBatchRecoveryRefusal("exact_history_scope_invalid")
     return _fingerprint(
         {
-            "schema_version": 3,
+            "schema_version": 4,
             "batch_id": BATCH_119_RECOVERY.batch_id,
             "position_ref": _redacted_ref(
                 "recovery_position", position_id

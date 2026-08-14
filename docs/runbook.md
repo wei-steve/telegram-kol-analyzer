@@ -1665,6 +1665,13 @@ PY
     > "$RESULT"
   chmod 0600 "$RESULT"
 done
+
+# 人工审阅前必须先执行有界、封闭字段的语义比较。比较器只输出固定的
+# stable/refused 结果，不回显任一输入字段；任何非零退出码立即停止。
+PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
+  "$CANDIDATE_ROOT/scripts/compare_batch119_dry_runs.py" \
+  "$RECOVERY_TMP/dry-run-1.json" \
+  "$RECOVERY_TMP/dry-run-2.json"
 ```
 
 上述命令需要已批准的只读 Deepcoin secret injection，但不得打印、复制或将凭据写入
@@ -1690,7 +1697,11 @@ detached worktree 和全部私有副本，并在任何拒绝或中断路径恢�
 - `protection_only_below_target`：当前数量大于零但小于 `19`，不加仓、不再平仓，只保护实际数量。
 - `position_absent`：精确仓位已不存在，本地安全终态化，不构造交易所 writer。
 
-服务保持 inactive 时，使用第二个新建副本和新 capture window 立即重复同一条 dry-run 命令。两次都必须
+服务保持 inactive 时，使用第二个新建副本和新 capture window 立即重复同一条 dry-run 命令。随后必须
+运行 candidate SHA 内的 `compare_batch119_dry_runs.py`；它有界读取两份 0600 JSON，拒绝重复键、
+超限结构、未知字段、非 ready 状态、非法 disposition、非零 write/call 计数、非法 fingerprint 或任意
+语义漂移。比较器成功时只输出 `{"status":"stable"}`，失败时只输出固定拒绝码且不得回显输入。
+两次都必须
 证明相同 source population、exact scope、collection digests、natural-stop ownership、
 source fingerprint 和 evidence fingerprint；capture 时间必须新鲜，但不得影响语义指纹。不能直接把
 instruction 的
