@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import hmac
@@ -16,16 +17,20 @@ from telegram_kol_research.deepcoin_snapshot_authority import (
     ExchangeCollectionEvidence,
     build_exchange_collection_evidence,
 )
+from telegram_kol_research.deepcoin_client import DeepcoinRequestScope
+from telegram_kol_research.deepcoin_request_policy import RequestPriority
 from telegram_kol_research.production_monitor_snapshot import (
     ProductionMonitorSnapshotStore,
     SnapshotCollectionEvidence,
     SnapshotGeneration,
+    SnapshotManifest,
 )
 
 
 _UID_SCOPE_HASH = re.compile(r"[0-9a-f]{64}")
 _MAX_PROJECTED_VALUE_BYTES = 1_024
 _MAX_PROJECTED_ROW_BYTES = 16_384
+_MONITOR_RESPONSE_MAX_BYTES = 1_024 * 1_024
 
 
 @runtime_checkable
@@ -67,6 +72,19 @@ class ReadOnlyDeepcoinMonitorClient:
 
     def read_trigger_orders_pending(self, *, inst_id: str) -> dict[str, Any]:
         return self.__transport.read_trigger_orders_pending(inst_id=inst_id)
+
+    def _monitor_read_scope(self, *, deadline_monotonic: float):
+        scope_factory = getattr(self.__transport, "request_scope", None)
+        if not callable(scope_factory):
+            return nullcontext()
+        return scope_factory(
+            DeepcoinRequestScope(
+                phase="production_monitor_snapshot",
+                priority=RequestPriority.BACKGROUND,
+                deadline_monotonic=deadline_monotonic,
+                max_response_bytes=_MONITOR_RESPONSE_MAX_BYTES,
+            )
+        )
 
 
 class ProductionMonitorRefreshError(RuntimeError):
@@ -175,12 +193,62 @@ def refresh_production_monitor_snapshot(
     timestamp_factory = (
         (lambda: now) if now is not None else (lambda: datetime.now(UTC))
     )
+    request_started_at = _aware_utc(timestamp_factory())
+    started_monotonic = _finite_monotonic(monotonic_factory())
     try:
-        manifest = store.load()
+        with store.try_refresh_lease(
+            uid_scope_hash=uid_scope_hash,
+            observed_at=request_started_at,
+        ) as lease:
+            if not lease.acquired:
+                latest = lease.manifest.latest_attempt
+                if (
+                    latest is None
+                    or latest.outcome != "FAILURE"
+                    or latest.failure_code != "refresh_overlap"
+                ):
+                    raise ProductionMonitorRefreshPersistenceError(
+                        "monitor snapshot overlap was not sealed"
+                    )
+                return ProductionMonitorRefreshOutcome(
+                    execution_status="COMPLETED",
+                    snapshot_outcome="FAILURE",
+                    generation=latest.generation,
+                    failure_code="refresh_overlap",
+                )
+            return _refresh_production_monitor_snapshot_under_lease(
+                client=client,
+                store=store,
+                manifest=lease.manifest,
+                uid_scope_hash=uid_scope_hash,
+                request_started_at=request_started_at,
+                timestamp_factory=timestamp_factory,
+                timeout=timeout,
+                started_monotonic=started_monotonic,
+                monotonic_factory=monotonic_factory,
+            )
+    except ProductionMonitorRefreshError:
+        raise
     except Exception as exc:
         raise ProductionMonitorRefreshPersistenceError(
-            "monitor snapshot manifest cannot be loaded"
+            "monitor snapshot refresh lease is unavailable"
         ) from exc
+
+
+def _refresh_production_monitor_snapshot_under_lease(
+    *,
+    client: DeepcoinMonitorReadProtocol,
+    store: ProductionMonitorSnapshotStore,
+    manifest: SnapshotManifest,
+    uid_scope_hash: str,
+    request_started_at: datetime,
+    timestamp_factory: Callable[[], datetime],
+    timeout: float,
+    started_monotonic: float,
+    monotonic_factory: Callable[[], float],
+) -> ProductionMonitorRefreshOutcome:
+    """Capture and seal while the caller holds the cross-process lease."""
+
     if manifest.uid_scope_hash is not None and not hmac.compare_digest(
         manifest.uid_scope_hash,
         uid_scope_hash,
@@ -196,8 +264,7 @@ def refresh_production_monitor_snapshot(
             "monitor snapshot generation is exhausted"
         )
     generation = previous_generation + 1
-    request_started_at = _aware_utc(timestamp_factory())
-    started_monotonic = _finite_monotonic(monotonic_factory())
+    deadline_monotonic = started_monotonic + timeout
 
     specs = (
         _CollectionSpec(
@@ -215,36 +282,43 @@ def refresh_production_monitor_snapshot(
     )
     collections: list[SnapshotCollectionEvidence] = []
     failure: _ClosedReadFailure | None = None
-    for spec in specs:
-        if _elapsed(monotonic_factory, started_monotonic) > timeout:
-            failure = _ClosedReadFailure("wall_clock_timeout")
-            break
-        try:
-            response = spec.reader()
-        except Exception as exc:
-            failure_code = _closed_exception_code(exc)
-            failure = _ClosedReadFailure(
-                failure_code,
-                SnapshotCollectionEvidence(
-                    name=spec.name,
-                    available=False,
-                    schema_valid=False,
-                    complete=False,
-                    page_count=0,
-                    row_count=0,
-                    rows=(),
-                    reason_code=failure_code,
-                ),
-            )
-            break
-        if _elapsed(monotonic_factory, started_monotonic) > timeout:
-            failure = _ClosedReadFailure("wall_clock_timeout")
-            break
-        try:
-            collections.append(_complete_collection(spec.name, response))
-        except _ClosedReadFailure as exc:
-            failure = exc
-            break
+    scope_factory = getattr(client, "_monitor_read_scope", None)
+    monitor_scope = (
+        scope_factory(deadline_monotonic=deadline_monotonic)
+        if callable(scope_factory)
+        else nullcontext()
+    )
+    with monitor_scope:
+        for spec in specs:
+            if _elapsed(monotonic_factory, started_monotonic) > timeout:
+                failure = _ClosedReadFailure("wall_clock_timeout")
+                break
+            try:
+                response = spec.reader()
+            except Exception as exc:
+                failure_code = _closed_exception_code(exc)
+                failure = _ClosedReadFailure(
+                    failure_code,
+                    SnapshotCollectionEvidence(
+                        name=spec.name,
+                        available=False,
+                        schema_valid=False,
+                        complete=False,
+                        page_count=0,
+                        row_count=0,
+                        rows=(),
+                        reason_code=failure_code,
+                    ),
+                )
+                break
+            if _elapsed(monotonic_factory, started_monotonic) > timeout:
+                failure = _ClosedReadFailure("wall_clock_timeout")
+                break
+            try:
+                collections.append(_complete_collection(spec.name, response))
+            except _ClosedReadFailure as exc:
+                failure = exc
+                break
 
     request_completed_at = _aware_utc(timestamp_factory())
     if request_completed_at < request_started_at:
@@ -446,6 +520,8 @@ def _closed_exception_code(exc: BaseException) -> str:
     safe_code = getattr(getattr(exc, "fact", None), "safe_code", None)
     if isinstance(safe_code, str):
         normalized = safe_code.lower()
+        if normalized == "monitor_response_size_exceeded":
+            return "snapshot_size_exceeded"
         if "rate" in normalized or "throttle" in normalized:
             return "exchange_rate_limited"
         if "timeout" in normalized or "deadline" in normalized:

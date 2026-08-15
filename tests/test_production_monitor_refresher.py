@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from contextlib import contextmanager
 import inspect
 
 import pytest
+
+from telegram_kol_research.deepcoin_client import (
+    DeepcoinCredentials,
+    DeepcoinRestClient,
+)
 
 from telegram_kol_research.production_monitor_refresher import (
     DeepcoinMonitorReadProtocol,
@@ -51,6 +57,70 @@ class RecordingDeepcoinClient:
 
     def set_position_sltp(self, payload):
         pytest.fail("refresher reached an exchange write method")
+
+
+class _AdvancingClock:
+    def __init__(self, current: float):
+        self.current = current
+
+    def __call__(self):
+        return self.current
+
+    def advance(self, seconds: float):
+        self.current += seconds
+
+
+class _JsonResponse:
+    status_code = 200
+    headers = {}
+
+    def json(self):
+        return {"code": "0", "data": []}
+
+    def iter_raw(self):
+        yield b'{"code":"0","data":[]}'
+
+
+class _TimeoutCapturingHttpClient:
+    def __init__(self, clock):
+        self.clock = clock
+        self.timeouts: list[float] = []
+
+    def request(self, method, request_path, content="", headers=None, timeout=None):
+        self.timeouts.append(timeout)
+        self.clock.advance(1.0)
+        return _JsonResponse()
+
+    @contextmanager
+    def stream(self, method, request_path, content="", headers=None, timeout=None):
+        self.timeouts.append(timeout)
+        self.clock.advance(1.0)
+        yield _JsonResponse()
+
+
+class _OversizedWireResponse:
+    status_code = 200
+    headers = {}
+
+    def __init__(self):
+        self.yielded = 0
+
+    def iter_raw(self):
+        for chunk in (b'{"code":"0","data":[', b"x" * (1024 * 1024), b"]}"):
+            self.yielded += 1
+            yield chunk
+
+
+class _OversizedStreamingHttpClient:
+    def __init__(self):
+        self.response = _OversizedWireResponse()
+
+    def request(self, *args, **kwargs):
+        raise AssertionError("monitor refresher must use bounded streaming HTTP")
+
+    @contextmanager
+    def stream(self, *args, **kwargs):
+        yield self.response
 
 
 def _store(path):
@@ -273,3 +343,81 @@ def test_refresher_wall_clock_timeout_seals_failure_and_stops_more_reads(tmp_pat
     assert outcome.snapshot_outcome == "FAILURE"
     assert outcome.failure_code == "wall_clock_timeout"
     assert client.calls == ["read_positions"]
+
+
+def test_refresher_overlap_is_sealed_without_any_exchange_read(tmp_path):
+    path = tmp_path / "snapshot.json"
+    owner_store = _store(path)
+    overlapping_store = _store(path)
+    client = RecordingDeepcoinClient()
+
+    with owner_store.try_refresh_lease(
+        uid_scope_hash=UID_HASH,
+        observed_at=NOW,
+    ) as owner_lease:
+        assert owner_lease.acquired is True
+
+        outcome = _refresh(client, overlapping_store)
+
+        assert outcome.execution_status == "COMPLETED"
+        assert outcome.snapshot_outcome == "FAILURE"
+        assert outcome.failure_code == "refresh_overlap"
+        assert outcome.generation == 0
+        assert client.calls == []
+
+    sealed = owner_store.load()
+    assert sealed.latest_attempt is not None
+    assert sealed.latest_attempt.failure_code == "refresh_overlap"
+    assert sealed.last_success is None
+
+
+def test_refresher_injects_one_absolute_deadline_into_each_http_read(tmp_path):
+    clock = _AdvancingClock(100.0)
+    http_client = _TimeoutCapturingHttpClient(clock)
+    transport = DeepcoinRestClient(
+        DeepcoinCredentials(
+            api_key="monitor-key",
+            api_secret="secret",
+            passphrase="pass",
+            timeout_seconds=15.0,
+        ),
+        http_client=http_client,
+        monotonic_factory=clock,
+        sleep_fn=lambda seconds: clock.advance(seconds),
+        read_only=True,
+    )
+
+    outcome = refresh_production_monitor_snapshot(
+        client=ReadOnlyDeepcoinMonitorClient(transport),
+        store=_store(tmp_path / "snapshot.json"),
+        now=NOW,
+        wall_clock_timeout_seconds=3.0,
+        monotonic_factory=clock,
+    )
+
+    assert outcome.snapshot_outcome == "SUCCESS"
+    assert http_client.timeouts == pytest.approx([3.0, 2.0, 1.0])
+
+
+def test_refresher_seals_oversized_wire_response_as_snapshot_size_exceeded(tmp_path):
+    http_client = _OversizedStreamingHttpClient()
+    transport = DeepcoinRestClient(
+        DeepcoinCredentials(
+            api_key="monitor-key",
+            api_secret="secret",
+            passphrase="pass",
+        ),
+        http_client=http_client,
+        read_only=True,
+    )
+
+    outcome = refresh_production_monitor_snapshot(
+        client=ReadOnlyDeepcoinMonitorClient(transport),
+        store=_store(tmp_path / "snapshot.json"),
+        now=NOW,
+    )
+
+    assert outcome.execution_status == "COMPLETED"
+    assert outcome.snapshot_outcome == "FAILURE"
+    assert outcome.failure_code == "snapshot_size_exceeded"
+    assert http_client.response.yielded == 2

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta
 import json
+import multiprocessing
 import os
 import stat
 
@@ -80,6 +81,40 @@ def _failure(
 
 def _store(path):
     return ProductionMonitorSnapshotStore(path, now_factory=lambda: NOW)
+
+
+def _overlap_worker(path, start_event, connection):
+    store = ProductionMonitorSnapshotStore(path, now_factory=lambda: NOW)
+    start_event.wait()
+    try:
+        with store.try_refresh_lease(
+            uid_scope_hash=UID_HASH,
+            observed_at=NOW,
+        ) as lease:
+            if lease.acquired:
+                connection.send(("unexpected_lease", None))
+                return
+            assert lease.manifest is not None
+            connection.send(("overlap", lease.manifest.latest_attempt.generation))
+    except Exception as exc:  # pragma: no cover - assertion reports child detail
+        connection.send(("error", repr(exc)))
+    finally:
+        connection.close()
+
+
+def _concurrent_overlap_writer(path, start_event, connection):
+    store = ProductionMonitorSnapshotStore(path, now_factory=lambda: NOW)
+    start_event.wait()
+    try:
+        manifest = store.record_refresh_overlap(
+            uid_scope_hash=UID_HASH,
+            observed_at=NOW,
+        )
+        connection.send(("ok", manifest.latest_attempt.generation))
+    except Exception as exc:  # pragma: no cover - assertion reports child detail
+        connection.send(("error", repr(exc)))
+    finally:
+        connection.close()
 
 
 def test_store_retains_only_three_distinct_complete_generations(tmp_path):
@@ -339,3 +374,108 @@ def test_atomic_write_failure_preserves_last_sealed_manifest(tmp_path, monkeypat
 
     assert store.path.read_bytes() == before
     assert list(tmp_path.glob(".manifest.json.*.tmp")) == []
+
+
+def test_refresh_lease_is_cross_process_and_overlap_cannot_be_overwritten(tmp_path):
+    path = tmp_path / "manifest.json"
+    store = _store(path)
+    store.seal_success(_generation(0))
+    pending_success = _generation(1, completed_at=NOW)
+    context = multiprocessing.get_context("spawn")
+    start_event = context.Event()
+    receiver, sender = context.Pipe(duplex=False)
+
+    with store.try_refresh_lease(
+        uid_scope_hash=UID_HASH,
+        observed_at=NOW,
+    ) as lease:
+        assert lease.acquired is True
+        assert lease.manifest is not None
+        assert lease.manifest.latest_attempt is not None
+        assert lease.manifest.latest_attempt.generation == 0
+        process = context.Process(
+            target=_overlap_worker,
+            args=(path, start_event, sender),
+        )
+        process.start()
+        sender.close()
+        start_event.set()
+        assert receiver.poll(5), "overlap process did not finish"
+        assert receiver.recv() == ("overlap", 1)
+        process.join(5)
+        assert process.exitcode == 0
+
+    with pytest.raises(ValueError, match="strictly increase"):
+        store.seal_success(pending_success)
+
+    loaded = store.load()
+    assert loaded.latest_attempt is not None
+    assert loaded.latest_attempt.generation == 1
+    assert loaded.latest_attempt.failure_code == "refresh_overlap"
+    assert loaded.last_success is not None
+    assert loaded.last_success.generation == 0
+    assert stat.S_IMODE(store.refresh_lock_path.stat().st_mode) == 0o600
+
+
+def test_manifest_writes_allocate_unique_generations_across_processes(tmp_path):
+    path = tmp_path / "manifest.json"
+    store = _store(path)
+    store.seal_success(_generation(0))
+    context = multiprocessing.get_context("spawn")
+    start_event = context.Event()
+    processes = []
+    receivers = []
+
+    for _ in range(4):
+        receiver, sender = context.Pipe(duplex=False)
+        process = context.Process(
+            target=_concurrent_overlap_writer,
+            args=(path, start_event, sender),
+        )
+        process.start()
+        sender.close()
+        processes.append(process)
+        receivers.append(receiver)
+    start_event.set()
+
+    results = []
+    for receiver, process in zip(receivers, processes):
+        assert receiver.poll(5), "manifest writer process did not finish"
+        results.append(receiver.recv())
+        process.join(5)
+        assert process.exitcode == 0
+
+    assert all(status == "ok" for status, _value in results), results
+    assert sorted(value for _status, value in results) == [1, 2, 3, 4]
+    loaded = store.load()
+    assert loaded.latest_attempt is not None
+    assert loaded.latest_attempt.generation == 4
+    assert loaded.latest_attempt.failure_code == "refresh_overlap"
+    assert loaded.last_success is not None
+    assert loaded.last_success.generation == 0
+    assert stat.S_IMODE(store.manifest_lock_path.stat().st_mode) == 0o600
+
+
+def test_refresh_and_manifest_lock_symlinks_are_refused_without_touching_target(
+    tmp_path,
+):
+    target = tmp_path / "lock-target"
+    target.write_text("do-not-touch", encoding="utf-8")
+    store = _store(tmp_path / "manifest.json")
+
+    store.refresh_lock_path.symlink_to(target)
+    with pytest.raises(ValueError, match="lock.*symlink"):
+        with store.try_refresh_lease(
+            uid_scope_hash=UID_HASH,
+            observed_at=NOW,
+        ):
+            pass
+    assert target.read_text(encoding="utf-8") == "do-not-touch"
+    store.refresh_lock_path.unlink()
+
+    store.manifest_lock_path.unlink()
+    store.manifest_lock_path.symlink_to(target)
+    with pytest.raises(ValueError, match="lock.*symlink"):
+        store.seal_success(_generation(0))
+    assert target.read_text(encoding="utf-8") == "do-not-touch"
+    assert not store.path.exists()

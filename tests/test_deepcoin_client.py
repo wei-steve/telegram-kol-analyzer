@@ -1,4 +1,5 @@
 import base64
+from contextlib import contextmanager
 import hashlib
 import hmac
 import json
@@ -9,7 +10,9 @@ import pytest
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import DeepcoinCredentials
 from telegram_kol_research.deepcoin_client import DeepcoinRestClient
+from telegram_kol_research.deepcoin_client import DeepcoinReadUnavailable
 from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
+from telegram_kol_research.deepcoin_client import DeepcoinRequestScope
 from telegram_kol_research.deepcoin_client import DeepcoinTpslWriteLimiter
 from telegram_kol_research.deepcoin_client import build_deepcoin_auth_headers
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
@@ -19,6 +22,7 @@ from telegram_kol_research.deepcoin_request_governor import (
     DeepcoinRequestGovernor,
     GovernorMode,
 )
+from telegram_kol_research.deepcoin_request_policy import RequestPriority
 
 
 class _FakeResponse:
@@ -74,6 +78,48 @@ class _HttpStatusClient:
         )
 
 
+class _ChunkedWireResponse:
+    status_code = 200
+    headers = {}
+
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+        self.yielded = 0
+        self.json_calls = 0
+
+    def iter_raw(self):
+        for chunk in self.chunks:
+            self.yielded += 1
+            yield chunk
+
+    def json(self):
+        self.json_calls += 1
+        raise AssertionError("bounded monitor response must not call response.json")
+
+
+class _MonitorStreamingHttpClient:
+    def __init__(self, response):
+        self.response = response
+        self.request_calls = 0
+        self.stream_calls = []
+
+    def request(self, *args, **kwargs):
+        self.request_calls += 1
+        raise AssertionError("bounded monitor response must use streaming HTTP")
+
+    @contextmanager
+    def stream(self, method, request_path, content="", headers=None, timeout=None):
+        self.stream_calls.append(
+            {
+                "method": method,
+                "request_path": request_path,
+                "headers": headers,
+                "timeout": timeout,
+            }
+        )
+        yield self.response
+
+
 class _FakeMonotonicClock:
     def __init__(self, current: float = 100.0):
         self.current = current
@@ -112,6 +158,69 @@ def test_read_only_deepcoin_client_refuses_write_before_http():
         "data": [],
     }
     assert [request["method"] for request in http_client.requests] == ["GET"]
+
+
+def test_monitor_scope_stops_reading_wire_bytes_before_json_decode():
+    response = _ChunkedWireResponse(
+        [
+            b'{"code":"0","data":[',
+            b'{"posId":"' + b"x" * 48,
+            b'"}]}',
+        ]
+    )
+    http_client = _MonitorStreamingHttpClient(response)
+    clock = _FakeMonotonicClock(100.0)
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(
+            api_key="key",
+            api_secret="secret",
+            passphrase="pass",
+        ),
+        http_client=http_client,
+        monotonic_factory=clock,
+        sleep_fn=clock.sleep,
+        read_only=True,
+    )
+
+    with client.request_scope(
+        DeepcoinRequestScope(
+            phase="production_monitor_snapshot",
+            priority=RequestPriority.BACKGROUND,
+            deadline_monotonic=105.0,
+            max_response_bytes=64,
+        )
+    ):
+        with pytest.raises(DeepcoinReadUnavailable) as captured:
+            client.read_positions()
+
+    assert captured.value.fact.safe_code == "monitor_response_size_exceeded"
+    assert response.yielded == 2
+    assert response.json_calls == 0
+    assert http_client.request_calls == 0
+    assert len(http_client.stream_calls) == 1
+
+
+def test_monitor_response_limit_cannot_be_used_for_exchange_write():
+    http_client = _CapturingHttpClient(
+        {"code": "0", "data": [{"ordId": "unexpected"}]}
+    )
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+    )
+
+    with client.request_scope(
+        DeepcoinRequestScope(
+            phase="production_monitor_snapshot",
+            priority=RequestPriority.BACKGROUND,
+            deadline_monotonic=None,
+            max_response_bytes=64,
+        )
+    ):
+        with pytest.raises(DeepcoinClientError, match="only supports GET"):
+            client.place_order({"instId": "BTC-USDT-SWAP"})
+
+    assert http_client.requests == []
 
 
 def test_build_deepcoin_auth_headers_signs_timestamp_method_path_and_body():

@@ -10,6 +10,8 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+import errno
+import fcntl
 import hashlib
 import json
 import math
@@ -127,6 +129,12 @@ class SnapshotManifest:
     last_success: SnapshotGeneration | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class SnapshotRefreshLease:
+    acquired: bool
+    manifest: SnapshotManifest
+
+
 class ProductionMonitorSnapshotStore:
     """Persist at most three complete generations through an atomic manifest."""
 
@@ -140,46 +148,125 @@ class ProductionMonitorSnapshotStore:
         self._now_factory = now_factory or (lambda: datetime.now(UTC))
         self._lock = threading.RLock()
 
+    @property
+    def refresh_lock_path(self) -> Path:
+        return self.path.with_name(f".{self.path.name}.refresh.lock")
+
+    @property
+    def manifest_lock_path(self) -> Path:
+        return self.path.with_name(f".{self.path.name}.manifest.lock")
+
+    def try_refresh_lease(
+        self,
+        *,
+        uid_scope_hash: str,
+        observed_at: datetime,
+    ) -> "_RefreshLease":
+        """Acquire a refresh baseline or atomically seal ``refresh_overlap``."""
+
+        return _RefreshLease(
+            self,
+            uid_scope_hash=_uid_scope_hash(uid_scope_hash),
+            observed_at=_aware_utc(observed_at, field="observed_at"),
+        )
+
     def load(self) -> SnapshotManifest:
         with self._lock:
             return self._load()
 
     def seal_success(self, generation: SnapshotGeneration) -> SnapshotManifest:
         with self._lock:
-            manifest = self._load()
-            sealed = _validate_and_seal_generation(
-                generation,
-                now=self._now(),
-                expected_outcome="SUCCESS",
-            )
-            _validate_next_generation(manifest, sealed)
-            retained = (*manifest.generations, sealed)[-3:]
-            updated = SnapshotManifest(
-                uid_scope_hash=sealed.uid_scope_hash,
-                generations=retained,
-                latest_attempt=sealed,
-                last_success=sealed,
-            )
-            self._persist(updated)
-            return updated
+            with self._manifest_write_lease():
+                manifest = self._load()
+                sealed = _validate_and_seal_generation(
+                    generation,
+                    now=self._now(),
+                    expected_outcome="SUCCESS",
+                )
+                _validate_next_generation(manifest, sealed)
+                retained = (*manifest.generations, sealed)[-3:]
+                updated = SnapshotManifest(
+                    uid_scope_hash=sealed.uid_scope_hash,
+                    generations=retained,
+                    latest_attempt=sealed,
+                    last_success=sealed,
+                )
+                self._persist(updated)
+                return updated
 
     def seal_failure(self, generation: SnapshotGeneration) -> SnapshotManifest:
         with self._lock:
-            manifest = self._load()
-            sealed = _validate_and_seal_generation(
-                generation,
-                now=self._now(),
-                expected_outcome="FAILURE",
-            )
-            _validate_next_generation(manifest, sealed)
-            updated = SnapshotManifest(
-                uid_scope_hash=sealed.uid_scope_hash,
-                generations=manifest.generations,
-                latest_attempt=sealed,
-                last_success=manifest.last_success,
-            )
-            self._persist(updated)
-            return updated
+            with self._manifest_write_lease():
+                return self._seal_failure_locked(generation)
+
+    def record_refresh_overlap(
+        self,
+        *,
+        uid_scope_hash: str,
+        observed_at: datetime,
+    ) -> SnapshotManifest:
+        """Allocate and seal one overlap attempt without a racy load/allocate gap."""
+
+        observed = _aware_utc(observed_at, field="observed_at")
+        with self._lock:
+            with self._manifest_write_lease():
+                manifest = self._load()
+                return self._record_refresh_overlap_locked(
+                    manifest,
+                    uid_scope_hash=_uid_scope_hash(uid_scope_hash),
+                    observed_at=observed,
+                )
+
+    def _manifest_write_lease(self) -> "_FileLease":
+        return _FileLease(self.manifest_lock_path, blocking=True)
+
+    def _seal_failure_locked(
+        self,
+        generation: SnapshotGeneration,
+        *,
+        manifest: SnapshotManifest | None = None,
+    ) -> SnapshotManifest:
+        current = self._load() if manifest is None else manifest
+        sealed = _validate_and_seal_generation(
+            generation,
+            now=self._now(),
+            expected_outcome="FAILURE",
+        )
+        _validate_next_generation(current, sealed)
+        updated = SnapshotManifest(
+            uid_scope_hash=sealed.uid_scope_hash,
+            generations=current.generations,
+            latest_attempt=sealed,
+            last_success=current.last_success,
+        )
+        self._persist(updated)
+        return updated
+
+    def _record_refresh_overlap_locked(
+        self,
+        manifest: SnapshotManifest,
+        *,
+        uid_scope_hash: str,
+        observed_at: datetime,
+    ) -> SnapshotManifest:
+        if manifest.uid_scope_hash is not None and not _constant_time_equal(
+            manifest.uid_scope_hash, uid_scope_hash
+        ):
+            raise ValueError("production monitor snapshot account scope mismatch")
+        previous = manifest.latest_attempt
+        previous_generation = -1 if previous is None else previous.generation
+        if previous_generation >= 2**63 - 1:
+            raise ValueError("snapshot generation is exhausted")
+        envelope = SnapshotGeneration(
+            generation=previous_generation + 1,
+            outcome="FAILURE",
+            request_started_at=observed_at,
+            request_completed_at=observed_at,
+            uid_scope_hash=uid_scope_hash,
+            collections=(),
+            failure_code="refresh_overlap",
+        )
+        return self._seal_failure_locked(envelope, manifest=manifest)
 
     def _now(self) -> datetime:
         return _aware_utc(self._now_factory(), field="current time")
@@ -268,6 +355,109 @@ class ProductionMonitorSnapshotStore:
                     pass
             os.close(parent_fd)
 
+
+class _RefreshLease:
+    """Establish the attempt baseline before exposing the held refresh lease."""
+
+    def __init__(
+        self,
+        store: ProductionMonitorSnapshotStore,
+        *,
+        uid_scope_hash: str,
+        observed_at: datetime,
+    ) -> None:
+        self._store = store
+        self._uid_scope_hash = uid_scope_hash
+        self._observed_at = observed_at
+        self._file_lease = _FileLease(store.refresh_lock_path, blocking=False)
+        self._file_lease_held = False
+
+    def __enter__(self) -> SnapshotRefreshLease:
+        with self._store._manifest_write_lease():
+            manifest = self._store._load()
+            acquired = self._file_lease.__enter__()
+            if acquired:
+                self._file_lease_held = True
+                return SnapshotRefreshLease(acquired=True, manifest=manifest)
+            updated = self._store._record_refresh_overlap_locked(
+                manifest,
+                uid_scope_hash=self._uid_scope_hash,
+                observed_at=self._observed_at,
+            )
+            return SnapshotRefreshLease(acquired=False, manifest=updated)
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        if self._file_lease_held:
+            self._file_lease_held = False
+            self._file_lease.__exit__(exc_type, exc_value, traceback)
+
+
+class _FileLease:
+    """Descriptor-bound advisory lock that never follows a lock-file symlink."""
+
+    def __init__(self, path: Path, *, blocking: bool) -> None:
+        self._path = path
+        self._blocking = blocking
+        self._descriptor: int | None = None
+        self._acquired = False
+
+    def __enter__(self) -> bool:
+        parent_fd = _open_safe_parent(self._path)
+        descriptor: int | None = None
+        try:
+            _reject_lock_symlink(parent_fd, self._path.name)
+            try:
+                descriptor = os.open(
+                    self._path.name,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | _no_follow_flag()
+                    | _close_on_exec_flag(),
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+            except OSError as exc:
+                raise ValueError(
+                    "production monitor snapshot lock is unsafe or a symlink"
+                ) from exc
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+            ):
+                raise ValueError("production monitor snapshot lock file is unsafe")
+            os.fchmod(descriptor, 0o600)
+            _verify_lock_identity(parent_fd, self._path.name, metadata)
+            operation = fcntl.LOCK_EX
+            if not self._blocking:
+                operation |= fcntl.LOCK_NB
+            try:
+                fcntl.flock(descriptor, operation)
+            except OSError as exc:
+                if not self._blocking and exc.errno in {errno.EACCES, errno.EAGAIN}:
+                    return False
+                raise
+            _verify_lock_identity(parent_fd, self._path.name, os.fstat(descriptor))
+            self._descriptor = descriptor
+            descriptor = None
+            self._acquired = True
+            return True
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(parent_fd)
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        descriptor = self._descriptor
+        self._descriptor = None
+        if descriptor is None:
+            return
+        try:
+            if self._acquired:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            self._acquired = False
+            os.close(descriptor)
 
 def _validate_next_generation(
     manifest: SnapshotManifest,
@@ -754,6 +944,32 @@ def _reject_existing_symlink(parent_fd: int, name: str) -> None:
         raise ValueError("production monitor snapshot manifest symlink is refused")
     if not stat.S_ISREG(metadata.st_mode):
         raise ValueError("production monitor snapshot manifest must be a regular file")
+
+
+def _reject_lock_symlink(parent_fd: int, name: str) -> None:
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ValueError("production monitor snapshot lock file symlink is refused")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("production monitor snapshot lock file is unsafe")
+
+
+def _verify_lock_identity(parent_fd: int, name: str, expected: os.stat_result) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise ValueError("production monitor snapshot lock file was replaced") from exc
+    if stat.S_ISLNK(current.st_mode):
+        raise ValueError("production monitor snapshot lock file symlink is refused")
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or current.st_dev != expected.st_dev
+        or current.st_ino != expected.st_ino
+    ):
+        raise ValueError("production monitor snapshot lock file was replaced")
 
 
 def _no_follow_flag() -> int:

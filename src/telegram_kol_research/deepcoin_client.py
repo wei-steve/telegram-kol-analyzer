@@ -122,6 +122,10 @@ class DeepcoinPreSendUnavailable(DeepcoinClientError):
         super().__init__(message)
 
 
+class _MonitorResponseSizeExceeded(RuntimeError):
+    """A monitor-scoped response crossed its pre-decode byte limit."""
+
+
 @dataclass(frozen=True, slots=True)
 class RequestAttemptFact:
     ordinal: int
@@ -147,6 +151,7 @@ class DeepcoinRequestScope:
     deadline_monotonic: float | None
     correlation_id: str | None = None
     attempt_recorder: Callable[[RequestAttemptFact], None] | None = None
+    max_response_bytes: int | None = None
 
 
 def _require_list_data(payload: dict[str, Any], *, endpoint: str) -> list[dict[str, Any]]:
@@ -464,6 +469,11 @@ class DeepcoinRestClient:
             raise TypeError("scope must be DeepcoinRequestScope")
         RequestPriority(scope.priority)
         _bounded_optional_deadline(scope.deadline_monotonic)
+        response_limit = _bounded_optional_response_limit(scope.max_response_bytes)
+        if response_limit is not None and scope.phase != "production_monitor_snapshot":
+            raise DeepcoinClientError(
+                "bounded response bytes are reserved for the production monitor"
+            )
         token = self._request_scope_context.set(scope)
         try:
             yield self
@@ -819,12 +829,20 @@ class DeepcoinRestClient:
             phase = "legacy_unscoped"
             correlation_id = None
             recorder = None
+            response_limit = None
         else:
             priority = RequestPriority(scope.priority)
             deadline = _bounded_optional_deadline(scope.deadline_monotonic)
             phase = _bounded_label(scope.phase, fallback="unspecified_phase")
             correlation_id = _bounded_optional_label(scope.correlation_id)
             recorder = scope.attempt_recorder
+            response_limit = _bounded_optional_response_limit(
+                scope.max_response_bytes
+            )
+        if response_limit is not None and normalized_method != "GET":
+            raise DeepcoinClientError(
+                "bounded production monitor response only supports GET"
+            )
         max_attempts = (
             1
             if normalized_method != "GET"
@@ -908,6 +926,8 @@ class DeepcoinRestClient:
                 body=body,
             )
             headers["Content-Type"] = "application/json"
+            if response_limit is not None:
+                headers["Accept-Encoding"] = "identity"
             remaining = _remaining_seconds(deadline, self._safe_monotonic())
             if remaining is not None and remaining <= 0:
                 fact = _request_deadline_exhausted_fact()
@@ -943,24 +963,47 @@ class DeepcoinRestClient:
             retry_after: float | None = None
             cause: BaseException | None = None
             try:
-                response = client.request(
-                    normalized_method,
-                    request_path,
-                    content=body,
-                    headers=headers,
-                    timeout=timeout_seconds,
-                )
-                if response.status_code >= 400:
+                raw_payload: bytes | None = None
+                if response_limit is None:
+                    response = client.request(
+                        normalized_method,
+                        request_path,
+                        content=body,
+                        headers=headers,
+                        timeout=timeout_seconds,
+                    )
+                    response_status = response.status_code
+                    response_headers = response.headers
+                else:
+                    with client.stream(
+                        normalized_method,
+                        request_path,
+                        content=body,
+                        headers=headers,
+                        timeout=timeout_seconds,
+                    ) as response:
+                        response_status = response.status_code
+                        response_headers = response.headers
+                        if response_status < 400:
+                            raw_payload = _read_bounded_monitor_response(
+                                response,
+                                limit=response_limit,
+                            )
+                if response_status >= 400:
                     failure = classify_http_failure(
                         method=normalized_method,
-                        status_code=response.status_code,
+                        status_code=response_status,
                     )
                     retry_after = _bounded_retry_after(
-                        response.headers.get("Retry-After")
+                        response_headers.get("Retry-After")
                     )
                 else:
                     try:
-                        payload = response.json()
+                        payload = (
+                            response.json()
+                            if raw_payload is None
+                            else json.loads(raw_payload)
+                        )
                     except (
                         json.JSONDecodeError,
                         RecursionError,
@@ -1020,7 +1063,7 @@ class DeepcoinRestClient:
                                         outcome_certainty=OutcomeCertainty.ACCEPTED,
                                         error_category=None,
                                         safe_code="request_accepted",
-                                        http_status=response.status_code,
+                                        http_status=response_status,
                                         business_code=None,
                                         governor_wait_ms=governor_wait_ms,
                                         retry_delay_ms=0,
@@ -1031,6 +1074,9 @@ class DeepcoinRestClient:
                                     ),
                                 )
                                 return payload
+            except _MonitorResponseSizeExceeded as exc:
+                failure = _monitor_response_size_failure()
+                cause = exc
             except httpx.RequestError as exc:
                 failure = classify_transport_failure(
                     method=normalized_method,
@@ -1301,6 +1347,38 @@ def _request_deadline_exhausted_fact() -> FailureFact:
     )
 
 
+def _monitor_response_size_failure() -> FailureFact:
+    return FailureFact(
+        category=ErrorCategory.SCHEMA_INVALID,
+        outcome_certainty=OutcomeCertainty.UNKNOWN,
+        retryable=False,
+        safe_code="monitor_response_size_exceeded",
+    )
+
+
+def _read_bounded_monitor_response(response: Any, *, limit: int) -> bytes:
+    raw_content_length = response.headers.get("Content-Length")
+    if raw_content_length not in (None, ""):
+        try:
+            declared_length = int(raw_content_length)
+        except (TypeError, ValueError):
+            declared_length = -1
+        if declared_length > limit:
+            raise _MonitorResponseSizeExceeded(
+                "monitor response content length exceeds limit"
+            )
+    payload = bytearray()
+    for chunk in response.iter_raw():
+        if not isinstance(chunk, (bytes, bytearray, memoryview)):
+            raise DeepcoinClientError("monitor response chunk is invalid")
+        if len(payload) + len(chunk) > limit:
+            raise _MonitorResponseSizeExceeded(
+                "monitor response body exceeds limit"
+            )
+        payload.extend(chunk)
+    return bytes(payload)
+
+
 def _validated_business_code(value: object) -> str:
     if isinstance(value, bool) or not isinstance(value, (str, int)):
         raise ValueError("business code schema invalid")
@@ -1347,6 +1425,16 @@ def _bounded_optional_deadline(value: object) -> float | None:
     if not math.isfinite(parsed) or parsed < 0:
         raise DeepcoinClientError("invalid request deadline")
     return parsed
+
+
+def _bounded_optional_response_limit(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise DeepcoinClientError("invalid monitor response byte limit")
+    if not (1 <= value <= 16 * 1024 * 1024):
+        raise DeepcoinClientError("invalid monitor response byte limit")
+    return value
 
 
 def _remaining_seconds(deadline: float | None, now: float) -> float | None:
