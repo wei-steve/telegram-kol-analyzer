@@ -7354,6 +7354,36 @@ def test_monitor_incident_writer_rejects_non_closed_payloads(tmp_path, body):
         assert session.query(RuntimeIncident).count() == 0
 
 
+@pytest.mark.parametrize("schema_version", [True, 1.0])
+def test_monitor_incident_writer_v1_requires_exact_integer_schema_version(
+    tmp_path, schema_version
+):
+    token = "m" * 43
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"monitor_adapter_failure"}),
+            monitor_capture_token=token,
+        ),
+    )
+
+    response = TestClient(app, client=("127.0.0.1", 50000)).post(
+        "/api/runtime-incidents/monitor-capture",
+        headers={"x-monitor-capture-token": token},
+        json={
+            "schema_version": schema_version,
+            "checked_at": "2026-08-14T20:00:00+00:00",
+            "reason_codes": ["adapter_failure"],
+            "adapter_failures": ["audit"],
+            "notification_error": None,
+        },
+    )
+
+    assert response.status_code == 422
+    with app.state.session_factory() as session:
+        assert session.query(RuntimeIncident).count() == 0
+
+
 def test_monitor_incident_writer_refuses_concurrent_capture(tmp_path):
     token = "m" * 43
     app = create_web_app(

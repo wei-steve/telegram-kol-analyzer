@@ -5300,7 +5300,10 @@ def create_web_app(
                 # timer. Keep schema v1 closed to its original six adapters.
                 if set(payload) != LEGACY_MONITOR_PROJECTION_V1_FIELDS:
                     raise ValueError("invalid fields")
-                if payload["schema_version"] != 1:
+                if (
+                    type(payload["schema_version"]) is not int
+                    or payload["schema_version"] != 1
+                ):
                     raise ValueError("invalid version")
                 checked_at = datetime.fromisoformat(payload["checked_at"])
                 if checked_at.tzinfo is None:
