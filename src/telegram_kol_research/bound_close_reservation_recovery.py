@@ -159,6 +159,10 @@ class BoundCloseReservationRecoveryConflict(RuntimeError):
     """The separately gated apply could not prove its exact CAS boundary."""
 
 
+class _SealedRecoveryCaptureExpired(ValueError):
+    """A capture missed its issuer-bound absolute monotonic deadline."""
+
+
 class _OpaqueUncopyableCapability:
     """Prevent accidental capability duplication or raw-state serialization."""
 
@@ -1182,6 +1186,7 @@ class SealedRecoveryCapture(_OpaqueUncopyableCapability):
     __slots__ = (
         "__apply_claimed",
         "__apply_claim_lock",
+        "__deadline_monotonic",
         "__plan",
         "__serialized_plan",
         "__source_capability",
@@ -1211,6 +1216,7 @@ _SEALED_CAPTURE_ISSUANCE_LOCK = threading.RLock()
 class _SealedCaptureIssuance:
     __slots__ = (
         "capture_ref",
+        "deadline_monotonic",
         "plan",
         "plan_snapshot_fingerprint",
         "raw_source_snapshot_fingerprint",
@@ -1222,6 +1228,7 @@ class _SealedCaptureIssuance:
         self,
         *,
         capture_ref: weakref.ReferenceType[SealedRecoveryCapture],
+        deadline_monotonic: float,
         plan: BoundCloseReservationRecoveryPlan,
         plan_snapshot_fingerprint: str,
         raw_source_snapshot_fingerprint: str,
@@ -1229,6 +1236,7 @@ class _SealedCaptureIssuance:
         source_capability: _BoundCloseReservationSourceCapability,
     ) -> None:
         self.capture_ref = capture_ref
+        self.deadline_monotonic = deadline_monotonic
         self.plan = plan
         self.plan_snapshot_fingerprint = plan_snapshot_fingerprint
         self.raw_source_snapshot_fingerprint = raw_source_snapshot_fingerprint
@@ -1258,6 +1266,9 @@ def _register_sealed_recovery_capture(capture: SealedRecoveryCapture) -> None:
     reference = weakref.ref(capture, discard)
     issuance = _SealedCaptureIssuance(
         capture_ref=reference,
+        deadline_monotonic=_finite_recovery_monotonic(
+            capture._SealedRecoveryCapture__deadline_monotonic
+        ),
         plan=capture.plan,
         plan_snapshot_fingerprint=_sha256_json(capture.plan),
         raw_source_snapshot_fingerprint=_raw_source_snapshot_fingerprint(
@@ -1276,13 +1287,20 @@ def _register_sealed_recovery_capture(capture: SealedRecoveryCapture) -> None:
 
 
 class _ClaimedSealedRecoveryCapture(_OpaqueUncopyableCapability):
-    __slots__ = ("__plan", "__source_capability")
+    __slots__ = (
+        "__capture_completed_at",
+        "__deadline_monotonic",
+        "__plan",
+        "__source_capability",
+    )
 
     def __init__(
         self,
         *,
         plan: BoundCloseReservationRecoveryPlan,
         source_capability: object,
+        capture_completed_at: datetime,
+        deadline_monotonic: float,
         _issuer: object,
     ) -> None:
         if _issuer is not _SEALED_APPLY_CLAIM_ISSUER:
@@ -1291,10 +1309,21 @@ class _ClaimedSealedRecoveryCapture(_OpaqueUncopyableCapability):
             raise TypeError("claimed recovery capture source capability is invalid")
         self.__plan = plan
         self.__source_capability = source_capability
+        self.__capture_completed_at = _require_aware_utc(
+            capture_completed_at,
+            "capture_completed_at",
+        )
+        self.__deadline_monotonic = _finite_recovery_monotonic(
+            deadline_monotonic
+        )
 
     @property
     def plan(self) -> BoundCloseReservationRecoveryPlan:
         return self.__plan
+
+    @property
+    def capture_completed_at(self) -> datetime:
+        return self.__capture_completed_at
 
 
 def _claim_sealed_recovery_capture_for_apply(
@@ -1310,6 +1339,15 @@ def _claim_sealed_recovery_capture_for_apply(
         issued = _SEALED_CAPTURE_ISSUANCE_REGISTRY.get(id(capture))
         if issued is None or issued.capture_ref() is not capture:
             raise ValueError("capture must be a privately issued SealedRecoveryCapture")
+        if (
+            getattr(capture, "_SealedRecoveryCapture__deadline_monotonic", None)
+            != issued.deadline_monotonic
+        ):
+            raise ValueError("sealed recovery capture issued contents changed")
+        if time.monotonic() >= issued.deadline_monotonic:
+            raise _SealedRecoveryCaptureExpired(
+                "sealed recovery capture deadline expired"
+            )
         if (
             getattr(capture, "_SealedRecoveryCapture__plan", None)
             is not issued.plan
@@ -1345,9 +1383,21 @@ def _claim_sealed_recovery_capture_for_apply(
             )
         if issued.plan.status != "ready":
             raise ValueError("only a ready sealed recovery capture can be claimed")
+        try:
+            parsed_capture = _parse_bound_close_reservation_dry_run_document(
+                issued.serialized_plan.encode("utf-8")
+            )
+        except (RecursionError, TypeError, UnicodeError, ValueError) as exc:
+            raise ValueError(
+                "sealed recovery capture issued contents changed"
+            ) from exc
+        if parsed_capture.plan != issued.plan:
+            raise ValueError("sealed recovery capture issued contents changed")
         claimed = _ClaimedSealedRecoveryCapture(
             plan=issued.plan,
             source_capability=issued.source_capability,
+            capture_completed_at=parsed_capture.capture_completed_at,
+            deadline_monotonic=issued.deadline_monotonic,
             _issuer=_SEALED_APPLY_CLAIM_ISSUER,
         )
         capture._SealedRecoveryCapture__apply_claimed = True
@@ -1436,6 +1486,8 @@ def _claim_exact_bound_close_reservation_apply_capture(
         raise _apply_refusal("fresh_capture_plan_drift")
     try:
         claimed = _claim_sealed_recovery_capture_for_apply(capture)
+    except _SealedRecoveryCaptureExpired as exc:
+        raise _apply_refusal("fresh_capture_expired") from exc
     except (AttributeError, RecursionError, TypeError, ValueError) as exc:
         raise _apply_refusal("fresh_capture_capability_invalid") from exc
     captured_plan = claimed.plan
@@ -1727,6 +1779,82 @@ def _sqlite_apply_time(value: datetime) -> str:
     )
 
 
+def _commit_bound_close_reservation_apply(
+    connection: sqlite3.Connection,
+) -> None:
+    connection.commit()
+
+
+def _close_recovery_connection_safely(connection: object) -> None:
+    try:
+        connection.close()
+    except Exception:
+        pass
+
+
+def _verify_committed_bound_close_reservation_apply_read_only(
+    database_path: Path,
+    *,
+    plan: BoundCloseReservationRecoveryPlan,
+    raw_rows: tuple[tuple[str, _RawReservationCapability], ...],
+    before_json: str,
+    after_json: str,
+) -> int | None:
+    uri = f"file:{quote(str(database_path), safe='/')}?mode=ro"
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(uri, uri=True, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        if int(connection.execute("PRAGMA query_only").fetchone()[0]) != 1:
+            return None
+        connection.execute("BEGIN")
+        if not _locked_mimo_contract_mode_is_v1(connection):
+            return None
+        audits = _load_bound_close_reservation_audits(connection)
+        matching = tuple(
+            row
+            for row in audits
+            if row["notification_fingerprint"] == plan.evidence_fingerprint
+        )
+        if (
+            len(audits) != 1
+            or len(matching) != 1
+            or not _exact_recovery_audit_matches(
+                matching[0],
+                plan=plan,
+                before_json=before_json,
+                after_json=after_json,
+            )
+            or not _planned_rows_are_exactly_confirmed(
+                connection,
+                raw_rows=raw_rows,
+                audit_created_at=matching[0]["created_at"],
+            )
+            or _locked_active_bound_close_reservation_source(
+                connection
+            ).reservations
+        ):
+            return None
+        return int(matching[0]["id"])
+    except (
+        BoundCloseReservationRecoveryConflict,
+        OSError,
+        RecursionError,
+        sqlite3.Error,
+        TypeError,
+        ValueError,
+    ):
+        return None
+    finally:
+        if connection is not None:
+            try:
+                if connection.in_transaction:
+                    connection.rollback()
+            finally:
+                _close_recovery_connection_safely(connection)
+
+
 def apply_bound_close_reservation_recovery(
     database_path: str | Path,
     *,
@@ -1780,6 +1908,14 @@ def apply_bound_close_reservation_recovery(
             if row["notification_fingerprint"] == plan.evidence_fingerprint
         )
         if matching:
+            audit_created_at = _parse_sqlite_utc(matching[0]["created_at"])
+            if (
+                audit_created_at is None
+                or claimed.capture_completed_at <= audit_created_at
+            ):
+                raise _apply_refusal(
+                    "fresh_capture_does_not_postdate_audit"
+                )
             if (
                 len(audits) != 1
                 or len(matching) != 1
@@ -1789,17 +1925,17 @@ def apply_bound_close_reservation_recovery(
                     before_json=before_json,
                     after_json=after_json,
                 )
-                    or not _planned_rows_are_exactly_confirmed(
-                        connection,
-                        raw_rows=raw_rows,
-                        audit_created_at=matching[0]["created_at"],
-                    )
+                or not _planned_rows_are_exactly_confirmed(
+                    connection,
+                    raw_rows=raw_rows,
+                    audit_created_at=matching[0]["created_at"],
+                )
             ):
                 raise _apply_refusal("unexpected_audit_event")
             active = _locked_active_bound_close_reservation_source(connection)
             if active.reservations:
                 raise _apply_refusal("source_state_conflict")
-            connection.commit()
+            connection.rollback()
             return BoundCloseReservationRecoveryResult(
                 status="already_applied",
                 evidence_fingerprint=plan.evidence_fingerprint,
@@ -1860,7 +1996,33 @@ def apply_bound_close_reservation_recovery(
         audit_event_id = cursor.lastrowid
         if type(audit_event_id) is not int or audit_event_id <= 0:
             raise _apply_refusal("audit_insert_failed")
-        connection.commit()
+        try:
+            _commit_bound_close_reservation_apply(connection)
+        except Exception as exc:
+            if connection.in_transaction:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+            _close_recovery_connection_safely(connection)
+            connection = None
+            verified_event_id = (
+                _verify_committed_bound_close_reservation_apply_read_only(
+                    resolved_database_path,
+                    plan=plan,
+                    raw_rows=raw_rows,
+                    before_json=before_json,
+                    after_json=after_json,
+                )
+            )
+            if verified_event_id is not None:
+                return BoundCloseReservationRecoveryResult(
+                    status="applied",
+                    evidence_fingerprint=plan.evidence_fingerprint,
+                    action_count=plan.action_count,
+                    audit_event_id=verified_event_id,
+                )
+            raise _apply_refusal("apply_commit_outcome_unresolved") from exc
         return BoundCloseReservationRecoveryResult(
             status="applied",
             evidence_fingerprint=plan.evidence_fingerprint,
@@ -1877,7 +2039,7 @@ def apply_bound_close_reservation_recovery(
         raise _apply_refusal("apply_transaction_failed") from exc
     finally:
         if connection is not None:
-            connection.close()
+            _close_recovery_connection_safely(connection)
 
 
 class _RawRecoveryCapture:
@@ -1905,30 +2067,16 @@ def _recovery_capture_now() -> datetime:
     return datetime.now(UTC)
 
 
-def capture_and_seal_bound_close_reservation_recovery(
-    source: BoundCloseReservationSource,
-    reader: BoundCloseReservationExchangeReader,
+def _capture_recovery_exchange_collections(
     *,
+    raw_by_ref: Mapping[str, _RawReservationCapability],
+    reader: BoundCloseReservationExchangeReader,
     deadline_monotonic: float,
-) -> SealedRecoveryCapture:
-    """Perform one fresh bounded GET capture and issue the only apply capability."""
-
-    if type(source) is not BoundCloseReservationSource:
-        raise TypeError("source must be BoundCloseReservationSource")
-    if type(reader) is not BoundCloseReservationExchangeReader:
-        raise TypeError("reader must be the dedicated recovery reader")
+) -> tuple[_RawRecoveryCapture, datetime, datetime]:
     started_at = _require_aware_utc(
         _recovery_capture_now(),
         "capture_started_at",
     )
-    raw_by_ref: dict[str, _RawReservationCapability] = {}
-    for local in source.reservations:
-        try:
-            raw = source._capability._get(local.reservation_ref)
-        except KeyError:
-            continue
-        if type(raw) is _RawReservationCapability:
-            raw_by_ref[local.reservation_ref] = raw
     order_queries = sorted(
         {
             (raw.instrument_id, raw.order_id)
@@ -1973,6 +2121,60 @@ def capture_and_seal_bound_close_reservation_recovery(
         "capture_completed_at",
     )
     _validated_capture_times(started_at, completed_at)
+    return capture, started_at, completed_at
+
+
+def _issue_sealed_recovery_capture(
+    *,
+    plan: BoundCloseReservationRecoveryPlan,
+    source_capability: _BoundCloseReservationSourceCapability,
+    capture_started_at: datetime,
+    capture_completed_at: datetime,
+    deadline_monotonic: float,
+) -> SealedRecoveryCapture:
+    serialized = serialize_bound_close_reservation_recovery_plan(
+        plan,
+        capture_started_at=capture_started_at,
+        capture_completed_at=capture_completed_at,
+    )
+    sealed = object.__new__(SealedRecoveryCapture)
+    sealed._SealedRecoveryCapture__apply_claimed = False
+    sealed._SealedRecoveryCapture__apply_claim_lock = threading.Lock()
+    sealed._SealedRecoveryCapture__deadline_monotonic = (
+        _finite_recovery_monotonic(deadline_monotonic)
+    )
+    sealed._SealedRecoveryCapture__plan = plan
+    sealed._SealedRecoveryCapture__serialized_plan = serialized
+    sealed._SealedRecoveryCapture__source_capability = source_capability
+    _register_sealed_recovery_capture(sealed)
+    return sealed
+
+
+def capture_and_seal_bound_close_reservation_recovery(
+    source: BoundCloseReservationSource,
+    reader: BoundCloseReservationExchangeReader,
+    *,
+    deadline_monotonic: float,
+) -> SealedRecoveryCapture:
+    """Perform one fresh bounded GET capture and issue the only apply capability."""
+
+    if type(source) is not BoundCloseReservationSource:
+        raise TypeError("source must be BoundCloseReservationSource")
+    if type(reader) is not BoundCloseReservationExchangeReader:
+        raise TypeError("reader must be the dedicated recovery reader")
+    raw_by_ref: dict[str, _RawReservationCapability] = {}
+    for local in source.reservations:
+        try:
+            raw = source._capability._get(local.reservation_ref)
+        except KeyError:
+            continue
+        if type(raw) is _RawReservationCapability:
+            raw_by_ref[local.reservation_ref] = raw
+    capture, started_at, completed_at = _capture_recovery_exchange_collections(
+        raw_by_ref=raw_by_ref,
+        reader=reader,
+        deadline_monotonic=deadline_monotonic,
+    )
     observations: list[BoundCloseReservationObservation] = []
     for local in source.reservations:
         exchange = _normalize_recovery_exchange_evidence(
@@ -1991,19 +2193,298 @@ def capture_and_seal_bound_close_reservation_recovery(
         source_fingerprint=source.source_fingerprint,
         observations=tuple(observations),
     )
-    serialized = serialize_bound_close_reservation_recovery_plan(
-        plan,
+    return _issue_sealed_recovery_capture(
+        plan=plan,
+        source_capability=source._capability,
         capture_started_at=started_at,
         capture_completed_at=completed_at,
+        deadline_monotonic=deadline_monotonic,
     )
-    sealed = object.__new__(SealedRecoveryCapture)
-    sealed._SealedRecoveryCapture__apply_claimed = False
-    sealed._SealedRecoveryCapture__apply_claim_lock = threading.Lock()
-    sealed._SealedRecoveryCapture__plan = plan
-    sealed._SealedRecoveryCapture__serialized_plan = serialized
-    sealed._SealedRecoveryCapture__source_capability = source._capability
-    _register_sealed_recovery_capture(sealed)
-    return sealed
+
+
+def _parse_applied_recovery_audit_statuses(
+    *,
+    plan: BoundCloseReservationRecoveryPlan,
+    before_json: object,
+    after_json: object,
+) -> dict[str, str]:
+    expected_top_before = frozenset(
+        {"action_count", "evidence_fingerprint", "reservations"}
+    )
+    expected_top_after = frozenset(
+        {"action_count", "evidence_fingerprint", "reservations", "status"}
+    )
+    expected_item = frozenset({"reservation_ref", "status"})
+    try:
+        if type(before_json) is not str or type(after_json) is not str:
+            raise TypeError("audit JSON must be text")
+        if any(
+            len(value.encode("utf-8")) > MAX_RECOVERY_PLAN_BYTES
+            for value in (before_json, after_json)
+        ):
+            raise ValueError("audit JSON exceeds its bound")
+        before = json.loads(
+            before_json,
+            object_pairs_hook=_closed_json_object,
+            parse_constant=_reject_json_constant,
+        )
+        after = json.loads(
+            after_json,
+            object_pairs_hook=_closed_json_object,
+            parse_constant=_reject_json_constant,
+        )
+        before = _exact_object_keys(before, expected_top_before, "audit.before")
+        after = _exact_object_keys(after, expected_top_after, "audit.after")
+        if (
+            before["action_count"] != plan.action_count
+            or after["action_count"] != plan.action_count
+            or before["evidence_fingerprint"] != plan.evidence_fingerprint
+            or after["evidence_fingerprint"] != plan.evidence_fingerprint
+            or after["status"] != "confirmed"
+            or type(before["reservations"]) is not list
+            or type(after["reservations"]) is not list
+            or len(before["reservations"]) != plan.action_count
+            or len(after["reservations"]) != plan.action_count
+        ):
+            raise ValueError("audit payload does not match the approved plan")
+        approved_refs = tuple(item.reservation_ref for item in plan.observations)
+        statuses: dict[str, str] = {}
+        after_refs: list[str] = []
+        for raw_item in before["reservations"]:
+            item = _exact_object_keys(raw_item, expected_item, "audit.before.item")
+            reference = _require_lower_hex_64(
+                item["reservation_ref"],
+                "reservation_ref",
+            )
+            status = item["status"]
+            if status not in ACTIVE_CLOSE_RESERVATION_STATUSES:
+                raise ValueError("audit source status is invalid")
+            if reference in statuses:
+                raise ValueError("audit reservation reference is duplicated")
+            statuses[reference] = status
+        for raw_item in after["reservations"]:
+            item = _exact_object_keys(raw_item, expected_item, "audit.after.item")
+            reference = _require_lower_hex_64(
+                item["reservation_ref"],
+                "reservation_ref",
+            )
+            if item["status"] != "confirmed":
+                raise ValueError("audit terminal status is invalid")
+            after_refs.append(reference)
+        if tuple(statuses) != approved_refs or tuple(after_refs) != approved_refs:
+            raise ValueError("audit population does not match the approved plan")
+        return statuses
+    except (
+        RecursionError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ) as exc:
+        raise _apply_refusal("unexpected_audit_event") from exc
+
+
+def _load_applied_recovery_source_read_only(
+    database_path: str | Path,
+    *,
+    approved_plan: BoundCloseReservationRecoveryPlan,
+) -> BoundCloseReservationSource:
+    expanded = Path(database_path).expanduser()
+    if expanded.is_symlink() or not expanded.is_file():
+        raise _apply_refusal("database_path_invalid")
+    resolved = expanded.resolve()
+    uri = f"file:{quote(str(resolved), safe='/')}?mode=ro"
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(uri, uri=True, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        if int(connection.execute("PRAGMA query_only").fetchone()[0]) != 1:
+            raise _apply_refusal("source_query_only_unavailable")
+        connection.execute("BEGIN")
+        if not _locked_mimo_contract_mode_is_v1(connection):
+            raise _apply_refusal("mimo_contract_mode_not_v1")
+        audits = _load_bound_close_reservation_audits(connection)
+        matching = tuple(
+            row
+            for row in audits
+            if row["notification_fingerprint"]
+            == approved_plan.evidence_fingerprint
+        )
+        if len(audits) != 1 or len(matching) != 1:
+            raise _apply_refusal("unexpected_audit_event")
+        audit = matching[0]
+        statuses_by_ref = _parse_applied_recovery_audit_statuses(
+            plan=approved_plan,
+            before_json=audit["before_json"],
+            after_json=audit["after_json"],
+        )
+        candidates = connection.execute(
+            """
+            SELECT id, pos_id, execution_binding_id, status, last_error,
+                   created_at, updated_at
+            FROM bound_position_close_reservations
+            WHERE status = 'confirmed' AND last_error IS NULL AND updated_at = ?
+            ORDER BY id
+            LIMIT 65
+            """,
+            (audit["created_at"],),
+        ).fetchall()
+        if len(candidates) > MAX_RESERVATION_OBSERVATIONS:
+            raise _apply_refusal("source_population_overflow")
+        candidates_by_ref = {
+            _redacted_ref("reservation", row["id"]): row
+            for row in candidates
+            if type(row["id"]) is int and row["id"] > 0
+        }
+        if set(candidates_by_ref) != set(statuses_by_ref):
+            raise _apply_refusal("source_state_conflict")
+        ordered_rows = [
+            candidates_by_ref[item.reservation_ref]
+            for item in approved_plan.observations
+        ]
+        status_overrides = {
+            int(row["id"]): statuses_by_ref[
+                _redacted_ref("reservation", row["id"])
+            ]
+            for row in ordered_rows
+        }
+        source = _load_source_descendants(
+            connection,
+            ordered_rows,
+            source_status_overrides=status_overrides,
+        )
+        raw_rows = _planned_raw_reservations_from_source(
+            source=source,
+            plan=approved_plan,
+        )
+        before_expected, after_expected = _recovery_audit_payloads(
+            plan=approved_plan,
+            raw_rows=raw_rows,
+        )
+        if (
+            not _exact_recovery_audit_matches(
+                audit,
+                plan=approved_plan,
+                before_json=before_expected,
+                after_json=after_expected,
+            )
+            or not _planned_rows_are_exactly_confirmed(
+                connection,
+                raw_rows=raw_rows,
+                audit_created_at=audit["created_at"],
+            )
+            or _locked_active_bound_close_reservation_source(
+                connection
+            ).reservations
+        ):
+            raise _apply_refusal("source_state_conflict")
+        return source
+    except BoundCloseReservationRecoveryConflict:
+        raise
+    except (OSError, RecursionError, sqlite3.Error, TypeError, ValueError) as exc:
+        raise _apply_refusal("idempotent_source_read_failed") from exc
+    finally:
+        if connection is not None:
+            try:
+                if connection.in_transaction:
+                    connection.rollback()
+            finally:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+
+def _planned_raw_reservations_from_source(
+    *,
+    source: BoundCloseReservationSource,
+    plan: BoundCloseReservationRecoveryPlan,
+) -> tuple[tuple[str, _RawReservationCapability], ...]:
+    raw_rows: list[tuple[str, _RawReservationCapability]] = []
+    try:
+        for observation in plan.observations:
+            raw = source._capability._get(observation.reservation_ref)
+            if type(raw) is not _RawReservationCapability:
+                raise TypeError("raw recovery authority is invalid")
+            raw_rows.append((observation.reservation_ref, raw))
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise _apply_refusal("idempotent_source_authority_invalid") from exc
+    if len(raw_rows) != plan.action_count:
+        raise _apply_refusal("idempotent_source_authority_invalid")
+    return tuple(raw_rows)
+
+
+def recapture_and_seal_applied_bound_close_reservation_recovery(
+    database_path: str | Path,
+    *,
+    approved_plan: BoundCloseReservationRecoveryPlan,
+    reader: BoundCloseReservationExchangeReader,
+    deadline_monotonic: float,
+) -> SealedRecoveryCapture:
+    """Re-read one already-applied exact population and all five GET facts."""
+
+    try:
+        _require_canonical_recovery_plan(approved_plan)
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise _apply_refusal("plan_not_actionable") from exc
+    if approved_plan.status != "ready" or approved_plan.action_count <= 0:
+        raise _apply_refusal("plan_not_actionable")
+    if type(reader) is not BoundCloseReservationExchangeReader:
+        raise TypeError("reader must be the dedicated recovery reader")
+    deadline = _finite_recovery_monotonic(deadline_monotonic)
+    if time.monotonic() >= deadline:
+        raise _apply_refusal("fresh_capture_expired")
+    source = _load_applied_recovery_source_read_only(
+        database_path,
+        approved_plan=approved_plan,
+    )
+    local_by_ref = {item.reservation_ref: item for item in source.reservations}
+    raw_rows = _planned_raw_reservations_from_source(
+        source=source,
+        plan=approved_plan,
+    )
+    raw_by_ref = dict(raw_rows)
+    capture, started_at, completed_at = _capture_recovery_exchange_collections(
+        raw_by_ref=raw_by_ref,
+        reader=reader,
+        deadline_monotonic=deadline,
+    )
+    observations: list[BoundCloseReservationObservation] = []
+    for approved in approved_plan.observations:
+        local = local_by_ref.get(approved.reservation_ref)
+        raw = raw_by_ref.get(approved.reservation_ref)
+        if local is None:
+            raise _apply_refusal("idempotent_source_authority_invalid")
+        exchange = _normalize_recovery_exchange_evidence(
+            local=local,
+            raw=raw,
+            capture=capture,
+        )
+        classified = _classify_bound_close_reservation_pure(
+            local,
+            exchange,
+            capture_completed_at=completed_at,
+        )
+        observations.append(
+            BoundCloseReservationObservation(
+                reservation_ref=approved.reservation_ref,
+                classification=classified.classification,
+                reason_code=classified.reason_code,
+                source_fingerprint=approved.source_fingerprint,
+                exchange_fingerprint=classified.exchange_fingerprint,
+            )
+        )
+    plan = build_bound_close_reservation_recovery_plan(
+        source_fingerprint=approved_plan.source_fingerprint,
+        observations=tuple(observations),
+    )
+    return _issue_sealed_recovery_capture(
+        plan=plan,
+        source_capability=source._capability,
+        capture_started_at=started_at,
+        capture_completed_at=completed_at,
+        deadline_monotonic=deadline,
+    )
 
 
 def _unavailable_exchange_evidence(reason_code: str) -> ExchangeReservationEvidence:
@@ -3292,6 +3773,8 @@ def _source_schema_is_valid(connection: sqlite3.Connection) -> bool:
 def _load_source_descendants(
     connection: sqlite3.Connection,
     reservation_rows: Sequence[sqlite3.Row],
+    *,
+    source_status_overrides: Mapping[int, str] | None = None,
 ) -> BoundCloseReservationSource:
     if not reservation_rows:
         return _make_source((), {})
@@ -3374,9 +3857,16 @@ def _load_source_descendants(
     evidences: list[LocalReservationEvidence] = []
     raw_capabilities: dict[str, _RawReservationCapability] = {}
     for index, reservation in enumerate(reservation_rows):
+        reservation_id = reservation["id"]
         evidence, raw = _build_local_reservation_evidence(
             reservation,
             row_index=index,
+            source_status_override=(
+                source_status_overrides.get(reservation_id)
+                if source_status_overrides is not None
+                and type(reservation_id) is int
+                else None
+            ),
             binding_rows=bindings_by_id.get(reservation["execution_binding_id"], ()),
             event_rows=events_by_position.get(reservation["pos_id"], ()),
             leg_rows=legs_by_position.get(reservation["pos_id"], ()),
@@ -3415,6 +3905,7 @@ def _build_local_reservation_evidence(
     reservation: sqlite3.Row,
     *,
     row_index: int,
+    source_status_override: str | None = None,
     binding_rows: Sequence[sqlite3.Row],
     event_rows: Sequence[sqlite3.Row],
     leg_rows: Sequence[sqlite3.Row],
@@ -3425,7 +3916,11 @@ def _build_local_reservation_evidence(
         "reservation",
         reservation_id if type(reservation_id) is int else f"malformed-{row_index}",
     )
-    source_status = reservation["status"]
+    source_status = (
+        source_status_override
+        if source_status_override is not None
+        else reservation["status"]
+    )
     if type(source_status) is not str:
         source_status = "source_row_invalid"
     position_id = reservation["pos_id"]

@@ -65,6 +65,7 @@ from telegram_kol_research.bound_close_reservation_recovery import (
     classify_bound_close_reservation,
     exchange_recovery_reason_from_error,
     load_bound_close_reservation_source,
+    recapture_and_seal_applied_bound_close_reservation_recovery,
     serialize_bound_close_reservation_recovery_plan,
 )
 
@@ -3718,7 +3719,7 @@ def test_apply_rolls_back_every_mutation_statement_boundary(
     assert _table_rows(database, "execution_events") == before_events
 
 
-def test_apply_idempotent_repeat_with_independent_fresh_capture_adds_no_event(
+def test_apply_rejects_a_capture_issued_before_the_committed_audit_as_fresh(
     tmp_path, monkeypatch
 ):
     database = _apply_database(tmp_path)
@@ -3728,14 +3729,201 @@ def test_apply_idempotent_repeat_with_independent_fresh_capture_adds_no_event(
     assert first.plan == second.plan
 
     applied = _apply_ready(database, first)
-    repeated = _apply_ready(database, second)
+    with pytest.raises(BoundCloseReservationRecoveryConflict, match="fresh_capture"):
+        _apply_ready(database, second)
 
     assert applied.status == "applied"
-    assert repeated.status == "already_applied"
-    assert repeated.audit_event_id == applied.audit_event_id
     events = [
         row
         for row in _table_rows(database, "execution_events")
         if row["action"] == "bound_close_reservation_history_converged"
     ]
     assert len(events) == 1
+
+
+def test_expired_capture_refuses_before_writable_open_without_consuming_issuance(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path)
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+    deadline = capture._SealedRecoveryCapture__deadline_monotonic
+    opened = []
+    monkeypatch.setattr(recovery_module.time, "monotonic", lambda: deadline + 1.0)
+    monkeypatch.setattr(
+        recovery_module,
+        "_open_bound_close_reservation_writable_connection",
+        lambda path: opened.append(path),
+    )
+
+    with pytest.raises(BoundCloseReservationRecoveryConflict, match="expired"):
+        _apply_ready(database, capture)
+
+    assert opened == []
+    assert capture._SealedRecoveryCapture__apply_claimed is False
+    assert id(capture) in recovery_module._SEALED_CAPTURE_ISSUANCE_REGISTRY
+
+
+def test_post_apply_fresh_recapture_reloads_db_repeats_gets_and_is_idempotent(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path)
+    source = load_bound_close_reservation_source(database)
+    first, first_http = _ready_apply_capture(monkeypatch, database)
+    first_result = _apply_ready(database, first)
+    assert first_result.status == "applied"
+    assert load_bound_close_reservation_source(database).reservations == ()
+
+    second_http = _RecoveryReaderHttpClient(
+        responses=_terminal_provider_responses(source)
+    )
+    second_reader, _transport, _selected = _factory_recovery_reader(
+        monkeypatch,
+        http_client=second_http,
+    )
+    monkeypatch.setattr(
+        recovery_module,
+        "_recovery_capture_now",
+        lambda: APPLY_TIME + timedelta(minutes=1),
+    )
+    second = recapture_and_seal_applied_bound_close_reservation_recovery(
+        database,
+        approved_plan=first.plan,
+        reader=second_reader,
+        deadline_monotonic=time.monotonic() + 5.0,
+    )
+
+    assert second is not first
+    assert second.plan == first.plan
+    assert len(first_http.requests) == 5
+    assert len(second_http.requests) == 5
+    assert {request[0] for request in second_http.requests} == {"GET"}
+    repeated = _apply_ready(
+        database,
+        second,
+        applied_at=APPLY_TIME + timedelta(minutes=2),
+    )
+    assert repeated.status == "already_applied"
+    assert repeated.audit_event_id == first_result.audit_event_id
+    events = [
+        row
+        for row in _table_rows(database, "execution_events")
+        if row["action"] == "bound_close_reservation_history_converged"
+    ]
+    assert len(events) == 1
+
+
+def test_post_apply_recapture_refuses_confirmed_row_drift_before_exchange_gets(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path)
+    source = load_bound_close_reservation_source(database)
+    first, _http = _ready_apply_capture(monkeypatch, database)
+    _apply_ready(database, first)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE bound_position_close_reservations "
+            "SET updated_at = '2026-08-15 12:00:01.000000' WHERE id = 901"
+        )
+        connection.commit()
+    http_client = _RecoveryReaderHttpClient(
+        responses=_terminal_provider_responses(source)
+    )
+    reader, _transport, _selected = _factory_recovery_reader(
+        monkeypatch,
+        http_client=http_client,
+    )
+
+    with pytest.raises(BoundCloseReservationRecoveryConflict, match="source"):
+        recapture_and_seal_applied_bound_close_reservation_recovery(
+            database,
+            approved_plan=first.plan,
+            reader=reader,
+            deadline_monotonic=time.monotonic() + 5.0,
+        )
+
+    assert http_client.requests == []
+
+
+def test_close_failure_after_committed_apply_does_not_replace_success(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path)
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+    real_open = recovery_module._open_bound_close_reservation_writable_connection
+
+    class CloseFailureConnection:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+        def close(self):
+            self._connection.close()
+            raise sqlite3.OperationalError("injected close failure")
+
+    monkeypatch.setattr(
+        recovery_module,
+        "_open_bound_close_reservation_writable_connection",
+        lambda path: CloseFailureConnection(real_open(path)),
+    )
+
+    result = _apply_ready(database, capture)
+
+    assert result.status == "applied"
+    assert _table_rows(database, "bound_position_close_reservations")[0][
+        "status"
+    ] == "confirmed"
+
+
+def test_commit_exception_after_real_commit_is_resolved_by_read_only_verification(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path)
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+    real_commit = recovery_module._commit_bound_close_reservation_apply
+
+    def commit_then_raise(connection):
+        real_commit(connection)
+        raise sqlite3.OperationalError("injected ambiguous commit acknowledgement")
+
+    monkeypatch.setattr(
+        recovery_module,
+        "_commit_bound_close_reservation_apply",
+        commit_then_raise,
+    )
+
+    result = _apply_ready(database, capture)
+
+    assert result.status == "applied"
+    assert len(
+        [
+            row
+            for row in _table_rows(database, "execution_events")
+            if row["action"] == "bound_close_reservation_history_converged"
+        ]
+    ) == 1
+
+
+def test_commit_exception_before_commit_rolls_back_and_reports_unresolved_outcome(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path)
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+    before_reservations = _table_rows(database, "bound_position_close_reservations")
+    before_events = _table_rows(database, "execution_events")
+    monkeypatch.setattr(
+        recovery_module,
+        "_commit_bound_close_reservation_apply",
+        lambda connection: (_ for _ in ()).throw(
+            sqlite3.OperationalError("injected failed commit")
+        ),
+    )
+
+    with pytest.raises(BoundCloseReservationRecoveryConflict, match="commit_outcome"):
+        _apply_ready(database, capture)
+
+    assert _table_rows(database, "bound_position_close_reservations") == (
+        before_reservations
+    )
+    assert _table_rows(database, "execution_events") == before_events
