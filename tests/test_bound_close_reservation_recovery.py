@@ -2310,6 +2310,111 @@ def test_issued_refused_capture_rejects_in_place_plan_mutation_to_ready(
     assert id(capture) in recovery_module._SEALED_CAPTURE_ISSUANCE_REGISTRY
 
 
+_RAW_AUTHORITY_FIELDS = (
+    "reservation_id",
+    "source_status",
+    "binding_id",
+    "event_id",
+    "position_id",
+    "order_id",
+    "instrument_id",
+    "entry_leg_id",
+    "mutation_ids",
+)
+
+
+def _changed_raw_authority_value(raw, field_name):
+    original = getattr(raw, field_name)
+    if field_name in {"reservation_id", "binding_id", "event_id"}:
+        return original + 1000
+    if field_name == "entry_leg_id":
+        return 1000 if original is None else original + 1000
+    if field_name == "mutation_ids":
+        return (*original, 1000)
+    if field_name == "source_status":
+        return "submitted" if original != "submitted" else "reserved"
+    return f"{original}-changed"
+
+
+@pytest.mark.parametrize("field_name", _RAW_AUTHORITY_FIELDS)
+def test_raw_reservation_authority_is_immutable(tmp_path, field_name):
+    source = _loaded_seal_source(tmp_path)
+    raw = source._capability._get(source.reservations[0].reservation_ref)
+
+    with pytest.raises(AttributeError, match="immutable"):
+        setattr(raw, field_name, _changed_raw_authority_value(raw, field_name))
+
+
+@pytest.mark.parametrize("field_name", _RAW_AUTHORITY_FIELDS)
+def test_raw_reservation_authority_cannot_be_deleted(tmp_path, field_name):
+    source = _loaded_seal_source(tmp_path)
+    raw = source._capability._get(source.reservations[0].reservation_ref)
+
+    with pytest.raises(AttributeError, match="immutable"):
+        delattr(raw, field_name)
+
+
+def test_claim_binds_complete_canonical_raw_source_snapshot(tmp_path, monkeypatch):
+    source = _loaded_seal_source(tmp_path)
+    capture, _reader, _http = _capture_with_provider_responses(
+        monkeypatch,
+        source,
+        _terminal_provider_responses(source),
+    )
+    raw = source._capability._get(source.reservations[0].reservation_ref)
+
+    for field_name in _RAW_AUTHORITY_FIELDS:
+        original = getattr(raw, field_name)
+        object.__setattr__(
+            raw,
+            field_name,
+            _changed_raw_authority_value(raw, field_name),
+        )
+        try:
+            with pytest.raises(ValueError, match="raw source authority"):
+                _claim_sealed_recovery_capture_for_apply(capture)
+        finally:
+            object.__setattr__(raw, field_name, original)
+
+    object.__setattr__(raw, "_RawReservationCapability__sealed", False)
+    try:
+        with pytest.raises(ValueError, match="raw source authority"):
+            _claim_sealed_recovery_capture_for_apply(capture)
+    finally:
+        object.__setattr__(raw, "_RawReservationCapability__sealed", True)
+
+    assert _claim_sealed_recovery_capture_for_apply(capture).plan is capture.plan
+
+
+def test_claim_binds_sorted_raw_source_reference_population(tmp_path, monkeypatch):
+    source = _loaded_seal_source(tmp_path, row_count=2)
+    capture, _reader, _http = _capture_with_provider_responses(
+        monkeypatch,
+        source,
+        _terminal_provider_responses(source),
+    )
+    raw_mapping = (
+        source._capability
+        ._BoundCloseReservationSourceCapability__raw_by_reservation_ref
+    )
+    issued = recovery_module._SEALED_CAPTURE_ISSUANCE_REGISTRY[id(capture)]
+    first_ref = next(iter(raw_mapping))
+    first_raw = raw_mapping.pop(first_ref)
+    raw_mapping[first_ref] = first_raw
+    assert recovery_module._raw_source_snapshot_fingerprint(
+        source._capability
+    ) == issued.raw_source_snapshot_fingerprint
+    raw = next(iter(raw_mapping.values()))
+    forged_ref = "f" * 64
+    raw_mapping[forged_ref] = raw
+
+    with pytest.raises(ValueError, match="raw source authority"):
+        _claim_sealed_recovery_capture_for_apply(capture)
+
+    raw_mapping.pop(forged_ref)
+    assert _claim_sealed_recovery_capture_for_apply(capture).plan is capture.plan
+
+
 def test_sealed_capture_issuance_registry_uses_exact_weak_identity(
     tmp_path, monkeypatch
 ):

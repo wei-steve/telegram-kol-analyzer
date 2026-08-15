@@ -611,6 +611,7 @@ class _RawReservationCapability(_OpaqueUncopyableCapability):
     """Raw identities retained only inside this process for later exact reads/CAS."""
 
     __slots__ = (
+        "__sealed",
         "binding_id",
         "entry_leg_id",
         "event_id",
@@ -644,6 +645,16 @@ class _RawReservationCapability(_OpaqueUncopyableCapability):
         self.instrument_id = instrument_id
         self.entry_leg_id = entry_leg_id
         self.mutation_ids = mutation_ids
+        self.__sealed = True
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_RawReservationCapability__sealed", False):
+            raise AttributeError("raw reservation authority is immutable")
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        del name
+        raise AttributeError("raw reservation authority is immutable")
 
 
 class _BoundCloseReservationSourceCapability(_OpaqueUncopyableCapability):
@@ -672,6 +683,85 @@ class BoundCloseReservationSource(_OpaqueUncopyableCapability):
         _require_lower_hex_64(self.source_fingerprint, "source_fingerprint")
         if type(self._capability) is not _BoundCloseReservationSourceCapability:
             raise TypeError("invalid private source capability")
+
+
+def _raw_source_snapshot_fingerprint(
+    source_capability: _BoundCloseReservationSourceCapability,
+) -> str:
+    """Hash every exact raw CAS identity without returning raw authority bytes."""
+
+    try:
+        if type(source_capability) is not _BoundCloseReservationSourceCapability:
+            raise TypeError("source capability type is invalid")
+        raw_by_ref = (
+            source_capability
+            ._BoundCloseReservationSourceCapability__raw_by_reservation_ref
+        )
+        if type(raw_by_ref) is not dict or len(raw_by_ref) > (
+            MAX_RESERVATION_OBSERVATIONS
+        ):
+            raise ValueError("raw source population is invalid")
+        if any(type(reference) is not str for reference in raw_by_ref):
+            raise TypeError("raw source reference is invalid")
+        rows: list[dict[str, object]] = []
+        for reservation_ref in sorted(raw_by_ref):
+            _require_lower_hex_64(reservation_ref, "reservation_ref")
+            raw = raw_by_ref[reservation_ref]
+            if type(raw) is not _RawReservationCapability:
+                raise TypeError("raw reservation authority type is invalid")
+            if getattr(raw, "_RawReservationCapability__sealed", None) is not True:
+                raise ValueError("raw reservation authority seal is invalid")
+            positive_ids = (
+                raw.reservation_id,
+                raw.binding_id,
+                raw.event_id,
+            )
+            if any(type(value) is not int or value <= 0 for value in positive_ids):
+                raise ValueError("raw numeric authority is invalid")
+            if raw.entry_leg_id is not None and (
+                type(raw.entry_leg_id) is not int or raw.entry_leg_id <= 0
+            ):
+                raise ValueError("raw entry-leg authority is invalid")
+            if (
+                type(raw.mutation_ids) is not tuple
+                or len(raw.mutation_ids) > _MAX_RECOVERY_PLAN_ITEMS
+                or any(
+                    type(value) is not int or value <= 0
+                    for value in raw.mutation_ids
+                )
+                or len(set(raw.mutation_ids)) != len(raw.mutation_ids)
+            ):
+                raise ValueError("raw mutation authority is invalid")
+            raw_texts = (
+                raw.source_status,
+                raw.position_id,
+                raw.order_id,
+                raw.instrument_id,
+            )
+            if any(
+                type(value) is not str
+                or not value.strip()
+                or len(value.encode("utf-8")) > _MAX_RECOVERY_PLAN_STRING_BYTES
+                for value in raw_texts
+            ):
+                raise ValueError("raw text authority is invalid")
+            rows.append(
+                {
+                    "binding_id": raw.binding_id,
+                    "entry_leg_id": raw.entry_leg_id,
+                    "event_id": raw.event_id,
+                    "instrument_id": raw.instrument_id,
+                    "mutation_ids": list(raw.mutation_ids),
+                    "order_id": raw.order_id,
+                    "position_id": raw.position_id,
+                    "reservation_id": raw.reservation_id,
+                    "reservation_ref": reservation_ref,
+                    "source_status": raw.source_status,
+                }
+            )
+        return _sha256_json({"raw_reservations": rows})
+    except (AttributeError, RecursionError, TypeError, ValueError) as exc:
+        raise ValueError("raw source authority is invalid") from exc
 
 
 class ReservationClassification(StrEnum):
@@ -1085,6 +1175,7 @@ class _SealedCaptureIssuance:
         "capture_ref",
         "plan",
         "plan_snapshot_fingerprint",
+        "raw_source_snapshot_fingerprint",
         "serialized_plan",
         "source_capability",
     )
@@ -1095,12 +1186,14 @@ class _SealedCaptureIssuance:
         capture_ref: weakref.ReferenceType[SealedRecoveryCapture],
         plan: BoundCloseReservationRecoveryPlan,
         plan_snapshot_fingerprint: str,
+        raw_source_snapshot_fingerprint: str,
         serialized_plan: str,
         source_capability: _BoundCloseReservationSourceCapability,
     ) -> None:
         self.capture_ref = capture_ref
         self.plan = plan
         self.plan_snapshot_fingerprint = plan_snapshot_fingerprint
+        self.raw_source_snapshot_fingerprint = raw_source_snapshot_fingerprint
         self.serialized_plan = serialized_plan
         self.source_capability = source_capability
 
@@ -1129,6 +1222,9 @@ def _register_sealed_recovery_capture(capture: SealedRecoveryCapture) -> None:
         capture_ref=reference,
         plan=capture.plan,
         plan_snapshot_fingerprint=_sha256_json(capture.plan),
+        raw_source_snapshot_fingerprint=_raw_source_snapshot_fingerprint(
+            capture._SealedRecoveryCapture__source_capability
+        ),
         serialized_plan=capture.serialized_plan,
         source_capability=capture._SealedRecoveryCapture__source_capability,
     )
@@ -1194,6 +1290,21 @@ def _claim_sealed_recovery_capture_for_apply(
             ) from exc
         if current_plan_fingerprint != issued.plan_snapshot_fingerprint:
             raise ValueError("sealed recovery capture issued contents changed")
+        try:
+            current_raw_source_fingerprint = _raw_source_snapshot_fingerprint(
+                issued.source_capability
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "sealed recovery capture raw source authority changed"
+            ) from exc
+        if (
+            current_raw_source_fingerprint
+            != issued.raw_source_snapshot_fingerprint
+        ):
+            raise ValueError(
+                "sealed recovery capture raw source authority changed"
+            )
         if issued.plan.status != "ready":
             raise ValueError("only a ready sealed recovery capture can be claimed")
         claimed = _ClaimedSealedRecoveryCapture(
