@@ -64,6 +64,53 @@ ACTIVE_CLOSE_RESERVATION_STATUSES = frozenset(
     }
 )
 
+# Closed from the actual persistence writers/reconcilers. A new status must be
+# reviewed here before recovery can treat its local identity as usable.
+_EXECUTION_BINDING_STATUSES = frozenset(
+    {"open", "active", "stale", "unknown", "closed"}
+)
+_BOUND_CLOSE_EVENT_STATUSES = frozenset({"submitted"})
+_ENTRY_LEG_STATUSES = frozenset(
+    {
+        "submitting",
+        "submitted",
+        "open",
+        "active",
+        "pending",
+        "unknown",
+        "filled",
+        "partially_filled",
+        "cancelled",
+        "manually_cancelled",
+        "exchange_cancelled",
+        "manually_closed",
+        "closed",
+        "expired",
+        "invalidated",
+    }
+)
+_ENTRY_LEG_ATTRIBUTION_STATUSES = frozenset(
+    {
+        "unassigned",
+        "verified",
+        "evidence_unavailable",
+        "attribution_conflict",
+        "protection_adoption_refused",
+    }
+)
+_POSITION_MUTATION_STATUSES = frozenset(
+    {
+        "reserved",
+        "not_sent",
+        "submitting",
+        "submitted",
+        "confirmed",
+        "rejected",
+        "recovery_required",
+        "blocked",
+    }
+)
+
 _MAX_LOCAL_DESCENDANTS = 256
 _MAX_LOCAL_JSON_BYTES = 1_048_576
 RECOVERY_RESPONSE_MAX_BYTES = 1_048_576
@@ -471,13 +518,17 @@ _REQUIRED_SOURCE_COLUMNS = {
             "id",
             "execution_binding_id",
             "strategy_instance_id",
+            "leg_index",
             "purpose",
+            "order_kind",
             "order_id",
+            "client_order_id",
             "pos_id",
             "venue",
             "attribution_status",
             "status",
             "attribution_evidence_json",
+            "terminal_reason",
             "request_json",
             "response_json",
             "last_verified_at",
@@ -488,12 +539,15 @@ _REQUIRED_SOURCE_COLUMNS = {
     "position_mutation_intents": frozenset(
         {
             "id",
+            "idempotency_key",
             "operation",
             "strategy_instance_id",
             "execution_binding_id",
             "execution_order_leg_id",
             "pos_id",
             "order_id",
+            "authority_fingerprint",
+            "request_fingerprint",
             "venue",
             "status",
             "request_json",
@@ -622,10 +676,11 @@ def _load_source_descendants(
     leg_rows = _select_in(
         connection,
         """
-        SELECT id, execution_binding_id, strategy_instance_id, purpose,
-               order_id, pos_id, venue, attribution_status, status,
-               attribution_evidence_json, request_json, response_json,
-               last_verified_at, created_at, updated_at
+        SELECT id, execution_binding_id, strategy_instance_id, leg_index,
+               purpose, order_kind, order_id, client_order_id, pos_id, venue,
+               attribution_status, status, attribution_evidence_json,
+               terminal_reason, request_json, response_json, last_verified_at,
+               created_at, updated_at
         FROM execution_order_legs
         WHERE pos_id IN ({placeholders})
         ORDER BY id
@@ -636,10 +691,11 @@ def _load_source_descendants(
     mutation_rows = _select_in(
         connection,
         """
-        SELECT id, operation, strategy_instance_id, execution_binding_id,
-               execution_order_leg_id, pos_id, order_id, venue, status,
-               request_json, response_json, error_json, reserved_at,
-               submitted_at, confirmed_at, created_at, updated_at
+        SELECT id, idempotency_key, operation, strategy_instance_id,
+               execution_binding_id, execution_order_leg_id, pos_id, order_id,
+               authority_fingerprint, request_fingerprint, venue, status,
+               request_json, response_json, error_json, reserved_at, submitted_at,
+               confirmed_at, created_at, updated_at
         FROM position_mutation_intents
         WHERE operation = 'close_position'
           AND pos_id IN ({placeholders})
@@ -912,7 +968,7 @@ def _binding_row_shape_is_complete(row: sqlite3.Row) -> bool:
         _required_text(row["strategy_instance_id"])
         and _required_text(row["symbol"])
         and row["side"] in {"long", "short"}
-        and _required_text(row["status"])
+        and row["status"] in _EXECUTION_BINDING_STATUSES
         and _valid_json(row["payload_json"], required=False)
         and _valid_time_pair(row["created_at"], row["updated_at"])
     )
@@ -940,7 +996,7 @@ def _event_row_shape_is_complete(row: sqlite3.Row) -> bool:
     return (
         type(row["id"]) is int
         and row["id"] > 0
-        and _required_text(row["status"])
+        and row["status"] in _BOUND_CLOSE_EVENT_STATUSES
         and _required_text(row["order_id"])
         and all(
             _valid_json(row[field], required=False)
@@ -1019,9 +1075,14 @@ def _entry_leg_evidence(
 
 def _entry_leg_row_shape_is_complete(row: sqlite3.Row) -> bool:
     return (
-        _required_text(row["status"])
-        and _required_text(row["attribution_status"])
+        type(row["leg_index"]) is int
+        and row["leg_index"] >= 0
+        and _required_text(row["order_kind"])
+        and row["status"] in _ENTRY_LEG_STATUSES
+        and row["attribution_status"] in _ENTRY_LEG_ATTRIBUTION_STATUSES
         and _optional_text(row["order_id"])
+        and _optional_text(row["client_order_id"])
+        and _optional_text(row["terminal_reason"])
         and _optional_utc(row["last_verified_at"])
         and _valid_time_pair(row["created_at"], row["updated_at"])
         and all(
@@ -1044,7 +1105,10 @@ def _mutation_evidence(
     created_at = _parse_sqlite_utc(row["created_at"])
     updated_at = _parse_sqlite_utc(row["updated_at"])
     if (
-        not _required_text(row["status"])
+        not _required_text(row["idempotency_key"])
+        or not _is_lower_hex_64(row["authority_fingerprint"])
+        or not _is_lower_hex_64(row["request_fingerprint"])
+        or row["status"] not in _POSITION_MUTATION_STATUSES
         or not _optional_text(row["order_id"])
         or not _valid_json(row["request_json"], required=True)
         or not _valid_json(row["response_json"], required=False)
@@ -1131,6 +1195,10 @@ def _binding_instrument_id(symbol: str) -> str:
 
 def _required_text(value: object) -> bool:
     return type(value) is str and bool(value.strip())
+
+
+def _is_lower_hex_64(value: object) -> bool:
+    return type(value) is str and _LOWER_HEX_64.fullmatch(value) is not None
 
 
 def _optional_text(value: object) -> bool:

@@ -462,13 +462,17 @@ def _create_reservation_source_database(path) -> sqlite3.Connection:
             id INTEGER PRIMARY KEY,
             execution_binding_id INTEGER NOT NULL,
             strategy_instance_id TEXT,
+            leg_index INTEGER NOT NULL,
             purpose TEXT NOT NULL,
+            order_kind TEXT NOT NULL,
             order_id TEXT,
+            client_order_id TEXT,
             pos_id TEXT,
             venue TEXT NOT NULL,
             attribution_status TEXT NOT NULL,
             status TEXT NOT NULL,
             attribution_evidence_json TEXT,
+            terminal_reason TEXT,
             request_json TEXT,
             response_json TEXT,
             last_verified_at TEXT,
@@ -477,12 +481,15 @@ def _create_reservation_source_database(path) -> sqlite3.Connection:
         );
         CREATE TABLE position_mutation_intents (
             id INTEGER PRIMARY KEY,
+            idempotency_key TEXT NOT NULL,
             operation TEXT NOT NULL,
             strategy_instance_id TEXT NOT NULL,
             execution_binding_id INTEGER NOT NULL,
             execution_order_leg_id INTEGER NOT NULL,
             pos_id TEXT NOT NULL,
             order_id TEXT,
+            authority_fingerprint TEXT NOT NULL,
+            request_fingerprint TEXT NOT NULL,
             venue TEXT NOT NULL,
             status TEXT NOT NULL,
             request_json TEXT NOT NULL,
@@ -556,18 +563,23 @@ def _seed_local_reservation(
         )
     if include_leg:
         connection.execute(
-            "INSERT INTO execution_order_legs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO execution_order_legs VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 row_id,
                 binding_id,
                 strategy_id,
+                row_id,
                 "entry",
+                "market",
                 f"raw-entry-order-{row_id}",
+                f"raw-entry-client-{row_id}",
                 pos_id,
                 "deepcoin",
                 "verified",
                 "manually_closed",
                 '{"proof":"local"}',
+                "manual_position_missing",
                 "{}",
                 "{}",
                 SOURCE_TIME,
@@ -577,28 +589,31 @@ def _seed_local_reservation(
         )
     if include_mutation:
         connection.execute(
-                "INSERT INTO position_mutation_intents VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    row_id,
-                    "close_position",
-                    strategy_id,
-                    binding_id,
-                    row_id,
-                    pos_id,
-                    order_id,
-                    "deepcoin",
-                    "confirmed",
-                    "{}",
-                    '{"code":"0"}',
-                    None,
-                    SOURCE_TIME,
-                    SOURCE_TIME,
-                    SOURCE_TIME,
-                    SOURCE_TIME,
-                    SOURCE_TIME,
-                ),
-            )
+            "INSERT INTO position_mutation_intents VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                row_id,
+                f"raw-mutation-key-{row_id}",
+                "close_position",
+                strategy_id,
+                binding_id,
+                row_id,
+                pos_id,
+                order_id,
+                "a" * 64,
+                "b" * 64,
+                "deepcoin",
+                "confirmed",
+                "{}",
+                '{"code":"0"}',
+                None,
+                SOURCE_TIME,
+                SOURCE_TIME,
+                SOURCE_TIME,
+                SOURCE_TIME,
+                SOURCE_TIME,
+            ),
+        )
 
 
 def test_source_loader_loads_all_closed_active_statuses_and_exact_descendants(
@@ -804,11 +819,130 @@ def test_source_loader_never_serializes_or_reprs_raw_identifiers(tmp_path):
         "raw-strategy-1",
         "raw-close-order-1",
         "raw-entry-order-1",
+        "raw-entry-client-1",
+        "raw-mutation-key-1",
     ):
         assert raw_value not in serialized
         assert raw_value not in rendered
     assert source.reservations[0].reservation_ref != "1"
     assert len(source.reservations[0].reservation_ref) == 64
+
+
+@pytest.mark.parametrize(
+    ("table_name", "column_name"),
+    [
+        ("execution_bindings", "status"),
+        ("execution_events", "status"),
+        ("execution_order_legs", "status"),
+        ("execution_order_legs", "attribution_status"),
+        ("position_mutation_intents", "status"),
+    ],
+)
+def test_source_loader_fail_closes_future_local_status_without_raw_capability(
+    tmp_path,
+    table_name,
+    column_name,
+):
+    database = tmp_path / f"future-{table_name}-{column_name}.sqlite3"
+    connection = _create_reservation_source_database(database)
+    _seed_local_reservation(connection)
+    connection.execute(
+        f'UPDATE "{table_name}" SET "{column_name}" = ?',
+        ("future_typo_status",),
+    )
+    connection.commit()
+    connection.close()
+
+    source = load_bound_close_reservation_source(database)
+    evidence = source.reservations[0]
+
+    assert evidence.local_reason_code == "local_evidence_incomplete"
+    with pytest.raises(KeyError):
+        source._capability._get(evidence.reservation_ref)
+
+
+@pytest.mark.parametrize(
+    ("table_name", "missing_column"),
+    [
+        ("execution_order_legs", "leg_index"),
+        ("execution_order_legs", "order_kind"),
+        ("execution_order_legs", "client_order_id"),
+        ("execution_order_legs", "terminal_reason"),
+        ("position_mutation_intents", "idempotency_key"),
+        ("position_mutation_intents", "authority_fingerprint"),
+        ("position_mutation_intents", "request_fingerprint"),
+    ],
+)
+def test_source_loader_requires_every_real_identity_column(
+    tmp_path,
+    table_name,
+    missing_column,
+):
+    database = tmp_path / f"missing-{table_name}-{missing_column}.sqlite3"
+    connection = _create_reservation_source_database(database)
+    _seed_local_reservation(connection)
+    columns = [
+        row[1]
+        for row in connection.execute(f'PRAGMA table_info("{table_name}")')
+        if row[1] != missing_column
+    ]
+    projection = ", ".join(f'"{column}"' for column in columns)
+    connection.execute(f'ALTER TABLE "{table_name}" RENAME TO "old_{table_name}"')
+    connection.execute(
+        f'CREATE TABLE "{table_name}" AS '
+        f'SELECT {projection} FROM "old_{table_name}"'
+    )
+    connection.commit()
+    connection.close()
+
+    source = load_bound_close_reservation_source(database)
+
+    assert len(source.reservations) == 1
+    assert source.reservations[0].source_status == "source_schema_invalid"
+    assert source.reservations[0].local_reason_code == "local_evidence_incomplete"
+
+
+@pytest.mark.parametrize(
+    ("table_name", "column_name", "changed_value"),
+    [
+        ("execution_order_legs", "leg_index", 9),
+        ("execution_order_legs", "order_kind", "trigger_limit"),
+        ("execution_order_legs", "client_order_id", "raw-other-client"),
+        ("execution_order_legs", "terminal_reason", "raw-other-terminal"),
+        (
+            "position_mutation_intents",
+            "idempotency_key",
+            "raw-other-idempotency",
+        ),
+        ("position_mutation_intents", "authority_fingerprint", "c" * 64),
+        ("position_mutation_intents", "request_fingerprint", "d" * 64),
+    ],
+)
+def test_source_identity_field_drift_changes_fingerprint_without_raw_disclosure(
+    tmp_path,
+    table_name,
+    column_name,
+    changed_value,
+):
+    database = tmp_path / f"drift-{table_name}-{column_name}.sqlite3"
+    connection = _create_reservation_source_database(database)
+    _seed_local_reservation(connection)
+    connection.commit()
+    baseline = load_bound_close_reservation_source(database)
+    connection.execute(
+        f'UPDATE "{table_name}" SET "{column_name}" = ?',
+        (changed_value,),
+    )
+    connection.commit()
+    connection.close()
+
+    changed = load_bound_close_reservation_source(database)
+    serialized = _canonical_json({"reservations": changed.reservations})
+
+    assert changed.source_fingerprint != baseline.source_fingerprint
+    if isinstance(changed_value, str):
+        assert changed_value not in serialized
+        assert changed_value not in repr(changed)
 
 
 class _RecoveryReaderHttpClient:
