@@ -3,14 +3,20 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError, fields, replace
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal, localcontext
+import copy
+import gc
 import json
+import pickle
 import signal
 import sqlite3
 import threading
 import time
+import weakref
 
 import httpx
 import pytest
+
+import telegram_kol_research.bound_close_reservation_recovery as recovery_module
 
 from telegram_kol_research.deepcoin_client import (
     DeepcoinCredentials,
@@ -40,14 +46,15 @@ from telegram_kol_research.bound_close_reservation_recovery import (
     LocalReservationEvidence,
     ReservationClassification,
     SealedRecoveryCapture,
+    _claim_sealed_recovery_capture_for_apply,
     _canonical_json,
+    _seal_bound_close_reservation_recovery_capture,
     _sha256_json,
     build_bound_close_reservation_recovery_plan,
     build_bound_close_reservation_exchange_reader_from_env,
     classify_bound_close_reservation,
     exchange_recovery_reason_from_error,
     load_bound_close_reservation_source,
-    seal_bound_close_reservation_recovery_capture,
     serialize_bound_close_reservation_recovery_plan,
 )
 
@@ -1616,25 +1623,102 @@ def test_serialized_plan_never_contains_raw_operational_evidence():
         assert forbidden not in document
 
 
-def test_sealed_capture_is_opaque_and_retains_no_serializable_raw_capability(
-    tmp_path,
-):
-    database = tmp_path / "sealed-source.sqlite3"
+def _loaded_seal_source(tmp_path, *, row_count: int = 1):
+    database = tmp_path / f"sealed-source-{row_count}.sqlite3"
     connection = _create_reservation_source_database(database)
-    _seed_local_reservation(connection, row_id=901)
+    for offset in range(row_count):
+        _seed_local_reservation(connection, row_id=901 + offset)
     connection.commit()
     connection.close()
-    source = load_bound_close_reservation_source(database)
+    return load_bound_close_reservation_source(database)
+
+
+def _terminal_exchange_for_local(
+    local: LocalReservationEvidence,
+) -> ExchangeReservationEvidence:
+    return _terminal_exchange_evidence(
+        order_history=(
+            _order_evidence(
+                instrument_ref=local.instrument_ref,
+                side=local.side,
+                position_ref=local.position_ref,
+                order_ref=local.close_order_ref,
+            ),
+        ),
+        fills=(
+            _fill_evidence(
+                instrument_ref=local.instrument_ref,
+                side=local.side,
+                position_ref=local.position_ref,
+                order_ref=local.close_order_ref,
+            ),
+        ),
+        position_history=(
+            _position_history_evidence(
+                instrument_ref=local.instrument_ref,
+                side=local.side,
+                position_ref=local.position_ref,
+            ),
+        ),
+    )
+
+
+def _classified_observation_for_source_local(
+    local: LocalReservationEvidence,
+    *,
+    capture_completed_at: datetime = PLAN_CAPTURE_COMPLETED,
+) -> BoundCloseReservationObservation:
+    return classify_bound_close_reservation(
+        local,
+        _terminal_exchange_for_local(local),
+        capture_completed_at=capture_completed_at,
+    )
+
+
+def test_public_plan_helpers_accept_documents_but_cannot_issue_apply_capability(
+    tmp_path,
+):
+    source = _loaded_seal_source(tmp_path)
     local = source.reservations[0]
-    observation = BoundCloseReservationObservation(
+    forged = BoundCloseReservationObservation(
         reservation_ref=local.reservation_ref,
         classification=ReservationClassification.PROVEN_TERMINAL,
         reason_code="exact_close_and_position_terminal",
         source_fingerprint=_sha256_json(local),
         exchange_fingerprint=FINGERPRINT_C,
     )
+    plan = build_bound_close_reservation_recovery_plan(
+        source_fingerprint=source.source_fingerprint,
+        observations=(forged,),
+    )
 
-    capture = seal_bound_close_reservation_recovery_capture(
+    assert json.loads(
+        serialize_bound_close_reservation_recovery_plan(
+            plan,
+            capture_started_at=PLAN_CAPTURE_STARTED,
+            capture_completed_at=PLAN_CAPTURE_COMPLETED,
+        )
+    )["status"] == "ready"
+    with pytest.raises(ValueError, match="classifier-issued provenance"):
+        _seal_bound_close_reservation_recovery_capture(
+            source=source,
+            observations=(forged,),
+            capture_started_at=PLAN_CAPTURE_STARTED,
+            capture_completed_at=PLAN_CAPTURE_COMPLETED,
+        )
+    assert not hasattr(
+        recovery_module,
+        "seal_bound_close_reservation_recovery_capture",
+    )
+
+
+def test_private_seal_requires_exact_classifier_provenance_and_is_opaque(
+    tmp_path,
+):
+    source = _loaded_seal_source(tmp_path)
+    observation = _classified_observation_for_source_local(source.reservations[0])
+
+    capture = _seal_bound_close_reservation_recovery_capture(
         source=source,
         observations=(observation,),
         capture_started_at=PLAN_CAPTURE_STARTED,
@@ -1647,6 +1731,201 @@ def test_sealed_capture_is_opaque_and_retains_no_serializable_raw_capability(
     assert "raw-pos-901" not in capture.serialized_plan
     with pytest.raises(TypeError):
         SealedRecoveryCapture()  # type: ignore[call-arg]
+
+
+def test_private_seal_rejects_timestamp_mismatch_without_consuming_provenance(
+    tmp_path,
+):
+    source = _loaded_seal_source(tmp_path)
+    observation = _classified_observation_for_source_local(source.reservations[0])
+
+    with pytest.raises(ValueError, match="capture_completed_at"):
+        _seal_bound_close_reservation_recovery_capture(
+            source=source,
+            observations=(observation,),
+            capture_started_at=PLAN_CAPTURE_STARTED,
+            capture_completed_at=PLAN_CAPTURE_COMPLETED + timedelta(microseconds=1),
+        )
+
+    capture = _seal_bound_close_reservation_recovery_capture(
+        source=source,
+        observations=(observation,),
+        capture_started_at=PLAN_CAPTURE_STARTED,
+        capture_completed_at=PLAN_CAPTURE_COMPLETED,
+    )
+    assert capture.plan.status == "ready"
+
+
+def test_private_seal_claims_classifier_observation_only_once(tmp_path):
+    source = _loaded_seal_source(tmp_path)
+    observation = _classified_observation_for_source_local(source.reservations[0])
+    _seal_bound_close_reservation_recovery_capture(
+        source=source,
+        observations=(observation,),
+        capture_started_at=PLAN_CAPTURE_STARTED,
+        capture_completed_at=PLAN_CAPTURE_COMPLETED,
+    )
+
+    with pytest.raises(ValueError, match="classifier-issued provenance"):
+        _seal_bound_close_reservation_recovery_capture(
+            source=source,
+            observations=(observation,),
+            capture_started_at=PLAN_CAPTURE_STARTED,
+            capture_completed_at=PLAN_CAPTURE_COMPLETED,
+        )
+
+
+def test_private_seal_uses_object_identity_not_dataclass_equality(tmp_path):
+    source = _loaded_seal_source(tmp_path)
+    observation = _classified_observation_for_source_local(source.reservations[0])
+    equal_but_unissued = replace(observation)
+
+    assert equal_but_unissued == observation
+    assert equal_but_unissued is not observation
+    with pytest.raises(ValueError, match="classifier-issued provenance"):
+        _seal_bound_close_reservation_recovery_capture(
+            source=source,
+            observations=(equal_but_unissued,),
+            capture_started_at=PLAN_CAPTURE_STARTED,
+            capture_completed_at=PLAN_CAPTURE_COMPLETED,
+        )
+
+    assert _seal_bound_close_reservation_recovery_capture(
+        source=source,
+        observations=(observation,),
+        capture_started_at=PLAN_CAPTURE_STARTED,
+        capture_completed_at=PLAN_CAPTURE_COMPLETED,
+    ).plan.status == "ready"
+
+
+def test_private_seal_requires_the_exact_source_local_object(tmp_path):
+    source = _loaded_seal_source(tmp_path)
+    equal_but_detached_local = replace(source.reservations[0])
+    observation = _classified_observation_for_source_local(equal_but_detached_local)
+
+    assert equal_but_detached_local == source.reservations[0]
+    assert equal_but_detached_local is not source.reservations[0]
+    with pytest.raises(ValueError, match="local identity"):
+        _seal_bound_close_reservation_recovery_capture(
+            source=source,
+            observations=(observation,),
+            capture_started_at=PLAN_CAPTURE_STARTED,
+            capture_completed_at=PLAN_CAPTURE_COMPLETED,
+        )
+
+
+def test_private_seal_rejects_observations_from_mixed_capture_times(tmp_path):
+    source = _loaded_seal_source(tmp_path, row_count=2)
+    first = _classified_observation_for_source_local(
+        source.reservations[0],
+        capture_completed_at=PLAN_CAPTURE_COMPLETED,
+    )
+    second = _classified_observation_for_source_local(
+        source.reservations[1],
+        capture_completed_at=PLAN_CAPTURE_COMPLETED + timedelta(microseconds=1),
+    )
+
+    with pytest.raises(ValueError, match="capture_completed_at"):
+        _seal_bound_close_reservation_recovery_capture(
+            source=source,
+            observations=(first, second),
+            capture_started_at=PLAN_CAPTURE_STARTED,
+            capture_completed_at=PLAN_CAPTURE_COMPLETED,
+        )
+
+    replacement_second = _classified_observation_for_source_local(
+        source.reservations[1],
+        capture_completed_at=PLAN_CAPTURE_COMPLETED,
+    )
+    capture = _seal_bound_close_reservation_recovery_capture(
+        source=source,
+        observations=(first, replacement_second),
+        capture_started_at=PLAN_CAPTURE_STARTED,
+        capture_completed_at=PLAN_CAPTURE_COMPLETED,
+    )
+    assert capture.plan.action_count == 2
+
+
+def test_classifier_provenance_registry_is_bounded_and_weakly_cleaned(tmp_path):
+    source = _loaded_seal_source(tmp_path)
+    local = source.reservations[0]
+    exchange = _terminal_exchange_for_local(local)
+    observations = [
+        classify_bound_close_reservation(
+            local,
+            exchange,
+            capture_completed_at=PLAN_CAPTURE_COMPLETED,
+        )
+        for _ in range(recovery_module._MAX_OBSERVATION_PROVENANCE + 1)
+    ]
+    first_identity = id(observations[0])
+    last = observations[-1]
+    last_identity = id(last)
+    last_ref = weakref.ref(last)
+
+    assert len(recovery_module._OBSERVATION_PROVENANCE) <= (
+        recovery_module._MAX_OBSERVATION_PROVENANCE
+    )
+    assert first_identity not in recovery_module._OBSERVATION_PROVENANCE
+    assert last_identity in recovery_module._OBSERVATION_PROVENANCE
+
+    observations.clear()
+    del last
+    gc.collect()
+
+    assert last_ref() is None
+    assert last_identity not in recovery_module._OBSERVATION_PROVENANCE
+
+
+def test_sealed_apply_capability_is_private_issuer_bound_and_one_shot(tmp_path):
+    source = _loaded_seal_source(tmp_path)
+    observation = _classified_observation_for_source_local(source.reservations[0])
+    capture = _seal_bound_close_reservation_recovery_capture(
+        source=source,
+        observations=(observation,),
+        capture_started_at=PLAN_CAPTURE_STARTED,
+        capture_completed_at=PLAN_CAPTURE_COMPLETED,
+    )
+
+    claimed = _claim_sealed_recovery_capture_for_apply(capture)
+
+    assert claimed.plan is capture.plan
+    assert not hasattr(claimed, "__dict__")
+    with pytest.raises(ValueError, match="already claimed"):
+        _claim_sealed_recovery_capture_for_apply(capture)
+
+
+def test_raw_and_sealed_capabilities_reject_pickle_copy_and_deepcopy(tmp_path):
+    source = _loaded_seal_source(tmp_path)
+    local = source.reservations[0]
+    raw_source_capability = source._capability
+    raw_reservation_capability = raw_source_capability._get(local.reservation_ref)
+    observation = _classified_observation_for_source_local(local)
+    sealed = _seal_bound_close_reservation_recovery_capture(
+        source=source,
+        observations=(observation,),
+        capture_started_at=PLAN_CAPTURE_STARTED,
+        capture_completed_at=PLAN_CAPTURE_COMPLETED,
+    )
+
+    for capability in (
+        raw_reservation_capability,
+        raw_source_capability,
+        source,
+        sealed,
+    ):
+        assert "raw-pos-901" not in repr(capability)
+        assert "raw-close-order-901" not in repr(capability)
+        for operation in (
+            pickle.dumps,
+            copy.copy,
+            copy.deepcopy,
+        ):
+            with pytest.raises(TypeError) as raised:
+                operation(capability)
+            error_payload = str(raised.value)
+            assert "raw-pos-901" not in error_payload
+            assert "raw-close-order-901" not in error_payload
 
 
 @pytest.mark.parametrize(

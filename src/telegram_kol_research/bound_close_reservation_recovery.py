@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import UTC, datetime, timedelta
@@ -18,6 +19,7 @@ import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import quote
+import weakref
 
 from telegram_kol_research.deepcoin_client import (
     DEEPCOIN_BOUND_CLOSE_RESERVATION_RECOVERY_PHASE,
@@ -133,6 +135,30 @@ class BoundCloseReservationExchangeConfigurationError(RuntimeError):
 
 class BoundCloseReservationExchangeDeadlineExceeded(RuntimeError):
     """The one absolute recovery capture deadline expired."""
+
+
+class _OpaqueUncopyableCapability:
+    """Prevent accidental capability duplication or raw-state serialization."""
+
+    __slots__ = ()
+
+    @staticmethod
+    def _copy_error() -> TypeError:
+        return TypeError("opaque recovery capability cannot be copied or serialized")
+
+    def __reduce__(self):
+        raise self._copy_error()
+
+    def __reduce_ex__(self, protocol):
+        del protocol
+        raise self._copy_error()
+
+    def __copy__(self):
+        raise self._copy_error()
+
+    def __deepcopy__(self, memo):
+        del memo
+        raise self._copy_error()
 
 
 def _require_recovery_wall_clock_guard() -> None:
@@ -577,7 +603,7 @@ class ExchangeReservationEvidence:
         )
 
 
-class _RawReservationCapability:
+class _RawReservationCapability(_OpaqueUncopyableCapability):
     """Raw identities retained only inside this process for later exact reads/CAS."""
 
     __slots__ = (
@@ -616,7 +642,7 @@ class _RawReservationCapability:
         self.mutation_ids = mutation_ids
 
 
-class _BoundCloseReservationSourceCapability:
+class _BoundCloseReservationSourceCapability(_OpaqueUncopyableCapability):
     __slots__ = ("__raw_by_reservation_ref",)
 
     def __init__(self, raw_by_reservation_ref: Mapping[str, _RawReservationCapability]):
@@ -627,7 +653,7 @@ class _BoundCloseReservationSourceCapability:
 
 
 @dataclass(frozen=True, slots=True)
-class BoundCloseReservationSource:
+class BoundCloseReservationSource(_OpaqueUncopyableCapability):
     reservations: tuple[LocalReservationEvidence, ...]
     source_fingerprint: str
     _capability: object
@@ -657,7 +683,7 @@ _REASONS_BY_CLASSIFICATION = {
 }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class BoundCloseReservationObservation:
     reservation_ref: str
     classification: ReservationClassification
@@ -678,6 +704,64 @@ class BoundCloseReservationObservation:
             self.exchange_fingerprint,
             "exchange_fingerprint",
         )
+
+
+class _ObservationProvenance:
+    __slots__ = (
+        "capture_completed_at",
+        "exchange",
+        "local",
+        "observation_ref",
+    )
+
+    def __init__(
+        self,
+        *,
+        observation_ref: weakref.ReferenceType[BoundCloseReservationObservation],
+        local: LocalReservationEvidence,
+        exchange: ExchangeReservationEvidence,
+        capture_completed_at: datetime,
+    ) -> None:
+        self.observation_ref = observation_ref
+        self.local = local
+        self.exchange = exchange
+        self.capture_completed_at = capture_completed_at
+
+
+_MAX_OBSERVATION_PROVENANCE = MAX_RESERVATION_OBSERVATIONS * 4
+_OBSERVATION_PROVENANCE_LOCK = threading.RLock()
+_OBSERVATION_PROVENANCE: OrderedDict[int, _ObservationProvenance] = OrderedDict()
+
+
+def _register_observation_provenance(
+    observation: BoundCloseReservationObservation,
+    *,
+    local: LocalReservationEvidence,
+    exchange: ExchangeReservationEvidence,
+    capture_completed_at: datetime,
+) -> None:
+    observation_identity = id(observation)
+
+    def cleanup(
+        dead_ref: weakref.ReferenceType[BoundCloseReservationObservation],
+    ) -> None:
+        with _OBSERVATION_PROVENANCE_LOCK:
+            current = _OBSERVATION_PROVENANCE.get(observation_identity)
+            if current is not None and current.observation_ref is dead_ref:
+                _OBSERVATION_PROVENANCE.pop(observation_identity, None)
+
+    observation_ref = weakref.ref(observation, cleanup)
+    provenance = _ObservationProvenance(
+        observation_ref=observation_ref,
+        local=local,
+        exchange=exchange,
+        capture_completed_at=capture_completed_at,
+    )
+    with _OBSERVATION_PROVENANCE_LOCK:
+        _OBSERVATION_PROVENANCE[observation_identity] = provenance
+        _OBSERVATION_PROVENANCE.move_to_end(observation_identity)
+        while len(_OBSERVATION_PROVENANCE) > _MAX_OBSERVATION_PROVENANCE:
+            _OBSERVATION_PROVENANCE.popitem(last=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -776,6 +860,7 @@ _RECOVERY_OBSERVATION_KEYS = frozenset(
 )
 _RECOVERY_CONFIRMATION_PREFIX = "BOUND-CLOSE-"
 _SEALED_CAPTURE_CONSTRUCTOR = object()
+_SEALED_APPLY_CLAIM_ISSUER = object()
 
 
 def _observation_payload(
@@ -1018,10 +1103,12 @@ def serialize_bound_close_reservation_recovery_plan(
     return document
 
 
-class SealedRecoveryCapture:
+class SealedRecoveryCapture(_OpaqueUncopyableCapability):
     """Opaque in-process capability reserved for the separately gated apply."""
 
     __slots__ = (
+        "__apply_claimed",
+        "__apply_claim_lock",
         "__plan",
         "__serialized_plan",
         "__source_capability",
@@ -1037,6 +1124,8 @@ class SealedRecoveryCapture:
     ) -> None:
         if _constructor is not _SEALED_CAPTURE_CONSTRUCTOR:
             raise TypeError("SealedRecoveryCapture cannot be constructed directly")
+        self.__apply_claimed = False
+        self.__apply_claim_lock = threading.Lock()
         self.__plan = plan
         self.__serialized_plan = serialized_plan
         self.__source_capability = source_capability
@@ -1053,7 +1142,127 @@ class SealedRecoveryCapture:
         return "<SealedRecoveryCapture opaque>"
 
 
-def seal_bound_close_reservation_recovery_capture(
+class _ClaimedSealedRecoveryCapture(_OpaqueUncopyableCapability):
+    __slots__ = ("__plan", "__source_capability")
+
+    def __init__(
+        self,
+        *,
+        plan: BoundCloseReservationRecoveryPlan,
+        source_capability: object,
+        _issuer: object,
+    ) -> None:
+        if _issuer is not _SEALED_APPLY_CLAIM_ISSUER:
+            raise TypeError("claimed recovery capture has no private issuer")
+        if type(source_capability) is not _BoundCloseReservationSourceCapability:
+            raise TypeError("claimed recovery capture source capability is invalid")
+        self.__plan = plan
+        self.__source_capability = source_capability
+
+    @property
+    def plan(self) -> BoundCloseReservationRecoveryPlan:
+        return self.__plan
+
+
+def _claim_sealed_recovery_capture_for_apply(
+    capture: SealedRecoveryCapture,
+) -> _ClaimedSealedRecoveryCapture:
+    """Consume the private apply token exactly once; never trust saved bytes."""
+
+    if type(capture) is not SealedRecoveryCapture:
+        raise TypeError("capture must be a privately issued SealedRecoveryCapture")
+    with capture._SealedRecoveryCapture__apply_claim_lock:
+        if capture._SealedRecoveryCapture__apply_claimed:
+            raise ValueError("sealed recovery capture was already claimed")
+        if capture.plan.status != "ready":
+            raise ValueError("only a ready sealed recovery capture can be claimed")
+        capture._SealedRecoveryCapture__apply_claimed = True
+        return _ClaimedSealedRecoveryCapture(
+            plan=capture.plan,
+            source_capability=(
+                capture._SealedRecoveryCapture__source_capability
+            ),
+            _issuer=_SEALED_APPLY_CLAIM_ISSUER,
+        )
+
+
+def _observations_match_field_for_field(
+    left: BoundCloseReservationObservation,
+    right: BoundCloseReservationObservation,
+) -> bool:
+    if (
+        type(left) is not BoundCloseReservationObservation
+        or type(right) is not BoundCloseReservationObservation
+    ):
+        return False
+    return all(
+        (
+            left.reservation_ref == right.reservation_ref,
+            left.classification is right.classification,
+            left.reason_code == right.reason_code,
+            left.source_fingerprint == right.source_fingerprint,
+            left.exchange_fingerprint == right.exchange_fingerprint,
+        )
+    )
+
+
+def _claim_classifier_observation_provenance(
+    *,
+    source: BoundCloseReservationSource,
+    observations: tuple[BoundCloseReservationObservation, ...],
+    capture_completed_at: datetime,
+) -> None:
+    if any(
+        type(item) is not BoundCloseReservationObservation
+        for item in observations
+    ):
+        raise TypeError(
+            "observations must contain BoundCloseReservationObservation"
+        )
+    local_by_ref = {item.reservation_ref: item for item in source.reservations}
+    if len(local_by_ref) != len(source.reservations):
+        raise ValueError("source reservation references must be unique")
+    if len(observations) != len(source.reservations) or set(local_by_ref) != {
+        item.reservation_ref for item in observations
+    }:
+        raise ValueError("observations must cover the exact source population")
+
+    claims: list[tuple[int, _ObservationProvenance]] = []
+    with _OBSERVATION_PROVENANCE_LOCK:
+        for observation in observations:
+            identity = id(observation)
+            provenance = _OBSERVATION_PROVENANCE.get(identity)
+            if (
+                provenance is None
+                or provenance.observation_ref() is not observation
+            ):
+                raise ValueError(
+                    "observation has no unused classifier-issued provenance"
+                )
+            expected_local = local_by_ref.get(observation.reservation_ref)
+            if provenance.local is not expected_local:
+                raise ValueError("classifier provenance local identity mismatch")
+            if provenance.capture_completed_at != capture_completed_at:
+                raise ValueError(
+                    "classifier provenance capture_completed_at mismatch"
+                )
+            rebuilt = _classify_bound_close_reservation_pure(
+                provenance.local,
+                provenance.exchange,
+                capture_completed_at=provenance.capture_completed_at,
+            )
+            if not _observations_match_field_for_field(observation, rebuilt):
+                raise ValueError("classifier provenance observation mismatch")
+            claims.append((identity, provenance))
+        for identity, provenance in claims:
+            current = _OBSERVATION_PROVENANCE.get(identity)
+            if current is not provenance:
+                raise ValueError("classifier provenance changed during claim")
+        for identity, _ in claims:
+            _OBSERVATION_PROVENANCE.pop(identity, None)
+
+
+def _seal_bound_close_reservation_recovery_capture(
     *,
     source: BoundCloseReservationSource,
     observations: tuple[BoundCloseReservationObservation, ...],
@@ -1066,15 +1275,15 @@ def seal_bound_close_reservation_recovery_capture(
         raise TypeError("source must be BoundCloseReservationSource")
     if type(observations) is not tuple:
         raise TypeError("observations must be a tuple")
-    local_by_ref = {item.reservation_ref: item for item in source.reservations}
-    if len(local_by_ref) != len(source.reservations):
-        raise ValueError("source reservation references must be unique")
-    if set(local_by_ref) != {item.reservation_ref for item in observations}:
-        raise ValueError("observations must cover the exact source population")
-    for item in observations:
-        local = local_by_ref.get(item.reservation_ref)
-        if local is None or item.source_fingerprint != _sha256_json(local):
-            raise ValueError("observation source fingerprint mismatch")
+    _, completed_at = _validated_capture_times(
+        capture_started_at,
+        capture_completed_at,
+    )
+    _claim_classifier_observation_provenance(
+        source=source,
+        observations=observations,
+        capture_completed_at=completed_at,
+    )
     plan = build_bound_close_reservation_recovery_plan(
         source_fingerprint=source.source_fingerprint,
         observations=observations,
@@ -1454,6 +1663,28 @@ def exchange_recovery_reason_from_error(error: BaseException) -> str:
 
 
 def classify_bound_close_reservation(
+    local: LocalReservationEvidence,
+    exchange: ExchangeReservationEvidence,
+    *,
+    capture_completed_at: datetime,
+) -> BoundCloseReservationObservation:
+    """Classify and issue one exact, one-use in-process provenance record."""
+
+    observation = _classify_bound_close_reservation_pure(
+        local,
+        exchange,
+        capture_completed_at=capture_completed_at,
+    )
+    _register_observation_provenance(
+        observation,
+        local=local,
+        exchange=exchange,
+        capture_completed_at=capture_completed_at,
+    )
+    return observation
+
+
+def _classify_bound_close_reservation_pure(
     local: LocalReservationEvidence,
     exchange: ExchangeReservationEvidence,
     *,
