@@ -131,6 +131,20 @@ _POSITION_MUTATION_STATUSES = frozenset(
 _MAX_LOCAL_DESCENDANTS = 256
 _MAX_LOCAL_JSON_BYTES = 1_048_576
 RECOVERY_RESPONSE_MAX_BYTES = 1_048_576
+BOUND_CLOSE_RESERVATION_APPLY_AUTHORIZATION = (
+    "I_APPROVE_BOUND_CLOSE_RESERVATIONS_ALL_DB_UNITS_STOPPED_APPLY_CAPTURE"
+)
+BOUND_CLOSE_RESERVATION_TERMINAL_ONLY_AUTHORIZATION = (
+    "I_AUTHORIZE_BOUND_CLOSE_RESERVATIONS_PROVEN_TERMINAL_ONLY"
+)
+BOUND_CLOSE_RESERVATION_CANONICAL_APPLY_AUTHORIZATION = (
+    BOUND_CLOSE_RESERVATION_APPLY_AUTHORIZATION
+    + "\n"
+    + BOUND_CLOSE_RESERVATION_TERMINAL_ONLY_AUTHORIZATION
+)
+_BOUND_CLOSE_RESERVATION_AUDIT_ACTION = (
+    "bound_close_reservation_history_converged"
+)
 
 
 class BoundCloseReservationExchangeConfigurationError(RuntimeError):
@@ -139,6 +153,10 @@ class BoundCloseReservationExchangeConfigurationError(RuntimeError):
 
 class BoundCloseReservationExchangeDeadlineExceeded(RuntimeError):
     """The one absolute recovery capture deadline expired."""
+
+
+class BoundCloseReservationRecoveryConflict(RuntimeError):
+    """The separately gated apply could not prove its exact CAS boundary."""
 
 
 class _OpaqueUncopyableCapability:
@@ -862,6 +880,26 @@ class BoundCloseReservationRecoveryPlan:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class BoundCloseReservationRecoveryResult:
+    status: str
+    evidence_fingerprint: str
+    action_count: int
+    audit_event_id: int
+
+    def __post_init__(self) -> None:
+        if self.status not in {"applied", "already_applied"}:
+            raise ValueError("recovery result status is invalid")
+        _require_lower_hex_64(
+            self.evidence_fingerprint,
+            "evidence_fingerprint",
+        )
+        if type(self.action_count) is not int or self.action_count <= 0:
+            raise ValueError("action_count must be a positive integer")
+        if type(self.audit_event_id) is not int or self.audit_event_id <= 0:
+            raise ValueError("audit_event_id must be a positive integer")
+
+
 _RECOVERY_PLAN_KEYS = frozenset(
     {
         "action_count",
@@ -1315,6 +1353,531 @@ def _claim_sealed_recovery_capture_for_apply(
         capture._SealedRecoveryCapture__apply_claimed = True
         _SEALED_CAPTURE_ISSUANCE_REGISTRY.pop(id(capture), None)
         return claimed
+
+
+def _apply_refusal(reason_code: str) -> BoundCloseReservationRecoveryConflict:
+    return BoundCloseReservationRecoveryConflict(reason_code)
+
+
+def _require_bound_close_reservation_apply_arguments(
+    *,
+    plan: BoundCloseReservationRecoveryPlan,
+    expected_fingerprint: str,
+    expected_action_count: int,
+    confirmation_token: str,
+    authorization: str,
+    applied_at: datetime,
+) -> datetime:
+    if type(authorization) is not str or authorization != (
+        BOUND_CLOSE_RESERVATION_CANONICAL_APPLY_AUTHORIZATION
+    ):
+        raise _apply_refusal("authorization_invalid")
+    try:
+        _require_canonical_recovery_plan(plan)
+    except (RecursionError, TypeError, ValueError, OverflowError) as exc:
+        raise _apply_refusal("plan_not_actionable") from exc
+    if plan.status != "ready" or plan.action_count <= 0:
+        raise _apply_refusal("plan_not_actionable")
+    if (
+        type(expected_fingerprint) is not str
+        or expected_fingerprint != plan.evidence_fingerprint
+    ):
+        raise _apply_refusal("evidence_fingerprint_mismatch")
+    if (
+        type(expected_action_count) is not int
+        or expected_action_count != plan.action_count
+    ):
+        raise _apply_refusal("action_count_mismatch")
+    if (
+        type(confirmation_token) is not str
+        or confirmation_token != plan.confirmation_token
+    ):
+        raise _apply_refusal("confirmation_token_mismatch")
+    try:
+        return _require_aware_utc(applied_at, "applied_at")
+    except (TypeError, ValueError) as exc:
+        raise _apply_refusal("applied_at_invalid") from exc
+
+
+def _claim_exact_bound_close_reservation_apply_capture(
+    *,
+    capture: SealedRecoveryCapture,
+    plan: BoundCloseReservationRecoveryPlan,
+    applied_at: datetime,
+) -> _ClaimedSealedRecoveryCapture:
+    try:
+        unclaimed_plan = capture.plan
+        parsed_capture = _parse_bound_close_reservation_dry_run_document(
+            capture.serialized_plan.encode("utf-8")
+        )
+    except (
+        AttributeError,
+        RecursionError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ) as exc:
+        raise _apply_refusal("fresh_capture_capability_invalid") from exc
+    if (
+        parsed_capture.plan != unclaimed_plan
+        or applied_at < parsed_capture.capture_completed_at
+    ):
+        raise _apply_refusal("applied_at_precedes_fresh_capture")
+    if unclaimed_plan.source_fingerprint != plan.source_fingerprint:
+        raise _apply_refusal("fresh_capture_source_drift")
+    if (
+        unclaimed_plan.exchange_snapshot_fingerprint
+        != plan.exchange_snapshot_fingerprint
+    ):
+        raise _apply_refusal("fresh_capture_exchange_drift")
+    if unclaimed_plan.evidence_fingerprint != plan.evidence_fingerprint:
+        raise _apply_refusal("fresh_capture_evidence_drift")
+    if unclaimed_plan != plan:
+        raise _apply_refusal("fresh_capture_plan_drift")
+    try:
+        claimed = _claim_sealed_recovery_capture_for_apply(capture)
+    except (AttributeError, RecursionError, TypeError, ValueError) as exc:
+        raise _apply_refusal("fresh_capture_capability_invalid") from exc
+    captured_plan = claimed.plan
+    if captured_plan.source_fingerprint != plan.source_fingerprint:
+        raise _apply_refusal("fresh_capture_source_drift")
+    if (
+        captured_plan.exchange_snapshot_fingerprint
+        != plan.exchange_snapshot_fingerprint
+    ):
+        raise _apply_refusal("fresh_capture_exchange_drift")
+    if captured_plan.evidence_fingerprint != plan.evidence_fingerprint:
+        raise _apply_refusal("fresh_capture_evidence_drift")
+    if captured_plan != plan:
+        raise _apply_refusal("fresh_capture_plan_drift")
+    return claimed
+
+
+def _open_bound_close_reservation_writable_connection(
+    database_path: str | Path,
+) -> sqlite3.Connection:
+    resolved = Path(database_path).expanduser().resolve()
+    uri = f"file:{quote(str(resolved), safe='/')}?mode=rw"
+    connection = sqlite3.connect(uri, uri=True, isolation_level=None)
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        return connection
+    except Exception:
+        connection.close()
+        raise
+
+
+def _execute_bound_close_reservation_apply_statement(
+    connection: sqlite3.Connection,
+    sql: str,
+    parameters: Sequence[object] = (),
+) -> sqlite3.Cursor:
+    """Single mutation seam used only for statement-boundary rollback tests."""
+
+    return connection.execute(sql, tuple(parameters))
+
+
+def _locked_mimo_contract_mode_is_v1(connection: sqlite3.Connection) -> bool:
+    try:
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                'PRAGMA table_info("trading_settings")'
+            ).fetchall()
+        }
+        if not {"key", "value_json"}.issubset(columns):
+            return False
+        rows = connection.execute(
+            "SELECT value_json FROM trading_settings WHERE key = 'global' LIMIT 2"
+        ).fetchall()
+        if len(rows) > 1:
+            return False
+        if not rows:
+            payload: object = {}
+        else:
+            raw = rows[0]["value_json"]
+            if type(raw) is not str or len(raw.encode("utf-8")) > (
+                _MAX_LOCAL_JSON_BYTES
+            ):
+                return False
+            payload = json.loads(
+                raw,
+                object_pairs_hook=_closed_json_object,
+                parse_constant=_reject_json_constant,
+            )
+        if type(payload) is not dict:
+            return False
+        mode = payload.get("mimo_contract_mode", "v1")
+        return type(mode) is str and mode == "v1"
+    except (
+        KeyError,
+        RecursionError,
+        sqlite3.Error,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ):
+        return False
+
+
+def _locked_active_bound_close_reservation_source(
+    connection: sqlite3.Connection,
+) -> BoundCloseReservationSource:
+    if not _source_schema_is_valid(connection):
+        raise _apply_refusal("source_schema_invalid")
+    rows = connection.execute(
+        """
+        SELECT id, pos_id, execution_binding_id, status, last_error,
+               created_at, updated_at
+        FROM bound_position_close_reservations
+        WHERE status IS NULL OR status != 'confirmed'
+        ORDER BY id
+        LIMIT 65
+        """
+    ).fetchall()
+    if len(rows) > MAX_RESERVATION_OBSERVATIONS:
+        raise _apply_refusal("source_population_overflow")
+    return _load_source_descendants(connection, rows)
+
+
+def _claimed_source_capability(
+    claimed: _ClaimedSealedRecoveryCapture,
+) -> _BoundCloseReservationSourceCapability:
+    capability = claimed._ClaimedSealedRecoveryCapture__source_capability
+    if type(capability) is not _BoundCloseReservationSourceCapability:
+        raise _apply_refusal("fresh_capture_capability_invalid")
+    return capability
+
+
+def _planned_raw_reservations(
+    *,
+    claimed: _ClaimedSealedRecoveryCapture,
+    plan: BoundCloseReservationRecoveryPlan,
+) -> tuple[tuple[str, _RawReservationCapability], ...]:
+    capability = _claimed_source_capability(claimed)
+    raw_rows: list[tuple[str, _RawReservationCapability]] = []
+    try:
+        for observation in plan.observations:
+            raw = capability._get(observation.reservation_ref)
+            if type(raw) is not _RawReservationCapability:
+                raise TypeError("raw recovery authority is invalid")
+            raw_rows.append((observation.reservation_ref, raw))
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise _apply_refusal("fresh_capture_capability_invalid") from exc
+    if len(raw_rows) != plan.action_count:
+        raise _apply_refusal("fresh_capture_capability_invalid")
+    return tuple(raw_rows)
+
+
+def _recovery_audit_payloads(
+    *,
+    plan: BoundCloseReservationRecoveryPlan,
+    raw_rows: tuple[tuple[str, _RawReservationCapability], ...],
+) -> tuple[str, str]:
+    before = {
+        "action_count": plan.action_count,
+        "evidence_fingerprint": plan.evidence_fingerprint,
+        "reservations": [
+            {
+                "reservation_ref": reservation_ref,
+                "status": raw.source_status,
+            }
+            for reservation_ref, raw in raw_rows
+        ],
+    }
+    after = {
+        "action_count": plan.action_count,
+        "evidence_fingerprint": plan.evidence_fingerprint,
+        "reservations": [
+            {
+                "reservation_ref": reservation_ref,
+                "status": "confirmed",
+            }
+            for reservation_ref, _raw in raw_rows
+        ],
+        "status": "confirmed",
+    }
+    before_json = _canonical_json(before)
+    after_json = _canonical_json(after)
+    if any(
+        len(value.encode("utf-8")) > MAX_RECOVERY_PLAN_BYTES
+        for value in (before_json, after_json)
+    ):
+        raise _apply_refusal("audit_payload_exceeds_bound")
+    return before_json, after_json
+
+
+def _load_bound_close_reservation_audits(
+    connection: sqlite3.Connection,
+) -> tuple[sqlite3.Row, ...]:
+    columns = {
+        row["name"]
+        for row in connection.execute(
+            'PRAGMA table_info("execution_events")'
+        ).fetchall()
+    }
+    required = {
+        "id",
+        "execution_binding_id",
+        "venue",
+        "action",
+        "status",
+        "order_id",
+        "client_order_id",
+        "pos_id",
+        "related_order_id",
+        "before_json",
+        "after_json",
+        "request_json",
+        "response_json",
+        "notification_fingerprint",
+        "notification_attempts",
+        "created_at",
+    }
+    if not required.issubset(columns):
+        raise _apply_refusal("audit_schema_invalid")
+    rows = connection.execute(
+        """
+        SELECT id, execution_binding_id, venue, action, status, order_id,
+               client_order_id, pos_id, related_order_id,
+               before_json, after_json, request_json, response_json,
+               notification_fingerprint, notification_attempts, created_at
+        FROM execution_events
+        WHERE action = ?
+        ORDER BY id
+        LIMIT 66
+        """,
+        (_BOUND_CLOSE_RESERVATION_AUDIT_ACTION,),
+    ).fetchall()
+    if len(rows) > MAX_RESERVATION_OBSERVATIONS:
+        raise _apply_refusal("unexpected_audit_event")
+    return tuple(rows)
+
+
+def _exact_recovery_audit_matches(
+    row: sqlite3.Row,
+    *,
+    plan: BoundCloseReservationRecoveryPlan,
+    before_json: str,
+    after_json: str,
+) -> bool:
+    return (
+        type(row["id"]) is int
+        and row["id"] > 0
+        and row["execution_binding_id"] is None
+        and row["venue"] == "deepcoin"
+        and row["action"] == _BOUND_CLOSE_RESERVATION_AUDIT_ACTION
+        and row["status"] == "succeeded"
+        and row["order_id"] is None
+        and row["client_order_id"] is None
+        and row["pos_id"] is None
+        and row["related_order_id"] is None
+        and row["before_json"] == before_json
+        and row["after_json"] == after_json
+        and row["request_json"] is None
+        and row["response_json"] is None
+        and row["notification_fingerprint"] == plan.evidence_fingerprint
+        and row["notification_attempts"] == 0
+        and _parse_sqlite_utc(row["created_at"]) is not None
+    )
+
+
+def _planned_rows_are_exactly_confirmed(
+    connection: sqlite3.Connection,
+    *,
+    raw_rows: tuple[tuple[str, _RawReservationCapability], ...],
+    audit_created_at: object,
+) -> bool:
+    planned_ids = tuple(raw.reservation_id for _ref, raw in raw_rows)
+    rows = _select_in(
+        connection,
+        """
+        SELECT id, pos_id, execution_binding_id, status, last_error, updated_at
+        FROM bound_position_close_reservations
+        WHERE id IN ({placeholders})
+        ORDER BY id
+        """,
+        planned_ids,
+    )
+    if len(rows) != len(planned_ids):
+        return False
+    by_id = {row["id"]: row for row in rows}
+    audit_time = _parse_sqlite_utc(audit_created_at)
+    if audit_time is None:
+        return False
+    for _reservation_ref, raw in raw_rows:
+        row = by_id.get(raw.reservation_id)
+        if (
+            row is None
+            or row["pos_id"] != raw.position_id
+            or row["execution_binding_id"] != raw.binding_id
+            or row["status"] != "confirmed"
+            or row["last_error"] is not None
+            or _parse_sqlite_utc(row["updated_at"]) != audit_time
+        ):
+            return False
+    return True
+
+
+def _sqlite_apply_time(value: datetime) -> str:
+    return value.astimezone(UTC).replace(tzinfo=None).isoformat(
+        sep=" ",
+        timespec="microseconds",
+    )
+
+
+def apply_bound_close_reservation_recovery(
+    database_path: str | Path,
+    *,
+    plan: BoundCloseReservationRecoveryPlan,
+    capture: SealedRecoveryCapture,
+    expected_fingerprint: str,
+    expected_action_count: int,
+    confirmation_token: str,
+    authorization: str,
+    applied_at: datetime,
+) -> BoundCloseReservationRecoveryResult:
+    """Atomically converge only a fresh capture's exact terminal population."""
+
+    if not isinstance(database_path, (str, Path)):
+        raise _apply_refusal("database_path_invalid")
+    applied = _require_bound_close_reservation_apply_arguments(
+        plan=plan,
+        expected_fingerprint=expected_fingerprint,
+        expected_action_count=expected_action_count,
+        confirmation_token=confirmation_token,
+        authorization=authorization,
+        applied_at=applied_at,
+    )
+    expanded_path = Path(database_path).expanduser()
+    if expanded_path.is_symlink() or not expanded_path.is_file():
+        raise _apply_refusal("database_path_invalid")
+    resolved_database_path = expanded_path.resolve()
+    claimed = _claim_exact_bound_close_reservation_apply_capture(
+        capture=capture,
+        plan=plan,
+        applied_at=applied,
+    )
+    raw_rows = _planned_raw_reservations(claimed=claimed, plan=plan)
+    before_json, after_json = _recovery_audit_payloads(
+        plan=plan,
+        raw_rows=raw_rows,
+    )
+
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _open_bound_close_reservation_writable_connection(
+            resolved_database_path
+        )
+        connection.execute("BEGIN IMMEDIATE")
+        if not _locked_mimo_contract_mode_is_v1(connection):
+            raise _apply_refusal("mimo_contract_mode_not_v1")
+        audits = _load_bound_close_reservation_audits(connection)
+        matching = tuple(
+            row
+            for row in audits
+            if row["notification_fingerprint"] == plan.evidence_fingerprint
+        )
+        if matching:
+            if (
+                len(audits) != 1
+                or len(matching) != 1
+                or not _exact_recovery_audit_matches(
+                    matching[0],
+                    plan=plan,
+                    before_json=before_json,
+                    after_json=after_json,
+                )
+                    or not _planned_rows_are_exactly_confirmed(
+                        connection,
+                        raw_rows=raw_rows,
+                        audit_created_at=matching[0]["created_at"],
+                    )
+            ):
+                raise _apply_refusal("unexpected_audit_event")
+            active = _locked_active_bound_close_reservation_source(connection)
+            if active.reservations:
+                raise _apply_refusal("source_state_conflict")
+            connection.commit()
+            return BoundCloseReservationRecoveryResult(
+                status="already_applied",
+                evidence_fingerprint=plan.evidence_fingerprint,
+                action_count=plan.action_count,
+                audit_event_id=int(matching[0]["id"]),
+            )
+        if audits:
+            raise _apply_refusal("unexpected_audit_event")
+
+        locked_source = _locked_active_bound_close_reservation_source(connection)
+        if (
+            locked_source.source_fingerprint != plan.source_fingerprint
+            or tuple(sorted(
+                item.reservation_ref for item in locked_source.reservations
+            ))
+            != tuple(item.reservation_ref for item in plan.observations)
+        ):
+            raise _apply_refusal("source_state_conflict")
+        if _raw_source_snapshot_fingerprint(locked_source._capability) != (
+            _raw_source_snapshot_fingerprint(
+                _claimed_source_capability(claimed)
+            )
+        ):
+            raise _apply_refusal("source_state_conflict")
+
+        updated_at = _sqlite_apply_time(applied)
+        for _reservation_ref, raw in raw_rows:
+            cursor = _execute_bound_close_reservation_apply_statement(
+                connection,
+                """
+                UPDATE bound_position_close_reservations
+                SET status = 'confirmed', last_error = NULL, updated_at = ?
+                WHERE id = ? AND status = ?
+                """,
+                (updated_at, raw.reservation_id, raw.source_status),
+            )
+            if cursor.rowcount != 1:
+                raise _apply_refusal("reservation_cas_conflict")
+        cursor = _execute_bound_close_reservation_apply_statement(
+            connection,
+            """
+            INSERT INTO execution_events (
+                execution_binding_id, venue, action, status, order_id,
+                client_order_id, pos_id, related_order_id,
+                before_json, after_json, request_json, response_json,
+                notification_fingerprint, notification_attempts, created_at
+            ) VALUES (NULL, 'deepcoin', ?, 'succeeded', NULL, NULL, NULL, NULL,
+                      ?, ?, NULL, NULL, ?, 0, ?)
+            """,
+            (
+                _BOUND_CLOSE_RESERVATION_AUDIT_ACTION,
+                before_json,
+                after_json,
+                plan.evidence_fingerprint,
+                updated_at,
+            ),
+        )
+        audit_event_id = cursor.lastrowid
+        if type(audit_event_id) is not int or audit_event_id <= 0:
+            raise _apply_refusal("audit_insert_failed")
+        connection.commit()
+        return BoundCloseReservationRecoveryResult(
+            status="applied",
+            evidence_fingerprint=plan.evidence_fingerprint,
+            action_count=plan.action_count,
+            audit_event_id=audit_event_id,
+        )
+    except BoundCloseReservationRecoveryConflict:
+        if connection is not None and connection.in_transaction:
+            connection.rollback()
+        raise
+    except (OSError, RecursionError, sqlite3.Error, TypeError, ValueError) as exc:
+        if connection is not None and connection.in_transaction:
+            connection.rollback()
+        raise _apply_refusal("apply_transaction_failed") from exc
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 class _RawRecoveryCapture:

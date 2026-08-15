@@ -35,6 +35,8 @@ from telegram_kol_research.bound_close_reservation_recovery import (
     UNKNOWN_REASONS,
     BoundCloseReservationObservation,
     BoundCloseReservationRecoveryPlan,
+    BoundCloseReservationRecoveryConflict,
+    BoundCloseReservationRecoveryResult,
     BoundCloseReservationSource,
     BoundCloseReservationExchangeReader,
     BoundCloseReservationExchangeConfigurationError,
@@ -50,9 +52,13 @@ from telegram_kol_research.bound_close_reservation_recovery import (
     LocalReservationEvidence,
     ReservationClassification,
     SealedRecoveryCapture,
+    BOUND_CLOSE_RESERVATION_APPLY_AUTHORIZATION,
+    BOUND_CLOSE_RESERVATION_CANONICAL_APPLY_AUTHORIZATION,
+    BOUND_CLOSE_RESERVATION_TERMINAL_ONLY_AUTHORIZATION,
     _claim_sealed_recovery_capture_for_apply,
     _canonical_json,
     _sha256_json,
+    apply_bound_close_reservation_recovery,
     build_bound_close_reservation_recovery_plan,
     build_bound_close_reservation_exchange_reader_from_env,
     capture_and_seal_bound_close_reservation_recovery,
@@ -1244,12 +1250,23 @@ def _create_reservation_source_database(path) -> sqlite3.Connection:
             symbol TEXT,
             side TEXT,
             order_id TEXT,
+            client_order_id TEXT,
             pos_id TEXT,
+            related_order_id TEXT,
             before_json TEXT,
             after_json TEXT,
             request_json TEXT,
             response_json TEXT,
+            notification_fingerprint TEXT UNIQUE,
+            notification_attempts INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
+        );
+        CREATE TABLE trading_settings (
+            id INTEGER PRIMARY KEY,
+            key TEXT NOT NULL UNIQUE,
+            value_json TEXT NOT NULL,
+            created_at TEXT,
+            updated_at TEXT
         );
         CREATE TABLE execution_order_legs (
             id INTEGER PRIMARY KEY,
@@ -1335,7 +1352,11 @@ def _seed_local_reservation(
         )
     if include_event:
         connection.execute(
-            "INSERT INTO execution_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            """INSERT INTO execution_events (
+                   id, execution_binding_id, strategy_instance_id, venue,
+                   action, status, symbol, side, order_id, pos_id, before_json,
+                   after_json, request_json, response_json, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 row_id,
                 binding_id,
@@ -2715,7 +2736,11 @@ def test_source_loader_fail_closes_bad_rows_as_unknown_local_facts(
     )
     if mutation == "duplicate_event":
         connection.execute(
-            "INSERT INTO execution_events SELECT 99, execution_binding_id, "
+            "INSERT INTO execution_events (id, execution_binding_id, "
+            "strategy_instance_id, venue, action, status, symbol, side, "
+            "order_id, pos_id, before_json, after_json, request_json, "
+            "response_json, created_at) "
+            "SELECT 99, execution_binding_id, "
             "strategy_instance_id, venue, action, status, symbol, side, "
             "'second-order', pos_id, before_json, after_json, request_json, "
             "response_json, created_at FROM execution_events"
@@ -3331,3 +3356,386 @@ def test_recovery_reader_fails_closed_without_posix_timer_capability(
             reader.read_positions()
 
     assert http_client.requests == []
+
+
+APPLY_TIME = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
+
+
+def _apply_authorization() -> str:
+    return BOUND_CLOSE_RESERVATION_CANONICAL_APPLY_AUTHORIZATION
+
+
+def test_apply_authorization_is_one_exact_canonical_two_line_value():
+    canonical = (
+        BOUND_CLOSE_RESERVATION_APPLY_AUTHORIZATION
+        + "\n"
+        + BOUND_CLOSE_RESERVATION_TERMINAL_ONLY_AUTHORIZATION
+    )
+    assert BOUND_CLOSE_RESERVATION_CANONICAL_APPLY_AUTHORIZATION == canonical
+    assert canonical.splitlines() == [
+        "I_APPROVE_BOUND_CLOSE_RESERVATIONS_ALL_DB_UNITS_STOPPED_APPLY_CAPTURE",
+        "I_AUTHORIZE_BOUND_CLOSE_RESERVATIONS_PROVEN_TERMINAL_ONLY",
+    ]
+
+
+def _apply_database(tmp_path, *, name: str = "apply.sqlite3", row_count: int = 1):
+    database = tmp_path / name
+    connection = _create_reservation_source_database(database)
+    for offset in range(row_count):
+        _seed_local_reservation(connection, row_id=901 + offset)
+    connection.execute(
+        "INSERT INTO trading_settings "
+        "(id, key, value_json, created_at, updated_at) VALUES (1, 'global', ?, ?, ?)",
+        ('{"mimo_contract_mode":"v1"}', SOURCE_TIME, SOURCE_TIME),
+    )
+    connection.commit()
+    connection.close()
+    return database
+
+
+def _ready_apply_capture(monkeypatch, database):
+    monkeypatch.setattr(
+        recovery_module,
+        "_recovery_capture_now",
+        lambda: APPLY_TIME - timedelta(minutes=1),
+    )
+    source = load_bound_close_reservation_source(database)
+    capture, _reader, http_client = _capture_with_provider_responses(
+        monkeypatch,
+        source,
+        _terminal_provider_responses(source),
+    )
+    assert capture.plan.status == "ready"
+    return capture, http_client
+
+
+def _apply_ready(database, capture, **overrides):
+    plan = overrides.pop("plan", capture.plan)
+    arguments = {
+        "plan": plan,
+        "capture": capture,
+        "expected_fingerprint": plan.evidence_fingerprint,
+        "expected_action_count": plan.action_count,
+        "confirmation_token": plan.confirmation_token,
+        "authorization": _apply_authorization(),
+        "applied_at": APPLY_TIME,
+    }
+    arguments.update(overrides)
+    return apply_bound_close_reservation_recovery(database, **arguments)
+
+
+def _table_rows(database, table_name: str):
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        return [
+            dict(row)
+            for row in connection.execute(
+                f'SELECT * FROM "{table_name}" ORDER BY id'
+            ).fetchall()
+        ]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"expected_fingerprint": "0" * 64},
+        {"expected_action_count": 0},
+        {"expected_action_count": True},
+        {"confirmation_token": "wrong"},
+        {"authorization": BOUND_CLOSE_RESERVATION_APPLY_AUTHORIZATION},
+        {"authorization": BOUND_CLOSE_RESERVATION_TERMINAL_ONLY_AUTHORIZATION},
+        {"authorization": ""},
+        {"authorization": _apply_authorization().replace("\n", "\r\n")},
+        {"authorization": "\n".join(reversed(_apply_authorization().splitlines()))},
+        {"authorization": _apply_authorization() + "\n"},
+        {"authorization": _apply_authorization() + "\n" + _apply_authorization()},
+        {"applied_at": APPLY_TIME.replace(tzinfo=None)},
+        {"applied_at": datetime(2020, 1, 1, tzinfo=UTC)},
+    ],
+)
+def test_apply_refuses_public_gate_mismatch_before_writable_open(
+    tmp_path, monkeypatch, override
+):
+    database = _apply_database(tmp_path)
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+    opened = []
+    real_open = recovery_module._open_bound_close_reservation_writable_connection
+
+    def record_open(path):
+        opened.append(path)
+        return real_open(path)
+
+    monkeypatch.setattr(
+        recovery_module,
+        "_open_bound_close_reservation_writable_connection",
+        record_open,
+    )
+
+    with pytest.raises(BoundCloseReservationRecoveryConflict):
+        _apply_ready(database, capture, **override)
+
+    assert opened == []
+    assert _table_rows(database, "bound_position_close_reservations")[0][
+        "status"
+    ] == "submitted"
+
+
+def test_apply_requires_privately_issued_unclaimed_fresh_capture_before_open(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path)
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+    _claim_sealed_recovery_capture_for_apply(capture)
+    opened = []
+    monkeypatch.setattr(
+        recovery_module,
+        "_open_bound_close_reservation_writable_connection",
+        lambda path: opened.append(path),
+    )
+
+    with pytest.raises(BoundCloseReservationRecoveryConflict, match="capture"):
+        _apply_ready(database, capture)
+
+    assert opened == []
+
+
+def test_apply_refuses_missing_database_without_creating_a_writable_file(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path)
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+    missing = tmp_path / "must-not-be-created.sqlite3"
+
+    with pytest.raises(BoundCloseReservationRecoveryConflict, match="database_path"):
+        _apply_ready(missing, capture)
+
+    assert not missing.exists()
+    assert _claim_sealed_recovery_capture_for_apply(capture).plan is capture.plan
+
+
+def test_apply_refuses_plan_capture_exchange_drift_before_writable_open(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path)
+    first, _http = _ready_apply_capture(monkeypatch, database)
+    source = load_bound_close_reservation_source(database)
+    changed = _terminal_provider_responses(source)
+    changed[2]["data"][0]["uTime"] = _provider_milliseconds(
+        CLASSIFICATION_TIME + timedelta(minutes=1, seconds=1)
+    )
+    second, _reader, _http2 = _capture_with_provider_responses(
+        monkeypatch, source, changed
+    )
+    assert second.plan.exchange_snapshot_fingerprint != (
+        first.plan.exchange_snapshot_fingerprint
+    )
+    opened = []
+    monkeypatch.setattr(
+        recovery_module,
+        "_open_bound_close_reservation_writable_connection",
+        lambda path: opened.append(path),
+    )
+
+    with pytest.raises(BoundCloseReservationRecoveryConflict, match="exchange"):
+        _apply_ready(database, second, plan=first.plan)
+
+    assert opened == []
+    assert _claim_sealed_recovery_capture_for_apply(second).plan is second.plan
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        (
+            "UPDATE trading_settings SET value_json = "
+            "'{\"mimo_contract_mode\":\"v2_live_adapter\"}' WHERE key = 'global'",
+            "mimo_contract_mode",
+        ),
+        (
+            "UPDATE execution_bindings SET status = 'active' WHERE id = 901",
+            "source",
+        ),
+        (
+            "UPDATE bound_position_close_reservations SET status = 'confirmed' "
+            "WHERE id = 901",
+            "state",
+        ),
+        (
+            "INSERT INTO execution_events "
+            "(id, venue, action, status, notification_fingerprint, created_at) "
+            "VALUES (9999, 'deepcoin', "
+            "'bound_close_reservation_history_converged', 'succeeded', "
+            "'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff', "
+            "'2026-08-15 10:00:00.000000')",
+            "audit",
+        ),
+    ],
+)
+def test_apply_fails_closed_on_locked_database_drift(
+    tmp_path, monkeypatch, mutation, reason
+):
+    database = _apply_database(tmp_path)
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(mutation)
+        connection.commit()
+
+    with pytest.raises(BoundCloseReservationRecoveryConflict, match=reason):
+        _apply_ready(database, capture)
+
+    rows = _table_rows(database, "bound_position_close_reservations")
+    assert all(row["updated_at"] == SOURCE_TIME for row in rows)
+
+
+def test_apply_refuses_new_or_mixed_reservation_population(tmp_path, monkeypatch):
+    for suffix, mutate in (
+        (
+            "new",
+            lambda connection: _seed_local_reservation(connection, row_id=902),
+        ),
+        (
+            "mixed",
+            lambda connection: connection.execute(
+                "UPDATE bound_position_close_reservations "
+                "SET status = 'confirmed' WHERE id = 901"
+            ),
+        ),
+    ):
+        database = _apply_database(
+            tmp_path,
+            name=f"{suffix}.sqlite3",
+            row_count=2 if suffix == "mixed" else 1,
+        )
+        capture, _http = _ready_apply_capture(monkeypatch, database)
+        with sqlite3.connect(database) as connection:
+            mutate(connection)
+            connection.commit()
+        with pytest.raises(BoundCloseReservationRecoveryConflict, match="state|source"):
+            _apply_ready(database, capture)
+
+
+def test_apply_changes_only_exact_reservations_and_one_redacted_aggregate_event(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path, row_count=2)
+    capture, http_client = _ready_apply_capture(monkeypatch, database)
+    unchanged_tables = (
+        "execution_bindings",
+        "execution_order_legs",
+        "position_mutation_intents",
+        "trading_settings",
+    )
+    before = {table: _table_rows(database, table) for table in unchanged_tables}
+    original_events = _table_rows(database, "execution_events")
+    exchange_call_count = len(http_client.requests)
+    statements = []
+    real_open = recovery_module._open_bound_close_reservation_writable_connection
+
+    def traced_open(path):
+        connection = real_open(path)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(
+        recovery_module,
+        "_open_bound_close_reservation_writable_connection",
+        traced_open,
+    )
+
+    result = _apply_ready(database, capture)
+
+    assert isinstance(result, BoundCloseReservationRecoveryResult)
+    assert result.status == "applied"
+    assert result.evidence_fingerprint == capture.plan.evidence_fingerprint
+    assert result.action_count == 2
+    assert statements[0] == "BEGIN IMMEDIATE"
+    assert statements[-1] == "COMMIT"
+    reservations = _table_rows(database, "bound_position_close_reservations")
+    assert [row["status"] for row in reservations] == ["confirmed", "confirmed"]
+    assert all(row["last_error"] is None for row in reservations)
+    assert all(row["updated_at"] == "2026-08-15 12:00:00.000000" for row in reservations)
+    assert all(row["created_at"] == SOURCE_TIME for row in reservations)
+    for table in unchanged_tables:
+        assert _table_rows(database, table) == before[table]
+    assert len(http_client.requests) == exchange_call_count
+
+    events = _table_rows(database, "execution_events")
+    assert events[:-1] == original_events
+    event = events[-1]
+    assert event["action"] == "bound_close_reservation_history_converged"
+    assert event["status"] == "succeeded"
+    assert event["order_id"] is None
+    assert event["client_order_id"] is None
+    assert event["pos_id"] is None
+    assert event["related_order_id"] is None
+    assert event["notification_fingerprint"] == capture.plan.evidence_fingerprint
+    assert event["notification_attempts"] == 0
+    assert event["execution_binding_id"] is None
+    assert len(event["before_json"].encode("utf-8")) <= 65_536
+    assert len(event["after_json"].encode("utf-8")) <= 65_536
+    audit_text = event["before_json"] + event["after_json"]
+    assert "raw-pos" not in audit_text
+    assert "raw-close-order" not in audit_text
+    assert "provider" not in audit_text
+    assert json.loads(event["before_json"])["action_count"] == 2
+    assert json.loads(event["after_json"])["status"] == "confirmed"
+
+
+@pytest.mark.parametrize("fail_statement", [1, 2, 3])
+def test_apply_rolls_back_every_mutation_statement_boundary(
+    tmp_path, monkeypatch, fail_statement
+):
+    database = _apply_database(
+        tmp_path,
+        name=f"rollback-{fail_statement}.sqlite3",
+        row_count=2,
+    )
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+    before_reservations = _table_rows(database, "bound_position_close_reservations")
+    before_events = _table_rows(database, "execution_events")
+    real_execute = recovery_module._execute_bound_close_reservation_apply_statement
+    calls = 0
+
+    def fail_at_boundary(connection, sql, parameters=()):
+        nonlocal calls
+        calls += 1
+        if calls == fail_statement:
+            raise sqlite3.OperationalError("injected apply statement failure")
+        return real_execute(connection, sql, parameters)
+
+    monkeypatch.setattr(
+        recovery_module,
+        "_execute_bound_close_reservation_apply_statement",
+        fail_at_boundary,
+    )
+
+    with pytest.raises(BoundCloseReservationRecoveryConflict, match="transaction"):
+        _apply_ready(database, capture)
+
+    assert _table_rows(database, "bound_position_close_reservations") == (
+        before_reservations
+    )
+    assert _table_rows(database, "execution_events") == before_events
+
+
+def test_apply_idempotent_repeat_with_independent_fresh_capture_adds_no_event(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path)
+    first, _http1 = _ready_apply_capture(monkeypatch, database)
+    second, _http2 = _ready_apply_capture(monkeypatch, database)
+    assert first is not second
+    assert first.plan == second.plan
+
+    applied = _apply_ready(database, first)
+    repeated = _apply_ready(database, second)
+
+    assert applied.status == "applied"
+    assert repeated.status == "already_applied"
+    assert repeated.audit_event_id == applied.audit_event_id
+    events = [
+        row
+        for row in _table_rows(database, "execution_events")
+        if row["action"] == "bound_close_reservation_history_converged"
+    ]
+    assert len(events) == 1
