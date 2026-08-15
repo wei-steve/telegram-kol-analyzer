@@ -257,11 +257,16 @@ class ProductionMonitorSnapshotStore:
         previous_generation = -1 if previous is None else previous.generation
         if previous_generation >= 2**63 - 1:
             raise ValueError("snapshot generation is exhausted")
+        sealed_at = (
+            observed_at
+            if previous is None
+            else max(observed_at, previous.request_completed_at)
+        )
         envelope = SnapshotGeneration(
             generation=previous_generation + 1,
             outcome="FAILURE",
-            request_started_at=observed_at,
-            request_completed_at=observed_at,
+            request_started_at=sealed_at,
+            request_completed_at=sealed_at,
             uid_scope_hash=uid_scope_hash,
             collections=(),
             failure_code="refresh_overlap",

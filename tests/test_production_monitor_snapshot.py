@@ -456,6 +456,34 @@ def test_manifest_writes_allocate_unique_generations_across_processes(tmp_path):
     assert stat.S_IMODE(store.manifest_lock_path.stat().st_mode) == 0o600
 
 
+def test_late_lock_winner_normalizes_earlier_overlap_time_without_losing_evidence(
+    tmp_path,
+):
+    path = tmp_path / "manifest.json"
+    first_store = _store(path)
+    second_store = _store(path)
+    first_store.seal_success(_generation(0))
+
+    later_observation = first_store.record_refresh_overlap(
+        uid_scope_hash=UID_HASH,
+        observed_at=NOW,
+    )
+    earlier_contender = second_store.record_refresh_overlap(
+        uid_scope_hash=UID_HASH,
+        observed_at=NOW - timedelta(seconds=30),
+    )
+
+    assert later_observation.latest_attempt is not None
+    assert later_observation.latest_attempt.generation == 1
+    assert earlier_contender.latest_attempt is not None
+    assert earlier_contender.latest_attempt.generation == 2
+    assert earlier_contender.latest_attempt.failure_code == "refresh_overlap"
+    assert earlier_contender.latest_attempt.request_started_at == NOW
+    assert earlier_contender.latest_attempt.request_completed_at == NOW
+    assert earlier_contender.last_success is not None
+    assert earlier_contender.last_success.generation == 0
+
+
 def test_refresh_and_manifest_lock_symlinks_are_refused_without_touching_target(
     tmp_path,
 ):
