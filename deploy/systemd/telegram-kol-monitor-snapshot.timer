@@ -11,4 +11,3 @@ Unit=telegram-kol-monitor-snapshot.service
 
 [Install]
 WantedBy=timers.target
-

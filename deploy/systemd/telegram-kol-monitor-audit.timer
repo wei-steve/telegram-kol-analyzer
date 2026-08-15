@@ -10,4 +10,3 @@ Unit=telegram-kol-monitor-audit.service
 
 [Install]
 WantedBy=timers.target
-

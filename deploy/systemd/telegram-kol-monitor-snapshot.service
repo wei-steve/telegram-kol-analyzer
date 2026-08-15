@@ -44,4 +44,3 @@ TemporaryFileSystem=/opt/telegram-kol-analyzer:ro
 BindReadOnlyPaths=/opt/telegram-kol-analyzer/.venv
 BindReadOnlyPaths=/opt/telegram-kol-analyzer/src
 ReadWritePaths=/var/lib/telegram-kol-monitor-v2/snapshot
-
