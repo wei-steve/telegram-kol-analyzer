@@ -7437,6 +7437,203 @@ def test_monitor_incident_writer_health_probe_is_persistence_free(tmp_path):
         assert session.query(RuntimeIncident).count() == 0
 
 
+def test_monitor_readiness_is_authenticated_exact_no_store_and_immutable(tmp_path):
+    token = "m" * 43
+    app = create_web_app(
+        database_path=tmp_path / "readiness.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            monitor_capture_token=token,
+        ),
+        message_operation_supervisor_config=MessageOperationSupervisorConfig(
+            enabled=False,
+        ),
+    )
+    before = app.state.monitor_readiness_state
+
+    missing = TestClient(app, client=("127.0.0.1", 50000)).get(
+        "/api/runtime-monitor-readiness"
+    )
+    remote = TestClient(app, client=("198.51.100.8", 50000)).get(
+        "/api/runtime-monitor-readiness",
+        headers={"x-monitor-capture-token": token},
+    )
+    client = TestClient(app, client=("127.0.0.1", 50000))
+    initial = client.get(
+        "/api/runtime-monitor-readiness",
+        headers={"x-monitor-capture-token": token},
+    )
+
+    assert missing.status_code == remote.status_code == 404
+    assert initial.status_code == 200
+    assert initial.headers["cache-control"] == "no-store"
+    assert initial.json() == {
+        "service_generation": before.service_generation,
+        "deepcoin_reconcile_first_success_at": None,
+        "deepcoin_reconcile_last_success_at": None,
+        "management_worker_last_success_at": None,
+        "message_supervisor_last_success_at": None,
+        "message_supervisor_policy_status": "disabled",
+    }
+    assert re.fullmatch(r"[0-9a-f]{64}", before.service_generation)
+    assert "path" not in initial.text
+    assert "error" not in initial.text
+    assert "_id" not in initial.text
+
+    app.state.publish_deepcoin_reconcile_success(
+        datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
+    )
+    app.state.publish_deepcoin_reconcile_success(
+        datetime(2026, 8, 15, 12, 1, tzinfo=UTC)
+    )
+    app.state.publish_management_worker_success(
+        datetime(2026, 8, 15, 12, 2, tzinfo=UTC)
+    )
+    after = app.state.monitor_readiness_state
+
+    assert before is not after
+    assert before.deepcoin_reconcile_first_success_at is None
+    assert after.deepcoin_reconcile_first_success_at == datetime(
+        2026, 8, 15, 12, 0, tzinfo=UTC
+    )
+    assert after.deepcoin_reconcile_last_success_at == datetime(
+        2026, 8, 15, 12, 1, tzinfo=UTC
+    )
+    assert after.management_worker_last_success_at == datetime(
+        2026, 8, 15, 12, 2, tzinfo=UTC
+    )
+
+
+def test_deepcoin_reconcile_heartbeat_publishes_after_background_success_even_if_liveness_fails(
+    tmp_path, monkeypatch
+):
+    completed = asyncio.Event()
+    callbacks = []
+
+    async def background(**kwargs):
+        return SimpleNamespace(
+            synced_at=datetime(2026, 8, 15, 12, 0, tzinfo=UTC),
+            reconciled=None,
+        )
+
+    async def protection(**kwargs):
+        completed.set()
+        raise DeepcoinClientError("liveness unavailable")
+
+    monkeypatch.setattr(web_app_module, "_await_deepcoin_background_sync", background)
+    monkeypatch.setattr(web_app_module, "_await_deepcoin_protection_liveness", protection)
+
+    async def exercise():
+        task = asyncio.create_task(
+            run_deepcoin_execution_reconcile_loop(
+                session_factory=create_session_factory(tmp_path / "heartbeat.db"),
+                deepcoin_client_factory=lambda: object(),
+                interval_seconds=3600,
+                now_provider=lambda: datetime(2026, 8, 15, 12, 0, 5, tzinfo=UTC),
+                success_callback=callbacks.append,
+            )
+        )
+        await asyncio.wait_for(completed.wait(), timeout=2)
+        while not callbacks:
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+
+    assert callbacks == [datetime(2026, 8, 15, 12, 0, 5, tzinfo=UTC)]
+
+
+def test_deepcoin_reconcile_callback_failure_is_isolated_before_liveness(
+    tmp_path, monkeypatch, caplog
+):
+    calls = []
+
+    async def background(**kwargs):
+        return SimpleNamespace(
+            synced_at=datetime(2026, 8, 15, 12, 0, tzinfo=UTC),
+            reconciled=object(),
+        )
+
+    async def protection(**kwargs):
+        calls.append("liveness")
+
+    def callback(_completed_at):
+        calls.append("callback")
+        raise RuntimeError("heartbeat sink failed")
+
+    async def notification(*args, **kwargs):
+        calls.append("notification")
+        raise RuntimeError("notification failed")
+
+    monkeypatch.setattr(web_app_module, "_await_deepcoin_background_sync", background)
+    monkeypatch.setattr(web_app_module, "_await_deepcoin_protection_liveness", protection)
+    monkeypatch.setattr(
+        web_app_module,
+        "deliver_pending_position_attribution_incidents",
+        notification,
+    )
+
+    async def exercise():
+        task = asyncio.create_task(
+            run_deepcoin_execution_reconcile_loop(
+                session_factory=create_session_factory(tmp_path / "callback.db"),
+                deepcoin_client_factory=lambda: object(),
+                interval_seconds=3600,
+                now_provider=lambda: datetime(2026, 8, 15, 12, 0, 5, tzinfo=UTC),
+                success_callback=callback,
+                system_operator_bot_config=SystemOperatorBotConfig(
+                    bot_token="token", chat_id="chat"
+                ),
+            )
+        )
+        while "liveness" not in calls:
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+
+    assert calls == ["callback", "notification", "liveness"]
+    assert "Deepcoin execution reconcile failed" not in caplog.text
+
+
+def test_deepcoin_reconcile_start_failure_and_cancellation_do_not_heartbeat(
+    tmp_path, monkeypatch
+):
+    protection_entered = asyncio.Event()
+    callbacks = []
+
+    async def background(**kwargs):
+        raise DeepcoinClientError("unavailable")
+
+    async def protection(**kwargs):
+        protection_entered.set()
+
+    monkeypatch.setattr(web_app_module, "_await_deepcoin_background_sync", background)
+    monkeypatch.setattr(web_app_module, "_await_deepcoin_protection_liveness", protection)
+
+    async def exercise():
+        task = asyncio.create_task(
+            run_deepcoin_execution_reconcile_loop(
+                session_factory=create_session_factory(tmp_path / "no-heartbeat.db"),
+                deepcoin_client_factory=lambda: object(),
+                interval_seconds=3600,
+                success_callback=callbacks.append,
+            )
+        )
+        await asyncio.wait_for(protection_entered.wait(), timeout=2)
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+
+    assert callbacks == []
+
+
 def test_message_operation_coverage_health_is_loopback_authenticated_and_read_only(
     tmp_path,
 ):
@@ -7525,6 +7722,10 @@ def test_message_operation_supervisor_lifecycle_records_only_successful_heartbea
         assert calls[0]["limit"] == 7
         assert (
             calls[0]["observed_at"]
+            <= app.state.message_operation_supervisor_last_success_at
+        )
+        assert (
+            app.state.monitor_readiness_state.message_supervisor_last_success_at
             == app.state.message_operation_supervisor_last_success_at
         )
         assert isinstance(calls[0]["runtime_incident_config"], RuntimeIncidentConfig)
@@ -7532,6 +7733,51 @@ def test_message_operation_supervisor_lifecycle_records_only_successful_heartbea
         assert app.state.message_operation_supervisor_task is not None
 
     assert app.state.message_operation_supervisor_task is None
+
+
+def test_message_supervisor_heartbeat_sink_failure_is_not_cycle_failure(
+    tmp_path, monkeypatch, caplog
+):
+    called = threading.Event()
+
+    def run_cycle(session_factory, **kwargs):
+        called.set()
+        return {
+            "last_scanned_raw_message_id": 1,
+            "errors": 0,
+            "outcome_errors": 0,
+            "model_calls": 0,
+            "outcome_model_calls": 0,
+            "capture_errors": 0,
+        }
+
+    monkeypatch.setattr(
+        web_app_module,
+        "_publish_monitor_readiness",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("sink failed")),
+    )
+    app = create_web_app(
+        database_path=tmp_path / "heartbeat-sink.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"message_operation_failure"})
+        ),
+        message_operation_supervisor_config=MessageOperationSupervisorConfig(
+            enabled=True,
+            shadow_only=True,
+            after_raw_message_id=0,
+        ),
+        message_operation_supervisor_runner=run_cycle,
+        message_operation_supervisor_interval_seconds=3600,
+    )
+
+    with TestClient(app):
+        assert called.wait(timeout=2)
+        deadline = time.monotonic() + 2
+        while app.state.message_operation_supervisor_last_success_at is None:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+
+    assert "message operation supervisor cycle failed" not in caplog.text
 
 
 @pytest.mark.parametrize("model_key", ["model_calls", "outcome_model_calls"])

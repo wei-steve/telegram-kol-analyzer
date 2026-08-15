@@ -83,11 +83,10 @@ from telegram_kol_research.production_monitor_refresher import (
 from telegram_kol_research.production_monitor_snapshot import (
     ProductionMonitorSnapshotStore,
 )
-from telegram_kol_research.production_monitor_contract import (
-    MONITOR_ADAPTER_NAMES,
+from telegram_kol_research.production_monitor_facts import (
+    collect_production_monitor_observation,
 )
 from telegram_kol_research.production_monitor_sentinel import (
-    SentinelObservation,
     run_production_monitor_sentinel,
 )
 from telegram_kol_research.production_monitor_state import (
@@ -429,32 +428,57 @@ def run_production_monitor_sentinel_cli(
     database_path: Path = typer.Option(
         ...,
         "--database-path",
-        help="Exact production SQLite path reserved for Task 6 query-only facts.",
+        help="Exact production SQLite path for query-only facts.",
     ),
     checkout_path: Path = typer.Option(
         ...,
         "--checkout-path",
-        help="Exact reviewed checkout path reserved for Task 6 facts.",
+        help="Exact reviewed checkout path for the code-identity fact.",
     ),
     settings_url: str = typer.Option(
         ...,
         "--settings-url",
-        help="Explicit loopback settings endpoint reserved for Task 6.",
+        help="Explicit loopback settings endpoint.",
     ),
     coverage_path: Path = typer.Option(
         ...,
         "--coverage-path",
         help="Exact message-operation coverage evidence path.",
     ),
+    journal_path: Path = typer.Option(
+        ...,
+        "--journal-path",
+        help="Exact bounded structured journal evidence path.",
+    ),
     expected_head: str = typer.Option(
         ...,
         "--expected-head",
         help="Explicit reviewed production commit identity.",
     ),
+    expected_auto_trade_enabled: str = typer.Option(
+        ...,
+        "--expected-auto-trade",
+        help="Explicit reviewed automatic-trading setting.",
+    ),
+    expected_max_concurrent_positions: int = typer.Option(
+        ...,
+        "--expected-position-limit",
+        help="Explicit reviewed concurrent-position limit.",
+    ),
+    expected_management_execution_mode: str = typer.Option(
+        ...,
+        "--expected-management-mode",
+        help="Explicit reviewed management mode.",
+    ),
+    expected_entry_preamble_mode: str = typer.Option(
+        ...,
+        "--expected-preamble-mode",
+        help="Explicit reviewed entry-preamble mode.",
+    ),
     readiness_url: str = typer.Option(
         ...,
         "--readiness-url",
-        help="Explicit loopback readiness endpoint reserved for Task 6.",
+        help="Explicit authenticated loopback readiness endpoint.",
     ),
     incident_loopback_url: str = typer.Option(
         ...,
@@ -462,27 +486,31 @@ def run_production_monitor_sentinel_cli(
         help="Explicit incident endpoint reserved for later routing work.",
     ),
 ) -> None:
-    """Persist one safely blocking dormant result until Task 6 wires facts."""
+    """Persist one dormant fact evaluation without submission or notification."""
 
-    # These explicit boundaries intentionally have no readers in Task 5. They
-    # prevent future activation from inheriting legacy defaults while the
-    # injected runner and its state semantics can already be tested end to end.
-    del (
-        snapshot_path,
-        database_path,
-        checkout_path,
-        settings_url,
-        coverage_path,
-        expected_head,
-        readiness_url,
-        incident_loopback_url,
-    )
+    normalized_auto_trade = expected_auto_trade_enabled.strip().lower()
+    if normalized_auto_trade not in {"true", "false"}:
+        raise typer.BadParameter(
+            "must be true or false", param_hint="--expected-auto-trade"
+        )
+    monitor_config = load_runtime_incident_config(environment_only=True)
     outcome = run_production_monitor_sentinel(
         state_store=ProductionMonitorStateStore(state_path),
-        observation_collector=lambda: SentinelObservation(
-            checked_at=datetime.now(UTC),
-            candidates=(),
-            adapter_failures=tuple(sorted(MONITOR_ADAPTER_NAMES)),
+        observation_collector=lambda: collect_production_monitor_observation(
+            database_path=database_path,
+            snapshot_path=snapshot_path,
+            checkout_path=checkout_path,
+            settings_url=settings_url,
+            coverage_path=coverage_path,
+            journal_path=journal_path,
+            expected_head=expected_head,
+            expected_auto_trade_enabled=normalized_auto_trade == "true",
+            expected_max_concurrent_positions=expected_max_concurrent_positions,
+            expected_management_execution_mode=expected_management_execution_mode,
+            expected_entry_preamble_mode=expected_entry_preamble_mode,
+            readiness_url=readiness_url,
+            incident_loopback_url=incident_loopback_url,
+            monitor_capture_token=monitor_config.monitor_capture_token,
         ),
     )
     typer.echo(

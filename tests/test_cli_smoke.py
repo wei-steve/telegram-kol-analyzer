@@ -813,8 +813,18 @@ def _sentinel_cli_args(tmp_path: Path) -> list[str]:
         "http://127.0.0.1:8000/api/trading-settings",
         "--coverage-path",
         str(tmp_path / "coverage.json"),
+        "--journal-path",
+        str(tmp_path / "journal.log"),
         "--expected-head",
         "a" * 40,
+        "--expected-auto-trade",
+        "true",
+        "--expected-position-limit",
+        "4",
+        "--expected-management-mode",
+        "live",
+        "--expected-preamble-mode",
+        "live",
         "--readiness-url",
         "http://127.0.0.1:8000/api/runtime-monitor-readiness",
         "--incident-loopback-url",
@@ -838,7 +848,12 @@ def test_production_monitor_sentinel_cli_requires_every_explicit_boundary():
         "--checkout-path",
         "--settings-url",
         "--coverage-path",
+        "--journal-path",
         "--expected-head",
+        "--expected-auto-trade",
+        "--expected-position-limit",
+        "--expected-management-mode",
+        "--expected-preamble-mode",
         "--readiness-url",
         "--incident-loopback-url",
     ):
@@ -853,12 +868,26 @@ def test_dormant_sentinel_cli_persists_unknown_and_never_submits(
     tmp_path, monkeypatch
 ):
     import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.production_monitor_sentinel import SentinelObservation
 
     submitted = []
+    collected = []
     monkeypatch.setattr(
         cli_module.httpx,
         "post",
         lambda *args, **kwargs: submitted.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "collect_production_monitor_observation",
+        lambda **kwargs: (
+                collected.append(kwargs)
+                or SentinelObservation(
+                    checked_at=datetime.now(UTC),
+                candidates=(),
+                adapter_failures=("readiness",),
+            )
+        ),
     )
 
     result = CliRunner().invoke(app, _sentinel_cli_args(tmp_path))
@@ -875,6 +904,15 @@ def test_dormant_sentinel_cli_persists_unknown_and_never_submits(
     }
     assert len(result.stdout.encode()) <= 512
     assert submitted == []
+    assert len(collected) == 1
+    assert collected[0]["database_path"] == tmp_path / "research.db"
+    assert collected[0]["snapshot_path"] == tmp_path / "snapshot.json"
+    assert collected[0]["checkout_path"] == tmp_path / "checkout"
+    assert collected[0]["settings_url"].startswith("http://127.0.0.1:")
+    assert collected[0]["readiness_url"].startswith("http://127.0.0.1:")
+    assert collected[0]["incident_loopback_url"].startswith(
+        "http://127.0.0.1:"
+    )
 
 
 def test_production_monitor_snapshot_cli_help_has_only_explicit_runtime_inputs():

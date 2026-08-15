@@ -108,6 +108,7 @@ class StrategyManagementWorkerResult:
     paused: int = 0
     skipped: int = 0
     failed: int = 0
+    cycle_success: bool = True
 
 
 @dataclass(slots=True)
@@ -165,6 +166,7 @@ def run_strategy_management_worker_tick(
         "skipped": 0,
         "failed": 0,
     }
+    cycle_success = True
     now = processed_at or datetime.now(UTC)
     try:
         from telegram_kol_research.instruction_execution_management_adapter import (
@@ -177,6 +179,7 @@ def run_strategy_management_worker_tick(
             limit=limit,
         )
     except Exception:
+        cycle_success = False
         logger.exception("unknown management execution-contract convergence failed")
     client = None
     snapshot = None
@@ -209,6 +212,7 @@ def run_strategy_management_worker_tick(
                 allow_new_writes=bool(allow_execution),
             )
         except Exception:
+            cycle_success = False
             logger.exception("composite management reconciliation failed")
 
     if (
@@ -467,6 +471,7 @@ def run_strategy_management_worker_tick(
                 contract_spec_provider=contract_spec_provider,
             )
         except Exception:
+            cycle_success = False
             logger.exception("backup-stop reconciliation before take-profit lane failed")
 
     if allow_execution:
@@ -482,6 +487,7 @@ def run_strategy_management_worker_tick(
                 or 0
             )
         except Exception:
+            cycle_success = False
             logger.exception("trigger take-profit convergence worker lane failed")
 
     def resolve_race_successor(*, batch_id: int, current_snapshot: Any) -> bool:
@@ -771,7 +777,10 @@ def run_strategy_management_worker_tick(
                 batch_id=int(batch.id),
                 synchronized_at=now,
             )
-    return StrategyManagementWorkerResult(**counts)
+    return StrategyManagementWorkerResult(
+        **counts,
+        cycle_success=cycle_success and counts["failed"] == 0,
+    )
 
 
 def _synchronize_linked_management_item_best_effort(
@@ -913,14 +922,16 @@ async def run_strategy_management_worker_loop(
     max_batches: int = 10,
     now_provider=None,
     contract_spec_provider=None,
+    success_callback: Callable[[datetime], None] | None = None,
 ) -> None:
     """Run bounded ticks forever; cancellation is owned by the Web lifespan."""
 
     cursor = StrategyManagementWorkerCursor()
     while True:
+        tick_succeeded = False
         try:
             settings = load_trading_settings(session_factory)
-            run_strategy_management_worker_tick(
+            result = run_strategy_management_worker_tick(
                 session_factory,
                 deepcoin_client_factory=deepcoin_client_factory,
                 max_batches=max_batches,
@@ -931,9 +942,47 @@ async def run_strategy_management_worker_loop(
                 ),
                 contract_spec_provider=contract_spec_provider,
             )
+            tick_succeeded = _management_worker_result_is_successful(result)
         except Exception:
             logger.exception("strategy management worker tick failed")
+        if tick_succeeded and success_callback is not None:
+            try:
+                completed_at = (
+                    now_provider()
+                    if now_provider is not None
+                    else datetime.now(UTC)
+                )
+                if not isinstance(completed_at, datetime):
+                    raise ValueError("management worker completion time invalid")
+                if completed_at.tzinfo is None:
+                    completed_at = completed_at.replace(tzinfo=UTC)
+                elif completed_at.utcoffset() is None:
+                    raise ValueError("management worker completion time invalid")
+                else:
+                    completed_at = completed_at.astimezone(UTC)
+                success_callback(completed_at)
+            except Exception:
+                logger.exception("strategy management worker success heartbeat failed")
         await asyncio.sleep(max(0.01, float(interval_seconds)))
+
+
+def _management_worker_result_is_successful(value: object) -> bool:
+    if not isinstance(value, StrategyManagementWorkerResult):
+        return False
+    counts = (
+        value.discovered,
+        value.recovered,
+        value.executed,
+        value.paused,
+        value.skipped,
+        value.failed,
+    )
+    return (
+        type(value.cycle_success) is bool
+        and value.cycle_success
+        and all(type(count) is int and count >= 0 for count in counts)
+        and value.failed == 0
+    )
 
 
 def _has_submission_evidence(batch: ManagementBatchRecord) -> bool:

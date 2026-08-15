@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from contextlib import asynccontextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 import asyncio
@@ -309,6 +309,84 @@ REFRESH_TIMEOUT_SECONDS = 180
 MESSAGE_PAGE_SIZE = 20
 SESSION_LOCK_OWNER_PID_PATTERN = re.compile(r"owner pid=(\d+)")
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class MonitorReadinessState:
+    """One immutable, secret-free process readiness projection."""
+
+    service_generation: str
+    deepcoin_reconcile_first_success_at: datetime | None = None
+    deepcoin_reconcile_last_success_at: datetime | None = None
+    management_worker_last_success_at: datetime | None = None
+    message_supervisor_last_success_at: datetime | None = None
+    message_supervisor_policy_status: str = "disabled"
+
+
+def _publish_monitor_readiness(
+    app: FastAPI,
+    *,
+    field: str,
+    completed_at: datetime,
+) -> None:
+    timestamp = _completion_timestamp(completed_at)
+    with app.state.monitor_readiness_lock:
+        current = app.state.monitor_readiness_state
+        if field == "deepcoin_reconcile":
+            updated = replace(
+                current,
+                deepcoin_reconcile_first_success_at=(
+                    current.deepcoin_reconcile_first_success_at or timestamp
+                ),
+                deepcoin_reconcile_last_success_at=timestamp,
+            )
+        elif field == "management_worker":
+            updated = replace(
+                current,
+                management_worker_last_success_at=timestamp,
+            )
+        elif field == "message_supervisor":
+            updated = replace(
+                current,
+                message_supervisor_last_success_at=timestamp,
+            )
+        else:  # pragma: no cover - private closed call sites
+            raise ValueError("monitor readiness field is invalid")
+        app.state.monitor_readiness_state = updated
+
+
+def _completion_timestamp(value: datetime) -> datetime:
+    if not isinstance(value, datetime):
+        raise ValueError("completion timestamp is invalid")
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    if value.utcoffset() is None:
+        raise ValueError("completion timestamp is invalid")
+    return value.astimezone(UTC)
+
+
+def _readiness_payload(state: MonitorReadinessState) -> dict[str, str | None]:
+    def encoded(value: datetime | None) -> str | None:
+        return None if value is None else value.astimezone(UTC).isoformat()
+
+    return {
+        "service_generation": state.service_generation,
+        "deepcoin_reconcile_first_success_at": encoded(
+            state.deepcoin_reconcile_first_success_at
+        ),
+        "deepcoin_reconcile_last_success_at": encoded(
+            state.deepcoin_reconcile_last_success_at
+        ),
+        "management_worker_last_success_at": encoded(
+            state.management_worker_last_success_at
+        ),
+        "message_supervisor_last_success_at": encoded(
+            state.message_supervisor_last_success_at
+        ),
+        "message_supervisor_policy_status": (
+            state.message_supervisor_policy_status
+        ),
+    }
 
 
 async def _run_monitor_capture_writer(writer: Callable[[], int]) -> int:
@@ -3832,7 +3910,16 @@ async def _run_message_operation_supervisor_loop(app: FastAPI) -> None:
                 raise RuntimeError("message operation supervisor cursor invalid")
             cursor = next_cursor
             app.state.message_operation_supervisor_cursor = cursor
-            app.state.message_operation_supervisor_last_success_at = observed_at
+            completed_at = _completion_timestamp(app.state.now_provider())
+            app.state.message_operation_supervisor_last_success_at = completed_at
+            try:
+                _publish_monitor_readiness(
+                    app,
+                    field="message_supervisor",
+                    completed_at=completed_at,
+                )
+            except Exception:
+                logger.exception("message supervisor success heartbeat failed")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -4366,6 +4453,9 @@ def create_web_app(
                         app.state.system_operator_bot_config
                     ),
                     contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+                    success_callback=(
+                        app.state.publish_deepcoin_reconcile_success
+                    ),
                 )
             )
             app.state.strategy_management_worker_task = asyncio.create_task(
@@ -4378,6 +4468,9 @@ def create_web_app(
                     max_batches=app.state.strategy_management_worker_max_batches,
                     now_provider=app.state.now_provider,
                     contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+                    success_callback=(
+                        app.state.publish_management_worker_success
+                    ),
                 )
             )
             app.state.strategy_management_worker_task.add_done_callback(
@@ -4757,6 +4850,27 @@ def create_web_app(
         message_operation_supervisor_policy_status(
             app.state.message_operation_supervisor_config,
             app.state.runtime_incident_config,
+        )
+    )
+    app.state.monitor_readiness_lock = threading.Lock()
+    app.state.monitor_readiness_state = MonitorReadinessState(
+        service_generation=secrets.token_hex(32),
+        message_supervisor_policy_status=(
+            app.state.message_operation_supervisor_policy_status
+        ),
+    )
+    app.state.publish_deepcoin_reconcile_success = lambda completed_at: (
+        _publish_monitor_readiness(
+            app,
+            field="deepcoin_reconcile",
+            completed_at=completed_at,
+        )
+    )
+    app.state.publish_management_worker_success = lambda completed_at: (
+        _publish_monitor_readiness(
+            app,
+            field="management_worker",
+            completed_at=completed_at,
         )
     )
     app.state.message_operation_supervisor_runner = (
@@ -5218,6 +5332,23 @@ def create_web_app(
     def api_runtime_incidents_monitor_capture_health(request: Request):
         require_monitor_capture_auth(request)
         return {"available": True, "schema_version": 1}
+
+    @app.get("/api/runtime-monitor-readiness")
+    def api_runtime_monitor_readiness(request: Request):
+        require_monitor_capture_auth(request)
+        with app.state.monitor_readiness_lock:
+            state = app.state.monitor_readiness_state
+        return Response(
+            content=json.dumps(
+                _readiness_payload(state),
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            media_type="application/json",
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/api/runtime-incidents/message-operation-coverage")
     def api_runtime_incidents_message_operation_coverage(request: Request):
@@ -8149,6 +8280,7 @@ async def run_deepcoin_execution_reconcile_loop(
     system_operator_bot_config: SystemOperatorBotConfig | None = None,
     terminal_entry_cleanup_bot_config: SystemOperatorBotConfig | None = None,
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
+    success_callback: Callable[[datetime], None] | None = None,
 ) -> None:
     while True:
         try:
@@ -8158,24 +8290,6 @@ async def run_deepcoin_execution_reconcile_loop(
                 now_provider=now_provider,
                 contract_spec_provider=contract_spec_provider,
             )
-            synced_at = cycle.synced_at
-            if cycle.reconciled is not None:
-                if system_operator_bot_enabled(system_operator_bot_config):
-                    await deliver_pending_position_attribution_incidents(
-                        session_factory,
-                        config=system_operator_bot_config,
-                        delivered_at=synced_at,
-                    )
-                    await deliver_pending_position_protection_incidents(
-                        session_factory, config=system_operator_bot_config,
-                        delivered_at=synced_at,
-                    )
-            if system_operator_bot_enabled(terminal_entry_cleanup_bot_config):
-                await deliver_terminal_entry_cleanup_notifications(
-                    session_factory,
-                    config=terminal_entry_cleanup_bot_config,
-                    delivered_at=synced_at,
-                )
         except DeepcoinClientError as exc:
             if _is_background_reconcile_deferred(exc):
                 logger.info(
@@ -8186,6 +8300,41 @@ async def run_deepcoin_execution_reconcile_loop(
                 logger.warning("Deepcoin execution reconcile skipped: %s", exc)
         except Exception:
             logger.exception("Deepcoin execution reconcile failed")
+        else:
+            if success_callback is not None:
+                try:
+                    success_callback(
+                        _completion_timestamp(
+                            now_provider()
+                            if now_provider is not None
+                            else datetime.now(UTC)
+                        )
+                    )
+                except Exception:
+                    logger.exception("Deepcoin reconcile success heartbeat failed")
+            synced_at = cycle.synced_at
+            try:
+                if cycle.reconciled is not None and system_operator_bot_enabled(
+                    system_operator_bot_config
+                ):
+                    await deliver_pending_position_attribution_incidents(
+                        session_factory,
+                        config=system_operator_bot_config,
+                        delivered_at=synced_at,
+                    )
+                    await deliver_pending_position_protection_incidents(
+                        session_factory,
+                        config=system_operator_bot_config,
+                        delivered_at=synced_at,
+                    )
+                if system_operator_bot_enabled(terminal_entry_cleanup_bot_config):
+                    await deliver_terminal_entry_cleanup_notifications(
+                        session_factory,
+                        config=terminal_entry_cleanup_bot_config,
+                        delivered_at=synced_at,
+                    )
+            except Exception:
+                logger.exception("Deepcoin reconcile notification delivery failed")
         try:
             await _await_deepcoin_protection_liveness(
                 session_factory=session_factory,

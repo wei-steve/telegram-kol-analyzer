@@ -30,6 +30,13 @@ from telegram_kol_research.production_monitor_state import (
 
 
 _MAX_OBSERVATION_GENERATION = 2**63 - 1
+_DURABLE_ABSENCE_ADAPTER_BY_REASON = {
+    "audit_abnormal": "audit",
+    "event_unknown_status": "events",
+    "event_recovery_status": "events",
+    "stalled_composite_component": "composite",
+    "stale_entry_preamble_unresolved": "entry_preamble",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +231,25 @@ def evaluate_sentinel_observation(
             )
     
     for candidate_state in previous_by_identity.values():
+        absence_adapter = _DURABLE_ABSENCE_ADAPTER_BY_REASON.get(
+            candidate_state.reason_code
+        )
+        if (
+            absence_adapter is not None
+            and absence_adapter not in adapter_failures
+            and candidate_state.lifecycle in {"CONFIRMED", "SETTLING"}
+        ):
+            next_candidates.append(
+                replace(
+                    candidate_state,
+                    last_observed_at=checked_at,
+                    consecutive_observations=1,
+                    last_observation_anomalous=False,
+                    lifecycle="RESOLVED",
+                    resolution_evidence_class="DURABLE_TERMINAL",
+                )
+            )
+            continue
         if candidate_state.lifecycle == "CONFIRMED":
             evidence_incomplete = True
             next_candidates.append(candidate_state)
