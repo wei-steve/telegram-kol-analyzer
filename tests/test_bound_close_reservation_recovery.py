@@ -4,6 +4,7 @@ from dataclasses import FrozenInstanceError, fields, replace
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal, localcontext
 import copy
+import gc
 import inspect
 import json
 from pathlib import Path
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 
 import httpx
 import pytest
@@ -1711,6 +1713,14 @@ def test_pure_classifier_outputs_and_plan_documents_cannot_issue_apply_capabilit
             source_capability=source._capability,
             _constructor=object(),
         )
+    forged = object.__new__(SealedRecoveryCapture)
+    forged._SealedRecoveryCapture__apply_claimed = False
+    forged._SealedRecoveryCapture__apply_claim_lock = threading.Lock()
+    forged._SealedRecoveryCapture__plan = plan
+    forged._SealedRecoveryCapture__serialized_plan = "{}"
+    forged._SealedRecoveryCapture__source_capability = source._capability
+    with pytest.raises(ValueError, match="privately issued"):
+        _claim_sealed_recovery_capture_for_apply(forged)
 
 
 def _provider_milliseconds(value: datetime) -> str:
@@ -1734,7 +1744,7 @@ def _terminal_provider_responses(source: BoundCloseReservationSource):
     for local, raw in raw_rows:
         identity = {
             "instId": raw.instrument_id,
-            "posId": raw.position_id,
+            "closePosId": raw.position_id,
             "posSide": local.side,
         }
         responses.extend((
@@ -1744,9 +1754,10 @@ def _terminal_provider_responses(source: BoundCloseReservationSource):
                 {
                     **identity,
                     "ordId": raw.order_id,
-                    "state": "filled",
+                    "status": "filled",
                     "sz": "1",
                     "accFillSz": "1.0",
+                    "cTime": _provider_milliseconds(order_time - timedelta(seconds=1)),
                     "uTime": _provider_milliseconds(order_time),
                 }
             ],
@@ -1758,7 +1769,9 @@ def _terminal_provider_responses(source: BoundCloseReservationSource):
                     **identity,
                     "ordId": raw.order_id,
                     "fillSz": "1.00",
+                    "cTime": _provider_milliseconds(order_time - timedelta(seconds=1)),
                     "fillTime": _provider_milliseconds(order_time),
+                    "uTime": _provider_milliseconds(order_time + timedelta(seconds=1)),
                 }
             ],
             },
@@ -1774,8 +1787,9 @@ def _terminal_provider_responses(source: BoundCloseReservationSource):
                     "instId": raw.instrument_id,
                     "posId": raw.position_id,
                     "posSide": local.side,
-                    "state": "closed",
-                    "closedSize": "1.000",
+                    "pos": "1",
+                    "closePos": "1.000",
+                    "cTime": _provider_milliseconds(order_time),
                     "uTime": _provider_milliseconds(close_time),
                 }
             ],
@@ -1828,6 +1842,29 @@ def test_authoritative_capture_reads_every_exact_collection_and_seals_terminal(
     assert repr(capture) == "<SealedRecoveryCapture opaque>"
 
 
+def test_authoritative_capture_accepts_consistent_closed_semantic_fields(
+    tmp_path, monkeypatch
+):
+    source = _loaded_seal_source(tmp_path)
+    responses = _terminal_provider_responses(source)
+    order_row = responses[2]["data"][0]
+    order_row["posId"] = order_row["closePosId"]
+    order_row["state"] = "FILLED"
+    position_row = responses[4]["data"][0]
+    position_row["closePosId"] = position_row["posId"]
+
+    capture, _reader, _http = _capture_with_provider_responses(
+        monkeypatch,
+        source,
+        responses,
+    )
+
+    assert capture.plan.status == "ready"
+    assert capture.plan.observations[0].classification is (
+        ReservationClassification.PROVEN_TERMINAL
+    )
+
+
 def test_authoritative_capture_deduplicates_only_exact_raw_queries(
     tmp_path, monkeypatch
 ):
@@ -1855,7 +1892,7 @@ def test_authoritative_capture_reports_active_current_position(tmp_path, monkeyp
                 "instId": raw.instrument_id,
                 "posId": raw.position_id,
                 "posSide": "long",
-                "sz": "1",
+                "pos": "1",
             }
         ],
     }
@@ -1875,6 +1912,37 @@ def test_authoritative_capture_reports_active_current_position(tmp_path, monkeyp
     )
 
 
+def test_authoritative_capture_rejects_old_sz_only_current_position_shape(
+    tmp_path, monkeypatch
+):
+    source = _loaded_seal_source(tmp_path)
+    responses = _terminal_provider_responses(source)
+    raw = source._capability._get(source.reservations[0].reservation_ref)
+    responses[0] = {
+        "code": "0",
+        "data": [
+            {
+                "instId": raw.instrument_id,
+                "posId": raw.position_id,
+                "posSide": "long",
+                "sz": "1",
+            }
+        ],
+    }
+
+    capture, _reader, _http = _capture_with_provider_responses(
+        monkeypatch,
+        source,
+        responses,
+    )
+
+    assert capture.plan.status == "refused"
+    assert capture.plan.observations[0].classification is (
+        ReservationClassification.UNKNOWN
+    )
+    assert capture.plan.observations[0].reason_code == "exchange_schema_invalid"
+
+
 def test_authoritative_capture_reports_exact_pending_close_order(
     tmp_path, monkeypatch
 ):
@@ -1887,10 +1955,10 @@ def test_authoritative_capture_reports_exact_pending_close_order(
         "data": [
             {
                 "instId": raw.instrument_id,
-                "posId": raw.position_id,
+                "closePosId": raw.position_id,
                 "posSide": local.side,
                 "ordId": raw.order_id,
-                "state": "live",
+                "status": "live",
                 "sz": "1",
                 "accFillSz": "0",
             }
@@ -1950,7 +2018,13 @@ def test_authoritative_capture_closes_on_read_error_without_echoing_payload(
         ("missing_identity", "exchange_schema_invalid"),
         ("duplicate_exact", "exchange_state_conflict"),
         ("ambiguous_alias", "exchange_schema_invalid"),
-        ("ambiguous_time_alias", "exchange_schema_invalid"),
+        ("conflicting_order_state", "exchange_schema_invalid"),
+        ("inverted_order_time", "exchange_schema_invalid"),
+        ("inverted_fill_time", "exchange_schema_invalid"),
+        ("inverted_position_time", "exchange_schema_invalid"),
+        ("conflicting_position_identity", "exchange_schema_invalid"),
+        ("partial_position_close", "exchange_schema_invalid"),
+        ("old_artificial_position_history_shape", "exchange_schema_invalid"),
         ("malformed_time", "exchange_schema_invalid"),
         ("malformed_decimal", "exchange_schema_invalid"),
     ],
@@ -1972,8 +2046,30 @@ def test_authoritative_capture_fails_closed_on_incomplete_or_malformed_exchange(
         responses[2]["data"].append(dict(responses[2]["data"][0]))
     elif mutation == "ambiguous_alias":
         responses[2]["data"][0]["fillSz"] = "1"
-    elif mutation == "ambiguous_time_alias":
-        responses[2]["data"][0]["cTime"] = responses[2]["data"][0]["uTime"]
+    elif mutation == "conflicting_order_state":
+        responses[2]["data"][0]["state"] = "rejected"
+    elif mutation == "inverted_order_time":
+        responses[2]["data"][0]["cTime"] = _provider_milliseconds(
+            CLASSIFICATION_TIME + timedelta(minutes=2)
+        )
+    elif mutation == "inverted_fill_time":
+        responses[3]["data"][0]["uTime"] = _provider_milliseconds(
+            CLASSIFICATION_TIME
+        )
+    elif mutation == "inverted_position_time":
+        responses[4]["data"][0]["cTime"] = _provider_milliseconds(
+            CLASSIFICATION_TIME + timedelta(minutes=3)
+        )
+    elif mutation == "conflicting_position_identity":
+        responses[4]["data"][0]["closePosId"] = "different-position"
+    elif mutation == "partial_position_close":
+        responses[4]["data"][0]["pos"] = "2"
+    elif mutation == "old_artificial_position_history_shape":
+        row = responses[4]["data"][0]
+        del row["pos"]
+        del row["closePos"]
+        row["state"] = "closed"
+        row["closedSize"] = "1"
     elif mutation == "malformed_time":
         responses[2]["data"][0]["uTime"] = "1"
     elif mutation == "malformed_decimal":
@@ -2113,6 +2209,189 @@ def test_sealed_apply_capability_is_private_issuer_bound_and_one_shot(
     assert not hasattr(claimed, "__dict__")
     with pytest.raises(ValueError, match="already claimed"):
         _claim_sealed_recovery_capture_for_apply(capture)
+
+
+def test_failed_claim_validation_does_not_consume_issued_capture(
+    tmp_path, monkeypatch
+):
+    source = _loaded_seal_source(tmp_path)
+    capture, _reader, _http = _capture_with_provider_responses(
+        monkeypatch,
+        source,
+        _terminal_provider_responses(source),
+    )
+    original_source_capability = (
+        capture._SealedRecoveryCapture__source_capability
+    )
+    capture._SealedRecoveryCapture__source_capability = object()
+
+    with pytest.raises(ValueError, match="issued contents"):
+        _claim_sealed_recovery_capture_for_apply(capture)
+
+    capture._SealedRecoveryCapture__source_capability = original_source_capability
+    assert _claim_sealed_recovery_capture_for_apply(capture).plan is capture.plan
+
+
+def test_issued_capture_rejects_plan_source_and_serialized_substitution(
+    tmp_path, monkeypatch
+):
+    source = _loaded_seal_source(tmp_path)
+    capture, _reader, _http = _capture_with_provider_responses(
+        monkeypatch,
+        source,
+        _terminal_provider_responses(source),
+    )
+    original_plan = capture.plan
+    original_serialized = capture.serialized_plan
+    original_source_capability = capture._SealedRecoveryCapture__source_capability
+    substituted_observation = replace(
+        original_plan.observations[0],
+        exchange_fingerprint="f" * 64,
+    )
+    substituted_plan = build_bound_close_reservation_recovery_plan(
+        source_fingerprint=original_plan.source_fingerprint,
+        observations=(substituted_observation,),
+    )
+    other_directory = tmp_path / "other"
+    other_directory.mkdir()
+    other_source = _loaded_seal_source(other_directory)
+
+    capture._SealedRecoveryCapture__plan = substituted_plan
+    with pytest.raises(ValueError, match="issued contents"):
+        _claim_sealed_recovery_capture_for_apply(capture)
+    capture._SealedRecoveryCapture__plan = original_plan
+
+    capture._SealedRecoveryCapture__source_capability = other_source._capability
+    with pytest.raises(ValueError, match="issued contents"):
+        _claim_sealed_recovery_capture_for_apply(capture)
+    capture._SealedRecoveryCapture__source_capability = original_source_capability
+
+    capture._SealedRecoveryCapture__serialized_plan = "{}"
+    with pytest.raises(ValueError, match="issued contents"):
+        _claim_sealed_recovery_capture_for_apply(capture)
+    capture._SealedRecoveryCapture__serialized_plan = original_serialized
+
+    assert _claim_sealed_recovery_capture_for_apply(capture).plan is original_plan
+
+
+def test_issued_refused_capture_rejects_in_place_plan_mutation_to_ready(
+    tmp_path, monkeypatch
+):
+    source = _loaded_seal_source(tmp_path)
+    responses = _terminal_provider_responses(source)
+    responses[4] = {"code": "0", "data": []}
+    capture, _reader, _http = _capture_with_provider_responses(
+        monkeypatch,
+        source,
+        responses,
+    )
+    local = source.reservations[0]
+    manual_observation = classify_bound_close_reservation(
+        local,
+        _terminal_exchange_for_local(local),
+        capture_completed_at=PLAN_CAPTURE_COMPLETED,
+    )
+    manual_ready = build_bound_close_reservation_recovery_plan(
+        source_fingerprint=source.source_fingerprint,
+        observations=(manual_observation,),
+    )
+    assert capture.plan.status == "refused"
+    for field in fields(BoundCloseReservationRecoveryPlan):
+        object.__setattr__(
+            capture.plan,
+            field.name,
+            getattr(manual_ready, field.name),
+        )
+    assert capture.plan.status == "ready"
+
+    with pytest.raises(ValueError, match="issued contents"):
+        _claim_sealed_recovery_capture_for_apply(capture)
+
+    assert id(capture) in recovery_module._SEALED_CAPTURE_ISSUANCE_REGISTRY
+
+
+def test_sealed_capture_issuance_registry_uses_exact_weak_identity(
+    tmp_path, monkeypatch
+):
+    source = _loaded_seal_source(tmp_path)
+    capture, _reader, _http = _capture_with_provider_responses(
+        monkeypatch,
+        source,
+        _terminal_provider_responses(source),
+    )
+    capture_id = id(capture)
+    capture_ref = weakref.ref(capture)
+
+    issued = recovery_module._SEALED_CAPTURE_ISSUANCE_REGISTRY[capture_id]
+    assert issued.capture_ref() is capture
+    assert issued.plan is capture.plan
+    assert len(recovery_module._SEALED_CAPTURE_ISSUANCE_REGISTRY) <= (
+        recovery_module._MAX_SEALED_CAPTURE_ISSUANCE
+    )
+
+    del capture
+    gc.collect()
+
+    assert capture_ref() is None
+    assert capture_id not in recovery_module._SEALED_CAPTURE_ISSUANCE_REGISTRY
+
+
+def test_sealed_capture_issuance_registry_is_bounded_and_evicts_closed(
+    tmp_path, monkeypatch
+):
+    source = _loaded_seal_source(tmp_path)
+    captures = []
+    for _ in range(recovery_module._MAX_SEALED_CAPTURE_ISSUANCE + 1):
+        capture, _reader, _http = _capture_with_provider_responses(
+            monkeypatch,
+            source,
+            _terminal_provider_responses(source),
+        )
+        captures.append(capture)
+
+    assert len(recovery_module._SEALED_CAPTURE_ISSUANCE_REGISTRY) == (
+        recovery_module._MAX_SEALED_CAPTURE_ISSUANCE
+    )
+    with pytest.raises(ValueError, match="privately issued"):
+        _claim_sealed_recovery_capture_for_apply(captures[0])
+    assert _claim_sealed_recovery_capture_for_apply(captures[-1]).plan.status == (
+        "ready"
+    )
+
+
+def test_concurrent_claim_consumes_exact_issued_capture_once(tmp_path, monkeypatch):
+    source = _loaded_seal_source(tmp_path)
+    capture, _reader, _http = _capture_with_provider_responses(
+        monkeypatch,
+        source,
+        _terminal_provider_responses(source),
+    )
+    barrier = threading.Barrier(3)
+    claims = []
+    errors = []
+    result_lock = threading.Lock()
+
+    def claim() -> None:
+        barrier.wait()
+        try:
+            result = _claim_sealed_recovery_capture_for_apply(capture)
+        except Exception as exc:
+            with result_lock:
+                errors.append(exc)
+        else:
+            with result_lock:
+                claims.append(result)
+
+    workers = [threading.Thread(target=claim) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    barrier.wait()
+    for worker in workers:
+        worker.join()
+
+    assert len(claims) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
 
 
 def test_raw_and_sealed_capabilities_reject_pickle_copy_and_deepcopy(

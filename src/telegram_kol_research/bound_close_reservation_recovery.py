@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import UTC, datetime, timedelta
@@ -18,6 +19,7 @@ import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import quote
+import weakref
 
 from telegram_kol_research.deepcoin_client import (
     DEEPCOIN_BOUND_CLOSE_RESERVATION_RECOVERY_PHASE,
@@ -1055,6 +1057,7 @@ class SealedRecoveryCapture(_OpaqueUncopyableCapability):
         "__plan",
         "__serialized_plan",
         "__source_capability",
+        "__weakref__",
     )
 
     def __init__(self, *args: object, **kwargs: object) -> None:
@@ -1071,6 +1074,71 @@ class SealedRecoveryCapture(_OpaqueUncopyableCapability):
 
     def __repr__(self) -> str:
         return "<SealedRecoveryCapture opaque>"
+
+
+_MAX_SEALED_CAPTURE_ISSUANCE = MAX_RESERVATION_OBSERVATIONS * 4
+_SEALED_CAPTURE_ISSUANCE_LOCK = threading.RLock()
+
+
+class _SealedCaptureIssuance:
+    __slots__ = (
+        "capture_ref",
+        "plan",
+        "plan_snapshot_fingerprint",
+        "serialized_plan",
+        "source_capability",
+    )
+
+    def __init__(
+        self,
+        *,
+        capture_ref: weakref.ReferenceType[SealedRecoveryCapture],
+        plan: BoundCloseReservationRecoveryPlan,
+        plan_snapshot_fingerprint: str,
+        serialized_plan: str,
+        source_capability: _BoundCloseReservationSourceCapability,
+    ) -> None:
+        self.capture_ref = capture_ref
+        self.plan = plan
+        self.plan_snapshot_fingerprint = plan_snapshot_fingerprint
+        self.serialized_plan = serialized_plan
+        self.source_capability = source_capability
+
+
+_SEALED_CAPTURE_ISSUANCE_REGISTRY: OrderedDict[
+    int,
+    _SealedCaptureIssuance,
+] = OrderedDict()
+
+
+def _register_sealed_recovery_capture(capture: SealedRecoveryCapture) -> None:
+    capture_identity = id(capture)
+
+    def discard(
+        reference: weakref.ReferenceType[SealedRecoveryCapture],
+        *,
+        expected_identity: int = capture_identity,
+    ) -> None:
+        with _SEALED_CAPTURE_ISSUANCE_LOCK:
+            current = _SEALED_CAPTURE_ISSUANCE_REGISTRY.get(expected_identity)
+            if current is not None and current.capture_ref is reference:
+                _SEALED_CAPTURE_ISSUANCE_REGISTRY.pop(expected_identity, None)
+
+    reference = weakref.ref(capture, discard)
+    issuance = _SealedCaptureIssuance(
+        capture_ref=reference,
+        plan=capture.plan,
+        plan_snapshot_fingerprint=_sha256_json(capture.plan),
+        serialized_plan=capture.serialized_plan,
+        source_capability=capture._SealedRecoveryCapture__source_capability,
+    )
+    with _SEALED_CAPTURE_ISSUANCE_LOCK:
+        _SEALED_CAPTURE_ISSUANCE_REGISTRY[capture_identity] = issuance
+        _SEALED_CAPTURE_ISSUANCE_REGISTRY.move_to_end(capture_identity)
+        while len(_SEALED_CAPTURE_ISSUANCE_REGISTRY) > (
+            _MAX_SEALED_CAPTURE_ISSUANCE
+        ):
+            _SEALED_CAPTURE_ISSUANCE_REGISTRY.popitem(last=False)
 
 
 class _ClaimedSealedRecoveryCapture(_OpaqueUncopyableCapability):
@@ -1102,19 +1170,40 @@ def _claim_sealed_recovery_capture_for_apply(
 
     if type(capture) is not SealedRecoveryCapture:
         raise TypeError("capture must be a privately issued SealedRecoveryCapture")
-    with capture._SealedRecoveryCapture__apply_claim_lock:
-        if capture._SealedRecoveryCapture__apply_claimed:
+    with _SEALED_CAPTURE_ISSUANCE_LOCK:
+        if getattr(capture, "_SealedRecoveryCapture__apply_claimed", False):
             raise ValueError("sealed recovery capture was already claimed")
-        if capture.plan.status != "ready":
+        issued = _SEALED_CAPTURE_ISSUANCE_REGISTRY.get(id(capture))
+        if issued is None or issued.capture_ref() is not capture:
+            raise ValueError("capture must be a privately issued SealedRecoveryCapture")
+        if (
+            getattr(capture, "_SealedRecoveryCapture__plan", None)
+            is not issued.plan
+            or getattr(capture, "_SealedRecoveryCapture__serialized_plan", None)
+            is not issued.serialized_plan
+            or getattr(capture, "_SealedRecoveryCapture__source_capability", None)
+            is not issued.source_capability
+        ):
+            raise ValueError("sealed recovery capture issued contents changed")
+        try:
+            _require_canonical_recovery_plan(issued.plan)
+            current_plan_fingerprint = _sha256_json(issued.plan)
+        except (RecursionError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "sealed recovery capture issued contents changed"
+            ) from exc
+        if current_plan_fingerprint != issued.plan_snapshot_fingerprint:
+            raise ValueError("sealed recovery capture issued contents changed")
+        if issued.plan.status != "ready":
             raise ValueError("only a ready sealed recovery capture can be claimed")
-        capture._SealedRecoveryCapture__apply_claimed = True
-        return _ClaimedSealedRecoveryCapture(
-            plan=capture.plan,
-            source_capability=(
-                capture._SealedRecoveryCapture__source_capability
-            ),
+        claimed = _ClaimedSealedRecoveryCapture(
+            plan=issued.plan,
+            source_capability=issued.source_capability,
             _issuer=_SEALED_APPLY_CLAIM_ISSUER,
         )
+        capture._SealedRecoveryCapture__apply_claimed = True
+        _SEALED_CAPTURE_ISSUANCE_REGISTRY.pop(id(capture), None)
+        return claimed
 
 
 class _RawRecoveryCapture:
@@ -1239,6 +1328,7 @@ def capture_and_seal_bound_close_reservation_recovery(
     sealed._SealedRecoveryCapture__plan = plan
     sealed._SealedRecoveryCapture__serialized_plan = serialized
     sealed._SealedRecoveryCapture__source_capability = source._capability
+    _register_sealed_recovery_capture(sealed)
     return sealed
 
 
@@ -1363,13 +1453,41 @@ def _provider_text(row: Mapping[str, Any], field_name: str) -> str:
     return normalized
 
 
+def _provider_consistent_text(
+    row: Mapping[str, Any],
+    *field_names: str,
+    required: bool = True,
+    casefold: bool = False,
+) -> str | None:
+    values = [
+        _provider_text(row, field_name)
+        for field_name in field_names
+        if row.get(field_name) not in (None, "")
+    ]
+    if not values:
+        if required:
+            raise ValueError("provider semantic field is missing")
+        return None
+    comparable = [value.casefold() if casefold else value for value in values]
+    if len(set(comparable)) != 1:
+        raise ValueError("provider semantic field is conflicting")
+    return comparable[0] if casefold else values[0]
+
+
 def _provider_identity(
     row: Mapping[str, Any],
     *,
     include_order: bool,
+    require_position_field: str | None = None,
 ) -> tuple[str, str, str, str | None]:
     instrument_id = _provider_text(row, "instId")
-    position_id = _provider_text(row, "posId")
+    position_id = _provider_consistent_text(row, "posId", "closePosId")
+    if position_id is None:
+        raise ValueError("provider position identity is missing")
+    if require_position_field is not None:
+        required_position_id = _provider_text(row, require_position_field)
+        if required_position_id != position_id:
+            raise ValueError("provider position identity is conflicting")
     side = _provider_text(row, "posSide").lower()
     if side not in {"long", "short"}:
         raise ValueError("provider posSide is invalid")
@@ -1400,11 +1518,17 @@ def _provider_decimal(
     return _require_decimal(parsed, aliases[0], positive=positive)
 
 
-def _provider_timestamp(row: Mapping[str, Any], *aliases: str) -> datetime:
-    values = [row[name] for name in aliases if row.get(name) not in (None, "")]
-    if len(values) != 1:
-        raise ValueError("provider timestamp alias is missing or ambiguous")
-    raw = values[0]
+def _provider_timestamp_field(
+    row: Mapping[str, Any],
+    field_name: str,
+    *,
+    required: bool,
+) -> datetime | None:
+    raw = row.get(field_name)
+    if raw in (None, ""):
+        if required:
+            raise ValueError(f"provider {field_name} is missing")
+        return None
     if type(raw) is not str or len(raw) != 13 or not raw.isascii() or not raw.isdigit():
         raise ValueError("provider timestamp must be epoch milliseconds")
     milliseconds = int(raw)
@@ -1419,6 +1543,31 @@ def _provider_timestamp(row: Mapping[str, Any], *aliases: str) -> datetime:
     ):
         raise ValueError("provider timestamp is out of recovery bounds")
     return parsed
+
+
+def _provider_authoritative_timestamp(
+    row: Mapping[str, Any],
+    authority_field: str,
+    *,
+    not_after_authority: tuple[str, ...] = (),
+    not_before_authority: tuple[str, ...] = (),
+) -> datetime:
+    authority = _provider_timestamp_field(
+        row,
+        authority_field,
+        required=True,
+    )
+    if authority is None:
+        raise ValueError("provider authoritative timestamp is missing")
+    for field_name in not_after_authority:
+        candidate = _provider_timestamp_field(row, field_name, required=False)
+        if candidate is not None and candidate > authority:
+            raise ValueError("provider timestamp order is invalid")
+    for field_name in not_before_authority:
+        candidate = _provider_timestamp_field(row, field_name, required=False)
+        if candidate is not None and candidate < authority:
+            raise ValueError("provider timestamp order is invalid")
+    return authority
 
 
 _PROVIDER_ORDER_STATES = {
@@ -1441,13 +1590,14 @@ def _normalize_provider_positions(
         instrument_ref, side, position_ref, _ = _provider_identity(
             row,
             include_order=False,
+            require_position_field="posId",
         )
         rows.append(
             ExchangePositionEvidence(
                 instrument_ref=instrument_ref,
                 side=side,
                 position_ref=position_ref,
-                quantity=_provider_decimal(row, "sz", positive=True),
+                quantity=_provider_decimal(row, "pos", positive=True),
             )
         )
     return tuple(rows)
@@ -1462,7 +1612,15 @@ def _normalize_provider_orders(
             row,
             include_order=True,
         )
-        provider_state = _provider_text(row, "state").lower()
+        provider_state_text = _provider_consistent_text(
+            row,
+            "state",
+            "status",
+            casefold=True,
+        )
+        if provider_state_text is None:
+            raise ValueError("provider order state is missing")
+        provider_state = provider_state_text.lower()
         state = _PROVIDER_ORDER_STATES.get(provider_state)
         if state is None:
             raise ValueError("provider order state is not closed")
@@ -1472,7 +1630,11 @@ def _normalize_provider_orders(
             ExchangeCloseOrderState.PENDING,
             ExchangeCloseOrderState.PARTIALLY_FILLED,
         }:
-            terminal_at = _provider_timestamp(row, "uTime", "cTime")
+            terminal_at = _provider_authoritative_timestamp(
+                row,
+                "uTime",
+                not_after_authority=("cTime",),
+            )
         rows.append(
             ExchangeOrderEvidence(
                 instrument_ref=instrument_ref,
@@ -1509,11 +1671,11 @@ def _normalize_provider_fills(
                 position_ref=position_ref,
                 order_ref=order_ref,
                 quantity=_provider_decimal(row, "fillSz", positive=True),
-                filled_at=_provider_timestamp(
+                filled_at=_provider_authoritative_timestamp(
                     row,
                     "fillTime",
-                    "uTime",
-                    "cTime",
+                    not_after_authority=("cTime",),
+                    not_before_authority=("uTime",),
                 ),
             )
         )
@@ -1528,29 +1690,33 @@ def _normalize_provider_position_history(
         instrument_ref, side, position_ref, _ = _provider_identity(
             row,
             include_order=False,
+            require_position_field="posId",
         )
-        provider_state = _provider_text(row, "state").lower()
-        try:
-            state = ExchangePositionHistoryState(provider_state)
-        except ValueError as exc:
-            raise ValueError("provider position-history state is not closed") from exc
-        closed_at = (
-            _provider_timestamp(row, "uTime", "cTime")
-            if state is ExchangePositionHistoryState.CLOSED
-            else None
+        provider_state = _provider_consistent_text(
+            row,
+            "state",
+            "status",
+            required=False,
+            casefold=True,
+        )
+        if provider_state is not None and provider_state.lower() != "closed":
+            raise ValueError("provider position-history state is not closed")
+        original_quantity = _provider_decimal(row, "pos", positive=True)
+        closed_quantity = _provider_decimal(row, "closePos", positive=True)
+        if closed_quantity != original_quantity:
+            raise ValueError("provider closed position quantity is invalid")
+        closed_at = _provider_authoritative_timestamp(
+            row,
+            "uTime",
+            not_after_authority=("cTime",),
         )
         rows.append(
             ExchangePositionHistoryEvidence(
                 instrument_ref=instrument_ref,
                 side=side,
                 position_ref=position_ref,
-                state=state,
-                closed_quantity=_provider_decimal(
-                    row,
-                    "closeSz",
-                    "closedSize",
-                    positive=False,
-                ),
+                state=ExchangePositionHistoryState.CLOSED,
+                closed_quantity=closed_quantity,
                 closed_at=closed_at,
             )
         )
