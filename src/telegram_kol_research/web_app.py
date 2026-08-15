@@ -5340,6 +5340,67 @@ def create_web_app(
         require_monitor_capture_auth(request)
         return {"available": True, "schema_version": 1}
 
+    @app.get("/api/runtime-incidents/monitor-v2-bridge-readiness")
+    def api_runtime_incidents_monitor_v2_bridge_readiness(request: Request):
+        config = require_monitor_capture_auth(request)
+        incident_type = "production_monitor_incident"
+        capture_selector = (
+            "included" if config.captures(incident_type) else "excluded"
+        )
+        notification_channel = (
+            "enabled" if config.telegram_notifications_enabled else "disabled"
+        )
+        if config.telegram_notification_types is None:
+            notification_selector = "legacy_all_refused"
+        else:
+            notification_selector = (
+                "included"
+                if incident_type in config.telegram_notification_types
+                else "excluded"
+            )
+        agent_channel = "enabled" if config.agent_enabled else "disabled"
+        if config.agent_incident_types is None:
+            agent_selector = "legacy_all_refused"
+        else:
+            agent_selector = (
+                "included"
+                if incident_type in config.agent_incident_types
+                else "excluded"
+            )
+        if config.telegram_notification_after_incident_id is None:
+            notification_watermark = "absent"
+        elif config.telegram_notification_after_incident_id == 2**63 - 1:
+            notification_watermark = "invalid_refused"
+        else:
+            notification_watermark = "configured"
+        available = (
+            capture_selector == "included"
+            and notification_channel == "enabled"
+            and notification_selector == "included"
+            and notification_watermark == "configured"
+        )
+        return Response(
+            content=json.dumps(
+                {
+                    "available": available,
+                    "schema_version": 2,
+                    "contract": "production_monitor_v2",
+                    "capture_selector": capture_selector,
+                    "notification_channel": notification_channel,
+                    "notification_selector": notification_selector,
+                    "agent_channel": agent_channel,
+                    "agent_selector": agent_selector,
+                    "notification_watermark": notification_watermark,
+                },
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            media_type="application/json",
+            headers={"Cache-Control": "no-store"},
+        )
+
     @app.get("/api/runtime-monitor-readiness")
     def api_runtime_monitor_readiness(request: Request):
         require_monitor_capture_auth(request)

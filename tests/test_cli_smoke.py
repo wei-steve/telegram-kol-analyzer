@@ -904,6 +904,7 @@ def test_dormant_sentinel_cli_persists_unknown_and_never_submits(
         "observation_generation": 1,
         "persisted": True,
         "failure_code": None,
+        "channel_failures": [],
     }
     assert len(result.stdout.encode()) <= 512
     assert submitted == []
@@ -1159,7 +1160,7 @@ def test_production_monitor_local_evidence_capture_writes_atomic_bounded_inputs(
         calls.append((url, kwargs))
         return Response(readiness if "readiness" in url else coverage)
 
-    monkeypatch.setattr(cli_module.httpx, "get", get)
+    monkeypatch.setattr(cli_module, "_monitor_localhost_get", get)
     monkeypatch.setattr(
         cli_module.subprocess,
         "run",
@@ -1203,6 +1204,7 @@ def test_production_monitor_local_evidence_capture_writes_atomic_bounded_inputs(
         call[1]["headers"]["x-monitor-capture-token"] == "t" * 32
         for call in calls
     )
+    assert all(call[1]["trust_env"] is False for call in calls)
 
 
 def test_sentinel_unit_captures_local_evidence_before_evaluation():
@@ -1226,8 +1228,8 @@ def test_production_monitor_local_evidence_rejects_nonexact_loopback_url(
 
     called = []
     monkeypatch.setattr(
-        cli_module.httpx,
-        "get",
+        cli_module,
+        "_monitor_localhost_get",
         lambda *args, **kwargs: called.append((args, kwargs)),
     )
 
@@ -1250,6 +1252,46 @@ def test_production_monitor_local_evidence_rejects_nonexact_loopback_url(
 
     assert result.exit_code != 0
     assert called == []
+
+
+def test_monitor_localhost_get_does_not_inherit_proxy_environment(monkeypatch):
+    import telegram_kol_research.cli as cli_module
+
+    observed = []
+
+    class Client:
+        def __init__(self, **kwargs):
+            observed.append(("init", kwargs))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def get(self, url, **kwargs):
+            observed.append(("get", url, kwargs))
+            return object()
+
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setattr(cli_module.httpx, "Client", Client)
+
+    result = cli_module._monitor_localhost_get(
+        "http://127.0.0.1:8000/api/runtime-monitor-readiness",
+        headers={"x-monitor-capture-token": "t" * 32},
+        timeout=5.0,
+        trust_env=False,
+    )
+
+    assert result is not None
+    assert observed == [
+        ("init", {"timeout": 5.0, "trust_env": False}),
+        (
+            "get",
+            "http://127.0.0.1:8000/api/runtime-monitor-readiness",
+            {"headers": {"x-monitor-capture-token": "t" * 32}},
+        ),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1327,8 +1369,8 @@ def test_production_monitor_journal_evidence_is_structured_and_generation_bound(
             self.content = json.dumps(payload).encode("utf-8")
 
     monkeypatch.setattr(
-        cli_module.httpx,
-        "get",
+        cli_module,
+        "_monitor_localhost_get",
         lambda url, **_kwargs: Response(readiness if "readiness" in url else {}),
     )
     monkeypatch.setattr(cli_module, "build_coverage_candidates", lambda *_args, **_kwargs: ())
@@ -1403,7 +1445,7 @@ def test_production_monitor_journal_evidence_fails_closed_across_service_restart
         readiness_calls += 1
         return Response(readiness(("d" if readiness_calls == 1 else "e") * 64))
 
-    monkeypatch.setattr(cli_module.httpx, "get", get)
+    monkeypatch.setattr(cli_module, "_monitor_localhost_get", get)
     monkeypatch.setattr(cli_module, "build_coverage_candidates", lambda *_args, **_kwargs: ())
     monkeypatch.setattr(
         cli_module.subprocess,
@@ -1484,7 +1526,7 @@ def test_production_monitor_snapshot_cli_is_environment_only_and_emits_bounded_j
 
     monkeypatch.setattr(
         cli_module,
-        "build_deepcoin_read_only_client_from_env",
+        "build_deepcoin_monitor_snapshot_client_from_env",
         build_client,
     )
     manifest = tmp_path / "monitor.json"
@@ -1543,7 +1585,7 @@ def test_production_monitor_snapshot_cli_sealed_read_failure_exits_zero(
 
     monkeypatch.setattr(
         cli_module,
-        "build_deepcoin_read_only_client_from_env",
+        "build_deepcoin_monitor_snapshot_client_from_env",
         lambda **kwargs: ReadClient(),
     )
 

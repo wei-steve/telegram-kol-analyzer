@@ -12,9 +12,11 @@ from telegram_kol_research.production_monitor_facts import (
     FACT_STATUS_COMPLETE,
     FACT_STATUS_UNKNOWN,
     MonitorReadinessEvidence,
+    _monitor_loopback_get,
     build_coverage_candidates,
     build_readiness_candidates,
     build_settings_candidates,
+    collect_production_monitor_observation,
     parse_monitor_readiness_projection,
     read_journal_candidates,
     read_local_monitor_facts,
@@ -33,6 +35,239 @@ from telegram_kol_research.production_monitor_state import ProductionMonitorStat
 
 
 NOW = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
+
+
+def test_monitor_loopback_get_disables_environment_proxy(monkeypatch):
+    import telegram_kol_research.production_monitor_facts as module
+
+    observed = []
+
+    class Client:
+        def __init__(self, **kwargs):
+            observed.append(("init", kwargs))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def get(self, url, **kwargs):
+            observed.append(("get", url, kwargs))
+            return object()
+
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setattr(module.httpx, "Client", Client)
+
+    result = _monitor_loopback_get(
+        "http://127.0.0.1:8000/api/trading-settings",
+        timeout=5.0,
+        trust_env=False,
+    )
+
+    assert result is not None
+    assert observed == [
+        ("init", {"timeout": 5.0, "trust_env": False}),
+        (
+            "get",
+            "http://127.0.0.1:8000/api/trading-settings",
+            {},
+        ),
+    ]
+
+
+def test_observation_collects_authenticated_v2_bridge_readiness_by_get(tmp_path):
+    calls = []
+    bridge_payload = {
+        "available": False,
+        "schema_version": 2,
+        "contract": "production_monitor_v2",
+        "capture_selector": "included",
+        "notification_channel": "enabled",
+        "notification_selector": "excluded",
+        "agent_channel": "enabled",
+        "agent_selector": "excluded",
+        "notification_watermark": "configured",
+    }
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+            self.content = json.dumps(payload).encode("utf-8")
+
+        def json(self):
+            return self._payload
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        if url.endswith("/monitor-v2-bridge-readiness"):
+            return Response(bridge_payload)
+        if url.endswith("/api/runtime-monitor-readiness"):
+            return Response(
+                {
+                    "service_generation": "a" * 64,
+                    "deepcoin_reconcile_first_success_at": NOW.isoformat(),
+                    "deepcoin_reconcile_last_success_at": NOW.isoformat(),
+                    "management_worker_last_success_at": NOW.isoformat(),
+                    "message_supervisor_last_success_at": NOW.isoformat(),
+                    "message_supervisor_policy_status": "valid",
+                }
+            )
+        raise RuntimeError("bounded test endpoint unavailable")
+
+    observation = collect_production_monitor_observation(
+        database_path=tmp_path / "missing.db",
+        snapshot_path=tmp_path / "missing-snapshot.json",
+        checkout_path=tmp_path / "missing-checkout",
+        settings_url="http://127.0.0.1:8000/api/trading-settings",
+        coverage_path=tmp_path / "missing-coverage.json",
+        journal_path=tmp_path / "missing-journal.json",
+        expected_head="a" * 40,
+        expected_auto_trade_enabled=True,
+        expected_max_concurrent_positions=4,
+        expected_management_execution_mode="live",
+        expected_entry_preamble_mode="live",
+        readiness_url="http://127.0.0.1:8000/api/runtime-monitor-readiness",
+        incident_loopback_url=(
+            "http://127.0.0.1:8000/api/runtime-incidents/monitor-capture"
+        ),
+        monitor_capture_token="t" * 32,
+        now=NOW,
+        http_get=get,
+    )
+
+    shadow_observation = collect_production_monitor_observation(
+        database_path=tmp_path / "missing.db",
+        snapshot_path=tmp_path / "missing-snapshot.json",
+        checkout_path=tmp_path / "missing-checkout",
+        settings_url="http://127.0.0.1:8000/api/trading-settings",
+        coverage_path=tmp_path / "missing-coverage.json",
+        journal_path=tmp_path / "missing-journal.json",
+        expected_head="a" * 40,
+        expected_auto_trade_enabled=True,
+        expected_max_concurrent_positions=4,
+        expected_management_execution_mode="live",
+        expected_entry_preamble_mode="live",
+        readiness_url="http://127.0.0.1:8000/api/runtime-monitor-readiness",
+        incident_loopback_url=(
+            "http://127.0.0.1:8000/api/runtime-incidents/monitor-capture"
+        ),
+        monitor_capture_token="t" * 32,
+        bridge_policy_mode="shadow",
+        now=NOW,
+        http_get=get,
+    )
+
+    bridge_payload["notification_channel"] = "disabled"
+    bridge_payload["notification_selector"] = "included"
+    with pytest.raises(ValueError, match="shadow bridge policy"):
+        collect_production_monitor_observation(
+            database_path=tmp_path / "missing.db",
+            snapshot_path=tmp_path / "missing-snapshot.json",
+            checkout_path=tmp_path / "missing-checkout",
+            settings_url="http://127.0.0.1:8000/api/trading-settings",
+            coverage_path=tmp_path / "missing-coverage.json",
+            journal_path=tmp_path / "missing-journal.json",
+            expected_head="a" * 40,
+            expected_auto_trade_enabled=True,
+            expected_max_concurrent_positions=4,
+            expected_management_execution_mode="live",
+            expected_entry_preamble_mode="live",
+            readiness_url="http://127.0.0.1:8000/api/runtime-monitor-readiness",
+            incident_loopback_url=(
+                "http://127.0.0.1:8000/api/runtime-incidents/monitor-capture"
+            ),
+            monitor_capture_token="t" * 32,
+            bridge_policy_mode="shadow",
+            now=NOW,
+            http_get=get,
+        )
+
+    bridge_payload.update(
+        {
+            "available": False,
+            "capture_selector": "excluded",
+            "notification_channel": "enabled",
+            "notification_selector": "included",
+            "agent_channel": "enabled",
+            "agent_selector": "included",
+            "notification_watermark": "configured",
+        }
+    )
+    capture_unavailable_observation = collect_production_monitor_observation(
+        database_path=tmp_path / "missing.db",
+        snapshot_path=tmp_path / "missing-snapshot.json",
+        checkout_path=tmp_path / "missing-checkout",
+        settings_url="http://127.0.0.1:8000/api/trading-settings",
+        coverage_path=tmp_path / "missing-coverage.json",
+        journal_path=tmp_path / "missing-journal.json",
+        expected_head="a" * 40,
+        expected_auto_trade_enabled=True,
+        expected_max_concurrent_positions=4,
+        expected_management_execution_mode="live",
+        expected_entry_preamble_mode="live",
+        readiness_url="http://127.0.0.1:8000/api/runtime-monitor-readiness",
+        incident_loopback_url=(
+            "http://127.0.0.1:8000/api/runtime-incidents/monitor-capture"
+        ),
+        monitor_capture_token="t" * 32,
+        now=NOW,
+        http_get=get,
+    )
+
+    bridge_calls = [call for call in calls if "bridge-readiness" in call[0]]
+    assert bridge_calls == [
+        (
+            "http://127.0.0.1:8000/api/runtime-incidents/"
+            "monitor-v2-bridge-readiness",
+            {
+                "headers": {"x-monitor-capture-token": "t" * 32},
+                "timeout": 5.0,
+                "trust_env": False,
+            },
+        ),
+        (
+            "http://127.0.0.1:8000/api/runtime-incidents/"
+            "monitor-v2-bridge-readiness",
+            {
+                "headers": {"x-monitor-capture-token": "t" * 32},
+                "timeout": 5.0,
+                "trust_env": False,
+            },
+        ),
+        (
+            "http://127.0.0.1:8000/api/runtime-incidents/"
+            "monitor-v2-bridge-readiness",
+            {
+                "headers": {"x-monitor-capture-token": "t" * 32},
+                "timeout": 5.0,
+                "trust_env": False,
+            },
+        ),
+        (
+            "http://127.0.0.1:8000/api/runtime-incidents/"
+            "monitor-v2-bridge-readiness",
+            {
+                "headers": {"x-monitor-capture-token": "t" * 32},
+                "timeout": 5.0,
+                "trust_env": False,
+            },
+        ),
+    ]
+    assert "readiness" not in observation.adapter_failures
+    assert "readiness" not in shadow_observation.adapter_failures
+    assert observation.channel_failures == (
+        "deterministic_notification",
+        "runtime_incident_agent",
+    )
+    assert shadow_observation.channel_failures == ()
+    assert "readiness" not in capture_unavailable_observation.adapter_failures
+    assert capture_unavailable_observation.channel_failures == (
+        "runtime_incident_intake",
+    )
+    assert all(kwargs["trust_env"] is False for _url, kwargs in calls)
 
 
 def _create_fact_database(path, *, wal: bool = False) -> None:

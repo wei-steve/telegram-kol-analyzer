@@ -30,6 +30,14 @@ from telegram_kol_research.production_monitor_state import (
 
 
 _MAX_OBSERVATION_GENERATION = 2**63 - 1
+MONITOR_CHANNEL_FAILURES = frozenset(
+    {
+        "bridge_readiness_unavailable",
+        "runtime_incident_intake",
+        "deterministic_notification",
+        "runtime_incident_agent",
+    }
+)
 _DURABLE_ABSENCE_ADAPTER_BY_REASON = {
     "audit_abnormal": "audit",
     "event_unknown_status": "events",
@@ -44,6 +52,7 @@ class SentinelObservation:
     checked_at: datetime
     candidates: tuple[CandidateObservation, ...]
     adapter_failures: tuple[str, ...] = ()
+    channel_failures: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +68,7 @@ class SentinelResult:
     candidate_states: tuple[CandidateState, ...]
     incident_projection: Mapping[str, object] | None
     anomaly_fingerprint: str | None = None
+    channel_failures: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +168,7 @@ def evaluate_sentinel_observation(
         raise ValueError("sentinel observation generation is not the exact next value")
     checked_at = _aware_utc(observation.checked_at, field="checked_at")
     adapter_failures = _closed_adapter_failures(observation.adapter_failures)
+    channel_failures = _closed_channel_failures(observation.channel_failures)
     if (
         not isinstance(observation.candidates, tuple)
         or len(observation.candidates) > MONITOR_STATE_MAX_CANDIDATES
@@ -176,6 +187,7 @@ def evaluate_sentinel_observation(
             checked_at=checked_at,
             observation_generation=observation_generation,
             adapter_failures=adapter_failures,
+            channel_failures=channel_failures,
             previous_state=previous_state,
         )
 
@@ -347,6 +359,7 @@ def evaluate_sentinel_observation(
         candidate_states=candidate_states,
         incident_projection=incident_projection,
         anomaly_fingerprint=anomaly_fingerprint,
+        channel_failures=channel_failures,
     )
     active_confirmed_fingerprints = {
         item.fingerprint for item in confirmed
@@ -463,6 +476,7 @@ def _evaluate_clock_rollback(
     checked_at: datetime,
     observation_generation: int,
     adapter_failures: tuple[str, ...],
+    channel_failures: tuple[str, ...],
     previous_state: ProductionMonitorState,
 ) -> tuple[SentinelResult, ProductionMonitorState]:
     """Persist a typed aggregate temporal anomaly without inventing a fact row."""
@@ -515,6 +529,7 @@ def _evaluate_clock_rollback(
         candidate_states=candidate_states,
         incident_projection=None,
         anomaly_fingerprint=anomaly_fingerprint,
+        channel_failures=channel_failures,
     )
     next_state = replace(
         previous_state,
@@ -570,6 +585,19 @@ def _closed_adapter_failures(value: object) -> tuple[str, ...]:
         raise ValueError("sentinel adapter failures are invalid")
     if tuple(sorted(set(value))) != value:
         raise ValueError("sentinel adapter failures are not canonical")
+    return value
+
+
+def _closed_channel_failures(value: object) -> tuple[str, ...]:
+    if not isinstance(value, tuple) or len(value) > len(MONITOR_CHANNEL_FAILURES):
+        raise ValueError("sentinel channel failures are invalid")
+    if any(
+        not isinstance(item, str) or item not in MONITOR_CHANNEL_FAILURES
+        for item in value
+    ):
+        raise ValueError("sentinel channel failures are invalid")
+    if tuple(sorted(set(value))) != value:
+        raise ValueError("sentinel channel failures are not canonical")
     return value
 
 

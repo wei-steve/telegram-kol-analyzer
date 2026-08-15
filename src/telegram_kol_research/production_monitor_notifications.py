@@ -12,6 +12,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
 
+import httpx
+
 from telegram_kol_research.production_monitor_contract import (
     MONITOR_FALLBACK_REASONS,
     parse_monitor_projection,
@@ -48,6 +50,19 @@ _AGENT_STATUSES = frozenset(
     }
 )
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_BRIDGE_READINESS_FIELDS = frozenset(
+    {
+        "available",
+        "schema_version",
+        "contract",
+        "capture_selector",
+        "notification_channel",
+        "notification_selector",
+        "agent_channel",
+        "agent_selector",
+        "notification_watermark",
+    }
+)
 
 
 class MonitorIntakeError(RuntimeError):
@@ -148,6 +163,106 @@ def request_monitor_acceptance(
     except Exception:
         raise MonitorIntakeError("schema_refused") from None
     return parse_monitor_acceptance(payload, now=now)
+
+
+def request_monitor_bridge_readiness(
+    *,
+    url: str,
+    token: str,
+    request: Callable[..., Any] | None = None,
+) -> Mapping[str, object]:
+    """Read and strictly validate the side-effect-free v2 bridge contract."""
+
+    _validate_loopback_url(
+        url,
+        expected_path="/api/runtime-incidents/monitor-v2-bridge-readiness",
+        label="monitor bridge readiness",
+    )
+    _validate_monitor_token(token)
+
+    def default_request(**kwargs):
+        if kwargs.pop("trust_env", None) is not False:
+            raise RuntimeError("monitor bridge transport policy unavailable")
+        with httpx.Client(timeout=5.0, trust_env=False) as client:
+            return client.get(**kwargs)
+
+    try:
+        response = (request or default_request)(
+            url=url,
+            headers={"x-monitor-capture-token": token},
+            timeout=5.0,
+            trust_env=False,
+        )
+    except Exception:
+        raise MonitorIntakeError("transport_unavailable") from None
+    status_code = getattr(response, "status_code", None)
+    if type(status_code) is not int or status_code != 200:
+        raise MonitorIntakeError("transport_unavailable")
+    content = getattr(response, "content", b"")
+    if not isinstance(content, (bytes, bytearray)) or len(content) > 4096:
+        raise MonitorIntakeError("schema_refused")
+    try:
+        payload = response.json()
+        if not isinstance(payload, Mapping) or frozenset(payload) != (
+            _BRIDGE_READINESS_FIELDS
+        ):
+            raise ValueError("invalid response")
+        if type(payload["available"]) is not bool:
+            raise ValueError("invalid availability")
+        if (
+            type(payload["schema_version"]) is not int
+            or payload["schema_version"] != 2
+        ):
+            raise ValueError("invalid schema")
+        if (
+            type(payload["contract"]) is not str
+            or payload["contract"] != "production_monitor_v2"
+        ):
+            raise ValueError("invalid contract")
+        if (
+            type(payload["capture_selector"]) is not str
+            or payload["capture_selector"] not in {"included", "excluded"}
+        ):
+            raise ValueError("invalid capture selector")
+        if (
+            type(payload["notification_channel"]) is not str
+            or payload["notification_channel"] not in {"enabled", "disabled"}
+        ):
+            raise ValueError("invalid notification channel")
+        if (
+            type(payload["notification_selector"]) is not str
+            or payload["notification_selector"]
+            not in {"included", "excluded", "legacy_all_refused"}
+        ):
+            raise ValueError("invalid notification selector")
+        if (
+            type(payload["agent_channel"]) is not str
+            or payload["agent_channel"] not in {"enabled", "disabled"}
+        ):
+            raise ValueError("invalid agent channel")
+        if (
+            type(payload["agent_selector"]) is not str
+            or payload["agent_selector"]
+            not in {"included", "excluded", "legacy_all_refused"}
+        ):
+            raise ValueError("invalid agent selector")
+        if (
+            type(payload["notification_watermark"]) is not str
+            or payload["notification_watermark"]
+            not in {"configured", "absent", "invalid_refused"}
+        ):
+            raise ValueError("invalid watermark")
+        expected_available = (
+            payload["capture_selector"] == "included"
+            and payload["notification_channel"] == "enabled"
+            and payload["notification_selector"] == "included"
+            and payload["notification_watermark"] == "configured"
+        )
+        if payload["available"] is not expected_available:
+            raise ValueError("inconsistent availability")
+    except (KeyError, TypeError, ValueError):
+        raise MonitorIntakeError("schema_refused") from None
+    return dict(payload)
 
 
 def parse_monitor_acceptance(

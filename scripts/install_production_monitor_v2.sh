@@ -1,9 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
+PATH="/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
 
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "install_production_monitor_v2.sh must run as root." >&2
   exit 1
+fi
+installer_real_path="$(readlink -f "${BASH_SOURCE[0]}")"
+if [[ "$(id -u)" -eq 0 ]]; then
+  installer_mode="$(stat -c %a "$installer_real_path")"
+  if [[ ! -f "$installer_real_path" || -L "$installer_real_path" || \
+        "$(stat -c %u "$installer_real_path")" != "0" || \
+        "$(stat -c %h "$installer_real_path")" != "1" ]] || \
+     (( (8#$installer_mode & 8#022) != 0 )); then
+    echo "The running installer must be root-owned and non-writable." >&2
+    exit 1
+  fi
 fi
 if [[ "$#" -ne 2 || "$1" != "--expected-head" || \
       ! "$2" =~ ^[0-9a-f]{40}$ ]]; then
@@ -24,6 +37,12 @@ SENTINEL_ENV_FILE="/etc/telegram-kol-monitor-sentinel.env"
 RUNTIME_POLICY_FILE="$PRODUCTION_ROOT/config/runtime_incident_agent.env"
 STATE_ROOT="/var/lib/telegram-kol-monitor-v2"
 CACHE_ROOT="/var/cache/telegram-kol-monitor-v2"
+RELEASE_ROOT="/opt/telegram-kol-monitor-v2/releases"
+CURRENT_RELEASE_LINK="/opt/telegram-kol-monitor-v2/current"
+UV_CACHE_TRUST_ANCHOR="/var/cache"
+UV_CACHE_PARENT="/var/cache/telegram-kol-monitor-v2-build"
+UV_CACHE_ROOT="/var/cache/telegram-kol-monitor-v2-build/uv"
+UV_CACHE_VALIDATOR_SOURCE="$PRODUCTION_ROOT/scripts/validate_production_monitor_uv_cache.py"
 DB_STAGE_HELPER_SOURCE="$PRODUCTION_ROOT/src/telegram_kol_research/production_monitor_db_stage.py"
 DB_STAGE_HELPER_DEST="/usr/local/libexec/telegram-kol-monitor-db-stage"
 
@@ -44,6 +63,8 @@ staging_instances=(
 )
 source_units=("${units[@]}" telegram-kol-monitor-db-stage@.service)
 reviewed_relative_paths=(
+  scripts/install_production_monitor_v2.sh
+  scripts/validate_production_monitor_uv_cache.py
   deploy/systemd/telegram-kol-monitor-snapshot.service
   deploy/systemd/telegram-kol-monitor-snapshot.timer
   deploy/systemd/telegram-kol-sentinel.service
@@ -53,6 +74,7 @@ reviewed_relative_paths=(
   deploy/systemd/telegram-kol-monitor-db-stage@.service
   src/telegram_kol_research/production_monitor_db_stage.py
   src/telegram_kol_research/cli.py
+  config/production-monitor-build-constraints.txt
 )
 
 if [[ "$PROJECT_ROOT" != "$PRODUCTION_ROOT" ]]; then
@@ -71,6 +93,100 @@ if [[ ! "$expected_head" =~ ^[0-9a-f]{40}$ ]]; then
 fi
 if [[ "$expected_head" != "$approved_head" ]]; then
   echo "Production HEAD does not match the explicitly approved SHA." >&2
+  exit 1
+fi
+if ! git -C "$PRODUCTION_ROOT" diff --quiet --ignore-submodules=none \
+  "$expected_head" -- . || \
+   ! git -C "$PRODUCTION_ROOT" diff --cached --quiet --ignore-submodules=none \
+  "$expected_head" -- .; then
+  echo "The complete production checkout differs from the approved SHA." >&2
+  exit 1
+fi
+if [[ -n "$(git -C "$PRODUCTION_ROOT" ls-files --others --exclude-standard -- .)" ]]; then
+  echo "The production checkout contains an untracked path." >&2
+  exit 1
+fi
+index_tags="$(git -C "$PRODUCTION_ROOT" ls-files -t -v)"
+if grep -Eq '^[S]|^[a-z]' <<<"$index_tags"; then
+  echo "The production checkout contains a hidden index override." >&2
+  exit 1
+fi
+runtime_shadow=""
+while IFS= read -r -d '' candidate_path; do
+  relative_path="${candidate_path#"$PRODUCTION_ROOT/"}"
+  if ! git -C "$PRODUCTION_ROOT" --literal-pathspecs \
+    ls-files --error-unmatch -- "$relative_path" \
+    >/dev/null 2>&1; then
+    runtime_shadow="$relative_path"
+    break
+  fi
+done < <(
+  find "$PRODUCTION_ROOT/src" "$PRODUCTION_ROOT/scripts" \
+    ! -type d -print0
+  find "$PRODUCTION_ROOT" -maxdepth 1 \
+    ! -type d \( \
+      -name '*.py' -o -name '*.pyc' -o -name '*.pyo' -o \
+      -name '*.so' -o -name '*.dylib' -o -name '*.pth' \
+    \) -print0
+)
+if [[ -n "$runtime_shadow" ]]; then
+  echo "The production checkout contains an untracked or ignored import shadow." >&2
+  exit 1
+fi
+checkout_mode="$(stat -c %a "$PRODUCTION_ROOT")"
+if [[ "$(stat -c %u "$PRODUCTION_ROOT")" != "0" ]] || \
+   (( (8#$checkout_mode & 8#022) != 0 )); then
+  echo "The production checkout must be root-owned and non-writable by other identities." >&2
+  exit 1
+fi
+untrusted_metadata="$({
+  find "$PRODUCTION_ROOT/.git" "$PRODUCTION_ROOT/src" \
+    "$PRODUCTION_ROOT/scripts" "$PRODUCTION_ROOT/deploy" -xdev \
+    \( ! -user root -o -perm /022 \) -print -quit
+} 2>/dev/null)"
+if [[ -n "$untrusted_metadata" ]]; then
+  echo "The reviewed checkout closure must be root-owned and non-writable." >&2
+  exit 1
+fi
+if ! command -v uv >/dev/null 2>&1; then
+  echo "A trusted uv binary is required to build the locked sealed runtime." >&2
+  exit 1
+fi
+uv_path="$(readlink -f "$(command -v uv)")"
+uv_mode="$(stat -c %a "$uv_path")"
+if [[ ! -f "$uv_path" || -L "$uv_path" || \
+      "$(stat -c %u "$uv_path")" != "0" || \
+      "$(stat -c %h "$uv_path")" != "1" ]] || \
+   (( (8#$uv_mode & 8#022) != 0 )); then
+  echo "The uv runtime builder must be root-owned and non-writable." >&2
+  exit 1
+fi
+if [[ ! -d "$UV_CACHE_PARENT" || -L "$UV_CACHE_PARENT" || \
+      ! -d "$UV_CACHE_ROOT" || -L "$UV_CACHE_ROOT" ]]; then
+  echo "The locked dependency cache is unavailable." >&2
+  exit 1
+fi
+if ! /usr/bin/python3 "$UV_CACHE_VALIDATOR_SOURCE" \
+  --cache-root "$UV_CACHE_ROOT" \
+  --trust-anchor "$UV_CACHE_TRUST_ANCHOR" \
+  --expected-owner-uid 0; then
+  echo "Locked dependency cache must be root-owned and non-writable." >&2
+  exit 1
+fi
+if ! command -v python3.12 >/dev/null 2>&1; then
+  echo "Python 3.12 is required to build the sealed runtime." >&2
+  exit 1
+fi
+python_path="$(readlink -f "$(command -v python3.12)")"
+python_mode="$(stat -c %a "$python_path")"
+if [[ ! -x "$python_path" || "$(stat -c %u "$python_path")" != "0" ]] || \
+   (( (8#$python_mode & 8#022) != 0 )); then
+  echo "The sealed runtime Python must be root-owned and non-writable." >&2
+  exit 1
+fi
+if ! "$python_path" -I -S -c \
+  'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)'; then
+  echo "The sealed runtime builder requires exactly Python 3.12." >&2
   exit 1
 fi
 for relative_path in "${reviewed_relative_paths[@]}"; do
@@ -179,6 +295,13 @@ for source_service in "${services[@]}"; do
   )"
   if [[ -n "$unexpected_write" ]]; then
     echo "$source_service contains an unexpected writable path." >&2
+    exit 1
+  fi
+  if ! grep -Fq "/opt/telegram-kol-monitor-v2/current/.venv/bin/telegram-kol-research" \
+       "$source_path" || \
+     grep -Fq "/opt/telegram-kol-analyzer/.venv" "$source_path" || \
+     grep -Fq "BindReadOnlyPaths=/opt/telegram-kol-analyzer/src" "$source_path"; then
+    echo "$source_service must execute only the sealed approved runtime." >&2
     exit 1
   fi
 done
@@ -395,26 +518,142 @@ if runuser -u "$SENTINEL_USER" -- test -x "$PRODUCTION_ROOT/data" || \
   exit 1
 fi
 
+release_staging=""
+current_link_staging=""
+sentinel_env=""
+cleanup_installer_temporaries() {
+  if [[ -n "$sentinel_env" ]]; then
+    rm -f -- "$sentinel_env"
+  fi
+  if [[ -n "$current_link_staging" ]]; then
+    rm -f -- "$current_link_staging"
+  fi
+  if [[ -n "$release_staging" && -L "$CURRENT_RELEASE_LINK" && \
+        "$(readlink "$CURRENT_RELEASE_LINK")" == "$release_staging" ]]; then
+    release_staging=""
+  fi
+  if [[ -n "$release_staging" && \
+        "$release_staging" == "$RELEASE_ROOT/$expected_head" ]]; then
+    rm -rf -- "$release_staging"
+  fi
+}
+trap cleanup_installer_temporaries EXIT
+
+install -d -o root -g root -m 0755 "$(dirname "$RELEASE_ROOT")" "$RELEASE_ROOT"
+sealed_release="$RELEASE_ROOT/$expected_head"
+if [[ -e "$sealed_release" || -L "$sealed_release" ]]; then
+  echo "The sealed release target already exists; refusing to reuse mutable runtime bytes." >&2
+  exit 1
+fi
+mkdir -m 0700 "$sealed_release"
+release_staging="$sealed_release"
+git -c core.hooksPath=/dev/null -C "$release_staging" init -q
+git -c core.hooksPath=/dev/null -C "$release_staging" fetch \
+  --no-tags "$PRODUCTION_ROOT" "$expected_head"
+git -c core.hooksPath=/dev/null -C "$release_staging" checkout \
+  "--detach" "$expected_head"
+if [[ "$(git -C "$release_staging" rev-parse --verify HEAD)" != \
+      "$expected_head" ]]; then
+  echo "The sealed release checkout does not match the approved SHA." >&2
+  exit 1
+fi
+(
+  cd "$release_staging"
+  HOME=/nonexistent UV_BUILD_CONSTRAINT="$release_staging/config/production-monitor-build-constraints.txt" \
+    UV_CACHE_DIR="$UV_CACHE_ROOT" UV_LINK_MODE=copy UV_NO_CONFIG=1 \
+    UV_NO_MANAGED_PYTHON=1 UV_PYTHON="$python_path" UV_OFFLINE=1 \
+    uv sync --locked --offline --no-dev
+)
+if [[ ! -x "$release_staging/.venv/bin/telegram-kol-research" ]]; then
+  echo "The locked sealed runtime entrypoint was not created." >&2
+  exit 1
+fi
+printf '%s\n' "$expected_head" > \
+  "$release_staging/.production-monitor-release-sha"
+chown -R root:root "$release_staging"
+chmod -R u=rwX,go=rX "$release_staging"
+chmod -R a-w "$release_staging"
+sealed_symlink_problem=""
+while IFS= read -r -d '' sealed_link; do
+  case "$sealed_link" in
+    "$release_staging/.venv/bin/python"|\
+    "$release_staging/.venv/bin/python3"|\
+    "$release_staging/.venv/bin/python3.12")
+      if [[ "$(readlink -f "$sealed_link")" != "$python_path" ]]; then
+        sealed_symlink_problem="$sealed_link"
+      fi
+      ;;
+    *)
+      sealed_symlink_problem="$sealed_link"
+      ;;
+  esac
+  if [[ -n "$sealed_symlink_problem" ]]; then
+    break
+  fi
+done < <(find "$sealed_release" -xdev -type l -print0)
+if [[ -n "$sealed_symlink_problem" ]]; then
+  echo "The sealed release contains an unexpected or untrusted symlink." >&2
+  exit 1
+fi
+release_entrypoint="$release_staging/.venv/bin/telegram-kol-research"
+if [[ "$(head -n 1 "$release_entrypoint")" != \
+      "#!$release_staging/.venv/bin/python" ]]; then
+  echo "The sealed runtime entrypoint shebang is not release-bound." >&2
+  exit 1
+fi
+if ! runuser -u "$SNAPSHOT_USER" -- env -i HOME=/nonexistent \
+      PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 \
+      /usr/bin/timeout 15 "$release_entrypoint" \
+      "refresh-production-monitor-snapshot" --help >/dev/null || \
+   ! runuser -u "$SENTINEL_USER" -- env -i HOME=/nonexistent \
+      PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 \
+      /usr/bin/timeout 15 "$release_entrypoint" \
+      "run-production-monitor-sentinel" --help >/dev/null || \
+   ! runuser -u "$SENTINEL_USER" -- env -i HOME=/nonexistent \
+      PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 \
+      /usr/bin/timeout 15 "$release_entrypoint" \
+      "run-production-monitor-audit" --help >/dev/null; then
+  echo "The sealed runtime command self-check failed." >&2
+  exit 1
+fi
+sealed_metadata_problem="$({
+  find "$sealed_release" -xdev \
+    \( ! -user root -o \( ! -type l -perm /022 \) \) -print -quit
+} 2>/dev/null)"
+if [[ -n "$sealed_metadata_problem" || \
+      "$(git -C "$sealed_release" rev-parse --verify HEAD)" != \
+      "$expected_head" || \
+      "$(cat "$sealed_release/.production-monitor-release-sha")" != \
+      "$expected_head" ]]; then
+  echo "The sealed release must remain root-owned, non-writable, and SHA-bound." >&2
+  exit 1
+fi
+
 install -d -o root -g root -m 0711 "$STATE_ROOT" "$CACHE_ROOT"
 install -d -o "$SNAPSHOT_USER" -g "$SNAPSHOT_USER" -m 0700 "$STATE_ROOT/snapshot"
 install -d -o "$SENTINEL_USER" -g "$SENTINEL_USER" -m 0700 \
   "$STATE_ROOT/sentinel" "$CACHE_ROOT/sentinel" "$CACHE_ROOT/audit"
 
 sentinel_env="$(mktemp)"
-trap 'rm -f "$sentinel_env"' EXIT
 chmod 0600 "$sentinel_env"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=%s\n' "$expected_head" > "$sentinel_env"
 printf '%s\n' "$monitor_token" >> "$sentinel_env"
 install -o root -g root -m 0600 "$sentinel_env" "$SENTINEL_ENV_FILE"
 install -d -o root -g root -m 0755 "$(dirname "$DB_STAGE_HELPER_DEST")"
-install -o root -g root -m 0755 "$DB_STAGE_HELPER_SOURCE" \
+install -o root -g root -m 0755 \
+  "$sealed_release/src/telegram_kol_research/production_monitor_db_stage.py" \
   "$DB_STAGE_HELPER_DEST"
 
 for source_unit in "${source_units[@]}"; do
   install -o root -g root -m 0644 \
-    "$SYSTEMD_SOURCE/$source_unit" "$SYSTEMD_DEST/$source_unit"
+    "$sealed_release/deploy/systemd/$source_unit" "$SYSTEMD_DEST/$source_unit"
 done
 systemctl daemon-reload
+current_link_staging="$(dirname "$CURRENT_RELEASE_LINK")/.current.${expected_head}.$$"
+ln -s "$sealed_release" "$current_link_staging"
+mv -T "$current_link_staging" "$CURRENT_RELEASE_LINK"
+release_staging=""
+current_link_staging=""
 
 echo "Installed production monitor v2 units for reviewed HEAD $expected_head."
 echo "All v2 services and timers remain disabled and inactive."

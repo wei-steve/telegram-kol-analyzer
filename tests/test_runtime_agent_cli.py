@@ -786,8 +786,9 @@ def test_runtime_agent_exchange_snapshot_reader_allows_bounded_provider_latency(
             }
 
     class Client:
-        def __init__(self, *, timeout):
+        def __init__(self, *, timeout, trust_env):
             observed["timeout"] = timeout
+            observed["trust_env"] = trust_env
 
         def __enter__(self):
             return self
@@ -804,6 +805,7 @@ def test_runtime_agent_exchange_snapshot_reader_allows_bounded_provider_latency(
     result = _read_runtime_agent_exchange_snapshot()
 
     assert observed["timeout"] == 20.0
+    assert observed["trust_env"] is False
     assert observed["url"].startswith("http://127.0.0.1:8000/")
     assert result["complete"] is True
 

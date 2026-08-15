@@ -9,7 +9,7 @@ User=telegram-kol-monitor-sentinel
 Group=telegram-kol-monitor-sentinel
 UMask=0077
 WorkingDirectory=/var/cache/telegram-kol-monitor-v2/audit
-ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research run-production-monitor-audit --state-path /var/lib/telegram-kol-monitor-v2/sentinel/sentinel-v2.json --database-path /var/cache/telegram-kol-monitor-v2/audit/research-snapshot.db --scratch-root /var/cache/telegram-kol-monitor-v2/audit
+ExecStart=/opt/telegram-kol-monitor-v2/current/.venv/bin/telegram-kol-research run-production-monitor-audit --state-path /var/lib/telegram-kol-monitor-v2/sentinel/sentinel-v2.json --database-path /var/cache/telegram-kol-monitor-v2/audit/research-snapshot.db --scratch-root /var/cache/telegram-kol-monitor-v2/audit
 
 AmbientCapabilities=
 CapabilityBoundingSet=
@@ -41,8 +41,6 @@ SystemCallErrorNumber=EPERM
 SystemCallFilter=@system-service
 SystemCallFilter=~@mount @network-io @privileged
 TemporaryFileSystem=/opt/telegram-kol-analyzer:ro
-BindReadOnlyPaths=/opt/telegram-kol-analyzer/.venv
-BindReadOnlyPaths=/opt/telegram-kol-analyzer/src
 ReadOnlyPaths=/var/cache/telegram-kol-monitor-v2/audit/research-snapshot.db
 ReadWritePaths=/var/lib/telegram-kol-monitor-v2/sentinel
 ReadWritePaths=/var/cache/telegram-kol-monitor-v2/audit

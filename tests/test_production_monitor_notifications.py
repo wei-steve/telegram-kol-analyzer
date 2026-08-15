@@ -11,10 +11,12 @@ from telegram_kol_research.production_monitor_contract import (
     build_monitor_projection,
 )
 from telegram_kol_research.production_monitor_notifications import (
+    MONITOR_INTAKE_SLA,
     MonitorAcceptance,
     MonitorIntakeError,
     format_fixed_fallback,
     parse_monitor_acceptance,
+    request_monitor_bridge_readiness,
     request_monitor_acceptance,
     request_monitor_fallback,
     recheck_due_monitor_notifications_persisted,
@@ -110,6 +112,102 @@ def test_lost_response_recheck_records_semantic_acceptance_without_fallback():
     assert delivered == []
 
 
+@pytest.mark.parametrize(
+    ("channel_failure", "notification_status", "agent_status"),
+    [
+        ("runtime_incident_intake", None, "pending"),
+        ("deterministic_notification", "failed", "pending"),
+        ("runtime_incident_agent", "pending", "timed_out"),
+    ],
+)
+def test_new_episode_routes_into_existing_sla_despite_bridge_channel_health(
+    tmp_path,
+    channel_failure,
+    notification_status,
+    agent_status,
+):
+    state_store = ProductionMonitorStateStore(
+        tmp_path / f"{channel_failure}.json",
+        now_factory=lambda: NOW,
+    )
+    route_calls = []
+
+    def submit(projection):
+        route_calls.append(projection["submission_id"])
+        if notification_status is None:
+            raise MonitorIntakeError("transport_unavailable")
+        return MonitorAcceptance(
+            submission_id=projection["submission_id"],
+            accepted_at=NOW,
+            notification_status=notification_status,
+            notification_claimed_at=None,
+            notification_claim_expires_at=None,
+            notification_failed_at=(
+                NOW if notification_status == "failed" else None
+            ),
+            agent_status=agent_status,
+        )
+
+    def route(projection):
+        return route_monitor_incident_persisted(
+            state_store=state_store,
+            projection=projection,
+            now=NOW,
+            submit=submit,
+            recheck=submit,
+            deliver_fallback=lambda _message: pytest.fail(
+                "first channel failure must remain inside its SLA"
+            ),
+        )
+
+    outcome = run_production_monitor_sentinel(
+        state_store=state_store,
+        observation_collector=lambda: SentinelObservation(
+            checked_at=NOW,
+            candidates=(
+                CandidateObservation(
+                    reason_code="audit_abnormal",
+                    fingerprint="c" * 64,
+                    observed_at=NOW,
+                    anomaly_present=True,
+                    evidence_complete=True,
+                    snapshot_generation=None,
+                    snapshot_started_at=None,
+                    snapshot_completed_at=None,
+                    last_progress_at=None,
+                    execution_deadline_at=None,
+                    durable_terminal_fact=True,
+                ),
+            ),
+            channel_failures=(channel_failure,),
+        ),
+        incident_router=route,
+    )
+
+    assert outcome.exit_code == 0
+    assert outcome.result is not None
+    assert outcome.result.evidence_complete is True
+    assert outcome.result.adapter_failures == ()
+    assert outcome.result.channel_failures == (channel_failure,)
+    assert outcome.result.incident_projection is not None
+    state = state_store.load()
+    if channel_failure == "runtime_incident_intake":
+        assert len(route_calls) == 2
+        assert state.fallback is not None
+        assert state.fallback.status == "PENDING"
+        assert state.fallback.next_attempt_at == NOW + MONITOR_INTAKE_SLA
+        assert state.incident_acceptances == ()
+    else:
+        assert len(route_calls) == 1
+        assert state.fallback is None
+        aggregate = next(
+            item
+            for item in state.incident_acceptances
+            if item.projection_json is not None
+        )
+        assert aggregate.accepted_at == NOW
+
+
 def test_monitor_acceptance_response_is_strict_and_closed():
     payload = {
         "accepted": True,
@@ -170,6 +268,224 @@ def test_loopback_request_is_exact_bounded_and_parses_acceptance():
             now=NOW,
             request=lambda **kwargs: Response(),
         )
+
+
+def test_bridge_readiness_get_is_exact_closed_and_has_no_request_body():
+    calls = []
+
+    class Response:
+        status_code = 200
+        content = b"{}"
+
+        def json(self):
+            return {
+                "available": True,
+                "schema_version": 2,
+                "contract": "production_monitor_v2",
+                "capture_selector": "included",
+                "notification_channel": "enabled",
+                "notification_selector": "included",
+                "agent_channel": "enabled",
+                "agent_selector": "included",
+                "notification_watermark": "configured",
+            }
+
+    payload = request_monitor_bridge_readiness(
+        url=(
+            "http://127.0.0.1:8000/api/runtime-incidents/"
+            "monitor-v2-bridge-readiness"
+        ),
+        token="r" * 43,
+        request=lambda **kwargs: calls.append(kwargs) or Response(),
+    )
+
+    assert payload["available"] is True
+    assert calls == [
+        {
+            "url": (
+                "http://127.0.0.1:8000/api/runtime-incidents/"
+                "monitor-v2-bridge-readiness"
+            ),
+            "headers": {"x-monitor-capture-token": "r" * 43},
+            "timeout": 5.0,
+            "trust_env": False,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"schema_version": 1},
+        {"schema_version": 2.0},
+        {"schema_version": True},
+        {"contract": "other"},
+        {"capture_selector": "legacy_all"},
+        {"notification_channel": "paused"},
+        {"agent_channel": True},
+        {"notification_watermark": "invalid_refused"},
+        {"extra": "open"},
+    ],
+)
+def test_bridge_readiness_response_is_strict_and_closed(mutation):
+    payload = {
+        "available": True,
+        "schema_version": 2,
+        "contract": "production_monitor_v2",
+        "capture_selector": "included",
+        "notification_channel": "enabled",
+        "notification_selector": "included",
+        "agent_channel": "enabled",
+        "agent_selector": "included",
+        "notification_watermark": "configured",
+    }
+    payload.update(mutation)
+
+    class Response:
+        status_code = 200
+        content = b"{}"
+
+        def json(self):
+            return payload
+
+    with pytest.raises(MonitorIntakeError, match="schema_refused"):
+        request_monitor_bridge_readiness(
+            url=(
+                "http://127.0.0.1:8000/api/runtime-incidents/"
+                "monitor-v2-bridge-readiness"
+            ),
+            token="r" * 43,
+            request=lambda **kwargs: Response(),
+        )
+
+
+def test_bridge_readiness_default_transport_ignores_proxy_env_and_redacts_token(
+    monkeypatch,
+):
+    import telegram_kol_research.production_monitor_notifications as module
+
+    token = "secret-token-" + "x" * 32
+    proxy = "http://proxy-user:proxy-password@198.51.100.7:3128"
+    clients = []
+
+    class Client:
+        def __init__(self, **kwargs):
+            clients.append(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def get(self, **kwargs):
+            raise RuntimeError(f"must not leak {token} through {proxy}")
+
+    monkeypatch.setenv("HTTP_PROXY", proxy)
+    monkeypatch.setenv("HTTPS_PROXY", proxy)
+    monkeypatch.setattr(module.httpx, "Client", Client)
+
+    with pytest.raises(MonitorIntakeError) as raised:
+        request_monitor_bridge_readiness(
+            url=(
+                "http://127.0.0.1:8000/api/runtime-incidents/"
+                "monitor-v2-bridge-readiness"
+            ),
+            token=token,
+        )
+
+    assert clients == [{"timeout": 5.0, "trust_env": False}]
+    assert token not in str(raised.value)
+    assert proxy not in str(raised.value)
+
+
+def test_bridge_readiness_requires_exact_integer_http_status():
+    class Response:
+        status_code = 200.0
+        content = b"{}"
+
+        def json(self):
+            return {
+                "available": True,
+                "schema_version": 2,
+                "contract": "production_monitor_v2",
+                "capture_selector": "included",
+                "notification_channel": "enabled",
+                "notification_selector": "included",
+                "agent_channel": "enabled",
+                "agent_selector": "included",
+                "notification_watermark": "configured",
+            }
+
+    with pytest.raises(MonitorIntakeError, match="transport_unavailable"):
+        request_monitor_bridge_readiness(
+            url=(
+                "http://127.0.0.1:8000/api/runtime-incidents/"
+                "monitor-v2-bridge-readiness"
+            ),
+            token="r" * 43,
+            request=lambda **kwargs: Response(),
+        )
+
+
+def test_bridge_readiness_accepts_closed_invalid_watermark_refusal():
+    payload = {
+        "available": False,
+        "schema_version": 2,
+        "contract": "production_monitor_v2",
+        "capture_selector": "included",
+        "notification_channel": "enabled",
+        "notification_selector": "included",
+        "agent_channel": "enabled",
+        "agent_selector": "included",
+        "notification_watermark": "invalid_refused",
+    }
+
+    class Response:
+        status_code = 200
+        content = b"{}"
+
+        def json(self):
+            return payload
+
+    assert request_monitor_bridge_readiness(
+        url=(
+            "http://127.0.0.1:8000/api/runtime-incidents/"
+            "monitor-v2-bridge-readiness"
+        ),
+        token="r" * 43,
+        request=lambda **kwargs: Response(),
+    ) == payload
+
+
+def test_bridge_readiness_agent_unavailable_does_not_close_deterministic_bridge():
+    payload = {
+        "available": True,
+        "schema_version": 2,
+        "contract": "production_monitor_v2",
+        "capture_selector": "included",
+        "notification_channel": "enabled",
+        "notification_selector": "included",
+        "agent_channel": "disabled",
+        "agent_selector": "excluded",
+        "notification_watermark": "configured",
+    }
+
+    class Response:
+        status_code = 200
+        content = b"{}"
+
+        def json(self):
+            return payload
+
+    assert request_monitor_bridge_readiness(
+        url=(
+            "http://127.0.0.1:8000/api/runtime-incidents/"
+            "monitor-v2-bridge-readiness"
+        ),
+        token="r" * 43,
+        request=lambda **kwargs: Response(),
+    ) == payload
 
 
 def test_fixed_fallback_uses_authenticated_loopback_proxy_only():

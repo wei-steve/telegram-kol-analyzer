@@ -11,7 +11,7 @@ UMask=0077
 WorkingDirectory=/var/lib/telegram-kol-monitor-v2/snapshot
 EnvironmentFile=/etc/telegram-kol-monitor-snapshot.credentials
 Environment=DEEPCOIN_BASE_URL=https://api.deepcoin.com
-ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research refresh-production-monitor-snapshot --manifest-path /var/lib/telegram-kol-monitor-v2/snapshot/manifest.json --wall-clock-timeout-seconds 45
+ExecStart=/opt/telegram-kol-monitor-v2/current/.venv/bin/telegram-kol-research refresh-production-monitor-snapshot --manifest-path /var/lib/telegram-kol-monitor-v2/snapshot/manifest.json --wall-clock-timeout-seconds 45
 
 AmbientCapabilities=
 CapabilityBoundingSet=
@@ -41,6 +41,4 @@ SystemCallErrorNumber=EPERM
 SystemCallFilter=@system-service
 SystemCallFilter=~@mount @privileged
 TemporaryFileSystem=/opt/telegram-kol-analyzer:ro
-BindReadOnlyPaths=/opt/telegram-kol-analyzer/.venv
-BindReadOnlyPaths=/opt/telegram-kol-analyzer/src
 ReadWritePaths=/var/lib/telegram-kol-monitor-v2/snapshot

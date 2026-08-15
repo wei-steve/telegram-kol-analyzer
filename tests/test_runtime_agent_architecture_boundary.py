@@ -41,7 +41,13 @@ ALLOWED_PACKAGE_IMPORTS_BY_MODULE = {
         {"models", "runtime_agent_playbooks", "runtime_incident_handoff"}
     ),
     "runtime_incident_adapters.py": frozenset(
-        {"config", "message_operation_types", "models", "runtime_incidents"}
+        {
+            "config",
+            "message_operation_types",
+            "models",
+            "production_monitor_contract",
+            "runtime_incidents",
+        }
     ),
     "runtime_agent_contracts.py": frozenset(),
     "runtime_agent_tools.py": frozenset(

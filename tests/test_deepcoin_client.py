@@ -16,6 +16,9 @@ from telegram_kol_research.deepcoin_client import DeepcoinRequestScope
 from telegram_kol_research.deepcoin_client import DeepcoinTpslWriteLimiter
 from telegram_kol_research.deepcoin_client import build_deepcoin_auth_headers
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
+from telegram_kol_research.deepcoin_client import (
+    build_deepcoin_monitor_snapshot_client_from_env,
+)
 from telegram_kol_research.deepcoin_client import load_deepcoin_credentials
 from telegram_kol_research.deepcoin_client import _raise_for_deepcoin_business_error
 from telegram_kol_research.deepcoin_request_governor import (
@@ -23,6 +26,43 @@ from telegram_kol_research.deepcoin_request_governor import (
     GovernorMode,
 )
 from telegram_kol_research.deepcoin_request_policy import RequestPriority
+
+
+def test_monitor_snapshot_transport_ignores_proxy_and_ca_environment(monkeypatch):
+    constructed: list[dict[str, object]] = []
+
+    class Client(_CapturingHttpClient):
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+            super().__init__({"code": "0", "data": []})
+
+    monkeypatch.setattr(httpx, "Client", Client)
+    environment = {
+        "DEEPCOIN_API_KEY": "monitor-key",
+        "DEEPCOIN_API_SECRET": "monitor-secret",
+        "DEEPCOIN_API_PASSPHRASE": "monitor-passphrase",
+        "HTTPS_PROXY": "http://proxy.example.invalid:8080",
+        "ALL_PROXY": "socks5://proxy.example.invalid:1080",
+        "SSL_CERT_FILE": "/untrusted/proxy-ca.pem",
+        "REQUESTS_CA_BUNDLE": "/untrusted/requests-ca.pem",
+    }
+
+    monitor = build_deepcoin_monitor_snapshot_client_from_env(
+        environ=environment,
+        env_file_paths=[],
+    )
+    assert monitor.read_positions() == {"code": "0", "data": []}
+    monitor.close()
+
+    ordinary = build_deepcoin_client_from_env(
+        environ=environment,
+        env_file_paths=[],
+    )
+    assert ordinary.read_positions() == {"code": "0", "data": []}
+    ordinary.close()
+
+    assert constructed[0]["trust_env"] is False
+    assert "trust_env" not in constructed[1]
 
 
 class _FakeResponse:

@@ -463,11 +463,28 @@ business identifier, fingerprint, or arbitrary summary. The installer copies
 only this token and the exact capture allowlist into the monitor environment;
 it does not copy provider, exchange, Agent, or business credentials.
 
-Use the authenticated GET endpoint
-`/api/runtime-incidents/monitor-capture-health` for deployment validation. It
-performs no source scan and no database write. Never use an empty POST as a
-health probe: every accepted capture POST intentionally runs the bounded
-durable-source scan after processing its monitor projection.
+For monitor v2, use the authenticated GET endpoint
+`/api/runtime-incidents/monitor-v2-bridge-readiness` for deployment validation.
+It returns the closed schema-v2 contract plus exact capture, deterministic
+notification and Agent selector states, separate channel-enabled states, and
+notification-watermark validity. Absent selectors are always reported as
+`legacy_all_refused`, even while their channel is disabled; a fail-closed
+SQLite-maximum watermark is reported as `invalid_refused`, not configured. It performs
+no source scan, database read/write, claim, Agent queue, or delivery. Follow the
+four policy stages in `docs/production-monitor-v2-runbook.md`; capture is widened
+before notification/Agent selectors, and the safe watermark plus zero existing
+`production_monitor_incident` rows are proved before either downstream selector
+is widened. Never use an empty POST as a health probe: every accepted capture
+POST is real incident intake and intentionally runs the bounded durable-source
+scan after processing its monitor projection.
+
+Bridge readiness is an activation/deployment gate and an independent channel-
+health fact only. It must never be copied into monitor `adapter_failures` or
+used to make otherwise complete anomaly evidence `UNKNOWN`. After activation,
+a confirmed new episode still enters the existing intake and deterministic-
+notification SLA if capture or notification policy becomes unavailable. Agent
+disabled, queueing, retry, or timeout state never blocks that intake or its
+deterministic notification path and never creates a duplicate ordinary alert.
 
 Failure of this loopback writer is fail-open for monitoring: the independent
 monitor result and operator alert remain authoritative, while the missing

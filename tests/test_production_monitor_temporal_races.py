@@ -1046,16 +1046,16 @@ def test_shadow_only_cli_disables_intake_fallback_and_agent_queue(tmp_path, monk
     from telegram_kol_research.cli import app
 
     captured = []
+    collector_modes = []
     real_runner = run_production_monitor_sentinel
 
     def recording_runner(**kwargs):
         captured.append(kwargs["incident_router"])
         return real_runner(**kwargs)
 
-    monkeypatch.setattr(
-        cli_module,
-        "collect_production_monitor_observation",
-        lambda **_kwargs: SentinelObservation(
+    def collect(**kwargs):
+        collector_modes.append(kwargs["bridge_policy_mode"])
+        return SentinelObservation(
             checked_at=BASE,
             candidates=(
                 _candidate(
@@ -1064,7 +1064,12 @@ def test_shadow_only_cli_disables_intake_fallback_and_agent_queue(tmp_path, monk
                     generation=None,
                 ),
             ),
-        ),
+        )
+
+    monkeypatch.setattr(
+        cli_module,
+        "collect_production_monitor_observation",
+        collect,
     )
     monkeypatch.setattr(
         cli_module,
@@ -1113,6 +1118,64 @@ def test_shadow_only_cli_disables_intake_fallback_and_agent_queue(tmp_path, monk
 
     assert result.exit_code == 0, result.output
     assert captured == [None]
+    assert collector_modes == ["shadow"]
     payload = __import__("json").loads(result.stdout)
     assert payload["execution_status"] == "COMPLETED"
     assert payload["observed_health"] == "UNHEALTHY"
+    assert payload["channel_failures"] == []
+
+
+def test_runbook_stages_v2_bridge_policy_watermark_and_selectors_safely():
+    runbook = (
+        Path(__file__).parents[1] / "docs" / "production-monitor-v2-runbook.md"
+    ).read_text(encoding="utf-8")
+
+    stage_1 = runbook.index("### Policy stage 1")
+    stage_2 = runbook.index("### Policy stage 2")
+    stage_3 = runbook.index("### Policy stage 3")
+    stage_4 = runbook.index("### Policy stage 4")
+    assert stage_1 < stage_2 < stage_3 < stage_4
+    for setting in (
+        "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES",
+        "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_TYPES",
+        "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_AFTER_ID",
+        "TELEGRAM_KOL_RUNTIME_AGENT_TYPES",
+    ):
+        assert setting in runbook
+    assert "SELECT COALESCE(MAX(id), 0)" in runbook
+    assert "incident_type = 'production_monitor_incident'" in runbook
+    assert "systemctl restart telegram-kol.service" in runbook
+    assert "systemctl is-active telegram-kol-runtime-agent.service" in runbook
+    assert "systemctl is-enabled telegram-kol-runtime-agent.service" in runbook
+    assert "systemctl try-restart telegram-kol-runtime-agent.service" in runbook
+    assert "sudo systemctl restart telegram-kol-runtime-agent.service" not in runbook
+    assert "/api/runtime-incidents/monitor-v2-bridge-readiness" in runbook
+    assert "x-monitor-capture-token" in runbook
+    assert "schema_version == 2" in runbook
+    assert "empty POST" in runbook
+    assert "bridge channel health 不得写入 `adapter_failures`" in runbook
+    assert "Agent channel 不参与 `available`" in runbook
+    assert "不启用 live sentinel" not in runbook
+    assert "--header @-" in runbook
+    assert "builtin printf" in runbook
+    assert (
+        '--header "x-monitor-capture-token: '
+        "${TELEGRAM_KOL_RUNTIME_MONITOR_CAPTURE_TOKEN}"
+        not in runbook
+    )
+    assert runbook.index("record the exclusive notification watermark") < stage_4
+    assert runbook.index("zero production_monitor_incident rows") < stage_4
+
+    unit = (
+        Path(__file__).parents[1] / "deploy/systemd/telegram-kol-sentinel.service"
+    ).read_text(encoding="utf-8")
+    live_exec = next(
+        line.removeprefix("ExecStart=")
+        for line in unit.splitlines()
+        if line.startswith("ExecStart=")
+    )
+    shadow_exec = live_exec.replace(
+        "/sentinel-v2.json",
+        "/shadow-sentinel-v2.json",
+    ) + " --shadow-only"
+    assert f"ExecStart={shadow_exec}" in runbook

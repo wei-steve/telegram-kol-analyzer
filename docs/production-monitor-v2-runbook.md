@@ -83,6 +83,246 @@ sudo jq '{latest_attempt:(.latest_attempt|{generation,outcome,
 
 不要用 `cat` 或 `journalctl -o cat` 输出原始快照、原始事故证据或环境文件。
 
+## Sealed runtime dependency cache
+
+这一节只能在 Task 11 获得普通代码部署的明确批准后执行；本地审查不得执行。
+它只预热 Monitor v2 自己的依赖缓存，不启动、启用或重启任何 service/timer。
+预热需要访问 Python 包索引，但不得携带 Deepcoin、Telegram、代理或自定义 CA 环境变量。
+`APPROVED_SHA` 必须是本次明确批准的完整 40 位 SHA，且生产 checkout 必须已由既定部署流程
+更新并保持 clean：
+
+```bash
+set -euo pipefail
+PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+PRODUCTION_ROOT=/opt/telegram-kol-analyzer
+BUILD_CACHE_TRUST_ANCHOR=/var/cache
+BUILD_CACHE_PARENT=/var/cache/telegram-kol-monitor-v2-build
+BUILD_CACHE=/var/cache/telegram-kol-monitor-v2-build/uv
+APPROVED_SHA='<approved-40-character-sha>'
+PYTHON_PATH="$(readlink -f "$(command -v python3.12)")"
+UV_PATH="$(readlink -f "$(command -v uv)")"
+for TRUSTED_TOOL in "$PYTHON_PATH" "$UV_PATH"; do
+  TOOL_MODE="$(stat -c %a "$TRUSTED_TOOL")"
+  test -f "$TRUSTED_TOOL"
+  test ! -L "$TRUSTED_TOOL"
+  test "$(stat -c %u "$TRUSTED_TOOL")" = 0
+  test "$(stat -c %h "$TRUSTED_TOOL")" = 1
+  (( (8#$TOOL_MODE & 8#022) == 0 ))
+done
+"$PYTHON_PATH" -I -S -c \
+  'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)'
+ANCHOR_MODE="$(stat -c %a "$BUILD_CACHE_TRUST_ANCHOR")"
+test -d "$BUILD_CACHE_TRUST_ANCHOR"
+test ! -L "$BUILD_CACHE_TRUST_ANCHOR"
+test "$(stat -c %u "$BUILD_CACHE_TRUST_ANCHOR")" = 0
+(( (8#$ANCHOR_MODE & 8#022) == 0 ))
+for CACHE_COMPONENT in "$BUILD_CACHE_PARENT" "$BUILD_CACHE"; do
+  if sudo /usr/bin/test -e "$CACHE_COMPONENT" ||
+     sudo /usr/bin/test -L "$CACHE_COMPONENT"; then
+    COMPONENT_MODE="$(sudo /usr/bin/stat -c %a "$CACHE_COMPONENT")"
+    sudo /usr/bin/test -d "$CACHE_COMPONENT"
+    sudo /usr/bin/test ! -L "$CACHE_COMPONENT"
+    test "$(sudo /usr/bin/stat -c %u "$CACHE_COMPONENT")" = 0
+    (( (8#$COMPONENT_MODE & 8#022) == 0 ))
+  fi
+done
+test "$(git -C "$PRODUCTION_ROOT" rev-parse --verify HEAD)" = "$APPROVED_SHA"
+git -C "$PRODUCTION_ROOT" diff --quiet "$APPROVED_SHA" -- .
+git -C "$PRODUCTION_ROOT" diff --cached --quiet "$APPROVED_SHA" -- .
+test -z "$(git -C "$PRODUCTION_ROOT" ls-files --others --exclude-standard -- .)"
+PREWARM_ROOT=''
+cleanup_monitor_prewarm() {
+  case "$PREWARM_ROOT" in
+    /var/tmp/telegram-kol-monitor-v2-prewarm.??????)
+      sudo rm -rf -- "$PREWARM_ROOT"
+      ;;
+    *)
+      echo 'refusing unsafe prewarm cleanup path' >&2
+      return 1
+      ;;
+  esac
+}
+trap cleanup_monitor_prewarm EXIT
+PREWARM_ROOT="$(sudo /usr/bin/mktemp -d \
+  /var/tmp/telegram-kol-monitor-v2-prewarm.XXXXXX)"
+sudo install -d -o root -g root -m 0700 "$BUILD_CACHE_PARENT" "$BUILD_CACHE"
+sudo install -d -o root -g root -m 0700 "$PREWARM_ROOT/source"
+git -C "$PRODUCTION_ROOT" archive "$APPROVED_SHA" |
+  sudo tar --no-same-owner -x -C "$PREWARM_ROOT/source"
+PREWARM_VALIDATOR="$PREWARM_ROOT/source/scripts/validate_production_monitor_uv_cache.py"
+PREWARM_SOURCE_PROBLEM="$(
+  sudo find "$PREWARM_ROOT/source" -xdev \
+    \( ! -user root -o -perm /022 -o -type l \) -print -quit
+)"
+test -z "$PREWARM_SOURCE_PROBLEM"
+VALIDATOR_MODE="$(sudo stat -c %a "$PREWARM_VALIDATOR")"
+sudo test -f "$PREWARM_VALIDATOR"
+sudo test ! -L "$PREWARM_VALIDATOR"
+test "$(sudo stat -c %u "$PREWARM_VALIDATOR")" = 0
+test "$(sudo stat -c %h "$PREWARM_VALIDATOR")" = 1
+(( (8#$VALIDATOR_MODE & 8#022) == 0 ))
+sudo /usr/bin/python3 \
+  "$PREWARM_ROOT/source/scripts/validate_production_monitor_uv_cache.py" \
+  --cache-root "$BUILD_CACHE" \
+  --trust-anchor "$BUILD_CACHE_TRUST_ANCHOR" \
+  --expected-owner-uid 0
+
+sudo env -i HOME=/root PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  UV_CACHE_DIR="$BUILD_CACHE" UV_LINK_MODE=copy UV_NO_CONFIG=1 \
+  UV_NO_MANAGED_PYTHON=1 UV_PYTHON="$PYTHON_PATH" \
+  UV_BUILD_CONSTRAINT="$PREWARM_ROOT/source/config/production-monitor-build-constraints.txt" \
+  "$UV_PATH" sync --project "$PREWARM_ROOT/source" --locked --no-dev
+sudo env -i HOME=/root PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  UV_CACHE_DIR="$BUILD_CACHE" UV_NO_CONFIG=1 UV_NO_MANAGED_PYTHON=1 \
+  "$UV_PATH" cache prune --ci
+sudo /usr/bin/python3 \
+  "$PREWARM_ROOT/source/scripts/validate_production_monitor_uv_cache.py" \
+  --cache-root "$BUILD_CACHE" \
+  --trust-anchor "$BUILD_CACHE_TRUST_ANCHOR" \
+  --expected-owner-uid 0
+
+sudo rm -rf -- "$PREWARM_ROOT/source/.venv"
+sudo env -i HOME=/root PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  UV_CACHE_DIR="$BUILD_CACHE" UV_LINK_MODE=copy UV_NO_CONFIG=1 \
+  UV_NO_MANAGED_PYTHON=1 UV_PYTHON="$PYTHON_PATH" UV_OFFLINE=1 \
+  UV_BUILD_CONSTRAINT="$PREWARM_ROOT/source/config/production-monitor-build-constraints.txt" \
+  UV_PROJECT_ENVIRONMENT="$PREWARM_ROOT/offline-venv" \
+  "$UV_PATH" sync --project "$PREWARM_ROOT/source" --locked --offline --no-dev
+sudo env -i HOME=/root PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  UV_CACHE_DIR="$BUILD_CACHE" UV_NO_CONFIG=1 UV_NO_MANAGED_PYTHON=1 \
+  "$UV_PATH" cache prune --ci
+sudo /usr/bin/python3 \
+  "$PREWARM_ROOT/source/scripts/validate_production_monitor_uv_cache.py" \
+  --cache-root "$BUILD_CACHE" \
+  --trust-anchor "$BUILD_CACHE_TRUST_ANCHOR" \
+  --expected-owner-uid 0
+cleanup_monitor_prewarm
+trap - EXIT
+```
+
+任一步失败都停止，不运行 installer。尤其不能把普通用户的 `~/.cache/uv` 或共享
+`/var/cache/uv` 直接交给 installer；标准 uv cache 内部的相对 symlink 只有在解析后仍
+完全位于上述 root-owned 专用 cache 内时才合法。离开 cache、断链、所有权不符或
+group/other 可写都会 fail closed。
+
+## Runtime Incident bridge 的四段 policy staging
+
+这四段只是 Task 11 获得单独生产授权后的操作顺序；本地审查期间不执行。
+每次修改 root-owned runtime policy 前都要重新证明安全窗口。`systemctl daemon-reload`
+不会重读主服务的环境变量；因此下面所说的 policy reload 是已审查的
+`systemctl restart telegram-kol.service`，不是只跑 daemon-reload。每次 restart 后先证明
+主服务、Telegram intake 和对账恢复，再继续。
+
+### Policy stage 1 — 先把 legacy-all 变成明确 allowlist
+
+保持 `TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES` 完全不变。把
+`TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_TYPES` 和
+`TELEGRAM_KOL_RUNTIME_AGENT_TYPES` 设成“当前已批准的旧 incident types”的精确列表，
+且两个列表都不得包含 `production_monitor_incident`。缺省 selector 表示
+legacy-all，不能用于这次 staging。在安全窗口内依次执行：
+
+```bash
+systemctl is-active telegram-kol-runtime-agent.service
+systemctl is-enabled telegram-kol-runtime-agent.service
+sudo systemctl restart telegram-kol.service
+sudo systemctl try-restart telegram-kol-runtime-agent.service
+```
+
+先把 Agent 的 active/enabled 结果写入当次脱敏基线。`try-restart` 只能重启本来
+active 的 Agent，不会启动本来 inactive 的单元；命令后的 active/enabled 必须与
+基线一致。主服务 restart 也必须已由 Task 11 的普通生产部署/policy 变更
+边界明确批准；本地审查、Batch 119 或任何之前的“同意”都不替代该授权。
+验证旧 selector 内的事故仍按原政策处理，且没有任何未批准类型可被
+Telegram 或 Agent claim。如果 Agent 本来未启用，保持未启用，但 selector 仍必须
+显式且排除 monitor 类型。
+
+### Policy stage 2 — 记录安全水位
+
+先证明所有当前应发的 deterministic notification 已终态，Agent 没有正在
+claim/诊断的事故。然后用 SQLite `mode=ro` 事务只读取证，不得手改数据库：
+
+```sql
+SELECT COALESCE(MAX(id), 0) FROM runtime_incidents;
+SELECT COUNT(*) FROM runtime_incidents
+ WHERE incident_type = 'production_monitor_incident';
+```
+
+第一个值是要 **record the exclusive notification watermark** 的安全基线；第二个值
+必须为 0，也就是 **zero production_monitor_incident rows**。把第一个值写入
+root-owned policy 的 `TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_AFTER_ID`，保持两个
+selector 仍排除 monitor，然后在安全窗口重启主服务。不得通过设水位
+跳过任何尚未终态的旧通知。Agent 没有同等的全局 ID 水位，所以“新类型行为
+0”是后面放宽 Agent selector 的必要门禁。
+bridge 如果把水位报成 `absent` 或 `invalid_refused` 都必须停止；后者包括配置
+解析失败后的 fail-closed SQLite 最大值，不能冒充已设好的安全水位。
+
+### Policy stage 3 — capture-only shadow 和真正的无副作用 GET
+
+只把 `production_monitor_incident` 加入
+`TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES`；Telegram 和 Agent selector 仍明确排除它，
+安全水位不变。重启主服务后，用认证的本机 GET 读取：
+
+```bash
+set +x
+builtin printf 'x-monitor-capture-token: %s\n' \
+  "$TELEGRAM_KOL_RUNTIME_MONITOR_CAPTURE_TOKEN" \
+  | curl --fail --silent --show-error --request GET --header @- \
+  http://127.0.0.1:8000/api/runtime-incidents/monitor-v2-bridge-readiness \
+  | jq -e '.schema_version == 2 and .contract == "production_monitor_v2" and
+    .available == false and .capture_selector == "included" and
+    (.notification_channel == "enabled" or .notification_channel == "disabled") and
+    .notification_selector == "excluded" and .agent_selector == "excluded" and
+    (.agent_channel == "enabled" or .agent_channel == "disabled") and
+    .notification_watermark == "configured"'
+```
+
+token 只能由 root-owned policy 进入当前 root shell，必须关闭 shell tracing，不得
+echo/记录 token。上面用 shell builtin 把 header 通过 stdin 传给 curl，token 不得
+出现在 curl argv、临时文件、错误输出或进程列表。这个 endpoint 只验证 contract v2 以及 capture、notification、Agent
+selectors，不读写 ledger，不 claim，不投递。禁止用 **empty POST** 或任何
+`monitor-capture` POST 当探针：POST 是真正的 incident intake，不是 no-op。
+
+bridge channel health 不得写入 `adapter_failures`，也不得改变异常证据的
+completeness、`observed_health` 或已确认新 episode 的 incident projection。Live 运行时，
+capture 或 deterministic notification 配置/通道失效必须进入原有 intake 或
+notification SLA，超期且 recheck 仍失败时才允许固定 fallback。Agent 只是独立
+channel-health 事实，无论 disabled、排队或超时都不得阻断 deterministic intake/
+notification。只有 shadow/activation 流程会因 bridge policy 不符合而停止；这是部署
+门禁，不是生产异常证据。
+
+此时才运行下一节的 `--shadow-only`。shadow CLI 会用上面的认证 GET 确认
+capture-only selector 组合，但绝不调用 POST；它仍强制 `incident_router=None`。运行前后
+重新读取水位，必须证明 runtime incident 数量、Telegram notification 水位和 Agent
+claim 水位全部不变，且 monitor 类型行仍为 0。
+
+### Policy stage 4 — 先放宽 deterministic notification，Agent 独立处理
+
+只有 capture-only shadow 验收合格，并再次证明没有旧
+`production_monitor_incident` 行后，才可把它加入
+`TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_TYPES`，同时保留 stage 2 的 exclusive
+Telegram 水位。这是 deterministic intake/notification 闭环的必需步骤。
+
+Agent selector 是独立的。只有 stage 1 基线证明 Runtime Agent 原本已经
+active/enabled，并且另外获得 Agent policy 的明确批准后，才可把
+`production_monitor_incident` 加入 `TELEGRAM_KOL_RUNTIME_AGENT_TYPES`。如果 Agent 原本
+inactive 或 disabled，保持未启用且 selector 显式排除 monitor；不得为了
+monitor cutover 启动 Agent，也不得把 selector staging 当作启用 Agent 的授权。
+
+在新的安全窗口内重启 `telegram-kol.service`。只有 Agent 基线为 active
+且本次 Agent policy 已单独批准时，才可执行
+`systemctl try-restart telegram-kol-runtime-agent.service`；原本 inactive/disabled 的单元
+必须保持原状。
+
+此时同一个 GET 必须返回 `schema_version=2`、capture selector `included`、
+notification channel `enabled`、notification selector `included`、水位 `configured`，
+且 `available=true`。Agent channel 不参与 `available`；它必须继续如实独立
+报告。已单独批准并放宽的 Agent 应显示 channel `enabled` 且 selector
+`included`；未启用或未批准的 Agent 应保持 `disabled`/`excluded`。Agent 不可用
+不得阻断 deterministic cutover 或已单独批准的 live sentinel，也不得阻断
+新确认异常进入既有 intake/notification SLA。完成这一步 GET 本身不会
+创建 incident；只有后续单独批准启用的 live sentinel 才能 POST 已确认的异常。
+
 ## 单独批准后的 no-notify shadow
 
 下列命令只能在 Task 10 后收到普通代码部署的明确批准、安全窗口
@@ -102,7 +342,7 @@ sudo systemctl edit --runtime --drop-in=shadow-only.conf --stdin \
   telegram-kol-sentinel.service <<'EOF'
 [Service]
 ExecStart=
-ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research run-production-monitor-sentinel --state-path /var/lib/telegram-kol-monitor-v2/sentinel/shadow-sentinel-v2.json --snapshot-path /var/cache/telegram-kol-monitor-v2/sentinel/snapshot.json --database-path /var/cache/telegram-kol-monitor-v2/sentinel/research-snapshot.db --checkout-path /opt/telegram-kol-analyzer --settings-url http://127.0.0.1:8000/api/trading-settings --coverage-path /var/cache/telegram-kol-monitor-v2/sentinel/coverage.json --journal-path /var/cache/telegram-kol-monitor-v2/sentinel/journal.json --expected-head ${TELEGRAM_KOL_MONITOR_EXPECTED_HEAD} --expected-auto-trade true --expected-position-limit 4 --expected-management-mode live --expected-preamble-mode live --readiness-url http://127.0.0.1:8000/api/runtime-monitor-readiness --incident-loopback-url http://127.0.0.1:8000/api/runtime-incidents/monitor-capture --shadow-only
+ExecStart=/opt/telegram-kol-monitor-v2/current/.venv/bin/telegram-kol-research run-production-monitor-sentinel --state-path /var/lib/telegram-kol-monitor-v2/sentinel/shadow-sentinel-v2.json --snapshot-path /var/cache/telegram-kol-monitor-v2/sentinel/snapshot.json --database-path /var/cache/telegram-kol-monitor-v2/sentinel/research-snapshot.db --checkout-path /opt/telegram-kol-monitor-v2/current --settings-url http://127.0.0.1:8000/api/trading-settings --coverage-path /var/cache/telegram-kol-monitor-v2/sentinel/coverage.json --journal-path /var/cache/telegram-kol-monitor-v2/sentinel/journal.json --expected-head ${TELEGRAM_KOL_MONITOR_EXPECTED_HEAD} --expected-auto-trade true --expected-position-limit 4 --expected-management-mode live --expected-preamble-mode live --readiness-url http://127.0.0.1:8000/api/runtime-monitor-readiness --incident-loopback-url http://127.0.0.1:8000/api/runtime-incidents/monitor-capture --shadow-only
 EOF
 sudo systemctl daemon-reload
 sudo systemctl start telegram-kol-sentinel.service
@@ -149,8 +389,9 @@ sudo jq '{schema_version,latest_completed_result,
    并证明没有 incident/通知/Agent claim。
 4. 先 `enable --now telegram-kol-monitor-snapshot.timer`；等到三个完整、不同、
    新鲜的代次。
-5. 再 `enable --now telegram-kol-sentinel.timer`；必须先证明身份验证的幂等
-   no-op capture 正常，才允许 Runtime Incident 拥有正常通知。
+5. 再 `enable --now telegram-kol-sentinel.timer`；必须先证明认证的只读
+   `monitor-v2-bridge-readiness` GET 和四段 policy staging 全部正常，才允许
+   Runtime Incident 拥有正常通知。不得用 capture POST 当 no-op 探针。
 6. 最后 `enable --now telegram-kol-monitor-audit.timer`。重审计不得放回五分钟
    sentinel 路径。
 7. 证明新路径稳定后再安排 Task 12 删除旧 Monitor。阶段一不删旧路径，

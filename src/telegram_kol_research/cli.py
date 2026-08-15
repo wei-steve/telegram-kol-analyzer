@@ -73,6 +73,7 @@ from telegram_kol_research.deepcoin_contract_spec_cache import (
 )
 from telegram_kol_research.deepcoin_client import (
     build_deepcoin_client_from_env,
+    build_deepcoin_monitor_snapshot_client_from_env,
     build_deepcoin_read_only_client_from_env,
 )
 from telegram_kol_research.production_monitor_refresher import (
@@ -375,7 +376,7 @@ def refresh_production_monitor_snapshot_cli(
 
     client = None
     try:
-        client = build_deepcoin_read_only_client_from_env(
+        client = build_deepcoin_monitor_snapshot_client_from_env(
             environ=dict(os.environ),
             env_file_paths=[],
         )
@@ -564,6 +565,7 @@ def run_production_monitor_sentinel_cli(
             readiness_url=readiness_url,
             incident_loopback_url=incident_loopback_url,
             monitor_capture_token=monitor_config.monitor_capture_token,
+            bridge_policy_mode="shadow" if shadow_only else "live",
         ),
         incident_router=None if shadow_only else route_incident,
     )
@@ -587,6 +589,11 @@ def run_production_monitor_sentinel_cli(
                 "observation_generation": outcome.observation_generation,
                 "persisted": outcome.persisted,
                 "failure_code": outcome.failure_code,
+                "channel_failures": (
+                    []
+                    if outcome.result is None
+                    else list(outcome.result.channel_failures)
+                ),
             },
             ensure_ascii=True,
             separators=(",", ":"),
@@ -793,6 +800,19 @@ def _monitor_evidence_url(value: str, *, expected_path: str) -> str:
     return str(parsed)
 
 
+def _monitor_localhost_get(
+    url: str,
+    *,
+    timeout: float,
+    trust_env: bool,
+    **kwargs: Any,
+) -> httpx.Response:
+    if trust_env is not False:
+        raise ValueError("monitor localhost reads must disable environment proxies")
+    with httpx.Client(timeout=timeout, trust_env=False) as client:
+        return client.get(url, **kwargs)
+
+
 def _write_monitor_evidence(path: Path, payload: object) -> None:
     encoded = (
         json.dumps(
@@ -875,10 +895,11 @@ def capture_production_monitor_local_evidence_cli(
     readiness = None
     coverage_payload: object = {}
     try:
-        readiness_response = httpx.get(
+        readiness_response = _monitor_localhost_get(
             readiness_endpoint,
             headers=headers,
             timeout=5.0,
+            trust_env=False,
         )
         if (
             readiness_response.status_code != 200
@@ -889,10 +910,11 @@ def capture_production_monitor_local_evidence_cli(
         readiness = parse_monitor_readiness_projection(readiness_payload)
         generation = readiness.service_generation
 
-        coverage_response = httpx.get(
+        coverage_response = _monitor_localhost_get(
             coverage_endpoint,
             headers=headers,
             timeout=5.0,
+            trust_env=False,
         )
         if (
             coverage_response.status_code != 200
@@ -968,10 +990,11 @@ def capture_production_monitor_local_evidence_cli(
                 journal_complete = False
                 continue
             journal_markers.append("authoritative_processor_required")
-        closing_readiness_response = httpx.get(
+        closing_readiness_response = _monitor_localhost_get(
             readiness_endpoint,
             headers=headers,
             timeout=5.0,
+            trust_env=False,
         )
         if (
             closing_readiness_response.status_code != 200
@@ -4411,7 +4434,7 @@ def _build_runtime_agent_action_handlers(
 
 
 def _read_runtime_agent_exchange_snapshot() -> dict[str, Any]:
-    with httpx.Client(timeout=20.0) as client:
+    with httpx.Client(timeout=20.0, trust_env=False) as client:
         response = client.get(
             "http://127.0.0.1:8000/api/runtime-agent/"
             "read-only-exchange-snapshot"

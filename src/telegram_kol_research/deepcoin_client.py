@@ -376,6 +376,7 @@ class DeepcoinRestClient:
         request_governor: Any | None = None,
         retry_jitter_fn: Callable[[], float] | None = None,
         read_only: bool = False,
+        trust_env: bool | None = None,
     ) -> None:
         self._credentials = credentials
         self._http_client = http_client
@@ -383,6 +384,7 @@ class DeepcoinRestClient:
         self._http_client_lock = threading.Lock()
         self._closed = False
         self._read_only = bool(read_only)
+        self._trust_env = trust_env
         self._timestamp_factory = timestamp_factory or _utc_timestamp_ms
         self._monotonic_factory = monotonic_factory or time.monotonic
         self._sleep_fn = sleep_fn or time.sleep
@@ -457,9 +459,14 @@ class DeepcoinRestClient:
             if self._closed:
                 raise DeepcoinClientError("Deepcoin client is closed")
             if self._http_client is None:
+                client_options: dict[str, Any] = {
+                    "base_url": self._credentials.base_url,
+                    "timeout": self._credentials.timeout_seconds,
+                }
+                if self._trust_env is not None:
+                    client_options["trust_env"] = self._trust_env
                 self._http_client = httpx.Client(
-                    base_url=self._credentials.base_url,
-                    timeout=self._credentials.timeout_seconds,
+                    **client_options,
                 )
             return self._http_client
 
@@ -1277,6 +1284,33 @@ def build_deepcoin_read_only_client_from_env(
         credentials,
         request_governor=governor,
         read_only=True,
+    )
+
+
+def build_deepcoin_monitor_snapshot_client_from_env(
+    environ: dict[str, str] | None = None,
+    env_file_paths: list[str | Path] | None = None,
+) -> DeepcoinRestClient:
+    """Build the isolated monitor transport without ambient proxy/CA trust."""
+
+    environment = _load_deepcoin_environment(
+        environ=environ,
+        env_file_paths=env_file_paths,
+    )
+    credentials = load_deepcoin_credentials(
+        environ=environment,
+        env_file_paths=[],
+    )
+    governor = build_deepcoin_request_governor_from_environment(
+        base_url=credentials.base_url,
+        api_key=credentials.api_key,
+        environ=environment,
+    )
+    return DeepcoinRestClient(
+        credentials,
+        request_governor=governor,
+        read_only=True,
+        trust_env=False,
     )
 
 

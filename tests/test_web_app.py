@@ -7847,6 +7847,151 @@ def test_monitor_incident_writer_health_probe_is_persistence_free(tmp_path):
         assert session.query(RuntimeIncident).count() == 0
 
 
+def test_monitor_v2_bridge_readiness_is_authenticated_read_only_and_selector_exact(
+    tmp_path, monkeypatch
+):
+    token = "m" * 43
+    side_effects = []
+    monkeypatch.setattr(
+        web_app_module,
+        "send_system_operator_bot_message",
+        lambda **kwargs: side_effects.append(kwargs),
+    )
+    app = create_web_app(
+        database_path=tmp_path / "bridge-readiness.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"production_monitor_incident"}),
+            telegram_notifications_enabled=True,
+            telegram_notification_types=frozenset(
+                {"management_partial_failed", "production_monitor_incident"}
+            ),
+            telegram_notification_after_incident_id=123,
+            agent_enabled=True,
+            agent_incident_types=frozenset(
+                {"management_partial_failed", "production_monitor_incident"}
+            ),
+            monitor_capture_token=token,
+        ),
+    )
+    client = TestClient(app, client=("127.0.0.1", 50000))
+    with app.state.session_factory() as session:
+        before = session.query(RuntimeIncident).count()
+
+    missing = client.get("/api/runtime-incidents/monitor-v2-bridge-readiness")
+    remote = TestClient(app, client=("198.51.100.8", 50000)).get(
+        "/api/runtime-incidents/monitor-v2-bridge-readiness",
+        headers={"x-monitor-capture-token": token},
+    )
+    response = client.get(
+        "/api/runtime-incidents/monitor-v2-bridge-readiness",
+        headers={"x-monitor-capture-token": token},
+    )
+
+    assert missing.status_code == remote.status_code == 404
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {
+        "available": True,
+        "schema_version": 2,
+        "contract": "production_monitor_v2",
+        "capture_selector": "included",
+        "notification_channel": "enabled",
+        "notification_selector": "included",
+        "agent_channel": "enabled",
+        "agent_selector": "included",
+        "notification_watermark": "configured",
+    }
+    with app.state.session_factory() as session:
+        assert session.query(RuntimeIncident).count() == before
+        assert session.query(MonitorFallbackDeliveryReceipt).count() == 0
+    assert side_effects == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "field", "expected", "expected_available"),
+    [
+        ({"capture_types": frozenset()}, "capture_selector", "excluded", False),
+        (
+            {"telegram_notification_types": None},
+            "notification_selector",
+            "legacy_all_refused",
+            False,
+        ),
+        (
+            {"telegram_notifications_enabled": False},
+            "notification_channel",
+            "disabled",
+            False,
+        ),
+        (
+            {
+                "telegram_notifications_enabled": False,
+                "telegram_notification_types": None,
+            },
+            "notification_selector",
+            "legacy_all_refused",
+            False,
+        ),
+        (
+            {"agent_incident_types": None},
+            "agent_selector",
+            "legacy_all_refused",
+            True,
+        ),
+        ({"agent_enabled": False}, "agent_channel", "disabled", True),
+        (
+            {"agent_enabled": False, "agent_incident_types": None},
+            "agent_selector",
+            "legacy_all_refused",
+            True,
+        ),
+        (
+            {"telegram_notification_after_incident_id": None},
+            "notification_watermark",
+            "absent",
+            False,
+        ),
+        (
+            {"telegram_notification_after_incident_id": 2**63 - 1},
+            "notification_watermark",
+            "invalid_refused",
+            False,
+        ),
+    ],
+)
+def test_monitor_v2_bridge_readiness_fails_closed_for_unsafe_policy(
+    tmp_path, overrides, field, expected, expected_available
+):
+    token = "m" * 43
+    values = {
+        "capture_types": frozenset({"production_monitor_incident"}),
+        "telegram_notifications_enabled": True,
+        "telegram_notification_types": frozenset(
+            {"management_partial_failed", "production_monitor_incident"}
+        ),
+        "telegram_notification_after_incident_id": 123,
+        "agent_enabled": True,
+        "agent_incident_types": frozenset(
+            {"management_partial_failed", "production_monitor_incident"}
+        ),
+        "monitor_capture_token": token,
+    }
+    values.update(overrides)
+    app = create_web_app(
+        database_path=tmp_path / f"unsafe-{field}.db",
+        runtime_incident_config=RuntimeIncidentConfig(**values),
+    )
+
+    response = TestClient(app, client=("127.0.0.1", 50000)).get(
+        "/api/runtime-incidents/monitor-v2-bridge-readiness",
+        headers={"x-monitor-capture-token": token},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["available"] is expected_available
+    assert response.json()[field] == expected
+
+
 def test_monitor_readiness_is_authenticated_exact_no_store_and_immutable(tmp_path):
     token = "m" * 43
     app = create_web_app(

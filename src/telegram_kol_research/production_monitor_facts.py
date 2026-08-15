@@ -30,6 +30,9 @@ from telegram_kol_research.production_monitor_policy import (
     REASON_POLICIES,
     CandidateObservation,
 )
+from telegram_kol_research.production_monitor_notifications import (
+    request_monitor_bridge_readiness,
+)
 from telegram_kol_research.production_monitor_snapshot import (
     SnapshotGeneration,
     SnapshotManifest,
@@ -102,6 +105,23 @@ _DATABASE_OWNED_REASON_CODES = frozenset(
         "stale_entry_preamble_unresolved",
     }
 )
+
+
+def _monitor_loopback_get(
+    url: str,
+    *,
+    timeout: float,
+    trust_env: bool,
+    **kwargs: Any,
+) -> Any:
+    """GET localhost evidence without inheriting proxy credentials or routes."""
+
+    if trust_env is not False:
+        raise ValueError("monitor localhost reads must disable environment proxies")
+    with httpx.Client(timeout=timeout, trust_env=False) as client:
+        return client.get(url, **kwargs)
+
+
 _COVERAGE_COUNT_FIELDS = frozenset(
     {
         "executable_messages_total", "contracts_created_total",
@@ -505,8 +525,9 @@ def collect_production_monitor_observation(
     readiness_url: str,
     incident_loopback_url: str,
     monitor_capture_token: str | None,
+    bridge_policy_mode: str = "live",
     now: datetime | None = None,
-    http_get: Callable[..., Any] = httpx.get,
+    http_get: Callable[..., Any] = _monitor_loopback_get,
 ) -> Any:
     """Collect the Task-6 adapters without submitting or notifying.
 
@@ -528,6 +549,8 @@ def collect_production_monitor_observation(
         or not 32 <= len(monitor_capture_token) <= 128
     ):
         raise ValueError("monitor capture token is invalid")
+    if bridge_policy_mode not in {"live", "shadow"}:
+        raise ValueError("monitor bridge policy mode is invalid")
 
     _validate_settings_expectations(
         expected_auto_trade_enabled=expected_auto_trade_enabled,
@@ -536,7 +559,48 @@ def collect_production_monitor_observation(
         expected_entry_preamble_mode=expected_entry_preamble_mode,
     )
     failures: set[str] = set()
+    channel_failures: set[str] = set()
     candidates: list[CandidateObservation] = []
+
+    bridge_readiness_url = incident_loopback_url.removesuffix(
+        "/monitor-capture"
+    ) + "/monitor-v2-bridge-readiness"
+    bridge: Mapping[str, object] | None = None
+    try:
+        if not monitor_capture_token:
+            raise ValueError("monitor capture token unavailable")
+        bridge = request_monitor_bridge_readiness(
+            url=bridge_readiness_url,
+            token=monitor_capture_token,
+            request=http_get,
+        )
+    except Exception:
+        if bridge_policy_mode == "shadow":
+            raise ValueError("shadow bridge policy unavailable") from None
+        channel_failures.add("bridge_readiness_unavailable")
+    if bridge is not None:
+        shadow_ready = (
+            bridge["capture_selector"] == "included"
+            and bridge["notification_selector"] == "excluded"
+            and bridge["agent_selector"] == "excluded"
+            and bridge["notification_watermark"] == "configured"
+        )
+        if bridge_policy_mode == "shadow" and not shadow_ready:
+            raise ValueError("shadow bridge policy is not capture-only")
+        if bridge_policy_mode == "live":
+            if bridge["capture_selector"] != "included":
+                channel_failures.add("runtime_incident_intake")
+            if (
+                bridge["notification_channel"] != "enabled"
+                or bridge["notification_selector"] != "included"
+                or bridge["notification_watermark"] != "configured"
+            ):
+                channel_failures.add("deterministic_notification")
+            if (
+                bridge["agent_channel"] != "enabled"
+                or bridge["agent_selector"] != "included"
+            ):
+                channel_failures.add("runtime_incident_agent")
 
     generations: tuple[SnapshotGeneration, ...] = ()
     try:
@@ -565,6 +629,7 @@ def collect_production_monitor_observation(
                 "cache-control": "no-cache",
             },
             timeout=5.0,
+            trust_env=False,
         )
         readiness_payload = _bounded_http_json(readiness_response, limit=4096)
         readiness = parse_monitor_readiness_projection(readiness_payload)
@@ -574,7 +639,11 @@ def collect_production_monitor_observation(
         failures.update({"service", "readiness"})
 
     try:
-        settings_response = http_get(settings_url, timeout=5.0)
+        settings_response = http_get(
+            settings_url,
+            timeout=5.0,
+            trust_env=False,
+        )
         settings_payload = _bounded_http_json(settings_response, limit=65_536)
         candidates.extend(
             build_settings_candidates(
@@ -635,12 +704,14 @@ def collect_production_monitor_observation(
             checked_at=checked_at,
             candidates=(),
             adapter_failures=tuple(sorted(failures | {"events"})),
+            channel_failures=tuple(sorted(channel_failures)),
         )
 
     return SentinelObservation(
         checked_at=checked_at,
         candidates=tuple(candidates),
         adapter_failures=tuple(sorted(failures)),
+        channel_failures=tuple(sorted(channel_failures)),
     )
 
 
