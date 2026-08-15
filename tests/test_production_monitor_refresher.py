@@ -3,6 +3,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from contextlib import contextmanager
 import inspect
+import signal
+import threading
+import time
 
 import pytest
 
@@ -32,6 +35,12 @@ class RecordingDeepcoinClient:
         self.responses = responses or {}
         self.failures = failures or {}
         self.uid_scope_hash = uid_scope_hash
+        self.request_scopes = []
+
+    @contextmanager
+    def request_scope(self, scope):
+        self.request_scopes.append(scope)
+        yield self
 
     def _read(self, name: str):
         self.calls.append(name)
@@ -57,6 +66,25 @@ class RecordingDeepcoinClient:
 
     def set_position_sltp(self, payload):
         pytest.fail("refresher reached an exchange write method")
+
+
+class _MissingScopeDeepcoinClient:
+    uid_scope_hash = UID_HASH
+
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def read_positions(self, *, inst_id=None):
+        self.calls.append("read_positions")
+        return {"data": []}
+
+    def read_open_orders(self, *, inst_id=None):
+        self.calls.append("read_open_orders")
+        return {"data": []}
+
+    def read_trigger_orders_pending(self, *, inst_id):
+        self.calls.append("read_trigger_orders_pending")
+        return {"data": []}
 
 
 class _AdvancingClock:
@@ -123,6 +151,34 @@ class _OversizedStreamingHttpClient:
         yield self.response
 
 
+class _SlowDripResponse:
+    status_code = 200
+    headers = {}
+
+    def __init__(self):
+        self.yielded = 0
+
+    def iter_raw(self):
+        self.yielded += 1
+        yield b'{"code":"0","data":[]}'
+        for _ in range(100):
+            time.sleep(0.01)
+            self.yielded += 1
+            yield b" "
+
+
+class _SlowDripStreamingHttpClient:
+    def __init__(self):
+        self.response = _SlowDripResponse()
+
+    def request(self, *args, **kwargs):
+        raise AssertionError("monitor refresher must use bounded streaming HTTP")
+
+    @contextmanager
+    def stream(self, *args, **kwargs):
+        yield self.response
+
+
 def _store(path):
     return ProductionMonitorSnapshotStore(path, now_factory=lambda: NOW)
 
@@ -157,6 +213,36 @@ def test_refresher_has_no_exchange_mutation_surface(tmp_path):
         "read_open_orders",
         "read_trigger_orders_pending",
     }
+
+
+def test_read_only_wrapper_requires_request_scope_before_any_exchange_read():
+    transport = _MissingScopeDeepcoinClient()
+
+    with pytest.raises(
+        ProductionMonitorRefreshConfigurationError,
+        match="request_scope",
+    ):
+        ReadOnlyDeepcoinMonitorClient(transport)
+
+    assert transport.calls == []
+
+
+def test_refresher_rejects_client_without_monitor_scope_before_exchange_read(
+    tmp_path,
+):
+    client = _MissingScopeDeepcoinClient()
+
+    with pytest.raises(
+        ProductionMonitorRefreshConfigurationError,
+        match="monitor read scope",
+    ):
+        refresh_production_monitor_snapshot(
+            client=client,
+            store=_store(tmp_path / "snapshot.json"),
+            now=NOW,
+        )
+
+    assert client.calls == []
 
 
 def test_refresher_module_contains_no_exchange_write_names_or_paths():
@@ -329,7 +415,7 @@ def test_refresher_validates_scope_and_advances_attempt_generation(tmp_path):
 
 
 def test_refresher_wall_clock_timeout_seals_failure_and_stops_more_reads(tmp_path):
-    ticks = iter((0.0, 0.1, 1.1, 1.2))
+    ticks = iter((0.0, 0.1, 0.2, 1.1))
     client = RecordingDeepcoinClient()
 
     outcome = _refresh(
@@ -421,3 +507,74 @@ def test_refresher_seals_oversized_wire_response_as_snapshot_size_exceeded(tmp_p
     assert outcome.snapshot_outcome == "FAILURE"
     assert outcome.failure_code == "snapshot_size_exceeded"
     assert http_client.response.yielded == 2
+
+
+def test_refresher_interrupts_slow_drip_at_total_wall_clock_deadline(tmp_path):
+    http_client = _SlowDripStreamingHttpClient()
+    transport = DeepcoinRestClient(
+        DeepcoinCredentials(
+            api_key="monitor-key",
+            api_secret="secret",
+            passphrase="pass",
+            timeout_seconds=15.0,
+        ),
+        http_client=http_client,
+        read_only=True,
+    )
+
+    started = time.monotonic()
+    outcome = refresh_production_monitor_snapshot(
+        client=ReadOnlyDeepcoinMonitorClient(transport),
+        store=_store(tmp_path / "snapshot.json"),
+        now=NOW,
+        wall_clock_timeout_seconds=0.05,
+    )
+    elapsed = time.monotonic() - started
+
+    assert outcome.execution_status == "COMPLETED"
+    assert outcome.snapshot_outcome == "FAILURE"
+    assert outcome.failure_code == "wall_clock_timeout"
+    assert elapsed < 0.25
+    assert http_client.response.yielded < 25
+
+
+def test_refresher_fails_closed_off_main_thread_before_exchange_read(tmp_path):
+    client = RecordingDeepcoinClient()
+    captured: list[object] = []
+
+    def run():
+        try:
+            captured.append(_refresh(client, _store(tmp_path / "snapshot.json")))
+        except BaseException as exc:
+            captured.append(exc)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    worker.join(timeout=1.0)
+
+    assert worker.is_alive() is False
+    assert len(captured) == 1
+    assert isinstance(captured[0], ProductionMonitorRefreshConfigurationError)
+    assert "main thread" in str(captured[0])
+    assert client.calls == []
+
+
+@pytest.mark.skipif(
+    not all(hasattr(signal, name) for name in ("getitimer", "setitimer", "ITIMER_REAL")),
+    reason="POSIX interval timers are unavailable",
+)
+def test_refresher_fails_closed_when_process_timer_is_already_active(tmp_path):
+    if signal.getitimer(signal.ITIMER_REAL) != (0.0, 0.0):
+        pytest.skip("test process already owns the real-time interval timer")
+    client = RecordingDeepcoinClient()
+    signal.setitimer(signal.ITIMER_REAL, 5.0)
+    try:
+        with pytest.raises(
+            ProductionMonitorRefreshConfigurationError,
+            match="timer conflict",
+        ):
+            _refresh(client, _store(tmp_path / "snapshot.json"))
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+
+    assert client.calls == []

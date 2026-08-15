@@ -1,4 +1,5 @@
 from typer.testing import CliRunner
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 import json
@@ -822,6 +823,10 @@ def test_production_monitor_snapshot_cli_is_environment_only_and_emits_bounded_j
     class ReadClient:
         uid_scope_hash = "a" * 64
 
+        @contextmanager
+        def request_scope(self, scope):
+            yield self
+
         def read_positions(self, *, inst_id=None):
             return {"data": []}
 
@@ -880,6 +885,10 @@ def test_production_monitor_snapshot_cli_sealed_read_failure_exits_zero(
 
     class ReadClient:
         uid_scope_hash = "a" * 64
+
+        @contextmanager
+        def request_scope(self, scope):
+            yield self
 
         def read_positions(self, *, inst_id=None):
             raise TimeoutError("secret transport detail")

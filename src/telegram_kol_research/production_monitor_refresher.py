@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from contextlib import nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import hmac
 import json
 import math
 import re
+import signal
+import threading
 import time
 from typing import Any, Protocol, runtime_checkable
 
@@ -61,6 +63,10 @@ class ReadOnlyDeepcoinMonitorClient:
                 raise ProductionMonitorRefreshConfigurationError(
                     "monitor read client is incomplete"
                 )
+        if not callable(getattr(transport, "request_scope", None)):
+            raise ProductionMonitorRefreshConfigurationError(
+                "monitor read client request_scope is required"
+            )
         self.__transport = transport
         self.uid_scope_hash = getattr(transport, "uid_scope_hash", None)
 
@@ -74,10 +80,7 @@ class ReadOnlyDeepcoinMonitorClient:
         return self.__transport.read_trigger_orders_pending(inst_id=inst_id)
 
     def _monitor_read_scope(self, *, deadline_monotonic: float):
-        scope_factory = getattr(self.__transport, "request_scope", None)
-        if not callable(scope_factory):
-            return nullcontext()
-        return scope_factory(
+        return self.__transport.request_scope(
             DeepcoinRequestScope(
                 phase="production_monitor_snapshot",
                 priority=RequestPriority.BACKGROUND,
@@ -122,6 +125,10 @@ class _ClosedReadFailure(RuntimeError):
         self.failure_code = failure_code
         self.collection = collection
         super().__init__(failure_code)
+
+
+class _MonitorWallClockDeadlineExceeded(RuntimeError):
+    """The strict deadline expired without transport timeout remapping."""
 
 
 _FIELD_ALIASES: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
@@ -190,6 +197,12 @@ def refresh_production_monitor_snapshot(
 
     timeout = _bounded_timeout(wall_clock_timeout_seconds)
     uid_scope_hash = _validated_scope_hash(getattr(client, "uid_scope_hash", None))
+    monitor_scope_factory = getattr(client, "_monitor_read_scope", None)
+    if not callable(monitor_scope_factory):
+        raise ProductionMonitorRefreshConfigurationError(
+            "monitor read scope is required"
+        )
+    _require_strict_wall_clock_guard()
     timestamp_factory = (
         (lambda: now) if now is not None else (lambda: datetime.now(UTC))
     )
@@ -226,6 +239,7 @@ def refresh_production_monitor_snapshot(
                 timeout=timeout,
                 started_monotonic=started_monotonic,
                 monotonic_factory=monotonic_factory,
+                monitor_scope_factory=monitor_scope_factory,
             )
     except ProductionMonitorRefreshError:
         raise
@@ -246,6 +260,7 @@ def _refresh_production_monitor_snapshot_under_lease(
     timeout: float,
     started_monotonic: float,
     monotonic_factory: Callable[[], float],
+    monitor_scope_factory: Callable[..., Any],
 ) -> ProductionMonitorRefreshOutcome:
     """Capture and seal while the caller holds the cross-process lease."""
 
@@ -282,43 +297,49 @@ def _refresh_production_monitor_snapshot_under_lease(
     )
     collections: list[SnapshotCollectionEvidence] = []
     failure: _ClosedReadFailure | None = None
-    scope_factory = getattr(client, "_monitor_read_scope", None)
-    monitor_scope = (
-        scope_factory(deadline_monotonic=deadline_monotonic)
-        if callable(scope_factory)
-        else nullcontext()
+    monitor_scope = monitor_scope_factory(
+        deadline_monotonic=deadline_monotonic
     )
-    with monitor_scope:
-        for spec in specs:
-            if _elapsed(monotonic_factory, started_monotonic) > timeout:
-                failure = _ClosedReadFailure("wall_clock_timeout")
-                break
-            try:
-                response = spec.reader()
-            except Exception as exc:
-                failure_code = _closed_exception_code(exc)
-                failure = _ClosedReadFailure(
-                    failure_code,
-                    SnapshotCollectionEvidence(
-                        name=spec.name,
-                        available=False,
-                        schema_valid=False,
-                        complete=False,
-                        page_count=0,
-                        row_count=0,
-                        rows=(),
-                        reason_code=failure_code,
-                    ),
-                )
-                break
-            if _elapsed(monotonic_factory, started_monotonic) > timeout:
-                failure = _ClosedReadFailure("wall_clock_timeout")
-                break
-            try:
-                collections.append(_complete_collection(spec.name, response))
-            except _ClosedReadFailure as exc:
-                failure = exc
-                break
+    try:
+        with _strict_wall_clock_guard(
+            deadline_monotonic=deadline_monotonic,
+            monotonic_factory=monotonic_factory,
+        ):
+            with monitor_scope:
+                for spec in specs:
+                    if _elapsed(monotonic_factory, started_monotonic) > timeout:
+                        failure = _ClosedReadFailure("wall_clock_timeout")
+                        break
+                    try:
+                        response = spec.reader()
+                    except _MonitorWallClockDeadlineExceeded:
+                        raise
+                    except Exception as exc:
+                        failure_code = _closed_exception_code(exc)
+                        failure = _ClosedReadFailure(
+                            failure_code,
+                            SnapshotCollectionEvidence(
+                                name=spec.name,
+                                available=False,
+                                schema_valid=False,
+                                complete=False,
+                                page_count=0,
+                                row_count=0,
+                                rows=(),
+                                reason_code=failure_code,
+                            ),
+                        )
+                        break
+                    if _elapsed(monotonic_factory, started_monotonic) > timeout:
+                        failure = _ClosedReadFailure("wall_clock_timeout")
+                        break
+                    try:
+                        collections.append(_complete_collection(spec.name, response))
+                    except _ClosedReadFailure as exc:
+                        failure = exc
+                        break
+    except _MonitorWallClockDeadlineExceeded:
+        failure = _ClosedReadFailure("wall_clock_timeout")
 
     request_completed_at = _aware_utc(timestamp_factory())
     if request_completed_at < request_started_at:
@@ -479,6 +500,66 @@ def _bounded_timeout(value: object) -> float:
             "monitor refresh wall-clock timeout is invalid"
         )
     return timeout
+
+
+def _require_strict_wall_clock_guard() -> None:
+    required = ("SIGALRM", "ITIMER_REAL", "getitimer", "setitimer")
+    if any(not hasattr(signal, name) for name in required):
+        raise ProductionMonitorRefreshConfigurationError(
+            "strict POSIX wall-clock timer is unavailable"
+        )
+    if threading.current_thread() is not threading.main_thread():
+        raise ProductionMonitorRefreshConfigurationError(
+            "strict wall-clock timer requires the main thread"
+        )
+    try:
+        handler = signal.getsignal(signal.SIGALRM)
+        active_timer = signal.getitimer(signal.ITIMER_REAL)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ProductionMonitorRefreshConfigurationError(
+            "strict wall-clock timer state is unavailable"
+        ) from exc
+    if handler is not signal.SIG_DFL or any(value > 0 for value in active_timer):
+        raise ProductionMonitorRefreshConfigurationError(
+            "strict wall-clock timer conflict"
+        )
+
+
+@contextmanager
+def _strict_wall_clock_guard(
+    *,
+    deadline_monotonic: float,
+    monotonic_factory: Callable[[], float],
+):
+    _require_strict_wall_clock_guard()
+    remaining = deadline_monotonic - _finite_monotonic(monotonic_factory())
+    if remaining <= 0:
+        raise _MonitorWallClockDeadlineExceeded("monitor wall-clock deadline expired")
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    handler_installed = False
+
+    def deadline_handler(signum, frame):
+        del signum, frame
+        raise _MonitorWallClockDeadlineExceeded(
+            "monitor wall-clock deadline expired"
+        )
+
+    try:
+        signal.signal(signal.SIGALRM, deadline_handler)
+        handler_installed = True
+        signal.setitimer(signal.ITIMER_REAL, remaining)
+    except (OSError, RuntimeError, ValueError) as exc:
+        if handler_installed:
+            signal.signal(signal.SIGALRM, previous_handler)
+        raise ProductionMonitorRefreshConfigurationError(
+            "strict wall-clock timer cannot be armed"
+        ) from exc
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def _aware_utc(value: object) -> datetime:
