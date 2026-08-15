@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import UTC, datetime, timedelta
@@ -19,7 +18,6 @@ import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import quote
-import weakref
 
 from telegram_kol_research.deepcoin_client import (
     DEEPCOIN_BOUND_CLOSE_RESERVATION_RECOVERY_PHASE,
@@ -30,6 +28,10 @@ from telegram_kol_research.deepcoin_client import (
     _claim_bound_close_reservation_recovery_transport,
 )
 from telegram_kol_research.deepcoin_request_policy import RequestPriority
+from telegram_kol_research.deepcoin_snapshot_authority import (
+    ExchangeCollectionEvidence,
+    build_exchange_collection_evidence,
+)
 
 
 RECOVERY_SCHEMA_VERSION = 1
@@ -683,7 +685,7 @@ _REASONS_BY_CLASSIFICATION = {
 }
 
 
-@dataclass(frozen=True, slots=True, weakref_slot=True)
+@dataclass(frozen=True, slots=True)
 class BoundCloseReservationObservation:
     reservation_ref: str
     classification: ReservationClassification
@@ -704,64 +706,6 @@ class BoundCloseReservationObservation:
             self.exchange_fingerprint,
             "exchange_fingerprint",
         )
-
-
-class _ObservationProvenance:
-    __slots__ = (
-        "capture_completed_at",
-        "exchange",
-        "local",
-        "observation_ref",
-    )
-
-    def __init__(
-        self,
-        *,
-        observation_ref: weakref.ReferenceType[BoundCloseReservationObservation],
-        local: LocalReservationEvidence,
-        exchange: ExchangeReservationEvidence,
-        capture_completed_at: datetime,
-    ) -> None:
-        self.observation_ref = observation_ref
-        self.local = local
-        self.exchange = exchange
-        self.capture_completed_at = capture_completed_at
-
-
-_MAX_OBSERVATION_PROVENANCE = MAX_RESERVATION_OBSERVATIONS * 4
-_OBSERVATION_PROVENANCE_LOCK = threading.RLock()
-_OBSERVATION_PROVENANCE: OrderedDict[int, _ObservationProvenance] = OrderedDict()
-
-
-def _register_observation_provenance(
-    observation: BoundCloseReservationObservation,
-    *,
-    local: LocalReservationEvidence,
-    exchange: ExchangeReservationEvidence,
-    capture_completed_at: datetime,
-) -> None:
-    observation_identity = id(observation)
-
-    def cleanup(
-        dead_ref: weakref.ReferenceType[BoundCloseReservationObservation],
-    ) -> None:
-        with _OBSERVATION_PROVENANCE_LOCK:
-            current = _OBSERVATION_PROVENANCE.get(observation_identity)
-            if current is not None and current.observation_ref is dead_ref:
-                _OBSERVATION_PROVENANCE.pop(observation_identity, None)
-
-    observation_ref = weakref.ref(observation, cleanup)
-    provenance = _ObservationProvenance(
-        observation_ref=observation_ref,
-        local=local,
-        exchange=exchange,
-        capture_completed_at=capture_completed_at,
-    )
-    with _OBSERVATION_PROVENANCE_LOCK:
-        _OBSERVATION_PROVENANCE[observation_identity] = provenance
-        _OBSERVATION_PROVENANCE.move_to_end(observation_identity)
-        while len(_OBSERVATION_PROVENANCE) > _MAX_OBSERVATION_PROVENANCE:
-            _OBSERVATION_PROVENANCE.popitem(last=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -859,7 +803,6 @@ _RECOVERY_OBSERVATION_KEYS = frozenset(
     }
 )
 _RECOVERY_CONFIRMATION_PREFIX = "BOUND-CLOSE-"
-_SEALED_CAPTURE_CONSTRUCTOR = object()
 _SEALED_APPLY_CLAIM_ISSUER = object()
 
 
@@ -1114,21 +1057,9 @@ class SealedRecoveryCapture(_OpaqueUncopyableCapability):
         "__source_capability",
     )
 
-    def __init__(
-        self,
-        *,
-        plan: BoundCloseReservationRecoveryPlan,
-        serialized_plan: str,
-        source_capability: object,
-        _constructor: object,
-    ) -> None:
-        if _constructor is not _SEALED_CAPTURE_CONSTRUCTOR:
-            raise TypeError("SealedRecoveryCapture cannot be constructed directly")
-        self.__apply_claimed = False
-        self.__apply_claim_lock = threading.Lock()
-        self.__plan = plan
-        self.__serialized_plan = serialized_plan
-        self.__source_capability = source_capability
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise TypeError("SealedRecoveryCapture cannot be constructed directly")
 
     @property
     def plan(self) -> BoundCloseReservationRecoveryPlan:
@@ -1186,119 +1117,444 @@ def _claim_sealed_recovery_capture_for_apply(
         )
 
 
-def _observations_match_field_for_field(
-    left: BoundCloseReservationObservation,
-    right: BoundCloseReservationObservation,
-) -> bool:
-    if (
-        type(left) is not BoundCloseReservationObservation
-        or type(right) is not BoundCloseReservationObservation
-    ):
-        return False
-    return all(
-        (
-            left.reservation_ref == right.reservation_ref,
-            left.classification is right.classification,
-            left.reason_code == right.reason_code,
-            left.source_fingerprint == right.source_fingerprint,
-            left.exchange_fingerprint == right.exchange_fingerprint,
-        )
+class _RawRecoveryCapture:
+    __slots__ = (
+        "capture_error",
+        "fills_by_order",
+        "open_orders",
+        "order_history_by_order",
+        "position_history_by_position",
+        "positions",
     )
 
+    def __init__(self) -> None:
+        self.capture_error: BaseException | None = None
+        self.positions: object = None
+        self.open_orders: object = None
+        self.order_history_by_order: dict[tuple[str, str], object] = {}
+        self.fills_by_order: dict[tuple[str, str], object] = {}
+        self.position_history_by_position: dict[tuple[str, str], object] = {}
 
-def _claim_classifier_observation_provenance(
-    *,
+
+def _recovery_capture_now() -> datetime:
+    """Internal clock; the public capture API never accepts caller timestamps."""
+
+    return datetime.now(UTC)
+
+
+def capture_and_seal_bound_close_reservation_recovery(
     source: BoundCloseReservationSource,
-    observations: tuple[BoundCloseReservationObservation, ...],
-    capture_completed_at: datetime,
-) -> None:
-    if any(
-        type(item) is not BoundCloseReservationObservation
-        for item in observations
-    ):
-        raise TypeError(
-            "observations must contain BoundCloseReservationObservation"
-        )
-    local_by_ref = {item.reservation_ref: item for item in source.reservations}
-    if len(local_by_ref) != len(source.reservations):
-        raise ValueError("source reservation references must be unique")
-    if len(observations) != len(source.reservations) or set(local_by_ref) != {
-        item.reservation_ref for item in observations
-    }:
-        raise ValueError("observations must cover the exact source population")
-
-    claims: list[tuple[int, _ObservationProvenance]] = []
-    with _OBSERVATION_PROVENANCE_LOCK:
-        for observation in observations:
-            identity = id(observation)
-            provenance = _OBSERVATION_PROVENANCE.get(identity)
-            if (
-                provenance is None
-                or provenance.observation_ref() is not observation
-            ):
-                raise ValueError(
-                    "observation has no unused classifier-issued provenance"
-                )
-            expected_local = local_by_ref.get(observation.reservation_ref)
-            if provenance.local is not expected_local:
-                raise ValueError("classifier provenance local identity mismatch")
-            if provenance.capture_completed_at != capture_completed_at:
-                raise ValueError(
-                    "classifier provenance capture_completed_at mismatch"
-                )
-            rebuilt = _classify_bound_close_reservation_pure(
-                provenance.local,
-                provenance.exchange,
-                capture_completed_at=provenance.capture_completed_at,
-            )
-            if not _observations_match_field_for_field(observation, rebuilt):
-                raise ValueError("classifier provenance observation mismatch")
-            claims.append((identity, provenance))
-        for identity, provenance in claims:
-            current = _OBSERVATION_PROVENANCE.get(identity)
-            if current is not provenance:
-                raise ValueError("classifier provenance changed during claim")
-        for identity, _ in claims:
-            _OBSERVATION_PROVENANCE.pop(identity, None)
-
-
-def _seal_bound_close_reservation_recovery_capture(
+    reader: BoundCloseReservationExchangeReader,
     *,
-    source: BoundCloseReservationSource,
-    observations: tuple[BoundCloseReservationObservation, ...],
-    capture_started_at: datetime,
-    capture_completed_at: datetime,
+    deadline_monotonic: float,
 ) -> SealedRecoveryCapture:
-    """Seal semantic evidence while retaining raw source authority in-process."""
+    """Perform one fresh bounded GET capture and issue the only apply capability."""
 
     if type(source) is not BoundCloseReservationSource:
         raise TypeError("source must be BoundCloseReservationSource")
-    if type(observations) is not tuple:
-        raise TypeError("observations must be a tuple")
-    _, completed_at = _validated_capture_times(
-        capture_started_at,
-        capture_completed_at,
+    if type(reader) is not BoundCloseReservationExchangeReader:
+        raise TypeError("reader must be the dedicated recovery reader")
+    started_at = _require_aware_utc(
+        _recovery_capture_now(),
+        "capture_started_at",
     )
-    _claim_classifier_observation_provenance(
-        source=source,
-        observations=observations,
-        capture_completed_at=completed_at,
+    raw_by_ref: dict[str, _RawReservationCapability] = {}
+    for local in source.reservations:
+        try:
+            raw = source._capability._get(local.reservation_ref)
+        except KeyError:
+            continue
+        if type(raw) is _RawReservationCapability:
+            raw_by_ref[local.reservation_ref] = raw
+    order_queries = sorted(
+        {
+            (raw.instrument_id, raw.order_id)
+            for raw in raw_by_ref.values()
+        }
     )
+    position_queries = sorted(
+        {
+            (raw.instrument_id, raw.position_id)
+            for raw in raw_by_ref.values()
+        }
+    )
+    capture = _RawRecoveryCapture()
+    try:
+        with reader.request_scope(deadline_monotonic=deadline_monotonic):
+            capture.positions = reader.read_positions()
+            capture.open_orders = reader.read_open_orders()
+            for instrument_id, order_id in order_queries:
+                key = (instrument_id, order_id)
+                capture.order_history_by_order[key] = reader.read_order_history(
+                    inst_id=instrument_id,
+                    order_id=order_id,
+                    limit=100,
+                )
+                capture.fills_by_order[key] = reader.read_trade_fills(
+                    inst_id=instrument_id,
+                    order_id=order_id,
+                    limit=100,
+                )
+            for instrument_id, position_id in position_queries:
+                key = (instrument_id, position_id)
+                capture.position_history_by_position[
+                    key
+                ] = reader.read_position_history(
+                    inst_id=instrument_id,
+                    pos_id=position_id,
+                )
+    except Exception as exc:
+        capture.capture_error = exc
+    completed_at = _require_aware_utc(
+        _recovery_capture_now(),
+        "capture_completed_at",
+    )
+    _validated_capture_times(started_at, completed_at)
+    observations: list[BoundCloseReservationObservation] = []
+    for local in source.reservations:
+        exchange = _normalize_recovery_exchange_evidence(
+            local=local,
+            raw=raw_by_ref.get(local.reservation_ref),
+            capture=capture,
+        )
+        observations.append(
+            _classify_bound_close_reservation_pure(
+                local,
+                exchange,
+                capture_completed_at=completed_at,
+            )
+        )
     plan = build_bound_close_reservation_recovery_plan(
         source_fingerprint=source.source_fingerprint,
-        observations=observations,
+        observations=tuple(observations),
     )
     serialized = serialize_bound_close_reservation_recovery_plan(
         plan,
-        capture_started_at=capture_started_at,
-        capture_completed_at=capture_completed_at,
+        capture_started_at=started_at,
+        capture_completed_at=completed_at,
     )
-    return SealedRecoveryCapture(
-        plan=plan,
-        serialized_plan=serialized,
-        source_capability=source._capability,
-        _constructor=_SEALED_CAPTURE_CONSTRUCTOR,
+    sealed = object.__new__(SealedRecoveryCapture)
+    sealed._SealedRecoveryCapture__apply_claimed = False
+    sealed._SealedRecoveryCapture__apply_claim_lock = threading.Lock()
+    sealed._SealedRecoveryCapture__plan = plan
+    sealed._SealedRecoveryCapture__serialized_plan = serialized
+    sealed._SealedRecoveryCapture__source_capability = source._capability
+    return sealed
+
+
+def _unavailable_exchange_evidence(reason_code: str) -> ExchangeReservationEvidence:
+    return ExchangeReservationEvidence(
+        capture_reason_code=reason_code,
+        schema_valid=False,
+        current_positions_complete=False,
+        pending_orders_complete=False,
+        order_history_complete=False,
+        fills_complete=False,
+        position_history_complete=False,
+        order_history_at_limit=False,
+        fills_at_limit=False,
+        position_history_at_limit=False,
+        current_positions=(),
+        pending_orders=(),
+        order_history=(),
+        fills=(),
+        position_history=(),
     )
+
+
+def _normalize_recovery_exchange_evidence(
+    *,
+    local: LocalReservationEvidence,
+    raw: _RawReservationCapability | None,
+    capture: _RawRecoveryCapture,
+) -> ExchangeReservationEvidence:
+    if capture.capture_error is not None:
+        return _unavailable_exchange_evidence(
+            exchange_recovery_reason_from_error(capture.capture_error)
+        )
+    if raw is None:
+        return _unavailable_exchange_evidence("exchange_evidence_unavailable")
+    order_key = (raw.instrument_id, raw.order_id)
+    position_key = (raw.instrument_id, raw.position_id)
+    collections = {
+        "positions": build_exchange_collection_evidence(
+            endpoint="bound_close_positions",
+            response=capture.positions,
+            page_limit=100,
+        ),
+        "open_orders": build_exchange_collection_evidence(
+            endpoint="bound_close_open_orders",
+            response=capture.open_orders,
+            page_limit=100,
+        ),
+        "order_history": build_exchange_collection_evidence(
+            endpoint="bound_close_order_history",
+            response=capture.order_history_by_order.get(order_key),
+            page_limit=100,
+        ),
+        "fills": build_exchange_collection_evidence(
+            endpoint="bound_close_fills",
+            response=capture.fills_by_order.get(order_key),
+            page_limit=100,
+        ),
+        "position_history": build_exchange_collection_evidence(
+            endpoint="bound_close_position_history",
+            response=capture.position_history_by_position.get(position_key),
+            page_limit=100,
+        ),
+    }
+    schema_valid = all(
+        evidence.available and evidence.schema_valid
+        for evidence in collections.values()
+    )
+    try:
+        all_positions = _normalize_provider_positions(collections["positions"])
+        all_open_orders = _normalize_provider_orders(collections["open_orders"])
+        order_history = _normalize_provider_orders(collections["order_history"])
+        fills = _normalize_provider_fills(collections["fills"])
+        position_history = _normalize_provider_position_history(
+            collections["position_history"]
+        )
+    except (TypeError, ValueError, ArithmeticError, OverflowError):
+        schema_valid = False
+        all_positions = ()
+        all_open_orders = ()
+        order_history = ()
+        fills = ()
+        position_history = ()
+    current_positions = tuple(
+        item for item in all_positions if item.position_ref == local.position_ref
+    )
+    pending_orders = tuple(
+        item for item in all_open_orders if item.order_ref == local.close_order_ref
+    )
+    return ExchangeReservationEvidence(
+        capture_reason_code=None,
+        schema_valid=schema_valid,
+        current_positions_complete=collections["positions"].complete,
+        pending_orders_complete=collections["open_orders"].complete,
+        order_history_complete=collections["order_history"].complete,
+        fills_complete=collections["fills"].complete,
+        position_history_complete=collections["position_history"].complete,
+        order_history_at_limit=_collection_at_limit(collections["order_history"]),
+        fills_at_limit=_collection_at_limit(collections["fills"]),
+        position_history_at_limit=_collection_at_limit(
+            collections["position_history"]
+        ),
+        current_positions=current_positions,
+        pending_orders=pending_orders,
+        order_history=order_history,
+        fills=fills,
+        position_history=position_history,
+    )
+
+
+def _collection_at_limit(evidence: ExchangeCollectionEvidence) -> bool:
+    return evidence.row_count >= 100 and not evidence.complete
+
+
+def _provider_text(row: Mapping[str, Any], field_name: str) -> str:
+    value = row.get(field_name)
+    if type(value) is not str:
+        raise TypeError(f"provider {field_name} must be a string")
+    normalized = value.strip()
+    if not normalized or len(normalized.encode("utf-8")) > 256:
+        raise ValueError(f"provider {field_name} is invalid")
+    return normalized
+
+
+def _provider_identity(
+    row: Mapping[str, Any],
+    *,
+    include_order: bool,
+) -> tuple[str, str, str, str | None]:
+    instrument_id = _provider_text(row, "instId")
+    position_id = _provider_text(row, "posId")
+    side = _provider_text(row, "posSide").lower()
+    if side not in {"long", "short"}:
+        raise ValueError("provider posSide is invalid")
+    order_id = _provider_text(row, "ordId") if include_order else None
+    return (
+        _redacted_ref("instrument", instrument_id),
+        side,
+        _redacted_ref("position", position_id),
+        _redacted_ref("close_order", order_id) if order_id is not None else None,
+    )
+
+
+def _provider_decimal(
+    row: Mapping[str, Any],
+    *aliases: str,
+    positive: bool,
+) -> Decimal:
+    values = [row[name] for name in aliases if row.get(name) not in (None, "")]
+    if len(values) != 1 or type(values[0]) is not str:
+        raise ValueError("provider decimal alias is missing or ambiguous")
+    raw = values[0].strip()
+    if not raw or len(raw.encode("ascii", errors="ignore")) != len(raw):
+        raise ValueError("provider decimal text is invalid")
+    try:
+        parsed = Decimal(raw)
+    except Exception as exc:
+        raise ValueError("provider decimal text is invalid") from exc
+    return _require_decimal(parsed, aliases[0], positive=positive)
+
+
+def _provider_timestamp(row: Mapping[str, Any], *aliases: str) -> datetime:
+    values = [row[name] for name in aliases if row.get(name) not in (None, "")]
+    if len(values) != 1:
+        raise ValueError("provider timestamp alias is missing or ambiguous")
+    raw = values[0]
+    if type(raw) is not str or len(raw) != 13 or not raw.isascii() or not raw.isdigit():
+        raise ValueError("provider timestamp must be epoch milliseconds")
+    milliseconds = int(raw)
+    try:
+        parsed = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(
+            milliseconds=milliseconds
+        )
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("provider timestamp is out of range") from exc
+    if not datetime(2000, 1, 1, tzinfo=UTC) <= parsed <= datetime(
+        2100, 1, 1, tzinfo=UTC
+    ):
+        raise ValueError("provider timestamp is out of recovery bounds")
+    return parsed
+
+
+_PROVIDER_ORDER_STATES = {
+    "filled": ExchangeCloseOrderState.FILLED,
+    "open": ExchangeCloseOrderState.OPEN,
+    "live": ExchangeCloseOrderState.OPEN,
+    "pending": ExchangeCloseOrderState.PENDING,
+    "partially_filled": ExchangeCloseOrderState.PARTIALLY_FILLED,
+    "rejected": ExchangeCloseOrderState.REJECTED,
+    "cancelled": ExchangeCloseOrderState.CANCELLED,
+    "canceled": ExchangeCloseOrderState.CANCELLED,
+}
+
+
+def _normalize_provider_positions(
+    evidence: ExchangeCollectionEvidence,
+) -> tuple[ExchangePositionEvidence, ...]:
+    rows: list[ExchangePositionEvidence] = []
+    for row in evidence.rows:
+        instrument_ref, side, position_ref, _ = _provider_identity(
+            row,
+            include_order=False,
+        )
+        rows.append(
+            ExchangePositionEvidence(
+                instrument_ref=instrument_ref,
+                side=side,
+                position_ref=position_ref,
+                quantity=_provider_decimal(row, "sz", positive=True),
+            )
+        )
+    return tuple(rows)
+
+
+def _normalize_provider_orders(
+    evidence: ExchangeCollectionEvidence,
+) -> tuple[ExchangeOrderEvidence, ...]:
+    rows: list[ExchangeOrderEvidence] = []
+    for row in evidence.rows:
+        instrument_ref, side, position_ref, order_ref = _provider_identity(
+            row,
+            include_order=True,
+        )
+        provider_state = _provider_text(row, "state").lower()
+        state = _PROVIDER_ORDER_STATES.get(provider_state)
+        if state is None:
+            raise ValueError("provider order state is not closed")
+        terminal_at = None
+        if state not in {
+            ExchangeCloseOrderState.OPEN,
+            ExchangeCloseOrderState.PENDING,
+            ExchangeCloseOrderState.PARTIALLY_FILLED,
+        }:
+            terminal_at = _provider_timestamp(row, "uTime", "cTime")
+        rows.append(
+            ExchangeOrderEvidence(
+                instrument_ref=instrument_ref,
+                side=side,
+                position_ref=position_ref,
+                order_ref=order_ref,
+                state=state,
+                requested_quantity=_provider_decimal(row, "sz", positive=True),
+                filled_quantity=_provider_decimal(
+                    row,
+                    "accFillSz",
+                    "fillSz",
+                    positive=False,
+                ),
+                terminal_at=terminal_at,
+            )
+        )
+    return tuple(rows)
+
+
+def _normalize_provider_fills(
+    evidence: ExchangeCollectionEvidence,
+) -> tuple[ExchangeFillEvidence, ...]:
+    rows: list[ExchangeFillEvidence] = []
+    for row in evidence.rows:
+        instrument_ref, side, position_ref, order_ref = _provider_identity(
+            row,
+            include_order=True,
+        )
+        rows.append(
+            ExchangeFillEvidence(
+                instrument_ref=instrument_ref,
+                side=side,
+                position_ref=position_ref,
+                order_ref=order_ref,
+                quantity=_provider_decimal(row, "fillSz", positive=True),
+                filled_at=_provider_timestamp(
+                    row,
+                    "fillTime",
+                    "uTime",
+                    "cTime",
+                ),
+            )
+        )
+    return tuple(rows)
+
+
+def _normalize_provider_position_history(
+    evidence: ExchangeCollectionEvidence,
+) -> tuple[ExchangePositionHistoryEvidence, ...]:
+    rows: list[ExchangePositionHistoryEvidence] = []
+    for row in evidence.rows:
+        instrument_ref, side, position_ref, _ = _provider_identity(
+            row,
+            include_order=False,
+        )
+        provider_state = _provider_text(row, "state").lower()
+        try:
+            state = ExchangePositionHistoryState(provider_state)
+        except ValueError as exc:
+            raise ValueError("provider position-history state is not closed") from exc
+        closed_at = (
+            _provider_timestamp(row, "uTime", "cTime")
+            if state is ExchangePositionHistoryState.CLOSED
+            else None
+        )
+        rows.append(
+            ExchangePositionHistoryEvidence(
+                instrument_ref=instrument_ref,
+                side=side,
+                position_ref=position_ref,
+                state=state,
+                closed_quantity=_provider_decimal(
+                    row,
+                    "closeSz",
+                    "closedSize",
+                    positive=False,
+                ),
+                closed_at=closed_at,
+            )
+        )
+    return tuple(rows)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1668,20 +1924,13 @@ def classify_bound_close_reservation(
     *,
     capture_completed_at: datetime,
 ) -> BoundCloseReservationObservation:
-    """Classify and issue one exact, one-use in-process provenance record."""
+    """Pure non-authoritative classifier; it never issues apply capability."""
 
-    observation = _classify_bound_close_reservation_pure(
+    return _classify_bound_close_reservation_pure(
         local,
         exchange,
         capture_completed_at=capture_completed_at,
     )
-    _register_observation_provenance(
-        observation,
-        local=local,
-        exchange=exchange,
-        capture_completed_at=capture_completed_at,
-    )
-    return observation
 
 
 def _classify_bound_close_reservation_pure(
