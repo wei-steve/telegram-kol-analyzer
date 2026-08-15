@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError, fields, replace
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal, localcontext
+import json
 import signal
 import sqlite3
 import threading
@@ -38,12 +39,16 @@ from telegram_kol_research.bound_close_reservation_recovery import (
     LocalCloseMutationEvidence,
     LocalReservationEvidence,
     ReservationClassification,
+    SealedRecoveryCapture,
     _canonical_json,
     _sha256_json,
+    build_bound_close_reservation_recovery_plan,
     build_bound_close_reservation_exchange_reader_from_env,
     classify_bound_close_reservation,
     exchange_recovery_reason_from_error,
     load_bound_close_reservation_source,
+    seal_bound_close_reservation_recovery_capture,
+    serialize_bound_close_reservation_recovery_plan,
 )
 
 
@@ -1425,6 +1430,223 @@ def test_source_loader_loads_all_closed_active_statuses_and_exact_descendants(
     assert source.source_fingerprint == _sha256_json(
         {"reservations": source.reservations}
     )
+
+
+PLAN_CAPTURE_STARTED = datetime(2026, 8, 15, 10, 0, tzinfo=UTC)
+PLAN_CAPTURE_COMPLETED = datetime(2026, 8, 15, 10, 1, tzinfo=UTC)
+
+
+def _built_recovery_plan(
+    observations: tuple[BoundCloseReservationObservation, ...],
+    *,
+    source_fingerprint: str = FINGERPRINT_D,
+) -> BoundCloseReservationRecoveryPlan:
+    return build_bound_close_reservation_recovery_plan(
+        source_fingerprint=source_fingerprint,
+        observations=observations,
+    )
+
+
+def test_plan_builder_sorts_unique_refs_conserves_counts_and_derives_seals():
+    observations = (
+        _observation(reservation_ref=FINGERPRINT_C),
+        _observation(reservation_ref=FINGERPRINT_A),
+    )
+
+    plan = _built_recovery_plan(observations)
+    document = serialize_bound_close_reservation_recovery_plan(
+        plan,
+        capture_started_at=PLAN_CAPTURE_STARTED,
+        capture_completed_at=PLAN_CAPTURE_COMPLETED,
+    )
+    payload = json.loads(document)
+
+    assert list(payload) == sorted(
+        {
+            "action_count",
+            "capture_completed_at",
+            "capture_identity",
+            "capture_started_at",
+            "confirmation_token",
+            "counts",
+            "database_writes",
+            "evidence_fingerprint",
+            "exchange_snapshot_fingerprint",
+            "exchange_writes",
+            "history_replays",
+            "mode",
+            "observations",
+            "schema_version",
+            "source_fingerprint",
+            "status",
+        }
+    )
+    assert list(payload["counts"]) == [
+        "active",
+        "proven_terminal",
+        "total",
+        "unknown",
+    ]
+    assert [item["reservation_ref"] for item in payload["observations"]] == [
+        FINGERPRINT_A,
+        FINGERPRINT_C,
+    ]
+    assert all(
+        list(item) == [
+            "classification",
+            "exchange_fingerprint",
+            "reason_code",
+            "reservation_ref",
+            "source_fingerprint",
+        ]
+        for item in payload["observations"]
+    )
+    assert payload["counts"] == {
+        "active": 0,
+        "proven_terminal": 2,
+        "total": 2,
+        "unknown": 0,
+    }
+    assert payload["action_count"] == 2
+    assert payload["exchange_writes"] == 0
+    assert payload["history_replays"] == 0
+    assert payload["database_writes"] == 0
+    assert payload["confirmation_token"].startswith("BOUND-CLOSE-")
+    assert payload["confirmation_token"] != payload["evidence_fingerprint"]
+
+
+def test_plan_builder_refuses_mixed_population_with_zero_actions():
+    active = _observation(
+        reservation_ref=FINGERPRINT_B,
+        classification=ReservationClassification.ACTIVE,
+        reason_code="exact_position_currently_live",
+    )
+    plan = _built_recovery_plan((_observation(), active))
+    payload = json.loads(
+        serialize_bound_close_reservation_recovery_plan(
+            plan,
+            capture_started_at=PLAN_CAPTURE_STARTED,
+            capture_completed_at=PLAN_CAPTURE_COMPLETED,
+        )
+    )
+
+    assert plan.status == "refused"
+    assert plan.action_count == 0
+    assert payload["counts"] == {
+        "active": 1,
+        "proven_terminal": 1,
+        "total": 2,
+        "unknown": 0,
+    }
+
+
+def test_plan_builder_rejects_duplicate_refs_and_serializer_rejects_forgery():
+    with pytest.raises(ValueError, match="unique"):
+        _built_recovery_plan((_observation(), _observation()))
+
+    valid = _built_recovery_plan((_observation(),))
+    forged = replace(valid, confirmation_token="BOUND-CLOSE-0000000000000000")
+    with pytest.raises(ValueError, match="confirmation_token"):
+        serialize_bound_close_reservation_recovery_plan(
+            forged,
+            capture_started_at=PLAN_CAPTURE_STARTED,
+            capture_completed_at=PLAN_CAPTURE_COMPLETED,
+        )
+
+
+@pytest.mark.parametrize(
+    ("started", "completed"),
+    [
+        (PLAN_CAPTURE_STARTED.replace(tzinfo=None), PLAN_CAPTURE_COMPLETED),
+        (PLAN_CAPTURE_STARTED, PLAN_CAPTURE_COMPLETED.replace(tzinfo=None)),
+        (PLAN_CAPTURE_COMPLETED, PLAN_CAPTURE_STARTED),
+        (PLAN_CAPTURE_STARTED.astimezone(timezone(timedelta(hours=1))), PLAN_CAPTURE_COMPLETED),
+    ],
+)
+def test_plan_serialization_requires_ordered_aware_utc_capture_times(
+    started, completed
+):
+    with pytest.raises(ValueError, match="capture"):
+        serialize_bound_close_reservation_recovery_plan(
+            _built_recovery_plan((_observation(),)),
+            capture_started_at=started,
+            capture_completed_at=completed,
+        )
+
+
+def test_capture_times_change_identity_but_not_semantic_fingerprint():
+    plan = _built_recovery_plan((_observation(),))
+    first = json.loads(
+        serialize_bound_close_reservation_recovery_plan(
+            plan,
+            capture_started_at=PLAN_CAPTURE_STARTED,
+            capture_completed_at=PLAN_CAPTURE_COMPLETED,
+        )
+    )
+    second = json.loads(
+        serialize_bound_close_reservation_recovery_plan(
+            plan,
+            capture_started_at=PLAN_CAPTURE_STARTED + timedelta(minutes=2),
+            capture_completed_at=PLAN_CAPTURE_COMPLETED + timedelta(minutes=2),
+        )
+    )
+
+    assert first["evidence_fingerprint"] == second["evidence_fingerprint"]
+    assert first["confirmation_token"] == second["confirmation_token"]
+    assert first["capture_identity"] != second["capture_identity"]
+
+
+def test_serialized_plan_never_contains_raw_operational_evidence():
+    document = serialize_bound_close_reservation_recovery_plan(
+        _built_recovery_plan((_observation(),)),
+        capture_started_at=PLAN_CAPTURE_STARTED,
+        capture_completed_at=PLAN_CAPTURE_COMPLETED,
+    )
+    for forbidden in (
+        "raw-db-id-901",
+        "raw-pos-901",
+        "raw-order-901",
+        "123.456789",
+        "98765.43",
+        "provider-secret-payload",
+        "telegram source text",
+        "DC-ACCESS-KEY",
+        "credential-value",
+    ):
+        assert forbidden not in document
+
+
+def test_sealed_capture_is_opaque_and_retains_no_serializable_raw_capability(
+    tmp_path,
+):
+    database = tmp_path / "sealed-source.sqlite3"
+    connection = _create_reservation_source_database(database)
+    _seed_local_reservation(connection, row_id=901)
+    connection.commit()
+    connection.close()
+    source = load_bound_close_reservation_source(database)
+    local = source.reservations[0]
+    observation = BoundCloseReservationObservation(
+        reservation_ref=local.reservation_ref,
+        classification=ReservationClassification.PROVEN_TERMINAL,
+        reason_code="exact_close_and_position_terminal",
+        source_fingerprint=_sha256_json(local),
+        exchange_fingerprint=FINGERPRINT_C,
+    )
+
+    capture = seal_bound_close_reservation_recovery_capture(
+        source=source,
+        observations=(observation,),
+        capture_started_at=PLAN_CAPTURE_STARTED,
+        capture_completed_at=PLAN_CAPTURE_COMPLETED,
+    )
+
+    assert isinstance(capture, SealedRecoveryCapture)
+    assert not hasattr(capture, "__dict__")
+    assert repr(capture) == "<SealedRecoveryCapture opaque>"
+    assert "raw-pos-901" not in capture.serialized_plan
+    with pytest.raises(TypeError):
+        SealedRecoveryCapture()  # type: ignore[call-arg]
 
 
 @pytest.mark.parametrize(

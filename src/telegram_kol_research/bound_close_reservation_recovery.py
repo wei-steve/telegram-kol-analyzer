@@ -32,6 +32,10 @@ from telegram_kol_research.deepcoin_request_policy import RequestPriority
 
 RECOVERY_SCHEMA_VERSION = 1
 MAX_RESERVATION_OBSERVATIONS = 64
+MAX_RECOVERY_PLAN_BYTES = 65_536
+_MAX_RECOVERY_PLAN_DEPTH = 4
+_MAX_RECOVERY_PLAN_ITEMS = 1_024
+_MAX_RECOVERY_PLAN_STRING_BYTES = 256
 
 PROVEN_TERMINAL_REASONS = frozenset(
     {
@@ -736,6 +740,539 @@ class BoundCloseReservationRecoveryPlan:
                 "action_count must equal the terminal population for ready "
                 "plans and zero for refused plans"
             )
+
+
+_RECOVERY_PLAN_KEYS = frozenset(
+    {
+        "action_count",
+        "capture_completed_at",
+        "capture_identity",
+        "capture_started_at",
+        "confirmation_token",
+        "counts",
+        "database_writes",
+        "evidence_fingerprint",
+        "exchange_snapshot_fingerprint",
+        "exchange_writes",
+        "history_replays",
+        "mode",
+        "observations",
+        "schema_version",
+        "source_fingerprint",
+        "status",
+    }
+)
+_RECOVERY_COUNT_KEYS = frozenset(
+    {"active", "proven_terminal", "total", "unknown"}
+)
+_RECOVERY_OBSERVATION_KEYS = frozenset(
+    {
+        "classification",
+        "exchange_fingerprint",
+        "reason_code",
+        "reservation_ref",
+        "source_fingerprint",
+    }
+)
+_RECOVERY_CONFIRMATION_PREFIX = "BOUND-CLOSE-"
+_SEALED_CAPTURE_CONSTRUCTOR = object()
+
+
+def _observation_payload(
+    observation: BoundCloseReservationObservation,
+) -> dict[str, object]:
+    return {
+        "classification": observation.classification.value,
+        "exchange_fingerprint": observation.exchange_fingerprint,
+        "reason_code": observation.reason_code,
+        "reservation_ref": observation.reservation_ref,
+        "source_fingerprint": observation.source_fingerprint,
+    }
+
+
+def _recovery_counts(
+    observations: tuple[BoundCloseReservationObservation, ...],
+) -> dict[str, int]:
+    return {
+        "active": sum(
+            item.classification is ReservationClassification.ACTIVE
+            for item in observations
+        ),
+        "proven_terminal": sum(
+            item.classification is ReservationClassification.PROVEN_TERMINAL
+            for item in observations
+        ),
+        "total": len(observations),
+        "unknown": sum(
+            item.classification is ReservationClassification.UNKNOWN
+            for item in observations
+        ),
+    }
+
+
+def _exchange_snapshot_fingerprint(
+    observations: tuple[BoundCloseReservationObservation, ...],
+) -> str:
+    return _sha256_json(
+        {
+            "exchange_observations": [
+                {
+                    "exchange_fingerprint": item.exchange_fingerprint,
+                    "reservation_ref": item.reservation_ref,
+                }
+                for item in observations
+            ]
+        }
+    )
+
+
+def _recovery_semantic_payload(
+    *,
+    status: str,
+    observations: tuple[BoundCloseReservationObservation, ...],
+    source_fingerprint: str,
+    exchange_snapshot_fingerprint: str,
+    action_count: int,
+) -> dict[str, object]:
+    return {
+        "action_count": action_count,
+        "counts": _recovery_counts(observations),
+        "database_writes": 0,
+        "exchange_snapshot_fingerprint": exchange_snapshot_fingerprint,
+        "exchange_writes": 0,
+        "history_replays": 0,
+        "mode": "dry_run",
+        "observations": [_observation_payload(item) for item in observations],
+        "schema_version": RECOVERY_SCHEMA_VERSION,
+        "source_fingerprint": source_fingerprint,
+        "status": status,
+    }
+
+
+def _derive_recovery_confirmation_token(evidence_fingerprint: str) -> str:
+    _require_lower_hex_64(evidence_fingerprint, "evidence_fingerprint")
+    digest = hashlib.sha256(
+        (
+            "bound-close-reservation-recovery-confirmation-v1:"
+            f"{evidence_fingerprint}"
+        ).encode("ascii")
+    ).hexdigest()
+    return f"{_RECOVERY_CONFIRMATION_PREFIX}{digest[:16]}"
+
+
+def build_bound_close_reservation_recovery_plan(
+    *,
+    source_fingerprint: str,
+    observations: tuple[BoundCloseReservationObservation, ...],
+) -> BoundCloseReservationRecoveryPlan:
+    """Build the only canonical semantic plan accepted by serialization."""
+
+    _require_lower_hex_64(source_fingerprint, "source_fingerprint")
+    if type(observations) is not tuple:
+        raise TypeError("observations must be a tuple")
+    if len(observations) > MAX_RESERVATION_OBSERVATIONS:
+        raise ValueError("observations cannot contain more than 64 items")
+    if any(type(item) is not BoundCloseReservationObservation for item in observations):
+        raise TypeError("observations must contain BoundCloseReservationObservation")
+    ordered = tuple(sorted(observations, key=lambda item: item.reservation_ref))
+    refs = tuple(item.reservation_ref for item in ordered)
+    if len(set(refs)) != len(refs):
+        raise ValueError("observation reservation references must be unique")
+    ready = bool(ordered) and all(
+        item.classification is ReservationClassification.PROVEN_TERMINAL
+        for item in ordered
+    )
+    status = "ready" if ready else "refused"
+    action_count = len(ordered) if ready else 0
+    exchange_fingerprint = _exchange_snapshot_fingerprint(ordered)
+    evidence_fingerprint = _sha256_json(
+        _recovery_semantic_payload(
+            status=status,
+            observations=ordered,
+            source_fingerprint=source_fingerprint,
+            exchange_snapshot_fingerprint=exchange_fingerprint,
+            action_count=action_count,
+        )
+    )
+    return BoundCloseReservationRecoveryPlan(
+        schema_version=RECOVERY_SCHEMA_VERSION,
+        status=status,
+        observations=ordered,
+        source_fingerprint=source_fingerprint,
+        exchange_snapshot_fingerprint=exchange_fingerprint,
+        evidence_fingerprint=evidence_fingerprint,
+        confirmation_token=_derive_recovery_confirmation_token(
+            evidence_fingerprint
+        ),
+        action_count=action_count,
+    )
+
+
+def _require_canonical_recovery_plan(
+    plan: BoundCloseReservationRecoveryPlan,
+) -> BoundCloseReservationRecoveryPlan:
+    if type(plan) is not BoundCloseReservationRecoveryPlan:
+        raise TypeError("plan must be BoundCloseReservationRecoveryPlan")
+    expected = build_bound_close_reservation_recovery_plan(
+        source_fingerprint=plan.source_fingerprint,
+        observations=plan.observations,
+    )
+    for field_name in (
+        "schema_version",
+        "status",
+        "observations",
+        "exchange_snapshot_fingerprint",
+        "evidence_fingerprint",
+        "confirmation_token",
+        "action_count",
+    ):
+        if getattr(plan, field_name) != getattr(expected, field_name):
+            raise ValueError(f"{field_name} does not match the canonical plan")
+    return plan
+
+
+def _capture_identity(
+    *,
+    capture_started_at: datetime,
+    capture_completed_at: datetime,
+    evidence_fingerprint: str,
+) -> str:
+    return _sha256_json(
+        {
+            "capture_completed_at": capture_completed_at,
+            "capture_started_at": capture_started_at,
+            "evidence_fingerprint": evidence_fingerprint,
+        }
+    )
+
+
+def _validated_capture_times(
+    capture_started_at: datetime,
+    capture_completed_at: datetime,
+) -> tuple[datetime, datetime]:
+    try:
+        started_at = _require_aware_utc(
+            capture_started_at,
+            "capture_started_at",
+        )
+        completed_at = _require_aware_utc(
+            capture_completed_at,
+            "capture_completed_at",
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("capture timestamps must be aware UTC") from exc
+    if completed_at < started_at:
+        raise ValueError("capture_completed_at cannot precede capture_started_at")
+    return started_at, completed_at
+
+
+def _recovery_plan_document(
+    plan: BoundCloseReservationRecoveryPlan,
+    *,
+    capture_started_at: datetime,
+    capture_completed_at: datetime,
+) -> dict[str, object]:
+    _require_canonical_recovery_plan(plan)
+    started_at, completed_at = _validated_capture_times(
+        capture_started_at,
+        capture_completed_at,
+    )
+    semantic = _recovery_semantic_payload(
+        status=plan.status,
+        observations=plan.observations,
+        source_fingerprint=plan.source_fingerprint,
+        exchange_snapshot_fingerprint=plan.exchange_snapshot_fingerprint,
+        action_count=plan.action_count,
+    )
+    return {
+        **semantic,
+        "capture_completed_at": _canonical_json_value(completed_at),
+        "capture_identity": _capture_identity(
+            capture_started_at=started_at,
+            capture_completed_at=completed_at,
+            evidence_fingerprint=plan.evidence_fingerprint,
+        ),
+        "capture_started_at": _canonical_json_value(started_at),
+        "confirmation_token": plan.confirmation_token,
+        "evidence_fingerprint": plan.evidence_fingerprint,
+    }
+
+
+def serialize_bound_close_reservation_recovery_plan(
+    plan: BoundCloseReservationRecoveryPlan,
+    *,
+    capture_started_at: datetime,
+    capture_completed_at: datetime,
+) -> str:
+    """Serialize only the bounded, redacted dry-run document."""
+
+    document = _canonical_json(
+        _recovery_plan_document(
+            plan,
+            capture_started_at=capture_started_at,
+            capture_completed_at=capture_completed_at,
+        )
+    )
+    if len(document.encode("utf-8")) > MAX_RECOVERY_PLAN_BYTES:
+        raise ValueError("serialized recovery plan exceeds its byte bound")
+    return document
+
+
+class SealedRecoveryCapture:
+    """Opaque in-process capability reserved for the separately gated apply."""
+
+    __slots__ = (
+        "__plan",
+        "__serialized_plan",
+        "__source_capability",
+    )
+
+    def __init__(
+        self,
+        *,
+        plan: BoundCloseReservationRecoveryPlan,
+        serialized_plan: str,
+        source_capability: object,
+        _constructor: object,
+    ) -> None:
+        if _constructor is not _SEALED_CAPTURE_CONSTRUCTOR:
+            raise TypeError("SealedRecoveryCapture cannot be constructed directly")
+        self.__plan = plan
+        self.__serialized_plan = serialized_plan
+        self.__source_capability = source_capability
+
+    @property
+    def plan(self) -> BoundCloseReservationRecoveryPlan:
+        return self.__plan
+
+    @property
+    def serialized_plan(self) -> str:
+        return self.__serialized_plan
+
+    def __repr__(self) -> str:
+        return "<SealedRecoveryCapture opaque>"
+
+
+def seal_bound_close_reservation_recovery_capture(
+    *,
+    source: BoundCloseReservationSource,
+    observations: tuple[BoundCloseReservationObservation, ...],
+    capture_started_at: datetime,
+    capture_completed_at: datetime,
+) -> SealedRecoveryCapture:
+    """Seal semantic evidence while retaining raw source authority in-process."""
+
+    if type(source) is not BoundCloseReservationSource:
+        raise TypeError("source must be BoundCloseReservationSource")
+    if type(observations) is not tuple:
+        raise TypeError("observations must be a tuple")
+    local_by_ref = {item.reservation_ref: item for item in source.reservations}
+    if len(local_by_ref) != len(source.reservations):
+        raise ValueError("source reservation references must be unique")
+    if set(local_by_ref) != {item.reservation_ref for item in observations}:
+        raise ValueError("observations must cover the exact source population")
+    for item in observations:
+        local = local_by_ref.get(item.reservation_ref)
+        if local is None or item.source_fingerprint != _sha256_json(local):
+            raise ValueError("observation source fingerprint mismatch")
+    plan = build_bound_close_reservation_recovery_plan(
+        source_fingerprint=source.source_fingerprint,
+        observations=observations,
+    )
+    serialized = serialize_bound_close_reservation_recovery_plan(
+        plan,
+        capture_started_at=capture_started_at,
+        capture_completed_at=capture_completed_at,
+    )
+    return SealedRecoveryCapture(
+        plan=plan,
+        serialized_plan=serialized,
+        source_capability=source._capability,
+        _constructor=_SEALED_CAPTURE_CONSTRUCTOR,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedRecoveryDryRun:
+    plan: BoundCloseReservationRecoveryPlan
+    capture_started_at: datetime
+    capture_completed_at: datetime
+    capture_identity: str
+    semantic_json: str
+
+
+def _bounded_recovery_json_tree(value: object) -> None:
+    item_count = 0
+    stack: list[tuple[object, int]] = [(value, 0)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > _MAX_RECOVERY_PLAN_DEPTH:
+            raise ValueError("recovery JSON exceeds its depth bound")
+        item_count += 1
+        if item_count > _MAX_RECOVERY_PLAN_ITEMS:
+            raise ValueError("recovery JSON exceeds its item bound")
+        if type(current) is str:
+            if len(current.encode("utf-8")) > _MAX_RECOVERY_PLAN_STRING_BYTES:
+                raise ValueError("recovery JSON string exceeds its byte bound")
+        elif type(current) is dict:
+            stack.extend((key, depth + 1) for key in current)
+            stack.extend((item, depth + 1) for item in current.values())
+        elif type(current) is list:
+            stack.extend((item, depth + 1) for item in current)
+        elif current is not None and type(current) not in {bool, int}:
+            raise TypeError("recovery JSON contains an unsupported value")
+
+
+def _exact_object_keys(
+    value: object,
+    expected: frozenset[str],
+    field_name: str,
+) -> dict[str, Any]:
+    if type(value) is not dict:
+        raise TypeError(f"{field_name} must be an object")
+    if frozenset(value) != expected:
+        raise ValueError(f"{field_name} has unknown or missing fields")
+    return value
+
+
+def _strict_nonnegative_int(value: object, field_name: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be an integer")
+    if value < 0:
+        raise ValueError(f"{field_name} cannot be negative")
+    return value
+
+
+def _parse_canonical_capture_time(value: object, field_name: str) -> datetime:
+    if type(value) is not str:
+        raise TypeError(f"{field_name} must be a string")
+    if not value.endswith("Z"):
+        raise ValueError(f"{field_name} must be canonical aware UTC")
+    try:
+        parsed = datetime.fromisoformat(f"{value[:-1]}+00:00")
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field_name} must be canonical aware UTC") from exc
+    _require_aware_utc(parsed, field_name)
+    if _canonical_json_value(parsed) != value:
+        raise ValueError(f"{field_name} must be canonical aware UTC")
+    return parsed
+
+
+def _parse_bound_close_reservation_dry_run_document(
+    raw: bytes,
+) -> _ParsedRecoveryDryRun:
+    if type(raw) is not bytes:
+        raise TypeError("raw recovery document must be bytes")
+    if not raw or len(raw) > MAX_RECOVERY_PLAN_BYTES:
+        raise ValueError("recovery document violates its byte bound")
+    try:
+        decoded = raw.decode("utf-8")
+        value = json.loads(
+            decoded,
+            object_pairs_hook=_closed_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, TypeError, ValueError, RecursionError, OverflowError) as exc:
+        raise ValueError("recovery document is invalid JSON") from exc
+    _bounded_recovery_json_tree(value)
+    payload = _exact_object_keys(value, _RECOVERY_PLAN_KEYS, "plan")
+    if type(payload["schema_version"]) is not int:
+        raise TypeError("schema_version must be an integer")
+    if payload["schema_version"] != RECOVERY_SCHEMA_VERSION:
+        raise ValueError("schema_version is unsupported")
+    if payload["mode"] != "dry_run" or type(payload["mode"]) is not str:
+        raise ValueError("mode must be dry_run")
+    observations_raw = payload["observations"]
+    if type(observations_raw) is not list:
+        raise TypeError("observations must be an array")
+    if len(observations_raw) > MAX_RESERVATION_OBSERVATIONS:
+        raise ValueError("observations exceed their item bound")
+    observations: list[BoundCloseReservationObservation] = []
+    for index, raw_item in enumerate(observations_raw):
+        item = _exact_object_keys(
+            raw_item,
+            _RECOVERY_OBSERVATION_KEYS,
+            f"observations[{index}]",
+        )
+        if type(item["classification"]) is not str:
+            raise TypeError("classification must be a string")
+        try:
+            classification = ReservationClassification(item["classification"])
+        except ValueError as exc:
+            raise ValueError("classification is not closed") from exc
+        observations.append(
+            BoundCloseReservationObservation(
+                reservation_ref=item["reservation_ref"],
+                classification=classification,
+                reason_code=item["reason_code"],
+                source_fingerprint=item["source_fingerprint"],
+                exchange_fingerprint=item["exchange_fingerprint"],
+            )
+        )
+    counts = _exact_object_keys(payload["counts"], _RECOVERY_COUNT_KEYS, "counts")
+    for name in _RECOVERY_COUNT_KEYS:
+        _strict_nonnegative_int(counts[name], f"counts.{name}")
+    for name in ("action_count", "exchange_writes", "history_replays", "database_writes"):
+        _strict_nonnegative_int(payload[name], name)
+    if any(payload[name] != 0 for name in ("exchange_writes", "history_replays", "database_writes")):
+        raise ValueError("recovery plan write counters must be zero")
+    source_fingerprint = _require_lower_hex_64(
+        payload["source_fingerprint"],
+        "source_fingerprint",
+    )
+    expected = build_bound_close_reservation_recovery_plan(
+        source_fingerprint=source_fingerprint,
+        observations=tuple(observations),
+    )
+    expected_counts = _recovery_counts(expected.observations)
+    if counts != expected_counts:
+        raise ValueError("counts do not conserve the observation population")
+    for field_name in (
+        "status",
+        "action_count",
+        "exchange_snapshot_fingerprint",
+        "evidence_fingerprint",
+        "confirmation_token",
+    ):
+        if payload[field_name] != getattr(expected, field_name):
+            raise ValueError(f"{field_name} does not match canonical evidence")
+    if tuple(observations) != expected.observations:
+        raise ValueError("observations must be sorted and unique")
+    started_at = _parse_canonical_capture_time(
+        payload["capture_started_at"],
+        "capture_started_at",
+    )
+    completed_at = _parse_canonical_capture_time(
+        payload["capture_completed_at"],
+        "capture_completed_at",
+    )
+    _validated_capture_times(started_at, completed_at)
+    capture_identity = _require_lower_hex_64(
+        payload["capture_identity"],
+        "capture_identity",
+    )
+    if capture_identity != _capture_identity(
+        capture_started_at=started_at,
+        capture_completed_at=completed_at,
+        evidence_fingerprint=expected.evidence_fingerprint,
+    ):
+        raise ValueError("capture_identity does not match capture")
+    semantic = _canonical_json(
+        _recovery_semantic_payload(
+            status=expected.status,
+            observations=expected.observations,
+            source_fingerprint=expected.source_fingerprint,
+            exchange_snapshot_fingerprint=expected.exchange_snapshot_fingerprint,
+            action_count=expected.action_count,
+        )
+    )
+    return _ParsedRecoveryDryRun(
+        plan=expected,
+        capture_started_at=started_at,
+        capture_completed_at=completed_at,
+        capture_identity=capture_identity,
+        semantic_json=semantic,
+    )
 
 
 def _require_lower_hex_64(value: object, field_name: str) -> str:
