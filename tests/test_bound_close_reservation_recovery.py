@@ -14,7 +14,7 @@ from telegram_kol_research.deepcoin_client import (
     DeepcoinCredentials,
     DeepcoinRestClient,
     DeepcoinRequestScope,
-    build_deepcoin_bound_close_reservation_recovery_client_from_env,
+    _build_deepcoin_bound_close_reservation_recovery_client_from_env,
 )
 from telegram_kol_research.deepcoin_request_policy import RequestPriority
 from telegram_kol_research.bound_close_reservation_recovery import (
@@ -1004,7 +1004,7 @@ def _factory_recovery_reader(monkeypatch, http_client=None):
         "Client",
         lambda **_kwargs: selected_http_client,
     )
-    transport = build_deepcoin_bound_close_reservation_recovery_client_from_env(
+    transport = _build_deepcoin_bound_close_reservation_recovery_client_from_env(
         environ={
             "DEEPCOIN_API_KEY": "recovery-key",
             "DEEPCOIN_API_SECRET": "recovery-secret",

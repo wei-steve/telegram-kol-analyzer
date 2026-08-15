@@ -3,9 +3,12 @@ from contextlib import contextmanager
 import hashlib
 import hmac
 import json
+import time
 
 import httpx
 import pytest
+
+import telegram_kol_research.deepcoin_client as deepcoin_client_module
 
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import DeepcoinCredentials
@@ -18,9 +21,6 @@ from telegram_kol_research.deepcoin_client import DeepcoinTpslWriteLimiter
 from telegram_kol_research.deepcoin_client import build_deepcoin_auth_headers
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
 from telegram_kol_research.deepcoin_client import (
-    build_deepcoin_bound_close_reservation_recovery_client_from_env,
-)
-from telegram_kol_research.deepcoin_client import (
     build_deepcoin_monitor_snapshot_client_from_env,
 )
 from telegram_kol_research.deepcoin_client import (
@@ -28,11 +28,25 @@ from telegram_kol_research.deepcoin_client import (
 )
 from telegram_kol_research.deepcoin_client import load_deepcoin_credentials
 from telegram_kol_research.deepcoin_client import _raise_for_deepcoin_business_error
+from telegram_kol_research.bound_close_reservation_recovery import (
+    build_bound_close_reservation_exchange_reader_from_env,
+)
 from telegram_kol_research.deepcoin_request_governor import (
     DeepcoinRequestGovernor,
     GovernorMode,
 )
 from telegram_kol_research.deepcoin_request_policy import RequestPriority
+
+
+def test_deepcoin_module_does_not_expose_raw_reservation_recovery_factory():
+    public_name = (
+        "build_deepcoin_bound_close_reservation_recovery_client_from_env"
+    )
+
+    assert not hasattr(deepcoin_client_module, public_name)
+    assert public_name not in {
+        name for name in dir(deepcoin_client_module) if not name.startswith("_")
+    }
 
 
 def test_monitor_snapshot_transport_ignores_proxy_and_ca_environment(monkeypatch):
@@ -101,6 +115,20 @@ class _CapturingHttpClient:
             }
         )
         return _FakeResponse(self.payload)
+
+    @contextmanager
+    def stream(self, method, request_path, content="", headers=None, timeout=None):
+        self.requests.append(
+            {
+                "method": method,
+                "request_path": request_path,
+                "content": content,
+                "headers": headers or {},
+            }
+        )
+        yield _ChunkedWireResponse(
+            [json.dumps(self.payload, separators=(",", ":")).encode("utf-8")]
+        )
 
     def close(self):
         self.close_calls += 1
@@ -302,14 +330,12 @@ def test_recovery_transport_ignores_ambient_proxy_ca_and_proxy_auth(monkeypatch)
         "REQUESTS_CA_BUNDLE": "/untrusted/requests-ca.pem",
     }
 
-    recovery = build_deepcoin_bound_close_reservation_recovery_client_from_env(
+    recovery = build_bound_close_reservation_exchange_reader_from_env(
         environ=environment,
         env_file_paths=[],
     )
-    assert recovery.read_positions() == {"code": "0", "data": []}
-    with pytest.raises(DeepcoinClientError, match="read-only"):
-        recovery.cancel_order({"ordId": "must-not-send"})
-    recovery.close()
+    with recovery.request_scope(deadline_monotonic=time.monotonic() + 1.0):
+        assert recovery.read_positions() == {"code": "0", "data": []}
 
     assert constructed == [
         {
@@ -342,12 +368,14 @@ def test_recovery_builder_does_not_change_ordinary_or_batch119_builder_semantics
     batch119 = build_deepcoin_read_only_client_from_env(
         environ=environment, env_file_paths=[]
     )
-    recovery = build_deepcoin_bound_close_reservation_recovery_client_from_env(
+    recovery = build_bound_close_reservation_exchange_reader_from_env(
         environ=environment, env_file_paths=[]
     )
-    for client in (ordinary, batch119, recovery):
+    for client in (ordinary, batch119):
         assert client.read_positions() == {"code": "0", "data": []}
         client.close()
+    with recovery.request_scope(deadline_monotonic=time.monotonic() + 1.0):
+        assert recovery.read_positions() == {"code": "0", "data": []}
 
     assert "trust_env" not in constructed[0]
     assert "trust_env" not in constructed[1]
@@ -355,26 +383,19 @@ def test_recovery_builder_does_not_change_ordinary_or_batch119_builder_semantics
 
 
 @pytest.mark.parametrize(
-    ("method_name", "payload"),
+    "method_name",
     [
-        ("place_order", {"instId": "BTC-USDT-SWAP"}),
-        ("trigger_order", {"instId": "BTC-USDT-SWAP"}),
-        ("set_position_sltp", {"instId": "BTC-USDT-SWAP"}),
-        (
-            "cancel_position_sltp",
-            {
-                "instType": "SWAP",
-                "instId": "BTC-USDT-SWAP",
-                "ordId": "order-1",
-            },
-        ),
-        ("replace_order_sltp", {"instId": "BTC-USDT-SWAP"}),
-        ("cancel_order", {"instId": "BTC-USDT-SWAP"}),
-        ("cancel_trigger_order", {"instId": "BTC-USDT-SWAP"}),
+        "place_order",
+        "trigger_order",
+        "set_position_sltp",
+        "cancel_position_sltp",
+        "replace_order_sltp",
+        "cancel_order",
+        "cancel_trigger_order",
     ],
 )
-def test_recovery_transport_rejects_every_public_writer_before_http(
-    monkeypatch, method_name, payload
+def test_recovery_capability_does_not_expose_any_public_writer(
+    monkeypatch, method_name
 ):
     constructed = []
 
@@ -384,7 +405,7 @@ def test_recovery_transport_rejects_every_public_writer_before_http(
             super().__init__({"code": "0", "data": []})
 
     monkeypatch.setattr(httpx, "Client", Client)
-    recovery = build_deepcoin_bound_close_reservation_recovery_client_from_env(
+    recovery = build_bound_close_reservation_exchange_reader_from_env(
         environ={
             "DEEPCOIN_API_KEY": "key",
             "DEEPCOIN_API_SECRET": "secret",
@@ -393,11 +414,9 @@ def test_recovery_transport_rejects_every_public_writer_before_http(
         env_file_paths=[],
     )
 
-    with pytest.raises(DeepcoinClientError, match="read-only"):
-        getattr(recovery, method_name)(payload)
+    assert not hasattr(recovery, method_name)
 
-    # Read-only rejection happens before lazy HTTP construction and therefore
-    # before any possible wire call.
+    # The high-level capability has no writer reachability and stays lazy.
     assert constructed == []
 
 

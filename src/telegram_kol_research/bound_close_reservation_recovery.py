@@ -23,8 +23,8 @@ from telegram_kol_research.deepcoin_client import (
     DeepcoinReadUnavailable,
     DeepcoinRequestScope,
     DeepcoinRestClient,
+    _build_deepcoin_bound_close_reservation_recovery_client_from_env,
     _claim_bound_close_reservation_recovery_transport,
-    build_deepcoin_bound_close_reservation_recovery_client_from_env,
 )
 from telegram_kol_research.deepcoin_request_policy import RequestPriority
 
@@ -328,7 +328,7 @@ def build_bound_close_reservation_exchange_reader_from_env(
 ) -> BoundCloseReservationExchangeReader:
     """Build only the closed recovery capability, never the raw transport."""
 
-    transport = build_deepcoin_bound_close_reservation_recovery_client_from_env(
+    transport = _build_deepcoin_bound_close_reservation_recovery_client_from_env(
         environ=environ,
         env_file_paths=env_file_paths,
     )

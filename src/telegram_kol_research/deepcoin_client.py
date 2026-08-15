@@ -1345,7 +1345,7 @@ def build_deepcoin_monitor_snapshot_client_from_env(
     )
 
 
-def build_deepcoin_bound_close_reservation_recovery_client_from_env(
+def _build_deepcoin_bound_close_reservation_recovery_client_from_env(
     environ: dict[str, str] | None = None,
     env_file_paths: list[str | Path] | None = None,
 ) -> DeepcoinRestClient:
