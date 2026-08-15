@@ -229,7 +229,7 @@ def evaluate_sentinel_observation(
                 if candidate.reason_code in SENTINEL_REASON_CODES
                 else "adapter_failure"
             )
-    
+
     for candidate_state in previous_by_identity.values():
         absence_adapter = _DURABLE_ABSENCE_ADAPTER_BY_REASON.get(
             candidate_state.reason_code
