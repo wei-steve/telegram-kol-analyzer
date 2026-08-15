@@ -12,6 +12,7 @@ import random
 import re
 import time
 import threading
+import weakref
 from collections import deque
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -80,6 +81,10 @@ _DEEPCOIN_LIST_READ_PATHS = frozenset(
     }
 )
 _SAFE_EXACT_EXCHANGE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$")
+_BOUND_CLOSE_RECOVERY_TRANSPORTS_LOCK = threading.Lock()
+_BOUND_CLOSE_RECOVERY_TRANSPORTS: weakref.WeakSet[DeepcoinRestClient] = (
+    weakref.WeakSet()
+)
 
 
 class DeepcoinClientError(RuntimeError):
@@ -1006,8 +1011,18 @@ class DeepcoinRestClient:
                             raw_payload = _read_bounded_monitor_response(
                                 response,
                                 limit=response_limit,
-                                deadline_monotonic=deadline,
-                                monotonic_factory=self._safe_monotonic,
+                                deadline_monotonic=(
+                                    deadline
+                                    if phase
+                                    == DEEPCOIN_BOUND_CLOSE_RESERVATION_RECOVERY_PHASE
+                                    else None
+                                ),
+                                monotonic_factory=(
+                                    self._safe_monotonic
+                                    if phase
+                                    == DEEPCOIN_BOUND_CLOSE_RESERVATION_RECOVERY_PHASE
+                                    else None
+                                ),
                             )
                 if response_status >= 400:
                     failure = classify_http_failure(
@@ -1349,12 +1364,29 @@ def build_deepcoin_bound_close_reservation_recovery_client_from_env(
         api_key=credentials.api_key,
         environ=environment,
     )
-    return DeepcoinRestClient(
+    client = DeepcoinRestClient(
         credentials,
         request_governor=governor,
         read_only=True,
         trust_env=False,
     )
+    with _BOUND_CLOSE_RECOVERY_TRANSPORTS_LOCK:
+        _BOUND_CLOSE_RECOVERY_TRANSPORTS.add(client)
+    return client
+
+
+def _claim_bound_close_reservation_recovery_transport(
+    transport: object,
+) -> bool:
+    """Consume proof that this exact transport came from the closed builder."""
+
+    if type(transport) is not DeepcoinRestClient:
+        return False
+    with _BOUND_CLOSE_RECOVERY_TRANSPORTS_LOCK:
+        if transport not in _BOUND_CLOSE_RECOVERY_TRANSPORTS:
+            return False
+        _BOUND_CLOSE_RECOVERY_TRANSPORTS.discard(transport)
+    return True
 
 
 def _load_deepcoin_environment(

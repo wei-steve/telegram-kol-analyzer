@@ -2,15 +2,21 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, fields
 from datetime import UTC, datetime, timedelta, timezone
+import signal
 import sqlite3
+import threading
+import time
 
+import httpx
 import pytest
 
 from telegram_kol_research.deepcoin_client import (
-    DeepcoinClientError,
     DeepcoinCredentials,
     DeepcoinRestClient,
+    DeepcoinRequestScope,
+    build_deepcoin_bound_close_reservation_recovery_client_from_env,
 )
+from telegram_kol_research.deepcoin_request_policy import RequestPriority
 from telegram_kol_research.bound_close_reservation_recovery import (
     ACTIVE_REASONS,
     PROVEN_TERMINAL_REASONS,
@@ -19,6 +25,8 @@ from telegram_kol_research.bound_close_reservation_recovery import (
     BoundCloseReservationRecoveryPlan,
     BoundCloseReservationSource,
     BoundCloseReservationExchangeReader,
+    BoundCloseReservationExchangeConfigurationError,
+    BoundCloseReservationExchangeDeadlineExceeded,
     LocalReservationEvidence,
     ReservationClassification,
     _canonical_json,
@@ -946,9 +954,11 @@ def test_source_identity_field_drift_changes_fingerprint_without_raw_disclosure(
 
 
 class _RecoveryReaderHttpClient:
-    def __init__(self):
+    def __init__(self, *, stream_mode="normal"):
         self.requests = []
         self.close_calls = 0
+        self.stream_mode = stream_mode
+        self.yielded = 0
 
     def request(self, method, request_path, content="", headers=None, timeout=None):
         raise AssertionError("bounded recovery reader must use streaming HTTP")
@@ -959,13 +969,25 @@ class _RecoveryReaderHttpClient:
         @contextmanager
         def response_context():
             self.requests.append((method, request_path, timeout))
+
+            def iter_raw(_response):
+                if self.stream_mode == "blocking":
+                    time.sleep(0.5)
+                elif self.stream_mode == "slow_drip":
+                    for _ in range(50):
+                        time.sleep(0.01)
+                        self.yielded += 1
+                        yield b" "
+                self.yielded += 1
+                yield b'{"code":"0","data":[]}'
+
             yield type(
                 "Response",
                 (),
                 {
                     "status_code": 200,
                     "headers": {},
-                    "iter_raw": lambda self: iter([b'{"code":"0","data":[]}']),
+                    "iter_raw": iter_raw,
                 },
             )()
 
@@ -975,16 +997,32 @@ class _RecoveryReaderHttpClient:
         self.close_calls += 1
 
 
-def test_recovery_reader_exposes_only_closed_get_capabilities_and_one_scope():
-    http_client = _RecoveryReaderHttpClient()
-    transport = DeepcoinRestClient(
-        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
-        http_client=http_client,
-        monotonic_factory=lambda: 100.0,
-        read_only=True,
-        trust_env=False,
+def _factory_recovery_reader(monkeypatch, http_client=None):
+    selected_http_client = http_client or _RecoveryReaderHttpClient()
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **_kwargs: selected_http_client,
     )
-    reader = BoundCloseReservationExchangeReader(transport)
+    transport = build_deepcoin_bound_close_reservation_recovery_client_from_env(
+        environ={
+            "DEEPCOIN_API_KEY": "recovery-key",
+            "DEEPCOIN_API_SECRET": "recovery-secret",
+            "DEEPCOIN_API_PASSPHRASE": "recovery-passphrase",
+        },
+        env_file_paths=[],
+    )
+    return (
+        BoundCloseReservationExchangeReader(transport),
+        transport,
+        selected_http_client,
+    )
+
+
+def test_recovery_reader_exposes_only_closed_get_capabilities_and_one_scope(
+    monkeypatch,
+):
+    reader, _transport, http_client = _factory_recovery_reader(monkeypatch)
 
     public_names = {name for name in dir(reader) if not name.startswith("_")}
     assert public_names == {
@@ -1005,7 +1043,7 @@ def test_recovery_reader_exposes_only_closed_get_capabilities_and_one_scope():
     ):
         assert not hasattr(reader, forbidden)
 
-    with reader.request_scope(deadline_monotonic=105.0):
+    with reader.request_scope(deadline_monotonic=time.monotonic() + 1.0):
         assert reader.read_positions() == {"code": "0", "data": []}
         assert reader.read_open_orders() == {"code": "0", "data": []}
         assert reader.read_order_history(
@@ -1022,52 +1060,255 @@ def test_recovery_reader_exposes_only_closed_get_capabilities_and_one_scope():
     assert {request[0] for request in http_client.requests} == {"GET"}
 
 
-def test_recovery_reader_scope_cleanup_closes_transport_after_failure():
-    transport = DeepcoinRestClient(
-        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
-        http_client=_RecoveryReaderHttpClient(),
-        monotonic_factory=lambda: 100.0,
-        read_only=True,
-        trust_env=False,
-    )
-    reader = BoundCloseReservationExchangeReader(transport)
+def test_recovery_reader_scope_cleanup_closes_transport_after_failure(monkeypatch):
+    reader, _transport, _http_client = _factory_recovery_reader(monkeypatch)
 
     with pytest.raises(RuntimeError, match="capture failed"):
-        with reader.request_scope(deadline_monotonic=105.0):
+        with reader.request_scope(deadline_monotonic=time.monotonic() + 1.0):
             raise RuntimeError("capture failed")
 
-    with pytest.raises(DeepcoinClientError, match="closed"):
+    with pytest.raises(
+        BoundCloseReservationExchangeConfigurationError,
+        match="active recovery scope",
+    ):
         reader.read_positions()
 
 
 def test_recovery_reader_builder_returns_capability_not_raw_transport(monkeypatch):
-    import telegram_kol_research.bound_close_reservation_recovery as recovery
-
-    built = []
-
-    def fake_builder(*, environ, env_file_paths):
-        transport = DeepcoinRestClient(
-            DeepcoinCredentials(
-                api_key="key", api_secret="secret", passphrase="pass"
-            ),
-            http_client=_RecoveryReaderHttpClient(),
-            monotonic_factory=lambda: 100.0,
-            read_only=True,
-            trust_env=False,
-        )
-        built.append(transport)
-        return transport
-
-    monkeypatch.setattr(
-        recovery,
-        "build_deepcoin_bound_close_reservation_recovery_client_from_env",
-        fake_builder,
-    )
+    http_client = _RecoveryReaderHttpClient()
+    monkeypatch.setattr(httpx, "Client", lambda **_kwargs: http_client)
 
     reader = build_bound_close_reservation_exchange_reader_from_env(
-        environ={"DEEPCOIN_API_KEY": "not-used"},
+        environ={
+            "DEEPCOIN_API_KEY": "key",
+            "DEEPCOIN_API_SECRET": "secret",
+            "DEEPCOIN_API_PASSPHRASE": "passphrase",
+        },
         env_file_paths=[],
     )
 
     assert isinstance(reader, BoundCloseReservationExchangeReader)
-    assert len(built) == 1
+    assert http_client.requests == []
+
+
+def test_recovery_reader_rejects_non_factory_transport_before_http():
+    http_client = _RecoveryReaderHttpClient()
+    unsafe_transport = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+        read_only=True,
+        trust_env=False,
+    )
+
+    with pytest.raises(
+        BoundCloseReservationExchangeConfigurationError,
+        match="dedicated recovery factory",
+    ):
+        BoundCloseReservationExchangeReader(unsafe_transport)
+
+    assert http_client.requests == []
+
+
+def test_recovery_reader_refuses_reads_outside_owned_scope_and_external_scope(
+    monkeypatch,
+):
+    reader, transport, http_client = _factory_recovery_reader(monkeypatch)
+
+    with pytest.raises(
+        BoundCloseReservationExchangeConfigurationError,
+        match="active recovery scope",
+    ):
+        reader.read_positions()
+
+    with transport.request_scope(
+        DeepcoinRequestScope(
+            phase="bound_close_reservation_recovery",
+            priority=RequestPriority.BACKGROUND,
+            deadline_monotonic=time.monotonic() + 1.0,
+            max_response_bytes=1024 * 1024,
+        )
+    ):
+        with pytest.raises(
+            BoundCloseReservationExchangeConfigurationError,
+            match="active recovery scope",
+        ):
+            reader.read_positions()
+
+    assert http_client.requests == []
+    transport.close()
+
+
+def test_recovery_reader_refuses_nested_scope_and_reuse(monkeypatch):
+    reader, _transport, http_client = _factory_recovery_reader(monkeypatch)
+
+    with reader.request_scope(deadline_monotonic=time.monotonic() + 1.0):
+        with pytest.raises(
+            BoundCloseReservationExchangeConfigurationError,
+            match="already active",
+        ):
+            with reader.request_scope(deadline_monotonic=time.monotonic() + 1.0):
+                pass
+
+    with pytest.raises(
+        BoundCloseReservationExchangeConfigurationError,
+        match="already consumed",
+    ):
+        with reader.request_scope(deadline_monotonic=time.monotonic() + 1.0):
+            pass
+
+    assert http_client.requests == []
+
+
+@pytest.mark.skipif(
+    not all(
+        hasattr(signal, name)
+        for name in ("SIGALRM", "ITIMER_REAL", "getitimer", "setitimer")
+    ),
+    reason="POSIX interval timers are unavailable",
+)
+@pytest.mark.parametrize("stream_mode", ["blocking", "slow_drip"])
+def test_recovery_reader_interrupts_real_blocking_stream_at_50ms(
+    monkeypatch, stream_mode
+):
+    http_client = _RecoveryReaderHttpClient(stream_mode=stream_mode)
+    reader, _transport, _http_client = _factory_recovery_reader(
+        monkeypatch, http_client
+    )
+
+    started = time.monotonic()
+    with pytest.raises(BoundCloseReservationExchangeDeadlineExceeded):
+        with reader.request_scope(deadline_monotonic=started + 0.05):
+            reader.read_positions()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.25
+    if stream_mode == "slow_drip":
+        assert http_client.yielded < 25
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+    assert signal.getsignal(signal.SIGALRM) is signal.SIG_DFL
+    with pytest.raises(
+        BoundCloseReservationExchangeConfigurationError,
+        match="already consumed",
+    ):
+        with reader.request_scope(deadline_monotonic=time.monotonic() + 1.0):
+            pass
+
+
+@pytest.mark.skipif(
+    not all(
+        hasattr(signal, name)
+        for name in ("SIGALRM", "ITIMER_REAL", "getitimer", "setitimer")
+    ),
+    reason="POSIX interval timers are unavailable",
+)
+@pytest.mark.parametrize("stage", ["json_decode", "collection_parse"])
+def test_recovery_deadline_covers_decode_and_caller_collection_parse(
+    monkeypatch, stage
+):
+    reader, _transport, _http_client = _factory_recovery_reader(monkeypatch)
+    if stage == "json_decode":
+        import telegram_kol_research.deepcoin_client as deepcoin_client
+
+        real_json_loads = deepcoin_client.json.loads
+
+        def slow_json_loads(*args, **kwargs):
+            time.sleep(0.5)
+            return real_json_loads(*args, **kwargs)
+
+        monkeypatch.setattr(deepcoin_client.json, "loads", slow_json_loads)
+
+    started = time.monotonic()
+    with pytest.raises(BoundCloseReservationExchangeDeadlineExceeded):
+        with reader.request_scope(deadline_monotonic=started + 0.05):
+            reader.read_positions()
+            if stage == "collection_parse":
+                time.sleep(0.5)
+
+    assert time.monotonic() - started < 0.25
+
+
+def test_recovery_reader_fails_closed_off_main_thread_before_http(monkeypatch):
+    reader, _transport, http_client = _factory_recovery_reader(monkeypatch)
+    captured = []
+
+    def run():
+        try:
+            with reader.request_scope(deadline_monotonic=time.monotonic() + 1.0):
+                reader.read_positions()
+        except BaseException as exc:
+            captured.append(exc)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    worker.join(timeout=1.0)
+
+    assert worker.is_alive() is False
+    assert len(captured) == 1
+    assert isinstance(captured[0], BoundCloseReservationExchangeConfigurationError)
+    assert "main thread" in str(captured[0])
+    assert http_client.requests == []
+
+
+@pytest.mark.skipif(
+    not all(
+        hasattr(signal, name)
+        for name in ("SIGALRM", "ITIMER_REAL", "getitimer", "setitimer")
+    ),
+    reason="POSIX interval timers are unavailable",
+)
+def test_recovery_reader_fails_closed_on_existing_timer_or_custom_handler(
+    monkeypatch,
+):
+    if signal.getitimer(signal.ITIMER_REAL) != (0.0, 0.0):
+        pytest.skip("test process already owns the real-time interval timer")
+
+    reader_with_timer, _transport, timer_http = _factory_recovery_reader(monkeypatch)
+    signal.setitimer(signal.ITIMER_REAL, 5.0)
+    try:
+        with pytest.raises(
+            BoundCloseReservationExchangeConfigurationError,
+            match="timer conflict",
+        ):
+            with reader_with_timer.request_scope(
+                deadline_monotonic=time.monotonic() + 1.0
+            ):
+                reader_with_timer.read_positions()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+    assert timer_http.requests == []
+
+    reader_with_handler, _transport, handler_http = _factory_recovery_reader(
+        monkeypatch
+    )
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, lambda _signum, _frame: None)
+    try:
+        with pytest.raises(
+            BoundCloseReservationExchangeConfigurationError,
+            match="timer conflict",
+        ):
+            with reader_with_handler.request_scope(
+                deadline_monotonic=time.monotonic() + 1.0
+            ):
+                reader_with_handler.read_positions()
+    finally:
+        signal.signal(signal.SIGALRM, previous_handler)
+    assert handler_http.requests == []
+
+
+def test_recovery_reader_fails_closed_without_posix_timer_capability(
+    monkeypatch,
+):
+    import telegram_kol_research.bound_close_reservation_recovery as recovery
+
+    reader, _transport, http_client = _factory_recovery_reader(monkeypatch)
+    monkeypatch.setattr(recovery.signal, "getitimer", None)
+
+    with pytest.raises(
+        BoundCloseReservationExchangeConfigurationError,
+        match="unavailable",
+    ):
+        with reader.request_scope(deadline_monotonic=time.monotonic() + 1.0):
+            reader.read_positions()
+
+    assert http_client.requests == []

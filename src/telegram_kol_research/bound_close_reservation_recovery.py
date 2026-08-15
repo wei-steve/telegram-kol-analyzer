@@ -8,16 +8,22 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum, StrEnum
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
+import signal
 import sqlite3
+import threading
+import time
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import quote
 
 from telegram_kol_research.deepcoin_client import (
     DEEPCOIN_BOUND_CLOSE_RESERVATION_RECOVERY_PHASE,
+    DeepcoinReadUnavailable,
     DeepcoinRequestScope,
     DeepcoinRestClient,
+    _claim_bound_close_reservation_recovery_transport,
     build_deepcoin_bound_close_reservation_recovery_client_from_env,
 )
 from telegram_kol_research.deepcoin_request_policy import RequestPriority
@@ -116,15 +122,105 @@ _MAX_LOCAL_JSON_BYTES = 1_048_576
 RECOVERY_RESPONSE_MAX_BYTES = 1_048_576
 
 
+class BoundCloseReservationExchangeConfigurationError(RuntimeError):
+    """The recovery reader cannot establish its closed safety boundary."""
+
+
+class BoundCloseReservationExchangeDeadlineExceeded(RuntimeError):
+    """The one absolute recovery capture deadline expired."""
+
+
+def _require_recovery_wall_clock_guard() -> None:
+    required = ("SIGALRM", "ITIMER_REAL", "getitimer", "setitimer")
+    if any(not callable(getattr(signal, name, None)) for name in required[2:]) or any(
+        not hasattr(signal, name) for name in required[:2]
+    ):
+        raise BoundCloseReservationExchangeConfigurationError(
+            "strict POSIX wall-clock timer is unavailable"
+        )
+    if threading.current_thread() is not threading.main_thread():
+        raise BoundCloseReservationExchangeConfigurationError(
+            "strict wall-clock timer requires the main thread"
+        )
+    try:
+        handler = signal.getsignal(signal.SIGALRM)
+        active_timer = signal.getitimer(signal.ITIMER_REAL)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise BoundCloseReservationExchangeConfigurationError(
+            "strict wall-clock timer state is unavailable"
+        ) from exc
+    if handler is not signal.SIG_DFL or any(value > 0 for value in active_timer):
+        raise BoundCloseReservationExchangeConfigurationError(
+            "strict wall-clock timer conflict"
+        )
+
+
+def _finite_recovery_monotonic(value: object) -> float:
+    if isinstance(value, bool):
+        raise BoundCloseReservationExchangeConfigurationError(
+            "recovery deadline is invalid"
+        )
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise BoundCloseReservationExchangeConfigurationError(
+            "recovery deadline is invalid"
+        ) from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise BoundCloseReservationExchangeConfigurationError(
+            "recovery deadline is invalid"
+        )
+    return parsed
+
+
+@contextmanager
+def _recovery_wall_clock_guard(*, deadline_monotonic: float):
+    _require_recovery_wall_clock_guard()
+    deadline = _finite_recovery_monotonic(deadline_monotonic)
+    remaining = deadline - _finite_recovery_monotonic(time.monotonic())
+    if remaining <= 0:
+        raise BoundCloseReservationExchangeDeadlineExceeded(
+            "recovery wall-clock deadline expired"
+        )
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    handler_installed = False
+
+    def deadline_handler(signum, frame):
+        del signum, frame
+        raise BoundCloseReservationExchangeDeadlineExceeded(
+            "recovery wall-clock deadline expired"
+        )
+
+    try:
+        signal.signal(signal.SIGALRM, deadline_handler)
+        handler_installed = True
+        signal.setitimer(signal.ITIMER_REAL, remaining)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        if handler_installed:
+            signal.signal(signal.SIGALRM, previous_handler)
+        raise BoundCloseReservationExchangeConfigurationError(
+            "strict wall-clock timer cannot be armed"
+        ) from exc
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
 class BoundCloseReservationExchangeReader:
     """One-shot capability exposing only exact Deepcoin recovery GET reads."""
 
-    __slots__ = ("__transport",)
+    __slots__ = ("__state", "__transport")
 
     def __init__(self, transport: DeepcoinRestClient) -> None:
-        if not isinstance(transport, DeepcoinRestClient):
-            raise TypeError("transport must be DeepcoinRestClient")
+        if not _claim_bound_close_reservation_recovery_transport(transport):
+            raise BoundCloseReservationExchangeConfigurationError(
+                "transport must come from the dedicated recovery factory"
+            )
         self.__transport = transport
+        self.__state = "fresh"
 
     @contextmanager
     def request_scope(
@@ -136,6 +232,15 @@ class BoundCloseReservationExchangeReader:
     ):
         """Apply one absolute deadline and always retire the owned transport."""
 
+        if self.__state == "active":
+            raise BoundCloseReservationExchangeConfigurationError(
+                "recovery scope is already active"
+            )
+        if self.__state == "consumed":
+            raise BoundCloseReservationExchangeConfigurationError(
+                "recovery scope is already consumed"
+            )
+
         scope = DeepcoinRequestScope(
             phase=DEEPCOIN_BOUND_CLOSE_RESERVATION_RECOVERY_PHASE,
             priority=RequestPriority.BACKGROUND,
@@ -144,17 +249,40 @@ class BoundCloseReservationExchangeReader:
             attempt_recorder=attempt_recorder,
             max_response_bytes=RECOVERY_RESPONSE_MAX_BYTES,
         )
-        try:
-            with self.__transport.request_scope(scope):
-                yield self
-        finally:
-            self.__transport.close()
+        with _recovery_wall_clock_guard(
+            deadline_monotonic=deadline_monotonic
+        ):
+            try:
+                self.__state = "active"
+                try:
+                    with self.__transport.request_scope(scope):
+                        yield self
+                except DeepcoinReadUnavailable as exc:
+                    if (
+                        exc.fact.safe_code == "request_deadline_exceeded"
+                        and time.monotonic()
+                        >= _finite_recovery_monotonic(deadline_monotonic)
+                    ):
+                        raise BoundCloseReservationExchangeDeadlineExceeded(
+                            "recovery wall-clock deadline expired"
+                        ) from exc
+                    raise
+            finally:
+                self.__state = "consumed"
+                self.__transport.close()
+
+    def _active_transport(self) -> DeepcoinRestClient:
+        if self.__state != "active":
+            raise BoundCloseReservationExchangeConfigurationError(
+                "exchange reads require the active recovery scope"
+            )
+        return self.__transport
 
     def read_positions(self) -> dict[str, Any]:
-        return self.__transport.read_positions()
+        return self._active_transport().read_positions()
 
     def read_open_orders(self) -> dict[str, Any]:
-        return self.__transport.read_open_orders()
+        return self._active_transport().read_open_orders()
 
     def read_order_history(
         self,
@@ -163,7 +291,7 @@ class BoundCloseReservationExchangeReader:
         order_id: str,
         limit: int = 100,
     ) -> dict[str, Any]:
-        return self.__transport.read_order_history(
+        return self._active_transport().read_order_history(
             inst_id=inst_id,
             order_id=order_id,
             limit=limit,
@@ -176,7 +304,7 @@ class BoundCloseReservationExchangeReader:
         order_id: str,
         limit: int = 100,
     ) -> dict[str, Any]:
-        return self.__transport.read_trade_fills(
+        return self._active_transport().read_trade_fills(
             inst_id=inst_id,
             order_id=order_id,
             limit=limit,
@@ -188,7 +316,7 @@ class BoundCloseReservationExchangeReader:
         inst_id: str,
         pos_id: str,
     ) -> dict[str, Any]:
-        return self.__transport.read_position_history(
+        return self._active_transport().read_position_history(
             inst_id=inst_id,
             pos_id=pos_id,
         )
