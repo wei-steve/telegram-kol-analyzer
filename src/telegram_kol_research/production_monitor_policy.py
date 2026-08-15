@@ -183,6 +183,7 @@ class CandidateClassification:
     observed_health: str
     incident_eligible: bool
     deployment_blocking: bool
+    evidence_complete: bool
     candidate_state: CandidateState | None
     decision_reason: str
 
@@ -285,6 +286,7 @@ def classify_candidate(
             observed_health="UNKNOWN",
             incident_eligible=False,
             deployment_blocking=True,
+            evidence_complete=False,
             candidate_state=state,
             decision_reason="EVIDENCE_POLICY_UNKNOWN",
         )
@@ -351,6 +353,7 @@ def classify_candidate(
             observed_health="UNKNOWN",
             incident_eligible=False,
             deployment_blocking=True,
+            evidence_complete=False,
             candidate_state=state,
             decision_reason="DURABLE_DEADLINE_MISSING",
         )
@@ -389,11 +392,17 @@ def classify_candidate(
             resolution_evidence_class=None,
         )
         if state.lifecycle == _CONFIRMED:
-            return _confirmed(state, policy, "BEFORE_DURABLE_DEADLINE")
+            return _confirmed(
+                state,
+                policy,
+                "BEFORE_DURABLE_DEADLINE",
+                evidence_complete=False,
+            )
         return CandidateClassification(
             observed_health="UNKNOWN",
             incident_eligible=False,
             deployment_blocking=True,
+            evidence_complete=False,
             candidate_state=state,
             decision_reason="BEFORE_DURABLE_DEADLINE",
         )
@@ -427,11 +436,17 @@ def classify_candidate(
                 resolution_evidence_class=None,
             )
             if sticky_confirmation_evidence is not None:
-                return _confirmed(state, policy, snapshot_validation)
+                return _confirmed(
+                    state,
+                    policy,
+                    snapshot_validation,
+                    evidence_complete=False,
+                )
             return CandidateClassification(
                 observed_health="UNKNOWN",
                 incident_eligible=False,
                 deployment_blocking=True,
+                evidence_complete=False,
                 candidate_state=state,
                 decision_reason=snapshot_validation,
             )
@@ -465,6 +480,7 @@ def classify_candidate(
                 observed_health="UNHEALTHY",
                 incident_eligible=policy.incident_eligible,
                 deployment_blocking=True,
+                evidence_complete=True,
                 candidate_state=state,
                 decision_reason="CONFIRMED",
             )
@@ -501,6 +517,7 @@ def classify_candidate(
             observed_health="UNKNOWN",
             incident_eligible=False,
             deployment_blocking=True,
+            evidence_complete=False,
             candidate_state=state,
             decision_reason="AWAITING_DISTINCT_BAD_GENERATIONS",
         )
@@ -756,11 +773,14 @@ def _confirmed(
     state: CandidateState,
     policy: ReasonPolicy,
     decision_reason: str,
+    *,
+    evidence_complete: bool = True,
 ) -> CandidateClassification:
     return CandidateClassification(
         observed_health="UNHEALTHY",
         incident_eligible=policy.incident_eligible,
         deployment_blocking=True,
+        evidence_complete=evidence_complete,
         candidate_state=state,
         decision_reason=decision_reason,
     )
@@ -774,6 +794,7 @@ def _healthy(
         observed_health="HEALTHY",
         incident_eligible=False,
         deployment_blocking=False,
+        evidence_complete=True,
         candidate_state=state,
         decision_reason=decision_reason,
     )
@@ -788,6 +809,7 @@ def _unknown(
             observed_health="UNHEALTHY",
             incident_eligible=True,
             deployment_blocking=True,
+            evidence_complete=False,
             candidate_state=previous,
             decision_reason=decision_reason,
         )
@@ -795,6 +817,7 @@ def _unknown(
         observed_health="UNKNOWN",
         incident_eligible=False,
         deployment_blocking=True,
+        evidence_complete=False,
         candidate_state=previous,
         decision_reason=decision_reason,
     )

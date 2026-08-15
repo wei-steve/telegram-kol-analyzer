@@ -82,6 +82,8 @@ _FALLBACK_FIELDS = frozenset(
 _RESULT_FIELDS = frozenset(
     {
         "checked_at",
+        "checked_at_high_watermark",
+        "observation_generation",
         "execution_status",
         "observed_health",
         "reason_codes",
@@ -132,7 +134,9 @@ class FallbackDeliveryState:
 
 @dataclass(frozen=True, slots=True)
 class LatestCompletedResult:
+    observation_generation: int
     checked_at: datetime
+    checked_at_high_watermark: datetime
     execution_status: str
     observed_health: str
     reason_codes: tuple[str, ...]
@@ -175,6 +179,12 @@ class ProductionMonitorStateStore:
         return SentinelStateLease(self)
 
     def load(self) -> ProductionMonitorState:
+        return self._load(clock_tolerant=False)
+
+    def _load_for_sentinel(self) -> ProductionMonitorState:
+        return self._load(clock_tolerant=True)
+
+    def _load(self, *, clock_tolerant: bool) -> ProductionMonitorState:
         now = _aware_utc(self._now_factory(), field="current time")
         parent_fd = _open_safe_parent(self.path)
         descriptor: int | None = None
@@ -204,7 +214,12 @@ class ProductionMonitorStateStore:
                 raw = handle.read(MONITOR_STATE_MAX_BYTES + 1)
             if len(raw) > MONITOR_STATE_MAX_BYTES:
                 raise ValueError("production monitor state exceeds safe size")
-            return _state_from_bytes(raw, now=now)
+            validation_now = (
+                _clock_tolerant_validation_now(raw, now=now)
+                if clock_tolerant
+                else now
+            )
+            return _state_from_bytes(raw, now=validation_now)
         finally:
             if descriptor is not None:
                 os.close(descriptor)
@@ -231,10 +246,11 @@ class ProductionMonitorStateStore:
                 "production monitor state lease belongs to another owner thread"
             )
         now = _aware_utc(self._now_factory(), field="current time")
-        encoded = _state_to_bytes(state, now=now)
+        validation_now = _clock_tolerant_state_validation_now(state, now=now)
+        encoded = _state_to_bytes(state, now=validation_now)
         if len(encoded) > MONITOR_STATE_MAX_BYTES:
             raise ValueError("production monitor state exceeds safe size")
-        validated = _state_from_bytes(encoded, now=now)
+        validated = _state_from_bytes(encoded, now=validation_now)
         parent_fd = _open_safe_parent(self.path)
         temporary_name = (
             f".{self.path.name}.{os.getpid()}.{os.urandom(16).hex()}.tmp"
@@ -356,6 +372,10 @@ class SentinelStateLease:
     def load(self) -> ProductionMonitorState:
         self._require_acquired()
         return self._store.load()
+
+    def load_for_sentinel(self) -> ProductionMonitorState:
+        self._require_acquired()
+        return self._store._load_for_sentinel()
 
     def save(self, state: ProductionMonitorState) -> ProductionMonitorState:
         self._require_acquired()
@@ -704,7 +724,11 @@ def _result_payload(value: LatestCompletedResult) -> dict[str, Any]:
     if not isinstance(value, LatestCompletedResult):
         raise ValueError("state completed result is invalid")
     return {
+        "observation_generation": value.observation_generation,
         "checked_at": _format_datetime(value.checked_at),
+        "checked_at_high_watermark": _format_datetime(
+            value.checked_at_high_watermark
+        ),
         "execution_status": value.execution_status,
         "observed_health": value.observed_health,
         "reason_codes": list(value.reason_codes),
@@ -724,6 +748,19 @@ def _result_from_payload(
     checked_at = _parse_datetime(payload["checked_at"])
     if checked_at > now:
         raise ValueError("state completed result is in the future")
+    checked_at_high_watermark = _parse_datetime(
+        payload["checked_at_high_watermark"]
+    )
+    if checked_at_high_watermark > now:
+        raise ValueError("state completed result watermark is in the future")
+    if checked_at_high_watermark < checked_at:
+        raise ValueError("state completed result watermark is invalid")
+    observation_generation = payload["observation_generation"]
+    if (
+        type(observation_generation) is not int
+        or observation_generation < 1
+    ):
+        raise ValueError("state observation generation is invalid")
     execution_status = payload["execution_status"]
     if execution_status not in MONITOR_EXECUTION_STATUSES:
         raise ValueError("state execution status is invalid")
@@ -745,12 +782,21 @@ def _result_from_payload(
     evidence_complete = payload["evidence_complete"]
     if type(evidence_complete) is not bool:
         raise ValueError("state evidence completeness is invalid")
+    clock_rollback = "monitor_clock_rollback" in reason_codes
+    if checked_at_high_watermark > checked_at and not clock_rollback:
+        raise ValueError("state clock rollback watermark is inconsistent")
+    if clock_rollback and (
+        evidence_complete or observed_health == "HEALTHY"
+    ):
+        raise ValueError("state clock rollback result is inconsistent")
     if observed_health == "HEALTHY" and (
         reason_codes or adapter_failures or not evidence_complete
     ):
         raise ValueError("state healthy result is inconsistent")
     return LatestCompletedResult(
+        observation_generation=observation_generation,
         checked_at=checked_at,
+        checked_at_high_watermark=checked_at_high_watermark,
         execution_status=execution_status,
         observed_health=observed_health,
         reason_codes=reason_codes,
@@ -760,6 +806,39 @@ def _result_from_payload(
             payload["state_fingerprint"], field="state"
         ),
     )
+
+
+def _clock_tolerant_validation_now(raw: bytes, *, now: datetime) -> datetime:
+    try:
+        payload = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_strict_object,
+            parse_constant=_reject_constant,
+        )
+        raw_result = payload["latest_completed_result"]
+        if raw_result is None:
+            return now
+        watermark = _parse_datetime(raw_result["checked_at_high_watermark"])
+    except (KeyError, TypeError, UnicodeError, json.JSONDecodeError, ValueError):
+        return now
+    return max(now, watermark)
+
+
+def _clock_tolerant_state_validation_now(
+    state: ProductionMonitorState,
+    *,
+    now: datetime,
+) -> datetime:
+    result = state.latest_completed_result
+    if (
+        not isinstance(result, LatestCompletedResult)
+        or "monitor_clock_rollback" not in result.reason_codes
+        or not isinstance(result.checked_at_high_watermark, datetime)
+        or result.checked_at_high_watermark.tzinfo is None
+        or result.checked_at_high_watermark.utcoffset() is None
+    ):
+        return now
+    return max(now, result.checked_at_high_watermark.astimezone(UTC))
 
 
 def _generation_tuple(value: object, *, field: str) -> tuple[int, ...]:

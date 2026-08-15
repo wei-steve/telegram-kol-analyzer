@@ -83,6 +83,16 @@ from telegram_kol_research.production_monitor_refresher import (
 from telegram_kol_research.production_monitor_snapshot import (
     ProductionMonitorSnapshotStore,
 )
+from telegram_kol_research.production_monitor_contract import (
+    MONITOR_ADAPTER_NAMES,
+)
+from telegram_kol_research.production_monitor_sentinel import (
+    SentinelObservation,
+    run_production_monitor_sentinel,
+)
+from telegram_kol_research.production_monitor_state import (
+    ProductionMonitorStateStore,
+)
 from telegram_kol_research.deepcoin_order_builder import (
     deepcoin_order_draft_fingerprint,
 )
@@ -402,6 +412,95 @@ def refresh_production_monitor_snapshot_cli(
     )
     if exit_code:
         raise typer.Exit(code=exit_code)
+
+
+@app.command("run-production-monitor-sentinel")
+def run_production_monitor_sentinel_cli(
+    state_path: Path = typer.Option(
+        ...,
+        "--state-path",
+        help="Exact sentinel-v2 state path.",
+    ),
+    snapshot_path: Path = typer.Option(
+        ...,
+        "--snapshot-path",
+        help="Exact sealed exchange snapshot manifest path.",
+    ),
+    database_path: Path = typer.Option(
+        ...,
+        "--database-path",
+        help="Exact production SQLite path reserved for Task 6 query-only facts.",
+    ),
+    checkout_path: Path = typer.Option(
+        ...,
+        "--checkout-path",
+        help="Exact reviewed checkout path reserved for Task 6 facts.",
+    ),
+    settings_url: str = typer.Option(
+        ...,
+        "--settings-url",
+        help="Explicit loopback settings endpoint reserved for Task 6.",
+    ),
+    coverage_path: Path = typer.Option(
+        ...,
+        "--coverage-path",
+        help="Exact message-operation coverage evidence path.",
+    ),
+    expected_head: str = typer.Option(
+        ...,
+        "--expected-head",
+        help="Explicit reviewed production commit identity.",
+    ),
+    readiness_url: str = typer.Option(
+        ...,
+        "--readiness-url",
+        help="Explicit loopback readiness endpoint reserved for Task 6.",
+    ),
+    incident_loopback_url: str = typer.Option(
+        ...,
+        "--incident-loopback-url",
+        help="Explicit incident endpoint reserved for later routing work.",
+    ),
+) -> None:
+    """Persist one safely blocking dormant result until Task 6 wires facts."""
+
+    # These explicit boundaries intentionally have no readers in Task 5. They
+    # prevent future activation from inheriting legacy defaults while the
+    # injected runner and its state semantics can already be tested end to end.
+    del (
+        snapshot_path,
+        database_path,
+        checkout_path,
+        settings_url,
+        coverage_path,
+        expected_head,
+        readiness_url,
+        incident_loopback_url,
+    )
+    outcome = run_production_monitor_sentinel(
+        state_store=ProductionMonitorStateStore(state_path),
+        observation_collector=lambda: SentinelObservation(
+            checked_at=datetime.now(UTC),
+            candidates=(),
+            adapter_failures=tuple(sorted(MONITOR_ADAPTER_NAMES)),
+        ),
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "execution_status": outcome.execution_status,
+                "observed_health": outcome.observed_health,
+                "observation_generation": outcome.observation_generation,
+                "persisted": outcome.persisted,
+                "failure_code": outcome.failure_code,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+    if outcome.exit_code:
+        raise typer.Exit(code=outcome.exit_code)
 
 
 def _bounded_contract_spec_cli_text(value: object) -> str:

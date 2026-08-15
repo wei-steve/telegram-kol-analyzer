@@ -7296,6 +7296,8 @@ def test_monitor_incident_writer_v2_accepts_composite_and_coverage(tmp_path):
     payload = build_monitor_projection(
         {
             "checked_at": datetime(2026, 8, 14, 20, 0, tzinfo=UTC),
+            "observation_generation": 1,
+            "anomaly_fingerprint": "a" * 64,
             "execution_status": "COMPLETED",
             "observed_health": "UNKNOWN",
             "reason_codes": ["adapter_failure"],

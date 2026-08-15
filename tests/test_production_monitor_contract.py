@@ -19,6 +19,8 @@ from telegram_kol_research.production_monitor_contract import (
 def _projection_input(**overrides):
     value = {
         "checked_at": datetime(2026, 8, 14, 20, 0, tzinfo=UTC),
+        "observation_generation": 7,
+        "anomaly_fingerprint": "f" * 64,
         "execution_status": "COMPLETED",
         "observed_health": "UNHEALTHY",
         "reason_codes": ["audit_incomplete", "adapter_failure"],
@@ -123,6 +125,38 @@ def test_projection_submission_id_is_deterministic_and_lists_are_canonical():
     assert first["reason_codes"] == ["adapter_failure", "audit_incomplete"]
     assert first["adapter_failures"] == ["composite", "coverage"]
     assert len(first["submission_id"]) == 64
+
+
+@pytest.mark.parametrize("generation", [None, True, 0, -1, 1.0, "1"])
+def test_v2_projection_requires_exact_positive_observation_generation(generation):
+    with pytest.raises(ValueError, match="observation_generation"):
+        build_monitor_projection(
+            _projection_input(observation_generation=generation)
+        )
+
+
+@pytest.mark.parametrize(
+    "fingerprint",
+    [None, "", "a" * 63, "A" * 64, "g" * 64, 7],
+)
+def test_v2_projection_requires_exact_sha256_anomaly_fingerprint(fingerprint):
+    with pytest.raises(ValueError, match="anomaly_fingerprint"):
+        build_monitor_projection(
+            _projection_input(anomaly_fingerprint=fingerprint)
+        )
+
+
+def test_v2_submission_id_binds_generation_and_anomaly_fingerprint():
+    baseline = build_monitor_projection(_projection_input())
+    next_generation = build_monitor_projection(
+        _projection_input(observation_generation=8)
+    )
+    changed_anomaly = build_monitor_projection(
+        _projection_input(anomaly_fingerprint="e" * 64)
+    )
+
+    assert baseline["submission_id"] != next_generation["submission_id"]
+    assert baseline["submission_id"] != changed_anomaly["submission_id"]
 
 
 @pytest.mark.parametrize(

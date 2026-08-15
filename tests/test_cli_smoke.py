@@ -795,6 +795,86 @@ def test_cli_help_renders():
     assert "audit-kol-pnl" in result.stdout
     assert "backfill-canonical-tpsl-ledger" in result.stdout
     assert "refresh-production-monitor-snapshot" in result.stdout
+    assert "run-production-monitor-sentinel" in result.stdout
+
+
+def _sentinel_cli_args(tmp_path: Path) -> list[str]:
+    return [
+        "run-production-monitor-sentinel",
+        "--state-path",
+        str(tmp_path / "sentinel-v2.json"),
+        "--snapshot-path",
+        str(tmp_path / "snapshot.json"),
+        "--database-path",
+        str(tmp_path / "research.db"),
+        "--checkout-path",
+        str(tmp_path / "checkout"),
+        "--settings-url",
+        "http://127.0.0.1:8000/api/trading-settings",
+        "--coverage-path",
+        str(tmp_path / "coverage.json"),
+        "--expected-head",
+        "a" * 40,
+        "--readiness-url",
+        "http://127.0.0.1:8000/api/runtime-monitor-readiness",
+        "--incident-loopback-url",
+        "http://127.0.0.1:8000/api/runtime-incidents/monitor-capture",
+    ]
+
+
+def test_production_monitor_sentinel_cli_requires_every_explicit_boundary():
+    help_result = CliRunner().invoke(
+        app,
+        ["run-production-monitor-sentinel", "--help"],
+        terminal_width=240,
+    )
+    missing = CliRunner().invoke(app, ["run-production-monitor-sentinel"])
+
+    assert help_result.exit_code == 0
+    for option in (
+        "--state-path",
+        "--snapshot-path",
+        "--database-path",
+        "--checkout-path",
+        "--settings-url",
+        "--coverage-path",
+        "--expected-head",
+        "--readiness-url",
+        "--incident-loopback-url",
+    ):
+        assert option in help_result.output
+    for prohibited in ("--notify", "--test", "--force"):
+        assert prohibited not in help_result.output
+    assert "data/research.db" not in help_result.output
+    assert missing.exit_code == 2
+
+
+def test_dormant_sentinel_cli_persists_unknown_and_never_submits(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.cli as cli_module
+
+    submitted = []
+    monkeypatch.setattr(
+        cli_module.httpx,
+        "post",
+        lambda *args, **kwargs: submitted.append((args, kwargs)),
+    )
+
+    result = CliRunner().invoke(app, _sentinel_cli_args(tmp_path))
+
+    assert result.exit_code == 0
+    assert len(result.stdout.splitlines()) == 1
+    payload = json.loads(result.stdout)
+    assert payload == {
+        "execution_status": "COMPLETED",
+        "observed_health": "UNKNOWN",
+        "observation_generation": 1,
+        "persisted": True,
+        "failure_code": None,
+    }
+    assert len(result.stdout.encode()) <= 512
+    assert submitted == []
 
 
 def test_production_monitor_snapshot_cli_help_has_only_explicit_runtime_inputs():

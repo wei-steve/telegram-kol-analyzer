@@ -76,7 +76,9 @@ def _state():
             next_attempt_at=NOW + timedelta(minutes=5),
         ),
         latest_completed_result=LatestCompletedResult(
+            observation_generation=7,
             checked_at=NOW - timedelta(seconds=10),
+            checked_at_high_watermark=NOW - timedelta(seconds=10),
             execution_status="COMPLETED",
             observed_health="UNHEALTHY",
             reason_codes=("composite_position_without_verified_stop",),
@@ -106,6 +108,132 @@ def test_state_store_round_trips_strict_bounded_state_with_mode_0600(tmp_path):
     assert store.load() == _state()
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert list(tmp_path.glob(".*.tmp")) == []
+
+
+@pytest.mark.parametrize("generation", [None, True, 0, -1, 1.0, "1"])
+def test_latest_completed_result_requires_exact_positive_observation_generation(
+    tmp_path, generation
+):
+    invalid = replace(
+        _state(),
+        latest_completed_result=replace(
+            _state().latest_completed_result,
+            observation_generation=generation,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="observation generation"):
+        _save_with_lease(
+            ProductionMonitorStateStore(
+                tmp_path / "sentinel-v2.json", now_factory=lambda: NOW
+            ),
+            invalid,
+        )
+
+
+def test_latest_completed_result_rejects_watermark_before_checked_at(tmp_path):
+    invalid = replace(
+        _state(),
+        latest_completed_result=replace(
+            _state().latest_completed_result,
+            checked_at_high_watermark=NOW - timedelta(seconds=11),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="watermark"):
+        _save_with_lease(
+            ProductionMonitorStateStore(
+                tmp_path / "sentinel-v2.json", now_factory=lambda: NOW
+            ),
+            invalid,
+        )
+
+
+def test_public_state_load_remains_strict_during_clock_rollback(tmp_path):
+    wall_clock = [NOW]
+    store = ProductionMonitorStateStore(
+        tmp_path / "sentinel-v2.json", now_factory=lambda: wall_clock[0]
+    )
+    _save_with_lease(store, _state())
+    wall_clock[0] = NOW - timedelta(minutes=1)
+
+    with pytest.raises(ValueError, match="future"):
+        store.load()
+
+    with store.single_flight() as lease:
+        assert lease.acquired is True
+        assert lease.load_for_sentinel() == _state()
+
+
+def _rollback_latest_result(**overrides):
+    value = replace(
+        _state().latest_completed_result,
+        checked_at_high_watermark=NOW - timedelta(seconds=5),
+        observed_health="UNHEALTHY",
+        reason_codes=("monitor_clock_rollback",),
+        adapter_failures=(),
+        evidence_complete=False,
+    )
+    return replace(value, **overrides)
+
+
+@pytest.mark.parametrize(
+    "latest_result",
+    [
+        replace(
+            _state().latest_completed_result,
+            checked_at_high_watermark=NOW - timedelta(seconds=5),
+        ),
+        _rollback_latest_result(evidence_complete=True),
+        _rollback_latest_result(observed_health="HEALTHY"),
+    ],
+)
+def test_state_save_rejects_inconsistent_clock_high_watermark_semantics(
+    tmp_path, latest_result
+):
+    with pytest.raises(ValueError, match="clock rollback"):
+        _save_with_lease(
+            ProductionMonitorStateStore(
+                tmp_path / "sentinel-v2.json", now_factory=lambda: NOW
+            ),
+            replace(_state(), latest_completed_result=latest_result),
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda result: result.update(
+            {"checked_at_high_watermark": (NOW - timedelta(seconds=5)).isoformat()}
+        ),
+        lambda result: result.update(
+            {
+                "reason_codes": ["monitor_clock_rollback"],
+                "evidence_complete": True,
+            }
+        ),
+        lambda result: result.update(
+            {
+                "reason_codes": ["monitor_clock_rollback"],
+                "evidence_complete": False,
+                "observed_health": "HEALTHY",
+            }
+        ),
+    ],
+)
+def test_state_load_rejects_inconsistent_clock_high_watermark_semantics(
+    tmp_path, mutation
+):
+    path = tmp_path / "sentinel-v2.json"
+    store = ProductionMonitorStateStore(path, now_factory=lambda: NOW)
+    _save_with_lease(store, _state())
+    payload = json.loads(path.read_text())
+    mutation(payload["latest_completed_result"])
+    path.write_text(json.dumps(payload))
+    path.chmod(0o600)
+
+    with pytest.raises(ValueError, match="clock rollback"):
+        store.load()
 
 
 def test_missing_state_loads_empty_current_schema(tmp_path):

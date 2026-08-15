@@ -101,6 +101,8 @@ MONITOR_PROJECTION_V2_FIELDS = frozenset(
         "schema_version",
         "submission_id",
         "checked_at",
+        "observation_generation",
+        "anomaly_fingerprint",
         "execution_status",
         "observed_health",
         "reason_codes",
@@ -195,6 +197,18 @@ def _projection_without_id(value: Mapping[str, Any]) -> dict[str, Any]:
     execution_status = value["execution_status"]
     observed_health = value["observed_health"]
     fallback_reason = value["fallback_reason"]
+    observation_generation = value["observation_generation"]
+    anomaly_fingerprint = value["anomaly_fingerprint"]
+    if (
+        type(observation_generation) is not int
+        or observation_generation < 1
+    ):
+        raise ValueError("invalid observation_generation")
+    if (
+        not isinstance(anomaly_fingerprint, str)
+        or _SHA256.fullmatch(anomaly_fingerprint) is None
+    ):
+        raise ValueError("invalid anomaly_fingerprint")
     if (
         not isinstance(execution_status, str)
         or execution_status not in MONITOR_EXECUTION_STATUSES
@@ -232,6 +246,8 @@ def _projection_without_id(value: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": MONITOR_SCHEMA_VERSION,
         "checked_at": _canonical_timestamp(value["checked_at"]),
+        "observation_generation": observation_generation,
+        "anomaly_fingerprint": anomaly_fingerprint,
         "execution_status": execution_status,
         "observed_health": observed_health,
         "reason_codes": reason_codes,
@@ -251,6 +267,8 @@ def build_monitor_projection(value: Mapping[str, Any]) -> dict[str, Any]:
         "schema_version": canonical["schema_version"],
         "submission_id": submission_id,
         "checked_at": canonical["checked_at"],
+        "observation_generation": canonical["observation_generation"],
+        "anomaly_fingerprint": canonical["anomaly_fingerprint"],
         "execution_status": canonical["execution_status"],
         "observed_health": canonical["observed_health"],
         "reason_codes": canonical["reason_codes"],
