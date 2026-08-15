@@ -152,6 +152,22 @@ stop and keep automatic management frozen.
 
 ## Server production safety monitor
 
+### 2026-08-15 Monitor v2 阶段一本地交接（未部署）
+
+- v2 新路径已在本地按两分钟读只快照、五分钟 sentinel、独立低频
+  audit 的结构实现，但本记录不表示服务器已安装、已启动或已切换。
+- 操作手册是 `docs/production-monitor-v2-runbook.md`。`UNKNOWN`、`STARTING`、
+  `SETTLING`、`UNHEALTHY` 和执行 `FAILED` 全部阻止部署；systemd
+  oneshot 退出 0 不代表生产健康。
+- `--shadow-only` 是阶段一的明确 no-notify 边界：会保存评估结果，但
+  不调用 incident intake、fallback、Telegram 通知重查或 Agent queue。
+- Task 12 必须按 `docs/production-monitor-v2-cleanup-inventory.md` 删除旧 command、
+  direct notification、exit coupling、state schema、unit、installer、fixtures 和当前
+  文档引用。旧 Monitor 不得成为永久兼容路径。
+- 下一个生产操作仍是 Task 10 之后单独批准的普通代码部署。本阶段未运行
+  stopped capture、未 apply Batch 119、未改数据库、未重放消息、未启用
+  MiMo v2。
+
 Production safety monitoring runs independently through
 `telegram-kol-monitor.service` and a persistent 30-minute
 `telegram-kol-monitor.timer`. The dedicated unprivileged monitor identity has

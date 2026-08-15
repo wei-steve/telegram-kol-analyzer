@@ -498,6 +498,14 @@ def run_production_monitor_sentinel_cli(
         "--incident-loopback-url",
         help="Explicit incident endpoint reserved for later routing work.",
     ),
+    shadow_only: bool = typer.Option(
+        False,
+        "--shadow-only",
+        help=(
+            "Evaluate and persist facts without incident intake, fallback "
+            "delivery, notification rechecks, or Agent queueing."
+        ),
+    ),
 ) -> None:
     """Persist facts and route only globally confirmed monitor incidents."""
 
@@ -557,9 +565,9 @@ def run_production_monitor_sentinel_cli(
             incident_loopback_url=incident_loopback_url,
             monitor_capture_token=monitor_config.monitor_capture_token,
         ),
-        incident_router=route_incident,
+        incident_router=None if shadow_only else route_incident,
     )
-    if outcome.execution_status == "COMPLETED":
+    if outcome.execution_status == "COMPLETED" and not shadow_only:
         try:
             recheck_due_monitor_notifications_persisted(
                 state_store=state_store,

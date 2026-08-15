@@ -235,7 +235,18 @@ BRANCH=codex/deepcoin-auto-trading-v1 \
 /usr/local/bin/telegram-kol-update
 ```
 
-## Install the production safety monitor
+## Production Monitor v2（当前仅本地完成，未部署）
+
+Monitor v2 的安装、read-only canary、no-notify shadow、顺序激活和回滚见
+`docs/production-monitor-v2-runbook.md`。当前不得在服务器执行
+`scripts/install_production_monitor_v2.sh`，也不得启动任何 v2 unit；这些操作
+必须等 Task 10 本地验证完成后，由操作人对普通代码部署边界给出
+明确批准。这个批准不包含停服双 dry-run 或 Batch 119 apply。
+
+阶段一切换验证完成后，必须继续 Task 12 删除旧 Monitor。精确删除范围见
+`docs/production-monitor-v2-cleanup-inventory.md`；旧逻辑不是永久兼容路径。
+
+## Install the legacy production safety monitor（阶段一切换前仍是现行路径）
 
 The independent `telegram-kol-monitor.service` observes production every 30
 minutes and sends deduplicated system-abnormality alerts. Normal trade
