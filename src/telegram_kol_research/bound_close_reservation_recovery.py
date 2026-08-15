@@ -1325,6 +1325,10 @@ class _ClaimedSealedRecoveryCapture(_OpaqueUncopyableCapability):
     def capture_completed_at(self) -> datetime:
         return self.__capture_completed_at
 
+    @property
+    def deadline_monotonic(self) -> float:
+        return self.__deadline_monotonic
+
 
 def _claim_sealed_recovery_capture_for_apply(
     capture: SealedRecoveryCapture,
@@ -1444,9 +1448,13 @@ def _require_bound_close_reservation_apply_arguments(
     ):
         raise _apply_refusal("confirmation_token_mismatch")
     try:
-        return _require_aware_utc(applied_at, "applied_at")
+        applied = _require_aware_utc(applied_at, "applied_at")
+        internal_now = _require_aware_utc(datetime.now(UTC), "internal_now")
     except (TypeError, ValueError) as exc:
         raise _apply_refusal("applied_at_invalid") from exc
+    if applied > internal_now:
+        raise _apply_refusal("applied_at_in_future")
+    return applied
 
 
 def _claim_exact_bound_close_reservation_apply_capture(
@@ -1622,16 +1630,124 @@ def _planned_raw_reservations(
     return tuple(raw_rows)
 
 
+def _durable_row_payload(
+    row: sqlite3.Row,
+    *,
+    excluded_columns: frozenset[str] = frozenset(),
+) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    for key in sorted(row.keys()):
+        if key in excluded_columns:
+            continue
+        value = row[key]
+        if value is not None and type(value) not in {str, int, bool}:
+            raise _apply_refusal("durable_invariant_shape_invalid")
+        payload[key] = value
+    return payload
+
+
+def _durable_invariant_fingerprints(
+    connection: sqlite3.Connection,
+    *,
+    raw_rows: tuple[tuple[str, _RawReservationCapability], ...],
+) -> dict[str, str]:
+    fingerprints: dict[str, str] = {}
+    for reservation_ref, raw in raw_rows:
+        reservation_rows = connection.execute(
+            "SELECT * FROM bound_position_close_reservations WHERE id = ?",
+            (raw.reservation_id,),
+        ).fetchall()
+        binding_rows = connection.execute(
+            "SELECT * FROM execution_bindings WHERE id = ?",
+            (raw.binding_id,),
+        ).fetchall()
+        event_rows = connection.execute(
+            "SELECT * FROM execution_events WHERE id = ?",
+            (raw.event_id,),
+        ).fetchall()
+        leg_rows = (
+            []
+            if raw.entry_leg_id is None
+            else connection.execute(
+                "SELECT * FROM execution_order_legs WHERE id = ?",
+                (raw.entry_leg_id,),
+            ).fetchall()
+        )
+        mutation_rows = _select_in(
+            connection,
+            "SELECT * FROM position_mutation_intents "
+            "WHERE id IN ({placeholders}) ORDER BY id",
+            raw.mutation_ids,
+        )
+        if (
+            len(reservation_rows) != 1
+            or len(binding_rows) != 1
+            or len(event_rows) != 1
+            or len(leg_rows) != (0 if raw.entry_leg_id is None else 1)
+            or len(mutation_rows) != len(raw.mutation_ids)
+        ):
+            raise _apply_refusal("durable_invariant_shape_invalid")
+        reservation = reservation_rows[0]
+        if (
+            reservation["pos_id"] != raw.position_id
+            or reservation["execution_binding_id"] != raw.binding_id
+        ):
+            raise _apply_refusal("durable_invariant_shape_invalid")
+        payload = {
+            "binding": _durable_row_payload(binding_rows[0]),
+            "close_event": _durable_row_payload(event_rows[0]),
+            "entry_leg": (
+                None
+                if not leg_rows
+                else _durable_row_payload(leg_rows[0])
+            ),
+            "mutations": [
+                _durable_row_payload(row) for row in mutation_rows
+            ],
+            "reservation_immutable": _durable_row_payload(
+                reservation,
+                excluded_columns=frozenset(
+                    {"status", "last_error", "updated_at"}
+                ),
+            ),
+        }
+        try:
+            fingerprints[reservation_ref] = _sha256_json(
+                {"durable_invariant": payload}
+            )
+        except (RecursionError, TypeError, ValueError, OverflowError) as exc:
+            raise _apply_refusal("durable_invariant_shape_invalid") from exc
+    return fingerprints
+
+
 def _recovery_audit_payloads(
     *,
     plan: BoundCloseReservationRecoveryPlan,
     raw_rows: tuple[tuple[str, _RawReservationCapability], ...],
+    durable_invariant_fingerprints: Mapping[str, str],
 ) -> tuple[str, str]:
+    expected_refs = {reservation_ref for reservation_ref, _raw in raw_rows}
+    if (
+        type(durable_invariant_fingerprints) is not dict
+        or set(durable_invariant_fingerprints) != expected_refs
+    ):
+        raise _apply_refusal("durable_invariant_binding_invalid")
+    for fingerprint in durable_invariant_fingerprints.values():
+        try:
+            _require_lower_hex_64(
+                fingerprint,
+                "durable_invariant_fingerprint",
+            )
+        except (TypeError, ValueError) as exc:
+            raise _apply_refusal("durable_invariant_binding_invalid") from exc
     before = {
         "action_count": plan.action_count,
         "evidence_fingerprint": plan.evidence_fingerprint,
         "reservations": [
             {
+                "durable_invariant_fingerprint": (
+                    durable_invariant_fingerprints[reservation_ref]
+                ),
                 "reservation_ref": reservation_ref,
                 "status": raw.source_status,
             }
@@ -1643,6 +1759,9 @@ def _recovery_audit_payloads(
         "evidence_fingerprint": plan.evidence_fingerprint,
         "reservations": [
             {
+                "durable_invariant_fingerprint": (
+                    durable_invariant_fingerprints[reservation_ref]
+                ),
                 "reservation_ref": reservation_ref,
                 "status": "confirmed",
             }
@@ -1779,6 +1898,13 @@ def _sqlite_apply_time(value: datetime) -> str:
     )
 
 
+def _require_claimed_apply_deadline(
+    claimed: _ClaimedSealedRecoveryCapture,
+) -> None:
+    if time.monotonic() >= claimed.deadline_monotonic:
+        raise _apply_refusal("fresh_capture_expired_during_apply")
+
+
 def _commit_bound_close_reservation_apply(
     connection: sqlite3.Connection,
 ) -> None:
@@ -1817,9 +1943,30 @@ def _verify_committed_bound_close_reservation_apply_read_only(
             for row in audits
             if row["notification_fingerprint"] == plan.evidence_fingerprint
         )
+        if len(matching) != 1:
+            return None
+        audited_statuses, audited_invariants = (
+            _parse_applied_recovery_audit_statuses(
+                plan=plan,
+                before_json=matching[0]["before_json"],
+                after_json=matching[0]["after_json"],
+            )
+        )
+        expected_statuses = {
+            reservation_ref: raw.source_status
+            for reservation_ref, raw in raw_rows
+        }
+        if (
+            audited_statuses != expected_statuses
+            or _durable_invariant_fingerprints(
+                connection,
+                raw_rows=raw_rows,
+            )
+            != audited_invariants
+        ):
+            return None
         if (
             len(audits) != 1
-            or len(matching) != 1
             or not _exact_recovery_audit_matches(
                 matching[0],
                 plan=plan,
@@ -1887,27 +2034,60 @@ def apply_bound_close_reservation_recovery(
         plan=plan,
         applied_at=applied,
     )
+    _require_claimed_apply_deadline(claimed)
     raw_rows = _planned_raw_reservations(claimed=claimed, plan=plan)
-    before_json, after_json = _recovery_audit_payloads(
-        plan=plan,
-        raw_rows=raw_rows,
-    )
+    _require_claimed_apply_deadline(claimed)
 
     connection: sqlite3.Connection | None = None
     try:
+        _require_claimed_apply_deadline(claimed)
         connection = _open_bound_close_reservation_writable_connection(
             resolved_database_path
         )
+        _require_claimed_apply_deadline(claimed)
         connection.execute("BEGIN IMMEDIATE")
+        _require_claimed_apply_deadline(claimed)
         if not _locked_mimo_contract_mode_is_v1(connection):
             raise _apply_refusal("mimo_contract_mode_not_v1")
+        _require_claimed_apply_deadline(claimed)
         audits = _load_bound_close_reservation_audits(connection)
+        _require_claimed_apply_deadline(claimed)
         matching = tuple(
             row
             for row in audits
             if row["notification_fingerprint"] == plan.evidence_fingerprint
         )
         if matching:
+            (
+                audited_statuses,
+                audited_invariant_fingerprints,
+            ) = _parse_applied_recovery_audit_statuses(
+                plan=plan,
+                before_json=matching[0]["before_json"],
+                after_json=matching[0]["after_json"],
+            )
+            expected_statuses = {
+                reservation_ref: raw.source_status
+                for reservation_ref, raw in raw_rows
+            }
+            if audited_statuses != expected_statuses:
+                raise _apply_refusal("unexpected_audit_event")
+            current_invariant_fingerprints = _durable_invariant_fingerprints(
+                connection,
+                raw_rows=raw_rows,
+            )
+            if current_invariant_fingerprints != (
+                audited_invariant_fingerprints
+            ):
+                raise _apply_refusal("durable_invariant_conflict")
+            before_json, after_json = _recovery_audit_payloads(
+                plan=plan,
+                raw_rows=raw_rows,
+                durable_invariant_fingerprints=(
+                    audited_invariant_fingerprints
+                ),
+            )
+            _require_claimed_apply_deadline(claimed)
             audit_created_at = _parse_sqlite_utc(matching[0]["created_at"])
             if (
                 audit_created_at is None
@@ -1933,6 +2113,7 @@ def apply_bound_close_reservation_recovery(
             ):
                 raise _apply_refusal("unexpected_audit_event")
             active = _locked_active_bound_close_reservation_source(connection)
+            _require_claimed_apply_deadline(claimed)
             if active.reservations:
                 raise _apply_refusal("source_state_conflict")
             connection.rollback()
@@ -1946,6 +2127,7 @@ def apply_bound_close_reservation_recovery(
             raise _apply_refusal("unexpected_audit_event")
 
         locked_source = _locked_active_bound_close_reservation_source(connection)
+        _require_claimed_apply_deadline(claimed)
         if (
             locked_source.source_fingerprint != plan.source_fingerprint
             or tuple(sorted(
@@ -1960,9 +2142,20 @@ def apply_bound_close_reservation_recovery(
             )
         ):
             raise _apply_refusal("source_state_conflict")
+        durable_invariant_fingerprints = _durable_invariant_fingerprints(
+            connection,
+            raw_rows=raw_rows,
+        )
+        _require_claimed_apply_deadline(claimed)
+        before_json, after_json = _recovery_audit_payloads(
+            plan=plan,
+            raw_rows=raw_rows,
+            durable_invariant_fingerprints=durable_invariant_fingerprints,
+        )
 
         updated_at = _sqlite_apply_time(applied)
         for _reservation_ref, raw in raw_rows:
+            _require_claimed_apply_deadline(claimed)
             cursor = _execute_bound_close_reservation_apply_statement(
                 connection,
                 """
@@ -1974,6 +2167,8 @@ def apply_bound_close_reservation_recovery(
             )
             if cursor.rowcount != 1:
                 raise _apply_refusal("reservation_cas_conflict")
+            _require_claimed_apply_deadline(claimed)
+        _require_claimed_apply_deadline(claimed)
         cursor = _execute_bound_close_reservation_apply_statement(
             connection,
             """
@@ -1993,9 +2188,11 @@ def apply_bound_close_reservation_recovery(
                 updated_at,
             ),
         )
+        _require_claimed_apply_deadline(claimed)
         audit_event_id = cursor.lastrowid
         if type(audit_event_id) is not int or audit_event_id <= 0:
             raise _apply_refusal("audit_insert_failed")
+        _require_claimed_apply_deadline(claimed)
         try:
             _commit_bound_close_reservation_apply(connection)
         except Exception as exc:
@@ -2207,14 +2404,16 @@ def _parse_applied_recovery_audit_statuses(
     plan: BoundCloseReservationRecoveryPlan,
     before_json: object,
     after_json: object,
-) -> dict[str, str]:
+) -> tuple[dict[str, str], dict[str, str]]:
     expected_top_before = frozenset(
         {"action_count", "evidence_fingerprint", "reservations"}
     )
     expected_top_after = frozenset(
         {"action_count", "evidence_fingerprint", "reservations", "status"}
     )
-    expected_item = frozenset({"reservation_ref", "status"})
+    expected_item = frozenset(
+        {"durable_invariant_fingerprint", "reservation_ref", "status"}
+    )
     try:
         if type(before_json) is not str or type(after_json) is not str:
             raise TypeError("audit JSON must be text")
@@ -2249,6 +2448,7 @@ def _parse_applied_recovery_audit_statuses(
             raise ValueError("audit payload does not match the approved plan")
         approved_refs = tuple(item.reservation_ref for item in plan.observations)
         statuses: dict[str, str] = {}
+        invariant_fingerprints: dict[str, str] = {}
         after_refs: list[str] = []
         for raw_item in before["reservations"]:
             item = _exact_object_keys(raw_item, expected_item, "audit.before.item")
@@ -2262,6 +2462,10 @@ def _parse_applied_recovery_audit_statuses(
             if reference in statuses:
                 raise ValueError("audit reservation reference is duplicated")
             statuses[reference] = status
+            invariant_fingerprints[reference] = _require_lower_hex_64(
+                item["durable_invariant_fingerprint"],
+                "durable_invariant_fingerprint",
+            )
         for raw_item in after["reservations"]:
             item = _exact_object_keys(raw_item, expected_item, "audit.after.item")
             reference = _require_lower_hex_64(
@@ -2270,10 +2474,14 @@ def _parse_applied_recovery_audit_statuses(
             )
             if item["status"] != "confirmed":
                 raise ValueError("audit terminal status is invalid")
+            if item["durable_invariant_fingerprint"] != (
+                invariant_fingerprints.get(reference)
+            ):
+                raise ValueError("audit durable invariant is inconsistent")
             after_refs.append(reference)
         if tuple(statuses) != approved_refs or tuple(after_refs) != approved_refs:
             raise ValueError("audit population does not match the approved plan")
-        return statuses
+        return statuses, invariant_fingerprints
     except (
         RecursionError,
         TypeError,
@@ -2313,7 +2521,10 @@ def _load_applied_recovery_source_read_only(
         if len(audits) != 1 or len(matching) != 1:
             raise _apply_refusal("unexpected_audit_event")
         audit = matching[0]
-        statuses_by_ref = _parse_applied_recovery_audit_statuses(
+        (
+            statuses_by_ref,
+            audited_invariant_fingerprints,
+        ) = _parse_applied_recovery_audit_statuses(
             plan=approved_plan,
             before_json=audit["before_json"],
             after_json=audit["after_json"],
@@ -2357,9 +2568,18 @@ def _load_applied_recovery_source_read_only(
             source=source,
             plan=approved_plan,
         )
+        current_invariant_fingerprints = _durable_invariant_fingerprints(
+            connection,
+            raw_rows=raw_rows,
+        )
+        if current_invariant_fingerprints != audited_invariant_fingerprints:
+            raise _apply_refusal("durable_invariant_conflict")
         before_expected, after_expected = _recovery_audit_payloads(
             plan=approved_plan,
             raw_rows=raw_rows,
+            durable_invariant_fingerprints=(
+                audited_invariant_fingerprints
+            ),
         )
         if (
             not _exact_recovery_audit_matches(

@@ -3680,6 +3680,16 @@ def test_apply_changes_only_exact_reservations_and_one_redacted_aggregate_event(
     assert "provider" not in audit_text
     assert json.loads(event["before_json"])["action_count"] == 2
     assert json.loads(event["after_json"])["status"] == "confirmed"
+    before_items = json.loads(event["before_json"])["reservations"]
+    assert all(
+        set(item) == {
+            "durable_invariant_fingerprint",
+            "reservation_ref",
+            "status",
+        }
+        and len(item["durable_invariant_fingerprint"]) == 64
+        for item in before_items
+    )
 
 
 @pytest.mark.parametrize("fail_statement", [1, 2, 3])
@@ -3763,6 +3773,108 @@ def test_expired_capture_refuses_before_writable_open_without_consuming_issuance
     assert id(capture) in recovery_module._SEALED_CAPTURE_ISSUANCE_REGISTRY
 
 
+def test_claim_then_begin_immediate_delay_crossing_deadline_rolls_back_without_writes(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path)
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+    deadline = capture._SealedRecoveryCapture__deadline_monotonic
+    clock = {"now": deadline - 0.5}
+    real_open = recovery_module._open_bound_close_reservation_writable_connection
+
+    class DelayedBeginConnection:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+        def execute(self, sql, parameters=()):
+            result = self._connection.execute(sql, parameters)
+            if str(sql).strip().upper() == "BEGIN IMMEDIATE":
+                clock["now"] = deadline + 0.5
+            return result
+
+    monkeypatch.setattr(recovery_module.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        recovery_module,
+        "_open_bound_close_reservation_writable_connection",
+        lambda path: DelayedBeginConnection(real_open(path)),
+    )
+
+    with pytest.raises(BoundCloseReservationRecoveryConflict, match="expired"):
+        _apply_ready(database, capture)
+
+    assert capture._SealedRecoveryCapture__apply_claimed is True
+    assert _table_rows(database, "bound_position_close_reservations")[0][
+        "status"
+    ] == "submitted"
+    assert not [
+        row
+        for row in _table_rows(database, "execution_events")
+        if row["action"] == "bound_close_reservation_history_converged"
+    ]
+
+
+def test_deadline_crossing_after_first_update_rolls_back_all_mutations(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path, row_count=2)
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+    deadline = capture._SealedRecoveryCapture__deadline_monotonic
+    clock = {"now": deadline - 0.5}
+    real_execute = recovery_module._execute_bound_close_reservation_apply_statement
+    calls = 0
+
+    def advance_after_first(connection, sql, parameters=()):
+        nonlocal calls
+        result = real_execute(connection, sql, parameters)
+        calls += 1
+        if calls == 1:
+            clock["now"] = deadline + 0.5
+        return result
+
+    monkeypatch.setattr(recovery_module.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        recovery_module,
+        "_execute_bound_close_reservation_apply_statement",
+        advance_after_first,
+    )
+
+    with pytest.raises(BoundCloseReservationRecoveryConflict, match="expired"):
+        _apply_ready(database, capture)
+
+    assert calls == 1
+    assert [
+        row["status"]
+        for row in _table_rows(database, "bound_position_close_reservations")
+    ] == ["submitted", "submitted"]
+
+
+def test_future_applied_at_refuses_before_claim_or_writable_open(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path)
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+    opened = []
+    monkeypatch.setattr(
+        recovery_module,
+        "_open_bound_close_reservation_writable_connection",
+        lambda path: opened.append(path),
+    )
+
+    with pytest.raises(BoundCloseReservationRecoveryConflict, match="future"):
+        _apply_ready(
+            database,
+            capture,
+            applied_at=datetime(2100, 1, 1, tzinfo=UTC),
+        )
+
+    assert opened == []
+    assert capture._SealedRecoveryCapture__apply_claimed is False
+    assert id(capture) in recovery_module._SEALED_CAPTURE_ISSUANCE_REGISTRY
+
+
 def test_post_apply_fresh_recapture_reloads_db_repeats_gets_and_is_idempotent(
     tmp_path, monkeypatch
 ):
@@ -3834,6 +3946,48 @@ def test_post_apply_recapture_refuses_confirmed_row_drift_before_exchange_gets(
     )
 
     with pytest.raises(BoundCloseReservationRecoveryConflict, match="source"):
+        recapture_and_seal_applied_bound_close_reservation_recovery(
+            database,
+            approved_plan=first.plan,
+            reader=reader,
+            deadline_monotonic=time.monotonic() + 5.0,
+        )
+
+    assert http_client.requests == []
+
+
+@pytest.mark.parametrize(
+    "descendant_drift",
+    [
+        "UPDATE execution_bindings SET payload_json = '{\"changed\":true}' "
+        "WHERE id = 901",
+        "UPDATE execution_events SET response_json = '{\"changed\":true}' "
+        "WHERE id = 901",
+        "UPDATE execution_order_legs SET terminal_reason = 'changed' "
+        "WHERE id = 901",
+        "UPDATE position_mutation_intents SET response_json = '{\"changed\":true}' "
+        "WHERE id = 901",
+    ],
+)
+def test_post_apply_recapture_refuses_any_descendant_authority_drift(
+    tmp_path, monkeypatch, descendant_drift
+):
+    database = _apply_database(tmp_path)
+    source = load_bound_close_reservation_source(database)
+    first, _http = _ready_apply_capture(monkeypatch, database)
+    _apply_ready(database, first)
+    with sqlite3.connect(database) as connection:
+        connection.execute(descendant_drift)
+        connection.commit()
+    http_client = _RecoveryReaderHttpClient(
+        responses=_terminal_provider_responses(source)
+    )
+    reader, _transport, _selected = _factory_recovery_reader(
+        monkeypatch,
+        http_client=http_client,
+    )
+
+    with pytest.raises(BoundCloseReservationRecoveryConflict, match="invariant"):
         recapture_and_seal_applied_bound_close_reservation_recovery(
             database,
             approved_plan=first.plan,
