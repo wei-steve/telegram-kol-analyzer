@@ -4725,6 +4725,19 @@ def test_monitor_incident_capture_projection_is_closed_and_bounded():
     }
 
 
+def test_legacy_monitor_projection_remains_compatible_with_v1_receiver():
+    projection = build_monitor_incident_capture_projection(
+        checked_at=datetime(2026, 8, 14, 20, 0, tzinfo=UTC),
+        reason_codes=("adapter_failure",),
+        adapter_failures=("composite", "coverage", "audit"),
+        notification_status="not_needed",
+        monitor_error=None,
+    )
+
+    assert projection["schema_version"] == 1
+    assert projection["adapter_failures"] == ["audit"]
+
+
 def test_monitor_incident_capture_client_is_fixed_loopback_no_proxy(monkeypatch):
     calls = []
 

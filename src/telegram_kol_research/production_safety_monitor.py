@@ -62,6 +62,11 @@ from telegram_kol_research.runtime_incident_adapters import (
 from telegram_kol_research.protection_health import (
     current_protection_incident_health_status,
 )
+from telegram_kol_research.production_monitor_contract import (
+    LEGACY_MONITOR_ADAPTER_NAMES_V1,
+    LEGACY_MONITOR_NOTIFICATION_ERRORS_V1,
+    LEGACY_MONITOR_REASON_CODES_V1,
+)
 from telegram_kol_research.system_operator_bot import (
     load_system_operator_bot_config,
     send_system_operator_bot_message,
@@ -167,12 +172,8 @@ _ADAPTER_NAMES = frozenset(
         "coverage",
     }
 )
-_MONITOR_CAPTURE_REASON_CODES = frozenset(
-    {"adapter_failure", "audit_incomplete"}
-)
-_MONITOR_CAPTURE_NOTIFICATION_ERRORS = frozenset(
-    {"notification_config_missing", "notification_delivery_failed"}
-)
+_MONITOR_CAPTURE_REASON_CODES = LEGACY_MONITOR_REASON_CODES_V1
+_MONITOR_CAPTURE_NOTIFICATION_ERRORS = LEGACY_MONITOR_NOTIFICATION_ERRORS_V1
 _MANAGEMENT_MODES = frozenset({"disabled", "shadow", "live"})
 _SERVICE_STATES = frozenset(
     {
@@ -269,7 +270,9 @@ def build_monitor_incident_capture_projection(
     reasons = sorted(
         set(reason_codes).intersection(_MONITOR_CAPTURE_REASON_CODES)
     )
-    failures = sorted(set(adapter_failures).intersection(_ADAPTER_NAMES))
+    failures = sorted(
+        set(adapter_failures).intersection(LEGACY_MONITOR_ADAPTER_NAMES_V1)
+    )
     notification_error = (
         monitor_error
         if notification_status in {"config_missing", "delivery_failed"}

@@ -7280,6 +7280,40 @@ def test_monitor_incident_writer_requires_loopback_and_dedicated_token(tmp_path)
         assert row.incident_type == "monitor_adapter_failure"
 
 
+def test_monitor_incident_writer_v2_accepts_composite_and_coverage(tmp_path):
+    from telegram_kol_research.production_monitor_contract import (
+        build_monitor_projection,
+    )
+
+    token = "m" * 43
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"monitor_adapter_failure"}),
+            monitor_capture_token=token,
+        ),
+    )
+    payload = build_monitor_projection(
+        {
+            "checked_at": datetime(2026, 8, 14, 20, 0, tzinfo=UTC),
+            "execution_status": "COMPLETED",
+            "observed_health": "UNKNOWN",
+            "reason_codes": ["adapter_failure"],
+            "adapter_failures": ["composite", "coverage"],
+            "fallback_reason": None,
+        }
+    )
+
+    response = TestClient(app, client=("127.0.0.1", 50000)).post(
+        "/api/runtime-incidents/monitor-capture",
+        headers={"x-monitor-capture-token": token},
+        json=payload,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"accepted": True, "captured": 1}
+
+
 @pytest.mark.parametrize(
     "body",
     [

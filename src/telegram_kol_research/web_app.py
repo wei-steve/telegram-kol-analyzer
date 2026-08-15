@@ -79,6 +79,15 @@ from telegram_kol_research.deepcoin_request_policy import (
     OutcomeCertainty,
     RequestPriority,
 )
+from telegram_kol_research.production_monitor_contract import (
+    LEGACY_MONITOR_ADAPTER_NAMES_V1,
+    LEGACY_MONITOR_NOTIFICATION_ERRORS_V1,
+    LEGACY_MONITOR_PROJECTION_V1_FIELDS,
+    LEGACY_MONITOR_REASON_CODES_V1,
+    MONITOR_MAX_PROJECTION_BYTES,
+    MONITOR_SCHEMA_VERSION,
+    parse_monitor_projection,
+)
 from telegram_kol_research.deepcoin_execution_actions import DeepcoinExecutionActionError
 from telegram_kol_research.deepcoin_execution_actions import close_bound_position_market
 from telegram_kol_research.runtime_agent_production_audit import (
@@ -5245,13 +5254,16 @@ def create_web_app(
             )
         except ValueError:
             content_length = -1
-        if content_length is not None and not 0 <= content_length <= 4096:
+        if (
+            content_length is not None
+            and not 0 <= content_length <= MONITOR_MAX_PROJECTION_BYTES
+        ):
             raise HTTPException(status_code=422, detail="invalid capture payload")
         chunks: list[bytes] = []
         body_size = 0
         async for chunk in request.stream():
             body_size += len(chunk)
-            if body_size > 4096:
+            if body_size > MONITOR_MAX_PROJECTION_BYTES:
                 raise HTTPException(
                     status_code=422,
                     detail="invalid capture payload",
@@ -5275,46 +5287,47 @@ def create_web_app(
                     ValueError("invalid constant")
                 ),
             )
-            if not isinstance(payload, dict) or set(payload) != {
-                "schema_version",
-                "checked_at",
-                "reason_codes",
-                "adapter_failures",
-                "notification_error",
-            }:
+            if not isinstance(payload, dict):
                 raise ValueError("invalid fields")
-            if payload["schema_version"] != 1:
-                raise ValueError("invalid version")
-            checked_at = datetime.fromisoformat(payload["checked_at"])
-            if checked_at.tzinfo is None:
-                raise ValueError("timestamp must be aware")
-            reason_codes = payload["reason_codes"]
-            adapter_failures = payload["adapter_failures"]
-            notification_error = payload["notification_error"]
-            if (
-                not isinstance(reason_codes, list)
-                or len(reason_codes) > 2
-                or any(
-                    reason not in {"adapter_failure", "audit_incomplete"}
-                    for reason in reason_codes
-                )
-                or len(set(reason_codes)) != len(reason_codes)
-                or not isinstance(adapter_failures, list)
-                or len(adapter_failures) > 6
-                or any(
-                    failure
-                    not in {"service", "head", "settings", "journal", "events", "audit"}
-                    for failure in adapter_failures
-                )
-                or len(set(adapter_failures)) != len(adapter_failures)
-                or notification_error
-                not in {
-                    None,
-                    "notification_config_missing",
-                    "notification_delivery_failed",
-                }
-            ):
-                raise ValueError("invalid values")
+            if payload.get("schema_version") == MONITOR_SCHEMA_VERSION:
+                projection = parse_monitor_projection(payload)
+                checked_at = datetime.fromisoformat(projection["checked_at"])
+                reason_codes = projection["reason_codes"]
+                adapter_failures = projection["adapter_failures"]
+                notification_error = None
+            else:
+                # Phase-one compatibility path for the currently active legacy
+                # timer. Keep schema v1 closed to its original six adapters.
+                if set(payload) != LEGACY_MONITOR_PROJECTION_V1_FIELDS:
+                    raise ValueError("invalid fields")
+                if payload["schema_version"] != 1:
+                    raise ValueError("invalid version")
+                checked_at = datetime.fromisoformat(payload["checked_at"])
+                if checked_at.tzinfo is None:
+                    raise ValueError("timestamp must be aware")
+                reason_codes = payload["reason_codes"]
+                adapter_failures = payload["adapter_failures"]
+                notification_error = payload["notification_error"]
+                if (
+                    not isinstance(reason_codes, list)
+                    or len(reason_codes) > len(LEGACY_MONITOR_REASON_CODES_V1)
+                    or any(
+                        reason not in LEGACY_MONITOR_REASON_CODES_V1
+                        for reason in reason_codes
+                    )
+                    or len(set(reason_codes)) != len(reason_codes)
+                    or not isinstance(adapter_failures, list)
+                    or len(adapter_failures)
+                    > len(LEGACY_MONITOR_ADAPTER_NAMES_V1)
+                    or any(
+                        failure not in LEGACY_MONITOR_ADAPTER_NAMES_V1
+                        for failure in adapter_failures
+                    )
+                    or len(set(adapter_failures)) != len(adapter_failures)
+                    or notification_error
+                    not in {None, *LEGACY_MONITOR_NOTIFICATION_ERRORS_V1}
+                ):
+                    raise ValueError("invalid values")
         except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
             raise HTTPException(
                 status_code=422,
