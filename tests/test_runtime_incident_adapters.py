@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -26,6 +26,7 @@ from telegram_kol_research.runtime_incident_adapters import (
     capture_context_worker_state,
     capture_management_state,
     capture_message_operation_failure,
+    capture_monitor_projection,
     capture_monitor_state,
     capture_notification_failure,
     capture_protection_state,
@@ -272,6 +273,7 @@ def test_read_only_capture_profile_is_closed_and_excludes_business_ambiguity():
             "severe_protection_incident",
             "monitor_adapter_failure",
             "monitor_audit_incomplete",
+            "production_monitor_incident",
             "notification_delivery_failure",
         }
     )
@@ -781,6 +783,108 @@ def test_monitor_ordinary_audit_abnormality_is_not_a_technical_incident(tmp_path
 
     assert captured == ()
     assert _rows(session_factory) == []
+
+
+def test_monitor_v2_projection_uses_submission_as_existing_ledger_identity(tmp_path):
+    from telegram_kol_research.production_monitor_contract import (
+        build_monitor_projection,
+    )
+
+    session_factory = create_session_factory(tmp_path / "monitor-v2.db")
+    projection = build_monitor_projection(
+        {
+            "checked_at": NOW,
+            "observation_generation": 3,
+            "anomaly_fingerprint": "a" * 64,
+            "execution_status": "COMPLETED",
+            "observed_health": "UNHEALTHY",
+            "reason_codes": ["audit_abnormal"],
+            "adapter_failures": [],
+            "fallback_reason": None,
+        }
+    )
+    config = RuntimeIncidentConfig(
+        capture_types=frozenset({"production_monitor_incident"})
+    )
+
+    first = capture_monitor_projection(
+        session_factory,
+        config=config,
+        projection=projection,
+    )
+    second = capture_monitor_projection(
+        session_factory,
+        config=config,
+        projection=projection,
+    )
+
+    assert first is not None
+    assert second.id == first.id
+    assert second.generation == first.generation == 1
+    assert second.repeat_count == first.repeat_count == 1
+    assert second.source_kind == "production_monitor_v2"
+    assert second.source_record_id == projection["submission_id"]
+    with session_factory() as session:
+        assert session.query(RuntimeIncident).count() == 1
+
+    later_projection = build_monitor_projection(
+        {
+            "checked_at": NOW + timedelta(minutes=5),
+            "observation_generation": 4,
+            "anomaly_fingerprint": "a" * 64,
+            "execution_status": "COMPLETED",
+            "observed_health": "UNHEALTHY",
+            "reason_codes": ["audit_abnormal"],
+            "adapter_failures": [],
+            "fallback_reason": None,
+        }
+    )
+    later = capture_monitor_projection(
+        session_factory,
+        config=config,
+        projection=later_projection,
+    )
+    assert later.id == first.id
+    with session_factory() as session:
+        assert session.query(RuntimeIncident).count() == 1
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"observed_health": "UNKNOWN"},
+        {"adapter_failures": ["audit"]},
+        {"fallback_reason": "incident_intake_unavailable"},
+    ],
+)
+def test_monitor_v2_adapter_refuses_non_global_confirmed_projection(
+    tmp_path, change
+):
+    from telegram_kol_research.production_monitor_contract import (
+        build_monitor_projection,
+    )
+
+    values = {
+        "checked_at": NOW,
+        "observation_generation": 3,
+        "anomaly_fingerprint": "a" * 64,
+        "execution_status": "COMPLETED",
+        "observed_health": "UNHEALTHY",
+        "reason_codes": ["audit_abnormal"],
+        "adapter_failures": [],
+        "fallback_reason": None,
+    }
+    values.update(change)
+    projection = build_monitor_projection(values)
+
+    with pytest.raises(ValueError, match="globally complete confirmed"):
+        capture_monitor_projection(
+            create_session_factory(tmp_path / "refused.db"),
+            config=RuntimeIncidentConfig(
+                capture_types=frozenset({"production_monitor_incident"})
+            ),
+            projection=projection,
+        )
 
 
 def test_only_severe_protection_incidents_are_captured(tmp_path):

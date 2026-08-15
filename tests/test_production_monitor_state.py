@@ -1125,5 +1125,6 @@ def test_state_file_contains_only_the_closed_top_level_schema(tmp_path):
         "incident_acceptances",
         "fallback",
         "latest_completed_result",
+        "latest_audit_result",
         "audit_cursor",
     }

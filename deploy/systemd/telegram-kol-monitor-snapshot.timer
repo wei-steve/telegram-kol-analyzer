@@ -1,0 +1,14 @@
+[Unit]
+Description=Refresh Telegram KOL read-only Deepcoin snapshot every two minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=10s
+RandomizedDelaySec=10s
+Persistent=true
+Unit=telegram-kol-monitor-snapshot.service
+
+[Install]
+WantedBy=timers.target
+

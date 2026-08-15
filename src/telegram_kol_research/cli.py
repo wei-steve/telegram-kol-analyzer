@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from datetime import UTC, datetime, timedelta
@@ -80,16 +80,29 @@ from telegram_kol_research.production_monitor_refresher import (
     ReadOnlyDeepcoinMonitorClient,
     refresh_production_monitor_snapshot,
 )
+from telegram_kol_research.production_monitor_db_stage import (
+    stage_production_monitor_database,
+)
 from telegram_kol_research.production_monitor_snapshot import (
     ProductionMonitorSnapshotStore,
 )
 from telegram_kol_research.production_monitor_facts import (
+    build_coverage_candidates,
     collect_production_monitor_observation,
+    parse_monitor_readiness_projection,
 )
 from telegram_kol_research.production_monitor_sentinel import (
     run_production_monitor_sentinel,
 )
+from telegram_kol_research.production_monitor_notifications import (
+    MonitorIntakeError,
+    request_monitor_acceptance,
+    request_monitor_fallback,
+    recheck_due_monitor_notifications_persisted,
+    route_monitor_incident_persisted,
+)
 from telegram_kol_research.production_monitor_state import (
+    LatestAuditResult,
     ProductionMonitorStateStore,
 )
 from telegram_kol_research.deepcoin_order_builder import (
@@ -486,7 +499,7 @@ def run_production_monitor_sentinel_cli(
         help="Explicit incident endpoint reserved for later routing work.",
     ),
 ) -> None:
-    """Persist one dormant fact evaluation without submission or notification."""
+    """Persist facts and route only globally confirmed monitor incidents."""
 
     normalized_auto_trade = expected_auto_trade_enabled.strip().lower()
     if normalized_auto_trade not in {"true", "false"}:
@@ -494,8 +507,40 @@ def run_production_monitor_sentinel_cli(
             "must be true or false", param_hint="--expected-auto-trade"
         )
     monitor_config = load_runtime_incident_config(environment_only=True)
+    state_store = ProductionMonitorStateStore(state_path)
+
+    def submit_incident(projection):
+        if not monitor_config.monitor_capture_token:
+            raise MonitorIntakeError("transport_unavailable")
+        return request_monitor_acceptance(
+            url=incident_loopback_url,
+            token=monitor_config.monitor_capture_token,
+            projection=projection,
+            now=datetime.now(UTC),
+        )
+
+    def deliver_fallback(message: str) -> None:
+        if not monitor_config.monitor_capture_token:
+            raise RuntimeError("monitor fallback delivery unavailable")
+        request_monitor_fallback(
+            url=incident_loopback_url.removesuffix("/monitor-capture")
+            + "/monitor-fallback",
+            token=monitor_config.monitor_capture_token,
+            message=message,
+        )
+
+    def route_incident(projection):
+        return route_monitor_incident_persisted(
+            state_store=state_store,
+            projection=projection,
+            now=datetime.now(UTC),
+            submit=submit_incident,
+            recheck=submit_incident,
+            deliver_fallback=deliver_fallback,
+        )
+
     outcome = run_production_monitor_sentinel(
-        state_store=ProductionMonitorStateStore(state_path),
+        state_store=state_store,
         observation_collector=lambda: collect_production_monitor_observation(
             database_path=database_path,
             snapshot_path=snapshot_path,
@@ -512,7 +557,20 @@ def run_production_monitor_sentinel_cli(
             incident_loopback_url=incident_loopback_url,
             monitor_capture_token=monitor_config.monitor_capture_token,
         ),
+        incident_router=route_incident,
     )
+    if outcome.execution_status == "COMPLETED":
+        try:
+            recheck_due_monitor_notifications_persisted(
+                state_store=state_store,
+                now=datetime.now(UTC),
+                recheck=submit_incident,
+                deliver_fallback=deliver_fallback,
+            )
+        except Exception:
+            # Channel recheck health is persisted independently and never
+            # changes a completed sentinel process exit.
+            pass
     typer.echo(
         json.dumps(
             {
@@ -529,6 +587,430 @@ def run_production_monitor_sentinel_cli(
     )
     if outcome.exit_code:
         raise typer.Exit(code=outcome.exit_code)
+
+
+def _production_monitor_audit_summary(
+    audit: object,
+    *,
+    checked_at: datetime,
+    execution_status: str = "COMPLETED",
+) -> LatestAuditResult:
+    complete = False
+    abnormal = False
+    if isinstance(audit, dict):
+        counts = audit.get("counts")
+        malformed_counts = (
+            audit.get("malformed_row_count"),
+            audit.get("malformed_field_count"),
+        )
+        complete = (
+            audit.get("snapshot_status") == "stable"
+            and audit.get("snapshot_validation") == "ok"
+            and audit.get("schema_status") == "available"
+            and audit.get("output_complete") is True
+            and isinstance(counts, dict)
+            and all(
+                type(counts.get(name)) is int and counts[name] >= 0
+                for name in _MANAGEMENT_ALERT_STATES
+            )
+            and all(type(value) is int and value >= 0 for value in malformed_counts)
+        )
+        if isinstance(counts, dict):
+            abnormal = any(
+                type(counts.get(name)) is int and counts[name] > 0
+                for name in _MANAGEMENT_ALERT_STATES
+            )
+        abnormal = abnormal or any(
+            type(value) is int and value > 0 for value in malformed_counts
+        )
+    reason_values: set[str] = set()
+    if abnormal:
+        reason_values.add("audit_abnormal")
+    if execution_status != "COMPLETED" or not complete:
+        reason_values.add("audit_incomplete")
+    reasons = tuple(sorted(reason_values))
+    observed_health = (
+        "UNHEALTHY"
+        if abnormal
+        else "HEALTHY"
+        if complete and execution_status == "COMPLETED"
+        else "UNKNOWN"
+    )
+    fingerprint_payload = {
+        "checked_at": checked_at.isoformat(),
+        "execution_status": execution_status,
+        "observed_health": observed_health,
+        "reason_codes": reasons,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    ).hexdigest()
+    return LatestAuditResult(
+        checked_at=checked_at,
+        execution_status=execution_status,
+        observed_health=observed_health,
+        reason_codes=reasons,
+        state_fingerprint=fingerprint,
+    )
+
+
+@app.command("stage-production-monitor-database")
+def stage_production_monitor_database_cli(
+    consumer: str = typer.Option(..., "--consumer"),
+) -> None:
+    """Run the privileged, closed-scope SQLite snapshot broker."""
+
+    try:
+        destination = stage_production_monitor_database(consumer)
+    except (OSError, PermissionError, ValueError, sqlite3.Error):
+        typer.echo(
+            '{"execution_status":"FAILED","staged":false}',
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    typer.echo(
+        json.dumps(
+            {
+                "consumer": consumer,
+                "destination": str(destination),
+                "execution_status": "COMPLETED",
+                "staged": True,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("run-production-monitor-audit")
+def run_production_monitor_audit_cli(
+    state_path: Path = typer.Option(
+        ...,
+        "--state-path",
+        help="Exact sentinel-v2 state path whose audit slot is updated.",
+    ),
+    database_path: Path = typer.Option(
+        ...,
+        "--database-path",
+        help="Exact production SQLite path read through a private snapshot.",
+    ),
+    scratch_root: Path = typer.Option(
+        ...,
+        "--scratch-root",
+        help="Exact private cache directory for the bounded audit snapshot.",
+    ),
+) -> None:
+    """Run the heavy read-only audit and atomically replace only its state slot."""
+
+    checked_at = datetime.now(UTC)
+    try:
+        audit = _audit_management_batches_read_only(
+            database_path,
+            limit=100,
+            scratch_root=scratch_root,
+        )
+        audit_result = _production_monitor_audit_summary(
+            audit,
+            checked_at=checked_at,
+        )
+    except Exception:
+        audit_result = _production_monitor_audit_summary(
+            None,
+            checked_at=checked_at,
+            execution_status="FAILED",
+        )
+
+    persisted = False
+    store = ProductionMonitorStateStore(state_path)
+    try:
+        with store.single_flight() as lease:
+            if not lease.acquired:
+                raise RuntimeError("production monitor state is busy")
+            current = lease.load_for_sentinel()
+            cursor = checked_at.isoformat().replace("+00:00", "Z")
+            lease.save(
+                replace(
+                    current,
+                    latest_audit_result=audit_result,
+                    audit_cursor=cursor,
+                )
+            )
+            persisted = True
+    except Exception:
+        persisted = False
+
+    execution_status = (
+        audit_result.execution_status if persisted else "FAILED"
+    )
+    observed_health = (
+        audit_result.observed_health if persisted else "UNKNOWN"
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "execution_status": execution_status,
+                "observed_health": observed_health,
+                "persisted": persisted,
+                "reason_codes": list(audit_result.reason_codes),
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+    if execution_status == "FAILED":
+        raise typer.Exit(code=1)
+
+
+def _monitor_evidence_url(value: str, *, expected_path: str) -> str:
+    try:
+        parsed = httpx.URL(value)
+    except Exception as exc:
+        raise ValueError("monitor evidence URL is invalid") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.host not in {"127.0.0.1", "::1", "localhost"}
+        or parsed.path != expected_path
+        or parsed.userinfo
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("monitor evidence URL must be the exact loopback endpoint")
+    return str(parsed)
+
+
+def _write_monitor_evidence(path: Path, payload: object) -> None:
+    encoded = (
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        + b"\n"
+    )
+    if len(encoded) > 65_536:
+        raise ValueError("monitor evidence exceeds safe size")
+    parent = path.parent
+    if parent.is_symlink() or not parent.is_dir():
+        raise ValueError("monitor evidence parent is unsafe")
+    if path.is_symlink():
+        raise ValueError("monitor evidence target is unsafe")
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=parent,
+        prefix=f".{path.name}.",
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if path.is_symlink():
+            raise ValueError("monitor evidence target is unsafe")
+        os.replace(temporary, path)
+        temporary = Path()
+        parent_descriptor = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary != Path():
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+@app.command("capture-production-monitor-local-evidence")
+def capture_production_monitor_local_evidence_cli(
+    readiness_url: str = typer.Option(..., "--readiness-url"),
+    coverage_url: str = typer.Option(..., "--coverage-url"),
+    coverage_path: Path = typer.Option(..., "--coverage-path"),
+    journal_path: Path = typer.Option(..., "--journal-path"),
+    service_name: str = typer.Option(..., "--service-name"),
+) -> None:
+    """Capture bounded loopback coverage and generation-bound journal facts."""
+
+    if service_name != "telegram-kol.service":
+        raise typer.BadParameter(
+            "must be telegram-kol.service", param_hint="--service-name"
+        )
+    readiness_endpoint = _monitor_evidence_url(
+        readiness_url,
+        expected_path="/api/runtime-monitor-readiness",
+    )
+    coverage_endpoint = _monitor_evidence_url(
+        coverage_url,
+        expected_path="/api/runtime-incidents/message-operation-coverage",
+    )
+    config = load_runtime_incident_config(environment_only=True)
+    token = config.monitor_capture_token or ""
+    headers = {
+        "cache-control": "no-cache",
+        "x-monitor-capture-token": token,
+    }
+    capture_started_at = datetime.now(UTC)
+    evidence_complete = True
+    generation = "0" * 64
+    readiness = None
+    coverage_payload: object = {}
+    try:
+        readiness_response = httpx.get(
+            readiness_endpoint,
+            headers=headers,
+            timeout=5.0,
+        )
+        if (
+            readiness_response.status_code != 200
+            or len(readiness_response.content) > 4096
+        ):
+            raise ValueError("readiness unavailable")
+        readiness_payload = json.loads(readiness_response.content.decode("utf-8"))
+        readiness = parse_monitor_readiness_projection(readiness_payload)
+        generation = readiness.service_generation
+
+        coverage_response = httpx.get(
+            coverage_endpoint,
+            headers=headers,
+            timeout=5.0,
+        )
+        if (
+            coverage_response.status_code != 200
+            or len(coverage_response.content) > 65_536
+        ):
+            raise ValueError("coverage unavailable")
+        coverage_payload = json.loads(coverage_response.content.decode("utf-8"))
+        build_coverage_candidates(coverage_payload, now=datetime.now(UTC))
+    except Exception:
+        evidence_complete = False
+        coverage_payload = {}
+
+    journal_markers: list[str] = []
+    journal_complete = False
+    try:
+        if readiness is None or readiness.deepcoin_reconcile_first_success_at is None:
+            raise ValueError("current service generation is not ready")
+        generation_boundary = readiness.deepcoin_reconcile_first_success_at
+        if generation_boundary > capture_started_at:
+            raise ValueError("current service generation boundary is invalid")
+        completed = subprocess.run(
+            [
+                "journalctl",
+                "--unit",
+                service_name,
+                "--priority",
+                "err",
+                "--since",
+                generation_boundary.isoformat(),
+                "--lines",
+                "100",
+                "--no-pager",
+                "--output",
+                "json",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if completed.returncode != 0 or len(completed.stdout.encode("utf-8")) > 65_536:
+            raise ValueError("journal unavailable")
+        journal_complete = True
+        observed_until = datetime.now(UTC)
+        authority_message = re.compile(
+            r"recognition authority unavailable raw_message_id=[1-9][0-9]{0,18} "
+            r"reason=authoritative_processor_required\Z"
+        )
+        for line in (line for line in completed.stdout.splitlines() if line.strip()):
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise ValueError("journal record is invalid")
+            raw_timestamp = record.get("__REALTIME_TIMESTAMP")
+            if (
+                record.get("_SYSTEMD_UNIT") != service_name
+                or record.get("PRIORITY") != "3"
+                or not isinstance(record.get("MESSAGE"), str)
+                or not isinstance(raw_timestamp, str)
+                or re.fullmatch(r"[1-9][0-9]{0,19}", raw_timestamp) is None
+            ):
+                journal_complete = False
+                continue
+            observed_at = datetime.fromtimestamp(
+                int(raw_timestamp) / 1_000_000,
+                tz=UTC,
+            )
+            if observed_at < generation_boundary:
+                continue
+            if observed_at > observed_until + timedelta(seconds=1):
+                journal_complete = False
+                continue
+            if authority_message.fullmatch(record["MESSAGE"]) is None:
+                journal_complete = False
+                continue
+            journal_markers.append("authoritative_processor_required")
+        closing_readiness_response = httpx.get(
+            readiness_endpoint,
+            headers=headers,
+            timeout=5.0,
+        )
+        if (
+            closing_readiness_response.status_code != 200
+            or len(closing_readiness_response.content) > 4096
+        ):
+            raise ValueError("closing readiness unavailable")
+        closing_readiness = parse_monitor_readiness_projection(
+            json.loads(closing_readiness_response.content.decode("utf-8"))
+        )
+        if (
+            closing_readiness.service_generation != generation
+            or closing_readiness.deepcoin_reconcile_first_success_at
+            != generation_boundary
+        ):
+            raise ValueError("service generation changed during journal capture")
+    except Exception:
+        journal_complete = False
+    evidence_complete = evidence_complete and journal_complete
+    capture_completed_at = datetime.now(UTC)
+    journal_payload = {
+        "schema_version": 1,
+        "service_generation": generation,
+        "capture_started_at": capture_started_at.isoformat(),
+        "capture_completed_at": capture_completed_at.isoformat(),
+        "complete": journal_complete,
+        "markers": sorted(set(journal_markers)),
+        "resolved_markers": [],
+    }
+    try:
+        _write_monitor_evidence(coverage_path, coverage_payload)
+        _write_monitor_evidence(journal_path, journal_payload)
+    except Exception:
+        typer.echo(
+            '{"evidence_complete":false,"execution_status":"FAILED"}'
+        )
+        raise typer.Exit(code=1)
+    typer.echo(
+        json.dumps(
+            {
+                "evidence_complete": evidence_complete,
+                "execution_status": "COMPLETED",
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
 
 
 def _bounded_contract_spec_cli_text(value: object) -> str:

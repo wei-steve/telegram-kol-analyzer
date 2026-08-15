@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import nullcontext
+import hashlib
 import json
 import re
 import sqlite3
@@ -84,6 +85,7 @@ from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.models import TradeSignal
 from telegram_kol_research.models import StrategyManagementBatch, StrategyManagementLeg
 from telegram_kol_research.models import RuntimeIncident
+from telegram_kol_research.models import MonitorFallbackDeliveryReceipt
 from telegram_kol_research.message_recognition import (
     MessageRecognitionResult,
     apply_authoritative_mimo_payload,
@@ -7314,6 +7316,414 @@ def test_monitor_incident_writer_v2_accepts_composite_and_coverage(tmp_path):
 
     assert response.status_code == 200
     assert response.json() == {"accepted": True, "captured": 1}
+
+
+def test_monitor_incident_writer_v2_retries_return_same_semantic_acceptance(
+    tmp_path,
+):
+    from telegram_kol_research.production_monitor_contract import (
+        build_monitor_projection,
+    )
+
+    token = "m" * 43
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"production_monitor_incident"}),
+            monitor_capture_token=token,
+        ),
+    )
+    payload = build_monitor_projection(
+        {
+            "checked_at": datetime(2026, 8, 14, 20, 0, tzinfo=UTC),
+            "observation_generation": 1,
+            "anomaly_fingerprint": "a" * 64,
+            "execution_status": "COMPLETED",
+            "observed_health": "UNHEALTHY",
+            "reason_codes": ["audit_abnormal"],
+            "adapter_failures": [],
+            "fallback_reason": None,
+        }
+    )
+    client = TestClient(app, client=("127.0.0.1", 50000))
+    request = {
+        "headers": {"x-monitor-capture-token": token},
+        "json": payload,
+    }
+
+    first = client.post("/api/runtime-incidents/monitor-capture", **request)
+    repeated = client.post("/api/runtime-incidents/monitor-capture", **request)
+    later_payload = build_monitor_projection(
+        {
+            "checked_at": datetime(2026, 8, 14, 20, 5, tzinfo=UTC),
+            "observation_generation": 2,
+            "anomaly_fingerprint": "a" * 64,
+            "execution_status": "COMPLETED",
+            "observed_health": "UNHEALTHY",
+            "reason_codes": ["audit_abnormal"],
+            "adapter_failures": [],
+            "fallback_reason": None,
+        }
+    )
+    later = client.post(
+        "/api/runtime-incidents/monitor-capture",
+        headers={"x-monitor-capture-token": token},
+        json=later_payload,
+    )
+
+    assert first.status_code == repeated.status_code == 200
+    assert first.json() == repeated.json()
+    assert first.json() == {
+        "accepted": True,
+        "submission_id": payload["submission_id"],
+        "accepted_at": payload["checked_at"],
+        "notification_status": "pending",
+        "notification_claimed_at": None,
+        "notification_claim_expires_at": None,
+        "notification_failed_at": None,
+        "agent_status": "pending",
+    }
+    assert later.status_code == 200
+    assert later.json()["submission_id"] == later_payload["submission_id"]
+    assert later.json()["accepted_at"] == payload["checked_at"]
+    with app.state.session_factory() as session:
+        row = session.query(RuntimeIncident).one()
+        assert row.source_record_id == payload["submission_id"]
+        assert row.generation == 1
+
+
+def test_monitor_fallback_proxy_is_loopback_authenticated_closed_and_bounded(
+    tmp_path, monkeypatch
+):
+    token = "m" * 43
+    delivered = []
+
+    async def fake_send(*, config, text):
+        delivered.append((config, text))
+        return 101
+
+    monkeypatch.setattr(
+        web_app_module, "send_system_operator_bot_message", fake_send
+    )
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"production_monitor_incident"}),
+            monitor_capture_token=token,
+        ),
+    )
+    bot_config = SystemOperatorBotConfig(
+        bot_token="123456:abcdefghijklmnopqrstuvwxyz123456",
+        chat_id=123,
+    )
+    app.state.system_operator_bot_config = bot_config
+    payload = {
+        "delivery_id": hashlib.sha256(
+            "\0".join(
+                (
+                    "incident_intake_unavailable",
+                    "runtime_incident_intake",
+                    "2026-08-15T12:00:00+00:00",
+                    "2026-08-15T12:10:00+00:00",
+                )
+            ).encode()
+        ).hexdigest(),
+        "reason": "incident_intake_unavailable",
+        "component": "runtime_incident_intake",
+        "observed_at": "2026-08-15T12:00:00+00:00",
+        "deadline_at": "2026-08-15T12:10:00+00:00",
+        "rechecked_at": "2026-08-15T12:11:00+00:00",
+    }
+    client = TestClient(app, client=("127.0.0.1", 50000))
+
+    accepted = client.post(
+        "/api/runtime-incidents/monitor-fallback",
+        headers={"x-monitor-capture-token": token},
+        json=payload,
+    )
+    response_lost_retry = client.post(
+        "/api/runtime-incidents/monitor-fallback",
+        headers={"x-monitor-capture-token": token},
+        json=payload,
+    )
+    remote = TestClient(app, client=("198.51.100.8", 50000)).post(
+        "/api/runtime-incidents/monitor-fallback",
+        headers={"x-monitor-capture-token": token},
+        json=payload,
+    )
+    open_payload = client.post(
+        "/api/runtime-incidents/monitor-fallback",
+        headers={"x-monitor-capture-token": token},
+        json={**payload, "message": "arbitrary"},
+    )
+
+    assert accepted.status_code == 200
+    assert accepted.json() == {"delivered": True}
+    assert response_lost_retry.status_code == 200
+    assert response_lost_retry.json() == {"delivered": True}
+    assert remote.status_code == 404
+    assert open_payload.status_code == 422
+    assert delivered == [
+        (
+            bot_config,
+            "Production monitor channel failure\n"
+            "reason=incident_intake_unavailable\n"
+            "component=runtime_incident_intake\n"
+            "observed_at=2026-08-15T12:00:00+00:00\n"
+            "deadline_at=2026-08-15T12:10:00+00:00\n"
+            "rechecked_at=2026-08-15T12:11:00+00:00",
+        )
+    ]
+
+
+def test_monitor_fallback_expired_claim_becomes_observable_ambiguous(
+    tmp_path, monkeypatch
+):
+    token = "m" * 43
+    sent = []
+
+    async def fake_send(*, config, text):
+        sent.append((config, text))
+
+    monkeypatch.setattr(
+        web_app_module, "send_system_operator_bot_message", fake_send
+    )
+    now = datetime(2026, 8, 15, 12, 20, tzinfo=UTC)
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        now_provider=lambda: now,
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"production_monitor_incident"}),
+            monitor_capture_token=token,
+        ),
+    )
+    app.state.system_operator_bot_config = SystemOperatorBotConfig(
+        bot_token="123456:abcdefghijklmnopqrstuvwxyz123456",
+        chat_id=123,
+    )
+    fields = (
+        "incident_intake_unavailable",
+        "runtime_incident_intake",
+        "2026-08-15T12:00:00+00:00",
+        "2026-08-15T12:10:00+00:00",
+    )
+    delivery_id = hashlib.sha256("\0".join(fields).encode()).hexdigest()
+    with app.state.session_factory() as session:
+        session.add(
+            MonitorFallbackDeliveryReceipt(
+                fingerprint=delivery_id,
+                status="DELIVERING",
+                created_at=now - timedelta(minutes=2),
+                updated_at=now - timedelta(minutes=2),
+                claim_expires_at=now - timedelta(minutes=1),
+            )
+        )
+        session.commit()
+
+    response = TestClient(app, client=("127.0.0.1", 50000)).post(
+        "/api/runtime-incidents/monitor-fallback",
+        headers={"x-monitor-capture-token": token},
+        json={
+            "delivery_id": delivery_id,
+            "reason": fields[0],
+            "component": fields[1],
+            "observed_at": fields[2],
+            "deadline_at": fields[3],
+            "rechecked_at": "2026-08-15T12:20:00+00:00",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "fallback delivery outcome ambiguous"
+    assert sent == []
+    with app.state.session_factory() as session:
+        assert session.get(
+            MonitorFallbackDeliveryReceipt, delivery_id
+        ).status == "AMBIGUOUS"
+
+
+def test_monitor_fallback_cancellation_is_durably_ambiguous(tmp_path, monkeypatch):
+    token = "m" * 43
+
+    async def cancelled_send(*, config, text):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        web_app_module, "send_system_operator_bot_message", cancelled_send
+    )
+    now = datetime(2026, 8, 15, 12, 20, tzinfo=UTC)
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        now_provider=lambda: now,
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"production_monitor_incident"}),
+            monitor_capture_token=token,
+        ),
+    )
+    app.state.system_operator_bot_config = SystemOperatorBotConfig(
+        bot_token="123456:abcdefghijklmnopqrstuvwxyz123456",
+        chat_id=123,
+    )
+    fields = (
+        "incident_intake_unavailable",
+        "runtime_incident_intake",
+        "2026-08-15T12:00:00+00:00",
+        "2026-08-15T12:10:00+00:00",
+    )
+    delivery_id = hashlib.sha256("\0".join(fields).encode()).hexdigest()
+
+    response = TestClient(
+        app,
+        client=("127.0.0.1", 50000),
+        raise_server_exceptions=False,
+    ).post(
+        "/api/runtime-incidents/monitor-fallback",
+        headers={"x-monitor-capture-token": token},
+        json={
+            "delivery_id": delivery_id,
+            "reason": fields[0],
+            "component": fields[1],
+            "observed_at": fields[2],
+            "deadline_at": fields[3],
+            "rechecked_at": "2026-08-15T12:20:00+00:00",
+        },
+    )
+
+    assert response.status_code == 500
+    with app.state.session_factory() as session:
+        assert session.get(
+            MonitorFallbackDeliveryReceipt, delivery_id
+        ).status == "AMBIGUOUS"
+
+
+def test_monitor_fallback_definite_connect_failure_can_retry(tmp_path, monkeypatch):
+    token = "m" * 43
+    attempts = []
+
+    async def flaky_send(*, config, text):
+        attempts.append(text)
+        if len(attempts) == 1:
+            raise httpx.ConnectError(
+                "connection not established",
+                request=httpx.Request("POST", "https://api.telegram.org"),
+            )
+        return 102
+
+    monkeypatch.setattr(
+        web_app_module, "send_system_operator_bot_message", flaky_send
+    )
+    now = datetime(2026, 8, 15, 12, 20, tzinfo=UTC)
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        now_provider=lambda: now,
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"production_monitor_incident"}),
+            monitor_capture_token=token,
+        ),
+    )
+    app.state.system_operator_bot_config = SystemOperatorBotConfig(
+        bot_token="123456:abcdefghijklmnopqrstuvwxyz123456",
+        chat_id=123,
+    )
+    fields = (
+        "incident_intake_unavailable",
+        "runtime_incident_intake",
+        "2026-08-15T12:00:00+00:00",
+        "2026-08-15T12:10:00+00:00",
+    )
+    delivery_id = hashlib.sha256("\0".join(fields).encode()).hexdigest()
+    request = {
+        "headers": {"x-monitor-capture-token": token},
+        "json": {
+            "delivery_id": delivery_id,
+            "reason": fields[0],
+            "component": fields[1],
+            "observed_at": fields[2],
+            "deadline_at": fields[3],
+            "rechecked_at": "2026-08-15T12:20:00+00:00",
+        },
+    }
+    client = TestClient(app, client=("127.0.0.1", 50000))
+
+    failed = client.post("/api/runtime-incidents/monitor-fallback", **request)
+    retried = client.post("/api/runtime-incidents/monitor-fallback", **request)
+    response_lost_retry = client.post(
+        "/api/runtime-incidents/monitor-fallback", **request
+    )
+
+    assert failed.status_code == 503
+    assert failed.json()["detail"] == "fallback delivery unavailable"
+    assert retried.status_code == response_lost_retry.status_code == 200
+    assert len(attempts) == 2
+    with app.state.session_factory() as session:
+        assert session.get(
+            MonitorFallbackDeliveryReceipt, delivery_id
+        ).status == "DELIVERED"
+
+
+@pytest.mark.parametrize("outcome", ["server_5xx", "missing_message_id"])
+def test_monitor_fallback_unverifiable_outcome_is_ambiguous_without_retry(
+    tmp_path, monkeypatch, outcome
+):
+    token = "m" * 43
+    attempts = []
+
+    async def uncertain_send(*, config, text):
+        attempts.append(text)
+        if outcome == "server_5xx":
+            request = httpx.Request("POST", "https://api.telegram.org")
+            response = httpx.Response(503, request=request)
+            raise httpx.HTTPStatusError(
+                "upstream unavailable", request=request, response=response
+            )
+        return None
+
+    monkeypatch.setattr(
+        web_app_module, "send_system_operator_bot_message", uncertain_send
+    )
+    now = datetime(2026, 8, 15, 12, 20, tzinfo=UTC)
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        now_provider=lambda: now,
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"production_monitor_incident"}),
+            monitor_capture_token=token,
+        ),
+    )
+    app.state.system_operator_bot_config = SystemOperatorBotConfig(
+        bot_token="123456:abcdefghijklmnopqrstuvwxyz123456",
+        chat_id=123,
+    )
+    fields = (
+        "incident_intake_unavailable",
+        "runtime_incident_intake",
+        "2026-08-15T12:00:00+00:00",
+        "2026-08-15T12:10:00+00:00",
+    )
+    delivery_id = hashlib.sha256("\0".join(fields).encode()).hexdigest()
+    request = {
+        "headers": {"x-monitor-capture-token": token},
+        "json": {
+            "delivery_id": delivery_id,
+            "reason": fields[0],
+            "component": fields[1],
+            "observed_at": fields[2],
+            "deadline_at": fields[3],
+            "rechecked_at": "2026-08-15T12:20:00+00:00",
+        },
+    }
+    client = TestClient(app, client=("127.0.0.1", 50000))
+
+    first = client.post("/api/runtime-incidents/monitor-fallback", **request)
+    retry = client.post("/api/runtime-incidents/monitor-fallback", **request)
+
+    assert first.status_code == retry.status_code == 503
+    assert first.json()["detail"] == "fallback delivery outcome ambiguous"
+    assert len(attempts) == 1
+    with app.state.session_factory() as session:
+        assert session.get(
+            MonitorFallbackDeliveryReceipt, delivery_id
+        ).status == "AMBIGUOUS"
 
 
 @pytest.mark.parametrize(

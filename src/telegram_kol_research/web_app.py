@@ -88,6 +88,10 @@ from telegram_kol_research.production_monitor_contract import (
     MONITOR_SCHEMA_VERSION,
     parse_monitor_projection,
 )
+from telegram_kol_research.production_monitor_notifications import (
+    format_fixed_fallback,
+    parse_fixed_fallback_payload,
+)
 from telegram_kol_research.deepcoin_execution_actions import DeepcoinExecutionActionError
 from telegram_kol_research.deepcoin_execution_actions import close_bound_position_market
 from telegram_kol_research.runtime_agent_production_audit import (
@@ -95,6 +99,7 @@ from telegram_kol_research.runtime_agent_production_audit import (
     run_bounded_production_audit_command,
 )
 from telegram_kol_research.runtime_incident_adapters import (
+    capture_monitor_projection,
     capture_monitor_state,
     capture_notification_failure,
 )
@@ -112,6 +117,7 @@ from telegram_kol_research.models import (
     ExecutionOrderLeg,
     MediaAsset,
     MessageEvidenceVersion,
+    MonitorFallbackDeliveryReceipt,
     PositionBackupStopOrder,
     PositionProtectionLedger,
     RecognitionDecision,
@@ -389,7 +395,7 @@ def _readiness_payload(state: MonitorReadinessState) -> dict[str, str | None]:
     }
 
 
-async def _run_monitor_capture_writer(writer: Callable[[], int]) -> int:
+async def _run_monitor_capture_writer(writer: Callable[[], Any]) -> Any:
     """Run one writer outside the saturated shared executor and drain on cancel."""
 
     executor = concurrent.futures.ThreadPoolExecutor(
@@ -4890,6 +4896,7 @@ def create_web_app(
         _message_operation_supervisor_watermark_is_valid(app)
     )
     app.state.monitor_incident_capture_lock = threading.Lock()
+    app.state.monitor_fallback_delivery_lock = threading.Lock()
     app.state.chat_requester = request_grounded_chat_answer
     app.state.prompt_test_runner = run_prompt_draft_test
     app.state.live_target_titles = live_target_titles or set()
@@ -5373,6 +5380,169 @@ def create_web_app(
         snapshot["supervisor_policy_status"] = policy_status
         return snapshot
 
+    @app.post("/api/runtime-incidents/monitor-fallback")
+    async def api_runtime_incidents_monitor_fallback(request: Request):
+        require_monitor_capture_auth(request)
+        raw_content_length = request.headers.get("content-length")
+        try:
+            content_length = (
+                int(raw_content_length)
+                if raw_content_length is not None
+                else None
+            )
+        except ValueError:
+            content_length = -1
+        if content_length is not None and not 0 <= content_length <= 1024:
+            raise HTTPException(status_code=422, detail="invalid fallback payload")
+        chunks: list[bytes] = []
+        body_size = 0
+        async for chunk in request.stream():
+            body_size += len(chunk)
+            if body_size > 1024:
+                raise HTTPException(
+                    status_code=422, detail="invalid fallback payload"
+                )
+            chunks.append(chunk)
+
+        def strict_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate key")
+                result[key] = value
+            return result
+
+        try:
+            raw_payload = json.loads(
+                b"".join(chunks).decode("utf-8"),
+                object_pairs_hook=strict_object,
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError("invalid constant")
+                ),
+            )
+            payload = parse_fixed_fallback_payload(raw_payload)
+            message = format_fixed_fallback(
+                reason=payload["reason"],
+                component=payload["component"],
+                observed_at=datetime.fromisoformat(payload["observed_at"]),
+                deadline_at=datetime.fromisoformat(payload["deadline_at"]),
+                rechecked_at=datetime.fromisoformat(payload["rechecked_at"]),
+            )
+        except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+            raise HTTPException(status_code=422, detail="invalid fallback payload")
+        config = app.state.system_operator_bot_config
+        if not isinstance(config, SystemOperatorBotConfig):
+            raise HTTPException(
+                status_code=503, detail="fallback delivery unavailable"
+            )
+        delivery_id = payload["delivery_id"]
+        if not app.state.monitor_fallback_delivery_lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="fallback delivery busy")
+        try:
+            with app.state.session_factory() as session:
+                receipt = session.get(
+                    MonitorFallbackDeliveryReceipt, delivery_id
+                )
+                if receipt is not None and receipt.status == "DELIVERED":
+                    return {"delivered": True}
+                timestamp = app.state.now_provider()
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=UTC)
+                if receipt is not None and receipt.status == "AMBIGUOUS":
+                    raise HTTPException(
+                        status_code=503,
+                        detail="fallback delivery outcome ambiguous",
+                    )
+                if receipt is not None and receipt.status == "DELIVERING":
+                    claim_expires_at = receipt.claim_expires_at
+                    if claim_expires_at.tzinfo is None:
+                        claim_expires_at = claim_expires_at.replace(tzinfo=UTC)
+                    if timestamp < claim_expires_at:
+                        raise HTTPException(
+                            status_code=409, detail="fallback delivery busy"
+                        )
+                    receipt.status = "AMBIGUOUS"
+                    receipt.updated_at = timestamp
+                    session.commit()
+                    logger.error(
+                        "Monitor fallback delivery outcome is ambiguous: id=%s",
+                        delivery_id,
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="fallback delivery outcome ambiguous",
+                    )
+                if receipt is None:
+                    receipt = MonitorFallbackDeliveryReceipt(
+                        fingerprint=delivery_id,
+                        status="DELIVERING",
+                        created_at=timestamp,
+                        updated_at=timestamp,
+                        claim_expires_at=timestamp + timedelta(minutes=1),
+                    )
+                    session.add(receipt)
+                elif receipt.status == "FAILED":
+                    receipt.status = "DELIVERING"
+                    receipt.updated_at = timestamp
+                    receipt.claim_expires_at = timestamp + timedelta(minutes=1)
+                session.commit()
+            try:
+                delivery_result = await send_system_operator_bot_message(
+                    config=config, text=message
+                )
+                if (
+                    type(delivery_result) is not int
+                    or delivery_result < 1
+                ):
+                    raise RuntimeError("Telegram delivery receipt is unverifiable")
+            except BaseException as exc:
+                definite_failure = isinstance(
+                    exc,
+                    (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout),
+                ) or (
+                    isinstance(exc, httpx.HTTPStatusError)
+                    and 400 <= exc.response.status_code < 500
+                )
+                with app.state.session_factory() as session:
+                    receipt = session.get(
+                        MonitorFallbackDeliveryReceipt, delivery_id
+                    )
+                    if receipt is not None:
+                        receipt.status = (
+                            "FAILED" if definite_failure else "AMBIGUOUS"
+                        )
+                        receipt.updated_at = app.state.now_provider()
+                        session.commit()
+                if not definite_failure:
+                    logger.error(
+                        "Monitor fallback delivery outcome is ambiguous: id=%s",
+                        delivery_id,
+                    )
+                if isinstance(exc, Exception):
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "fallback delivery unavailable"
+                            if definite_failure
+                            else "fallback delivery outcome ambiguous"
+                        ),
+                    ) from None
+                raise
+            with app.state.session_factory() as session:
+                receipt = session.get(
+                    MonitorFallbackDeliveryReceipt, delivery_id
+                )
+                if receipt is None or receipt.status != "DELIVERING":
+                    raise HTTPException(
+                        status_code=503, detail="fallback receipt unavailable"
+                    )
+                receipt.status = "DELIVERED"
+                receipt.updated_at = app.state.now_provider()
+                session.commit()
+            return {"delivered": True}
+        finally:
+            app.state.monitor_fallback_delivery_lock.release()
+
     @app.post("/api/runtime-incidents/monitor-capture")
     async def api_runtime_incidents_monitor_capture(request: Request):
         capture_config = require_monitor_capture_auth(request)
@@ -5422,11 +5592,13 @@ def create_web_app(
                 raise ValueError("invalid fields")
             if payload.get("schema_version") == MONITOR_SCHEMA_VERSION:
                 projection = parse_monitor_projection(payload)
+                is_v2 = True
                 checked_at = datetime.fromisoformat(projection["checked_at"])
                 reason_codes = projection["reason_codes"]
                 adapter_failures = projection["adapter_failures"]
                 notification_error = None
             else:
+                is_v2 = False
                 # Phase-one compatibility path for the currently active legacy
                 # timer. Keep schema v1 closed to its original six adapters.
                 if set(payload) != LEGACY_MONITOR_PROJECTION_V1_FIELDS:
@@ -5472,6 +5644,76 @@ def create_web_app(
         if not acquired:
             raise HTTPException(status_code=409, detail="capture busy")
         try:
+            is_confirmed_v2 = bool(
+                is_v2
+                and projection["execution_status"] == "COMPLETED"
+                and projection["observed_health"] == "UNHEALTHY"
+                and projection["reason_codes"]
+                and not projection["adapter_failures"]
+                and projection["fallback_reason"] is None
+            )
+
+            if is_confirmed_v2:
+                def persist_confirmed_projection():
+                    return capture_monitor_projection(
+                        app.state.session_factory,
+                        config=capture_config,
+                        projection=projection,
+                    )
+
+                incident = await _run_monitor_capture_writer(
+                    persist_confirmed_projection
+                )
+                if incident is None:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="monitor incident intake unavailable",
+                    )
+
+                def encoded_timestamp(value):
+                    if value is None:
+                        return None
+                    if value.tzinfo is None:
+                        value = value.replace(tzinfo=UTC)
+                    return value.astimezone(UTC).isoformat()
+
+                notification_failed_at = (
+                    encoded_timestamp(incident.notification_claimed_at)
+                    if incident.notification_status in {"failed", "exhausted"}
+                    else None
+                )
+                notification_claimed_at = (
+                    encoded_timestamp(incident.notification_claimed_at)
+                    if incident.notification_status
+                    in {"delivering", "failed", "exhausted"}
+                    else None
+                )
+                notification_claim_expires_at = (
+                    encoded_timestamp(
+                        incident.notification_claimed_at
+                        + timedelta(
+                            seconds=capture_config.notification_lease_seconds
+                        )
+                    )
+                    if incident.notification_status == "delivering"
+                    and incident.notification_claimed_at is not None
+                    else None
+                )
+                return {
+                    "accepted": True,
+                    "submission_id": projection["submission_id"],
+                    # Keep the semantic acceptance clock stable when a later
+                    # polling generation retries the same anomaly episode.
+                    "accepted_at": encoded_timestamp(incident.created_at),
+                    "notification_status": incident.notification_status,
+                    "notification_claimed_at": notification_claimed_at,
+                    "notification_claim_expires_at": (
+                        notification_claim_expires_at
+                    ),
+                    "notification_failed_at": notification_failed_at,
+                    "agent_status": incident.status,
+                }
+
             def persist_capture_projection() -> int:
                 config = capture_config
                 captured = len(

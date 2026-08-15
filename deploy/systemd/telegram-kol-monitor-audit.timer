@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Telegram KOL production monitor heavy audit daily
+
+[Timer]
+OnCalendar=daily
+AccuracySec=15min
+RandomizedDelaySec=30min
+Persistent=true
+Unit=telegram-kol-monitor-audit.service
+
+[Install]
+WantedBy=timers.target
+

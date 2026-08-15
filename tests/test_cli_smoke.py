@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import tracemalloc
 from types import SimpleNamespace
 
@@ -796,6 +797,8 @@ def test_cli_help_renders():
     assert "backfill-canonical-tpsl-ledger" in result.stdout
     assert "refresh-production-monitor-snapshot" in result.stdout
     assert "run-production-monitor-sentinel" in result.stdout
+    assert "run-production-monitor-audit" in result.stdout
+    assert "capture-production-monitor-local-evidence" in result.stdout
 
 
 def _sentinel_cli_args(tmp_path: Path) -> list[str]:
@@ -913,6 +916,524 @@ def test_dormant_sentinel_cli_persists_unknown_and_never_submits(
     assert collected[0]["incident_loopback_url"].startswith(
         "http://127.0.0.1:"
     )
+
+
+def test_sentinel_cli_routes_only_confirmed_projection_through_task7_bridge(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.production_monitor_policy import (
+        CandidateObservation,
+    )
+    from telegram_kol_research.production_monitor_sentinel import (
+        SentinelObservation,
+    )
+
+    now = datetime.now(UTC)
+    routed = []
+    fallback_requests = []
+    monkeypatch.setattr(
+        cli_module,
+        "load_runtime_incident_config",
+        lambda **kwargs: SimpleNamespace(monitor_capture_token="m" * 43),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "collect_production_monitor_observation",
+        lambda **kwargs: SentinelObservation(
+            checked_at=now,
+            candidates=(
+                CandidateObservation(
+                    reason_code="audit_abnormal",
+                    fingerprint="a" * 64,
+                    observed_at=now,
+                    anomaly_present=True,
+                    evidence_complete=True,
+                    snapshot_generation=None,
+                    snapshot_started_at=None,
+                    snapshot_completed_at=None,
+                    last_progress_at=None,
+                    execution_deadline_at=None,
+                    durable_terminal_fact=True,
+                ),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "route_monitor_incident_persisted",
+        lambda **kwargs: routed.append(kwargs),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "request_monitor_fallback",
+        lambda **kwargs: fallback_requests.append(kwargs),
+    )
+
+    result = CliRunner().invoke(app, _sentinel_cli_args(tmp_path))
+
+    assert result.exit_code == 0, result.output
+    assert len(routed) == 1
+    assert routed[0]["projection"]["observed_health"] == "UNHEALTHY"
+    assert callable(routed[0]["submit"])
+    assert callable(routed[0]["recheck"])
+    assert callable(routed[0]["deliver_fallback"])
+    routed[0]["deliver_fallback"](
+        "Production monitor channel failure\n"
+        "reason=incident_intake_unavailable\n"
+        "component=runtime_incident_intake\n"
+        f"observed_at={now.isoformat()}\n"
+        f"deadline_at={now.isoformat()}\n"
+        f"rechecked_at={now.isoformat()}"
+    )
+    assert fallback_requests[0]["url"] == (
+        "http://127.0.0.1:8000/api/runtime-incidents/monitor-fallback"
+    )
+    assert fallback_requests[0]["token"] == "m" * 43
+
+
+def test_production_monitor_audit_cli_updates_only_audit_result_and_cursor(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.production_monitor_state import (
+        ProductionMonitorState,
+        ProductionMonitorStateStore,
+    )
+
+    now = datetime.now(UTC)
+    state_path = tmp_path / "sentinel-v2.json"
+    store = ProductionMonitorStateStore(state_path, now_factory=lambda: now)
+    before = ProductionMonitorState(audit_cursor="prior-cursor")
+    with store.single_flight() as lease:
+        assert lease.acquired is True
+        lease.save(before)
+    audit = {
+        "snapshot_status": "stable",
+        "snapshot_validation": "ok",
+        "schema_status": "available",
+        "output_complete": True,
+        "counts": {
+            "blocked": 0,
+            "submit_unknown": 0,
+            "partial_failed": 0,
+            "recovery_required": 0,
+        },
+        "malformed_row_count": 0,
+        "malformed_field_count": 0,
+    }
+    monkeypatch.setattr(
+        cli_module,
+        "_audit_management_batches_read_only",
+        lambda *args, **kwargs: audit,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "run-production-monitor-audit",
+            "--state-path",
+            str(state_path),
+            "--database-path",
+            str(tmp_path / "research.db"),
+            "--scratch-root",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["execution_status"] == "COMPLETED"
+    assert payload["observed_health"] == "HEALTHY"
+    after = ProductionMonitorStateStore(
+        state_path, now_factory=lambda: datetime.now(UTC)
+    ).load()
+    assert after.candidates == before.candidates
+    assert after.incident_acceptances == before.incident_acceptances
+    assert after.fallback == before.fallback
+    assert after.latest_completed_result == before.latest_completed_result
+    assert after.audit_cursor != before.audit_cursor
+    assert after.latest_audit_result is not None
+    assert after.latest_audit_result.observed_health == "HEALTHY"
+
+
+def test_production_monitor_audit_and_sentinel_have_no_legacy_force_switch():
+    import inspect
+
+    from telegram_kol_research.cli import monitor_production_safety
+
+    audit_help = CliRunner().invoke(
+        app, ["run-production-monitor-audit", "--help"], terminal_width=200
+    )
+    sentinel_help = CliRunner().invoke(
+        app, ["run-production-monitor-sentinel", "--help"], terminal_width=200
+    )
+
+    assert audit_help.exit_code == 0
+    assert sentinel_help.exit_code == 0
+    assert "--force-full-audit" not in audit_help.output
+    assert "--force-full-audit" not in sentinel_help.output
+    # The legacy monitor keeps its compatibility flag until Task 12.
+    assert "force_full_audit" in inspect.signature(
+        monitor_production_safety
+    ).parameters
+
+
+def test_production_monitor_database_stage_cli_has_only_closed_consumer_input(
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+
+    calls = []
+    monkeypatch.setattr(
+        cli_module,
+        "stage_production_monitor_database",
+        lambda consumer: calls.append(consumer)
+        or Path(
+            f"/var/cache/telegram-kol-monitor-v2/{consumer}/research-snapshot.db"
+        ),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["stage-production-monitor-database", "--consumer", "sentinel"],
+    )
+    help_result = CliRunner().invoke(
+        app,
+        ["stage-production-monitor-database", "--help"],
+        terminal_width=200,
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout)["staged"] is True
+    assert calls == ["sentinel"]
+    assert "--consumer" in help_result.output
+    assert "--source" not in help_result.output
+    assert "--destination" not in help_result.output
+
+
+def test_production_monitor_local_evidence_capture_writes_atomic_bounded_inputs(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.cli as cli_module
+
+    checked_at = datetime.now(UTC)
+    generation = "b" * 64
+    count_names = (
+        "executable_messages_total contracts_created_total contracts_verified_total "
+        "contracts_violated_total executable_without_contract_total "
+        "violations_without_stage1_total stage1_pending stage1_delivered stage1_failed "
+        "agent_pending agent_diagnosed agent_failed agent_timed_out "
+        "incidents_without_terminal_stage2_total handoffs_persisted_total stage2_pending "
+        "stage2_delivered stage2_failed oldest_nonterminal_age_seconds "
+        "instruction_execution_contradictions_total"
+    ).split()
+    coverage = {
+        **{name: 0 for name in count_names},
+        "schema_version": 1,
+        "coverage_enabled": True,
+        "scan_truncated": False,
+        "supervisor_policy_status": "valid",
+        "supervisor_last_success_at": checked_at.isoformat(),
+        "instruction_execution_scan_truncated": False,
+        "instruction_execution_facts": [],
+    }
+    readiness = {
+        "service_generation": generation,
+        "deepcoin_reconcile_first_success_at": checked_at.isoformat(),
+        "deepcoin_reconcile_last_success_at": checked_at.isoformat(),
+        "management_worker_last_success_at": checked_at.isoformat(),
+        "message_supervisor_last_success_at": checked_at.isoformat(),
+        "message_supervisor_policy_status": "valid",
+    }
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, payload):
+            self.content = json.dumps(payload).encode("utf-8")
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response(readiness if "readiness" in url else coverage)
+
+    monkeypatch.setattr(cli_module.httpx, "get", get)
+    monkeypatch.setattr(
+        cli_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="",
+            stderr="",
+        ),
+    )
+    monkeypatch.setenv("TELEGRAM_KOL_RUNTIME_MONITOR_CAPTURE_TOKEN", "t" * 32)
+    coverage_path = tmp_path / "coverage.json"
+    journal_path = tmp_path / "journal.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "capture-production-monitor-local-evidence",
+            "--readiness-url",
+            "http://127.0.0.1:8000/api/runtime-monitor-readiness",
+            "--coverage-url",
+            "http://127.0.0.1:8000/api/runtime-incidents/message-operation-coverage",
+            "--coverage-path",
+            str(coverage_path),
+            "--journal-path",
+            str(journal_path),
+            "--service-name",
+            "telegram-kol.service",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(coverage_path.read_text()) == coverage
+    journal = json.loads(journal_path.read_text())
+    assert journal["complete"] is True
+    assert journal["service_generation"] == generation
+    assert journal["markers"] == []
+    assert journal["resolved_markers"] == []
+    assert stat.S_IMODE(coverage_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(journal_path.stat().st_mode) == 0o600
+    assert all(
+        call[1]["headers"]["x-monitor-capture-token"] == "t" * 32
+        for call in calls
+    )
+
+
+def test_sentinel_unit_captures_local_evidence_before_evaluation():
+    service = (
+        Path(__file__).parents[1]
+        / "deploy/systemd/telegram-kol-sentinel.service"
+    ).read_text(encoding="utf-8")
+
+    assert "capture-production-monitor-local-evidence" in service
+    assert service.index("capture-production-monitor-local-evidence") < service.index(
+        "run-production-monitor-sentinel"
+    )
+    assert "/api/runtime-incidents/message-operation-coverage" in service
+    assert "--service-name telegram-kol.service" in " ".join(service.split())
+
+
+def test_production_monitor_local_evidence_rejects_nonexact_loopback_url(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.cli as cli_module
+
+    called = []
+    monkeypatch.setattr(
+        cli_module.httpx,
+        "get",
+        lambda *args, **kwargs: called.append((args, kwargs)),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "capture-production-monitor-local-evidence",
+            "--readiness-url",
+            "http://127.0.0.1:8000/api/runtime-monitor-readiness?unsafe=1",
+            "--coverage-url",
+            "http://127.0.0.1:8000/api/runtime-incidents/message-operation-coverage",
+            "--coverage-path",
+            str(tmp_path / "coverage.json"),
+            "--journal-path",
+            str(tmp_path / "journal.json"),
+            "--service-name",
+            "telegram-kol.service",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert called == []
+
+
+@pytest.mark.parametrize(
+    ("records", "expected_complete", "expected_markers"),
+    [
+        (
+            lambda boundary: [
+                {
+                    "_SYSTEMD_UNIT": "telegram-kol.service",
+                    "PRIORITY": "3",
+                    "MESSAGE": (
+                        "recognition authority unavailable raw_message_id=42 "
+                        "reason=authoritative_processor_required"
+                    ),
+                    "__REALTIME_TIMESTAMP": str(
+                        int((boundary + timedelta(seconds=1)).timestamp() * 1_000_000)
+                    ),
+                }
+            ],
+            True,
+            ["authoritative_processor_required"],
+        ),
+        (
+            lambda boundary: [
+                {
+                    "_SYSTEMD_UNIT": "telegram-kol.service",
+                    "PRIORITY": "3",
+                    "MESSAGE": (
+                        "recognition authority unavailable raw_message_id=41 "
+                        "reason=authoritative_processor_required"
+                    ),
+                    "__REALTIME_TIMESTAMP": str(
+                        int((boundary - timedelta(seconds=1)).timestamp() * 1_000_000)
+                    ),
+                },
+                {
+                    "_SYSTEMD_UNIT": "telegram-kol.service",
+                    "PRIORITY": "3",
+                    "MESSAGE": (
+                        "untrusted input reason=authoritative_processor_required"
+                    ),
+                    "__REALTIME_TIMESTAMP": str(
+                        int((boundary + timedelta(seconds=1)).timestamp() * 1_000_000)
+                    ),
+                },
+            ],
+            False,
+            [],
+        ),
+    ],
+)
+def test_production_monitor_journal_evidence_is_structured_and_generation_bound(
+    tmp_path,
+    monkeypatch,
+    records,
+    expected_complete,
+    expected_markers,
+):
+    import telegram_kol_research.cli as cli_module
+
+    boundary = datetime.now(UTC) - timedelta(seconds=5)
+    readiness = {
+        "service_generation": "c" * 64,
+        "deepcoin_reconcile_first_success_at": boundary.isoformat(),
+        "deepcoin_reconcile_last_success_at": boundary.isoformat(),
+        "management_worker_last_success_at": boundary.isoformat(),
+        "message_supervisor_last_success_at": boundary.isoformat(),
+        "message_supervisor_policy_status": "valid",
+    }
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, payload):
+            self.content = json.dumps(payload).encode("utf-8")
+
+    monkeypatch.setattr(
+        cli_module.httpx,
+        "get",
+        lambda url, **_kwargs: Response(readiness if "readiness" in url else {}),
+    )
+    monkeypatch.setattr(cli_module, "build_coverage_candidates", lambda *_args, **_kwargs: ())
+    journal_calls = []
+
+    def run(command, **_kwargs):
+        journal_calls.append(command)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="\n".join(json.dumps(record) for record in records(boundary)),
+            stderr="",
+        )
+
+    monkeypatch.setattr(cli_module.subprocess, "run", run)
+    monkeypatch.setenv("TELEGRAM_KOL_RUNTIME_MONITOR_CAPTURE_TOKEN", "t" * 32)
+    journal_path = tmp_path / "journal.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "capture-production-monitor-local-evidence",
+            "--readiness-url",
+            "http://127.0.0.1:8000/api/runtime-monitor-readiness",
+            "--coverage-url",
+            "http://127.0.0.1:8000/api/runtime-incidents/message-operation-coverage",
+            "--coverage-path",
+            str(tmp_path / "coverage.json"),
+            "--journal-path",
+            str(journal_path),
+            "--service-name",
+            "telegram-kol.service",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    journal = json.loads(journal_path.read_text())
+    assert journal["complete"] is expected_complete
+    assert journal["markers"] == expected_markers
+    assert journal_calls[0][journal_calls[0].index("--output") + 1] == "json"
+    assert journal_calls[0][journal_calls[0].index("--since") + 1] == boundary.isoformat()
+
+
+def test_production_monitor_journal_evidence_fails_closed_across_service_restart(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.cli as cli_module
+
+    boundary = datetime.now(UTC) - timedelta(seconds=5)
+
+    def readiness(generation):
+        return {
+            "service_generation": generation,
+            "deepcoin_reconcile_first_success_at": boundary.isoformat(),
+            "deepcoin_reconcile_last_success_at": boundary.isoformat(),
+            "management_worker_last_success_at": boundary.isoformat(),
+            "message_supervisor_last_success_at": boundary.isoformat(),
+            "message_supervisor_policy_status": "valid",
+        }
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, payload):
+            self.content = json.dumps(payload).encode("utf-8")
+
+    readiness_calls = 0
+
+    def get(url, **_kwargs):
+        nonlocal readiness_calls
+        if "readiness" not in url:
+            return Response({})
+        readiness_calls += 1
+        return Response(readiness(("d" if readiness_calls == 1 else "e") * 64))
+
+    monkeypatch.setattr(cli_module.httpx, "get", get)
+    monkeypatch.setattr(cli_module, "build_coverage_candidates", lambda *_args, **_kwargs: ())
+    monkeypatch.setattr(
+        cli_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setenv("TELEGRAM_KOL_RUNTIME_MONITOR_CAPTURE_TOKEN", "t" * 32)
+    journal_path = tmp_path / "journal.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "capture-production-monitor-local-evidence",
+            "--readiness-url",
+            "http://127.0.0.1:8000/api/runtime-monitor-readiness",
+            "--coverage-url",
+            "http://127.0.0.1:8000/api/runtime-incidents/message-operation-coverage",
+            "--coverage-path",
+            str(tmp_path / "coverage.json"),
+            "--journal-path",
+            str(journal_path),
+            "--service-name",
+            "telegram-kol.service",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert readiness_calls == 2
+    assert json.loads(journal_path.read_text())["complete"] is False
+    assert json.loads(result.stdout)["evidence_complete"] is False
 
 
 def test_production_monitor_snapshot_cli_help_has_only_explicit_runtime_inputs():

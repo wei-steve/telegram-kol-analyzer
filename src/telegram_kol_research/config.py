@@ -23,6 +23,7 @@ READ_ONLY_CAPTURE_PROFILE = frozenset(
         "severe_protection_incident",
         "monitor_adapter_failure",
         "monitor_audit_incomplete",
+        "production_monitor_incident",
         "notification_delivery_failure",
     }
 )

@@ -1,0 +1,47 @@
+[Unit]
+Description=Telegram KOL read-only Deepcoin snapshot refresher v2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=telegram-kol-monitor-snapshot
+Group=telegram-kol-monitor-snapshot
+UMask=0077
+WorkingDirectory=/var/lib/telegram-kol-monitor-v2/snapshot
+EnvironmentFile=/etc/telegram-kol-monitor-snapshot.credentials
+Environment=DEEPCOIN_BASE_URL=https://api.deepcoin.com
+ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research refresh-production-monitor-snapshot --manifest-path /var/lib/telegram-kol-monitor-v2/snapshot/manifest.json --wall-clock-timeout-seconds 45
+
+AmbientCapabilities=
+CapabilityBoundingSet=
+InaccessiblePaths=-/run/dbus/system_bus_socket -/run/systemd/private
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateMounts=true
+PrivateTmp=true
+ProcSubset=pid
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @privileged
+TemporaryFileSystem=/opt/telegram-kol-analyzer:ro
+BindReadOnlyPaths=/opt/telegram-kol-analyzer/.venv
+BindReadOnlyPaths=/opt/telegram-kol-analyzer/src
+ReadWritePaths=/var/lib/telegram-kol-monitor-v2/snapshot
+

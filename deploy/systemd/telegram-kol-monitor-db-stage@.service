@@ -1,0 +1,46 @@
+[Unit]
+Description=Stage a coherent SQLite snapshot for production monitor %i
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/var/cache/telegram-kol-monitor-v2/%i
+ExecStart=/usr/bin/python3 /usr/local/libexec/telegram-kol-monitor-db-stage --consumer %i
+TimeoutStartSec=60s
+RuntimeMaxSec=60s
+LimitFSIZE=1073741824
+MemoryMax=512M
+
+AmbientCapabilities=
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE
+InaccessiblePaths=-/run/dbus/system_bus_socket -/run/systemd/private
+IPAddressDeny=any
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateMounts=true
+PrivateNetwork=true
+PrivateTmp=true
+ProcSubset=pid
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+TemporaryFileSystem=/opt/telegram-kol-analyzer:ro
+BindReadOnlyPaths=/opt/telegram-kol-analyzer/data
+ReadWritePaths=/var/cache/telegram-kol-monitor-v2/%i

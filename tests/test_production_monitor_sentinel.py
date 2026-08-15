@@ -21,6 +21,7 @@ from telegram_kol_research.production_monitor_sentinel import (
     run_production_monitor_sentinel,
 )
 from telegram_kol_research.production_monitor_state import (
+    IncidentAcceptanceState,
     LatestCompletedResult,
     ProductionMonitorState,
     ProductionMonitorStateStore,
@@ -227,6 +228,138 @@ def test_multiple_confirmed_candidates_build_exactly_one_canonical_projection():
     assert projection["reason_codes"] == [
         "composite_position_without_verified_stop"
     ]
+
+
+def test_accepted_anomaly_does_not_reproject_until_resolved_then_recurred():
+    candidate = _candidate()
+    first, first_state = evaluate_sentinel_observation(
+        observation=_observation(candidate),
+        previous_state=ProductionMonitorState(),
+        observation_generation=1,
+    )
+    assert first.incident_projection is not None
+    accepted_state = replace(
+        first_state,
+        incident_acceptances=(
+            IncidentAcceptanceState(
+                candidate_fingerprint=first.anomaly_fingerprint,
+                submission_id=first.incident_projection["submission_id"],
+                accepted_at=NOW,
+            ),
+        ),
+    )
+    still_present = replace(candidate, observed_at=NOW + timedelta(seconds=1))
+    repeated, repeated_state = evaluate_sentinel_observation(
+        observation=SentinelObservation(
+            checked_at=NOW + timedelta(seconds=1),
+            candidates=(still_present,),
+        ),
+        previous_state=accepted_state,
+        observation_generation=2,
+    )
+
+    assert repeated.observed_health == "UNHEALTHY"
+    assert repeated.incident_projection is not None
+    assert (
+        repeated.incident_projection["anomaly_fingerprint"]
+        == first.anomaly_fingerprint
+    )
+
+    resolved_candidate = replace(
+        candidate,
+        observed_at=NOW + timedelta(seconds=2),
+        anomaly_present=False,
+        durable_terminal_fact=True,
+    )
+    resolved, resolved_state = evaluate_sentinel_observation(
+        observation=SentinelObservation(
+            checked_at=NOW + timedelta(seconds=2),
+            candidates=(resolved_candidate,),
+        ),
+        previous_state=repeated_state,
+        observation_generation=3,
+    )
+    assert resolved.observed_health == "HEALTHY"
+    assert resolved_state.incident_acceptances == ()
+
+    recurrence = replace(candidate, observed_at=NOW + timedelta(seconds=3))
+    recurred, _ = evaluate_sentinel_observation(
+        observation=SentinelObservation(
+            checked_at=NOW + timedelta(seconds=3),
+            candidates=(recurrence,),
+        ),
+        previous_state=resolved_state,
+        observation_generation=4,
+    )
+    assert recurred.incident_projection is not None
+
+
+def test_acceptance_is_cleared_per_candidate_before_a_multi_anomaly_recurrence():
+    candidate_a = _candidate(fingerprint="a" * 64)
+    candidate_b = _candidate(fingerprint="b" * 64)
+    combined, combined_state = evaluate_sentinel_observation(
+        observation=_observation(candidate_a, candidate_b),
+        previous_state=ProductionMonitorState(),
+        observation_generation=1,
+    )
+    assert combined.incident_projection is not None
+    accepted_state = replace(
+        combined_state,
+        incident_acceptances=(
+            IncidentAcceptanceState(
+                candidate_fingerprint=candidate_a.fingerprint,
+                submission_id="1" * 64,
+                accepted_at=NOW,
+            ),
+            IncidentAcceptanceState(
+                candidate_fingerprint=candidate_b.fingerprint,
+                submission_id="2" * 64,
+                accepted_at=NOW,
+            ),
+        ),
+    )
+    resolved_a = replace(
+        candidate_a,
+        observed_at=NOW + timedelta(seconds=1),
+        anomaly_present=False,
+        durable_terminal_fact=True,
+    )
+    present_b = replace(
+        candidate_b,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+    remaining, remaining_state = evaluate_sentinel_observation(
+        observation=SentinelObservation(
+            checked_at=NOW + timedelta(seconds=1),
+            candidates=(resolved_a, present_b),
+        ),
+        previous_state=accepted_state,
+        observation_generation=2,
+    )
+
+    assert remaining.incident_projection is None
+    assert {
+        item.candidate_fingerprint
+        for item in remaining_state.incident_acceptances
+    } == {candidate_b.fingerprint}
+
+    recurred_a = replace(
+        candidate_a,
+        observed_at=NOW + timedelta(seconds=2),
+    )
+    later_b = replace(
+        candidate_b,
+        observed_at=NOW + timedelta(seconds=2),
+    )
+    recurred, _ = evaluate_sentinel_observation(
+        observation=SentinelObservation(
+            checked_at=NOW + timedelta(seconds=2),
+            candidates=(recurred_a, later_b),
+        ),
+        previous_state=remaining_state,
+        observation_generation=3,
+    )
+    assert recurred.incident_projection is not None
 
 
 @pytest.mark.parametrize("current_evidence", ["incomplete", "repeated"])
@@ -568,6 +701,30 @@ def test_exit_code_describes_execution_not_business_health(
     )
     assert outcome.observed_health == health
     assert "secret" not in repr(outcome)
+
+
+def test_incident_routing_failure_does_not_change_completed_sentinel_exit(tmp_path):
+    store = ProductionMonitorStateStore(
+        tmp_path / "sentinel-v2.json",
+        now_factory=lambda: NOW + timedelta(seconds=1),
+    )
+    routed = []
+
+    def fail_after_persistence(projection):
+        routed.append(dict(projection))
+        raise RuntimeError("notification transport unavailable")
+
+    outcome = run_production_monitor_sentinel(
+        state_store=store,
+        observation_collector=lambda: _observation(_candidate()),
+        incident_router=fail_after_persistence,
+    )
+
+    assert outcome.execution_status == "COMPLETED"
+    assert outcome.exit_code == 0
+    assert outcome.persisted is True
+    assert len(routed) == 1
+    assert store.load().latest_completed_result.execution_status == "COMPLETED"
 
 
 def test_single_flight_covers_load_collect_evaluate_persist_and_overlap(

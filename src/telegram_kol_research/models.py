@@ -3625,6 +3625,30 @@ class RuntimeIncidentAffectedMessage(Base):
     )
 
 
+class MonitorFallbackDeliveryReceipt(Base):
+    """Durable idempotency receipt for one closed monitor channel fallback."""
+
+    __tablename__ = "monitor_fallback_delivery_receipts"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('DELIVERING','DELIVERED','FAILED','AMBIGUOUS')",
+            name="ck_monitor_fallback_receipt_status",
+        ),
+    )
+
+    fingerprint: Mapped[str] = mapped_column(String(64), primary_key=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    claim_expires_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False
+    )
+
+
 class RuntimeIncidentHandoffArtifact(Base):
     """Revisioned, redacted Codex handoff and Stage 2 delivery outbox."""
 

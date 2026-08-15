@@ -20,6 +20,7 @@ from telegram_kol_research.production_monitor_contract import (
     MONITOR_EXECUTION_STATUSES,
     MONITOR_OBSERVED_HEALTH_STATUSES,
     SENTINEL_REASON_CODES,
+    parse_monitor_projection,
 )
 from telegram_kol_research.production_monitor_policy import (
     EVIDENCE_UNKNOWN,
@@ -33,7 +34,9 @@ from telegram_kol_research.production_monitor_policy import (
 MONITOR_STATE_SCHEMA_VERSION = 2
 MONITOR_STATE_MAX_BYTES = 512 * 1024
 MONITOR_STATE_MAX_CANDIDATES = 128
-MONITOR_STATE_MAX_ACCEPTANCES = 128
+# Bounded active candidates plus the short notification-SLA window of aggregate
+# episode receipts. Terminal aggregates are pruned deterministically.
+MONITOR_STATE_MAX_ACCEPTANCES = (MONITOR_STATE_MAX_CANDIDATES * 2) + 1
 DEFAULT_SENTINEL_STATE_PATH = (
     "/var/lib/telegram-kol-monitor/sentinel-v2.json"
 )
@@ -45,6 +48,7 @@ _STATE_FIELDS = frozenset(
         "incident_acceptances",
         "fallback",
         "latest_completed_result",
+        "latest_audit_result",
         "audit_cursor",
     }
 )
@@ -68,7 +72,14 @@ _CANDIDATE_FIELDS = frozenset(
     }
 )
 _ACCEPTANCE_FIELDS = frozenset(
-    {"candidate_fingerprint", "submission_id", "accepted_at"}
+    {
+        "candidate_fingerprint",
+        "submission_id",
+        "accepted_at",
+        "projection_json",
+        "member_fingerprints",
+        "routing_terminal",
+    }
 )
 _FALLBACK_FIELDS = frozenset(
     {
@@ -89,6 +100,15 @@ _RESULT_FIELDS = frozenset(
         "reason_codes",
         "adapter_failures",
         "evidence_complete",
+        "state_fingerprint",
+    }
+)
+_AUDIT_RESULT_FIELDS = frozenset(
+    {
+        "checked_at",
+        "execution_status",
+        "observed_health",
+        "reason_codes",
         "state_fingerprint",
     }
 )
@@ -121,6 +141,9 @@ class IncidentAcceptanceState:
     candidate_fingerprint: str
     submission_id: str
     accepted_at: datetime
+    projection_json: str | None = None
+    member_fingerprints: tuple[str, ...] = ()
+    routing_terminal: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,12 +169,22 @@ class LatestCompletedResult:
 
 
 @dataclass(frozen=True, slots=True)
+class LatestAuditResult:
+    checked_at: datetime
+    execution_status: str
+    observed_health: str
+    reason_codes: tuple[str, ...]
+    state_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
 class ProductionMonitorState:
     schema_version: int = MONITOR_STATE_SCHEMA_VERSION
     candidates: tuple[CandidateState, ...] = ()
     incident_acceptances: tuple[IncidentAcceptanceState, ...] = ()
     fallback: FallbackDeliveryState | None = None
     latest_completed_result: LatestCompletedResult | None = None
+    latest_audit_result: LatestAuditResult | None = None
     audit_cursor: str | None = None
 
 
@@ -410,6 +443,11 @@ def _state_to_bytes(state: ProductionMonitorState, *, now: datetime) -> bytes:
             if state.latest_completed_result is None
             else _result_payload(state.latest_completed_result)
         ),
+        "latest_audit_result": (
+            None
+            if state.latest_audit_result is None
+            else _audit_result_payload(state.latest_audit_result)
+        ),
         "audit_cursor": state.audit_cursor,
     }
     encoded = _canonical_json(payload) + b"\n"
@@ -474,6 +512,12 @@ def _state_from_bytes(raw: bytes, *, now: datetime) -> ProductionMonitorState:
             if raw_result is None
             else _result_from_payload(raw_result, now=now)
         )
+        raw_audit_result = payload["latest_audit_result"]
+        latest_audit_result = (
+            None
+            if raw_audit_result is None
+            else _audit_result_from_payload(raw_audit_result, now=now)
+        )
         audit_cursor = payload["audit_cursor"]
         if audit_cursor is not None and (
             not isinstance(audit_cursor, str)
@@ -485,6 +529,7 @@ def _state_from_bytes(raw: bytes, *, now: datetime) -> ProductionMonitorState:
             incident_acceptances=acceptances,
             fallback=fallback,
             latest_completed_result=latest_result,
+            latest_audit_result=latest_audit_result,
             audit_cursor=audit_cursor,
         )
     except (
@@ -651,6 +696,9 @@ def _acceptance_payload(value: IncidentAcceptanceState) -> dict[str, Any]:
         "candidate_fingerprint": value.candidate_fingerprint,
         "submission_id": value.submission_id,
         "accepted_at": _format_datetime(value.accepted_at),
+        "projection_json": value.projection_json,
+        "member_fingerprints": list(value.member_fingerprints),
+        "routing_terminal": value.routing_terminal,
     }
 
 
@@ -664,12 +712,51 @@ def _acceptance_from_payload(
     accepted_at = _parse_datetime(payload["accepted_at"])
     if accepted_at > now:
         raise ValueError("state incident acceptance is in the future")
+    candidate_fingerprint = _fingerprint(
+        payload["candidate_fingerprint"], field="candidate"
+    )
+    submission_id = _fingerprint(payload["submission_id"], field="submission")
+    projection_json = payload["projection_json"]
+    member_fingerprints = payload["member_fingerprints"]
+    routing_terminal = payload["routing_terminal"]
+    if type(routing_terminal) is not bool:
+        raise ValueError("state incident acceptance terminal is invalid")
+    if projection_json is not None:
+        if not isinstance(projection_json, str) or len(projection_json.encode()) > 4096:
+            raise ValueError("state incident projection is invalid")
+        try:
+            projection = parse_monitor_projection(json.loads(projection_json))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("state incident projection is invalid") from None
+        if projection_json != json.dumps(
+            projection,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ):
+            raise ValueError("state incident projection is not canonical")
+        if (
+            projection["submission_id"] != submission_id
+            or projection["anomaly_fingerprint"] != candidate_fingerprint
+        ):
+            raise ValueError("state incident projection identity is invalid")
+    if (
+        not isinstance(member_fingerprints, list)
+        or len(member_fingerprints) > MONITOR_STATE_MAX_CANDIDATES
+        or any(
+            not isinstance(item, str) or _SHA256.fullmatch(item) is None
+            for item in member_fingerprints
+        )
+        or member_fingerprints != sorted(set(member_fingerprints))
+    ):
+        raise ValueError("state incident acceptance members are invalid")
     return IncidentAcceptanceState(
-        candidate_fingerprint=_fingerprint(
-            payload["candidate_fingerprint"], field="candidate"
-        ),
-        submission_id=_fingerprint(payload["submission_id"], field="submission"),
+        candidate_fingerprint=candidate_fingerprint,
+        submission_id=submission_id,
         accepted_at=accepted_at,
+        projection_json=projection_json,
+        member_fingerprints=tuple(member_fingerprints),
+        routing_terminal=routing_terminal,
     )
 
 
@@ -808,6 +895,58 @@ def _result_from_payload(
     )
 
 
+def _audit_result_payload(value: LatestAuditResult) -> dict[str, Any]:
+    if not isinstance(value, LatestAuditResult):
+        raise ValueError("state audit result is invalid")
+    return {
+        "checked_at": _format_datetime(value.checked_at),
+        "execution_status": value.execution_status,
+        "observed_health": value.observed_health,
+        "reason_codes": list(value.reason_codes),
+        "state_fingerprint": value.state_fingerprint,
+    }
+
+
+def _audit_result_from_payload(
+    payload: object,
+    *,
+    now: datetime,
+) -> LatestAuditResult:
+    if not isinstance(payload, dict) or frozenset(payload) != _AUDIT_RESULT_FIELDS:
+        raise ValueError("state audit result fields are invalid")
+    checked_at = _parse_datetime(payload["checked_at"])
+    if checked_at > now:
+        raise ValueError("state audit result is in the future")
+    execution_status = payload["execution_status"]
+    if execution_status not in MONITOR_EXECUTION_STATUSES:
+        raise ValueError("state audit execution status is invalid")
+    observed_health = payload["observed_health"]
+    if observed_health not in MONITOR_OBSERVED_HEALTH_STATUSES:
+        raise ValueError("state audit observed health is invalid")
+    reason_codes = _closed_tuple(
+        payload["reason_codes"],
+        allowed=frozenset({"audit_abnormal", "audit_incomplete"}),
+        field="audit reason",
+    )
+    if execution_status == "FAILED" and observed_health != "UNKNOWN":
+        raise ValueError("state failed audit health is invalid")
+    if observed_health == "HEALTHY" and reason_codes:
+        raise ValueError("state healthy audit result is inconsistent")
+    if observed_health == "UNHEALTHY" and "audit_abnormal" not in reason_codes:
+        raise ValueError("state unhealthy audit result is inconsistent")
+    if observed_health == "UNKNOWN" and "audit_incomplete" not in reason_codes:
+        raise ValueError("state unknown audit result is inconsistent")
+    return LatestAuditResult(
+        checked_at=checked_at,
+        execution_status=execution_status,
+        observed_health=observed_health,
+        reason_codes=reason_codes,
+        state_fingerprint=_fingerprint(
+            payload["state_fingerprint"], field="audit state"
+        ),
+    )
+
+
 def _clock_tolerant_validation_now(raw: bytes, *, now: datetime) -> datetime:
     try:
         payload = json.loads(
@@ -816,12 +955,20 @@ def _clock_tolerant_validation_now(raw: bytes, *, now: datetime) -> datetime:
             parse_constant=_reject_constant,
         )
         raw_result = payload["latest_completed_result"]
-        if raw_result is None:
-            return now
-        watermark = _parse_datetime(raw_result["checked_at_high_watermark"])
+        raw_audit_result = payload["latest_audit_result"]
+        watermark = (
+            now
+            if raw_result is None
+            else _parse_datetime(raw_result["checked_at_high_watermark"])
+        )
+        audit_checked_at = (
+            now
+            if raw_audit_result is None
+            else _parse_datetime(raw_audit_result["checked_at"])
+        )
     except (KeyError, TypeError, UnicodeError, json.JSONDecodeError, ValueError):
         return now
-    return max(now, watermark)
+    return max(now, watermark, audit_checked_at)
 
 
 def _clock_tolerant_state_validation_now(
@@ -829,16 +976,25 @@ def _clock_tolerant_state_validation_now(
     *,
     now: datetime,
 ) -> datetime:
+    candidates = [now]
     result = state.latest_completed_result
     if (
-        not isinstance(result, LatestCompletedResult)
-        or "monitor_clock_rollback" not in result.reason_codes
-        or not isinstance(result.checked_at_high_watermark, datetime)
-        or result.checked_at_high_watermark.tzinfo is None
-        or result.checked_at_high_watermark.utcoffset() is None
+        isinstance(result, LatestCompletedResult)
+        and "monitor_clock_rollback" in result.reason_codes
+        and isinstance(result.checked_at_high_watermark, datetime)
+        and result.checked_at_high_watermark.tzinfo is not None
+        and result.checked_at_high_watermark.utcoffset() is not None
     ):
-        return now
-    return max(now, result.checked_at_high_watermark.astimezone(UTC))
+        candidates.append(result.checked_at_high_watermark.astimezone(UTC))
+    audit_result = state.latest_audit_result
+    if (
+        isinstance(audit_result, LatestAuditResult)
+        and isinstance(audit_result.checked_at, datetime)
+        and audit_result.checked_at.tzinfo is not None
+        and audit_result.checked_at.utcoffset() is not None
+    ):
+        candidates.append(audit_result.checked_at.astimezone(UTC))
+    return max(candidates)
 
 
 def _generation_tuple(value: object, *, field: str) -> tuple[int, ...]:

@@ -288,7 +288,28 @@ def evaluate_sentinel_observation(
         else None
     )
     incident_projection: Mapping[str, object] | None = None
-    if incident_candidates and evidence_complete:
+    incident_candidate_fingerprints = {
+        item.fingerprint for item in incident_candidates
+    }
+    accepted_fingerprints = {
+        item.candidate_fingerprint
+        for item in previous_state.incident_acceptances
+    }
+    same_episode_accepted = bool(
+        anomaly_fingerprint in accepted_fingerprints
+    )
+    candidate_set_already_accepted = bool(
+        incident_candidate_fingerprints
+        and incident_candidate_fingerprints <= accepted_fingerprints
+    )
+    # A stable accepted episode still projects as a semantic status recheck so
+    # its deterministic-notification SLA remains reachable. If the aggregate
+    # changed only because already-accepted candidates resolved, suppress a new
+    # ledger incident for the remaining accepted candidate set.
+    suppress_new_subset = (
+        candidate_set_already_accepted and not same_episode_accepted
+    )
+    if incident_candidates and evidence_complete and not suppress_new_subset:
         confirmed_reasons = sorted(
             {item.reason_code for item in incident_candidates}
         )
@@ -327,9 +348,32 @@ def evaluate_sentinel_observation(
         incident_projection=incident_projection,
         anomaly_fingerprint=anomaly_fingerprint,
     )
+    active_confirmed_fingerprints = {
+        item.fingerprint for item in confirmed
+    }
+    retained_acceptances = tuple(
+        item
+        for item in previous_state.incident_acceptances
+        if (
+            item.projection_json is not None
+            and (
+                not item.routing_terminal
+                or item.candidate_fingerprint == anomaly_fingerprint
+            )
+            and bool(
+                set(item.member_fingerprints) & active_confirmed_fingerprints
+            )
+        )
+        or item.candidate_fingerprint in active_confirmed_fingerprints
+        or (
+            anomaly_fingerprint is not None
+            and item.candidate_fingerprint == anomaly_fingerprint
+        )
+    )
     next_state = replace(
         previous_state,
         candidates=candidate_states,
+        incident_acceptances=retained_acceptances,
         latest_completed_result=LatestCompletedResult(
             observation_generation=observation_generation,
             checked_at=checked_at,
@@ -349,11 +393,14 @@ def run_production_monitor_sentinel(
     *,
     state_store: ProductionMonitorStateStore,
     observation_collector: SentinelObservationCollector,
+    incident_router: Callable[[Mapping[str, object]], object] | None = None,
 ) -> SentinelRunOutcome:
     """Own one load-collect-evaluate-persist transition under one lease."""
 
-    if not isinstance(state_store, ProductionMonitorStateStore) or not callable(
-        observation_collector
+    if (
+        not isinstance(state_store, ProductionMonitorStateStore)
+        or not callable(observation_collector)
+        or (incident_router is not None and not callable(incident_router))
     ):
         return _failed_outcome("sentinel_configuration_invalid")
     result: SentinelResult | None = None
@@ -388,7 +435,7 @@ def run_production_monitor_sentinel(
                     failure_code="sentinel_persistence_failed",
                     result=result,
                 )
-            return SentinelRunOutcome(
+            completed_outcome = SentinelRunOutcome(
                 execution_status="COMPLETED",
                 observed_health=result.observed_health,
                 observation_generation=generation,
@@ -397,6 +444,14 @@ def run_production_monitor_sentinel(
                 failure_code=None,
                 result=result,
             )
+        if result.incident_projection is not None and incident_router is not None:
+            try:
+                incident_router(result.incident_projection)
+            except Exception:
+                # Incident intake and fallback delivery are observable channel
+                # failures; they never redefine a completed sentinel process.
+                pass
+        return completed_outcome
     except ValueError:
         return _failed_outcome("sentinel_input_invalid", result=result)
     except Exception:
@@ -522,7 +577,14 @@ def _confirmed_fingerprint(candidates: Sequence[CandidateState]) -> str:
     return _sha256_json(
         {
             "confirmed": [
-                {"fingerprint": item.fingerprint, "reason_code": item.reason_code}
+                {
+                    "fingerprint": item.fingerprint,
+                    "reason_code": item.reason_code,
+                    # This is the durable episode boundary. It stays fixed
+                    # while an anomaly remains confirmed and changes after a
+                    # complete resolution followed by recurrence.
+                    "first_observed_at": item.first_observed_at.isoformat(),
+                }
                 for item in sorted(
                     candidates,
                     key=lambda value: (value.reason_code, value.fingerprint),

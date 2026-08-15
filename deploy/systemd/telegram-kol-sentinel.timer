@@ -1,0 +1,14 @@
+[Unit]
+Description=Run Telegram KOL deterministic sentinel every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+RandomizedDelaySec=30s
+Persistent=true
+Unit=telegram-kol-sentinel.service
+
+[Install]
+WantedBy=timers.target
+

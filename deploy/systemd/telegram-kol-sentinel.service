@@ -1,0 +1,56 @@
+[Unit]
+Description=Telegram KOL deterministic production sentinel v2
+After=network-online.target
+Wants=network-online.target
+Requires=telegram-kol-monitor-db-stage@sentinel.service
+After=telegram-kol-monitor-db-stage@sentinel.service
+
+[Service]
+Type=oneshot
+User=telegram-kol-monitor-sentinel
+Group=telegram-kol-monitor-sentinel
+SupplementaryGroups=systemd-journal
+UMask=0077
+WorkingDirectory=/var/lib/telegram-kol-monitor-v2/sentinel
+EnvironmentFile=/etc/telegram-kol-monitor-sentinel.env
+LoadCredential=monitor-snapshot:/var/lib/telegram-kol-monitor-v2/snapshot/manifest.json
+ExecStartPre=/usr/bin/install -m 0600 ${CREDENTIALS_DIRECTORY}/monitor-snapshot /var/cache/telegram-kol-monitor-v2/sentinel/snapshot.json
+ExecStartPre=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research capture-production-monitor-local-evidence --readiness-url http://127.0.0.1:8000/api/runtime-monitor-readiness --coverage-url http://127.0.0.1:8000/api/runtime-incidents/message-operation-coverage --coverage-path /var/cache/telegram-kol-monitor-v2/sentinel/coverage.json --journal-path /var/cache/telegram-kol-monitor-v2/sentinel/journal.json --service-name telegram-kol.service
+ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research run-production-monitor-sentinel --state-path /var/lib/telegram-kol-monitor-v2/sentinel/sentinel-v2.json --snapshot-path /var/cache/telegram-kol-monitor-v2/sentinel/snapshot.json --database-path /var/cache/telegram-kol-monitor-v2/sentinel/research-snapshot.db --checkout-path /opt/telegram-kol-analyzer --settings-url http://127.0.0.1:8000/api/trading-settings --coverage-path /var/cache/telegram-kol-monitor-v2/sentinel/coverage.json --journal-path /var/cache/telegram-kol-monitor-v2/sentinel/journal.json --expected-head ${TELEGRAM_KOL_MONITOR_EXPECTED_HEAD} --expected-auto-trade true --expected-position-limit 4 --expected-management-mode live --expected-preamble-mode live --readiness-url http://127.0.0.1:8000/api/runtime-monitor-readiness --incident-loopback-url http://127.0.0.1:8000/api/runtime-incidents/monitor-capture
+
+AmbientCapabilities=
+CapabilityBoundingSet=
+InaccessiblePaths=-/run/dbus/system_bus_socket -/run/systemd/private
+IPAddressDeny=any
+IPAddressAllow=localhost
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateMounts=true
+PrivateTmp=true
+ProcSubset=pid
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @privileged
+TemporaryFileSystem=/opt/telegram-kol-analyzer:ro
+BindReadOnlyPaths=/opt/telegram-kol-analyzer/.venv
+BindReadOnlyPaths=/opt/telegram-kol-analyzer/src
+BindReadOnlyPaths=/opt/telegram-kol-analyzer/.git
+ReadOnlyPaths=/var/cache/telegram-kol-monitor-v2/sentinel/research-snapshot.db
+ReadWritePaths=/var/lib/telegram-kol-monitor-v2/sentinel
+ReadWritePaths=/var/cache/telegram-kol-monitor-v2/sentinel

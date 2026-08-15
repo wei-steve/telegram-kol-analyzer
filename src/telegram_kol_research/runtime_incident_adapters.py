@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, Callable
 
@@ -21,9 +22,13 @@ from telegram_kol_research.message_operation_types import (
 from telegram_kol_research.models import (
     ManagementMessageTarget,
     MessageOperationContract,
+    RuntimeIncident,
     utc_now,
 )
 from telegram_kol_research.runtime_incidents import record_runtime_incident
+from telegram_kol_research.production_monitor_contract import (
+    parse_monitor_projection,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -143,6 +148,7 @@ def _capture(
     affected_raw_message_id: int | None = None,
     message_operation_contract_id: int | None = None,
     recorder: Callable[..., Any] | None = None,
+    fingerprint_override: str | None = None,
 ):
     if not config.captures(incident_type):
         return None
@@ -155,11 +161,15 @@ def _capture(
             "source_record_id": source_record_id,
             "incident_type": incident_type,
             "severity": severity,
-            "fingerprint": _fingerprint(
-                incident_type=incident_type,
-                source_kind=source_kind,
-                source_record_id=source_record_id,
-                summary=redacted_summary,
+            "fingerprint": (
+                fingerprint_override
+                if fingerprint_override is not None
+                else _fingerprint(
+                    incident_type=incident_type,
+                    source_kind=source_kind,
+                    source_record_id=source_record_id,
+                    summary=redacted_summary,
+                )
             ),
             "redacted_summary": redacted_summary,
             "occurred_at": occurred_at,
@@ -511,6 +521,79 @@ def capture_monitor_state(
         if row is not None:
             captured.append(row)
     return tuple(captured)
+
+
+def capture_monitor_projection(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    projection: Mapping[str, Any],
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture one globally complete v2 monitor incident idempotently."""
+
+    normalized = parse_monitor_projection(projection)
+    if (
+        normalized["execution_status"] != "COMPLETED"
+        or normalized["observed_health"] != "UNHEALTHY"
+        or not normalized["reason_codes"]
+        or normalized["adapter_failures"]
+        or normalized["fallback_reason"] is not None
+    ):
+        raise ValueError(
+            "monitor projection must be a globally complete confirmed incident"
+        )
+    checked_at = datetime.fromisoformat(normalized["checked_at"])
+    submission_id = normalized["submission_id"]
+    reason_codes = ",".join(normalized["reason_codes"])
+    summary = _summary(
+        component="production_monitor_v2",
+        incident_state="confirmed",
+        reason_code=reason_codes,
+    )
+    if not config.captures("production_monitor_incident"):
+        return None
+    # The anomaly fingerprint identifies the sentinel episode. Unlike the
+    # delivery submission id it is stable across polling generations, so a
+    # response-lost retry cannot create a second ledger row.
+    incident_fingerprint = _fingerprint(
+        incident_type="production_monitor_incident",
+        source_kind="production_monitor_v2",
+        source_record_id=normalized["anomaly_fingerprint"],
+        summary=summary,
+    )
+    # Repeated submissions in one episode are semantic delivery retries, not
+    # additional occurrences. The first submission remains the source record.
+    with session_factory() as session:
+        existing = (
+            session.query(RuntimeIncident)
+            .filter(
+                RuntimeIncident.fingerprint == incident_fingerprint,
+                RuntimeIncident.generation == 1,
+                RuntimeIncident.source_kind == "production_monitor_v2",
+            )
+            .one_or_none()
+        )
+        if existing is not None:
+            session.expunge(existing)
+            return existing
+    return _capture(
+        session_factory,
+        config=config,
+        source_kind="production_monitor_v2",
+        source_record_id=submission_id,
+        incident_type="production_monitor_incident",
+        severity="high",
+        redacted_summary=summary,
+        occurred_at=checked_at,
+        evidence_refs_json=json.dumps(
+            [f"monitor_submission:{submission_id}"],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ),
+        recorder=recorder,
+        fingerprint_override=incident_fingerprint,
+    )
 
 
 def capture_protection_state(
