@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, fields, replace
 from datetime import UTC, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, localcontext
 import signal
 import sqlite3
 import threading
@@ -448,7 +448,11 @@ def _local_classification_evidence(
         status=mutation_status,
         order_ref=mutation_order_ref,
         reserved_at=CLASSIFICATION_TIME,
-        submitted_at=CLASSIFICATION_TIME,
+        submitted_at=(
+            CLASSIFICATION_TIME
+            if mutation_status in {"submitted", "confirmed"}
+            else None
+        ),
         confirmed_at=(
             CLASSIFICATION_TIME if mutation_status == "confirmed" else None
         ),
@@ -993,19 +997,79 @@ def test_terminal_classification_never_uses_age_or_callback_deadline():
     )
 
 
-def test_fill_timestamp_does_not_replace_the_required_terminal_time_chain():
+@pytest.mark.parametrize(
+    "filled_at",
+    [
+        CLASSIFICATION_TIME - timedelta(microseconds=1),
+        CLASSIFICATION_TIME + timedelta(minutes=1, microseconds=1),
+        CLASSIFICATION_TIME + timedelta(minutes=2, microseconds=1),
+        CLASSIFICATION_TIME + timedelta(minutes=3, microseconds=1),
+    ],
+)
+def test_fill_timestamp_outside_the_terminal_chain_is_unknown(filled_at):
     local = _local_classification_evidence()
     exchange = _terminal_exchange_evidence(
-        fills=(
-            _fill_evidence(
-                filled_at=CLASSIFICATION_TIME - timedelta(microseconds=1)
-            ),
-        )
+        fills=(_fill_evidence(filled_at=filled_at),)
     )
 
     observation = _classify(exchange, local=local)
 
-    assert observation.classification is ReservationClassification.PROVEN_TERMINAL
+    assert observation.classification is ReservationClassification.UNKNOWN
+    assert observation.reason_code == "exchange_state_conflict"
+
+
+@pytest.mark.parametrize(
+    ("collection", "order"),
+    [
+        (
+            "pending_orders",
+            _order_evidence(
+                state=ExchangeCloseOrderState.PENDING,
+                filled_quantity=Decimal("0"),
+                terminal_at=CLASSIFICATION_TIME,
+            ),
+        ),
+        (
+            "pending_orders",
+            _order_evidence(
+                state=ExchangeCloseOrderState.OPEN,
+                requested_quantity=Decimal("0"),
+                filled_quantity=Decimal("0"),
+                terminal_at=None,
+            ),
+        ),
+        (
+            "pending_orders",
+            _order_evidence(
+                state=ExchangeCloseOrderState.PENDING,
+                requested_quantity=Decimal("1"),
+                filled_quantity=Decimal("2"),
+                terminal_at=None,
+            ),
+        ),
+        (
+            "order_history",
+            _order_evidence(
+                state=ExchangeCloseOrderState.OPEN,
+                filled_quantity=Decimal("0"),
+                terminal_at=CLASSIFICATION_TIME,
+            ),
+        ),
+        (
+            "order_history",
+            _order_evidence(
+                state=ExchangeCloseOrderState.FILLED,
+                terminal_at=None,
+            ),
+        ),
+    ],
+)
+def test_malformed_order_state_shape_is_unknown_before_active(collection, order):
+    observation = _classify(
+        _terminal_exchange_evidence(**{collection: (order,)})
+    )
+    assert observation.classification is ReservationClassification.UNKNOWN
+    assert observation.reason_code == "exchange_state_conflict"
 
 
 def test_exchange_evidence_schema_is_frozen_closed_and_bounded():
@@ -1036,6 +1100,34 @@ def test_exchange_evidence_records_require_exact_decimals_and_aware_utc():
         _fill_evidence(filled_at=CLASSIFICATION_TIME.replace(tzinfo=None))
     with pytest.raises(ValueError, match="side"):
         _fill_evidence(side="buy")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        Decimal("1e33"),
+        Decimal("1e-33"),
+        Decimal("1234567890" * 7),
+    ],
+)
+def test_exchange_decimal_schema_rejects_extreme_values_before_hashing(value):
+    with pytest.raises(ValueError, match="bounded"):
+        _fill_evidence(quantity=value)
+
+
+def test_decimal_canonicalization_is_exact_and_context_independent():
+    left = Decimal("1.000000000000000001")
+    right = Decimal("1.000000000000000002")
+    with localcontext() as context:
+        context.prec = 3
+        left_json = _canonical_json({"quantity": left})
+        right_json = _canonical_json({"quantity": right})
+
+    assert left_json == '{"quantity":"1.000000000000000001"}'
+    assert right_json == '{"quantity":"1.000000000000000002"}'
+    assert _sha256_json({"quantity": left}) != _sha256_json(
+        {"quantity": right}
+    )
 
 
 def test_classifier_requires_strict_types_and_aware_utc_capture():
@@ -1333,6 +1425,145 @@ def test_source_loader_loads_all_closed_active_statuses_and_exact_descendants(
     assert source.source_fingerprint == _sha256_json(
         {"reservations": source.reservations}
     )
+
+
+@pytest.mark.parametrize(
+    ("status", "submitted_at", "confirmed_at"),
+    [
+        ("reserved", None, None),
+        ("not_sent", None, None),
+        ("submitting", None, None),
+        ("submitted", "2026-08-14 10:01:00.000000", None),
+        (
+            "confirmed",
+            "2026-08-14 10:01:00.000000",
+            "2026-08-14 10:02:00.000000",
+        ),
+        ("rejected", None, None),
+        (
+            "rejected",
+            "2026-08-14 10:01:00.000000",
+            "2026-08-14 10:02:00.000000",
+        ),
+        ("recovery_required", None, None),
+        ("recovery_required", "2026-08-14 10:01:00.000000", None),
+        ("blocked", None, None),
+        ("blocked", "2026-08-14 10:01:00.000000", None),
+    ],
+)
+def test_source_loader_accepts_only_authoritative_mutation_time_shapes(
+    tmp_path,
+    status,
+    submitted_at,
+    confirmed_at,
+):
+    database = tmp_path / f"valid-mutation-{status}.sqlite3"
+    connection = _create_reservation_source_database(database)
+    _seed_local_reservation(connection)
+    connection.execute(
+        """
+        UPDATE position_mutation_intents
+        SET status = ?, submitted_at = ?, confirmed_at = ?,
+            updated_at = '2026-08-14 10:03:00.000000'
+        """,
+        (status, submitted_at, confirmed_at),
+    )
+    connection.commit()
+    connection.close()
+
+    source = load_bound_close_reservation_source(database)
+
+    assert source.reservations[0].local_reason_code is None
+    assert source.reservations[0].close_mutations[0].status == status
+
+
+@pytest.mark.parametrize(
+    ("status", "submitted_at", "confirmed_at"),
+    [
+        ("reserved", "2026-08-14 10:01:00.000000", None),
+        ("submitted", None, None),
+        (
+            "submitted",
+            "2026-08-14 10:01:00.000000",
+            "2026-08-14 10:02:00.000000",
+        ),
+        ("confirmed", None, "2026-08-14 10:02:00.000000"),
+        ("confirmed", "2026-08-14 10:01:00.000000", None),
+        (
+            "confirmed",
+            "2026-08-14 10:02:00.000000",
+            "2026-08-14 10:01:00.000000",
+        ),
+        ("rejected", None, "2026-08-14 10:02:00.000000"),
+        ("recovery_required", None, "2026-08-14 10:02:00.000000"),
+    ],
+)
+def test_source_loader_rejects_contradictory_mutation_time_shapes_without_capability(
+    tmp_path,
+    status,
+    submitted_at,
+    confirmed_at,
+):
+    database = tmp_path / f"invalid-mutation-{status}.sqlite3"
+    connection = _create_reservation_source_database(database)
+    _seed_local_reservation(connection)
+    connection.execute(
+        """
+        UPDATE position_mutation_intents
+        SET status = ?, submitted_at = ?, confirmed_at = ?,
+            updated_at = '2026-08-14 10:03:00.000000'
+        """,
+        (status, submitted_at, confirmed_at),
+    )
+    connection.commit()
+    connection.close()
+
+    source = load_bound_close_reservation_source(database)
+    evidence = source.reservations[0]
+
+    assert evidence.local_reason_code == "local_evidence_incomplete"
+    assert evidence.close_mutations == ()
+    with pytest.raises(KeyError):
+        source._capability._get(evidence.reservation_ref)
+
+
+def test_classifier_rejects_confirmed_mutation_with_inverted_times():
+    local = _local_classification_evidence()
+    mutation = replace(
+        local.close_mutations[0],
+        submitted_at=CLASSIFICATION_TIME + timedelta(minutes=2),
+        confirmed_at=CLASSIFICATION_TIME + timedelta(minutes=1),
+        updated_at=CLASSIFICATION_TIME + timedelta(minutes=3),
+    )
+
+    observation = _classify(
+        _terminal_exchange_evidence(),
+        local=replace(local, close_mutations=(mutation,)),
+        capture_completed_at=CLASSIFICATION_TIME + timedelta(minutes=4),
+    )
+
+    assert observation.classification is ReservationClassification.UNKNOWN
+    assert observation.reason_code == "local_evidence_incomplete"
+
+
+def test_classifier_rejects_mutation_timestamp_after_capture():
+    local = _local_classification_evidence()
+    future = CLASSIFICATION_TIME + timedelta(minutes=5)
+    mutation = replace(
+        local.close_mutations[0],
+        submitted_at=CLASSIFICATION_TIME + timedelta(minutes=1),
+        confirmed_at=future,
+        updated_at=future,
+    )
+
+    observation = _classify(
+        _terminal_exchange_evidence(),
+        local=replace(local, close_mutations=(mutation,)),
+        capture_completed_at=CLASSIFICATION_TIME + timedelta(minutes=4),
+    )
+
+    assert observation.classification is ReservationClassification.UNKNOWN
+    assert observation.reason_code == "local_evidence_incomplete"
 
 
 def test_source_loader_accepts_exact_closed_leg_of_an_active_split_binding(

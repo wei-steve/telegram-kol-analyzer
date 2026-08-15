@@ -502,6 +502,9 @@ _EXCHANGE_CAPTURE_FAILURE_REASONS = frozenset(
     }
 )
 _MAX_EXCHANGE_EVIDENCE_ITEMS = 100
+_MAX_EXCHANGE_DECIMAL_DIGITS = 64
+_MAX_EXCHANGE_DECIMAL_ABS_EXPONENT = 32
+_MAX_EXCHANGE_DECIMAL_TEXT_BYTES = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -761,12 +764,7 @@ def _canonical_json_value(value: Any) -> Any:
     if value is None or type(value) in {str, bool, int}:
         return value
     if type(value) is Decimal:
-        if not value.is_finite():
-            raise ValueError("Decimal must be finite")
-        normalized = value.normalize()
-        if normalized == 0:
-            return "0"
-        return format(normalized, "f")
+        return _canonical_decimal_text(value)
     if isinstance(value, datetime):
         offset = value.utcoffset() if value.tzinfo is not None else None
         if offset != timedelta(0):
@@ -822,10 +820,51 @@ def _require_decimal(
         raise TypeError(f"{field_name} must be a Decimal")
     if not value.is_finite():
         raise ValueError(f"{field_name} must be finite")
+    try:
+        _canonical_decimal_text(value)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be bounded") from exc
     if value < 0 or (positive and value <= 0):
         qualifier = "positive" if positive else "nonnegative"
         raise ValueError(f"{field_name} must be {qualifier}")
     return value
+
+
+def _canonical_decimal_text(value: Decimal) -> str:
+    """Render one exact bounded decimal without consulting Decimal context."""
+
+    if type(value) is not Decimal:
+        raise TypeError("value must be a Decimal")
+    if not value.is_finite():
+        raise ValueError("Decimal must be finite")
+    sign, raw_digits, raw_exponent = value.as_tuple()
+    if type(raw_exponent) is not int:
+        raise ValueError("Decimal exponent must be finite")
+    digits = list(raw_digits)
+    if len(digits) > _MAX_EXCHANGE_DECIMAL_DIGITS:
+        raise ValueError("Decimal digits exceed recovery bound")
+    exponent = raw_exponent
+    if abs(exponent) > _MAX_EXCHANGE_DECIMAL_ABS_EXPONENT:
+        raise ValueError("Decimal exponent exceeds recovery bound")
+    if not any(digits):
+        return "0"
+    while len(digits) > 1 and digits[-1] == 0:
+        digits.pop()
+        exponent += 1
+    coefficient = "".join(chr(48 + digit) for digit in digits)
+    if exponent >= 0:
+        rendered = coefficient + ("0" * exponent)
+    else:
+        point = len(coefficient) + exponent
+        if point > 0:
+            rendered = f"{coefficient[:point]}.{coefficient[point:]}"
+        else:
+            rendered = f"0.{('0' * -point)}{coefficient}"
+    if sign:
+        rendered = f"-{rendered}"
+    if len(rendered.encode("ascii")) > _MAX_EXCHANGE_DECIMAL_TEXT_BYTES:
+        raise ValueError("Decimal text exceeds recovery bound")
+    return rendered
 
 
 def _validate_exchange_identity(
@@ -914,7 +953,10 @@ def classify_bound_close_reservation(
             ReservationClassification.UNKNOWN,
             local.local_reason_code,
         )
-    if not _local_classification_shape_is_complete(local):
+    if not _local_classification_shape_is_complete(
+        local,
+        capture_completed_at=capture_completed_at,
+    ):
         return observation(
             ReservationClassification.UNKNOWN,
             "local_evidence_incomplete",
@@ -962,6 +1004,14 @@ def classify_bound_close_reservation(
             exchange.fills,
             exchange.position_history,
         )
+    ):
+        return observation(
+            ReservationClassification.UNKNOWN,
+            "exchange_state_conflict",
+        )
+    if not all(
+        _exchange_order_shape_is_valid(order)
+        for order in (*exchange.pending_orders, *exchange.order_history)
     ):
         return observation(
             ReservationClassification.UNKNOWN,
@@ -1036,6 +1086,11 @@ def classify_bound_close_reservation(
         and local.event_created_at <= order.terminal_at
         and order.terminal_at <= position.closed_at
         and position.closed_at <= capture_completed_at
+        and local.reservation_created_at <= fill.filled_at
+        and local.event_created_at <= fill.filled_at
+        and fill.filled_at <= order.terminal_at
+        and fill.filled_at <= position.closed_at
+        and fill.filled_at <= capture_completed_at
     ):
         return observation(
             ReservationClassification.UNKNOWN,
@@ -1049,6 +1104,8 @@ def classify_bound_close_reservation(
 
 def _local_classification_shape_is_complete(
     local: LocalReservationEvidence,
+    *,
+    capture_completed_at: datetime,
 ) -> bool:
     required_refs = (
         local.reservation_ref,
@@ -1087,7 +1144,92 @@ def _local_classification_shape_is_complete(
         _require_aware_utc(local.event_created_at, "event_created_at")
     except (TypeError, ValueError):
         return False
-    return reservation_created_at <= reservation_updated_at
+    if not (
+        reservation_created_at <= reservation_updated_at <= capture_completed_at
+        and local.event_created_at <= capture_completed_at
+    ):
+        return False
+    return all(
+        _local_mutation_shape_is_valid(
+            mutation,
+            capture_completed_at=capture_completed_at,
+        )
+        for mutation in local.close_mutations
+    )
+
+
+def _exchange_order_shape_is_valid(order: ExchangeOrderEvidence) -> bool:
+    if (
+        order.requested_quantity <= 0
+        or order.filled_quantity > order.requested_quantity
+    ):
+        return False
+    if order.state in {
+        ExchangeCloseOrderState.OPEN,
+        ExchangeCloseOrderState.PENDING,
+        ExchangeCloseOrderState.PARTIALLY_FILLED,
+    }:
+        return order.terminal_at is None
+    if order.terminal_at is None:
+        return False
+    if order.state is ExchangeCloseOrderState.FILLED:
+        return order.filled_quantity == order.requested_quantity
+    return True
+
+
+def _local_mutation_shape_is_valid(
+    mutation: LocalCloseMutationEvidence,
+    *,
+    capture_completed_at: datetime | None,
+) -> bool:
+    if (
+        not _is_lower_hex_64(mutation.mutation_ref)
+        or mutation.status not in _POSITION_MUTATION_STATUSES
+        or (
+            mutation.order_ref is not None
+            and not _is_lower_hex_64(mutation.order_ref)
+        )
+        or not _is_lower_hex_64(mutation.record_fingerprint)
+    ):
+        return False
+    try:
+        reserved_at = _require_aware_utc(mutation.reserved_at, "reserved_at")
+        created_at = _require_aware_utc(mutation.created_at, "created_at")
+        updated_at = _require_aware_utc(mutation.updated_at, "updated_at")
+        submitted_at = _require_optional_aware_utc(
+            mutation.submitted_at,
+            "submitted_at",
+        )
+        confirmed_at = _require_optional_aware_utc(
+            mutation.confirmed_at,
+            "confirmed_at",
+        )
+    except (TypeError, ValueError):
+        return False
+    if not created_at <= reserved_at <= updated_at:
+        return False
+    if submitted_at is not None and not (
+        reserved_at <= submitted_at <= updated_at
+    ):
+        return False
+    if confirmed_at is not None and (
+        submitted_at is None
+        or not submitted_at <= confirmed_at <= updated_at
+    ):
+        return False
+    if capture_completed_at is not None and updated_at > capture_completed_at:
+        return False
+    if mutation.status in {"reserved", "not_sent", "submitting"}:
+        return submitted_at is None and confirmed_at is None
+    if mutation.status == "submitted":
+        return submitted_at is not None and confirmed_at is None
+    if mutation.status == "confirmed":
+        return submitted_at is not None and confirmed_at is not None
+    if mutation.status == "rejected":
+        return (submitted_at is None and confirmed_at is None) or (
+            submitted_at is not None and confirmed_at is not None
+        )
+    return confirmed_at is None
 
 
 def _exchange_identities_match(
@@ -1784,7 +1926,7 @@ def _mutation_evidence(
     fingerprint = _safe_row_fingerprint("close_mutation", row)
     if fingerprint is None:
         return None
-    return LocalCloseMutationEvidence(
+    evidence = LocalCloseMutationEvidence(
         mutation_ref=_redacted_ref("close_mutation", row["id"]),
         status=row["status"],
         order_ref=(
@@ -1799,6 +1941,12 @@ def _mutation_evidence(
         updated_at=updated_at,
         record_fingerprint=fingerprint,
     )
+    if not _local_mutation_shape_is_valid(
+        evidence,
+        capture_completed_at=None,
+    ):
+        return None
+    return evidence
 
 
 def _source_failure(status: str) -> BoundCloseReservationSource:
