@@ -793,6 +793,127 @@ def test_cli_help_renders():
     assert "audit-tpsl-ownership" in result.stdout
     assert "audit-kol-pnl" in result.stdout
     assert "backfill-canonical-tpsl-ledger" in result.stdout
+    assert "refresh-production-monitor-snapshot" in result.stdout
+
+
+def test_production_monitor_snapshot_cli_help_has_only_explicit_runtime_inputs():
+    result = CliRunner().invoke(
+        app,
+        ["refresh-production-monitor-snapshot", "--help"],
+        terminal_width=200,
+    )
+
+    assert result.exit_code == 0
+    assert "--manifest-path" in result.output
+    # Rich truncates long option labels at narrow test-terminal widths. The
+    # successful invocation below exercises the exact full option spelling.
+    assert "--wall-clock-timeout" in result.output
+    assert "--database" not in result.output
+
+
+def test_production_monitor_snapshot_cli_is_environment_only_and_emits_bounded_json(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+
+    calls: list[dict[str, object]] = []
+
+    class ReadClient:
+        uid_scope_hash = "a" * 64
+
+        def read_positions(self, *, inst_id=None):
+            return {"data": []}
+
+        def read_open_orders(self, *, inst_id=None):
+            return {"data": []}
+
+        def read_trigger_orders_pending(self, *, inst_id):
+            return {"data": []}
+
+        def close(self):
+            calls.append({"closed": True})
+
+    def build_client(*, environ, env_file_paths):
+        calls.append({"environ": environ, "env_file_paths": env_file_paths})
+        return ReadClient()
+
+    monkeypatch.setattr(
+        cli_module,
+        "build_deepcoin_read_only_client_from_env",
+        build_client,
+    )
+    manifest = tmp_path / "monitor.json"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "refresh-production-monitor-snapshot",
+            "--manifest-path",
+            str(manifest),
+            "--wall-clock-timeout-seconds",
+            "3",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert len(result.stdout.splitlines()) == 1
+    payload = json.loads(result.stdout)
+    assert payload == {
+        "execution_status": "COMPLETED",
+        "failure_code": None,
+        "generation": 0,
+        "snapshot_outcome": "SUCCESS",
+    }
+    assert len(result.stdout.encode("utf-8")) <= 512
+    assert calls[0]["env_file_paths"] == []
+    assert isinstance(calls[0]["environ"], dict)
+    assert calls[1] == {"closed": True}
+    assert manifest.exists()
+
+
+def test_production_monitor_snapshot_cli_sealed_read_failure_exits_zero(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+
+    class ReadClient:
+        uid_scope_hash = "a" * 64
+
+        def read_positions(self, *, inst_id=None):
+            raise TimeoutError("secret transport detail")
+
+        def read_open_orders(self, *, inst_id=None):
+            pytest.fail("refresh must stop after a failed collection")
+
+        def read_trigger_orders_pending(self, *, inst_id):
+            pytest.fail("refresh must stop after a failed collection")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        cli_module,
+        "build_deepcoin_read_only_client_from_env",
+        lambda **kwargs: ReadClient(),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "refresh-production-monitor-snapshot",
+            "--manifest-path",
+            str(tmp_path / "monitor.json"),
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["execution_status"] == "COMPLETED"
+    assert payload["snapshot_outcome"] == "FAILURE"
+    assert payload["failure_code"] == "exchange_timeout"
+    assert "secret" not in result.stdout
 
 
 def test_take_profit_protection_leg_repair_help_exposes_review_gates():

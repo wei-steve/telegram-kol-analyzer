@@ -75,6 +75,14 @@ from telegram_kol_research.deepcoin_client import (
     build_deepcoin_client_from_env,
     build_deepcoin_read_only_client_from_env,
 )
+from telegram_kol_research.production_monitor_refresher import (
+    ProductionMonitorRefreshError,
+    ReadOnlyDeepcoinMonitorClient,
+    refresh_production_monitor_snapshot,
+)
+from telegram_kol_research.production_monitor_snapshot import (
+    ProductionMonitorSnapshotStore,
+)
 from telegram_kol_research.deepcoin_order_builder import (
     deepcoin_order_draft_fingerprint,
 )
@@ -324,6 +332,76 @@ _DEEPCOIN_CONTRACT_SPEC_CACHE_PATH = Path(
     "data/deepcoin_contract_specs_cache.json"
 )
 _DEEPCOIN_CONTRACT_SPEC_CLI_TEXT_LIMIT = 512
+
+
+@app.command("refresh-production-monitor-snapshot")
+def refresh_production_monitor_snapshot_cli(
+    manifest_path: Path = typer.Option(
+        ...,
+        "--manifest-path",
+        help="Exact sealed monitor snapshot manifest path.",
+    ),
+    wall_clock_timeout_seconds: float = typer.Option(
+        45.0,
+        "--wall-clock-timeout-seconds",
+        min=0.001,
+        max=120.0,
+        help="Bounded wall-clock budget for one read-only capture.",
+    ),
+) -> None:
+    """Seal one environment-only, read-only Deepcoin monitor snapshot."""
+
+    client = None
+    try:
+        client = build_deepcoin_read_only_client_from_env(
+            environ=dict(os.environ),
+            env_file_paths=[],
+        )
+        outcome = refresh_production_monitor_snapshot(
+            client=ReadOnlyDeepcoinMonitorClient(client),
+            store=ProductionMonitorSnapshotStore(manifest_path),
+            wall_clock_timeout_seconds=wall_clock_timeout_seconds,
+        )
+        summary = {
+            "execution_status": outcome.execution_status,
+            "failure_code": outcome.failure_code,
+            "generation": outcome.generation,
+            "snapshot_outcome": outcome.snapshot_outcome,
+        }
+        exit_code = 0
+    except ProductionMonitorRefreshError:
+        summary = {
+            "execution_status": "FAILED",
+            "failure_code": "configuration_or_persistence_unavailable",
+            "generation": None,
+            "snapshot_outcome": "FAILURE",
+        }
+        exit_code = 1
+    except Exception:
+        summary = {
+            "execution_status": "FAILED",
+            "failure_code": "configuration_unavailable",
+            "generation": None,
+            "snapshot_outcome": "FAILURE",
+        }
+        exit_code = 1
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+    typer.echo(
+        json.dumps(
+            summary,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+    if exit_code:
+        raise typer.Exit(code=exit_code)
 
 
 def _bounded_contract_spec_cli_text(value: object) -> str:
