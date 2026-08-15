@@ -9,6 +9,7 @@ import pytest
 
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import DeepcoinCredentials
+from telegram_kol_research.deepcoin_client import DeepcoinDefiniteRejection
 from telegram_kol_research.deepcoin_client import DeepcoinRestClient
 from telegram_kol_research.deepcoin_client import DeepcoinReadUnavailable
 from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
@@ -17,7 +18,13 @@ from telegram_kol_research.deepcoin_client import DeepcoinTpslWriteLimiter
 from telegram_kol_research.deepcoin_client import build_deepcoin_auth_headers
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
 from telegram_kol_research.deepcoin_client import (
+    build_deepcoin_bound_close_reservation_recovery_client_from_env,
+)
+from telegram_kol_research.deepcoin_client import (
     build_deepcoin_monitor_snapshot_client_from_env,
+)
+from telegram_kol_research.deepcoin_client import (
+    build_deepcoin_read_only_client_from_env,
 )
 from telegram_kol_research.deepcoin_client import load_deepcoin_credentials
 from telegram_kol_research.deepcoin_client import _raise_for_deepcoin_business_error
@@ -135,6 +142,19 @@ class _ChunkedWireResponse:
     def json(self):
         self.json_calls += 1
         raise AssertionError("bounded monitor response must not call response.json")
+
+
+class _SlowChunkedWireResponse(_ChunkedWireResponse):
+    def __init__(self, chunks, *, clock, seconds_per_chunk):
+        super().__init__(chunks)
+        self.clock = clock
+        self.seconds_per_chunk = seconds_per_chunk
+
+    def iter_raw(self):
+        for chunk in self.chunks:
+            self.yielded += 1
+            self.clock.advance(self.seconds_per_chunk)
+            yield chunk
 
 
 class _MonitorStreamingHttpClient:
@@ -261,6 +281,268 @@ def test_monitor_response_limit_cannot_be_used_for_exchange_write():
             client.place_order({"instId": "BTC-USDT-SWAP"})
 
     assert http_client.requests == []
+
+
+def test_recovery_transport_ignores_ambient_proxy_ca_and_proxy_auth(monkeypatch):
+    constructed: list[dict[str, object]] = []
+
+    class Client(_CapturingHttpClient):
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+            super().__init__({"code": "0", "data": []})
+
+    monkeypatch.setattr(httpx, "Client", Client)
+    environment = {
+        "DEEPCOIN_API_KEY": "recovery-key",
+        "DEEPCOIN_API_SECRET": "recovery-secret",
+        "DEEPCOIN_API_PASSPHRASE": "recovery-passphrase",
+        "HTTPS_PROXY": "http://user:password@proxy.example.invalid:8080",
+        "ALL_PROXY": "socks5://proxy.example.invalid:1080",
+        "SSL_CERT_FILE": "/untrusted/proxy-ca.pem",
+        "REQUESTS_CA_BUNDLE": "/untrusted/requests-ca.pem",
+    }
+
+    recovery = build_deepcoin_bound_close_reservation_recovery_client_from_env(
+        environ=environment,
+        env_file_paths=[],
+    )
+    assert recovery.read_positions() == {"code": "0", "data": []}
+    with pytest.raises(DeepcoinClientError, match="read-only"):
+        recovery.cancel_order({"ordId": "must-not-send"})
+    recovery.close()
+
+    assert constructed == [
+        {
+            "base_url": "https://api.deepcoin.com",
+            "timeout": 15.0,
+            "trust_env": False,
+        }
+    ]
+
+
+def test_recovery_builder_does_not_change_ordinary_or_batch119_builder_semantics(
+    monkeypatch,
+):
+    constructed: list[dict[str, object]] = []
+
+    class Client(_CapturingHttpClient):
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+            super().__init__({"code": "0", "data": []})
+
+    monkeypatch.setattr(httpx, "Client", Client)
+    environment = {
+        "DEEPCOIN_API_KEY": "key",
+        "DEEPCOIN_API_SECRET": "secret",
+        "DEEPCOIN_API_PASSPHRASE": "passphrase",
+        "HTTPS_PROXY": "http://proxy.example.invalid:8080",
+    }
+
+    ordinary = build_deepcoin_client_from_env(environ=environment, env_file_paths=[])
+    batch119 = build_deepcoin_read_only_client_from_env(
+        environ=environment, env_file_paths=[]
+    )
+    recovery = build_deepcoin_bound_close_reservation_recovery_client_from_env(
+        environ=environment, env_file_paths=[]
+    )
+    for client in (ordinary, batch119, recovery):
+        assert client.read_positions() == {"code": "0", "data": []}
+        client.close()
+
+    assert "trust_env" not in constructed[0]
+    assert "trust_env" not in constructed[1]
+    assert constructed[2]["trust_env"] is False
+
+
+@pytest.mark.parametrize(
+    ("method_name", "payload"),
+    [
+        ("place_order", {"instId": "BTC-USDT-SWAP"}),
+        ("trigger_order", {"instId": "BTC-USDT-SWAP"}),
+        ("set_position_sltp", {"instId": "BTC-USDT-SWAP"}),
+        (
+            "cancel_position_sltp",
+            {
+                "instType": "SWAP",
+                "instId": "BTC-USDT-SWAP",
+                "ordId": "order-1",
+            },
+        ),
+        ("replace_order_sltp", {"instId": "BTC-USDT-SWAP"}),
+        ("cancel_order", {"instId": "BTC-USDT-SWAP"}),
+        ("cancel_trigger_order", {"instId": "BTC-USDT-SWAP"}),
+    ],
+)
+def test_recovery_transport_rejects_every_public_writer_before_http(
+    monkeypatch, method_name, payload
+):
+    constructed = []
+
+    class Client(_CapturingHttpClient):
+        def __init__(self, **kwargs):
+            constructed.append(self)
+            super().__init__({"code": "0", "data": []})
+
+    monkeypatch.setattr(httpx, "Client", Client)
+    recovery = build_deepcoin_bound_close_reservation_recovery_client_from_env(
+        environ={
+            "DEEPCOIN_API_KEY": "key",
+            "DEEPCOIN_API_SECRET": "secret",
+            "DEEPCOIN_API_PASSPHRASE": "passphrase",
+        },
+        env_file_paths=[],
+    )
+
+    with pytest.raises(DeepcoinClientError, match="read-only"):
+        getattr(recovery, method_name)(payload)
+
+    # Read-only rejection happens before lazy HTTP construction and therefore
+    # before any possible wire call.
+    assert constructed == []
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "bound_close_reservation_recovery_extra",
+        "BOUND_CLOSE_RESERVATION_RECOVERY",
+        "ordinary_read",
+    ],
+)
+def test_response_limit_rejects_every_non_monitor_non_exact_recovery_phase(phase):
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=_CapturingHttpClient({"code": "0", "data": []}),
+        read_only=True,
+    )
+
+    with pytest.raises(DeepcoinClientError, match="reserved"):
+        with client.request_scope(
+            DeepcoinRequestScope(
+                phase=phase,
+                priority=RequestPriority.BACKGROUND,
+                deadline_monotonic=105.0,
+                max_response_bytes=1024 * 1024,
+            )
+        ):
+            pass
+
+
+def test_exact_recovery_phase_rejects_oversized_declared_content_length():
+    response = _ChunkedWireResponse([b'{"code":"0","data":[]}'])
+    response.headers = {"Content-Length": str(1024 * 1024 + 1)}
+    http_client = _MonitorStreamingHttpClient(response)
+    clock = _FakeMonotonicClock(100.0)
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+        monotonic_factory=clock,
+        sleep_fn=clock.sleep,
+        read_only=True,
+    )
+
+    with client.request_scope(
+        DeepcoinRequestScope(
+            phase="bound_close_reservation_recovery",
+            priority=RequestPriority.BACKGROUND,
+            deadline_monotonic=105.0,
+            max_response_bytes=1024 * 1024,
+        )
+    ), pytest.raises(DeepcoinReadUnavailable) as captured:
+        client.read_positions()
+
+    assert captured.value.fact.safe_code == "monitor_response_size_exceeded"
+    assert response.yielded == 0
+
+
+def test_exact_recovery_phase_stops_stream_overflow_before_json_decode():
+    response = _ChunkedWireResponse(
+        [b'{"code":"0","data":[', b'"' + b"x" * 48, b'"]}']
+    )
+    http_client = _MonitorStreamingHttpClient(response)
+    clock = _FakeMonotonicClock(100.0)
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+        monotonic_factory=clock,
+        sleep_fn=clock.sleep,
+        read_only=True,
+    )
+
+    with client.request_scope(
+        DeepcoinRequestScope(
+            phase="bound_close_reservation_recovery",
+            priority=RequestPriority.BACKGROUND,
+            deadline_monotonic=105.0,
+            max_response_bytes=32,
+        )
+    ), pytest.raises(DeepcoinReadUnavailable) as captured:
+        client.read_positions()
+
+    assert captured.value.fact.safe_code == "monitor_response_size_exceeded"
+    assert response.yielded == 2
+    assert response.json_calls == 0
+
+
+def test_exact_recovery_phase_enforces_absolute_deadline_during_slow_drip():
+    clock = _FakeMonotonicClock(100.0)
+    response = _SlowChunkedWireResponse(
+        [b'{"code":"0",', b'"data":[]}'],
+        clock=clock,
+        seconds_per_chunk=0.6,
+    )
+    http_client = _MonitorStreamingHttpClient(response)
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+        monotonic_factory=clock,
+        sleep_fn=clock.sleep,
+        read_only=True,
+    )
+
+    with client.request_scope(
+        DeepcoinRequestScope(
+            phase="bound_close_reservation_recovery",
+            priority=RequestPriority.BACKGROUND,
+            deadline_monotonic=101.0,
+            max_response_bytes=1024 * 1024,
+        )
+    ), pytest.raises(DeepcoinReadUnavailable) as captured:
+        client.read_positions()
+
+    assert captured.value.fact.safe_code == "request_deadline_exceeded"
+    assert response.yielded == 2
+
+
+@pytest.mark.parametrize(
+    ("wire_payload", "expected_exception"),
+    [
+        (b"{", DeepcoinReadUnavailable),
+        (b'{"code":"51000","msg":"rejected","data":[]}', DeepcoinDefiniteRejection),
+    ],
+)
+def test_exact_recovery_phase_rejects_malformed_json_and_business_errors(
+    wire_payload, expected_exception
+):
+    http_client = _MonitorStreamingHttpClient(_ChunkedWireResponse([wire_payload]))
+    clock = _FakeMonotonicClock(100.0)
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+        monotonic_factory=clock,
+        sleep_fn=clock.sleep,
+        read_only=True,
+    )
+
+    with client.request_scope(
+        DeepcoinRequestScope(
+            phase="bound_close_reservation_recovery",
+            priority=RequestPriority.BACKGROUND,
+            deadline_monotonic=105.0,
+            max_response_bytes=1024 * 1024,
+        )
+    ), pytest.raises(expected_exception):
+        client.read_positions()
 
 
 def test_build_deepcoin_auth_headers_signs_timestamp_method_path_and_body():

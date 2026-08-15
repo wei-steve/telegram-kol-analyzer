@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum, StrEnum
@@ -12,6 +13,14 @@ import re
 import sqlite3
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import quote
+
+from telegram_kol_research.deepcoin_client import (
+    DEEPCOIN_BOUND_CLOSE_RESERVATION_RECOVERY_PHASE,
+    DeepcoinRequestScope,
+    DeepcoinRestClient,
+    build_deepcoin_bound_close_reservation_recovery_client_from_env,
+)
+from telegram_kol_research.deepcoin_request_policy import RequestPriority
 
 
 RECOVERY_SCHEMA_VERSION = 1
@@ -57,6 +66,98 @@ ACTIVE_CLOSE_RESERVATION_STATUSES = frozenset(
 
 _MAX_LOCAL_DESCENDANTS = 256
 _MAX_LOCAL_JSON_BYTES = 1_048_576
+RECOVERY_RESPONSE_MAX_BYTES = 1_048_576
+
+
+class BoundCloseReservationExchangeReader:
+    """One-shot capability exposing only exact Deepcoin recovery GET reads."""
+
+    __slots__ = ("__transport",)
+
+    def __init__(self, transport: DeepcoinRestClient) -> None:
+        if not isinstance(transport, DeepcoinRestClient):
+            raise TypeError("transport must be DeepcoinRestClient")
+        self.__transport = transport
+
+    @contextmanager
+    def request_scope(
+        self,
+        *,
+        deadline_monotonic: float,
+        correlation_id: str | None = None,
+        attempt_recorder: Callable[[Any], None] | None = None,
+    ):
+        """Apply one absolute deadline and always retire the owned transport."""
+
+        scope = DeepcoinRequestScope(
+            phase=DEEPCOIN_BOUND_CLOSE_RESERVATION_RECOVERY_PHASE,
+            priority=RequestPriority.BACKGROUND,
+            deadline_monotonic=deadline_monotonic,
+            correlation_id=correlation_id,
+            attempt_recorder=attempt_recorder,
+            max_response_bytes=RECOVERY_RESPONSE_MAX_BYTES,
+        )
+        try:
+            with self.__transport.request_scope(scope):
+                yield self
+        finally:
+            self.__transport.close()
+
+    def read_positions(self) -> dict[str, Any]:
+        return self.__transport.read_positions()
+
+    def read_open_orders(self) -> dict[str, Any]:
+        return self.__transport.read_open_orders()
+
+    def read_order_history(
+        self,
+        *,
+        inst_id: str,
+        order_id: str,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        return self.__transport.read_order_history(
+            inst_id=inst_id,
+            order_id=order_id,
+            limit=limit,
+        )
+
+    def read_trade_fills(
+        self,
+        *,
+        inst_id: str,
+        order_id: str,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        return self.__transport.read_trade_fills(
+            inst_id=inst_id,
+            order_id=order_id,
+            limit=limit,
+        )
+
+    def read_position_history(
+        self,
+        *,
+        inst_id: str,
+        pos_id: str,
+    ) -> dict[str, Any]:
+        return self.__transport.read_position_history(
+            inst_id=inst_id,
+            pos_id=pos_id,
+        )
+
+
+def build_bound_close_reservation_exchange_reader_from_env(
+    environ: dict[str, str] | None = None,
+    env_file_paths: list[str | Path] | None = None,
+) -> BoundCloseReservationExchangeReader:
+    """Build only the closed recovery capability, never the raw transport."""
+
+    transport = build_deepcoin_bound_close_reservation_recovery_client_from_env(
+        environ=environ,
+        env_file_paths=env_file_paths,
+    )
+    return BoundCloseReservationExchangeReader(transport)
 
 
 @dataclass(frozen=True, slots=True)

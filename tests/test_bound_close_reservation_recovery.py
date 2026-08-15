@@ -6,6 +6,11 @@ import sqlite3
 
 import pytest
 
+from telegram_kol_research.deepcoin_client import (
+    DeepcoinClientError,
+    DeepcoinCredentials,
+    DeepcoinRestClient,
+)
 from telegram_kol_research.bound_close_reservation_recovery import (
     ACTIVE_REASONS,
     PROVEN_TERMINAL_REASONS,
@@ -13,10 +18,12 @@ from telegram_kol_research.bound_close_reservation_recovery import (
     BoundCloseReservationObservation,
     BoundCloseReservationRecoveryPlan,
     BoundCloseReservationSource,
+    BoundCloseReservationExchangeReader,
     LocalReservationEvidence,
     ReservationClassification,
     _canonical_json,
     _sha256_json,
+    build_bound_close_reservation_exchange_reader_from_env,
     load_bound_close_reservation_source,
 )
 
@@ -802,3 +809,131 @@ def test_source_loader_never_serializes_or_reprs_raw_identifiers(tmp_path):
         assert raw_value not in rendered
     assert source.reservations[0].reservation_ref != "1"
     assert len(source.reservations[0].reservation_ref) == 64
+
+
+class _RecoveryReaderHttpClient:
+    def __init__(self):
+        self.requests = []
+        self.close_calls = 0
+
+    def request(self, method, request_path, content="", headers=None, timeout=None):
+        raise AssertionError("bounded recovery reader must use streaming HTTP")
+
+    def stream(self, method, request_path, content="", headers=None, timeout=None):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def response_context():
+            self.requests.append((method, request_path, timeout))
+            yield type(
+                "Response",
+                (),
+                {
+                    "status_code": 200,
+                    "headers": {},
+                    "iter_raw": lambda self: iter([b'{"code":"0","data":[]}']),
+                },
+            )()
+
+        return response_context()
+
+    def close(self):
+        self.close_calls += 1
+
+
+def test_recovery_reader_exposes_only_closed_get_capabilities_and_one_scope():
+    http_client = _RecoveryReaderHttpClient()
+    transport = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+        monotonic_factory=lambda: 100.0,
+        read_only=True,
+        trust_env=False,
+    )
+    reader = BoundCloseReservationExchangeReader(transport)
+
+    public_names = {name for name in dir(reader) if not name.startswith("_")}
+    assert public_names == {
+        "read_open_orders",
+        "read_order_history",
+        "read_position_history",
+        "read_positions",
+        "read_trade_fills",
+        "request_scope",
+    }
+    for forbidden in (
+        "place_order",
+        "cancel_order",
+        "cancel_trigger_order",
+        "replace_order_sltp",
+        "transport",
+        "client",
+    ):
+        assert not hasattr(reader, forbidden)
+
+    with reader.request_scope(deadline_monotonic=105.0):
+        assert reader.read_positions() == {"code": "0", "data": []}
+        assert reader.read_open_orders() == {"code": "0", "data": []}
+        assert reader.read_order_history(
+            inst_id="BTC-USDT-SWAP", order_id="order-1", limit=100
+        ) == {"code": "0", "data": []}
+        assert reader.read_trade_fills(
+            inst_id="BTC-USDT-SWAP", order_id="order-1", limit=100
+        ) == {"code": "0", "data": []}
+        assert reader.read_position_history(
+            inst_id="BTC-USDT-SWAP", pos_id="position-1"
+        ) == {"code": "0", "data": []}
+
+    assert len(http_client.requests) == 5
+    assert {request[0] for request in http_client.requests} == {"GET"}
+
+
+def test_recovery_reader_scope_cleanup_closes_transport_after_failure():
+    transport = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=_RecoveryReaderHttpClient(),
+        monotonic_factory=lambda: 100.0,
+        read_only=True,
+        trust_env=False,
+    )
+    reader = BoundCloseReservationExchangeReader(transport)
+
+    with pytest.raises(RuntimeError, match="capture failed"):
+        with reader.request_scope(deadline_monotonic=105.0):
+            raise RuntimeError("capture failed")
+
+    with pytest.raises(DeepcoinClientError, match="closed"):
+        reader.read_positions()
+
+
+def test_recovery_reader_builder_returns_capability_not_raw_transport(monkeypatch):
+    import telegram_kol_research.bound_close_reservation_recovery as recovery
+
+    built = []
+
+    def fake_builder(*, environ, env_file_paths):
+        transport = DeepcoinRestClient(
+            DeepcoinCredentials(
+                api_key="key", api_secret="secret", passphrase="pass"
+            ),
+            http_client=_RecoveryReaderHttpClient(),
+            monotonic_factory=lambda: 100.0,
+            read_only=True,
+            trust_env=False,
+        )
+        built.append(transport)
+        return transport
+
+    monkeypatch.setattr(
+        recovery,
+        "build_deepcoin_bound_close_reservation_recovery_client_from_env",
+        fake_builder,
+    )
+
+    reader = build_bound_close_reservation_exchange_reader_from_env(
+        environ={"DEEPCOIN_API_KEY": "not-used"},
+        env_file_paths=[],
+    )
+
+    assert isinstance(reader, BoundCloseReservationExchangeReader)
+    assert len(built) == 1

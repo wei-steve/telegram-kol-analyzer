@@ -62,6 +62,9 @@ DEEPCOIN_ACCOUNT_POSITIONS_PATH = "/deepcoin/account/positions"
 DEEPCOIN_ACCOUNT_POSITIONS_HISTORY_PATH = "/deepcoin/account/positions-history"
 DEEPCOIN_MARKET_INSTRUMENTS_PATH = "/deepcoin/market/instruments"
 DEEPCOIN_MARKET_TICKERS_PATH = "/deepcoin/market/tickers"
+DEEPCOIN_BOUND_CLOSE_RESERVATION_RECOVERY_PHASE = (
+    "bound_close_reservation_recovery"
+)
 
 _DEEPCOIN_LIST_READ_PATHS = frozenset(
     {
@@ -124,6 +127,10 @@ class DeepcoinPreSendUnavailable(DeepcoinClientError):
 
 class _MonitorResponseSizeExceeded(RuntimeError):
     """A monitor-scoped response crossed its pre-decode byte limit."""
+
+
+class _BoundedResponseDeadlineExceeded(RuntimeError):
+    """A bounded response crossed its absolute request-scope deadline."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,9 +484,13 @@ class DeepcoinRestClient:
         RequestPriority(scope.priority)
         _bounded_optional_deadline(scope.deadline_monotonic)
         response_limit = _bounded_optional_response_limit(scope.max_response_bytes)
-        if response_limit is not None and scope.phase != "production_monitor_snapshot":
+        if response_limit is not None and scope.phase not in {
+            "production_monitor_snapshot",
+            DEEPCOIN_BOUND_CLOSE_RESERVATION_RECOVERY_PHASE,
+        }:
             raise DeepcoinClientError(
-                "bounded response bytes are reserved for the production monitor"
+                "bounded response bytes are reserved for the production monitor "
+                "and bound close reservation recovery"
             )
         token = self._request_scope_context.set(scope)
         try:
@@ -995,6 +1006,8 @@ class DeepcoinRestClient:
                             raw_payload = _read_bounded_monitor_response(
                                 response,
                                 limit=response_limit,
+                                deadline_monotonic=deadline,
+                                monotonic_factory=self._safe_monotonic,
                             )
                 if response_status >= 400:
                     failure = classify_http_failure(
@@ -1083,6 +1096,9 @@ class DeepcoinRestClient:
                                 return payload
             except _MonitorResponseSizeExceeded as exc:
                 failure = _monitor_response_size_failure()
+                cause = exc
+            except _BoundedResponseDeadlineExceeded as exc:
+                failure = _request_deadline_exhausted_fact()
                 cause = exc
             except httpx.RequestError as exc:
                 failure = classify_transport_failure(
@@ -1314,6 +1330,33 @@ def build_deepcoin_monitor_snapshot_client_from_env(
     )
 
 
+def build_deepcoin_bound_close_reservation_recovery_client_from_env(
+    environ: dict[str, str] | None = None,
+    env_file_paths: list[str | Path] | None = None,
+) -> DeepcoinRestClient:
+    """Build the isolated read-only transport for close-reservation recovery."""
+
+    environment = _load_deepcoin_environment(
+        environ=environ,
+        env_file_paths=env_file_paths,
+    )
+    credentials = load_deepcoin_credentials(
+        environ=environment,
+        env_file_paths=[],
+    )
+    governor = build_deepcoin_request_governor_from_environment(
+        base_url=credentials.base_url,
+        api_key=credentials.api_key,
+        environ=environment,
+    )
+    return DeepcoinRestClient(
+        credentials,
+        request_governor=governor,
+        read_only=True,
+        trust_env=False,
+    )
+
+
 def _load_deepcoin_environment(
     *,
     environ: dict[str, str] | None,
@@ -1390,7 +1433,24 @@ def _monitor_response_size_failure() -> FailureFact:
     )
 
 
-def _read_bounded_monitor_response(response: Any, *, limit: int) -> bytes:
+def _read_bounded_monitor_response(
+    response: Any,
+    *,
+    limit: int,
+    deadline_monotonic: float | None = None,
+    monotonic_factory: Callable[[], float] | None = None,
+) -> bytes:
+    def require_deadline() -> None:
+        if deadline_monotonic is None:
+            return
+        if monotonic_factory is None:
+            raise DeepcoinClientError("bounded response deadline clock is missing")
+        if monotonic_factory() >= deadline_monotonic:
+            raise _BoundedResponseDeadlineExceeded(
+                "bounded response deadline exceeded"
+            )
+
+    require_deadline()
     raw_content_length = response.headers.get("Content-Length")
     if raw_content_length not in (None, ""):
         try:
@@ -1403,6 +1463,7 @@ def _read_bounded_monitor_response(response: Any, *, limit: int) -> bytes:
             )
     payload = bytearray()
     for chunk in response.iter_raw():
+        require_deadline()
         if not isinstance(chunk, (bytes, bytearray, memoryview)):
             raise DeepcoinClientError("monitor response chunk is invalid")
         if len(payload) + len(chunk) > limit:
@@ -1410,6 +1471,8 @@ def _read_bounded_monitor_response(response: Any, *, limit: int) -> bytes:
                 "monitor response body exceeds limit"
             )
         payload.extend(chunk)
+        require_deadline()
+    require_deadline()
     return bytes(payload)
 
 
