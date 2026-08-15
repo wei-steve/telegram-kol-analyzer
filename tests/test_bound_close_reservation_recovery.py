@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import FrozenInstanceError, fields, replace
 from datetime import UTC, datetime, timedelta, timezone
+from decimal import Decimal
 import signal
 import sqlite3
 import threading
@@ -27,11 +28,21 @@ from telegram_kol_research.bound_close_reservation_recovery import (
     BoundCloseReservationExchangeReader,
     BoundCloseReservationExchangeConfigurationError,
     BoundCloseReservationExchangeDeadlineExceeded,
+    ExchangeCloseOrderState,
+    ExchangeFillEvidence,
+    ExchangeOrderEvidence,
+    ExchangePositionEvidence,
+    ExchangePositionHistoryEvidence,
+    ExchangePositionHistoryState,
+    ExchangeReservationEvidence,
+    LocalCloseMutationEvidence,
     LocalReservationEvidence,
     ReservationClassification,
     _canonical_json,
     _sha256_json,
     build_bound_close_reservation_exchange_reader_from_env,
+    classify_bound_close_reservation,
+    exchange_recovery_reason_from_error,
     load_bound_close_reservation_source,
 )
 
@@ -418,6 +429,672 @@ def test_confirmation_token_must_be_a_nonempty_string():
     values["confirmation_token"] = True
     with pytest.raises(TypeError, match="confirmation_token"):
         BoundCloseReservationRecoveryPlan(**values)
+
+
+CLASSIFICATION_TIME = datetime(2026, 8, 14, 10, 0, tzinfo=UTC)
+
+
+def _local_classification_evidence(
+    *,
+    binding_status: str = "closed",
+    local_reason_code: str | None = None,
+    mutation_status: str = "confirmed",
+    mutation_order_ref: str | None = FINGERPRINT_D,
+    reservation_created_at: datetime = CLASSIFICATION_TIME,
+    event_created_at: datetime = CLASSIFICATION_TIME,
+) -> LocalReservationEvidence:
+    mutation = LocalCloseMutationEvidence(
+        mutation_ref="e" * 64,
+        status=mutation_status,
+        order_ref=mutation_order_ref,
+        reserved_at=CLASSIFICATION_TIME,
+        submitted_at=CLASSIFICATION_TIME,
+        confirmed_at=(
+            CLASSIFICATION_TIME if mutation_status == "confirmed" else None
+        ),
+        created_at=CLASSIFICATION_TIME,
+        updated_at=CLASSIFICATION_TIME,
+        record_fingerprint="f" * 64,
+    )
+    return LocalReservationEvidence(
+        reservation_ref=FINGERPRINT_A,
+        source_status="submitted",
+        local_reason_code=local_reason_code,
+        reservation_created_at=reservation_created_at,
+        reservation_updated_at=reservation_created_at,
+        reservation_record_fingerprint=FINGERPRINT_B,
+        binding_ref=FINGERPRINT_C,
+        binding_status=binding_status,
+        instrument_ref=FINGERPRINT_B,
+        side="long",
+        binding_record_fingerprint=FINGERPRINT_C,
+        position_ref=FINGERPRINT_C,
+        close_event_ref=FINGERPRINT_D,
+        close_order_ref=FINGERPRINT_D,
+        event_created_at=event_created_at,
+        close_event_record_fingerprint="e" * 64,
+        entry_leg=None,
+        close_mutations=(mutation,),
+    )
+
+
+def _order_evidence(
+    *,
+    state: ExchangeCloseOrderState = ExchangeCloseOrderState.FILLED,
+    instrument_ref: str = FINGERPRINT_B,
+    side: str = "long",
+    position_ref: str = FINGERPRINT_C,
+    order_ref: str = FINGERPRINT_D,
+    requested_quantity: Decimal = Decimal("1"),
+    filled_quantity: Decimal = Decimal("1.00"),
+    terminal_at: datetime | None = CLASSIFICATION_TIME + timedelta(minutes=1),
+) -> ExchangeOrderEvidence:
+    return ExchangeOrderEvidence(
+        instrument_ref=instrument_ref,
+        side=side,
+        position_ref=position_ref,
+        order_ref=order_ref,
+        state=state,
+        requested_quantity=requested_quantity,
+        filled_quantity=filled_quantity,
+        terminal_at=terminal_at,
+    )
+
+
+def _fill_evidence(
+    *,
+    instrument_ref: str = FINGERPRINT_B,
+    side: str = "long",
+    position_ref: str = FINGERPRINT_C,
+    order_ref: str = FINGERPRINT_D,
+    quantity: Decimal = Decimal("1.000"),
+    filled_at: datetime = CLASSIFICATION_TIME + timedelta(minutes=1),
+) -> ExchangeFillEvidence:
+    return ExchangeFillEvidence(
+        instrument_ref=instrument_ref,
+        side=side,
+        position_ref=position_ref,
+        order_ref=order_ref,
+        quantity=quantity,
+        filled_at=filled_at,
+    )
+
+
+def _position_history_evidence(
+    *,
+    instrument_ref: str = FINGERPRINT_B,
+    side: str = "long",
+    position_ref: str = FINGERPRINT_C,
+    closed_quantity: Decimal = Decimal("1.0"),
+    closed_at: datetime = CLASSIFICATION_TIME + timedelta(minutes=2),
+    state: ExchangePositionHistoryState = ExchangePositionHistoryState.CLOSED,
+) -> ExchangePositionHistoryEvidence:
+    return ExchangePositionHistoryEvidence(
+        instrument_ref=instrument_ref,
+        side=side,
+        position_ref=position_ref,
+        state=state,
+        closed_quantity=closed_quantity,
+        closed_at=closed_at,
+    )
+
+
+def _current_position_evidence(
+    *,
+    instrument_ref: str = FINGERPRINT_B,
+    side: str = "long",
+    position_ref: str = FINGERPRINT_C,
+    quantity: Decimal = Decimal("1"),
+) -> ExchangePositionEvidence:
+    return ExchangePositionEvidence(
+        instrument_ref=instrument_ref,
+        side=side,
+        position_ref=position_ref,
+        quantity=quantity,
+    )
+
+
+def _terminal_exchange_evidence(**overrides) -> ExchangeReservationEvidence:
+    values = {
+        "capture_reason_code": None,
+        "schema_valid": True,
+        "current_positions_complete": True,
+        "pending_orders_complete": True,
+        "order_history_complete": True,
+        "fills_complete": True,
+        "position_history_complete": True,
+        "order_history_at_limit": False,
+        "fills_at_limit": False,
+        "position_history_at_limit": False,
+        "current_positions": (),
+        "pending_orders": (),
+        "order_history": (_order_evidence(),),
+        "fills": (_fill_evidence(),),
+        "position_history": (_position_history_evidence(),),
+    }
+    values.update(overrides)
+    return ExchangeReservationEvidence(**values)
+
+
+def _classify(
+    exchange: ExchangeReservationEvidence,
+    *,
+    local: LocalReservationEvidence | None = None,
+    capture_completed_at: datetime = CLASSIFICATION_TIME + timedelta(minutes=3),
+) -> BoundCloseReservationObservation:
+    return classify_bound_close_reservation(
+        local or _local_classification_evidence(),
+        exchange,
+        capture_completed_at=capture_completed_at,
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "local", "exchange", "expected", "reason"),
+    [
+        pytest.param(
+            "exact terminal chain",
+            _local_classification_evidence(),
+            _terminal_exchange_evidence(),
+            ReservationClassification.PROVEN_TERMINAL,
+            "exact_close_and_position_terminal",
+            id="exact-terminal-chain",
+        ),
+        pytest.param(
+            "active parent with independently closed sibling",
+            _local_classification_evidence(binding_status="active"),
+            _terminal_exchange_evidence(),
+            ReservationClassification.PROVEN_TERMINAL,
+            "exact_close_and_position_terminal",
+            id="active-parent-closed-sibling",
+        ),
+        pytest.param(
+            "exact current position",
+            _local_classification_evidence(),
+            _terminal_exchange_evidence(
+                current_positions=(_current_position_evidence(),)
+            ),
+            ReservationClassification.ACTIVE,
+            "exact_position_currently_live",
+            id="current-position",
+        ),
+        pytest.param(
+            "exact pending order",
+            _local_classification_evidence(),
+            _terminal_exchange_evidence(
+                pending_orders=(
+                    _order_evidence(
+                        state=ExchangeCloseOrderState.PENDING,
+                        filled_quantity=Decimal("0"),
+                        terminal_at=None,
+                    ),
+                )
+            ),
+            ReservationClassification.ACTIVE,
+            "exact_close_order_currently_pending",
+            id="pending-order",
+        ),
+        pytest.param(
+            "exchange nonterminal order",
+            _local_classification_evidence(),
+            _terminal_exchange_evidence(
+                order_history=(
+                    _order_evidence(
+                        state=ExchangeCloseOrderState.OPEN,
+                        filled_quantity=Decimal("0"),
+                        terminal_at=None,
+                    ),
+                )
+            ),
+            ReservationClassification.ACTIVE,
+            "exact_close_order_nonterminal",
+            id="nonterminal-order",
+        ),
+        pytest.param(
+            "local evidence incomplete",
+            _local_classification_evidence(
+                local_reason_code="local_evidence_incomplete"
+            ),
+            _terminal_exchange_evidence(),
+            ReservationClassification.UNKNOWN,
+            "local_evidence_incomplete",
+            id="local-incomplete",
+        ),
+        pytest.param(
+            "local identity conflict",
+            _local_classification_evidence(
+                local_reason_code="local_identity_conflict"
+            ),
+            _terminal_exchange_evidence(),
+            ReservationClassification.UNKNOWN,
+            "local_identity_conflict",
+            id="local-identity-conflict",
+        ),
+        pytest.param(
+            "exchange schema invalid before active fact",
+            _local_classification_evidence(),
+            _terminal_exchange_evidence(
+                schema_valid=False,
+                current_positions=(_current_position_evidence(),),
+            ),
+            ReservationClassification.UNKNOWN,
+            "exchange_schema_invalid",
+            id="schema-invalid-precedes-active",
+        ),
+        pytest.param(
+            "position callback delayed",
+            _local_classification_evidence(),
+            _terminal_exchange_evidence(position_history=()),
+            ReservationClassification.UNKNOWN,
+            "exchange_history_incomplete",
+            id="callback-delay",
+        ),
+    ],
+)
+def test_classification_matrix(case, local, exchange, expected, reason):
+    del case
+    observation = _classify(exchange, local=local)
+    assert observation.classification is expected
+    assert observation.reason_code == reason
+    assert observation.source_fingerprint == _sha256_json(local)
+    assert observation.exchange_fingerprint == _sha256_json(exchange)
+
+
+@pytest.mark.parametrize(
+    ("state", "filled_quantity"),
+    [
+        (ExchangeCloseOrderState.REJECTED, Decimal("0")),
+        (ExchangeCloseOrderState.CANCELLED, Decimal("0")),
+        (ExchangeCloseOrderState.PARTIALLY_FILLED, Decimal("0.5")),
+    ],
+)
+def test_rejected_cancelled_and_partial_history_are_unknown(
+    state, filled_quantity
+):
+    exchange = _terminal_exchange_evidence(
+        order_history=(
+            _order_evidence(state=state, filled_quantity=filled_quantity),
+        )
+    )
+
+    observation = _classify(exchange)
+
+    assert observation.classification is ReservationClassification.UNKNOWN
+    assert observation.reason_code == "exchange_state_conflict"
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        ExchangeCloseOrderState.REJECTED,
+        ExchangeCloseOrderState.CANCELLED,
+        ExchangeCloseOrderState.PARTIALLY_FILLED,
+        ExchangeCloseOrderState.FILLED,
+    ],
+)
+def test_contradictory_order_state_in_pending_snapshot_is_unknown(state):
+    exchange = _terminal_exchange_evidence(
+        pending_orders=(
+            _order_evidence(
+                state=state,
+                terminal_at=(
+                    None
+                    if state is ExchangeCloseOrderState.PARTIALLY_FILLED
+                    else CLASSIFICATION_TIME + timedelta(minutes=1)
+                ),
+            ),
+        )
+    )
+
+    observation = _classify(exchange)
+
+    assert observation.classification is ReservationClassification.UNKNOWN
+    assert observation.reason_code == "exchange_state_conflict"
+
+
+@pytest.mark.parametrize(
+    ("collection", "value"),
+    [
+        ("order_history", ()),
+        ("order_history", (_order_evidence(), _order_evidence())),
+        ("fills", ()),
+        ("fills", (_fill_evidence(), _fill_evidence())),
+        ("position_history", ()),
+        (
+            "position_history",
+            (_position_history_evidence(), _position_history_evidence()),
+        ),
+    ],
+)
+def test_missing_or_duplicate_terminal_evidence_is_unknown(collection, value):
+    observation = _classify(
+        _terminal_exchange_evidence(**{collection: value})
+    )
+    assert observation.classification is ReservationClassification.UNKNOWN
+    assert observation.reason_code in {
+        "exchange_history_incomplete",
+        "exchange_state_conflict",
+    }
+
+
+def test_nonterminal_position_history_is_unknown():
+    observation = _classify(
+        _terminal_exchange_evidence(
+            position_history=(
+                _position_history_evidence(
+                    state=ExchangePositionHistoryState.OPEN,
+                ),
+            )
+        )
+    )
+    assert observation.classification is ReservationClassification.UNKNOWN
+    assert observation.reason_code == "exchange_state_conflict"
+
+
+@pytest.mark.parametrize(
+    ("collection", "value"),
+    [
+        (
+            "current_positions",
+            (_current_position_evidence(instrument_ref="9" * 64),),
+        ),
+        (
+            "pending_orders",
+            (
+                _order_evidence(
+                    state=ExchangeCloseOrderState.PENDING,
+                    filled_quantity=Decimal("0"),
+                    terminal_at=None,
+                    side="short",
+                ),
+            ),
+        ),
+        (
+            "order_history",
+            (_order_evidence(order_ref="9" * 64),),
+        ),
+        (
+            "fills",
+            (_fill_evidence(position_ref="9" * 64),),
+        ),
+        (
+            "position_history",
+            (_position_history_evidence(position_ref="9" * 64),),
+        ),
+    ],
+)
+def test_any_exchange_identity_mismatch_is_unknown_before_active(
+    collection, value
+):
+    observation = _classify(
+        _terminal_exchange_evidence(**{collection: value})
+    )
+    assert observation.classification is ReservationClassification.UNKNOWN
+    assert observation.reason_code == "exchange_identity_conflict"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"order_history_complete": False},
+        {"fills_complete": False},
+        {"position_history_complete": False},
+        {"current_positions_complete": False},
+        {"pending_orders_complete": False},
+        {"order_history_at_limit": True},
+        {"fills_at_limit": True},
+        {"position_history_at_limit": True},
+    ],
+)
+def test_incomplete_or_page_limit_ambiguous_exchange_capture_is_unknown(
+    overrides,
+):
+    observation = _classify(_terminal_exchange_evidence(**overrides))
+    assert observation.classification is ReservationClassification.UNKNOWN
+    assert observation.reason_code == "exchange_history_incomplete"
+
+
+@pytest.mark.parametrize(
+    ("order_quantity", "filled_quantity", "fill_quantity", "closed_quantity"),
+    [
+        ("1", "0.999999999999999999", "1", "1"),
+        ("1", "1", "0.999999999999999999", "1"),
+        ("1", "1", "1", "1.000000000000000001"),
+        ("0", "0", "0", "0"),
+    ],
+)
+def test_terminal_quantities_require_positive_exact_decimal_equality(
+    order_quantity, filled_quantity, fill_quantity, closed_quantity
+):
+    exchange = _terminal_exchange_evidence(
+        order_history=(
+            _order_evidence(
+                requested_quantity=Decimal(order_quantity),
+                filled_quantity=Decimal(filled_quantity),
+            ),
+        ),
+        fills=(_fill_evidence(quantity=Decimal(fill_quantity)),),
+        position_history=(
+            _position_history_evidence(
+                closed_quantity=Decimal(closed_quantity)
+            ),
+        ),
+    )
+
+    observation = _classify(exchange)
+
+    assert observation.classification is ReservationClassification.UNKNOWN
+    assert observation.reason_code == "exchange_state_conflict"
+
+
+@pytest.mark.parametrize(
+    ("local", "exchange", "capture_completed_at"),
+    [
+        (
+            _local_classification_evidence(
+                reservation_created_at=CLASSIFICATION_TIME + timedelta(minutes=2)
+            ),
+            _terminal_exchange_evidence(),
+            CLASSIFICATION_TIME + timedelta(minutes=3),
+        ),
+        (
+            _local_classification_evidence(
+                event_created_at=CLASSIFICATION_TIME + timedelta(minutes=2)
+            ),
+            _terminal_exchange_evidence(),
+            CLASSIFICATION_TIME + timedelta(minutes=3),
+        ),
+        (
+            _local_classification_evidence(),
+            _terminal_exchange_evidence(
+                position_history=(
+                    _position_history_evidence(
+                        closed_at=CLASSIFICATION_TIME + timedelta(seconds=30)
+                    ),
+                )
+            ),
+            CLASSIFICATION_TIME + timedelta(minutes=3),
+        ),
+        (
+            _local_classification_evidence(),
+            _terminal_exchange_evidence(),
+            CLASSIFICATION_TIME + timedelta(minutes=1, seconds=30),
+        ),
+    ],
+)
+def test_timestamp_inversion_is_unknown(local, exchange, capture_completed_at):
+    observation = _classify(
+        exchange,
+        local=local,
+        capture_completed_at=capture_completed_at,
+    )
+    assert observation.classification is ReservationClassification.UNKNOWN
+    assert observation.reason_code == "exchange_state_conflict"
+
+
+@pytest.mark.parametrize(
+    "local",
+    [
+        _local_classification_evidence(mutation_status="rejected"),
+        _local_classification_evidence(mutation_status="recovery_required"),
+        _local_classification_evidence(mutation_order_ref="9" * 64),
+    ],
+)
+def test_conflicting_close_mutation_is_unknown(local):
+    observation = _classify(_terminal_exchange_evidence(), local=local)
+    assert observation.classification is ReservationClassification.UNKNOWN
+    assert observation.reason_code == "exchange_state_conflict"
+
+
+@pytest.mark.parametrize(
+    ("capture_reason", "expected"),
+    [
+        ("exchange_evidence_unavailable", "exchange_evidence_unavailable"),
+        ("exchange_schema_invalid", "exchange_schema_invalid"),
+        ("exchange_capture_timeout", "exchange_capture_timeout"),
+        ("exchange_response_size_exceeded", "exchange_response_size_exceeded"),
+    ],
+)
+def test_closed_capture_failure_reasons_precede_exchange_facts(
+    capture_reason, expected
+):
+    observation = _classify(
+        _terminal_exchange_evidence(
+            capture_reason_code=capture_reason,
+            current_positions=(_current_position_evidence(),),
+        )
+    )
+    assert observation.classification is ReservationClassification.UNKNOWN
+    assert observation.reason_code == expected
+
+
+def test_terminal_classification_never_uses_age_or_callback_deadline():
+    old = datetime(2020, 1, 1, tzinfo=UTC)
+    local = _local_classification_evidence(
+        reservation_created_at=old,
+        event_created_at=old,
+    )
+    exchange = _terminal_exchange_evidence(
+        order_history=(
+            _order_evidence(terminal_at=old + timedelta(minutes=1)),
+        ),
+        fills=(_fill_evidence(filled_at=old + timedelta(minutes=1)),),
+        position_history=(
+            _position_history_evidence(closed_at=old + timedelta(minutes=2)),
+        ),
+    )
+
+    assert _classify(exchange, local=local).classification is (
+        ReservationClassification.PROVEN_TERMINAL
+    )
+    delayed = replace(exchange, position_history=())
+    assert _classify(delayed, local=local).classification is (
+        ReservationClassification.UNKNOWN
+    )
+
+
+def test_fill_timestamp_does_not_replace_the_required_terminal_time_chain():
+    local = _local_classification_evidence()
+    exchange = _terminal_exchange_evidence(
+        fills=(
+            _fill_evidence(
+                filled_at=CLASSIFICATION_TIME - timedelta(microseconds=1)
+            ),
+        )
+    )
+
+    observation = _classify(exchange, local=local)
+
+    assert observation.classification is ReservationClassification.PROVEN_TERMINAL
+
+
+def test_exchange_evidence_schema_is_frozen_closed_and_bounded():
+    exchange = _terminal_exchange_evidence()
+    assert not hasattr(exchange, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        exchange.schema_valid = False  # type: ignore[misc]
+    with pytest.raises(TypeError, match="current_positions"):
+        _terminal_exchange_evidence(  # type: ignore[arg-type]
+            current_positions=[_current_position_evidence()]
+        )
+    with pytest.raises(ValueError, match="100"):
+        _terminal_exchange_evidence(
+            fills=tuple(_fill_evidence() for _ in range(101))
+        )
+    with pytest.raises(TypeError, match="schema_valid"):
+        _terminal_exchange_evidence(schema_valid=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="capture_reason_code"):
+        _terminal_exchange_evidence(capture_reason_code="future_reason")
+
+
+def test_exchange_evidence_records_require_exact_decimals_and_aware_utc():
+    with pytest.raises(TypeError, match="quantity"):
+        _current_position_evidence(quantity=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="finite"):
+        _fill_evidence(quantity=Decimal("NaN"))
+    with pytest.raises(ValueError, match="aware UTC"):
+        _fill_evidence(filled_at=CLASSIFICATION_TIME.replace(tzinfo=None))
+    with pytest.raises(ValueError, match="side"):
+        _fill_evidence(side="buy")
+
+
+def test_classifier_requires_strict_types_and_aware_utc_capture():
+    with pytest.raises(TypeError, match="local"):
+        classify_bound_close_reservation(  # type: ignore[arg-type]
+            object(),
+            _terminal_exchange_evidence(),
+            capture_completed_at=CLASSIFICATION_TIME,
+        )
+    with pytest.raises(TypeError, match="exchange"):
+        classify_bound_close_reservation(  # type: ignore[arg-type]
+            _local_classification_evidence(),
+            object(),
+            capture_completed_at=CLASSIFICATION_TIME,
+        )
+    with pytest.raises(ValueError, match="aware UTC"):
+        _classify(
+            _terminal_exchange_evidence(),
+            capture_completed_at=CLASSIFICATION_TIME.replace(tzinfo=None),
+        )
+
+
+def test_exchange_reader_errors_map_only_to_closed_unknown_reasons():
+    from telegram_kol_research.deepcoin_request_policy import (
+        ErrorCategory,
+        FailureFact,
+        OutcomeCertainty,
+    )
+    from telegram_kol_research.deepcoin_client import DeepcoinReadUnavailable
+
+    def failure(safe_code):
+        return DeepcoinReadUnavailable(
+            safe_code,
+            fact=FailureFact(
+                category=ErrorCategory.SCHEMA_INVALID,
+                outcome_certainty=OutcomeCertainty.UNKNOWN,
+                retryable=False,
+                safe_code=safe_code,
+            ),
+        )
+
+    assert exchange_recovery_reason_from_error(
+        BoundCloseReservationExchangeDeadlineExceeded("expired")
+    ) == "exchange_capture_timeout"
+    assert exchange_recovery_reason_from_error(
+        failure("request_deadline_exceeded")
+    ) == "exchange_capture_timeout"
+    assert exchange_recovery_reason_from_error(
+        failure("monitor_response_size_exceeded")
+    ) == "exchange_response_size_exceeded"
+    assert exchange_recovery_reason_from_error(
+        failure("response_schema_invalid")
+    ) == "exchange_schema_invalid"
+    assert exchange_recovery_reason_from_error(
+        failure("read_timeout")
+    ) == "exchange_evidence_unavailable"
+    assert exchange_recovery_reason_from_error(RuntimeError("future")) == (
+        "exchange_evidence_unavailable"
+    )
 
 
 SOURCE_TIME = "2026-08-14 10:00:00.000000"

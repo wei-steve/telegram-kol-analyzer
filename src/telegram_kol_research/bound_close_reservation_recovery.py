@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from enum import Enum, StrEnum
 import hashlib
 import json
@@ -382,6 +383,193 @@ class LocalReservationEvidence:
     close_mutations: tuple[LocalCloseMutationEvidence, ...]
 
 
+class ExchangeCloseOrderState(StrEnum):
+    """Closed normalized exchange order states accepted by recovery."""
+
+    FILLED = "filled"
+    OPEN = "open"
+    PENDING = "pending"
+    PARTIALLY_FILLED = "partially_filled"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+
+
+class ExchangePositionHistoryState(StrEnum):
+    CLOSED = "closed"
+    OPEN = "open"
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangePositionEvidence:
+    instrument_ref: str
+    side: str
+    position_ref: str
+    quantity: Decimal
+
+    def __post_init__(self) -> None:
+        _validate_exchange_identity(
+            instrument_ref=self.instrument_ref,
+            side=self.side,
+            position_ref=self.position_ref,
+        )
+        _require_decimal(self.quantity, "quantity", positive=True)
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangeOrderEvidence:
+    instrument_ref: str
+    side: str
+    position_ref: str
+    order_ref: str
+    state: ExchangeCloseOrderState
+    requested_quantity: Decimal
+    filled_quantity: Decimal
+    terminal_at: datetime | None
+
+    def __post_init__(self) -> None:
+        _validate_exchange_identity(
+            instrument_ref=self.instrument_ref,
+            side=self.side,
+            position_ref=self.position_ref,
+            order_ref=self.order_ref,
+        )
+        if type(self.state) is not ExchangeCloseOrderState:
+            raise TypeError("state must be ExchangeCloseOrderState")
+        _require_decimal(
+            self.requested_quantity,
+            "requested_quantity",
+            positive=False,
+        )
+        _require_decimal(
+            self.filled_quantity,
+            "filled_quantity",
+            positive=False,
+        )
+        _require_optional_aware_utc(self.terminal_at, "terminal_at")
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangeFillEvidence:
+    instrument_ref: str
+    side: str
+    position_ref: str
+    order_ref: str
+    quantity: Decimal
+    filled_at: datetime
+
+    def __post_init__(self) -> None:
+        _validate_exchange_identity(
+            instrument_ref=self.instrument_ref,
+            side=self.side,
+            position_ref=self.position_ref,
+            order_ref=self.order_ref,
+        )
+        _require_decimal(self.quantity, "quantity", positive=False)
+        _require_aware_utc(self.filled_at, "filled_at")
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangePositionHistoryEvidence:
+    instrument_ref: str
+    side: str
+    position_ref: str
+    state: ExchangePositionHistoryState
+    closed_quantity: Decimal
+    closed_at: datetime | None
+
+    def __post_init__(self) -> None:
+        _validate_exchange_identity(
+            instrument_ref=self.instrument_ref,
+            side=self.side,
+            position_ref=self.position_ref,
+        )
+        if type(self.state) is not ExchangePositionHistoryState:
+            raise TypeError("state must be ExchangePositionHistoryState")
+        _require_decimal(
+            self.closed_quantity,
+            "closed_quantity",
+            positive=False,
+        )
+        _require_optional_aware_utc(self.closed_at, "closed_at")
+
+
+_EXCHANGE_CAPTURE_FAILURE_REASONS = frozenset(
+    {
+        "exchange_evidence_unavailable",
+        "exchange_schema_invalid",
+        "exchange_capture_timeout",
+        "exchange_response_size_exceeded",
+    }
+)
+_MAX_EXCHANGE_EVIDENCE_ITEMS = 100
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangeReservationEvidence:
+    """Strict normalized evidence for one exact reservation identity chain."""
+
+    capture_reason_code: str | None
+    schema_valid: bool
+    current_positions_complete: bool
+    pending_orders_complete: bool
+    order_history_complete: bool
+    fills_complete: bool
+    position_history_complete: bool
+    order_history_at_limit: bool
+    fills_at_limit: bool
+    position_history_at_limit: bool
+    current_positions: tuple[ExchangePositionEvidence, ...]
+    pending_orders: tuple[ExchangeOrderEvidence, ...]
+    order_history: tuple[ExchangeOrderEvidence, ...]
+    fills: tuple[ExchangeFillEvidence, ...]
+    position_history: tuple[ExchangePositionHistoryEvidence, ...]
+
+    def __post_init__(self) -> None:
+        if self.capture_reason_code is not None:
+            if type(self.capture_reason_code) is not str:
+                raise TypeError("capture_reason_code must be a string or None")
+            if self.capture_reason_code not in _EXCHANGE_CAPTURE_FAILURE_REASONS:
+                raise ValueError("capture_reason_code is not a closed recovery reason")
+        for field_name in (
+            "schema_valid",
+            "current_positions_complete",
+            "pending_orders_complete",
+            "order_history_complete",
+            "fills_complete",
+            "position_history_complete",
+            "order_history_at_limit",
+            "fills_at_limit",
+            "position_history_at_limit",
+        ):
+            if type(getattr(self, field_name)) is not bool:
+                raise TypeError(f"{field_name} must be a boolean")
+        _require_exchange_collection(
+            self.current_positions,
+            "current_positions",
+            ExchangePositionEvidence,
+        )
+        _require_exchange_collection(
+            self.pending_orders,
+            "pending_orders",
+            ExchangeOrderEvidence,
+        )
+        _require_exchange_collection(
+            self.order_history,
+            "order_history",
+            ExchangeOrderEvidence,
+        )
+        _require_exchange_collection(
+            self.fills,
+            "fills",
+            ExchangeFillEvidence,
+        )
+        _require_exchange_collection(
+            self.position_history,
+            "position_history",
+            ExchangePositionHistoryEvidence,
+        )
+
+
 class _RawReservationCapability:
     """Raw identities retained only inside this process for later exact reads/CAS."""
 
@@ -572,6 +760,13 @@ def _sha256_json(value: Any) -> str:
 def _canonical_json_value(value: Any) -> Any:
     if value is None or type(value) in {str, bool, int}:
         return value
+    if type(value) is Decimal:
+        if not value.is_finite():
+            raise ValueError("Decimal must be finite")
+        normalized = value.normalize()
+        if normalized == 0:
+            return "0"
+        return format(normalized, "f")
     if isinstance(value, datetime):
         offset = value.utcoffset() if value.tzinfo is not None else None
         if offset != timedelta(0):
@@ -594,6 +789,341 @@ def _canonical_json_value(value: Any) -> Any:
     if type(value) in {tuple, list}:
         return [_canonical_json_value(item) for item in value]
     raise TypeError(f"unsupported canonical JSON value: {type(value).__name__}")
+
+
+def _require_aware_utc(value: object, field_name: str) -> datetime:
+    if type(value) is not datetime or value.tzinfo is None:
+        raise ValueError(f"{field_name} must be an aware UTC datetime")
+    try:
+        offset = value.utcoffset()
+    except (OverflowError, ValueError):
+        offset = None
+    if offset != timedelta(0):
+        raise ValueError(f"{field_name} must be an aware UTC datetime")
+    return value
+
+
+def _require_optional_aware_utc(
+    value: object,
+    field_name: str,
+) -> datetime | None:
+    if value is None:
+        return None
+    return _require_aware_utc(value, field_name)
+
+
+def _require_decimal(
+    value: object,
+    field_name: str,
+    *,
+    positive: bool,
+) -> Decimal:
+    if type(value) is not Decimal:
+        raise TypeError(f"{field_name} must be a Decimal")
+    if not value.is_finite():
+        raise ValueError(f"{field_name} must be finite")
+    if value < 0 or (positive and value <= 0):
+        qualifier = "positive" if positive else "nonnegative"
+        raise ValueError(f"{field_name} must be {qualifier}")
+    return value
+
+
+def _validate_exchange_identity(
+    *,
+    instrument_ref: object,
+    side: object,
+    position_ref: object,
+    order_ref: object | None = None,
+) -> None:
+    _require_lower_hex_64(instrument_ref, "instrument_ref")
+    if type(side) is not str:
+        raise TypeError("side must be a string")
+    if side not in {"long", "short"}:
+        raise ValueError("side must be long or short")
+    _require_lower_hex_64(position_ref, "position_ref")
+    if order_ref is not None:
+        _require_lower_hex_64(order_ref, "order_ref")
+
+
+def _require_exchange_collection(
+    value: object,
+    field_name: str,
+    expected_type: type,
+) -> None:
+    if type(value) is not tuple:
+        raise TypeError(f"{field_name} must be a tuple")
+    if len(value) > _MAX_EXCHANGE_EVIDENCE_ITEMS:
+        raise ValueError(f"{field_name} cannot contain more than 100 items")
+    if any(type(item) is not expected_type for item in value):
+        raise TypeError(f"{field_name} contains an invalid evidence item")
+
+
+def exchange_recovery_reason_from_error(error: BaseException) -> str:
+    """Map recovery read failures to the closed UNKNOWN reason vocabulary."""
+
+    if isinstance(error, BoundCloseReservationExchangeDeadlineExceeded):
+        return "exchange_capture_timeout"
+    if isinstance(error, DeepcoinReadUnavailable):
+        safe_code = error.fact.safe_code
+        if safe_code in {
+            "request_deadline_exceeded",
+            "governor_deadline_exceeded",
+        }:
+            return "exchange_capture_timeout"
+        if safe_code == "monitor_response_size_exceeded":
+            return "exchange_response_size_exceeded"
+        if "schema" in safe_code:
+            return "exchange_schema_invalid"
+    return "exchange_evidence_unavailable"
+
+
+def classify_bound_close_reservation(
+    local: LocalReservationEvidence,
+    exchange: ExchangeReservationEvidence,
+    *,
+    capture_completed_at: datetime,
+) -> BoundCloseReservationObservation:
+    """Classify one exact chain without age or callback-delay inference."""
+
+    if type(local) is not LocalReservationEvidence:
+        raise TypeError("local must be LocalReservationEvidence")
+    if type(exchange) is not ExchangeReservationEvidence:
+        raise TypeError("exchange must be ExchangeReservationEvidence")
+    _require_aware_utc(capture_completed_at, "capture_completed_at")
+
+    source_fingerprint = _sha256_json(local)
+    exchange_fingerprint = _sha256_json(exchange)
+
+    def observation(
+        classification: ReservationClassification,
+        reason_code: str,
+    ) -> BoundCloseReservationObservation:
+        return BoundCloseReservationObservation(
+            reservation_ref=local.reservation_ref,
+            classification=classification,
+            reason_code=reason_code,
+            source_fingerprint=source_fingerprint,
+            exchange_fingerprint=exchange_fingerprint,
+        )
+
+    if local.local_reason_code in {
+        "local_evidence_incomplete",
+        "local_identity_conflict",
+    }:
+        return observation(
+            ReservationClassification.UNKNOWN,
+            local.local_reason_code,
+        )
+    if not _local_classification_shape_is_complete(local):
+        return observation(
+            ReservationClassification.UNKNOWN,
+            "local_evidence_incomplete",
+        )
+    if exchange.capture_reason_code is not None:
+        return observation(
+            ReservationClassification.UNKNOWN,
+            exchange.capture_reason_code,
+        )
+    if not exchange.schema_valid:
+        return observation(
+            ReservationClassification.UNKNOWN,
+            "exchange_schema_invalid",
+        )
+    if not all(
+        (
+            exchange.current_positions_complete,
+            exchange.pending_orders_complete,
+            exchange.order_history_complete,
+            exchange.fills_complete,
+            exchange.position_history_complete,
+        )
+    ) or any(
+        (
+            exchange.order_history_at_limit,
+            exchange.fills_at_limit,
+            exchange.position_history_at_limit,
+        )
+    ):
+        return observation(
+            ReservationClassification.UNKNOWN,
+            "exchange_history_incomplete",
+        )
+    if not _exchange_identities_match(local, exchange):
+        return observation(
+            ReservationClassification.UNKNOWN,
+            "exchange_identity_conflict",
+        )
+    if any(
+        len(collection) > 1
+        for collection in (
+            exchange.current_positions,
+            exchange.pending_orders,
+            exchange.order_history,
+            exchange.fills,
+            exchange.position_history,
+        )
+    ):
+        return observation(
+            ReservationClassification.UNKNOWN,
+            "exchange_state_conflict",
+        )
+    if exchange.current_positions:
+        return observation(
+            ReservationClassification.ACTIVE,
+            "exact_position_currently_live",
+        )
+    if exchange.pending_orders:
+        if exchange.pending_orders[0].state not in {
+            ExchangeCloseOrderState.OPEN,
+            ExchangeCloseOrderState.PENDING,
+        }:
+            return observation(
+                ReservationClassification.UNKNOWN,
+                "exchange_state_conflict",
+            )
+        return observation(
+            ReservationClassification.ACTIVE,
+            "exact_close_order_currently_pending",
+        )
+
+    if len(exchange.order_history) != 1:
+        return observation(
+            ReservationClassification.UNKNOWN,
+            "exchange_history_incomplete",
+        )
+    order = exchange.order_history[0]
+    if order.state in {
+        ExchangeCloseOrderState.OPEN,
+        ExchangeCloseOrderState.PENDING,
+    }:
+        return observation(
+            ReservationClassification.ACTIVE,
+            "exact_close_order_nonterminal",
+        )
+    if order.state is not ExchangeCloseOrderState.FILLED:
+        return observation(
+            ReservationClassification.UNKNOWN,
+            "exchange_state_conflict",
+        )
+    if len(exchange.fills) != 1 or len(exchange.position_history) != 1:
+        return observation(
+            ReservationClassification.UNKNOWN,
+            "exchange_history_incomplete",
+        )
+
+    fill = exchange.fills[0]
+    position = exchange.position_history[0]
+    if _local_mutation_conflicts(local):
+        return observation(
+            ReservationClassification.UNKNOWN,
+            "exchange_state_conflict",
+        )
+    if (
+        order.terminal_at is None
+        or position.closed_at is None
+        or position.state is not ExchangePositionHistoryState.CLOSED
+        or order.requested_quantity <= 0
+        or order.filled_quantity != order.requested_quantity
+        or fill.quantity != order.requested_quantity
+        or position.closed_quantity != order.requested_quantity
+    ):
+        return observation(
+            ReservationClassification.UNKNOWN,
+            "exchange_state_conflict",
+        )
+    if not (
+        local.reservation_created_at <= order.terminal_at
+        and local.event_created_at <= order.terminal_at
+        and order.terminal_at <= position.closed_at
+        and position.closed_at <= capture_completed_at
+    ):
+        return observation(
+            ReservationClassification.UNKNOWN,
+            "exchange_state_conflict",
+        )
+    return observation(
+        ReservationClassification.PROVEN_TERMINAL,
+        "exact_close_and_position_terminal",
+    )
+
+
+def _local_classification_shape_is_complete(
+    local: LocalReservationEvidence,
+) -> bool:
+    required_refs = (
+        local.reservation_ref,
+        local.reservation_record_fingerprint,
+        local.binding_ref,
+        local.binding_record_fingerprint,
+        local.instrument_ref,
+        local.position_ref,
+        local.close_event_ref,
+        local.close_order_ref,
+        local.close_event_record_fingerprint,
+    )
+    if any(not _is_lower_hex_64(value) for value in required_refs):
+        return False
+    if (
+        local.local_reason_code is not None
+        or local.source_status not in ACTIVE_CLOSE_RESERVATION_STATUSES
+        or local.binding_status not in _EXECUTION_BINDING_STATUSES
+        or local.side not in {"long", "short"}
+        or type(local.close_mutations) is not tuple
+        or any(
+            type(mutation) is not LocalCloseMutationEvidence
+            for mutation in local.close_mutations
+        )
+    ):
+        return False
+    try:
+        reservation_created_at = _require_aware_utc(
+            local.reservation_created_at,
+            "reservation_created_at",
+        )
+        reservation_updated_at = _require_aware_utc(
+            local.reservation_updated_at,
+            "reservation_updated_at",
+        )
+        _require_aware_utc(local.event_created_at, "event_created_at")
+    except (TypeError, ValueError):
+        return False
+    return reservation_created_at <= reservation_updated_at
+
+
+def _exchange_identities_match(
+    local: LocalReservationEvidence,
+    exchange: ExchangeReservationEvidence,
+) -> bool:
+    def position_matches(item: object) -> bool:
+        return (
+            item.instrument_ref == local.instrument_ref
+            and item.side == local.side
+            and item.position_ref == local.position_ref
+        )
+
+    def order_matches(item: object) -> bool:
+        return position_matches(item) and item.order_ref == local.close_order_ref
+
+    return all(
+        (
+            all(position_matches(item) for item in exchange.current_positions),
+            all(order_matches(item) for item in exchange.pending_orders),
+            all(order_matches(item) for item in exchange.order_history),
+            all(order_matches(item) for item in exchange.fills),
+            all(position_matches(item) for item in exchange.position_history),
+        )
+    )
+
+
+def _local_mutation_conflicts(local: LocalReservationEvidence) -> bool:
+    for mutation in local.close_mutations:
+        if mutation.order_ref is not None and mutation.order_ref != local.close_order_ref:
+            return True
+        if mutation.status in {"rejected", "recovery_required", "blocked"}:
+            return True
+        if mutation.status == "confirmed" and mutation.order_ref is None:
+            return True
+    return False
 
 
 _REQUIRED_SOURCE_COLUMNS = {
