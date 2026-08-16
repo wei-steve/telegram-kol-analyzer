@@ -1308,7 +1308,7 @@ run_bound_close_double_capture
     assert result.stderr == ""
 
 
-def test_runbook_quiescence_poll_is_bounded_and_capture_is_ready_gated():
+def test_runbook_stopped_recheck_is_bounded_and_capture_is_ready_gated():
     block = _bound_close_read_only_block()
 
     stopped = block.index(
@@ -1318,7 +1318,8 @@ def test_runbook_quiescence_poll_is_bounded_and_capture_is_ready_gated():
     helper = block.index("run_bound_close_writer_quiescence_helper", deadline)
     capture = block.index("run_bound_close_double_capture", helper)
     assert "$(( $(bound_close_now_epoch) + 720 ))" in block[deadline:helper]
-    assert "QUIESCENCE_POLL_SECONDS=15" in block[deadline:helper]
+    assert "QUIESCENCE_POLL_SECONDS" not in block[deadline:capture]
+    assert "sleep " not in block[deadline:capture]
     assert "sleep 600" not in block
     assert "sleep 10m" not in block
     assert deadline < helper < capture
@@ -1331,6 +1332,18 @@ def test_runbook_quiescence_poll_is_bounded_and_capture_is_ready_gated():
     assert "*) exit 1" in block[helper:capture]
     assert "require_exact_ready_projection" in block[helper:capture]
     assert "require_exact_refused_projection" in block[helper:capture]
+
+
+def test_post_stop_writer_check_is_single_shot_without_aging_sleep():
+    stopped = _bound_close_poll_snippet()
+
+    assert "while :" not in stopped
+    assert "sleep " not in stopped
+    assert stopped.count("run_bound_close_writer_quiescence_helper") == 1
+    assert stopped.count("run_bound_close_double_capture_before_deadline") == 1
+    assert stopped.index("run_bound_close_writer_quiescence_helper") < stopped.index(
+        "run_bound_close_double_capture_before_deadline"
+    )
 
 
 def test_live_prequiescence_precedes_runner_build_and_every_unit_stop():
@@ -1522,6 +1535,82 @@ printf 'live-ready\n' >> "$EVENTS"
     return result, events
 
 
+def _simulate_stopped_recheck(
+    tmp_path: Path,
+    *,
+    helper_status: int,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    events = tmp_path / "stopped-events.txt"
+    script = f"""
+set -euo pipefail
+EVENTS={shlex.quote(str(events))}
+RECOVERY_TMP={shlex.quote(str(tmp_path))}
+NOW_EPOCH=100
+BOUND_CLOSE_SAFE_DIAGNOSTIC=''
+bound_close_now_epoch() {{ printf '%s\n' "$NOW_EPOCH"; }}
+sleep() {{
+  printf 'sleep\n' >> "$EVENTS"
+  NOW_EPOCH=$((NOW_EPOCH + 15))
+}}
+verify_all_local_quiescence_and_identity() {{ printf 'verify\n' >> "$EVENTS"; }}
+run_bound_close_writer_quiescence_helper() {{
+  local output_path="$1"
+  HELPER_STATUS={helper_status}
+  printf 'helper\n' >> "$EVENTS"
+  if [ "$HELPER_STATUS" -eq 0 ]; then
+    printf '%s\n' '{{"block_regardless_of_age_writer_count":0,"blocking_writer_count":0,"checked_table_count":20,"fresh_active_or_unknown_writer_count":0,"historical_active_or_unknown_residue_count":2,"missing_table_count":0,"schema_version":1,"status":"ready","target_reservation_count":29,"unrecognized_or_null_state_count":0}}' > "$output_path"
+  else
+    printf '%s\n' '{{"block_regardless_of_age_writer_count":0,"blocking_writer_count":1,"checked_table_count":20,"fresh_active_or_unknown_writer_count":1,"historical_active_or_unknown_residue_count":1,"missing_table_count":0,"schema_version":1,"status":"refused","target_reservation_count":29,"unrecognized_or_null_state_count":0}}' > "$output_path"
+  fi
+}}
+project_bound_close_writer_quiescence_result() {{
+  printf 'project\n' >> "$EVENTS"
+  cp "$1" "$3"
+}}
+require_exact_ready_projection() {{ grep -q '"status":"ready"' "$1"; }}
+require_exact_refused_projection() {{ grep -q '"status":"refused"' "$1"; }}
+run_bound_close_double_capture_before_deadline() {{
+  printf 'capture\n' >> "$EVENTS"
+}}
+restore() {{ printf 'restore\n' >> "$EVENTS"; }}
+trap restore EXIT
+printf 'stop\n' >> "$EVENTS"
+{_bound_close_poll_snippet()}
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    return result, events
+
+
+def test_post_stop_writer_race_restores_without_exchange_capture(tmp_path):
+    result, events = _simulate_stopped_recheck(tmp_path, helper_status=2)
+
+    assert result.returncode != 0
+    event_lines = events.read_text(encoding="utf-8").splitlines()
+    assert event_lines.count("helper") == 1
+    assert "sleep" not in event_lines
+    assert "capture" not in event_lines
+    assert event_lines[0] == "stop"
+    assert event_lines[-1] == "restore"
+
+
+def test_post_stop_writer_ready_invokes_helper_once_then_double_capture(tmp_path):
+    result, events = _simulate_stopped_recheck(tmp_path, helper_status=0)
+
+    assert result.returncode == 0, result.stderr
+    event_lines = events.read_text(encoding="utf-8").splitlines()
+    assert event_lines.count("helper") == 1
+    assert event_lines.count("capture") == 1
+    assert "sleep" not in event_lines
+    assert event_lines[0] == "stop"
+    assert event_lines[-1] == "restore"
+
+
 def test_live_prequiescence_refused_then_ready_never_stops_services(tmp_path):
     result, events = _simulate_live_prequiescence(
         tmp_path,
@@ -1571,10 +1660,10 @@ def test_live_prequiescence_errors_fail_before_any_stop(
     assert "stop" not in events.read_text(encoding="utf-8").splitlines()
 
 
-def test_runbook_quiescence_poll_reaches_capture_once_only_after_ready(tmp_path):
+def test_runbook_post_stop_recheck_reaches_capture_once_only_when_ready(tmp_path):
     result = _simulate_runbook_quiescence_poll(
         tmp_path,
-        helper_statuses=(2, 2, 0),
+        helper_statuses=(0,),
         sleep_jump=15,
     )
 

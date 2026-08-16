@@ -2368,49 +2368,39 @@ verify_all_local_quiescence_and_identity
 
 # BEGIN BOUND_CLOSE_QUIESCENCE_POLL
 QUIESCENCE_DEADLINE_EPOCH="$(( $(bound_close_now_epoch) + 720 ))"
-QUIESCENCE_POLL_SECONDS=15
 BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS=180
 BOUND_CLOSE_CAPTURE_OVERHEAD_RESERVE_SECONDS=60
 BOUND_CLOSE_DIAGNOSTIC_HANDOFF="$RECOVERY_TMP/capture-diagnostic-handoff.json"
-QUIESCENCE_ATTEMPT=0
+WRITER_QUIESCENCE_RAW="$RECOVERY_TMP/writer-quiescence-raw.json"
+WRITER_QUIESCENCE_PROJECTION="$RECOVERY_TMP/writer-quiescence-projection.json"
 WRITER_QUIESCENCE_RESULT="$RECOVERY_TMP/writer-quiescence.json"
-while :; do
-  [ "$(bound_close_now_epoch)" -lt "$QUIESCENCE_DEADLINE_EPOCH" ] || exit 1
-  QUIESCENCE_ATTEMPT=$((QUIESCENCE_ATTEMPT + 1))
-  WRITER_QUIESCENCE_RAW="$RECOVERY_TMP/writer-quiescence-${QUIESCENCE_ATTEMPT}.json"
-  WRITER_QUIESCENCE_PROJECTION="$RECOVERY_TMP/writer-quiescence-${QUIESCENCE_ATTEMPT}-projection.json"
-  verify_all_local_quiescence_and_identity
-  run_bound_close_writer_quiescence_helper "$WRITER_QUIESCENCE_RAW"
-  verify_all_local_quiescence_and_identity
-  chmod 0600 "$WRITER_QUIESCENCE_RAW"
-  case "$HELPER_STATUS" in
-    0|2)
-      project_bound_close_writer_quiescence_result \
-        "$WRITER_QUIESCENCE_RAW" "$HELPER_STATUS" \
-        "$WRITER_QUIESCENCE_PROJECTION"
-      chmod 0600 "$WRITER_QUIESCENCE_PROJECTION"
-      ;;
-    *) exit 1 ;;
-  esac
-  [ "$(bound_close_now_epoch)" -lt "$QUIESCENCE_DEADLINE_EPOCH" ] || exit 1
-  case "$HELPER_STATUS" in
-    0)
-      require_exact_ready_projection "$WRITER_QUIESCENCE_PROJECTION"
-      mv -- "$WRITER_QUIESCENCE_PROJECTION" "$WRITER_QUIESCENCE_RESULT"
-      chmod 0600 "$WRITER_QUIESCENCE_RESULT"
-      break
-      ;;
-    2) require_exact_refused_projection "$WRITER_QUIESCENCE_PROJECTION" ;;
-    *) exit 1 ;;
-  esac
-  REMAINING_SECONDS=$((QUIESCENCE_DEADLINE_EPOCH - $(bound_close_now_epoch)))
-  [ "$REMAINING_SECONDS" -gt 0 ] || exit 1
-  SLEEP_SECONDS="$QUIESCENCE_POLL_SECONDS"
-  if [ "$REMAINING_SECONDS" -lt "$SLEEP_SECONDS" ]; then
-    SLEEP_SECONDS="$REMAINING_SECONDS"
-  fi
-  sleep "$SLEEP_SECONDS"
-done
+verify_all_local_quiescence_and_identity
+run_bound_close_writer_quiescence_helper "$WRITER_QUIESCENCE_RAW"
+verify_all_local_quiescence_and_identity
+chmod 0600 "$WRITER_QUIESCENCE_RAW"
+case "$HELPER_STATUS" in
+  0|2)
+    project_bound_close_writer_quiescence_result \
+      "$WRITER_QUIESCENCE_RAW" "$HELPER_STATUS" \
+      "$WRITER_QUIESCENCE_PROJECTION"
+    chmod 0600 "$WRITER_QUIESCENCE_PROJECTION"
+    ;;
+  *) exit 1 ;;
+esac
+[ "$(bound_close_now_epoch)" -lt "$QUIESCENCE_DEADLINE_EPOCH" ] || exit 1
+case "$HELPER_STATUS" in
+  0)
+    require_exact_ready_projection "$WRITER_QUIESCENCE_PROJECTION"
+    mv -- "$WRITER_QUIESCENCE_PROJECTION" "$WRITER_QUIESCENCE_RESULT"
+    chmod 0600 "$WRITER_QUIESCENCE_RESULT"
+    ;;
+  2)
+    require_exact_refused_projection "$WRITER_QUIESCENCE_PROJECTION"
+    BOUND_CLOSE_SAFE_DIAGNOSTIC='{"status":"post_stop_writer_race"}'
+    exit 2
+    ;;
+  *) exit 1 ;;
+esac
 REMAINING_SECONDS=$((QUIESCENCE_DEADLINE_EPOCH - $(bound_close_now_epoch)))
 REQUIRED_CAPTURE_SECONDS=$((
   2 * BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS
@@ -2421,14 +2411,15 @@ run_bound_close_double_capture_before_deadline
 # END BOUND_CLOSE_QUIESCENCE_POLL
 ```
 
-上述 12 分钟是全部 unit 已停止之后只计算一次的 absolute deadline，
-不是固定睡满十分钟。helper 只在每轮前后均证明 unit 清单未变、
-进程为零、production SHA 未变，且数据库的 resolved path/device/inode 未变
-时执行。`refused` 只能按 15 秒条件轮询，让已知本地 writer marker
-跨过官方 historical cutoff；这绝不会宣告交易所工作已终态。target
-reservation 仍必须通过随后两次全新交易所 capture。超时、signal、
-helper error、非法 JSON/投影、unit/进程/SHA/数据库身份漂移都会在
-capture 不可达时退出，并由 trap 恢复原状态。
+停服前的 live pre-quiescence 最多只读轮询 12 分钟，每 15 秒检查一次；
+这段时间全部服务保持原状态。live `ready` 只允许尝试停服，不是 capture
+authority。全部 unit 停止后会启动一个独立的 12 分钟 absolute deadline，
+并在 helper 前后证明 unit 清单未变、进程为零、production SHA 未变，且
+数据库的 resolved path/device/inode 未变。停服后的 helper 只执行一次，
+不再 sleep 或等待 marker 老化；任何 `refused` 都固定投影为
+`post_stop_writer_race`，在交易所 capture 不可达时立即由 trap 恢复原状态。
+target reservation 仍必须通过随后两次全新交易所 capture。超时、signal、
+helper error、非法 JSON/投影、unit/进程/SHA/数据库身份漂移也都会安全退出。
 
 每次全新的交易所 capture 都有自己独立的时间预算：单次 capture 的绝对硬上限为 180 秒，
 完成即立即返回，并不是固定等待 180 秒。该上限覆盖网络流式读取、响应解码和证据规范化；
