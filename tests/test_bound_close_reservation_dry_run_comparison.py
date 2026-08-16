@@ -376,6 +376,23 @@ def test_runbook_closes_stopped_service_capture_and_apply_boundaries():
     assert "PRAGMA quick_check" in section[postcheck:combined_exit]
 
 
+def test_bound_close_runbook_deadline_contract_is_explicit():
+    project_root = Path(__file__).resolve().parents[1]
+    runbook = (project_root / "docs" / "runbook.md").read_text(encoding="utf-8")
+    section = runbook.split(
+        "## Bound position close reservation convergence", 1
+    )[1].split("## Batch 119 composite-management recovery", 1)[0]
+
+    for expected in (
+        "单次 capture 的绝对硬上限为 180 秒",
+        "完成即立即返回",
+        "停服窗口的 12 分钟 absolute deadline 不变",
+        "timeout 仍为 `UNKNOWN / exchange_capture_timeout`",
+        "不能在同一停服窗口重试",
+    ):
+        assert expected in section
+
+
 def test_runbook_quiescence_inventory_preserves_state_and_refuses_unit_races():
     project_root = Path(__file__).resolve().parents[1]
     runbook = (project_root / "docs" / "runbook.md").read_text(encoding="utf-8")

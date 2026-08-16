@@ -2274,6 +2274,13 @@ reservation 仍必须通过随后两次全新交易所 capture。超时、signal
 helper error、非法 JSON/投影、unit/进程/SHA/数据库身份漂移都会在
 capture 不可达时退出，并由 trap 恢复原状态。
 
+每次全新的交易所 capture 都有自己独立的时间预算：单次 capture 的绝对硬上限为 180 秒，
+完成即立即返回，并不是固定等待 180 秒。该上限覆盖网络流式读取、响应解码和证据规范化；
+停服窗口的 12 分钟 absolute deadline 不变。超时不会被推断成安全终态，
+timeout 仍为 `UNKNOWN / exchange_capture_timeout`，而且首次 capture 被拒后第二次 capture 不可达。
+任何超时或拒绝都必须恢复服务、形成新的 reviewed SHA 并重新取得两个完整 token，
+不能在同一停服窗口重试。
+
 若任一交易所 capture 返回 `refused`，脚本只保留已经通过 closed parser
 验证的 classification/reason 计数，并且只在服务恢复尝试完成后输出一行脱敏
 diagnostic。该 diagnostic 没有 apply authority，不包含 reservation、仓位、订单、
