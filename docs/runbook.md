@@ -1488,8 +1488,9 @@ WHERE idempotency_key LIKE :component_id || ':%' ORDER BY id;
 
 ## Bound position close reservation convergence
 
-这是 Batch 119 之前的独立门禁恢复，只能把“交易所已经证明终态”的
-`bound_position_close_reservations` 收敛为 `confirmed`。它不忽略旧记录，
+这是 bound-close reservations 与 Batch 119 的联合只读证据窗口。它先证明
+两组本地 material 在停服前后都没有变化，再交错取得两次 Batch 119
+与两次 bound-close 交易所证据。它不忽略旧记录，
 不手改数据库，不重放消息，不构造交易所 writer，不改 Batch 119，
 也不启用 MiMo v2。恢复 candidate 固定位于
 `codex/bound-close-reservation-recovery`；Phase One 目标仍是
@@ -1499,19 +1500,22 @@ WHERE idempotency_key LIKE :component_id || ':%' ORDER BY id;
 服务后立即停止；只有另行获得 apply 授权，才能再开一个停服窗口。
 诊断授权不是 apply 授权，apply 授权也不是 Batch119 或普通部署授权。
 
-### 窗口一：停服只读双 capture
+### 窗口一：Bound-close + Batch 119 联合停服只读 capture
 
 只有操作员明确提供下列两个完整 token 才可执行：
 
 ```text
-I_APPROVE_BOUND_CLOSE_RESERVATIONS_ALL_DB_UNITS_STOPPED_READ_ONLY_DOUBLE_CAPTURE
+I_APPROVE_BOUND_CLOSE_BATCH119_ALL_DB_UNITS_STOPPED_JOINT_READ_ONLY_CAPTURE
 I_APPROVE_LEGACY_MONITOR_FAILED_STATE_RESET_FOR_BOUND_CLOSE_READ_ONLY_WINDOW
 ```
 
 第二个 token 只授权在所有 monitor timers 已停止之后，将已安装的旧
 `telegram-kol-monitor.service` 从 `failed` 重置为 `inactive`，并把
 `inactive` 作为本窗口恢复基线；它不授权启动该 service。若该旧 unit
-未安装，reset 是 no-op，仍保持 `absent`。两个 token 都不授权 apply。
+未安装，reset 是 no-op，仍保持 `absent`。两个 token 都不授权 apply，
+不授权交易所写入，不授权部署，也不授权启用 MiMo v2。旧的
+`I_APPROVE_BOUND_CLOSE_RESERVATIONS_ALL_DB_UNITS_STOPPED_READ_ONLY_DOUBLE_CAPTURE`
+不能进入本联合窗口。
 
 将 `REVIEWED_SHA` 替换为已完成本地全量验证和 Critical/Important 审查的
 40 位完整 SHA；不得使用短 SHA。下列命令保存原始 unit 状态，任意
@@ -1534,6 +1538,7 @@ umask 077
 PRODUCTION_ROOT=/opt/telegram-kol-analyzer
 PRODUCTION_DB="$PRODUCTION_ROOT/data/research.db"
 PRODUCTION_DEEPCOIN_ENV="$PRODUCTION_ROOT/config/telegram.env"
+DEEPCOIN_CONTRACT_SPECS="$PRODUCTION_ROOT/config/deepcoin_contract_specs.yaml"
 RUNTIME_PYTHON="$PRODUCTION_ROOT/.venv/bin/python"
 REVIEWED_SHA='<exact-reviewed-recovery-sha>'
 PHASE_ONE_SHA='c50887b991712340d7d5606fb6916cdbb033926e'
@@ -2193,6 +2198,226 @@ sys.stdout.write(
 PY
 }
 
+run_joint_admission() {
+  local OUTPUT_PATH="$1"
+  local PHASE="$2"
+  local ADMISSION_STATUS
+  set +e
+  PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
+    telegram_kol_research.cli \
+    inspect-bound-close-batch119-joint-recovery \
+    --database-path "$PRODUCTION_DB" \
+    --phase "$PHASE" > "$OUTPUT_PATH"
+  ADMISSION_STATUS=$?
+  set -e
+  chmod 0600 "$OUTPUT_PATH"
+  [ "$ADMISSION_STATUS" -eq 0 ]
+}
+
+run_joint_live_admissions() {
+  local JOINT_LIVE_POLL_SECONDS=15
+  verify_all_local_identity_before_stop
+  run_joint_admission "$RECOVERY_TMP/joint-live-1.json" joint_diagnostic
+  verify_all_local_identity_before_stop
+  sleep "$JOINT_LIVE_POLL_SECONDS"
+  verify_all_local_identity_before_stop
+  run_joint_admission "$RECOVERY_TMP/joint-live-2.json" joint_diagnostic
+  verify_all_local_identity_before_stop
+  PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
+    "$CANDIDATE_ROOT/scripts/compare_bound_close_batch119_joint_admissions.py" \
+    "$RECOVERY_TMP/joint-live-1.json" \
+    "$RECOVERY_TMP/joint-live-2.json" > \
+    "$RECOVERY_TMP/joint-live-comparison.json"
+  chmod 0600 "$RECOVERY_TMP/joint-live-comparison.json"
+  PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
+    "$CANDIDATE_ROOT/scripts/project_bound_close_batch119_joint_output.py" < \
+    "$RECOVERY_TMP/joint-live-2.json" > "$JOINT_LIVE_ADMISSION_RESULT"
+  chmod 0600 "$JOINT_LIVE_ADMISSION_RESULT"
+}
+
+run_joint_capture_with_limit() {
+  local HARD_LIMIT_SECONDS="$1"
+  shift
+  local REMAINING_SECONDS
+  REMAINING_SECONDS=$((
+    QUIESCENCE_DEADLINE_EPOCH - $(bound_close_now_epoch)
+  ))
+  [ "$REMAINING_SECONDS" -gt 0 ] || return 1
+  if [ "$HARD_LIMIT_SECONDS" -gt "$REMAINING_SECONDS" ]; then
+    HARD_LIMIT_SECONDS="$REMAINING_SECONDS"
+  fi
+  timeout --signal=KILL "$HARD_LIMIT_SECONDS" "$@"
+}
+
+run_joint_capture_step_before_deadline() {
+  local REMAINING_CAPTURE_SECONDS
+  local REMAINING_WINDOW_SECONDS
+  local STEP_LIMIT_SECONDS
+  REMAINING_CAPTURE_SECONDS=$((
+    JOINT_CAPTURE_DEADLINE_EPOCH - $(bound_close_now_epoch)
+  ))
+  REMAINING_WINDOW_SECONDS=$((
+    QUIESCENCE_DEADLINE_EPOCH - $(bound_close_now_epoch)
+  ))
+  [ "$REMAINING_CAPTURE_SECONDS" -gt 0 ] || return 1
+  [ "$REMAINING_WINDOW_SECONDS" -gt 0 ] || return 1
+  STEP_LIMIT_SECONDS="$REMAINING_CAPTURE_SECONDS"
+  if [ "$REMAINING_WINDOW_SECONDS" -lt "$STEP_LIMIT_SECONDS" ]; then
+    STEP_LIMIT_SECONDS="$REMAINING_WINDOW_SECONDS"
+  fi
+  timeout --signal=KILL "$STEP_LIMIT_SECONDS" "$@"
+}
+
+run_joint_batch119_capture() {
+  local ATTEMPT="$1"
+  local JOINT_CAPTURE_DEADLINE_EPOCH
+  local RECOVERY_DB_COPY="$RECOVERY_TMP/research-copy-${ATTEMPT}.db"
+  local RESULT="$RECOVERY_TMP/batch119-${ATTEMPT}.json"
+  JOINT_CAPTURE_DEADLINE_EPOCH=$((
+    $(bound_close_now_epoch) + BATCH119_CAPTURE_HARD_LIMIT_SECONDS
+  ))
+  if [ "$JOINT_CAPTURE_DEADLINE_EPOCH" -gt "$QUIESCENCE_DEADLINE_EPOCH" ]; then
+    JOINT_CAPTURE_DEADLINE_EPOCH="$QUIESCENCE_DEADLINE_EPOCH"
+  fi
+  run_joint_capture_step_before_deadline \
+    sqlite3 -readonly "$PRODUCTION_DB" ".backup '$RECOVERY_DB_COPY'"
+  chmod 0600 "$RECOVERY_DB_COPY"
+  [ "$(run_joint_capture_step_before_deadline \
+    sqlite3 -readonly "$RECOVERY_DB_COPY" 'PRAGMA quick_check;')" = ok ]
+  run_joint_capture_step_before_deadline \
+    env PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" - \
+    "$RECOVERY_DB_COPY" <<'PY'
+import sys
+from telegram_kol_research.db import create_session_factory
+
+factory = create_session_factory(sys.argv[1])
+factory.kw["bind"].dispose()
+PY
+  set +e
+  run_joint_capture_step_before_deadline \
+    env PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
+    telegram_kol_research.cli recover-composite-management-batch \
+    --database-path "$RECOVERY_DB_COPY" \
+    --generation-database-path "$RECOVERY_DB_COPY" \
+    --batch-id 119 \
+    --deepcoin-contract-specs-path "$DEEPCOIN_CONTRACT_SPECS" > "$RESULT"
+  local CAPTURE_STATUS=$?
+  set -e
+  chmod 0600 "$RESULT"
+  [ "$CAPTURE_STATUS" -eq 0 ]
+}
+
+run_joint_bound_close_capture() {
+  local ATTEMPT="$1"
+  local RESULT="$RECOVERY_TMP/bound-close-${ATTEMPT}.json"
+  set +e
+  (
+    cd "$PRODUCTION_ROOT"
+    run_joint_capture_with_limit "$BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS" \
+      env PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
+      telegram_kol_research.cli recover-bound-position-close-reservations \
+      --database-path "$PRODUCTION_DB" \
+      --generation-database-path "$PRODUCTION_DB"
+  ) > "$RESULT"
+  local CAPTURE_STATUS=$?
+  set -e
+  chmod 0600 "$RESULT"
+  [ "$CAPTURE_STATUS" -eq 0 ]
+}
+
+run_joint_stopped_phase() {
+  local REMAINING_SECONDS
+  for VERIFY_PASS in 1 2 3; do
+    sleep 1
+    verify_bound_close_quiescence
+  done
+  verify_all_local_quiescence_and_identity
+  run_joint_admission "$RECOVERY_TMP/joint-post-stop.json" joint_diagnostic
+  verify_all_local_quiescence_and_identity
+  PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
+    "$CANDIDATE_ROOT/scripts/compare_bound_close_batch119_joint_admissions.py" \
+    "$RECOVERY_TMP/joint-live-2.json" \
+    "$RECOVERY_TMP/joint-post-stop.json" > \
+    "$RECOVERY_TMP/joint-post-stop-comparison.json"
+  chmod 0600 "$RECOVERY_TMP/joint-post-stop-comparison.json"
+  PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
+    "$CANDIDATE_ROOT/scripts/project_bound_close_batch119_joint_output.py" < \
+    "$RECOVERY_TMP/joint-post-stop.json" > \
+    "$RECOVERY_TMP/joint-post-stop-projection.json"
+  chmod 0600 "$RECOVERY_TMP/joint-post-stop-projection.json"
+  REMAINING_SECONDS=$((QUIESCENCE_DEADLINE_EPOCH - $(bound_close_now_epoch)))
+  [ "$REMAINING_SECONDS" -ge "$JOINT_CAPTURE_ADMISSION_SECONDS" ]
+  run_joint_batch119_capture 1
+  verify_all_local_quiescence_and_identity
+  run_joint_bound_close_capture 1
+  verify_all_local_quiescence_and_identity
+  run_joint_batch119_capture 2
+  verify_all_local_quiescence_and_identity
+  run_joint_bound_close_capture 2
+  verify_all_local_quiescence_and_identity
+  PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
+    "$CANDIDATE_ROOT/scripts/compare_batch119_dry_runs.py" \
+    "$RECOVERY_TMP/batch119-1.json" "$RECOVERY_TMP/batch119-2.json" > \
+    "$RECOVERY_TMP/batch119-comparison.json"
+  chmod 0600 "$RECOVERY_TMP/batch119-comparison.json"
+  PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
+    "$CANDIDATE_ROOT/scripts/compare_bound_close_reservation_dry_runs.py" \
+    "$RECOVERY_TMP/bound-close-1.json" \
+    "$RECOVERY_TMP/bound-close-2.json" > \
+    "$RECOVERY_TMP/bound-close-comparison.json"
+  chmod 0600 "$RECOVERY_TMP/bound-close-comparison.json"
+  verify_all_local_quiescence_and_identity
+}
+
+write_joint_live_runner() {
+  local RUNNER_PATH="$1"
+  {
+    printf '%s\n' 'set -euo pipefail' 'umask 077'
+    declare -p \
+      RECOVERY_TMP CANDIDATE_ROOT PRODUCTION_ROOT RUNTIME_PYTHON PRODUCTION_DB \
+      ORIGINAL_SHA PRODUCTION_DB_RESOLVED_PATH PRODUCTION_DB_DEVICE_INODE \
+      DB_STAGE_INITIAL_INVENTORY DB_STAGE_CURRENT_INVENTORY \
+      JOINT_LIVE_ADMISSION_RESULT QUIESCE_DB_STAGE_SEED_UNITS QUIESCE_UNITS \
+      ORIGINAL_UNIT_INSTALL_STATE ORIGINAL_UNIT_STATE
+    declare -f \
+      discover_bound_close_db_stage_units \
+      verify_bound_close_legacy_monitor_live_state \
+      verify_bound_close_unit_group_original_state \
+      verify_bound_close_unit_group_live_state \
+      verify_all_local_identity_before_stop run_joint_admission \
+      run_joint_live_admissions
+    printf '%s\n' 'run_joint_live_admissions'
+  } > "$RUNNER_PATH"
+  chmod 0700 "$RUNNER_PATH"
+}
+
+write_joint_stopped_runner() {
+  local RUNNER_PATH="$1"
+  {
+    printf '%s\n' 'set -euo pipefail' 'umask 077'
+    declare -p \
+      RECOVERY_TMP CANDIDATE_ROOT PRODUCTION_ROOT RUNTIME_PYTHON PRODUCTION_DB \
+      DEEPCOIN_CONTRACT_SPECS ORIGINAL_SHA PRODUCTION_DB_RESOLVED_PATH \
+      PRODUCTION_DB_DEVICE_INODE DB_STAGE_INITIAL_INVENTORY \
+      DB_STAGE_CURRENT_INVENTORY QUIESCE_DB_STAGE_SEED_UNITS \
+      QUIESCE_TIMER_UNITS QUIESCE_SERVICE_UNITS QUIESCE_SOCKET_UNITS \
+      ORIGINAL_UNIT_INSTALL_STATE \
+      JOINT_CAPTURE_ADMISSION_SECONDS BATCH119_CAPTURE_HARD_LIMIT_SECONDS \
+      BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS
+    declare -f \
+      bound_close_now_epoch discover_bound_close_db_stage_units \
+      run_bound_close_external_command_before_deadline \
+      verify_bound_close_unit_group_inactive verify_bound_close_quiescence \
+      verify_all_local_quiescence_and_identity run_joint_admission \
+      run_joint_capture_with_limit run_joint_capture_step_before_deadline \
+      run_joint_batch119_capture \
+      run_joint_bound_close_capture run_joint_stopped_phase
+    printf '%s\n' 'QUIESCENCE_DEADLINE_EPOCH="$1"' \
+      'run_joint_stopped_phase'
+  } > "$RUNNER_PATH"
+  chmod 0700 "$RUNNER_PATH"
+}
+
 write_bound_close_capture_runner() {
   local RUNNER_PATH="$1"
   {
@@ -2541,8 +2766,8 @@ for UNIT in "${QUIESCE_TRANSIENT_ONESHOT_UNITS[@]}"; do
     *) exit 1 ;;
   esac
 done
-test "${BOUND_CLOSE_DRY_RUN_APPROVAL:-}" = \
-  'I_APPROVE_BOUND_CLOSE_RESERVATIONS_ALL_DB_UNITS_STOPPED_READ_ONLY_DOUBLE_CAPTURE'
+test "${BOUND_CLOSE_BATCH119_JOINT_READ_ONLY_APPROVAL:-}" = \
+  'I_APPROVE_BOUND_CLOSE_BATCH119_ALL_DB_UNITS_STOPPED_JOINT_READ_ONLY_CAPTURE'
 test "${BOUND_CLOSE_LEGACY_MONITOR_RESET_APPROVAL:-}" = \
   'I_APPROVE_LEGACY_MONITOR_FAILED_STATE_RESET_FOR_BOUND_CLOSE_READ_ONLY_WINDOW'
 
@@ -2560,23 +2785,18 @@ test "$(git -C "$CANDIDATE_ROOT" rev-parse HEAD)" = "$REVIEWED_SHA"
 test -z "$(git -C "$CANDIDATE_ROOT" status --porcelain)"
 
 LIVE_PREQUIESCENCE_DEADLINE_EPOCH="$(( $(bound_close_now_epoch) + 720 ))"
-LIVE_PREQUIESCENCE_RESULT="$RECOVERY_TMP/live-writer-quiescence.json"
-LIVE_PREQUIESCENCE_RUNNER="$RECOVERY_TMP/live-prequiescence-runner.sh"
-write_bound_close_live_prequiescence_runner "$LIVE_PREQUIESCENCE_RUNNER"
+JOINT_LIVE_ADMISSION_RESULT="$RECOVERY_TMP/joint-live-admission.json"
+LIVE_PREQUIESCENCE_RUNNER="$RECOVERY_TMP/joint-live-runner.sh"
+write_joint_live_runner "$LIVE_PREQUIESCENCE_RUNNER"
 run_bound_close_runner_before_deadline \
   "$LIVE_PREQUIESCENCE_RUNNER" "$LIVE_PREQUIESCENCE_DEADLINE_EPOCH"
 verify_all_local_identity_before_stop
 
-CAPTURE_RUNNER="$RECOVERY_TMP/capture-runner.sh"
-write_bound_close_capture_runner "$CAPTURE_RUNNER"
 BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS=180
-BOUND_CLOSE_CAPTURE_OVERHEAD_RESERVE_SECONDS=60
-BOUND_CLOSE_DIAGNOSTIC_HANDOFF="$RECOVERY_TMP/capture-diagnostic-handoff.json"
-WRITER_QUIESCENCE_RAW="$RECOVERY_TMP/writer-quiescence-raw.json"
-WRITER_QUIESCENCE_PROJECTION="$RECOVERY_TMP/writer-quiescence-projection.json"
-WRITER_QUIESCENCE_RESULT="$RECOVERY_TMP/writer-quiescence.json"
-STOPPED_PHASE_RUNNER="$RECOVERY_TMP/stopped-phase-runner.sh"
-write_bound_close_stopped_phase_runner "$STOPPED_PHASE_RUNNER"
+BATCH119_CAPTURE_HARD_LIMIT_SECONDS=120
+JOINT_CAPTURE_ADMISSION_SECONDS=660
+STOPPED_PHASE_RUNNER="$RECOVERY_TMP/joint-stopped-runner.sh"
+write_joint_stopped_runner "$STOPPED_PHASE_RUNNER"
 verify_all_local_identity_before_stop
 
 QUIESCENCE_DEADLINE_EPOCH="$(( $(bound_close_now_epoch) + 720 ))"
@@ -2593,32 +2813,28 @@ STOPPED_PHASE_STATUS=$?
 set -e
 case "$STOPPED_PHASE_STATUS" in
   0) ;;
-  2)
-    [ -f "$BOUND_CLOSE_DIAGNOSTIC_HANDOFF" ] && \
-      [ ! -L "$BOUND_CLOSE_DIAGNOSTIC_HANDOFF" ] || exit 2
-    BOUND_CLOSE_SAFE_DIAGNOSTIC="$(< "$BOUND_CLOSE_DIAGNOSTIC_HANDOFF")"
-    exit 2
-    ;;
   *) exit "$STOPPED_PHASE_STATUS" ;;
 esac
 ```
 
-停服前的 live pre-quiescence 最多只读轮询 12 分钟，每 15 秒检查一次；
-这段时间全部服务保持原状态。live `ready` 只允许尝试停服，不是 capture
-authority。全部 unit 停止后会启动一个独立的 12 分钟 absolute deadline，
-并在 helper 前后证明 unit 清单未变、进程为零、production SHA 未变，且
-数据库的 resolved path/device/inode 未变。停服后的 helper 只执行一次，
-不再 sleep 或等待 marker 老化；任何 `refused` 都固定投影为
-`post_stop_writer_race`，在交易所 capture 不可达时立即由 trap 恢复原状态。
-target reservation 仍必须通过随后两次全新交易所 capture。超时、signal、
-helper error、非法 JSON/投影、unit/进程/SHA/数据库身份漂移也都会安全退出。
+停服前在同一个受限 runner 内读取两次 `joint_diagnostic` admission，
+中间精确等待 15 秒。两次的 material fingerprint、29 条 reservation、
+1 个 Batch 119 incident 和 0 个额外 writer 必须稳定；这一 `ready` 只允许
+尝试停服，不是 capture authority。全部 unit 停止后会启动一个独立的
+12 分钟 absolute deadline，并在第三次 joint admission 前后证明 unit 清单、
+进程、production SHA 与数据库 resolved path/device/inode 都未变。第三次
+material 必须与第二次相同；任何 `refused`、超时、signal、非法 JSON/
+投影或身份漂移都会在交易所 capture 不可达时由 trap 恢复原状态。
 
 每次全新的交易所 capture 都有自己独立的时间预算：单次 capture 的绝对硬上限为 180 秒，
 完成即立即返回，并不是固定等待 180 秒。该上限覆盖网络流式读取、响应解码和证据规范化；
 停服窗口的 12 分钟 absolute deadline 不变。超时不会被推断成安全终态，
 timeout 仍为 `UNKNOWN / exchange_capture_timeout`，而且首次 capture 被拒后第二次 capture 不可达。
-双 capture 只会在窗口至少还剩 420 秒时启动；每次开始前都会重新核算剩余 capture
-的完整 180 秒预算，并始终保留 60 秒给本地投影、比较和恢复前检查。
+四次 capture 仅在窗口至少还剩 660 秒时启动：两次 bound-close
+各保留 180 秒，两次 Batch 119 各保留 120 秒，另保留 60 秒给本地
+投影、语义比较、身份核验和恢复前检查。四条命令的固定顺序是
+Batch119-1 → bound-close-1 → Batch119-2 → bound-close-2；每条命令都是
+一个全新 CLI 进程和全新只读 reader。
 任何超时或拒绝都必须恢复服务、形成新的 reviewed SHA 并重新取得两个完整 token，
 不能在同一停服窗口重试。
 

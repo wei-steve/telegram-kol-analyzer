@@ -187,6 +187,56 @@ def test_batch119_dry_run_comparator_accepts_only_identical_safe_ready_plans(
     assert result.stderr == ""
 
 
+def test_joint_runbook_keeps_batch119_captures_fresh_sequential_and_read_only():
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    section = runbook.split(
+        "## Bound position close reservation convergence", 1
+    )[1].split("## Batch 119 composite-management recovery", 1)[0]
+    block = section.split("```bash", 1)[1].split("```", 1)[0]
+    stopped = block.split("run_joint_stopped_phase() {", 1)[1].split(
+        "\n}\n", 1
+    )[0]
+
+    assert stopped.index("run_joint_batch119_capture 1") < stopped.index(
+        "run_joint_bound_close_capture 1"
+    )
+    assert stopped.index("run_joint_bound_close_capture 1") < stopped.index(
+        "run_joint_batch119_capture 2"
+    )
+    assert stopped.index("run_joint_batch119_capture 2") < stopped.index(
+        "run_joint_bound_close_capture 2"
+    )
+    assert 'research-copy-${ATTEMPT}.db' in block
+    assert block.count("recover-composite-management-batch") == 1
+    assert 'run_joint_batch119_capture 1' in stopped
+    assert 'run_joint_batch119_capture 2' in stopped
+    assert "--batch-id 119" in block
+    assert "compare_batch119_dry_runs.py" in stopped
+    assert "production_writes" not in stopped
+    assert "--apply" not in block
+
+
+def test_joint_batch119_hard_limit_covers_copy_bootstrap_and_capture():
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    section = runbook.split(
+        "## Bound position close reservation convergence", 1
+    )[1].split("## Batch 119 composite-management recovery", 1)[0]
+    block = section.split("```bash", 1)[1].split("```", 1)[0]
+    batch = block.split("run_joint_batch119_capture() {", 1)[1].split(
+        "\n}\n", 1
+    )[0]
+
+    assert "JOINT_CAPTURE_DEADLINE_EPOCH" in batch
+    assert batch.count("run_joint_capture_step_before_deadline") == 4
+    assert 'sqlite3 -readonly "$PRODUCTION_DB" ".backup' in batch
+    assert batch.index("run_joint_capture_step_before_deadline") < batch.index(
+        'sqlite3 -readonly "$PRODUCTION_DB"'
+    )
+    assert batch.rindex("run_joint_capture_step_before_deadline") < batch.index(
+        "recover-composite-management-batch"
+    )
+
+
 def test_batch119_runbook_requires_all_units_inactive_and_cleanup_failure_nonzero():
     runbook = RUNBOOK.read_text(encoding="utf-8")
 

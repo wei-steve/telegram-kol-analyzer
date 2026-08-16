@@ -402,9 +402,9 @@ def test_bound_close_runbook_deadline_contract_is_explicit():
     ):
         assert expected in section
 
-    writer_definition = section.index("write_bound_close_capture_runner() {")
+    writer_definition = section.index("write_joint_stopped_runner() {")
     writer_invocation = section.index(
-        'write_bound_close_capture_runner "$CAPTURE_RUNNER"'
+        'write_joint_stopped_runner "$STOPPED_PHASE_RUNNER"'
     )
     first_unit_stop = section.index("QUIESCE_ATTEMPTED=1")
     assert writer_definition < writer_invocation < first_unit_stop
@@ -697,6 +697,328 @@ def _bound_close_live_prequiescence_snippet() -> str:
 
 def _bound_close_shell_function(block: str, name: str) -> str:
     return block.split(f"{name}() {{", 1)[1].split("\n}\n", 1)[0]
+
+
+def test_joint_window_requires_new_exact_approval_and_disclaims_mutation():
+    project_root = Path(__file__).resolve().parents[1]
+    runbook = (project_root / "docs" / "runbook.md").read_text(encoding="utf-8")
+    section = runbook.split(
+        "## Bound position close reservation convergence", 1
+    )[1].split("## Batch 119 composite-management recovery", 1)[0]
+    approval_text = section.split("```bash", 1)[0]
+    block = _bound_close_read_only_block()
+    joint_token = (
+        "I_APPROVE_BOUND_CLOSE_BATCH119_ALL_DB_UNITS_STOPPED_"
+        "JOINT_READ_ONLY_CAPTURE"
+    )
+    old_token = (
+        "I_APPROVE_BOUND_CLOSE_RESERVATIONS_ALL_DB_UNITS_STOPPED_"
+        "READ_ONLY_DOUBLE_CAPTURE"
+    )
+
+    assert joint_token in approval_text
+    assert joint_token in block
+    assert old_token not in block
+    assert "不授权 apply" in approval_text
+    assert "不授权交易所写入" in approval_text
+    assert "不授权部署" in approval_text
+    assert "不授权启用 MiMo v2" in approval_text
+
+
+def test_joint_window_takes_three_admissions_and_four_ordered_fresh_captures():
+    block = _bound_close_read_only_block()
+    live = _bound_close_shell_function(block, "run_joint_live_admissions")
+    stopped = _bound_close_shell_function(block, "run_joint_stopped_phase")
+
+    admission = _bound_close_shell_function(block, "run_joint_admission")
+    assert "inspect-bound-close-batch119-joint-recovery" in admission
+    assert live.count("run_joint_admission") == 2
+    assert "sleep \"$JOINT_LIVE_POLL_SECONDS\"" in live
+    assert live.index("joint-live-1.json") < live.index("sleep ")
+    assert live.index("sleep ") < live.index("joint-live-2.json")
+    assert live.count("compare_bound_close_batch119_joint_admissions.py") == 1
+
+    assert stopped.count("run_joint_admission") == 1
+    assert stopped.count("compare_bound_close_batch119_joint_admissions.py") == 1
+    ordered = (
+        "run_joint_batch119_capture 1",
+        "run_joint_bound_close_capture 1",
+        "run_joint_batch119_capture 2",
+        "run_joint_bound_close_capture 2",
+    )
+    offsets = [stopped.index(command) for command in ordered]
+    assert offsets == sorted(offsets)
+    assert stopped.count("compare_batch119_dry_runs.py") == 1
+    assert stopped.count("compare_bound_close_reservation_dry_runs.py") == 1
+    assert "apply" not in stopped.lower()
+    assert "notify" not in stopped.lower()
+
+
+def test_joint_stopped_phase_reserves_complete_four_capture_budget():
+    block = _bound_close_read_only_block()
+    stopped = _bound_close_shell_function(block, "run_joint_stopped_phase")
+    first_capture = stopped.index("run_joint_batch119_capture 1")
+    admission = stopped.index("run_joint_admission")
+
+    assert "JOINT_CAPTURE_ADMISSION_SECONDS=660" in block
+    assert '"$REMAINING_SECONDS" -ge "$JOINT_CAPTURE_ADMISSION_SECONDS"' in stopped
+    assert admission < stopped.index("JOINT_CAPTURE_ADMISSION_SECONDS", admission) < first_capture
+    assert "QUIESCENCE_DEADLINE_EPOCH" in stopped
+    assert "verify_all_local_quiescence_and_identity" in stopped
+
+
+def test_joint_private_documents_are_0600_and_removed_by_existing_trap():
+    block = _bound_close_read_only_block()
+    live = _bound_close_shell_function(block, "run_joint_live_admissions")
+    stopped = _bound_close_shell_function(block, "run_joint_stopped_phase")
+
+    for filename in (
+        "joint-live-1.json",
+        "joint-live-2.json",
+        "joint-post-stop.json",
+        "batch119-1.json",
+        "bound-close-1.json",
+        "batch119-2.json",
+        "bound-close-2.json",
+    ):
+        assert filename in live + stopped
+    admission = _bound_close_shell_function(block, "run_joint_admission")
+    batch_capture = _bound_close_shell_function(
+        block, "run_joint_batch119_capture"
+    )
+    bound_capture = _bound_close_shell_function(
+        block, "run_joint_bound_close_capture"
+    )
+    assert "chmod 0600" in admission
+    assert batch_capture.count("chmod 0600") >= 2
+    assert "chmod 0600" in bound_capture
+    assert live.count("chmod 0600") >= 2
+    assert stopped.count("chmod 0600") >= 4
+    cleanup = _bound_close_shell_function(
+        block, "restore_bound_close_reservation_units"
+    )
+    assert 'rm -rf -- "$RECOVERY_TMP"' in cleanup
+
+
+def test_complete_joint_recovery_bash_block_is_syntax_valid(tmp_path):
+    extracted = tmp_path / "joint-recovery-window.sh"
+    extracted.write_text(_bound_close_read_only_block(), encoding="utf-8")
+
+    result = subprocess.run(
+        ["bash", "-n", str(extracted)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+def test_joint_live_admissions_are_separated_and_compared_with_identity_checks(
+    tmp_path,
+):
+    block = _bound_close_read_only_block()
+    live = _bound_close_shell_function(block, "run_joint_live_admissions")
+    events = tmp_path / "events.txt"
+    runtime = tmp_path / "runtime"
+    runtime.write_text(
+        "#!/bin/bash\n"
+        "printf 'compare:%s\\n' \"$(basename \"${1:-module}\")\" >> \"$EVENTS\"\n"
+        "printf '{}\\n'\n",
+        encoding="utf-8",
+    )
+    runtime.chmod(0o700)
+    script = f"""
+set -euo pipefail
+umask 077
+RECOVERY_TMP={shlex.quote(str(tmp_path))}
+CANDIDATE_ROOT={shlex.quote(str(tmp_path))}
+RUNTIME_PYTHON={shlex.quote(str(runtime))}
+PRODUCTION_DB=/unused
+JOINT_LIVE_ADMISSION_RESULT="$RECOVERY_TMP/result.json"
+EVENTS={shlex.quote(str(events))}
+export EVENTS
+verify_all_local_identity_before_stop() {{ printf 'identity\n' >> "$EVENTS"; }}
+run_joint_admission() {{
+  printf 'admission:%s\n' "$(basename "$1")" >> "$EVENTS"
+  printf '{{}}\n' > "$1"
+  chmod 0600 "$1"
+}}
+sleep() {{ printf 'sleep:%s\n' "$1" >> "$EVENTS"; }}
+run_joint_live_admissions() {{
+{live}
+}}
+run_joint_live_admissions
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode == 0, result.stderr
+    lines = events.read_text(encoding="utf-8").splitlines()
+    assert lines == [
+        "identity",
+        "admission:joint-live-1.json",
+        "identity",
+        "sleep:15",
+        "identity",
+        "admission:joint-live-2.json",
+        "identity",
+        "compare:compare_bound_close_batch119_joint_admissions.py",
+        "compare:project_bound_close_batch119_joint_output.py",
+    ]
+
+
+def test_joint_live_material_drift_refuses_before_any_unit_stop(tmp_path):
+    block = _bound_close_read_only_block()
+    live = _bound_close_shell_function(block, "run_joint_live_admissions")
+    events = tmp_path / "events.txt"
+    runtime = tmp_path / "runtime"
+    runtime.write_text(
+        "#!/bin/bash\n"
+        "case \"$(basename \"${1:-module}\")\" in\n"
+        "  compare_bound_close_batch119_joint_admissions.py) exit 2 ;;\n"
+        "  *) printf '{}\\n' ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    runtime.chmod(0o700)
+    script = f"""
+set -euo pipefail
+umask 077
+RECOVERY_TMP={shlex.quote(str(tmp_path))}
+CANDIDATE_ROOT={shlex.quote(str(tmp_path))}
+RUNTIME_PYTHON={shlex.quote(str(runtime))}
+PRODUCTION_DB=/unused
+JOINT_LIVE_ADMISSION_RESULT="$RECOVERY_TMP/result.json"
+EVENTS={shlex.quote(str(events))}
+verify_all_local_identity_before_stop() {{ :; }}
+run_joint_admission() {{
+  printf 'admission\n' >> "$EVENTS"
+  printf '{{}}\n' > "$1"
+  chmod 0600 "$1"
+}}
+sleep() {{ :; }}
+stop_bound_close_unit_group() {{ printf 'STOP\n' >> "$EVENTS"; }}
+run_joint_live_admissions() {{
+{live}
+}}
+run_joint_live_admissions
+stop_bound_close_unit_group forbidden
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode != 0
+    assert events.read_text(encoding="utf-8") == "admission\nadmission\n"
+
+
+@pytest.mark.parametrize(
+    ("fail_at", "expected_captures"),
+    [
+        ("batch-1", ["batch-1"]),
+        ("bound-1", ["batch-1", "bound-1"]),
+        ("batch-2", ["batch-1", "bound-1", "batch-2"]),
+    ],
+)
+def test_joint_stopped_capture_refusal_makes_later_captures_unreachable(
+    tmp_path,
+    fail_at,
+    expected_captures,
+):
+    block = _bound_close_read_only_block()
+    stopped = _bound_close_shell_function(block, "run_joint_stopped_phase")
+    events = tmp_path / "events.txt"
+    runtime = tmp_path / "runtime"
+    runtime.write_text("#!/bin/bash\nprintf '{}\\n'\n", encoding="utf-8")
+    runtime.chmod(0o700)
+    (tmp_path / "joint-live-2.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "joint-live-2.json").chmod(0o600)
+    script = f"""
+set -euo pipefail
+umask 077
+RECOVERY_TMP={shlex.quote(str(tmp_path))}
+CANDIDATE_ROOT={shlex.quote(str(tmp_path))}
+RUNTIME_PYTHON={shlex.quote(str(runtime))}
+QUIESCENCE_DEADLINE_EPOCH=9999999999
+JOINT_CAPTURE_ADMISSION_SECONDS=660
+EVENTS={shlex.quote(str(events))}
+FAIL_AT={shlex.quote(fail_at)}
+bound_close_now_epoch() {{ printf '1\n'; }}
+sleep() {{ :; }}
+verify_bound_close_quiescence() {{ :; }}
+verify_all_local_quiescence_and_identity() {{ :; }}
+run_joint_admission() {{ printf '{{}}\n' > "$1"; chmod 0600 "$1"; }}
+run_joint_batch119_capture() {{
+  printf 'batch-%s\n' "$1" >> "$EVENTS"
+  [ "$FAIL_AT" != "batch-$1" ]
+}}
+run_joint_bound_close_capture() {{
+  printf 'bound-%s\n' "$1" >> "$EVENTS"
+  [ "$FAIL_AT" != "bound-$1" ]
+}}
+run_joint_stopped_phase() {{
+{stopped}
+}}
+run_joint_stopped_phase
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode != 0
+    assert events.read_text(encoding="utf-8").splitlines() == expected_captures
+
+
+def test_joint_post_stop_material_drift_makes_all_captures_unreachable(tmp_path):
+    block = _bound_close_read_only_block()
+    stopped = _bound_close_shell_function(block, "run_joint_stopped_phase")
+    events = tmp_path / "events.txt"
+    runtime = tmp_path / "runtime"
+    runtime.write_text(
+        "#!/bin/bash\n"
+        "case \"$(basename \"${1:-module}\")\" in\n"
+        "  compare_bound_close_batch119_joint_admissions.py) exit 2 ;;\n"
+        "  *) printf '{}\\n' ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    runtime.chmod(0o700)
+    (tmp_path / "joint-live-2.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "joint-live-2.json").chmod(0o600)
+    script = f"""
+set -euo pipefail
+umask 077
+RECOVERY_TMP={shlex.quote(str(tmp_path))}
+CANDIDATE_ROOT={shlex.quote(str(tmp_path))}
+RUNTIME_PYTHON={shlex.quote(str(runtime))}
+QUIESCENCE_DEADLINE_EPOCH=9999999999
+JOINT_CAPTURE_ADMISSION_SECONDS=660
+EVENTS={shlex.quote(str(events))}
+bound_close_now_epoch() {{ printf '1\n'; }}
+sleep() {{ :; }}
+verify_bound_close_quiescence() {{ :; }}
+verify_all_local_quiescence_and_identity() {{ :; }}
+run_joint_admission() {{ printf '{{}}\n' > "$1"; chmod 0600 "$1"; }}
+run_joint_batch119_capture() {{ printf 'CAPTURE\n' >> "$EVENTS"; }}
+run_joint_bound_close_capture() {{ printf 'CAPTURE\n' >> "$EVENTS"; }}
+run_joint_stopped_phase() {{
+{stopped}
+}}
+run_joint_stopped_phase
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode != 0
+    assert not events.exists()
 
 
 def _bound_close_diagnostic_validator_function(block: str) -> str:
@@ -1029,7 +1351,7 @@ def test_every_bound_close_recovery_cli_runs_from_production_root():
         "telegram_kol_research.cli recover-bound-position-close-reservations"
     )
 
-    assert section.count(command) == 3
+    assert section.count(command) == 4
     assert section.count('cd "$PRODUCTION_ROOT"') == section.count(command)
 
 
@@ -1378,28 +1700,28 @@ def test_post_stop_writer_check_is_single_shot_without_aging_sleep():
 def test_live_prequiescence_precedes_runner_build_and_every_unit_stop():
     block = _bound_close_read_only_block()
 
-    live_start = block.index("# BEGIN BOUND_CLOSE_LIVE_PREQUIESCENCE")
-    live_end = block.index("# END BOUND_CLOSE_LIVE_PREQUIESCENCE")
+    live_start = block.index("run_joint_live_admissions() {")
+    live_end = block.index("\n}\n", live_start)
     runner_build = block.index(
-        'write_bound_close_capture_runner "$CAPTURE_RUNNER"'
+        'write_joint_stopped_runner "$STOPPED_PHASE_RUNNER"'
     )
     first_stop = block.index("QUIESCE_ATTEMPTED=1")
 
     assert live_start < live_end < runner_build < first_stop
     live = block[live_start:live_end]
     assert "$(( $(bound_close_now_epoch) + 720 ))" in block[live_end:runner_build]
-    assert "local LIVE_PREQUIESCENCE_POLL_SECONDS=15" in block[:live_start]
+    assert "local JOINT_LIVE_POLL_SECONDS=15" in live
     assert "verify_all_local_identity_before_stop" in live
     assert "verify_all_local_quiescence_and_identity" not in live
     assert "stop_bound_close_unit_group" not in live
-    assert "run_bound_close_double_capture" not in live
+    assert "run_joint_batch119_capture" not in live
 
 
 def test_live_and_stopped_writer_stages_share_process_group_hard_deadline():
     block = _bound_close_read_only_block()
 
     live_build = block.index(
-        'write_bound_close_live_prequiescence_runner "$LIVE_PREQUIESCENCE_RUNNER"'
+        'write_joint_live_runner "$LIVE_PREQUIESCENCE_RUNNER"'
     )
     live_run = block.index(
         'run_bound_close_runner_before_deadline \\\n  "$LIVE_PREQUIESCENCE_RUNNER"',
@@ -1407,7 +1729,7 @@ def test_live_and_stopped_writer_stages_share_process_group_hard_deadline():
     )
     first_stop = block.index("QUIESCE_ATTEMPTED=1")
     stopped_build = block.index(
-        'write_bound_close_stopped_phase_runner "$STOPPED_PHASE_RUNNER"'
+        'write_joint_stopped_runner "$STOPPED_PHASE_RUNNER"'
     )
     stopped_run = block.index(
         'run_bound_close_runner_before_deadline \\\n  "$STOPPED_PHASE_RUNNER"',
@@ -1839,7 +2161,7 @@ def test_live_identity_verifier_checks_all_original_unit_states():
 def test_original_unit_state_is_rechecked_immediately_before_first_stop():
     block = _bound_close_read_only_block()
     stopped_runner = block.index(
-        'write_bound_close_stopped_phase_runner "$STOPPED_PHASE_RUNNER"'
+        'write_joint_stopped_runner "$STOPPED_PHASE_RUNNER"'
     )
     first_stop = block.index("QUIESCE_ATTEMPTED=1")
     final_verify = block.rfind(
