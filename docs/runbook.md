@@ -1582,6 +1582,7 @@ QUIESCE_UNITS=(
 declare -A ORIGINAL_UNIT_STATE
 declare -A ORIGINAL_UNIT_INSTALL_STATE
 QUIESCE_ATTEMPTED=0
+BOUND_CLOSE_SAFE_DIAGNOSTIC=''
 ORIGINAL_SHA="$(git -C "$PRODUCTION_ROOT" rev-parse HEAD)"
 PRODUCTION_DB_RESOLVED_PATH="$(readlink -f -- "$PRODUCTION_DB")"
 test -f "$PRODUCTION_DB_RESOLVED_PATH"
@@ -1832,6 +1833,9 @@ finish_bound_close_reservation_window() {
   local cleanup_status=0
   trap - EXIT
   restore_bound_close_reservation_units || cleanup_status=$?
+  if [ -n "$BOUND_CLOSE_SAFE_DIAGNOSTIC" ]; then
+    printf '%s\n' "$BOUND_CLOSE_SAFE_DIAGNOSTIC"
+  fi
   if [ "$cleanup_status" -ne 0 ]; then
     exit "$cleanup_status"
   fi
@@ -2009,19 +2013,188 @@ require_exact_refused_projection() {
   grep -Fq '"status":"refused"' "$1"
 }
 
+validate_bound_close_capture_diagnostic() {
+  local input_path="$1"
+  local capture_status="$2"
+  local output_path="$3"
+  PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" - \
+    "$input_path" "$capture_status" > "$output_path" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+FIELDS = frozenset(
+    {
+        "action_count",
+        "counts",
+        "database_writes",
+        "exchange_writes",
+        "history_replays",
+        "reason_counts",
+        "status",
+    }
+)
+COUNT_FIELDS = frozenset({"active", "proven_terminal", "total", "unknown"})
+REASONS = {
+    "active": frozenset(
+        {
+            "exact_position_currently_live",
+            "exact_close_order_currently_pending",
+            "exact_close_order_nonterminal",
+        }
+    ),
+    "proven_terminal": frozenset({"exact_close_and_position_terminal"}),
+    "unknown": frozenset(
+        {
+            "local_evidence_incomplete",
+            "local_identity_conflict",
+            "exchange_evidence_unavailable",
+            "exchange_schema_invalid",
+            "exchange_identity_conflict",
+            "exchange_history_incomplete",
+            "exchange_capture_timeout",
+            "exchange_response_size_exceeded",
+            "exchange_state_conflict",
+        }
+    ),
+}
+MAX_BYTES = 16_384
+MAX_COUNT = 64
+
+
+class InvalidDiagnostic(ValueError):
+    pass
+
+
+def closed_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if type(key) is not str or key in result:
+            raise InvalidDiagnostic
+        result[key] = value
+    return result
+
+
+try:
+    source = Path(sys.argv[1])
+    cli_status = int(sys.argv[2])
+    if cli_status not in {0, 2} or source.is_symlink() or not source.is_file():
+        raise InvalidDiagnostic
+    raw = source.read_bytes()
+    if not raw or len(raw) > MAX_BYTES:
+        raise InvalidDiagnostic
+    payload = json.loads(
+        raw,
+        object_pairs_hook=closed_object,
+        parse_constant=lambda _value: (_ for _ in ()).throw(InvalidDiagnostic()),
+    )
+    if type(payload) is not dict or set(payload) != FIELDS:
+        raise InvalidDiagnostic
+    counts = payload["counts"]
+    reasons = payload["reason_counts"]
+    if (
+        type(counts) is not dict
+        or set(counts) != COUNT_FIELDS
+        or type(reasons) is not dict
+    ):
+        raise InvalidDiagnostic
+    for value in counts.values():
+        if type(value) is not int or not 0 <= value <= MAX_COUNT:
+            raise InvalidDiagnostic
+    if counts["active"] + counts["proven_terminal"] + counts["unknown"] != counts["total"]:
+        raise InvalidDiagnostic
+    reason_class_counts = {name: 0 for name in REASONS}
+    for reason, value in reasons.items():
+        if type(reason) is not str or type(value) is not int or not 0 < value <= MAX_COUNT:
+            raise InvalidDiagnostic
+        matches = [name for name, allowed in REASONS.items() if reason in allowed]
+        if len(matches) != 1:
+            raise InvalidDiagnostic
+        reason_class_counts[matches[0]] += value
+    if reason_class_counts != {
+        name: counts[name] for name in ("active", "proven_terminal", "unknown")
+    }:
+        raise InvalidDiagnostic
+    if sum(reasons.values()) != counts["total"]:
+        raise InvalidDiagnostic
+    for name in ("database_writes", "exchange_writes", "history_replays"):
+        if type(payload[name]) is not int or payload[name] != 0:
+            raise InvalidDiagnostic
+    action_count = payload["action_count"]
+    if type(action_count) is not int or not 0 <= action_count <= MAX_COUNT:
+        raise InvalidDiagnostic
+    status = payload["status"]
+    if type(status) is not str or status not in {"ready", "refused"}:
+        raise InvalidDiagnostic
+    ready = (
+        counts["total"] > 0
+        and counts["active"] == 0
+        and counts["unknown"] == 0
+        and counts["proven_terminal"] == counts["total"]
+        and action_count == counts["total"]
+    )
+    if ready != (status == "ready") or (not ready and action_count != 0):
+        raise InvalidDiagnostic
+    if (cli_status == 0) != ready:
+        raise InvalidDiagnostic
+except (InvalidDiagnostic, OSError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(2)
+
+sys.stdout.write(
+    json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    + "\n"
+)
+PY
+}
+
 run_bound_close_double_capture() {
   local ATTEMPT
+  local CAPTURE_STATUS
+  local DIAGNOSTIC
+  local DIAGNOSTIC_STATUS
   local RESULT
   local SUMMARY
+  local VALIDATED_DIAGNOSTIC
+  local VALIDATION_STATUS
   for ATTEMPT in 1 2; do
     verify_all_local_quiescence_and_identity
     RESULT="$RECOVERY_TMP/dry-run-${ATTEMPT}.json"
+    set +e
     PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
       telegram_kol_research.cli recover-bound-position-close-reservations \
       --database-path "$PRODUCTION_DB" \
       --generation-database-path "$PRODUCTION_DB" \
       > "$RESULT"
+    CAPTURE_STATUS=$?
+    set -e
     chmod 0600 "$RESULT"
+    DIAGNOSTIC="$RECOVERY_TMP/dry-run-${ATTEMPT}-diagnostic.json"
+    set +e
+    PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
+      "$CANDIDATE_ROOT/scripts/project_bound_close_reservation_recovery_output.py" \
+      capture-diagnostic < "$RESULT" > "$DIAGNOSTIC"
+    DIAGNOSTIC_STATUS=$?
+    set -e
+    chmod 0600 "$DIAGNOSTIC"
+    if [ "$DIAGNOSTIC_STATUS" -ne 0 ]; then
+      BOUND_CLOSE_SAFE_DIAGNOSTIC='{"status":"diagnostic_unavailable"}'
+      return 2
+    fi
+    VALIDATED_DIAGNOSTIC="$RECOVERY_TMP/dry-run-${ATTEMPT}-diagnostic-validated.json"
+    set +e
+    validate_bound_close_capture_diagnostic \
+      "$DIAGNOSTIC" "$CAPTURE_STATUS" "$VALIDATED_DIAGNOSTIC"
+    VALIDATION_STATUS=$?
+    set -e
+    chmod 0600 "$VALIDATED_DIAGNOSTIC"
+    if [ "$VALIDATION_STATUS" -ne 0 ]; then
+      BOUND_CLOSE_SAFE_DIAGNOSTIC='{"status":"diagnostic_unavailable"}'
+      return 2
+    fi
+    BOUND_CLOSE_SAFE_DIAGNOSTIC="$(< "$VALIDATED_DIAGNOSTIC")"
+    if [ "$CAPTURE_STATUS" -eq 2 ]; then
+      return 2
+    fi
     SUMMARY="$RECOVERY_TMP/dry-run-${ATTEMPT}-summary.json"
     PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
       "$CANDIDATE_ROOT/scripts/project_bound_close_reservation_recovery_output.py" \
@@ -2089,6 +2262,14 @@ run_bound_close_double_capture
 reservation 仍必须通过随后两次全新交易所 capture。超时、signal、
 helper error、非法 JSON/投影、unit/进程/SHA/数据库身份漂移都会在
 capture 不可达时退出，并由 trap 恢复原状态。
+
+若任一交易所 capture 返回 `refused`，脚本只保留已经通过 closed parser
+验证的 classification/reason 计数，并且只在服务恢复尝试完成后输出一行脱敏
+diagnostic。该 diagnostic 没有 apply authority，不包含 reservation、仓位、订单、
+消息、指纹、时间戳、provider row、原始错误或凭据。本次窗口授权已经消耗；
+`refused` 或 `diagnostic_unavailable` 都必须先形成新的 reviewed SHA 并重新取得
+两个完整 token，不能在同一窗口重试。原始 capture 文件仍由 trap 删除，不写入
+数据库、journal、仓库或其他持久文件。
 
 比较器必须只输出 `{"status":"stable"}`；其他输出或非零退出均为
 拒绝。两个不同的 private 0600 文件必须都是 `ready`，且语义完全稳定。

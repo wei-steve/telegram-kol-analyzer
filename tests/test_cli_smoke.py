@@ -5035,6 +5035,12 @@ def test_bound_close_recovery_runbook_uses_exact_cli_and_separate_approvals():
         "--authorization",
     ):
         assert option in section
+    assert "capture-diagnostic" in section
+    assert "BOUND_CLOSE_SAFE_DIAGNOSTIC" in section
+    assert "只在服务恢复尝试完成后输出" in section
+    assert "没有 apply authority" in section
+    assert "本次窗口授权已经消耗" in section
+    assert "原始 capture 文件仍由 trap 删除" in section
     assert "c50887b991712340d7d5606fb6916cdbb033926e" in status
     assert (
         "reservation recovery -> Batch119 apply -> stable snapshot -> ordinary "

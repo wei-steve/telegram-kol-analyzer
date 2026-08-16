@@ -632,6 +632,446 @@ def _bound_close_poll_snippet() -> str:
     )[0]
 
 
+def _bound_close_shell_function(block: str, name: str) -> str:
+    return block.split(f"{name}() {{", 1)[1].split("\n}\n", 1)[0]
+
+
+def _bound_close_diagnostic_validator_function(block: str) -> str:
+    body = block.split("validate_bound_close_capture_diagnostic() {", 1)[1]
+    return body.split("\nPY\n}\n", 1)[0] + "\nPY"
+
+
+def test_runbook_refused_capture_prints_diagnostic_only_after_restore(tmp_path):
+    block = _bound_close_read_only_block()
+    capture_function = _bound_close_shell_function(
+        block, "run_bound_close_double_capture"
+    )
+    finish_function = _bound_close_shell_function(
+        block, "finish_bound_close_reservation_window"
+    )
+    validator_function = _bound_close_diagnostic_validator_function(block)
+    recovery_tmp = tmp_path / "recovery"
+    recovery_tmp.mkdir()
+    events = tmp_path / "events.txt"
+    capture_document = tmp_path / "capture.json"
+    capture_document.write_text(
+        _document(
+            started_at=START,
+            observations=(
+                _observation(
+                    classification=ReservationClassification.UNKNOWN,
+                    reason_code="exchange_history_incomplete",
+                ),
+            ),
+        ),
+        encoding="utf-8",
+    )
+    runtime = tmp_path / "runtime-python"
+    runtime.write_text(
+        """#!/bin/bash
+set -euo pipefail
+if [ "${1:-}" = -m ]; then
+  printf 'capture-1\\n' >> "$EVENTS"
+  cat "$CAPTURE_DOCUMENT"
+  exit 2
+fi
+case "${1:-}" in
+  -) exec "$REAL_PYTHON" "$@" ;;
+  *project_bound_close_reservation_recovery_output.py)
+    printf 'project-%s\\n' "${2:-missing}" >> "$EVENTS"
+    exec "$REAL_PYTHON" "$@"
+    ;;
+  *compare_bound_close_reservation_dry_runs.py)
+    printf 'compare\\n' >> "$EVENTS"
+    exec "$REAL_PYTHON" "$@"
+    ;;
+  *) exit 91 ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    runtime.chmod(0o700)
+    project_root = Path(__file__).resolve().parents[1]
+    script = f"""
+set -euo pipefail
+export EVENTS={shlex.quote(str(events))}
+export CAPTURE_DOCUMENT={shlex.quote(str(capture_document))}
+export REAL_PYTHON={shlex.quote(sys.executable)}
+RECOVERY_TMP={shlex.quote(str(recovery_tmp))}
+CANDIDATE_ROOT={shlex.quote(str(project_root))}
+RUNTIME_PYTHON={shlex.quote(str(runtime))}
+PRODUCTION_DB={shlex.quote(str(tmp_path / 'production.db'))}
+BOUND_CLOSE_SAFE_DIAGNOSTIC=''
+verify_all_local_quiescence_and_identity() {{ :; }}
+restore_bound_close_reservation_units() {{
+  printf 'restore\\n'
+  rm -rf -- "$RECOVERY_TMP"
+}}
+finish_bound_close_reservation_window() {{
+{finish_function}
+}}
+validate_bound_close_capture_diagnostic() {{
+{validator_function}
+}}
+run_bound_close_double_capture() {{
+{capture_function}
+}}
+trap finish_bound_close_reservation_window EXIT
+run_bound_close_double_capture
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == (
+        "restore\n"
+        '{"action_count":0,"counts":{"active":0,"proven_terminal":0,'
+        '"total":1,"unknown":1},"database_writes":0,"exchange_writes":0,'
+        '"history_replays":0,"reason_counts":{"exchange_history_incomplete":1},'
+        '"status":"refused"}\n'
+    )
+    assert events.read_text(encoding="utf-8") == (
+        "capture-1\nproject-capture-diagnostic\n"
+    )
+    assert not recovery_tmp.exists()
+    assert result.stderr == ""
+
+
+def _simulate_runbook_capture_failure(
+    tmp_path: Path,
+    *,
+    capture_status: int,
+    capture_document: str,
+    diagnostic_status: int | None = None,
+    diagnostic_output: str | None = None,
+    cleanup_status: int = 0,
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    block = _bound_close_read_only_block()
+    capture_function = _bound_close_shell_function(
+        block, "run_bound_close_double_capture"
+    )
+    finish_function = _bound_close_shell_function(
+        block, "finish_bound_close_reservation_window"
+    )
+    validator_function = _bound_close_diagnostic_validator_function(block)
+    recovery_tmp = tmp_path / "recovery"
+    recovery_tmp.mkdir()
+    events = tmp_path / "events.txt"
+    capture_path = tmp_path / "capture.json"
+    capture_path.write_text(capture_document, encoding="utf-8")
+    diagnostic_path = tmp_path / "diagnostic.json"
+    diagnostic_path.write_text(diagnostic_output or "", encoding="utf-8")
+    runtime = tmp_path / "runtime-python"
+    diagnostic_branch = (
+        "cat \"$DIAGNOSTIC_OUTPUT\"\n"
+        f"    exit {diagnostic_status}"
+        if diagnostic_status is not None
+        else 'exec "$REAL_PYTHON" "$@"'
+    )
+    runtime.write_text(
+        f"""#!/bin/bash
+set -euo pipefail
+if [ "${{1:-}}" = -m ]; then
+  printf 'capture-1\\n' >> "$EVENTS"
+  cat "$CAPTURE_DOCUMENT"
+  exit {capture_status}
+fi
+case "${{1:-}}" in
+  -) exec "$REAL_PYTHON" "$@" ;;
+  *project_bound_close_reservation_recovery_output.py)
+    printf 'project-%s\\n' "${{2:-missing}}" >> "$EVENTS"
+    {diagnostic_branch}
+    ;;
+  *compare_bound_close_reservation_dry_runs.py)
+    printf 'compare\\n' >> "$EVENTS"
+    exec "$REAL_PYTHON" "$@"
+    ;;
+  *) exit 91 ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    runtime.chmod(0o700)
+    project_root = Path(__file__).resolve().parents[1]
+    script = f"""
+set -euo pipefail
+export EVENTS={shlex.quote(str(events))}
+export CAPTURE_DOCUMENT={shlex.quote(str(capture_path))}
+export DIAGNOSTIC_OUTPUT={shlex.quote(str(diagnostic_path))}
+export REAL_PYTHON={shlex.quote(sys.executable)}
+RECOVERY_TMP={shlex.quote(str(recovery_tmp))}
+CANDIDATE_ROOT={shlex.quote(str(project_root))}
+RUNTIME_PYTHON={shlex.quote(str(runtime))}
+PRODUCTION_DB={shlex.quote(str(tmp_path / 'production.db'))}
+BOUND_CLOSE_SAFE_DIAGNOSTIC=''
+verify_all_local_quiescence_and_identity() {{ :; }}
+restore_bound_close_reservation_units() {{
+  printf 'restore\\n'
+  rm -rf -- "$RECOVERY_TMP"
+  return {cleanup_status}
+}}
+finish_bound_close_reservation_window() {{
+{finish_function}
+}}
+validate_bound_close_capture_diagnostic() {{
+{validator_function}
+}}
+run_bound_close_double_capture() {{
+{capture_function}
+}}
+trap finish_bound_close_reservation_window EXIT
+run_bound_close_double_capture
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    return result, events, recovery_tmp
+
+
+@pytest.mark.parametrize(
+    ("capture_status", "document"),
+    [
+        (
+            0,
+            lambda: _document(
+                started_at=START,
+                observations=(
+                    _observation(
+                        classification=ReservationClassification.UNKNOWN,
+                        reason_code="exchange_history_incomplete",
+                    ),
+                ),
+            ),
+        ),
+        (2, lambda: _document(started_at=START)),
+    ],
+)
+def test_runbook_capture_exit_and_document_status_mismatch_is_unavailable(
+    tmp_path,
+    capture_status,
+    document,
+):
+    result, events, recovery_tmp = _simulate_runbook_capture_failure(
+        tmp_path,
+        capture_status=capture_status,
+        capture_document=document(),
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == 'restore\n{"status":"diagnostic_unavailable"}\n'
+    assert "capture-1\n" in events.read_text(encoding="utf-8")
+    assert "compare\n" not in events.read_text(encoding="utf-8")
+    assert not recovery_tmp.exists()
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize("capture_status", [1, 3, 126, 127, 129, 130, 143])
+def test_runbook_unexpected_capture_exit_is_diagnostic_unavailable(
+    tmp_path,
+    capture_status,
+):
+    result, events, recovery_tmp = _simulate_runbook_capture_failure(
+        tmp_path,
+        capture_status=capture_status,
+        capture_document="{",
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == 'restore\n{"status":"diagnostic_unavailable"}\n'
+    assert events.read_text(encoding="utf-8").startswith("capture-1\n")
+    assert "compare\n" not in events.read_text(encoding="utf-8")
+    assert not recovery_tmp.exists()
+    assert result.stderr == ""
+
+
+def test_runbook_projector_failure_is_diagnostic_unavailable(tmp_path):
+    result, events, recovery_tmp = _simulate_runbook_capture_failure(
+        tmp_path,
+        capture_status=2,
+        capture_document="TOPSECRET-RAW-CAPTURE",
+        diagnostic_status=2,
+        diagnostic_output='{"status":"diagnostic_unavailable"}\n',
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == 'restore\n{"status":"diagnostic_unavailable"}\n'
+    assert "TOPSECRET" not in result.stdout
+    assert "compare\n" not in events.read_text(encoding="utf-8")
+    assert not recovery_tmp.exists()
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "diagnostic_output",
+    [
+        "",
+        "{",
+        '{"status":"refused","provider_row":"TOPSECRET"}\n',
+        '{"status":"refused"}' + (" " * 20_000),
+    ],
+)
+def test_runbook_invalid_projector_success_output_is_unavailable(
+    tmp_path,
+    diagnostic_output,
+):
+    result, events, recovery_tmp = _simulate_runbook_capture_failure(
+        tmp_path,
+        capture_status=2,
+        capture_document="TOPSECRET-RAW-CAPTURE",
+        diagnostic_status=0,
+        diagnostic_output=diagnostic_output,
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == 'restore\n{"status":"diagnostic_unavailable"}\n'
+    assert "TOPSECRET" not in result.stdout
+    assert "compare\n" not in events.read_text(encoding="utf-8")
+    assert not recovery_tmp.exists()
+    assert result.stderr == ""
+
+
+def test_runbook_cleanup_failure_stays_nonzero_after_safe_refusal(tmp_path):
+    refused = _document(
+        started_at=START,
+        observations=(
+            _observation(
+                classification=ReservationClassification.UNKNOWN,
+                reason_code="exchange_history_incomplete",
+            ),
+        ),
+    )
+    result, events, recovery_tmp = _simulate_runbook_capture_failure(
+        tmp_path,
+        capture_status=2,
+        capture_document=refused,
+        cleanup_status=7,
+    )
+
+    assert result.returncode == 7
+    assert result.stdout.startswith("restore\n")
+    assert result.stdout.endswith('"status":"refused"}\n')
+    assert "compare\n" not in events.read_text(encoding="utf-8")
+    assert not recovery_tmp.exists()
+    assert result.stderr == ""
+
+
+def test_runbook_two_ready_captures_still_compare_once_and_restore(tmp_path):
+    block = _bound_close_read_only_block()
+    capture_function = _bound_close_shell_function(
+        block, "run_bound_close_double_capture"
+    )
+    finish_function = _bound_close_shell_function(
+        block, "finish_bound_close_reservation_window"
+    )
+    validator_function = _bound_close_diagnostic_validator_function(block)
+    recovery_tmp = tmp_path / "recovery"
+    recovery_tmp.mkdir()
+    events = tmp_path / "events.txt"
+    counter = tmp_path / "counter.txt"
+    counter.write_text("0", encoding="utf-8")
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text(_document(started_at=START), encoding="utf-8")
+    second.write_text(
+        _document(started_at=START + timedelta(minutes=2)), encoding="utf-8"
+    )
+    runtime = tmp_path / "runtime-python"
+    runtime.write_text(
+        """#!/bin/bash
+set -euo pipefail
+if [ "${1:-}" = -m ]; then
+  count="$(cat "$CAPTURE_COUNTER")"
+  count=$((count + 1))
+  printf '%s' "$count" > "$CAPTURE_COUNTER"
+  printf 'capture-%s\n' "$count" >> "$EVENTS"
+  case "$count" in
+    1) cat "$CAPTURE_DOCUMENT_1" ;;
+    2) cat "$CAPTURE_DOCUMENT_2" ;;
+    *) exit 92 ;;
+  esac
+  exit 0
+fi
+case "${1:-}" in
+  -) exec "$REAL_PYTHON" "$@" ;;
+  *project_bound_close_reservation_recovery_output.py)
+    printf 'project-%s\n' "${2:-missing}" >> "$EVENTS"
+    exec "$REAL_PYTHON" "$@"
+    ;;
+  *compare_bound_close_reservation_dry_runs.py)
+    printf 'compare\n' >> "$EVENTS"
+    exec "$REAL_PYTHON" "$@"
+    ;;
+  *) exit 91 ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    runtime.chmod(0o700)
+    project_root = Path(__file__).resolve().parents[1]
+    script = f"""
+set -euo pipefail
+export EVENTS={shlex.quote(str(events))}
+export CAPTURE_COUNTER={shlex.quote(str(counter))}
+export CAPTURE_DOCUMENT_1={shlex.quote(str(first))}
+export CAPTURE_DOCUMENT_2={shlex.quote(str(second))}
+export REAL_PYTHON={shlex.quote(sys.executable)}
+RECOVERY_TMP={shlex.quote(str(recovery_tmp))}
+CANDIDATE_ROOT={shlex.quote(str(project_root))}
+RUNTIME_PYTHON={shlex.quote(str(runtime))}
+PRODUCTION_DB={shlex.quote(str(tmp_path / 'production.db'))}
+BOUND_CLOSE_SAFE_DIAGNOSTIC=''
+verify_all_local_quiescence_and_identity() {{ :; }}
+restore_bound_close_reservation_units() {{
+  printf 'restore\\n'
+  rm -rf -- "$RECOVERY_TMP"
+}}
+finish_bound_close_reservation_window() {{
+{finish_function}
+}}
+validate_bound_close_capture_diagnostic() {{
+{validator_function}
+}}
+run_bound_close_double_capture() {{
+{capture_function}
+}}
+trap finish_bound_close_reservation_window EXIT
+run_bound_close_double_capture
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith('{"status":"stable"}\nrestore\n')
+    assert result.stdout.endswith('"status":"ready"}\n')
+    assert events.read_text(encoding="utf-8") == (
+        "capture-1\n"
+        "project-capture-diagnostic\n"
+        "project-capture\n"
+        "capture-2\n"
+        "project-capture-diagnostic\n"
+        "project-capture\n"
+        "compare\n"
+    )
+    assert not recovery_tmp.exists()
+    assert result.stderr == ""
+
+
 def test_runbook_quiescence_poll_is_bounded_and_capture_is_ready_gated():
     block = _bound_close_read_only_block()
 
