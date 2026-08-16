@@ -4688,6 +4688,56 @@ def test_bound_close_recovery_cli_emits_only_exact_canonical_dry_run(
     assert calls[0][1] == database_path.resolve()
 
 
+def test_bound_close_recovery_cli_initial_capture_deadline_is_180_seconds(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+
+    database_path = tmp_path / "recovery.sqlite3"
+    database_path.touch()
+    _plan, capture = _bound_close_recovery_cli_plan()
+    source = object()
+    reader = object()
+    received_deadlines = []
+
+    monkeypatch.setattr(
+        cli_module,
+        "load_bound_close_reservation_source",
+        lambda _path: source,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_bound_close_reservation_exchange_reader_from_env",
+        lambda: reader,
+        raising=False,
+    )
+    monkeypatch.setattr(cli_module.time, "monotonic", lambda: 100.0)
+
+    def capture_once(received_source, received_reader, *, deadline_monotonic):
+        assert received_source is source
+        assert received_reader is reader
+        received_deadlines.append(deadline_monotonic)
+        return capture
+
+    monkeypatch.setattr(
+        cli_module,
+        "capture_and_seal_bound_close_reservation_recovery",
+        capture_once,
+        raising=False,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        _bound_close_recovery_cli_args(database_path),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout == capture.serialized_plan + "\n"
+    assert received_deadlines == [280.0]
+
+
 def test_bound_close_recovery_cli_apply_requires_all_gates_and_same_path_before_reads(
     tmp_path,
     monkeypatch,
@@ -4846,6 +4896,7 @@ def test_bound_close_recovery_cli_narrowly_recaptures_an_ambiguous_postapply(
     postapply_capture = SimpleNamespace(plan=plan, serialized_plan="postapply")
     readers = iter((object(), object()))
     apply_captures = []
+    initial_deadlines = []
     recaptures = []
     monkeypatch.setattr(
         cli_module,
@@ -4859,10 +4910,21 @@ def test_bound_close_recovery_cli_narrowly_recaptures_an_ambiguous_postapply(
         lambda: next(readers),
         raising=False,
     )
+    monotonic_values = iter((100.0, 200.0))
+    monkeypatch.setattr(
+        cli_module.time,
+        "monotonic",
+        lambda: next(monotonic_values),
+    )
+
+    def fake_initial_capture(source, reader, **kwargs):
+        initial_deadlines.append(kwargs["deadline_monotonic"])
+        return first_capture
+
     monkeypatch.setattr(
         cli_module,
         "capture_and_seal_bound_close_reservation_recovery",
-        lambda source, reader, **kwargs: first_capture,
+        fake_initial_capture,
         raising=False,
     )
 
@@ -4917,6 +4979,9 @@ def test_bound_close_recovery_cli_narrowly_recaptures_an_ambiguous_postapply(
     assert apply_captures == [first_capture, postapply_capture]
     assert recaptures[0][0] == database_path.resolve()
     assert recaptures[0][1]["approved_plan"] is plan
+    assert initial_deadlines == [280.0]
+    assert recaptures[0][1]["deadline_monotonic"] == 380.0
+    assert recaptures[0][1]["deadline_monotonic"] != initial_deadlines[0]
 
 
 @pytest.mark.parametrize(
