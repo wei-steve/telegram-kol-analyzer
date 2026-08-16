@@ -4665,6 +4665,7 @@ def test_joint_recovery_admission_cli_emits_canonical_private_document(
     calls = []
     authority = JointRecoveryMaterialAuthority(
         material_fingerprint="a" * 64,
+        batch119_material_fingerprint="b" * 64,
         reservation_count=29,
         batch119_incident_count=1,
         blocking_writer_count=0 if ready else 1,
@@ -4693,6 +4694,7 @@ def test_joint_recovery_admission_cli_emits_canonical_private_document(
     payload = json.loads(result.stdout)
     assert set(payload) == {
         "batch119_incident_count",
+        "batch119_material_fingerprint",
         "blocking_writer_count",
         "capture_completed_at",
         "capture_id",

@@ -4592,6 +4592,60 @@ def test_apply_authorizer_denies_unplanned_table_write_and_rolls_back(
     ]
 
 
+def test_apply_authorizer_denies_batch119_write_during_transaction_seam(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE strategy_management_batches "
+            "(id INTEGER PRIMARY KEY, reason_code TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO strategy_management_batches (id, reason_code) "
+            "VALUES (119, 'false_submission')"
+        )
+        connection.commit()
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+    real_execute = recovery_module._execute_bound_close_reservation_apply_statement
+    attempted = False
+
+    def attempt_batch119_write(connection, sql, parameters=()):
+        nonlocal attempted
+        if not attempted:
+            attempted = True
+            connection.execute(
+                "UPDATE strategy_management_batches "
+                "SET reason_code = 'unauthorized' WHERE id = 119"
+            )
+        return real_execute(connection, sql, parameters)
+
+    monkeypatch.setattr(
+        recovery_module,
+        "_execute_bound_close_reservation_apply_statement",
+        attempt_batch119_write,
+    )
+
+    with pytest.raises(
+        BoundCloseReservationRecoveryConflict,
+        match="transaction",
+    ):
+        _apply_ready(database, capture)
+
+    assert attempted is True
+    assert _table_rows(database, "strategy_management_batches") == [
+        {"id": 119, "reason_code": "false_submission"}
+    ]
+    assert _table_rows(database, "bound_position_close_reservations")[0][
+        "status"
+    ] == "submitted"
+    assert not [
+        row
+        for row in _table_rows(database, "execution_events")
+        if row["action"] == "bound_close_reservation_history_converged"
+    ]
+
+
 @pytest.mark.parametrize("pragma_name", ["user_version", "application_id"])
 def test_apply_authorizer_denies_header_pragma_write_and_rolls_back(
     tmp_path, monkeypatch, pragma_name

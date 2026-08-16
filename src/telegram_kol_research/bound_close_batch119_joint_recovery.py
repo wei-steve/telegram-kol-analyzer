@@ -56,6 +56,7 @@ _MAX_TARGET_ROWS = 64
 @dataclass(frozen=True, slots=True)
 class JointRecoveryMaterialAuthority:
     material_fingerprint: str
+    batch119_material_fingerprint: str
     reservation_count: int
     batch119_incident_count: int
     blocking_writer_count: int
@@ -69,6 +70,9 @@ def _refused(
     return JointRecoveryMaterialAuthority(
         material_fingerprint=_fingerprint(
             {"schema_version": 1, "status": "refused"}
+        ),
+        batch119_material_fingerprint=_fingerprint(
+            {"schema_version": 1, "batch119_status": "unavailable"}
         ),
         reservation_count=0,
         batch119_incident_count=0,
@@ -310,10 +314,14 @@ def inspect_joint_recovery_material_authority(
                     "reservation_source": reservation_source_material,
                 }
             )
+            batch119_material_fingerprint = _fingerprint(
+                {"schema_version": 1, "batch119": local.payload}
+            )
             session.rollback()
         if blocking != 0:
             return JointRecoveryMaterialAuthority(
                 material_fingerprint=material_fingerprint,
+                batch119_material_fingerprint=batch119_material_fingerprint,
                 reservation_count=reservation_count,
                 batch119_incident_count=1,
                 blocking_writer_count=blocking,
@@ -322,6 +330,7 @@ def inspect_joint_recovery_material_authority(
             )
         return JointRecoveryMaterialAuthority(
             material_fingerprint=material_fingerprint,
+            batch119_material_fingerprint=batch119_material_fingerprint,
             reservation_count=reservation_count,
             batch119_incident_count=1,
             blocking_writer_count=0,

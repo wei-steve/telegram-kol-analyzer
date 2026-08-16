@@ -28,6 +28,7 @@ _PHASES = frozenset(
 _KEYS = frozenset(
     {
         "batch119_incident_count",
+        "batch119_material_fingerprint",
         "blocking_writer_count",
         "capture_completed_at",
         "capture_id",
@@ -127,6 +128,8 @@ def _parse_document_bytes(raw: bytes) -> tuple[dict[str, Any], datetime, datetim
         or _HEX_64.fullmatch(value["capture_id"]) is None
         or type(value["material_fingerprint"]) is not str
         or _HEX_64.fullmatch(value["material_fingerprint"]) is None
+        or type(value["batch119_material_fingerprint"]) is not str
+        or _HEX_64.fullmatch(value["batch119_material_fingerprint"]) is None
     ):
         raise JointAdmissionRefused("invalid authority")
     started = _utc_timestamp(value["capture_started_at"])
@@ -234,6 +237,8 @@ def _admissions_are_stable(paths: Sequence[str]) -> bool:
         or second_completed < second_started
         or first["phase"] != second["phase"]
         or first["material_fingerprint"] != second["material_fingerprint"]
+        or first["batch119_material_fingerprint"]
+        != second["batch119_material_fingerprint"]
         or any(
             first[field] != second[field]
             for field in (
@@ -251,10 +256,48 @@ def _admissions_are_stable(paths: Sequence[str]) -> bool:
     return True
 
 
+def _bound_apply_transition_is_stable(paths: Sequence[str]) -> bool:
+    if type(paths) not in {list, tuple} or len(paths) != 2:
+        raise JointAdmissionRefused("exactly two files required")
+    first_raw, first_identity = _read_private_file(paths[0])
+    second_raw, second_identity = _read_private_file(paths[1])
+    if first_identity[:2] == second_identity[:2]:
+        raise JointAdmissionRefused("files repeated")
+    first, _first_started, first_completed = _parse_document_bytes(first_raw)
+    second, second_started, second_completed = _parse_document_bytes(second_raw)
+    if (
+        first["phase"] != "bound_apply_pre"
+        or second["phase"] != "bound_apply_post"
+        or first["capture_id"] == second["capture_id"]
+        or first_completed >= second_started
+        or second_completed < second_started
+        or first["material_fingerprint"] == second["material_fingerprint"]
+        or first["batch119_material_fingerprint"]
+        != second["batch119_material_fingerprint"]
+        or any(
+            first[field] != second[field]
+            for field in (
+                "reservation_count",
+                "batch119_incident_count",
+                "blocking_writer_count",
+                "status",
+                "reason_code",
+            )
+        )
+    ):
+        raise JointAdmissionRefused("bound apply authority drifted")
+    _revalidate_private_path(paths[0], first_identity)
+    _revalidate_private_path(paths[1], second_identity)
+    return True
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     paths = list(sys.argv[1:] if argv is None else argv)
     try:
-        stable = _admissions_are_stable(paths)
+        if paths[:1] == ["--bound-apply-transition"]:
+            stable = _bound_apply_transition_is_stable(paths[1:])
+        else:
+            stable = _admissions_are_stable(paths)
     except (OSError, TypeError, ValueError, OverflowError, RecursionError):
         stable = False
     sys.stdout.write(_STABLE if stable else _REFUSED)

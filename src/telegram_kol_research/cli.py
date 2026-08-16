@@ -5632,6 +5632,10 @@ def inspect_bound_close_batch119_joint_recovery(
             r"[0-9a-f]{64}", authority.material_fingerprint
         )
         is not None
+        and re.fullmatch(
+            r"[0-9a-f]{64}", authority.batch119_material_fingerprint
+        )
+        is not None
         and all(type(value) is int and value >= 0 for value in counts)
         and authority.status in {"ready", "refused"}
         and (
@@ -5669,6 +5673,9 @@ def inspect_bound_close_batch119_joint_recovery(
     emit(
         {
             "batch119_incident_count": authority.batch119_incident_count,
+            "batch119_material_fingerprint": (
+                authority.batch119_material_fingerprint
+            ),
             "blocking_writer_count": authority.blocking_writer_count,
             "capture_completed_at": capture_completed_at.isoformat(),
             "capture_id": capture_id,

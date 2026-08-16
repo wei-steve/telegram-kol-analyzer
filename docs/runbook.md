@@ -1809,16 +1809,16 @@ verify_bound_close_unit_group_live_state() {
 }
 
 verify_bound_close_quiescence() {
-  discover_bound_close_db_stage_units "$DB_STAGE_CURRENT_INVENTORY"
-  cmp -s "$DB_STAGE_INITIAL_INVENTORY" "$DB_STAGE_CURRENT_INVENTORY"
-  verify_bound_close_unit_group_inactive "${QUIESCE_TIMER_UNITS[@]}"
-  verify_bound_close_unit_group_inactive "${QUIESCE_SERVICE_UNITS[@]}"
-  verify_bound_close_unit_group_inactive "${QUIESCE_SOCKET_UNITS[@]}"
+  discover_bound_close_db_stage_units "$DB_STAGE_CURRENT_INVENTORY" || return 1
+  cmp -s "$DB_STAGE_INITIAL_INVENTORY" "$DB_STAGE_CURRENT_INVENTORY" || return 1
+  verify_bound_close_unit_group_inactive "${QUIESCE_TIMER_UNITS[@]}" || return 1
+  verify_bound_close_unit_group_inactive "${QUIESCE_SERVICE_UNITS[@]}" || return 1
+  verify_bound_close_unit_group_inactive "${QUIESCE_SOCKET_UNITS[@]}" || return 1
 }
 
 verify_all_local_quiescence_and_identity() {
   local PROCESS_SCAN_STATUS
-  verify_bound_close_quiescence
+  verify_bound_close_quiescence || return 1
   if pgrep -f '[t]elegram_kol_research|[t]elegram-kol' >/dev/null; then
     PROCESS_SCAN_STATUS=0
   else
@@ -1829,18 +1829,18 @@ verify_all_local_quiescence_and_identity() {
     1) ;;
     *) return 1 ;;
   esac
-  [ "$(git -C "$PRODUCTION_ROOT" rev-parse HEAD)" = "$ORIGINAL_SHA" ]
+  [ "$(git -C "$PRODUCTION_ROOT" rev-parse HEAD)" = "$ORIGINAL_SHA" ] || return 1
   [ "$(readlink -f -- "$PRODUCTION_DB")" = \
-    "$PRODUCTION_DB_RESOLVED_PATH" ]
+    "$PRODUCTION_DB_RESOLVED_PATH" ] || return 1
   [ "$(stat -Lc '%d:%i' -- "$PRODUCTION_DB")" = \
-    "$PRODUCTION_DB_DEVICE_INODE" ]
+    "$PRODUCTION_DB_DEVICE_INODE" ] || return 1
 }
 
 verify_all_local_identity_before_stop() {
   local PROCESS_SCAN_STATUS
-  discover_bound_close_db_stage_units "$DB_STAGE_CURRENT_INVENTORY"
-  cmp -s "$DB_STAGE_INITIAL_INVENTORY" "$DB_STAGE_CURRENT_INVENTORY"
-  verify_bound_close_unit_group_live_state "${QUIESCE_UNITS[@]}"
+  discover_bound_close_db_stage_units "$DB_STAGE_CURRENT_INVENTORY" || return 1
+  cmp -s "$DB_STAGE_INITIAL_INVENTORY" "$DB_STAGE_CURRENT_INVENTORY" || return 1
+  verify_bound_close_unit_group_live_state "${QUIESCE_UNITS[@]}" || return 1
   if pgrep -f '[t]elegram_kol_research|[t]elegram-kol' >/dev/null; then
     PROCESS_SCAN_STATUS=0
   else
@@ -1850,11 +1850,11 @@ verify_all_local_identity_before_stop() {
     0|1) ;;
     *) return 1 ;;
   esac
-  [ "$(git -C "$PRODUCTION_ROOT" rev-parse HEAD)" = "$ORIGINAL_SHA" ]
+  [ "$(git -C "$PRODUCTION_ROOT" rev-parse HEAD)" = "$ORIGINAL_SHA" ] || return 1
   [ "$(readlink -f -- "$PRODUCTION_DB")" = \
-    "$PRODUCTION_DB_RESOLVED_PATH" ]
+    "$PRODUCTION_DB_RESOLVED_PATH" ] || return 1
   [ "$(stat -Lc '%d:%i' -- "$PRODUCTION_DB")" = \
-    "$PRODUCTION_DB_DEVICE_INODE" ]
+    "$PRODUCTION_DB_DEVICE_INODE" ] || return 1
 }
 
 restore_bound_close_reservation_units() {
@@ -2877,13 +2877,31 @@ test "${BOUND_CLOSE_APPLY_AUTHORIZATION:-}" = "$APPLY_AUTHORIZATION"
 ```
 
 所有 unit 精确 inactive、未知进程为零、其他 durable writer 为零之后，
-先建立可验证备份。`BACKUP_PATH` 必须是全新文件，不得覆盖旧备份：
+先用当前停服数据库生成一份全新 `bound_apply_pre` 联合 authority。
+它只是本窗口的新鲜只读入场证明，不得使用诊断窗口的文件、
+capture ID、fingerprint 或 capability：
+
+```bash
+BOUND_APPLY_PRE="$RECOVERY_TMP/bound-apply-pre.json"
+verify_all_local_quiescence_and_identity
+PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
+  telegram_kol_research.cli \
+  inspect-bound-close-batch119-joint-recovery \
+  --database-path "$PRODUCTION_DB" \
+  --phase bound_apply_pre > "$BOUND_APPLY_PRE"
+chmod 0600 "$BOUND_APPLY_PRE"
+verify_all_local_quiescence_and_identity
+```
+
+只有该命令以 `ready`/exit 0 返回精确 29 条 target、1 个 Batch 119 incident
+与 0 个额外 writer 才能继续。然后建立可验证备份。`BACKUP_PATH` 必须是
+全新文件，不得覆盖旧备份：
 
 ```bash
 BACKUP_DIR="$PRODUCTION_ROOT/data/backups"
 BACKUP_PATH="$BACKUP_DIR/research-before-bound-close-reservation-apply-$(date -u +%Y%m%dT%H%M%SZ).db"
 test ! -e "$BACKUP_PATH"
-sqlite3 "$PRODUCTION_DB" ".backup '$BACKUP_PATH'"
+sqlite3 -readonly "$PRODUCTION_DB" ".backup '$BACKUP_PATH'"
 chmod 0600 "$BACKUP_PATH"
 test "$(stat -c '%a' "$BACKUP_PATH")" = 600
 test "$(sqlite3 -readonly "$BACKUP_PATH" 'PRAGMA quick_check;')" = ok
@@ -2910,7 +2928,29 @@ chmod 0600 "$APPLY_CAPTURE_SUMMARY"
 
 人工只审阅这次 capture 的 ready 状态、classification counts 和三个
 fingerprint。如果不是全部 `PROVEN_TERMINAL`，或与已批准范围不符，立即
-退出并由 trap 恢复服务。通过后，从 private 文件中取得而不回显
+退出并由 trap 恢复服务。通过后，在任何写事务可达之前再取一份
+全新 `bound_apply_pre` authority，并证明它与本窗口第一份 pre authority
+完全稳定：
+
+```bash
+BOUND_APPLY_PRE_FINAL="$RECOVERY_TMP/bound-apply-pre-final.json"
+verify_all_local_quiescence_and_identity
+PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
+  telegram_kol_research.cli \
+  inspect-bound-close-batch119-joint-recovery \
+  --database-path "$PRODUCTION_DB" \
+  --phase bound_apply_pre > "$BOUND_APPLY_PRE_FINAL"
+chmod 0600 "$BOUND_APPLY_PRE_FINAL"
+PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
+  "$CANDIDATE_ROOT/scripts/compare_bound_close_batch119_joint_admissions.py" \
+  "$BOUND_APPLY_PRE" "$BOUND_APPLY_PRE_FINAL" > \
+  "$RECOVERY_TMP/bound-apply-pre-comparison.json"
+chmod 0600 "$RECOVERY_TMP/bound-apply-pre-comparison.json"
+verify_all_local_quiescence_and_identity
+```
+
+两份 pre authority 的 material/count/capture-window 任一不稳定，apply CLI 都不可达。
+通过后，从 private 文件中取得而不回显
 `<fresh-evidence-fingerprint>`、`<exact-action-count>` 和
 `<fresh-confirmation-token>`，完整执行一次 CLI：
 
@@ -2974,6 +3014,28 @@ if [ "$QUICK_CHECK_READ_STATUS" -eq 0 ]; then
   QUICK_CHECK_MATCH_STATUS=$?
 fi
 
+BOUND_APPLY_POST="$RECOVERY_TMP/bound-apply-post.json"
+verify_all_local_quiescence_and_identity
+BOUND_APPLY_POST_IDENTITY_BEFORE_STATUS=$?
+PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
+  telegram_kol_research.cli \
+  inspect-bound-close-batch119-joint-recovery \
+  --database-path "$PRODUCTION_DB" \
+  --phase bound_apply_post > "$BOUND_APPLY_POST"
+BOUND_APPLY_POST_STATUS=$?
+chmod 0600 "$BOUND_APPLY_POST"
+BOUND_APPLY_POST_CHMOD_STATUS=$?
+BOUND_APPLY_TRANSITION="$RECOVERY_TMP/bound-apply-transition.json"
+PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
+  "$CANDIDATE_ROOT/scripts/compare_bound_close_batch119_joint_admissions.py" \
+  --bound-apply-transition "$BOUND_APPLY_PRE" "$BOUND_APPLY_POST" > \
+  "$BOUND_APPLY_TRANSITION"
+BOUND_APPLY_TRANSITION_STATUS=$?
+chmod 0600 "$BOUND_APPLY_TRANSITION"
+BOUND_APPLY_TRANSITION_CHMOD_STATUS=$?
+verify_all_local_quiescence_and_identity
+BOUND_APPLY_POST_IDENTITY_AFTER_STATUS=$?
+
 APPLY_COMBINED_STATUS=0
 for STATUS in \
   "$APPLY_CLI_STATUS" \
@@ -2982,7 +3044,13 @@ for STATUS in \
   "$POSTCHECK_READ_STATUS" \
   "$POSTCHECK_MATCH_STATUS" \
   "$QUICK_CHECK_READ_STATUS" \
-  "$QUICK_CHECK_MATCH_STATUS"
+  "$QUICK_CHECK_MATCH_STATUS" \
+  "$BOUND_APPLY_POST_STATUS" \
+  "$BOUND_APPLY_POST_CHMOD_STATUS" \
+  "$BOUND_APPLY_TRANSITION_STATUS" \
+  "$BOUND_APPLY_TRANSITION_CHMOD_STATUS" \
+  "$BOUND_APPLY_POST_IDENTITY_BEFORE_STATUS" \
+  "$BOUND_APPLY_POST_IDENTITY_AFTER_STATUS"
 do
   if [ "$STATUS" -ne 0 ]; then
     APPLY_COMBINED_STATUS=1
@@ -2997,7 +3065,11 @@ fi
 上述必须作为一个完整 shell block 执行。apply 一旦启动，临时关闭
 errexit 并立即保存 CLI、projector/summary write 和 chmod 的状态；无论
 任何一项是否失败，都必须先完成 exact query-only postcheck 与
-`quick_check`，然后才综合退出并由 trap 恢复服务。这避免“数据库已提交，
+`quick_check`，再用新 CLI 进程读取 `bound_apply_post`。pre/post 比较器允许
+reservation 从待收敛状态变为精确 29 条 `confirmed`，但必须证明独立的
+Batch 119 material fingerprint 完全一致。它不接受操作员手填的 fingerprint；
+两份 fingerprint 均直接由 query-only Task 2 loader 签发。完成联合 post authority
+和最后身份核验后，才可综合退出并由 trap 恢复服务。这避免“数据库已提交，
 但输出投影或文件权限失败”时跳过必须的提交后检查。
 
 上述 pipe 在内存中严格验证 CLI 的六个固定字段，但只持久化

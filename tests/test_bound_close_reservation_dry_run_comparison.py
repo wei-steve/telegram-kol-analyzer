@@ -681,6 +681,76 @@ def _bound_close_read_only_block() -> str:
     return section.split("```bash", 1)[1].split("```", 1)[0]
 
 
+def _bound_close_apply_section() -> str:
+    project_root = Path(__file__).resolve().parents[1]
+    runbook = (project_root / "docs" / "runbook.md").read_text(encoding="utf-8")
+    section = runbook.split(
+        "## Bound position close reservation convergence", 1
+    )[1].split("## Batch 119 composite-management recovery", 1)[0]
+    return section.split("### 窗口二：单独授权的 apply", 1)[1]
+
+
+def test_bound_apply_window_uses_fresh_joint_pre_and_post_authority():
+    apply = _bound_close_apply_section()
+    pre = apply.index("--phase bound_apply_pre")
+    capture = apply.index('APPLY_CAPTURE="$RECOVERY_TMP/apply-capture.json"')
+    final_pre = apply.index("--phase bound_apply_pre", pre + 1)
+    pre_comparison = apply.index(
+        '"$BOUND_APPLY_PRE" "$BOUND_APPLY_PRE_FINAL"', final_pre
+    )
+    mutation = apply.index("--apply", pre_comparison)
+    post = apply.index("--phase bound_apply_post", mutation)
+    comparison = apply.index("--bound-apply-transition", post)
+    success = apply.index("APPLY_COMBINED_STATUS", comparison)
+
+    assert pre < capture < final_pre < pre_comparison < mutation < post < comparison < success
+    assert apply.count("inspect-bound-close-batch119-joint-recovery") == 3
+    assert "compare_bound_close_batch119_joint_admissions.py" in apply
+    assert "joint_diagnostic" not in apply
+    assert "joint-live-" not in apply
+    assert "joint-post-stop" not in apply
+
+
+def test_bound_apply_post_authority_is_checked_before_success_on_every_outcome():
+    apply = _bound_close_apply_section()
+    apply_start = apply.index('APPLY_SUMMARY="$RECOVERY_TMP/apply-summary.json"')
+    post_start = apply.index(
+        'BOUND_APPLY_POST="$RECOVERY_TMP/bound-apply-post.json"', apply_start
+    )
+    post = apply.index("--phase bound_apply_post", apply_start)
+    combined = apply.index("APPLY_COMBINED_STATUS", post)
+    status_loop = apply.index('for STATUS in \\', combined)
+
+    assert apply.index("set +e", apply_start) < post
+    assert "BOUND_APPLY_POST_STATUS" in apply[post_start:status_loop]
+    assert "BOUND_APPLY_TRANSITION_STATUS" in apply[post_start:status_loop]
+    assert "BOUND_APPLY_POST_IDENTITY_BEFORE_STATUS" in apply[post_start:status_loop]
+    assert "BOUND_APPLY_POST_IDENTITY_AFTER_STATUS" in apply[post_start:status_loop]
+    assert '"$BOUND_APPLY_POST_STATUS"' in apply[status_loop:]
+    assert '"$BOUND_APPLY_TRANSITION_STATUS"' in apply[status_loop:]
+    assert '"$BOUND_APPLY_POST_IDENTITY_BEFORE_STATUS"' in apply[status_loop:]
+    assert '"$BOUND_APPLY_POST_IDENTITY_AFTER_STATUS"' in apply[status_loop:]
+    assert "--apply" not in apply[post:]
+    assert "recover-composite-management-batch" not in apply
+
+
+def test_bound_apply_joint_documents_are_private_and_not_reused_from_diagnostic():
+    apply = _bound_close_apply_section()
+
+    assert 'BOUND_APPLY_PRE="$RECOVERY_TMP/bound-apply-pre.json"' in apply
+    assert (
+        'BOUND_APPLY_PRE_FINAL="$RECOVERY_TMP/bound-apply-pre-final.json"'
+        in apply
+    )
+    assert 'BOUND_APPLY_POST="$RECOVERY_TMP/bound-apply-post.json"' in apply
+    assert 'chmod 0600 "$BOUND_APPLY_PRE"' in apply
+    assert 'chmod 0600 "$BOUND_APPLY_PRE_FINAL"' in apply
+    assert 'chmod 0600 "$BOUND_APPLY_POST"' in apply
+    assert "I_APPROVE_BOUND_CLOSE_BATCH119_ALL_DB_UNITS_STOPPED" not in apply
+    assert "BOUND_CLOSE_APPLY_AUTHORIZATION" in apply
+    assert 'sqlite3 -readonly "$PRODUCTION_DB" ".backup' in apply
+
+
 def _bound_close_poll_snippet() -> str:
     block = _bound_close_read_only_block()
     return block.split("# BEGIN BOUND_CLOSE_QUIESCENCE_POLL", 1)[1].split(
@@ -697,6 +767,48 @@ def _bound_close_live_prequiescence_snippet() -> str:
 
 def _bound_close_shell_function(block: str, name: str) -> str:
     return block.split(f"{name}() {{", 1)[1].split("\n}\n", 1)[0]
+
+
+@pytest.mark.parametrize("failed_check", ["quiescence", "sha", "path"])
+def test_stopped_identity_helper_fails_closed_without_errexit(failed_check):
+    body = _bound_close_shell_function(
+        _bound_close_read_only_block(),
+        "verify_all_local_quiescence_and_identity",
+    )
+    expected_sha = "a" * 40
+    actual_sha = "b" * 40 if failed_check == "sha" else expected_sha
+    expected_path = "/srv/production.sqlite3"
+    actual_path = "/srv/replaced.sqlite3" if failed_check == "path" else expected_path
+    quiescence_status = 1 if failed_check == "quiescence" else 0
+    script = f"""
+set +e
+verify_bound_close_quiescence() {{ return {quiescence_status}; }}
+pgrep() {{ return 1; }}
+git() {{ printf '%s\\n' '{actual_sha}'; }}
+readlink() {{ printf '%s\\n' '{actual_path}'; }}
+stat() {{ printf '%s\\n' '7:11'; }}
+PRODUCTION_ROOT=/srv/app
+PRODUCTION_DB=/srv/production.sqlite3
+ORIGINAL_SHA='{expected_sha}'
+PRODUCTION_DB_RESOLVED_PATH='{expected_path}'
+PRODUCTION_DB_DEVICE_INODE='7:11'
+verify_all_local_quiescence_and_identity() {{{body}
+}}
+verify_all_local_quiescence_and_identity
+STATUS=$?
+exit "$STATUS"
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert result.stderr == ""
 
 
 def test_joint_window_requires_new_exact_approval_and_disclaims_mutation():

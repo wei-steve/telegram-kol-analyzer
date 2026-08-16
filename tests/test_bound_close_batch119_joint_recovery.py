@@ -41,6 +41,16 @@ NOW = _COMPOSITE_TEST_SUPPORT.NOW
 _seed_batch_119_false_submission = (
     _COMPOSITE_TEST_SUPPORT._seed_batch_119_false_submission
 )
+_RECOVERY_TEST_PATH = Path(__file__).with_name(
+    "test_bound_close_reservation_recovery.py"
+)
+_RECOVERY_TEST_SPEC = importlib.util.spec_from_file_location(
+    "_joint_bound_close_test_support", _RECOVERY_TEST_PATH
+)
+assert _RECOVERY_TEST_SPEC is not None
+assert _RECOVERY_TEST_SPEC.loader is not None
+_RECOVERY_TEST_SUPPORT = importlib.util.module_from_spec(_RECOVERY_TEST_SPEC)
+_RECOVERY_TEST_SPEC.loader.exec_module(_RECOVERY_TEST_SUPPORT)
 
 
 def _seed_joint_incident(tmp_path):
@@ -169,6 +179,7 @@ def test_exact_joint_incident_is_ready_and_public_projection_is_aggregate(tmp_pa
     assert len(result.material_fingerprint) == 64
     assert set(asdict(result)) == {
         "batch119_incident_count",
+        "batch119_material_fingerprint",
         "blocking_writer_count",
         "material_fingerprint",
         "reason_code",
@@ -473,6 +484,8 @@ def test_reservation_nonheartbeat_timestamp_changes_material_fingerprint(tmp_pat
 def test_closed_phase_requires_confirmed_reservations_after_bound_apply(tmp_path):
     factory, database = _seed_joint_incident(tmp_path)
 
+    before = _inspect(database, phase="bound_apply_pre")
+
     assert _inspect(database, phase="bound_apply_post").status == "refused"
     with factory() as session:
         session.query(BoundPositionCloseReservation).update(
@@ -483,6 +496,88 @@ def test_closed_phase_requires_confirmed_reservations_after_bound_apply(tmp_path
     result = _inspect(database, phase="bound_apply_post")
     assert result.status == "ready"
     assert result.reservation_count == 29
+    assert result.material_fingerprint != before.material_fingerprint
+    assert (
+        result.batch119_material_fingerprint
+        == before.batch119_material_fingerprint
+    )
+
+
+def test_joint_pre_is_the_only_admission_that_can_bypass_exact_batch119_block(tmp_path):
+    _, database = _seed_joint_incident(tmp_path)
+
+    ordinary = __import__(
+        "telegram_kol_research.bound_close_writer_quiescence",
+        fromlist=["inspect_bound_close_writer_quiescence"],
+    ).inspect_bound_close_writer_quiescence(database, now=NOW)
+    joint = _inspect(database, phase="bound_apply_pre")
+
+    assert ordinary["status"] == "refused"
+    assert ordinary["blocking_writer_count"] > 0
+    assert joint.status == "ready"
+    assert joint.batch119_incident_count == 1
+
+
+def test_real_bound_apply_changes_only_reservations_and_preserves_batch119(
+    tmp_path,
+    monkeypatch,
+):
+    _, database = _seed_joint_incident(tmp_path)
+    before = _inspect(database, phase="bound_apply_pre")
+    monkeypatch.setattr(
+        _RECOVERY_TEST_SUPPORT.recovery_module,
+        "_recovery_capture_now",
+        lambda: _RECOVERY_TEST_SUPPORT.APPLY_TIME - timedelta(minutes=1),
+    )
+    source = _RECOVERY_TEST_SUPPORT.load_bound_close_reservation_source(database)
+    http_client = _RECOVERY_TEST_SUPPORT._RecoveryReaderHttpClient(
+        responses=_RECOVERY_TEST_SUPPORT._terminal_provider_responses(source)
+    )
+    reader, _transport, _selected = (
+        _RECOVERY_TEST_SUPPORT._factory_recovery_reader(
+            monkeypatch, http_client=http_client
+        )
+    )
+    capture = (
+        _RECOVERY_TEST_SUPPORT.capture_and_seal_bound_close_reservation_recovery(
+            source,
+            reader,
+            deadline_monotonic=__import__("time").monotonic() + 30.0,
+        )
+    )
+    assert capture.plan.status == "ready"
+    request_count = len(http_client.requests)
+
+    applied = _RECOVERY_TEST_SUPPORT._apply_ready(database, capture)
+    after = _inspect(database, phase="bound_apply_post")
+
+    assert applied.status in {"applied", "applied_after_deadline_verified"}
+    assert applied.action_count == 29
+    assert after.status == "ready"
+    assert after.reservation_count == 29
+    assert after.material_fingerprint != before.material_fingerprint
+    assert (
+        after.batch119_material_fingerprint
+        == before.batch119_material_fingerprint
+    )
+    assert len(http_client.requests) == request_count
+
+
+def test_batch119_material_fingerprint_changes_only_with_batch119_authority(tmp_path):
+    factory, database = _seed_joint_incident(tmp_path)
+    before = _inspect(database, phase="bound_apply_pre")
+    with factory() as session:
+        batch = session.query(StrategyManagementBatch).filter_by(id=119).one()
+        batch.created_at = NOW + timedelta(seconds=1)
+        session.commit()
+
+    after = _inspect(database, phase="bound_apply_pre")
+
+    assert after.status == "ready"
+    assert (
+        after.batch119_material_fingerprint
+        != before.batch119_material_fingerprint
+    )
 
 
 def test_unknown_phase_is_rejected_before_database_access(tmp_path):
@@ -499,15 +594,24 @@ def test_unknown_phase_is_rejected_before_database_access(tmp_path):
     assert result.reason_code == "joint_phase_invalid"
 
 
-def _admission_document(*, capture_id: str, started: str, completed: str):
+def _admission_document(
+    *,
+    capture_id: str,
+    started: str,
+    completed: str,
+    phase: str = "joint_diagnostic",
+    material_fingerprint: str = "a" * 64,
+    batch119_material_fingerprint: str = "b" * 64,
+):
     return {
         "batch119_incident_count": 1,
+        "batch119_material_fingerprint": batch119_material_fingerprint,
         "blocking_writer_count": 0,
         "capture_completed_at": completed,
         "capture_id": capture_id,
         "capture_started_at": started,
-        "material_fingerprint": "a" * 64,
-        "phase": "joint_diagnostic",
+        "material_fingerprint": material_fingerprint,
+        "phase": phase,
         "reason_code": None,
         "reservation_count": 29,
         "schema_version": 1,
@@ -555,6 +659,114 @@ def test_joint_admission_comparator_accepts_two_strict_stable_captures(tmp_path)
 
     assert result.returncode == 0
     assert result.stdout == '{"status":"stable"}\n'
+    assert result.stderr == ""
+
+
+def test_joint_admission_comparator_accepts_closed_bound_apply_transition(tmp_path):
+    first = tmp_path / "bound-apply-pre.json"
+    second = tmp_path / "bound-apply-post.json"
+    _write_private_json(
+        first,
+        _admission_document(
+            capture_id="1" * 64,
+            started="2026-08-16T10:00:00+00:00",
+            completed="2026-08-16T10:00:01+00:00",
+            phase="bound_apply_pre",
+            material_fingerprint="a" * 64,
+        ),
+    )
+    _write_private_json(
+        second,
+        _admission_document(
+            capture_id="2" * 64,
+            started="2026-08-16T10:00:02+00:00",
+            completed="2026-08-16T10:00:03+00:00",
+            phase="bound_apply_post",
+            material_fingerprint="c" * 64,
+        ),
+    )
+    script = Path(__file__).parents[1] / "scripts" / (
+        "compare_bound_close_batch119_joint_admissions.py"
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--bound-apply-transition",
+            str(first),
+            str(second),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == '{"status":"stable"}\n'
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "batch119_drift",
+        "unchanged_joint_material",
+        "wrong_pre_phase",
+        "wrong_post_phase",
+        "reused_capture",
+    ],
+)
+def test_joint_admission_comparator_refuses_invalid_bound_apply_transition(
+    tmp_path,
+    mutation,
+):
+    pre = _admission_document(
+        capture_id="1" * 64,
+        started="2026-08-16T10:00:00+00:00",
+        completed="2026-08-16T10:00:01+00:00",
+        phase="bound_apply_pre",
+    )
+    post = _admission_document(
+        capture_id="2" * 64,
+        started="2026-08-16T10:00:02+00:00",
+        completed="2026-08-16T10:00:03+00:00",
+        phase="bound_apply_post",
+        material_fingerprint="c" * 64,
+    )
+    if mutation == "batch119_drift":
+        post["batch119_material_fingerprint"] = "d" * 64
+    elif mutation == "unchanged_joint_material":
+        post["material_fingerprint"] = pre["material_fingerprint"]
+    elif mutation == "wrong_pre_phase":
+        pre["phase"] = "joint_diagnostic"
+    elif mutation == "wrong_post_phase":
+        post["phase"] = "bound_apply_pre"
+    else:
+        post["capture_id"] = pre["capture_id"]
+    paths = []
+    for name, payload in (("pre.json", pre), ("post.json", post)):
+        path = tmp_path / name
+        _write_private_json(path, payload)
+        paths.append(path)
+    script = Path(__file__).parents[1] / "scripts" / (
+        "compare_bound_close_batch119_joint_admissions.py"
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--bound-apply-transition",
+            *(str(path) for path in paths),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == '{"status":"refused"}\n'
     assert result.stderr == ""
 
 
