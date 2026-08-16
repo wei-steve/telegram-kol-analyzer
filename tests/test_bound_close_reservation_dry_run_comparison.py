@@ -491,6 +491,30 @@ def test_recovery_output_projector_rejects_duplicate_or_unknown_apply_fields():
         assert result.stderr == ""
 
 
+@pytest.mark.parametrize("schema_version", [True, 1.0, "1"])
+def test_recovery_output_projector_requires_integer_apply_schema_version(
+    schema_version,
+):
+    document = json.dumps(
+        {
+            "action_count": 29,
+            "audit_event_id": 987654,
+            "evidence_fingerprint": FP_A,
+            "mode": "apply",
+            "schema_version": schema_version,
+            "status": "applied",
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    result = _project_recovery_output("apply-result", document)
+
+    assert result.returncode == 2
+    assert result.stdout == '{"status":"refused"}\n'
+    assert result.stderr == ""
+
+
 def test_writer_quiescence_inventory_exactly_mirrors_deployment_preflight_specs(
     tmp_path,
 ):

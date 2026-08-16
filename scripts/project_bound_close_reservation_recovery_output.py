@@ -85,7 +85,11 @@ def _apply_projection(raw: bytes) -> dict[str, object]:
     )
     if type(payload) is not dict or set(payload) != _APPLY_KEYS:
         raise _ProjectionRefused("apply result shape invalid")
-    if payload["schema_version"] != 1 or payload["mode"] != "apply":
+    if (
+        type(payload["schema_version"]) is not int
+        or payload["schema_version"] != 1
+        or payload["mode"] != "apply"
+    ):
         raise _ProjectionRefused("apply result contract invalid")
     if type(payload["status"]) is not str or payload["status"] not in _APPLY_STATUSES:
         raise _ProjectionRefused("apply result status invalid")
