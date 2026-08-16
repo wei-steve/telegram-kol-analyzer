@@ -1695,7 +1695,7 @@ reset_bound_close_legacy_monitor_after_timer_freeze() {
       current_state="$(run_bound_close_external_command_before_deadline \
         systemctl is-active telegram-kol-monitor.service || true)"
       case "$current_state" in
-        active)
+        activating)
           run_bound_close_external_command_before_deadline \
             sudo systemctl stop telegram-kol-monitor.service
           ORIGINAL_UNIT_STATE["telegram-kol-monitor.service"]=inactive

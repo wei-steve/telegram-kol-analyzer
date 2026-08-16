@@ -523,6 +523,10 @@ def test_runbook_freezes_monitor_timer_before_resetting_legacy_failed_state():
     stop_timer = block.index(
         'stop_bound_close_unit_group "${QUIESCE_TIMER_UNITS[@]}"'
     )
+    verify_timer = block.index(
+        'verify_bound_close_unit_group_inactive "${QUIESCE_TIMER_UNITS[@]}"',
+        stop_timer,
+    )
     reset_call = block.index(
         "\nreset_bound_close_legacy_monitor_after_timer_freeze\n",
         stop_timer,
@@ -530,7 +534,7 @@ def test_runbook_freezes_monitor_timer_before_resetting_legacy_failed_state():
     stop_services = block.index(
         'stop_bound_close_unit_group "${QUIESCE_SERVICE_UNITS[@]}"'
     )
-    assert stop_timer < reset_call < stop_services
+    assert stop_timer < verify_timer < reset_call < stop_services
     reset_function = block.split(
         "reset_bound_close_legacy_monitor_after_timer_freeze() {", 1
     )[1].split("\n}\n", 1)[0]
@@ -555,6 +559,7 @@ def test_runbook_freezes_monitor_timer_before_resetting_legacy_failed_state():
         "current_state",
         "expected_log",
         "expected_state",
+        "expected_status",
     ),
     [
         (
@@ -563,39 +568,48 @@ def test_runbook_freezes_monitor_timer_before_resetting_legacy_failed_state():
             "failed",
             "reset-failed telegram-kol-monitor.service\n",
             "inactive",
+            0,
         ),
-        ("installed", "inactive", "inactive", "", "inactive"),
-        ("installed", "failed", "inactive", "", "inactive"),
+        ("installed", "inactive", "inactive", "", "inactive", 0),
+        ("installed", "failed", "inactive", "", "inactive", 0),
         (
             "installed",
             "inactive",
             "failed",
             "reset-failed telegram-kol-monitor.service\n",
             "inactive",
+            0,
         ),
         (
             "installed",
             "inactive",
-            "active",
+            "activating",
             "stop telegram-kol-monitor.service\n",
             "inactive",
+            0,
         ),
         (
             "installed",
             "failed",
-            "active",
+            "activating",
             "stop telegram-kol-monitor.service\n",
             "inactive",
+            0,
         ),
-        ("absent", "absent", "absent", "", "absent"),
+        ("installed", "failed", "active", "", "failed", 1),
+        ("installed", "failed", "deactivating", "", "failed", 1),
+        ("installed", "failed", "unknown", "", "failed", 1),
+        ("installed", "failed", "", "", "failed", 1),
+        ("absent", "absent", "absent", "", "absent", 0),
     ],
 )
-def test_legacy_monitor_reset_function_preserves_absent_install_state(
+def test_timer_frozen_monitor_convergence_is_closed(
     install_state,
     original_state,
     current_state,
     expected_log,
     expected_state,
+    expected_status,
 ):
     block = _bound_close_read_only_block()
     function = block.split(
@@ -631,8 +645,11 @@ run_bound_close_external_command_before_deadline() {{ "$@"; }}
 reset_bound_close_legacy_monitor_after_timer_freeze() {{
 {function}
 }}
+set +e
 reset_bound_close_legacy_monitor_after_timer_freeze
-printf 'STATE=%s\\n' "$ORIGINAL_STATE"
+STATUS=$?
+set -e
+printf 'STATE=%s\\nSTATUS=%s\\n' "$ORIGINAL_STATE" "$STATUS"
 """
 
     result = subprocess.run(
@@ -640,7 +657,9 @@ printf 'STATE=%s\\n' "$ORIGINAL_STATE"
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout == expected_log + f"STATE={expected_state}\n"
+    assert result.stdout == (
+        expected_log + f"STATE={expected_state}\nSTATUS={expected_status}\n"
+    )
     assert result.stderr == ""
 
 
@@ -2014,6 +2033,127 @@ printf 'live-ready\n' >> "$EVENTS"
     return result, events
 
 
+def _simulate_live_monitor_state_transitions(
+    tmp_path: Path,
+    *,
+    monitor_states: tuple[str, ...],
+    timer_drift_on: int = 0,
+    core_drift_on: int = 0,
+    install_drift_on: int = 0,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    block = _bound_close_read_only_block()
+    legacy_verifier = _bound_close_shell_function(
+        block, "verify_bound_close_legacy_monitor_live_state"
+    )
+    legacy_verifier = legacy_verifier.replace(
+        "${ORIGINAL_UNIT_INSTALL_STATE[telegram-kol-monitor.service]}",
+        "$ORIGINAL_MONITOR_INSTALL",
+    ).replace(
+        "${ORIGINAL_UNIT_INSTALL_STATE[telegram-kol-monitor.timer]}",
+        "$ORIGINAL_TIMER_INSTALL",
+    ).replace(
+        "${ORIGINAL_UNIT_STATE[telegram-kol-monitor.service]}",
+        "$ORIGINAL_MONITOR_STATE",
+    ).replace(
+        "${ORIGINAL_UNIT_STATE[telegram-kol-monitor.timer]}",
+        "$ORIGINAL_TIMER_STATE",
+    )
+    events = tmp_path / "live-monitor-events.txt"
+    states = " ".join(shlex.quote(value) for value in monitor_states)
+    script = f"""
+set -euo pipefail
+EVENTS={shlex.quote(str(events))}
+RECOVERY_TMP={shlex.quote(str(tmp_path))}
+NOW_EPOCH=100
+LIVE_PREQUIESCENCE_DEADLINE_EPOCH=820
+LIVE_PREQUIESCENCE_RESULT="$RECOVERY_TMP/live-writer-quiescence.json"
+LIVE_PREQUIESCENCE_ATTEMPT=0
+LIVE_PREQUIESCENCE_POLL_SECONDS=15
+LIVE_PREQUIESCENCE_PROJECTION=''
+LIVE_PREQUIESCENCE_RAW=''
+LIVE_PREQUIESCENCE_REMAINING_SECONDS=0
+LIVE_PREQUIESCENCE_SLEEP_SECONDS=0
+HELPER_SEQUENCE=(2 2 0)
+HELPER_CALL=0
+VERIFY_CALL=0
+MONITOR_STATES=({states})
+TIMER_DRIFT_ON={timer_drift_on}
+CORE_DRIFT_ON={core_drift_on}
+INSTALL_DRIFT_ON={install_drift_on}
+ORIGINAL_MONITOR_INSTALL=installed
+ORIGINAL_TIMER_INSTALL=installed
+ORIGINAL_MONITOR_STATE=failed
+ORIGINAL_TIMER_STATE=active
+bound_close_now_epoch() {{ printf '%s\n' "$NOW_EPOCH"; }}
+sleep() {{
+  printf 'sleep\n' >> "$EVENTS"
+  NOW_EPOCH=$((NOW_EPOCH + 15))
+}}
+systemctl() {{
+  case "$1:$2" in
+    show:telegram-kol-monitor.service)
+      if [ "$VERIFY_CALL" -eq "$INSTALL_DRIFT_ON" ]; then
+        printf 'not-found\n'
+      else
+        printf 'loaded\n'
+      fi
+      ;;
+    is-active:telegram-kol-monitor.service)
+      printf '%s\n' "${{MONITOR_STATES[$((VERIFY_CALL - 1))]:-unknown}}"
+      ;;
+    show:telegram-kol-monitor.timer) printf 'loaded\n' ;;
+    is-active:telegram-kol-monitor.timer)
+      if [ "$VERIFY_CALL" -eq "$TIMER_DRIFT_ON" ]; then
+        printf 'inactive\n'
+      else
+        printf 'active\n'
+      fi
+      ;;
+    *) return 91 ;;
+  esac
+}}
+verify_bound_close_legacy_monitor_live_state() {{
+{legacy_verifier}
+}}
+verify_all_local_identity_before_stop() {{
+  VERIFY_CALL=$((VERIFY_CALL + 1))
+  printf 'verify\n' >> "$EVENTS"
+  verify_bound_close_legacy_monitor_live_state
+  [ "$VERIFY_CALL" -ne "$CORE_DRIFT_ON" ]
+}}
+run_bound_close_writer_quiescence_helper() {{
+  local output_path="$1"
+  local index="$HELPER_CALL"
+  HELPER_CALL=$((HELPER_CALL + 1))
+  HELPER_STATUS="${{HELPER_SEQUENCE[$index]:-1}}"
+  printf 'helper\n' >> "$EVENTS"
+  if [ "$HELPER_STATUS" -eq 0 ]; then
+    printf '%s\n' '{{"schema_version":1,"status":"ready"}}' > "$output_path"
+  else
+    printf '%s\n' '{{"schema_version":1,"status":"refused"}}' > "$output_path"
+  fi
+}}
+project_bound_close_writer_quiescence_result() {{ cp "$1" "$3"; }}
+require_exact_ready_projection() {{ grep -q '"status":"ready"' "$1"; }}
+require_exact_refused_projection() {{ grep -q '"status":"refused"' "$1"; }}
+stop_bound_close_unit_group() {{ printf 'stop\n' >> "$EVENTS"; }}
+run_bound_close_double_capture() {{ printf 'capture\n' >> "$EVENTS"; }}
+run_bound_close_live_prequiescence() {{
+{_bound_close_live_prequiescence_snippet()}
+}}
+run_bound_close_live_prequiescence
+printf 'live-ready\n' >> "$EVENTS"
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    return result, events
+
+
 def _simulate_stopped_recheck(
     tmp_path: Path,
     *,
@@ -2114,6 +2254,59 @@ def test_live_prequiescence_refused_then_ready_never_stops_services(tmp_path):
     assert event_lines.count("sleep") == 2
     assert event_lines[-1] == "live-ready"
     assert "stop" not in event_lines
+
+
+def test_live_wait_accepts_timer_driven_failed_activating_failed(tmp_path):
+    result, events = _simulate_live_monitor_state_transitions(
+        tmp_path,
+        monitor_states=(
+            "failed",
+            "failed",
+            "activating",
+            "activating",
+            "failed",
+            "failed",
+        ),
+    )
+
+    assert result.returncode == 0, result.stderr
+    event_lines = events.read_text(encoding="utf-8").splitlines()
+    assert event_lines.count("helper") == 3
+    assert event_lines.count("verify") == 6
+    assert event_lines[-1] == "live-ready"
+    assert "stop" not in event_lines
+    assert "capture" not in event_lines
+
+
+@pytest.mark.parametrize(
+    ("monitor_states", "timer_drift_on", "core_drift_on", "install_drift_on"),
+    [
+        (("failed",) * 6, 2, 0, 0),
+        (("active",) * 6, 0, 0, 0),
+        (("failed",) * 6, 0, 2, 0),
+        (("failed",) * 6, 0, 0, 2),
+    ],
+)
+def test_live_wait_monitor_exception_counterexamples_fail_before_stop_or_capture(
+    tmp_path,
+    monitor_states,
+    timer_drift_on,
+    core_drift_on,
+    install_drift_on,
+):
+    result, events = _simulate_live_monitor_state_transitions(
+        tmp_path,
+        monitor_states=monitor_states,
+        timer_drift_on=timer_drift_on,
+        core_drift_on=core_drift_on,
+        install_drift_on=install_drift_on,
+    )
+
+    assert result.returncode != 0
+    event_lines = events.read_text(encoding="utf-8").splitlines()
+    assert "stop" not in event_lines
+    assert "capture" not in event_lines
+    assert "live-ready" not in event_lines
 
 
 def test_live_prequiescence_timeout_never_stops_services(tmp_path):
