@@ -4625,6 +4625,166 @@ def test_bound_close_recovery_cli_is_dormant_strict_and_defaults_to_dry_run():
         assert prohibited not in command.output
 
 
+def test_joint_recovery_admission_cli_is_dormant_and_exact_only():
+    root = CliRunner().invoke(app, ["--help"])
+    command = CliRunner().invoke(
+        app,
+        ["inspect-bound-close-batch119-joint-recovery", "--help"],
+    )
+
+    assert root.exit_code == 0
+    assert "inspect-bound-close-batch119-joint-recovery" in root.output
+    assert command.exit_code == 0
+    assert "--database-path" in command.output
+    assert "--phase" in command.output
+    for prohibited in (
+        "--apply",
+        "--force",
+        "--ignore",
+        "--row-id",
+        "--age",
+        "--notify",
+    ):
+        assert prohibited not in command.output
+
+
+@pytest.mark.parametrize(("ready", "expected_exit"), [(True, 0), (False, 2)])
+def test_joint_recovery_admission_cli_emits_canonical_private_document(
+    tmp_path,
+    monkeypatch,
+    ready,
+    expected_exit,
+):
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.bound_close_batch119_joint_recovery import (
+        JointRecoveryMaterialAuthority,
+    )
+
+    database = tmp_path / "joint.sqlite3"
+    database.touch()
+    calls = []
+    authority = JointRecoveryMaterialAuthority(
+        material_fingerprint="a" * 64,
+        reservation_count=29,
+        batch119_incident_count=1,
+        blocking_writer_count=0 if ready else 1,
+        status="ready" if ready else "refused",
+        reason_code=None if ready else "joint_writer_not_quiescent",
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "inspect_joint_recovery_material_authority",
+        lambda path, **kwargs: calls.append((path, kwargs)) or authority,
+        raising=False,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "inspect-bound-close-batch119-joint-recovery",
+            "--database-path",
+            str(database),
+            "--phase",
+            "joint_diagnostic",
+        ],
+    )
+
+    assert result.exit_code == expected_exit, result.output
+    payload = json.loads(result.stdout)
+    assert set(payload) == {
+        "batch119_incident_count",
+        "blocking_writer_count",
+        "capture_completed_at",
+        "capture_id",
+        "capture_started_at",
+        "material_fingerprint",
+        "phase",
+        "reason_code",
+        "reservation_count",
+        "schema_version",
+        "status",
+    }
+    assert payload["status"] == authority.status
+    assert payload["phase"] == "joint_diagnostic"
+    assert len(payload["capture_id"]) == 64
+    assert len(result.stdout.splitlines()) == 1
+    assert calls[0][0] == database.resolve()
+    assert calls[0][1]["phase"] == "joint_diagnostic"
+
+
+def test_joint_recovery_admission_cli_rejects_invalid_path_before_inspection(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+
+    target = tmp_path / "target.sqlite3"
+    target.touch()
+    link = tmp_path / "linked.sqlite3"
+    link.symlink_to(target)
+    monkeypatch.setattr(
+        cli_module,
+        "inspect_joint_recovery_material_authority",
+        lambda *args, **kwargs: pytest.fail("inspection must be unreachable"),
+        raising=False,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "inspect-bound-close-batch119-joint-recovery",
+            "--database-path",
+            str(link),
+            "--phase",
+            "joint_diagnostic",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == {
+        "reason_code": "joint_database_invalid",
+        "schema_version": 1,
+        "status": "error",
+    }
+
+
+def test_joint_recovery_admission_cli_rejects_malformed_internal_result(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+
+    database = tmp_path / "joint.sqlite3"
+    database.touch()
+    monkeypatch.setattr(
+        cli_module,
+        "inspect_joint_recovery_material_authority",
+        lambda *args, **kwargs: SimpleNamespace(
+            status="ready",
+            reservation_count=True,
+        ),
+        raising=False,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "inspect-bound-close-batch119-joint-recovery",
+            "--database-path",
+            str(database),
+            "--phase",
+            "joint_diagnostic",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == {
+        "reason_code": "joint_result_invalid",
+        "schema_version": 1,
+        "status": "error",
+    }
+
+
 @pytest.mark.parametrize(("ready", "expected_exit"), [(True, 0), (False, 2)])
 def test_bound_close_recovery_cli_emits_only_exact_canonical_dry_run(
     tmp_path,

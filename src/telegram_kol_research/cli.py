@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import sqlite3
 import shutil
 import subprocess
@@ -69,6 +70,11 @@ from telegram_kol_research.bound_close_reservation_recovery import (
     load_bound_close_reservation_source,
     recapture_and_seal_applied_bound_close_reservation_recovery,
     serialize_bound_close_reservation_recovery_result,
+)
+from telegram_kol_research.bound_close_batch119_joint_recovery import (
+    JOINT_RECOVERY_PHASES,
+    JointRecoveryMaterialAuthority,
+    inspect_joint_recovery_material_authority,
 )
 from telegram_kol_research.message_operation_supervisor import (
     run_message_operation_supervisor_cycle,
@@ -5545,6 +5551,136 @@ def recover_management_history(
             ensure_ascii=False,
             sort_keys=True,
         )
+    )
+
+
+@app.command("inspect-bound-close-batch119-joint-recovery")
+def inspect_bound_close_batch119_joint_recovery(
+    database_path: Path = typer.Option(..., "--database-path"),
+    phase: str = typer.Option(..., "--phase"),
+) -> None:
+    """Inspect the closed joint incident without writes or exchange access."""
+
+    def emit(payload: dict[str, object], *, exit_code: int) -> None:
+        typer.echo(
+            json.dumps(
+                payload,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        if exit_code:
+            raise typer.Exit(code=exit_code)
+
+    if type(phase) is not str or phase not in JOINT_RECOVERY_PHASES:
+        emit(
+            {
+                "reason_code": "joint_phase_invalid",
+                "schema_version": 1,
+                "status": "refused",
+            },
+            exit_code=2,
+        )
+        return
+
+    try:
+        if database_path.is_symlink() or not database_path.is_file():
+            raise ValueError("invalid database")
+        resolved = database_path.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        emit(
+            {
+                "reason_code": "joint_database_invalid",
+                "schema_version": 1,
+                "status": "error",
+            },
+            exit_code=1,
+        )
+        return
+
+    capture_started_at = datetime.now(UTC)
+    capture_id = secrets.token_hex(32)
+    try:
+        authority = inspect_joint_recovery_material_authority(
+            resolved,
+            phase=phase,
+            now=capture_started_at,
+        )
+    except Exception:
+        emit(
+            {
+                "reason_code": "joint_inspection_unavailable",
+                "schema_version": 1,
+                "status": "error",
+            },
+            exit_code=1,
+        )
+        return
+    counts = (
+        (
+            authority.reservation_count,
+            authority.batch119_incident_count,
+            authority.blocking_writer_count,
+        )
+        if type(authority) is JointRecoveryMaterialAuthority
+        else ()
+    )
+    authority_valid = bool(
+        type(authority) is JointRecoveryMaterialAuthority
+        and re.fullmatch(
+            r"[0-9a-f]{64}", authority.material_fingerprint
+        )
+        is not None
+        and all(type(value) is int and value >= 0 for value in counts)
+        and authority.status in {"ready", "refused"}
+        and (
+            (
+                authority.status == "ready"
+                and counts == (29, 1, 0)
+                and authority.reason_code is None
+            )
+            or (
+                authority.status == "refused"
+                and type(authority.reason_code) is str
+                and authority.reason_code
+                in {
+                    "joint_material_invalid",
+                    "joint_phase_invalid",
+                    "joint_read_failed",
+                    "joint_writer_not_quiescent",
+                }
+            )
+        )
+    )
+    if not authority_valid:
+        emit(
+            {
+                "reason_code": "joint_result_invalid",
+                "schema_version": 1,
+                "status": "error",
+            },
+            exit_code=1,
+        )
+        return
+    capture_completed_at = datetime.now(UTC)
+    if capture_completed_at <= capture_started_at:
+        capture_completed_at = capture_started_at + timedelta(microseconds=1)
+    emit(
+        {
+            "batch119_incident_count": authority.batch119_incident_count,
+            "blocking_writer_count": authority.blocking_writer_count,
+            "capture_completed_at": capture_completed_at.isoformat(),
+            "capture_id": capture_id,
+            "capture_started_at": capture_started_at.isoformat(),
+            "material_fingerprint": authority.material_fingerprint,
+            "phase": phase,
+            "reason_code": authority.reason_code,
+            "reservation_count": authority.reservation_count,
+            "schema_version": 1,
+            "status": authority.status,
+        },
+        exit_code=0 if authority.status == "ready" else 2,
     )
 
 

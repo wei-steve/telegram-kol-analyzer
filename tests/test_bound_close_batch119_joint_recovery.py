@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import timedelta
 import importlib.util
+import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -494,3 +497,226 @@ def test_unknown_phase_is_rejected_before_database_access(tmp_path):
     )
     assert result.status == "refused"
     assert result.reason_code == "joint_phase_invalid"
+
+
+def _admission_document(*, capture_id: str, started: str, completed: str):
+    return {
+        "batch119_incident_count": 1,
+        "blocking_writer_count": 0,
+        "capture_completed_at": completed,
+        "capture_id": capture_id,
+        "capture_started_at": started,
+        "material_fingerprint": "a" * 64,
+        "phase": "joint_diagnostic",
+        "reason_code": None,
+        "reservation_count": 29,
+        "schema_version": 1,
+        "status": "ready",
+    }
+
+
+def _write_private_json(path, payload):
+    path.write_text(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+
+def test_joint_admission_comparator_accepts_two_strict_stable_captures(tmp_path):
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    _write_private_json(
+        first,
+        _admission_document(
+            capture_id="1" * 64,
+            started="2026-08-16T10:00:00+00:00",
+            completed="2026-08-16T10:00:01+00:00",
+        ),
+    )
+    _write_private_json(
+        second,
+        _admission_document(
+            capture_id="2" * 64,
+            started="2026-08-16T10:00:02+00:00",
+            completed="2026-08-16T10:00:03+00:00",
+        ),
+    )
+    script = Path(__file__).parents[1] / "scripts" / (
+        "compare_bound_close_batch119_joint_admissions.py"
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(script), str(first), str(second)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == '{"status":"stable"}\n'
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda payload: payload.update(schema_version=True),
+        lambda payload: payload.update(reservation_count=28),
+        lambda payload: payload.update(material_fingerprint="b" * 64),
+        lambda payload: payload.update(phase="future_phase"),
+        lambda payload: payload.update(phase="bound_apply_pre"),
+        lambda payload: payload.update(status="refused"),
+        lambda payload: payload.update(reason_code="joint_read_failed"),
+        lambda payload: payload.update(capture_id="1" * 64),
+        lambda payload: payload.update(extra_field="unexpected"),
+        lambda payload: payload.pop("reason_code"),
+        lambda payload: payload.update(capture_id="1" * 300),
+        lambda payload: payload.update(
+            capture_started_at="2026-08-16T10:00:00"
+        ),
+        lambda payload: payload.update(
+            capture_started_at="2026-08-16T10:00:01+00:00"
+        ),
+        lambda payload: payload.update(
+            capture_completed_at="2026-08-16T10:00:02+00:00"
+        ),
+    ],
+)
+def test_joint_admission_comparator_refuses_malformed_or_drifting_capture(
+    tmp_path, mutation
+):
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first_payload = _admission_document(
+        capture_id="1" * 64,
+        started="2026-08-16T10:00:00+00:00",
+        completed="2026-08-16T10:00:01+00:00",
+    )
+    second_payload = _admission_document(
+        capture_id="2" * 64,
+        started="2026-08-16T10:00:02+00:00",
+        completed="2026-08-16T10:00:03+00:00",
+    )
+    mutation(second_payload)
+    _write_private_json(first, first_payload)
+    _write_private_json(second, second_payload)
+    script = Path(__file__).parents[1] / "scripts" / (
+        "compare_bound_close_batch119_joint_admissions.py"
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(script), str(first), str(second)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == '{"status":"refused"}\n'
+
+
+def test_joint_admission_comparator_refuses_duplicate_json_key(tmp_path):
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    payload = _admission_document(
+        capture_id="1" * 64,
+        started="2026-08-16T10:00:00+00:00",
+        completed="2026-08-16T10:00:01+00:00",
+    )
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    first.write_text(raw[:-1] + ',"status":"ready"}', encoding="utf-8")
+    first.chmod(0o600)
+    _write_private_json(
+        second,
+        _admission_document(
+            capture_id="2" * 64,
+            started="2026-08-16T10:00:02+00:00",
+            completed="2026-08-16T10:00:03+00:00",
+        ),
+    )
+    script = Path(__file__).parents[1] / "scripts" / (
+        "compare_bound_close_batch119_joint_admissions.py"
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(script), str(first), str(second)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == '{"status":"refused"}\n'
+
+
+def test_joint_admission_comparator_refuses_first_path_replacement(tmp_path):
+    script = Path(__file__).parents[1] / "scripts" / (
+        "compare_bound_close_batch119_joint_admissions.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_joint_admission_comparator_test", script
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    replacement = tmp_path / "replacement.json"
+    first_payload = _admission_document(
+        capture_id="1" * 64,
+        started="2026-08-16T10:00:00+00:00",
+        completed="2026-08-16T10:00:01+00:00",
+    )
+    second_payload = _admission_document(
+        capture_id="2" * 64,
+        started="2026-08-16T10:00:02+00:00",
+        completed="2026-08-16T10:00:03+00:00",
+    )
+    replacement_payload = dict(first_payload)
+    replacement_payload["material_fingerprint"] = "b" * 64
+    _write_private_json(first, first_payload)
+    _write_private_json(second, second_payload)
+    _write_private_json(replacement, replacement_payload)
+    original_read = module._read_private_file
+    calls = 0
+
+    def replacing_read(path_text):
+        nonlocal calls
+        result = original_read(path_text)
+        calls += 1
+        if calls == 1:
+            replacement.replace(first)
+        return result
+
+    module._read_private_file = replacing_read
+
+    with pytest.raises(module.JointAdmissionRefused):
+        module._admissions_are_stable([str(first), str(second)])
+
+
+def test_joint_operator_projector_outputs_only_safe_aggregate(tmp_path):
+    payload = _admission_document(
+        capture_id="1" * 64,
+        started="2026-08-16T10:00:00+00:00",
+        completed="2026-08-16T10:00:01+00:00",
+    )
+    script = Path(__file__).parents[1] / "scripts" / (
+        "project_bound_close_batch119_joint_output.py"
+    )
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {
+        "batch119_incident_count": 1,
+        "blocking_writer_count": 0,
+        "reservation_count": 29,
+        "schema_version": 1,
+        "status": "ready",
+    }
