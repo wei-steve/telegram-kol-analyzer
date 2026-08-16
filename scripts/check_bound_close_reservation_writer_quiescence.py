@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
 import sqlite3
@@ -23,7 +24,31 @@ from telegram_kol_research.trigger_protection_intents import (
 
 
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9_]*\Z")
+_CANONICAL_SQLITE_DATETIME = re.compile(
+    r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6}\Z"
+)
+_EXPLICIT_UTC_DATETIME = re.compile(
+    r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d{1,6})?(?:Z|\+00:00)\Z"
+)
+_ACTIVE_WINDOW = timedelta(minutes=10)
+_MAX_INSPECTED_ROWS_PER_TABLE = 10_000
+_OUTPUT_FIELDS = frozenset(
+    {
+        "block_regardless_of_age_writer_count",
+        "blocking_writer_count",
+        "checked_table_count",
+        "fresh_active_or_unknown_writer_count",
+        "historical_active_or_unknown_residue_count",
+        "missing_table_count",
+        "schema_version",
+        "status",
+        "target_reservation_count",
+        "unrecognized_or_null_state_count",
+    }
+)
 _TARGET_TABLE = "bound_position_close_reservations"
+_DEEPCOIN_TABLE = "deepcoin_execution_operations"
 _TARGET_STATES = frozenset(
     {
         "reserved",
@@ -149,6 +174,7 @@ _SAFE_NONWRITER_STATES = {
             "blocked",
             "succeeded",
             "resolved",
+            "restored",
             "safely_skipped",
         }
     ),
@@ -170,6 +196,7 @@ _SAFE_NONWRITER_STATES = {
             "failed",
             "rejected",
             "expired",
+            "missing",
         }
     ),
     "position_take_profit_orders": frozenset(
@@ -223,7 +250,7 @@ _SAFE_NONWRITER_STATES = {
         }
     ),
     "source_message_deletion_exits": frozenset(
-        {"succeeded", "failed", "blocked"}
+        {"succeeded", "failed", "blocked", "unbound"}
     ),
 }
 
@@ -238,30 +265,139 @@ def _identifier(value: str) -> str:
     return f'"{value}"'
 
 
-def _count_where(
+def _unsafe_rows(
     connection: sqlite3.Connection,
     *,
     table: str,
     state_column: str,
+    time_column: str | None,
     allowed_states: frozenset[str],
-) -> int:
+) -> list[tuple[object, ...]]:
     if not allowed_states:
         raise _WriterQuiescenceError("writer_quiescence_contract_invalid")
     placeholders = ",".join("?" for _ in allowed_states)
-    row = connection.execute(
-        f"SELECT COUNT(*) FROM {_identifier(table)} "
+    selected = _identifier(state_column)
+    if time_column is not None:
+        selected += f", {_identifier(time_column)}"
+    rows = connection.execute(
+        f"SELECT {selected} FROM {_identifier(table)} "
         f"WHERE {_identifier(state_column)} IS NULL "
-        f"OR {_identifier(state_column)} NOT IN ({placeholders})",
+        f"OR {_identifier(state_column)} NOT IN ({placeholders}) "
+        f"LIMIT {_MAX_INSPECTED_ROWS_PER_TABLE + 1}",
         tuple(sorted(allowed_states)),
-    ).fetchone()
-    if row is None or type(row[0]) is not int or row[0] < 0:
-        raise _WriterQuiescenceError("writer_quiescence_read_invalid")
-    return int(row[0])
+    ).fetchall()
+    if len(rows) > _MAX_INSPECTED_ROWS_PER_TABLE:
+        raise _WriterQuiescenceError(
+            "writer_quiescence_inspection_limit_exceeded"
+        )
+    return rows
 
 
-def inspect_writer_quiescence(database_path: str | Path) -> dict[str, object]:
+def _parse_writer_timestamp(value: object) -> datetime:
+    if type(value) is not str or not value:
+        raise _WriterQuiescenceError("writer_quiescence_timestamp_invalid")
+    is_canonical_naive = _CANONICAL_SQLITE_DATETIME.fullmatch(value) is not None
+    is_explicit_utc = _EXPLICIT_UTC_DATETIME.fullmatch(value) is not None
+    if not is_canonical_naive and not is_explicit_utc:
+        raise _WriterQuiescenceError("writer_quiescence_timestamp_invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise _WriterQuiescenceError(
+            "writer_quiescence_timestamp_invalid"
+        ) from exc
+    if parsed.tzinfo is None:
+        if not is_canonical_naive:
+            raise _WriterQuiescenceError(
+                "writer_quiescence_timestamp_invalid"
+            )
+        return parsed.replace(tzinfo=timezone.utc)
+    if parsed.utcoffset() != timedelta(0):
+        raise _WriterQuiescenceError("writer_quiescence_timestamp_invalid")
+    return parsed.astimezone(timezone.utc)
+
+
+def _normalize_now(value: datetime | None) -> datetime:
+    if value is None:
+        return datetime.now(timezone.utc)
+    if type(value) is not datetime or value.tzinfo is None:
+        raise _WriterQuiescenceError("writer_quiescence_clock_invalid")
+    try:
+        offset = value.utcoffset()
+    except (OverflowError, ValueError) as exc:
+        raise _WriterQuiescenceError("writer_quiescence_clock_invalid") from exc
+    if offset != timedelta(0):
+        raise _WriterQuiescenceError("writer_quiescence_clock_invalid")
+    return value.astimezone(timezone.utc)
+
+
+def _build_result(
+    *,
+    checked_table_count: int,
+    missing_table_count: int,
+    target_reservation_count: int,
+    fresh_active_or_unknown_writer_count: int,
+    historical_active_or_unknown_residue_count: int,
+    unrecognized_or_null_state_count: int,
+    block_regardless_of_age_writer_count: int,
+) -> dict[str, object]:
+    counts = (
+        checked_table_count,
+        missing_table_count,
+        target_reservation_count,
+        fresh_active_or_unknown_writer_count,
+        historical_active_or_unknown_residue_count,
+        unrecognized_or_null_state_count,
+        block_regardless_of_age_writer_count,
+    )
+    if any(type(count) is not int or count < 0 for count in counts):
+        raise _WriterQuiescenceError("writer_quiescence_result_invalid")
+    if checked_table_count + missing_table_count != len(_WORK_SPECS):
+        raise _WriterQuiescenceError("writer_quiescence_result_invalid")
+    blocking = (
+        fresh_active_or_unknown_writer_count
+        + unrecognized_or_null_state_count
+        + block_regardless_of_age_writer_count
+    )
+    status = (
+        "ready"
+        if 0 < target_reservation_count <= 64 and blocking == 0
+        else "refused"
+    )
+    result: dict[str, object] = {
+        "block_regardless_of_age_writer_count": (
+            block_regardless_of_age_writer_count
+        ),
+        "blocking_writer_count": blocking,
+        "checked_table_count": checked_table_count,
+        "fresh_active_or_unknown_writer_count": (
+            fresh_active_or_unknown_writer_count
+        ),
+        "historical_active_or_unknown_residue_count": (
+            historical_active_or_unknown_residue_count
+        ),
+        "missing_table_count": missing_table_count,
+        "schema_version": 1,
+        "status": status,
+        "target_reservation_count": target_reservation_count,
+        "unrecognized_or_null_state_count": (
+            unrecognized_or_null_state_count
+        ),
+    }
+    if set(result) != _OUTPUT_FIELDS:
+        raise _WriterQuiescenceError("writer_quiescence_result_invalid")
+    return result
+
+
+def inspect_writer_quiescence(
+    database_path: str | Path,
+    *,
+    now: datetime | None = None,
+) -> dict[str, object]:
     """Return only aggregate counts from one coherent read-only snapshot."""
 
+    checked_at = _normalize_now(now)
+    cutoff = checked_at - _ACTIVE_WINDOW
     path = Path(database_path)
     try:
         if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
@@ -323,7 +459,10 @@ def inspect_writer_quiescence(database_path: str | Path) -> dict[str, object]:
             raise _WriterQuiescenceError("writer_quiescence_schema_invalid")
         checked = 0
         target_count = 0
-        other_count = 0
+        fresh_count = 0
+        historical_count = 0
+        unrecognized_count = 0
+        block_regardless_count = 0
         for spec in _WORK_SPECS:
             if spec.table not in available:
                 continue
@@ -334,39 +473,68 @@ def inspect_writer_quiescence(database_path: str | Path) -> dict[str, object]:
                     f"PRAGMA table_info({_identifier(spec.table)})"
                 ).fetchall()
             }
-            if spec.state_column not in columns:
+            if (
+                spec.state_column not in columns
+                or spec.time_column not in columns
+            ):
                 raise _WriterQuiescenceError("writer_quiescence_schema_invalid")
             safe_states = _SAFE_NONWRITER_STATES[spec.table]
             active_states = frozenset(spec.active_states)
+            known_work_states = active_states | frozenset(spec.unknown_states)
             if spec.table == _TARGET_TABLE:
-                if active_states != _TARGET_STATES:
+                if (
+                    active_states != _TARGET_STATES
+                    or safe_states != frozenset({"confirmed"})
+                ):
                     raise _WriterQuiescenceError(
                         "writer_quiescence_contract_invalid"
                     )
-                target_placeholders = ",".join("?" for _ in _TARGET_STATES)
-                target_count = int(
-                    connection.execute(
-                        f"SELECT COUNT(*) FROM {_identifier(spec.table)} "
-                        f"WHERE {_identifier(spec.state_column)} "
-                        f"IN ({target_placeholders})",
-                        tuple(sorted(_TARGET_STATES)),
-                    ).fetchone()[0]
-                )
-                other_count += _count_where(
+                rows = _unsafe_rows(
                     connection,
                     table=spec.table,
                     state_column=spec.state_column,
-                    allowed_states=_TARGET_STATES | safe_states,
+                    time_column=None,
+                    allowed_states=safe_states,
+                )
+                for (state,) in rows:
+                    if type(state) is str and state in _TARGET_STATES:
+                        target_count += 1
+                    else:
+                        unrecognized_count += 1
+                continue
+            if known_work_states & safe_states:
+                raise _WriterQuiescenceError("writer_quiescence_contract_invalid")
+            if spec.table == _DEEPCOIN_TABLE:
+                block_regardless_count += len(
+                    _unsafe_rows(
+                        connection,
+                        table=spec.table,
+                        state_column=spec.state_column,
+                        time_column=None,
+                        allowed_states=safe_states,
+                    )
                 )
                 continue
-            if active_states & safe_states:
-                raise _WriterQuiescenceError("writer_quiescence_contract_invalid")
-            other_count += _count_where(
+            rows = _unsafe_rows(
                 connection,
                 table=spec.table,
                 state_column=spec.state_column,
+                time_column=spec.time_column,
                 allowed_states=safe_states,
             )
+            for state, raw_timestamp in rows:
+                if (
+                    state is None
+                    or type(state) is not str
+                    or state not in known_work_states
+                ):
+                    unrecognized_count += 1
+                    continue
+                timestamp = _parse_writer_timestamp(raw_timestamp)
+                if timestamp >= cutoff:
+                    fresh_count += 1
+                else:
+                    historical_count += 1
         connection.rollback()
     except _WriterQuiescenceError:
         raise
@@ -376,19 +544,15 @@ def inspect_writer_quiescence(database_path: str | Path) -> dict[str, object]:
         if connection is not None:
             connection.close()
 
-    status = (
-        "ready"
-        if 0 < target_count <= 64 and other_count == 0
-        else "refused"
+    return _build_result(
+        checked_table_count=checked,
+        missing_table_count=len(_WORK_SPECS) - checked,
+        target_reservation_count=target_count,
+        fresh_active_or_unknown_writer_count=fresh_count,
+        historical_active_or_unknown_residue_count=historical_count,
+        unrecognized_or_null_state_count=unrecognized_count,
+        block_regardless_of_age_writer_count=block_regardless_count,
     )
-    return {
-        "checked_table_count": checked,
-        "missing_table_count": len(_WORK_SPECS) - checked,
-        "other_active_or_unknown_writer_count": other_count,
-        "schema_version": 1,
-        "status": status,
-        "target_reservation_count": target_count,
-    }
 
 
 def main(argv: Sequence[str] | None = None) -> int:

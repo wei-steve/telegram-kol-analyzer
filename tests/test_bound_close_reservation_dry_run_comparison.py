@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 import importlib.util
 import json
 import os
@@ -46,6 +46,13 @@ _WRITER_QUIESCENCE_SCRIPT = (
     / "scripts"
     / "check_bound_close_reservation_writer_quiescence.py"
 )
+_WRITER_SCRIPT_SPEC = importlib.util.spec_from_file_location(
+    "check_bound_close_reservation_writer_quiescence",
+    _WRITER_QUIESCENCE_SCRIPT,
+)
+assert _WRITER_SCRIPT_SPEC is not None and _WRITER_SCRIPT_SPEC.loader is not None
+_WRITER_MODULE = importlib.util.module_from_spec(_WRITER_SCRIPT_SPEC)
+_WRITER_SCRIPT_SPEC.loader.exec_module(_WRITER_MODULE)
 _RECOVERY_OUTPUT_PROJECTOR = (
     Path(__file__).resolve().parents[1]
     / "scripts"
@@ -77,6 +84,9 @@ _WRITER_SPEC_BY_TABLE = {
     table: (column, active_state)
     for table, column, active_state in _EXPECTED_WRITER_SPECS
 }
+CHECKED_AT = datetime(2026, 8, 15, 20, 0, tzinfo=timezone.utc)
+CUTOFF = CHECKED_AT - timedelta(minutes=10)
+_HISTORICAL_SQLITE_UTC = "2026-08-15 00:00:00.000000"
 
 
 def _observation(
@@ -424,16 +434,29 @@ def test_apply_window_failure_simulation_runs_postcheck_before_exit():
 
 def _writer_quiescence_database(path: Path) -> None:
     with sqlite3.connect(path) as connection:
-        for table, column, _active_state in _EXPECTED_WRITER_SPECS:
+        for spec in _WORK_SPECS:
             connection.execute(
-                f'CREATE TABLE "{table}" (id INTEGER PRIMARY KEY, "{column}" TEXT)'
+                f'CREATE TABLE "{spec.table}" ('
+                f'id INTEGER PRIMARY KEY, "{spec.state_column}" TEXT, '
+                f'"{spec.time_column}" DEFAULT \'{_HISTORICAL_SQLITE_UTC}\')'
             )
         connection.execute("CREATE TABLE execution_bindings (id INTEGER PRIMARY KEY)")
         connection.execute("CREATE TABLE execution_events (id INTEGER PRIMARY KEY)")
         connection.execute(
-            "INSERT INTO bound_position_close_reservations (id, status) "
-            "VALUES (1, 'submitted')"
+            "INSERT INTO bound_position_close_reservations "
+            "(id, status, updated_at) VALUES (1, 'submitted', ?)",
+            (_HISTORICAL_SQLITE_UTC,),
         )
+
+
+def _inspect_writer_quiescence(path: Path, *, now: datetime = CHECKED_AT):
+    return _WRITER_MODULE.inspect_writer_quiescence(path, now=now)
+
+
+def _sqlite_utc(value: datetime) -> str:
+    return value.astimezone(UTC).replace(tzinfo=None).isoformat(
+        sep=" ", timespec="microseconds"
+    )
 
 
 def _run_writer_quiescence(path: Path) -> subprocess.CompletedProcess[str]:
@@ -569,12 +592,16 @@ def test_writer_quiescence_inventory_exactly_mirrors_deployment_preflight_specs(
 
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {
+        "block_regardless_of_age_writer_count": 0,
+        "blocking_writer_count": 0,
         "checked_table_count": len(_EXPECTED_WRITER_SPECS),
+        "fresh_active_or_unknown_writer_count": 0,
+        "historical_active_or_unknown_residue_count": 0,
         "missing_table_count": 0,
-        "other_active_or_unknown_writer_count": 0,
         "schema_version": 1,
         "status": "ready",
         "target_reservation_count": 1,
+        "unrecognized_or_null_state_count": 0,
     }
     assert result.stderr == ""
 
@@ -617,7 +644,7 @@ def test_writer_quiescence_contract_includes_reviewed_nonwriter_states():
             ),
             "strategy_management_legs": (
                 "confirmed", "definitely_rejected", "failed", "blocked", "succeeded",
-                "resolved", "safely_skipped",
+                "resolved", "restored", "safely_skipped",
             ),
             "strategy_management_components": (
                 "blocked", "confirmed", "operator_required", "safely_skipped"
@@ -626,7 +653,7 @@ def test_writer_quiescence_contract_includes_reviewed_nonwriter_states():
             "bound_position_close_reservations": ("confirmed",),
             "position_backup_stop_orders": (
                 "not_sent", "active", "verified", "cancelled", "superseded",
-                "unverified_exchange", "failed", "rejected", "expired",
+                "unverified_exchange", "failed", "rejected", "expired", "missing",
             ),
             "position_take_profit_orders": (
                 "active", "cancelled", "filled", "expired", "conflicted", "completed"
@@ -645,7 +672,9 @@ def test_writer_quiescence_contract_includes_reviewed_nonwriter_states():
                 "planned", "shadow_planned", "stop_confirmed", "verified", "confirmed",
                 "succeeded", "failed_terminal", "blocked",
             ),
-            "source_message_deletion_exits": ("succeeded", "failed", "blocked"),
+            "source_message_deletion_exits": (
+                "succeeded", "failed", "blocked", "unbound"
+            ),
         }.items()
         for state in states
     ],
@@ -684,7 +713,7 @@ def test_writer_quiescence_refuses_unreviewed_trigger_protection_state(tmp_path)
     assert result.returncode == 2
     payload = json.loads(result.stdout)
     assert payload["status"] == "refused"
-    assert payload["other_active_or_unknown_writer_count"] == 1
+    assert payload["unrecognized_or_null_state_count"] == 1
 
 
 @pytest.mark.parametrize(
@@ -705,8 +734,12 @@ def test_writer_quiescence_refuses_each_preflight_active_or_unknown_state(
     database = tmp_path / "writers.db"
     _writer_quiescence_database(database)
     with sqlite3.connect(database) as connection:
+        time_column = next(
+            spec.time_column for spec in _WORK_SPECS if spec.table == table
+        )
         connection.execute(
-            f'INSERT INTO "{table}" (id, "{column}") VALUES (1, ?)',
+            f'INSERT INTO "{table}" (id, "{column}", "{time_column}") '
+            "VALUES (1, ?, '2999-01-01 00:00:00.000000')",
             (active_state,),
         )
 
@@ -715,14 +748,23 @@ def test_writer_quiescence_refuses_each_preflight_active_or_unknown_state(
     assert result.returncode == 2
     payload = json.loads(result.stdout)
     assert payload["status"] == "refused"
-    assert payload["other_active_or_unknown_writer_count"] == 1
+    count_field = (
+        "block_regardless_of_age_writer_count"
+        if table == "deepcoin_execution_operations"
+        else "fresh_active_or_unknown_writer_count"
+    )
+    assert payload[count_field] == 1
     assert set(payload) == {
+        "block_regardless_of_age_writer_count",
+        "blocking_writer_count",
         "checked_table_count",
+        "fresh_active_or_unknown_writer_count",
+        "historical_active_or_unknown_residue_count",
         "missing_table_count",
-        "other_active_or_unknown_writer_count",
         "schema_version",
         "status",
         "target_reservation_count",
+        "unrecognized_or_null_state_count",
     }
     assert table not in result.stdout
     assert json.dumps(active_state) not in result.stdout
@@ -757,7 +799,7 @@ def test_writer_quiescence_exempts_only_exact_target_population(
     payload = json.loads(result.stdout)
     assert payload["status"] == "ready"
     assert payload["target_reservation_count"] == 1
-    assert payload["other_active_or_unknown_writer_count"] == 0
+    assert payload["blocking_writer_count"] == 0
 
 
 @pytest.mark.parametrize("invalid_state", [None, "future_writer_state"])
@@ -786,10 +828,284 @@ def test_writer_quiescence_refuses_null_and_future_states_in_every_existing_tabl
     assert result.returncode == 2
     payload = json.loads(result.stdout)
     assert payload["status"] == "refused"
-    assert payload["other_active_or_unknown_writer_count"] == 1
+    expected_field = (
+        "block_regardless_of_age_writer_count"
+        if table == "deepcoin_execution_operations"
+        else "unrecognized_or_null_state_count"
+    )
+    assert payload[expected_field] == 1
     assert "future_writer_state" not in result.stdout
     assert table not in result.stdout
     assert result.stderr == ""
+
+
+@pytest.mark.parametrize("known_state", ["submitting", "unknown"])
+@pytest.mark.parametrize(
+    ("updated_at", "expected_status", "fresh", "historical"),
+    [
+        (CUTOFF - timedelta(microseconds=1), "ready", 0, 1),
+        (CUTOFF, "refused", 1, 0),
+        (CUTOFF + timedelta(microseconds=1), "refused", 1, 0),
+    ],
+)
+def test_writer_quiescence_known_active_or_unknown_state_uses_exact_cutoff(
+    tmp_path,
+    known_state,
+    updated_at,
+    expected_status,
+    fresh,
+    historical,
+):
+    database = tmp_path / "writers.db"
+    _writer_quiescence_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO execution_order_legs (id, status, updated_at) "
+            "VALUES (1, ?, ?)",
+            (known_state, _sqlite_utc(updated_at)),
+        )
+
+    payload = _inspect_writer_quiescence(database)
+
+    assert payload["status"] == expected_status
+    assert payload["fresh_active_or_unknown_writer_count"] == fresh
+    assert payload["historical_active_or_unknown_residue_count"] == historical
+    assert payload["blocking_writer_count"] == fresh
+
+
+def test_writer_quiescence_future_timestamp_is_fresh_and_blocking(tmp_path):
+    database = tmp_path / "writers.db"
+    _writer_quiescence_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO message_instruction_items (id, status, updated_at) "
+            "VALUES (1, 'pending', ?)",
+            (_sqlite_utc(CHECKED_AT + timedelta(days=1)),),
+        )
+
+    payload = _inspect_writer_quiescence(database)
+
+    assert payload["status"] == "refused"
+    assert payload["fresh_active_or_unknown_writer_count"] == 1
+    assert payload["historical_active_or_unknown_residue_count"] == 0
+    assert payload["blocking_writer_count"] == 1
+
+
+def test_writer_quiescence_accepts_explicit_utc_timestamp(tmp_path):
+    database = tmp_path / "writers.db"
+    _writer_quiescence_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO message_instruction_items (id, status, updated_at) "
+            "VALUES (1, 'pending', ?)",
+            ((CUTOFF - timedelta(microseconds=1)).isoformat(),),
+        )
+
+    payload = _inspect_writer_quiescence(database)
+
+    assert payload["status"] == "ready"
+    assert payload["historical_active_or_unknown_residue_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "invalid_timestamp",
+    [
+        None,
+        123,
+        "not-a-timestamp",
+        "2026-08-15T12:00:00-07:00",
+        "2026-08-15T19:00:00+0000",
+    ],
+)
+def test_writer_quiescence_rejects_invalid_or_non_utc_timestamp(
+    tmp_path,
+    invalid_timestamp,
+):
+    database = tmp_path / "writers.db"
+    _writer_quiescence_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO message_instruction_items (id, status, updated_at) "
+            "VALUES (1, 'pending', ?)",
+            (invalid_timestamp,),
+        )
+
+    with pytest.raises(
+        _WRITER_MODULE._WriterQuiescenceError,
+        match="writer_quiescence_timestamp_invalid",
+    ):
+        _inspect_writer_quiescence(database)
+
+
+@pytest.mark.parametrize(
+    "updated_at",
+    [CUTOFF - timedelta(microseconds=1), CUTOFF + timedelta(days=1)],
+)
+def test_writer_quiescence_unrecognized_state_blocks_regardless_of_timestamp(
+    tmp_path,
+    updated_at,
+):
+    database = tmp_path / "writers.db"
+    _writer_quiescence_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO message_instruction_items (id, status, updated_at) "
+            "VALUES (1, 'future_writer_state', ?)",
+            (_sqlite_utc(updated_at),),
+        )
+
+    payload = _inspect_writer_quiescence(database)
+
+    assert payload["status"] == "refused"
+    assert payload["unrecognized_or_null_state_count"] == 1
+    assert payload["fresh_active_or_unknown_writer_count"] == 0
+    assert payload["historical_active_or_unknown_residue_count"] == 0
+    assert payload["blocking_writer_count"] == 1
+
+
+@pytest.mark.parametrize("state", ["entry_unknown", None, "future_writer_state"])
+@pytest.mark.parametrize(
+    "updated_at",
+    [CUTOFF - timedelta(microseconds=1), CUTOFF + timedelta(days=1)],
+)
+def test_writer_quiescence_deepcoin_nonterminal_blocks_regardless_of_timestamp(
+    tmp_path,
+    state,
+    updated_at,
+):
+    database = tmp_path / "writers.db"
+    _writer_quiescence_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO deepcoin_execution_operations (id, state, updated_at) "
+            "VALUES (1, ?, ?)",
+            (state, _sqlite_utc(updated_at)),
+        )
+
+    payload = _inspect_writer_quiescence(database)
+
+    assert payload["status"] == "refused"
+    assert payload["block_regardless_of_age_writer_count"] == 1
+    assert payload["fresh_active_or_unknown_writer_count"] == 0
+    assert payload["historical_active_or_unknown_residue_count"] == 0
+    assert payload["blocking_writer_count"] == 1
+
+
+def test_writer_quiescence_bounded_table_inspection_refuses_overflow(tmp_path):
+    database = tmp_path / "writers.db"
+    _writer_quiescence_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.executemany(
+            "INSERT INTO message_instruction_items (id, status, updated_at) "
+            "VALUES (?, 'pending', ?)",
+            (
+                (row_id, _HISTORICAL_SQLITE_UTC)
+                for row_id in range(
+                    1, _WRITER_MODULE._MAX_INSPECTED_ROWS_PER_TABLE + 2
+                )
+            ),
+        )
+
+    with pytest.raises(
+        _WRITER_MODULE._WriterQuiescenceError,
+        match="writer_quiescence_inspection_limit_exceeded",
+    ):
+        _inspect_writer_quiescence(database)
+
+
+@pytest.mark.parametrize("invalid_count", [True, 1.0])
+def test_writer_quiescence_result_rejects_non_exact_integer_counts(invalid_count):
+    with pytest.raises(
+        _WRITER_MODULE._WriterQuiescenceError,
+        match="writer_quiescence_result_invalid",
+    ):
+        _WRITER_MODULE._build_result(
+            checked_table_count=invalid_count,
+            missing_table_count=0,
+            target_reservation_count=1,
+            fresh_active_or_unknown_writer_count=0,
+            historical_active_or_unknown_residue_count=0,
+            unrecognized_or_null_state_count=0,
+            block_regardless_of_age_writer_count=0,
+        )
+
+
+def test_writer_quiescence_production_shaped_aggregate_transitions_to_ready(
+    tmp_path,
+):
+    database = tmp_path / "writers.db"
+    _writer_quiescence_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute("DELETE FROM bound_position_close_reservations")
+        connection.executemany(
+            "INSERT INTO bound_position_close_reservations "
+            "(id, status, updated_at) VALUES (?, 'submitted', ?)",
+            ((row_id, _HISTORICAL_SQLITE_UTC) for row_id in range(1, 30)),
+        )
+        connection.executemany(
+            "INSERT INTO execution_order_legs (id, status, updated_at) "
+            "VALUES (?, 'submitting', ?)",
+            ((row_id, _HISTORICAL_SQLITE_UTC) for row_id in range(1, 514)),
+        )
+        connection.executemany(
+            "INSERT INTO strategy_management_legs (id, status, updated_at) "
+            "VALUES (?, 'restored', ?)",
+            ((row_id, _HISTORICAL_SQLITE_UTC) for row_id in range(1, 3)),
+        )
+        connection.executemany(
+            "INSERT INTO position_backup_stop_orders (id, status, updated_at) "
+            "VALUES (?, 'missing', ?)",
+            ((row_id, _HISTORICAL_SQLITE_UTC) for row_id in range(1, 17)),
+        )
+        connection.executemany(
+            "INSERT INTO source_message_deletion_exits (id, state, updated_at) "
+            "VALUES (?, 'unbound', ?)",
+            ((row_id, _HISTORICAL_SQLITE_UTC) for row_id in range(1, 76)),
+        )
+        connection.executemany(
+            "INSERT INTO message_instruction_items (id, status, updated_at) "
+            "VALUES (?, 'pending', ?)",
+            ((row_id, _sqlite_utc(CUTOFF)) for row_id in range(1, 3)),
+        )
+
+    blocked = _inspect_writer_quiescence(database)
+
+    assert {
+        key: blocked[key]
+        for key in (
+            "fresh_active_or_unknown_writer_count",
+            "historical_active_or_unknown_residue_count",
+            "target_reservation_count",
+            "unrecognized_or_null_state_count",
+            "block_regardless_of_age_writer_count",
+            "blocking_writer_count",
+            "status",
+        )
+    } == {
+        "fresh_active_or_unknown_writer_count": 2,
+        "historical_active_or_unknown_residue_count": 513,
+        "target_reservation_count": 29,
+        "unrecognized_or_null_state_count": 0,
+        "block_regardless_of_age_writer_count": 0,
+        "blocking_writer_count": 2,
+        "status": "refused",
+    }
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE message_instruction_items SET updated_at = ?",
+            (_sqlite_utc(CUTOFF - timedelta(microseconds=1)),),
+        )
+
+    ready = _inspect_writer_quiescence(database)
+
+    assert ready["status"] == "ready"
+    assert ready["fresh_active_or_unknown_writer_count"] == 0
+    assert ready["historical_active_or_unknown_residue_count"] == 515
+    assert ready["target_reservation_count"] == 29
+    assert ready["unrecognized_or_null_state_count"] == 0
+    assert ready["block_regardless_of_age_writer_count"] == 0
+    assert ready["blocking_writer_count"] == 0
 
 
 @pytest.mark.parametrize(
