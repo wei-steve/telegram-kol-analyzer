@@ -1854,58 +1854,6 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-discover_bound_close_db_stage_units "$DB_STAGE_INITIAL_INVENTORY"
-mapfile -t QUIESCE_DB_STAGE_UNITS < "$DB_STAGE_INITIAL_INVENTORY"
-QUIESCE_SERVICE_UNITS+=("${QUIESCE_DB_STAGE_UNITS[@]}")
-QUIESCE_TRANSIENT_ONESHOT_UNITS+=("${QUIESCE_DB_STAGE_UNITS[@]}")
-QUIESCE_UNITS=(
-  "${QUIESCE_TIMER_UNITS[@]}"
-  "${QUIESCE_SERVICE_UNITS[@]}"
-  "${QUIESCE_SOCKET_UNITS[@]}"
-)
-for UNIT in "${QUIESCE_UNITS[@]}"; do
-  record_bound_close_unit_state "$UNIT"
-done
-for UNIT in "${QUIESCE_TRANSIENT_ONESHOT_UNITS[@]}"; do
-  case "${ORIGINAL_UNIT_INSTALL_STATE[$UNIT]}:${ORIGINAL_UNIT_STATE[$UNIT]}" in
-    installed:active) exit 1 ;;
-    installed:inactive|absent:absent) ;;
-    installed:failed)
-      [ "$UNIT" = telegram-kol-monitor.service ] || exit 1
-      ;;
-    *) exit 1 ;;
-  esac
-done
-test "${BOUND_CLOSE_DRY_RUN_APPROVAL:-}" = \
-  'I_APPROVE_BOUND_CLOSE_RESERVATIONS_ALL_DB_UNITS_STOPPED_READ_ONLY_DOUBLE_CAPTURE'
-test "${BOUND_CLOSE_LEGACY_MONITOR_RESET_APPROVAL:-}" = \
-  'I_APPROVE_LEGACY_MONITOR_FAILED_STATE_RESET_FOR_BOUND_CLOSE_READ_ONLY_WINDOW'
-
-git -C "$PRODUCTION_ROOT" fetch --no-tags origin \
-  "refs/heads/codex/bound-close-reservation-recovery:$APPROVED_REF" \
-  >/dev/null 2>&1
-git -C "$PRODUCTION_ROOT" cat-file -e "${REVIEWED_SHA}^{commit}"
-REMOTE_SHA="$(git -C "$PRODUCTION_ROOT" rev-parse "$APPROVED_REF")"
-test "$REMOTE_SHA" = "$REVIEWED_SHA"
-git -C "$PRODUCTION_ROOT" merge-base --is-ancestor \
-  "$PHASE_ONE_SHA" "$REVIEWED_SHA"
-git -C "$PRODUCTION_ROOT" worktree add --detach \
-  "$CANDIDATE_ROOT" "$REVIEWED_SHA" >/dev/null
-test "$(git -C "$CANDIDATE_ROOT" rev-parse HEAD)" = "$REVIEWED_SHA"
-test -z "$(git -C "$CANDIDATE_ROOT" status --porcelain)"
-
-QUIESCE_ATTEMPTED=1
-stop_bound_close_unit_group "${QUIESCE_TIMER_UNITS[@]}"
-verify_bound_close_unit_group_inactive "${QUIESCE_TIMER_UNITS[@]}"
-reset_bound_close_legacy_monitor_after_timer_freeze
-stop_bound_close_unit_group "${QUIESCE_SERVICE_UNITS[@]}"
-stop_bound_close_unit_group "${QUIESCE_SOCKET_UNITS[@]}"
-for VERIFY_PASS in 1 2 3; do
-  sleep 1
-  verify_bound_close_quiescence
-done
-verify_all_local_quiescence_and_identity
-
 bound_close_now_epoch() {
   date -u +%s
 }
@@ -2155,18 +2103,59 @@ sys.stdout.write(
 PY
 }
 
+write_bound_close_capture_runner() {
+  local RUNNER_PATH="$1"
+  {
+    printf '%s\n' 'set -euo pipefail' 'umask 077'
+    declare -p \
+      RECOVERY_TMP CANDIDATE_ROOT PRODUCTION_ROOT RUNTIME_PYTHON PRODUCTION_DB \
+      ORIGINAL_SHA PRODUCTION_DB_RESOLVED_PATH PRODUCTION_DB_DEVICE_INODE \
+      DB_STAGE_INITIAL_INVENTORY DB_STAGE_CURRENT_INVENTORY \
+      QUIESCE_DB_STAGE_SEED_UNITS QUIESCE_TIMER_UNITS QUIESCE_SERVICE_UNITS \
+      QUIESCE_SOCKET_UNITS ORIGINAL_UNIT_INSTALL_STATE
+    declare -f \
+      bound_close_now_epoch discover_bound_close_db_stage_units \
+      verify_bound_close_unit_group_inactive verify_bound_close_quiescence \
+      verify_all_local_quiescence_and_identity \
+      validate_bound_close_capture_diagnostic \
+      run_bound_close_double_capture
+    printf '%s\n' \
+      'QUIESCENCE_DEADLINE_EPOCH="$1"' \
+      'BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS="$2"' \
+      'BOUND_CLOSE_CAPTURE_OVERHEAD_RESERVE_SECONDS="$3"' \
+      'BOUND_CLOSE_DIAGNOSTIC_HANDOFF="$4"' \
+      'BOUND_CLOSE_SAFE_DIAGNOSTIC='"'"'{"status":"diagnostic_unavailable"}'"'"'' \
+      'run_bound_close_double_capture'
+  } > "$RUNNER_PATH"
+  chmod 0700 "$RUNNER_PATH"
+}
+
 run_bound_close_double_capture() {
   local ATTEMPT
   local CAPTURE_STATUS
   local DIAGNOSTIC
   local DIAGNOSTIC_STATUS
+  local REMAINING_CAPTURES
+  local REMAINING_WINDOW_SECONDS
+  local REQUIRED_CAPTURE_SECONDS
   local RESULT
   local SUMMARY
   local VALIDATED_DIAGNOSTIC
   local VALIDATION_STATUS
   for ATTEMPT in 1 2; do
     BOUND_CLOSE_SAFE_DIAGNOSTIC='{"status":"diagnostic_unavailable"}'
+    rm -f -- "$BOUND_CLOSE_DIAGNOSTIC_HANDOFF" \
+      "$BOUND_CLOSE_DIAGNOSTIC_HANDOFF.tmp"
     verify_all_local_quiescence_and_identity
+    REMAINING_CAPTURES=$((3 - ATTEMPT))
+    REQUIRED_CAPTURE_SECONDS=$((
+      REMAINING_CAPTURES * BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS
+      + BOUND_CLOSE_CAPTURE_OVERHEAD_RESERVE_SECONDS
+    ))
+    REMAINING_WINDOW_SECONDS=$((
+      QUIESCENCE_DEADLINE_EPOCH - $(bound_close_now_epoch)
+    ))
+    [ "$REMAINING_WINDOW_SECONDS" -ge "$REQUIRED_CAPTURE_SECONDS" ] || return 1
     RESULT="$RECOVERY_TMP/dry-run-${ATTEMPT}.json"
     set +e
     (
@@ -2203,6 +2192,10 @@ run_bound_close_double_capture() {
       return 2
     fi
     BOUND_CLOSE_SAFE_DIAGNOSTIC="$(< "$VALIDATED_DIAGNOSTIC")"
+    cp -- "$VALIDATED_DIAGNOSTIC" "$BOUND_CLOSE_DIAGNOSTIC_HANDOFF.tmp"
+    chmod 0600 "$BOUND_CLOSE_DIAGNOSTIC_HANDOFF.tmp"
+    mv -- "$BOUND_CLOSE_DIAGNOSTIC_HANDOFF.tmp" \
+      "$BOUND_CLOSE_DIAGNOSTIC_HANDOFF"
     if [ "$CAPTURE_STATUS" -eq 2 ]; then
       return 2
     fi
@@ -2217,11 +2210,99 @@ run_bound_close_double_capture() {
     "$CANDIDATE_ROOT/scripts/compare_bound_close_reservation_dry_runs.py" \
     "$RECOVERY_TMP/dry-run-1.json" \
     "$RECOVERY_TMP/dry-run-2.json"
+  [ "$(bound_close_now_epoch)" -lt "$QUIESCENCE_DEADLINE_EPOCH" ]
 }
+
+run_bound_close_double_capture_before_deadline() {
+  local CAPTURE_STATUS
+  local REMAINING_WINDOW_SECONDS
+  BOUND_CLOSE_SAFE_DIAGNOSTIC='{"status":"diagnostic_unavailable"}'
+  REMAINING_WINDOW_SECONDS=$((
+    QUIESCENCE_DEADLINE_EPOCH - $(bound_close_now_epoch)
+  ))
+  [ "$REMAINING_WINDOW_SECONDS" -gt 0 ] || return 1
+  set +e
+  timeout --signal=KILL \
+    "$REMAINING_WINDOW_SECONDS" bash "$CAPTURE_RUNNER" \
+    "$QUIESCENCE_DEADLINE_EPOCH" \
+    "$BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS" \
+    "$BOUND_CLOSE_CAPTURE_OVERHEAD_RESERVE_SECONDS" \
+    "$BOUND_CLOSE_DIAGNOSTIC_HANDOFF"
+  CAPTURE_STATUS=$?
+  set -e
+  case "$CAPTURE_STATUS" in
+    0) return 0 ;;
+    2)
+      [ -f "$BOUND_CLOSE_DIAGNOSTIC_HANDOFF" ] && \
+        [ ! -L "$BOUND_CLOSE_DIAGNOSTIC_HANDOFF" ] || return 2
+      BOUND_CLOSE_SAFE_DIAGNOSTIC="$(< "$BOUND_CLOSE_DIAGNOSTIC_HANDOFF")"
+      return 2
+      ;;
+    *) return "$CAPTURE_STATUS" ;;
+  esac
+}
+
+discover_bound_close_db_stage_units "$DB_STAGE_INITIAL_INVENTORY"
+mapfile -t QUIESCE_DB_STAGE_UNITS < "$DB_STAGE_INITIAL_INVENTORY"
+QUIESCE_SERVICE_UNITS+=("${QUIESCE_DB_STAGE_UNITS[@]}")
+QUIESCE_TRANSIENT_ONESHOT_UNITS+=("${QUIESCE_DB_STAGE_UNITS[@]}")
+QUIESCE_UNITS=(
+  "${QUIESCE_TIMER_UNITS[@]}"
+  "${QUIESCE_SERVICE_UNITS[@]}"
+  "${QUIESCE_SOCKET_UNITS[@]}"
+)
+for UNIT in "${QUIESCE_UNITS[@]}"; do
+  record_bound_close_unit_state "$UNIT"
+done
+for UNIT in "${QUIESCE_TRANSIENT_ONESHOT_UNITS[@]}"; do
+  case "${ORIGINAL_UNIT_INSTALL_STATE[$UNIT]}:${ORIGINAL_UNIT_STATE[$UNIT]}" in
+    installed:active) exit 1 ;;
+    installed:inactive|absent:absent) ;;
+    installed:failed)
+      [ "$UNIT" = telegram-kol-monitor.service ] || exit 1
+      ;;
+    *) exit 1 ;;
+  esac
+done
+test "${BOUND_CLOSE_DRY_RUN_APPROVAL:-}" = \
+  'I_APPROVE_BOUND_CLOSE_RESERVATIONS_ALL_DB_UNITS_STOPPED_READ_ONLY_DOUBLE_CAPTURE'
+test "${BOUND_CLOSE_LEGACY_MONITOR_RESET_APPROVAL:-}" = \
+  'I_APPROVE_LEGACY_MONITOR_FAILED_STATE_RESET_FOR_BOUND_CLOSE_READ_ONLY_WINDOW'
+
+git -C "$PRODUCTION_ROOT" fetch --no-tags origin \
+  "refs/heads/codex/bound-close-reservation-recovery:$APPROVED_REF" \
+  >/dev/null 2>&1
+git -C "$PRODUCTION_ROOT" cat-file -e "${REVIEWED_SHA}^{commit}"
+REMOTE_SHA="$(git -C "$PRODUCTION_ROOT" rev-parse "$APPROVED_REF")"
+test "$REMOTE_SHA" = "$REVIEWED_SHA"
+git -C "$PRODUCTION_ROOT" merge-base --is-ancestor \
+  "$PHASE_ONE_SHA" "$REVIEWED_SHA"
+git -C "$PRODUCTION_ROOT" worktree add --detach \
+  "$CANDIDATE_ROOT" "$REVIEWED_SHA" >/dev/null
+test "$(git -C "$CANDIDATE_ROOT" rev-parse HEAD)" = "$REVIEWED_SHA"
+test -z "$(git -C "$CANDIDATE_ROOT" status --porcelain)"
+
+CAPTURE_RUNNER="$RECOVERY_TMP/capture-runner.sh"
+write_bound_close_capture_runner "$CAPTURE_RUNNER"
+
+QUIESCE_ATTEMPTED=1
+stop_bound_close_unit_group "${QUIESCE_TIMER_UNITS[@]}"
+verify_bound_close_unit_group_inactive "${QUIESCE_TIMER_UNITS[@]}"
+reset_bound_close_legacy_monitor_after_timer_freeze
+stop_bound_close_unit_group "${QUIESCE_SERVICE_UNITS[@]}"
+stop_bound_close_unit_group "${QUIESCE_SOCKET_UNITS[@]}"
+for VERIFY_PASS in 1 2 3; do
+  sleep 1
+  verify_bound_close_quiescence
+done
+verify_all_local_quiescence_and_identity
 
 # BEGIN BOUND_CLOSE_QUIESCENCE_POLL
 QUIESCENCE_DEADLINE_EPOCH="$(( $(bound_close_now_epoch) + 720 ))"
 QUIESCENCE_POLL_SECONDS=15
+BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS=180
+BOUND_CLOSE_CAPTURE_OVERHEAD_RESERVE_SECONDS=60
+BOUND_CLOSE_DIAGNOSTIC_HANDOFF="$RECOVERY_TMP/capture-diagnostic-handoff.json"
 QUIESCENCE_ATTEMPT=0
 WRITER_QUIESCENCE_RESULT="$RECOVERY_TMP/writer-quiescence.json"
 while :; do
@@ -2261,7 +2342,13 @@ while :; do
   fi
   sleep "$SLEEP_SECONDS"
 done
-run_bound_close_double_capture
+REMAINING_SECONDS=$((QUIESCENCE_DEADLINE_EPOCH - $(bound_close_now_epoch)))
+REQUIRED_CAPTURE_SECONDS=$((
+  2 * BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS
+  + BOUND_CLOSE_CAPTURE_OVERHEAD_RESERVE_SECONDS
+))
+[ "$REMAINING_SECONDS" -ge "$REQUIRED_CAPTURE_SECONDS" ] || exit 1
+run_bound_close_double_capture_before_deadline
 # END BOUND_CLOSE_QUIESCENCE_POLL
 ```
 
@@ -2278,6 +2365,8 @@ capture 不可达时退出，并由 trap 恢复原状态。
 完成即立即返回，并不是固定等待 180 秒。该上限覆盖网络流式读取、响应解码和证据规范化；
 停服窗口的 12 分钟 absolute deadline 不变。超时不会被推断成安全终态，
 timeout 仍为 `UNKNOWN / exchange_capture_timeout`，而且首次 capture 被拒后第二次 capture 不可达。
+双 capture 只会在窗口至少还剩 420 秒时启动；每次开始前都会重新核算剩余 capture
+的完整 180 秒预算，并始终保留 60 秒给本地投影、比较和恢复前检查。
 任何超时或拒绝都必须恢复服务、形成新的 reviewed SHA 并重新取得两个完整 token，
 不能在同一停服窗口重试。
 

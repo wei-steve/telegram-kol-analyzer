@@ -9,6 +9,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -392,6 +393,15 @@ def test_bound_close_runbook_deadline_contract_is_explicit():
     ):
         assert expected in section
 
+    writer_definition = section.index("write_bound_close_capture_runner() {")
+    writer_invocation = section.index(
+        'write_bound_close_capture_runner "$CAPTURE_RUNNER"'
+    )
+    first_unit_stop = section.index("QUIESCE_ATTEMPTED=1")
+    assert writer_definition < writer_invocation < first_unit_stop
+    assert "timeout --signal=KILL" in section
+    assert "--kill-after" not in section
+
 
 def test_runbook_quiescence_inventory_preserves_state_and_refuses_unit_races():
     project_root = Path(__file__).resolve().parents[1]
@@ -722,6 +732,11 @@ PRODUCTION_ROOT={shlex.quote(str(production_root))}
 RUNTIME_PYTHON={shlex.quote(str(runtime))}
 PRODUCTION_DB={shlex.quote(str(tmp_path / 'production.db'))}
 BOUND_CLOSE_SAFE_DIAGNOSTIC=''
+BOUND_CLOSE_DIAGNOSTIC_HANDOFF="$RECOVERY_TMP/diagnostic-handoff.json"
+QUIESCENCE_DEADLINE_EPOCH=820
+BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS=180
+BOUND_CLOSE_CAPTURE_OVERHEAD_RESERVE_SECONDS=60
+bound_close_now_epoch() {{ printf '100\n'; }}
 verify_all_local_quiescence_and_identity() {{ :; }}
 restore_bound_close_reservation_units() {{
   printf 'restore\\n'
@@ -854,6 +869,11 @@ PRODUCTION_ROOT={shlex.quote(str(production_root))}
 RUNTIME_PYTHON={shlex.quote(str(runtime))}
 PRODUCTION_DB={shlex.quote(str(tmp_path / 'production.db'))}
 BOUND_CLOSE_SAFE_DIAGNOSTIC=''
+BOUND_CLOSE_DIAGNOSTIC_HANDOFF="$RECOVERY_TMP/diagnostic-handoff.json"
+QUIESCENCE_DEADLINE_EPOCH=820
+BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS=180
+BOUND_CLOSE_CAPTURE_OVERHEAD_RESERVE_SECONDS=60
+bound_close_now_epoch() {{ printf '100\n'; }}
 verify_all_local_quiescence_and_identity() {{
   count="$(cat "$VERIFY_COUNTER")"
   count=$((count + 1))
@@ -1234,6 +1254,11 @@ PRODUCTION_ROOT={shlex.quote(str(production_root))}
 RUNTIME_PYTHON={shlex.quote(str(runtime))}
 PRODUCTION_DB={shlex.quote(str(tmp_path / 'production.db'))}
 BOUND_CLOSE_SAFE_DIAGNOSTIC=''
+BOUND_CLOSE_DIAGNOSTIC_HANDOFF="$RECOVERY_TMP/diagnostic-handoff.json"
+QUIESCENCE_DEADLINE_EPOCH=820
+BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS=180
+BOUND_CLOSE_CAPTURE_OVERHEAD_RESERVE_SECONDS=60
+bound_close_now_epoch() {{ printf '100\n'; }}
 verify_all_local_quiescence_and_identity() {{ :; }}
 restore_bound_close_reservation_units() {{
   printf 'restore\\n'
@@ -1395,7 +1420,9 @@ project_bound_close_writer_quiescence_result() {{
 }}
 require_exact_ready_projection() {{ grep -q '"status":"ready"' "$1"; }}
 require_exact_refused_projection() {{ grep -q '"status":"refused"' "$1"; }}
-run_bound_close_double_capture() {{ printf 'capture\n' >> "$EVENTS"; }}
+run_bound_close_double_capture_before_deadline() {{
+  printf 'capture\n' >> "$EVENTS"
+}}
 """
     return subprocess.run(
         ["bash", "-c", prefix + _bound_close_poll_snippet()],
@@ -1434,6 +1461,141 @@ def test_runbook_quiescence_timeout_or_helper_error_restores_without_capture(
 
     assert result.returncode != 0
     assert (tmp_path / "events.txt").read_text() == "restore\n"
+
+
+def test_runbook_refuses_late_ready_without_full_double_capture_budget(tmp_path):
+    result = _simulate_runbook_quiescence_poll(
+        tmp_path,
+        helper_statuses=((2,) * 21) + (0,),
+        sleep_jump=15,
+    )
+
+    assert result.returncode != 0
+    assert (tmp_path / "events.txt").read_text() == "restore\n"
+
+
+def test_runbook_outer_deadline_interrupts_a_blocked_capture_phase(tmp_path):
+    block = _bound_close_read_only_block()
+    runner = _bound_close_shell_function(
+        block, "run_bound_close_double_capture_before_deadline"
+    )
+    events = tmp_path / "events.txt"
+    timeout_command = tmp_path / "timeout"
+    timeout_command.write_text(
+        f"""#!{sys.executable}
+import os
+import signal
+import subprocess
+import sys
+
+arguments = sys.argv[1:]
+deadline_signal = signal.SIGTERM
+while arguments and arguments[0].startswith("--"):
+    option = arguments.pop(0)
+    if option == "--signal=KILL":
+        deadline_signal = signal.SIGKILL
+duration = float(arguments.pop(0))
+process = subprocess.Popen(arguments, start_new_session=True)
+try:
+    raise SystemExit(process.wait(timeout=duration))
+except subprocess.TimeoutExpired:
+    os.killpg(process.pid, deadline_signal)
+    process.wait()
+    raise SystemExit(124)
+""",
+        encoding="utf-8",
+    )
+    timeout_command.chmod(0o700)
+    script = f"""
+set -euo pipefail
+PATH={shlex.quote(str(tmp_path))}:$PATH
+RECOVERY_TMP={shlex.quote(str(tmp_path))}
+EVENTS={shlex.quote(str(events))}
+QUIESCENCE_DEADLINE_EPOCH=$(( $(date +%s) + 2 ))
+BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS=180
+BOUND_CLOSE_CAPTURE_OVERHEAD_RESERVE_SECONDS=60
+BOUND_CLOSE_SAFE_DIAGNOSTIC=''
+BOUND_CLOSE_DIAGNOSTIC_HANDOFF="$RECOVERY_TMP/diagnostic-handoff.json"
+CAPTURE_RUNNER="$RECOVERY_TMP/capture-runner.sh"
+printf '%s\n' '#!/bin/bash' "trap '' TERM" \
+  {shlex.quote(f"printf 'started\\n' >> {events}")} \
+  'sleep 5' > "$CAPTURE_RUNNER"
+chmod 0700 "$CAPTURE_RUNNER"
+bound_close_now_epoch() {{ date +%s; }}
+restore() {{ printf 'restore\n' >> "$EVENTS"; }}
+run_bound_close_double_capture_before_deadline() {{
+{runner}
+}}
+trap restore EXIT
+run_bound_close_double_capture_before_deadline
+"""
+
+    started_at = time.monotonic()
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=4,
+    )
+
+    assert result.returncode != 0
+    assert time.monotonic() - started_at < 4
+    assert events.read_text(encoding="utf-8") == "started\nrestore\n", result.stderr
+
+
+def test_runbook_prebuilt_capture_runner_is_private_and_syntax_valid(tmp_path):
+    block = _bound_close_read_only_block()
+    writer = _bound_close_shell_function(block, "write_bound_close_capture_runner")
+    validator = _bound_close_diagnostic_validator_function(block)
+    capture = _bound_close_shell_function(block, "run_bound_close_double_capture")
+    runner_path = tmp_path / "capture-runner.sh"
+    script = f"""
+set -euo pipefail
+RECOVERY_TMP={shlex.quote(str(tmp_path))}
+CANDIDATE_ROOT=/candidate
+PRODUCTION_ROOT=/production
+RUNTIME_PYTHON=/runtime-python
+PRODUCTION_DB=/production/data/research.db
+ORIGINAL_SHA={'a' * 40}
+PRODUCTION_DB_RESOLVED_PATH=/production/data/research.db
+PRODUCTION_DB_DEVICE_INODE=1:2
+DB_STAGE_INITIAL_INVENTORY="$RECOVERY_TMP/initial"
+DB_STAGE_CURRENT_INVENTORY="$RECOVERY_TMP/current"
+declare -a QUIESCE_DB_STAGE_SEED_UNITS=()
+declare -a QUIESCE_TIMER_UNITS=()
+declare -a QUIESCE_SERVICE_UNITS=()
+declare -a QUIESCE_SOCKET_UNITS=()
+declare -a ORIGINAL_UNIT_INSTALL_STATE=()
+bound_close_now_epoch() {{ date +%s; }}
+discover_bound_close_db_stage_units() {{ :; }}
+verify_bound_close_unit_group_inactive() {{ :; }}
+verify_bound_close_quiescence() {{ :; }}
+verify_all_local_quiescence_and_identity() {{ :; }}
+validate_bound_close_capture_diagnostic() {{
+{validator}
+}}
+run_bound_close_double_capture() {{
+{capture}
+}}
+write_bound_close_capture_runner() {{
+{writer}
+}}
+write_bound_close_capture_runner {shlex.quote(str(runner_path))}
+bash -n {shlex.quote(str(runner_path))}
+stat -f '%Lp' {shlex.quote(str(runner_path))}
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "700\n"
 
 
 @pytest.mark.parametrize(

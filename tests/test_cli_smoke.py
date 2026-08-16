@@ -4894,7 +4894,9 @@ def test_bound_close_recovery_cli_narrowly_recaptures_an_ambiguous_postapply(
     database_path.touch()
     plan, first_capture = _bound_close_recovery_cli_plan()
     postapply_capture = SimpleNamespace(plan=plan, serialized_plan="postapply")
-    readers = iter((object(), object()))
+    first_reader = object()
+    postapply_reader = object()
+    readers = iter((first_reader, postapply_reader))
     apply_captures = []
     initial_deadlines = []
     recaptures = []
@@ -4918,6 +4920,7 @@ def test_bound_close_recovery_cli_narrowly_recaptures_an_ambiguous_postapply(
     )
 
     def fake_initial_capture(source, reader, **kwargs):
+        assert reader is first_reader
         initial_deadlines.append(kwargs["deadline_monotonic"])
         return first_capture
 
@@ -4979,6 +4982,8 @@ def test_bound_close_recovery_cli_narrowly_recaptures_an_ambiguous_postapply(
     assert apply_captures == [first_capture, postapply_capture]
     assert recaptures[0][0] == database_path.resolve()
     assert recaptures[0][1]["approved_plan"] is plan
+    assert recaptures[0][1]["reader"] is postapply_reader
+    assert recaptures[0][1]["reader"] is not first_reader
     assert initial_deadlines == [280.0]
     assert recaptures[0][1]["deadline_monotonic"] == 380.0
     assert recaptures[0][1]["deadline_monotonic"] != initial_deadlines[0]
