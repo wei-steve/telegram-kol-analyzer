@@ -2579,6 +2579,27 @@ def _plan(factory, snapshot=None):
     return plan
 
 
+def test_joint_material_heartbeat_normalization_does_not_weaken_apply_fingerprint(
+    tmp_path,
+):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    before = _plan(factory)
+    assert before.status == "ready"
+
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        leg = session.query(StrategyManagementLeg).filter_by(
+            management_batch_id=119
+        ).one()
+        batch.updated_at = NOW + timedelta(seconds=4)
+        leg.updated_at = NOW + timedelta(seconds=4)
+        session.commit()
+
+    after = _plan(factory)
+    assert after.status == "ready"
+    assert after.source_fingerprint != before.source_fingerprint
+
+
 def _apply_recovery(
     module,
     session_factory,

@@ -177,6 +177,15 @@ class _Batch119ResolvedStopRole:
     order_id: str = field(repr=False)
 
 
+@dataclass(frozen=True, slots=True)
+class _Batch119LocalMaterialAuthority:
+    payload: Mapping[str, Any] = field(repr=False)
+    batch_row_id: int = field(repr=False)
+    management_leg_row_id: int = field(repr=False)
+    component_row_ids: tuple[int, ...] = field(repr=False)
+    instruction_item_row_ids: tuple[int, ...] = field(repr=False)
+
+
 @dataclass
 class Batch119ExactRecoverySnapshot:
     positions: list[dict[str, Any]] = field(default_factory=list, repr=False)
@@ -312,6 +321,7 @@ _INSTRUCTION_DISPOSITIONS = (
     "verified_terminal_mirror",
 )
 _MAX_INSTRUCTION_POPULATION = 4096
+_MAX_JOINT_MATERIAL_ROWS = 4096
 _MAX_INSTRUCTION_PAYLOAD_BYTES = 16_384
 _MAX_INSTRUCTION_PAYLOAD_DEPTH = 64
 _MAX_INSTRUCTION_PAYLOAD_NODES = 2048
@@ -790,6 +800,7 @@ def _build_batch119_exact_history_scope_in_session(
         session.query(StrategyManagementLeg)
         .filter_by(management_batch_id=profile.batch_id)
         .order_by(StrategyManagementLeg.leg_index, StrategyManagementLeg.id)
+        .limit(2)
         .all()
     )
     if binding is None or len(legs) != 1:
@@ -5279,6 +5290,21 @@ def _build_composite_batch_recovery_plan(
         except CompositeBatchRecoveryRefusal:
             return _refusal(profile.batch_id, "durable_evidence_invalid")
         source_fingerprint = _fingerprint(source_payload)
+        try:
+            _load_batch119_local_material_authority_in_session(
+                session,
+                validated_source=(
+                    batch,
+                    binding,
+                    entry,
+                    leg,
+                    components,
+                    ledger,
+                    source_fingerprint,
+                ),
+            )
+        except CompositeBatchRecoveryRefusal:
+            return _refusal(profile.batch_id, "durable_evidence_invalid")
         exchange_payload = _exchange_evidence_payload(
             snapshot,
             position=position,
@@ -5370,6 +5396,7 @@ def _load_locked_recovery_source(session):
         session.query(StrategyManagementLeg)
         .filter_by(management_batch_id=BATCH_119_RECOVERY.batch_id)
         .order_by(StrategyManagementLeg.leg_index, StrategyManagementLeg.id)
+        .limit(2)
         .all()
     )
     components = (
@@ -5379,6 +5406,7 @@ def _load_locked_recovery_source(session):
             StrategyManagementComponent.sequence,
             StrategyManagementComponent.id,
         )
+        .limit(len(_EXPECTED_COMPONENTS) + 1)
         .all()
     )
     if (
@@ -5465,8 +5493,11 @@ def _load_locked_recovery_source(session):
             PositionProtectionLedger.pos_id == str(leg.pos_id),
         )
         .order_by(PositionProtectionLedger.id)
+        .limit(_MAX_JOINT_MATERIAL_ROWS + 1)
         .all()
     )
+    if len(ledger) > _MAX_JOINT_MATERIAL_ROWS:
+        return None
     try:
         payload = _source_evidence_payload(
             batch=batch,
@@ -5485,6 +5516,141 @@ def _load_locked_recovery_source(session):
     except (CompositeBatchRecoveryRefusal, TypeError, ValueError, RecursionError):
         return None
     return batch, binding, entry, leg, components, ledger, source_fingerprint
+
+
+def _batch119_material_row_payload(
+    row: Any,
+    *,
+    exclude_retry_heartbeat: bool = False,
+) -> dict[str, Any]:
+    table = getattr(row, "__table__", None)
+    columns = getattr(table, "columns", None)
+    if columns is None:
+        raise CompositeBatchRecoveryRefusal("durable_evidence_invalid")
+    result: dict[str, Any] = {}
+    try:
+        for column in columns:
+            name = str(column.name)
+            if exclude_retry_heartbeat and name == "updated_at":
+                continue
+            result[name] = _durable_column_scalar(column, getattr(row, name))
+    except (
+        AttributeError,
+        TypeError,
+        ValueError,
+        UnicodeEncodeError,
+        RecursionError,
+        OverflowError,
+    ) as exc:
+        raise CompositeBatchRecoveryRefusal(
+            "durable_evidence_invalid"
+        ) from exc
+    return result
+
+
+def _load_batch119_local_material_authority_in_session(
+    session,
+    *,
+    validated_source=None,
+) -> _Batch119LocalMaterialAuthority:
+    """Load the exact local incident authority without exchange evidence.
+
+    Only the audited batch/management-leg retry heartbeat ``updated_at``
+    columns are normalized out.  The ordinary apply source fingerprint remains
+    unchanged and continues to include those columns.
+    """
+
+    source = (
+        validated_source
+        if validated_source is not None
+        else _load_locked_recovery_source(session)
+    )
+    if source is None:
+        raise CompositeBatchRecoveryRefusal("durable_evidence_invalid")
+    (
+        batch,
+        binding,
+        entry,
+        leg,
+        components,
+        ledger,
+        _source_fingerprint,
+    ) = source
+    raw = session.get(RawMessage, BATCH_119_RECOVERY.raw_message_id)
+    lifecycle = session.get(
+        StrategyLifecycle, BATCH_119_RECOVERY.lifecycle_id
+    )
+    if raw is None or lifecycle is None:
+        raise CompositeBatchRecoveryRefusal("durable_evidence_invalid")
+    try:
+        instruction_population = _instruction_population_payload(
+            session,
+            batch=batch,
+            profile=BATCH_119_RECOVERY,
+        )
+        instruction_rows = (
+            session.query(MessageInstructionItem)
+            .filter(
+                MessageInstructionItem.retired_at.is_(None),
+                MessageInstructionItem.status.notin_(
+                    _SAFE_TERMINAL_INSTRUCTION_STATUSES
+                ),
+            )
+            .order_by(MessageInstructionItem.id)
+            .limit(_MAX_INSTRUCTION_POPULATION + 1)
+            .all()
+        )
+        population_rows = instruction_population.get("rows")
+        if (
+            not isinstance(population_rows, list)
+            or len(population_rows) != len(instruction_rows)
+        ):
+            raise CompositeBatchRecoveryRefusal("durable_evidence_invalid")
+        target_instruction_ids = tuple(
+            int(item.id)
+            for item, evidence in zip(
+                instruction_rows, population_rows, strict=True
+            )
+            if isinstance(evidence, Mapping)
+            and evidence.get("disposition") == "target_incident_frozen"
+        )
+        if len(target_instruction_ids) != 1:
+            raise CompositeBatchRecoveryRefusal("durable_evidence_invalid")
+        payload = {
+            "schema_version": 1,
+            "batch": _batch119_material_row_payload(
+                batch, exclude_retry_heartbeat=True
+            ),
+            "management_leg": _batch119_material_row_payload(
+                leg, exclude_retry_heartbeat=True
+            ),
+            "components": [
+                _batch119_material_row_payload(row) for row in components
+            ],
+            "binding": _batch119_material_row_payload(binding),
+            "entry": _batch119_material_row_payload(entry),
+            "raw_message": _batch119_material_row_payload(raw),
+            "lifecycle": _batch119_material_row_payload(lifecycle),
+            "protection_ledger": [
+                _batch119_material_row_payload(row) for row in ledger
+            ],
+            "instruction_population": instruction_population,
+        }
+        # Force canonical validation here; callers only receive the opaque hash.
+        _fingerprint(payload)
+    except CompositeBatchRecoveryRefusal:
+        raise
+    except (TypeError, ValueError, UnicodeEncodeError, RecursionError) as exc:
+        raise CompositeBatchRecoveryRefusal(
+            "durable_evidence_invalid"
+        ) from exc
+    return _Batch119LocalMaterialAuthority(
+        payload=_freeze_mapping(payload),
+        batch_row_id=int(batch.id),
+        management_leg_row_id=int(leg.id),
+        component_row_ids=tuple(int(row.id) for row in components),
+        instruction_item_row_ids=target_instruction_ids,
+    )
 
 
 def _recovery_audit_after(
@@ -7326,6 +7492,7 @@ def _instruction_population_payload(
             ),
         )
         .order_by(MessageInstructionItem.id)
+        .limit(_MAX_INSTRUCTION_POPULATION + 1)
         .all()
     )
     if not rows or len(rows) > _MAX_INSTRUCTION_POPULATION:
