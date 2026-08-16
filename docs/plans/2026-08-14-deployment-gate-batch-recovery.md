@@ -34,6 +34,29 @@
 - Batch 119 recovery and Deepcoin request-governance Stage 1 rollout must not share one quiet window.
 - Stop immediately on incomplete pagination, identity drift, unknown exchange outcome, unprotected exposure, cleanup failure, or a production fact that differs from this plan.
 
+## Bound-close-reservation prerequisite discovered during execution
+
+The first approved Batch 119 apply window stopped before backup or mutation
+because the unchanged deployment gate found a separate population of nonterminal
+`bound_position_close_reservations`. That fact must not be bypassed inside this
+plan. Before resuming Task 5, execute the independently reviewed
+`docs/plans/2026-08-15-bound-position-close-reservation-convergence.md` on
+`codex/bound-close-reservation-recovery`.
+
+Its stopped-service read-only double capture and its later apply are two new,
+separately authorized windows. After its apply and query-only postchecks, restore
+the original unit states and explicitly stop before returning here. Do not reuse
+its approval, capture, fingerprint, confirmation token, backup, or quiet window
+for Batch 119. The exact return chain is:
+
+```text
+reservation recovery -> Batch119 apply -> stable snapshot -> ordinary preflight
+-> deploy exact c50887b -> Phase One canary/cutover
+```
+
+The approved Phase One target remains
+`c50887b991712340d7d5606fb6916cdbb033926e`; MiMo remains `v1` throughout.
+
 ### Task 1: Establish the exact local and remote baseline
 
 **Files:**

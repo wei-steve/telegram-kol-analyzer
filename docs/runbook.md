@@ -1486,6 +1486,346 @@ WHERE idempotency_key LIKE :component_id || ':%' ORDER BY id;
 将模式切为 `disabled` 只会阻止新批次，不会把已发出的未知结果当作回滚。
 米娅和三姐的历史消息永不自动重放；历史补操作必须单独只读规划、人工批准和交易所回读。
 
+## Bound position close reservation convergence
+
+这是 Batch 119 之前的独立门禁恢复，只能把“交易所已经证明终态”的
+`bound_position_close_reservations` 收敛为 `confirmed`。它不忽略旧记录，
+不手改数据库，不重放消息，不构造交易所 writer，不改 Batch 119，
+也不启用 MiMo v2。恢复 candidate 固定位于
+`codex/bound-close-reservation-recovery`；Phase One 目标仍是
+`c50887b991712340d7d5606fb6916cdbb033926e`。
+
+生产操作分为两个必须分开的窗口：先停服做两次只读 capture，恢复
+服务后立即停止；只有另行获得 apply 授权，才能再开一个停服窗口。
+诊断授权不是 apply 授权，apply 授权也不是 Batch119 或普通部署授权。
+
+### 窗口一：停服只读双 capture
+
+只有操作员明确提供下列完整 token 才可执行：
+
+```text
+I_APPROVE_BOUND_CLOSE_RESERVATIONS_ALL_DB_UNITS_STOPPED_READ_ONLY_DOUBLE_CAPTURE
+```
+
+将 `REVIEWED_SHA` 替换为已完成本地全量验证和 Critical/Important 审查的
+40 位完整 SHA；不得使用短 SHA。下列命令保存原始 unit 状态，任意
+失败都由 trap 恢复原状态。它只直接读生产库；CLI loader 使用
+SQLite `mode=ro` + `PRAGMA query_only=ON` + 显式只读事务，不执行 bootstrap。
+
+```bash
+set -euo pipefail
+umask 077
+
+PRODUCTION_ROOT=/opt/telegram-kol-analyzer
+PRODUCTION_DB="$PRODUCTION_ROOT/data/research.db"
+RUNTIME_PYTHON="$PRODUCTION_ROOT/.venv/bin/python"
+REVIEWED_SHA='<exact-reviewed-recovery-sha>'
+PHASE_ONE_SHA='c50887b991712340d7d5606fb6916cdbb033926e'
+APPROVED_REF='refs/remotes/origin/codex/bound-close-reservation-recovery'
+RECOVERY_TMP="$(mktemp -d /tmp/bound-close-reservation-recovery.XXXXXX)"
+chmod 0700 "$RECOVERY_TMP"
+CANDIDATE_ROOT="$RECOVERY_TMP/candidate"
+QUIESCE_UNITS=(
+  telegram-kol-monitor.timer
+  telegram-kol-monitor.service
+  telegram-kol-monitor-diagnostic.service
+  telegram-kol-monitor-test-notification.service
+  telegram-kol-runtime-scanner.service
+  telegram-kol-runtime-agent.service
+  telegram-kol.service
+)
+declare -A ORIGINAL_UNIT_STATE
+QUIESCE_ATTEMPTED=0
+ORIGINAL_SHA="$(git -C "$PRODUCTION_ROOT" rev-parse HEAD)"
+for UNIT in "${QUIESCE_UNITS[@]}"; do
+  ORIGINAL_UNIT_STATE["$UNIT"]="$(systemctl is-active "$UNIT" || true)"
+done
+
+restore_bound_close_reservation_units() {
+  local cleanup_status=0
+  case "$RECOVERY_TMP" in
+    /tmp/bound-close-reservation-recovery.*) ;;
+    *) return 1 ;;
+  esac
+  if [ -d "$CANDIDATE_ROOT" ]; then
+    if ! git -C "$PRODUCTION_ROOT" worktree remove --force "$CANDIDATE_ROOT"; then
+      cleanup_status=1
+    fi
+  fi
+  if [ "$QUIESCE_ATTEMPTED" = 1 ]; then
+    for ((INDEX=${#QUIESCE_UNITS[@]}-1; INDEX>=0; INDEX--)); do
+      UNIT="${QUIESCE_UNITS[$INDEX]}"
+      if [ "${ORIGINAL_UNIT_STATE[$UNIT]}" = active ]; then
+        if ! sudo systemctl start "$UNIT"; then
+          cleanup_status=1
+        elif ! timeout 30 systemctl is-active --quiet "$UNIT"; then
+          cleanup_status=1
+        fi
+      elif [ "${ORIGINAL_UNIT_STATE[$UNIT]}" = inactive ]; then
+        if ! sudo systemctl stop "$UNIT"; then
+          cleanup_status=1
+        elif [ "$(systemctl is-active "$UNIT" || true)" != inactive ]; then
+          cleanup_status=1
+        fi
+      else
+        cleanup_status=1
+      fi
+    done
+    for VERIFY_PASS in 1 2 3; do
+      sleep 1
+      for UNIT in "${QUIESCE_UNITS[@]}"; do
+        if [ "$(systemctl is-active "$UNIT" || true)" != \
+          "${ORIGINAL_UNIT_STATE[$UNIT]}" ]; then
+          cleanup_status=1
+        fi
+      done
+    done
+  fi
+  if [ "$(git -C "$PRODUCTION_ROOT" rev-parse HEAD)" != "$ORIGINAL_SHA" ]; then
+    cleanup_status=1
+  fi
+  if ! rm -rf -- "$RECOVERY_TMP"; then
+    cleanup_status=1
+  fi
+  return "$cleanup_status"
+}
+finish_bound_close_reservation_window() {
+  local original_status=$?
+  local cleanup_status=0
+  trap - EXIT
+  restore_bound_close_reservation_units || cleanup_status=$?
+  if [ "$cleanup_status" -ne 0 ]; then
+    exit "$cleanup_status"
+  fi
+  exit "$original_status"
+}
+trap finish_bound_close_reservation_window EXIT
+
+for UNIT in "${QUIESCE_UNITS[@]}"; do
+  case "${ORIGINAL_UNIT_STATE[$UNIT]}" in
+    active|inactive) ;;
+    *) exit 1 ;;
+  esac
+done
+test "${BOUND_CLOSE_DRY_RUN_APPROVAL:-}" = \
+  'I_APPROVE_BOUND_CLOSE_RESERVATIONS_ALL_DB_UNITS_STOPPED_READ_ONLY_DOUBLE_CAPTURE'
+
+git -C "$PRODUCTION_ROOT" fetch --no-tags origin \
+  codex/bound-close-reservation-recovery >/dev/null 2>&1
+git -C "$PRODUCTION_ROOT" cat-file -e "${REVIEWED_SHA}^{commit}"
+REMOTE_SHA="$(git -C "$PRODUCTION_ROOT" rev-parse "$APPROVED_REF")"
+test "$REMOTE_SHA" = "$REVIEWED_SHA"
+git -C "$PRODUCTION_ROOT" merge-base --is-ancestor \
+  "$PHASE_ONE_SHA" "$REVIEWED_SHA"
+git -C "$PRODUCTION_ROOT" worktree add --detach \
+  "$CANDIDATE_ROOT" "$REVIEWED_SHA" >/dev/null
+test "$(git -C "$CANDIDATE_ROOT" rev-parse HEAD)" = "$REVIEWED_SHA"
+test -z "$(git -C "$CANDIDATE_ROOT" status --porcelain)"
+
+QUIESCE_ATTEMPTED=1
+sudo systemctl stop "${QUIESCE_UNITS[@]}"
+for UNIT in "${QUIESCE_UNITS[@]}"; do
+  test "$(systemctl is-active "$UNIT" || true)" = inactive
+done
+if pgrep -f '[t]elegram_kol_research|[t]elegram-kol' >/dev/null; then
+  exit 1
+fi
+
+# 只排除本命令完整装载的五种 target reservation；其他持久化
+# active/unknown exchange writer 事实必须全部为零。
+TARGET_RESERVATION_COUNT="$(sqlite3 -readonly "$PRODUCTION_DB" <<'SQL'
+PRAGMA query_only=ON;
+SELECT COUNT(*) FROM bound_position_close_reservations
+ WHERE status IN (
+   'reserved','submitted','submit_unknown','unknown_exchange_outcome',
+   'recovery_required'
+ );
+SQL
+)"
+test "$TARGET_RESERVATION_COUNT" -gt 0
+test "$TARGET_RESERVATION_COUNT" -le 64
+UNRECOGNIZED_RESERVATION_COUNT="$(sqlite3 -readonly "$PRODUCTION_DB" <<'SQL'
+PRAGMA query_only=ON;
+SELECT COUNT(*) FROM bound_position_close_reservations
+ WHERE status NOT IN (
+   'reserved','submitted','submit_unknown','unknown_exchange_outcome',
+   'recovery_required','confirmed'
+ );
+SQL
+)"
+test "$UNRECOGNIZED_RESERVATION_COUNT" = 0
+DEEPCOIN_OPERATION_TABLE_PRESENT="$(sqlite3 -readonly "$PRODUCTION_DB" \
+  "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='deepcoin_execution_operations';")"
+DEEPCOIN_OPERATION_ACTIVE_COUNT=0
+case "$DEEPCOIN_OPERATION_TABLE_PRESENT" in
+  0) ;;
+  1)
+    DEEPCOIN_OPERATION_ACTIVE_COUNT="$(sqlite3 -readonly "$PRODUCTION_DB" <<'SQL'
+PRAGMA query_only=ON;
+SELECT COUNT(*) FROM deepcoin_execution_operations
+ WHERE state IS NULL OR state NOT IN (
+   'pre_submit_deferred','completed','submission_failed_no_exposure'
+ );
+SQL
+)"
+    ;;
+  *) exit 1 ;;
+esac
+OTHER_ACTIVE_OR_UNKNOWN_WRITERS="$(sqlite3 -readonly "$PRODUCTION_DB" <<'SQL'
+PRAGMA query_only=ON;
+SELECT SUM(n) FROM (
+  SELECT COUNT(*) AS n FROM position_mutation_intents
+   WHERE status IN (
+     'reserved','submitting','submitted','submit_unknown','recovery_required'
+   )
+  UNION ALL
+  SELECT COUNT(*) FROM position_backup_stop_orders
+   WHERE status IN ('submitting','pending_readback','unknown_exchange_outcome')
+);
+SQL
+)"
+ACTIVE_OR_UNKNOWN_WRITERS_EXCEPT_TARGET="$((
+  OTHER_ACTIVE_OR_UNKNOWN_WRITERS + DEEPCOIN_OPERATION_ACTIVE_COUNT
+))"
+test "$ACTIVE_OR_UNKNOWN_WRITERS_EXCEPT_TARGET" = 0
+
+for ATTEMPT in 1 2; do
+  RESULT="$RECOVERY_TMP/dry-run-${ATTEMPT}.json"
+  PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
+    telegram_kol_research.cli recover-bound-position-close-reservations \
+    --database-path "$PRODUCTION_DB" \
+    --generation-database-path "$PRODUCTION_DB" \
+    > "$RESULT"
+  chmod 0600 "$RESULT"
+done
+PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
+  "$CANDIDATE_ROOT/scripts/compare_bound_close_reservation_dry_runs.py" \
+  "$RECOVERY_TMP/dry-run-1.json" \
+  "$RECOVERY_TMP/dry-run-2.json"
+```
+
+比较器必须只输出 `{"status":"stable"}`；其他输出或非零退出均为
+拒绝。两个不同的 private 0600 文件必须都是 `ready`，且语义完全稳定。
+操作记录只允许 classification counts、source/exchange/evidence fingerprints、
+`database_writes=0`、`exchange_writes=0`、`history_replays=0`、服务恢复结果和
+未改动的 production SHA。不得记录 raw ids、provider rows、credentials、
+observation 明细或 confirmation token。两个 JSON 只能留在 0700 临时目录，
+trap 恢复服务后会删除。到此必须停止并单独请求 apply 授权。
+
+### 窗口二：单独授权的 apply
+
+不得沿用窗口一的停服 permit、capture 文件、fingerprint 或进程内
+capability。只有操作员在新窗口中明确批准下列两行，才可进入：
+
+```text
+I_APPROVE_BOUND_CLOSE_RESERVATIONS_ALL_DB_UNITS_STOPPED_APPLY_CAPTURE
+I_AUTHORIZE_BOUND_CLOSE_RESERVATIONS_PROVEN_TERMINAL_ONLY
+```
+
+新窗口必须从上一节的 `set -euo pipefail` 开始，重新执行同一组
+branch/SHA 检查、完整 `QUIESCE_UNITS` 清单、原状态记录、
+`restore_bound_close_reservation_units`/`finish_bound_close_reservation_window` trap、
+unknown-process 拒绝和 `ACTIVE_OR_UNKNOWN_WRITERS_EXCEPT_TARGET=0` 检查。
+将干跑 token 检查替换为下列 apply token 检查：
+
+```bash
+APPLY_AUTHORIZATION='I_APPROVE_BOUND_CLOSE_RESERVATIONS_ALL_DB_UNITS_STOPPED_APPLY_CAPTURE
+I_AUTHORIZE_BOUND_CLOSE_RESERVATIONS_PROVEN_TERMINAL_ONLY'
+test "${BOUND_CLOSE_APPLY_AUTHORIZATION:-}" = "$APPLY_AUTHORIZATION"
+```
+
+所有 unit 精确 inactive、未知进程为零、其他 durable writer 为零之后，
+先建立可验证备份。`BACKUP_PATH` 必须是全新文件，不得覆盖旧备份：
+
+```bash
+BACKUP_DIR="$PRODUCTION_ROOT/data/backups"
+BACKUP_PATH="$BACKUP_DIR/research-before-bound-close-reservation-apply-$(date -u +%Y%m%dT%H%M%SZ).db"
+test ! -e "$BACKUP_PATH"
+sqlite3 "$PRODUCTION_DB" ".backup '$BACKUP_PATH'"
+chmod 0600 "$BACKUP_PATH"
+test "$(stat -c '%a' "$BACKUP_PATH")" = 600
+test "$(sqlite3 -readonly "$BACKUP_PATH" 'PRAGMA quick_check;')" = ok
+```
+
+然后在同一停服窗口里直接对生产库生成一份全新的 0600 capture：
+
+```bash
+APPLY_CAPTURE="$RECOVERY_TMP/apply-capture.json"
+PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
+  telegram_kol_research.cli recover-bound-position-close-reservations \
+  --database-path "$PRODUCTION_DB" \
+  --generation-database-path "$PRODUCTION_DB" \
+  > "$APPLY_CAPTURE"
+chmod 0600 "$APPLY_CAPTURE"
+```
+
+人工只审阅这次 capture 的 ready 状态、classification counts 和三个
+fingerprint。如果不是全部 `PROVEN_TERMINAL`，或与已批准范围不符，立即
+退出并由 trap 恢复服务。通过后，从 private 文件中取得而不回显
+`<fresh-evidence-fingerprint>`、`<exact-action-count>` 和
+`<fresh-confirmation-token>`，完整执行一次 CLI：
+
+```bash
+PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
+  telegram_kol_research.cli recover-bound-position-close-reservations \
+  --database-path "$PRODUCTION_DB" \
+  --generation-database-path "$PRODUCTION_DB" \
+  --apply \
+  --expected-fingerprint '<fresh-evidence-fingerprint>' \
+  --expected-action-count '<exact-action-count>' \
+  --confirmation-token '<fresh-confirmation-token>' \
+  --authorization "$APPLY_AUTHORIZATION" \
+  > "$RECOVERY_TMP/apply-result.json"
+chmod 0600 "$RECOVERY_TMP/apply-result.json"
+```
+
+apply 成功后在任何服务重启前，只用 query-only 连接检查剩余 target、
+唯一审计事件和 MiMo v1。将 `<fresh-evidence-fingerprint>` 替换为本窗口的
+完整 fingerprint；查询只输出聚合数量和模式，不输出任何 ID 或 JSON：
+
+```bash
+POSTCHECK="$(sqlite3 -readonly "$PRODUCTION_DB" <<'SQL'
+PRAGMA query_only=ON;
+SELECT 'remaining_target_count=' || COUNT(*)
+  FROM bound_position_close_reservations
+ WHERE status IN (
+   'reserved','submitted','submit_unknown','unknown_exchange_outcome',
+   'recovery_required'
+ );
+SELECT 'recovery_audit_count=' || COUNT(*)
+  FROM execution_events
+ WHERE action='bound_close_reservation_history_converged'
+   AND status='succeeded'
+   AND order_id IS NULL AND client_order_id IS NULL AND pos_id IS NULL
+   AND request_json IS NULL AND response_json IS NULL
+   AND notification_fingerprint='<fresh-evidence-fingerprint>';
+SELECT 'mimo_contract_mode=' || COALESCE(
+  (SELECT json_extract(value_json, '$.mimo_contract_mode')
+     FROM trading_settings WHERE key='global' LIMIT 1),
+  'v1'
+);
+SQL
+)"
+test "$POSTCHECK" = $'remaining_target_count=0\nrecovery_audit_count=1\nmimo_contract_mode=v1'
+test "$(sqlite3 -readonly "$PRODUCTION_DB" 'PRAGMA query_only=ON; PRAGMA quick_check;')" = ok
+```
+
+内部 CAS 已限制只能改 target reservation 的 `status/last_error/updated_at`，
+并新增一条聚合审计事件；任何拒绝、计数差异或 query-only postcheck
+失败都不得手改数据库。操作记录只允许 action count、fingerprint、
+zero-write 交易所/重放计数、服务恢复结果、production SHA 和已验证的
+backup path；不得记录 raw ids、provider rows 或 credentials。
+
+`STOP_BOUND_CLOSE_RESERVATION_RECOVERY_BEFORE_BATCH119`：恢复原始 unit 状态并证明
+production SHA 未变后，必须停止。本窗口不授权 Batch119 apply、stable
+snapshot、ordinary preflight 或部署。下一段返回链必须在各自独立授权窗口中
+顺序执行：
+
+```text
+reservation recovery -> Batch119 apply -> stable snapshot -> ordinary preflight
+-> deploy exact c50887b -> Phase One canary/cutover
+```
+
 ## Batch 119 composite-management recovery
 
 这是仅适用于批次 `119` 的封闭恢复流程，不是通用数据库编辑器。根因是旧管理对账器

@@ -261,3 +261,40 @@ def test_comparator_does_not_write_or_change_capture_files(tmp_path, capsys):
 
     after = [(path.read_bytes(), os.stat(path).st_mtime_ns) for path in (first, second)]
     assert after == before
+
+
+def test_runbook_closes_stopped_service_capture_and_apply_boundaries():
+    project_root = Path(__file__).resolve().parents[1]
+    runbook = (project_root / "docs" / "runbook.md").read_text(encoding="utf-8")
+    section = runbook.split(
+        "## Bound position close reservation convergence", 1
+    )[1].split("## Batch 119 composite-management recovery", 1)[0]
+
+    for unit in (
+        "telegram-kol-monitor.timer",
+        "telegram-kol-monitor.service",
+        "telegram-kol-monitor-diagnostic.service",
+        "telegram-kol-monitor-test-notification.service",
+        "telegram-kol-runtime-scanner.service",
+        "telegram-kol-runtime-agent.service",
+        "telegram-kol.service",
+    ):
+        assert unit in section
+    assert "trap finish_bound_close_reservation_window EXIT" in section
+    assert "restore_bound_close_reservation_units" in section
+    assert "pgrep -f '[t]elegram_kol_research|[t]elegram-kol'" in section
+    assert "ACTIVE_OR_UNKNOWN_WRITERS_EXCEPT_TARGET" in section
+    assert "TARGET_RESERVATION_COUNT" in section
+    assert 'RESULT="$RECOVERY_TMP/dry-run-${ATTEMPT}.json"' in section
+    assert 'chmod 0600 "$RESULT"' in section
+    assert "compare_bound_close_reservation_dry_runs.py" in section
+    assert '{"status":"stable"}' in section
+    assert 'PRAGMA quick_check;' in section
+    assert "PRAGMA query_only=ON;" in section
+    assert "json_extract(value_json, '$.mimo_contract_mode')" in section
+    assert "FROM trading_settings WHERE key='global'" in section
+    assert "STOP_BOUND_CLOSE_RESERVATION_RECOVERY_BEFORE_BATCH119" in section
+    assert "classification counts" in section
+    assert "raw ids" in section
+    assert "provider rows" in section
+    assert "credentials" in section

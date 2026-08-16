@@ -5000,6 +5000,48 @@ def test_bound_close_recovery_cli_invalid_tilde_path_is_canonical_and_redacted(
     assert raw_invalid_path not in result.output
 
 
+def test_bound_close_recovery_runbook_uses_exact_cli_and_separate_approvals():
+    project_root = Path(__file__).resolve().parents[1]
+    runbook = (project_root / "docs" / "runbook.md").read_text(encoding="utf-8")
+    section = runbook.split(
+        "## Bound position close reservation convergence", 1
+    )[1].split("## Batch 119 composite-management recovery", 1)[0]
+    status = (
+        project_root
+        / "docs"
+        / "runtime-bound-close-reservation-recovery-status.md"
+    ).read_text(encoding="utf-8")
+
+    assert "codex/bound-close-reservation-recovery" in section
+    assert "refs/remotes/origin/codex/bound-close-reservation-recovery" in section
+    assert "<exact-reviewed-recovery-sha>" in section
+    assert (
+        "I_APPROVE_BOUND_CLOSE_RESERVATIONS_ALL_DB_UNITS_STOPPED_"
+        "READ_ONLY_DOUBLE_CAPTURE"
+    ) in section
+    apply_lines = (
+        "I_APPROVE_BOUND_CLOSE_RESERVATIONS_ALL_DB_UNITS_STOPPED_"
+        "APPLY_CAPTURE\n"
+        "I_AUTHORIZE_BOUND_CLOSE_RESERVATIONS_PROVEN_TERMINAL_ONLY"
+    )
+    assert apply_lines in section
+    for option in (
+        "--database-path",
+        "--generation-database-path",
+        "--apply",
+        "--expected-fingerprint",
+        "--expected-action-count",
+        "--confirmation-token",
+        "--authorization",
+    ):
+        assert option in section
+    assert "c50887b991712340d7d5606fb6916cdbb033926e" in status
+    assert (
+        "reservation recovery -> Batch119 apply -> stable snapshot -> ordinary "
+        "preflight -> deploy exact c50887b -> Phase One canary/cutover"
+    ) in status
+
+
 def test_recover_composite_management_batch_invalid_specs_stop_before_repair(
     tmp_path,
     monkeypatch,
