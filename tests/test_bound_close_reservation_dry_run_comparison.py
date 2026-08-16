@@ -20,6 +20,9 @@ from telegram_kol_research.bound_close_reservation_recovery import (
     build_bound_close_reservation_recovery_plan,
     serialize_bound_close_reservation_recovery_plan,
 )
+from telegram_kol_research.bound_close_writer_quiescence import (
+    inspect_bound_close_writer_quiescence,
+)
 from telegram_kol_research.deployment_preflight import _WORK_SPECS
 
 
@@ -48,6 +51,12 @@ _WRITER_QUIESCENCE_SCRIPT = (
     Path(__file__).resolve().parents[1]
     / "scripts"
     / "check_bound_close_reservation_writer_quiescence.py"
+)
+_WRITER_QUIESCENCE_LIBRARY = (
+    Path(__file__).resolve().parents[1]
+    / "src"
+    / "telegram_kol_research"
+    / "bound_close_writer_quiescence.py"
 )
 _WRITER_SCRIPT_SPEC = importlib.util.spec_from_file_location(
     "check_bound_close_reservation_writer_quiescence",
@@ -2651,7 +2660,7 @@ def _writer_quiescence_database(path: Path) -> None:
 
 
 def _inspect_writer_quiescence(path: Path, *, now: datetime = CHECKED_AT):
-    return _WRITER_MODULE.inspect_writer_quiescence(path, now=now)
+    return inspect_bound_close_writer_quiescence(path, now=now)
 
 
 def _sqlite_utc(value: datetime) -> str:
@@ -2949,7 +2958,12 @@ def test_writer_quiescence_inventory_exactly_mirrors_deployment_preflight_specs(
     result = _run_writer_quiescence(database)
 
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == {
+    payload = json.loads(result.stdout)
+    assert payload == _inspect_writer_quiescence(
+        database,
+        now=datetime.now(timezone.utc),
+    )
+    assert payload == {
         "block_regardless_of_age_writer_count": 0,
         "blocking_writer_count": 0,
         "checked_table_count": len(_EXPECTED_WRITER_SPECS),
@@ -2965,7 +2979,7 @@ def test_writer_quiescence_inventory_exactly_mirrors_deployment_preflight_specs(
 
 
 def test_writer_quiescence_contract_includes_reviewed_nonwriter_states():
-    helper_text = _WRITER_QUIESCENCE_SCRIPT.read_text(encoding="utf-8")
+    helper_text = _WRITER_QUIESCENCE_LIBRARY.read_text(encoding="utf-8")
 
     assert '"resolved"' in helper_text
     assert '"waiting_backup_stop"' in helper_text
