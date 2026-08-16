@@ -41,6 +41,15 @@ loader. Confirmed residue is not granted apply authority and cannot contribute
 raw reservation capability. Its complete canonical row material is included
 in the admission fingerprint so any change between captures is detected.
 
+For `bound_apply_post`, status alone cannot distinguish the newly confirmed
+target 29 from prior confirmed residue. The post inspector must therefore use
+the unique existing `bound_close_reservation_history_converged` audit: validate
+its closed redacted 29-item before/after payload, select only confirmed rows
+whose update timestamp equals that audit's creation timestamp, and require the
+rows' redacted references to match the audit exactly. Those rows are the post
+target population; all other confirmed rows remain residue. Missing, duplicate,
+malformed, or inconsistent audit evidence refuses.
+
 ### Numeric identity
 
 `quantity_step` is a numeric identity field. The validator will parse both the
@@ -59,6 +68,8 @@ Batch 119 identity predicate changes.
   notification, message replay, or MiMo v2 activation.
 - The recovery apply path can only receive the same 29 actionable rows; safe
   confirmed residue is observation-only.
+- Post-apply target reconstruction uses the already-required unique redacted
+  audit and never trusts status or timestamp alone.
 
 ## Verification
 
@@ -67,6 +78,8 @@ TDD regressions will prove:
 - 29 actionable plus 9 confirmed rows are admitted;
 - confirmed-residue field drift changes the joint fingerprint;
 - an extra actionable row, `NULL`, unknown, or non-confirmed residue refuses;
+- a real apply with prior confirmed residue reconstructs the same target 29,
+  leaves the residue untouched, and produces valid post authority;
 - numerically equal `quantity_step` representations are admitted;
 - a numerically different or malformed `quantity_step` refuses;
 - ordinary Batch 119 recovery and deployment preflight behavior do not change.

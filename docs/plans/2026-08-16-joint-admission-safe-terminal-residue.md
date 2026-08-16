@@ -31,6 +31,10 @@ another known nonterminal state. Assert each returns `joint_material_invalid`.
 Keep the existing proof that changing one of the 29 actionable rows to
 `confirmed` refuses because the actionable population becomes 28.
 
+Add a real apply regression starting from 29 actionable plus nine confirmed
+residue rows. Assert the action count is 29, the residue rows are unchanged,
+and `bound_apply_post` is ready with target count 29.
+
 **Step 3: Write quantity-step RED tests**
 
 Using `_seed_batch_119_false_submission`, change only the snapshot
@@ -84,8 +88,12 @@ Pass only actionable rows to `_load_source_descendants` and derive binding and
 position IDs only from them. Include complete canonical confirmed-row material
 under `confirmed_residue` in `reservation_source_material`, so it affects the
 joint fingerprint but cannot grant raw/apply authority. Preserve the closed
-`BOUND_APPLY_POST` contract: the exact target 29 must transition to confirmed;
-pre-existing confirmed residue never becomes a target.
+`BOUND_APPLY_POST` contract by validating the unique convergence audit, its
+closed 29-item redacted before/after payload, and the exact set of confirmed
+rows whose `updated_at` equals the audit `created_at`. Match their redacted
+references to the audit before treating them as the post target 29. Prior
+confirmed residue never becomes a target. Missing, duplicate, or malformed
+audit evidence refuses.
 
 **Step 2: Compare quantity steps as bounded Decimals**
 
@@ -160,8 +168,10 @@ Request independent Critical/Important review. It must verify that only exact
 `confirmed` residue is admitted; residue affects the fingerprint but receives
 no apply/raw authority; the actionable population stays exactly 29; malformed
 or different Decimal values refuse; ordinary recovery and deployment preflight
-do not change; and no write, exchange mutation, replay, notification, deploy,
-or MiMo v2 path is added. Resolve every finding with RED-GREEN evidence.
+do not change; post targets are bound to the unique closed redacted audit rather
+than status/timestamp alone; and no write, exchange mutation, replay,
+notification, deploy, or MiMo v2 path is added. Resolve every finding with
+RED-GREEN evidence.
 
 **Step 3: Stop before push and production retry**
 
