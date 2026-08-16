@@ -4963,6 +4963,43 @@ def test_bound_close_recovery_cli_configuration_failure_is_redacted_json(
     assert "secret" not in result.output
 
 
+@pytest.mark.parametrize(
+    ("invalid_option", "reason_code"),
+    [
+        ("--database-path", "database_path_invalid"),
+        ("--generation-database-path", "generation_database_path_invalid"),
+    ],
+)
+def test_bound_close_recovery_cli_invalid_tilde_path_is_canonical_and_redacted(
+    tmp_path,
+    invalid_option,
+    reason_code,
+):
+    database_path = tmp_path / "recovery.sqlite3"
+    database_path.touch()
+    raw_invalid_path = "~codex_bound_close_recovery_missing_user/private.sqlite3"
+    args = _bound_close_recovery_cli_args(database_path)
+    option_index = args.index(invalid_option)
+    args[option_index + 1] = raw_invalid_path
+
+    result = CliRunner().invoke(app, args)
+
+    assert result.exit_code == 1
+    assert result.stdout == json.dumps(
+        {
+            "mode": "dry_run",
+            "reason_code": reason_code,
+            "schema_version": 1,
+            "status": "error",
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ) + "\n"
+    assert result.stderr == ""
+    assert raw_invalid_path not in result.output
+
+
 def test_recover_composite_management_batch_invalid_specs_stop_before_repair(
     tmp_path,
     monkeypatch,

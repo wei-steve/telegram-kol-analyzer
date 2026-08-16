@@ -5310,11 +5310,14 @@ def recover_bound_position_close_reservations(
         raise typer.Exit(code=exit_code)
 
     def resolve_existing_file(path: Path) -> Path | None:
-        expanded = path.expanduser()
-        if expanded.is_symlink() or not expanded.is_file():
-            return None
-        resolved = expanded.resolve()
-        if not resolved.is_file():
+        try:
+            expanded = path.expanduser()
+            if expanded.is_symlink() or not expanded.is_file():
+                return None
+            resolved = expanded.resolve()
+            if not resolved.is_file():
+                return None
+        except (OSError, RuntimeError):
             return None
         return resolved
 
