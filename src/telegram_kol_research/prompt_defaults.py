@@ -200,7 +200,7 @@ DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT = """
 - 同一目标的 risk_update 已包含继续持有语义时，不要再输出 hold_update；不得为同一目标输出语义重叠的多个生命周期动作。
 - 若输入包含 reply_context，它是精确 Telegram 回复目标。只能在当前消息动作与该目标状态兼容时引用其 lifecycle_id；reply_context 已 entered 时，“取消/撤单”不得自动转成退出。
 - 无法唯一对应历史策略时，target.lifecycle_id 保持 null、降低置信度并说明不确定性，不得猜测。
-- thread_id 不能替代 lifecycle_id；生命周期动作若只有 thread_id 而没有可核对的 lifecycle_id，则 target 的两个字段都保持 null。已有 lifecycle_id 时 thread_id 只可作为同一目标的伴随标识。
+- thread_id 不能替代 lifecycle_id；生命周期动作若只有 thread_id 而没有可核对的 lifecycle_id，则 target 的两个字段都保持 null。任何带 lifecycle_id 的动作都必须把 thread_id 输出为 null，避免伴随标识漂移。
 - 上下文只用于关联 target 和理解消息，不能作为当前消息的新动作证据；不得把旧上下文复制成当前意图。
 
 【入场前置语义和非执行信息】
@@ -289,7 +289,7 @@ _MIMO_V2_COMPATIBILITY_RULE_LINES = frozenset(
         '- 到达止盈点并明确保留剩余仓位，表示已对一部分仓位止盈，输出 partial_take_profit，而不是 position_report、hold_update 或非执行内容。',
         '- “设置 50% 仓位止盈价”表示未来止盈挂单设置，不表示当前已经减仓；同一目标的 move_stop_to_protect 与止盈挂单设置同时出现时，只输出 move_stop_to_protect，止盈设置保留在证据中，不要额外输出 partial_take_profit 或 hold_update。',
         '- 同一目标的 risk_update 已包含继续持有语义时，不要再输出 hold_update；不得为同一目标输出语义重叠的多个生命周期动作。',
-        '- thread_id 不能替代 lifecycle_id；生命周期动作若只有 thread_id 而没有可核对的 lifecycle_id，则 target 的两个字段都保持 null。已有 lifecycle_id 时 thread_id 只可作为同一目标的伴随标识。',
+        '- thread_id 不能替代 lifecycle_id；生命周期动作若只有 thread_id 而没有可核对的 lifecycle_id，则 target 的两个字段都保持 null。任何带 lifecycle_id 的动作都必须把 thread_id 输出为 null，避免伴随标识漂移。',
         '- cancel_pending_entry 的 parameters 必须是空对象，即使原文提到被撤销挂单的价格也不得放入 parameters。',
         '- 所有价格类 parameters 必须输出字符串，包括 entry_price、exit_price、stop_loss、take_profit；不得输出 JSON 数字。',
         '- management_fraction 必须输出 0 到 1 之间的 JSON 数字，例如 50% 输出 0.5，不得输出 50、"50%" 或 "0.5"。',

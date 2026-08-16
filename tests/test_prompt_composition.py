@@ -235,6 +235,7 @@ def test_mimo_v2_validation_accepts_closed_default_contract():
         "cancel_pending_entry 的 parameters 必须是空对象",
         "所有价格类 parameters 必须输出字符串",
         "thread_id 不能替代 lifecycle_id",
+        "任何带 lifecycle_id 的动作都必须把 thread_id 输出为 null",
         "明确写出 priority 或 P1/P2 时，只把最高优先级方案输出为 entry",
         "到达止盈点并明确保留剩余仓位",
     ),

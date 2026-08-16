@@ -537,6 +537,30 @@ def test_confidence_only_difference_is_not_execution_semantic_drift():
     assert comparison.v1_fingerprint == comparison.v2_fingerprint
 
 
+def test_confidence_crossing_execution_threshold_is_unsafe():
+    v1 = _management_payload()
+    v2 = deepcopy(v1)
+    v2["confidence"] = 0.69
+    v2["instructions"][0]["confidence"] = 0.69
+    v2["lifecycle_event"]["confidence"] = 0.69
+
+    comparison = compare_execution_projections(v1, v2)
+
+    assert comparison.status == "unsafe_mismatch"
+    assert comparison.v1_fingerprint != comparison.v2_fingerprint
+
+
+def test_companion_thread_target_drift_is_unsafe():
+    v1 = _management_payload()
+    v2 = deepcopy(v1)
+    v2["instructions"][0]["target"]["thread_id"] = 53
+
+    comparison = compare_execution_projections(v1, v2)
+
+    assert comparison.status == "unsafe_mismatch"
+    assert comparison.v1_fingerprint != comparison.v2_fingerprint
+
+
 @pytest.mark.parametrize(
     ("kind", "intent_type", "event_type", "management_action", "parameters"),
     (
@@ -581,7 +605,7 @@ def test_legacy_lifecycle_and_v2_instruction_shapes_compare_semantically(
                     "intent_type": intent_type,
                     "action": {
                         "kind": kind,
-                        "target": {"lifecycle_id": 832, "thread_id": 41},
+                        "target": {"lifecycle_id": 832, "thread_id": None},
                         "strategy": None,
                         "parameters": parameters,
                     },

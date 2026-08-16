@@ -33,6 +33,7 @@ from telegram_kol_research.recognition_experiments import (
 
 MAX_REPLAY_MESSAGES = 200
 REPLAY_ARTIFACT_SCHEMA_VERSION = 1
+_EXECUTION_CONFIDENCE_THRESHOLD = 0.7
 _POSITIVE_MESSAGE_ID = re.compile(r"^[1-9][0-9]*$")
 _COMPARISON_ARTIFACT_FIELDS = (
     "raw_message_id",
@@ -893,6 +894,9 @@ def _canonical_execution_projection(
     projection: dict[str, Any] = {
         "executable": True,
         "recognition_result": str(payload.get("recognition_result") or ""),
+        "execution_eligible": _execution_confidence_bucket(
+            payload.get("confidence")
+        ),
         "strategy": _plain_projection_value(
             strategy if isinstance(strategy, Mapping) else {}
         ),
@@ -947,6 +951,9 @@ def _canonical_instruction_projection(
             rows.append(
                 {
                     "kind": kind,
+                    "execution_eligible": _execution_confidence_bucket(
+                        lifecycle.get("confidence")
+                    ),
                     "strategy": None,
                     "target": {
                         "lifecycle_id": lifecycle.get("target_lifecycle_id"),
@@ -964,6 +971,9 @@ def _canonical_instruction_projection(
         rows.append(
             {
                 "kind": "entry",
+                "execution_eligible": _execution_confidence_bucket(
+                    payload.get("confidence")
+                ),
                 "strategy": _plain_projection_value(strategy),
                 "target": {"lifecycle_id": None, "thread_id": None},
                 "parameters": {},
@@ -980,10 +990,13 @@ def _canonical_instruction_row(row: Mapping[str, Any]) -> dict[str, Any]:
     parameters = row.get("parameters")
     return {
         "kind": _canonical_instruction_kind(row.get("kind") or row.get("action")),
+        "execution_eligible": _execution_confidence_bucket(
+            row.get("confidence")
+        ),
         "strategy": _plain_projection_value(row.get("strategy")),
         "target": {
             "lifecycle_id": lifecycle_id,
-            "thread_id": None if lifecycle_id is not None else thread_id,
+            "thread_id": thread_id,
         },
         "parameters": _plain_projection_value(
             parameters if isinstance(parameters, Mapping) else {}
@@ -1015,12 +1028,29 @@ def _canonical_instruction_kind(value: Any) -> str:
 
 
 def _semantic_projection_row(value: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    projection = {
         str(key): _plain_projection_value(item)
         for key, item in value.items()
         if key not in {"reason", "confidence", "_exact_context_risk_reduction_authorized"}
         and item is not None
     }
+    if "confidence" in value:
+        projection["execution_eligible"] = _execution_confidence_bucket(
+            value.get("confidence")
+        )
+    return projection
+
+
+def _execution_confidence_bucket(value: Any) -> bool:
+    if isinstance(value, bool):
+        raise MimoV2ReplayInputError("execution_projection_invalid")
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise MimoV2ReplayInputError("execution_projection_invalid") from exc
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        raise MimoV2ReplayInputError("execution_projection_invalid")
+    return confidence >= _EXECUTION_CONFIDENCE_THRESHOLD
 
 
 def _plain_projection_value(value: Any) -> Any:
