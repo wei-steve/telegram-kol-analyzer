@@ -7161,6 +7161,60 @@ def test_position_absent_allows_exact_natural_stop_with_no_pending_orders(
     assert plan.position.disposition == "position_absent"
 
 
+def _set_empty_legacy_position_snapshot(factory):
+    with factory() as session:
+        leg = session.query(StrategyManagementLeg).filter_by(
+            management_batch_id=119
+        ).one()
+        leg.last_exchange_snapshot_json = json.dumps(
+            {
+                "matching_regular_orders": [],
+                "position_rows": [],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        session.commit()
+
+
+def test_empty_legacy_position_snapshot_reaches_fresh_natural_stop(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _set_empty_legacy_position_snapshot(factory)
+
+    plan = _plan(factory, _natural_stop_snapshot())
+
+    assert plan.status == "ready"
+    assert plan.position.disposition == "position_absent"
+
+
+def test_empty_legacy_position_snapshot_does_not_prove_fresh_absence(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _set_empty_legacy_position_snapshot(factory)
+
+    plan = _plan(
+        factory,
+        _snapshot(
+            positions=[],
+            pending_trigger_orders=[],
+            position_history=[],
+            trigger_history=[],
+        ),
+    )
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "natural_stop_proof_position_invalid"
+
+
+def test_empty_legacy_position_snapshot_reaches_fresh_live_position(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _set_empty_legacy_position_snapshot(factory)
+
+    plan = _plan(factory, _snapshot())
+
+    assert plan.status == "ready"
+    assert plan.position.disposition == "resume_to_target"
+
+
 def _add_other_terminal_batch(session, *, binding_id, batch119):
     row = StrategyManagementBatch(
         idempotency_fingerprint="other-terminal-active-child",
@@ -7493,6 +7547,7 @@ def test_planner_refuses_malformed_durable_evidence_without_raising(
     "mutation",
     [
         "matching_order",
+        "second_position",
         "position_reduced",
         "wrong_position",
         "top_level_provider_payload",
@@ -7506,6 +7561,8 @@ def test_planner_refuses_nonexact_legacy_exchange_snapshot(tmp_path, mutation):
         payload = json.loads(leg.last_exchange_snapshot_json)
         if mutation == "matching_order":
             payload["matching_regular_orders"] = [{"ordId": "close-order"}]
+        elif mutation == "second_position":
+            payload["position_rows"].append(dict(payload["position_rows"][0]))
         elif mutation == "position_reduced":
             payload["position_rows"][0]["pos"] = "19"
         elif mutation == "wrong_position":

@@ -340,6 +340,19 @@ def test_exact_joint_incident_is_ready_and_public_projection_is_aggregate(tmp_pa
     assert "sensitive" not in repr(result)
 
 
+def test_joint_admission_accepts_empty_legacy_position_snapshot(tmp_path):
+    factory, database = _seed_joint_incident(tmp_path)
+    _COMPOSITE_TEST_SUPPORT._set_empty_legacy_position_snapshot(factory)
+
+    result = _inspect(database)
+
+    assert result.status == "ready"
+    assert result.reason_code is None
+    assert result.reservation_count == 29
+    assert result.batch119_incident_count == 1
+    assert result.blocking_writer_count == 0
+
+
 def test_joint_admission_accepts_nine_confirmed_residue_rows(tmp_path):
     factory, database = _seed_joint_incident(tmp_path)
     _add_confirmed_reservation_residue(factory)
