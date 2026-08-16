@@ -247,6 +247,17 @@ def upgrade_seeded_prompt_definition(
     previous = previous_content.strip()
     if not normalized or not previous or normalized == previous:
         raise PromptRegistryValidationError("prompt seed upgrade is invalid")
+    current = get_prompt_detail(
+        session_factory,
+        seed.prompt_key,
+        chat_id=seed.scope_chat_id,
+    )
+    if (
+        current.active_version.content.strip() == normalized
+        or current.active_version.content.strip() != previous
+        or current.draft_version is not None
+    ):
+        return current
     now = utc_now()
     with session_factory() as session:
         session.execute(text("BEGIN IMMEDIATE"))

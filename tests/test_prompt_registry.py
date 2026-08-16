@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from sqlalchemy import event
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
@@ -125,6 +126,24 @@ def test_default_seed_preserves_operator_modified_mimo_v2_contract(tmp_path):
     detail = get_prompt_detail(factory, MIMO_V2_AUTHORITATIVE_PROMPT)
     assert detail.active_version.content == customized
     assert detail.active_version.version_number == 1
+
+
+def test_current_default_seed_does_not_take_an_immediate_write_lock(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    seed_default_prompt_registry(factory)
+    statements = []
+    engine = factory.kw["bind"]
+
+    def capture_statement(_conn, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement.strip().upper())
+
+    event.listen(engine, "before_cursor_execute", capture_statement)
+    try:
+        seed_default_prompt_registry(factory)
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_statement)
+
+    assert "BEGIN IMMEDIATE" not in statements
 
 
 def test_save_draft_does_not_change_active_version(tmp_path):
