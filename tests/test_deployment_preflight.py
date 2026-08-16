@@ -1306,15 +1306,25 @@ def test_collector_accepts_current_application_schema(tmp_path):
         "recovery_required",
     ],
 )
+@pytest.mark.parametrize(
+    ("age", "updated_at"),
+    [
+        ("fresh", NOW - timedelta(seconds=30)),
+        ("historical", NOW - timedelta(days=1)),
+    ],
+)
 def test_collector_blocks_every_nonterminal_deepcoin_execution_operation(
     tmp_path,
     state,
+    age,
+    updated_at,
 ):
     import sqlite3
 
-    database = tmp_path / f"operation-{state}.db"
+    database = tmp_path / f"operation-{age}-{state}.db"
     create_session_factory(database)
     connection = sqlite3.connect(database)
+    serialized_updated_at = updated_at.replace(tzinfo=None).isoformat(" ")
     connection.execute(
         "INSERT INTO deepcoin_execution_operations ("
         "operation_key, trade_signal_id, contract_version, phase, state, "
@@ -1328,8 +1338,8 @@ def test_collector_blocks_every_nonterminal_deepcoin_execution_operation(
             "a" * 64,
             "b" * 64,
             (NOW + timedelta(minutes=5)).replace(tzinfo=None).isoformat(" "),
-            NOW.replace(tzinfo=None).isoformat(" "),
-            NOW.replace(tzinfo=None).isoformat(" "),
+            serialized_updated_at,
+            serialized_updated_at,
         ),
     )
     connection.commit()
@@ -1340,8 +1350,11 @@ def test_collector_blocks_every_nonterminal_deepcoin_execution_operation(
         change_class="code",
         now=NOW,
     )
+    artifact = _build("code", facts)
 
     assert facts.fresh_active_work["deepcoin_execution_operations"] == 1
+    assert artifact["decision"] == "BLOCK"
+    assert "fresh_active_exchange_work" in artifact["reason_codes"]
 
 
 @pytest.mark.parametrize("state", ["entry_confirmed", "future_state"])
@@ -1506,6 +1519,67 @@ def _collect_code_gate(
     return facts, _build("code", facts)
 
 
+@pytest.mark.parametrize(
+    ("state", "expected_historical_unknown"),
+    [("pending", 0), ("unknown", 1)],
+)
+@pytest.mark.parametrize(
+    ("updated_at", "expected_decision", "expected_fresh", "expected_historical"),
+    [
+        (
+            NOW - timedelta(minutes=10, microseconds=1),
+            "WARN",
+            {},
+            1,
+        ),
+        (
+            NOW - timedelta(minutes=10),
+            "BLOCK",
+            {"instruction_items": 1},
+            0,
+        ),
+        (
+            NOW - timedelta(minutes=10) + timedelta(microseconds=1),
+            "BLOCK",
+            {"instruction_items": 1},
+            0,
+        ),
+    ],
+)
+def test_real_collector_preserves_exact_active_writer_cutoff_boundary(
+    tmp_path,
+    state,
+    expected_historical_unknown,
+    updated_at,
+    expected_decision,
+    expected_fresh,
+    expected_historical,
+):
+    import sqlite3
+
+    database = _clean_gate_fixture(tmp_path / f"cutoff-{state}.db")
+    serialized_time = updated_at.replace(tzinfo=None).isoformat(" ")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO message_instruction_items (id, status, updated_at) "
+            "VALUES (99, ?, ?)",
+            (state, serialized_time),
+        )
+
+    facts, artifact = _collect_code_gate(database)
+
+    assert facts.fresh_active_work == expected_fresh
+    assert facts.historical_active_residue_count == expected_historical
+    assert facts.historical_unknown_outcome_count == (
+        expected_historical * expected_historical_unknown
+    )
+    assert artifact["decision"] == expected_decision
+    if expected_decision == "BLOCK":
+        assert "fresh_active_exchange_work" in artifact["reason_codes"]
+    else:
+        assert "historical_active_residue_present" in artifact["reason_codes"]
+
+
 def _refused_recovery_plan(classification: str, reason_code: str):
     from telegram_kol_research.bound_close_reservation_recovery import (
         BoundCloseReservationObservation,
@@ -1576,6 +1650,14 @@ def test_every_fresh_close_reservation_state_blocks_ordinary_code_deployment(
     assert facts.fresh_active_work == {"position_closes": 1}
     assert artifact["decision"] == "BLOCK"
     assert "fresh_active_exchange_work" in artifact["reason_codes"]
+
+    _converge_gate_fact(database, "bound_position_close_reservations")
+    converged_facts, converged_artifact = _collect_code_gate(database)
+
+    assert converged_facts.fresh_active_work == {}
+    assert converged_facts.historical_active_residue_count == 0
+    assert converged_facts.historical_unknown_outcome_count == 0
+    assert converged_artifact["decision"] != "BLOCK"
 
 
 @pytest.mark.parametrize(
