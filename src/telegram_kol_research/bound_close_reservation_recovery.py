@@ -1717,24 +1717,30 @@ def _bound_close_reservation_write_authorizer(
     database_name: str | None,
     trigger_name: str | None,
 ) -> int:
-    del database_name, trigger_name
     if action == sqlite3.SQLITE_UPDATE:
-        if table_name == "bound_position_close_reservations" and column_name in {
-            "status",
-            "last_error",
-            "updated_at",
-        }:
+        if (
+            database_name == "main"
+            and trigger_name is None
+            and table_name == "bound_position_close_reservations"
+            and column_name in {"status", "last_error", "updated_at"}
+        ):
             return sqlite3.SQLITE_OK
         return sqlite3.SQLITE_DENY
     if action == sqlite3.SQLITE_INSERT:
         return (
             sqlite3.SQLITE_OK
-            if table_name == "execution_events"
+            if database_name == "main"
+            and trigger_name is None
+            and table_name == "execution_events"
             else sqlite3.SQLITE_DENY
         )
-    if action == sqlite3.SQLITE_DELETE:
-        return sqlite3.SQLITE_DENY
-    return sqlite3.SQLITE_OK
+    if action in {
+        sqlite3.SQLITE_FUNCTION,
+        sqlite3.SQLITE_READ,
+        sqlite3.SQLITE_SELECT,
+    }:
+        return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
 
 
 def _execute_bound_close_reservation_apply_statement(
@@ -1747,16 +1753,21 @@ def _execute_bound_close_reservation_apply_statement(
     return connection.execute(sql, tuple(parameters))
 
 
-def _locked_mimo_contract_mode_is_v1(connection: sqlite3.Connection) -> bool:
+def _locked_mimo_contract_mode_is_v1(
+    connection: sqlite3.Connection,
+    *,
+    schema_already_validated: bool = False,
+) -> bool:
     try:
-        columns = {
-            row["name"]
-            for row in connection.execute(
-                'PRAGMA table_info("trading_settings")'
-            ).fetchall()
-        }
-        if not {"key", "value_json"}.issubset(columns):
-            return False
+        if not schema_already_validated:
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    'PRAGMA table_info("trading_settings")'
+                ).fetchall()
+            }
+            if not {"key", "value_json"}.issubset(columns):
+                return False
         rows = connection.execute(
             "SELECT value_json FROM trading_settings WHERE key = 'global' LIMIT 2"
         ).fetchall()
@@ -1792,8 +1803,10 @@ def _locked_mimo_contract_mode_is_v1(connection: sqlite3.Connection) -> bool:
 
 def _locked_active_bound_close_reservation_source(
     connection: sqlite3.Connection,
+    *,
+    schema_already_validated: bool = False,
 ) -> BoundCloseReservationSource:
-    if not _source_schema_is_valid(connection):
+    if not schema_already_validated and not _source_schema_is_valid(connection):
         raise _apply_refusal("source_schema_invalid")
     rows = connection.execute(
         """
@@ -2022,33 +2035,36 @@ def _recovery_audit_payloads(
 
 def _load_bound_close_reservation_audits(
     connection: sqlite3.Connection,
+    *,
+    schema_already_validated: bool = False,
 ) -> tuple[sqlite3.Row, ...]:
-    columns = {
-        row["name"]
-        for row in connection.execute(
-            'PRAGMA table_info("execution_events")'
-        ).fetchall()
-    }
-    required = {
-        "id",
-        "execution_binding_id",
-        "venue",
-        "action",
-        "status",
-        "order_id",
-        "client_order_id",
-        "pos_id",
-        "related_order_id",
-        "before_json",
-        "after_json",
-        "request_json",
-        "response_json",
-        "notification_fingerprint",
-        "notification_attempts",
-        "created_at",
-    }
-    if not required.issubset(columns):
-        raise _apply_refusal("audit_schema_invalid")
+    if not schema_already_validated:
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                'PRAGMA table_info("execution_events")'
+            ).fetchall()
+        }
+        required = {
+            "id",
+            "execution_binding_id",
+            "venue",
+            "action",
+            "status",
+            "order_id",
+            "client_order_id",
+            "pos_id",
+            "related_order_id",
+            "before_json",
+            "after_json",
+            "request_json",
+            "response_json",
+            "notification_fingerprint",
+            "notification_attempts",
+            "created_at",
+        }
+        if not required.issubset(columns):
+            raise _apply_refusal("audit_schema_invalid")
     rows = connection.execute(
         """
         SELECT id, execution_binding_id, venue, action, status, order_id,
@@ -2293,7 +2309,7 @@ def apply_bound_close_reservation_recovery(
 
     connection: sqlite3.Connection | None = None
     authorizer_installed = False
-    commit_exception: BaseException | None = None
+    commit_exception: Exception | None = None
     commit_attempted = False
     commit_returned_after_deadline = False
     audit_event_id: int | None = None
@@ -2485,8 +2501,6 @@ def apply_bound_close_reservation_recovery(
             audit_event_id = cursor.lastrowid
             if type(audit_event_id) is not int or audit_event_id <= 0:
                 raise _apply_refusal("audit_insert_failed")
-            connection.set_authorizer(None)
-            authorizer_installed = False
             if connection.total_changes - baseline_changes != plan.action_count + 1:
                 raise _apply_refusal("unexpected_transaction_changes")
             if _durable_invariant_fingerprints(
@@ -2494,7 +2508,10 @@ def apply_bound_close_reservation_recovery(
                 raw_rows=raw_rows,
             ) != durable_invariant_fingerprints:
                 raise _apply_refusal("durable_invariant_conflict")
-            postwrite_audits = _load_bound_close_reservation_audits(connection)
+            postwrite_audits = _load_bound_close_reservation_audits(
+                connection,
+                schema_already_validated=True,
+            )
             if (
                 len(postwrite_audits) != 1
                 or int(postwrite_audits[0]["id"]) != audit_event_id
@@ -2510,17 +2527,26 @@ def apply_bound_close_reservation_recovery(
                     audit_created_at=updated_at,
                 )
                 or _locked_active_bound_close_reservation_source(
-                    connection
+                    connection,
+                    schema_already_validated=True,
                 ).reservations
-                or not _locked_mimo_contract_mode_is_v1(connection)
+                or not _locked_mimo_contract_mode_is_v1(
+                    connection,
+                    schema_already_validated=True,
+                )
             ):
                 raise _apply_refusal("postwrite_state_conflict")
             _require_claimed_apply_deadline(claimed)
-            if not _connection_matches_database_identity(
-                connection,
-                expected=claimed.database_identity,
+            if _database_file_identity(resolved_database_path) != (
+                claimed.database_identity
             ):
                 raise _apply_refusal("database_authority_mismatch")
+            if connection.total_changes - baseline_changes != plan.action_count + 1:
+                raise _apply_refusal("unexpected_transaction_changes")
+            if not connection.in_transaction:
+                raise _apply_refusal("recovery_transaction_not_active")
+            connection.set_authorizer(None)
+            authorizer_installed = False
             commit_attempted = True
             try:
                 _commit_bound_close_reservation_apply(connection)
@@ -2531,7 +2557,7 @@ def apply_bound_close_reservation_recovery(
                 commit_returned_after_deadline = (
                     time.monotonic() >= claimed.deadline_monotonic
                 )
-            except BaseException as exc:
+            except Exception as exc:
                 commit_exception = exc
 
         if commit_exception is not None or commit_returned_after_deadline:
@@ -2671,7 +2697,7 @@ def apply_bound_close_reservation_recovery(
         if connection is not None and connection.in_transaction:
             connection.rollback()
         raise _apply_refusal("fresh_capture_expired_during_apply") from exc
-    except (OSError, RecursionError, sqlite3.Error, TypeError, ValueError) as exc:
+    except Exception as exc:
         if connection is not None and authorizer_installed:
             try:
                 connection.set_authorizer(None)
@@ -2711,6 +2737,42 @@ def apply_bound_close_reservation_recovery(
         if connection is not None and connection.in_transaction:
             connection.rollback()
         raise _apply_refusal("apply_transaction_failed") from exc
+    except BaseException as exc:
+        if connection is not None and authorizer_installed:
+            try:
+                connection.set_authorizer(None)
+            except Exception:
+                pass
+        if connection is not None and connection.in_transaction:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+        if commit_attempted:
+            if connection is not None:
+                _close_recovery_connection_safely(connection)
+                connection = None
+            verified_event_id = (
+                _verify_committed_bound_close_reservation_apply_read_only(
+                    resolved_database_path,
+                    expected_database_identity=claimed.database_identity,
+                    plan=plan,
+                    raw_rows=raw_rows,
+                    before_json=before_json,
+                    after_json=after_json,
+                )
+            )
+            if verified_event_id == audit_event_id:
+                exc.add_note(
+                    "bound-close recovery commit was verified on the sealed "
+                    "database path before this system interrupt was re-raised"
+                )
+            else:
+                exc.add_note(
+                    "bound-close recovery commit outcome could not be verified "
+                    "on the sealed database path"
+                )
+        raise
     finally:
         if connection is not None:
             _close_recovery_connection_safely(connection)

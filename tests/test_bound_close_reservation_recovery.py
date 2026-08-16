@@ -4398,6 +4398,147 @@ def test_apply_authorizer_denies_unplanned_table_write_and_rolls_back(
     ]
 
 
+@pytest.mark.parametrize("pragma_name", ["user_version", "application_id"])
+def test_apply_authorizer_denies_header_pragma_write_and_rolls_back(
+    tmp_path, monkeypatch, pragma_name
+):
+    database = _apply_database(tmp_path)
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+    real_execute = recovery_module._execute_bound_close_reservation_apply_statement
+    attempted = False
+
+    def attempt_pragma_write(connection, sql, parameters=()):
+        nonlocal attempted
+        if not attempted:
+            attempted = True
+            connection.execute(f"PRAGMA {pragma_name} = 4242")
+        return real_execute(connection, sql, parameters)
+
+    monkeypatch.setattr(
+        recovery_module,
+        "_execute_bound_close_reservation_apply_statement",
+        attempt_pragma_write,
+    )
+
+    with pytest.raises(
+        BoundCloseReservationRecoveryConflict,
+        match="transaction",
+    ):
+        _apply_ready(database, capture)
+
+    assert attempted is True
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(f"PRAGMA {pragma_name}").fetchone()[0] == 0
+    assert _table_rows(database, "bound_position_close_reservations")[0][
+        "status"
+    ] == "submitted"
+
+
+def test_apply_authorizer_denies_attach_and_rolls_back(tmp_path, monkeypatch):
+    database = _apply_database(tmp_path)
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+    real_execute = recovery_module._execute_bound_close_reservation_apply_statement
+    attempted = False
+
+    def attempt_attach(connection, sql, parameters=()):
+        nonlocal attempted
+        if not attempted:
+            attempted = True
+            connection.execute("ATTACH DATABASE ':memory:' AS forbidden")
+        return real_execute(connection, sql, parameters)
+
+    monkeypatch.setattr(
+        recovery_module,
+        "_execute_bound_close_reservation_apply_statement",
+        attempt_attach,
+    )
+
+    with pytest.raises(
+        BoundCloseReservationRecoveryConflict,
+        match="transaction",
+    ):
+        _apply_ready(database, capture)
+
+    assert attempted is True
+    assert _table_rows(database, "bound_position_close_reservations")[0][
+        "status"
+    ] == "submitted"
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        sqlite3.SQLITE_CREATE_TABLE,
+        sqlite3.SQLITE_ALTER_TABLE,
+        sqlite3.SQLITE_REINDEX,
+        sqlite3.SQLITE_ANALYZE,
+        sqlite3.SQLITE_CREATE_VTABLE,
+    ],
+)
+def test_recovery_authorizer_default_denies_schema_actions(action):
+    assert recovery_module._bound_close_reservation_write_authorizer(
+        action,
+        "forbidden",
+        None,
+        "main",
+        None,
+    ) == sqlite3.SQLITE_DENY
+
+
+@pytest.mark.parametrize(
+    "action",
+    [sqlite3.SQLITE_TRANSACTION, sqlite3.SQLITE_SAVEPOINT],
+)
+def test_recovery_authorizer_denies_early_transaction_control(action):
+    assert recovery_module._bound_close_reservation_write_authorizer(
+        action,
+        "COMMIT",
+        None,
+        None,
+        None,
+    ) == sqlite3.SQLITE_DENY
+
+
+def test_apply_denies_early_commit_and_rolls_back_partial_update(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path)
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+    real_execute = recovery_module._execute_bound_close_reservation_apply_statement
+    attempted = False
+
+    def commit_after_first_update(connection, sql, parameters=()):
+        nonlocal attempted
+        cursor = real_execute(connection, sql, parameters)
+        if not attempted and sql.lstrip().startswith("UPDATE"):
+            attempted = True
+            connection.commit()
+            raise sqlite3.OperationalError("injected failure after early commit")
+        return cursor
+
+    monkeypatch.setattr(
+        recovery_module,
+        "_execute_bound_close_reservation_apply_statement",
+        commit_after_first_update,
+    )
+
+    with pytest.raises(
+        BoundCloseReservationRecoveryConflict,
+        match="transaction",
+    ):
+        _apply_ready(database, capture)
+
+    assert attempted is True
+    assert _table_rows(database, "bound_position_close_reservations")[0][
+        "status"
+    ] == "submitted"
+    assert not [
+        row
+        for row in _table_rows(database, "execution_events")
+        if row["action"] == "bound_close_reservation_history_converged"
+    ]
+
+
 def test_apply_total_changes_rejects_extra_allowed_column_write(
     tmp_path, monkeypatch
 ):
@@ -4440,7 +4581,7 @@ def test_apply_total_changes_rejects_extra_allowed_column_write(
     ]
 
 
-def test_apply_postwrite_invariant_recheck_rolls_back_injected_drift(
+def test_apply_postwrite_authorizer_rolls_back_injected_descendant_drift(
     tmp_path, monkeypatch
 ):
     database = _apply_database(tmp_path)
@@ -4466,7 +4607,7 @@ def test_apply_postwrite_invariant_recheck_rolls_back_injected_drift(
 
     with pytest.raises(
         BoundCloseReservationRecoveryConflict,
-        match="invariant",
+        match="transaction",
     ):
         _apply_ready(database, capture)
 
@@ -4482,6 +4623,76 @@ def test_apply_postwrite_invariant_recheck_rolls_back_injected_drift(
         for row in _table_rows(database, "execution_events")
         if row["action"] == "bound_close_reservation_history_converged"
     ]
+
+
+def test_apply_authorizer_remains_active_during_postwrite_pragma_attempt(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path)
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+    real_fingerprints = recovery_module._durable_invariant_fingerprints
+    calls = 0
+
+    def attempt_postwrite_pragma(connection, *, raw_rows):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            connection.execute("PRAGMA user_version = 4242")
+        return real_fingerprints(connection, raw_rows=raw_rows)
+
+    monkeypatch.setattr(
+        recovery_module,
+        "_durable_invariant_fingerprints",
+        attempt_postwrite_pragma,
+    )
+
+    with pytest.raises(
+        BoundCloseReservationRecoveryConflict,
+        match="transaction",
+    ):
+        _apply_ready(database, capture)
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
+    assert _table_rows(database, "bound_position_close_reservations")[0][
+        "status"
+    ] == "submitted"
+
+
+def test_apply_final_total_changes_rejects_postwrite_noop_update(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path)
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+    real_fingerprints = recovery_module._durable_invariant_fingerprints
+    calls = 0
+
+    def inject_postwrite_noop(connection, *, raw_rows):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            connection.execute(
+                "UPDATE bound_position_close_reservations "
+                "SET updated_at = updated_at WHERE id = 901"
+            )
+        return real_fingerprints(connection, raw_rows=raw_rows)
+
+    monkeypatch.setattr(
+        recovery_module,
+        "_durable_invariant_fingerprints",
+        inject_postwrite_noop,
+    )
+
+    with pytest.raises(
+        BoundCloseReservationRecoveryConflict,
+        match="changes",
+    ):
+        _apply_ready(database, capture)
+
+    assert calls == 2
+    assert _table_rows(database, "bound_position_close_reservations")[0][
+        "status"
+    ] == "submitted"
 
 
 def test_commit_returning_after_deadline_reports_verified_late_commit(
@@ -4540,8 +4751,9 @@ def test_commit_crossing_deadline_without_commit_reports_failure_and_no_change(
     ] == "submitted"
 
 
+@pytest.mark.parametrize("exception_type", [OSError, RuntimeError])
 def test_guard_teardown_failure_after_commit_uses_read_only_exact_verification(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, exception_type
 ):
     database = _apply_database(tmp_path)
     capture, _http = _ready_apply_capture(monkeypatch, database)
@@ -4550,7 +4762,7 @@ def test_guard_teardown_failure_after_commit_uses_read_only_exact_verification(
     def teardown_failure(*, deadline_monotonic):
         del deadline_monotonic
         yield
-        raise OSError("injected timer teardown failure")
+        raise exception_type("injected timer teardown failure")
 
     monkeypatch.setattr(
         recovery_module,
@@ -4571,6 +4783,108 @@ def test_guard_teardown_failure_after_commit_uses_read_only_exact_verification(
             if row["action"] == "bound_close_reservation_history_converged"
         ]
     ) == 1
+
+
+def test_system_interrupt_after_commit_is_verified_and_annotated(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path)
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+    real_verify = (
+        recovery_module._verify_committed_bound_close_reservation_apply_read_only
+    )
+    verify_calls = 0
+
+    def record_verify(*args, **kwargs):
+        nonlocal verify_calls
+        verify_calls += 1
+        return real_verify(*args, **kwargs)
+
+    @contextmanager
+    def interrupt_on_teardown(*, deadline_monotonic):
+        del deadline_monotonic
+        yield
+        raise KeyboardInterrupt("injected timer teardown interrupt")
+
+    monkeypatch.setattr(
+        recovery_module,
+        "_verify_committed_bound_close_reservation_apply_read_only",
+        record_verify,
+    )
+    monkeypatch.setattr(
+        recovery_module,
+        "_recovery_wall_clock_guard",
+        interrupt_on_teardown,
+    )
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        _apply_ready(database, capture)
+
+    assert verify_calls == 1
+    assert any(
+        "verified" in note
+        for note in getattr(captured.value, "__notes__", ())
+    )
+    assert _table_rows(database, "bound_position_close_reservations")[0][
+        "status"
+    ] == "confirmed"
+
+
+def test_commit_then_system_interrupt_is_verified_annotated_and_reraised(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path)
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+    real_commit = recovery_module._commit_bound_close_reservation_apply
+
+    def commit_then_interrupt(connection):
+        real_commit(connection)
+        raise KeyboardInterrupt("injected interrupt after commit")
+
+    monkeypatch.setattr(
+        recovery_module,
+        "_commit_bound_close_reservation_apply",
+        commit_then_interrupt,
+    )
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        _apply_ready(database, capture)
+
+    assert any(
+        "verified" in note
+        for note in getattr(captured.value, "__notes__", ())
+    )
+    assert _table_rows(database, "bound_position_close_reservations")[0][
+        "status"
+    ] == "confirmed"
+
+
+def test_system_interrupt_before_commit_is_annotated_unresolved_and_reraised(
+    tmp_path, monkeypatch
+):
+    database = _apply_database(tmp_path)
+    capture, _http = _ready_apply_capture(monkeypatch, database)
+
+    def interrupt_before_commit(connection):
+        del connection
+        raise KeyboardInterrupt("injected interrupt before commit")
+
+    monkeypatch.setattr(
+        recovery_module,
+        "_commit_bound_close_reservation_apply",
+        interrupt_before_commit,
+    )
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        _apply_ready(database, capture)
+
+    assert any(
+        "could not be verified" in note
+        for note in getattr(captured.value, "__notes__", ())
+    )
+    assert _table_rows(database, "bound_position_close_reservations")[0][
+        "status"
+    ] == "submitted"
 
 
 def test_close_failure_after_committed_apply_does_not_replace_success(
