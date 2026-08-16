@@ -325,14 +325,25 @@ def _target_material(
             source_rows,
             source_status_overrides=source_status_overrides,
         )
-        if post_invariant_by_ref is not None:
-            raw_rows = tuple(
-                (
-                    reservation.reservation_ref,
-                    source._capability._get(reservation.reservation_ref),
-                )
-                for reservation in source.reservations
+        if (
+            len(source.reservations) != _EXPECTED_RESERVATION_COUNT
+            or any(
+                item.local_reason_code is not None
+                for item in source.reservations
             )
+        ):
+            raise ValueError("joint_population_invalid")
+        if post_invariant_by_ref is not None:
+            try:
+                raw_rows = tuple(
+                    (
+                        reservation.reservation_ref,
+                        source._capability._get(reservation.reservation_ref),
+                    )
+                    for reservation in source.reservations
+                )
+            except (AttributeError, KeyError, TypeError, ValueError) as exc:
+                raise ValueError("joint_population_invalid") from exc
             if (
                 _durable_invariant_fingerprints(
                     driver_connection,
@@ -343,11 +354,6 @@ def _target_material(
                 raise ValueError("joint_population_invalid")
     finally:
         driver_connection.row_factory = previous_row_factory
-    if (
-        len(source.reservations) != _EXPECTED_RESERVATION_COUNT
-        or any(item.local_reason_code is not None for item in source.reservations)
-    ):
-        raise ValueError("joint_population_invalid")
     binding_ids = tuple(int(row["execution_binding_id"]) for row in target_rows)
     position_ids = tuple(str(row["pos_id"]) for row in target_rows)
 

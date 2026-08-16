@@ -1000,9 +1000,11 @@ def test_real_bound_apply_preserves_confirmed_residue_and_post_authority(
     assert after.reservation_count == 29
 
 
+@pytest.mark.parametrize("drift", ["binding_timestamp", "missing_close_event"])
 def test_bound_apply_post_refuses_descendant_drift_from_closed_audit(
     tmp_path,
     monkeypatch,
+    drift,
 ):
     factory, database = _seed_joint_incident(tmp_path)
     monkeypatch.setattr(
@@ -1036,8 +1038,19 @@ def test_bound_apply_post_refuses_descendant_drift_from_closed_audit(
             .first()
         )
         assert target is not None
-        binding = session.get(ExecutionBinding, target.execution_binding_id)
-        binding.updated_at = binding.updated_at + timedelta(seconds=1)
+        if drift == "binding_timestamp":
+            binding = session.get(ExecutionBinding, target.execution_binding_id)
+            binding.updated_at = binding.updated_at + timedelta(seconds=1)
+        else:
+            event = (
+                session.query(ExecutionEvent)
+                .filter_by(
+                    action="close_bound_position_market",
+                    pos_id=target.pos_id,
+                )
+                .one()
+            )
+            session.delete(event)
         session.commit()
 
     after = _inspect(database, phase="bound_apply_post")
