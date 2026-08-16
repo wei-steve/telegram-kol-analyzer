@@ -289,9 +289,11 @@ def _set_test_state_column_nullable_and_null(
             connection.execute("PRAGMA schema_version").fetchone()[0]
         )
         connection.execute("PRAGMA writable_schema=ON")
+        status_width = 64 if table == "bound_position_close_reservations" else 32
         connection.execute(
             "UPDATE sqlite_master SET sql=replace(sql, "
-            "'status VARCHAR(32) NOT NULL', 'status VARCHAR(32)') "
+            f"'status VARCHAR({status_width}) NOT NULL', "
+            f"'status VARCHAR({status_width})') "
             "WHERE type='table' AND name=?",
             (table,),
         )
@@ -850,7 +852,7 @@ def test_reservation_nonheartbeat_timestamp_changes_material_fingerprint(tmp_pat
     assert after.material_fingerprint != before.material_fingerprint
 
 
-def test_closed_phase_requires_confirmed_reservations_after_bound_apply(tmp_path):
+def test_closed_phase_refuses_manual_confirmation_without_apply_audit(tmp_path):
     factory, database = _seed_joint_incident(tmp_path)
 
     before = _inspect(database, phase="bound_apply_pre")
@@ -863,13 +865,9 @@ def test_closed_phase_requires_confirmed_reservations_after_bound_apply(tmp_path
         session.commit()
 
     result = _inspect(database, phase="bound_apply_post")
-    assert result.status == "ready"
-    assert result.reservation_count == 29
-    assert result.material_fingerprint != before.material_fingerprint
-    assert (
-        result.batch119_material_fingerprint
-        == before.batch119_material_fingerprint
-    )
+    assert before.status == "ready"
+    assert result.status == "refused"
+    assert result.reason_code == "joint_material_invalid"
 
 
 def test_joint_pre_is_the_only_admission_that_can_bypass_exact_batch119_block(tmp_path):

@@ -7325,7 +7325,7 @@ def test_quantity_step_decimal_equivalent_representation_is_ready(tmp_path):
     plan = _plan(factory)
 
     assert plan.status == "ready"
-    assert plan.reason_code is None
+    assert plan.reason_code == "false_legacy_submission_proven"
 
 
 @pytest.mark.parametrize("value", ["2", "0", "-1", "not-a-decimal"])

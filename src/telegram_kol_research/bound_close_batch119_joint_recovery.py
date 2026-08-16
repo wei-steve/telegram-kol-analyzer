@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import json
 from pathlib import Path
 import sqlite3
 from typing import Literal
@@ -23,8 +24,19 @@ from telegram_kol_research.bound_close_writer_quiescence import (
     _parse_writer_timestamp,
 )
 from telegram_kol_research.bound_close_reservation_recovery import (
+    ACTIVE_CLOSE_RESERVATION_STATUSES,
+    MAX_RECOVERY_PLAN_BYTES,
+    _BOUND_CLOSE_RESERVATION_AUDIT_ACTION,
     _REQUIRED_SOURCE_COLUMNS,
+    _bounded_recovery_json_tree,
+    _closed_json_object,
+    _exact_object_keys,
+    _load_bound_close_reservation_audits,
     _load_source_descendants,
+    _parse_sqlite_utc,
+    _redacted_ref,
+    _reject_json_constant,
+    _require_lower_hex_64,
 )
 from telegram_kol_research.composite_management_batch_recovery import (
     CompositeBatchRecoveryRefusal,
@@ -52,6 +64,7 @@ BOUND_APPLY_POST = "bound_apply_post"
 _PHASES = frozenset({JOINT_DIAGNOSTIC, BOUND_APPLY_PRE, BOUND_APPLY_POST})
 _EXPECTED_RESERVATION_COUNT = 29
 _MAX_TARGET_ROWS = 64
+_CONFIRMED_RESERVATION_STATUS = "confirmed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +103,142 @@ def _table_columns(session, table: str) -> frozenset[str]:
     return frozenset(str(row[1]) for row in rows)
 
 
+def _post_target_rows(
+    session,
+    rows: list[dict],
+) -> tuple[list[dict], dict[int, str], dict[str, object]]:
+    connection = session.connection().connection.driver_connection
+    if type(connection) is not sqlite3.Connection:
+        raise ValueError("joint_database_invalid")
+    previous_row_factory = connection.row_factory
+    try:
+        connection.row_factory = sqlite3.Row
+        audits = _load_bound_close_reservation_audits(connection)
+    finally:
+        connection.row_factory = previous_row_factory
+    if len(audits) != 1:
+        raise ValueError("joint_population_invalid")
+    audit = audits[0]
+    if not (
+        type(audit["id"]) is int
+        and audit["id"] > 0
+        and audit["execution_binding_id"] is None
+        and audit["venue"] == "deepcoin"
+        and audit["action"] == _BOUND_CLOSE_RESERVATION_AUDIT_ACTION
+        and audit["status"] == "succeeded"
+        and audit["order_id"] is None
+        and audit["client_order_id"] is None
+        and audit["pos_id"] is None
+        and audit["related_order_id"] is None
+        and audit["request_json"] is None
+        and audit["response_json"] is None
+        and type(audit["notification_attempts"]) is int
+        and audit["notification_attempts"] == 0
+        and _parse_sqlite_utc(audit["created_at"]) is not None
+    ):
+        raise ValueError("joint_population_invalid")
+    evidence_fingerprint = _require_lower_hex_64(
+        audit["notification_fingerprint"],
+        "notification_fingerprint",
+    )
+    expected_before_keys = frozenset(
+        {"action_count", "evidence_fingerprint", "reservations"}
+    )
+    expected_after_keys = frozenset(
+        {"action_count", "evidence_fingerprint", "reservations", "status"}
+    )
+    expected_item_keys = frozenset(
+        {"durable_invariant_fingerprint", "reservation_ref", "status"}
+    )
+    documents = (audit["before_json"], audit["after_json"])
+    if any(
+        type(document) is not str
+        or len(document.encode("utf-8")) > MAX_RECOVERY_PLAN_BYTES
+        for document in documents
+    ):
+        raise ValueError("joint_population_invalid")
+    before = json.loads(
+        documents[0],
+        object_pairs_hook=_closed_json_object,
+        parse_constant=_reject_json_constant,
+    )
+    after = json.loads(
+        documents[1],
+        object_pairs_hook=_closed_json_object,
+        parse_constant=_reject_json_constant,
+    )
+    _bounded_recovery_json_tree(before)
+    _bounded_recovery_json_tree(after)
+    before = _exact_object_keys(before, expected_before_keys, "audit.before")
+    after = _exact_object_keys(after, expected_after_keys, "audit.after")
+    if (
+        type(before["action_count"]) is not int
+        or before["action_count"] != _EXPECTED_RESERVATION_COUNT
+        or type(after["action_count"]) is not int
+        or after["action_count"] != _EXPECTED_RESERVATION_COUNT
+        or before["evidence_fingerprint"] != evidence_fingerprint
+        or after["evidence_fingerprint"] != evidence_fingerprint
+        or after["status"] != _CONFIRMED_RESERVATION_STATUS
+        or type(before["reservations"]) is not list
+        or type(after["reservations"]) is not list
+        or len(before["reservations"]) != _EXPECTED_RESERVATION_COUNT
+        or len(after["reservations"]) != _EXPECTED_RESERVATION_COUNT
+    ):
+        raise ValueError("joint_population_invalid")
+    source_status_by_ref: dict[str, str] = {}
+    invariant_by_ref: dict[str, str] = {}
+    ordered_refs: list[str] = []
+    for raw_item in before["reservations"]:
+        item = _exact_object_keys(raw_item, expected_item_keys, "audit.before.item")
+        reference = _require_lower_hex_64(item["reservation_ref"], "reservation_ref")
+        invariant = _require_lower_hex_64(
+            item["durable_invariant_fingerprint"],
+            "durable_invariant_fingerprint",
+        )
+        status = item["status"]
+        if (
+            type(status) is not str
+            or status not in ACTIVE_CLOSE_RESERVATION_STATUSES
+            or reference in source_status_by_ref
+        ):
+            raise ValueError("joint_population_invalid")
+        source_status_by_ref[reference] = status
+        invariant_by_ref[reference] = invariant
+        ordered_refs.append(reference)
+    after_refs: list[str] = []
+    for raw_item in after["reservations"]:
+        item = _exact_object_keys(raw_item, expected_item_keys, "audit.after.item")
+        reference = _require_lower_hex_64(item["reservation_ref"], "reservation_ref")
+        invariant = _require_lower_hex_64(
+            item["durable_invariant_fingerprint"],
+            "durable_invariant_fingerprint",
+        )
+        if (
+            item["status"] != _CONFIRMED_RESERVATION_STATUS
+            or invariant_by_ref.get(reference) != invariant
+        ):
+            raise ValueError("joint_population_invalid")
+        after_refs.append(reference)
+    if after_refs != ordered_refs:
+        raise ValueError("joint_population_invalid")
+    candidates = {
+        _redacted_ref("reservation", row["id"]): row
+        for row in rows
+        if row["status"] == _CONFIRMED_RESERVATION_STATUS
+        and row["last_error"] is None
+        and row["updated_at"] == audit["created_at"]
+    }
+    if set(candidates) != set(ordered_refs):
+        raise ValueError("joint_population_invalid")
+    target_rows = [candidates[reference] for reference in ordered_refs]
+    source_status_by_id = {
+        int(row["id"]): source_status_by_ref[reference]
+        for reference, row in zip(ordered_refs, target_rows, strict=True)
+    }
+    audit_material = {key: audit[key] for key in audit.keys()}
+    return target_rows, source_status_by_id, audit_material
+
+
 def _target_material(
     session, *, phase: str
 ) -> tuple[list[dict], int, dict[str, object]]:
@@ -106,41 +255,60 @@ def _target_material(
     ).mappings().all()
     if len(rows) > _MAX_TARGET_ROWS:
         raise ValueError("joint_population_invalid")
-    expected_status = "confirmed" if phase == BOUND_APPLY_POST else None
-    material: list[dict] = []
-    for row in rows:
-        status = row.get("status")
-        if expected_status is None:
-            if type(status) is not str or status not in _TARGET_STATES:
-                raise ValueError("joint_population_invalid")
-        elif status != expected_status:
-            raise ValueError("joint_population_invalid")
-        material.append({name: row[name] for name in sorted(columns)})
-    if len(material) != _EXPECTED_RESERVATION_COUNT:
+    row_material = [
+        {name: row[name] for name in sorted(columns)} for row in rows
+    ]
+    post_audit_material: dict[str, object] | None = None
+    source_status_overrides: dict[int, str] | None = None
+    if phase == BOUND_APPLY_POST:
+        target_rows, source_status_overrides, post_audit_material = (
+            _post_target_rows(session, row_material)
+        )
+        target_ids = {int(row["id"]) for row in target_rows}
+        confirmed_residue = [
+            row for row in row_material if int(row["id"]) not in target_ids
+        ]
+    else:
+        target_rows = [
+            row for row in row_material if row["status"] in _TARGET_STATES
+        ]
+        confirmed_residue = [
+            row
+            for row in row_material
+            if row["status"] == _CONFIRMED_RESERVATION_STATUS
+        ]
+    if (
+        len(target_rows) != _EXPECTED_RESERVATION_COUNT
+        or len(target_rows) + len(confirmed_residue) != len(row_material)
+        or any(
+            row["status"] != _CONFIRMED_RESERVATION_STATUS
+            for row in confirmed_residue
+        )
+    ):
         raise ValueError("joint_population_invalid")
+    material = target_rows
     driver_connection = session.connection().connection.driver_connection
     if type(driver_connection) is not sqlite3.Connection:
         raise ValueError("joint_database_invalid")
     previous_row_factory = driver_connection.row_factory
     try:
         driver_connection.row_factory = sqlite3.Row
+        target_ids = tuple(int(row["id"]) for row in target_rows)
+        placeholders = ",".join("?" for _ in target_ids)
         source_rows = driver_connection.execute(
-            """
+            f"""
             SELECT id, pos_id, execution_binding_id, status, last_error,
                    created_at, updated_at
             FROM bound_position_close_reservations
+            WHERE id IN ({placeholders})
             ORDER BY id
-            LIMIT 65
-            """
+            """,
+            target_ids,
         ).fetchall()
         source = _load_source_descendants(
             driver_connection,
             source_rows,
-            source_status_overrides=(
-                {int(row["id"]): "submitted" for row in source_rows}
-                if phase == BOUND_APPLY_POST
-                else None
-            ),
+            source_status_overrides=source_status_overrides,
         )
     finally:
         driver_connection.row_factory = previous_row_factory
@@ -149,8 +317,8 @@ def _target_material(
         or any(item.local_reason_code is not None for item in source.reservations)
     ):
         raise ValueError("joint_population_invalid")
-    binding_ids = tuple(int(row["execution_binding_id"]) for row in rows)
-    position_ids = tuple(str(row["pos_id"]) for row in rows)
+    binding_ids = tuple(int(row["execution_binding_id"]) for row in target_rows)
+    position_ids = tuple(str(row["pos_id"]) for row in target_rows)
 
     def complete_rows(query) -> list[dict[str, object]]:
         selected = query.limit(257).all()
@@ -160,6 +328,8 @@ def _target_material(
 
     descendant_material: dict[str, object] = {
         "source_fingerprint": str(source.source_fingerprint),
+        "confirmed_residue": confirmed_residue,
+        "post_audit": post_audit_material,
         "execution_bindings": complete_rows(
             session.query(ExecutionBinding)
             .filter(ExecutionBinding.id.in_(binding_ids))
@@ -304,11 +474,16 @@ def inspect_joint_recovery_material_authority(
                 validated_source=exact_source,
                 target_instruction_only=True,
             )
-            (
-                reservations,
-                reservation_count,
-                reservation_source_material,
-            ) = _target_material(session, phase=phase)
+            try:
+                (
+                    reservations,
+                    reservation_count,
+                    reservation_source_material,
+                ) = _target_material(session, phase=phase)
+            except (RecursionError, RuntimeError, TypeError, ValueError) as exc:
+                raise CompositeBatchRecoveryRefusal(
+                    "joint_material_invalid"
+                ) from exc
             blocking = _blocking_writer_count(
                 session,
                 now=observed_at,

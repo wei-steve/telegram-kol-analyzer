@@ -6768,6 +6768,17 @@ def _validated_target_snapshot(batch, *, binding, leg, entry, profile):
     )
     if any(row.get(key) in (None, "") for key in required):
         return "target_snapshot_identity_mismatch"
+    try:
+        leg_quantity_step = _positive_decimal(
+            leg.quantity_step,
+            "quantity_step",
+        )
+        snapshot_quantity_step = _positive_decimal(
+            row["quantity_step"],
+            "quantity_step",
+        )
+    except CompositeBatchRecoveryRefusal:
+        return "target_snapshot_identity_mismatch"
     if (
         str(row["trusted_start_size"]) != profile.trusted_start_size
         or str(row["target_remaining_size"]) != profile.target_remaining_size
@@ -6776,7 +6787,7 @@ def _validated_target_snapshot(batch, *, binding, leg, entry, profile):
         or str(row.get("side") or "").lower() != profile.side.lower()
         or str(row.get("size") or "") != profile.trusted_start_size
         or str(leg.avg_entry_price) != str(row["avg_entry_price"])
-        or str(leg.quantity_step) != str(row["quantity_step"])
+        or leg_quantity_step != snapshot_quantity_step
         or int(leg.execution_order_leg_id) != int(entry.id)
         or _exact_int(row.get("execution_order_leg_id")) != int(entry.id)
         or str(row.get("margin_mode") or "") != str(binding.margin_mode)
@@ -6785,7 +6796,6 @@ def _validated_target_snapshot(batch, *, binding, leg, entry, profile):
         return "target_snapshot_identity_mismatch"
     try:
         _positive_decimal(row["avg_entry_price"], "avg_entry_price")
-        _positive_decimal(row["quantity_step"], "quantity_step")
         _positive_decimal(row["min_quantity"], "min_quantity")
     except CompositeBatchRecoveryRefusal:
         return "target_snapshot_identity_mismatch"
