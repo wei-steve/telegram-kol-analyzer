@@ -1678,7 +1678,10 @@ stop_bound_close_unit_group() {
   local unit
   for unit in "$@"; do
     case "${ORIGINAL_UNIT_INSTALL_STATE[$unit]}" in
-      installed) sudo systemctl stop "$unit" ;;
+      installed)
+        run_bound_close_external_command_before_deadline \
+          sudo systemctl stop "$unit"
+        ;;
       absent) ;;
       *) return 1 ;;
     esac
@@ -1689,14 +1692,17 @@ reset_bound_close_legacy_monitor_after_timer_freeze() {
   local current_state
   case "${ORIGINAL_UNIT_INSTALL_STATE[telegram-kol-monitor.service]}" in
     installed)
-      current_state="$(systemctl is-active telegram-kol-monitor.service || true)"
+      current_state="$(run_bound_close_external_command_before_deadline \
+        systemctl is-active telegram-kol-monitor.service || true)"
       case "$current_state" in
         active)
-          sudo systemctl stop telegram-kol-monitor.service
+          run_bound_close_external_command_before_deadline \
+            sudo systemctl stop telegram-kol-monitor.service
           ORIGINAL_UNIT_STATE["telegram-kol-monitor.service"]=inactive
           ;;
         failed)
-          sudo systemctl reset-failed telegram-kol-monitor.service
+          run_bound_close_external_command_before_deadline \
+            sudo systemctl reset-failed telegram-kol-monitor.service
           ORIGINAL_UNIT_STATE["telegram-kol-monitor.service"]=inactive
           ;;
         inactive)
@@ -1709,7 +1715,8 @@ reset_bound_close_legacy_monitor_after_timer_freeze() {
           ;;
         *) return 1 ;;
       esac
-      test "$(systemctl is-active telegram-kol-monitor.service || true)" = inactive
+      test "$(run_bound_close_external_command_before_deadline \
+        systemctl is-active telegram-kol-monitor.service || true)" = inactive
       ;;
     absent)
       [ "${ORIGINAL_UNIT_STATE[telegram-kol-monitor.service]}" = absent ]
@@ -1722,13 +1729,36 @@ verify_bound_close_unit_group_inactive() {
   local unit
   local load_state
   for unit in "$@"; do
+    load_state="$(run_bound_close_external_command_before_deadline \
+      systemctl show "$unit" --property=LoadState --value)"
+    case "${ORIGINAL_UNIT_INSTALL_STATE[$unit]}" in
+      installed)
+        [ "$load_state" = loaded ] || return 1
+        [ "$(run_bound_close_external_command_before_deadline \
+          systemctl is-active "$unit" || true)" = inactive ] || return 1
+        ;;
+      absent) [ "$load_state" = not-found ] || return 1 ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+verify_bound_close_unit_group_original_state() {
+  local unit
+  local load_state
+  local active_state
+  for unit in "$@"; do
     load_state="$(systemctl show "$unit" --property=LoadState --value)"
     case "${ORIGINAL_UNIT_INSTALL_STATE[$unit]}" in
       installed)
         [ "$load_state" = loaded ] || return 1
-        [ "$(systemctl is-active "$unit" || true)" = inactive ] || return 1
+        active_state="$(systemctl is-active "$unit" || true)"
+        [ "$active_state" = "${ORIGINAL_UNIT_STATE[$unit]}" ] || return 1
         ;;
-      absent) [ "$load_state" = not-found ] || return 1 ;;
+      absent)
+        [ "$load_state" = not-found ] || return 1
+        [ "${ORIGINAL_UNIT_STATE[$unit]}" = absent ] || return 1
+        ;;
       *) return 1 ;;
     esac
   done
@@ -1766,6 +1796,7 @@ verify_all_local_identity_before_stop() {
   local PROCESS_SCAN_STATUS
   discover_bound_close_db_stage_units "$DB_STAGE_CURRENT_INVENTORY"
   cmp -s "$DB_STAGE_INITIAL_INVENTORY" "$DB_STAGE_CURRENT_INVENTORY"
+  verify_bound_close_unit_group_original_state "${QUIESCE_UNITS[@]}"
   if pgrep -f '[t]elegram_kol_research|[t]elegram-kol' >/dev/null; then
     PROCESS_SCAN_STATUS=0
   else
@@ -2135,6 +2166,7 @@ write_bound_close_capture_runner() {
       QUIESCE_SOCKET_UNITS ORIGINAL_UNIT_INSTALL_STATE
     declare -f \
       bound_close_now_epoch discover_bound_close_db_stage_units \
+      run_bound_close_external_command_before_deadline \
       verify_bound_close_unit_group_inactive verify_bound_close_quiescence \
       verify_all_local_quiescence_and_identity \
       validate_bound_close_capture_diagnostic \
@@ -2262,6 +2294,190 @@ run_bound_close_double_capture_before_deadline() {
   esac
 }
 
+run_bound_close_live_prequiescence() {
+  local LIVE_PREQUIESCENCE_ATTEMPT=0
+  local LIVE_PREQUIESCENCE_POLL_SECONDS=15
+  local LIVE_PREQUIESCENCE_PROJECTION
+  local LIVE_PREQUIESCENCE_RAW
+  local LIVE_PREQUIESCENCE_REMAINING_SECONDS
+  local LIVE_PREQUIESCENCE_SLEEP_SECONDS
+  # BEGIN BOUND_CLOSE_LIVE_PREQUIESCENCE
+  while :; do
+    [ "$(bound_close_now_epoch)" -lt \
+      "$LIVE_PREQUIESCENCE_DEADLINE_EPOCH" ] || return 1
+    LIVE_PREQUIESCENCE_ATTEMPT=$((LIVE_PREQUIESCENCE_ATTEMPT + 1))
+    LIVE_PREQUIESCENCE_RAW="$RECOVERY_TMP/live-writer-quiescence-${LIVE_PREQUIESCENCE_ATTEMPT}.json"
+    LIVE_PREQUIESCENCE_PROJECTION="$RECOVERY_TMP/live-writer-quiescence-${LIVE_PREQUIESCENCE_ATTEMPT}-projection.json"
+    verify_all_local_identity_before_stop
+    run_bound_close_writer_quiescence_helper "$LIVE_PREQUIESCENCE_RAW"
+    verify_all_local_identity_before_stop
+    chmod 0600 "$LIVE_PREQUIESCENCE_RAW"
+    case "$HELPER_STATUS" in
+      0|2)
+        project_bound_close_writer_quiescence_result \
+          "$LIVE_PREQUIESCENCE_RAW" "$HELPER_STATUS" \
+          "$LIVE_PREQUIESCENCE_PROJECTION"
+        chmod 0600 "$LIVE_PREQUIESCENCE_PROJECTION"
+        ;;
+      *) return 1 ;;
+    esac
+    [ "$(bound_close_now_epoch)" -lt \
+      "$LIVE_PREQUIESCENCE_DEADLINE_EPOCH" ] || return 1
+    case "$HELPER_STATUS" in
+      0)
+        require_exact_ready_projection "$LIVE_PREQUIESCENCE_PROJECTION"
+        mv -- "$LIVE_PREQUIESCENCE_PROJECTION" "$LIVE_PREQUIESCENCE_RESULT"
+        chmod 0600 "$LIVE_PREQUIESCENCE_RESULT"
+        return 0
+        ;;
+      2) require_exact_refused_projection "$LIVE_PREQUIESCENCE_PROJECTION" ;;
+      *) return 1 ;;
+    esac
+    LIVE_PREQUIESCENCE_REMAINING_SECONDS=$((
+      LIVE_PREQUIESCENCE_DEADLINE_EPOCH - $(bound_close_now_epoch)
+    ))
+    [ "$LIVE_PREQUIESCENCE_REMAINING_SECONDS" -gt 0 ] || return 1
+    LIVE_PREQUIESCENCE_SLEEP_SECONDS="$LIVE_PREQUIESCENCE_POLL_SECONDS"
+    if [ "$LIVE_PREQUIESCENCE_REMAINING_SECONDS" -lt \
+      "$LIVE_PREQUIESCENCE_SLEEP_SECONDS" ]; then
+      LIVE_PREQUIESCENCE_SLEEP_SECONDS="$LIVE_PREQUIESCENCE_REMAINING_SECONDS"
+    fi
+    sleep "$LIVE_PREQUIESCENCE_SLEEP_SECONDS"
+  done
+  # END BOUND_CLOSE_LIVE_PREQUIESCENCE
+}
+
+run_bound_close_stopped_phase() {
+  local REQUIRED_CAPTURE_SECONDS
+  local REMAINING_SECONDS
+  for VERIFY_PASS in 1 2 3; do
+    sleep 1
+    verify_bound_close_quiescence
+  done
+  # BEGIN BOUND_CLOSE_QUIESCENCE_POLL
+  verify_all_local_quiescence_and_identity
+  run_bound_close_writer_quiescence_helper "$WRITER_QUIESCENCE_RAW"
+  verify_all_local_quiescence_and_identity
+  chmod 0600 "$WRITER_QUIESCENCE_RAW"
+  case "$HELPER_STATUS" in
+    0|2)
+      project_bound_close_writer_quiescence_result \
+        "$WRITER_QUIESCENCE_RAW" "$HELPER_STATUS" \
+        "$WRITER_QUIESCENCE_PROJECTION"
+      chmod 0600 "$WRITER_QUIESCENCE_PROJECTION"
+      ;;
+    *) return 1 ;;
+  esac
+  [ "$(bound_close_now_epoch)" -lt "$QUIESCENCE_DEADLINE_EPOCH" ] || return 1
+  case "$HELPER_STATUS" in
+    0)
+      require_exact_ready_projection "$WRITER_QUIESCENCE_PROJECTION"
+      mv -- "$WRITER_QUIESCENCE_PROJECTION" "$WRITER_QUIESCENCE_RESULT"
+      chmod 0600 "$WRITER_QUIESCENCE_RESULT"
+      ;;
+    2)
+      require_exact_refused_projection "$WRITER_QUIESCENCE_PROJECTION"
+      printf '%s\n' '{"status":"post_stop_writer_race"}' > \
+        "$BOUND_CLOSE_DIAGNOSTIC_HANDOFF.tmp"
+      chmod 0600 "$BOUND_CLOSE_DIAGNOSTIC_HANDOFF.tmp"
+      mv -- "$BOUND_CLOSE_DIAGNOSTIC_HANDOFF.tmp" \
+        "$BOUND_CLOSE_DIAGNOSTIC_HANDOFF"
+      return 2
+      ;;
+    *) return 1 ;;
+  esac
+  REMAINING_SECONDS=$((QUIESCENCE_DEADLINE_EPOCH - $(bound_close_now_epoch)))
+  REQUIRED_CAPTURE_SECONDS=$((
+    2 * BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS
+    + BOUND_CLOSE_CAPTURE_OVERHEAD_RESERVE_SECONDS
+  ))
+  [ "$REMAINING_SECONDS" -ge "$REQUIRED_CAPTURE_SECONDS" ] || return 1
+  run_bound_close_double_capture_before_deadline
+  # END BOUND_CLOSE_QUIESCENCE_POLL
+}
+
+run_bound_close_external_command_before_deadline() {
+  local REMAINING_SECONDS
+  REMAINING_SECONDS=$((
+    QUIESCENCE_DEADLINE_EPOCH - $(bound_close_now_epoch)
+  ))
+  [ "$REMAINING_SECONDS" -gt 0 ] || return 1
+  timeout --signal=KILL "$REMAINING_SECONDS" "$@"
+}
+
+run_bound_close_runner_before_deadline() {
+  local RUNNER_PATH="$1"
+  local DEADLINE_EPOCH="$2"
+  local REMAINING_SECONDS
+  local RUNNER_STATUS
+  REMAINING_SECONDS=$((DEADLINE_EPOCH - $(bound_close_now_epoch)))
+  [ "$REMAINING_SECONDS" -gt 0 ] || return 1
+  set +e
+  timeout --signal=KILL "$REMAINING_SECONDS" \
+    bash "$RUNNER_PATH" "$DEADLINE_EPOCH"
+  RUNNER_STATUS=$?
+  set -e
+  return "$RUNNER_STATUS"
+}
+
+write_bound_close_live_prequiescence_runner() {
+  local RUNNER_PATH="$1"
+  {
+    printf '%s\n' 'set -euo pipefail' 'umask 077'
+    declare -p \
+      RECOVERY_TMP CANDIDATE_ROOT PRODUCTION_ROOT RUNTIME_PYTHON PRODUCTION_DB \
+      ORIGINAL_SHA PRODUCTION_DB_RESOLVED_PATH PRODUCTION_DB_DEVICE_INODE \
+      DB_STAGE_INITIAL_INVENTORY DB_STAGE_CURRENT_INVENTORY \
+      LIVE_PREQUIESCENCE_RESULT QUIESCE_DB_STAGE_SEED_UNITS QUIESCE_UNITS \
+      ORIGINAL_UNIT_INSTALL_STATE ORIGINAL_UNIT_STATE
+    declare -f \
+      bound_close_now_epoch discover_bound_close_db_stage_units \
+      verify_bound_close_unit_group_original_state \
+      verify_all_local_identity_before_stop \
+      run_bound_close_writer_quiescence_helper \
+      project_bound_close_writer_quiescence_result \
+      require_exact_ready_projection require_exact_refused_projection \
+      run_bound_close_live_prequiescence
+    printf '%s\n' \
+      'LIVE_PREQUIESCENCE_DEADLINE_EPOCH="$1"' \
+      'run_bound_close_live_prequiescence'
+  } > "$RUNNER_PATH"
+  chmod 0700 "$RUNNER_PATH"
+}
+
+write_bound_close_stopped_phase_runner() {
+  local RUNNER_PATH="$1"
+  {
+    printf '%s\n' 'set -euo pipefail' 'umask 077'
+    declare -p \
+      RECOVERY_TMP CANDIDATE_ROOT PRODUCTION_ROOT RUNTIME_PYTHON PRODUCTION_DB \
+      ORIGINAL_SHA PRODUCTION_DB_RESOLVED_PATH PRODUCTION_DB_DEVICE_INODE \
+      DB_STAGE_INITIAL_INVENTORY DB_STAGE_CURRENT_INVENTORY \
+      QUIESCE_DB_STAGE_SEED_UNITS QUIESCE_TIMER_UNITS QUIESCE_SERVICE_UNITS \
+      QUIESCE_SOCKET_UNITS ORIGINAL_UNIT_INSTALL_STATE \
+      BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS \
+      BOUND_CLOSE_CAPTURE_OVERHEAD_RESERVE_SECONDS \
+      BOUND_CLOSE_DIAGNOSTIC_HANDOFF CAPTURE_RUNNER \
+      WRITER_QUIESCENCE_RAW WRITER_QUIESCENCE_PROJECTION \
+      WRITER_QUIESCENCE_RESULT
+    declare -f \
+      bound_close_now_epoch discover_bound_close_db_stage_units \
+      run_bound_close_external_command_before_deadline \
+      verify_bound_close_unit_group_inactive verify_bound_close_quiescence \
+      verify_all_local_quiescence_and_identity \
+      run_bound_close_writer_quiescence_helper \
+      project_bound_close_writer_quiescence_result \
+      require_exact_ready_projection require_exact_refused_projection \
+      run_bound_close_double_capture_before_deadline \
+      run_bound_close_stopped_phase
+    printf '%s\n' \
+      'QUIESCENCE_DEADLINE_EPOCH="$1"' \
+      'BOUND_CLOSE_SAFE_DIAGNOSTIC='"'"'{"status":"diagnostic_unavailable"}'"'"'' \
+      'run_bound_close_stopped_phase'
+  } > "$RUNNER_PATH"
+  chmod 0700 "$RUNNER_PATH"
+}
+
 discover_bound_close_db_stage_units "$DB_STAGE_INITIAL_INVENTORY"
 mapfile -t QUIESCE_DB_STAGE_UNITS < "$DB_STAGE_INITIAL_INVENTORY"
 QUIESCE_SERVICE_UNITS+=("${QUIESCE_DB_STAGE_UNITS[@]}")
@@ -2302,113 +2518,48 @@ git -C "$PRODUCTION_ROOT" worktree add --detach \
 test "$(git -C "$CANDIDATE_ROOT" rev-parse HEAD)" = "$REVIEWED_SHA"
 test -z "$(git -C "$CANDIDATE_ROOT" status --porcelain)"
 
-# BEGIN BOUND_CLOSE_LIVE_PREQUIESCENCE
 LIVE_PREQUIESCENCE_DEADLINE_EPOCH="$(( $(bound_close_now_epoch) + 720 ))"
-LIVE_PREQUIESCENCE_POLL_SECONDS=15
-LIVE_PREQUIESCENCE_ATTEMPT=0
 LIVE_PREQUIESCENCE_RESULT="$RECOVERY_TMP/live-writer-quiescence.json"
-while :; do
-  [ "$(bound_close_now_epoch)" -lt \
-    "$LIVE_PREQUIESCENCE_DEADLINE_EPOCH" ] || exit 1
-  LIVE_PREQUIESCENCE_ATTEMPT=$((LIVE_PREQUIESCENCE_ATTEMPT + 1))
-  LIVE_PREQUIESCENCE_RAW="$RECOVERY_TMP/live-writer-quiescence-${LIVE_PREQUIESCENCE_ATTEMPT}.json"
-  LIVE_PREQUIESCENCE_PROJECTION="$RECOVERY_TMP/live-writer-quiescence-${LIVE_PREQUIESCENCE_ATTEMPT}-projection.json"
-  verify_all_local_identity_before_stop
-  run_bound_close_writer_quiescence_helper "$LIVE_PREQUIESCENCE_RAW"
-  verify_all_local_identity_before_stop
-  chmod 0600 "$LIVE_PREQUIESCENCE_RAW"
-  case "$HELPER_STATUS" in
-    0|2)
-      project_bound_close_writer_quiescence_result \
-        "$LIVE_PREQUIESCENCE_RAW" "$HELPER_STATUS" \
-        "$LIVE_PREQUIESCENCE_PROJECTION"
-      chmod 0600 "$LIVE_PREQUIESCENCE_PROJECTION"
-      ;;
-    *) exit 1 ;;
-  esac
-  [ "$(bound_close_now_epoch)" -lt \
-    "$LIVE_PREQUIESCENCE_DEADLINE_EPOCH" ] || exit 1
-  case "$HELPER_STATUS" in
-    0)
-      require_exact_ready_projection "$LIVE_PREQUIESCENCE_PROJECTION"
-      mv -- "$LIVE_PREQUIESCENCE_PROJECTION" "$LIVE_PREQUIESCENCE_RESULT"
-      chmod 0600 "$LIVE_PREQUIESCENCE_RESULT"
-      break
-      ;;
-    2) require_exact_refused_projection "$LIVE_PREQUIESCENCE_PROJECTION" ;;
-    *) exit 1 ;;
-  esac
-  LIVE_PREQUIESCENCE_REMAINING_SECONDS=$((
-    LIVE_PREQUIESCENCE_DEADLINE_EPOCH - $(bound_close_now_epoch)
-  ))
-  [ "$LIVE_PREQUIESCENCE_REMAINING_SECONDS" -gt 0 ] || exit 1
-  LIVE_PREQUIESCENCE_SLEEP_SECONDS="$LIVE_PREQUIESCENCE_POLL_SECONDS"
-  if [ "$LIVE_PREQUIESCENCE_REMAINING_SECONDS" -lt \
-    "$LIVE_PREQUIESCENCE_SLEEP_SECONDS" ]; then
-    LIVE_PREQUIESCENCE_SLEEP_SECONDS="$LIVE_PREQUIESCENCE_REMAINING_SECONDS"
-  fi
-  sleep "$LIVE_PREQUIESCENCE_SLEEP_SECONDS"
-done
-# END BOUND_CLOSE_LIVE_PREQUIESCENCE
+LIVE_PREQUIESCENCE_RUNNER="$RECOVERY_TMP/live-prequiescence-runner.sh"
+write_bound_close_live_prequiescence_runner "$LIVE_PREQUIESCENCE_RUNNER"
+run_bound_close_runner_before_deadline \
+  "$LIVE_PREQUIESCENCE_RUNNER" "$LIVE_PREQUIESCENCE_DEADLINE_EPOCH"
+verify_all_local_identity_before_stop
 
 CAPTURE_RUNNER="$RECOVERY_TMP/capture-runner.sh"
 write_bound_close_capture_runner "$CAPTURE_RUNNER"
-
-QUIESCE_ATTEMPTED=1
-stop_bound_close_unit_group "${QUIESCE_TIMER_UNITS[@]}"
-verify_bound_close_unit_group_inactive "${QUIESCE_TIMER_UNITS[@]}"
-reset_bound_close_legacy_monitor_after_timer_freeze
-stop_bound_close_unit_group "${QUIESCE_SERVICE_UNITS[@]}"
-stop_bound_close_unit_group "${QUIESCE_SOCKET_UNITS[@]}"
-for VERIFY_PASS in 1 2 3; do
-  sleep 1
-  verify_bound_close_quiescence
-done
-verify_all_local_quiescence_and_identity
-
-# BEGIN BOUND_CLOSE_QUIESCENCE_POLL
-QUIESCENCE_DEADLINE_EPOCH="$(( $(bound_close_now_epoch) + 720 ))"
 BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS=180
 BOUND_CLOSE_CAPTURE_OVERHEAD_RESERVE_SECONDS=60
 BOUND_CLOSE_DIAGNOSTIC_HANDOFF="$RECOVERY_TMP/capture-diagnostic-handoff.json"
 WRITER_QUIESCENCE_RAW="$RECOVERY_TMP/writer-quiescence-raw.json"
 WRITER_QUIESCENCE_PROJECTION="$RECOVERY_TMP/writer-quiescence-projection.json"
 WRITER_QUIESCENCE_RESULT="$RECOVERY_TMP/writer-quiescence.json"
-verify_all_local_quiescence_and_identity
-run_bound_close_writer_quiescence_helper "$WRITER_QUIESCENCE_RAW"
-verify_all_local_quiescence_and_identity
-chmod 0600 "$WRITER_QUIESCENCE_RAW"
-case "$HELPER_STATUS" in
-  0|2)
-    project_bound_close_writer_quiescence_result \
-      "$WRITER_QUIESCENCE_RAW" "$HELPER_STATUS" \
-      "$WRITER_QUIESCENCE_PROJECTION"
-    chmod 0600 "$WRITER_QUIESCENCE_PROJECTION"
-    ;;
-  *) exit 1 ;;
-esac
-[ "$(bound_close_now_epoch)" -lt "$QUIESCENCE_DEADLINE_EPOCH" ] || exit 1
-case "$HELPER_STATUS" in
-  0)
-    require_exact_ready_projection "$WRITER_QUIESCENCE_PROJECTION"
-    mv -- "$WRITER_QUIESCENCE_PROJECTION" "$WRITER_QUIESCENCE_RESULT"
-    chmod 0600 "$WRITER_QUIESCENCE_RESULT"
-    ;;
+STOPPED_PHASE_RUNNER="$RECOVERY_TMP/stopped-phase-runner.sh"
+write_bound_close_stopped_phase_runner "$STOPPED_PHASE_RUNNER"
+verify_all_local_identity_before_stop
+
+QUIESCENCE_DEADLINE_EPOCH="$(( $(bound_close_now_epoch) + 720 ))"
+QUIESCE_ATTEMPTED=1
+stop_bound_close_unit_group "${QUIESCE_TIMER_UNITS[@]}"
+verify_bound_close_unit_group_inactive "${QUIESCE_TIMER_UNITS[@]}"
+reset_bound_close_legacy_monitor_after_timer_freeze
+stop_bound_close_unit_group "${QUIESCE_SERVICE_UNITS[@]}"
+stop_bound_close_unit_group "${QUIESCE_SOCKET_UNITS[@]}"
+set +e
+run_bound_close_runner_before_deadline \
+  "$STOPPED_PHASE_RUNNER" "$QUIESCENCE_DEADLINE_EPOCH"
+STOPPED_PHASE_STATUS=$?
+set -e
+case "$STOPPED_PHASE_STATUS" in
+  0) ;;
   2)
-    require_exact_refused_projection "$WRITER_QUIESCENCE_PROJECTION"
-    BOUND_CLOSE_SAFE_DIAGNOSTIC='{"status":"post_stop_writer_race"}'
+    [ -f "$BOUND_CLOSE_DIAGNOSTIC_HANDOFF" ] && \
+      [ ! -L "$BOUND_CLOSE_DIAGNOSTIC_HANDOFF" ] || exit 2
+    BOUND_CLOSE_SAFE_DIAGNOSTIC="$(< "$BOUND_CLOSE_DIAGNOSTIC_HANDOFF")"
     exit 2
     ;;
-  *) exit 1 ;;
+  *) exit "$STOPPED_PHASE_STATUS" ;;
 esac
-REMAINING_SECONDS=$((QUIESCENCE_DEADLINE_EPOCH - $(bound_close_now_epoch)))
-REQUIRED_CAPTURE_SECONDS=$((
-  2 * BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS
-  + BOUND_CLOSE_CAPTURE_OVERHEAD_RESERVE_SECONDS
-))
-[ "$REMAINING_SECONDS" -ge "$REQUIRED_CAPTURE_SECONDS" ] || exit 1
-run_bound_close_double_capture_before_deadline
-# END BOUND_CLOSE_QUIESCENCE_POLL
 ```
 
 停服前的 live pre-quiescence 最多只读轮询 12 分钟，每 15 秒检查一次；

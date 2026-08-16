@@ -627,6 +627,7 @@ systemctl() {{
   esac
 }}
 sudo() {{ "$@"; }}
+run_bound_close_external_command_before_deadline() {{ "$@"; }}
 reset_bound_close_legacy_monitor_after_timer_freeze() {{
 {function}
 }}
@@ -1311,27 +1312,27 @@ run_bound_close_double_capture
 def test_runbook_stopped_recheck_is_bounded_and_capture_is_ready_gated():
     block = _bound_close_read_only_block()
 
-    stopped = block.index(
-        'stop_bound_close_unit_group "${QUIESCE_SOCKET_UNITS[@]}"'
+    first_stop = block.index("QUIESCE_ATTEMPTED=1")
+    deadline = block.rfind(
+        'QUIESCENCE_DEADLINE_EPOCH="$(( $(bound_close_now_epoch) + 720 ))"',
+        0,
+        first_stop,
     )
-    deadline = block.index("QUIESCENCE_DEADLINE_EPOCH", stopped)
-    helper = block.index("run_bound_close_writer_quiescence_helper", deadline)
-    capture = block.index("run_bound_close_double_capture", helper)
-    assert "$(( $(bound_close_now_epoch) + 720 ))" in block[deadline:helper]
-    assert "QUIESCENCE_POLL_SECONDS" not in block[deadline:capture]
-    assert "sleep " not in block[deadline:capture]
+    phase = _bound_close_poll_snippet()
+    helper = phase.index("run_bound_close_writer_quiescence_helper")
+    capture = phase.index("run_bound_close_double_capture", helper)
+    assert deadline >= 0
+    assert "QUIESCENCE_POLL_SECONDS" not in phase
+    assert "sleep " not in phase
     assert "sleep 600" not in block
     assert "sleep 10m" not in block
-    assert deadline < helper < capture
-    assert "set +e" in block[:helper]
-    assert "HELPER_STATUS=$?" in block[:helper]
-    assert "set -e" in block[:helper]
-    assert 'case "$HELPER_STATUS" in' in block[helper:capture]
-    assert "0)" in block[helper:capture]
-    assert "2)" in block[helper:capture]
-    assert "*) exit 1" in block[helper:capture]
-    assert "require_exact_ready_projection" in block[helper:capture]
-    assert "require_exact_refused_projection" in block[helper:capture]
+    assert helper < capture
+    assert 'case "$HELPER_STATUS" in' in phase[helper:capture]
+    assert "0)" in phase[helper:capture]
+    assert "2)" in phase[helper:capture]
+    assert "*) return 1" in phase[helper:capture]
+    assert "require_exact_ready_projection" in phase[helper:capture]
+    assert "require_exact_refused_projection" in phase[helper:capture]
 
 
 def test_post_stop_writer_check_is_single_shot_without_aging_sleep():
@@ -1358,12 +1359,277 @@ def test_live_prequiescence_precedes_runner_build_and_every_unit_stop():
 
     assert live_start < live_end < runner_build < first_stop
     live = block[live_start:live_end]
-    assert "$(( $(bound_close_now_epoch) + 720 ))" in live
-    assert "LIVE_PREQUIESCENCE_POLL_SECONDS=15" in live
+    assert "$(( $(bound_close_now_epoch) + 720 ))" in block[live_end:runner_build]
+    assert "local LIVE_PREQUIESCENCE_POLL_SECONDS=15" in block[:live_start]
     assert "verify_all_local_identity_before_stop" in live
     assert "verify_all_local_quiescence_and_identity" not in live
     assert "stop_bound_close_unit_group" not in live
     assert "run_bound_close_double_capture" not in live
+
+
+def test_live_and_stopped_writer_stages_share_process_group_hard_deadline():
+    block = _bound_close_read_only_block()
+
+    live_build = block.index(
+        'write_bound_close_live_prequiescence_runner "$LIVE_PREQUIESCENCE_RUNNER"'
+    )
+    live_run = block.index(
+        'run_bound_close_runner_before_deadline \\\n  "$LIVE_PREQUIESCENCE_RUNNER"',
+        live_build,
+    )
+    first_stop = block.index("QUIESCE_ATTEMPTED=1")
+    stopped_build = block.index(
+        'write_bound_close_stopped_phase_runner "$STOPPED_PHASE_RUNNER"'
+    )
+    stopped_run = block.index(
+        'run_bound_close_runner_before_deadline \\\n  "$STOPPED_PHASE_RUNNER"',
+        first_stop,
+    )
+
+    assert live_build < live_run < stopped_build < first_stop < stopped_run
+    deadline_runner = _bound_close_shell_function(
+        block, "run_bound_close_runner_before_deadline"
+    )
+    assert "timeout --signal=KILL" in deadline_runner
+    assert "--kill-after" not in deadline_runner
+
+
+def test_process_group_deadline_interrupts_blocked_writer_stage(tmp_path):
+    block = _bound_close_read_only_block()
+    deadline_runner = _bound_close_shell_function(
+        block, "run_bound_close_runner_before_deadline"
+    )
+    events = tmp_path / "events.txt"
+    runner = tmp_path / "blocked-runner.sh"
+    timeout_command = tmp_path / "timeout"
+    timeout_command.write_text(
+        f"""#!{sys.executable}
+import os
+import signal
+import subprocess
+import sys
+
+arguments = sys.argv[1:]
+while arguments and arguments[0].startswith("--"):
+    arguments.pop(0)
+duration = float(arguments.pop(0))
+process = subprocess.Popen(arguments, start_new_session=True)
+try:
+    raise SystemExit(process.wait(timeout=duration))
+except subprocess.TimeoutExpired:
+    os.killpg(process.pid, signal.SIGKILL)
+    process.wait()
+    raise SystemExit(124)
+""",
+        encoding="utf-8",
+    )
+    timeout_command.chmod(0o700)
+    runner.write_text(
+        f"#!/bin/bash\ntrap '' TERM\nprintf 'started\\n' >> {shlex.quote(str(events))}\nsleep 5\n",
+        encoding="utf-8",
+    )
+    runner.chmod(0o700)
+    script = f"""
+set -euo pipefail
+PATH={shlex.quote(str(tmp_path))}:$PATH
+RUNNER={shlex.quote(str(runner))}
+EVENTS={shlex.quote(str(events))}
+bound_close_now_epoch() {{ date +%s; }}
+restore() {{ printf 'restore\n' >> "$EVENTS"; }}
+run_bound_close_runner_before_deadline() {{
+{deadline_runner}
+}}
+trap restore EXIT
+run_bound_close_runner_before_deadline "$RUNNER" "$(( $(date +%s) + 2 ))"
+"""
+
+    started_at = time.monotonic()
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=4,
+    )
+
+    assert result.returncode != 0
+    assert time.monotonic() - started_at < 4
+    assert events.read_text(encoding="utf-8") == "started\nrestore\n"
+
+
+def test_stopped_deadline_interrupts_blocked_initial_quiescence_check(tmp_path):
+    block = _bound_close_read_only_block()
+    stopped_phase = _bound_close_shell_function(block, "run_bound_close_stopped_phase")
+    deadline_runner = _bound_close_shell_function(
+        block, "run_bound_close_runner_before_deadline"
+    )
+    events = tmp_path / "events.txt"
+    runner = tmp_path / "stopped-runner.sh"
+    timeout_command = tmp_path / "timeout"
+    timeout_command.write_text(
+        f"""#!{sys.executable}
+import os
+import signal
+import subprocess
+import sys
+
+arguments = sys.argv[1:]
+while arguments and arguments[0].startswith("--"):
+    arguments.pop(0)
+duration = float(arguments.pop(0))
+process = subprocess.Popen(arguments, start_new_session=True)
+try:
+    raise SystemExit(process.wait(timeout=duration))
+except subprocess.TimeoutExpired:
+    os.killpg(process.pid, signal.SIGKILL)
+    process.wait()
+    raise SystemExit(124)
+""",
+        encoding="utf-8",
+    )
+    timeout_command.chmod(0o700)
+    runner.write_text(
+        f"""#!/bin/bash
+set -euo pipefail
+EVENTS={shlex.quote(str(events))}
+QUIESCENCE_DEADLINE_EPOCH="$1"
+BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS=180
+BOUND_CLOSE_CAPTURE_OVERHEAD_RESERVE_SECONDS=60
+RECOVERY_TMP={shlex.quote(str(tmp_path))}
+WRITER_QUIESCENCE_RAW="$RECOVERY_TMP/raw.json"
+WRITER_QUIESCENCE_PROJECTION="$RECOVERY_TMP/projection.json"
+WRITER_QUIESCENCE_RESULT="$RECOVERY_TMP/result.json"
+BOUND_CLOSE_DIAGNOSTIC_HANDOFF="$RECOVERY_TMP/diagnostic.json"
+bound_close_now_epoch() {{ date +%s; }}
+sleep() {{ command sleep "$@"; }}
+verify_bound_close_quiescence() {{
+  printf 'verify-start\n' >> "$EVENTS"
+  sleep 5
+}}
+verify_all_local_quiescence_and_identity() {{ :; }}
+run_bound_close_writer_quiescence_helper() {{ return 91; }}
+project_bound_close_writer_quiescence_result() {{ return 91; }}
+require_exact_ready_projection() {{ return 91; }}
+require_exact_refused_projection() {{ return 91; }}
+run_bound_close_double_capture_before_deadline() {{ return 91; }}
+run_bound_close_stopped_phase() {{
+{stopped_phase}
+}}
+run_bound_close_stopped_phase
+""",
+        encoding="utf-8",
+    )
+    runner.chmod(0o700)
+    script = f"""
+set -euo pipefail
+PATH={shlex.quote(str(tmp_path))}:$PATH
+EVENTS={shlex.quote(str(events))}
+RUNNER={shlex.quote(str(runner))}
+bound_close_now_epoch() {{ date +%s; }}
+restore() {{ printf 'restore\n' >> "$EVENTS"; }}
+run_bound_close_runner_before_deadline() {{
+{deadline_runner}
+}}
+trap restore EXIT
+printf 'stop\n' >> "$EVENTS"
+run_bound_close_runner_before_deadline "$RUNNER" "$(( $(date +%s) + 2 ))"
+"""
+
+    started_at = time.monotonic()
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=4,
+    )
+
+    assert result.returncode != 0
+    assert time.monotonic() - started_at < 4
+    assert events.read_text(encoding="utf-8") == "stop\nverify-start\nrestore\n"
+
+
+def test_stopped_deadline_is_created_before_first_unit_stop():
+    block = _bound_close_read_only_block()
+    deadline = block.index(
+        'QUIESCENCE_DEADLINE_EPOCH="$(( $(bound_close_now_epoch) + 720 ))"'
+    )
+    first_stop = block.index("QUIESCE_ATTEMPTED=1")
+
+    assert deadline < first_stop
+
+
+@pytest.mark.parametrize(
+    ("install_state", "original_state", "current_load", "current_state", "expected"),
+    [
+        ("installed", "active", "loaded", "active", 0),
+        ("installed", "active", "loaded", "inactive", 1),
+        ("installed", "inactive", "not-found", "inactive", 1),
+        ("absent", "absent", "not-found", "inactive", 0),
+        ("absent", "absent", "loaded", "inactive", 1),
+    ],
+)
+def test_original_unit_state_verifier_rejects_pre_stop_drift(
+    install_state,
+    original_state,
+    current_load,
+    current_state,
+    expected,
+):
+    block = _bound_close_read_only_block()
+    verifier = _bound_close_shell_function(
+        block, "verify_bound_close_unit_group_original_state"
+    )
+    verifier = verifier.replace(
+        "${ORIGINAL_UNIT_INSTALL_STATE[$unit]}", "$INSTALL_STATE"
+    ).replace("${ORIGINAL_UNIT_STATE[$unit]}", "$ORIGINAL_STATE")
+    script = f"""
+set -euo pipefail
+INSTALL_STATE={install_state}
+ORIGINAL_STATE={original_state}
+CURRENT_LOAD={current_load}
+CURRENT_STATE={current_state}
+systemctl() {{
+  case "$1" in
+    show) printf '%s\n' "$CURRENT_LOAD" ;;
+    is-active) printf '%s\n' "$CURRENT_STATE" ;;
+    *) return 91 ;;
+  esac
+}}
+verify_bound_close_unit_group_original_state() {{
+{verifier}
+}}
+verify_bound_close_unit_group_original_state example.service
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == expected, result.stderr
+
+
+def test_live_identity_verifier_checks_all_original_unit_states():
+    block = _bound_close_read_only_block()
+    verifier = _bound_close_shell_function(block, "verify_all_local_identity_before_stop")
+
+    assert 'verify_bound_close_unit_group_original_state "${QUIESCE_UNITS[@]}"' in verifier
+
+
+def test_original_unit_state_is_rechecked_immediately_before_first_stop():
+    block = _bound_close_read_only_block()
+    stopped_runner = block.index(
+        'write_bound_close_stopped_phase_runner "$STOPPED_PHASE_RUNNER"'
+    )
+    first_stop = block.index("QUIESCE_ATTEMPTED=1")
+    final_verify = block.rfind(
+        "verify_all_local_identity_before_stop", stopped_runner, first_stop
+    )
+
+    assert stopped_runner < final_verify < first_stop
 
 
 def test_runbook_quiescence_poll_rechecks_every_local_identity_around_helper():
@@ -1431,6 +1697,13 @@ RUNTIME_PYTHON={shlex.quote(sys.executable)}
 CANDIDATE_ROOT={shlex.quote(str(tmp_path / 'candidate'))}
 PRODUCTION_DB={shlex.quote(str(tmp_path / 'production.db'))}
 NOW_EPOCH=100
+QUIESCENCE_DEADLINE_EPOCH=820
+BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS=180
+BOUND_CLOSE_CAPTURE_OVERHEAD_RESERVE_SECONDS=60
+BOUND_CLOSE_DIAGNOSTIC_HANDOFF="$RECOVERY_TMP/capture-diagnostic-handoff.json"
+WRITER_QUIESCENCE_RAW="$RECOVERY_TMP/writer-quiescence-raw.json"
+WRITER_QUIESCENCE_PROJECTION="$RECOVERY_TMP/writer-quiescence-projection.json"
+WRITER_QUIESCENCE_RESULT="$RECOVERY_TMP/writer-quiescence.json"
 HELPER_SEQUENCE=({sequence})
 HELPER_CALL=0
 VERIFY_CALL=0
@@ -1464,8 +1737,14 @@ run_bound_close_double_capture_before_deadline() {{
   printf 'capture\n' >> "$EVENTS"
 }}
 """
+    script = (
+        prefix
+        + "\nrun_bound_close_stopped_phase() {\n"
+        + _bound_close_poll_snippet()
+        + "\n}\nrun_bound_close_stopped_phase\n"
+    )
     return subprocess.run(
-        ["bash", "-c", prefix + _bound_close_poll_snippet()],
+        ["bash", "-c", script],
         capture_output=True,
         text=True,
         check=False,
@@ -1488,6 +1767,14 @@ set -euo pipefail
 EVENTS={shlex.quote(str(events))}
 RECOVERY_TMP={shlex.quote(str(tmp_path))}
 NOW_EPOCH=100
+LIVE_PREQUIESCENCE_DEADLINE_EPOCH=820
+LIVE_PREQUIESCENCE_RESULT="$RECOVERY_TMP/live-writer-quiescence.json"
+LIVE_PREQUIESCENCE_ATTEMPT=0
+LIVE_PREQUIESCENCE_POLL_SECONDS=15
+LIVE_PREQUIESCENCE_PROJECTION=''
+LIVE_PREQUIESCENCE_RAW=''
+LIVE_PREQUIESCENCE_REMAINING_SECONDS=0
+LIVE_PREQUIESCENCE_SLEEP_SECONDS=0
 HELPER_SEQUENCE=({sequence})
 HELPER_CALL=0
 VERIFY_CALL=0
@@ -1522,7 +1809,10 @@ project_bound_close_writer_quiescence_result() {{
 require_exact_ready_projection() {{ grep -q '"status":"ready"' "$1"; }}
 require_exact_refused_projection() {{ grep -q '"status":"refused"' "$1"; }}
 stop_bound_close_unit_group() {{ printf 'stop\n' >> "$EVENTS"; }}
+run_bound_close_live_prequiescence() {{
 {_bound_close_live_prequiescence_snippet()}
+}}
+run_bound_close_live_prequiescence
 printf 'live-ready\n' >> "$EVENTS"
 """
     result = subprocess.run(
@@ -1547,6 +1837,13 @@ EVENTS={shlex.quote(str(events))}
 RECOVERY_TMP={shlex.quote(str(tmp_path))}
 NOW_EPOCH=100
 BOUND_CLOSE_SAFE_DIAGNOSTIC=''
+QUIESCENCE_DEADLINE_EPOCH=820
+BOUND_CLOSE_CAPTURE_HARD_LIMIT_SECONDS=180
+BOUND_CLOSE_CAPTURE_OVERHEAD_RESERVE_SECONDS=60
+BOUND_CLOSE_DIAGNOSTIC_HANDOFF="$RECOVERY_TMP/capture-diagnostic-handoff.json"
+WRITER_QUIESCENCE_RAW="$RECOVERY_TMP/writer-quiescence-raw.json"
+WRITER_QUIESCENCE_PROJECTION="$RECOVERY_TMP/writer-quiescence-projection.json"
+WRITER_QUIESCENCE_RESULT="$RECOVERY_TMP/writer-quiescence.json"
 bound_close_now_epoch() {{ printf '%s\n' "$NOW_EPOCH"; }}
 sleep() {{
   printf 'sleep\n' >> "$EVENTS"
@@ -1575,7 +1872,10 @@ run_bound_close_double_capture_before_deadline() {{
 restore() {{ printf 'restore\n' >> "$EVENTS"; }}
 trap restore EXIT
 printf 'stop\n' >> "$EVENTS"
+run_bound_close_stopped_phase() {{
 {_bound_close_poll_snippet()}
+}}
+run_bound_close_stopped_phase
 """
     result = subprocess.run(
         ["bash", "-c", script],
@@ -1796,6 +2096,7 @@ declare -a QUIESCE_SOCKET_UNITS=()
 declare -a ORIGINAL_UNIT_INSTALL_STATE=()
 bound_close_now_epoch() {{ date +%s; }}
 discover_bound_close_db_stage_units() {{ :; }}
+run_bound_close_external_command_before_deadline() {{ "$@"; }}
 verify_bound_close_unit_group_inactive() {{ :; }}
 verify_bound_close_quiescence() {{ :; }}
 verify_all_local_quiescence_and_identity() {{ :; }}
