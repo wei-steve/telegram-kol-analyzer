@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -344,7 +345,9 @@ def test_runbook_closes_stopped_service_capture_and_apply_boundaries():
     assert "trap finish_bound_close_reservation_window EXIT" in section
     assert "restore_bound_close_reservation_units" in section
     assert "pgrep -f '[t]elegram_kol_research|[t]elegram-kol'" in section
-    assert "other_active_or_unknown_writer_count" in section
+    assert "fresh_active_or_unknown_writer_count" in section
+    assert "historical_active_or_unknown_residue_count" in section
+    assert "blocking_writer_count" in section
     assert "target_reservation_count" in section
     assert 'RESULT="$RECOVERY_TMP/dry-run-${ATTEMPT}.json"' in section
     assert 'chmod 0600 "$RESULT"' in section
@@ -404,6 +407,281 @@ def test_runbook_quiescence_inventory_preserves_state_and_refuses_unit_races():
     assert "PartOf=telegram-kol-runtime-agent.service" in section
     assert "不读取生产数据库" in section
     assert "不调用 Deepcoin/交易所" in section
+
+
+def _bound_close_read_only_block() -> str:
+    project_root = Path(__file__).resolve().parents[1]
+    runbook = (project_root / "docs" / "runbook.md").read_text(encoding="utf-8")
+    section = runbook.split(
+        "## Bound position close reservation convergence", 1
+    )[1].split("## Batch 119 composite-management recovery", 1)[0]
+    return section.split("```bash", 1)[1].split("```", 1)[0]
+
+
+def _bound_close_poll_snippet() -> str:
+    block = _bound_close_read_only_block()
+    return block.split("# BEGIN BOUND_CLOSE_QUIESCENCE_POLL", 1)[1].split(
+        "# END BOUND_CLOSE_QUIESCENCE_POLL", 1
+    )[0]
+
+
+def test_runbook_quiescence_poll_is_bounded_and_capture_is_ready_gated():
+    block = _bound_close_read_only_block()
+
+    stopped = block.index(
+        'stop_bound_close_unit_group "${QUIESCE_SOCKET_UNITS[@]}"'
+    )
+    deadline = block.index("QUIESCENCE_DEADLINE_EPOCH", stopped)
+    helper = block.index("run_bound_close_writer_quiescence_helper", deadline)
+    capture = block.index("run_bound_close_double_capture", helper)
+    assert "$(( $(bound_close_now_epoch) + 720 ))" in block[deadline:helper]
+    assert "QUIESCENCE_POLL_SECONDS=15" in block[deadline:helper]
+    assert "sleep 600" not in block
+    assert "sleep 10m" not in block
+    assert deadline < helper < capture
+    assert "set +e" in block[:helper]
+    assert "HELPER_STATUS=$?" in block[:helper]
+    assert "set -e" in block[:helper]
+    assert 'case "$HELPER_STATUS" in' in block[helper:capture]
+    assert "0)" in block[helper:capture]
+    assert "2)" in block[helper:capture]
+    assert "*) exit 1" in block[helper:capture]
+    assert "require_exact_ready_projection" in block[helper:capture]
+    assert "require_exact_refused_projection" in block[helper:capture]
+
+
+def test_runbook_quiescence_poll_rechecks_every_local_identity_around_helper():
+    block = _bound_close_read_only_block()
+    poll = _bound_close_poll_snippet()
+
+    assert "verify_all_local_quiescence_and_identity" in block
+    assert "pgrep -f '[t]elegram_kol_research|[t]elegram-kol'" in block
+    assert 'git -C "$PRODUCTION_ROOT" rev-parse HEAD' in block
+    assert "PRODUCTION_DB_RESOLVED_PATH" in block
+    assert "PRODUCTION_DB_DEVICE_INODE" in block
+    assert "PROCESS_SCAN_STATUS=$?" in block
+    assert "1) ;;" in block
+    assert "*) return 1" in block
+    helper = poll.index("run_bound_close_writer_quiescence_helper")
+    assert poll.rfind(
+        "verify_all_local_quiescence_and_identity", 0, helper
+    ) >= 0
+    assert poll.find(
+        "verify_all_local_quiescence_and_identity", helper
+    ) >= 0
+
+
+def test_runbook_quiescence_projection_is_strict_private_and_fail_closed():
+    block = _bound_close_read_only_block()
+
+    for field in (
+        "block_regardless_of_age_writer_count",
+        "blocking_writer_count",
+        "checked_table_count",
+        "fresh_active_or_unknown_writer_count",
+        "historical_active_or_unknown_residue_count",
+        "missing_table_count",
+        "schema_version",
+        "status",
+        "target_reservation_count",
+        "unrecognized_or_null_state_count",
+    ):
+        assert field in block
+    assert "type(value) is not int" in block
+    assert "blocking != fresh + unrecognized + block_regardless" in block
+    assert "checked + missing != 20" in block
+    assert 'chmod 0600 "$WRITER_QUIESCENCE_RESULT"' in block
+    assert "trap finish_bound_close_reservation_window EXIT" in block
+    assert "trap 'exit 129' HUP" in block
+    assert "trap 'exit 130' INT" in block
+    assert "trap 'exit 143' TERM" in block
+
+
+def _simulate_runbook_quiescence_poll(
+    tmp_path: Path,
+    *,
+    helper_statuses: tuple[int, ...],
+    sleep_jump: int,
+    projection_fails: bool = False,
+    verify_fail_on: int = 0,
+) -> subprocess.CompletedProcess[str]:
+    events = tmp_path / "events.txt"
+    sequence = " ".join(str(value) for value in helper_statuses)
+    prefix = f"""
+set -euo pipefail
+EVENTS={shlex.quote(str(events))}
+RECOVERY_TMP={shlex.quote(str(tmp_path))}
+RUNTIME_PYTHON={shlex.quote(sys.executable)}
+CANDIDATE_ROOT={shlex.quote(str(tmp_path / 'candidate'))}
+PRODUCTION_DB={shlex.quote(str(tmp_path / 'production.db'))}
+NOW_EPOCH=100
+HELPER_SEQUENCE=({sequence})
+HELPER_CALL=0
+VERIFY_CALL=0
+PROJECTION_FAIL={int(projection_fails)}
+restore_bound_close_reservation_units() {{ printf 'restore\n' >> "$EVENTS"; }}
+trap restore_bound_close_reservation_units EXIT
+bound_close_now_epoch() {{ printf '%s\n' "$NOW_EPOCH"; }}
+sleep() {{ NOW_EPOCH=$((NOW_EPOCH + {sleep_jump})); }}
+verify_all_local_quiescence_and_identity() {{
+  VERIFY_CALL=$((VERIFY_CALL + 1))
+  [ "$VERIFY_CALL" -ne {verify_fail_on} ]
+}}
+run_bound_close_writer_quiescence_helper() {{
+  local output_path="$1"
+  local index="$HELPER_CALL"
+  HELPER_CALL=$((HELPER_CALL + 1))
+  HELPER_STATUS="${{HELPER_SEQUENCE[$index]:-1}}"
+  if [ "$HELPER_STATUS" -eq 0 ]; then
+    printf '%s\n' '{{"block_regardless_of_age_writer_count":0,"blocking_writer_count":0,"checked_table_count":20,"fresh_active_or_unknown_writer_count":0,"historical_active_or_unknown_residue_count":2,"missing_table_count":0,"schema_version":1,"status":"ready","target_reservation_count":1,"unrecognized_or_null_state_count":0}}' > "$output_path"
+  else
+    printf '%s\n' '{{"block_regardless_of_age_writer_count":0,"blocking_writer_count":1,"checked_table_count":20,"fresh_active_or_unknown_writer_count":1,"historical_active_or_unknown_residue_count":1,"missing_table_count":0,"schema_version":1,"status":"refused","target_reservation_count":1,"unrecognized_or_null_state_count":0}}' > "$output_path"
+  fi
+}}
+project_bound_close_writer_quiescence_result() {{
+  [ "$PROJECTION_FAIL" -eq 0 ]
+  cp "$1" "$3"
+}}
+require_exact_ready_projection() {{ grep -q '"status":"ready"' "$1"; }}
+require_exact_refused_projection() {{ grep -q '"status":"refused"' "$1"; }}
+run_bound_close_double_capture() {{ printf 'capture\n' >> "$EVENTS"; }}
+"""
+    return subprocess.run(
+        ["bash", "-c", prefix + _bound_close_poll_snippet()],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+
+def test_runbook_quiescence_poll_reaches_capture_once_only_after_ready(tmp_path):
+    result = _simulate_runbook_quiescence_poll(
+        tmp_path,
+        helper_statuses=(2, 2, 0),
+        sleep_jump=15,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "events.txt").read_text() == "capture\nrestore\n"
+
+
+@pytest.mark.parametrize(
+    ("helper_statuses", "sleep_jump"),
+    [((2,), 720), ((1,), 15)],
+)
+def test_runbook_quiescence_timeout_or_helper_error_restores_without_capture(
+    tmp_path,
+    helper_statuses,
+    sleep_jump,
+):
+    result = _simulate_runbook_quiescence_poll(
+        tmp_path,
+        helper_statuses=helper_statuses,
+        sleep_jump=sleep_jump,
+    )
+
+    assert result.returncode != 0
+    assert (tmp_path / "events.txt").read_text() == "restore\n"
+
+
+@pytest.mark.parametrize(
+    ("projection_fails", "verify_fail_on"),
+    [(True, 0), (False, 2)],
+)
+def test_runbook_quiescence_malformed_projection_or_identity_drift_restores(
+    tmp_path,
+    projection_fails,
+    verify_fail_on,
+):
+    result = _simulate_runbook_quiescence_poll(
+        tmp_path,
+        helper_statuses=(0,),
+        sleep_jump=15,
+        projection_fails=projection_fails,
+        verify_fail_on=verify_fail_on,
+    )
+
+    assert result.returncode != 0
+    assert (tmp_path / "events.txt").read_text() == "restore\n"
+
+
+def _run_runbook_quiescence_projection(
+    tmp_path: Path,
+    *,
+    payload: dict[str, object],
+    helper_status: int,
+) -> subprocess.CompletedProcess[str]:
+    block = _bound_close_read_only_block()
+    source = tmp_path / "helper.json"
+    source.write_text(json.dumps(payload), encoding="utf-8")
+    source.chmod(0o600)
+    projection_source = block.split(
+        '"$input_path" "$helper_status" > "$output_path" <<\'PY\'\n', 1
+    )[1].split("\nPY\n", 1)[0]
+    return subprocess.run(
+        [sys.executable, "-", str(source), str(helper_status)],
+        input=projection_source,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _valid_quiescence_projection() -> dict[str, object]:
+    return {
+        "block_regardless_of_age_writer_count": 0,
+        "blocking_writer_count": 0,
+        "checked_table_count": 20,
+        "fresh_active_or_unknown_writer_count": 0,
+        "historical_active_or_unknown_residue_count": 2,
+        "missing_table_count": 0,
+        "schema_version": 1,
+        "status": "ready",
+        "target_reservation_count": 1,
+        "unrecognized_or_null_state_count": 0,
+    }
+
+
+def test_runbook_quiescence_projection_accepts_only_canonical_ready_aggregate(
+    tmp_path,
+):
+    payload = _valid_quiescence_projection()
+
+    result = _run_runbook_quiescence_projection(
+        tmp_path,
+        payload=payload,
+        helper_status=0,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == payload
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload.update(blocking_writer_count=True),
+        lambda payload: payload.update(blocking_writer_count=1),
+        lambda payload: payload.update(status="refused"),
+        lambda payload: payload.update(unexpected=0),
+    ],
+)
+def test_runbook_quiescence_projection_rejects_type_arithmetic_status_or_shape(
+    tmp_path,
+    mutate,
+):
+    payload = _valid_quiescence_projection()
+    mutate(payload)
+
+    result = _run_runbook_quiescence_projection(
+        tmp_path,
+        payload=payload,
+        helper_status=0,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
 
 
 def test_apply_window_failure_simulation_runs_postcheck_before_exit():

@@ -1577,6 +1577,9 @@ declare -A ORIGINAL_UNIT_STATE
 declare -A ORIGINAL_UNIT_INSTALL_STATE
 QUIESCE_ATTEMPTED=0
 ORIGINAL_SHA="$(git -C "$PRODUCTION_ROOT" rev-parse HEAD)"
+PRODUCTION_DB_RESOLVED_PATH="$(readlink -f -- "$PRODUCTION_DB")"
+test -f "$PRODUCTION_DB_RESOLVED_PATH"
+PRODUCTION_DB_DEVICE_INODE="$(stat -Lc '%d:%i' -- "$PRODUCTION_DB")"
 DB_STAGE_INITIAL_INVENTORY="$RECOVERY_TMP/db-stage-initial.txt"
 DB_STAGE_CURRENT_INVENTORY="$RECOVERY_TMP/db-stage-current.txt"
 
@@ -1658,6 +1661,26 @@ verify_bound_close_quiescence() {
   verify_bound_close_unit_group_inactive "${QUIESCE_SOCKET_UNITS[@]}"
 }
 
+verify_all_local_quiescence_and_identity() {
+  local PROCESS_SCAN_STATUS
+  verify_bound_close_quiescence
+  if pgrep -f '[t]elegram_kol_research|[t]elegram-kol' >/dev/null; then
+    PROCESS_SCAN_STATUS=0
+  else
+    PROCESS_SCAN_STATUS=$?
+  fi
+  case "$PROCESS_SCAN_STATUS" in
+    0) return 1 ;;
+    1) ;;
+    *) return 1 ;;
+  esac
+  [ "$(git -C "$PRODUCTION_ROOT" rev-parse HEAD)" = "$ORIGINAL_SHA" ]
+  [ "$(readlink -f -- "$PRODUCTION_DB")" = \
+    "$PRODUCTION_DB_RESOLVED_PATH" ]
+  [ "$(stat -Lc '%d:%i' -- "$PRODUCTION_DB")" = \
+    "$PRODUCTION_DB_DEVICE_INODE" ]
+}
+
 restore_bound_close_reservation_units() {
   local cleanup_status=0
   case "$RECOVERY_TMP" in
@@ -1737,6 +1760,9 @@ finish_bound_close_reservation_window() {
   exit "$original_status"
 }
 trap finish_bound_close_reservation_window EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 discover_bound_close_db_stage_units "$DB_STAGE_INITIAL_INVENTORY"
 mapfile -t QUIESCE_DB_STAGE_UNITS < "$DB_STAGE_INITIAL_INVENTORY"
@@ -1781,45 +1807,203 @@ for VERIFY_PASS in 1 2 3; do
   sleep 1
   verify_bound_close_quiescence
 done
-if pgrep -f '[t]elegram_kol_research|[t]elegram-kol' >/dev/null; then
-  exit 1
-fi
-verify_bound_close_quiescence
+verify_all_local_quiescence_and_identity
 
-# 使用 candidate 内审查的 closed inventory，精确镜像
-# deployment_preflight._WORK_SPECS 的全部表。它只排除本命令
-# 完整装载的五种 target reservation；其他存在表的 active、
-# NULL 或未来未知状态都计入 other_active_or_unknown_writer_count。
-# 只允许 deployment_preflight 明示审计的 prior-schema missing set；
-# 当前 recovery source 必需表不得缺失，任意其他缺表拒绝。不执行 bootstrap。
-# 安全输出另外只包含 checked_table_count 和 target_reservation_count。
-WRITER_QUIESCENCE_RESULT="$RECOVERY_TMP/writer-quiescence.json"
-PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
-  "$CANDIDATE_ROOT/scripts/check_bound_close_reservation_writer_quiescence.py" \
-  "$PRODUCTION_DB" > "$WRITER_QUIESCENCE_RESULT"
-chmod 0600 "$WRITER_QUIESCENCE_RESULT"
+bound_close_now_epoch() {
+  date -u +%s
+}
 
-for ATTEMPT in 1 2; do
-  verify_bound_close_quiescence
-  RESULT="$RECOVERY_TMP/dry-run-${ATTEMPT}.json"
-  PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
-    telegram_kol_research.cli recover-bound-position-close-reservations \
-    --database-path "$PRODUCTION_DB" \
-    --generation-database-path "$PRODUCTION_DB" \
-    > "$RESULT"
-  chmod 0600 "$RESULT"
-  SUMMARY="$RECOVERY_TMP/dry-run-${ATTEMPT}-summary.json"
+run_bound_close_writer_quiescence_helper() {
+  local output_path="$1"
+  set +e
   PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
-    "$CANDIDATE_ROOT/scripts/project_bound_close_reservation_recovery_output.py" \
-    capture < "$RESULT" > "$SUMMARY"
-  chmod 0600 "$SUMMARY"
-  verify_bound_close_quiescence
+    "$CANDIDATE_ROOT/scripts/check_bound_close_reservation_writer_quiescence.py" \
+    "$PRODUCTION_DB" > "$output_path"
+  HELPER_STATUS=$?
+  set -e
+}
+
+project_bound_close_writer_quiescence_result() {
+  local input_path="$1"
+  local helper_status="$2"
+  local output_path="$3"
+  PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" - \
+    "$input_path" "$helper_status" > "$output_path" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+FIELDS = frozenset(
+    {
+        "block_regardless_of_age_writer_count",
+        "blocking_writer_count",
+        "checked_table_count",
+        "fresh_active_or_unknown_writer_count",
+        "historical_active_or_unknown_residue_count",
+        "missing_table_count",
+        "schema_version",
+        "status",
+        "target_reservation_count",
+        "unrecognized_or_null_state_count",
+    }
+)
+COUNT_FIELDS = FIELDS - {"schema_version", "status"}
+MAX_AGGREGATE_COUNT = 200_000
+
+
+class InvalidProjection(ValueError):
+    pass
+
+
+def closed_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if type(key) is not str or key in result:
+            raise InvalidProjection
+        result[key] = value
+    return result
+
+
+try:
+    source = Path(sys.argv[1])
+    helper_status = int(sys.argv[2])
+    if helper_status not in {0, 2}:
+        raise InvalidProjection
+    if source.is_symlink() or not source.is_file():
+        raise InvalidProjection
+    raw = source.read_bytes()
+    if not raw or len(raw) > 32_768:
+        raise InvalidProjection
+    payload = json.loads(
+        raw,
+        object_pairs_hook=closed_object,
+        parse_constant=lambda _value: (_ for _ in ()).throw(InvalidProjection()),
+    )
+    if type(payload) is not dict or set(payload) != FIELDS:
+        raise InvalidProjection
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+        raise InvalidProjection
+    for field in COUNT_FIELDS:
+        value = payload[field]
+        if type(value) is not int or not 0 <= value <= MAX_AGGREGATE_COUNT:
+            raise InvalidProjection
+    checked = payload["checked_table_count"]
+    missing = payload["missing_table_count"]
+    if checked > 20 or missing > 20 or checked + missing != 20:
+        raise InvalidProjection
+    fresh = payload["fresh_active_or_unknown_writer_count"]
+    unrecognized = payload["unrecognized_or_null_state_count"]
+    block_regardless = payload["block_regardless_of_age_writer_count"]
+    blocking = payload["blocking_writer_count"]
+    if blocking != fresh + unrecognized + block_regardless:
+        raise InvalidProjection
+    target = payload["target_reservation_count"]
+    ready_counts = 0 < target <= 64 and blocking == 0
+    status = payload["status"]
+    if type(status) is not str or status not in {"ready", "refused"}:
+        raise InvalidProjection
+    if helper_status == 0 and (status != "ready" or not ready_counts):
+        raise InvalidProjection
+    if helper_status == 2 and (status != "refused" or ready_counts):
+        raise InvalidProjection
+except (InvalidProjection, OSError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(2)
+
+sys.stdout.write(
+    json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    + "\n"
+)
+PY
+}
+
+require_exact_ready_projection() {
+  grep -Fq '"status":"ready"' "$1"
+}
+
+require_exact_refused_projection() {
+  grep -Fq '"status":"refused"' "$1"
+}
+
+run_bound_close_double_capture() {
+  local ATTEMPT
+  local RESULT
+  local SUMMARY
+  for ATTEMPT in 1 2; do
+    verify_all_local_quiescence_and_identity
+    RESULT="$RECOVERY_TMP/dry-run-${ATTEMPT}.json"
+    PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
+      telegram_kol_research.cli recover-bound-position-close-reservations \
+      --database-path "$PRODUCTION_DB" \
+      --generation-database-path "$PRODUCTION_DB" \
+      > "$RESULT"
+    chmod 0600 "$RESULT"
+    SUMMARY="$RECOVERY_TMP/dry-run-${ATTEMPT}-summary.json"
+    PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
+      "$CANDIDATE_ROOT/scripts/project_bound_close_reservation_recovery_output.py" \
+      capture < "$RESULT" > "$SUMMARY"
+    chmod 0600 "$SUMMARY"
+    verify_all_local_quiescence_and_identity
+  done
+  PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
+    "$CANDIDATE_ROOT/scripts/compare_bound_close_reservation_dry_runs.py" \
+    "$RECOVERY_TMP/dry-run-1.json" \
+    "$RECOVERY_TMP/dry-run-2.json"
+}
+
+# BEGIN BOUND_CLOSE_QUIESCENCE_POLL
+QUIESCENCE_DEADLINE_EPOCH="$(( $(bound_close_now_epoch) + 720 ))"
+QUIESCENCE_POLL_SECONDS=15
+QUIESCENCE_ATTEMPT=0
+WRITER_QUIESCENCE_RESULT="$RECOVERY_TMP/writer-quiescence.json"
+while :; do
+  [ "$(bound_close_now_epoch)" -lt "$QUIESCENCE_DEADLINE_EPOCH" ] || exit 1
+  QUIESCENCE_ATTEMPT=$((QUIESCENCE_ATTEMPT + 1))
+  WRITER_QUIESCENCE_RAW="$RECOVERY_TMP/writer-quiescence-${QUIESCENCE_ATTEMPT}.json"
+  WRITER_QUIESCENCE_PROJECTION="$RECOVERY_TMP/writer-quiescence-${QUIESCENCE_ATTEMPT}-projection.json"
+  verify_all_local_quiescence_and_identity
+  run_bound_close_writer_quiescence_helper "$WRITER_QUIESCENCE_RAW"
+  verify_all_local_quiescence_and_identity
+  chmod 0600 "$WRITER_QUIESCENCE_RAW"
+  case "$HELPER_STATUS" in
+    0|2)
+      project_bound_close_writer_quiescence_result \
+        "$WRITER_QUIESCENCE_RAW" "$HELPER_STATUS" \
+        "$WRITER_QUIESCENCE_PROJECTION"
+      chmod 0600 "$WRITER_QUIESCENCE_PROJECTION"
+      ;;
+    *) exit 1 ;;
+  esac
+  [ "$(bound_close_now_epoch)" -lt "$QUIESCENCE_DEADLINE_EPOCH" ] || exit 1
+  case "$HELPER_STATUS" in
+    0)
+      require_exact_ready_projection "$WRITER_QUIESCENCE_PROJECTION"
+      mv -- "$WRITER_QUIESCENCE_PROJECTION" "$WRITER_QUIESCENCE_RESULT"
+      chmod 0600 "$WRITER_QUIESCENCE_RESULT"
+      break
+      ;;
+    2) require_exact_refused_projection "$WRITER_QUIESCENCE_PROJECTION" ;;
+    *) exit 1 ;;
+  esac
+  REMAINING_SECONDS=$((QUIESCENCE_DEADLINE_EPOCH - $(bound_close_now_epoch)))
+  [ "$REMAINING_SECONDS" -gt 0 ] || exit 1
+  SLEEP_SECONDS="$QUIESCENCE_POLL_SECONDS"
+  if [ "$REMAINING_SECONDS" -lt "$SLEEP_SECONDS" ]; then
+    SLEEP_SECONDS="$REMAINING_SECONDS"
+  fi
+  sleep "$SLEEP_SECONDS"
 done
-PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
-  "$CANDIDATE_ROOT/scripts/compare_bound_close_reservation_dry_runs.py" \
-  "$RECOVERY_TMP/dry-run-1.json" \
-  "$RECOVERY_TMP/dry-run-2.json"
+run_bound_close_double_capture
+# END BOUND_CLOSE_QUIESCENCE_POLL
 ```
+
+上述 12 分钟是全部 unit 已停止之后只计算一次的 absolute deadline，
+不是固定睡满十分钟。helper 只在每轮前后均证明 unit 清单未变、
+进程为零、production SHA 未变，且数据库的 resolved path/device/inode 未变
+时执行。`refused` 只能按 15 秒条件轮询，让已知本地 writer marker
+跨过官方 historical cutoff；这绝不会宣告交易所工作已终态。target
+reservation 仍必须通过随后两次全新交易所 capture。超时、signal、
+helper error、非法 JSON/投影、unit/进程/SHA/数据库身份漂移都会在
+capture 不可达时退出，并由 trap 恢复原状态。
 
 比较器必须只输出 `{"status":"stable"}`；其他输出或非零退出均为
 拒绝。两个不同的 private 0600 文件必须都是 `ready`，且语义完全稳定。
