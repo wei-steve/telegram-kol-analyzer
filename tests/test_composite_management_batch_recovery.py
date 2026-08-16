@@ -6399,6 +6399,38 @@ def test_planner_refuses_additional_active_management_batch(tmp_path):
     assert plan.reason_code == "additional_active_work_present"
 
 
+def test_planner_refuses_historical_nonterminal_management_residue(tmp_path):
+    factory, _, binding_id, _, _ = _seed_batch_119_false_submission(tmp_path)
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        session.add(
+            StrategyManagementBatch(
+                idempotency_fingerprint="other-historical-active",
+                raw_message_id=batch.raw_message_id,
+                recognition_decision_id=batch.recognition_decision_id,
+                recognition_generation="other-historical",
+                target_lifecycle_id=batch.target_lifecycle_id,
+                strategy_instance_id="other-historical-active-strategy",
+                execution_binding_id=binding_id,
+                intent="full_exit",
+                effective_action="full_exit",
+                execution_mode="live",
+                status="executing",
+                target_fingerprint="other-historical-target",
+                target_snapshot_json="{}",
+                planned_at=NOW - timedelta(minutes=30),
+                created_at=NOW - timedelta(minutes=30),
+                updated_at=NOW - timedelta(minutes=30),
+            )
+        )
+        session.commit()
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "additional_active_work_present"
+
+
 def test_planner_refuses_additional_active_component(tmp_path):
     factory, _, _, _, leg_id = _seed_batch_119_false_submission(tmp_path)
     with factory() as session:

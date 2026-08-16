@@ -5385,7 +5385,13 @@ def _acquire_recovery_write_lock(session) -> None:
         session.execute(text("BEGIN IMMEDIATE"))
 
 
-def _load_locked_recovery_source(session):
+def _load_exact_batch119_recovery_source(
+    session,
+    *,
+    target_instruction_only: bool = False,
+):
+    """Load the exact incident source without deciding global exclusivity."""
+
     batch = session.get(StrategyManagementBatch, BATCH_119_RECOVERY.batch_id)
     if batch is None:
         return None
@@ -5473,15 +5479,12 @@ def _load_locked_recovery_source(session):
         session, batch=batch, leg=leg, entry=entry
     ):
         return None
-    if _has_additional_active_database_work(
-        session, batch_id=BATCH_119_RECOVERY.batch_id
-    ):
-        return None
     try:
         instruction_population = _instruction_population_payload(
             session,
             batch=batch,
             profile=BATCH_119_RECOVERY,
+            target_only=target_instruction_only,
         )
     except CompositeBatchRecoveryRefusal:
         return None
@@ -5518,6 +5521,17 @@ def _load_locked_recovery_source(session):
     return batch, binding, entry, leg, components, ledger, source_fingerprint
 
 
+def _load_locked_recovery_source(session):
+    """Load the ordinary Batch 119 source under global exclusivity."""
+
+    source = _load_exact_batch119_recovery_source(session)
+    if source is None or _has_additional_active_database_work(
+        session, batch_id=BATCH_119_RECOVERY.batch_id
+    ):
+        return None
+    return source
+
+
 def _batch119_material_row_payload(
     row: Any,
     *,
@@ -5552,6 +5566,7 @@ def _load_batch119_local_material_authority_in_session(
     session,
     *,
     validated_source=None,
+    target_instruction_only: bool = False,
 ) -> _Batch119LocalMaterialAuthority:
     """Load the exact local incident authority without exchange evidence.
 
@@ -5587,8 +5602,9 @@ def _load_batch119_local_material_authority_in_session(
             session,
             batch=batch,
             profile=BATCH_119_RECOVERY,
+            target_only=target_instruction_only,
         )
-        instruction_rows = (
+        instruction_query = (
             session.query(MessageInstructionItem)
             .filter(
                 MessageInstructionItem.retired_at.is_(None),
@@ -5596,6 +5612,14 @@ def _load_batch119_local_material_authority_in_session(
                     _SAFE_TERMINAL_INSTRUCTION_STATUSES
                 ),
             )
+        )
+        if target_instruction_only:
+            instruction_query = instruction_query.filter(
+                MessageInstructionItem.raw_message_id
+                == BATCH_119_RECOVERY.raw_message_id
+            )
+        instruction_rows = (
+            instruction_query
             .order_by(MessageInstructionItem.id)
             .limit(_MAX_INSTRUCTION_POPULATION + 1)
             .all()
@@ -7482,8 +7506,9 @@ def _instruction_population_payload(
     *,
     batch: StrategyManagementBatch,
     profile: CompositeBatchRecoveryProfile,
+    target_only: bool = False,
 ) -> dict[str, Any]:
-    rows = (
+    query = (
         session.query(MessageInstructionItem)
         .filter(
             MessageInstructionItem.retired_at.is_(None),
@@ -7491,6 +7516,13 @@ def _instruction_population_payload(
                 _SAFE_TERMINAL_INSTRUCTION_STATUSES
             ),
         )
+    )
+    if target_only:
+        query = query.filter(
+            MessageInstructionItem.raw_message_id == profile.raw_message_id
+        )
+    rows = (
+        query
         .order_by(MessageInstructionItem.id)
         .limit(_MAX_INSTRUCTION_POPULATION + 1)
         .all()

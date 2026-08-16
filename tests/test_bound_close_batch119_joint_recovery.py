@@ -5,6 +5,7 @@ from datetime import timedelta
 import importlib.util
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 
@@ -12,6 +13,7 @@ import pytest
 
 from telegram_kol_research.models import (
     BoundPositionCloseReservation,
+    DeepcoinExecutionOperation,
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
@@ -20,10 +22,12 @@ from telegram_kol_research.models import (
     PositionProtectionLeg,
     PositionProtectionLedger,
     RawMessage,
+    SignalCandidate,
     StrategyLifecycle,
     StrategyManagementBatch,
     StrategyManagementComponent,
     StrategyManagementLeg,
+    TradeSignal,
 )
 
 
@@ -154,6 +158,130 @@ def _seed_joint_incident(tmp_path):
     return factory, database
 
 
+def _add_historical_nonterminal_management_residue(factory):
+    with factory() as session:
+        target = session.get(StrategyManagementBatch, 119)
+        target_leg = (
+            session.query(StrategyManagementLeg)
+            .filter_by(management_batch_id=119)
+            .one()
+        )
+        batches = []
+        for index in range(3):
+            batch = StrategyManagementBatch(
+                idempotency_fingerprint=f"joint-historical-{index}",
+                raw_message_id=target.raw_message_id,
+                recognition_decision_id=target.recognition_decision_id,
+                recognition_generation=f"joint-historical-{index}",
+                target_lifecycle_id=target.target_lifecycle_id,
+                strategy_instance_id=f"joint-historical-strategy-{index}",
+                execution_binding_id=target.execution_binding_id,
+                intent="full_exit",
+                effective_action="full_exit",
+                execution_mode="live",
+                status="executing",
+                target_fingerprint=f"joint-historical-target-{index}",
+                target_snapshot_json="{}",
+                planned_at=NOW - timedelta(minutes=30),
+                created_at=NOW - timedelta(minutes=30),
+                updated_at=NOW - timedelta(minutes=30),
+            )
+            session.add(batch)
+            session.flush()
+            batches.append(batch)
+        components = []
+        component_kinds = (
+            "consume_take_profit_stage",
+            "converge_partial_close",
+            "replace_remaining_protection",
+        )
+        for index in range(8):
+            component = StrategyManagementComponent(
+                management_batch_id=batches[index % len(batches)].id,
+                strategy_management_leg_id=target_leg.id,
+                strategy_management_leg_scope=target_leg.id,
+                component_kind=component_kinds[index // len(batches)],
+                sequence=100 + index,
+                status="pending",
+                idempotency_key=f"joint-historical-component-{index}",
+                desired_json="{}",
+                evidence_json="[]",
+                created_at=NOW - timedelta(minutes=30),
+                updated_at=NOW - timedelta(minutes=30),
+            )
+            session.add(component)
+            components.append(component)
+        session.commit()
+        return batches[0].id, components[0].id
+
+
+def _add_historical_unclassified_instruction_residue(factory):
+    with factory() as session:
+        items = []
+        for index, status in enumerate(("submitted", "unknown", "unknown")):
+            raw = RawMessage(
+                chat_id=7000 + index,
+                message_id=7100 + index,
+                posted_at=NOW - timedelta(minutes=30),
+                text="historical management residue",
+                created_at=NOW - timedelta(minutes=30),
+            )
+            session.add(raw)
+            session.flush()
+            candidate = SignalCandidate(
+                raw_message_id=raw.id,
+                symbol="BTC",
+                side="long",
+                event_type="position_update",
+                target_lifecycle_id=None,
+                management_action="partial_then_break_even",
+                review_status="confirmed",
+                created_at=NOW - timedelta(minutes=30),
+            )
+            session.add(candidate)
+            session.flush()
+            item = MessageInstructionItem(
+                    raw_message_id=raw.id,
+                    signal_candidate_id=candidate.id,
+                    sequence=0,
+                    instruction_kind="management",
+                    strategy_instance_id=f"historical-instruction-{index}",
+                    idempotency_key=f"historical-instruction-{index}",
+                    status=status,
+                    created_at=NOW - timedelta(minutes=30),
+                    updated_at=NOW - timedelta(minutes=30),
+            )
+            session.add(item)
+            items.append(item)
+        session.commit()
+        return items[1].id
+
+
+def _set_test_state_column_nullable_and_null(
+    database,
+    *,
+    table,
+    row_id,
+):
+    with sqlite3.connect(database) as connection:
+        schema_version = int(
+            connection.execute("PRAGMA schema_version").fetchone()[0]
+        )
+        connection.execute("PRAGMA writable_schema=ON")
+        connection.execute(
+            "UPDATE sqlite_master SET sql=replace(sql, "
+            "'status VARCHAR(32) NOT NULL', 'status VARCHAR(32)') "
+            "WHERE type='table' AND name=?",
+            (table,),
+        )
+        connection.execute(f"PRAGMA schema_version={schema_version + 1}")
+        connection.execute("PRAGMA writable_schema=OFF")
+        connection.commit()
+    with sqlite3.connect(database) as connection:
+        connection.execute(f"UPDATE {table} SET status=NULL WHERE id=?", (row_id,))
+        connection.commit()
+
+
 def _inspect(database, *, phase="joint_diagnostic"):
     from telegram_kol_research.bound_close_batch119_joint_recovery import (
         inspect_joint_recovery_material_authority,
@@ -187,6 +315,175 @@ def test_exact_joint_incident_is_ready_and_public_projection_is_aggregate(tmp_pa
         "status",
     }
     assert "sensitive" not in repr(result)
+
+
+def test_joint_admission_accepts_known_historical_nonterminal_management_residue(
+    tmp_path,
+):
+    factory, database = _seed_joint_incident(tmp_path)
+    _add_historical_nonterminal_management_residue(factory)
+
+    result = _inspect(database)
+
+    assert result.status == "ready"
+    assert result.reason_code is None
+    assert result.reservation_count == 29
+    assert result.batch119_incident_count == 1
+    assert result.blocking_writer_count == 0
+
+
+def test_joint_admission_accepts_historical_unclassified_instruction_residue(
+    tmp_path,
+):
+    factory, database = _seed_joint_incident(tmp_path)
+    _add_historical_unclassified_instruction_residue(factory)
+
+    result = _inspect(database)
+
+    assert result.status == "ready"
+    assert result.reason_code is None
+    assert result.blocking_writer_count == 0
+
+
+def test_joint_admission_accepts_combined_production_historical_residue_shape(
+    tmp_path,
+):
+    factory, database = _seed_joint_incident(tmp_path)
+    _add_historical_nonterminal_management_residue(factory)
+    _add_historical_unclassified_instruction_residue(factory)
+
+    result = _inspect(database)
+
+    assert result.status == "ready"
+    assert result.reason_code is None
+    assert result.blocking_writer_count == 0
+    assert result.reservation_count == 29
+    assert result.batch119_incident_count == 1
+
+
+@pytest.mark.parametrize("drift_kind", ["fresh", "unknown"])
+def test_joint_admission_still_refuses_fresh_or_unknown_instruction_residue(
+    tmp_path,
+    drift_kind,
+):
+    factory, database = _seed_joint_incident(tmp_path)
+    item_id = _add_historical_unclassified_instruction_residue(factory)
+    with factory() as session:
+        item = session.get(MessageInstructionItem, item_id)
+        if drift_kind == "fresh":
+            item.updated_at = NOW
+        else:
+            item.status = "future_unknown_state"
+        session.commit()
+
+    result = _inspect(database)
+
+    assert result.status == "refused"
+    assert result.reason_code == "joint_writer_not_quiescent"
+    assert result.blocking_writer_count >= 1
+
+
+@pytest.mark.parametrize("residue_kind", ["management", "instruction"])
+def test_joint_admission_refuses_null_residue_state(tmp_path, residue_kind):
+    factory, database = _seed_joint_incident(tmp_path)
+    if residue_kind == "management":
+        row_id, _ = _add_historical_nonterminal_management_residue(factory)
+        table = "strategy_management_batches"
+    else:
+        row_id = _add_historical_unclassified_instruction_residue(factory)
+        table = "message_instruction_items"
+    _set_test_state_column_nullable_and_null(
+        database,
+        table=table,
+        row_id=row_id,
+    )
+
+    result = _inspect(database)
+
+    assert result.status == "refused"
+    assert result.reason_code == "joint_writer_not_quiescent"
+    assert result.blocking_writer_count >= 1
+
+
+def test_joint_admission_refuses_historical_deepcoin_nonterminal_operation(
+    tmp_path,
+):
+    factory, database = _seed_joint_incident(tmp_path)
+    with factory() as session:
+        signal = TradeSignal(
+            signal_uid="joint-historical-deepcoin-signal",
+            source_type="recovery",
+            venue="deepcoin",
+            kol_id="joint-recovery",
+            chat_id=1,
+            message_id=1,
+            symbol="BTCUSDT",
+            side="long",
+            action="open_position",
+            status="confirmed",
+            payload_json="{}",
+            created_at=NOW - timedelta(minutes=30),
+            updated_at=NOW - timedelta(minutes=30),
+        )
+        session.add(signal)
+        session.flush()
+        session.add(
+            DeepcoinExecutionOperation(
+                operation_key="joint-historical-deepcoin-operation",
+                trade_signal_id=signal.id,
+                contract_version="1",
+                phase="entry_readback",
+                state="entry_confirmed",
+                outcome_certainty="confirmed",
+                request_fingerprint="d" * 64,
+                economics_fingerprint="e" * 64,
+                deadline_at=NOW - timedelta(minutes=29),
+                attempt_count=0,
+                state_version=0,
+                evidence_json="{}",
+                created_at=NOW - timedelta(minutes=30),
+                updated_at=NOW - timedelta(minutes=30),
+            )
+        )
+        session.commit()
+
+    result = _inspect(database)
+
+    assert result.status == "refused"
+    assert result.reason_code == "joint_writer_not_quiescent"
+    assert result.blocking_writer_count >= 1
+
+
+@pytest.mark.parametrize("residue_kind", ["batch", "component"])
+@pytest.mark.parametrize("drift_kind", ["fresh", "unknown"])
+def test_joint_admission_still_refuses_fresh_or_unknown_management_residue(
+    tmp_path,
+    residue_kind,
+    drift_kind,
+):
+    factory, database = _seed_joint_incident(tmp_path)
+    batch_id, component_id = _add_historical_nonterminal_management_residue(
+        factory
+    )
+    model = (
+        StrategyManagementBatch
+        if residue_kind == "batch"
+        else StrategyManagementComponent
+    )
+    row_id = batch_id if residue_kind == "batch" else component_id
+    with factory() as session:
+        row = session.get(model, row_id)
+        if drift_kind == "fresh":
+            row.updated_at = NOW
+        else:
+            row.status = "future_unknown_state"
+        session.commit()
+
+    result = _inspect(database)
+
+    assert result.status == "refused"
+    assert result.reason_code == "joint_writer_not_quiescent"
+    assert result.blocking_writer_count >= 1
 
 
 def test_only_batch_and_leg_retry_heartbeat_changes_are_normalized(tmp_path):

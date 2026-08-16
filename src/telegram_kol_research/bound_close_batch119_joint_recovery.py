@@ -30,6 +30,7 @@ from telegram_kol_research.composite_management_batch_recovery import (
     CompositeBatchRecoveryRefusal,
     _batch119_material_row_payload,
     _fingerprint,
+    _load_exact_batch119_recovery_source,
     _load_batch119_local_material_authority_in_session,
     create_composite_recovery_read_only_session_factory,
 )
@@ -292,7 +293,17 @@ def inspect_joint_recovery_material_authority(
             if type(query_only) is not int or query_only != 1:
                 raise ValueError("joint_query_only_failed")
             session.execute(text("BEGIN"))
-            local = _load_batch119_local_material_authority_in_session(session)
+            exact_source = _load_exact_batch119_recovery_source(
+                session,
+                target_instruction_only=True,
+            )
+            if exact_source is None:
+                raise CompositeBatchRecoveryRefusal("durable_evidence_invalid")
+            local = _load_batch119_local_material_authority_in_session(
+                session,
+                validated_source=exact_source,
+                target_instruction_only=True,
+            )
             (
                 reservations,
                 reservation_count,
