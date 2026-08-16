@@ -6929,10 +6929,12 @@ def _legacy_false_exchange_snapshot_refusal(leg, *, profile) -> str | None:
     position_rows = snapshot.get("position_rows")
     if (
         not isinstance(position_rows, list)
-        or len(position_rows) != 1
+        or len(position_rows) > 1
         or snapshot.get("matching_regular_orders") != []
     ):
         return "false_submission_state_mismatch"
+    if not position_rows:
+        return None
     position_row = position_rows[0]
     if not isinstance(position_row, Mapping) or set(position_row) != {
         "posId", "instId", "posSide", "pos"
