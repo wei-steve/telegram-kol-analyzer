@@ -2018,7 +2018,7 @@ validate_bound_close_capture_diagnostic() {
   local capture_status="$2"
   local output_path="$3"
   PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" - \
-    "$input_path" "$capture_status" > "$output_path" <<'PY'
+    "$input_path" "$capture_status" > "$output_path" 2>/dev/null <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -2157,6 +2157,7 @@ run_bound_close_double_capture() {
   local VALIDATED_DIAGNOSTIC
   local VALIDATION_STATUS
   for ATTEMPT in 1 2; do
+    BOUND_CLOSE_SAFE_DIAGNOSTIC='{"status":"diagnostic_unavailable"}'
     verify_all_local_quiescence_and_identity
     RESULT="$RECOVERY_TMP/dry-run-${ATTEMPT}.json"
     set +e
@@ -2172,7 +2173,7 @@ run_bound_close_double_capture() {
     set +e
     PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
       "$CANDIDATE_ROOT/scripts/project_bound_close_reservation_recovery_output.py" \
-      capture-diagnostic < "$RESULT" > "$DIAGNOSTIC"
+      capture-diagnostic < "$RESULT" > "$DIAGNOSTIC" 2>/dev/null
     DIAGNOSTIC_STATUS=$?
     set -e
     chmod 0600 "$DIAGNOSTIC"

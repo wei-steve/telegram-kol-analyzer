@@ -750,7 +750,10 @@ def _simulate_runbook_capture_failure(
     capture_document: str,
     diagnostic_status: int | None = None,
     diagnostic_output: str | None = None,
+    diagnostic_stderr: str = "",
+    validator_stderr: str = "",
     cleanup_status: int = 0,
+    verify_fail_at: int | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
     block = _bound_close_read_only_block()
     capture_function = _bound_close_shell_function(
@@ -767,6 +770,8 @@ def _simulate_runbook_capture_failure(
     capture_path.write_text(capture_document, encoding="utf-8")
     diagnostic_path = tmp_path / "diagnostic.json"
     diagnostic_path.write_text(diagnostic_output or "", encoding="utf-8")
+    verify_counter = tmp_path / "verify-counter.txt"
+    verify_counter.write_text("0", encoding="utf-8")
     runtime = tmp_path / "runtime-python"
     diagnostic_branch = (
         "cat \"$DIAGNOSTIC_OUTPUT\"\n"
@@ -783,9 +788,13 @@ if [ "${{1:-}}" = -m ]; then
   exit {capture_status}
 fi
 case "${{1:-}}" in
-  -) exec "$REAL_PYTHON" "$@" ;;
+  -)
+    printf '%s' "$VALIDATOR_STDERR" >&2
+    exec "$REAL_PYTHON" "$@"
+    ;;
   *project_bound_close_reservation_recovery_output.py)
     printf 'project-%s\\n' "${{2:-missing}}" >> "$EVENTS"
+    printf '%s' "$DIAGNOSTIC_STDERR" >&2
     {diagnostic_branch}
     ;;
   *compare_bound_close_reservation_dry_runs.py)
@@ -804,13 +813,23 @@ set -euo pipefail
 export EVENTS={shlex.quote(str(events))}
 export CAPTURE_DOCUMENT={shlex.quote(str(capture_path))}
 export DIAGNOSTIC_OUTPUT={shlex.quote(str(diagnostic_path))}
+export DIAGNOSTIC_STDERR={shlex.quote(diagnostic_stderr)}
+export VALIDATOR_STDERR={shlex.quote(validator_stderr)}
+export VERIFY_COUNTER={shlex.quote(str(verify_counter))}
 export REAL_PYTHON={shlex.quote(sys.executable)}
 RECOVERY_TMP={shlex.quote(str(recovery_tmp))}
 CANDIDATE_ROOT={shlex.quote(str(project_root))}
 RUNTIME_PYTHON={shlex.quote(str(runtime))}
 PRODUCTION_DB={shlex.quote(str(tmp_path / 'production.db'))}
 BOUND_CLOSE_SAFE_DIAGNOSTIC=''
-verify_all_local_quiescence_and_identity() {{ :; }}
+verify_all_local_quiescence_and_identity() {{
+  count="$(cat "$VERIFY_COUNTER")"
+  count=$((count + 1))
+  printf '%s' "$count" > "$VERIFY_COUNTER"
+  if [ "$count" -eq {verify_fail_at if verify_fail_at is not None else -1} ]; then
+    return 7
+  fi
+}}
 restore_bound_close_reservation_units() {{
   printf 'restore\\n'
   rm -rf -- "$RECOVERY_TMP"
@@ -909,6 +928,68 @@ def test_runbook_projector_failure_is_diagnostic_unavailable(tmp_path):
     assert "compare\n" not in events.read_text(encoding="utf-8")
     assert not recovery_tmp.exists()
     assert result.stderr == ""
+
+
+def test_runbook_projector_stderr_never_reaches_operator(tmp_path):
+    result, events, recovery_tmp = _simulate_runbook_capture_failure(
+        tmp_path,
+        capture_status=2,
+        capture_document="TOPSECRET-RAW-CAPTURE",
+        diagnostic_status=2,
+        diagnostic_output='{"status":"diagnostic_unavailable"}\n',
+        diagnostic_stderr="TOPSECRET-PATH-OR-TRACEBACK",
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == 'restore\n{"status":"diagnostic_unavailable"}\n'
+    assert "TOPSECRET" not in result.stdout
+    assert result.stderr == ""
+    assert "compare\n" not in events.read_text(encoding="utf-8")
+    assert not recovery_tmp.exists()
+
+
+def test_runbook_validator_stderr_never_reaches_operator(tmp_path):
+    refused = _document(
+        started_at=START,
+        observations=(
+            _observation(
+                classification=ReservationClassification.UNKNOWN,
+                reason_code="exchange_history_incomplete",
+            ),
+        ),
+    )
+    result, events, recovery_tmp = _simulate_runbook_capture_failure(
+        tmp_path,
+        capture_status=2,
+        capture_document=refused,
+        validator_stderr="TOPSECRET-VALIDATOR-TRACEBACK",
+    )
+
+    assert result.returncode == 2
+    assert result.stdout.endswith('"status":"refused"}\n')
+    assert "TOPSECRET" not in result.stdout
+    assert result.stderr == ""
+    assert events.read_text(encoding="utf-8") == (
+        "capture-1\nproject-capture-diagnostic\n"
+    )
+    assert not recovery_tmp.exists()
+
+
+def test_runbook_second_attempt_failure_clears_first_ready_diagnostic(tmp_path):
+    result, events, recovery_tmp = _simulate_runbook_capture_failure(
+        tmp_path,
+        capture_status=0,
+        capture_document=_document(started_at=START),
+        verify_fail_at=3,
+    )
+
+    assert result.returncode == 7
+    assert result.stdout == 'restore\n{"status":"diagnostic_unavailable"}\n'
+    assert events.read_text(encoding="utf-8") == (
+        "capture-1\nproject-capture-diagnostic\nproject-capture\n"
+    )
+    assert result.stderr == ""
+    assert not recovery_tmp.exists()
 
 
 @pytest.mark.parametrize(
