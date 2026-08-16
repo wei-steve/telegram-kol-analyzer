@@ -1762,6 +1762,26 @@ verify_all_local_quiescence_and_identity() {
     "$PRODUCTION_DB_DEVICE_INODE" ]
 }
 
+verify_all_local_identity_before_stop() {
+  local PROCESS_SCAN_STATUS
+  discover_bound_close_db_stage_units "$DB_STAGE_CURRENT_INVENTORY"
+  cmp -s "$DB_STAGE_INITIAL_INVENTORY" "$DB_STAGE_CURRENT_INVENTORY"
+  if pgrep -f '[t]elegram_kol_research|[t]elegram-kol' >/dev/null; then
+    PROCESS_SCAN_STATUS=0
+  else
+    PROCESS_SCAN_STATUS=$?
+  fi
+  case "$PROCESS_SCAN_STATUS" in
+    0|1) ;;
+    *) return 1 ;;
+  esac
+  [ "$(git -C "$PRODUCTION_ROOT" rev-parse HEAD)" = "$ORIGINAL_SHA" ]
+  [ "$(readlink -f -- "$PRODUCTION_DB")" = \
+    "$PRODUCTION_DB_RESOLVED_PATH" ]
+  [ "$(stat -Lc '%d:%i' -- "$PRODUCTION_DB")" = \
+    "$PRODUCTION_DB_DEVICE_INODE" ]
+}
+
 restore_bound_close_reservation_units() {
   local cleanup_status=0
   case "$RECOVERY_TMP" in
@@ -2281,6 +2301,55 @@ git -C "$PRODUCTION_ROOT" worktree add --detach \
   "$CANDIDATE_ROOT" "$REVIEWED_SHA" >/dev/null
 test "$(git -C "$CANDIDATE_ROOT" rev-parse HEAD)" = "$REVIEWED_SHA"
 test -z "$(git -C "$CANDIDATE_ROOT" status --porcelain)"
+
+# BEGIN BOUND_CLOSE_LIVE_PREQUIESCENCE
+LIVE_PREQUIESCENCE_DEADLINE_EPOCH="$(( $(bound_close_now_epoch) + 720 ))"
+LIVE_PREQUIESCENCE_POLL_SECONDS=15
+LIVE_PREQUIESCENCE_ATTEMPT=0
+LIVE_PREQUIESCENCE_RESULT="$RECOVERY_TMP/live-writer-quiescence.json"
+while :; do
+  [ "$(bound_close_now_epoch)" -lt \
+    "$LIVE_PREQUIESCENCE_DEADLINE_EPOCH" ] || exit 1
+  LIVE_PREQUIESCENCE_ATTEMPT=$((LIVE_PREQUIESCENCE_ATTEMPT + 1))
+  LIVE_PREQUIESCENCE_RAW="$RECOVERY_TMP/live-writer-quiescence-${LIVE_PREQUIESCENCE_ATTEMPT}.json"
+  LIVE_PREQUIESCENCE_PROJECTION="$RECOVERY_TMP/live-writer-quiescence-${LIVE_PREQUIESCENCE_ATTEMPT}-projection.json"
+  verify_all_local_identity_before_stop
+  run_bound_close_writer_quiescence_helper "$LIVE_PREQUIESCENCE_RAW"
+  verify_all_local_identity_before_stop
+  chmod 0600 "$LIVE_PREQUIESCENCE_RAW"
+  case "$HELPER_STATUS" in
+    0|2)
+      project_bound_close_writer_quiescence_result \
+        "$LIVE_PREQUIESCENCE_RAW" "$HELPER_STATUS" \
+        "$LIVE_PREQUIESCENCE_PROJECTION"
+      chmod 0600 "$LIVE_PREQUIESCENCE_PROJECTION"
+      ;;
+    *) exit 1 ;;
+  esac
+  [ "$(bound_close_now_epoch)" -lt \
+    "$LIVE_PREQUIESCENCE_DEADLINE_EPOCH" ] || exit 1
+  case "$HELPER_STATUS" in
+    0)
+      require_exact_ready_projection "$LIVE_PREQUIESCENCE_PROJECTION"
+      mv -- "$LIVE_PREQUIESCENCE_PROJECTION" "$LIVE_PREQUIESCENCE_RESULT"
+      chmod 0600 "$LIVE_PREQUIESCENCE_RESULT"
+      break
+      ;;
+    2) require_exact_refused_projection "$LIVE_PREQUIESCENCE_PROJECTION" ;;
+    *) exit 1 ;;
+  esac
+  LIVE_PREQUIESCENCE_REMAINING_SECONDS=$((
+    LIVE_PREQUIESCENCE_DEADLINE_EPOCH - $(bound_close_now_epoch)
+  ))
+  [ "$LIVE_PREQUIESCENCE_REMAINING_SECONDS" -gt 0 ] || exit 1
+  LIVE_PREQUIESCENCE_SLEEP_SECONDS="$LIVE_PREQUIESCENCE_POLL_SECONDS"
+  if [ "$LIVE_PREQUIESCENCE_REMAINING_SECONDS" -lt \
+    "$LIVE_PREQUIESCENCE_SLEEP_SECONDS" ]; then
+    LIVE_PREQUIESCENCE_SLEEP_SECONDS="$LIVE_PREQUIESCENCE_REMAINING_SECONDS"
+  fi
+  sleep "$LIVE_PREQUIESCENCE_SLEEP_SECONDS"
+done
+# END BOUND_CLOSE_LIVE_PREQUIESCENCE
 
 CAPTURE_RUNNER="$RECOVERY_TMP/capture-runner.sh"
 write_bound_close_capture_runner "$CAPTURE_RUNNER"

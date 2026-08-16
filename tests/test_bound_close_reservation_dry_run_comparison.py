@@ -659,6 +659,13 @@ def _bound_close_poll_snippet() -> str:
     )[0]
 
 
+def _bound_close_live_prequiescence_snippet() -> str:
+    block = _bound_close_read_only_block()
+    return block.split("# BEGIN BOUND_CLOSE_LIVE_PREQUIESCENCE", 1)[1].split(
+        "# END BOUND_CLOSE_LIVE_PREQUIESCENCE", 1
+    )[0]
+
+
 def _bound_close_shell_function(block: str, name: str) -> str:
     return block.split(f"{name}() {{", 1)[1].split("\n}\n", 1)[0]
 
@@ -1326,6 +1333,26 @@ def test_runbook_quiescence_poll_is_bounded_and_capture_is_ready_gated():
     assert "require_exact_refused_projection" in block[helper:capture]
 
 
+def test_live_prequiescence_precedes_runner_build_and_every_unit_stop():
+    block = _bound_close_read_only_block()
+
+    live_start = block.index("# BEGIN BOUND_CLOSE_LIVE_PREQUIESCENCE")
+    live_end = block.index("# END BOUND_CLOSE_LIVE_PREQUIESCENCE")
+    runner_build = block.index(
+        'write_bound_close_capture_runner "$CAPTURE_RUNNER"'
+    )
+    first_stop = block.index("QUIESCE_ATTEMPTED=1")
+
+    assert live_start < live_end < runner_build < first_stop
+    live = block[live_start:live_end]
+    assert "$(( $(bound_close_now_epoch) + 720 ))" in live
+    assert "LIVE_PREQUIESCENCE_POLL_SECONDS=15" in live
+    assert "verify_all_local_identity_before_stop" in live
+    assert "verify_all_local_quiescence_and_identity" not in live
+    assert "stop_bound_close_unit_group" not in live
+    assert "run_bound_close_double_capture" not in live
+
+
 def test_runbook_quiescence_poll_rechecks_every_local_identity_around_helper():
     block = _bound_close_read_only_block()
     poll = _bound_close_poll_snippet()
@@ -1431,6 +1458,117 @@ run_bound_close_double_capture_before_deadline() {{
         check=False,
         timeout=10,
     )
+
+
+def _simulate_live_prequiescence(
+    tmp_path: Path,
+    *,
+    helper_statuses: tuple[int, ...],
+    sleep_jump: int,
+    projection_fails: bool = False,
+    verify_fail_on: int = 0,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    events = tmp_path / "live-events.txt"
+    sequence = " ".join(str(value) for value in helper_statuses)
+    script = f"""
+set -euo pipefail
+EVENTS={shlex.quote(str(events))}
+RECOVERY_TMP={shlex.quote(str(tmp_path))}
+NOW_EPOCH=100
+HELPER_SEQUENCE=({sequence})
+HELPER_CALL=0
+VERIFY_CALL=0
+PROJECTION_FAIL={int(projection_fails)}
+bound_close_now_epoch() {{ printf '%s\n' "$NOW_EPOCH"; }}
+sleep() {{
+  printf 'sleep\n' >> "$EVENTS"
+  NOW_EPOCH=$((NOW_EPOCH + {sleep_jump}))
+}}
+verify_all_local_identity_before_stop() {{
+  VERIFY_CALL=$((VERIFY_CALL + 1))
+  printf 'verify\n' >> "$EVENTS"
+  [ "$VERIFY_CALL" -ne {verify_fail_on} ]
+}}
+run_bound_close_writer_quiescence_helper() {{
+  local output_path="$1"
+  local index="$HELPER_CALL"
+  HELPER_CALL=$((HELPER_CALL + 1))
+  HELPER_STATUS="${{HELPER_SEQUENCE[$index]:-1}}"
+  printf 'helper\n' >> "$EVENTS"
+  if [ "$HELPER_STATUS" -eq 0 ]; then
+    printf '%s\n' '{{"block_regardless_of_age_writer_count":0,"blocking_writer_count":0,"checked_table_count":20,"fresh_active_or_unknown_writer_count":0,"historical_active_or_unknown_residue_count":2,"missing_table_count":0,"schema_version":1,"status":"ready","target_reservation_count":29,"unrecognized_or_null_state_count":0}}' > "$output_path"
+  else
+    printf '%s\n' '{{"block_regardless_of_age_writer_count":0,"blocking_writer_count":1,"checked_table_count":20,"fresh_active_or_unknown_writer_count":1,"historical_active_or_unknown_residue_count":1,"missing_table_count":0,"schema_version":1,"status":"refused","target_reservation_count":29,"unrecognized_or_null_state_count":0}}' > "$output_path"
+  fi
+}}
+project_bound_close_writer_quiescence_result() {{
+  printf 'project\n' >> "$EVENTS"
+  [ "$PROJECTION_FAIL" -eq 0 ]
+  cp "$1" "$3"
+}}
+require_exact_ready_projection() {{ grep -q '"status":"ready"' "$1"; }}
+require_exact_refused_projection() {{ grep -q '"status":"refused"' "$1"; }}
+stop_bound_close_unit_group() {{ printf 'stop\n' >> "$EVENTS"; }}
+{_bound_close_live_prequiescence_snippet()}
+printf 'live-ready\n' >> "$EVENTS"
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    return result, events
+
+
+def test_live_prequiescence_refused_then_ready_never_stops_services(tmp_path):
+    result, events = _simulate_live_prequiescence(
+        tmp_path,
+        helper_statuses=(2, 2, 0),
+        sleep_jump=15,
+    )
+
+    assert result.returncode == 0, result.stderr
+    event_lines = events.read_text(encoding="utf-8").splitlines()
+    assert event_lines.count("helper") == 3
+    assert event_lines.count("verify") == 6
+    assert event_lines.count("sleep") == 2
+    assert event_lines[-1] == "live-ready"
+    assert "stop" not in event_lines
+
+
+def test_live_prequiescence_timeout_never_stops_services(tmp_path):
+    result, events = _simulate_live_prequiescence(
+        tmp_path,
+        helper_statuses=(2,),
+        sleep_jump=720,
+    )
+
+    assert result.returncode != 0
+    assert "stop" not in events.read_text(encoding="utf-8").splitlines()
+
+
+@pytest.mark.parametrize(
+    ("helper_statuses", "projection_fails", "verify_fail_on"),
+    [((1,), False, 0), ((2,), True, 0), ((2,), False, 1), ((2,), False, 2)],
+)
+def test_live_prequiescence_errors_fail_before_any_stop(
+    tmp_path,
+    helper_statuses,
+    projection_fails,
+    verify_fail_on,
+):
+    result, events = _simulate_live_prequiescence(
+        tmp_path,
+        helper_statuses=helper_statuses,
+        sleep_jump=15,
+        projection_fails=projection_fails,
+        verify_fail_on=verify_fail_on,
+    )
+
+    assert result.returncode != 0
+    assert "stop" not in events.read_text(encoding="utf-8").splitlines()
 
 
 def test_runbook_quiescence_poll_reaches_capture_once_only_after_ready(tmp_path):
