@@ -10,6 +10,7 @@ from typing import Sequence
 
 from telegram_kol_research.bound_close_reservation_recovery import (
     MAX_RECOVERY_PLAN_BYTES,
+    ReservationClassification,
     _parse_bound_close_reservation_dry_run_document,
 )
 
@@ -75,6 +76,42 @@ def _capture_projection(raw: bytes) -> dict[str, object]:
     return {key: payload[key] for key in _CAPTURE_SAFE_KEYS}
 
 
+def _capture_diagnostic_projection(raw: bytes) -> dict[str, object]:
+    parsed = _parse_bound_close_reservation_dry_run_document(raw)
+    classification_counts = {
+        "active": 0,
+        "proven_terminal": 0,
+        "total": len(parsed.plan.observations),
+        "unknown": 0,
+    }
+    reason_counts: dict[str, int] = {}
+    classification_fields = {
+        ReservationClassification.ACTIVE: "active",
+        ReservationClassification.PROVEN_TERMINAL: "proven_terminal",
+        ReservationClassification.UNKNOWN: "unknown",
+    }
+    for observation in parsed.plan.observations:
+        classification_counts[classification_fields[observation.classification]] += 1
+        reason_counts[observation.reason_code] = (
+            reason_counts.get(observation.reason_code, 0) + 1
+        )
+    if (
+        sum(classification_counts[name] for name in classification_fields.values())
+        != classification_counts["total"]
+        or sum(reason_counts.values()) != classification_counts["total"]
+    ):
+        raise _ProjectionRefused("diagnostic counts do not conserve population")
+    return {
+        "action_count": parsed.plan.action_count,
+        "counts": classification_counts,
+        "database_writes": 0,
+        "exchange_writes": 0,
+        "history_replays": 0,
+        "reason_counts": reason_counts,
+        "status": parsed.plan.status,
+    }
+
+
 def _apply_projection(raw: bytes) -> dict[str, object]:
     payload = json.loads(
         raw,
@@ -109,15 +146,21 @@ def _apply_projection(raw: bytes) -> dict[str, object]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
+    diagnostic_mode = arguments == ["capture-diagnostic"]
     try:
-        if arguments not in (["capture"], ["apply-result"]):
+        if arguments not in (
+            ["capture"],
+            ["capture-diagnostic"],
+            ["apply-result"],
+        ):
             raise _ProjectionRefused("projection kind invalid")
         raw = _read_bounded_stdin()
-        projected = (
-            _capture_projection(raw)
-            if arguments[0] == "capture"
-            else _apply_projection(raw)
-        )
+        if arguments[0] == "capture":
+            projected = _capture_projection(raw)
+        elif arguments[0] == "capture-diagnostic":
+            projected = _capture_diagnostic_projection(raw)
+        else:
+            projected = _apply_projection(raw)
     except (
         KeyError,
         RecursionError,
@@ -127,7 +170,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         UnicodeError,
         json.JSONDecodeError,
     ):
-        sys.stdout.write('{"status":"refused"}\n')
+        if diagnostic_mode:
+            sys.stdout.write('{"status":"diagnostic_unavailable"}\n')
+        else:
+            sys.stdout.write('{"status":"refused"}\n')
         return 2
     sys.stdout.write(
         json.dumps(

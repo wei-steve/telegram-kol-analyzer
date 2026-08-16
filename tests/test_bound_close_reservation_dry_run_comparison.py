@@ -14,6 +14,7 @@ import pytest
 
 from telegram_kol_research.bound_close_reservation_recovery import (
     BoundCloseReservationObservation,
+    MAX_RECOVERY_PLAN_BYTES,
     ReservationClassification,
     build_bound_close_reservation_recovery_plan,
     serialize_bound_close_reservation_recovery_plan,
@@ -965,6 +966,18 @@ def _project_recovery_output(
     )
 
 
+def _project_recovery_output_bytes(
+    kind: str,
+    document: bytes,
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        [sys.executable, str(_RECOVERY_OUTPUT_PROJECTOR), kind],
+        input=document,
+        capture_output=True,
+        check=False,
+    )
+
+
 def test_recovery_output_projector_hides_capture_token_and_observations():
     document = _document(started_at=START)
 
@@ -987,6 +1000,151 @@ def test_recovery_output_projector_hides_capture_token_and_observations():
     assert "observations" not in result.stdout
     assert FP_A not in result.stdout
     assert result.stderr == ""
+
+
+def test_capture_diagnostic_projects_valid_refusal_reason_counts():
+    observations = (
+        _observation(reservation_ref="1" * 64),
+        _observation(
+            reservation_ref="2" * 64,
+            classification=ReservationClassification.ACTIVE,
+            reason_code="exact_close_order_currently_pending",
+        ),
+        _observation(
+            reservation_ref="3" * 64,
+            classification=ReservationClassification.ACTIVE,
+            reason_code="exact_close_order_currently_pending",
+        ),
+        _observation(
+            reservation_ref="4" * 64,
+            classification=ReservationClassification.UNKNOWN,
+            reason_code="exchange_history_incomplete",
+        ),
+        _observation(
+            reservation_ref="5" * 64,
+            classification=ReservationClassification.UNKNOWN,
+            reason_code="exchange_history_incomplete",
+        ),
+    )
+    document = _document(started_at=START, observations=observations)
+
+    result = _project_recovery_output("capture-diagnostic", document)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "action_count": 0,
+        "counts": {
+            "active": 2,
+            "proven_terminal": 1,
+            "total": 5,
+            "unknown": 2,
+        },
+        "database_writes": 0,
+        "exchange_writes": 0,
+        "history_replays": 0,
+        "reason_counts": {
+            "exact_close_and_position_terminal": 1,
+            "exact_close_order_currently_pending": 2,
+            "exchange_history_incomplete": 2,
+        },
+        "status": "refused",
+    }
+    assert sum(json.loads(result.stdout)["reason_counts"].values()) == 5
+    assert result.stderr == ""
+
+
+def test_capture_diagnostic_hides_all_private_capture_authority():
+    document = _document(
+        started_at=START,
+        observations=(
+            _observation(
+                classification=ReservationClassification.UNKNOWN,
+                reason_code="exchange_history_incomplete",
+            ),
+        ),
+    )
+
+    result = _project_recovery_output("capture-diagnostic", document)
+
+    assert result.returncode == 0, result.stderr
+    assert set(json.loads(result.stdout)) == {
+        "action_count",
+        "counts",
+        "database_writes",
+        "exchange_writes",
+        "history_replays",
+        "reason_counts",
+        "status",
+    }
+    for private_value in (
+        FP_A,
+        FP_B,
+        FP_C,
+        FP_D,
+        "confirmation_token",
+        "capture_identity",
+        "capture_started_at",
+        "capture_completed_at",
+        "observations",
+        "reservation_ref",
+        "source_fingerprint",
+        "exchange_fingerprint",
+        "evidence_fingerprint",
+        "exchange_snapshot_fingerprint",
+    ):
+        assert private_value not in result.stdout
+    assert result.stderr == ""
+
+
+def _invalid_capture_diagnostic_documents() -> tuple[bytes, ...]:
+    valid = _document(
+        started_at=START,
+        observations=(
+            _observation(
+                classification=ReservationClassification.UNKNOWN,
+                reason_code="exchange_history_incomplete",
+            ),
+        ),
+    )
+    payload = json.loads(valid)
+
+    unknown_field = dict(payload)
+    unknown_field["provider_row"] = "TOPSECRET-PROVIDER-ROW"
+
+    unknown_reason = json.loads(valid)
+    unknown_reason["observations"][0]["reason_code"] = "TOPSECRET-UNKNOWN-REASON"
+
+    invalid_schema = json.loads(valid)
+    invalid_schema["schema_version"] = True
+
+    duplicate = valid.replace(
+        '"action_count":0,',
+        '"action_count":0,"action_count":0,',
+        1,
+    )
+    non_finite = valid.replace('"action_count":0', '"action_count":NaN', 1)
+
+    return (
+        b"",
+        b"{",
+        b"\xff\xfe",
+        (valid + (" " * (MAX_RECOVERY_PLAN_BYTES + 1))).encode("utf-8"),
+        duplicate.encode("utf-8"),
+        json.dumps(unknown_field).encode("utf-8"),
+        json.dumps(unknown_reason).encode("utf-8"),
+        json.dumps(invalid_schema).encode("utf-8"),
+        non_finite.encode("utf-8"),
+    )
+
+
+@pytest.mark.parametrize("document", _invalid_capture_diagnostic_documents())
+def test_capture_diagnostic_rejects_invalid_input_without_echoing(document):
+    result = _project_recovery_output_bytes("capture-diagnostic", document)
+
+    assert result.returncode == 2
+    assert result.stdout == b'{"status":"diagnostic_unavailable"}\n'
+    assert b"TOPSECRET" not in result.stdout
+    assert result.stderr == b""
 
 
 def test_recovery_output_projector_drops_apply_audit_event_id():
