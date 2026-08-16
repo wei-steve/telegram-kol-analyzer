@@ -409,6 +409,55 @@ def test_runbook_quiescence_inventory_preserves_state_and_refuses_unit_races():
     assert "不调用 Deepcoin/交易所" in section
 
 
+@pytest.mark.parametrize(
+    ("list_unit_files_status", "expected_status"),
+    [(1, 0), (2, 1)],
+)
+def test_db_stage_discovery_distinguishes_no_matches_from_systemctl_failure(
+    tmp_path,
+    list_unit_files_status,
+    expected_status,
+):
+    block = _bound_close_read_only_block()
+    function = block.split("discover_bound_close_db_stage_units() {", 1)[1].split(
+        "\n}\n", 1
+    )[0]
+    output = tmp_path / "inventory.txt"
+    script = f"""
+set -euo pipefail
+QUIESCE_DB_STAGE_SEED_UNITS=(
+  telegram-kol-monitor-db-stage@sentinel.service
+  telegram-kol-monitor-db-stage@audit.service
+)
+systemctl() {{
+  case "$1" in
+    list-units) return 0 ;;
+    list-unit-files) return {list_unit_files_status} ;;
+    *) return 91 ;;
+  esac
+}}
+discover_bound_close_db_stage_units() {{
+{function}
+}}
+discover_bound_close_db_stage_units "$1"
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script, "bash", str(output)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == expected_status, result.stderr
+    if expected_status == 0:
+        assert output.read_text(encoding="utf-8").splitlines() == [
+            "telegram-kol-monitor-db-stage@audit.service",
+            "telegram-kol-monitor-db-stage@sentinel.service",
+        ]
+    assert result.stderr == ""
+
+
 def test_runbook_fetch_updates_the_exact_ref_it_later_verifies():
     block = _bound_close_read_only_block()
 

@@ -1591,13 +1591,40 @@ DB_STAGE_CURRENT_INVENTORY="$RECOVERY_TMP/db-stage-current.txt"
 
 discover_bound_close_db_stage_units() {
   local output_path="$1"
+  local loaded_instances
+  local installed_instances
+  local inventory_status
   local unit
+  if loaded_instances="$(
+    systemctl list-units --all --type=service --plain --no-legend --no-pager \
+      'telegram-kol-monitor-db-stage@*.service' 2>&1
+  )"; then
+    :
+  else
+    inventory_status=$?
+    if [ "$inventory_status" -ne 1 ] || [ -n "$loaded_instances" ]; then
+      return 1
+    fi
+  fi
+  if installed_instances="$(
+    systemctl list-unit-files --type=service --no-legend --no-pager \
+      'telegram-kol-monitor-db-stage@*.service' 2>&1
+  )"; then
+    :
+  else
+    inventory_status=$?
+    if [ "$inventory_status" -ne 1 ] || [ -n "$installed_instances" ]; then
+      return 1
+    fi
+  fi
   {
     printf '%s\n' "${QUIESCE_DB_STAGE_SEED_UNITS[@]}"
-    systemctl list-units --all --type=service --plain --no-legend --no-pager \
-      'telegram-kol-monitor-db-stage@*.service'
-    systemctl list-unit-files --type=service --no-legend --no-pager \
-      'telegram-kol-monitor-db-stage@*.service'
+    if [ -n "$loaded_instances" ]; then
+      printf '%s\n' "$loaded_instances"
+    fi
+    if [ -n "$installed_instances" ]; then
+      printf '%s\n' "$installed_instances"
+    fi
   } | awk '
     $1 ~ /^telegram-kol-monitor-db-stage@/ &&
     $1 != "telegram-kol-monitor-db-stage@.service" {print $1}
