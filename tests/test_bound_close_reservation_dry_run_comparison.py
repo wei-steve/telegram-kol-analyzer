@@ -5,6 +5,9 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sqlite3
+import subprocess
+import sys
 
 import pytest
 
@@ -36,6 +39,39 @@ FP_A = "a" * 64
 FP_B = "b" * 64
 FP_C = "c" * 64
 FP_D = "d" * 64
+
+_WRITER_QUIESCENCE_SCRIPT = (
+    Path(__file__).resolve().parents[1]
+    / "scripts"
+    / "check_bound_close_reservation_writer_quiescence.py"
+)
+_RECOVERY_OUTPUT_PROJECTOR = (
+    Path(__file__).resolve().parents[1]
+    / "scripts"
+    / "project_bound_close_reservation_recovery_output.py"
+)
+_EXPECTED_WRITER_SPECS = (
+    ("deepcoin_execution_operations", "state", "entry_pending_readback"),
+    ("execution_order_legs", "status", "submitting"),
+    ("message_instruction_items", "status", "pending"),
+    ("trade_signals", "status", "processing"),
+    ("instruction_execution_contracts", "state", "deferred"),
+    ("strategy_revision_batches", "status", "planned"),
+    ("strategy_management_batches", "status", "ready"),
+    ("strategy_management_legs", "status", "reserved"),
+    ("strategy_management_components", "status", "preflighting"),
+    ("position_mutation_intents", "status", "reserved"),
+    ("bound_position_close_reservations", "status", "submitted"),
+    ("position_backup_stop_orders", "status", "pending_readback"),
+    ("position_take_profit_orders", "status", "cancel_requested"),
+    ("position_protection_legs", "status", "waiting_fill"),
+    ("trigger_protection_intents", "recovery_state", "retrying"),
+    ("trigger_protection_stop_rescues", "status", "ready"),
+    ("trigger_take_profit_convergences", "status", "reserved"),
+    ("strategy_break_even_convergences", "status", "claimed"),
+    ("strategy_break_even_convergence_legs", "status", "decision_reserved"),
+    ("source_message_deletion_exits", "state", "reconciling"),
+)
 
 
 def _observation(
@@ -283,8 +319,8 @@ def test_runbook_closes_stopped_service_capture_and_apply_boundaries():
     assert "trap finish_bound_close_reservation_window EXIT" in section
     assert "restore_bound_close_reservation_units" in section
     assert "pgrep -f '[t]elegram_kol_research|[t]elegram-kol'" in section
-    assert "ACTIVE_OR_UNKNOWN_WRITERS_EXCEPT_TARGET" in section
-    assert "TARGET_RESERVATION_COUNT" in section
+    assert "other_active_or_unknown_writer_count" in section
+    assert "target_reservation_count" in section
     assert 'RESULT="$RECOVERY_TMP/dry-run-${ATTEMPT}.json"' in section
     assert 'chmod 0600 "$RESULT"' in section
     assert "compare_bound_close_reservation_dry_runs.py" in section
@@ -298,3 +334,232 @@ def test_runbook_closes_stopped_service_capture_and_apply_boundaries():
     assert "raw ids" in section
     assert "provider rows" in section
     assert "credentials" in section
+    assert "check_bound_close_reservation_writer_quiescence.py" in section
+    assert "apply-result.json" not in section
+    assert 'APPLY_SUMMARY="$RECOVERY_TMP/apply-summary.json"' in section
+    assert '"status","action_count","evidence_fingerprint"' in section
+
+
+def _writer_quiescence_database(path: Path) -> None:
+    with sqlite3.connect(path) as connection:
+        for table, column, _active_state in _EXPECTED_WRITER_SPECS:
+            connection.execute(
+                f'CREATE TABLE "{table}" (id INTEGER PRIMARY KEY, "{column}" TEXT)'
+            )
+        connection.execute(
+            "INSERT INTO bound_position_close_reservations (id, status) "
+            "VALUES (1, 'submitted')"
+        )
+
+
+def _run_writer_quiescence(path: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(_WRITER_QUIESCENCE_SCRIPT), str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _project_recovery_output(
+    kind: str,
+    document: str,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(_RECOVERY_OUTPUT_PROJECTOR), kind],
+        input=document,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_recovery_output_projector_hides_capture_token_and_observations():
+    document = _document(started_at=START)
+
+    result = _project_recovery_output("capture", document)
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert set(payload) == {
+        "action_count",
+        "counts",
+        "database_writes",
+        "evidence_fingerprint",
+        "exchange_snapshot_fingerprint",
+        "exchange_writes",
+        "history_replays",
+        "source_fingerprint",
+        "status",
+    }
+    assert "confirmation_token" not in result.stdout
+    assert "observations" not in result.stdout
+    assert FP_A not in result.stdout
+    assert result.stderr == ""
+
+
+def test_recovery_output_projector_drops_apply_audit_event_id():
+    document = json.dumps(
+        {
+            "action_count": 29,
+            "audit_event_id": 987654,
+            "evidence_fingerprint": FP_A,
+            "mode": "apply",
+            "schema_version": 1,
+            "status": "applied",
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    result = _project_recovery_output("apply-result", document)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "action_count": 29,
+        "evidence_fingerprint": FP_A,
+        "status": "applied",
+    }
+    assert "audit_event_id" not in result.stdout
+    assert "987654" not in result.stdout
+    assert result.stderr == ""
+
+
+def test_recovery_output_projector_rejects_duplicate_or_unknown_apply_fields():
+    duplicate = (
+        '{"action_count":1,"action_count":1,"audit_event_id":2,'
+        f'"evidence_fingerprint":"{FP_A}","mode":"apply",'
+        '"schema_version":1,"status":"applied"}'
+    )
+    unknown = json.dumps(
+        {
+            "action_count": 1,
+            "audit_event_id": 2,
+            "evidence_fingerprint": FP_A,
+            "mode": "apply",
+            "provider_row": "TOPSECRET",
+            "schema_version": 1,
+            "status": "applied",
+        }
+    )
+
+    for document in (duplicate, unknown):
+        result = _project_recovery_output("apply-result", document)
+        assert result.returncode == 2
+        assert result.stdout == '{"status":"refused"}\n'
+        assert "TOPSECRET" not in result.stdout
+        assert result.stderr == ""
+
+
+def test_writer_quiescence_inventory_exactly_mirrors_deployment_preflight_specs(
+    tmp_path,
+):
+    database = tmp_path / "writers.db"
+    _writer_quiescence_database(database)
+
+    result = _run_writer_quiescence(database)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "checked_table_count": len(_EXPECTED_WRITER_SPECS),
+        "missing_table_count": 0,
+        "other_active_or_unknown_writer_count": 0,
+        "schema_version": 1,
+        "status": "ready",
+        "target_reservation_count": 1,
+    }
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    ("table", "column", "active_state"),
+    [
+        spec
+        for spec in _EXPECTED_WRITER_SPECS
+        if spec[0] != "bound_position_close_reservations"
+    ],
+)
+def test_writer_quiescence_refuses_each_preflight_writer_table(
+    tmp_path,
+    table,
+    column,
+    active_state,
+):
+    database = tmp_path / "writers.db"
+    _writer_quiescence_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            f'INSERT INTO "{table}" (id, "{column}") VALUES (1, ?)',
+            (active_state,),
+        )
+
+    result = _run_writer_quiescence(database)
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "refused"
+    assert payload["other_active_or_unknown_writer_count"] == 1
+    assert set(payload) == {
+        "checked_table_count",
+        "missing_table_count",
+        "other_active_or_unknown_writer_count",
+        "schema_version",
+        "status",
+        "target_reservation_count",
+    }
+    assert table not in result.stdout
+    assert active_state not in result.stdout
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize("invalid_state", [None, "future_writer_state"])
+@pytest.mark.parametrize(
+    ("table", "column", "_active_state"),
+    _EXPECTED_WRITER_SPECS,
+)
+def test_writer_quiescence_refuses_null_and_future_states_in_every_existing_table(
+    tmp_path,
+    table,
+    column,
+    _active_state,
+    invalid_state,
+):
+    database = tmp_path / "writers.db"
+    _writer_quiescence_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(f'DELETE FROM "{table}"')
+        connection.execute(
+            f'INSERT INTO "{table}" (id, "{column}") VALUES (1, ?)',
+            (invalid_state,),
+        )
+
+    result = _run_writer_quiescence(database)
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "refused"
+    assert payload["other_active_or_unknown_writer_count"] == 1
+    assert "future_writer_state" not in result.stdout
+    assert table not in result.stdout
+    assert result.stderr == ""
+
+
+def test_writer_quiescence_explicitly_accepts_missing_prior_schema_tables(tmp_path):
+    database = tmp_path / "prior.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE bound_position_close_reservations "
+            "(id INTEGER PRIMARY KEY, status TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO bound_position_close_reservations VALUES (1, 'submitted')"
+        )
+
+    result = _run_writer_quiescence(database)
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "ready"
+    assert payload["checked_table_count"] == 1
+    assert payload["missing_table_count"] == len(_EXPECTED_WRITER_SPECS) - 1
+    assert payload["other_active_or_unknown_writer_count"] == 0

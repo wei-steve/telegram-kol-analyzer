@@ -1631,63 +1631,17 @@ if pgrep -f '[t]elegram_kol_research|[t]elegram-kol' >/dev/null; then
   exit 1
 fi
 
-# 只排除本命令完整装载的五种 target reservation；其他持久化
-# active/unknown exchange writer 事实必须全部为零。
-TARGET_RESERVATION_COUNT="$(sqlite3 -readonly "$PRODUCTION_DB" <<'SQL'
-PRAGMA query_only=ON;
-SELECT COUNT(*) FROM bound_position_close_reservations
- WHERE status IN (
-   'reserved','submitted','submit_unknown','unknown_exchange_outcome',
-   'recovery_required'
- );
-SQL
-)"
-test "$TARGET_RESERVATION_COUNT" -gt 0
-test "$TARGET_RESERVATION_COUNT" -le 64
-UNRECOGNIZED_RESERVATION_COUNT="$(sqlite3 -readonly "$PRODUCTION_DB" <<'SQL'
-PRAGMA query_only=ON;
-SELECT COUNT(*) FROM bound_position_close_reservations
- WHERE status NOT IN (
-   'reserved','submitted','submit_unknown','unknown_exchange_outcome',
-   'recovery_required','confirmed'
- );
-SQL
-)"
-test "$UNRECOGNIZED_RESERVATION_COUNT" = 0
-DEEPCOIN_OPERATION_TABLE_PRESENT="$(sqlite3 -readonly "$PRODUCTION_DB" \
-  "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='deepcoin_execution_operations';")"
-DEEPCOIN_OPERATION_ACTIVE_COUNT=0
-case "$DEEPCOIN_OPERATION_TABLE_PRESENT" in
-  0) ;;
-  1)
-    DEEPCOIN_OPERATION_ACTIVE_COUNT="$(sqlite3 -readonly "$PRODUCTION_DB" <<'SQL'
-PRAGMA query_only=ON;
-SELECT COUNT(*) FROM deepcoin_execution_operations
- WHERE state IS NULL OR state NOT IN (
-   'pre_submit_deferred','completed','submission_failed_no_exposure'
- );
-SQL
-)"
-    ;;
-  *) exit 1 ;;
-esac
-OTHER_ACTIVE_OR_UNKNOWN_WRITERS="$(sqlite3 -readonly "$PRODUCTION_DB" <<'SQL'
-PRAGMA query_only=ON;
-SELECT SUM(n) FROM (
-  SELECT COUNT(*) AS n FROM position_mutation_intents
-   WHERE status IN (
-     'reserved','submitting','submitted','submit_unknown','recovery_required'
-   )
-  UNION ALL
-  SELECT COUNT(*) FROM position_backup_stop_orders
-   WHERE status IN ('submitting','pending_readback','unknown_exchange_outcome')
-);
-SQL
-)"
-ACTIVE_OR_UNKNOWN_WRITERS_EXCEPT_TARGET="$((
-  OTHER_ACTIVE_OR_UNKNOWN_WRITERS + DEEPCOIN_OPERATION_ACTIVE_COUNT
-))"
-test "$ACTIVE_OR_UNKNOWN_WRITERS_EXCEPT_TARGET" = 0
+# 使用 candidate 内审查的 closed inventory，精确镜像
+# deployment_preflight._WORK_SPECS 的全部表。它只排除本命令
+# 完整装载的五种 target reservation；其他存在表的 active、
+# NULL 或未来未知状态都计入 other_active_or_unknown_writer_count。
+# 旧 schema 中不存在的表只计入 missing_table_count，不会被 bootstrap。
+# 安全输出另外只包含 checked_table_count 和 target_reservation_count。
+WRITER_QUIESCENCE_RESULT="$RECOVERY_TMP/writer-quiescence.json"
+PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
+  "$CANDIDATE_ROOT/scripts/check_bound_close_reservation_writer_quiescence.py" \
+  "$PRODUCTION_DB" > "$WRITER_QUIESCENCE_RESULT"
+chmod 0600 "$WRITER_QUIESCENCE_RESULT"
 
 for ATTEMPT in 1 2; do
   RESULT="$RECOVERY_TMP/dry-run-${ATTEMPT}.json"
@@ -1697,6 +1651,11 @@ for ATTEMPT in 1 2; do
     --generation-database-path "$PRODUCTION_DB" \
     > "$RESULT"
   chmod 0600 "$RESULT"
+  SUMMARY="$RECOVERY_TMP/dry-run-${ATTEMPT}-summary.json"
+  PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
+    "$CANDIDATE_ROOT/scripts/project_bound_close_reservation_recovery_output.py" \
+    capture < "$RESULT" > "$SUMMARY"
+  chmod 0600 "$SUMMARY"
 done
 PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
   "$CANDIDATE_ROOT/scripts/compare_bound_close_reservation_dry_runs.py" \
@@ -1725,7 +1684,7 @@ I_AUTHORIZE_BOUND_CLOSE_RESERVATIONS_PROVEN_TERMINAL_ONLY
 新窗口必须从上一节的 `set -euo pipefail` 开始，重新执行同一组
 branch/SHA 检查、完整 `QUIESCE_UNITS` 清单、原状态记录、
 `restore_bound_close_reservation_units`/`finish_bound_close_reservation_window` trap、
-unknown-process 拒绝和 `ACTIVE_OR_UNKNOWN_WRITERS_EXCEPT_TARGET=0` 检查。
+unknown-process 拒绝和完整 writer-quiescence aggregate 检查。
 将干跑 token 检查替换为下列 apply token 检查：
 
 ```bash
@@ -1757,6 +1716,11 @@ PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
   --generation-database-path "$PRODUCTION_DB" \
   > "$APPLY_CAPTURE"
 chmod 0600 "$APPLY_CAPTURE"
+APPLY_CAPTURE_SUMMARY="$RECOVERY_TMP/apply-capture-summary.json"
+PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
+  "$CANDIDATE_ROOT/scripts/project_bound_close_reservation_recovery_output.py" \
+  capture < "$APPLY_CAPTURE" > "$APPLY_CAPTURE_SUMMARY"
+chmod 0600 "$APPLY_CAPTURE_SUMMARY"
 ```
 
 人工只审阅这次 capture 的 ready 状态、classification counts 和三个
@@ -1766,6 +1730,7 @@ fingerprint。如果不是全部 `PROVEN_TERMINAL`，或与已批准范围不符
 `<fresh-confirmation-token>`，完整执行一次 CLI：
 
 ```bash
+APPLY_SUMMARY="$RECOVERY_TMP/apply-summary.json"
 PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
   telegram_kol_research.cli recover-bound-position-close-reservations \
   --database-path "$PRODUCTION_DB" \
@@ -1775,9 +1740,16 @@ PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
   --expected-action-count '<exact-action-count>' \
   --confirmation-token '<fresh-confirmation-token>' \
   --authorization "$APPLY_AUTHORIZATION" \
-  > "$RECOVERY_TMP/apply-result.json"
-chmod 0600 "$RECOVERY_TMP/apply-result.json"
+  | PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
+    "$CANDIDATE_ROOT/scripts/project_bound_close_reservation_recovery_output.py" \
+    apply-result > "$APPLY_SUMMARY"
+chmod 0600 "$APPLY_SUMMARY"
 ```
+
+上述 pipe 在内存中严格验证 CLI 的六个固定字段，但只持久化
+`("status","action_count","evidence_fingerprint")`。原始 apply JSON 及其
+`audit_event_id` 不落盘。capture summary 同样不包含 confirmation token 或
+raw observations；这些只能存在当次 0700/0600 private capture 中，不得回显。
 
 apply 成功后在任何服务重启前，只用 query-only 连接检查剩余 target、
 唯一审计事件和 MiMo v1。将 `<fresh-evidence-fingerprint>` 替换为本窗口的
