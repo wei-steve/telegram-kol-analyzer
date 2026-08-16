@@ -1533,6 +1533,7 @@ umask 077
 
 PRODUCTION_ROOT=/opt/telegram-kol-analyzer
 PRODUCTION_DB="$PRODUCTION_ROOT/data/research.db"
+PRODUCTION_DEEPCOIN_ENV="$PRODUCTION_ROOT/config/telegram.env"
 RUNTIME_PYTHON="$PRODUCTION_ROOT/.venv/bin/python"
 REVIEWED_SHA='<exact-reviewed-recovery-sha>'
 PHASE_ONE_SHA='c50887b991712340d7d5606fb6916cdbb033926e'
@@ -1584,6 +1585,13 @@ declare -A ORIGINAL_UNIT_INSTALL_STATE
 QUIESCE_ATTEMPTED=0
 BOUND_CLOSE_SAFE_DIAGNOSTIC=''
 ORIGINAL_SHA="$(git -C "$PRODUCTION_ROOT" rev-parse HEAD)"
+test ! -e "$PRODUCTION_ROOT/.env"
+test ! -L "$PRODUCTION_DEEPCOIN_ENV"
+test -f "$PRODUCTION_DEEPCOIN_ENV"
+test "$(stat -Lc '%u:%a' -- "$PRODUCTION_DEEPCOIN_ENV")" = '0:600'
+if env | grep '^DEEPCOIN_' >/dev/null; then
+  exit 1
+fi
 PRODUCTION_DB_RESOLVED_PATH="$(readlink -f -- "$PRODUCTION_DB")"
 test -f "$PRODUCTION_DB_RESOLVED_PATH"
 PRODUCTION_DB_DEVICE_INODE="$(stat -Lc '%d:%i' -- "$PRODUCTION_DB")"
@@ -2161,11 +2169,13 @@ run_bound_close_double_capture() {
     verify_all_local_quiescence_and_identity
     RESULT="$RECOVERY_TMP/dry-run-${ATTEMPT}.json"
     set +e
-    PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
-      telegram_kol_research.cli recover-bound-position-close-reservations \
-      --database-path "$PRODUCTION_DB" \
-      --generation-database-path "$PRODUCTION_DB" \
-      > "$RESULT"
+    (
+      cd "$PRODUCTION_ROOT"
+      PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
+        telegram_kol_research.cli recover-bound-position-close-reservations \
+        --database-path "$PRODUCTION_DB" \
+        --generation-database-path "$PRODUCTION_DB"
+    ) > "$RESULT"
     CAPTURE_STATUS=$?
     set -e
     chmod 0600 "$RESULT"
@@ -2319,11 +2329,13 @@ test "$(sqlite3 -readonly "$BACKUP_PATH" 'PRAGMA quick_check;')" = ok
 
 ```bash
 APPLY_CAPTURE="$RECOVERY_TMP/apply-capture.json"
-PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
-  telegram_kol_research.cli recover-bound-position-close-reservations \
-  --database-path "$PRODUCTION_DB" \
-  --generation-database-path "$PRODUCTION_DB" \
-  > "$APPLY_CAPTURE"
+(
+  cd "$PRODUCTION_ROOT"
+  PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
+    telegram_kol_research.cli recover-bound-position-close-reservations \
+    --database-path "$PRODUCTION_DB" \
+    --generation-database-path "$PRODUCTION_DB"
+) > "$APPLY_CAPTURE"
 chmod 0600 "$APPLY_CAPTURE"
 APPLY_CAPTURE_SUMMARY="$RECOVERY_TMP/apply-capture-summary.json"
 PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
@@ -2341,16 +2353,18 @@ fingerprint。如果不是全部 `PROVEN_TERMINAL`，或与已批准范围不符
 ```bash
 APPLY_SUMMARY="$RECOVERY_TMP/apply-summary.json"
 set +e
-PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
-  telegram_kol_research.cli recover-bound-position-close-reservations \
-  --database-path "$PRODUCTION_DB" \
-  --generation-database-path "$PRODUCTION_DB" \
-  --apply \
-  --expected-fingerprint '<fresh-evidence-fingerprint>' \
-  --expected-action-count '<exact-action-count>' \
-  --confirmation-token '<fresh-confirmation-token>' \
-  --authorization "$APPLY_AUTHORIZATION" \
-  | PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
+(
+  cd "$PRODUCTION_ROOT"
+  PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
+    telegram_kol_research.cli recover-bound-position-close-reservations \
+    --database-path "$PRODUCTION_DB" \
+    --generation-database-path "$PRODUCTION_DB" \
+    --apply \
+    --expected-fingerprint '<fresh-evidence-fingerprint>' \
+    --expected-action-count '<exact-action-count>' \
+    --confirmation-token '<fresh-confirmation-token>' \
+    --authorization "$APPLY_AUTHORIZATION"
+) | PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
     "$CANDIDATE_ROOT/scripts/project_bound_close_reservation_recovery_output.py" \
     apply-result > "$APPLY_SUMMARY"
 APPLY_PIPE_STATUS=("${PIPESTATUS[@]}")

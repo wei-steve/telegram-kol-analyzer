@@ -652,6 +652,8 @@ def test_runbook_refused_capture_prints_diagnostic_only_after_restore(tmp_path):
     validator_function = _bound_close_diagnostic_validator_function(block)
     recovery_tmp = tmp_path / "recovery"
     recovery_tmp.mkdir()
+    production_root = tmp_path / "production"
+    production_root.mkdir()
     events = tmp_path / "events.txt"
     capture_document = tmp_path / "capture.json"
     capture_document.write_text(
@@ -699,6 +701,7 @@ export CAPTURE_DOCUMENT={shlex.quote(str(capture_document))}
 export REAL_PYTHON={shlex.quote(sys.executable)}
 RECOVERY_TMP={shlex.quote(str(recovery_tmp))}
 CANDIDATE_ROOT={shlex.quote(str(project_root))}
+PRODUCTION_ROOT={shlex.quote(str(production_root))}
 RUNTIME_PYTHON={shlex.quote(str(runtime))}
 PRODUCTION_DB={shlex.quote(str(tmp_path / 'production.db'))}
 BOUND_CLOSE_SAFE_DIAGNOSTIC=''
@@ -754,6 +757,7 @@ def _simulate_runbook_capture_failure(
     validator_stderr: str = "",
     cleanup_status: int = 0,
     verify_fail_at: int | None = None,
+    record_capture_cwd: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
     block = _bound_close_read_only_block()
     capture_function = _bound_close_shell_function(
@@ -772,6 +776,12 @@ def _simulate_runbook_capture_failure(
     diagnostic_path.write_text(diagnostic_output or "", encoding="utf-8")
     verify_counter = tmp_path / "verify-counter.txt"
     verify_counter.write_text("0", encoding="utf-8")
+    production_root = tmp_path / "production"
+    (production_root / "config").mkdir(parents=True)
+    (production_root / "config" / "telegram.env").write_text(
+        "DEEPCOIN_API_KEY=test-only\n",
+        encoding="utf-8",
+    )
     runtime = tmp_path / "runtime-python"
     diagnostic_branch = (
         "cat \"$DIAGNOSTIC_OUTPUT\"\n"
@@ -783,6 +793,9 @@ def _simulate_runbook_capture_failure(
         f"""#!/bin/bash
 set -euo pipefail
 if [ "${{1:-}}" = -m ]; then
+  if [ "$RECORD_CAPTURE_CWD" = 1 ]; then
+    printf 'capture-cwd=%s\\n' "$PWD" >> "$EVENTS"
+  fi
   printf 'capture-1\\n' >> "$EVENTS"
   cat "$CAPTURE_DOCUMENT"
   exit {capture_status}
@@ -816,9 +829,11 @@ export DIAGNOSTIC_OUTPUT={shlex.quote(str(diagnostic_path))}
 export DIAGNOSTIC_STDERR={shlex.quote(diagnostic_stderr)}
 export VALIDATOR_STDERR={shlex.quote(validator_stderr)}
 export VERIFY_COUNTER={shlex.quote(str(verify_counter))}
+export RECORD_CAPTURE_CWD={1 if record_capture_cwd else 0}
 export REAL_PYTHON={shlex.quote(sys.executable)}
 RECOVERY_TMP={shlex.quote(str(recovery_tmp))}
 CANDIDATE_ROOT={shlex.quote(str(project_root))}
+PRODUCTION_ROOT={shlex.quote(str(production_root))}
 RUNTIME_PYTHON={shlex.quote(str(runtime))}
 PRODUCTION_DB={shlex.quote(str(tmp_path / 'production.db'))}
 BOUND_CLOSE_SAFE_DIAGNOSTIC=''
@@ -855,6 +870,94 @@ run_bound_close_double_capture
         timeout=10,
     )
     return result, events, recovery_tmp
+
+
+def test_runbook_capture_executes_cli_from_production_root(tmp_path):
+    result, events, recovery_tmp = _simulate_runbook_capture_failure(
+        tmp_path,
+        capture_status=2,
+        capture_document=_document(
+            started_at=START,
+            observations=(
+                _observation(
+                    classification=ReservationClassification.UNKNOWN,
+                    reason_code="exchange_history_incomplete",
+                ),
+            ),
+        ),
+        record_capture_cwd=True,
+    )
+
+    assert result.returncode == 2
+    assert events.read_text(encoding="utf-8").splitlines()[0] == (
+        f"capture-cwd={tmp_path / 'production'}"
+    )
+    assert result.stderr == ""
+    assert not recovery_tmp.exists()
+
+
+def test_runbook_validates_closed_production_deepcoin_environment_before_stop():
+    block = _bound_close_read_only_block()
+    config_path = 'PRODUCTION_DEEPCOIN_ENV="$PRODUCTION_ROOT/config/telegram.env"'
+    config_regular = 'test -f "$PRODUCTION_DEEPCOIN_ENV"'
+    config_symlink = 'test ! -L "$PRODUCTION_DEEPCOIN_ENV"'
+    config_owner_mode = (
+        'test "$(stat -Lc \'%u:%a\' -- "$PRODUCTION_DEEPCOIN_ENV")" = \'0:600\''
+    )
+    no_shadow = 'test ! -e "$PRODUCTION_ROOT/.env"'
+    no_ambient = "if env | grep '^DEEPCOIN_' >/dev/null; then"
+    stop_boundary = block.index("QUIESCE_ATTEMPTED=1")
+
+    for required in (
+        config_path,
+        config_regular,
+        config_symlink,
+        config_owner_mode,
+        no_shadow,
+        no_ambient,
+    ):
+        assert required in block
+        assert block.index(required) < stop_boundary
+
+
+def test_runbook_rejects_ambient_deepcoin_in_large_environment_before_stop():
+    block = _bound_close_read_only_block()
+    guard_start = block.index("if env | grep")
+    guard_end = block.index("\nfi", guard_start) + len("\nfi")
+    guard = block[guard_start:guard_end]
+    environment = {
+        "DEEPCOIN_API_KEY": "test-only-never-print",
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+    }
+    environment.update(
+        {f"BOUND_CLOSE_PADDING_{index:04d}": "x" * 512 for index in range(400)}
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", f"set -euo pipefail\n{guard}\nprintf 'incorrectly-allowed\\n'"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+def test_every_bound_close_recovery_cli_runs_from_production_root():
+    project_root = Path(__file__).resolve().parents[1]
+    runbook = (project_root / "docs" / "runbook.md").read_text(encoding="utf-8")
+    section = runbook.split(
+        "## Bound position close reservation convergence", 1
+    )[1].split("## Batch 119 composite-management recovery", 1)[0]
+    command = (
+        "telegram_kol_research.cli recover-bound-position-close-reservations"
+    )
+
+    assert section.count(command) == 3
+    assert section.count('cd "$PRODUCTION_ROOT"') == section.count(command)
 
 
 @pytest.mark.parametrize(
@@ -1057,6 +1160,8 @@ def test_runbook_two_ready_captures_still_compare_once_and_restore(tmp_path):
     validator_function = _bound_close_diagnostic_validator_function(block)
     recovery_tmp = tmp_path / "recovery"
     recovery_tmp.mkdir()
+    production_root = tmp_path / "production"
+    production_root.mkdir()
     events = tmp_path / "events.txt"
     counter = tmp_path / "counter.txt"
     counter.write_text("0", encoding="utf-8")
@@ -1108,6 +1213,7 @@ export CAPTURE_DOCUMENT_2={shlex.quote(str(second))}
 export REAL_PYTHON={shlex.quote(sys.executable)}
 RECOVERY_TMP={shlex.quote(str(recovery_tmp))}
 CANDIDATE_ROOT={shlex.quote(str(project_root))}
+PRODUCTION_ROOT={shlex.quote(str(production_root))}
 RUNTIME_PYTHON={shlex.quote(str(runtime))}
 PRODUCTION_DB={shlex.quote(str(tmp_path / 'production.db'))}
 BOUND_CLOSE_SAFE_DIAGNOSTIC=''
