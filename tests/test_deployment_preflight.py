@@ -1582,7 +1582,10 @@ def test_every_fresh_close_reservation_state_blocks_ordinary_code_deployment(
     ("status", "unknown_count"),
     [
         ("reserved", 0),
+        ("submitted", 0),
+        ("submit_unknown", 1),
         ("unknown_exchange_outcome", 1),
+        ("recovery_required", 1),
     ],
 )
 def test_historical_close_reservation_residue_remains_visible_as_warning(

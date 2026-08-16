@@ -5000,6 +5000,49 @@ def test_apply_result_serialization_is_exact_bounded_canonical_json(status):
     assert len(serialized.encode("utf-8")) <= MAX_RECOVERY_PLAN_BYTES
 
 
+def _complete_recovery_database_for_preflight(database: Path) -> None:
+    from telegram_kol_research.db import create_session_factory
+
+    template = database.with_name(f"{database.stem}-preflight-template.sqlite3")
+    session_factory = create_session_factory(template)
+    session_factory.kw["bind"].dispose()
+    with sqlite3.connect(template) as source, sqlite3.connect(database) as target:
+        existing = {
+            str(row[0])
+            for row in target.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        table_definitions = source.execute(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()
+        for table_name, definition in table_definitions:
+            if table_name not in existing:
+                target.execute(str(definition))
+
+
+def _collect_recovery_database_preflight(database: Path):
+    from telegram_kol_research.deployment_preflight import (
+        build_deployment_preflight_artifact,
+        collect_deployment_preflight_facts,
+    )
+
+    gate_now = datetime(2026, 8, 14, 10, 1, tzinfo=UTC)
+    facts = collect_deployment_preflight_facts(
+        database_path=database,
+        change_class="code",
+        now=gate_now,
+    )
+    artifact = build_deployment_preflight_artifact(
+        expected_commit="a" * 40,
+        change_class="code",
+        facts=facts,
+        now=gate_now,
+    )
+    return facts, artifact["decision"]
+
+
 @pytest.mark.parametrize(
     ("classification", "reason_code"),
     [
@@ -5013,27 +5056,62 @@ def test_apply_result_serialization_is_exact_bounded_canonical_json(status):
         ),
     ],
 )
-def test_nonterminal_recovery_plan_is_refused_without_a_gate_override(
+def test_nonterminal_recovery_capture_cannot_open_writer_or_clear_preflight(
+    tmp_path,
+    monkeypatch,
     classification,
     reason_code,
 ):
-    plan = _built_recovery_plan(
-        (
-            _observation(
-                classification=classification,
-                reason_code=reason_code,
-            ),
-        )
+    database = _apply_database(tmp_path, name=f"refused-{classification}.sqlite3")
+    _complete_recovery_database_for_preflight(database)
+    source = load_bound_close_reservation_source(database)
+    responses = _terminal_provider_responses(source)
+    raw = source._capability._get(source.reservations[0].reservation_ref)
+    if classification is ReservationClassification.ACTIVE:
+        responses[0] = {
+            "code": "0",
+            "data": [
+                {
+                    "instId": raw.instrument_id,
+                    "posId": raw.position_id,
+                    "posSide": source.reservations[0].side,
+                    "pos": "1",
+                }
+            ],
+        }
+    else:
+        responses[4] = {"code": "0", "data": []}
+    capture, _reader, _http = _capture_with_provider_responses(
+        monkeypatch,
+        source,
+        responses,
     )
-    payload = json.loads(
-        serialize_bound_close_reservation_recovery_plan(
-            plan,
-            capture_started_at=PLAN_CAPTURE_STARTED,
-            capture_completed_at=PLAN_CAPTURE_COMPLETED,
-        )
+    before_facts, before_decision = _collect_recovery_database_preflight(
+        database
+    )
+    opened = []
+    monkeypatch.setattr(
+        recovery_module,
+        "_open_bound_close_reservation_writable_connection",
+        lambda path: opened.append(path),
     )
 
-    assert plan.status == "refused"
-    assert plan.action_count == 0
-    assert "deployment_gate_override" not in payload
-    assert "deployable" not in payload
+    assert capture.plan.status == "refused"
+    assert capture.plan.action_count == 0
+    assert capture.plan.observations[0].classification is classification
+    assert capture.plan.observations[0].reason_code == reason_code
+    assert before_facts.fresh_active_work == {"position_closes": 1}
+    assert before_decision == "BLOCK"
+    with pytest.raises(
+        BoundCloseReservationRecoveryConflict,
+        match="plan_not_actionable",
+    ):
+        _apply_ready(database, capture)
+
+    after_facts, after_decision = _collect_recovery_database_preflight(database)
+    assert opened == []
+    assert _table_rows(database, "bound_position_close_reservations")[0][
+        "status"
+    ] == "submitted"
+    assert after_facts.fresh_active_work == {"position_closes": 1}
+    assert after_decision == "BLOCK"
