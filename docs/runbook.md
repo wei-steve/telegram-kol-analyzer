@@ -1512,6 +1512,15 @@ I_APPROVE_BOUND_CLOSE_RESERVATIONS_ALL_DB_UNITS_STOPPED_READ_ONLY_DOUBLE_CAPTURE
 失败都由 trap 恢复原状态。它只直接读生产库；CLI loader 使用
 SQLite `mode=ro` + `PRAGMA query_only=ON` + 显式只读事务，不执行 bootstrap。
 
+`telegram-kol-agent-model-egress.socket/service` 只是 MiMo 固定出站代理，
+不读取生产数据库，也不调用 Deepcoin/交易所。但两者都声明
+`PartOf=telegram-kol-runtime-agent.service`，停止 Runtime Agent 会级联改变它们的
+状态，所以仍必须纳入 installed/absent 与 active/inactive 原状态保存和
+恢复，不将它们误当成数据库或交易所 writer。
+任意 oneshot monitor/db-stage service 若在初始取样时为 active，必须在停止
+任何 unit 之前拒绝并稍后重试；重新 start 一个 oneshot 会重做任务，
+不是恢复那个瞬时 active 状态。
+
 ```bash
 set -euo pipefail
 umask 077
@@ -1525,21 +1534,129 @@ APPROVED_REF='refs/remotes/origin/codex/bound-close-reservation-recovery'
 RECOVERY_TMP="$(mktemp -d /tmp/bound-close-reservation-recovery.XXXXXX)"
 chmod 0700 "$RECOVERY_TMP"
 CANDIDATE_ROOT="$RECOVERY_TMP/candidate"
-QUIESCE_UNITS=(
+QUIESCE_TIMER_UNITS=(
   telegram-kol-monitor.timer
+  telegram-kol-monitor-snapshot.timer
+  telegram-kol-sentinel.timer
+  telegram-kol-monitor-audit.timer
+)
+QUIESCE_SERVICE_UNITS=(
   telegram-kol-monitor.service
   telegram-kol-monitor-diagnostic.service
   telegram-kol-monitor-test-notification.service
+  telegram-kol-monitor-snapshot.service
+  telegram-kol-sentinel.service
+  telegram-kol-monitor-audit.service
   telegram-kol-runtime-scanner.service
   telegram-kol-runtime-agent.service
+  telegram-kol-agent-model-egress.service
   telegram-kol.service
 )
+QUIESCE_TRANSIENT_ONESHOT_UNITS=(
+  telegram-kol-monitor.service
+  telegram-kol-monitor-diagnostic.service
+  telegram-kol-monitor-test-notification.service
+  telegram-kol-monitor-snapshot.service
+  telegram-kol-sentinel.service
+  telegram-kol-monitor-audit.service
+)
+QUIESCE_SOCKET_UNITS=(
+  telegram-kol-agent-model-egress.socket
+)
+QUIESCE_DB_STAGE_SEED_UNITS=(
+  telegram-kol-monitor-db-stage@sentinel.service
+  telegram-kol-monitor-db-stage@audit.service
+)
+QUIESCE_DB_STAGE_UNITS=()
+QUIESCE_UNITS=(
+  "${QUIESCE_TIMER_UNITS[@]}"
+  "${QUIESCE_SERVICE_UNITS[@]}"
+  "${QUIESCE_SOCKET_UNITS[@]}"
+)
 declare -A ORIGINAL_UNIT_STATE
+declare -A ORIGINAL_UNIT_INSTALL_STATE
 QUIESCE_ATTEMPTED=0
 ORIGINAL_SHA="$(git -C "$PRODUCTION_ROOT" rev-parse HEAD)"
-for UNIT in "${QUIESCE_UNITS[@]}"; do
-  ORIGINAL_UNIT_STATE["$UNIT"]="$(systemctl is-active "$UNIT" || true)"
-done
+DB_STAGE_INITIAL_INVENTORY="$RECOVERY_TMP/db-stage-initial.txt"
+DB_STAGE_CURRENT_INVENTORY="$RECOVERY_TMP/db-stage-current.txt"
+
+discover_bound_close_db_stage_units() {
+  local output_path="$1"
+  local unit
+  {
+    printf '%s\n' "${QUIESCE_DB_STAGE_SEED_UNITS[@]}"
+    systemctl list-units --all --type=service --plain --no-legend --no-pager \
+      'telegram-kol-monitor-db-stage@*.service'
+    systemctl list-unit-files --type=service --no-legend --no-pager \
+      'telegram-kol-monitor-db-stage@*.service'
+  } | awk '
+    $1 ~ /^telegram-kol-monitor-db-stage@/ &&
+    $1 != "telegram-kol-monitor-db-stage@.service" {print $1}
+  ' | LC_ALL=C sort -u > "$output_path"
+  while IFS= read -r unit; do
+    if [[ ! "$unit" =~ ^telegram-kol-monitor-db-stage@[A-Za-z0-9_.:-]+\.service$ ]]; then
+      return 1
+    fi
+  done < "$output_path"
+}
+
+record_bound_close_unit_state() {
+  local unit="$1"
+  local load_state
+  local active_state
+  if ! load_state="$(systemctl show "$unit" --property=LoadState --value)"; then
+    return 1
+  fi
+  case "$load_state" in
+    loaded) ORIGINAL_UNIT_INSTALL_STATE["$unit"]=installed ;;
+    not-found) ORIGINAL_UNIT_INSTALL_STATE["$unit"]=absent ;;
+    *) return 1 ;;
+  esac
+  if [ "${ORIGINAL_UNIT_INSTALL_STATE[$unit]}" = installed ]; then
+    active_state="$(systemctl is-active "$unit" || true)"
+    case "$active_state" in
+      active|inactive) ORIGINAL_UNIT_STATE["$unit"]="$active_state" ;;
+      *) return 1 ;;
+    esac
+  else
+    ORIGINAL_UNIT_STATE["$unit"]=absent
+  fi
+}
+
+stop_bound_close_unit_group() {
+  local unit
+  for unit in "$@"; do
+    case "${ORIGINAL_UNIT_INSTALL_STATE[$unit]}" in
+      installed) sudo systemctl stop "$unit" ;;
+      absent) ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+verify_bound_close_unit_group_inactive() {
+  local unit
+  local load_state
+  for unit in "$@"; do
+    load_state="$(systemctl show "$unit" --property=LoadState --value)"
+    case "${ORIGINAL_UNIT_INSTALL_STATE[$unit]}" in
+      installed)
+        [ "$load_state" = loaded ] || return 1
+        [ "$(systemctl is-active "$unit" || true)" = inactive ] || return 1
+        ;;
+      absent) [ "$load_state" = not-found ] || return 1 ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+verify_bound_close_quiescence() {
+  discover_bound_close_db_stage_units "$DB_STAGE_CURRENT_INVENTORY"
+  cmp -s "$DB_STAGE_INITIAL_INVENTORY" "$DB_STAGE_CURRENT_INVENTORY"
+  verify_bound_close_unit_group_inactive "${QUIESCE_TIMER_UNITS[@]}"
+  verify_bound_close_unit_group_inactive "${QUIESCE_SERVICE_UNITS[@]}"
+  verify_bound_close_unit_group_inactive "${QUIESCE_SOCKET_UNITS[@]}"
+}
 
 restore_bound_close_reservation_units() {
   local cleanup_status=0
@@ -1555,29 +1672,49 @@ restore_bound_close_reservation_units() {
   if [ "$QUIESCE_ATTEMPTED" = 1 ]; then
     for ((INDEX=${#QUIESCE_UNITS[@]}-1; INDEX>=0; INDEX--)); do
       UNIT="${QUIESCE_UNITS[$INDEX]}"
-      if [ "${ORIGINAL_UNIT_STATE[$UNIT]}" = active ]; then
-        if ! sudo systemctl start "$UNIT"; then
-          cleanup_status=1
-        elif ! timeout 30 systemctl is-active --quiet "$UNIT"; then
-          cleanup_status=1
-        fi
-      elif [ "${ORIGINAL_UNIT_STATE[$UNIT]}" = inactive ]; then
-        if ! sudo systemctl stop "$UNIT"; then
-          cleanup_status=1
-        elif [ "$(systemctl is-active "$UNIT" || true)" != inactive ]; then
-          cleanup_status=1
-        fi
-      else
-        cleanup_status=1
-      fi
+      case "${ORIGINAL_UNIT_INSTALL_STATE[$UNIT]}:${ORIGINAL_UNIT_STATE[$UNIT]}" in
+        installed:active)
+          if ! sudo systemctl start "$UNIT"; then
+            cleanup_status=1
+          elif ! timeout 30 systemctl is-active --quiet "$UNIT"; then
+            cleanup_status=1
+          fi
+          ;;
+        installed:inactive)
+          if ! sudo systemctl stop "$UNIT"; then
+            cleanup_status=1
+          elif [ "$(systemctl is-active "$UNIT" || true)" != inactive ]; then
+            cleanup_status=1
+          fi
+          ;;
+        absent:absent)
+          if [ "$(systemctl show "$UNIT" --property=LoadState --value)" != \
+            not-found ]; then
+            cleanup_status=1
+          fi
+          ;;
+        *) cleanup_status=1 ;;
+      esac
     done
     for VERIFY_PASS in 1 2 3; do
       sleep 1
       for UNIT in "${QUIESCE_UNITS[@]}"; do
-        if [ "$(systemctl is-active "$UNIT" || true)" != \
-          "${ORIGINAL_UNIT_STATE[$UNIT]}" ]; then
-          cleanup_status=1
-        fi
+        case "${ORIGINAL_UNIT_INSTALL_STATE[$UNIT]}" in
+          installed)
+            if [ "$(systemctl show "$UNIT" --property=LoadState --value)" != \
+              loaded ] || [ "$(systemctl is-active "$UNIT" || true)" != \
+              "${ORIGINAL_UNIT_STATE[$UNIT]}" ]; then
+              cleanup_status=1
+            fi
+            ;;
+          absent)
+            if [ "$(systemctl show "$UNIT" --property=LoadState --value)" != \
+              not-found ]; then
+              cleanup_status=1
+            fi
+            ;;
+          *) cleanup_status=1 ;;
+        esac
       done
     done
   fi
@@ -1601,9 +1738,22 @@ finish_bound_close_reservation_window() {
 }
 trap finish_bound_close_reservation_window EXIT
 
+discover_bound_close_db_stage_units "$DB_STAGE_INITIAL_INVENTORY"
+mapfile -t QUIESCE_DB_STAGE_UNITS < "$DB_STAGE_INITIAL_INVENTORY"
+QUIESCE_SERVICE_UNITS+=("${QUIESCE_DB_STAGE_UNITS[@]}")
+QUIESCE_TRANSIENT_ONESHOT_UNITS+=("${QUIESCE_DB_STAGE_UNITS[@]}")
+QUIESCE_UNITS=(
+  "${QUIESCE_TIMER_UNITS[@]}"
+  "${QUIESCE_SERVICE_UNITS[@]}"
+  "${QUIESCE_SOCKET_UNITS[@]}"
+)
 for UNIT in "${QUIESCE_UNITS[@]}"; do
-  case "${ORIGINAL_UNIT_STATE[$UNIT]}" in
-    active|inactive) ;;
+  record_bound_close_unit_state "$UNIT"
+done
+for UNIT in "${QUIESCE_TRANSIENT_ONESHOT_UNITS[@]}"; do
+  case "${ORIGINAL_UNIT_INSTALL_STATE[$UNIT]}:${ORIGINAL_UNIT_STATE[$UNIT]}" in
+    installed:active) exit 1 ;;
+    installed:inactive|absent:absent) ;;
     *) exit 1 ;;
   esac
 done
@@ -1623,19 +1773,25 @@ test "$(git -C "$CANDIDATE_ROOT" rev-parse HEAD)" = "$REVIEWED_SHA"
 test -z "$(git -C "$CANDIDATE_ROOT" status --porcelain)"
 
 QUIESCE_ATTEMPTED=1
-sudo systemctl stop "${QUIESCE_UNITS[@]}"
-for UNIT in "${QUIESCE_UNITS[@]}"; do
-  test "$(systemctl is-active "$UNIT" || true)" = inactive
+stop_bound_close_unit_group "${QUIESCE_TIMER_UNITS[@]}"
+verify_bound_close_unit_group_inactive "${QUIESCE_TIMER_UNITS[@]}"
+stop_bound_close_unit_group "${QUIESCE_SERVICE_UNITS[@]}"
+stop_bound_close_unit_group "${QUIESCE_SOCKET_UNITS[@]}"
+for VERIFY_PASS in 1 2 3; do
+  sleep 1
+  verify_bound_close_quiescence
 done
 if pgrep -f '[t]elegram_kol_research|[t]elegram-kol' >/dev/null; then
   exit 1
 fi
+verify_bound_close_quiescence
 
 # 使用 candidate 内审查的 closed inventory，精确镜像
 # deployment_preflight._WORK_SPECS 的全部表。它只排除本命令
 # 完整装载的五种 target reservation；其他存在表的 active、
 # NULL 或未来未知状态都计入 other_active_or_unknown_writer_count。
-# 旧 schema 中不存在的表只计入 missing_table_count，不会被 bootstrap。
+# 只允许 deployment_preflight 明示审计的 prior-schema missing set；
+# 当前 recovery source 必需表不得缺失，任意其他缺表拒绝。不执行 bootstrap。
 # 安全输出另外只包含 checked_table_count 和 target_reservation_count。
 WRITER_QUIESCENCE_RESULT="$RECOVERY_TMP/writer-quiescence.json"
 PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
@@ -1644,6 +1800,7 @@ PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
 chmod 0600 "$WRITER_QUIESCENCE_RESULT"
 
 for ATTEMPT in 1 2; do
+  verify_bound_close_quiescence
   RESULT="$RECOVERY_TMP/dry-run-${ATTEMPT}.json"
   PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
     telegram_kol_research.cli recover-bound-position-close-reservations \
@@ -1656,6 +1813,7 @@ for ATTEMPT in 1 2; do
     "$CANDIDATE_ROOT/scripts/project_bound_close_reservation_recovery_output.py" \
     capture < "$RESULT" > "$SUMMARY"
   chmod 0600 "$SUMMARY"
+  verify_bound_close_quiescence
 done
 PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
   "$CANDIDATE_ROOT/scripts/compare_bound_close_reservation_dry_runs.py" \

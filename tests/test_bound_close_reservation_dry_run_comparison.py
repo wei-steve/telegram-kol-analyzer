@@ -316,8 +316,18 @@ def test_runbook_closes_stopped_service_capture_and_apply_boundaries():
         "telegram-kol-monitor.service",
         "telegram-kol-monitor-diagnostic.service",
         "telegram-kol-monitor-test-notification.service",
+        "telegram-kol-monitor-snapshot.timer",
+        "telegram-kol-monitor-snapshot.service",
+        "telegram-kol-sentinel.timer",
+        "telegram-kol-sentinel.service",
+        "telegram-kol-monitor-audit.timer",
+        "telegram-kol-monitor-audit.service",
+        "telegram-kol-monitor-db-stage@sentinel.service",
+        "telegram-kol-monitor-db-stage@audit.service",
         "telegram-kol-runtime-scanner.service",
         "telegram-kol-runtime-agent.service",
+        "telegram-kol-agent-model-egress.socket",
+        "telegram-kol-agent-model-egress.service",
         "telegram-kol.service",
     ):
         assert unit in section
@@ -350,6 +360,40 @@ def test_runbook_closes_stopped_service_capture_and_apply_boundaries():
     assert "PIPESTATUS" in section[apply_start:postcheck]
     assert postcheck < combined_exit
     assert "PRAGMA quick_check" in section[postcheck:combined_exit]
+
+
+def test_runbook_quiescence_inventory_preserves_state_and_refuses_unit_races():
+    project_root = Path(__file__).resolve().parents[1]
+    runbook = (project_root / "docs" / "runbook.md").read_text(encoding="utf-8")
+    section = runbook.split(
+        "## Bound position close reservation convergence", 1
+    )[1].split("## Batch 119 composite-management recovery", 1)[0]
+
+    assert "QUIESCE_TIMER_UNITS=(" in section
+    assert "QUIESCE_SERVICE_UNITS=(" in section
+    assert "QUIESCE_SOCKET_UNITS=(" in section
+    assert "QUIESCE_TRANSIENT_ONESHOT_UNITS=(" in section
+    assert "ORIGINAL_UNIT_INSTALL_STATE" in section
+    assert "--property=LoadState" in section
+    assert "loaded) ORIGINAL_UNIT_INSTALL_STATE" in section
+    assert "not-found) ORIGINAL_UNIT_INSTALL_STATE" in section
+    assert "active|inactive" in section
+    assert "installed:active) exit 1" in section
+    assert "discover_bound_close_db_stage_units" in section
+    assert "'telegram-kol-monitor-db-stage@*.service'" in section
+    assert "DB_STAGE_INITIAL_INVENTORY" in section
+    assert 'cmp -s "$DB_STAGE_INITIAL_INVENTORY"' in section
+    assert "stop_bound_close_unit_group \"${QUIESCE_TIMER_UNITS[@]}\"" in section
+    assert "stop_bound_close_unit_group \"${QUIESCE_SERVICE_UNITS[@]}\"" in section
+    assert section.index(
+        'stop_bound_close_unit_group "${QUIESCE_TIMER_UNITS[@]}"'
+    ) < section.index(
+        'stop_bound_close_unit_group "${QUIESCE_SERVICE_UNITS[@]}"'
+    )
+    assert "for ((INDEX=${#QUIESCE_UNITS[@]}-1; INDEX>=0; INDEX--))" in section
+    assert "PartOf=telegram-kol-runtime-agent.service" in section
+    assert "不读取生产数据库" in section
+    assert "不调用 Deepcoin/交易所" in section
 
 
 def test_apply_window_failure_simulation_runs_postcheck_before_exit():
