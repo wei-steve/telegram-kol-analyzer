@@ -4970,3 +4970,31 @@ def test_commit_exception_before_commit_rolls_back_and_reports_unresolved_outcom
         before_reservations
     )
     assert _table_rows(database, "execution_events") == before_events
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["applied", "applied_after_deadline_verified", "already_applied"],
+)
+def test_apply_result_serialization_is_exact_bounded_canonical_json(status):
+    from telegram_kol_research.bound_close_reservation_recovery import (
+        MAX_RECOVERY_PLAN_BYTES,
+        BoundCloseReservationRecoveryResult,
+        serialize_bound_close_reservation_recovery_result,
+    )
+
+    result = BoundCloseReservationRecoveryResult(
+        status=status,
+        evidence_fingerprint="a" * 64,
+        action_count=2,
+        audit_event_id=17,
+    )
+
+    serialized = serialize_bound_close_reservation_recovery_result(result)
+
+    assert serialized == (
+        '{"action_count":2,"audit_event_id":17,'
+        '"evidence_fingerprint":"' + "a" * 64 + '","mode":"apply",'
+        '"schema_version":1,"status":"' + status + '"}'
+    )
+    assert len(serialized.encode("utf-8")) <= MAX_RECOVERY_PLAN_BYTES

@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import asdict, replace
 from decimal import Decimal, InvalidOperation
 from enum import Enum
@@ -58,6 +59,16 @@ from telegram_kol_research.composite_management_batch_recovery import (
     create_composite_recovery_read_only_session_factory,
     load_composite_batch_recovery_snapshot_read_only,
     serialize_composite_batch_recovery_plan,
+)
+from telegram_kol_research.bound_close_reservation_recovery import (
+    BOUND_CLOSE_RESERVATION_CANONICAL_APPLY_AUTHORIZATION,
+    BoundCloseReservationRecoveryConflict,
+    apply_bound_close_reservation_recovery,
+    build_bound_close_reservation_exchange_reader_from_env,
+    capture_and_seal_bound_close_reservation_recovery,
+    load_bound_close_reservation_source,
+    recapture_and_seal_applied_bound_close_reservation_recovery,
+    serialize_bound_close_reservation_recovery_result,
 )
 from telegram_kol_research.message_operation_supervisor import (
     run_message_operation_supervisor_cycle,
@@ -5240,6 +5251,208 @@ def repair_historical_state_convergence(
         f"Applied {result.applied_actions} historical repair action(s). "
         f"Audit event {result.audit_event_id}."
     )
+
+
+_BOUND_CLOSE_RESERVATION_CAPTURE_TIMEOUT_SECONDS = 30.0
+_BOUND_CLOSE_RESERVATION_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
+_BOUND_CLOSE_RESERVATION_TOKEN = re.compile(r"BOUND-CLOSE-[0-9a-f]{16}\Z")
+
+
+def _bound_close_reservation_cli_document(
+    *,
+    mode: str,
+    status: str,
+    reason_code: str,
+) -> str:
+    return json.dumps(
+        {
+            "mode": mode,
+            "reason_code": reason_code,
+            "schema_version": 1,
+            "status": status,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+@app.command("recover-bound-position-close-reservations")
+def recover_bound_position_close_reservations(
+    database_path: Path = typer.Option(..., "--database-path"),
+    generation_database_path: Path = typer.Option(
+        ..., "--generation-database-path"
+    ),
+    apply: bool = typer.Option(False, "--apply"),
+    expected_fingerprint: str | None = typer.Option(
+        None, "--expected-fingerprint"
+    ),
+    expected_action_count: int | None = typer.Option(
+        None, "--expected-action-count"
+    ),
+    confirmation_token: str | None = typer.Option(
+        None, "--confirmation-token"
+    ),
+    authorization: str | None = typer.Option(None, "--authorization"),
+) -> None:
+    """Capture or separately apply exact terminal close reservations."""
+
+    mode = "apply" if apply else "dry_run"
+
+    def stop(*, status: str, reason_code: str, exit_code: int) -> None:
+        typer.echo(
+            _bound_close_reservation_cli_document(
+                mode=mode,
+                status=status,
+                reason_code=reason_code,
+            )
+        )
+        raise typer.Exit(code=exit_code)
+
+    def resolve_existing_file(path: Path) -> Path | None:
+        expanded = path.expanduser()
+        if expanded.is_symlink() or not expanded.is_file():
+            return None
+        resolved = expanded.resolve()
+        if not resolved.is_file():
+            return None
+        return resolved
+
+    resolved_database_path = resolve_existing_file(database_path)
+    if resolved_database_path is None:
+        stop(
+            status="error",
+            reason_code="database_path_invalid",
+            exit_code=1,
+        )
+    resolved_generation_database_path = resolve_existing_file(
+        generation_database_path
+    )
+    if resolved_generation_database_path is None:
+        stop(
+            status="error",
+            reason_code="generation_database_path_invalid",
+            exit_code=1,
+        )
+
+    if apply:
+        gates_complete = (
+            type(expected_fingerprint) is str
+            and _BOUND_CLOSE_RESERVATION_FINGERPRINT.fullmatch(
+                expected_fingerprint
+            )
+            is not None
+            and type(expected_action_count) is int
+            and expected_action_count > 0
+            and type(confirmation_token) is str
+            and _BOUND_CLOSE_RESERVATION_TOKEN.fullmatch(confirmation_token)
+            is not None
+            and authorization
+            == BOUND_CLOSE_RESERVATION_CANONICAL_APPLY_AUTHORIZATION
+        )
+        if not gates_complete:
+            stop(
+                status="refused",
+                reason_code="apply_authorization_incomplete",
+                exit_code=2,
+            )
+        if resolved_generation_database_path != resolved_database_path:
+            stop(
+                status="refused",
+                reason_code="generation_database_must_match_apply_database",
+                exit_code=2,
+            )
+
+    try:
+        source = load_bound_close_reservation_source(
+            resolved_generation_database_path
+        )
+    except Exception:
+        stop(
+            status="error",
+            reason_code="local_source_unavailable",
+            exit_code=1,
+        )
+    try:
+        reader = build_bound_close_reservation_exchange_reader_from_env()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        stop(
+            status="error",
+            reason_code="exchange_configuration_unavailable",
+            exit_code=1,
+        )
+    deadline_monotonic = (
+        time.monotonic() + _BOUND_CLOSE_RESERVATION_CAPTURE_TIMEOUT_SECONDS
+    )
+    try:
+        capture = capture_and_seal_bound_close_reservation_recovery(
+            source,
+            reader,
+            deadline_monotonic=deadline_monotonic,
+        )
+    except (BoundCloseReservationRecoveryConflict, TypeError, ValueError):
+        stop(
+            status="error",
+            reason_code="capture_unavailable",
+            exit_code=1,
+        )
+
+    if not apply:
+        typer.echo(capture.serialized_plan)
+        if capture.plan.status != "ready":
+            raise typer.Exit(code=2)
+        return
+
+    def apply_capture(apply_capture_authority):
+        return apply_bound_close_reservation_recovery(
+            resolved_database_path,
+            plan=capture.plan,
+            capture=apply_capture_authority,
+            expected_fingerprint=expected_fingerprint,
+            expected_action_count=expected_action_count,
+            confirmation_token=confirmation_token,
+            authorization=authorization,
+            applied_at=datetime.now(UTC),
+        )
+
+    try:
+        result = apply_capture(capture)
+    except BoundCloseReservationRecoveryConflict as exc:
+        if str(exc) != "apply_commit_outcome_unresolved":
+            stop(
+                status="refused",
+                reason_code="apply_conflict",
+                exit_code=2,
+            )
+        try:
+            postapply_reader = (
+                build_bound_close_reservation_exchange_reader_from_env()
+            )
+            postapply_capture = (
+                recapture_and_seal_applied_bound_close_reservation_recovery(
+                    resolved_database_path,
+                    approved_plan=capture.plan,
+                    reader=postapply_reader,
+                    deadline_monotonic=(
+                        time.monotonic()
+                        + _BOUND_CLOSE_RESERVATION_CAPTURE_TIMEOUT_SECONDS
+                    ),
+                )
+            )
+            result = apply_capture(postapply_capture)
+        except (
+            BoundCloseReservationRecoveryConflict,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            stop(
+                status="refused",
+                reason_code="postapply_recapture_unavailable",
+                exit_code=2,
+            )
+    typer.echo(serialize_bound_close_reservation_recovery_result(result))
 
 
 @app.command("recover-management-history")

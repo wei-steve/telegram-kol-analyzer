@@ -4549,6 +4549,420 @@ def test_recover_composite_management_batch_apply_repairs_then_executes_once(
     assert json.loads(result.stdout) == {"mode": "apply", "result": summary}
 
 
+def _bound_close_recovery_cli_plan(*, ready: bool = True):
+    from telegram_kol_research.bound_close_reservation_recovery import (
+        BoundCloseReservationObservation,
+        ReservationClassification,
+        build_bound_close_reservation_recovery_plan,
+        serialize_bound_close_reservation_recovery_plan,
+    )
+
+    observation = BoundCloseReservationObservation(
+        reservation_ref="1" * 64,
+        classification=(
+            ReservationClassification.PROVEN_TERMINAL
+            if ready
+            else ReservationClassification.UNKNOWN
+        ),
+        reason_code=(
+            "exact_close_and_position_terminal"
+            if ready
+            else "exchange_evidence_unavailable"
+        ),
+        source_fingerprint="2" * 64,
+        exchange_fingerprint="3" * 64,
+    )
+    plan = build_bound_close_reservation_recovery_plan(
+        source_fingerprint="4" * 64,
+        observations=(observation,),
+    )
+    serialized = serialize_bound_close_reservation_recovery_plan(
+        plan,
+        capture_started_at=datetime(2026, 8, 15, 12, 0, tzinfo=UTC),
+        capture_completed_at=datetime(2026, 8, 15, 12, 0, 1, tzinfo=UTC),
+    )
+    return plan, SimpleNamespace(plan=plan, serialized_plan=serialized)
+
+
+def _bound_close_recovery_cli_args(database_path: Path) -> list[str]:
+    return [
+        "recover-bound-position-close-reservations",
+        "--database-path",
+        str(database_path),
+        "--generation-database-path",
+        str(database_path),
+    ]
+
+
+def test_bound_close_recovery_cli_is_dormant_strict_and_defaults_to_dry_run():
+    root = CliRunner().invoke(app, ["--help"])
+    command = CliRunner().invoke(
+        app,
+        ["recover-bound-position-close-reservations", "--help"],
+    )
+
+    assert root.exit_code == 0
+    assert "recover-bound-position-close-reservations" in root.output
+    assert command.exit_code == 0
+    for option in (
+        "--database-path",
+        "--generation-database-path",
+        "--apply",
+        "--expected-fingerprint",
+        "--expected-action-count",
+        "--confirmation-token",
+        "--authorization",
+    ):
+        assert option in command.output
+    for prohibited in (
+        "--row-id",
+        "--reservation-id",
+        "--force",
+        "--ignore",
+        "--age",
+        "--notify",
+    ):
+        assert prohibited not in command.output
+
+
+@pytest.mark.parametrize(("ready", "expected_exit"), [(True, 0), (False, 2)])
+def test_bound_close_recovery_cli_emits_only_exact_canonical_dry_run(
+    tmp_path,
+    monkeypatch,
+    ready,
+    expected_exit,
+):
+    import telegram_kol_research.cli as cli_module
+
+    database_path = tmp_path / "recovery.sqlite3"
+    database_path.touch()
+    plan, capture = _bound_close_recovery_cli_plan(ready=ready)
+    source = object()
+    reader = object()
+    calls = []
+
+    monkeypatch.setattr(
+        cli_module,
+        "load_bound_close_reservation_source",
+        lambda path: calls.append(("load", path)) or source,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_bound_close_reservation_exchange_reader_from_env",
+        lambda: calls.append(("reader",)) or reader,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "capture_and_seal_bound_close_reservation_recovery",
+        lambda received_source, received_reader, **kwargs: (
+            calls.append(("capture", received_source, received_reader, kwargs))
+            or capture
+        ),
+        raising=False,
+    )
+
+    def prohibited(*args, **kwargs):
+        pytest.fail("dormant recovery reached a prohibited integration")
+
+    for name in (
+        "create_session_factory",
+        "create_existing_session_factory",
+        "build_deepcoin_client_from_env",
+        "send_monitor_test_notification",
+        "run_runtime_incident_agent_once",
+        "execute_composite_management_batch",
+    ):
+        monkeypatch.setattr(cli_module, name, prohibited, raising=False)
+
+    result = CliRunner().invoke(
+        app,
+        _bound_close_recovery_cli_args(database_path),
+    )
+
+    assert result.exit_code == expected_exit, result.output
+    assert result.stdout == capture.serialized_plan + "\n"
+    assert json.loads(result.stdout)["status"] == plan.status
+    assert [item[0] for item in calls] == ["load", "reader", "capture"]
+    assert calls[0][1] == database_path.resolve()
+
+
+def test_bound_close_recovery_cli_apply_requires_all_gates_and_same_path_before_reads(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+
+    database_path = tmp_path / "recovery.sqlite3"
+    generation_path = tmp_path / "other.sqlite3"
+    database_path.touch()
+    generation_path.touch()
+
+    def prohibited(*args, **kwargs):
+        pytest.fail("invalid apply boundary must stop before any recovery read")
+
+    for name in (
+        "load_bound_close_reservation_source",
+        "build_bound_close_reservation_exchange_reader_from_env",
+        "capture_and_seal_bound_close_reservation_recovery",
+        "apply_bound_close_reservation_recovery",
+    ):
+        monkeypatch.setattr(cli_module, name, prohibited, raising=False)
+
+    missing = CliRunner().invoke(
+        app,
+        _bound_close_recovery_cli_args(database_path) + ["--apply"],
+    )
+    mismatched = CliRunner().invoke(
+        app,
+        [
+            "recover-bound-position-close-reservations",
+            "--database-path",
+            str(database_path),
+            "--generation-database-path",
+            str(generation_path),
+            "--apply",
+            "--expected-fingerprint",
+            "a" * 64,
+            "--expected-action-count",
+            "1",
+            "--confirmation-token",
+            "BOUND-CLOSE-" + "b" * 16,
+            "--authorization",
+            (
+                "I_APPROVE_BOUND_CLOSE_RESERVATIONS_ALL_DB_UNITS_STOPPED_"
+                "APPLY_CAPTURE\n"
+                "I_AUTHORIZE_BOUND_CLOSE_RESERVATIONS_PROVEN_TERMINAL_ONLY"
+            ),
+        ],
+    )
+
+    assert missing.exit_code == 2
+    assert json.loads(missing.stdout)["reason_code"] == "apply_authorization_incomplete"
+    assert mismatched.exit_code == 2
+    assert json.loads(mismatched.stdout)["reason_code"] == (
+        "generation_database_must_match_apply_database"
+    )
+
+
+def test_bound_close_recovery_cli_apply_recaptures_and_passes_only_opaque_authority(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.bound_close_reservation_recovery import (
+        BOUND_CLOSE_RESERVATION_CANONICAL_APPLY_AUTHORIZATION,
+        BoundCloseReservationRecoveryResult,
+    )
+
+    database_path = tmp_path / "recovery.sqlite3"
+    database_path.touch()
+    plan, capture = _bound_close_recovery_cli_plan()
+    source = object()
+    reader = object()
+    received = []
+    result_value = BoundCloseReservationRecoveryResult(
+        status="already_applied",
+        evidence_fingerprint=plan.evidence_fingerprint,
+        action_count=plan.action_count,
+        audit_event_id=19,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "load_bound_close_reservation_source",
+        lambda path: source,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_bound_close_reservation_exchange_reader_from_env",
+        lambda: reader,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "capture_and_seal_bound_close_reservation_recovery",
+        lambda received_source, received_reader, **kwargs: capture,
+        raising=False,
+    )
+
+    def fake_apply(path, **kwargs):
+        received.append((path, kwargs))
+        return result_value
+
+    monkeypatch.setattr(
+        cli_module,
+        "apply_bound_close_reservation_recovery",
+        fake_apply,
+        raising=False,
+    )
+    args = _bound_close_recovery_cli_args(database_path) + [
+        "--apply",
+        "--expected-fingerprint",
+        plan.evidence_fingerprint,
+        "--expected-action-count",
+        str(plan.action_count),
+        "--confirmation-token",
+        plan.confirmation_token,
+        "--authorization",
+        BOUND_CLOSE_RESERVATION_CANONICAL_APPLY_AUTHORIZATION,
+    ]
+
+    result = CliRunner().invoke(app, args)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {
+        "action_count": 1,
+        "audit_event_id": 19,
+        "evidence_fingerprint": plan.evidence_fingerprint,
+        "mode": "apply",
+        "schema_version": 1,
+        "status": "already_applied",
+    }
+    assert len(result.stdout.splitlines()) == 1
+    assert received[0][0] == database_path.resolve()
+    assert received[0][1]["plan"] is plan
+    assert received[0][1]["capture"] is capture
+    assert received[0][1]["authorization"] == (
+        BOUND_CLOSE_RESERVATION_CANONICAL_APPLY_AUTHORIZATION
+    )
+
+
+def test_bound_close_recovery_cli_narrowly_recaptures_an_ambiguous_postapply(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.bound_close_reservation_recovery import (
+        BOUND_CLOSE_RESERVATION_CANONICAL_APPLY_AUTHORIZATION,
+        BoundCloseReservationRecoveryConflict,
+        BoundCloseReservationRecoveryResult,
+    )
+
+    database_path = tmp_path / "recovery.sqlite3"
+    database_path.touch()
+    plan, first_capture = _bound_close_recovery_cli_plan()
+    postapply_capture = SimpleNamespace(plan=plan, serialized_plan="postapply")
+    readers = iter((object(), object()))
+    apply_captures = []
+    recaptures = []
+    monkeypatch.setattr(
+        cli_module,
+        "load_bound_close_reservation_source",
+        lambda path: object(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_bound_close_reservation_exchange_reader_from_env",
+        lambda: next(readers),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "capture_and_seal_bound_close_reservation_recovery",
+        lambda source, reader, **kwargs: first_capture,
+        raising=False,
+    )
+
+    def fake_recapture(path, **kwargs):
+        recaptures.append((path, kwargs))
+        return postapply_capture
+
+    monkeypatch.setattr(
+        cli_module,
+        "recapture_and_seal_applied_bound_close_reservation_recovery",
+        fake_recapture,
+        raising=False,
+    )
+
+    def fake_apply(path, **kwargs):
+        apply_captures.append(kwargs["capture"])
+        if len(apply_captures) == 1:
+            raise BoundCloseReservationRecoveryConflict(
+                "apply_commit_outcome_unresolved"
+            )
+        return BoundCloseReservationRecoveryResult(
+            status="already_applied",
+            evidence_fingerprint=plan.evidence_fingerprint,
+            action_count=plan.action_count,
+            audit_event_id=23,
+        )
+
+    monkeypatch.setattr(
+        cli_module,
+        "apply_bound_close_reservation_recovery",
+        fake_apply,
+        raising=False,
+    )
+    result = CliRunner().invoke(
+        app,
+        _bound_close_recovery_cli_args(database_path)
+        + [
+            "--apply",
+            "--expected-fingerprint",
+            plan.evidence_fingerprint,
+            "--expected-action-count",
+            str(plan.action_count),
+            "--confirmation-token",
+            plan.confirmation_token,
+            "--authorization",
+            BOUND_CLOSE_RESERVATION_CANONICAL_APPLY_AUTHORIZATION,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["status"] == "already_applied"
+    assert apply_captures == [first_capture, postapply_capture]
+    assert recaptures[0][0] == database_path.resolve()
+    assert recaptures[0][1]["approved_plan"] is plan
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ValueError("secret credential detail"),
+        RuntimeError("secret client detail"),
+    ],
+)
+def test_bound_close_recovery_cli_configuration_failure_is_redacted_json(
+    tmp_path,
+    monkeypatch,
+    failure,
+):
+    import telegram_kol_research.cli as cli_module
+
+    database_path = tmp_path / "recovery.sqlite3"
+    database_path.touch()
+    monkeypatch.setattr(
+        cli_module,
+        "load_bound_close_reservation_source",
+        lambda path: object(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_bound_close_reservation_exchange_reader_from_env",
+        lambda: (_ for _ in ()).throw(failure),
+        raising=False,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        _bound_close_recovery_cli_args(database_path),
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == {
+        "mode": "dry_run",
+        "reason_code": "exchange_configuration_unavailable",
+        "schema_version": 1,
+        "status": "error",
+    }
+    assert "secret" not in result.output
+
+
 def test_recover_composite_management_batch_invalid_specs_stop_before_repair(
     tmp_path,
     monkeypatch,

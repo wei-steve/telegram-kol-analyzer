@@ -1025,6 +1025,28 @@ class BoundCloseReservationRecoveryResult:
             raise ValueError("audit_event_id must be a positive integer")
 
 
+def serialize_bound_close_reservation_recovery_result(
+    result: BoundCloseReservationRecoveryResult,
+) -> str:
+    """Serialize the closed, redacted result returned by the dormant CLI."""
+
+    if type(result) is not BoundCloseReservationRecoveryResult:
+        raise TypeError("result must be BoundCloseReservationRecoveryResult")
+    document = _canonical_json(
+        {
+            "action_count": result.action_count,
+            "audit_event_id": result.audit_event_id,
+            "evidence_fingerprint": result.evidence_fingerprint,
+            "mode": "apply",
+            "schema_version": RECOVERY_SCHEMA_VERSION,
+            "status": result.status,
+        }
+    )
+    if len(document.encode("utf-8")) > MAX_RECOVERY_PLAN_BYTES:
+        raise ValueError("serialized recovery result exceeds its byte bound")
+    return document
+
+
 _RECOVERY_PLAN_KEYS = frozenset(
     {
         "action_count",
