@@ -1000,6 +1000,52 @@ def test_real_bound_apply_preserves_confirmed_residue_and_post_authority(
     assert after.reservation_count == 29
 
 
+def test_bound_apply_post_refuses_descendant_drift_from_closed_audit(
+    tmp_path,
+    monkeypatch,
+):
+    factory, database = _seed_joint_incident(tmp_path)
+    monkeypatch.setattr(
+        _RECOVERY_TEST_SUPPORT.recovery_module,
+        "_recovery_capture_now",
+        lambda: _RECOVERY_TEST_SUPPORT.APPLY_TIME - timedelta(minutes=1),
+    )
+    source = _RECOVERY_TEST_SUPPORT.load_bound_close_reservation_source(database)
+    http_client = _RECOVERY_TEST_SUPPORT._RecoveryReaderHttpClient(
+        responses=_RECOVERY_TEST_SUPPORT._terminal_provider_responses(source)
+    )
+    reader, _transport, _selected = (
+        _RECOVERY_TEST_SUPPORT._factory_recovery_reader(
+            monkeypatch, http_client=http_client
+        )
+    )
+    capture = (
+        _RECOVERY_TEST_SUPPORT.capture_and_seal_bound_close_reservation_recovery(
+            source,
+            reader,
+            deadline_monotonic=__import__("time").monotonic() + 30.0,
+        )
+    )
+    applied = _RECOVERY_TEST_SUPPORT._apply_ready(database, capture)
+    assert applied.status in {"applied", "applied_after_deadline_verified"}
+    with factory() as session:
+        target = (
+            session.query(BoundPositionCloseReservation)
+            .filter_by(status="confirmed")
+            .order_by(BoundPositionCloseReservation.id)
+            .first()
+        )
+        assert target is not None
+        binding = session.get(ExecutionBinding, target.execution_binding_id)
+        binding.updated_at = binding.updated_at + timedelta(seconds=1)
+        session.commit()
+
+    after = _inspect(database, phase="bound_apply_post")
+
+    assert after.status == "refused"
+    assert after.reason_code == "joint_material_invalid"
+
+
 def test_batch119_material_fingerprint_changes_only_with_batch119_authority(tmp_path):
     factory, database = _seed_joint_incident(tmp_path)
     before = _inspect(database, phase="bound_apply_pre")

@@ -9775,11 +9775,32 @@ def classify_recovery_position(
 
 
 def _positive_decimal(value: object, field_name: str) -> Decimal:
+    if isinstance(value, bool):
+        raise CompositeBatchRecoveryRefusal(f"{field_name}_invalid")
     try:
-        result = Decimal(str(value))
+        raw_text = str(value)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise CompositeBatchRecoveryRefusal(f"{field_name}_invalid") from exc
+    if (
+        not raw_text
+        or len(raw_text) > 64
+        or not raw_text.isascii()
+        or any(character not in "0123456789+-.eE" for character in raw_text)
+    ):
+        raise CompositeBatchRecoveryRefusal(f"{field_name}_invalid")
+    try:
+        result = Decimal(raw_text)
     except (InvalidOperation, TypeError, ValueError) as exc:
         raise CompositeBatchRecoveryRefusal(f"{field_name}_invalid") from exc
     if not result.is_finite() or result <= 0:
+        raise CompositeBatchRecoveryRefusal(f"{field_name}_invalid")
+    decimal_tuple = result.as_tuple()
+    if (
+        len(decimal_tuple.digits) > 64
+        or not isinstance(decimal_tuple.exponent, int)
+        or abs(decimal_tuple.exponent) > 128
+        or abs(result.adjusted()) > 128
+    ):
         raise CompositeBatchRecoveryRefusal(f"{field_name}_invalid")
     return result
 

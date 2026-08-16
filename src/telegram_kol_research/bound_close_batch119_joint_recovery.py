@@ -30,6 +30,7 @@ from telegram_kol_research.bound_close_reservation_recovery import (
     _REQUIRED_SOURCE_COLUMNS,
     _bounded_recovery_json_tree,
     _closed_json_object,
+    _durable_invariant_fingerprints,
     _exact_object_keys,
     _load_bound_close_reservation_audits,
     _load_source_descendants,
@@ -106,7 +107,12 @@ def _table_columns(session, table: str) -> frozenset[str]:
 def _post_target_rows(
     session,
     rows: list[dict],
-) -> tuple[list[dict], dict[int, str], dict[str, object]]:
+) -> tuple[
+    list[dict],
+    dict[int, str],
+    dict[str, object],
+    dict[str, str],
+]:
     connection = session.connection().connection.driver_connection
     if type(connection) is not sqlite3.Connection:
         raise ValueError("joint_database_invalid")
@@ -236,7 +242,12 @@ def _post_target_rows(
         for reference, row in zip(ordered_refs, target_rows, strict=True)
     }
     audit_material = {key: audit[key] for key in audit.keys()}
-    return target_rows, source_status_by_id, audit_material
+    return (
+        target_rows,
+        source_status_by_id,
+        audit_material,
+        invariant_by_ref,
+    )
 
 
 def _target_material(
@@ -259,11 +270,15 @@ def _target_material(
         {name: row[name] for name in sorted(columns)} for row in rows
     ]
     post_audit_material: dict[str, object] | None = None
+    post_invariant_by_ref: dict[str, str] | None = None
     source_status_overrides: dict[int, str] | None = None
     if phase == BOUND_APPLY_POST:
-        target_rows, source_status_overrides, post_audit_material = (
-            _post_target_rows(session, row_material)
-        )
+        (
+            target_rows,
+            source_status_overrides,
+            post_audit_material,
+            post_invariant_by_ref,
+        ) = _post_target_rows(session, row_material)
         target_ids = {int(row["id"]) for row in target_rows}
         confirmed_residue = [
             row for row in row_material if int(row["id"]) not in target_ids
@@ -310,6 +325,22 @@ def _target_material(
             source_rows,
             source_status_overrides=source_status_overrides,
         )
+        if post_invariant_by_ref is not None:
+            raw_rows = tuple(
+                (
+                    reservation.reservation_ref,
+                    source._capability._get(reservation.reservation_ref),
+                )
+                for reservation in source.reservations
+            )
+            if (
+                _durable_invariant_fingerprints(
+                    driver_connection,
+                    raw_rows=raw_rows,
+                )
+                != post_invariant_by_ref
+            ):
+                raise ValueError("joint_population_invalid")
     finally:
         driver_connection.row_factory = previous_row_factory
     if (
