@@ -4389,12 +4389,14 @@ def _exchange_identities_match(
 
 
 def _local_mutation_conflicts(local: LocalReservationEvidence) -> bool:
+    if len(local.close_mutations) > 1:
+        return True
     for mutation in local.close_mutations:
         if mutation.order_ref is not None and mutation.order_ref != local.close_order_ref:
             return True
-        if mutation.status in {"rejected", "recovery_required", "blocked"}:
+        if mutation.status != "confirmed":
             return True
-        if mutation.status == "confirmed" and mutation.order_ref is None:
+        if mutation.order_ref is None:
             return True
     return False
 
@@ -4817,6 +4819,18 @@ def _build_local_reservation_evidence(
             entry_leg = _entry_leg_evidence(entry_leg_row)
             if entry_leg is None:
                 local_reason = "local_evidence_incomplete"
+
+    mutation_row_ids = [row["id"] for row in mutation_rows]
+    mutation_identity_keys = [
+        row["idempotency_key"]
+        for row in mutation_rows
+        if _required_text(row["idempotency_key"])
+    ]
+    if (
+        len(mutation_row_ids) != len(set(mutation_row_ids))
+        or len(mutation_identity_keys) != len(set(mutation_identity_keys))
+    ):
+        local_reason = "local_identity_conflict"
 
     mutation_evidences: list[LocalCloseMutationEvidence] = []
     for mutation in mutation_rows:

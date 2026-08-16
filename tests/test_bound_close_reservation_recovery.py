@@ -604,6 +604,31 @@ def _terminal_exchange_evidence(**overrides) -> ExchangeReservationEvidence:
     return ExchangeReservationEvidence(**values)
 
 
+def _terminal_exchange_for_local(
+    local: LocalReservationEvidence,
+) -> ExchangeReservationEvidence:
+    identity = {
+        "instrument_ref": local.instrument_ref,
+        "side": local.side,
+        "position_ref": local.position_ref,
+    }
+    return _terminal_exchange_evidence(
+        order_history=(
+            _order_evidence(
+                **identity,
+                order_ref=local.close_order_ref,
+            ),
+        ),
+        fills=(
+            _fill_evidence(
+                **identity,
+                order_ref=local.close_order_ref,
+            ),
+        ),
+        position_history=(_position_history_evidence(**identity),),
+    )
+
+
 def _classify(
     exchange: ExchangeReservationEvidence,
     *,
@@ -965,11 +990,71 @@ def test_timestamp_inversion_is_unknown(local, exchange, capture_completed_at):
     [
         _local_classification_evidence(mutation_status="rejected"),
         _local_classification_evidence(mutation_status="recovery_required"),
+        _local_classification_evidence(mutation_status="blocked"),
+        _local_classification_evidence(mutation_order_ref=None),
         _local_classification_evidence(mutation_order_ref="9" * 64),
     ],
 )
 def test_conflicting_close_mutation_is_unknown(local):
     observation = _classify(_terminal_exchange_evidence(), local=local)
+    assert observation.classification is ReservationClassification.UNKNOWN
+    assert observation.reason_code == "exchange_state_conflict"
+
+
+def test_no_local_close_mutation_preserves_terminal_classification():
+    local = replace(_local_classification_evidence(), close_mutations=())
+
+    observation = _classify(_terminal_exchange_evidence(), local=local)
+
+    assert observation.classification is (
+        ReservationClassification.PROVEN_TERMINAL
+    )
+    assert observation.reason_code == "exact_close_and_position_terminal"
+
+
+@pytest.mark.parametrize(
+    "mutation_status",
+    ["reserved", "not_sent", "submitting", "submitted"],
+)
+def test_active_close_mutation_is_unknown(mutation_status):
+    observation = _classify(
+        _terminal_exchange_evidence(),
+        local=_local_classification_evidence(
+            mutation_status=mutation_status,
+        ),
+    )
+
+    assert observation.classification is ReservationClassification.UNKNOWN
+    assert observation.reason_code == "exchange_state_conflict"
+
+
+def test_duplicate_local_mutation_descendant_is_unknown():
+    local = _local_classification_evidence()
+    mutation = local.close_mutations[0]
+
+    observation = _classify(
+        _terminal_exchange_evidence(),
+        local=replace(local, close_mutations=(mutation, mutation)),
+    )
+
+    assert observation.classification is ReservationClassification.UNKNOWN
+    assert observation.reason_code == "exchange_state_conflict"
+
+
+def test_extra_distinct_confirmed_mutation_descendant_is_unknown():
+    local = _local_classification_evidence()
+    first = local.close_mutations[0]
+    second = replace(
+        first,
+        mutation_ref="1" * 64,
+        record_fingerprint="2" * 64,
+    )
+
+    observation = _classify(
+        _terminal_exchange_evidence(),
+        local=replace(local, close_mutations=(first, second)),
+    )
+
     assert observation.classification is ReservationClassification.UNKNOWN
     assert observation.reason_code == "exchange_state_conflict"
 
@@ -2603,6 +2688,115 @@ def test_source_loader_accepts_only_authoritative_mutation_time_shapes(
 
     assert source.reservations[0].local_reason_code is None
     assert source.reservations[0].close_mutations[0].status == status
+
+
+@pytest.mark.parametrize(
+    ("status", "submitted_at"),
+    [
+        ("reserved", None),
+        ("not_sent", None),
+        ("submitting", None),
+        ("submitted", "2026-08-14 10:01:00.000000"),
+    ],
+)
+def test_real_loader_active_mutation_cannot_be_classified_terminal(
+    tmp_path,
+    status,
+    submitted_at,
+):
+    database = tmp_path / f"active-mutation-{status}.sqlite3"
+    connection = _create_reservation_source_database(database)
+    _seed_local_reservation(connection)
+    connection.execute(
+        """
+        UPDATE position_mutation_intents
+        SET status = ?, submitted_at = ?, confirmed_at = NULL,
+            updated_at = '2026-08-14 10:03:00.000000'
+        """,
+        (status, submitted_at),
+    )
+    connection.commit()
+    connection.close()
+
+    source = load_bound_close_reservation_source(database)
+    local = source.reservations[0]
+    observation = _classify(
+        _terminal_exchange_for_local(local),
+        local=local,
+        capture_completed_at=CLASSIFICATION_TIME + timedelta(minutes=4),
+    )
+
+    assert local.local_reason_code is None
+    assert observation.classification is ReservationClassification.UNKNOWN
+    assert observation.reason_code == "exchange_state_conflict"
+
+
+def test_real_loader_rejects_duplicate_mutation_identity(tmp_path):
+    database = tmp_path / "duplicate-mutation-identity.sqlite3"
+    connection = _create_reservation_source_database(database)
+    _seed_local_reservation(connection)
+    connection.execute(
+        """
+        INSERT INTO position_mutation_intents
+        SELECT id + 100, idempotency_key, operation, strategy_instance_id,
+               execution_binding_id, execution_order_leg_id, pos_id, order_id,
+               authority_fingerprint, request_fingerprint, venue, status,
+               request_json, response_json, error_json, reserved_at, submitted_at,
+               confirmed_at, created_at, updated_at
+        FROM position_mutation_intents
+        WHERE id = 1
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    source = load_bound_close_reservation_source(database)
+    local = source.reservations[0]
+    observation = _classify(
+        _terminal_exchange_evidence(),
+        local=local,
+        capture_completed_at=CLASSIFICATION_TIME + timedelta(minutes=4),
+    )
+
+    assert local.local_reason_code == "local_identity_conflict"
+    assert observation.classification is ReservationClassification.UNKNOWN
+    assert observation.reason_code == "local_identity_conflict"
+    with pytest.raises(KeyError):
+        source._capability._get(local.reservation_ref)
+
+
+def test_real_loader_extra_distinct_confirmed_mutation_is_unknown(tmp_path):
+    database = tmp_path / "extra-confirmed-mutation.sqlite3"
+    connection = _create_reservation_source_database(database)
+    _seed_local_reservation(connection)
+    connection.execute(
+        """
+        INSERT INTO position_mutation_intents
+        SELECT id + 100, idempotency_key || '-retry', operation,
+               strategy_instance_id, execution_binding_id,
+               execution_order_leg_id, pos_id, order_id,
+               authority_fingerprint, request_fingerprint, venue, status,
+               request_json, response_json, error_json, reserved_at, submitted_at,
+               confirmed_at, created_at, updated_at
+        FROM position_mutation_intents
+        WHERE id = 1
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    source = load_bound_close_reservation_source(database)
+    local = source.reservations[0]
+    observation = _classify(
+        _terminal_exchange_for_local(local),
+        local=local,
+        capture_completed_at=CLASSIFICATION_TIME + timedelta(minutes=4),
+    )
+
+    assert local.local_reason_code is None
+    assert len(local.close_mutations) == 2
+    assert observation.classification is ReservationClassification.UNKNOWN
+    assert observation.reason_code == "exchange_state_conflict"
 
 
 @pytest.mark.parametrize(
