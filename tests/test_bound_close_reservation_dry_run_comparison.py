@@ -423,6 +423,149 @@ def test_runbook_fetch_updates_the_exact_ref_it_later_verifies():
     assert 'rev-parse "$APPROVED_REF"' in block
 
 
+def test_runbook_freezes_monitor_timer_before_resetting_legacy_failed_state():
+    block = _bound_close_read_only_block()
+    project_root = Path(__file__).resolve().parents[1]
+    runbook = (project_root / "docs" / "runbook.md").read_text(encoding="utf-8")
+    section = runbook.split(
+        "## Bound position close reservation convergence", 1
+    )[1].split("## Batch 119 composite-management recovery", 1)[0]
+    approval_text = section.split("```bash", 1)[0]
+
+    reset_token = (
+        "I_APPROVE_LEGACY_MONITOR_FAILED_STATE_RESET_FOR_"
+        "BOUND_CLOSE_READ_ONLY_WINDOW"
+    )
+    assert "BOUND_CLOSE_LEGACY_MONITOR_RESET_APPROVAL" in block
+    assert reset_token in block
+    assert reset_token in approval_text
+    assert "failed` 重置为 `inactive`" in approval_text
+    assert "active|inactive|failed" in block
+    assert 'if [ "$active_state" = failed ]' in block
+    assert '[ "$unit" != telegram-kol-monitor.service ]; then' in block
+    stop_timer = block.index(
+        'stop_bound_close_unit_group "${QUIESCE_TIMER_UNITS[@]}"'
+    )
+    reset_call = block.index(
+        "\nreset_bound_close_legacy_monitor_after_timer_freeze\n",
+        stop_timer,
+    )
+    stop_services = block.index(
+        'stop_bound_close_unit_group "${QUIESCE_SERVICE_UNITS[@]}"'
+    )
+    assert stop_timer < reset_call < stop_services
+    reset_function = block.split(
+        "reset_bound_close_legacy_monitor_after_timer_freeze() {", 1
+    )[1].split("\n}\n", 1)[0]
+    assert reset_function.index("systemctl stop telegram-kol-monitor.service") < (
+        reset_function.index("systemctl reset-failed telegram-kol-monitor.service")
+    )
+    assert (
+        'ORIGINAL_UNIT_STATE["telegram-kol-monitor.service"]=inactive'
+        in reset_function
+    )
+    restore = block.split("restore_bound_close_reservation_units() {", 1)[1].split(
+        "finish_bound_close_reservation_window() {", 1
+    )[0]
+    assert "installed:failed)" in restore
+    assert "systemctl is-failed --quiet" in restore
+
+
+@pytest.mark.parametrize(
+    (
+        "install_state",
+        "original_state",
+        "current_state",
+        "expected_log",
+        "expected_state",
+    ),
+    [
+        (
+            "installed",
+            "failed",
+            "failed",
+            "reset-failed telegram-kol-monitor.service\n",
+            "inactive",
+        ),
+        ("installed", "inactive", "inactive", "", "inactive"),
+        ("installed", "failed", "inactive", "", "inactive"),
+        (
+            "installed",
+            "inactive",
+            "failed",
+            "reset-failed telegram-kol-monitor.service\n",
+            "inactive",
+        ),
+        (
+            "installed",
+            "inactive",
+            "active",
+            "stop telegram-kol-monitor.service\n",
+            "inactive",
+        ),
+        (
+            "installed",
+            "failed",
+            "active",
+            "stop telegram-kol-monitor.service\n",
+            "inactive",
+        ),
+        ("absent", "absent", "absent", "", "absent"),
+    ],
+)
+def test_legacy_monitor_reset_function_preserves_absent_install_state(
+    install_state,
+    original_state,
+    current_state,
+    expected_log,
+    expected_state,
+):
+    block = _bound_close_read_only_block()
+    function = block.split(
+        "reset_bound_close_legacy_monitor_after_timer_freeze() {", 1
+    )[1].split("\n}\n", 1)[0]
+    function = function.replace(
+        "${ORIGINAL_UNIT_INSTALL_STATE[telegram-kol-monitor.service]}",
+        "$INSTALL_STATE",
+    ).replace(
+        "${ORIGINAL_UNIT_STATE[telegram-kol-monitor.service]}",
+        "$ORIGINAL_STATE",
+    ).replace(
+        'ORIGINAL_UNIT_STATE["telegram-kol-monitor.service"]=inactive',
+        "ORIGINAL_STATE=inactive",
+    )
+    script = f"""
+set -euo pipefail
+INSTALL_STATE={install_state}
+ORIGINAL_STATE={original_state}
+CURRENT_STATE={current_state}
+systemctl() {{
+  case "$1" in
+    stop|reset-failed)
+      printf '%s %s\\n' "$1" "$2"
+      CURRENT_STATE=inactive
+      ;;
+    is-active) printf '%s\\n' "$CURRENT_STATE" ;;
+    *) return 91 ;;
+  esac
+}}
+sudo() {{ "$@"; }}
+reset_bound_close_legacy_monitor_after_timer_freeze() {{
+{function}
+}}
+reset_bound_close_legacy_monitor_after_timer_freeze
+printf 'STATE=%s\\n' "$ORIGINAL_STATE"
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected_log + f"STATE={expected_state}\n"
+    assert result.stderr == ""
+
+
 def _bound_close_read_only_block() -> str:
     project_root = Path(__file__).resolve().parents[1]
     runbook = (project_root / "docs" / "runbook.md").read_text(encoding="utf-8")

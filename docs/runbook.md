@@ -1501,11 +1501,17 @@ WHERE idempotency_key LIKE :component_id || ':%' ORDER BY id;
 
 ### 窗口一：停服只读双 capture
 
-只有操作员明确提供下列完整 token 才可执行：
+只有操作员明确提供下列两个完整 token 才可执行：
 
 ```text
 I_APPROVE_BOUND_CLOSE_RESERVATIONS_ALL_DB_UNITS_STOPPED_READ_ONLY_DOUBLE_CAPTURE
+I_APPROVE_LEGACY_MONITOR_FAILED_STATE_RESET_FOR_BOUND_CLOSE_READ_ONLY_WINDOW
 ```
+
+第二个 token 只授权在所有 monitor timers 已停止之后，将已安装的旧
+`telegram-kol-monitor.service` 从 `failed` 重置为 `inactive`，并把
+`inactive` 作为本窗口恢复基线；它不授权启动该 service。若该旧 unit
+未安装，reset 是 no-op，仍保持 `absent`。两个 token 都不授权 apply。
 
 将 `REVIEWED_SHA` 替换为已完成本地全量验证和 Critical/Important 审查的
 40 位完整 SHA；不得使用短 SHA。下列命令保存原始 unit 状态，任意
@@ -1618,7 +1624,13 @@ record_bound_close_unit_state() {
   if [ "${ORIGINAL_UNIT_INSTALL_STATE[$unit]}" = installed ]; then
     active_state="$(systemctl is-active "$unit" || true)"
     case "$active_state" in
-      active|inactive) ORIGINAL_UNIT_STATE["$unit"]="$active_state" ;;
+      active|inactive|failed)
+        if [ "$active_state" = failed ] && \
+          [ "$unit" != telegram-kol-monitor.service ]; then
+          return 1
+        fi
+        ORIGINAL_UNIT_STATE["$unit"]="$active_state"
+        ;;
       *) return 1 ;;
     esac
   else
@@ -1635,6 +1647,39 @@ stop_bound_close_unit_group() {
       *) return 1 ;;
     esac
   done
+}
+
+reset_bound_close_legacy_monitor_after_timer_freeze() {
+  local current_state
+  case "${ORIGINAL_UNIT_INSTALL_STATE[telegram-kol-monitor.service]}" in
+    installed)
+      current_state="$(systemctl is-active telegram-kol-monitor.service || true)"
+      case "$current_state" in
+        active)
+          sudo systemctl stop telegram-kol-monitor.service
+          ORIGINAL_UNIT_STATE["telegram-kol-monitor.service"]=inactive
+          ;;
+        failed)
+          sudo systemctl reset-failed telegram-kol-monitor.service
+          ORIGINAL_UNIT_STATE["telegram-kol-monitor.service"]=inactive
+          ;;
+        inactive)
+          case "${ORIGINAL_UNIT_STATE[telegram-kol-monitor.service]}" in
+            failed|inactive)
+              ORIGINAL_UNIT_STATE["telegram-kol-monitor.service"]=inactive
+              ;;
+            *) return 1 ;;
+          esac
+          ;;
+        *) return 1 ;;
+      esac
+      test "$(systemctl is-active telegram-kol-monitor.service || true)" = inactive
+      ;;
+    absent)
+      [ "${ORIGINAL_UNIT_STATE[telegram-kol-monitor.service]}" = absent ]
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 verify_bound_close_unit_group_inactive() {
@@ -1710,6 +1755,12 @@ restore_bound_close_reservation_units() {
             cleanup_status=1
           fi
           ;;
+        installed:failed)
+          if [ "$UNIT" != telegram-kol-monitor.service ] || \
+            ! systemctl is-failed --quiet "$UNIT"; then
+            cleanup_status=1
+          fi
+          ;;
         absent:absent)
           if [ "$(systemctl show "$UNIT" --property=LoadState --value)" != \
             not-found ]; then
@@ -1780,11 +1831,16 @@ for UNIT in "${QUIESCE_TRANSIENT_ONESHOT_UNITS[@]}"; do
   case "${ORIGINAL_UNIT_INSTALL_STATE[$UNIT]}:${ORIGINAL_UNIT_STATE[$UNIT]}" in
     installed:active) exit 1 ;;
     installed:inactive|absent:absent) ;;
+    installed:failed)
+      [ "$UNIT" = telegram-kol-monitor.service ] || exit 1
+      ;;
     *) exit 1 ;;
   esac
 done
 test "${BOUND_CLOSE_DRY_RUN_APPROVAL:-}" = \
   'I_APPROVE_BOUND_CLOSE_RESERVATIONS_ALL_DB_UNITS_STOPPED_READ_ONLY_DOUBLE_CAPTURE'
+test "${BOUND_CLOSE_LEGACY_MONITOR_RESET_APPROVAL:-}" = \
+  'I_APPROVE_LEGACY_MONITOR_FAILED_STATE_RESET_FOR_BOUND_CLOSE_READ_ONLY_WINDOW'
 
 git -C "$PRODUCTION_ROOT" fetch --no-tags origin \
   "refs/heads/codex/bound-close-reservation-recovery:$APPROVED_REF" \
@@ -1802,6 +1858,7 @@ test -z "$(git -C "$CANDIDATE_ROOT" status --porcelain)"
 QUIESCE_ATTEMPTED=1
 stop_bound_close_unit_group "${QUIESCE_TIMER_UNITS[@]}"
 verify_bound_close_unit_group_inactive "${QUIESCE_TIMER_UNITS[@]}"
+reset_bound_close_legacy_monitor_after_timer_freeze
 stop_bound_close_unit_group "${QUIESCE_SERVICE_UNITS[@]}"
 stop_bound_close_unit_group "${QUIESCE_SOCKET_UNITS[@]}"
 for VERIFY_PASS in 1 2 3; do
