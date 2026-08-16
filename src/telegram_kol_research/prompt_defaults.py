@@ -14,6 +14,7 @@ from telegram_kol_research.prompt_registry import (
     PromptDetail,
     PromptSeed,
     seed_prompt_definition,
+    upgrade_seeded_prompt_definition,
 )
 
 
@@ -183,6 +184,7 @@ DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT = """
 - 只有方向没有入场、只有价格没有方向、已经错过、明确不要进场、普通观点或联系方式，均不是新策略。
 - 如果完整新开仓参数已经明确，不要仅因“可以考虑”“参考”等弱提示判为非策略。
 - 正文明示会员单盈利、已盈利、做个参考或复盘时，完整参数属于历史信号回顾，不得创建新策略。
+- 同一条消息列出多个备选开仓方案且明确写出 priority 或 P1/P2 时，只把最高优先级方案输出为 entry；其他备选方案保留在证据中，不得生成第二个可执行 entry。
 
 【生命周期事件与仓位管理】
 - 当前消息可能同时包含新策略、入场确认、仓位管理、退出、取消入场、策略修订、入场前置语义、持仓报告、市场评论或非交易内容；每个独立意图分别输出，不能互相覆盖。
@@ -193,8 +195,12 @@ DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT = """
 - strategy_revision：明确替换尚未执行或已有策略的入场参数时使用 replace_entry；替换后的 strategy 必须仍是完整策略。
 - “第一止盈点来了”且对应已有持仓属于 position_management，不是新开仓。
 - “回成本了，注意保护成本，平加仓”可同时输出 partial_take_profit 与 move_stop_to_protect 两个独立意图。
+- 到达止盈点并明确保留剩余仓位，表示已对一部分仓位止盈，输出 partial_take_profit，而不是 position_report、hold_update 或非执行内容。
+- “设置 50% 仓位止盈价”表示未来止盈挂单设置，不表示当前已经减仓；同一目标的 move_stop_to_protect 与止盈挂单设置同时出现时，只输出 move_stop_to_protect，止盈设置保留在证据中，不要额外输出 partial_take_profit 或 hold_update。
+- 同一目标的 risk_update 已包含继续持有语义时，不要再输出 hold_update；不得为同一目标输出语义重叠的多个生命周期动作。
 - 若输入包含 reply_context，它是精确 Telegram 回复目标。只能在当前消息动作与该目标状态兼容时引用其 lifecycle_id；reply_context 已 entered 时，“取消/撤单”不得自动转成退出。
 - 无法唯一对应历史策略时，target.lifecycle_id 保持 null、降低置信度并说明不确定性，不得猜测。
+- thread_id 不能替代 lifecycle_id；生命周期动作若只有 thread_id 而没有可核对的 lifecycle_id，则 target 的两个字段都保持 null。已有 lifecycle_id 时 thread_id 只可作为同一目标的伴随标识。
 - 上下文只用于关联 target 和理解消息，不能作为当前消息的新动作证据；不得把旧上下文复制成当前意图。
 
 【入场前置语义和非执行信息】
@@ -214,6 +220,9 @@ DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT = """
 - BTC 的“5.89-5.93附近、5.89万-5.93万、5.89-5.93w”统一为“58900-59300”；ETH 等其他币种不得套用 BTC 万位规则，除非原文明确带“万”。
 - 文字标的与全部关键价格尺度明显冲突时，必须在 reason 与 evidence.conflicts 说明，不得静默纠正；只有当前证据足够明确时才输出最可能标的，并把置信度降到 0.69 以下。
 - 非 entry/replace_entry 动作的 strategy 必须为 null。没有明确 target 时 target 的两个字段都为 null。parameters 只保存当前动作所需的明确参数，不得增加推测值。
+- cancel_pending_entry 的 parameters 必须是空对象，即使原文提到被撤销挂单的价格也不得放入 parameters。
+- 所有价格类 parameters 必须输出字符串，包括 entry_price、exit_price、stop_loss、take_profit；不得输出 JSON 数字。
+- management_fraction 必须输出 0 到 1 之间的 JSON 数字，例如 50% 输出 0.5，不得输出 50、"50%" 或 "0.5"。
 - 相同动作、相同 target、相同 strategy 和相同 parameters 不得重复输出。
 
 【图文证据分离】
@@ -273,6 +282,24 @@ DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT = """
   }
 }
 """.strip()
+
+_MIMO_V2_COMPATIBILITY_RULE_LINES = frozenset(
+    {
+        '- 同一条消息列出多个备选开仓方案且明确写出 priority 或 P1/P2 时，只把最高优先级方案输出为 entry；其他备选方案保留在证据中，不得生成第二个可执行 entry。',
+        '- 到达止盈点并明确保留剩余仓位，表示已对一部分仓位止盈，输出 partial_take_profit，而不是 position_report、hold_update 或非执行内容。',
+        '- “设置 50% 仓位止盈价”表示未来止盈挂单设置，不表示当前已经减仓；同一目标的 move_stop_to_protect 与止盈挂单设置同时出现时，只输出 move_stop_to_protect，止盈设置保留在证据中，不要额外输出 partial_take_profit 或 hold_update。',
+        '- 同一目标的 risk_update 已包含继续持有语义时，不要再输出 hold_update；不得为同一目标输出语义重叠的多个生命周期动作。',
+        '- thread_id 不能替代 lifecycle_id；生命周期动作若只有 thread_id 而没有可核对的 lifecycle_id，则 target 的两个字段都保持 null。已有 lifecycle_id 时 thread_id 只可作为同一目标的伴随标识。',
+        '- cancel_pending_entry 的 parameters 必须是空对象，即使原文提到被撤销挂单的价格也不得放入 parameters。',
+        '- 所有价格类 parameters 必须输出字符串，包括 entry_price、exit_price、stop_loss、take_profit；不得输出 JSON 数字。',
+        '- management_fraction 必须输出 0 到 1 之间的 JSON 数字，例如 50% 输出 0.5，不得输出 50、"50%" 或 "0.5"。',
+    }
+)
+INITIAL_MIMO_V2_AUTHORITATIVE_PROMPT = "\n".join(
+    line
+    for line in DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT.splitlines()
+    if line not in _MIMO_V2_COMPATIBILITY_RULE_LINES
+)
 
 
 DEFAULT_RESEARCH_CHAT_SYSTEM_PROMPT = (
@@ -485,10 +512,18 @@ def seed_default_prompt_registry(
     legacy_config: AiRecognitionConfig | None = None,
 ) -> list[PromptDetail]:
     config = legacy_config or AiRecognitionConfig()
-    return [
-        seed_prompt_definition(session_factory, seed)
-        for seed in build_prompt_seeds_from_legacy(config)
-    ]
+    details: list[PromptDetail] = []
+    for seed in build_prompt_seeds_from_legacy(config):
+        detail = seed_prompt_definition(session_factory, seed)
+        if seed.prompt_key == MIMO_V2_AUTHORITATIVE_PROMPT:
+            detail = upgrade_seeded_prompt_definition(
+                session_factory,
+                seed,
+                previous_content=INITIAL_MIMO_V2_AUTHORITATIVE_PROMPT,
+                change_note="Close MiMo v2 replay compatibility gaps",
+            )
+        details.append(detail)
+    return details
 
 
 def seed_group_research_prompt(

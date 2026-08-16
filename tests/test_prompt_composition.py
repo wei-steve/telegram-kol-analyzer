@@ -227,6 +227,23 @@ def test_mimo_v2_validation_accepts_closed_default_contract():
 
 
 @pytest.mark.parametrize(
+    "required_rule",
+    (
+        "同一目标的 risk_update 已包含继续持有语义时，不要再输出 hold_update",
+        "同一目标的 move_stop_to_protect 与止盈挂单设置同时出现时",
+        "management_fraction 必须输出 0 到 1 之间的 JSON 数字",
+        "cancel_pending_entry 的 parameters 必须是空对象",
+        "所有价格类 parameters 必须输出字符串",
+        "thread_id 不能替代 lifecycle_id",
+        "明确写出 priority 或 P1/P2 时，只把最高优先级方案输出为 entry",
+        "到达止盈点并明确保留剩余仓位",
+    ),
+)
+def test_mimo_v2_default_prompt_closes_replay_compatibility_rules(required_rule):
+    assert required_rule in DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT
+
+
+@pytest.mark.parametrize(
     "marker",
     (
         '"intents"',

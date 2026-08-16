@@ -888,43 +888,138 @@ def _canonical_execution_projection(
         return {"executable": False}
     strategy = payload.get("strategy")
     lifecycle = payload.get("lifecycle_event")
-    instructions = payload.get("instructions")
     entry_context = payload.get("entry_context")
     entry_fragments = payload.get("entry_fragments")
     projection: dict[str, Any] = {
         "executable": True,
         "recognition_result": str(payload.get("recognition_result") or ""),
-        "confidence": payload.get("confidence"),
         "strategy": _plain_projection_value(
             strategy if isinstance(strategy, Mapping) else {}
         ),
-        "instructions": [
-            _projection_row(row)
-            for row in instructions
-            if isinstance(row, Mapping)
-        ]
-        if isinstance(instructions, list)
-        else [],
-        "lifecycle_event": _projection_row(lifecycle)
+        "instructions": _canonical_instruction_projection(payload),
+        "lifecycle_event": _semantic_projection_row(lifecycle)
         if isinstance(lifecycle, Mapping)
         else {},
     }
     if isinstance(entry_context, Mapping):
-        projection["entry_context"] = _projection_row(entry_context)
+        projection["entry_context"] = _semantic_projection_row(entry_context)
     if isinstance(entry_fragments, list):
         projection["entry_fragments"] = [
-            _projection_row(row)
+            _semantic_projection_row(row)
             for row in entry_fragments
             if isinstance(row, Mapping)
         ]
     return projection
 
 
-def _projection_row(value: Mapping[str, Any]) -> dict[str, Any]:
+def _canonical_instruction_projection(
+    payload: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    raw = payload.get("instructions")
+    if isinstance(raw, list) and raw:
+        return [
+            _canonical_instruction_row(row)
+            for row in raw
+            if isinstance(row, Mapping)
+        ]
+
+    rows: list[dict[str, Any]] = []
+    lifecycle = payload.get("lifecycle_event")
+    if isinstance(lifecycle, Mapping):
+        kind = _legacy_lifecycle_instruction_kind(lifecycle)
+        if kind is not None:
+            parameters = {
+                str(key): _plain_projection_value(value)
+                for key, value in lifecycle.items()
+                if key
+                not in {
+                    "event_type",
+                    "management_action",
+                    "target_lifecycle_id",
+                    "target_thread_id",
+                    "confidence",
+                    "reason",
+                    "symbol",
+                    "side",
+                }
+                and value is not None
+            }
+            rows.append(
+                {
+                    "kind": kind,
+                    "strategy": None,
+                    "target": {
+                        "lifecycle_id": lifecycle.get("target_lifecycle_id"),
+                        "thread_id": None,
+                    },
+                    "parameters": parameters,
+                }
+            )
+    strategy = payload.get("strategy")
+    if (
+        str(payload.get("recognition_result") or "") == "是策略"
+        and isinstance(strategy, Mapping)
+        and strategy
+    ):
+        rows.append(
+            {
+                "kind": "entry",
+                "strategy": _plain_projection_value(strategy),
+                "target": {"lifecycle_id": None, "thread_id": None},
+                "parameters": {},
+            }
+        )
+    return rows
+
+
+def _canonical_instruction_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    target = row.get("target")
+    target = target if isinstance(target, Mapping) else {}
+    lifecycle_id = target.get("lifecycle_id", row.get("target_lifecycle_id"))
+    thread_id = target.get("thread_id", row.get("target_thread_id"))
+    parameters = row.get("parameters")
+    return {
+        "kind": _canonical_instruction_kind(row.get("kind") or row.get("action")),
+        "strategy": _plain_projection_value(row.get("strategy")),
+        "target": {
+            "lifecycle_id": lifecycle_id,
+            "thread_id": None if lifecycle_id is not None else thread_id,
+        },
+        "parameters": _plain_projection_value(
+            parameters if isinstance(parameters, Mapping) else {}
+        ),
+    }
+
+
+def _legacy_lifecycle_instruction_kind(
+    lifecycle: Mapping[str, Any],
+) -> str | None:
+    event_type = str(lifecycle.get("event_type") or "none")
+    action = _canonical_instruction_kind(lifecycle.get("management_action"))
+    if event_type == "cancel_entry":
+        return "cancel_pending_entry"
+    if event_type == "exit_position":
+        return action if action in {"full_exit", "partial_exit"} else "full_exit"
+    if event_type == "position_update":
+        return action or "hold_update"
+    return None
+
+
+def _canonical_instruction_kind(value: Any) -> str:
+    kind = str(value or "").strip().lower()
+    return {
+        "cancel_entry": "cancel_pending_entry",
+        "exit_full": "full_exit",
+        "exit_partial": "partial_exit",
+    }.get(kind, kind)
+
+
+def _semantic_projection_row(value: Mapping[str, Any]) -> dict[str, Any]:
     return {
         str(key): _plain_projection_value(item)
         for key, item in value.items()
-        if key not in {"reason", "_exact_context_risk_reduction_authorized"}
+        if key not in {"reason", "confidence", "_exact_context_risk_reduction_authorized"}
+        and item is not None
     }
 
 

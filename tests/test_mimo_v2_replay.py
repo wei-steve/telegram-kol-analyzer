@@ -25,6 +25,9 @@ from telegram_kol_research.mimo_v2_replay import (
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import MediaAsset, RawMessage
 from telegram_kol_research.mimo_v2_contract import parse_mimo_v2_payload
+from telegram_kol_research.mimo_v2_execution_adapter import (
+    adapt_mimo_v2_to_current_payload,
+)
 
 
 _COMPARISON_ARTIFACT_FIELDS = (
@@ -521,6 +524,87 @@ def test_reason_and_observed_text_do_not_change_projection():
     assert comparison.v1_fingerprint == comparison.v2_fingerprint
 
 
+def test_confidence_only_difference_is_not_execution_semantic_drift():
+    v1 = _management_payload()
+    v2 = deepcopy(v1)
+    v2["confidence"] = 0.73
+    v2["instructions"][0]["confidence"] = 0.73
+    v2["lifecycle_event"]["confidence"] = 0.73
+
+    comparison = compare_execution_projections(v1, v2)
+
+    assert comparison.status == "safe_match"
+    assert comparison.v1_fingerprint == comparison.v2_fingerprint
+
+
+@pytest.mark.parametrize(
+    ("kind", "intent_type", "event_type", "management_action", "parameters"),
+    (
+        ("full_exit", "exit", "exit_position", "exit_full", {}),
+        (
+            "partial_take_profit",
+            "position_management",
+            "position_update",
+            "partial_take_profit",
+            {"management_fraction": 0.5},
+        ),
+    ),
+)
+def test_legacy_lifecycle_and_v2_instruction_shapes_compare_semantically(
+    kind,
+    intent_type,
+    event_type,
+    management_action,
+    parameters,
+):
+    legacy = {
+        "recognition_result": "非策略",
+        "confidence": 0.9,
+        "strategy": {},
+        "instructions": [],
+        "lifecycle_event": {
+            "event_type": event_type,
+            "management_action": management_action,
+            "target_lifecycle_id": 832,
+            **parameters,
+            "confidence": 0.9,
+            "reason": "legacy wording",
+        },
+    }
+    parsed = parse_mimo_v2_payload(
+        {
+            "contract_version": "mimo-authoritative-v2",
+            "summary": "v2 wording",
+            "confidence": 0.81,
+            "intents": [
+                {
+                    "intent_type": intent_type,
+                    "action": {
+                        "kind": kind,
+                        "target": {"lifecycle_id": 832, "thread_id": 41},
+                        "strategy": None,
+                        "parameters": parameters,
+                    },
+                    "reason": "v2 wording",
+                    "confidence": 0.81,
+                    "evidence_refs": ["text:observed_text"],
+                }
+            ],
+            "evidence": {
+                "text": {"observed_text": "source", "fields": {}},
+                "images": [],
+                "conflicts": [],
+            },
+        }
+    )
+    adapted = adapt_mimo_v2_to_current_payload(parsed).payload
+
+    comparison = compare_execution_projections(legacy, adapted)
+
+    assert comparison.status == "safe_match"
+    assert comparison.v1_fingerprint == comparison.v2_fingerprint
+
+
 @pytest.mark.parametrize(
     ("field", "changed"),
     [
@@ -542,12 +626,11 @@ def test_strategy_projection_drift_is_unsafe(field, changed):
     assert compare_execution_projections(v1, v2).status == "unsafe_mismatch"
 
 
-def test_target_and_confidence_projection_drift_is_unsafe():
+def test_target_projection_drift_is_unsafe():
     v1 = _management_payload()
     v2 = deepcopy(v1)
     v2["instructions"][0]["target"]["lifecycle_id"] = 791
     v2["lifecycle_event"]["target_lifecycle_id"] = 791
-    v2["confidence"] = 0.94
 
     assert compare_execution_projections(v1, v2).status == "unsafe_mismatch"
 

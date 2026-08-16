@@ -27,7 +27,9 @@ from telegram_kol_research.prompt_registry import (
 from telegram_kol_research.prompt_defaults import (
     DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT,
     DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT,
+    INITIAL_MIMO_V2_AUTHORITATIVE_PROMPT,
     MIMO_V2_AUTHORITATIVE_PROMPT,
+    seed_default_prompt_registry,
 )
 
 
@@ -70,6 +72,59 @@ def test_seed_prompt_definition_is_idempotent(tmp_path):
     with factory() as session:
         assert session.query(AiPromptDefinition).count() == 1
         assert session.query(AiPromptVersion).count() == 1
+
+
+def test_default_seed_upgrades_only_the_initial_mimo_v2_contract(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    seed_prompt_definition(
+        factory,
+        PromptSeed(
+            prompt_key=MIMO_V2_AUTHORITATIVE_PROMPT,
+            display_name="MiMo v2",
+            description="MiMo v2 authoritative contract",
+            category="trading",
+            consumers=("mimo",),
+            required_variables=(),
+            validation_profile="mimo_v2_authoritative",
+            content=INITIAL_MIMO_V2_AUTHORITATIVE_PROMPT,
+        ),
+    )
+
+    first = seed_default_prompt_registry(factory)
+    second = seed_default_prompt_registry(factory)
+    detail = get_prompt_detail(factory, MIMO_V2_AUTHORITATIVE_PROMPT)
+
+    assert first and second
+    assert detail.active_version.content == DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT
+    assert detail.active_version.version_number == 2
+    assert [version.status for version in detail.history] == [
+        "published",
+        "superseded",
+    ]
+
+
+def test_default_seed_preserves_operator_modified_mimo_v2_contract(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    customized = INITIAL_MIMO_V2_AUTHORITATIVE_PROMPT + "\noperator customization"
+    seed_prompt_definition(
+        factory,
+        PromptSeed(
+            prompt_key=MIMO_V2_AUTHORITATIVE_PROMPT,
+            display_name="MiMo v2",
+            description="MiMo v2 authoritative contract",
+            category="trading",
+            consumers=("mimo",),
+            required_variables=(),
+            validation_profile="mimo_v2_authoritative",
+            content=customized,
+        ),
+    )
+
+    seed_default_prompt_registry(factory)
+
+    detail = get_prompt_detail(factory, MIMO_V2_AUTHORITATIVE_PROMPT)
+    assert detail.active_version.content == customized
+    assert detail.active_version.version_number == 1
 
 
 def test_save_draft_does_not_change_active_version(tmp_path):

@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
@@ -230,6 +230,90 @@ def seed_prompt_definition(
         session.add(version)
         session.flush()
         definition.active_version_id = version.id
+        session.commit()
+        return _load_detail(session, definition)
+
+
+def upgrade_seeded_prompt_definition(
+    session_factory: sessionmaker,
+    seed: PromptSeed,
+    *,
+    previous_content: str,
+    change_note: str,
+) -> PromptDetail:
+    """Publish a new default only while the exact prior seed is still active."""
+
+    normalized = seed.content.strip()
+    previous = previous_content.strip()
+    if not normalized or not previous or normalized == previous:
+        raise PromptRegistryValidationError("prompt seed upgrade is invalid")
+    now = utc_now()
+    with session_factory() as session:
+        session.execute(text("BEGIN IMMEDIATE"))
+        definition = _get_definition(session, seed.prompt_key, seed.scope_chat_id)
+        active = session.get(AiPromptVersion, definition.active_version_id)
+        if active is None:
+            raise PromptRegistryValidationError(
+                f"prompt {definition.prompt_key} has no active version"
+            )
+        if active.content.strip() == normalized:
+            session.commit()
+            return _load_detail(session, definition)
+        draft_exists = (
+            session.query(AiPromptVersion.id)
+            .filter(AiPromptVersion.prompt_definition_id == definition.id)
+            .filter(AiPromptVersion.status == "draft")
+            .first()
+            is not None
+        )
+        if active.content.strip() != previous or draft_exists:
+            session.commit()
+            return _load_detail(session, definition)
+
+        from telegram_kol_research.prompt_composition import (
+            validate_prompt_content,
+        )
+
+        validation = validate_prompt_content(
+            definition.prompt_key,
+            normalized,
+            validation_profile=definition.validation_profile,
+            required_variables=_decode_tuple(definition.required_variables_json),
+        )
+        if not validation.success:
+            raise PromptRegistryValidationError(
+                "seeded prompt upgrade failed validation: "
+                + "; ".join(validation.errors)
+            )
+        max_version = (
+            session.query(func.max(AiPromptVersion.version_number))
+            .filter(AiPromptVersion.prompt_definition_id == definition.id)
+            .scalar()
+            or 0
+        )
+        active.status = "superseded"
+        active.updated_at = now
+        published = AiPromptVersion(
+            prompt_definition_id=definition.id,
+            version_number=max_version + 1,
+            content=normalized,
+            status="published",
+            change_note=change_note.strip(),
+            source_version_id=active.id,
+            validated_at=now,
+            validation_result_json=json.dumps(
+                {"success": True, "errors": []},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            created_at=now,
+            updated_at=now,
+            published_at=now,
+        )
+        session.add(published)
+        session.flush()
+        definition.active_version_id = published.id
+        definition.updated_at = now
         session.commit()
         return _load_detail(session, definition)
 
