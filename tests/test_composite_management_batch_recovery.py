@@ -7302,6 +7302,43 @@ def test_source_fingerprint_covers_binding_modes_when_target_remains_coherent(tm
     assert after.source_fingerprint != before.source_fingerprint
 
 
+def _set_coherent_target_quantity_step_representation(factory, value):
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, 119)
+        payload = json.loads(batch.target_snapshot_json)
+        payload["positions"][0]["quantity_step"] = value
+        batch.target_snapshot_json = json.dumps(payload, sort_keys=True)
+        batch.target_fingerprint = management_target_fingerprint(payload)
+        for component in session.query(StrategyManagementComponent).filter_by(
+            management_batch_id=119
+        ):
+            desired = json.loads(component.desired_json)
+            desired["quantity_step"] = value
+            component.desired_json = json.dumps(desired, sort_keys=True)
+        session.commit()
+
+
+def test_quantity_step_decimal_equivalent_representation_is_ready(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _set_coherent_target_quantity_step_representation(factory, "1.0")
+
+    plan = _plan(factory)
+
+    assert plan.status == "ready"
+    assert plan.reason_code is None
+
+
+@pytest.mark.parametrize("value", ["2", "0", "-1", "not-a-decimal"])
+def test_quantity_step_decimal_drift_or_invalid_value_refuses(tmp_path, value):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    _set_coherent_target_quantity_step_representation(factory, value)
+
+    plan = _plan(factory)
+
+    assert plan.status == "refused"
+    assert plan.reason_code == "target_snapshot_identity_mismatch"
+
+
 def test_planner_refuses_target_position_execution_leg_drift(tmp_path):
     factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
     with factory() as session:

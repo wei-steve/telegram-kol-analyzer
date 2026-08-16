@@ -158,6 +158,27 @@ def _seed_joint_incident(tmp_path):
     return factory, database
 
 
+def _add_confirmed_reservation_residue(factory, *, count=9):
+    with factory() as session:
+        binding_id = session.query(ExecutionBinding.id).order_by(
+            ExecutionBinding.id
+        ).first()[0]
+        rows = [
+            BoundPositionCloseReservation(
+                pos_id=f"joint-confirmed-residue-{index}",
+                execution_binding_id=binding_id,
+                status="confirmed",
+                last_error=None,
+                created_at=NOW - timedelta(hours=2, minutes=index),
+                updated_at=NOW - timedelta(hours=1, minutes=index),
+            )
+            for index in range(count)
+        ]
+        session.add_all(rows)
+        session.commit()
+        return tuple(row.id for row in rows)
+
+
 def _add_historical_nonterminal_management_residue(factory):
     with factory() as session:
         target = session.get(StrategyManagementBatch, 119)
@@ -315,6 +336,57 @@ def test_exact_joint_incident_is_ready_and_public_projection_is_aggregate(tmp_pa
         "status",
     }
     assert "sensitive" not in repr(result)
+
+
+def test_joint_admission_accepts_nine_confirmed_residue_rows(tmp_path):
+    factory, database = _seed_joint_incident(tmp_path)
+    _add_confirmed_reservation_residue(factory)
+
+    result = _inspect(database)
+
+    assert result.status == "ready"
+    assert result.reason_code is None
+    assert result.reservation_count == 29
+    assert result.batch119_incident_count == 1
+    assert result.blocking_writer_count == 0
+
+
+def test_confirmed_residue_field_drift_changes_joint_fingerprint(tmp_path):
+    factory, database = _seed_joint_incident(tmp_path)
+    residue_ids = _add_confirmed_reservation_residue(factory)
+    before = _inspect(database)
+    with factory() as session:
+        residue = session.get(BoundPositionCloseReservation, residue_ids[0])
+        residue.updated_at = residue.updated_at + timedelta(seconds=1)
+        session.commit()
+
+    after = _inspect(database)
+
+    assert before.status == "ready"
+    assert after.status == "ready"
+    assert after.material_fingerprint != before.material_fingerprint
+
+
+@pytest.mark.parametrize("status", [None, "future_state", "submitted", "reserved"])
+def test_joint_admission_refuses_nonconfirmed_extra_residue(tmp_path, status):
+    factory, database = _seed_joint_incident(tmp_path)
+    residue_ids = _add_confirmed_reservation_residue(factory, count=1)
+    if status is None:
+        _set_test_state_column_nullable_and_null(
+            database,
+            table="bound_position_close_reservations",
+            row_id=residue_ids[0],
+        )
+    else:
+        with factory() as session:
+            residue = session.get(BoundPositionCloseReservation, residue_ids[0])
+            residue.status = status
+            session.commit()
+
+    result = _inspect(database)
+
+    assert result.status == "refused"
+    assert result.reason_code == "joint_material_invalid"
 
 
 def test_joint_admission_accepts_known_historical_nonterminal_management_residue(
@@ -858,6 +930,76 @@ def test_real_bound_apply_changes_only_reservations_and_preserves_batch119(
         == before.batch119_material_fingerprint
     )
     assert len(http_client.requests) == request_count
+
+
+def test_real_bound_apply_preserves_confirmed_residue_and_post_authority(
+    tmp_path,
+    monkeypatch,
+):
+    factory, database = _seed_joint_incident(tmp_path)
+    residue_ids = _add_confirmed_reservation_residue(factory)
+    with factory() as session:
+        residue_before = tuple(
+            (
+                row.id,
+                row.pos_id,
+                row.execution_binding_id,
+                row.status,
+                row.last_error,
+                row.created_at,
+                row.updated_at,
+            )
+            for row in session.query(BoundPositionCloseReservation)
+            .filter(BoundPositionCloseReservation.id.in_(residue_ids))
+            .order_by(BoundPositionCloseReservation.id)
+        )
+    before = _inspect(database, phase="bound_apply_pre")
+    monkeypatch.setattr(
+        _RECOVERY_TEST_SUPPORT.recovery_module,
+        "_recovery_capture_now",
+        lambda: _RECOVERY_TEST_SUPPORT.APPLY_TIME - timedelta(minutes=1),
+    )
+    source = _RECOVERY_TEST_SUPPORT.load_bound_close_reservation_source(database)
+    http_client = _RECOVERY_TEST_SUPPORT._RecoveryReaderHttpClient(
+        responses=_RECOVERY_TEST_SUPPORT._terminal_provider_responses(source)
+    )
+    reader, _transport, _selected = (
+        _RECOVERY_TEST_SUPPORT._factory_recovery_reader(
+            monkeypatch, http_client=http_client
+        )
+    )
+    capture = (
+        _RECOVERY_TEST_SUPPORT.capture_and_seal_bound_close_reservation_recovery(
+            source,
+            reader,
+            deadline_monotonic=__import__("time").monotonic() + 30.0,
+        )
+    )
+
+    applied = _RECOVERY_TEST_SUPPORT._apply_ready(database, capture)
+    after = _inspect(database, phase="bound_apply_post")
+    with factory() as session:
+        residue_after = tuple(
+            (
+                row.id,
+                row.pos_id,
+                row.execution_binding_id,
+                row.status,
+                row.last_error,
+                row.created_at,
+                row.updated_at,
+            )
+            for row in session.query(BoundPositionCloseReservation)
+            .filter(BoundPositionCloseReservation.id.in_(residue_ids))
+            .order_by(BoundPositionCloseReservation.id)
+        )
+
+    assert before.status == "ready"
+    assert capture.plan.action_count == 29
+    assert applied.action_count == 29
+    assert residue_after == residue_before
+    assert after.status == "ready"
+    assert after.reservation_count == 29
 
 
 def test_batch119_material_fingerprint_changes_only_with_batch119_authority(tmp_path):
