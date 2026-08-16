@@ -689,7 +689,7 @@ class _BoundCloseReservationSourceCapability(_OpaqueUncopyableCapability):
         return self.__raw_by_reservation_ref[reservation_ref]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class BoundCloseReservationSource(_OpaqueUncopyableCapability):
     reservations: tuple[LocalReservationEvidence, ...]
     source_fingerprint: str
@@ -705,6 +705,123 @@ class BoundCloseReservationSource(_OpaqueUncopyableCapability):
         _require_lower_hex_64(self.source_fingerprint, "source_fingerprint")
         if type(self._capability) is not _BoundCloseReservationSourceCapability:
             raise TypeError("invalid private source capability")
+
+
+@dataclass(frozen=True, slots=True)
+class _DatabaseFileIdentity:
+    resolved_path: str
+    device: int
+    inode: int
+
+
+class _BoundCloseReservationSourceIssuance:
+    __slots__ = (
+        "capability",
+        "database_identity",
+        "raw_source_snapshot_fingerprint",
+        "reservations",
+        "reservations_snapshot_fingerprint",
+        "source_fingerprint",
+        "source_ref",
+    )
+
+    def __init__(
+        self,
+        *,
+        source_ref: weakref.ReferenceType[BoundCloseReservationSource],
+        source: BoundCloseReservationSource,
+        database_identity: _DatabaseFileIdentity,
+    ) -> None:
+        self.source_ref = source_ref
+        self.reservations = source.reservations
+        self.reservations_snapshot_fingerprint = _sha256_json(
+            source.reservations
+        )
+        self.source_fingerprint = source.source_fingerprint
+        self.capability = source._capability
+        self.raw_source_snapshot_fingerprint = (
+            _raw_source_snapshot_fingerprint(source._capability)
+        )
+        self.database_identity = database_identity
+
+
+_SOURCE_ISSUANCE_LOCK = threading.RLock()
+_MAX_SOURCE_ISSUANCE = MAX_RESERVATION_OBSERVATIONS * 8
+_SOURCE_ISSUANCE_REGISTRY: OrderedDict[
+    int,
+    _BoundCloseReservationSourceIssuance,
+] = OrderedDict()
+
+
+def _database_file_identity(path: Path) -> _DatabaseFileIdentity:
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+        stat_result = resolved.stat()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise _apply_refusal("database_authority_invalid") from exc
+    if not resolved.is_file():
+        raise _apply_refusal("database_authority_invalid")
+    return _DatabaseFileIdentity(
+        resolved_path=str(resolved),
+        device=int(stat_result.st_dev),
+        inode=int(stat_result.st_ino),
+    )
+
+
+def _register_bound_close_reservation_source(
+    source: BoundCloseReservationSource,
+    *,
+    database_identity: _DatabaseFileIdentity,
+) -> BoundCloseReservationSource:
+    source_identity = id(source)
+
+    def discard(
+        reference: weakref.ReferenceType[BoundCloseReservationSource],
+        *,
+        expected_identity: int = source_identity,
+    ) -> None:
+        with _SOURCE_ISSUANCE_LOCK:
+            current = _SOURCE_ISSUANCE_REGISTRY.get(expected_identity)
+            if current is not None and current.source_ref is reference:
+                _SOURCE_ISSUANCE_REGISTRY.pop(expected_identity, None)
+
+    reference = weakref.ref(source, discard)
+    issuance = _BoundCloseReservationSourceIssuance(
+        source_ref=reference,
+        source=source,
+        database_identity=database_identity,
+    )
+    with _SOURCE_ISSUANCE_LOCK:
+        _SOURCE_ISSUANCE_REGISTRY[source_identity] = issuance
+        _SOURCE_ISSUANCE_REGISTRY.move_to_end(source_identity)
+        while len(_SOURCE_ISSUANCE_REGISTRY) > _MAX_SOURCE_ISSUANCE:
+            _SOURCE_ISSUANCE_REGISTRY.popitem(last=False)
+    return source
+
+
+def _require_issued_bound_close_reservation_source(
+    source: BoundCloseReservationSource,
+) -> _DatabaseFileIdentity:
+    if type(source) is not BoundCloseReservationSource:
+        raise _apply_refusal("source_authority_invalid")
+    with _SOURCE_ISSUANCE_LOCK:
+        issued = _SOURCE_ISSUANCE_REGISTRY.get(id(source))
+        if issued is None or issued.source_ref() is not source:
+            raise _apply_refusal("source_authority_invalid")
+        try:
+            if (
+                source.reservations is not issued.reservations
+                or source._capability is not issued.capability
+                or source.source_fingerprint != issued.source_fingerprint
+                or _sha256_json(source.reservations)
+                != issued.reservations_snapshot_fingerprint
+                or _raw_source_snapshot_fingerprint(source._capability)
+                != issued.raw_source_snapshot_fingerprint
+            ):
+                raise _apply_refusal("source_authority_invalid")
+        except (AttributeError, RecursionError, TypeError, ValueError) as exc:
+            raise _apply_refusal("source_authority_invalid") from exc
+        return issued.database_identity
 
 
 def _raw_source_snapshot_fingerprint(
@@ -892,7 +1009,11 @@ class BoundCloseReservationRecoveryResult:
     audit_event_id: int
 
     def __post_init__(self) -> None:
-        if self.status not in {"applied", "already_applied"}:
+        if self.status not in {
+            "applied",
+            "applied_after_deadline_verified",
+            "already_applied",
+        }:
             raise ValueError("recovery result status is invalid")
         _require_lower_hex_64(
             self.evidence_fingerprint,
@@ -1186,6 +1307,7 @@ class SealedRecoveryCapture(_OpaqueUncopyableCapability):
     __slots__ = (
         "__apply_claimed",
         "__apply_claim_lock",
+        "__database_identity",
         "__deadline_monotonic",
         "__plan",
         "__serialized_plan",
@@ -1216,6 +1338,7 @@ _SEALED_CAPTURE_ISSUANCE_LOCK = threading.RLock()
 class _SealedCaptureIssuance:
     __slots__ = (
         "capture_ref",
+        "database_identity",
         "deadline_monotonic",
         "plan",
         "plan_snapshot_fingerprint",
@@ -1228,6 +1351,7 @@ class _SealedCaptureIssuance:
         self,
         *,
         capture_ref: weakref.ReferenceType[SealedRecoveryCapture],
+        database_identity: _DatabaseFileIdentity,
         deadline_monotonic: float,
         plan: BoundCloseReservationRecoveryPlan,
         plan_snapshot_fingerprint: str,
@@ -1236,6 +1360,7 @@ class _SealedCaptureIssuance:
         source_capability: _BoundCloseReservationSourceCapability,
     ) -> None:
         self.capture_ref = capture_ref
+        self.database_identity = database_identity
         self.deadline_monotonic = deadline_monotonic
         self.plan = plan
         self.plan_snapshot_fingerprint = plan_snapshot_fingerprint
@@ -1266,6 +1391,13 @@ def _register_sealed_recovery_capture(capture: SealedRecoveryCapture) -> None:
     reference = weakref.ref(capture, discard)
     issuance = _SealedCaptureIssuance(
         capture_ref=reference,
+        database_identity=_DatabaseFileIdentity(
+            resolved_path=(
+                capture._SealedRecoveryCapture__database_identity.resolved_path
+            ),
+            device=capture._SealedRecoveryCapture__database_identity.device,
+            inode=capture._SealedRecoveryCapture__database_identity.inode,
+        ),
         deadline_monotonic=_finite_recovery_monotonic(
             capture._SealedRecoveryCapture__deadline_monotonic
         ),
@@ -1289,6 +1421,7 @@ def _register_sealed_recovery_capture(capture: SealedRecoveryCapture) -> None:
 class _ClaimedSealedRecoveryCapture(_OpaqueUncopyableCapability):
     __slots__ = (
         "__capture_completed_at",
+        "__database_identity",
         "__deadline_monotonic",
         "__plan",
         "__source_capability",
@@ -1300,6 +1433,7 @@ class _ClaimedSealedRecoveryCapture(_OpaqueUncopyableCapability):
         plan: BoundCloseReservationRecoveryPlan,
         source_capability: object,
         capture_completed_at: datetime,
+        database_identity: _DatabaseFileIdentity,
         deadline_monotonic: float,
         _issuer: object,
     ) -> None:
@@ -1313,6 +1447,9 @@ class _ClaimedSealedRecoveryCapture(_OpaqueUncopyableCapability):
             capture_completed_at,
             "capture_completed_at",
         )
+        if type(database_identity) is not _DatabaseFileIdentity:
+            raise TypeError("claimed recovery database authority is invalid")
+        self.__database_identity = database_identity
         self.__deadline_monotonic = _finite_recovery_monotonic(
             deadline_monotonic
         )
@@ -1328,6 +1465,10 @@ class _ClaimedSealedRecoveryCapture(_OpaqueUncopyableCapability):
     @property
     def deadline_monotonic(self) -> float:
         return self.__deadline_monotonic
+
+    @property
+    def database_identity(self) -> _DatabaseFileIdentity:
+        return self.__database_identity
 
 
 def _claim_sealed_recovery_capture_for_apply(
@@ -1346,6 +1487,8 @@ def _claim_sealed_recovery_capture_for_apply(
         if (
             getattr(capture, "_SealedRecoveryCapture__deadline_monotonic", None)
             != issued.deadline_monotonic
+            or getattr(capture, "_SealedRecoveryCapture__database_identity", None)
+            != issued.database_identity
         ):
             raise ValueError("sealed recovery capture issued contents changed")
         if time.monotonic() >= issued.deadline_monotonic:
@@ -1401,6 +1544,7 @@ def _claim_sealed_recovery_capture_for_apply(
             plan=issued.plan,
             source_capability=issued.source_capability,
             capture_completed_at=parsed_capture.capture_completed_at,
+            database_identity=issued.database_identity,
             deadline_monotonic=issued.deadline_monotonic,
             _issuer=_SEALED_APPLY_CLAIM_ISSUER,
         )
@@ -1528,6 +1672,71 @@ def _open_bound_close_reservation_writable_connection(
         raise
 
 
+def _connection_matches_database_identity(
+    connection: sqlite3.Connection,
+    *,
+    expected: _DatabaseFileIdentity,
+) -> bool:
+    """Recheck the named main database around open and lock acquisition."""
+
+    try:
+        rows = connection.execute("PRAGMA database_list").fetchall()
+        main = [row for row in rows if row[1] == "main"]
+        if len(main) != 1 or not main[0][2]:
+            return False
+        return _database_file_identity(Path(main[0][2])) == expected
+    except (
+        BoundCloseReservationRecoveryConflict,
+        OSError,
+        RuntimeError,
+        sqlite3.Error,
+        TypeError,
+        ValueError,
+    ):
+        return False
+
+
+def _require_no_user_recovery_triggers(
+    connection: sqlite3.Connection,
+) -> None:
+    """Fail closed instead of attempting to reason about trigger side effects."""
+
+    for schema_table in ("sqlite_master", "sqlite_temp_master"):
+        rows = connection.execute(
+            f"SELECT name FROM {schema_table} "
+            "WHERE type = 'trigger' AND name NOT LIKE 'sqlite_%' LIMIT 1"
+        ).fetchall()
+        if rows:
+            raise _apply_refusal("unexpected_user_trigger")
+
+
+def _bound_close_reservation_write_authorizer(
+    action: int,
+    table_name: str | None,
+    column_name: str | None,
+    database_name: str | None,
+    trigger_name: str | None,
+) -> int:
+    del database_name, trigger_name
+    if action == sqlite3.SQLITE_UPDATE:
+        if table_name == "bound_position_close_reservations" and column_name in {
+            "status",
+            "last_error",
+            "updated_at",
+        }:
+            return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+    if action == sqlite3.SQLITE_INSERT:
+        return (
+            sqlite3.SQLITE_OK
+            if table_name == "execution_events"
+            else sqlite3.SQLITE_DENY
+        )
+    if action == sqlite3.SQLITE_DELETE:
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
 def _execute_bound_close_reservation_apply_statement(
     connection: sqlite3.Connection,
     sql: str,
@@ -1599,6 +1808,38 @@ def _locked_active_bound_close_reservation_source(
     if len(rows) > MAX_RESERVATION_OBSERVATIONS:
         raise _apply_refusal("source_population_overflow")
     return _load_source_descendants(connection, rows)
+
+
+def _locked_plan_observations_match_source(
+    *,
+    plan: BoundCloseReservationRecoveryPlan,
+    source: BoundCloseReservationSource,
+) -> bool:
+    """Bind every approved observation to the exact locked local fact."""
+
+    if (
+        type(plan) is not BoundCloseReservationRecoveryPlan
+        or type(source) is not BoundCloseReservationSource
+        or source.source_fingerprint != plan.source_fingerprint
+        or source.source_fingerprint
+        != _sha256_json({"reservations": source.reservations})
+        or len(source.reservations) != len(plan.observations)
+    ):
+        return False
+    local_by_ref = {item.reservation_ref: item for item in source.reservations}
+    if len(local_by_ref) != len(source.reservations):
+        return False
+    for observation in plan.observations:
+        local = local_by_ref.get(observation.reservation_ref)
+        if (
+            local is None
+            or observation.classification
+            is not ReservationClassification.PROVEN_TERMINAL
+            or observation.reason_code != "exact_close_and_position_terminal"
+            or observation.source_fingerprint != _sha256_json(local)
+        ):
+            return False
+    return True
 
 
 def _claimed_source_capability(
@@ -1921,6 +2162,7 @@ def _close_recovery_connection_safely(connection: object) -> None:
 def _verify_committed_bound_close_reservation_apply_read_only(
     database_path: Path,
     *,
+    expected_database_identity: _DatabaseFileIdentity,
     plan: BoundCloseReservationRecoveryPlan,
     raw_rows: tuple[tuple[str, _RawReservationCapability], ...],
     before_json: str,
@@ -1929,12 +2171,19 @@ def _verify_committed_bound_close_reservation_apply_read_only(
     uri = f"file:{quote(str(database_path), safe='/')}?mode=ro"
     connection: sqlite3.Connection | None = None
     try:
+        if _database_file_identity(database_path) != expected_database_identity:
+            return None
         connection = sqlite3.connect(uri, uri=True, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only=ON")
         if int(connection.execute("PRAGMA query_only").fetchone()[0]) != 1:
             return None
         connection.execute("BEGIN")
+        if not _connection_matches_database_identity(
+            connection,
+            expected=expected_database_identity,
+        ):
+            return None
         if not _locked_mimo_contract_mode_is_v1(connection):
             return None
         audits = _load_bound_close_reservation_audits(connection)
@@ -2035,72 +2284,222 @@ def apply_bound_close_reservation_recovery(
         applied_at=applied,
     )
     _require_claimed_apply_deadline(claimed)
+    if _database_file_identity(resolved_database_path) != (
+        claimed.database_identity
+    ):
+        raise _apply_refusal("database_authority_mismatch")
     raw_rows = _planned_raw_reservations(claimed=claimed, plan=plan)
     _require_claimed_apply_deadline(claimed)
 
     connection: sqlite3.Connection | None = None
+    authorizer_installed = False
+    commit_exception: BaseException | None = None
+    commit_attempted = False
+    commit_returned_after_deadline = False
+    audit_event_id: int | None = None
+    before_json = ""
+    after_json = ""
     try:
-        _require_claimed_apply_deadline(claimed)
-        connection = _open_bound_close_reservation_writable_connection(
-            resolved_database_path
-        )
-        _require_claimed_apply_deadline(claimed)
-        connection.execute("BEGIN IMMEDIATE")
-        _require_claimed_apply_deadline(claimed)
-        if not _locked_mimo_contract_mode_is_v1(connection):
-            raise _apply_refusal("mimo_contract_mode_not_v1")
-        _require_claimed_apply_deadline(claimed)
-        audits = _load_bound_close_reservation_audits(connection)
-        _require_claimed_apply_deadline(claimed)
-        matching = tuple(
-            row
-            for row in audits
-            if row["notification_fingerprint"] == plan.evidence_fingerprint
-        )
-        if matching:
-            (
-                audited_statuses,
-                audited_invariant_fingerprints,
-            ) = _parse_applied_recovery_audit_statuses(
-                plan=plan,
-                before_json=matching[0]["before_json"],
-                after_json=matching[0]["after_json"],
+        with _recovery_wall_clock_guard(
+            deadline_monotonic=claimed.deadline_monotonic
+        ):
+            _require_claimed_apply_deadline(claimed)
+            if _database_file_identity(resolved_database_path) != (
+                claimed.database_identity
+            ):
+                raise _apply_refusal("database_authority_mismatch")
+            connection = _open_bound_close_reservation_writable_connection(
+                resolved_database_path
             )
-            expected_statuses = {
-                reservation_ref: raw.source_status
-                for reservation_ref, raw in raw_rows
-            }
-            if audited_statuses != expected_statuses:
+            if _database_file_identity(resolved_database_path) != (
+                claimed.database_identity
+            ):
+                raise _apply_refusal("database_authority_mismatch")
+            _require_claimed_apply_deadline(claimed)
+            connection.execute("BEGIN IMMEDIATE")
+            _require_claimed_apply_deadline(claimed)
+            if not _connection_matches_database_identity(
+                connection,
+                expected=claimed.database_identity,
+            ):
+                raise _apply_refusal("database_authority_mismatch")
+            if not _locked_mimo_contract_mode_is_v1(connection):
+                raise _apply_refusal("mimo_contract_mode_not_v1")
+            _require_claimed_apply_deadline(claimed)
+            audits = _load_bound_close_reservation_audits(connection)
+            _require_claimed_apply_deadline(claimed)
+            matching = tuple(
+                row
+                for row in audits
+                if row["notification_fingerprint"] == plan.evidence_fingerprint
+            )
+            if matching:
+                (
+                    audited_statuses,
+                    audited_invariant_fingerprints,
+                ) = _parse_applied_recovery_audit_statuses(
+                    plan=plan,
+                    before_json=matching[0]["before_json"],
+                    after_json=matching[0]["after_json"],
+                )
+                expected_statuses = {
+                    reservation_ref: raw.source_status
+                    for reservation_ref, raw in raw_rows
+                }
+                if audited_statuses != expected_statuses:
+                    raise _apply_refusal("unexpected_audit_event")
+                current_invariant_fingerprints = _durable_invariant_fingerprints(
+                    connection,
+                    raw_rows=raw_rows,
+                )
+                if current_invariant_fingerprints != (
+                    audited_invariant_fingerprints
+                ):
+                    raise _apply_refusal("durable_invariant_conflict")
+                before_json, after_json = _recovery_audit_payloads(
+                    plan=plan,
+                    raw_rows=raw_rows,
+                    durable_invariant_fingerprints=(
+                        audited_invariant_fingerprints
+                    ),
+                )
+                _require_claimed_apply_deadline(claimed)
+                audit_created_at = _parse_sqlite_utc(matching[0]["created_at"])
+                if (
+                    audit_created_at is None
+                    or claimed.capture_completed_at <= audit_created_at
+                ):
+                    raise _apply_refusal(
+                        "fresh_capture_does_not_postdate_audit"
+                    )
+                if (
+                    len(audits) != 1
+                    or len(matching) != 1
+                    or not _exact_recovery_audit_matches(
+                        matching[0],
+                        plan=plan,
+                        before_json=before_json,
+                        after_json=after_json,
+                    )
+                    or not _planned_rows_are_exactly_confirmed(
+                        connection,
+                        raw_rows=raw_rows,
+                        audit_created_at=matching[0]["created_at"],
+                    )
+                ):
+                    raise _apply_refusal("unexpected_audit_event")
+                active = _locked_active_bound_close_reservation_source(connection)
+                _require_claimed_apply_deadline(claimed)
+                if active.reservations:
+                    raise _apply_refusal("source_state_conflict")
+                connection.rollback()
+                _close_recovery_connection_safely(connection)
+                connection = None
+                verified_event_id = (
+                    _verify_committed_bound_close_reservation_apply_read_only(
+                        resolved_database_path,
+                        expected_database_identity=claimed.database_identity,
+                        plan=plan,
+                        raw_rows=raw_rows,
+                        before_json=before_json,
+                        after_json=after_json,
+                    )
+                )
+                if verified_event_id != int(matching[0]["id"]):
+                    raise _apply_refusal("database_authority_mismatch")
+                return BoundCloseReservationRecoveryResult(
+                    status="already_applied",
+                    evidence_fingerprint=plan.evidence_fingerprint,
+                    action_count=plan.action_count,
+                    audit_event_id=int(matching[0]["id"]),
+                )
+            if audits:
                 raise _apply_refusal("unexpected_audit_event")
-            current_invariant_fingerprints = _durable_invariant_fingerprints(
+
+            locked_source = _locked_active_bound_close_reservation_source(
+                connection
+            )
+            _require_claimed_apply_deadline(claimed)
+            if not _locked_plan_observations_match_source(
+                plan=plan,
+                source=locked_source,
+            ):
+                raise _apply_refusal("source_state_conflict")
+            if _raw_source_snapshot_fingerprint(locked_source._capability) != (
+                _raw_source_snapshot_fingerprint(
+                    _claimed_source_capability(claimed)
+                )
+            ):
+                raise _apply_refusal("source_state_conflict")
+            _require_no_user_recovery_triggers(connection)
+            _require_claimed_apply_deadline(claimed)
+            durable_invariant_fingerprints = _durable_invariant_fingerprints(
                 connection,
                 raw_rows=raw_rows,
             )
-            if current_invariant_fingerprints != (
-                audited_invariant_fingerprints
-            ):
-                raise _apply_refusal("durable_invariant_conflict")
+            _require_claimed_apply_deadline(claimed)
             before_json, after_json = _recovery_audit_payloads(
                 plan=plan,
                 raw_rows=raw_rows,
-                durable_invariant_fingerprints=(
-                    audited_invariant_fingerprints
+                durable_invariant_fingerprints=durable_invariant_fingerprints,
+            )
+
+            updated_at = _sqlite_apply_time(applied)
+            baseline_changes = connection.total_changes
+            connection.set_authorizer(_bound_close_reservation_write_authorizer)
+            authorizer_installed = True
+            for _reservation_ref, raw in raw_rows:
+                _require_claimed_apply_deadline(claimed)
+                cursor = _execute_bound_close_reservation_apply_statement(
+                    connection,
+                    """
+                    UPDATE bound_position_close_reservations
+                    SET status = 'confirmed', last_error = NULL, updated_at = ?
+                    WHERE id = ? AND status = ?
+                    """,
+                    (updated_at, raw.reservation_id, raw.source_status),
+                )
+                if cursor.rowcount != 1:
+                    raise _apply_refusal("reservation_cas_conflict")
+                _require_claimed_apply_deadline(claimed)
+            cursor = _execute_bound_close_reservation_apply_statement(
+                connection,
+                """
+                INSERT INTO execution_events (
+                    execution_binding_id, venue, action, status, order_id,
+                    client_order_id, pos_id, related_order_id,
+                    before_json, after_json, request_json, response_json,
+                    notification_fingerprint, notification_attempts, created_at
+                ) VALUES (NULL, 'deepcoin', ?, 'succeeded', NULL, NULL, NULL, NULL,
+                          ?, ?, NULL, NULL, ?, 0, ?)
+                """,
+                (
+                    _BOUND_CLOSE_RESERVATION_AUDIT_ACTION,
+                    before_json,
+                    after_json,
+                    plan.evidence_fingerprint,
+                    updated_at,
                 ),
             )
             _require_claimed_apply_deadline(claimed)
-            audit_created_at = _parse_sqlite_utc(matching[0]["created_at"])
+            audit_event_id = cursor.lastrowid
+            if type(audit_event_id) is not int or audit_event_id <= 0:
+                raise _apply_refusal("audit_insert_failed")
+            connection.set_authorizer(None)
+            authorizer_installed = False
+            if connection.total_changes - baseline_changes != plan.action_count + 1:
+                raise _apply_refusal("unexpected_transaction_changes")
+            if _durable_invariant_fingerprints(
+                connection,
+                raw_rows=raw_rows,
+            ) != durable_invariant_fingerprints:
+                raise _apply_refusal("durable_invariant_conflict")
+            postwrite_audits = _load_bound_close_reservation_audits(connection)
             if (
-                audit_created_at is None
-                or claimed.capture_completed_at <= audit_created_at
-            ):
-                raise _apply_refusal(
-                    "fresh_capture_does_not_postdate_audit"
-                )
-            if (
-                len(audits) != 1
-                or len(matching) != 1
+                len(postwrite_audits) != 1
+                or int(postwrite_audits[0]["id"]) != audit_event_id
                 or not _exact_recovery_audit_matches(
-                    matching[0],
+                    postwrite_audits[0],
                     plan=plan,
                     before_json=before_json,
                     after_json=after_json,
@@ -2108,129 +2507,207 @@ def apply_bound_close_reservation_recovery(
                 or not _planned_rows_are_exactly_confirmed(
                     connection,
                     raw_rows=raw_rows,
-                    audit_created_at=matching[0]["created_at"],
+                    audit_created_at=updated_at,
                 )
+                or _locked_active_bound_close_reservation_source(
+                    connection
+                ).reservations
+                or not _locked_mimo_contract_mode_is_v1(connection)
             ):
-                raise _apply_refusal("unexpected_audit_event")
-            active = _locked_active_bound_close_reservation_source(connection)
+                raise _apply_refusal("postwrite_state_conflict")
             _require_claimed_apply_deadline(claimed)
-            if active.reservations:
-                raise _apply_refusal("source_state_conflict")
-            connection.rollback()
-            return BoundCloseReservationRecoveryResult(
-                status="already_applied",
-                evidence_fingerprint=plan.evidence_fingerprint,
-                action_count=plan.action_count,
-                audit_event_id=int(matching[0]["id"]),
-            )
-        if audits:
-            raise _apply_refusal("unexpected_audit_event")
-
-        locked_source = _locked_active_bound_close_reservation_source(connection)
-        _require_claimed_apply_deadline(claimed)
-        if (
-            locked_source.source_fingerprint != plan.source_fingerprint
-            or tuple(sorted(
-                item.reservation_ref for item in locked_source.reservations
-            ))
-            != tuple(item.reservation_ref for item in plan.observations)
-        ):
-            raise _apply_refusal("source_state_conflict")
-        if _raw_source_snapshot_fingerprint(locked_source._capability) != (
-            _raw_source_snapshot_fingerprint(
-                _claimed_source_capability(claimed)
-            )
-        ):
-            raise _apply_refusal("source_state_conflict")
-        durable_invariant_fingerprints = _durable_invariant_fingerprints(
-            connection,
-            raw_rows=raw_rows,
-        )
-        _require_claimed_apply_deadline(claimed)
-        before_json, after_json = _recovery_audit_payloads(
-            plan=plan,
-            raw_rows=raw_rows,
-            durable_invariant_fingerprints=durable_invariant_fingerprints,
-        )
-
-        updated_at = _sqlite_apply_time(applied)
-        for _reservation_ref, raw in raw_rows:
-            _require_claimed_apply_deadline(claimed)
-            cursor = _execute_bound_close_reservation_apply_statement(
+            if not _connection_matches_database_identity(
                 connection,
-                """
-                UPDATE bound_position_close_reservations
-                SET status = 'confirmed', last_error = NULL, updated_at = ?
-                WHERE id = ? AND status = ?
-                """,
-                (updated_at, raw.reservation_id, raw.source_status),
-            )
-            if cursor.rowcount != 1:
-                raise _apply_refusal("reservation_cas_conflict")
-            _require_claimed_apply_deadline(claimed)
-        _require_claimed_apply_deadline(claimed)
-        cursor = _execute_bound_close_reservation_apply_statement(
-            connection,
-            """
-            INSERT INTO execution_events (
-                execution_binding_id, venue, action, status, order_id,
-                client_order_id, pos_id, related_order_id,
-                before_json, after_json, request_json, response_json,
-                notification_fingerprint, notification_attempts, created_at
-            ) VALUES (NULL, 'deepcoin', ?, 'succeeded', NULL, NULL, NULL, NULL,
-                      ?, ?, NULL, NULL, ?, 0, ?)
-            """,
-            (
-                _BOUND_CLOSE_RESERVATION_AUDIT_ACTION,
-                before_json,
-                after_json,
-                plan.evidence_fingerprint,
-                updated_at,
-            ),
-        )
-        _require_claimed_apply_deadline(claimed)
-        audit_event_id = cursor.lastrowid
-        if type(audit_event_id) is not int or audit_event_id <= 0:
-            raise _apply_refusal("audit_insert_failed")
-        _require_claimed_apply_deadline(claimed)
-        try:
-            _commit_bound_close_reservation_apply(connection)
-        except Exception as exc:
-            if connection.in_transaction:
+                expected=claimed.database_identity,
+            ):
+                raise _apply_refusal("database_authority_mismatch")
+            commit_attempted = True
+            try:
+                _commit_bound_close_reservation_apply(connection)
+                if _database_file_identity(resolved_database_path) != (
+                    claimed.database_identity
+                ):
+                    raise _apply_refusal("database_authority_mismatch")
+                commit_returned_after_deadline = (
+                    time.monotonic() >= claimed.deadline_monotonic
+                )
+            except BaseException as exc:
+                commit_exception = exc
+
+        if commit_exception is not None or commit_returned_after_deadline:
+            if connection is not None and connection.in_transaction:
                 try:
                     connection.rollback()
                 except Exception:
                     pass
-            _close_recovery_connection_safely(connection)
-            connection = None
+            if connection is not None:
+                _close_recovery_connection_safely(connection)
+                connection = None
             verified_event_id = (
                 _verify_committed_bound_close_reservation_apply_read_only(
                     resolved_database_path,
+                    expected_database_identity=claimed.database_identity,
                     plan=plan,
                     raw_rows=raw_rows,
                     before_json=before_json,
                     after_json=after_json,
                 )
             )
-            if verified_event_id is not None:
+            if verified_event_id == audit_event_id:
+                late = commit_returned_after_deadline or (
+                    isinstance(
+                        commit_exception,
+                        BoundCloseReservationExchangeDeadlineExceeded,
+                    )
+                    or time.monotonic() >= claimed.deadline_monotonic
+                )
                 return BoundCloseReservationRecoveryResult(
-                    status="applied",
+                    status=(
+                        "applied_after_deadline_verified" if late else "applied"
+                    ),
+                    evidence_fingerprint=plan.evidence_fingerprint,
+                    action_count=plan.action_count,
+                    audit_event_id=verified_event_id,
+                )
+            raise _apply_refusal("apply_commit_outcome_unresolved") from (
+                commit_exception
+            )
+        if audit_event_id is None:
+            raise _apply_refusal("audit_insert_failed")
+        if connection is not None:
+            _close_recovery_connection_safely(connection)
+            connection = None
+        verified_event_id = (
+            _verify_committed_bound_close_reservation_apply_read_only(
+                resolved_database_path,
+                expected_database_identity=claimed.database_identity,
+                plan=plan,
+                raw_rows=raw_rows,
+                before_json=before_json,
+                after_json=after_json,
+            )
+        )
+        if verified_event_id != audit_event_id:
+            raise _apply_refusal("apply_commit_outcome_unresolved")
+        return BoundCloseReservationRecoveryResult(
+            status="applied",
+            evidence_fingerprint=plan.evidence_fingerprint,
+            action_count=plan.action_count,
+            audit_event_id=verified_event_id,
+        )
+    except BoundCloseReservationRecoveryConflict as exc:
+        if connection is not None and authorizer_installed:
+            try:
+                connection.set_authorizer(None)
+            except Exception:
+                pass
+        if commit_attempted:
+            if connection is not None and connection.in_transaction:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+            if connection is not None:
+                _close_recovery_connection_safely(connection)
+                connection = None
+            verified_event_id = (
+                _verify_committed_bound_close_reservation_apply_read_only(
+                    resolved_database_path,
+                    expected_database_identity=claimed.database_identity,
+                    plan=plan,
+                    raw_rows=raw_rows,
+                    before_json=before_json,
+                    after_json=after_json,
+                )
+            )
+            if verified_event_id == audit_event_id:
+                return BoundCloseReservationRecoveryResult(
+                    status=(
+                        "applied_after_deadline_verified"
+                        if time.monotonic() >= claimed.deadline_monotonic
+                        else "applied"
+                    ),
                     evidence_fingerprint=plan.evidence_fingerprint,
                     action_count=plan.action_count,
                     audit_event_id=verified_event_id,
                 )
             raise _apply_refusal("apply_commit_outcome_unresolved") from exc
-        return BoundCloseReservationRecoveryResult(
-            status="applied",
-            evidence_fingerprint=plan.evidence_fingerprint,
-            action_count=plan.action_count,
-            audit_event_id=audit_event_id,
-        )
-    except BoundCloseReservationRecoveryConflict:
         if connection is not None and connection.in_transaction:
             connection.rollback()
         raise
+    except BoundCloseReservationExchangeDeadlineExceeded as exc:
+        if connection is not None and authorizer_installed:
+            try:
+                connection.set_authorizer(None)
+            except Exception:
+                pass
+        if commit_attempted:
+            if connection is not None and connection.in_transaction:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+            if connection is not None:
+                _close_recovery_connection_safely(connection)
+                connection = None
+            verified_event_id = (
+                _verify_committed_bound_close_reservation_apply_read_only(
+                    resolved_database_path,
+                    expected_database_identity=claimed.database_identity,
+                    plan=plan,
+                    raw_rows=raw_rows,
+                    before_json=before_json,
+                    after_json=after_json,
+                )
+            )
+            if verified_event_id == audit_event_id:
+                return BoundCloseReservationRecoveryResult(
+                    status="applied_after_deadline_verified",
+                    evidence_fingerprint=plan.evidence_fingerprint,
+                    action_count=plan.action_count,
+                    audit_event_id=verified_event_id,
+                )
+            raise _apply_refusal("apply_commit_outcome_unresolved") from exc
+        if connection is not None and connection.in_transaction:
+            connection.rollback()
+        raise _apply_refusal("fresh_capture_expired_during_apply") from exc
     except (OSError, RecursionError, sqlite3.Error, TypeError, ValueError) as exc:
+        if connection is not None and authorizer_installed:
+            try:
+                connection.set_authorizer(None)
+            except Exception:
+                pass
+        if commit_attempted:
+            if connection is not None and connection.in_transaction:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+            if connection is not None:
+                _close_recovery_connection_safely(connection)
+                connection = None
+            verified_event_id = (
+                _verify_committed_bound_close_reservation_apply_read_only(
+                    resolved_database_path,
+                    expected_database_identity=claimed.database_identity,
+                    plan=plan,
+                    raw_rows=raw_rows,
+                    before_json=before_json,
+                    after_json=after_json,
+                )
+            )
+            if verified_event_id == audit_event_id:
+                return BoundCloseReservationRecoveryResult(
+                    status=(
+                        "applied_after_deadline_verified"
+                        if time.monotonic() >= claimed.deadline_monotonic
+                        else "applied"
+                    ),
+                    evidence_fingerprint=plan.evidence_fingerprint,
+                    action_count=plan.action_count,
+                    audit_event_id=verified_event_id,
+                )
+            raise _apply_refusal("apply_commit_outcome_unresolved") from exc
         if connection is not None and connection.in_transaction:
             connection.rollback()
         raise _apply_refusal("apply_transaction_failed") from exc
@@ -2325,6 +2802,7 @@ def _issue_sealed_recovery_capture(
     *,
     plan: BoundCloseReservationRecoveryPlan,
     source_capability: _BoundCloseReservationSourceCapability,
+    database_identity: _DatabaseFileIdentity,
     capture_started_at: datetime,
     capture_completed_at: datetime,
     deadline_monotonic: float,
@@ -2337,6 +2815,7 @@ def _issue_sealed_recovery_capture(
     sealed = object.__new__(SealedRecoveryCapture)
     sealed._SealedRecoveryCapture__apply_claimed = False
     sealed._SealedRecoveryCapture__apply_claim_lock = threading.Lock()
+    sealed._SealedRecoveryCapture__database_identity = database_identity
     sealed._SealedRecoveryCapture__deadline_monotonic = (
         _finite_recovery_monotonic(deadline_monotonic)
     )
@@ -2355,8 +2834,7 @@ def capture_and_seal_bound_close_reservation_recovery(
 ) -> SealedRecoveryCapture:
     """Perform one fresh bounded GET capture and issue the only apply capability."""
 
-    if type(source) is not BoundCloseReservationSource:
-        raise TypeError("source must be BoundCloseReservationSource")
+    database_identity = _require_issued_bound_close_reservation_source(source)
     if type(reader) is not BoundCloseReservationExchangeReader:
         raise TypeError("reader must be the dedicated recovery reader")
     raw_by_ref: dict[str, _RawReservationCapability] = {}
@@ -2393,6 +2871,7 @@ def capture_and_seal_bound_close_reservation_recovery(
     return _issue_sealed_recovery_capture(
         plan=plan,
         source_capability=source._capability,
+        database_identity=database_identity,
         capture_started_at=started_at,
         capture_completed_at=completed_at,
         deadline_monotonic=deadline_monotonic,
@@ -2500,6 +2979,7 @@ def _load_applied_recovery_source_read_only(
     if expanded.is_symlink() or not expanded.is_file():
         raise _apply_refusal("database_path_invalid")
     resolved = expanded.resolve()
+    database_identity = _database_file_identity(resolved)
     uri = f"file:{quote(str(resolved), safe='/')}?mode=ro"
     connection: sqlite3.Connection | None = None
     try:
@@ -2509,6 +2989,8 @@ def _load_applied_recovery_source_read_only(
         if int(connection.execute("PRAGMA query_only").fetchone()[0]) != 1:
             raise _apply_refusal("source_query_only_unavailable")
         connection.execute("BEGIN")
+        if _database_file_identity(resolved) != database_identity:
+            raise _apply_refusal("database_authority_mismatch")
         if not _locked_mimo_contract_mode_is_v1(connection):
             raise _apply_refusal("mimo_contract_mode_not_v1")
         audits = _load_bound_close_reservation_audits(connection)
@@ -2598,7 +3080,12 @@ def _load_applied_recovery_source_read_only(
             ).reservations
         ):
             raise _apply_refusal("source_state_conflict")
-        return source
+        if _database_file_identity(resolved) != database_identity:
+            raise _apply_refusal("database_authority_mismatch")
+        return _register_bound_close_reservation_source(
+            source,
+            database_identity=database_identity,
+        )
     except BoundCloseReservationRecoveryConflict:
         raise
     except (OSError, RecursionError, sqlite3.Error, TypeError, ValueError) as exc:
@@ -2658,6 +3145,7 @@ def recapture_and_seal_applied_bound_close_reservation_recovery(
         database_path,
         approved_plan=approved_plan,
     )
+    database_identity = _require_issued_bound_close_reservation_source(source)
     local_by_ref = {item.reservation_ref: item for item in source.reservations}
     raw_rows = _planned_raw_reservations_from_source(
         source=source,
@@ -2701,6 +3189,7 @@ def recapture_and_seal_applied_bound_close_reservation_recovery(
     return _issue_sealed_recovery_capture(
         plan=plan,
         source_capability=source._capability,
+        database_identity=database_identity,
         capture_started_at=started_at,
         capture_completed_at=completed_at,
         deadline_monotonic=deadline,
@@ -3940,16 +4429,33 @@ def load_bound_close_reservation_source(
     resolved = Path(database_path).expanduser().resolve()
     uri = f"file:{quote(str(resolved), safe='/')}?mode=ro"
     connection: sqlite3.Connection | None = None
+    database_identity: _DatabaseFileIdentity | None = None
+
+    def issued(
+        source: BoundCloseReservationSource,
+    ) -> BoundCloseReservationSource:
+        if database_identity is None:
+            return source
+        if _database_file_identity(resolved) != database_identity:
+            return _source_failure("source_file_identity_changed")
+        return _register_bound_close_reservation_source(
+            source,
+            database_identity=database_identity,
+        )
+
     try:
+        database_identity = _database_file_identity(resolved)
         connection = sqlite3.connect(uri, uri=True, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only=ON")
         query_only = connection.execute("PRAGMA query_only").fetchone()
         if query_only is None or int(query_only[0]) != 1:
-            return _source_failure("source_query_only_unavailable")
+            return issued(_source_failure("source_query_only_unavailable"))
         connection.execute("BEGIN")
+        if _database_file_identity(resolved) != database_identity:
+            return _source_failure("source_file_identity_changed")
         if not _source_schema_is_valid(connection):
-            return _source_failure("source_schema_invalid")
+            return issued(_source_failure("source_schema_invalid"))
         reservation_rows = connection.execute(
             """
             SELECT id, pos_id, execution_binding_id, status, last_error,
@@ -3961,12 +4467,19 @@ def load_bound_close_reservation_source(
             """
         ).fetchall()
         if len(reservation_rows) > MAX_RESERVATION_OBSERVATIONS:
-            return _source_failure("source_overflow")
+            return issued(_source_failure("source_overflow"))
         if between_selects_hook is not None:
             between_selects_hook()
-        return _load_source_descendants(connection, reservation_rows)
-    except (sqlite3.Error, OSError, TypeError, ValueError, OverflowError):
-        return _source_failure("source_read_failed")
+        return issued(_load_source_descendants(connection, reservation_rows))
+    except (
+        BoundCloseReservationRecoveryConflict,
+        sqlite3.Error,
+        OSError,
+        TypeError,
+        ValueError,
+        OverflowError,
+    ):
+        return issued(_source_failure("source_read_failed"))
     finally:
         if connection is not None:
             try:
