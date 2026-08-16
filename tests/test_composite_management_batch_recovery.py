@@ -29,6 +29,7 @@ from telegram_kol_research.deepcoin_execution_operations import (
     advance_account_write_generation,
 )
 from telegram_kol_research.models import (
+    BoundPositionCloseReservation,
     ContextResolutionAttempt,
     ExecutionBinding,
     ExecutionEvent,
@@ -7847,6 +7848,61 @@ def test_apply_repairs_only_false_legacy_state_in_one_transaction(tmp_path):
             assert sensitive not in serialized_event
 
 
+def test_batch119_apply_does_not_mutate_confirmed_close_reservations(tmp_path):
+    factory, _, _, _, _ = _seed_batch_119_false_submission(tmp_path)
+    module = _recovery_module()
+    with factory() as session:
+        binding = session.query(ExecutionBinding).filter_by(pos_id=POS_ID).one()
+        session.add_all(
+            BoundPositionCloseReservation(
+                pos_id=f"confirmed-bound-close-{index}",
+                execution_binding_id=binding.id,
+                status="confirmed",
+                last_error=None,
+                created_at=NOW - timedelta(minutes=1),
+                updated_at=NOW - timedelta(minutes=1),
+            )
+            for index in range(29)
+        )
+        session.commit()
+        before = [
+            tuple(row)
+            for row in session.execute(
+                text(
+                    "SELECT * FROM bound_position_close_reservations "
+                    "ORDER BY id"
+                )
+            ).all()
+        ]
+    plan = _plan(factory)
+
+    result = _apply_recovery(
+        module,
+        factory,
+        plan=plan,
+        expected_fingerprint=plan.evidence_fingerprint,
+        authorization="I_AUTHORIZE_BATCH_119_TO_REMAINING_19",
+        applied_at=NOW,
+    )
+
+    assert result.status == "repaired"
+    with factory() as session:
+        after = [
+            tuple(row)
+            for row in session.execute(
+                text(
+                    "SELECT * FROM bound_position_close_reservations "
+                    "ORDER BY id"
+                )
+            ).all()
+        ]
+        assert after == before
+        assert session.get(StrategyManagementBatch, 119).status == "ready"
+        assert session.query(ExecutionEvent).filter_by(
+            action="composite_batch_false_state_repaired"
+        ).count() == 1
+
+
 def test_recovery_status_summary_counts_only_component_owned_mutations(tmp_path):
     module = _recovery_module()
     factory, _, binding_id, entry_id, _ = _seed_batch_119_false_submission(
@@ -11148,6 +11204,7 @@ def test_batch119_comparator_accepts_two_real_serialized_absent_plans(
             json.dumps(document, ensure_ascii=True, sort_keys=True),
             encoding="utf-8",
         )
+        path.chmod(0o600)
         documents.append(path)
 
     result = subprocess.run(

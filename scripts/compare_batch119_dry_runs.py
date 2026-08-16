@@ -6,8 +6,10 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import re
+import stat
 import sys
 from typing import Any
 
@@ -77,10 +79,73 @@ def _reject_constant(_: str) -> None:
     raise ComparisonRefused("non-finite number")
 
 
-def _bounded_json(path: Path) -> dict[str, Any]:
-    if not path.is_file() or path.stat().st_size > MAX_FILE_BYTES:
+def _stat_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _read_private_file(path_value: str | Path) -> tuple[bytes, tuple[int, ...]]:
+    path = Path(path_value)
+    try:
+        path_metadata = os.lstat(path)
+    except OSError as exc:
+        raise ComparisonRefused("file unavailable") from exc
+    if (
+        not stat.S_ISREG(path_metadata.st_mode)
+        or stat.S_IMODE(path_metadata.st_mode) != 0o600
+        or path_metadata.st_nlink != 1
+        or path_metadata.st_size <= 0
+        or path_metadata.st_size > MAX_FILE_BYTES
+    ):
         raise ComparisonRefused("file unavailable")
-    raw = path.read_bytes()
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ComparisonRefused("file unavailable") from exc
+    try:
+        before = os.fstat(descriptor)
+        identity = _stat_identity(before)
+        if identity != _stat_identity(path_metadata):
+            raise ComparisonRefused("file changed before read")
+        chunks: list[bytes] = []
+        remaining = MAX_FILE_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if not raw or len(raw) > MAX_FILE_BYTES:
+            raise ComparisonRefused("file too large")
+        if _stat_identity(os.fstat(descriptor)) != identity:
+            raise ComparisonRefused("file changed during read")
+    finally:
+        os.close(descriptor)
+    return raw, identity
+
+
+def _revalidate_private_path(
+    path_value: str | Path,
+    expected_identity: tuple[int, ...],
+) -> None:
+    try:
+        current = os.lstat(Path(path_value))
+    except OSError as exc:
+        raise ComparisonRefused("file unavailable") from exc
+    if _stat_identity(current) != expected_identity:
+        raise ComparisonRefused("file changed after read")
+
+
+def _bounded_json(raw: bytes) -> dict[str, Any]:
     if len(raw) > MAX_FILE_BYTES:
         raise ComparisonRefused("file too large")
     try:
@@ -391,16 +456,34 @@ def _emit(payload: dict[str, str]) -> None:
 
 
 def main(argv: list[str]) -> int:
+    project_fingerprint = bool(argv and argv[0] == "--project-fingerprint")
     try:
+        if project_fingerprint:
+            if len(argv) != 2:
+                raise ComparisonRefused("one file required")
+            raw, identity = _read_private_file(argv[1])
+            document = _bounded_json(raw)
+            _validate_document(document)
+            _revalidate_private_path(argv[1], identity)
+            print(document["plan"]["evidence_fingerprint"])
+            return 0
         if len(argv) != 2:
             raise ComparisonRefused("two files required")
-        left = _bounded_json(Path(argv[0]))
-        right = _bounded_json(Path(argv[1]))
+        left_raw, left_identity = _read_private_file(argv[0])
+        right_raw, right_identity = _read_private_file(argv[1])
+        if left_identity[:2] == right_identity[:2]:
+            raise ComparisonRefused("files repeated")
+        left = _bounded_json(left_raw)
+        right = _bounded_json(right_raw)
         _validate_document(left)
         _validate_document(right)
         if left["plan"] != right["plan"]:
             raise ComparisonRefused("semantic drift")
+        _revalidate_private_path(argv[0], left_identity)
+        _revalidate_private_path(argv[1], right_identity)
     except Exception:
+        if project_fingerprint:
+            return 2
         _emit(
             {
                 "reason_code": "dry_run_comparison_refused",

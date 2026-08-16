@@ -1748,6 +1748,21 @@ def test_reservation_convergence_does_not_clear_independent_batch119_block(
     assert "fresh_active_exchange_work" in artifact["reason_codes"]
 
 
+def test_batch119_convergence_cannot_run_first_to_clear_reservation_block(
+    tmp_path,
+):
+    database = _clean_gate_fixture(tmp_path / "reverse-independent-facts.db")
+    _insert_gate_fact(database, "bound_position_close_reservations", "submitted")
+    _insert_gate_fact(database, "strategy_management_batches", "recovery_required")
+
+    _converge_gate_fact(database, "strategy_management_batches")
+    facts, artifact = _collect_code_gate(database)
+
+    assert facts.fresh_active_work == {"position_closes": 1}
+    assert artifact["decision"] == "BLOCK"
+    assert "fresh_active_exchange_work" in artifact["reason_codes"]
+
+
 def test_only_independent_convergence_of_reservations_and_batch119_clears_both_facts(
     tmp_path,
 ):

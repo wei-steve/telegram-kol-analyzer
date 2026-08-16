@@ -3408,6 +3408,335 @@ management component、mutation intent、recovery 或交易所对账；每个开
 `--generation-database-path` 与 `--database-path` 经路径解析后必须
 完全相同，否则 CLI 拒绝继续。当前阶段仍禁止任何 apply，该授权不属于当前步骤。
 
+### 后续独立窗口：Batch 119 必须第二执行
+
+只有 bound-close apply 已在前一个独立窗口完成，且本窗口重新执行完整
+unit/inventory/process/SHA/database-identity 停服证明后，才能进入下面步骤。
+不得复用联合诊断或 bound-close apply 的 permit、JSON、capture ID、
+fingerprint、reader 或进程内 capability。下面只是后续 Batch 119 apply 窗口的
+封闭执行合同；它不是本轮本地实施的生产授权。
+
+首先定义一个只读的 confirmed-population 检查器。它从唯一的
+bound-close convergence audit 取得 29 个脱敏 reservation ref，在同一
+`mode=ro` / `query_only` / `BEGIN` 快照中将它们精确映射到当前的
+`confirmed` 行，并对目标行的完整 SQLite 列投影计算 SHA-256。输出只有
+计数和 fingerprint，不包含原始数据库 ID 或仓位标识：
+
+```bash
+capture_confirmed_bound_close_population() {
+  local OUTPUT_PATH="$1"
+  local TEMP_PATH="${OUTPUT_PATH}.tmp"
+  test ! -e "$OUTPUT_PATH" || return 1
+  test ! -e "$TEMP_PATH" || return 1
+  if ! "$RUNTIME_PYTHON" - "$PRODUCTION_DB" > "$TEMP_PATH" <<'PY'
+# BEGIN BATCH119_CONFIRMED_RESERVATION_INSPECTOR_PY
+from __future__ import annotations
+
+from hashlib import sha256
+import json
+from pathlib import Path
+import re
+import sqlite3
+import sys
+
+
+HEX_64 = re.compile(r"^[0-9a-f]{64}$")
+EXPECTED_COUNT = 29
+ROW_LIMIT = 10_001
+
+
+def canonical(value: object) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def closed_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if type(key) is not str or key in result:
+            raise ValueError("invalid JSON object")
+        result[key] = value
+    return result
+
+
+def exact_keys(value: object, expected: set[str]) -> dict[str, object]:
+    if type(value) is not dict or set(value) != expected:
+        raise ValueError("invalid JSON shape")
+    return value
+
+
+def reservation_ref(row_id: int) -> str:
+    return sha256(canonical({"kind": "reservation", "value": row_id})).hexdigest()
+
+
+def inspect(database_argument: str) -> dict[str, object]:
+    database = Path(database_argument)
+    if database.is_symlink() or not database.is_file():
+        raise ValueError("database path refused")
+    resolved = database.resolve(strict=True)
+    connection = sqlite3.connect(
+        f"{resolved.as_uri()}?mode=ro",
+        uri=True,
+        timeout=5.0,
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        query_only = connection.execute("PRAGMA query_only").fetchone()
+        if query_only is None or query_only[0] != 1:
+            raise ValueError("query-only mode unavailable")
+        connection.execute("BEGIN")
+        reservation_columns = tuple(
+            row[1]
+            for row in connection.execute(
+                'PRAGMA table_info("bound_position_close_reservations")'
+            ).fetchall()
+        )
+        event_columns = tuple(
+            row[1]
+            for row in connection.execute(
+                'PRAGMA table_info("execution_events")'
+            ).fetchall()
+        )
+        if not {
+            "id", "pos_id", "execution_binding_id", "status", "last_error",
+            "created_at", "updated_at",
+        }.issubset(reservation_columns) or not {
+            "id", "action", "status", "order_id", "client_order_id",
+            "pos_id", "related_order_id", "after_json", "request_json",
+            "response_json", "notification_fingerprint",
+            "notification_attempts", "created_at",
+        }.issubset(event_columns):
+            raise ValueError("required schema unavailable")
+        events = connection.execute(
+            "SELECT * FROM execution_events WHERE action = ? ORDER BY id LIMIT 2",
+            ("bound_close_reservation_history_converged",),
+        ).fetchall()
+        if len(events) != 1:
+            raise ValueError("recovery audit population refused")
+        event = events[0]
+        if (
+            event["status"] != "succeeded"
+            or any(
+                event[field] is not None
+                for field in (
+                    "order_id", "client_order_id", "pos_id", "related_order_id",
+                    "request_json", "response_json",
+                )
+            )
+            or type(event["notification_attempts"]) is not int
+            or event["notification_attempts"] != 0
+            or type(event["notification_fingerprint"]) is not str
+            or HEX_64.fullmatch(event["notification_fingerprint"]) is None
+            or type(event["created_at"]) is not str
+            or not event["created_at"]
+        ):
+            raise ValueError("recovery audit refused")
+        after = json.loads(
+            event["after_json"],
+            object_pairs_hook=closed_object,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                ValueError("invalid JSON constant")
+            ),
+        )
+        after = exact_keys(
+            after,
+            {"action_count", "evidence_fingerprint", "reservations", "status"},
+        )
+        if (
+            type(after["action_count"]) is not int
+            or after["action_count"] != EXPECTED_COUNT
+            or after["status"] != "confirmed"
+            or type(after["evidence_fingerprint"]) is not str
+            or HEX_64.fullmatch(after["evidence_fingerprint"]) is None
+            or after["evidence_fingerprint"] != event["notification_fingerprint"]
+            or type(after["reservations"]) is not list
+            or len(after["reservations"]) != EXPECTED_COUNT
+        ):
+            raise ValueError("recovery audit authority refused")
+        audit_refs: list[str] = []
+        for raw_item in after["reservations"]:
+            item = exact_keys(
+                raw_item,
+                {"durable_invariant_fingerprint", "reservation_ref", "status"},
+            )
+            if (
+                item["status"] != "confirmed"
+                or type(item["reservation_ref"]) is not str
+                or HEX_64.fullmatch(item["reservation_ref"]) is None
+                or type(item["durable_invariant_fingerprint"]) is not str
+                or HEX_64.fullmatch(item["durable_invariant_fingerprint"]) is None
+            ):
+                raise ValueError("recovery audit item refused")
+            audit_refs.append(item["reservation_ref"])
+        if len(set(audit_refs)) != EXPECTED_COUNT:
+            raise ValueError("recovery audit refs refused")
+        rows = connection.execute(
+            "SELECT * FROM bound_position_close_reservations ORDER BY id "
+            f"LIMIT {ROW_LIMIT}"
+        ).fetchall()
+        if len(rows) >= ROW_LIMIT:
+            raise ValueError("reservation population overflow")
+        rows_by_ref: dict[str, sqlite3.Row] = {}
+        for row in rows:
+            if type(row["id"]) is not int or row["id"] <= 0:
+                raise ValueError("reservation identity refused")
+            reference = reservation_ref(row["id"])
+            if reference in rows_by_ref:
+                raise ValueError("reservation identity duplicated")
+            rows_by_ref[reference] = row
+        if set(audit_refs) - set(rows_by_ref):
+            raise ValueError("approved reservation missing")
+        material = []
+        for reference in sorted(audit_refs):
+            row = rows_by_ref[reference]
+            if row["status"] != "confirmed" or row["last_error"] is not None:
+                raise ValueError("approved reservation not confirmed")
+            material.append(
+                {
+                    "reservation_ref": reference,
+                    "row": {column: row[column] for column in reservation_columns},
+                }
+            )
+        fingerprint = sha256(
+            canonical(
+                {
+                    "audit": {
+                        column: event[column] for column in event_columns
+                    },
+                    "reservations": material,
+                    "schema_version": 1,
+                }
+            )
+        ).hexdigest()
+        connection.rollback()
+        return {
+            "material_fingerprint": fingerprint,
+            "reservation_count": EXPECTED_COUNT,
+            "schema_version": 1,
+            "status": "confirmed",
+        }
+    finally:
+        connection.close()
+
+
+try:
+    if len(sys.argv) != 2:
+        raise ValueError("exact database argument required")
+    result = inspect(sys.argv[1])
+    sys.stdout.write(canonical(result).decode("utf-8") + "\n")
+except (OSError, RecursionError, sqlite3.Error, TypeError, UnicodeError, ValueError):
+    sys.stderr.write("confirmed reservation authority refused\n")
+    raise SystemExit(2)
+# END BATCH119_CONFIRMED_RESERVATION_INSPECTOR_PY
+PY
+  then
+    rm -f -- "$TEMP_PATH"
+    return 1
+  fi
+  chmod 0600 "$TEMP_PATH" || return 1
+  mv -- "$TEMP_PATH" "$OUTPUT_PATH" || return 1
+}
+```
+
+在全部 unit 仍为 inactive、未知进程仍为零、SHA 和数据库 identity 仍与
+本窗口起点一致的前提下，执行下面的封闭块。
+脚本先在本窗口内生成新鲜 dry-run，严格投影它的 fingerprint，然后才
+通过终端读取人工审阅后输入的 `BATCH119_EXPECTED_FINGERPRINT`。不得从上一个
+诊断或 apply 窗口预先注入该值。apply CLI 会在另一个新进程内再次加载
+source 并使用新 reader 采集交易所证据。
+
+```bash
+# BEGIN BATCH119_APPLY_ISOLATION
+test "${BATCH119_APPLY_AUTHORIZATION:-}" = \
+  'I_AUTHORIZE_BATCH_119_TO_REMAINING_19'
+test "${BATCH119_STOPPED_CAPTURE_AUTHORIZATION:-}" = \
+  'I_APPROVE_BATCH119_ALL_DB_UNITS_STOPPED_APPLY_CAPTURE'
+
+BATCH119_RESERVATIONS_PRE="$RECOVERY_TMP/batch119-reservations-pre.json"
+capture_confirmed_bound_close_population "$BATCH119_RESERVATIONS_PRE"
+
+BATCH119_FRESH_REVIEW="$RECOVERY_TMP/batch119-fresh-review.json"
+PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
+  telegram_kol_research.cli recover-composite-management-batch \
+  --database-path "$PRODUCTION_DB" \
+  --generation-database-path "$PRODUCTION_DB" \
+  --batch-id 119 \
+  --deepcoin-contract-specs-path "$DEEPCOIN_CONTRACT_SPECS" \
+  --stopped-service-capture-authorization \
+  "$BATCH119_STOPPED_CAPTURE_AUTHORIZATION" > "$BATCH119_FRESH_REVIEW"
+chmod 0600 "$BATCH119_FRESH_REVIEW"
+BATCH119_FRESH_FINGERPRINT="$(PYTHONPATH="$CANDIDATE_ROOT/src" \
+  "$RUNTIME_PYTHON" \
+  "$CANDIDATE_ROOT/scripts/compare_batch119_dry_runs.py" \
+  --project-fingerprint "$BATCH119_FRESH_REVIEW")"
+printf 'batch119 fresh evidence fingerprint: %s\n' \
+  "$BATCH119_FRESH_FINGERPRINT"
+printf 'Type the exact reviewed fingerprint to continue: ' >&2
+IFS= read -r BATCH119_EXPECTED_FINGERPRINT
+test "$BATCH119_EXPECTED_FINGERPRINT" = "$BATCH119_FRESH_FINGERPRINT"
+[[ "$BATCH119_EXPECTED_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]]
+
+BATCH119_BACKUP_DIR="$PRODUCTION_ROOT/data/backups"
+test -d "$BATCH119_BACKUP_DIR"
+BATCH119_BACKUP_PATH="$BATCH119_BACKUP_DIR/research-before-batch119-apply-$(date -u +%Y%m%dT%H%M%SZ).db"
+test ! -e "$BATCH119_BACKUP_PATH"
+test ! -L "$BATCH119_BACKUP_PATH"
+sqlite3 -readonly "$PRODUCTION_DB" ".backup '$BATCH119_BACKUP_PATH'"
+chmod 0600 "$BATCH119_BACKUP_PATH"
+test "$(stat -c '%a' "$BATCH119_BACKUP_PATH")" = 600
+test "$(sqlite3 -readonly "$BATCH119_BACKUP_PATH" 'PRAGMA quick_check;')" = ok
+
+BATCH119_RESERVATIONS_PRE_FINAL="$RECOVERY_TMP/batch119-reservations-pre-final.json"
+capture_confirmed_bound_close_population "$BATCH119_RESERVATIONS_PRE_FINAL"
+cmp -s "$BATCH119_RESERVATIONS_PRE" "$BATCH119_RESERVATIONS_PRE_FINAL"
+
+BATCH119_APPLY_RESULT="$RECOVERY_TMP/batch119-apply-result.json"
+set +e
+PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
+  telegram_kol_research.cli recover-composite-management-batch \
+  --database-path "$PRODUCTION_DB" \
+  --generation-database-path "$PRODUCTION_DB" \
+  --batch-id 119 \
+  --deepcoin-contract-specs-path "$DEEPCOIN_CONTRACT_SPECS" \
+  --apply \
+  --expected-fingerprint "$BATCH119_EXPECTED_FINGERPRINT" \
+  --authorization "$BATCH119_APPLY_AUTHORIZATION" \
+  --stopped-service-capture-authorization \
+  "$BATCH119_STOPPED_CAPTURE_AUTHORIZATION" > "$BATCH119_APPLY_RESULT"
+BATCH119_APPLY_STATUS=$?
+chmod 0600 "$BATCH119_APPLY_RESULT"
+BATCH119_APPLY_CHMOD_STATUS=$?
+
+BATCH119_RESERVATIONS_POST="$RECOVERY_TMP/batch119-reservations-post.json"
+capture_confirmed_bound_close_population "$BATCH119_RESERVATIONS_POST"
+BATCH119_RESERVATIONS_POST_STATUS=$?
+cmp -s "$BATCH119_RESERVATIONS_PRE" "$BATCH119_RESERVATIONS_POST"
+BATCH119_RESERVATIONS_COMPARE_STATUS=$?
+set -e
+
+for STATUS in \
+  "$BATCH119_APPLY_STATUS" \
+  "$BATCH119_APPLY_CHMOD_STATUS" \
+  "$BATCH119_RESERVATIONS_POST_STATUS" \
+  "$BATCH119_RESERVATIONS_COMPARE_STATUS"
+do
+  test "$STATUS" -eq 0
+done
+# END BATCH119_APPLY_ISOLATION
+```
+
+上述块在 apply CLI 返回后无论其状态是否为零，都会先重新打开生产库的
+query-only 快照并重新计算同一批 29 条 confirmed reservation 的 fingerprint；
+只有 pre/post 私有文档字节完全相同、Batch 119 apply 返回成功，才可以报告本窗口成功。
+任何未 confirmed 目标、audit 不唯一、population/schema 漂移、行字段变化或
+post-commit 读取失败都必须以非零状态停止；不得盲目重试 Batch 119 apply。
+
 停服脚本只接受每个列举单元的初始状态为精确 `active` 或 `inactive`；
 `activating`、`deactivating`、`reloading`、`failed`、`unknown` 等一律在备份前拒绝。
 无论初始状态如何，所有列举单元都执行 stop，并逐个证明精确 `inactive`
