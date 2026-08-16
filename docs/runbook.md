@@ -1787,7 +1787,8 @@ test "${BOUND_CLOSE_DRY_RUN_APPROVAL:-}" = \
   'I_APPROVE_BOUND_CLOSE_RESERVATIONS_ALL_DB_UNITS_STOPPED_READ_ONLY_DOUBLE_CAPTURE'
 
 git -C "$PRODUCTION_ROOT" fetch --no-tags origin \
-  codex/bound-close-reservation-recovery >/dev/null 2>&1
+  "refs/heads/codex/bound-close-reservation-recovery:$APPROVED_REF" \
+  >/dev/null 2>&1
 git -C "$PRODUCTION_ROOT" cat-file -e "${REVIEWED_SHA}^{commit}"
 REMOTE_SHA="$(git -C "$PRODUCTION_ROOT" rev-parse "$APPROVED_REF")"
 test "$REMOTE_SHA" = "$REVIEWED_SHA"

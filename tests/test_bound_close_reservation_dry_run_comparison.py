@@ -409,6 +409,20 @@ def test_runbook_quiescence_inventory_preserves_state_and_refuses_unit_races():
     assert "不调用 Deepcoin/交易所" in section
 
 
+def test_runbook_fetch_updates_the_exact_ref_it_later_verifies():
+    block = _bound_close_read_only_block()
+
+    assert (
+        '"refs/heads/codex/bound-close-reservation-recovery:$APPROVED_REF"'
+        in block
+    )
+    assert (
+        "fetch --no-tags origin \\\n+  codex/bound-close-reservation-recovery"
+        not in block
+    )
+    assert 'rev-parse "$APPROVED_REF"' in block
+
+
 def _bound_close_read_only_block() -> str:
     project_root = Path(__file__).resolve().parents[1]
     runbook = (project_root / "docs" / "runbook.md").read_text(encoding="utf-8")
