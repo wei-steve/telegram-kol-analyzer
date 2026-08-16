@@ -4998,3 +4998,42 @@ def test_apply_result_serialization_is_exact_bounded_canonical_json(status):
         '"schema_version":1,"status":"' + status + '"}'
     )
     assert len(serialized.encode("utf-8")) <= MAX_RECOVERY_PLAN_BYTES
+
+
+@pytest.mark.parametrize(
+    ("classification", "reason_code"),
+    [
+        (
+            ReservationClassification.ACTIVE,
+            "exact_position_currently_live",
+        ),
+        (
+            ReservationClassification.UNKNOWN,
+            "exchange_history_incomplete",
+        ),
+    ],
+)
+def test_nonterminal_recovery_plan_is_refused_without_a_gate_override(
+    classification,
+    reason_code,
+):
+    plan = _built_recovery_plan(
+        (
+            _observation(
+                classification=classification,
+                reason_code=reason_code,
+            ),
+        )
+    )
+    payload = json.loads(
+        serialize_bound_close_reservation_recovery_plan(
+            plan,
+            capture_started_at=PLAN_CAPTURE_STARTED,
+            capture_completed_at=PLAN_CAPTURE_COMPLETED,
+        )
+    )
+
+    assert plan.status == "refused"
+    assert plan.action_count == 0
+    assert "deployment_gate_override" not in payload
+    assert "deployable" not in payload

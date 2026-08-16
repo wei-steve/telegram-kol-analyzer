@@ -1457,3 +1457,231 @@ def test_collector_ignores_terminal_deepcoin_execution_operations(tmp_path, stat
 
     assert facts.fresh_active_work == {}
     assert facts.historical_unknown_outcome_count == 0
+
+
+_GATE_FACT_FIXTURES = {
+    "bound_position_close_reservations": (29, "confirmed"),
+    "strategy_management_batches": (119, "completed"),
+}
+
+
+def _clean_gate_fixture(path: Path) -> Path:
+    import sqlite3
+
+    _create_preflight_database(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute("DELETE FROM trade_signals")
+        connection.execute(
+            "UPDATE instruction_execution_contracts SET state = 'completed'"
+        )
+    return path
+
+
+def _insert_gate_fact(
+    database: Path,
+    table: str,
+    status: str,
+    *,
+    updated_at: datetime = NOW - timedelta(seconds=30),
+) -> None:
+    import sqlite3
+
+    row_id, _terminal_status = _GATE_FACT_FIXTURES[table]
+    serialized_time = updated_at.replace(tzinfo=None).isoformat(" ")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            f"INSERT INTO {table} (id, status, updated_at) VALUES (?, ?, ?)",
+            (row_id, status, serialized_time),
+        )
+
+
+def _collect_code_gate(
+    database: Path,
+) -> tuple[DeploymentPreflightFacts, dict[str, object]]:
+    facts = collect_deployment_preflight_facts(
+        database_path=database,
+        change_class="code",
+        now=NOW,
+    )
+    return facts, _build("code", facts)
+
+
+def _refused_recovery_plan(classification: str, reason_code: str):
+    from telegram_kol_research.bound_close_reservation_recovery import (
+        BoundCloseReservationObservation,
+        ReservationClassification,
+        build_bound_close_reservation_recovery_plan,
+    )
+
+    observation = BoundCloseReservationObservation(
+        reservation_ref="1" * 64,
+        classification=ReservationClassification(classification),
+        reason_code=reason_code,
+        source_fingerprint="2" * 64,
+        exchange_fingerprint="3" * 64,
+    )
+    return build_bound_close_reservation_recovery_plan(
+        source_fingerprint="4" * 64,
+        observations=(observation,),
+    )
+
+
+def _gate_fact_statuses(database: Path, table: str) -> list[str]:
+    import sqlite3
+
+    _GATE_FACT_FIXTURES[table]
+    with sqlite3.connect(database) as connection:
+        return [
+            str(row[0])
+            for row in connection.execute(
+                f"SELECT status FROM {table} ORDER BY id"
+            ).fetchall()
+        ]
+
+
+def _converge_gate_fact(database: Path, table: str) -> None:
+    import sqlite3
+
+    row_id, terminal_status = _GATE_FACT_FIXTURES[table]
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            f"UPDATE {table} SET status = ?, updated_at = ? WHERE id = ?",
+            (
+                terminal_status,
+                NOW.replace(tzinfo=None).isoformat(" "),
+                row_id,
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "reserved",
+        "submitted",
+        "submit_unknown",
+        "unknown_exchange_outcome",
+        "recovery_required",
+    ],
+)
+def test_every_fresh_close_reservation_state_blocks_ordinary_code_deployment(
+    tmp_path,
+    status,
+):
+    database = _clean_gate_fixture(tmp_path / f"fresh-{status}.db")
+    _insert_gate_fact(database, "bound_position_close_reservations", status)
+
+    facts, artifact = _collect_code_gate(database)
+
+    assert facts.fresh_active_work == {"position_closes": 1}
+    assert artifact["decision"] == "BLOCK"
+    assert "fresh_active_exchange_work" in artifact["reason_codes"]
+
+
+@pytest.mark.parametrize(
+    ("status", "unknown_count"),
+    [
+        ("reserved", 0),
+        ("unknown_exchange_outcome", 1),
+    ],
+)
+def test_historical_close_reservation_residue_remains_visible_as_warning(
+    tmp_path,
+    status,
+    unknown_count,
+):
+    database = _clean_gate_fixture(tmp_path / f"historical-{status}.db")
+    _insert_gate_fact(
+        database,
+        "bound_position_close_reservations",
+        status,
+        updated_at=NOW - timedelta(days=3),
+    )
+
+    facts, artifact = _collect_code_gate(database)
+
+    assert facts.fresh_active_work == {}
+    assert facts.historical_active_residue_count == 1
+    assert facts.historical_unknown_outcome_count == unknown_count
+    assert artifact["decision"] == "WARN"
+    assert "historical_active_residue_present" in artifact["reason_codes"]
+    if unknown_count:
+        assert "historical_unknown_outcomes_present" in artifact["reason_codes"]
+
+
+def test_confirmed_close_reservation_is_terminal_and_not_active(tmp_path):
+    database = _clean_gate_fixture(tmp_path / "confirmed.db")
+    _insert_gate_fact(database, "bound_position_close_reservations", "confirmed")
+
+    facts, artifact = _collect_code_gate(database)
+
+    assert facts.fresh_active_work == {}
+    assert facts.historical_active_residue_count == 0
+    assert facts.historical_unknown_outcome_count == 0
+    assert artifact["decision"] != "BLOCK"
+
+
+@pytest.mark.parametrize(
+    ("classification", "reason_code"),
+    [
+        ("ACTIVE", "exact_position_currently_live"),
+        ("UNKNOWN", "exchange_history_incomplete"),
+    ],
+)
+def test_refused_recovery_plan_cannot_make_preflight_deployable(
+    tmp_path,
+    classification,
+    reason_code,
+):
+    database = _clean_gate_fixture(tmp_path / f"refused-{classification}.db")
+    _insert_gate_fact(database, "bound_position_close_reservations", "submitted")
+    plan = _refused_recovery_plan(classification, reason_code)
+
+    facts, artifact = _collect_code_gate(database)
+
+    assert plan.status == "refused"
+    assert plan.action_count == 0
+    assert facts.fresh_active_work == {"position_closes": 1}
+    assert artifact["decision"] == "BLOCK"
+    assert _gate_fact_statuses(database, "bound_position_close_reservations") == [
+        "submitted"
+    ]
+
+
+def test_reservation_convergence_does_not_clear_independent_batch119_block(
+    tmp_path,
+):
+    database = _clean_gate_fixture(tmp_path / "independent-facts.db")
+    _insert_gate_fact(database, "bound_position_close_reservations", "submitted")
+    _insert_gate_fact(database, "strategy_management_batches", "recovery_required")
+
+    _converge_gate_fact(database, "bound_position_close_reservations")
+    facts, artifact = _collect_code_gate(database)
+
+    assert facts.fresh_active_work == {"management_batches": 1}
+    assert artifact["decision"] == "BLOCK"
+    assert "fresh_active_exchange_work" in artifact["reason_codes"]
+
+
+def test_only_independent_convergence_of_reservations_and_batch119_clears_both_facts(
+    tmp_path,
+):
+    database = _clean_gate_fixture(tmp_path / "both-facts.db")
+    _insert_gate_fact(database, "bound_position_close_reservations", "submitted")
+    _insert_gate_fact(database, "strategy_management_batches", "recovery_required")
+
+    initial_facts, initial_artifact = _collect_code_gate(database)
+    _converge_gate_fact(database, "bound_position_close_reservations")
+    reservation_facts, reservation_artifact = _collect_code_gate(database)
+    _converge_gate_fact(database, "strategy_management_batches")
+    converged_facts, converged_artifact = _collect_code_gate(database)
+
+    assert initial_facts.fresh_active_work == {
+        "management_batches": 1,
+        "position_closes": 1,
+    }
+    assert initial_artifact["decision"] == "BLOCK"
+    assert reservation_facts.fresh_active_work == {"management_batches": 1}
+    assert reservation_artifact["decision"] == "BLOCK"
+    assert converged_facts.fresh_active_work == {}
+    assert converged_artifact["decision"] != "BLOCK"
