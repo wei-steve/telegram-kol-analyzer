@@ -10,7 +10,16 @@ import sqlite3
 import sys
 from typing import Sequence
 
-from telegram_kol_research.deployment_preflight import _WORK_SPECS
+from telegram_kol_research.bound_close_reservation_recovery import (
+    _REQUIRED_SOURCE_COLUMNS,
+)
+from telegram_kol_research.deployment_preflight import (
+    _KNOWN_PRIOR_SCHEMA_MISSING_TABLE_SETS,
+    _WORK_SPECS,
+)
+from telegram_kol_research.trigger_protection_intents import (
+    ALLOWED_TRIGGER_PROTECTION_RECOVERY_STATES,
+)
 
 
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9_]*\Z")
@@ -24,11 +33,48 @@ _TARGET_STATES = frozenset(
         "recovery_required",
     }
 )
+_TRIGGER_TAKE_PROFIT_KNOWN_STATES = frozenset(
+    {
+        "waiting_position",
+        "waiting_backup_stop",
+        "ready",
+        "reserved",
+        "submitted",
+        "submit_unknown",
+        "completed",
+        "conflicted",
+        "blocked",
+    }
+)
 
-# Closed non-writer states for every table in deployment_preflight._WORK_SPECS.
-# Anything else, including NULL and a future state, is refused. A new durable
-# state therefore requires an explicit review here before a stopped-service
-# recovery window can treat it as quiescent.
+# Closed/non-writer states for every table in deployment_preflight._WORK_SPECS.
+# The active side is authoritative in _WORK_SPECS.  The safe side was audited
+# against each owning module's exported state constant where one exists and
+# against all repository persistence assignments/model defaults otherwise.
+# In particular, trigger_protection_intents.py exports
+# ALLOWED_TRIGGER_PROTECTION_RECOVERY_STATES, while
+# trigger_take_profit_convergence.py and its executor/binding/TP-order paths
+# contain the complete persisted convergence transitions. Anything else,
+# including NULL and a future state, is refused. A new durable state therefore
+# requires an explicit review here before a stopped-service recovery window can
+# treat it as quiescent.
+#
+# Audited persistence sources, in table order below (model defaults/migrations
+# were checked as well):
+# - deepcoin_execution_operations.py and deepcoin_execution_actions.py;
+# - execution_bindings.py, recovery_live_submit.py, and exchange reconciliation;
+# - message_instruction_items.py/auto_trade_execution.py and trade_signals.py;
+# - instruction_execution_contracts.py and instruction execution adapters;
+# - strategy_revision_planner.py and the strategy revision execution paths;
+# - strategy_management_batches.py plus planner/executor/reconciliation modules;
+# - position_mutation_intents.py/gateway.py and bound close recovery/apply paths;
+# - trigger_backup_stop.py/executor.py and position_take_profit_orders.py;
+# - position_protection_legs.py and protection repair/reconciliation modules;
+# - trigger_protection_intents.py and trigger_protection_rescue_worker.py;
+# - trigger_take_profit_convergence.py/executor.py, execution_bindings.py, and
+#   position_take_profit_orders.py;
+# - break_even_convergence planner/executor/worker modules; and
+# - source_message_deletion.py/worker.py.
 _SAFE_NONWRITER_STATES = {
     "deepcoin_execution_operations": frozenset(
         {
@@ -140,13 +186,19 @@ _SAFE_NONWRITER_STATES = {
         {"verified", "filled", "failed", "blocked", "missing"}
     ),
     "trigger_protection_intents": frozenset(
-        {"adopted", "failed", "blocked"}
+        {"adopted", "failed", "resolved"}
     ),
     "trigger_protection_stop_rescues": frozenset(
         {"confirmed", "succeeded", "failed", "blocked"}
     ),
     "trigger_take_profit_convergences": frozenset(
-        {"waiting_position", "completed", "conflicted", "blocked"}
+        {
+            "waiting_position",
+            "waiting_backup_stop",
+            "completed",
+            "conflicted",
+            "blocked",
+        }
     ),
     "strategy_break_even_convergences": frozenset(
         {
@@ -225,6 +277,25 @@ def inspect_writer_quiescence(database_path: str | Path) -> dict[str, object]:
         or _TARGET_TABLE not in spec_tables
     ):
         raise _WriterQuiescenceError("writer_quiescence_contract_invalid")
+    specs_by_table = {spec.table: spec for spec in _WORK_SPECS}
+    protection_spec = specs_by_table["trigger_protection_intents"]
+    if (
+        (
+            frozenset(protection_spec.active_states)
+            | _SAFE_NONWRITER_STATES["trigger_protection_intents"]
+        )
+        != ALLOWED_TRIGGER_PROTECTION_RECOVERY_STATES
+    ):
+        raise _WriterQuiescenceError("writer_quiescence_contract_invalid")
+    convergence_spec = specs_by_table["trigger_take_profit_convergences"]
+    if (
+        (
+            frozenset(convergence_spec.active_states)
+            | _SAFE_NONWRITER_STATES["trigger_take_profit_convergences"]
+        )
+        != _TRIGGER_TAKE_PROFIT_KNOWN_STATES
+    ):
+        raise _WriterQuiescenceError("writer_quiescence_contract_invalid")
 
     connection: sqlite3.Connection | None = None
     try:
@@ -244,6 +315,12 @@ def inspect_writer_quiescence(database_path: str | Path) -> dict[str, object]:
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
+        required_source_tables = frozenset(_REQUIRED_SOURCE_COLUMNS)
+        if not required_source_tables.issubset(available):
+            raise _WriterQuiescenceError("writer_quiescence_schema_invalid")
+        missing_work_tables = frozenset(spec_tables) - available
+        if missing_work_tables not in _KNOWN_PRIOR_SCHEMA_MISSING_TABLE_SETS:
+            raise _WriterQuiescenceError("writer_quiescence_schema_invalid")
         checked = 0
         target_count = 0
         other_count = 0

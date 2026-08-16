@@ -17,6 +17,7 @@ from telegram_kol_research.bound_close_reservation_recovery import (
     build_bound_close_reservation_recovery_plan,
     serialize_bound_close_reservation_recovery_plan,
 )
+from telegram_kol_research.deployment_preflight import _WORK_SPECS
 
 
 _SCRIPT_PATH = (
@@ -72,6 +73,10 @@ _EXPECTED_WRITER_SPECS = (
     ("strategy_break_even_convergence_legs", "status", "decision_reserved"),
     ("source_message_deletion_exits", "state", "reconciling"),
 )
+_WRITER_SPEC_BY_TABLE = {
+    table: (column, active_state)
+    for table, column, active_state in _EXPECTED_WRITER_SPECS
+}
 
 
 def _observation(
@@ -338,6 +343,39 @@ def test_runbook_closes_stopped_service_capture_and_apply_boundaries():
     assert "apply-result.json" not in section
     assert 'APPLY_SUMMARY="$RECOVERY_TMP/apply-summary.json"' in section
     assert '"status","action_count","evidence_fingerprint"' in section
+    apply_start = section.index('APPLY_SUMMARY="$RECOVERY_TMP/apply-summary.json"')
+    postcheck = section.index('POSTCHECK="$(sqlite3 -readonly', apply_start)
+    combined_exit = section.index("APPLY_COMBINED_STATUS", postcheck)
+    assert section.index("set +e", apply_start) < postcheck
+    assert "PIPESTATUS" in section[apply_start:postcheck]
+    assert postcheck < combined_exit
+    assert "PRAGMA quick_check" in section[postcheck:combined_exit]
+
+
+def test_apply_window_failure_simulation_runs_postcheck_before_exit():
+    simulation = subprocess.run(
+        [
+            "bash",
+            "-c",
+            "set -uo pipefail; events=(); set +e; "
+            "false | true; pipe_status=(\"${PIPESTATUS[@]}\"); "
+            "events+=(apply); false; summary_status=$?; "
+            "events+=(postcheck); false; postcheck_status=$?; "
+            "events+=(quick_check); true; quick_status=$?; set -e; "
+            "combined=0; "
+            "for value in \"${pipe_status[@]}\" \"$summary_status\" "
+            "\"$postcheck_status\" \"$quick_status\"; do "
+            "if [ \"$value\" -ne 0 ]; then combined=9; fi; done; "
+            "printf '%s\\n' \"${events[*]}\"; exit \"$combined\"",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert simulation.returncode == 9
+    assert simulation.stdout == "apply postcheck quick_check\n"
+    assert simulation.stderr == ""
 
 
 def _writer_quiescence_database(path: Path) -> None:
@@ -346,6 +384,8 @@ def _writer_quiescence_database(path: Path) -> None:
             connection.execute(
                 f'CREATE TABLE "{table}" (id INTEGER PRIMARY KEY, "{column}" TEXT)'
             )
+        connection.execute("CREATE TABLE execution_bindings (id INTEGER PRIMARY KEY)")
+        connection.execute("CREATE TABLE execution_events (id INTEGER PRIMARY KEY)")
         connection.execute(
             "INSERT INTO bound_position_close_reservations (id, status) "
             "VALUES (1, 'submitted')"
@@ -471,15 +511,124 @@ def test_writer_quiescence_inventory_exactly_mirrors_deployment_preflight_specs(
     assert result.stderr == ""
 
 
+def test_writer_quiescence_contract_includes_reviewed_nonwriter_states():
+    helper_text = _WRITER_QUIESCENCE_SCRIPT.read_text(encoding="utf-8")
+
+    assert '"resolved"' in helper_text
+    assert '"waiting_backup_stop"' in helper_text
+    assert "ALLOWED_TRIGGER_PROTECTION_RECOVERY_STATES" in helper_text
+    assert "trigger_take_profit_convergence.py" in helper_text
+
+
+@pytest.mark.parametrize(
+    ("table", "state"),
+    [
+        (table, state)
+        for table, states in {
+            "deepcoin_execution_operations": (
+                "pre_submit_deferred", "completed", "submission_failed_no_exposure"
+            ),
+            "execution_order_legs": (
+                "planned", "reserved", "submitted", "pending", "open", "active",
+                "filled", "partially_filled", "partial", "confirmed", "succeeded",
+                "failed", "rejected", "cancelled", "canceled", "manually_cancelled",
+                "exchange_cancelled", "manually_closed", "closed", "expired",
+                "invalidated", "blocked",
+            ),
+            "message_instruction_items": ("submitted", "succeeded", "failed"),
+            "trade_signals": (
+                "submitted", "recovery_required", "confirmed", "failed", "rejected",
+                "blocked", "skipped", "expired", "cancelled",
+            ),
+            "instruction_execution_contracts": (
+                "verified", "failed", "expired", "completed"
+            ),
+            "strategy_revision_batches": ("succeeded", "failed", "blocked"),
+            "strategy_management_batches": (
+                "blocked", "failed", "succeeded", "resolved", "shadow_planned", "completed"
+            ),
+            "strategy_management_legs": (
+                "confirmed", "definitely_rejected", "failed", "blocked", "succeeded",
+                "resolved", "safely_skipped",
+            ),
+            "strategy_management_components": (
+                "blocked", "confirmed", "operator_required", "safely_skipped"
+            ),
+            "position_mutation_intents": ("not_sent", "confirmed", "rejected", "blocked"),
+            "bound_position_close_reservations": ("confirmed",),
+            "position_backup_stop_orders": (
+                "not_sent", "active", "verified", "cancelled", "superseded",
+                "unverified_exchange", "failed", "rejected", "expired",
+            ),
+            "position_take_profit_orders": (
+                "active", "cancelled", "filled", "expired", "conflicted", "completed"
+            ),
+            "position_protection_legs": ("verified", "filled", "failed", "blocked", "missing"),
+            "trigger_protection_intents": ("adopted", "failed", "resolved"),
+            "trigger_protection_stop_rescues": ("confirmed", "succeeded", "failed", "blocked"),
+            "trigger_take_profit_convergences": (
+                "waiting_position", "waiting_backup_stop", "completed", "conflicted", "blocked"
+            ),
+            "strategy_break_even_convergences": (
+                "blocked", "shadow_deciding", "shadow_planned", "completed",
+                "failed_terminal", "succeeded",
+            ),
+            "strategy_break_even_convergence_legs": (
+                "planned", "shadow_planned", "stop_confirmed", "verified", "confirmed",
+                "succeeded", "failed_terminal", "blocked",
+            ),
+            "source_message_deletion_exits": ("succeeded", "failed", "blocked"),
+        }.items()
+        for state in states
+    ],
+)
+def test_writer_quiescence_accepts_every_reviewed_nonwriter_state(
+    tmp_path,
+    table,
+    state,
+):
+    database = tmp_path / "writers.db"
+    _writer_quiescence_database(database)
+    column, _active_state = _WRITER_SPEC_BY_TABLE[table]
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            f'INSERT INTO "{table}" (id, "{column}") VALUES (?, ?)',
+            (2, state),
+        )
+
+    result = _run_writer_quiescence(database)
+
+    assert result.returncode == 0, (table, state, result.stdout, result.stderr)
+    assert json.loads(result.stdout)["status"] == "ready"
+
+
+def test_writer_quiescence_refuses_unreviewed_trigger_protection_state(tmp_path):
+    database = tmp_path / "writers.db"
+    _writer_quiescence_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO trigger_protection_intents (id, recovery_state) "
+            "VALUES (1, 'blocked')"
+        )
+
+    result = _run_writer_quiescence(database)
+
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "refused"
+    assert payload["other_active_or_unknown_writer_count"] == 1
+
+
 @pytest.mark.parametrize(
     ("table", "column", "active_state"),
     [
-        spec
-        for spec in _EXPECTED_WRITER_SPECS
-        if spec[0] != "bound_position_close_reservations"
+        (spec.table, spec.state_column, state)
+        for spec in _WORK_SPECS
+        if spec.table != "bound_position_close_reservations"
+        for state in sorted(set(spec.active_states) | set(spec.unknown_states))
     ],
 )
-def test_writer_quiescence_refuses_each_preflight_writer_table(
+def test_writer_quiescence_refuses_each_preflight_active_or_unknown_state(
     tmp_path,
     table,
     column,
@@ -508,8 +657,39 @@ def test_writer_quiescence_refuses_each_preflight_writer_table(
         "target_reservation_count",
     }
     assert table not in result.stdout
-    assert active_state not in result.stdout
+    assert json.dumps(active_state) not in result.stdout
     assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "target_state",
+    [
+        "reserved",
+        "submitted",
+        "submit_unknown",
+        "unknown_exchange_outcome",
+        "recovery_required",
+    ],
+)
+def test_writer_quiescence_exempts_only_exact_target_population(
+    tmp_path,
+    target_state,
+):
+    database = tmp_path / "writers.db"
+    _writer_quiescence_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE bound_position_close_reservations SET status = ? WHERE id = 1",
+            (target_state,),
+        )
+
+    result = _run_writer_quiescence(database)
+
+    assert result.returncode == 0
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "ready"
+    assert payload["target_reservation_count"] == 1
+    assert payload["other_active_or_unknown_writer_count"] == 0
 
 
 @pytest.mark.parametrize("invalid_state", [None, "future_writer_state"])
@@ -544,22 +724,76 @@ def test_writer_quiescence_refuses_null_and_future_states_in_every_existing_tabl
     assert result.stderr == ""
 
 
-def test_writer_quiescence_explicitly_accepts_missing_prior_schema_tables(tmp_path):
+@pytest.mark.parametrize(
+    "missing",
+    [
+        (),
+        ("trigger_take_profit_convergences",),
+        (
+            "strategy_break_even_convergences",
+            "strategy_break_even_convergence_legs",
+        ),
+        (
+            "trigger_take_profit_convergences",
+            "strategy_break_even_convergences",
+            "strategy_break_even_convergence_legs",
+        ),
+        ("deepcoin_execution_operations",),
+    ],
+)
+def test_writer_quiescence_accepts_only_audited_prior_schema_missing_sets(
+    tmp_path,
+    missing,
+):
     database = tmp_path / "prior.db"
+    _writer_quiescence_database(database)
     with sqlite3.connect(database) as connection:
-        connection.execute(
-            "CREATE TABLE bound_position_close_reservations "
-            "(id INTEGER PRIMARY KEY, status TEXT)"
-        )
-        connection.execute(
-            "INSERT INTO bound_position_close_reservations VALUES (1, 'submitted')"
-        )
+        for table in missing:
+            connection.execute(f'DROP TABLE "{table}"')
 
     result = _run_writer_quiescence(database)
 
-    assert result.returncode == 0
+    assert result.returncode == 0, result.stdout
     payload = json.loads(result.stdout)
     assert payload["status"] == "ready"
-    assert payload["checked_table_count"] == 1
-    assert payload["missing_table_count"] == len(_EXPECTED_WRITER_SPECS) - 1
-    assert payload["other_active_or_unknown_writer_count"] == 0
+    assert payload["missing_table_count"] == len(missing)
+
+
+@pytest.mark.parametrize(
+    "missing_table",
+    [
+        "strategy_management_batches",
+        "bound_position_close_reservations",
+        "execution_bindings",
+        "execution_events",
+        "execution_order_legs",
+        "position_mutation_intents",
+    ],
+)
+def test_writer_quiescence_rejects_unapproved_or_source_required_missing_table(
+    tmp_path,
+    missing_table,
+):
+    database = tmp_path / "missing.db"
+    _writer_quiescence_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(f'DROP TABLE "{missing_table}"')
+
+    result = _run_writer_quiescence(database)
+
+    assert result.returncode == 1
+    assert json.loads(result.stdout)["status"] == "error"
+
+
+def test_writer_quiescence_rejects_nineteen_missing_work_tables(tmp_path):
+    database = tmp_path / "missing.db"
+    _writer_quiescence_database(database)
+    with sqlite3.connect(database) as connection:
+        for table, _column, _active in _EXPECTED_WRITER_SPECS:
+            if table != "bound_position_close_reservations":
+                connection.execute(f'DROP TABLE "{table}"')
+
+    result = _run_writer_quiescence(database)
+
+    assert result.returncode == 1
+    assert json.loads(result.stdout)["status"] == "error"

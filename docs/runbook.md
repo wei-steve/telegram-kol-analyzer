@@ -1731,6 +1731,7 @@ fingerprint。如果不是全部 `PROVEN_TERMINAL`，或与已批准范围不符
 
 ```bash
 APPLY_SUMMARY="$RECOVERY_TMP/apply-summary.json"
+set +e
 PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
   telegram_kol_research.cli recover-bound-position-close-reservations \
   --database-path "$PRODUCTION_DB" \
@@ -1743,19 +1744,12 @@ PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" -m \
   | PYTHONPATH="$CANDIDATE_ROOT/src" "$RUNTIME_PYTHON" \
     "$CANDIDATE_ROOT/scripts/project_bound_close_reservation_recovery_output.py" \
     apply-result > "$APPLY_SUMMARY"
+APPLY_PIPE_STATUS=("${PIPESTATUS[@]}")
+APPLY_CLI_STATUS="${APPLY_PIPE_STATUS[0]}"
+APPLY_PROJECT_AND_SUMMARY_STATUS="${APPLY_PIPE_STATUS[1]}"
 chmod 0600 "$APPLY_SUMMARY"
-```
+APPLY_SUMMARY_CHMOD_STATUS=$?
 
-上述 pipe 在内存中严格验证 CLI 的六个固定字段，但只持久化
-`("status","action_count","evidence_fingerprint")`。原始 apply JSON 及其
-`audit_event_id` 不落盘。capture summary 同样不包含 confirmation token 或
-raw observations；这些只能存在当次 0700/0600 private capture 中，不得回显。
-
-apply 成功后在任何服务重启前，只用 query-only 连接检查剩余 target、
-唯一审计事件和 MiMo v1。将 `<fresh-evidence-fingerprint>` 替换为本窗口的
-完整 fingerprint；查询只输出聚合数量和模式，不输出任何 ID 或 JSON：
-
-```bash
 POSTCHECK="$(sqlite3 -readonly "$PRODUCTION_DB" <<'SQL'
 PRAGMA query_only=ON;
 SELECT 'remaining_target_count=' || COUNT(*)
@@ -1778,9 +1772,55 @@ SELECT 'mimo_contract_mode=' || COALESCE(
 );
 SQL
 )"
-test "$POSTCHECK" = $'remaining_target_count=0\nrecovery_audit_count=1\nmimo_contract_mode=v1'
-test "$(sqlite3 -readonly "$PRODUCTION_DB" 'PRAGMA query_only=ON; PRAGMA quick_check;')" = ok
+POSTCHECK_READ_STATUS=$?
+POSTCHECK_MATCH_STATUS=1
+if [ "$POSTCHECK_READ_STATUS" -eq 0 ]; then
+  test "$POSTCHECK" = $'remaining_target_count=0\nrecovery_audit_count=1\nmimo_contract_mode=v1'
+  POSTCHECK_MATCH_STATUS=$?
+fi
+QUICK_CHECK="$(sqlite3 -readonly "$PRODUCTION_DB" \
+  'PRAGMA query_only=ON; PRAGMA quick_check;')"
+QUICK_CHECK_READ_STATUS=$?
+QUICK_CHECK_MATCH_STATUS=1
+if [ "$QUICK_CHECK_READ_STATUS" -eq 0 ]; then
+  test "$QUICK_CHECK" = ok
+  QUICK_CHECK_MATCH_STATUS=$?
+fi
+
+APPLY_COMBINED_STATUS=0
+for STATUS in \
+  "$APPLY_CLI_STATUS" \
+  "$APPLY_PROJECT_AND_SUMMARY_STATUS" \
+  "$APPLY_SUMMARY_CHMOD_STATUS" \
+  "$POSTCHECK_READ_STATUS" \
+  "$POSTCHECK_MATCH_STATUS" \
+  "$QUICK_CHECK_READ_STATUS" \
+  "$QUICK_CHECK_MATCH_STATUS"
+do
+  if [ "$STATUS" -ne 0 ]; then
+    APPLY_COMBINED_STATUS=1
+  fi
+done
+set -e
+if [ "$APPLY_COMBINED_STATUS" -ne 0 ]; then
+  exit "$APPLY_COMBINED_STATUS"
+fi
 ```
+
+上述必须作为一个完整 shell block 执行。apply 一旦启动，临时关闭
+errexit 并立即保存 CLI、projector/summary write 和 chmod 的状态；无论
+任何一项是否失败，都必须先完成 exact query-only postcheck 与
+`quick_check`，然后才综合退出并由 trap 恢复服务。这避免“数据库已提交，
+但输出投影或文件权限失败”时跳过必须的提交后检查。
+
+上述 pipe 在内存中严格验证 CLI 的六个固定字段，但只持久化
+`("status","action_count","evidence_fingerprint")`。原始 apply JSON 及其
+`audit_event_id` 不落盘。capture summary 同样不包含 confirmation token 或
+raw observations；这些只能存在当次 0700/0600 private capture 中，不得回显。
+
+apply 尝试后在任何服务重启前，只用 query-only 连接检查剩余 target、
+唯一审计事件和 MiMo v1。将 `<fresh-evidence-fingerprint>` 替换为本窗口的
+完整 fingerprint；查询只输出聚合数量和模式，不输出任何 ID 或 JSON。
 
 内部 CAS 已限制只能改 target reservation 的 `status/last_error/updated_at`，
 并新增一条聚合审计事件；任何拒绝、计数差异或 query-only postcheck
