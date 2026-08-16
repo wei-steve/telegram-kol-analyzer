@@ -1612,11 +1612,200 @@ verify_bound_close_unit_group_original_state example.service
     assert result.returncode == expected, result.stderr
 
 
+@pytest.mark.parametrize(
+    ("monitor_load", "monitor_state", "timer_load", "timer_state", "expected"),
+    [
+        ("loaded", "failed", "loaded", "active", 0),
+        ("loaded", "activating", "loaded", "active", 0),
+        ("loaded", "inactive", "loaded", "active", 0),
+        ("loaded", "active", "loaded", "active", 1),
+        ("loaded", "deactivating", "loaded", "active", 1),
+        ("loaded", "unknown", "loaded", "active", 1),
+        ("not-found", "failed", "loaded", "active", 1),
+        ("loaded", "failed", "loaded", "inactive", 1),
+        ("loaded", "failed", "not-found", "inactive", 1),
+    ],
+)
+@pytest.mark.parametrize("original_monitor_state", ["failed", "inactive"])
+def test_legacy_monitor_live_state_exception_is_closed(
+    monitor_load,
+    monitor_state,
+    timer_load,
+    timer_state,
+    expected,
+    original_monitor_state,
+):
+    block = _bound_close_read_only_block()
+    verifier = _bound_close_shell_function(
+        block, "verify_bound_close_legacy_monitor_live_state"
+    )
+    verifier = verifier.replace(
+        "${ORIGINAL_UNIT_INSTALL_STATE[telegram-kol-monitor.service]}",
+        "$ORIGINAL_MONITOR_INSTALL",
+    ).replace(
+        "${ORIGINAL_UNIT_INSTALL_STATE[telegram-kol-monitor.timer]}",
+        "$ORIGINAL_TIMER_INSTALL",
+    ).replace(
+        "${ORIGINAL_UNIT_STATE[telegram-kol-monitor.service]}",
+        "$ORIGINAL_MONITOR_STATE",
+    ).replace(
+        "${ORIGINAL_UNIT_STATE[telegram-kol-monitor.timer]}",
+        "$ORIGINAL_TIMER_STATE",
+    )
+    script = f"""
+set -euo pipefail
+ORIGINAL_MONITOR_INSTALL=installed
+ORIGINAL_TIMER_INSTALL=installed
+ORIGINAL_MONITOR_STATE={original_monitor_state}
+ORIGINAL_TIMER_STATE=active
+MONITOR_LOAD={monitor_load}
+MONITOR_STATE={monitor_state}
+TIMER_LOAD={timer_load}
+TIMER_STATE={timer_state}
+systemctl() {{
+  local unit="$2"
+  case "$1:$unit" in
+    show:telegram-kol-monitor.service) printf '%s\n' "$MONITOR_LOAD" ;;
+    is-active:telegram-kol-monitor.service) printf '%s\n' "$MONITOR_STATE" ;;
+    show:telegram-kol-monitor.timer) printf '%s\n' "$TIMER_LOAD" ;;
+    is-active:telegram-kol-monitor.timer) printf '%s\n' "$TIMER_STATE" ;;
+    *) return 91 ;;
+  esac
+}}
+verify_bound_close_legacy_monitor_live_state() {{
+{verifier}
+}}
+verify_bound_close_legacy_monitor_live_state
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode == expected, result.stderr
+
+
+@pytest.mark.parametrize(
+    (
+        "original_monitor_install",
+        "original_monitor_state",
+        "original_timer_install",
+        "original_timer_state",
+    ),
+    [
+        ("absent", "absent", "installed", "active"),
+        ("installed", "active", "installed", "active"),
+        ("installed", "failed", "absent", "absent"),
+        ("installed", "failed", "installed", "inactive"),
+    ],
+)
+def test_legacy_monitor_live_state_exception_requires_approved_original_snapshot(
+    original_monitor_install,
+    original_monitor_state,
+    original_timer_install,
+    original_timer_state,
+):
+    block = _bound_close_read_only_block()
+    verifier = _bound_close_shell_function(
+        block, "verify_bound_close_legacy_monitor_live_state"
+    )
+    verifier = verifier.replace(
+        "${ORIGINAL_UNIT_INSTALL_STATE[telegram-kol-monitor.service]}",
+        "$ORIGINAL_MONITOR_INSTALL",
+    ).replace(
+        "${ORIGINAL_UNIT_INSTALL_STATE[telegram-kol-monitor.timer]}",
+        "$ORIGINAL_TIMER_INSTALL",
+    ).replace(
+        "${ORIGINAL_UNIT_STATE[telegram-kol-monitor.service]}",
+        "$ORIGINAL_MONITOR_STATE",
+    ).replace(
+        "${ORIGINAL_UNIT_STATE[telegram-kol-monitor.timer]}",
+        "$ORIGINAL_TIMER_STATE",
+    )
+    script = f"""
+set -euo pipefail
+ORIGINAL_MONITOR_INSTALL={original_monitor_install}
+ORIGINAL_TIMER_INSTALL={original_timer_install}
+ORIGINAL_MONITOR_STATE={original_monitor_state}
+ORIGINAL_TIMER_STATE={original_timer_state}
+systemctl() {{
+  case "$1:$2" in
+    show:*) printf 'loaded\n' ;;
+    is-active:telegram-kol-monitor.service) printf 'failed\n' ;;
+    is-active:telegram-kol-monitor.timer) printf 'active\n' ;;
+    *) return 91 ;;
+  esac
+}}
+verify_bound_close_legacy_monitor_live_state() {{
+{verifier}
+}}
+verify_bound_close_legacy_monitor_live_state
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode != 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("core_load", "core_state", "socket_load", "expected"),
+    [
+        ("loaded", "active", "loaded", 0),
+        ("loaded", "inactive", "loaded", 1),
+        ("loaded", "active", "not-found", 1),
+    ],
+)
+def test_live_unit_verifier_keeps_core_and_install_states_exact(
+    core_load, core_state, socket_load, expected
+):
+    block = _bound_close_read_only_block()
+    live_verifier = _bound_close_shell_function(
+        block, "verify_bound_close_unit_group_live_state"
+    )
+    live_verifier = live_verifier.replace(
+        "${ORIGINAL_UNIT_INSTALL_STATE[$unit]}", "$MONITOR_INSTALL"
+    )
+    script = f"""
+set -euo pipefail
+MONITOR_INSTALL=installed
+CORE_LOAD={core_load}
+CORE_STATE={core_state}
+SOCKET_LOAD={socket_load}
+verify_bound_close_legacy_monitor_live_state() {{ return 0; }}
+verify_bound_close_unit_group_original_state() {{
+  case "$1" in
+    telegram-kol-monitor.timer) return 0 ;;
+    telegram-kol.service)
+      [ "$CORE_LOAD" = loaded ] && [ "$CORE_STATE" = active ]
+      ;;
+    telegram-kol-agent-model-egress.socket)
+      [ "$SOCKET_LOAD" = loaded ]
+      ;;
+    *) return 91 ;;
+  esac
+}}
+verify_bound_close_unit_group_live_state() {{
+{live_verifier}
+}}
+verify_bound_close_unit_group_live_state \
+  telegram-kol-monitor.service telegram-kol-monitor.timer \
+  telegram-kol.service telegram-kol-agent-model-egress.socket
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode == expected, result.stderr
+
+
 def test_live_identity_verifier_checks_all_original_unit_states():
     block = _bound_close_read_only_block()
     verifier = _bound_close_shell_function(block, "verify_all_local_identity_before_stop")
 
-    assert 'verify_bound_close_unit_group_original_state "${QUIESCE_UNITS[@]}"' in verifier
+    assert 'verify_bound_close_unit_group_live_state "${QUIESCE_UNITS[@]}"' in verifier
 
 
 def test_original_unit_state_is_rechecked_immediately_before_first_stop():

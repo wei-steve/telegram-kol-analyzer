@@ -1764,6 +1764,45 @@ verify_bound_close_unit_group_original_state() {
   done
 }
 
+verify_bound_close_legacy_monitor_live_state() {
+  local monitor_load
+  local monitor_state
+  local timer_load
+  local timer_state
+  [ "${ORIGINAL_UNIT_INSTALL_STATE[telegram-kol-monitor.service]}" = installed ]
+  case "${ORIGINAL_UNIT_STATE[telegram-kol-monitor.service]}" in
+    failed|inactive) ;;
+    *) return 1 ;;
+  esac
+  [ "${ORIGINAL_UNIT_INSTALL_STATE[telegram-kol-monitor.timer]}" = installed ]
+  [ "${ORIGINAL_UNIT_STATE[telegram-kol-monitor.timer]}" = active ]
+  monitor_load="$(systemctl show telegram-kol-monitor.service \
+    --property=LoadState --value)"
+  [ "$monitor_load" = loaded ] || return 1
+  monitor_state="$(systemctl is-active telegram-kol-monitor.service || true)"
+  case "$monitor_state" in
+    failed|activating|inactive) ;;
+    *) return 1 ;;
+  esac
+  timer_load="$(systemctl show telegram-kol-monitor.timer \
+    --property=LoadState --value)"
+  [ "$timer_load" = loaded ] || return 1
+  timer_state="$(systemctl is-active telegram-kol-monitor.timer || true)"
+  [ "$timer_state" = active ]
+}
+
+verify_bound_close_unit_group_live_state() {
+  local unit
+  for unit in "$@"; do
+    if [ "$unit" = telegram-kol-monitor.service ] && \
+      [ "${ORIGINAL_UNIT_INSTALL_STATE[$unit]}" = installed ]; then
+      verify_bound_close_legacy_monitor_live_state
+    else
+      verify_bound_close_unit_group_original_state "$unit"
+    fi
+  done
+}
+
 verify_bound_close_quiescence() {
   discover_bound_close_db_stage_units "$DB_STAGE_CURRENT_INVENTORY"
   cmp -s "$DB_STAGE_INITIAL_INVENTORY" "$DB_STAGE_CURRENT_INVENTORY"
@@ -1796,7 +1835,7 @@ verify_all_local_identity_before_stop() {
   local PROCESS_SCAN_STATUS
   discover_bound_close_db_stage_units "$DB_STAGE_CURRENT_INVENTORY"
   cmp -s "$DB_STAGE_INITIAL_INVENTORY" "$DB_STAGE_CURRENT_INVENTORY"
-  verify_bound_close_unit_group_original_state "${QUIESCE_UNITS[@]}"
+  verify_bound_close_unit_group_live_state "${QUIESCE_UNITS[@]}"
   if pgrep -f '[t]elegram_kol_research|[t]elegram-kol' >/dev/null; then
     PROCESS_SCAN_STATUS=0
   else
@@ -2432,7 +2471,9 @@ write_bound_close_live_prequiescence_runner() {
       ORIGINAL_UNIT_INSTALL_STATE ORIGINAL_UNIT_STATE
     declare -f \
       bound_close_now_epoch discover_bound_close_db_stage_units \
+      verify_bound_close_legacy_monitor_live_state \
       verify_bound_close_unit_group_original_state \
+      verify_bound_close_unit_group_live_state \
       verify_all_local_identity_before_stop \
       run_bound_close_writer_quiescence_helper \
       project_bound_close_writer_quiescence_result \
