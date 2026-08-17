@@ -53,7 +53,8 @@ EXECUTION_WRITER_PATHS = frozenset(
         "src/telegram_kol_research/entry_revision_executor.py",
         "src/telegram_kol_research/execution_bindings.py",
         "src/telegram_kol_research/instruction_execution_reconciliation.py",
-        "src/telegram_kol_research/position_backup_stop_orders.py",
+        "src/telegram_kol_research/legacy_conditional_cancel.py",
+        "src/telegram_kol_research/native_tpsl_migration.py",
         "src/telegram_kol_research/position_mutation_gateway.py",
         "src/telegram_kol_research/position_mutation_intents.py",
         "src/telegram_kol_research/position_protection_legs.py",
@@ -68,6 +69,7 @@ EXECUTION_WRITER_PATHS = frozenset(
         "src/telegram_kol_research/strategy_management_worker.py",
         "src/telegram_kol_research/system_operator_bot.py",
         "src/telegram_kol_research/terminal_entry_cleanup.py",
+        "src/telegram_kol_research/trigger_backup_stop_executor.py",
         "src/telegram_kol_research/trigger_take_profit_convergence_executor.py",
         "src/telegram_kol_research/web_app.py",
     }
@@ -90,7 +92,7 @@ _REVIEWED_RETIREMENT_RISK_PATHS = frozenset(
 )
 # Filled from the exact reviewed production-to-retirement Git object pair.
 _REVIEWED_RETIREMENT_RISK_FINGERPRINT = (
-    "92c342bb8ce5a8b944bd3c2fcfd2fc9c319af3a297ade760d6a05f72bfc31183"
+    "93b0572cf030c067a1a1b82500d2cd7cb4ef42ce95358d757c95ad14a695e763"
 )
 
 

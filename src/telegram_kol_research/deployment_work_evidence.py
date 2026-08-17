@@ -48,6 +48,7 @@ class WorkEvidenceAdapter:
     in_flight_states: frozenset[str]
     unknown_states: frozenset[str]
     terminal_states: frozenset[str]
+    required_columns: frozenset[str] = frozenset({"created_at"})
     progress_columns: tuple[str, ...] = ()
     origin_columns: tuple[str, ...] = ("created_at", "planned_at", "reserved_at")
     restart_surface_files: tuple[str, ...] = ()
@@ -89,12 +90,10 @@ WORK_EVIDENCE_ADAPTERS = (
         "execution_order_legs",
         "execution_order_legs",
         "status",
+        restart=("pending", "submitted", "open"),
         in_flight=("submitting", "cancel_submitting"),
         unknown=("submit_unknown", "unknown_exchange_outcome", "unknown"),
         terminal=(
-            "pending",
-            "submitted",
-            "open",
             "active",
             "filled",
             "partial_closed",
@@ -260,7 +259,7 @@ WORK_EVIDENCE_ADAPTERS = (
         unknown=("pending_readback", "unknown_exchange_outcome"),
         terminal=("active", "verified", "filled", "cancelled", "expired", "failed"),
         restart_surface=(
-            "src/telegram_kol_research/position_backup_stop_orders.py",
+            "src/telegram_kol_research/trigger_backup_stop_executor.py",
         ),
     ),
     _adapter(
@@ -313,7 +312,7 @@ WORK_EVIDENCE_ADAPTERS = (
         "trigger_take_profit_convergences",
         "trigger_take_profit_convergences",
         "status",
-        restart=("ready", "submitted"),
+        restart=("ready", "submitted", "waiting_backup_stop"),
         in_flight=("reserved",),
         unknown=("submit_unknown",),
         terminal=("completed", "conflicted", "blocked", "failed"),
@@ -325,7 +324,7 @@ WORK_EVIDENCE_ADAPTERS = (
         "break_even_convergences",
         "strategy_break_even_convergences",
         "status",
-        restart=("planned",),
+        restart=("planned", "shadow_deciding"),
         in_flight=(
             "claimed",
             "preflight_verified",
@@ -333,7 +332,14 @@ WORK_EVIDENCE_ADAPTERS = (
             "executing_market_decisions",
         ),
         unknown=("recovery_required",),
-        terminal=("completed", "succeeded", "blocked", "failed"),
+        terminal=(
+            "completed",
+            "succeeded",
+            "blocked",
+            "failed",
+            "failed_terminal",
+            "shadow_planned",
+        ),
         restart_surface=(
             "src/telegram_kol_research/break_even_convergence_worker.py",
         ),
@@ -351,6 +357,11 @@ WORK_EVIDENCE_ADAPTERS = (
             "succeeded",
             "blocked",
             "failed",
+            "failed_terminal",
+            "verified",
+            "confirmed",
+            "cancelled",
+            "shadow_planned",
         ),
         restart_surface=(
             "src/telegram_kol_research/break_even_convergence_worker.py",
@@ -368,6 +379,43 @@ WORK_EVIDENCE_ADAPTERS = (
             "src/telegram_kol_research/source_message_deletion_worker.py",
         ),
     ),
+)
+
+WORK_EVIDENCE_SOURCES = frozenset(
+    adapter.output_name for adapter in WORK_EVIDENCE_ADAPTERS
+)
+_NON_WORK_STATE_TABLES = frozenset(
+    {
+        "ai_prompt_invocations",
+        "ai_prompt_test_runs",
+        "ai_prompt_versions",
+        "context_resolution_attempts",
+        "entry_assembly_attempts",
+        "entry_preambles",
+        "entry_revision_replacements",
+        "entry_strategy_fragments",
+        "execution_bindings",
+        "execution_events",
+        "message_operation_contracts",
+        "message_operation_items",
+        "message_operation_stage1_notifications",
+        "message_recognitions",
+        "position_protection_ledger",
+        "position_protection_revisions",
+        "recognition_experiments",
+        "recovery_order_confirmations",
+        "runtime_agent_model_usage",
+        "runtime_agent_recovery_attempts",
+        "runtime_incident_handoff_artifacts",
+        "runtime_incident_observations",
+        "runtime_incidents",
+        "strategy_alerts",
+        "strategy_management_notifications",
+        "strategy_message_links",
+        "strategy_revision_legs",
+        "strategy_threads",
+        "trade_ideas",
+    }
 )
 
 
@@ -395,12 +443,18 @@ def collect_work_evidence(
                 f"PRAGMA table_info({_identifier(adapter.table)})"
             ).fetchall()
         }
-        if adapter.state_column not in columns:
+        required = {adapter.state_column, *adapter.required_columns}
+        if not required.issubset(columns):
             raise DeploymentWorkEvidenceError("deployment_evidence_malformed")
         evidence_columns = tuple(
-            column
-            for column in (*adapter.progress_columns, *adapter.origin_columns)
-            if column in columns
+            dict.fromkeys(
+                column
+                for column in (
+                    *adapter.progress_columns,
+                    *adapter.origin_columns,
+                )
+                if column in columns
+            )
         )
         states = sorted(
             adapter.restart_safe_states
@@ -408,40 +462,38 @@ def collect_work_evidence(
             | adapter.unknown_states
             | adapter.terminal_states
         )
-        if not states:
-            continue
-        selected = [adapter.state_column, *evidence_columns]
-        rows = connection.execute(
-            f"SELECT {', '.join(_identifier(item) for item in selected)} "
-            f"FROM {_identifier(adapter.table)}",
-        ).fetchall()
-        aggregated: dict[tuple[str, str, tuple[bool, ...]], int] = {}
+        rows = _aggregate_adapter_rows(
+            connection,
+            adapter=adapter,
+            evidence_columns=evidence_columns,
+            recognized_states=states,
+            cutoff=cutoff,
+        )
         for row in rows:
-            state = str(row[0])
-            if state in adapter.unknown_states:
+            state = "" if row[0] is None else str(row[0])
+            malformed = bool(row[1])
+            historical = bool(row[2])
+            evidence_presence = tuple(bool(value) for value in row[3:-1])
+            count = int(row[-1])
+            if count < 0 or count > _MAX_BOUNDED_COUNT:
+                raise DeploymentWorkEvidenceError("deployment_evidence_malformed")
+            if malformed:
+                classification = "malformed"
+            elif state in adapter.unknown_states:
                 classification = "unknown_outcome"
             elif state in adapter.in_flight_states:
                 classification = "in_flight_write"
             elif state in adapter.restart_safe_states:
-                authoritative = _first_timestamp(row[1:])
                 classification = (
-                    "historical_residue"
-                    if authoritative is not None and authoritative < cutoff
-                    else "restart_safe_wait"
+                    "historical_residue" if historical else "restart_safe_wait"
                 )
             elif state in adapter.terminal_states:
                 classification = "terminal"
             else:
                 classification = "malformed"
             counts[classification][adapter.output_name] = (
-                counts[classification].get(adapter.output_name, 0) + 1
+                counts[classification].get(adapter.output_name, 0) + count
             )
-            evidence_presence = tuple(value not in (None, "") for value in row[1:])
-            key = (state, classification, evidence_presence)
-            aggregated[key] = aggregated.get(key, 0) + 1
-        for (state, classification, evidence_presence), count in sorted(
-            aggregated.items()
-        ):
             fingerprint_rows.append(
                 {
                     "source": adapter.output_name,
@@ -451,11 +503,28 @@ def collect_work_evidence(
                     "count": count,
                 }
             )
+
+    unregistered = _unregistered_state_table_count(
+        connection,
+        available_tables=available_tables,
+    )
+    if unregistered:
+        counts["malformed"]["unregistered_work_tables"] = unregistered
+        fingerprint_rows.append(
+            {
+                "source": "unregistered_work_tables",
+                "state": "unregistered",
+                "classification": "malformed",
+                "evidence_presence": (),
+                "count": unregistered,
+            }
+        )
     bounded = {
         classification: dict(sorted(sources.items()))
         for classification, sources in counts.items()
         if sources
     }
+    _validate_counts(bounded)
     body = json.dumps(fingerprint_rows, sort_keys=True, separators=(",", ":"))
     return DeploymentWorkSummary(
         counts=bounded,
@@ -463,20 +532,109 @@ def collect_work_evidence(
     )
 
 
-def _first_timestamp(values: Collection[object]) -> datetime | None:
-    for value in values:
-        if value in (None, ""):
-            continue
-        try:
-            parsed = datetime.fromisoformat(str(value))
-        except (TypeError, ValueError):
-            continue
-        return (
-            parsed.replace(tzinfo=UTC)
-            if parsed.tzinfo is None
-            else parsed.astimezone(UTC)
+def _aggregate_adapter_rows(
+    connection: sqlite3.Connection,
+    *,
+    adapter: WorkEvidenceAdapter,
+    evidence_columns: tuple[str, ...],
+    recognized_states: Collection[str],
+    cutoff: datetime,
+):
+    state = _identifier(adapter.state_column)
+    placeholders = ",".join("?" for _ in recognized_states)
+    normalized_state = (
+        f"CASE WHEN {state} IN ({placeholders}) "
+        f"THEN {state} ELSE '__unrecognized__' END"
+    )
+    malformed_parts = [
+        f"{state} IS NULL",
+        f"{state} NOT IN ({placeholders})",
+    ]
+    for column in adapter.required_columns:
+        identifier = _identifier(column)
+        malformed_parts.extend(
+            (f"{identifier} IS NULL", f"julianday({identifier}) IS NULL")
         )
-    return None
+    for column in evidence_columns:
+        if column in adapter.required_columns:
+            continue
+        identifier = _identifier(column)
+        malformed_parts.append(
+            f"({identifier} IS NOT NULL AND julianday({identifier}) IS NULL)"
+        )
+    if "created_at" in evidence_columns:
+        created = _identifier("created_at")
+        for column in adapter.progress_columns:
+            if column not in evidence_columns:
+                continue
+            progress = _identifier(column)
+            malformed_parts.append(
+                f"({progress} IS NOT NULL AND "
+                f"julianday({progress}) < julianday({created}))"
+            )
+    authoritative_columns = [
+        column
+        for column in (*adapter.progress_columns, *adapter.origin_columns)
+        if column in evidence_columns
+    ]
+    authoritative = ", ".join(_identifier(column) for column in authoritative_columns)
+    if len(authoritative_columns) > 1:
+        authoritative = f"COALESCE({authoritative})"
+    presence_expressions = [
+        f"CASE WHEN {_identifier(column)} IS NULL THEN 0 ELSE 1 END"
+        for column in evidence_columns
+    ]
+    inner_fields = [
+        f"{normalized_state} AS state_value",
+        f"CASE WHEN {' OR '.join(malformed_parts)} THEN 1 ELSE 0 END "
+        "AS malformed_value",
+        f"CASE WHEN julianday({authoritative}) < julianday(?) "
+        "THEN 1 ELSE 0 END AS historical_value",
+        *(
+            f"{expression} AS evidence_{index}"
+            for index, expression in enumerate(presence_expressions)
+        ),
+    ]
+    group_fields = [
+        "state_value",
+        "malformed_value",
+        "historical_value",
+        *(f"evidence_{index}" for index in range(len(presence_expressions))),
+    ]
+    sql = (
+        f"SELECT {', '.join(group_fields)}, COUNT(*) "
+        f"FROM (SELECT {', '.join(inner_fields)} "
+        f"FROM {_identifier(adapter.table)}) "
+        f"GROUP BY {', '.join(group_fields)}"
+    )
+    parameters = [
+        *recognized_states,
+        *recognized_states,
+        cutoff.replace(tzinfo=None).isoformat(" "),
+    ]
+    return connection.execute(sql, parameters)
+
+
+def _unregistered_state_table_count(
+    connection: sqlite3.Connection,
+    *,
+    available_tables: Collection[str],
+) -> int:
+    registered = {adapter.table for adapter in WORK_EVIDENCE_ADAPTERS}
+    allowed = registered | set(_NON_WORK_STATE_TABLES)
+    unregistered = 0
+    for table in sorted(set(available_tables) - allowed):
+        columns = {
+            str(row[1])
+            for row in connection.execute(
+                f"PRAGMA table_info({_identifier(table)})"
+            ).fetchall()
+        }
+        if columns.intersection({"state", "status"}):
+            unregistered += 1
+    if unregistered > _MAX_BOUNDED_COUNT:
+        raise DeploymentWorkEvidenceError("deployment_evidence_malformed")
+    return unregistered
 
 
 def _identifier(value: str) -> str:
@@ -535,7 +693,12 @@ def _validate_counts(counts: Mapping[str, Mapping[str, int]]) -> None:
         if classification not in allowed or not isinstance(sources, Mapping):
             raise DeploymentWorkEvidenceError("deployment_evidence_malformed")
         for source, value in sources.items():
-            if not isinstance(source, str) or not source:
+            allowed_sources = WORK_EVIDENCE_SOURCES | (
+                {"unregistered_work_tables"}
+                if classification == "malformed"
+                else set()
+            )
+            if source not in allowed_sources:
                 raise DeploymentWorkEvidenceError("deployment_evidence_malformed")
             if (
                 isinstance(value, bool)

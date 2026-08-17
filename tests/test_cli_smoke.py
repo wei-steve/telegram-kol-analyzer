@@ -12,6 +12,7 @@ import pytest
 
 from telegram_kol_research.cli import app
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.deployment_work_evidence import WORK_EVIDENCE_ADAPTERS
 from telegram_kol_research.execution_bindings import (
     ExecutionBindingRecord,
     list_execution_order_legs,
@@ -82,9 +83,17 @@ def test_deployment_preflight_cli_writes_verifiable_json(tmp_path):
         CREATE TABLE source_message_deletion_exits (id INTEGER PRIMARY KEY, state TEXT, updated_at TEXT);
         """
     )
+    for adapter in WORK_EVIDENCE_ADAPTERS:
+        connection.execute(
+            f"ALTER TABLE {adapter.table} ADD COLUMN created_at TEXT"
+        )
     connection.execute(
-        "INSERT INTO trade_signals VALUES (1, 'processing', ?)",
-        ((now - timedelta(minutes=1)).replace(tzinfo=None).isoformat(" "),),
+        "INSERT INTO trade_signals (id, status, updated_at, created_at) "
+        "VALUES (1, 'processing', ?, ?)",
+        (
+            (now - timedelta(minutes=1)).replace(tzinfo=None).isoformat(" "),
+            (now - timedelta(minutes=1)).replace(tzinfo=None).isoformat(" "),
+        ),
     )
     connection.commit()
     connection.close()

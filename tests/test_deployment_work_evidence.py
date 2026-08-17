@@ -14,6 +14,7 @@ from telegram_kol_research.deployment_preflight import (
 )
 from telegram_kol_research.deployment_work_evidence import (
     DeploymentWorkEvidenceError,
+    WORK_EVIDENCE_ADAPTERS,
     classify_deployment_work,
     collect_work_evidence,
 )
@@ -82,7 +83,10 @@ def test_terminal_only_work_adds_no_reason_code():
     ],
 )
 def test_malformed_work_counts_are_rejected(counts):
-    with pytest.raises(DeploymentWorkEvidenceError, match="deployment_evidence_malformed"):
+    with pytest.raises(
+        DeploymentWorkEvidenceError,
+        match="deployment_evidence_malformed",
+    ):
         classify_deployment_work(counts=counts, change_class="code")
 
 
@@ -181,10 +185,12 @@ def test_management_heartbeat_is_historical_evidence_not_fresh_write(tmp_path):
 def test_unrecognized_durable_state_is_malformed():
     connection = sqlite3.connect(":memory:")
     connection.execute(
-        "CREATE TABLE execution_order_legs (id INTEGER PRIMARY KEY, status TEXT)"
+        "CREATE TABLE execution_order_legs "
+        "(id INTEGER PRIMARY KEY, status TEXT, created_at TEXT)"
     )
     connection.execute(
-        "INSERT INTO execution_order_legs (id, status) VALUES (1, 'new_unreviewed_state')"
+        "INSERT INTO execution_order_legs (id, status, created_at) "
+        "VALUES (1, 'new_unreviewed_state', CURRENT_TIMESTAMP)"
     )
 
     result = collect_work_evidence(
@@ -196,3 +202,160 @@ def test_unrecognized_durable_state_is_malformed():
     assert result.counts["malformed"] == {"execution_order_legs": 1}
     decision = classify_deployment_work(counts=result.counts, change_class="code")
     assert decision.blocking_reason_codes == ("deployment_evidence_malformed",)
+
+
+@pytest.mark.parametrize("state", ["pending", "submitted", "open"])
+def test_nonterminal_execution_order_state_is_restart_safe(state):
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE execution_order_legs "
+        "(id INTEGER PRIMARY KEY, status TEXT, created_at TEXT)"
+    )
+    connection.execute(
+        "INSERT INTO execution_order_legs (id, status, created_at) VALUES (1, ?, ?)",
+        (state, NOW.replace(tzinfo=None).isoformat(" ")),
+    )
+
+    result = collect_work_evidence(
+        connection,
+        available_tables={"execution_order_legs"},
+        now=NOW,
+    )
+
+    assert result.counts["restart_safe_wait"] == {"execution_order_legs": 1}
+    assert "terminal" not in result.counts
+
+
+def test_missing_required_origin_column_fails_closed():
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE execution_order_legs (id INTEGER PRIMARY KEY, status TEXT)"
+    )
+
+    with pytest.raises(
+        DeploymentWorkEvidenceError,
+        match="deployment_evidence_malformed",
+    ):
+        collect_work_evidence(
+            connection,
+            available_tables={"execution_order_legs"},
+            now=NOW,
+        )
+
+
+def test_invalid_timestamp_evidence_is_malformed():
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE execution_order_legs "
+        "(id INTEGER PRIMARY KEY, status TEXT, created_at TEXT)"
+    )
+    connection.execute(
+        "INSERT INTO execution_order_legs (id, status, created_at) "
+        "VALUES (1, 'submitted', 'not-a-timestamp')"
+    )
+
+    result = collect_work_evidence(
+        connection,
+        available_tables={"execution_order_legs"},
+        now=NOW,
+    )
+
+    assert result.counts["malformed"] == {"execution_order_legs": 1}
+
+
+def test_progress_before_creation_is_malformed():
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE message_instruction_items "
+        "(id INTEGER PRIMARY KEY, status TEXT, created_at TEXT, "
+        "last_progress_at TEXT)"
+    )
+    connection.execute(
+        "INSERT INTO message_instruction_items "
+        "(id, status, created_at, last_progress_at) VALUES (1, 'pending', ?, ?)",
+        (
+            NOW.replace(tzinfo=None).isoformat(" "),
+            (NOW - timedelta(days=1)).replace(tzinfo=None).isoformat(" "),
+        ),
+    )
+
+    result = collect_work_evidence(
+        connection,
+        available_tables={"message_instruction_items"},
+        now=NOW,
+    )
+
+    assert result.counts["malformed"] == {"instruction_items": 1}
+
+
+def test_adapter_state_sets_are_disjoint_and_restart_states_bind_handlers():
+    for adapter in WORK_EVIDENCE_ADAPTERS:
+        groups = (
+            adapter.restart_safe_states,
+            adapter.in_flight_states,
+            adapter.unknown_states,
+            adapter.terminal_states,
+        )
+        for index, left in enumerate(groups):
+            for right in groups[index + 1 :]:
+                assert left.isdisjoint(right), adapter.output_name
+        if adapter.restart_safe_states:
+            assert adapter.restart_surface_files, adapter.output_name
+
+
+def test_collection_aggregates_in_sql_instead_of_fetching_full_tables():
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE execution_order_legs "
+        "(id INTEGER PRIMARY KEY, status TEXT, created_at TEXT)"
+    )
+    connection.executemany(
+        "INSERT INTO execution_order_legs (status, created_at) VALUES ('filled', ?)",
+        [(NOW.replace(tzinfo=None).isoformat(" "),)] * 5000,
+    )
+    statements = []
+    connection.set_trace_callback(statements.append)
+
+    result = collect_work_evidence(
+        connection,
+        available_tables={"execution_order_legs"},
+        now=NOW,
+    )
+
+    assert result.counts["terminal"] == {"execution_order_legs": 5000}
+    select_statements = [
+        statement for statement in statements if statement.lstrip().startswith("SELECT")
+    ]
+    assert select_statements
+    assert all("GROUP BY" in statement for statement in select_statements)
+
+
+def test_unknown_source_name_is_rejected_by_policy():
+    with pytest.raises(
+        DeploymentWorkEvidenceError,
+        match="deployment_evidence_malformed",
+    ):
+        classify_deployment_work(
+            counts={"restart_safe_wait": {"unregistered_writer": 1}},
+            change_class="code",
+        )
+
+
+def test_unregistered_execution_state_table_is_malformed():
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE future_execution_writes "
+        "(id INTEGER PRIMARY KEY, status TEXT, created_at TEXT)"
+    )
+    connection.execute(
+        "INSERT INTO future_execution_writes (status, created_at) "
+        "VALUES ('reserved', CURRENT_TIMESTAMP)"
+    )
+
+    result = collect_work_evidence(
+        connection,
+        available_tables={"future_execution_writes"},
+        now=NOW,
+    )
+
+    assert result.counts["malformed"] == {"unregistered_work_tables": 1}

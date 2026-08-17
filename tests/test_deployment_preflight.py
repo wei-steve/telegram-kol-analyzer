@@ -392,6 +392,7 @@ def _create_preflight_database(path: Path) -> None:
         CREATE TABLE raw_messages (id INTEGER PRIMARY KEY);
         CREATE TABLE message_instruction_items (
             id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             signal_candidate_id INTEGER, instruction_kind TEXT,
             retired_at TEXT, result_json TEXT, error_json TEXT
         );
@@ -402,66 +403,84 @@ def _create_preflight_database(path: Path) -> None:
             id INTEGER PRIMARY KEY, key TEXT, value_json TEXT
         );
         CREATE TABLE trade_signals (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
+            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE execution_events (id INTEGER PRIMARY KEY);
         CREATE TABLE execution_order_legs (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
+            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE instruction_execution_contracts (
             id INTEGER PRIMARY KEY, state TEXT, updated_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             message_instruction_item_id INTEGER, state_version INTEGER,
             terminal_kind TEXT, completion_scope TEXT
         );
         CREATE TABLE strategy_revision_batches (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
+            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE strategy_management_batches (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
+            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE strategy_management_legs (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
+            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE strategy_management_components (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
+            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE position_mutation_intents (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
+            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE bound_position_close_reservations (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
+            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE position_protection_legs (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
+            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE position_backup_stop_orders (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
+            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE position_take_profit_orders (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
+            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE trigger_protection_intents (
             id INTEGER PRIMARY KEY, recovery_state TEXT,
-            recovery_disposition TEXT, updated_at TEXT
+            recovery_disposition TEXT, updated_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE trigger_protection_stop_rescues (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
+            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE trigger_take_profit_convergences (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
+            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE strategy_break_even_convergences (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
+            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE strategy_break_even_convergence_legs (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
+            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE position_protection_ledger (
             id INTEGER PRIMARY KEY, venue TEXT, order_id TEXT, pos_id TEXT,
             instrument_id TEXT, side TEXT, purpose TEXT, status TEXT
         );
         CREATE TABLE source_message_deletion_exits (
-            id INTEGER PRIMARY KEY, state TEXT, updated_at TEXT
+            id INTEGER PRIMARY KEY, state TEXT, updated_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         """
     )
@@ -474,7 +493,8 @@ def _create_preflight_database(path: Path) -> None:
         (old,),
     )
     connection.execute(
-        "INSERT INTO trade_signals VALUES (4, 'processing', ?)",
+        "INSERT INTO trade_signals (id, status, updated_at) "
+        "VALUES (4, 'processing', ?)",
         (fresh,),
     )
     connection.execute("INSERT INTO execution_events VALUES (7)")
