@@ -437,13 +437,12 @@ if ! cleanup_schema_dry_run; then
   echo "Could not remove the disposable schema copy." >&2
   exit 4
 fi
-if [ -n "$updater_backup" ] && ! rm -f -- "$updater_backup"; then
-  echo "Could not remove the durable-updater backup." >&2
-  exit 4
-fi
-updater_backup=""
 deployment_finalized=1
 stop_attempted=0
 checkout_mutated=0
 updater_installed=0
 trap - EXIT INT TERM
+if [ -n "$updater_backup" ]; then
+  rm -f -- "$updater_backup" || true
+fi
+updater_backup=""

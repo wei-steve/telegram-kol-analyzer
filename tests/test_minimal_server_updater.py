@@ -327,6 +327,12 @@ printf 'http-health\n' >>"$HARNESS_LOG"
 set -euo pipefail
 case " $* " in
   *telegram-kol-updater-backup.*)
+    if [ -n "${HARNESS_BACKUP_REMOVE_SIGNAL:-}" ] && [ ! -f "$HARNESS_STATE/backup_remove_signaled" ]; then
+      touch "$HARNESS_STATE/backup_remove_signaled"
+      /bin/rm "$@"
+      kill -"$HARNESS_BACKUP_REMOVE_SIGNAL" "$PPID"
+      exit 128
+    fi
     [ "${HARNESS_FINAL_BACKUP_REMOVE_FAIL:-0}" != "1" ] || exit 1
     ;;
   *schema-dry-run-*)
@@ -762,7 +768,6 @@ def test_rollback_failure_is_hard_failure(
     ("fault", "extra"),
     (
         ("HARNESS_WORKTREE_REMOVE_FAIL", {}),
-        ("HARNESS_FINAL_BACKUP_REMOVE_FAIL", {}),
         (
             "HARNESS_FINAL_DRY_RUN_REMOVE_FAIL",
             {"HARNESS_CHANGED_PATH": "src/telegram_kol_research/models.py"},
@@ -781,6 +786,20 @@ def test_final_cleanup_failure_rolls_back_instead_of_applying_candidate(
     assert result.returncode == 4
     assert (state / "head").read_text().strip() == PREVIOUS
     assert (state / "branch").read_text().strip() == PREVIOUS
+
+
+def test_backup_cleanup_failure_is_best_effort_after_finalization(
+    updater_harness,
+) -> None:
+    run, log, state = updater_harness
+
+    result = run(HARNESS_FINAL_BACKUP_REMOVE_FAIL="1")
+
+    assert result.returncode == 0
+    assert (state / "head").read_text().strip() == CANDIDATE
+    assert (state / "branch").read_text().strip() == CANDIDATE
+    assert (log.parent / "durable-updater").read_text() == "candidate updater\n"
+    assert list(log.parent.glob("telegram-kol-updater-backup.*"))
 
 
 def test_hard_rollback_failure_preserves_recovery_materials(
@@ -814,6 +833,23 @@ def test_signal_during_final_cleanup_rolls_back_candidate(
     assert result.returncode == expected
     assert (state / "head").read_text().strip() == PREVIOUS
     assert (state / "branch").read_text().strip() == PREVIOUS
+
+
+@pytest.mark.parametrize("signal", ("TERM", "INT"))
+def test_signal_during_backup_cleanup_never_removes_durable_updater(
+    updater_harness,
+    signal: str,
+) -> None:
+    run, log, state = updater_harness
+
+    result = run(HARNESS_BACKUP_REMOVE_SIGNAL=signal)
+
+    assert (state / "backup_remove_signaled").exists()
+    if signal == "TERM":
+        assert result.returncode != 0
+    assert (state / "head").read_text().strip() == CANDIDATE
+    assert (state / "branch").read_text().strip() == CANDIDATE
+    assert (log.parent / "durable-updater").read_text() == "candidate updater\n"
 
 
 def test_http_health_is_bounded_and_uses_required_endpoint() -> None:
