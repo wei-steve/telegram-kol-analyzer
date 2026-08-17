@@ -1,8 +1,11 @@
 # Simple Deployment Safety Gate Design
 
-**Date:** 2026-08-16  
-**Status:** Approved for implementation planning  
-**Production baseline:** `2274d90bd2b1a5bb7e7ed1c420c30e925d2bbdfa`  
+**Date:** 2026-08-16
+
+**Status:** Approved for implementation planning
+
+**Production baseline:** `2274d90bd2b1a5bb7e7ed1c420c30e925d2bbdfa`
+
 **Implementation branch:** `codex/deployment-gate-simplification`
 
 ## Context
