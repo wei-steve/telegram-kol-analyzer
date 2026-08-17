@@ -1757,53 +1757,56 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
 
 ## 确定性部署预检
 
-新的部署路径不再依赖操作员临时拼 SQL 判断。本地必须先推送已评审的
-40 位 commit，再显式声明变更类型：
+新的部署路径不再依赖操作员临时拼 SQL 或选择变更类型。推送、
+服务器只读 shadow 和真正部署各需一次独立明确批准（push approval、
+shadow approval、deployment approval）。只有取得当前阶段批准后才使用已评审的
+40 位 commit：
+
+push approval 只允许把精确 SHA 推到 `codex/deployment-gate-simplification`以供脱离的
+只读 shadow。shadow approval 不允许改生产分支。只有另行取得 deployment approval 后，
+才可把同一个已 shadow SHA fast-forward 到 `codex/deepcoin-auto-trading-v1`，核对远程 ref
+与该 SHA 完全相等，然后针对生产分支调用 helper。不得把 feature branch 直接传给当前
+仍附着在生产分支的 updater。
 
 ```bash
 EXPECTED_COMMIT="$(git rev-parse HEAD)" \
-CHANGE_CLASS=code \
 ./scripts/server_git_update.sh
 ```
 
-PowerShell 使用 `-ExpectedCommit <sha>` 和 `-ChangeClass <class>`。可用类型仅为
-`code`、`schema_compatible`、`execution_writer`、`live_promotion`。
-缺少参数、分支尖端与预期 commit 不一致或预检证据不完整，都在
-checkout、安装和重启前失败关闭。
+PowerShell 只使用 `-ExpectedCommit <sha>`。更新器从精确 Git 对象自动计算
+writer fingerprint 和 schema diff，操作员无降级或 BLOCK 豁免参数。四条阻断规则为：
 
-预检仅读取本地 SQLite 和已持久化的 Deepcoin 只读快照，检查：
+| 证据 | 结果 |
+| --- | --- |
+| 已注册执行证据无法解释 | `BLOCK` |
+| 交易所写入正在进行 | `BLOCK` |
+| 写入可能已发送但无完整终态证明 | `BLOCK` |
+| 有可队列工作且 writer fingerprint 改变 | `BLOCK` |
+| 有可队列工作但 writer fingerprint 未变 | `WARN` |
+| 终态、永久暂停或其他 inactive 证据 | `PASS` |
 
-- TradeSignal 和 instruction execution contract；
-- management batch/component；
-- position mutation、精确平仓保留、保护与 rescue；
-- source-message deletion job；
-- 历史 unknown 残留、活仓数、快照完整性和数据库水位。
+检测到 schema 变更时，自动执行 SQLite online backup、backup `quick_check`、
+候选代码对可丢弃副本的 migration dry-run 和水位核对；任一失败均在停服前拒绝。
 
-任意新鲜在途操作或未证明止损保护的活仓都是 `BLOCK`。旧 unknown 和已保护活仓是显式
-`WARN`，不能被隐藏为 PASS。对 `execution_writer` 和 `live_promotion`，
-止损只能由仓位自身的 SL 字段，或同时精确匹配 `posId` 与 durable ledger `ordId` 的 TPSL 证明；
-同品种同方向的其他订单不构成 ownership。
-交易所快照必须是两个不同 version/抓取时间的独立采集，且规范化事实一致；
-同一缓存文件连读两次不构成稳定证据。其他类型的快照缺失仍会以 WARN 显示。
-`schema_compatible` 会生成 SQLite backup，再用候选 commit 对可丢弃副本执行迁移演练和
-`quick_check`，因此允许已知旧 schema 在真实迁移前进入预检。
-
-输出文件位于 `/run/telegram-kol/deployment-preflight-<sha>.json`，权限为
-`0600`，五分钟后过期。更新器先做一次预检，通过后停止唯一交易写服务，
-再在无新 writer 可启动的状态下重新采集和校验，并保持到安装完成。中途失败
-会由 trap 恢复原服务。退出码为：
+Phase A 在线以 SQLite `mode=ro` 和 `query_only=ON` 采集脱敏聚合证据。通过后才记录
+stop attempt 并停止唯一 writer。systemd 必须精确到达 `inactive` 或 `failed`；然后
+Phase B 重新采集，并直接绑定已保存的 Phase A fingerprint。只有 Phase B 的 PASS
+或经验证 WARN 才允许 checkout、安装和重启。任意 BLOCK、invalid、信号、安装或启动
+失败都会进入 trap 尝试恢复原 checkout、package 和 service。若 rollback checkout、install、
+start 或停服终态证明失败，必须 hard non-zero 停止并人工处置，不得声称原服务已恢复。
+artifact 权限为 `0600`，仅保留计数、reason code、
+SHA、fingerprint、水位和时间。退出码为：
 
 ```text
-0 PASS
-2 WARN（允许发布，但必须保留原因）
-3 BLOCK
-4 输入或证据不完整
+0=PASS
+2=WARN（允许发布，但必须保留原因）
+3=BLOCK
+4=invalid 输入或证据
 ```
 
-`live_promotion` 还必须提供已评审 shadow 证据 artifact 的服务器路径和
-`I_AUTHORIZE_LIVE_PROMOTION` 显式授权。一般代码发布、之前的“认可”或
-沉默都不等于 live 授权。预检会重算 artifact 指纹，并校验 commit、水位、
-观察窗口、覆盖面、有效样本数和零未解释差异，不接受单独输入的 64 位字符串。
+本 gate-only 候选不改动 MiMo v2 的 runtime、prompt、schema、replay 或 activation；
+MiMo v1 继续 authoritative。它也不包含独立的 terminal-entry writer 修复，不编辑数据库历史，
+不发送测试通知，不调用交易所测试写入。
 
 ## 统一执行真相故障与回放门禁
 
@@ -1853,7 +1856,7 @@ TP order、ledger 和 execution event 的数量与最大 ID 均无变化，待�
 TP 逻辑腿由一条降为零，verified TP 增加一条，confirmation token 增加一条。
 
 两次正式预检均无 fresh active work，五个活仓都有止损保护，未保护仓位为零，
-backup 和 migration dry-run 均有效。`schema_compatible` 的 WARN 仅保留历史 residue、
+backup 和 migration dry-run 均有效。当时的自动 schema 预检 WARN 仅保留历史 residue、
 历史 unknown、已保护活仓和非稳定 display snapshot 事实，不构成执行权放开。
 
 部署后验证：服务为 active，settings API 为 HTTP 200，包路径指向生产 checkout；

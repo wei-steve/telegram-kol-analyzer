@@ -150,6 +150,38 @@ stop and keep automatic management frozen.
 - Store only non-secret decisions and operational notes in repository documentation.
 - If a credential is discovered in Git history, revoke or rotate it; deleting a working-tree file is insufficient.
 
+## Automatic deployment gate handoff
+
+The current deployment interface accepts only the exact reviewed commit. It
+automatically computes the writer fingerprint and schema diff; there is no
+operator-selected class or manual BLOCK escape hatch. Push approval, shadow
+approval, and deployment approval are three separate decisions.
+
+Push the reviewed SHA first only to `codex/deployment-gate-simplification` for
+the detached shadow. After deployment approval, fast-forward that exact same
+shadowed SHA to `codex/deepcoin-auto-trading-v1`, verify the remote ref, and run
+the updater against the production branch. Passing the feature branch directly
+to a checkout still attached to the production branch is an invalid rollback
+point and must fail before service stop.
+
+Phase A runs online from the detached candidate with read-only SQLite evidence.
+Only PASS or a verified WARN may stop the writer service. Phase B runs after
+systemd proves the unit inactive and binds directly to the saved Phase A
+fingerprint. Its stable results are `0=PASS`, `2=WARN`, `3=BLOCK`, and
+`4=invalid`. A detected schema change automatically requires an online backup,
+`quick_check`, candidate migration dry-run, and watermark verification.
+
+Queued work is WARN when the writer fingerprint is unchanged and BLOCK when it
+changes. Invalid registered evidence, an active exchange write, or a genuinely
+unknown exchange outcome is always BLOCK. Mutation-side failures restore the
+previous checkout, package, and service; artifacts are sanitized and mode
+`0600`.
+
+The gate-only candidate keeps MiMo v1 authoritative and leaves dormant MiMo v2
+runtime, prompt, schema, replay, and activation behavior unchanged. It must not
+be combined with the separate terminal-entry writer candidate, a database
+history edit, a test notification, or an exchange test write.
+
 ## Server production safety monitor
 
 Production safety monitoring runs independently through

@@ -115,20 +115,39 @@ meanings.
 
 ## Update Flow
 
-After making local changes, commit and push first. Then choose the helper for
-your workstation:
+The gate-only rollout uses one explicit branch path:
 
-```powershell
-git add .
-git commit -m "describe the change"
-git push origin codex/deepcoin-auto-trading-v1
+1. After push approval, push the exact reviewed SHA only to
+   `codex/deployment-gate-simplification`.
+2. After shadow approval, stage that branch as a detached read-only candidate.
+   Do not run the updater or move the production branch.
+3. After a separate deployment approval, fast-forward the exact same shadowed
+   SHA to `codex/deepcoin-auto-trading-v1`, verify the remote ref, and only then
+   run the managed updater against that production branch.
+
+The feature branch must not be passed directly to the updater while production
+is attached to the production branch; the rollback-point check will correctly
+reject that mismatch.
+
+After those approvals, choose the helper for your workstation. The operator
+provides only the full reviewed commit; the candidate calculates its writer
+fingerprint and schema surface automatically:
+
+```bash
+reviewed_sha="$(git rev-parse HEAD)"
+git push origin "$reviewed_sha:refs/heads/codex/deployment-gate-simplification"
+# Stop here for shadow approval and read-only shadow verification.
+
+# Run these only after the later deployment approval:
+git push origin "$reviewed_sha:refs/heads/codex/deepcoin-auto-trading-v1"
+test "$(git ls-remote origin refs/heads/codex/deepcoin-auto-trading-v1 | awk '{print $1}')" = "$reviewed_sha"
 ```
 
 macOS / Linux:
 
 ```bash
 EXPECTED_COMMIT="$(git rev-parse HEAD)" \
-CHANGE_CLASS=code \
+BRANCH=codex/deepcoin-auto-trading-v1 \
 ./scripts/server_git_update.sh
 ```
 
@@ -137,72 +156,54 @@ Windows:
 ```powershell
 $commit = git rev-parse HEAD
 powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1 `
-  -ExpectedCommit $commit `
-  -ChangeClass code
+  -Branch codex/deepcoin-auto-trading-v1 `
+  -ExpectedCommit $commit
 ```
 
-Both helpers require the full reviewed commit and one change class:
+The automatic decision table is intentionally small:
 
-| Change class | Intended scope | Exchange snapshot policy |
-|---|---|---|
-| `code` | Ordinary code with no new writer authority | Incomplete snapshot is `WARN` |
-| `schema_compatible` | Additive/backward-compatible schema | Creates and validates a SQLite backup; incomplete snapshot is `WARN` |
-| `execution_writer` | Changes an exchange mutation boundary | Complete, fresh, stable read-only snapshot is mandatory |
-| `live_promotion` | Enables a dormant execution path | Same as writer, plus a validated reviewed-shadow artifact and explicit authorization |
+| Evidence | Result |
+|---|---|
+| Invalid registered execution evidence | `BLOCK` |
+| Active exchange write | `BLOCK` |
+| Attempted exchange mutation without complete terminal proof | `BLOCK` |
+| Queued work and changed writer fingerprint | `BLOCK` |
+| Queued work and unchanged writer fingerprint | `WARN` |
+| Inactive, terminal, or permanently paused evidence | `PASS` |
 
 The server updater then:
 
 1. Fetches the branch and refuses unless `FETCH_HEAD` exactly equals
    `EXPECTED_COMMIT`.
-2. Runs the candidate commit from a detached staging worktree, collects all
-   SQLite facts in one read transaction, and compares two independently
-   versioned Deepcoin captures when the change is writer-sensitive.
-3. Refuses fresh active work and any unprotected open position for every change
-   class. Historical unknown rows and protected open positions are warnings,
-   not silent passes.
-4. After the preliminary gate passes, stops the sole exchange-writer service,
-   repeats preflight, and keeps the service stopped through artifact
-   verification, checkout, installation, and startup. Failure restarts the old
-   service through the cleanup trap.
-5. Fast-forwards to the exact commit, reinstalls the editable package, updates
-   the versioned server helper, and starts `telegram-kol.service`.
+2. Extracts the reviewed updater into a mode-0700 temporary directory and
+   verifies its SHA-256. Bootstrap runs that temporary helper; it does not
+   install candidate code or replace the durable updater before Phase B.
+3. Runs Phase A from a detached candidate worktree. SQLite is opened read-only,
+   the exact writer fingerprint and schema diff are calculated automatically,
+   and a bounded preliminary artifact is written mode 0600.
+4. If Phase A is PASS or verified WARN, records the stop attempt, stops the sole
+   writer service, and waits for systemd to report exactly `inactive` or
+   `failed`. Phase B recollects the facts and binds directly to the saved Phase
+   A fingerprint. A BLOCK or invalid result restarts the unchanged old service.
+5. Fast-forwards to the exact commit, reinstalls the editable package, starts
+   and verifies `telegram-kol.service`, and updates the durable updater last.
 
 Preflight exit codes are stable: `0=PASS`, `2=WARN` (deployable), `3=BLOCK`, and
-`4=malformed/incomplete` (refused). The artifact contains only commit/class,
-aggregate watermarks and counts, reason codes, times, and its fingerprint. It
-never contains raw Telegram text, order payloads, position IDs, or credentials.
+`4=invalid` input or evidence (refused). Artifacts contain only aggregate
+counts, reason codes, SHA values, fingerprints, watermarks, and timestamps;
+they never contain raw Telegram text, order payloads, position IDs, or
+credentials. A detected schema change automatically requires an online SQLite
+backup, backup `quick_check`, candidate migration against a disposable copy,
+and watermark verification before Phase A may continue.
 
-For an additive schema deployment use:
+The gate-only candidate leaves MiMo v1 authoritative and dormant MiMo v2 code
+unchanged. It does not activate or replay MiMo v2, edit database history, or
+include the separate terminal-entry writer candidate.
 
-```bash
-EXPECTED_COMMIT="$(git rev-parse HEAD)" \
-CHANGE_CLASS=schema_compatible \
-./scripts/server_git_update.sh
-```
-
-For `execution_writer` and `live_promotion`, provide the server path to an
-independent previous capture whose version and capture time differ from the
-current cache. For `live_promotion`, also provide a reviewed shadow-evidence
-JSON artifact. The preflight recomputes its fingerprint and verifies the exact
-commit, watermarks, observation window, coverage, eligible count, zero
-unexplained divergence, and approved conclusion. Promotion approval is not
-inferred from a caller-supplied digest:
-
-```bash
-EXPECTED_COMMIT="$(git rev-parse HEAD)" \
-CHANGE_CLASS=live_promotion \
-PREVIOUS_LIVE_SNAPSHOT_PATH='/run/telegram-kol/deepcoin-live-previous.json' \
-REVIEWED_SHADOW_EVIDENCE_PATH='/var/lib/telegram-kol/shadow-review.json' \
-LIVE_PROMOTION_AUTHORIZATION=I_AUTHORIZE_LIVE_PROMOTION \
-./scripts/server_git_update.sh
-```
-
-The workstation helper bootstraps the updater safely on first use: it extracts
-`deploy/telegram-kol-update` from the exact expected commit on the server,
-compares its SHA-256 with the reviewed local file, and only then installs and
-executes it. This avoids depending on an older checkout or older installed
-helper. For `schema_compatible`, the candidate code migrates a disposable copy
-of the verified backup; the live database remains unchanged until deployment.
+Cleanup attempts to restore the previous checkout, package, and active service
+after any mutation-side failure. A rollback failure is a hard non-zero result;
+the updater stops without further mutation and requires direct operator
+inspection rather than claiming the old service is healthy.
 
 ## Backup-stop rollout gate
 
@@ -230,7 +231,6 @@ The equivalent server-side command is:
 
 ```bash
 EXPECTED_COMMIT='<full-reviewed-commit>' \
-CHANGE_CLASS=code \
 BRANCH=codex/deepcoin-auto-trading-v1 \
 /usr/local/bin/telegram-kol-update
 ```
