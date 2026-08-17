@@ -245,7 +245,14 @@ def test_missing_required_origin_column_fails_closed():
 
 @pytest.mark.parametrize(
     "timestamp",
-    ["not-a-timestamp", "123", "0", "2026-02-30 00:00:00"],
+    [
+        "not-a-timestamp",
+        "123",
+        "0",
+        "2026-02-30 00:00:00",
+        "2026-13-01 00:00:00",
+        "2026-00-01 00:00:00",
+    ],
 )
 def test_invalid_timestamp_evidence_is_malformed(timestamp):
     connection = sqlite3.connect(":memory:")
@@ -266,6 +273,32 @@ def test_invalid_timestamp_evidence_is_malformed(timestamp):
     )
 
     assert result.counts["malformed"] == {"execution_order_legs": 1}
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    ["2024-02-29 23:59:59.999999", "2026-01-01 12:34:56.999999"],
+)
+def test_valid_high_precision_timestamp_evidence_is_not_malformed(timestamp):
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE execution_order_legs "
+        "(id INTEGER PRIMARY KEY, status TEXT, created_at TEXT)"
+    )
+    connection.execute(
+        "INSERT INTO execution_order_legs (id, status, created_at) "
+        "VALUES (1, 'submitted', ?)",
+        (timestamp,),
+    )
+
+    result = collect_work_evidence(
+        connection,
+        available_tables={"execution_order_legs"},
+        now=NOW,
+    )
+
+    assert "malformed" not in result.counts
+    assert result.counts["historical_residue"] == {"execution_order_legs": 1}
 
 
 def test_progress_before_creation_is_malformed():

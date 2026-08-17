@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sqlite3
 import subprocess
+import sys
 
 from telegram_kol_research.db import create_session_factory
 
@@ -56,7 +57,7 @@ def _repository(tmp_path):
 def _run(*args):
     return subprocess.run(
         [
-            ".venv/bin/python",
+            sys.executable,
             "-m",
             "telegram_kol_research.deployment_preflight_cli",
             *map(str, args),
