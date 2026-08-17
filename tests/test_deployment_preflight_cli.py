@@ -45,6 +45,34 @@ def _run(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _git(repository: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _changed_writer_repository(tmp_path: Path) -> tuple[Path, str, str]:
+    repository = tmp_path / "writer-repository"
+    writer = repository / "src/telegram_kol_research/deepcoin_client.py"
+    writer.parent.mkdir(parents=True)
+    repository.mkdir(exist_ok=True)
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.name", "Gate Test")
+    _git(repository, "config", "user.email", "gate@example.invalid")
+    writer.write_text("WRITER = 'production'\n", encoding="utf-8")
+    _git(repository, "add", "-A")
+    _git(repository, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "production")
+    production = _git(repository, "rev-parse", "HEAD")
+    writer.write_text("WRITER = 'candidate'\n", encoding="utf-8")
+    _git(repository, "add", "-A")
+    _git(repository, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "candidate")
+    return repository, production, _git(repository, "rev-parse", "HEAD")
+
+
 def _inputs(tmp_path: Path, *, trade_status: str | None = None) -> dict[str, Path]:
     database = tmp_path / "gate.db"
     session_factory = create_session_factory(database)
@@ -97,17 +125,24 @@ def _inputs(tmp_path: Path, *, trade_status: str | None = None) -> dict[str, Pat
     }
 
 
-def _collect_args(inputs: dict[str, Path], output: Path) -> list[str]:
+def _collect_args(
+    inputs: dict[str, Path],
+    output: Path,
+    *,
+    repository: Path = ROOT,
+    production_commit: str = PRODUCTION,
+    candidate_commit: str | None = None,
+) -> list[str]:
     return [
         "collect",
         "--phase",
         "preliminary",
         "--repository",
-        str(ROOT),
+        str(repository),
         "--production-commit",
-        PRODUCTION,
+        production_commit,
         "--candidate-commit",
-        _head(),
+        candidate_commit or _head(),
         "--database-path",
         str(inputs["database"]),
         "--snapshot-status",
@@ -169,6 +204,7 @@ def test_surface_command_returns_only_sanitized_facts() -> None:
     [
         (None, 0, "PASS"),
         ("pending", 2, "WARN"),
+        ("unknown_exchange_outcome", 2, "WARN"),
         ("processing", 3, "BLOCK"),
     ],
 )
@@ -187,6 +223,63 @@ def test_collect_returns_stable_decision_codes(
     assert f"decision={expected_decision}" in result.stdout
     assert output.is_file()
     assert output.stat().st_mode & 0o777 == 0o600
+
+
+def test_changed_writer_unknown_returns_block_exit_code(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path, trade_status="unknown_exchange_outcome")
+    repository, production, candidate = _changed_writer_repository(tmp_path)
+    output = tmp_path / "changed-writer-unknown.json"
+
+    result = _run(
+        *_collect_args(
+            inputs,
+            output,
+            repository=repository,
+            production_commit=production,
+            candidate_commit=candidate,
+        )
+    )
+
+    assert result.returncode == 3
+    assert "decision=BLOCK" in result.stdout
+    assert "writer_changed_with_unknown_outcome" in result.stdout
+
+
+def test_unchanged_writer_unknown_collect_and_verify_are_warn(
+    tmp_path: Path,
+) -> None:
+    inputs = _inputs(tmp_path, trade_status="unknown_exchange_outcome")
+    artifact = tmp_path / "unknown-warn.json"
+    collected = _run(*_collect_args(inputs, artifact))
+    assert collected.returncode == 2
+
+    verified = _run(
+        "verify",
+        "--expected-phase",
+        "preliminary",
+        "--repository",
+        str(ROOT),
+        "--production-commit",
+        PRODUCTION,
+        "--candidate-commit",
+        _head(),
+        "--database-path",
+        str(inputs["database"]),
+        "--snapshot-status",
+        str(inputs["snapshot"]),
+        "--schema-verification",
+        str(inputs["schema"]),
+        "--database-watermark",
+        str(inputs["watermark"]),
+        "--input",
+        str(artifact),
+        "--now",
+        "2026-08-17T08:00:00+00:00",
+    )
+
+    assert verified.returncode == 2
+    assert "decision=WARN" in verified.stdout
+    assert "unknown_outcome_with_unchanged_writer" in verified.stdout
 
 
 def test_verify_recollects_and_verifies_exact_facts(tmp_path: Path) -> None:

@@ -147,6 +147,37 @@ def test_preliminary_recomputes_block_from_evidence() -> None:
     assert _verify(artifact, phase="preliminary", evidence=evidence) == "BLOCK"
 
 
+def test_unknown_with_unchanged_writer_builds_verified_warn() -> None:
+    evidence = _evidence(unknown_outcome=1)
+    artifact = _preliminary(evidence=evidence)
+
+    assert artifact["decision"] == "WARN"
+    assert artifact["reason_codes"] == [
+        "unknown_outcome_with_unchanged_writer"
+    ]
+    assert _verify(artifact, phase="preliminary", evidence=evidence) == "WARN"
+
+
+def test_unknown_with_changed_writer_builds_verified_block() -> None:
+    evidence = _evidence(unknown_outcome=1)
+    surface = _surface(writer_changed=True)
+    artifact = _preliminary(evidence=evidence, surface=surface)
+
+    assert artifact["decision"] == "BLOCK"
+    assert artifact["reason_codes"] == [
+        "writer_changed_with_unknown_outcome"
+    ]
+    assert (
+        _verify(
+            artifact,
+            phase="preliminary",
+            evidence=evidence,
+            surface=surface,
+        )
+        == "BLOCK"
+    )
+
+
 def test_final_binds_one_direct_preliminary_parent() -> None:
     preliminary = _preliminary()
     final = build_final_deployment_preflight_artifact(

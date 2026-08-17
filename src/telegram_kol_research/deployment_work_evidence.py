@@ -97,18 +97,25 @@ def decide_deployment(
         raise ValueError("writer_changed_invalid")
 
     blocking_reasons: list[str] = []
+    warning_reasons: list[str] = []
     if counts.invalid_evidence:
         blocking_reasons.append("invalid_registered_evidence")
     if counts.active_write:
         blocking_reasons.append("active_exchange_write")
     if counts.unknown_outcome:
-        blocking_reasons.append("unknown_exchange_outcome")
-    if writer_changed and counts.queued_work:
-        blocking_reasons.append("writer_changed_with_queued_work")
+        if writer_changed:
+            blocking_reasons.append("writer_changed_with_unknown_outcome")
+        else:
+            warning_reasons.append("unknown_outcome_with_unchanged_writer")
+    if counts.queued_work:
+        if writer_changed:
+            blocking_reasons.append("writer_changed_with_queued_work")
+        else:
+            warning_reasons.append("queued_work_with_unchanged_writer")
     if blocking_reasons:
         return DeploymentDecision("BLOCK", tuple(blocking_reasons))
-    if counts.queued_work:
-        return DeploymentDecision("WARN", ("queued_work_with_unchanged_writer",))
+    if warning_reasons:
+        return DeploymentDecision("WARN", tuple(warning_reasons))
     return DeploymentDecision("PASS", ())
 
 
@@ -308,18 +315,35 @@ def _collect_source_deletion_exits(connection: sqlite3.Connection) -> EvidenceTa
             target_fingerprint,
         )
         claim_values = (claim_token, claimed_at)
+        no_claim = all(value is None for value in claim_values)
+        live_claim = (
+            isinstance(claim_token, str)
+            and bool(claim_token)
+            and isinstance(claimed_at, str)
+            and bool(claimed_at)
+        )
+        claim_valid = no_claim or live_claim
+        if not claim_valid:
+            totals["invalid_evidence"] += 1
+            continue
         if state == "unbound":
             if all(value is None for value in target_values + claim_values):
                 totals["inactive"] += 1
             else:
                 totals["invalid_evidence"] += 1
         elif state in {"succeeded", "ignored", "failed", "cancelled"}:
-            totals["inactive"] += 1
-        elif state in {"pending", "waiting"}:
-            if any(value is not None for value in target_values) and all(
-                value is None for value in claim_values
-            ):
+            if no_claim:
+                totals["inactive"] += 1
+            else:
+                totals["invalid_evidence"] += 1
+        elif state in {"pending", "waiting", "closing_positions", "reconciling"}:
+            if any(value is not None for value in target_values):
                 totals["queued_work"] += 1
+            else:
+                totals["invalid_evidence"] += 1
+        elif state == "recovery_required":
+            if no_claim:
+                totals["inactive"] += 1
             else:
                 totals["invalid_evidence"] += 1
         else:

@@ -28,8 +28,14 @@ from telegram_kol_research.deployment_work_evidence import (
         (
             DeploymentEvidenceCounts(unknown_outcome=1),
             False,
+            "WARN",
+            "unknown_outcome_with_unchanged_writer",
+        ),
+        (
+            DeploymentEvidenceCounts(unknown_outcome=1),
+            True,
             "BLOCK",
-            "unknown_exchange_outcome",
+            "writer_changed_with_unknown_outcome",
         ),
         (
             DeploymentEvidenceCounts(invalid_evidence=1),
@@ -82,8 +88,21 @@ def test_blocking_reasons_follow_fixed_safety_order() -> None:
     assert result.reason_codes == (
         "invalid_registered_evidence",
         "active_exchange_write",
-        "unknown_exchange_outcome",
+        "writer_changed_with_unknown_outcome",
         "writer_changed_with_queued_work",
+    )
+
+
+def test_unchanged_writer_reports_unknown_and_queued_warn_reasons() -> None:
+    result = decide_deployment(
+        counts=DeploymentEvidenceCounts(unknown_outcome=1, queued_work=1),
+        writer_changed=False,
+    )
+
+    assert result.decision == "WARN"
+    assert result.reason_codes == (
+        "unknown_outcome_with_unchanged_writer",
+        "queued_work_with_unchanged_writer",
     )
 
 
@@ -303,6 +322,82 @@ def test_unbound_source_without_target_or_claim_is_inactive(tmp_path: Path) -> N
     snapshot = collect_deployment_evidence(database)
 
     assert snapshot.counts == DeploymentEvidenceCounts(inactive=1)
+
+
+@pytest.mark.parametrize("state", ["closing_positions", "reconciling"])
+def test_source_deletion_orchestration_states_are_queued(
+    tmp_path: Path,
+    state: str,
+) -> None:
+    database = tmp_path / f"source-{state}.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO source_message_deletion_exits "
+            "(id, source_event_id, raw_message_id, state) "
+            "VALUES (1, 11, 22, ?)",
+            (state,),
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "queued_work")
+
+
+def test_source_deletion_recovery_required_without_claim_is_inactive(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "source-recovery-required.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO source_message_deletion_exits "
+            "(id, source_event_id, state) VALUES (1, 11, 'recovery_required')"
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "inactive")
+
+
+@pytest.mark.parametrize(
+    ("claim_token", "claimed_at"),
+    [
+        ("claim-redacted", None),
+        (None, "2026-08-17T00:00:00Z"),
+        ("", "2026-08-17T00:00:00Z"),
+    ],
+)
+def test_source_deletion_malformed_claim_is_invalid(
+    tmp_path: Path,
+    claim_token: str | None,
+    claimed_at: str | None,
+) -> None:
+    database = tmp_path / "source-malformed-claim.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO source_message_deletion_exits "
+            "(id, source_event_id, raw_message_id, state, claim_token, claimed_at) "
+            "VALUES (1, 11, 22, 'pending', ?, ?)",
+            (claim_token, claimed_at),
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "invalid_evidence")
+
+
+@pytest.mark.parametrize("state", ["succeeded", "recovery_required"])
+def test_source_deletion_terminal_or_paused_claim_is_invalid(
+    tmp_path: Path,
+    state: str,
+) -> None:
+    database = tmp_path / f"source-claimed-{state}.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO source_message_deletion_exits "
+            "(id, source_event_id, raw_message_id, state, claim_token, claimed_at) "
+            "VALUES (1, 11, 22, ?, 'claim-redacted', '2026-08-17T00:00:00Z')",
+            (state,),
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "invalid_evidence")
 
 
 def test_unknown_state_in_registered_table_is_invalid_only(tmp_path: Path) -> None:
