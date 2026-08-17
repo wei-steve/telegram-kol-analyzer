@@ -234,6 +234,23 @@ def _create_registered_tables(
                 processed_at TEXT,
                 updated_at TEXT
             );
+            CREATE TABLE strategy_revision_batches (
+                id INTEGER PRIMARY KEY,
+                status TEXT,
+                reason_code TEXT,
+                advance_claim_token TEXT,
+                advance_claimed_at TEXT
+            );
+            CREATE TABLE strategy_revision_legs (
+                id INTEGER PRIMARY KEY,
+                revision_batch_id INTEGER,
+                status TEXT
+            );
+            CREATE TABLE entry_revision_replacements (
+                id INTEGER PRIMARY KEY,
+                revision_batch_id INTEGER,
+                status TEXT
+            );
             """
         )
 
@@ -545,6 +562,181 @@ def test_paused_management_with_unknown_attempted_child_is_unknown(
         )
 
     _assert_only_category(collect_deployment_evidence(database), "unknown_outcome")
+
+
+def _insert_revision_batch(
+    connection: sqlite3.Connection,
+    *,
+    status: str,
+    reason_code: str | None = None,
+    claim: bool = False,
+) -> None:
+    connection.execute(
+        "INSERT INTO strategy_revision_batches "
+        "(id, status, reason_code, advance_claim_token, advance_claimed_at) "
+        "VALUES (1, ?, ?, ?, ?)",
+        (
+            status,
+            reason_code,
+            "claim-redacted" if claim else None,
+            "2026-01-01T00:00:00Z" if claim else None,
+        ),
+    )
+
+
+def test_revision_cancel_submitting_with_live_claim_is_active_write(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "revision-cancel-active.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        _insert_revision_batch(
+            connection,
+            status="cancelling_old_entries",
+            claim=True,
+        )
+        connection.execute(
+            "INSERT INTO strategy_revision_legs "
+            "(id, revision_batch_id, status) VALUES (1, 1, 'cancel_submitting')"
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "active_write")
+
+
+def test_revision_ambiguous_cancel_after_recovery_is_unknown(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "revision-cancel-unknown.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        _insert_revision_batch(
+            connection,
+            status="recovery_required",
+            reason_code="entry_revision_cancel_outcome_unknown",
+        )
+        connection.execute(
+            "INSERT INTO strategy_revision_legs "
+            "(id, revision_batch_id, status) VALUES (1, 1, 'cancel_submitting')"
+        )
+
+    _assert_only_category(
+        collect_deployment_evidence(database), "unknown_outcome"
+    )
+
+
+@pytest.mark.parametrize(
+    ("claim", "replacement_status", "expected_category"),
+    [
+        (True, "submit_reserved", "active_write"),
+        (False, "submit_reserved", "unknown_outcome"),
+        (True, "submitted", "unknown_outcome"),
+    ],
+)
+def test_revision_replacement_write_boundary_is_classified_contextually(
+    tmp_path: Path,
+    claim: bool,
+    replacement_status: str,
+    expected_category: str,
+) -> None:
+    database = tmp_path / f"revision-replacement-{claim}-{replacement_status}.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        _insert_revision_batch(
+            connection,
+            status="rebuilding" if claim else "recovery_required",
+            reason_code=(
+                None if claim else "entry_revision_replacement_outcome_unknown"
+            ),
+            claim=claim,
+        )
+        connection.execute(
+            "INSERT INTO entry_revision_replacements "
+            "(id, revision_batch_id, status) VALUES (1, 1, ?)",
+            (replacement_status,),
+        )
+
+    _assert_only_category(
+        collect_deployment_evidence(database), expected_category
+    )
+
+
+def test_revision_planned_work_is_queued(tmp_path: Path) -> None:
+    database = tmp_path / "revision-queued.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        _insert_revision_batch(connection, status="planned")
+        connection.execute(
+            "INSERT INTO strategy_revision_legs "
+            "(id, revision_batch_id, status) VALUES (1, 1, 'planned')"
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "queued_work")
+
+
+def test_revision_terminal_projection_is_inactive(tmp_path: Path) -> None:
+    database = tmp_path / "revision-terminal.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        _insert_revision_batch(connection, status="succeeded")
+        connection.execute(
+            "INSERT INTO strategy_revision_legs "
+            "(id, revision_batch_id, status) VALUES (1, 1, 'cancelled')"
+        )
+        connection.execute(
+            "INSERT INTO entry_revision_replacements "
+            "(id, revision_batch_id, status) VALUES (1, 1, 'verified')"
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "inactive")
+
+
+@pytest.mark.parametrize(
+    "table",
+    ["strategy_revision_legs", "entry_revision_replacements"],
+)
+def test_orphan_revision_children_are_invalid(
+    tmp_path: Path,
+    table: str,
+) -> None:
+    database = tmp_path / f"revision-orphan-{table}.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            f"INSERT INTO {table} (id, revision_batch_id, status) "
+            "VALUES (1, 999, 'planned')"
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "invalid_evidence")
+
+
+@pytest.mark.parametrize(
+    ("table", "status"),
+    [
+        ("strategy_revision_batches", "invented_batch_state"),
+        ("strategy_revision_legs", "invented_leg_state"),
+        ("entry_revision_replacements", "invented_replacement_state"),
+    ],
+)
+def test_malformed_revision_states_are_invalid(
+    tmp_path: Path,
+    table: str,
+    status: str,
+) -> None:
+    database = tmp_path / f"revision-malformed-{table}.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        _insert_revision_batch(
+            connection,
+            status=status if table == "strategy_revision_batches" else "planned",
+        )
+        if table != "strategy_revision_batches":
+            connection.execute(
+                f"INSERT INTO {table} (id, revision_batch_id, status) "
+                "VALUES (1, 1, ?)",
+                (status,),
+            )
+
+    _assert_only_category(collect_deployment_evidence(database), "invalid_evidence")
 
 
 @pytest.mark.parametrize(

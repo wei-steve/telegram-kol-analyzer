@@ -11,7 +11,7 @@ from typing import Callable, Literal
 
 MAX_EVIDENCE_COUNT = 1_000_000_000
 MAX_EVIDENCE_ROWS = 100_000
-EVIDENCE_REGISTRY_VERSION = 1
+EVIDENCE_REGISTRY_VERSION = 2
 _TERMINAL_EXECUTION_LEG_STATUSES = frozenset(
     {
         "closed",
@@ -580,6 +580,156 @@ def _collect_management_batches(connection: sqlite3.Connection) -> EvidenceTally
     return EvidenceTally(**totals)
 
 
+def _collect_strategy_revisions(connection: sqlite3.Connection) -> EvidenceTally:
+    batch_rows, batches_bounded = _bounded_rows(
+        connection,
+        "SELECT id, status, reason_code, advance_claim_token, advance_claimed_at "
+        "FROM strategy_revision_batches ORDER BY id",
+    )
+    leg_rows, legs_bounded = _bounded_rows(
+        connection,
+        "SELECT revision_batch_id, status FROM strategy_revision_legs ORDER BY id",
+    )
+    replacement_rows, replacements_bounded = _bounded_rows(
+        connection,
+        "SELECT revision_batch_id, status FROM entry_revision_replacements ORDER BY id",
+    )
+    if not (batches_bounded and legs_bounded and replacements_bounded):
+        return EvidenceTally(invalid_evidence=1)
+
+    batches: dict[int, tuple[object, object, object, object]] = {}
+    for batch_id, status, reason, claim_token, claimed_at in batch_rows:
+        if (
+            not isinstance(batch_id, int)
+            or isinstance(batch_id, bool)
+            or batch_id in batches
+        ):
+            return EvidenceTally(invalid_evidence=1)
+        batches[batch_id] = (status, reason, claim_token, claimed_at)
+
+    legs: dict[int, list[object]] = {batch_id: [] for batch_id in batches}
+    replacements: dict[int, list[object]] = {batch_id: [] for batch_id in batches}
+    orphan_count = 0
+    for batch_id, status in leg_rows:
+        if batch_id not in legs:
+            orphan_count += 1
+        else:
+            legs[batch_id].append(status)
+    for batch_id, status in replacement_rows:
+        if batch_id not in replacements:
+            orphan_count += 1
+        else:
+            replacements[batch_id].append(status)
+
+    known_batch_statuses = {
+        "planned",
+        "shadow_planned",
+        "cancelling_old_entries",
+        "old_entries_terminal",
+        "submitting_replacements",
+        "rebuilding",
+        "reconciling",
+        "succeeded",
+        "recovery_required",
+        "failed",
+        "blocked",
+    }
+    active_leg_statuses = {"cancel_submitting"}
+    unknown_leg_statuses = {"submit_unknown"}
+    known_leg_statuses = active_leg_statuses | unknown_leg_statuses | {
+        "planned",
+        "cancelled",
+        "retained",
+        "terminal",
+    }
+    active_replacement_statuses = {"submit_reserved"}
+    unknown_replacement_statuses = {"submitted"}
+    known_replacement_statuses = active_replacement_statuses | unknown_replacement_statuses | {
+        "planned",
+        "verified",
+    }
+    ambiguous_recovery_reasons = {
+        "revision_advance_claim_stale",
+        "revision_cancel_outcome_unknown",
+        "revision_replacement_submit_unknown",
+        "revision_replacement_reconciliation_required",
+        "entry_revision_stale_claim_write_ambiguous",
+        "entry_revision_cancel_outcome_unknown",
+        "entry_revision_cancel_not_terminal",
+        "entry_revision_cancel_restart_requires_reconciliation",
+        "entry_revision_replacement_outcome_unknown",
+        "entry_revision_replacement_identity_missing",
+        "entry_revision_replacement_readback_missing",
+        "entry_revision_replacement_economics_mismatch",
+        "entry_revision_replacement_position_unprotected",
+        "entry_revision_replacement_restart_requires_reconciliation",
+    }
+    queued_batch_statuses = {
+        "planned",
+        "cancelling_old_entries",
+        "old_entries_terminal",
+        "rebuilding",
+    }
+    inactive_batch_statuses = {"shadow_planned", "succeeded", "failed", "blocked"}
+
+    totals = {field.name: 0 for field in fields(EvidenceTally)}
+    totals["invalid_evidence"] += orphan_count
+    for batch_id, (status, reason, claim_token, claimed_at) in batches.items():
+        leg_statuses = legs[batch_id]
+        replacement_statuses = replacements[batch_id]
+        no_claim = claim_token is None and claimed_at is None
+        live_claim = (
+            isinstance(claim_token, str)
+            and bool(claim_token)
+            and isinstance(claimed_at, str)
+            and bool(claimed_at)
+        )
+        if (
+            not isinstance(status, str)
+            or status not in known_batch_statuses
+            or (reason is not None and not isinstance(reason, str))
+            or not (no_claim or live_claim)
+            or any(
+                not isinstance(child, str) or child not in known_leg_statuses
+                for child in leg_statuses
+            )
+            or any(
+                not isinstance(child, str) or child not in known_replacement_statuses
+                for child in replacement_statuses
+            )
+        ):
+            totals["invalid_evidence"] += 1
+        elif live_claim and (
+            any(child in active_leg_statuses for child in leg_statuses)
+            or any(child in active_replacement_statuses for child in replacement_statuses)
+        ):
+            totals["active_write"] += 1
+        elif (
+            any(child in unknown_leg_statuses for child in leg_statuses)
+            or any(
+                child in unknown_replacement_statuses
+                for child in replacement_statuses
+            )
+            or any(child in active_leg_statuses for child in leg_statuses)
+            or any(
+                child in active_replacement_statuses
+                for child in replacement_statuses
+            )
+            or (status == "recovery_required" and reason in ambiguous_recovery_reasons)
+            or status == "reconciling"
+        ):
+            totals["unknown_outcome"] += 1
+        elif status == "submitting_replacements":
+            totals["active_write"] += 1
+        elif status in queued_batch_statuses:
+            totals["queued_work"] += 1
+        elif status in inactive_batch_statuses or status == "recovery_required":
+            totals["inactive"] += 1
+        else:
+            totals["invalid_evidence"] += 1
+    return EvidenceTally(**totals)
+
+
 def _collect_trigger_protection(connection: sqlite3.Connection) -> EvidenceTally:
     rows, bounded = _bounded_rows(
         connection,
@@ -759,6 +909,35 @@ WORK_EVIDENCE_ADAPTERS = (
             ),
         ),
         collect=_collect_management_batches,
+    ),
+    EvidenceAdapter(
+        name="strategy_revision_batches",
+        required_tables=(
+            "strategy_revision_batches",
+            "strategy_revision_legs",
+            "entry_revision_replacements",
+        ),
+        required_columns=(
+            (
+                "strategy_revision_batches",
+                (
+                    "id",
+                    "status",
+                    "reason_code",
+                    "advance_claim_token",
+                    "advance_claimed_at",
+                ),
+            ),
+            (
+                "strategy_revision_legs",
+                ("id", "revision_batch_id", "status"),
+            ),
+            (
+                "entry_revision_replacements",
+                ("id", "revision_batch_id", "status"),
+            ),
+        ),
+        collect=_collect_strategy_revisions,
     ),
     EvidenceAdapter(
         name="trigger_protection_intents",

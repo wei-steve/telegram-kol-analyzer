@@ -339,17 +339,116 @@ def _posting_methods(client_path: Path) -> set[str]:
     return posting
 
 
+def _expression_references_writer_api(
+    expression: ast.expr,
+    *,
+    methods: set[str],
+    aliases: set[str],
+) -> bool:
+    if isinstance(expression, ast.Name):
+        return expression.id in methods or expression.id in aliases
+    if isinstance(expression, ast.Attribute):
+        return expression.attr in methods
+    if isinstance(expression, ast.Constant):
+        return expression.value in methods
+    if (
+        isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Name)
+        and expression.func.id == "getattr"
+        and len(expression.args) >= 2
+    ):
+        return _expression_references_writer_api(
+            expression.args[1],
+            methods=methods,
+            aliases=aliases,
+        )
+    if isinstance(expression, (ast.Tuple, ast.List)):
+        return any(
+            _expression_references_writer_api(item, methods=methods, aliases=aliases)
+            for item in expression.elts
+        )
+    return False
+
+
+def _assigned_writer_aliases(
+    target: ast.expr,
+    value: ast.expr,
+    *,
+    methods: set[str],
+    aliases: set[str],
+) -> set[str]:
+    if isinstance(target, ast.Name):
+        if _expression_references_writer_api(value, methods=methods, aliases=aliases):
+            return {target.id}
+        return set()
+    if (
+        isinstance(target, (ast.Tuple, ast.List))
+        and isinstance(value, (ast.Tuple, ast.List))
+        and len(target.elts) == len(value.elts)
+    ):
+        return set().union(
+            *(
+                _assigned_writer_aliases(
+                    child_target,
+                    child_value,
+                    methods=methods,
+                    aliases=aliases,
+                )
+                for child_target, child_value in zip(
+                    target.elts,
+                    value.elts,
+                    strict=True,
+                )
+            )
+        )
+    return set()
+
+
+def _writer_api_aliases(tree: ast.AST, methods: set[str]) -> set[str]:
+    aliases = {
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+        if alias.name in methods
+    }
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            discovered = set().union(
+                *(
+                    _assigned_writer_aliases(
+                        target,
+                        node.value,
+                        methods=methods,
+                        aliases=aliases,
+                    )
+                    for target in targets
+                )
+            )
+            if not discovered <= aliases:
+                aliases.update(discovered)
+                changed = True
+    return aliases
+
+
 def _post_call_site_paths(source_root: Path, methods: set[str]) -> set[str]:
     paths: set[str] = set()
     for source in source_root.glob("*.py"):
         if source.name == "deepcoin_client.py":
             continue
         tree = ast.parse(source.read_text(encoding="utf-8"))
+        aliases = _writer_api_aliases(tree, methods)
         if any(
             isinstance(node, ast.Call)
-            and (
-                (isinstance(node.func, ast.Attribute) and node.func.attr in methods)
-                or (isinstance(node.func, ast.Name) and node.func.id in methods)
+            and _expression_references_writer_api(
+                node.func,
+                methods=methods,
+                aliases=aliases,
             )
             for node in ast.walk(tree)
         ) or any(
@@ -456,4 +555,35 @@ def test_synthetic_gateway_caller_would_fail_outside_manifest(tmp_path: Path) ->
 
     assert call_sites - WRITER_SURFACE_PATHS == {
         "src/telegram_kol_research/new_gateway_writer.py"
+    }
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from telegram_kol_research.position_mutation_gateway import "
+        "close_exact_position as close\nclose()\n",
+        "from telegram_kol_research.position_mutation_gateway import "
+        "close_exact_position\nclose = close_exact_position\nclose()\n",
+        "import telegram_kol_research.position_mutation_gateway as gateway\n"
+        "close = gateway.close_exact_position\nclose()\n",
+        "import telegram_kol_research.position_mutation_gateway as gateway\n"
+        "getattr(gateway, 'close_exact_position')()\n",
+        "import telegram_kol_research.position_mutation_gateway as gateway\n"
+        "method = 'close_exact_position'\ngetattr(gateway, method)()\n",
+        "import telegram_kol_research.position_mutation_gateway as gateway\n"
+        "(close,) = (gateway.close_exact_position,)\nclose()\n",
+    ],
+)
+def test_synthetic_gateway_aliases_are_detected_outside_manifest(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    source_root = tmp_path / "src/telegram_kol_research"
+    _write(source_root / "new_aliased_gateway_writer.py", source)
+
+    call_sites = _post_call_site_paths(source_root, set(HIGH_LEVEL_MUTATION_APIS))
+
+    assert call_sites - WRITER_SURFACE_PATHS == {
+        "src/telegram_kol_research/new_aliased_gateway_writer.py"
     }
