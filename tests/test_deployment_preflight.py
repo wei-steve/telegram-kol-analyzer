@@ -1,1249 +1,365 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
 
-from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deployment_preflight import (
-    DeploymentPreflightFacts,
+    ARTIFACT_VERSION,
     DeploymentPreflightInputError,
-    build_deployment_preflight_artifact,
-    collect_deployment_preflight_facts,
+    build_final_deployment_preflight_artifact,
+    build_preliminary_deployment_preflight_artifact,
+    read_deployment_preflight_artifact,
     verify_deployment_preflight_artifact,
+    write_deployment_preflight_artifact,
 )
-
-
-NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
-EXPECTED_COMMIT = "a" * 40
-
-
-def _facts(**changes) -> DeploymentPreflightFacts:
-    base = DeploymentPreflightFacts(
-        database_watermark={
-            "raw_message_max_id": 10,
-            "instruction_item_max_id": 8,
-            "trade_signal_max_id": 4,
-            "execution_event_max_id": 7,
-        },
-        fresh_active_work={},
-        historical_active_residue_count=0,
-        historical_unknown_outcome_count=0,
-        protected_open_position_count=0,
-        exchange_snapshot_available=True,
-        exchange_snapshot_complete=True,
-        exchange_snapshot_fresh=True,
-        exchange_snapshot_stable=True,
-        schema_backup_valid=None,
-        schema_migration_dry_run_valid=True,
-        prior_schema_missing_table_count=0,
-        reviewed_shadow_evidence=False,
-        explicit_live_authorization=False,
-        reviewed_shadow_evidence_fingerprint=None,
-    )
-    return replace(base, **changes)
-
-
-def _build(change_class: str, facts: DeploymentPreflightFacts):
-    return build_deployment_preflight_artifact(
-        expected_commit=EXPECTED_COMMIT,
-        change_class=change_class,
-        facts=facts,
-        now=NOW,
-    )
-
-
-def test_fresh_active_exchange_write_blocks_every_change_class():
-    artifact = _build(
-        "code",
-        _facts(fresh_active_work={"trade_signals": 1}),
-    )
-
-    assert artifact["decision"] == "BLOCK"
-    assert "fresh_active_exchange_work" in artifact["reason_codes"]
-
-
-def test_protected_open_position_is_a_warning_not_a_blocker():
-    artifact = _build(
-        "code",
-        _facts(protected_open_position_count=2),
-    )
-
-    assert artifact["decision"] == "WARN"
-    assert artifact["reason_codes"] == ["protected_open_positions_present"]
-
-
-def test_historical_unknown_outcome_is_a_warning_not_a_blocker():
-    artifact = _build(
-        "code",
-        _facts(historical_unknown_outcome_count=3),
-    )
-
-    assert artifact["decision"] == "WARN"
-    assert artifact["reason_codes"] == ["historical_unknown_outcomes_present"]
-
-
-@pytest.mark.parametrize(
-    ("change_class", "expected"),
-    [("code", "WARN"), ("execution_writer", "BLOCK")],
+from telegram_kol_research.deployment_work_evidence import (
+    DeploymentEvidenceCounts,
+    DeploymentEvidenceSnapshot,
 )
-def test_incomplete_exchange_snapshot_depends_on_change_class(
-    change_class,
-    expected,
-):
-    artifact = _build(
-        change_class,
-        _facts(
-            exchange_snapshot_complete=False,
-            exchange_snapshot_fresh=False,
-        ),
-    )
-
-    assert artifact["decision"] == expected
-    assert "exchange_snapshot_incomplete" in artifact["reason_codes"]
+from telegram_kol_research.deployment_writer_surface import CandidateSurface
 
 
-def test_schema_compatible_requires_a_valid_backup():
-    artifact = _build(
-        "schema_compatible",
-        _facts(schema_backup_valid=False),
-    )
-
-    assert artifact["decision"] == "BLOCK"
-    assert "schema_backup_unavailable" in artifact["reason_codes"]
+NOW = datetime(2026, 8, 17, 8, 0, tzinfo=UTC)
+PRODUCTION = "a" * 40
+CANDIDATE = "b" * 40
 
 
-@pytest.mark.parametrize(
-    ("reviewed", "authorized", "reason"),
-    [
-        (False, True, "reviewed_shadow_evidence_missing"),
-        (True, False, "live_promotion_authorization_missing"),
-    ],
-)
-def test_live_promotion_requires_reviewed_shadow_and_explicit_authorization(
-    reviewed,
-    authorized,
-    reason,
-):
-    artifact = _build(
-        "live_promotion",
-        _facts(
-            reviewed_shadow_evidence=reviewed,
-            reviewed_shadow_evidence_fingerprint=("c" * 64 if reviewed else None),
-            explicit_live_authorization=authorized,
-        ),
-    )
-
-    assert artifact["decision"] == "BLOCK"
-    assert reason in artifact["reason_codes"]
-
-
-def test_live_promotion_artifact_records_reviewed_shadow_fingerprint():
-    evidence_fingerprint = "c" * 64
-    artifact = _build(
-        "live_promotion",
-        _facts(
-            reviewed_shadow_evidence=True,
-            reviewed_shadow_evidence_fingerprint=evidence_fingerprint,
-            explicit_live_authorization=True,
-        ),
-    )
-
-    assert artifact["decision"] == "PASS"
-    assert (
-        artifact["checked_facts"]["reviewed_shadow_evidence_fingerprint"]
-        == evidence_fingerprint
+def _surface(*, writer_changed: bool = False, schema_changed: bool = False):
+    production_fingerprint = "c" * 64
+    candidate_fingerprint = "d" * 64 if writer_changed else production_fingerprint
+    return CandidateSurface(
+        manifest_version=1,
+        production_writer_fingerprint=production_fingerprint,
+        candidate_writer_fingerprint=candidate_fingerprint,
+        writer_changed=writer_changed,
+        schema_changed=schema_changed,
+        changed_path_count=1,
     )
 
 
-def test_shadow_evidence_must_be_a_matching_review_artifact(tmp_path):
-    import sqlite3
+def _evidence(**counts: int) -> DeploymentEvidenceSnapshot:
+    return DeploymentEvidenceSnapshot(
+        counts=DeploymentEvidenceCounts(**counts),
+        evidence_fingerprint="e" * 64,
+        registered_adapter_count=8,
+    )
 
-    database = tmp_path / "research.db"
-    evidence = tmp_path / "shadow-review.json"
-    _create_preflight_database(database)
-    connection = sqlite3.connect(database)
-    connection.execute(
-        "INSERT INTO signal_candidates VALUES (1, 'mimo_authoritative')"
-    )
-    connection.execute(
-        "INSERT INTO trading_settings VALUES (1, 'global', ?)",
-        (
-            json.dumps(
-                {
-                    "instruction_execution_contract_mode": "shadow",
-                    "instruction_execution_entry_after_item_id": 8,
-                }
-            ),
-        ),
-    )
-    connection.execute(
-        "INSERT INTO message_instruction_items "
-        "(id, status, updated_at, signal_candidate_id, instruction_kind, "
-        "retired_at, result_json, error_json) VALUES (9, 'submitted', ?, 1, "
-        "'entry', NULL, ?, NULL)",
-        (
-            (NOW - timedelta(minutes=15)).replace(tzinfo=None).isoformat(" "),
-            json.dumps(
-                {
-                    "instruction_execution_contract": {
-                        "contract_id": 2,
-                        "divergence": False,
-                        "state": "verified",
-                        "state_version": 3,
-                        "terminal_kind": "verified_entry",
-                        "completion_scope": "full",
-                    }
-                }
-            ),
-        ),
-    )
-    connection.execute(
-        "INSERT INTO instruction_execution_contracts "
-        "(id, state, updated_at, message_instruction_item_id, state_version, "
-        "terminal_kind, completion_scope) "
-        "VALUES (2, 'verified', ?, 9, 3, 'verified_entry', 'full')",
-        ((NOW - timedelta(minutes=15)).replace(tzinfo=None).isoformat(" "),),
-    )
-    connection.commit(); connection.close()
-    body = {
-        "schema_version": 1,
-        "kind": "instruction_execution_shadow_review",
-        "reviewed_commit": EXPECTED_COMMIT,
-        "promotion_scope": "entry",
-        "activation_watermark": 8,
-        "observation_end_item_id": 9,
-        "observation_started_at": (NOW - timedelta(hours=2)).isoformat(),
-        "observation_ended_at": (NOW - timedelta(minutes=10)).isoformat(),
-        "eligible_contract_count": 1,
-        "observed_contract_count": 1,
-        "unexplained_divergence_count": 0,
-        "conclusion": "approved",
+
+def _snapshot(*, complete: bool = True, protected: int = 0) -> dict[str, object]:
+    return {"complete": complete, "protected_live_positions": protected}
+
+
+def _schema(*, verified: bool = False) -> dict[str, bool]:
+    return {
+        "backup_verified": verified,
+        "migration_dry_run_verified": verified,
+        "watermark_verified": verified,
     }
-    body["fingerprint"] = hashlib.sha256(
-        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    evidence.write_text(json.dumps(body), encoding="utf-8")
-
-    valid = collect_deployment_preflight_facts(
-        database_path=database,
-        change_class="live_promotion",
-        reviewed_shadow_evidence_path=evidence,
-        expected_commit=EXPECTED_COMMIT,
-        now=NOW,
-    )
-    mismatched = collect_deployment_preflight_facts(
-        database_path=database,
-        change_class="live_promotion",
-        reviewed_shadow_evidence_path=evidence,
-        expected_commit="b" * 40,
-        now=NOW,
-    )
-    impossible_body = dict(body)
-    impossible_body["activation_watermark"] = 9
-    impossible_body.pop("fingerprint")
-    impossible_body["fingerprint"] = hashlib.sha256(
-        json.dumps(impossible_body, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    evidence.write_text(json.dumps(impossible_body), encoding="utf-8")
-    impossible = collect_deployment_preflight_facts(
-        database_path=database,
-        change_class="live_promotion",
-        reviewed_shadow_evidence_path=evidence,
-        expected_commit=EXPECTED_COMMIT,
-        now=NOW,
-    )
-    connection = sqlite3.connect(database)
-    connection.execute(
-        "UPDATE trading_settings SET value_json = ? WHERE key = 'global'",
-        (
-            json.dumps(
-                {
-                    "instruction_execution_contract_mode": "disabled",
-                    "instruction_execution_entry_after_item_id": 8,
-                }
-            ),
-        ),
-    )
-    connection.commit(); connection.close()
-    evidence.write_text(json.dumps(body), encoding="utf-8")
-    disabled_mode = collect_deployment_preflight_facts(
-        database_path=database,
-        change_class="live_promotion",
-        reviewed_shadow_evidence_path=evidence,
-        expected_commit=EXPECTED_COMMIT,
-        now=NOW,
-    )
-    connection = sqlite3.connect(database)
-    connection.execute(
-        "UPDATE trading_settings SET value_json = ? WHERE key = 'global'",
-        (
-            json.dumps(
-                {
-                    "instruction_execution_contract_mode": "shadow",
-                    "instruction_execution_entry_after_item_id": 8,
-                }
-            ),
-        ),
-    )
-    connection.execute(
-        "INSERT INTO signal_candidates VALUES (2, 'mimo_authoritative')"
-    )
-    connection.execute(
-        "INSERT INTO message_instruction_items "
-        "(id, status, updated_at, signal_candidate_id, instruction_kind, "
-        "retired_at, result_json, error_json) VALUES (10, 'submitted', ?, 2, "
-        "'entry', NULL, NULL, NULL)",
-        ((NOW - timedelta(minutes=15)).replace(tzinfo=None).isoformat(" "),),
-    )
-    connection.commit(); connection.close()
-    missing_contract_body = dict(body)
-    missing_contract_body["observation_end_item_id"] = 10
-    missing_contract_body["eligible_contract_count"] = 2
-    missing_contract_body.pop("fingerprint")
-    missing_contract_body["fingerprint"] = hashlib.sha256(
-        json.dumps(
-            missing_contract_body, sort_keys=True, separators=(",", ":")
-        ).encode()
-    ).hexdigest()
-    evidence.write_text(json.dumps(missing_contract_body), encoding="utf-8")
-    missing_contract = collect_deployment_preflight_facts(
-        database_path=database,
-        change_class="live_promotion",
-        reviewed_shadow_evidence_path=evidence,
-        expected_commit=EXPECTED_COMMIT,
-        now=NOW,
-    )
-
-    assert valid.reviewed_shadow_evidence is True
-    assert valid.reviewed_shadow_evidence_fingerprint == body["fingerprint"]
-    assert mismatched.reviewed_shadow_evidence is False
-    assert impossible.reviewed_shadow_evidence is False
-    assert disabled_mode.reviewed_shadow_evidence is False
-    assert missing_contract.reviewed_shadow_evidence is False
 
 
-def test_artifact_has_bounded_contract_and_verifiable_expiry():
-    artifact = _build("code", _facts())
+def _watermark(value: int = 10) -> dict[str, int]:
+    return {"raw_messages": value, "execution_events": value}
 
-    assert artifact["schema_version"] == 1
-    assert artifact["expected_commit"] == EXPECTED_COMMIT
-    assert artifact["change_class"] == "code"
-    assert artifact["decision"] == "PASS"
-    assert artifact["created_at"] == NOW.isoformat()
-    assert artifact["expires_at"] == (NOW + timedelta(minutes=5)).isoformat()
-    assert len(artifact["fingerprint"]) == 64
-    assert verify_deployment_preflight_artifact(
+
+def _preliminary(
+    *,
+    surface: CandidateSurface | None = None,
+    evidence: DeploymentEvidenceSnapshot | None = None,
+    snapshot: dict[str, object] | None = None,
+    schema: dict[str, bool] | None = None,
+    watermark: dict[str, int] | None = None,
+    now: datetime = NOW,
+) -> dict[str, object]:
+    return build_preliminary_deployment_preflight_artifact(
+        production_commit=PRODUCTION,
+        candidate_commit=CANDIDATE,
+        surface=surface or _surface(),
+        evidence=evidence or _evidence(),
+        snapshot_status=snapshot or _snapshot(),
+        schema_verification=schema or _schema(),
+        database_watermark=watermark or _watermark(),
+        now=now,
+    )
+
+
+def _verify(
+    artifact: dict[str, object],
+    *,
+    phase: str,
+    surface: CandidateSurface | None = None,
+    evidence: DeploymentEvidenceSnapshot | None = None,
+    snapshot: dict[str, object] | None = None,
+    schema: dict[str, bool] | None = None,
+    watermark: dict[str, int] | None = None,
+    preliminary: dict[str, object] | None = None,
+    now: datetime = NOW,
+) -> str:
+    return verify_deployment_preflight_artifact(
         artifact,
-        expected_commit=EXPECTED_COMMIT,
-        change_class="code",
-        now=NOW + timedelta(minutes=4),
+        expected_phase=phase,
+        production_commit=PRODUCTION,
+        candidate_commit=CANDIDATE,
+        surface=surface or _surface(),
+        evidence=evidence or _evidence(),
+        snapshot_status=snapshot or _snapshot(),
+        schema_verification=schema or _schema(),
+        database_watermark=watermark or _watermark(),
+        preliminary_artifact=preliminary,
+        now=now,
+    )
+
+
+def _rehash(artifact: dict[str, object]) -> None:
+    payload = dict(artifact)
+    payload.pop("fingerprint", None)
+    artifact["fingerprint"] = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def test_preliminary_recomputes_block_from_evidence() -> None:
+    evidence = _evidence(active_write=1)
+    artifact = _preliminary(evidence=evidence)
+
+    assert artifact["phase"] == "preliminary"
+    assert artifact["decision"] == "BLOCK"
+    assert artifact["reason_codes"] == ["active_exchange_write"]
+    assert _verify(artifact, phase="preliminary", evidence=evidence) == "BLOCK"
+
+
+def test_final_binds_one_direct_preliminary_parent() -> None:
+    preliminary = _preliminary()
+    final = build_final_deployment_preflight_artifact(
+        production_commit=PRODUCTION,
+        candidate_commit=CANDIDATE,
+        surface=_surface(),
+        evidence=_evidence(),
+        snapshot_status=_snapshot(),
+        schema_verification=_schema(),
+        database_watermark=_watermark(11),
+        preliminary_artifact=preliminary,
+        now=NOW + timedelta(seconds=30),
+    )
+
+    assert final["phase"] == "final"
+    assert final["parent_fingerprint"] == preliminary["fingerprint"]
+    assert _verify(
+        final,
+        phase="final",
+        watermark=_watermark(11),
+        preliminary=preliminary,
+        now=NOW + timedelta(seconds=30),
     ) == "PASS"
 
-    tampered = dict(artifact, decision="WARN")
-    with pytest.raises(DeploymentPreflightInputError, match="fingerprint"):
-        verify_deployment_preflight_artifact(
-            tampered,
-            expected_commit=EXPECTED_COMMIT,
-            change_class="code",
-            now=NOW,
-        )
-    with pytest.raises(DeploymentPreflightInputError, match="expired"):
-        verify_deployment_preflight_artifact(
-            artifact,
-            expected_commit=EXPECTED_COMMIT,
-            change_class="code",
-            now=NOW + timedelta(minutes=6),
-        )
-
-
-def test_blocking_artifact_with_warnings_remains_verifiable():
-    artifact = _build(
-        "execution_writer",
-        _facts(
-            fresh_active_work={"position_mutations": 1},
-            historical_unknown_outcome_count=1,
-            protected_open_position_count=2,
-            exchange_snapshot_complete=False,
-        ),
-    )
-
-    assert artifact["decision"] == "BLOCK"
-    assert artifact["reason_codes"] == sorted(artifact["reason_codes"])
-    assert verify_deployment_preflight_artifact(
-        artifact,
-        expected_commit=EXPECTED_COMMIT,
-        change_class="execution_writer",
-        now=NOW,
-    ) == "BLOCK"
-
-
-def _create_preflight_database(path: Path) -> None:
-    import sqlite3
-
-    connection = sqlite3.connect(path)
-    connection.executescript(
-        """
-        CREATE TABLE raw_messages (id INTEGER PRIMARY KEY);
-        CREATE TABLE message_instruction_items (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT,
-            signal_candidate_id INTEGER, instruction_kind TEXT,
-            retired_at TEXT, result_json TEXT, error_json TEXT
-        );
-        CREATE TABLE signal_candidates (
-            id INTEGER PRIMARY KEY, parse_source TEXT
-        );
-        CREATE TABLE trading_settings (
-            id INTEGER PRIMARY KEY, key TEXT, value_json TEXT
-        );
-        CREATE TABLE trade_signals (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
-        );
-        CREATE TABLE execution_events (id INTEGER PRIMARY KEY);
-        CREATE TABLE execution_order_legs (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
-        );
-        CREATE TABLE instruction_execution_contracts (
-            id INTEGER PRIMARY KEY, state TEXT, updated_at TEXT,
-            message_instruction_item_id INTEGER, state_version INTEGER,
-            terminal_kind TEXT, completion_scope TEXT
-        );
-        CREATE TABLE strategy_revision_batches (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
-        );
-        CREATE TABLE strategy_management_batches (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
-        );
-        CREATE TABLE strategy_management_legs (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
-        );
-        CREATE TABLE strategy_management_components (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
-        );
-        CREATE TABLE position_mutation_intents (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
-        );
-        CREATE TABLE bound_position_close_reservations (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
-        );
-        CREATE TABLE position_protection_legs (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
-        );
-        CREATE TABLE position_backup_stop_orders (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
-        );
-        CREATE TABLE position_take_profit_orders (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
-        );
-        CREATE TABLE trigger_protection_intents (
-            id INTEGER PRIMARY KEY, recovery_state TEXT,
-            recovery_disposition TEXT, updated_at TEXT
-        );
-        CREATE TABLE trigger_protection_stop_rescues (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
-        );
-        CREATE TABLE trigger_take_profit_convergences (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
-        );
-        CREATE TABLE strategy_break_even_convergences (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
-        );
-        CREATE TABLE strategy_break_even_convergence_legs (
-            id INTEGER PRIMARY KEY, status TEXT, updated_at TEXT
-        );
-        CREATE TABLE position_protection_ledger (
-            id INTEGER PRIMARY KEY, venue TEXT, order_id TEXT, pos_id TEXT,
-            instrument_id TEXT, side TEXT, purpose TEXT, status TEXT
-        );
-        CREATE TABLE source_message_deletion_exits (
-            id INTEGER PRIMARY KEY, state TEXT, updated_at TEXT
-        );
-        """
-    )
-    fresh = (NOW - timedelta(minutes=1)).replace(tzinfo=None).isoformat(" ")
-    old = (NOW - timedelta(days=3)).replace(tzinfo=None).isoformat(" ")
-    connection.execute("INSERT INTO raw_messages VALUES (10)")
-    connection.execute(
-        "INSERT INTO message_instruction_items (id, status, updated_at) "
-        "VALUES (8, 'submitted', ?)",
-        (old,),
-    )
-    connection.execute(
-        "INSERT INTO trade_signals VALUES (4, 'processing', ?)",
-        (fresh,),
-    )
-    connection.execute("INSERT INTO execution_events VALUES (7)")
-    connection.execute(
-        "INSERT INTO instruction_execution_contracts (id, state, updated_at) "
-        "VALUES (1, 'submit_unknown', ?)",
-        (old,),
-    )
-    connection.commit()
-    connection.close()
-
-
-def _write_snapshot(
-    path: Path,
-    *,
-    complete: bool = True,
-    version: str = "snapshot-v1",
-    captured_at: datetime | None = None,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "version": version,
-                "captured_at": (captured_at or NOW - timedelta(seconds=20)).isoformat(),
-                "payload": {
-                    "error": None,
-                    "_live_source": {
-                        "positions": [
-                            {
-                                "posId": "SECRET-POS-ID",
-                                "pos": "1",
-                                "instId": "BTC-USDT-SWAP",
-                                "posSide": "long",
-                                "slTriggerPx": "60000",
-                            }
-                        ],
-                        "tpsl_evidence_available": complete,
-                        "tpsl_orders": [],
-                    },
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-
-def test_collector_is_read_only_bounded_and_does_not_emit_position_ids(tmp_path):
-    database = tmp_path / "research.db"
-    snapshot = tmp_path / "deepcoin_live_positions.json"
-    _create_preflight_database(database)
-    _write_snapshot(snapshot)
-    previous = tmp_path / "deepcoin_live_positions.previous.json"
-    _write_snapshot(
-        previous,
-        version="snapshot-v0",
-        captured_at=NOW - timedelta(seconds=40),
-    )
-    before = hashlib.sha256(database.read_bytes()).hexdigest()
-
-    facts = collect_deployment_preflight_facts(
-        database_path=database,
-        change_class="execution_writer",
-        live_snapshot_path=snapshot,
-        previous_live_snapshot_path=previous,
-        now=NOW,
-    )
-
-    assert hashlib.sha256(database.read_bytes()).hexdigest() == before
-    assert facts.fresh_active_work == {"trade_signals": 1}
-    assert facts.historical_unknown_outcome_count == 1
-    assert facts.protected_open_position_count == 1
-    assert facts.exchange_snapshot_complete is True
-    assert facts.exchange_snapshot_stable is True
-    assert "SECRET-POS-ID" not in json.dumps(facts.to_json())
-
-
-def test_collector_opens_one_explicit_read_transaction(tmp_path, monkeypatch):
-    import sqlite3
-    import telegram_kol_research.deployment_preflight as module
-
-    database = tmp_path / "research.db"
-    _create_preflight_database(database)
-    real_connect = sqlite3.connect
-    statements: list[str] = []
-
-    class ConnectionProxy:
-        def __init__(self, connection):
-            self.connection = connection
-
-        def __enter__(self):
-            self.connection.__enter__()
-            return self
-
-        def __exit__(self, *args):
-            return self.connection.__exit__(*args)
-
-        def execute(self, statement, parameters=()):
-            statements.append(str(statement))
-            return self.connection.execute(statement, parameters)
-
-        def rollback(self):
-            return self.connection.rollback()
-
-    monkeypatch.setattr(
-        module.sqlite3,
-        "connect",
-        lambda *args, **kwargs: ConnectionProxy(real_connect(*args, **kwargs)),
-    )
-
-    collect_deployment_preflight_facts(
-        database_path=database,
-        change_class="code",
-        now=NOW,
-    )
-
-    assert statements.count("BEGIN") == 1
-
 
 @pytest.mark.parametrize(
-    ("table", "state_column", "state", "fact_name"),
+    "mutation",
     [
-        (
-            "position_mutation_intents",
-            "status",
-            "submit_unknown",
-            "position_mutations",
-        ),
-        (
-            "strategy_management_batches",
-            "status",
-            "protection_ready",
-            "management_batches",
-        ),
-        (
-            "message_instruction_items",
-            "status",
-            "pending",
-            "instruction_items",
-        ),
-        (
-            "strategy_management_components",
-            "status",
-            "definitely_rejected",
-            "management_components",
-        ),
-        (
-            "bound_position_close_reservations",
-            "status",
-            "unknown_exchange_outcome",
-            "position_closes",
-        ),
-        (
-            "trigger_protection_intents",
-            "recovery_state",
-            "submitting",
-            "protection_intents",
-        ),
-        (
-            "execution_order_legs",
-            "status",
-            "cancel_submitting",
-            "execution_order_legs",
-        ),
-        (
-            "strategy_revision_batches",
-            "status",
-            "submitting_replacements",
-            "strategy_revisions",
-        ),
-        (
-            "strategy_management_legs",
-            "status",
-            "submit_unknown",
-            "management_legs",
-        ),
-        (
-            "position_backup_stop_orders",
-            "status",
-            "unknown_exchange_outcome",
-            "backup_stop_orders",
-        ),
-        (
-            "position_take_profit_orders",
-            "status",
-            "cancel_requested",
-            "take_profit_orders",
-        ),
-        (
-            "strategy_management_batches",
-            "status",
-            "submit_unknown",
-            "management_batches",
-        ),
-        (
-            "source_message_deletion_exits",
-            "state",
-            "recovery_required",
-            "source_deletions",
-        ),
-        (
-            "trigger_protection_stop_rescues",
-            "status",
-            "submit_unknown",
-            "protection_rescues",
-        ),
-        (
-            "trigger_take_profit_convergences",
-            "status",
-            "reserved",
-            "trigger_take_profit_convergences",
-        ),
-        (
-            "strategy_break_even_convergences",
-            "status",
-            "executing_market_decisions",
-            "break_even_convergences",
-        ),
-        (
-            "strategy_break_even_convergence_legs",
-            "status",
-            "decision_reserved",
-            "break_even_convergence_legs",
-        ),
+        lambda artifact: artifact.__setitem__("production_commit", "f" * 40),
+        lambda artifact: artifact.__setitem__("candidate_commit", "f" * 40),
+        lambda artifact: artifact.__setitem__("writer_changed", True),
+        lambda artifact: artifact.__setitem__("schema_changed", True),
+        lambda artifact: artifact.__setitem__("phase", "unknown"),
     ],
 )
-def test_collector_blocks_fresh_nonterminal_writer_states(
-    tmp_path,
-    table,
-    state_column,
-    state,
-    fact_name,
-):
-    database = tmp_path / "research.db"
-    _create_preflight_database(database)
-    import sqlite3
+def test_verifier_rejects_expected_input_drift(mutation) -> None:
+    artifact = _preliminary()
+    mutation(artifact)
+    _rehash(artifact)
 
-    connection = sqlite3.connect(database)
-    connection.execute("DELETE FROM trade_signals")
-    connection.execute(
-        f"INSERT INTO {table} (id, {state_column}, updated_at) VALUES (99, ?, ?)",
-        (
-            state,
-            (NOW - timedelta(seconds=30)).replace(tzinfo=None).isoformat(" "),
-        ),
+    with pytest.raises(DeploymentPreflightInputError):
+        _verify(artifact, phase="preliminary")
+
+
+def test_final_rejects_wrong_parent_fingerprint() -> None:
+    preliminary = _preliminary()
+    final = build_final_deployment_preflight_artifact(
+        production_commit=PRODUCTION,
+        candidate_commit=CANDIDATE,
+        surface=_surface(),
+        evidence=_evidence(),
+        snapshot_status=_snapshot(),
+        schema_verification=_schema(),
+        database_watermark=_watermark(),
+        preliminary_artifact=preliminary,
+        now=NOW + timedelta(seconds=10),
     )
-    connection.commit()
-    connection.close()
+    final["parent_fingerprint"] = "f" * 64
+    _rehash(final)
 
-    facts = collect_deployment_preflight_facts(
-        database_path=database,
-        change_class="code",
-        now=NOW,
-    )
-
-    assert facts.fresh_active_work == {fact_name: 1}
-
-
-def test_unprotected_open_position_blocks_deployment(tmp_path):
-    database = tmp_path / "research.db"
-    snapshot = tmp_path / "snapshot.json"
-    _create_preflight_database(database)
-    import sqlite3
-
-    connection = sqlite3.connect(database)
-    connection.execute("DELETE FROM trade_signals")
-    connection.commit()
-    connection.close()
-    _write_snapshot(snapshot)
-    payload = json.loads(snapshot.read_text(encoding="utf-8"))
-    payload["payload"]["_live_source"]["positions"][0]["slTriggerPx"] = ""
-    snapshot.write_text(json.dumps(payload), encoding="utf-8")
-
-    facts = collect_deployment_preflight_facts(
-        database_path=database,
-        change_class="code",
-        live_snapshot_path=snapshot,
-        now=NOW,
-    )
-    artifact = _build("code", facts)
-
-    assert facts.protected_open_position_count == 0
-    assert facts.unprotected_open_position_count == 1
-    assert artifact["decision"] == "BLOCK"
-    assert "unprotected_open_positions_present" in artifact["reason_codes"]
-
-
-def test_other_position_stop_cannot_prove_protection(tmp_path):
-    database = tmp_path / "research.db"
-    snapshot = tmp_path / "snapshot.json"
-    _create_preflight_database(database)
-    import sqlite3
-
-    connection = sqlite3.connect(database)
-    connection.execute("DELETE FROM trade_signals")
-    connection.execute(
-        "INSERT INTO position_protection_ledger "
-        "(id, venue, order_id, pos_id, instrument_id, side, purpose, status) "
-        "VALUES (1, 'deepcoin', 'OWNED-ORDER', 'OTHER-POS', "
-        "'BTC-USDT-SWAP', 'long', 'stop_loss', 'verified')"
-    )
-    connection.commit()
-    connection.close()
-    _write_snapshot(snapshot)
-    payload = json.loads(snapshot.read_text(encoding="utf-8"))
-    position = payload["payload"]["_live_source"]["positions"][0]
-    position["slTriggerPx"] = ""
-    payload["payload"]["_live_source"]["tpsl_orders"] = [
-        {
-            "ordId": "OWNED-ORDER",
-            "posId": "OTHER-POS",
-            "instId": "BTC-USDT-SWAP",
-            "posSide": "long",
-            "slTriggerPrice": "59000",
-        }
-    ]
-    snapshot.write_text(json.dumps(payload), encoding="utf-8")
-
-    facts = collect_deployment_preflight_facts(
-        database_path=database,
-        change_class="code",
-        live_snapshot_path=snapshot,
-        now=NOW,
-    )
-
-    assert facts.protected_open_position_count == 0
-    assert facts.unprotected_open_position_count == 1
-
-
-def test_exact_owned_native_sl_trigger_px_proves_protection(tmp_path):
-    database = tmp_path / "research.db"
-    snapshot = tmp_path / "snapshot.json"
-    _create_preflight_database(database)
-    import sqlite3
-
-    connection = sqlite3.connect(database)
-    connection.execute("DELETE FROM trade_signals")
-    connection.execute(
-        "INSERT INTO position_protection_ledger "
-        "(id, venue, order_id, pos_id, instrument_id, side, purpose, status) "
-        "VALUES (1, 'deepcoin', 'OWNED-ORDER', 'SECRET-POS-ID', "
-        "'BTC-USDT-SWAP', 'long', 'stop_loss', 'verified')"
-    )
-    connection.commit(); connection.close()
-    _write_snapshot(snapshot)
-    payload = json.loads(snapshot.read_text(encoding="utf-8"))
-    payload["payload"]["_live_source"]["positions"][0]["slTriggerPx"] = ""
-    payload["payload"]["_live_source"]["tpsl_orders"] = [
-        {
-            "ordId": "OWNED-ORDER",
-            "slTriggerPx": "59000",
-        }
-    ]
-    snapshot.write_text(json.dumps(payload), encoding="utf-8")
-
-    facts = collect_deployment_preflight_facts(
-        database_path=database,
-        change_class="code",
-        live_snapshot_path=snapshot,
-        now=NOW,
-    )
-
-    assert facts.protected_open_position_count == 1
-    assert facts.unprotected_open_position_count == 0
-
-
-def test_ledger_owned_stop_with_conflicting_close_position_is_rejected(tmp_path):
-    database = tmp_path / "research.db"
-    snapshot = tmp_path / "snapshot.json"
-    _create_preflight_database(database)
-    import sqlite3
-
-    connection = sqlite3.connect(database)
-    connection.execute("DELETE FROM trade_signals")
-    connection.execute(
-        "INSERT INTO position_protection_ledger "
-        "(id, venue, order_id, pos_id, instrument_id, side, purpose, status) "
-        "VALUES (1, 'deepcoin', 'OWNED-ORDER', 'SECRET-POS-ID', "
-        "'BTC-USDT-SWAP', 'long', 'stop_loss', 'verified')"
-    )
-    connection.commit(); connection.close()
-    _write_snapshot(snapshot)
-    payload = json.loads(snapshot.read_text(encoding="utf-8"))
-    payload["payload"]["_live_source"]["positions"][0]["slTriggerPx"] = ""
-    payload["payload"]["_live_source"]["tpsl_orders"] = [
-        {
-            "ordId": "OWNED-ORDER",
-            "closePosId": "OTHER-POS",
-            "slTriggerPx": "59000",
-        }
-    ]
-    snapshot.write_text(json.dumps(payload), encoding="utf-8")
-
-    facts = collect_deployment_preflight_facts(
-        database_path=database,
-        change_class="code",
-        live_snapshot_path=snapshot,
-        now=NOW,
-    )
-
-    assert facts.protected_open_position_count == 0
-    assert facts.unprotected_open_position_count == 1
-
-
-def test_two_distinct_equal_captures_are_required_for_stability(tmp_path):
-    database = tmp_path / "research.db"
-    current = tmp_path / "current.json"
-    previous = tmp_path / "previous.json"
-    _create_preflight_database(database)
-    _write_snapshot(current, version="v2", captured_at=NOW - timedelta(seconds=10))
-    _write_snapshot(previous, version="v1", captured_at=NOW - timedelta(seconds=30))
-
-    stable = collect_deployment_preflight_facts(
-        database_path=database,
-        change_class="code",
-        live_snapshot_path=current,
-        previous_live_snapshot_path=previous,
-        now=NOW,
-    )
-    same_file = collect_deployment_preflight_facts(
-        database_path=database,
-        change_class="code",
-        live_snapshot_path=current,
-        previous_live_snapshot_path=current,
-        now=NOW,
-    )
-
-    assert stable.exchange_snapshot_stable is True
-    assert same_file.exchange_snapshot_stable is False
-
-
-def test_market_only_fields_do_not_make_exchange_safety_facts_unstable(tmp_path):
-    database = tmp_path / "research.db"
-    current = tmp_path / "current.json"
-    previous = tmp_path / "previous.json"
-    _create_preflight_database(database)
-    _write_snapshot(current, version="v2", captured_at=NOW - timedelta(seconds=10))
-    _write_snapshot(previous, version="v1", captured_at=NOW - timedelta(seconds=30))
-    first = json.loads(current.read_text(encoding="utf-8"))
-    second = json.loads(previous.read_text(encoding="utf-8"))
-    first["payload"]["_live_source"]["positions"][0]["markPx"] = "65001"
-    second["payload"]["_live_source"]["positions"][0]["markPx"] = "65000"
-    current.write_text(json.dumps(first), encoding="utf-8")
-    previous.write_text(json.dumps(second), encoding="utf-8")
-
-    facts = collect_deployment_preflight_facts(
-        database_path=database,
-        change_class="code",
-        live_snapshot_path=current,
-        previous_live_snapshot_path=previous,
-        now=NOW,
-    )
-
-    assert facts.exchange_snapshot_stable is True
-
-
-def test_live_database_cannot_be_claimed_as_schema_backup(tmp_path):
-    database = tmp_path / "research.db"
-    snapshot = tmp_path / "snapshot.json"
-    _create_preflight_database(database)
-    _write_snapshot(snapshot)
-
-    facts = collect_deployment_preflight_facts(
-        database_path=database,
-        change_class="schema_compatible",
-        live_snapshot_path=snapshot,
-        schema_backup_path=database,
-        now=NOW,
-    )
-    artifact = _build("schema_compatible", facts)
-
-    assert facts.schema_backup_valid is False
-    assert artifact["decision"] == "BLOCK"
-    assert "schema_backup_unavailable" in artifact["reason_codes"]
-
-
-def test_distinct_integrity_checked_schema_backup_is_accepted(tmp_path):
-    database = tmp_path / "research.db"
-    backup = tmp_path / "research.backup.db"
-    snapshot = tmp_path / "snapshot.json"
-    create_session_factory(database)
-    import sqlite3
-
-    source = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
-    target = sqlite3.connect(backup)
-    source.backup(target)
-    target.close()
-    source.close()
-    dry_run = tmp_path / "research.dry-run.db"
-    source = sqlite3.connect(f"file:{backup}?mode=ro", uri=True)
-    target = sqlite3.connect(dry_run)
-    source.backup(target)
-    target.close()
-    source.close()
-    _write_snapshot(snapshot)
-
-    facts = collect_deployment_preflight_facts(
-        database_path=database,
-        change_class="schema_compatible",
-        live_snapshot_path=snapshot,
-        schema_backup_path=backup,
-        schema_migration_dry_run_path=dry_run,
-        now=NOW,
-    )
-    artifact = _build("schema_compatible", facts)
-
-    assert facts.schema_backup_valid is True
-    assert facts.schema_migration_dry_run_valid is True
-    assert artifact["decision"] == "WARN"
-    assert artifact["reason_codes"] == [
-        "exchange_snapshot_incomplete",
-        "protected_open_positions_present",
-    ]
-
-
-def test_schema_change_accepts_known_prior_schema_after_dry_run(tmp_path):
-    import sqlite3
-
-    database = tmp_path / "prior.db"
-    backup = tmp_path / "prior.backup.db"
-    dry_run = tmp_path / "prior.dry-run.db"
-    create_session_factory(database)
-    connection = sqlite3.connect(database)
-    connection.execute("DROP TABLE trigger_take_profit_convergences")
-    connection.commit()
-    connection.close()
-    source = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
-    target = sqlite3.connect(backup)
-    source.backup(target)
-    target.close(); source.close()
-    source = sqlite3.connect(f"file:{backup}?mode=ro", uri=True)
-    target = sqlite3.connect(dry_run)
-    source.backup(target)
-    target.close(); source.close()
-    create_session_factory(dry_run)
-
-    facts = collect_deployment_preflight_facts(
-        database_path=database,
-        change_class="schema_compatible",
-        schema_backup_path=backup,
-        schema_migration_dry_run_path=dry_run,
-        now=NOW,
-    )
-
-    assert facts.prior_schema_missing_table_count == 1
-    assert facts.schema_backup_valid is True
-    assert facts.schema_migration_dry_run_valid is True
-
-
-def test_schema_change_rejects_unrecognized_missing_table_set(tmp_path):
-    import sqlite3
-
-    database = tmp_path / "corrupt.db"
-    create_session_factory(database)
-    connection = sqlite3.connect(database)
-    connection.execute("DROP TABLE position_mutation_intents")
-    connection.commit()
-    connection.close()
-
-    with pytest.raises(
-        DeploymentPreflightInputError,
-        match="database_prior_schema_unrecognized",
-    ):
-        collect_deployment_preflight_facts(
-            database_path=database,
-            change_class="schema_compatible",
-            now=NOW,
+    with pytest.raises(DeploymentPreflightInputError, match="parent"):
+        _verify(
+            final,
+            phase="final",
+            preliminary=preliminary,
+            now=NOW + timedelta(seconds=10),
         )
 
 
-def test_schema_dry_run_rejects_missing_candidate_model_column(tmp_path):
-    import sqlite3
+def test_final_rejects_watermark_rollback() -> None:
+    preliminary = _preliminary(watermark=_watermark(10))
 
-    database = tmp_path / "current.db"
-    backup = tmp_path / "current.backup.db"
-    dry_run = tmp_path / "current.dry-run.db"
-    create_session_factory(database)
-    source = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
-    target = sqlite3.connect(backup)
-    source.backup(target)
-    target.close(); source.close()
-    source = sqlite3.connect(f"file:{backup}?mode=ro", uri=True)
-    target = sqlite3.connect(dry_run)
-    source.backup(target)
-    target.execute("ALTER TABLE strategy_management_batches DROP COLUMN intent")
-    target.commit(); target.close(); source.close()
-
-    facts = collect_deployment_preflight_facts(
-        database_path=database,
-        change_class="schema_compatible",
-        schema_backup_path=backup,
-        schema_migration_dry_run_path=dry_run,
-        now=NOW,
-    )
-    artifact = _build("schema_compatible", facts)
-
-    assert facts.schema_backup_valid is True
-    assert facts.schema_migration_dry_run_valid is False
-    assert artifact["decision"] == "BLOCK"
-    assert "schema_migration_dry_run_failed" in artifact["reason_codes"]
-
-
-def test_schema_dry_run_rejects_partial_replacement_for_global_unique_index(
-    tmp_path,
-):
-    import sqlite3
-    import telegram_kol_research.deployment_preflight as module
-
-    dry_run = tmp_path / "partial-index.db"
-    create_session_factory(dry_run)
-    connection = sqlite3.connect(dry_run)
-    connection.execute("DROP INDEX uq_message_instruction_items_idempotency")
-    connection.execute(
-        "CREATE UNIQUE INDEX uq_message_instruction_items_idempotency "
-        "ON message_instruction_items (idempotency_key) WHERE id < 0"
-    )
-    connection.commit(); connection.close()
-
-    assert module._candidate_model_schema_matches(dry_run) is False
-
-
-def test_schema_dry_run_rejects_expression_key_in_global_unique_index(tmp_path):
-    import sqlite3
-    import telegram_kol_research.deployment_preflight as module
-
-    dry_run = tmp_path / "expression-index.db"
-    create_session_factory(dry_run)
-    connection = sqlite3.connect(dry_run)
-    connection.execute("DROP INDEX uq_message_instruction_items_idempotency")
-    connection.execute(
-        "CREATE UNIQUE INDEX uq_message_instruction_items_idempotency "
-        "ON message_instruction_items (idempotency_key, id + 0)"
-    )
-    connection.commit(); connection.close()
-
-    assert module._candidate_model_schema_matches(dry_run) is False
-
-
-def test_schema_dry_run_accepts_audited_legacy_position_owner_duplicates(tmp_path):
-    import sqlite3
-    import telegram_kol_research.deployment_preflight as module
-
-    dry_run = tmp_path / "legacy-position-duplicates.db"
-    create_session_factory(dry_run)
-    connection = sqlite3.connect(dry_run)
-    connection.execute("DROP INDEX uq_execution_order_legs_venue_pos")
-    connection.executemany(
-        "INSERT INTO execution_order_legs "
-        "(execution_binding_id, leg_index, purpose, order_kind, pos_id, status, "
-        "venue, attribution_status, created_at, updated_at) VALUES "
-        "(?, 1, 'entry', 'unknown', "
-        "'legacy-duplicate-pos', 'active', 'deepcoin', 'unassigned', CURRENT_TIMESTAMP, "
-        "CURRENT_TIMESTAMP)",
-        [(1,), (2,)],
-    )
-    connection.commit()
-    connection.close()
-    create_session_factory(dry_run)
-
-    assert module._candidate_model_schema_matches(dry_run) is True
-
-
-def test_schema_dry_run_rejects_missing_position_owner_index_without_duplicates(
-    tmp_path,
-):
-    import sqlite3
-    import telegram_kol_research.deployment_preflight as module
-
-    dry_run = tmp_path / "missing-position-owner-index.db"
-    create_session_factory(dry_run)
-    connection = sqlite3.connect(dry_run)
-    connection.execute("DROP INDEX uq_execution_order_legs_venue_pos")
-    connection.commit()
-    connection.close()
-
-    assert module._candidate_model_schema_matches(dry_run) is False
-
-
-@pytest.mark.parametrize(
-    "replacement_sql",
-    [
-        "CREATE INDEX uq_execution_order_legs_venue_pos "
-        "ON execution_order_legs (venue, pos_id)",
-        "CREATE UNIQUE INDEX uq_execution_order_legs_venue_pos "
-        "ON execution_order_legs (venue, pos_id, id + 0)",
-    ],
-)
-def test_schema_dry_run_rejects_invalid_named_position_index_with_duplicates(
-    tmp_path,
-    replacement_sql,
-):
-    import sqlite3
-    import telegram_kol_research.deployment_preflight as module
-
-    dry_run = tmp_path / "invalid-named-position-index.db"
-    create_session_factory(dry_run)
-    connection = sqlite3.connect(dry_run)
-    connection.execute("DROP INDEX uq_execution_order_legs_venue_pos")
-    connection.executemany(
-        "INSERT INTO execution_order_legs "
-        "(execution_binding_id, leg_index, purpose, order_kind, pos_id, status, "
-        "venue, attribution_status, created_at, updated_at) VALUES "
-        "(?, 1, 'entry', 'unknown', 'legacy-duplicate-pos', 'active', "
-        "'deepcoin', 'unassigned', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
-        [(1,), (2,)],
-    )
-    connection.execute(replacement_sql)
-    connection.commit()
-    connection.close()
-
-    assert module._candidate_model_schema_matches(dry_run) is False
-
-
-def test_schema_dry_run_rejects_position_index_name_owned_by_another_table(
-    tmp_path,
-):
-    import sqlite3
-    import telegram_kol_research.deployment_preflight as module
-
-    dry_run = tmp_path / "cross-table-position-index.db"
-    create_session_factory(dry_run)
-    connection = sqlite3.connect(dry_run)
-    connection.execute("DROP INDEX uq_execution_order_legs_venue_pos")
-    connection.executemany(
-        "INSERT INTO execution_order_legs "
-        "(execution_binding_id, leg_index, purpose, order_kind, pos_id, status, "
-        "venue, attribution_status, created_at, updated_at) VALUES "
-        "(?, 1, 'entry', 'unknown', 'legacy-duplicate-pos', 'active', "
-        "'deepcoin', 'unassigned', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
-        [(1,), (2,)],
-    )
-    connection.execute(
-        "CREATE UNIQUE INDEX uq_execution_order_legs_venue_pos ON raw_messages(id)"
-    )
-    connection.commit()
-    connection.close()
-
-    assert module._candidate_model_schema_matches(dry_run) is False
-
-
-def test_collector_rejects_incomplete_database_schema(tmp_path):
-    database = tmp_path / "empty.db"
-    database.touch()
-
-    with pytest.raises(DeploymentPreflightInputError, match="database_schema"):
-        collect_deployment_preflight_facts(
-            database_path=database,
-            change_class="code",
-            now=NOW,
+    with pytest.raises(DeploymentPreflightInputError, match="watermark"):
+        build_final_deployment_preflight_artifact(
+            production_commit=PRODUCTION,
+            candidate_commit=CANDIDATE,
+            surface=_surface(),
+            evidence=_evidence(),
+            snapshot_status=_snapshot(),
+            schema_verification=_schema(),
+            database_watermark=_watermark(9),
+            preliminary_artifact=preliminary,
+            now=NOW + timedelta(seconds=10),
         )
 
 
-def test_collector_accepts_current_application_schema(tmp_path):
-    database = tmp_path / "current.db"
-    snapshot = tmp_path / "snapshot.json"
-    create_session_factory(database)
-    _write_snapshot(snapshot)
+def test_decision_and_reasons_cannot_be_changed_then_rehashed() -> None:
+    evidence = _evidence(unknown_outcome=1)
+    artifact = _preliminary(evidence=evidence)
+    artifact["decision"] = "PASS"
+    artifact["reason_codes"] = []
+    _rehash(artifact)
 
-    facts = collect_deployment_preflight_facts(
-        database_path=database,
-        change_class="code",
-        live_snapshot_path=snapshot,
-        now=NOW,
-    )
+    with pytest.raises(DeploymentPreflightInputError, match="semantic"):
+        _verify(artifact, phase="preliminary", evidence=evidence)
 
-    assert facts.fresh_active_work == {}
-    assert facts.database_watermark == {
-        "raw_message_max_id": 0,
-        "instruction_item_max_id": 0,
-        "trade_signal_max_id": 0,
-        "execution_event_max_id": 0,
+
+def test_checked_facts_cannot_be_changed_then_rehashed() -> None:
+    artifact = _preliminary()
+    artifact["evidence_counts"] = {
+        "active_write": 0,
+        "unknown_outcome": 0,
+        "queued_work": 99,
+        "inactive": 0,
+        "invalid_evidence": 0,
     }
+    _rehash(artifact)
+
+    with pytest.raises(DeploymentPreflightInputError, match="facts"):
+        _verify(artifact, phase="preliminary")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("artifact_version", 999),
+        ("reason_codes", ["x" * 10_000]),
+        ("checked_at", "not-a-time"),
+        ("expires_at", "not-a-time"),
+        ("fingerprint", "bad"),
+    ],
+)
+def test_malformed_artifact_fields_fail_closed(field: str, value: object) -> None:
+    artifact = _preliminary()
+    artifact[field] = value
+    if field != "fingerprint":
+        _rehash(artifact)
+
+    with pytest.raises(DeploymentPreflightInputError):
+        _verify(artifact, phase="preliminary")
+
+
+def test_unknown_artifact_key_fails_closed() -> None:
+    artifact = _preliminary()
+    artifact["operator_override"] = True
+    _rehash(artifact)
+
+    with pytest.raises(DeploymentPreflightInputError, match="shape"):
+        _verify(artifact, phase="preliminary")
+
+
+def test_artifact_expires_and_cannot_come_from_future() -> None:
+    artifact = _preliminary()
+
+    with pytest.raises(DeploymentPreflightInputError, match="expired"):
+        _verify(artifact, phase="preliminary", now=NOW + timedelta(minutes=6))
+    with pytest.raises(DeploymentPreflightInputError, match="future"):
+        _verify(artifact, phase="preliminary", now=NOW - timedelta(seconds=1))
+
+
+def test_preliminary_cannot_contain_parent_and_final_cannot_chain_final() -> None:
+    preliminary = _preliminary()
+    preliminary["parent_fingerprint"] = "f" * 64
+    _rehash(preliminary)
+    with pytest.raises(DeploymentPreflightInputError, match="shape"):
+        _verify(preliminary, phase="preliminary")
+
+    valid_preliminary = _preliminary()
+    final_parent = dict(valid_preliminary)
+    final_parent["phase"] = "final"
+    final_parent["parent_fingerprint"] = "f" * 64
+    _rehash(final_parent)
+    with pytest.raises(DeploymentPreflightInputError, match="parent"):
+        build_final_deployment_preflight_artifact(
+            production_commit=PRODUCTION,
+            candidate_commit=CANDIDATE,
+            surface=_surface(),
+            evidence=_evidence(),
+            snapshot_status=_snapshot(),
+            schema_verification=_schema(),
+            database_watermark=_watermark(),
+            preliminary_artifact=final_parent,
+            now=NOW,
+        )
+
+
+def test_incomplete_snapshot_warns_unchanged_writer_and_blocks_changed_writer() -> None:
+    unchanged = _preliminary(snapshot=_snapshot(complete=False))
+    changed_surface = _surface(writer_changed=True)
+    changed = _preliminary(
+        surface=changed_surface,
+        snapshot=_snapshot(complete=False),
+    )
+
+    assert unchanged["decision"] == "WARN"
+    assert "exchange_snapshot_incomplete" in unchanged["reason_codes"]
+    assert changed["decision"] == "BLOCK"
+    assert "changed_writer_snapshot_incomplete" in changed["reason_codes"]
+
+
+def test_protected_live_positions_are_warning_only() -> None:
+    artifact = _preliminary(snapshot=_snapshot(protected=2))
+
+    assert artifact["decision"] == "WARN"
+    assert artifact["reason_codes"] == ["protected_live_positions"]
+
+
+def test_schema_change_requires_all_backup_and_dry_run_proofs() -> None:
+    surface = _surface(schema_changed=True)
+    blocked = _preliminary(surface=surface, schema=_schema(verified=False))
+    allowed = _preliminary(surface=surface, schema=_schema(verified=True))
+
+    assert blocked["decision"] == "BLOCK"
+    assert "schema_verification_incomplete" in blocked["reason_codes"]
+    assert allowed["decision"] == "PASS"
+
+
+def test_artifact_build_is_deterministic_for_same_inputs() -> None:
+    assert _preliminary() == _preliminary()
+
+
+def test_write_is_atomic_mode_0600_and_read_is_bounded(tmp_path: Path) -> None:
+    path = tmp_path / "artifact.json"
+    write_deployment_preflight_artifact(path, _preliminary())
+
+    assert os.stat(path).st_mode & 0o777 == 0o600
+    assert read_deployment_preflight_artifact(path) == _preliminary()
+    assert not list(tmp_path.glob("*.tmp"))
+
+    path.write_bytes(b"{" + b"x" * 100_000 + b"}")
+    with pytest.raises(DeploymentPreflightInputError, match="too_large"):
+        read_deployment_preflight_artifact(path)
+
+
+def test_artifact_version_is_v2() -> None:
+    assert ARTIFACT_VERSION == 2
