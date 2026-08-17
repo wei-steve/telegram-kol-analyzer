@@ -184,6 +184,20 @@ def test_exact_reviewed_retirement_diff_does_not_promote_live_authority():
     assert facts.underdeclared is False
 
 
+def test_exact_reviewed_retirement_still_requires_schema_class():
+    repository = Path(__file__).resolve().parents[1]
+
+    facts = classify_change_surface(
+        repository=repository,
+        production_commit="2274d90bd2b1a5bb7e7ed1c420c30e925d2bbdfa",
+        candidate_commit="7813150b7b33cd8ce3d90a6145889c6fef192dc7",
+        requested_change_class="code",
+    )
+
+    assert facts.effective_change_class == "schema_compatible"
+    assert facts.underdeclared is True
+
+
 @pytest.mark.parametrize(
     "writer_path",
     [
@@ -208,7 +222,7 @@ def test_each_reviewed_direct_exchange_writer_upgrades_change_class(
 
     assert facts.effective_change_class == "execution_writer"
     assert facts.underdeclared is True
-    assert facts.registry_version == 4
+    assert facts.registry_version == 5
 
 
 def test_trade_signal_retry_and_state_transitions_are_writer_sensitive(tmp_path):

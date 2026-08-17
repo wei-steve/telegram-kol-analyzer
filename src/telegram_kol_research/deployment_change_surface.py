@@ -15,7 +15,7 @@ from .deployment_work_evidence import (
 )
 
 
-CHANGE_SURFACE_REGISTRY_VERSION = 4
+CHANGE_SURFACE_REGISTRY_VERSION = 5
 _CLASS_RANK = {
     "code": 0,
     "schema_compatible": 1,
@@ -205,7 +205,9 @@ def classify_change_surface(
     observed = "code"
     for path in changes:
         path_class = "code"
-        if _is_unchanged_reviewed_retirement_path(
+        if path in SCHEMA_PATHS or path.startswith("migrations/"):
+            path_class = "schema_compatible"
+        elif _is_unchanged_reviewed_retirement_path(
             root,
             production,
             candidate,
@@ -216,8 +218,6 @@ def classify_change_surface(
             path_class = "live_promotion"
         elif path in EXECUTION_WRITER_PATHS:
             path_class = "execution_writer"
-        elif path in SCHEMA_PATHS or path.startswith("migrations/"):
-            path_class = "schema_compatible"
         elif path in DEPLOYMENT_GUARD_PATHS:
             path_class = "code"
         elif path.startswith("src/telegram_kol_research/"):
