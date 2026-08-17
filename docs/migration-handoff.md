@@ -830,6 +830,26 @@ mode to `disabled` and leaves confirmed exchange orders, ledger rows, recovery
 records, and incident history intact. Never delete them to make rollback appear
 clean.
 
+## Evidence-based two-phase deployment gate
+
+The handoff vocabulary has six exhaustive work classes: `in_flight_write`,
+`unknown_outcome`, `restart_safe_wait`, `historical_residue`, `terminal`, and
+`malformed`. Phase A is a read-only preliminary collection from the detached
+candidate. Phase B runs only after the sole writer service is stopped and must
+bind the final artifact to Phase A, the exact candidate, the change surface,
+and the current database watermark. The candidate updater is not installed
+before Phase B.
+
+Unknown outcomes block regardless of age. Restart-safe/history is WARN only for
+code/schema and becomes BLOCK for writer-sensitive changes. Missing adapters,
+columns, states, or artifact facts are malformed and fail closed. Historical
+rows must never be edited to make a gate pass, and operator approval cannot
+override a legitimate BLOCK. A schema rollback may restart around unchanged
+read-only residue; an `execution_writer` change may not. PASS/WARN grants no
+exchange-write, replay, or MiMo v2 authority. Push approval and deployment
+approval are separate; candidate staging and shadow verification consume only
+the former.
+
 ## Multi-instruction recognition handoff
 
 Authoritative recognition now has a bounded per-action `instructions` contract.

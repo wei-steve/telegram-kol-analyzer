@@ -128,6 +128,25 @@ Deepcoin recovery lineage, touches a large operational surface, and has not
 passed an independent production rollout. No part of that branch is deployed
 by this retirement.
 
+### Evidence-based two-phase deployment gate
+
+The replacement deployment gate classifies durable evidence as
+`in_flight_write`, `unknown_outcome`, `restart_safe_wait`,
+`historical_residue`, `terminal`, or `malformed`. Phase A collects a read-only
+preliminary artifact from the detached candidate. Phase B runs after the sole
+writer is stopped and binds fresh facts to the Phase A fingerprint, exact SHA,
+database watermark, and reviewed change surface. The candidate updater is not
+installed before Phase B.
+
+Unknown outcomes block regardless of age. Restart-safe/history is WARN only for
+code/schema; it is BLOCK for `execution_writer` and `live_promotion`. Unknown
+states, missing schema facts, unregistered writers, and malformed artifacts
+fail closed. No historical row may be edited and no legitimate BLOCK may be
+overridden. A schema rollback may restart around unchanged read-only residue;
+a writer change may not. PASS/WARN does not authorize exchange writes,
+historical replay, or MiMo v2 activation. Push approval and deployment approval
+are separate, and shadow success is not deployment authorization.
+
 ## Verification
 
 Local verification must prove:

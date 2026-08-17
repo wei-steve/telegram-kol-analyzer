@@ -204,6 +204,26 @@ executes it. This avoids depending on an older checkout or older installed
 helper. For `schema_compatible`, the candidate code migrates a disposable copy
 of the verified backup; the live database remains unchanged until deployment.
 
+### Evidence-based two-phase deployment gate
+
+Every durable row is classified as `in_flight_write`, `unknown_outcome`,
+`restart_safe_wait`, `historical_residue`, `terminal`, or `malformed`. Phase A
+runs from the detached candidate and produces a preliminary artifact without
+mutating production. After it passes, the updater stops the sole writer. Phase
+B collects fresh facts while stopped, binds them to the Phase A fingerprint,
+and verifies the final decision before checkout. The candidate updater is not
+installed before Phase B.
+
+Unknown outcomes block regardless of age. Restart-safe/history is WARN only for
+code/schema; the same residue is BLOCK for `execution_writer` and
+`live_promotion`. Unknown states, missing columns, unregistered tables, or a
+malformed artifact fail closed. Never edit historical database rows or
+override a legitimate BLOCK to deploy. A schema rollback may restart around
+unchanged read-only residue; a writer change may not. PASS/WARN does not
+authorize an exchange write, historical replay, or MiMo v2 activation. Push
+approval and deployment approval are separate, and a successful server shadow
+still requires the latter.
+
 ## Backup-stop rollout gate
 
 After a reviewed deployment, first verify the service and deployed SHA, then run

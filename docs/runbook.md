@@ -1834,6 +1834,24 @@ TradeSignal、ExecutionBinding、ExecutionEvent、订单草稿或 execution cont
 失败标记为无关基线。调查失败时保留数据库和 fixture 证据，不重放旧 Telegram
 消息，也不调用任何交易所变更接口。
 
+### Evidence-based two-phase deployment gate
+
+部署证据统一归入六类：`in_flight_write`、`unknown_outcome`、
+`restart_safe_wait`、`historical_residue`、`terminal`、`malformed`。
+Phase A 在 detached candidate 中只读采集 preliminary artifact；通过后才停止唯一
+writer 服务。Phase B 在停服状态重新采集 final artifact，并校验候选 SHA、数据库
+水位、change-surface 指纹和 Phase A 父指纹。candidate updater is not installed before
+Phase B；只有 final artifact 重新计算后仍为 PASS/WARN 才能进入 checkout。
+
+unknown outcomes block regardless of age。`restart_safe_wait` 与
+`historical_residue` 不再根据 `updated_at` 推断正在执行；restart-safe/history is WARN
+only for code/schema，对 `execution_writer` 或 `live_promotion` 则是 BLOCK。任何未知
+状态、缺列、未登记表或 malformed evidence 都失败关闭。不得编辑历史数据库行来
+换取通过，也不得覆盖合法 BLOCK。schema rollback 可以在只读 residue 未变化时停服
+重启，writer change 不可以。PASS/WARN 不授权交易所写入、历史重放或 MiMo v2 启用。
+push approval and deployment approval are separate；服务器 shadow 通过后仍须单独取得
+部署批准。
+
 ## 2026-08-11 统一执行真相休眠发布记录
 
 生产已通过确定性更新器部署 commit

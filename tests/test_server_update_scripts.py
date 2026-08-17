@@ -5,6 +5,21 @@ import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
+EVIDENCE_GATE_DOCS = (
+    "docs/runbook.md",
+    "docs/server-deployment.md",
+    "docs/migration-handoff.md",
+    "docs/plans/2026-08-16-mimo-v2-retirement-and-safety-gate-history-design.md",
+    "docs/plans/2026-08-16-mimo-v2-retirement-and-safety-gate-history.md",
+)
+WORK_CLASSIFICATIONS = (
+    "in_flight_write",
+    "unknown_outcome",
+    "restart_safe_wait",
+    "historical_residue",
+    "terminal",
+    "malformed",
+)
 
 
 def test_update_scripts_are_syntax_valid():
@@ -57,6 +72,22 @@ def test_deployment_docs_keep_both_workstation_helpers_visible():
     assert "./scripts/server_git_update.sh" in deployment
     assert "server_git_update.ps1" in deployment
     assert "./scripts/server_git_update.sh" in handoff
+
+
+def test_deployment_documentation_records_two_phase_evidence_policy():
+    for relative_path in EVIDENCE_GATE_DOCS:
+        text = (ROOT / relative_path).read_text(encoding="utf-8")
+        normalized = " ".join(text.lower().split())
+        assert "Evidence-based two-phase deployment gate" in text
+        assert all(classification in text for classification in WORK_CLASSIFICATIONS)
+        assert "phase a" in normalized
+        assert "phase b" in normalized
+        assert "unknown outcomes block regardless of age" in normalized
+        assert "restart-safe/history is warn only for code/schema" in normalized
+        assert "candidate updater" in normalized
+        assert "not installed" in normalized
+        assert "push approval and deployment approval are separate" in normalized
+        assert "fresh_active_exchange_work" not in text
 
 
 def test_server_updater_runs_two_bound_phases_before_mutation():

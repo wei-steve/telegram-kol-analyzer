@@ -287,3 +287,21 @@ write, notification, or historical replay was used for testing.
 Leave production unchanged at `2274d90`, preserve the reviewed branch, and
 report the exact bounded preflight reason. Do not resume Batch119 recovery or
 redesign the gate in this task.
+
+## Evidence-based two-phase deployment gate
+
+The retirement rollout uses six durable classifications: `in_flight_write`,
+`unknown_outcome`, `restart_safe_wait`, `historical_residue`, `terminal`, and
+`malformed`. Phase A collects a preliminary read-only artifact from the exact
+detached candidate. Only after it passes may the sole writer stop. Phase B then
+collects and verifies fresh final evidence bound to Phase A before checkout or
+installation; the candidate updater is not installed before Phase B.
+
+Unknown outcomes block regardless of age. Restart-safe/history is WARN only for
+code/schema, while writer-sensitive changes BLOCK on the same residue. Missing
+columns, unknown states, unregistered adapters, malformed artifacts, or phase
+drift fail closed. Never edit historical data or override a legitimate BLOCK.
+A schema rollback may restart around unchanged read-only residue; a writer
+change may not. PASS/WARN authorizes neither exchange writes, historical replay,
+nor MiMo v2 activation. Push approval and deployment approval are separate;
+Task 5 staging does not authorize Task 6 deployment.
