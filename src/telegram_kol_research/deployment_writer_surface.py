@@ -13,6 +13,35 @@ WRITER_MANIFEST_VERSION = 1
 _FULL_SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
 _SOURCE_PREFIX = "src/telegram_kol_research/"
 
+# Public exchange-mutation and durable-claim entry points whose callers must
+# remain inside the flat writer surface. Tests bind this set to the complete
+# public APIs of the two central mutation authority modules.
+HIGH_LEVEL_MUTATION_APIS = frozenset(
+    {
+        "submit_exact_position_sltp",
+        "cancel_exact_position_sltp",
+        "close_exact_position",
+        "exact_position_write_gate",
+        "reconcile_submitted_position_mutation_intents",
+        "cancel_owned_position_sltp",
+        "set_exact_position_sltp",
+        "execute_deepcoin_management_signal",
+        "partial_close_and_move_stop_to_entry",
+        "adjust_position_tpsl",
+        "close_position_market",
+        "close_bound_position_market",
+        "cancel_entry_order",
+        "cancel_revision_entry_leg",
+        "cancel_pending_entry_legs",
+        "recreate_trigger_entry_tpsl",
+        "execute_management_batch",
+        "execute_trigger_protection_stop_rescue",
+        "execute_trigger_take_profit_convergence",
+        "create_management_batch",
+        "create_management_batch_in_session",
+    }
+)
+
 
 def _source_paths(*names: str) -> frozenset[str]:
     return frozenset(f"{_SOURCE_PREFIX}{name}" for name in names)

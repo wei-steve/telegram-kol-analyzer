@@ -8,6 +8,7 @@ import subprocess
 import pytest
 
 from telegram_kol_research.deployment_writer_surface import (
+    HIGH_LEVEL_MUTATION_APIS,
     MUTATION_AUTHORITY_PATHS,
     OUTCOME_AUTHORITY_PATHS,
     WORKER_CLAIM_PATHS,
@@ -396,17 +397,7 @@ def test_indirect_authority_and_worker_primitives_remain_in_manifest() -> None:
 
 
 def test_high_level_mutation_and_claim_callers_are_writer_sensitive() -> None:
-    high_level_writer_calls = {
-        "submit_exact_position_sltp",
-        "execute_management_batch",
-        "execute_deepcoin_management_signal",
-        "execute_trigger_protection_stop_rescue",
-        "execute_trigger_take_profit_convergence",
-        "create_management_batch",
-        "create_management_batch_in_session",
-    }
-
-    call_sites = _post_call_site_paths(SOURCE_ROOT, high_level_writer_calls)
+    call_sites = _post_call_site_paths(SOURCE_ROOT, set(HIGH_LEVEL_MUTATION_APIS))
 
     assert {
         "src/telegram_kol_research/backup_stop_repair.py",
@@ -416,3 +407,53 @@ def test_high_level_mutation_and_claim_callers_are_writer_sensitive() -> None:
         "src/telegram_kol_research/telegram_bot_commands.py",
     } <= call_sites
     assert call_sites <= WRITER_SURFACE_PATHS
+
+
+def _public_module_functions(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and not node.name.startswith("_")
+    }
+
+
+def _public_class_methods(path: Path, class_name: str) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    class_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    return {
+        node.name
+        for node in class_node.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and not node.name.startswith("_")
+    }
+
+
+def test_authoritative_public_mutation_apis_are_completely_declared() -> None:
+    gateway = SOURCE_ROOT / "position_mutation_gateway.py"
+    actions = SOURCE_ROOT / "deepcoin_execution_actions.py"
+    gateway_functions = _public_module_functions(gateway)
+    gateway_methods = _public_class_methods(gateway, "PositionMutationGateway")
+    action_functions = _public_module_functions(actions) - {
+        "resolve_existing_position_contract_spec"
+    }
+
+    assert gateway_functions | gateway_methods | action_functions <= set(
+        HIGH_LEVEL_MUTATION_APIS
+    )
+
+
+def test_synthetic_gateway_caller_would_fail_outside_manifest(tmp_path: Path) -> None:
+    source_root = tmp_path / "src/telegram_kol_research"
+    _write(source_root / "new_gateway_writer.py", "close_exact_position()\n")
+
+    call_sites = _post_call_site_paths(source_root, set(HIGH_LEVEL_MUTATION_APIS))
+
+    assert call_sites - WRITER_SURFACE_PATHS == {
+        "src/telegram_kol_research/new_gateway_writer.py"
+    }
