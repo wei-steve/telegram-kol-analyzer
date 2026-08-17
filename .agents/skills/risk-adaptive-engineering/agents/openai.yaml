@@ -1,0 +1,7 @@
+interface:
+  display_name: "Risk-Adaptive Engineering"
+  short_description: "Route project work through risk-matched agent teams"
+  default_prompt: "Use $risk-adaptive-engineering to classify this project task and select the safest proportionate workflow."
+
+policy:
+  allow_implicit_invocation: false

@@ -4,6 +4,7 @@
 - Push reviewed local commits to GitHub on `codex/deepcoin-auto-trading-v1`.
 - Update production by pulling from GitHub on the server, reinstalling the editable package, and restarting `telegram-kol.service`.
 - Send no notifications during active work, including commentary updates, tool calls, tests, reviews, commits, pushes, deployments, or other intermediate progress. Send exactly one notification only when the current turn's work stops and control is being returned to the user, whether because the task completed, work paused for user input, or progress is blocked. Immediately before that final response, run `python3 "$(git rev-parse --show-toplevel)/scripts/codex_telegram_notify.py" "<short non-sensitive status summary>"`. Telegram is the primary stop notification. Never include credentials or sensitive values in the summary. If Telegram delivery fails, use `osascript -e 'display notification "工作已停止，请查看 Codex。" with title "Telegram 获取消息项目"'` as the fallback and clearly report the Telegram failure in the final response. If both notification methods are unavailable, state that clearly in the final response.
+- Only the user-facing main Sol orchestrator sends that single stop notification. Subagents, custom workers, reviewers, testers, and isolated validation sessions are intermediate work and must never send it.
 - Prefer the existing helper after pushing:
 
 ```powershell
