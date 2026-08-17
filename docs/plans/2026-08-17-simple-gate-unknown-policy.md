@@ -1,5 +1,8 @@
 # Simple Gate Unknown Policy Implementation Plan
 
+> Superseded by 2026-08-17-minimal-deployment-gate-design.md.
+> Retained only as historical context; do not execute this runbook.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Allow historical unknown outcomes to produce a verified WARN only when the exact deployment writer fingerprint is unchanged, while keeping active writes, malformed evidence, and changed-writer unknowns fail-closed.

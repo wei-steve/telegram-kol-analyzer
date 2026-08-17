@@ -1,5 +1,8 @@
 # Simple Deployment Safety Gate Design
 
+> Superseded by 2026-08-17-minimal-deployment-gate-design.md.
+> Retained only as historical context; do not execute this runbook.
+
 **Date:** 2026-08-16
 
 **Status:** Approved for implementation planning

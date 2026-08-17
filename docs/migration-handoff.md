@@ -152,36 +152,31 @@ stop and keep automatic management frozen.
 
 ## Automatic deployment gate handoff
 
-The current deployment interface accepts only the exact reviewed commit. It
-automatically computes the writer fingerprint and schema diff; there is no
-operator-selected class or manual BLOCK escape hatch. Push approval, shadow
-approval, and deployment approval are three separate decisions.
+Finish local tests and independent review, record the clean exact SHA, then ask
+once for approval to push and deploy that SHA. The same approval covers the
+fast-forward to `codex/deepcoin-auto-trading-v1` and the managed updater. It
+does not authorize force, database edits, historical replay, test
+notifications, exchange test writes, or runtime feature activation. Ordinary
+deployments require no detached server shadow.
 
-Push the reviewed SHA first only to `codex/deployment-gate-simplification` for
-the detached shadow. After deployment approval, fast-forward that exact same
-shadowed SHA to `codex/deepcoin-auto-trading-v1`, verify the remote ref, and run
-the updater against the production branch. Passing the feature branch directly
-to a checkout still attached to the production branch is an invalid rollback
-point and must fail before service stop.
+The updater requires the remote exact SHA, an attached clean production branch,
+and a usable old-commit rollback point. A path change under `models.py`,
+`db.py`, or a migration directory triggers online backup, two `quick_check`
+runs, candidate migration on a disposable copy, and raw/execution watermark
+comparison. Other paths skip schema work.
 
-Phase A runs online from the detached candidate with read-only SQLite evidence.
-Only PASS or a verified WARN may stop the writer service. Phase B runs after
-systemd proves the unit inactive and binds directly to the saved Phase A
-fingerprint. Its stable results are `0=PASS`, `2=WARN`, `3=BLOCK`, and
-`4=invalid`. A detected schema change automatically requires an online backup,
-`quick_check`, candidate migration dry-run, and watermark verification.
+The candidate checker opens SQLite read-only with `query_only=ON` and requires
+`active_write_count=0` once before stop and again after systemd proves the sole
+writer `inactive` or `failed`. Only then may the updater fast-forward, install,
+start, verify local HTTP health, and install the durable updater last.
+Historical unknown, queued, paused, recovery, and terminal records never block
+this deployment check. It creates no artifact or deployment fingerprint.
 
-Queued work or an unknown exchange outcome is WARN when the writer fingerprint
-is unchanged and BLOCK when it changes. Invalid registered evidence and an
-active exchange write always BLOCK. WARN is computed from exact Git facts and
-bound into the artifact; it is not an operator override. Mutation-side failures
-restore the previous checkout, package, and service; artifacts are sanitized
-and mode `0600`.
-
-The gate-only candidate keeps MiMo v1 authoritative and leaves dormant MiMo v2
-runtime, prompt, schema, replay, and activation behavior unchanged. It must not
-be combined with the separate terminal-entry writer candidate, a database
-history edit, a test notification, or an exchange test write.
+Exit `3` means an active exchange write refused deployment. Exit `4` means the
+checker/input, updater, health, or rollback failed. After any stop attempt, a
+failure must restore and verify the old checkout, package, durable updater, and
+service or report a hard rollback failure. Passing a feature branch directly to
+a checkout still attached to the production branch remains invalid.
 
 ## Server production safety monitor
 

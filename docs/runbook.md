@@ -1755,62 +1755,48 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
 候选项、执行项、交易所事件及异常证据。不得删除审计行，也不得为验证回滚
 而重放历史消息。
 
-## 确定性部署预检
+## 最小部署门禁
 
-新的部署路径不再依赖操作员临时拼 SQL 或选择变更类型。推送、
-服务器只读 shadow 和真正部署各需一次独立明确批准（push approval、
-shadow approval、deployment approval）。只有取得当前阶段批准后才使用已评审的
-40 位 commit：
+完成本地测试和独立评审后，记录干净的精确 40 位 SHA，只请求一次
+明确批准。这一次批准同时覆盖把该 SHA 推到
+`codex/deepcoin-auto-trading-v1` 并部署。它不授权 force push、数据库修改、
+历史回放、测试通知、交易所测试写入或 runtime 功能激活。普通部署
+不要求服务器 shadow。不得把 feature branch 直接传给仍附着在生产分支的
+updater。
 
-push approval 只允许把精确 SHA 推到 `codex/deployment-gate-simplification`以供脱离的
-只读 shadow。shadow approval 不允许改生产分支。只有另行取得 deployment approval 后，
-才可把同一个已 shadow SHA fast-forward 到 `codex/deepcoin-auto-trading-v1`，核对远程 ref
-与该 SHA 完全相等，然后针对生产分支调用 helper。不得把 feature branch 直接传给当前
-仍附着在生产分支的 updater。
+获得批准后，先将精确 SHA fast-forward 到生产分支并核对远程 ref，再调用
+helper：
 
 ```bash
-EXPECTED_COMMIT="$(git rev-parse HEAD)" \
-./scripts/server_git_update.sh
+reviewed_sha="$(git rev-parse HEAD)"
+git push origin "$reviewed_sha:refs/heads/codex/deepcoin-auto-trading-v1"
+test "$(git ls-remote origin refs/heads/codex/deepcoin-auto-trading-v1 | awk '{print $1}')" = "$reviewed_sha"
+EXPECTED_COMMIT="$reviewed_sha" ./scripts/server_git_update.sh
 ```
 
-PowerShell 只使用 `-ExpectedCommit <sha>`。更新器从精确 Git 对象自动计算
-writer fingerprint 和 schema diff，操作员无降级或 BLOCK 豁免参数。四条阻断规则为：
+PowerShell 使用 `-ExpectedCommit <sha>`。更新器按以下短流程执行：
 
-| 证据 | 结果 |
-| --- | --- |
-| 已注册执行证据无法解释 | `BLOCK` |
-| 交易所写入正在进行 | `BLOCK` |
-| 写入结果未知且 writer fingerprint 改变 | `BLOCK` |
-| 写入结果未知但 writer fingerprint 未变 | `WARN` |
-| 有可队列工作且 writer fingerprint 改变 | `BLOCK` |
-| 有可队列工作但 writer fingerprint 未变 | `WARN` |
-| 终态、永久暂停或其他 inactive 证据 | `PASS` |
+1. 校验远程精确 SHA、已附着的生产分支、旧 commit 回滚点和干净 tracked tree。
+2. 根据 `models.py`、`db.py` 或 migration 目录的 Git 路径差异决定是否执行
+   online backup、两次 `quick_check`、候选 migration dry-run 和原始/执行水位核对。
+3. 旧服务仍在运行时，候选 checker 以 SQLite `mode=ro` 和 `query_only=ON`
+   执行第一次 `active_write_count=0` 检查。
+4. 记录 stop attempt，停止唯一 writer，等待 systemd 精确到达 `inactive` 或
+   `failed`，再执行第二次零计数检查。
+5. 只有两次都为零才 checkout/fast-forward、安装、启动、核对 active 和本地
+   HTTP health，最后才安装 durable updater。
 
-WARN 由精确 Git fingerprint 和聚合证据自动计算，并绑定进 Phase A/Phase B artifact；
-它不是操作员 override，不能豁免 invalid evidence 或 active exchange write。
-
-检测到 schema 变更时，自动执行 SQLite online backup、backup `quick_check`、
-候选代码对可丢弃副本的 migration dry-run 和水位核对；任一失败均在停服前拒绝。
-
-Phase A 在线以 SQLite `mode=ro` 和 `query_only=ON` 采集脱敏聚合证据。通过后才记录
-stop attempt 并停止唯一 writer。systemd 必须精确到达 `inactive` 或 `failed`；然后
-Phase B 重新采集，并直接绑定已保存的 Phase A fingerprint。只有 Phase B 的 PASS
-或经验证 WARN 才允许 checkout、安装和重启。任意 BLOCK、invalid、信号、安装或启动
-失败都会进入 trap 尝试恢复原 checkout、package 和 service。若 rollback checkout、install、
-start 或停服终态证明失败，必须 hard non-zero 停止并人工处置，不得声称原服务已恢复。
-artifact 权限为 `0600`，仅保留计数、reason code、
-SHA、fingerprint、水位和时间。退出码为：
+历史 unknown、queued、paused、recovery 和 terminal 记录只是信息，不阻断部署。
+部署门禁不生成 artifact、fingerprint 或完整状态词汇分类。退出码为：
 
 ```text
-0=PASS
-2=WARN（允许发布，但必须保留原因）
-3=BLOCK
-4=invalid 输入或证据
+0=成功
+3=检测到 active exchange write，拒绝部署
+4=checker/输入、updater、health 或 rollback 失败
 ```
 
-本 gate-only 候选不改动 MiMo v2 的 runtime、prompt、schema、replay 或 activation；
-MiMo v1 继续 authoritative。它也不包含独立的 terminal-entry writer 修复，不编辑数据库历史，
-不发送测试通知，不调用交易所测试写入。
+停服后任何失败都尝试恢复旧 checkout、package、durable updater 和 active service。
+如果不能证明回滚完成，以 hard `4` 停止，不得继续改文件或声称已恢复。
 
 ## 统一执行真相故障与回放门禁
 
@@ -1859,16 +1845,16 @@ durable order、ledger、活仓和 Deepcoin pending readback 共同证明的现�
 TP order、ledger 和 execution event 的数量与最大 ID 均无变化，待修复的活跃
 TP 逻辑腿由一条降为零，verified TP 增加一条，confirmation token 增加一条。
 
-两次正式预检均无 fresh active work，五个活仓都有止损保护，未保护仓位为零，
-backup 和 migration dry-run 均有效。当时的自动 schema 预检 WARN 仅保留历史 residue、
-历史 unknown、已保护活仓和非稳定 display snapshot 事实，不构成执行权放开。
+当时发布检查均无 fresh active work，五个活仓都有止损保护，未保护仓位为零，
+backup 和 migration dry-run 均有效。旧门禁当时记录的历史 residue、
+历史 unknown、已保护活仓和非稳定 display snapshot 只是历史证据，不构成执行权放开。
 
 部署后验证：服务为 active，settings API 为 HTTP 200，包路径指向生产 checkout；
 服务器聚焦测试先通过 643 项，最终 monitor 补丁再通过 285 项。最后一次不带
 `--notify` 的 full audit 为 `healthy=true`、零 reason code、无 monitor error，
 notification status 为 `not_needed`。
 
-若回滚，先保持 contract 模式 `disabled`，通过新评审的 revert commit 和同一预检
+若回滚，先保持 contract 模式 `disabled`，通过新评审的 revert commit 和当前最小部署门禁
 流程发布；不得删除监督修复 token、解绑已验证 TP、清理历史 unknown 或重放旧消息。
 任何 shadow/live 灰度必须另取未来水位、生成并评审证据 artifact，再取得明确授权。
 

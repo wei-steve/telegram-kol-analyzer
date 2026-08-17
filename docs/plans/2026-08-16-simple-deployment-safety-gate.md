@@ -1,5 +1,8 @@
 # Simple Deployment Safety Gate Implementation Plan
 
+> Superseded by 2026-08-17-minimal-deployment-gate-design.md.
+> Retained only as historical context; do not execute this runbook.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Replace the production deployment preflight with a small, automatic,

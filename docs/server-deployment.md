@@ -115,33 +115,23 @@ meanings.
 
 ## Update Flow
 
-The gate-only rollout uses one explicit branch path:
+Finish local tests and independent review, record the clean exact SHA, then ask
+once for approval to push and deploy that SHA. That single approval covers both
+steps. It does not authorize a database edit, historical replay, test
+notification, exchange test write, force push, or runtime feature activation.
 
-1. After push approval, push the exact reviewed SHA only to
-   `codex/deployment-gate-simplification`.
-2. After shadow approval, stage that branch as a detached read-only candidate.
-   Do not run the updater or move the production branch.
-3. After a separate deployment approval, fast-forward the exact same shadowed
-   SHA to `codex/deepcoin-auto-trading-v1`, verify the remote ref, and only then
-   run the managed updater against that production branch.
-
-The feature branch must not be passed directly to the updater while production
-is attached to the production branch; the rollback-point check will correctly
-reject that mismatch.
-
-After those approvals, choose the helper for your workstation. The operator
-provides only the full reviewed commit; the candidate calculates its writer
-fingerprint and schema surface automatically:
+After approval, fast-forward only the exact reviewed SHA to the production
+branch and verify the remote ref:
 
 ```bash
 reviewed_sha="$(git rev-parse HEAD)"
-git push origin "$reviewed_sha:refs/heads/codex/deployment-gate-simplification"
-# Stop here for shadow approval and read-only shadow verification.
-
-# Run these only after the later deployment approval:
 git push origin "$reviewed_sha:refs/heads/codex/deepcoin-auto-trading-v1"
 test "$(git ls-remote origin refs/heads/codex/deepcoin-auto-trading-v1 | awk '{print $1}')" = "$reviewed_sha"
 ```
+
+The feature branch must not be passed directly to the updater while production
+is attached to the production branch; the rollback-point check rejects that
+mismatch. Ordinary deployments do not require a detached server shadow.
 
 macOS / Linux:
 
@@ -160,50 +150,32 @@ powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1 `
   -ExpectedCommit $commit
 ```
 
-The automatic decision table is intentionally small:
-
-| Evidence | Result |
-|---|---|
-| Invalid registered execution evidence | `BLOCK` |
-| Active exchange write | `BLOCK` |
-| Unknown outcome and changed writer fingerprint | `BLOCK` |
-| Unknown outcome and unchanged writer fingerprint | `WARN` |
-| Queued work and changed writer fingerprint | `BLOCK` |
-| Queued work and unchanged writer fingerprint | `WARN` |
-| Inactive, terminal, or permanently paused evidence | `PASS` |
-
-The WARN result is computed from the exact Git fingerprint and bound into both
-preflight artifacts. It is not an operator override and cannot excuse invalid
-evidence or an active exchange write.
-
 The server updater then:
 
 1. Fetches the branch and refuses unless `FETCH_HEAD` exactly equals
-   `EXPECTED_COMMIT`.
+   `EXPECTED_COMMIT`; the production branch must be attached, at the recorded
+   rollback commit, with a clean tracked tree.
 2. Extracts the reviewed updater into a mode-0700 temporary directory and
-   verifies its SHA-256. Bootstrap runs that temporary helper; it does not
-   install candidate code or replace the durable updater before Phase B.
-3. Runs Phase A from a detached candidate worktree. SQLite is opened read-only,
-   the exact writer fingerprint and schema diff are calculated automatically,
-   and a bounded preliminary artifact is written mode 0600.
-4. If Phase A is PASS or verified WARN, records the stop attempt, stops the sole
-   writer service, and waits for systemd to report exactly `inactive` or
-   `failed`. Phase B recollects the facts and binds directly to the saved Phase
-   A fingerprint. A BLOCK or invalid result restarts the unchanged old service.
-5. Fast-forwards to the exact commit, reinstalls the editable package, starts
-   and verifies `telegram-kol.service`, and updates the durable updater last.
+   verifies its SHA-256, then creates a detached exact-candidate worktree. The
+   durable updater is not replaced yet.
+3. Uses `git diff --quiet` on `models.py`, `db.py`, and any migration directory.
+   A schema-path change requires an online SQLite backup, backup `quick_check`,
+   candidate migration on a disposable copy, another `quick_check`, and raw/
+   execution watermark equality. Other changes skip schema work.
+4. Runs the candidate active-write checker against SQLite in `mode=ro` with
+   `query_only=ON`. `active_write_count` must be exactly zero before stop.
+5. Records the stop attempt, stops the sole writer, waits for systemd to report
+   exactly `inactive` or `failed`, and runs the same zero-count checker again.
+6. Fast-forwards to the exact commit, installs the editable package, starts the
+   service, requires active state and local HTTP health, then installs the
+   durable updater last.
 
-Preflight exit codes are stable: `0=PASS`, `2=WARN` (deployable), `3=BLOCK`, and
-`4=invalid` input or evidence (refused). Artifacts contain only aggregate
-counts, reason codes, SHA values, fingerprints, watermarks, and timestamps;
-they never contain raw Telegram text, order payloads, position IDs, or
-credentials. A detected schema change automatically requires an online SQLite
-backup, backup `quick_check`, candidate migration against a disposable copy,
-and watermark verification before Phase A may continue.
-
-The gate-only candidate leaves MiMo v1 authoritative and dormant MiMo v2 code
-unchanged. It does not activate or replay MiMo v2, edit database history, or
-include the separate terminal-entry writer candidate.
+Exit `3` means an active exchange write refused deployment. Exit `4` means the
+checker/input, updater, health check, or rollback failed. Missing tables or
+columns and unreadable databases fail closed. Historical unknown, queued,
+paused, recovery, and terminal records are informational and never block this
+deployment check. No deployment artifacts, state-vocabulary classifiers, or
+deployment fingerprints are created.
 
 Cleanup attempts to restore the previous checkout, package, and active service
 after any mutation-side failure. A rollback failure is a hard non-zero result;
