@@ -154,6 +154,88 @@ def _create_registered_tables(
         connection.execute(
             f"CREATE TABLE source_message_deletion_exits ({source_columns})"
         )
+        connection.executescript(
+            """
+            CREATE TABLE execution_bindings (
+                id INTEGER PRIMARY KEY,
+                chat_id INTEGER,
+                message_id INTEGER,
+                symbol TEXT,
+                side TEXT,
+                status TEXT,
+                updated_at TEXT
+            );
+            CREATE TABLE execution_order_legs (
+                id INTEGER PRIMARY KEY,
+                execution_binding_id INTEGER,
+                purpose TEXT,
+                status TEXT,
+                order_id TEXT,
+                client_order_id TEXT,
+                pos_id TEXT,
+                request_json TEXT,
+                response_json TEXT,
+                updated_at TEXT
+            );
+            CREATE TABLE message_instruction_items (
+                id INTEGER PRIMARY KEY,
+                status TEXT,
+                updated_at TEXT
+            );
+            CREATE TABLE instruction_execution_contracts (
+                id INTEGER PRIMARY KEY,
+                message_instruction_item_id INTEGER,
+                state TEXT,
+                terminal_kind TEXT,
+                completion_scope TEXT,
+                evidence_refs_json TEXT,
+                updated_at TEXT
+            );
+            CREATE TABLE strategy_management_batches (
+                id INTEGER PRIMARY KEY,
+                status TEXT,
+                reason_code TEXT,
+                execution_mode TEXT,
+                updated_at TEXT
+            );
+            CREATE TABLE strategy_management_components (
+                id INTEGER PRIMARY KEY,
+                management_batch_id INTEGER,
+                status TEXT,
+                request_json TEXT,
+                response_json TEXT,
+                updated_at TEXT
+            );
+            CREATE TABLE trigger_protection_intents (
+                id INTEGER PRIMARY KEY,
+                execution_binding_id INTEGER,
+                execution_order_leg_id INTEGER,
+                recovery_state TEXT,
+                parent_trigger_order_id TEXT,
+                adopted_order_id TEXT,
+                updated_at TEXT
+            );
+            CREATE TABLE position_mutation_intents (
+                id INTEGER PRIMARY KEY,
+                status TEXT,
+                submitted_at TEXT,
+                confirmed_at TEXT,
+                response_json TEXT,
+                error_json TEXT,
+                updated_at TEXT
+            );
+            CREATE TABLE trade_signals (
+                id INTEGER PRIMARY KEY,
+                chat_id INTEGER,
+                message_id INTEGER,
+                symbol TEXT,
+                side TEXT,
+                status TEXT,
+                processed_at TEXT,
+                updated_at TEXT
+            );
+            """
+        )
 
 
 def test_recognition_audit_tables_are_not_execution_evidence(tmp_path: Path) -> None:
@@ -375,3 +457,248 @@ def test_collection_result_is_bounded_and_sanitized(tmp_path: Path) -> None:
 
     assert len(rendered) < 1_024
     assert all(secret not in rendered for secret in secret_values)
+
+
+def _assert_only_category(snapshot, category: str) -> None:
+    values = asdict(snapshot.counts)
+    assert values[category] > 0
+    assert all(value == 0 for name, value in values.items() if name != category)
+
+
+def test_stale_unknown_binding_and_leg_without_claim_are_inactive(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "stale-binding.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO execution_bindings "
+            "(id, chat_id, message_id, symbol, side, status) "
+            "VALUES (1, 10, 20, 'BTC', 'long', 'unknown')"
+        )
+        connection.execute(
+            "INSERT INTO execution_order_legs "
+            "(id, execution_binding_id, purpose, status) "
+            "VALUES (1, 1, 'entry', 'unknown')"
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "inactive")
+
+
+def test_unknown_instruction_without_contract_is_inactive(tmp_path: Path) -> None:
+    database = tmp_path / "item-without-contract.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO message_instruction_items (id, status) VALUES (1, 'unknown')"
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "inactive")
+
+
+def test_submit_unknown_contract_without_terminal_proof_is_unknown(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "unknown-contract.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO message_instruction_items (id, status) VALUES (1, 'unknown')"
+        )
+        connection.execute(
+            "INSERT INTO instruction_execution_contracts "
+            "(id, message_instruction_item_id, state, evidence_refs_json) "
+            "VALUES (1, 1, 'submit_unknown', '[]')"
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "unknown_outcome")
+
+
+def test_operator_paused_management_recovery_is_inactive(tmp_path: Path) -> None:
+    database = tmp_path / "paused-management.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO strategy_management_batches "
+            "(id, status, reason_code, execution_mode) "
+            "VALUES (1, 'recovery_required', 'operator_review_required', 'live')"
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "inactive")
+
+
+def test_paused_management_with_unknown_attempted_child_is_unknown(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "management-child-unknown.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO strategy_management_batches "
+            "(id, status, reason_code, execution_mode) "
+            "VALUES (1, 'recovery_required', 'operator_review_required', 'live')"
+        )
+        connection.execute(
+            "INSERT INTO strategy_management_components "
+            "(id, management_batch_id, status, request_json) "
+            "VALUES (1, 1, 'submit_unknown', '{}')"
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "unknown_outcome")
+
+
+def test_closed_parent_protection_recovery_is_inactive(tmp_path: Path) -> None:
+    database = tmp_path / "closed-protection.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO execution_bindings "
+            "(id, chat_id, message_id, symbol, side, status) "
+            "VALUES (1, 10, 20, 'BTC', 'long', 'closed')"
+        )
+        connection.execute(
+            "INSERT INTO execution_order_legs "
+            "(id, execution_binding_id, purpose, status) "
+            "VALUES (1, 1, 'entry', 'closed')"
+        )
+        connection.execute(
+            "INSERT INTO trigger_protection_intents "
+            "(id, execution_binding_id, execution_order_leg_id, recovery_state) "
+            "VALUES (1, 1, 1, 'recovery_required')"
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "inactive")
+
+
+def _insert_partial_submission(
+    connection: sqlite3.Connection,
+    *,
+    second_leg_status: str,
+) -> None:
+    connection.execute(
+        "INSERT INTO trade_signals "
+        "(id, chat_id, message_id, symbol, side, status) "
+        "VALUES (1, 10, 20, 'BTC', 'long', 'partial_submission_failed')"
+    )
+    connection.execute(
+        "INSERT INTO execution_bindings "
+        "(id, chat_id, message_id, symbol, side, status) "
+        "VALUES (1, 10, 20, 'BTC', 'long', 'active')"
+    )
+    connection.executemany(
+        "INSERT INTO execution_order_legs "
+        "(id, execution_binding_id, purpose, status, order_id) "
+        "VALUES (?, 1, 'entry', ?, ?)",
+        [
+            (1, "active", "order-a"),
+            (2, second_leg_status, "order-b" if second_leg_status != "submit_unknown" else None),
+        ],
+    )
+
+
+def test_verified_partial_submission_projection_is_inactive(tmp_path: Path) -> None:
+    database = tmp_path / "verified-partial.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        _insert_partial_submission(connection, second_leg_status="closed")
+
+    _assert_only_category(collect_deployment_evidence(database), "inactive")
+
+
+def test_incomplete_partial_submission_projection_is_unknown(tmp_path: Path) -> None:
+    database = tmp_path / "unknown-partial.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        _insert_partial_submission(connection, second_leg_status="submit_unknown")
+
+    _assert_only_category(collect_deployment_evidence(database), "unknown_outcome")
+
+
+@pytest.mark.parametrize("status", ["submitting", "cancel_submitting"])
+def test_durable_position_mutation_claim_is_active_write(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    database = tmp_path / f"active-{status}.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO position_mutation_intents "
+            "(id, status, submitted_at) VALUES (1, ?, NULL)",
+            (status,),
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "active_write")
+
+
+def test_pending_entry_is_queued_work(tmp_path: Path) -> None:
+    database = tmp_path / "pending-entry.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO trade_signals "
+            "(id, chat_id, message_id, symbol, side, status) "
+            "VALUES (1, 10, 20, 'BTC', 'long', 'pending')"
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "queued_work")
+
+
+def test_ready_management_is_queued_work(tmp_path: Path) -> None:
+    database = tmp_path / "ready-management.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO strategy_management_batches "
+            "(id, status, execution_mode) VALUES (1, 'ready', 'live')"
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "queued_work")
+
+
+def test_terminal_and_permanently_paused_work_are_inactive(tmp_path: Path) -> None:
+    database = tmp_path / "terminal-paused.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO trade_signals "
+            "(id, chat_id, message_id, symbol, side, status) "
+            "VALUES (1, 10, 20, 'BTC', 'long', 'failed')"
+        )
+        connection.execute(
+            "INSERT INTO strategy_management_batches "
+            "(id, status, reason_code, execution_mode) "
+            "VALUES (1, 'recovery_required', 'operator_review_required', 'disabled')"
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "inactive")
+
+
+def test_timestamp_only_change_does_not_change_evidence_fingerprint(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "fingerprint.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO trade_signals "
+            "(id, chat_id, message_id, symbol, side, status, updated_at) "
+            "VALUES (1, 10, 20, 'BTC', 'long', 'pending', '2026-01-01')"
+        )
+    original = collect_deployment_evidence(database)
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE trade_signals SET updated_at = '2030-12-31' WHERE id = 1"
+        )
+    timestamp_only = collect_deployment_evidence(database)
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE trade_signals SET status = 'processing' WHERE id = 1"
+        )
+    claimed = collect_deployment_evidence(database)
+
+    assert timestamp_only.evidence_fingerprint == original.evidence_fingerprint
+    assert claimed.evidence_fingerprint != original.evidence_fingerprint
+    _assert_only_category(claimed, "active_write")

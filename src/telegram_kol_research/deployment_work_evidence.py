@@ -53,7 +53,7 @@ class EvidenceTally:
 class EvidenceAdapter:
     name: str
     required_tables: tuple[str, ...]
-    required_columns: tuple[str, ...]
+    required_columns: tuple[tuple[str, tuple[str, ...]], ...]
     collect: Callable[[sqlite3.Connection], EvidenceTally]
 
 
@@ -139,6 +139,7 @@ def _collect_adapter(
     connection: sqlite3.Connection,
     adapter: EvidenceAdapter,
 ) -> EvidenceTally:
+    required_columns = dict(adapter.required_columns)
     for table in adapter.required_tables:
         table_row = connection.execute(
             "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?",
@@ -149,7 +150,7 @@ def _collect_adapter(
         present_columns = {
             str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")
         }
-        if not set(adapter.required_columns) <= present_columns:
+        if not set(required_columns.get(table, ())) <= present_columns:
             return EvidenceTally(invalid_evidence=1)
     return adapter.collect(connection)
 
@@ -306,17 +307,331 @@ def _collect_source_deletion_exits(connection: sqlite3.Connection) -> EvidenceTa
     return EvidenceTally(**totals)
 
 
+def _collect_execution_bindings(connection: sqlite3.Connection) -> EvidenceTally:
+    rows, bounded = _bounded_rows(
+        connection,
+        "SELECT b.id, b.status, l.status "
+        "FROM execution_bindings AS b "
+        "LEFT JOIN execution_order_legs AS l ON l.execution_binding_id = b.id "
+        "ORDER BY b.id, l.id",
+    )
+    if not bounded:
+        return EvidenceTally(invalid_evidence=1)
+    grouped: dict[int, tuple[object, list[object]]] = {}
+    for binding_id, binding_status, leg_status in rows:
+        if not isinstance(binding_id, int) or isinstance(binding_id, bool):
+            return EvidenceTally(invalid_evidence=1)
+        current = grouped.setdefault(binding_id, (binding_status, []))
+        if current[0] != binding_status:
+            return EvidenceTally(invalid_evidence=1)
+        if leg_status is not None:
+            current[1].append(leg_status)
+
+    totals = {field.name: 0 for field in fields(EvidenceTally)}
+    known_binding = {
+        "open",
+        "active",
+        "unknown",
+        "closed",
+        "cancelled",
+        "completed",
+        "failed",
+        "resolved",
+        "superseded",
+    }
+    active_legs = {"submitting", "cancel_submitting"}
+    unknown_legs = {"submit_unknown", "unknown_exchange_outcome"}
+    known_legs = active_legs | unknown_legs | {
+        "unknown",
+        "pending",
+        "open",
+        "submitted",
+        "active",
+        "filled",
+        "partially_filled",
+        "closed",
+        "cancelled",
+        "failed",
+        "expired",
+        "invalidated",
+    }
+    for binding_status, leg_statuses in grouped.values():
+        if not isinstance(binding_status, str) or binding_status not in known_binding:
+            totals["invalid_evidence"] += 1
+        elif any(not isinstance(status, str) or status not in known_legs for status in leg_statuses):
+            totals["invalid_evidence"] += 1
+        elif any(status in active_legs for status in leg_statuses):
+            totals["active_write"] += 1
+        elif any(status in unknown_legs for status in leg_statuses):
+            totals["unknown_outcome"] += 1
+        else:
+            totals["inactive"] += 1
+    return EvidenceTally(**totals)
+
+
+def _collect_instruction_contracts(connection: sqlite3.Connection) -> EvidenceTally:
+    rows, bounded = _bounded_rows(
+        connection,
+        "SELECT i.id, i.status, c.id, c.state, c.terminal_kind, "
+        "c.completion_scope FROM message_instruction_items AS i "
+        "LEFT JOIN instruction_execution_contracts AS c "
+        "ON c.message_instruction_item_id = i.id ORDER BY i.id, c.id",
+    )
+    if not bounded:
+        return EvidenceTally(invalid_evidence=1)
+    grouped: dict[int, tuple[object, list[tuple[object, object, object, object]]]] = {}
+    for item_id, item_status, contract_id, state, terminal_kind, scope in rows:
+        if not isinstance(item_id, int) or isinstance(item_id, bool):
+            return EvidenceTally(invalid_evidence=1)
+        current = grouped.setdefault(item_id, (item_status, []))
+        if current[0] != item_status:
+            return EvidenceTally(invalid_evidence=1)
+        if contract_id is not None:
+            current[1].append((contract_id, state, terminal_kind, scope))
+
+    orphan_contracts = connection.execute(
+        "SELECT COUNT(*) FROM instruction_execution_contracts AS c "
+        "LEFT JOIN message_instruction_items AS i "
+        "ON i.id = c.message_instruction_item_id WHERE i.id IS NULL"
+    ).fetchone()
+    totals = {field.name: 0 for field in fields(EvidenceTally)}
+    if orphan_contracts is None or not isinstance(orphan_contracts[0], int):
+        return EvidenceTally(invalid_evidence=1)
+    totals["invalid_evidence"] += min(orphan_contracts[0], MAX_EVIDENCE_COUNT)
+
+    item_statuses = {
+        "pending",
+        "executing",
+        "submitted",
+        "succeeded",
+        "failed",
+        "unknown",
+    }
+    for item_status, contracts in grouped.values():
+        if not isinstance(item_status, str) or item_status not in item_statuses:
+            totals["invalid_evidence"] += 1
+            continue
+        if len(contracts) > 1:
+            totals["invalid_evidence"] += 1
+            continue
+        if not contracts:
+            if item_status in {"pending", "executing"}:
+                totals["queued_work"] += 1
+            else:
+                totals["inactive"] += 1
+            continue
+        _contract_id, state, terminal_kind, scope = contracts[0]
+        if not isinstance(state, str):
+            totals["invalid_evidence"] += 1
+        elif state == "submitting":
+            totals["active_write"] += 1
+        elif state == "submit_unknown":
+            totals["unknown_outcome"] += 1
+        elif state in {"pending", "deferred"}:
+            totals["queued_work"] += 1
+        elif state == "verified":
+            if terminal_kind is None or scope not in {"full", "partial"}:
+                totals["invalid_evidence"] += 1
+            else:
+                totals["inactive"] += 1
+        elif state in {"failed", "expired"}:
+            totals["inactive"] += 1
+        else:
+            totals["invalid_evidence"] += 1
+    return EvidenceTally(**totals)
+
+
+def _collect_management_batches(connection: sqlite3.Connection) -> EvidenceTally:
+    rows, bounded = _bounded_rows(
+        connection,
+        "SELECT b.id, b.status, b.reason_code, b.execution_mode, c.status "
+        "FROM strategy_management_batches AS b "
+        "LEFT JOIN strategy_management_components AS c "
+        "ON c.management_batch_id = b.id ORDER BY b.id, c.id",
+    )
+    if not bounded:
+        return EvidenceTally(invalid_evidence=1)
+    grouped: dict[int, tuple[object, object, object, list[object]]] = {}
+    for batch_id, status, reason, mode, component_status in rows:
+        if not isinstance(batch_id, int) or isinstance(batch_id, bool):
+            return EvidenceTally(invalid_evidence=1)
+        current = grouped.setdefault(batch_id, (status, reason, mode, []))
+        if current[:3] != (status, reason, mode):
+            return EvidenceTally(invalid_evidence=1)
+        if component_status is not None:
+            current[3].append(component_status)
+
+    totals = {field.name: 0 for field in fields(EvidenceTally)}
+    active_children = {"submitting", "cancel_submitting"}
+    unknown_children = {"submit_unknown", "unknown_exchange_outcome"}
+    known_children = active_children | unknown_children | {
+        "pending",
+        "ready",
+        "reserved",
+        "submitted",
+        "succeeded",
+        "failed",
+        "blocked",
+        "resolved",
+        "cancelled",
+    }
+    temporary_visibility = {
+        "protection_missing_cancellable_order_id",
+        "target_protection_snapshot_incomplete",
+    }
+    for status, reason, mode, component_statuses in grouped.values():
+        if (
+            not isinstance(status, str)
+            or not isinstance(mode, str)
+            or any(
+                not isinstance(child, str) or child not in known_children
+                for child in component_statuses
+            )
+        ):
+            totals["invalid_evidence"] += 1
+        elif any(child in active_children for child in component_statuses):
+            totals["active_write"] += 1
+        elif any(child in unknown_children for child in component_statuses):
+            totals["unknown_outcome"] += 1
+        elif status == "executing":
+            totals["active_write"] += 1
+        elif status in {"submitted", "submit_unknown"}:
+            totals["unknown_outcome"] += 1
+        elif status in {"ready", "protection_ready", "reserved", "reconciling"}:
+            totals["queued_work"] += 1
+        elif status == "recovery_required":
+            if reason == "deferred_entry_cancel_race_detected":
+                totals["queued_work"] += 1
+            else:
+                totals["inactive"] += 1
+        elif status == "blocked" and reason in temporary_visibility:
+            totals["queued_work"] += 1
+        elif status in {"succeeded", "blocked", "resolved", "failed"}:
+            totals["inactive"] += 1
+        else:
+            totals["invalid_evidence"] += 1
+    return EvidenceTally(**totals)
+
+
+def _collect_trigger_protection(connection: sqlite3.Connection) -> EvidenceTally:
+    rows, bounded = _bounded_rows(
+        connection,
+        "SELECT i.recovery_state, b.status, l.status "
+        "FROM trigger_protection_intents AS i "
+        "LEFT JOIN execution_bindings AS b ON b.id = i.execution_binding_id "
+        "LEFT JOIN execution_order_legs AS l ON l.id = i.execution_order_leg_id "
+        "ORDER BY i.id",
+    )
+    if not bounded:
+        return EvidenceTally(invalid_evidence=1)
+    totals = {field.name: 0 for field in fields(EvidenceTally)}
+    terminal_bindings = {"closed", "cancelled", "completed", "failed", "resolved", "superseded"}
+    terminal_legs = {"closed", "cancelled", "failed", "expired", "invalidated"}
+    for recovery_state, binding_status, leg_status in rows:
+        if not all(isinstance(value, str) and value for value in (recovery_state, binding_status, leg_status)):
+            totals["invalid_evidence"] += 1
+        elif binding_status in terminal_bindings and leg_status in terminal_legs:
+            totals["inactive"] += 1
+        elif recovery_state in {"submitting", "cancel_submitting"}:
+            totals["active_write"] += 1
+        elif recovery_state in {"submit_unknown", "unknown_exchange_outcome"}:
+            totals["unknown_outcome"] += 1
+        elif recovery_state in {"pending", "retrying", "failed"}:
+            totals["queued_work"] += 1
+        elif recovery_state in {"recovery_required", "succeeded", "resolved", "adopted"}:
+            totals["inactive"] += 1
+        else:
+            totals["invalid_evidence"] += 1
+    return EvidenceTally(**totals)
+
+
+def _collect_position_mutations(connection: sqlite3.Connection) -> EvidenceTally:
+    rows, bounded = _bounded_rows(
+        connection,
+        "SELECT status FROM position_mutation_intents ORDER BY id",
+    )
+    if not bounded:
+        return EvidenceTally(invalid_evidence=1)
+    totals = {field.name: 0 for field in fields(EvidenceTally)}
+    for (status,) in rows:
+        if status in {"submitting", "cancel_submitting"}:
+            totals["active_write"] += 1
+        elif status in {"submitted", "recovery_required", "submit_unknown", "unknown_exchange_outcome"}:
+            totals["unknown_outcome"] += 1
+        elif status == "reserved":
+            totals["queued_work"] += 1
+        elif status in {"confirmed", "blocked", "rejected", "failed", "cancelled"}:
+            totals["inactive"] += 1
+        else:
+            totals["invalid_evidence"] += 1
+    return EvidenceTally(**totals)
+
+
+def _collect_trade_signals(connection: sqlite3.Connection) -> EvidenceTally:
+    rows, bounded = _bounded_rows(
+        connection,
+        "SELECT id, chat_id, message_id, symbol, side, status "
+        "FROM trade_signals ORDER BY id",
+    )
+    if not bounded:
+        return EvidenceTally(invalid_evidence=1)
+    totals = {field.name: 0 for field in fields(EvidenceTally)}
+    verified_leg_states = {
+        "active",
+        "filled",
+        "partially_filled",
+        "closed",
+        "cancelled",
+        "failed",
+        "expired",
+        "invalidated",
+    }
+    for _signal_id, chat_id, message_id, symbol, side, status in rows:
+        if not isinstance(status, str):
+            totals["invalid_evidence"] += 1
+        elif status == "pending":
+            totals["queued_work"] += 1
+        elif status in {"processing", "submitting", "cancel_submitting"}:
+            totals["active_write"] += 1
+        elif status in {"unknown_exchange_outcome", "submit_unknown"}:
+            totals["unknown_outcome"] += 1
+        elif status == "partial_submission_failed":
+            bindings = connection.execute(
+                "SELECT id FROM execution_bindings WHERE chat_id = ? AND message_id = ? "
+                "AND symbol = ? AND side = ? ORDER BY id LIMIT 2",
+                (chat_id, message_id, symbol, side),
+            ).fetchall()
+            if len(bindings) != 1:
+                totals["unknown_outcome"] += 1
+                continue
+            leg_rows = connection.execute(
+                "SELECT status FROM execution_order_legs "
+                "WHERE execution_binding_id = ? ORDER BY id LIMIT ?",
+                (bindings[0][0], MAX_EVIDENCE_ROWS + 1),
+            ).fetchall()
+            if leg_rows and len(leg_rows) <= MAX_EVIDENCE_ROWS and all(
+                isinstance(row[0], str) and row[0] in verified_leg_states
+                for row in leg_rows
+            ):
+                totals["inactive"] += 1
+            else:
+                totals["unknown_outcome"] += 1
+        elif status in {"submitted", "succeeded", "executed", "failed", "cancelled"}:
+            totals["inactive"] += 1
+        else:
+            totals["invalid_evidence"] += 1
+    return EvidenceTally(**totals)
+
+
 WORK_EVIDENCE_ADAPTERS = (
     EvidenceAdapter(
         name="position_backup_stop_orders",
         required_tables=("position_backup_stop_orders",),
         required_columns=(
-            "id",
-            "venue",
-            "pos_id",
-            "order_id",
-            "client_order_id",
-            "status",
+            (
+                "position_backup_stop_orders",
+                ("id", "venue", "pos_id", "order_id", "client_order_id", "status"),
+            ),
         ),
         collect=_collect_backup_stop_orders,
     ),
@@ -324,17 +639,108 @@ WORK_EVIDENCE_ADAPTERS = (
         name="source_message_deletion_exits",
         required_tables=("source_message_deletion_exits",),
         required_columns=(
-            "id",
-            "source_event_id",
-            "raw_message_id",
-            "target_lifecycle_id",
-            "execution_binding_id",
-            "strategy_instance_id",
-            "target_fingerprint",
-            "state",
-            "claim_token",
-            "claimed_at",
+            (
+                "source_message_deletion_exits",
+                (
+                    "id",
+                    "source_event_id",
+                    "raw_message_id",
+                    "target_lifecycle_id",
+                    "execution_binding_id",
+                    "strategy_instance_id",
+                    "target_fingerprint",
+                    "state",
+                    "claim_token",
+                    "claimed_at",
+                ),
+            ),
         ),
         collect=_collect_source_deletion_exits,
+    ),
+    EvidenceAdapter(
+        name="execution_bindings",
+        required_tables=("execution_bindings", "execution_order_legs"),
+        required_columns=(
+            ("execution_bindings", ("id", "status")),
+            ("execution_order_legs", ("id", "execution_binding_id", "status")),
+        ),
+        collect=_collect_execution_bindings,
+    ),
+    EvidenceAdapter(
+        name="instruction_execution_contracts",
+        required_tables=("message_instruction_items", "instruction_execution_contracts"),
+        required_columns=(
+            ("message_instruction_items", ("id", "status")),
+            (
+                "instruction_execution_contracts",
+                (
+                    "id",
+                    "message_instruction_item_id",
+                    "state",
+                    "terminal_kind",
+                    "completion_scope",
+                ),
+            ),
+        ),
+        collect=_collect_instruction_contracts,
+    ),
+    EvidenceAdapter(
+        name="strategy_management_batches",
+        required_tables=("strategy_management_batches", "strategy_management_components"),
+        required_columns=(
+            (
+                "strategy_management_batches",
+                ("id", "status", "reason_code", "execution_mode"),
+            ),
+            (
+                "strategy_management_components",
+                ("id", "management_batch_id", "status"),
+            ),
+        ),
+        collect=_collect_management_batches,
+    ),
+    EvidenceAdapter(
+        name="trigger_protection_intents",
+        required_tables=(
+            "trigger_protection_intents",
+            "execution_bindings",
+            "execution_order_legs",
+        ),
+        required_columns=(
+            (
+                "trigger_protection_intents",
+                (
+                    "id",
+                    "execution_binding_id",
+                    "execution_order_leg_id",
+                    "recovery_state",
+                ),
+            ),
+            ("execution_bindings", ("id", "status")),
+            ("execution_order_legs", ("id", "status")),
+        ),
+        collect=_collect_trigger_protection,
+    ),
+    EvidenceAdapter(
+        name="position_mutation_intents",
+        required_tables=("position_mutation_intents",),
+        required_columns=(("position_mutation_intents", ("id", "status")),),
+        collect=_collect_position_mutations,
+    ),
+    EvidenceAdapter(
+        name="trade_signals",
+        required_tables=("trade_signals", "execution_bindings", "execution_order_legs"),
+        required_columns=(
+            (
+                "trade_signals",
+                ("id", "chat_id", "message_id", "symbol", "side", "status"),
+            ),
+            (
+                "execution_bindings",
+                ("id", "chat_id", "message_id", "symbol", "side", "status"),
+            ),
+            ("execution_order_legs", ("id", "execution_binding_id", "status")),
+        ),
+        collect=_collect_trade_signals,
     ),
 )
