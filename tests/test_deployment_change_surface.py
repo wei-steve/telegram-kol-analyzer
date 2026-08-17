@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import subprocess
 from pathlib import Path
 import re
@@ -9,6 +10,7 @@ import pytest
 from telegram_kol_research.deployment_change_surface import (
     ChangeSurfaceError,
     EXECUTION_WRITER_PATHS,
+    MUTATION_AUTHORITY_PATHS,
     bind_phase_restart_surface_counts,
     classify_change_surface,
 )
@@ -205,7 +207,7 @@ def test_each_reviewed_direct_exchange_writer_upgrades_change_class(
 
     assert facts.effective_change_class == "execution_writer"
     assert facts.underdeclared is True
-    assert facts.registry_version == 2
+    assert facts.registry_version == 3
 
 
 def test_trade_signal_retry_and_state_transitions_are_writer_sensitive(tmp_path):
@@ -229,6 +231,64 @@ def test_trade_signal_retry_and_state_transitions_are_writer_sensitive(tmp_path)
 
     assert facts.effective_change_class == "execution_writer"
     assert facts.underdeclared is True
+
+
+def test_position_authority_lock_change_is_writer_sensitive(tmp_path):
+    repository, base = _repository(tmp_path)
+    candidate = _commit(
+        repository,
+        "src/telegram_kol_research/position_authority_lock.py",
+        "removed serialization\n",
+        "authority lock drift",
+    )
+
+    facts = classify_change_surface(
+        repository=repository,
+        production_commit=base,
+        candidate_commit=candidate,
+        requested_change_class="code",
+        work_classification_counts={
+            "historical_residue": {"management_batches": 1}
+        },
+    )
+
+    assert facts.effective_change_class == "execution_writer"
+    assert facts.underdeclared is True
+
+
+def test_core_mutation_authority_primitives_are_writer_sensitive():
+    assert MUTATION_AUTHORITY_PATHS == {
+        "src/telegram_kol_research/position_attribution.py",
+        "src/telegram_kol_research/position_authority_lock.py",
+        "src/telegram_kol_research/position_mutation_authority.py",
+        "src/telegram_kol_research/position_mutation_gateway.py",
+        "src/telegram_kol_research/protection_attribution.py",
+        "src/telegram_kol_research/protection_ledger.py",
+        "src/telegram_kol_research/recovery_live_submit_gate.py",
+        "src/telegram_kol_research/source_message_deletion.py",
+    }
+    assert MUTATION_AUTHORITY_PATHS <= EXECUTION_WRITER_PATHS
+
+
+def test_mutation_serializers_and_write_gates_are_registered():
+    repository = Path(__file__).resolve().parents[1]
+    authority_symbols = {
+        "position_authority_lock",
+        "serialized_position_authority_mutation",
+        "source_message_execution_authority",
+        "serialized_source_message_execution",
+    }
+    authority_modules = set()
+    for path in (repository / "src/telegram_kol_research").glob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        if any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and (node.name in authority_symbols or node.name.endswith("_write_gate"))
+            for node in ast.walk(tree)
+        ):
+            authority_modules.add(path.relative_to(repository).as_posix())
+
+    assert authority_modules <= EXECUTION_WRITER_PATHS
 
 
 def test_every_restart_handler_is_registered_as_writer_sensitive():

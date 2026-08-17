@@ -15,7 +15,7 @@ from .deployment_work_evidence import (
 )
 
 
-CHANGE_SURFACE_REGISTRY_VERSION = 2
+CHANGE_SURFACE_REGISTRY_VERSION = 3
 _CLASS_RANK = {
     "code": 0,
     "schema_compatible": 1,
@@ -40,6 +40,19 @@ SCHEMA_PATHS = frozenset(
     {
         "src/telegram_kol_research/db.py",
         "src/telegram_kol_research/models.py",
+    }
+)
+
+MUTATION_AUTHORITY_PATHS = frozenset(
+    {
+        "src/telegram_kol_research/position_attribution.py",
+        "src/telegram_kol_research/position_authority_lock.py",
+        "src/telegram_kol_research/position_mutation_authority.py",
+        "src/telegram_kol_research/position_mutation_gateway.py",
+        "src/telegram_kol_research/protection_attribution.py",
+        "src/telegram_kol_research/protection_ledger.py",
+        "src/telegram_kol_research/recovery_live_submit_gate.py",
+        "src/telegram_kol_research/source_message_deletion.py",
     }
 )
 
@@ -84,7 +97,7 @@ EXECUTION_WRITER_PATHS = frozenset(
         "src/telegram_kol_research/trigger_protection_rescue_worker.py",
         "src/telegram_kol_research/web_app.py",
     }
-)
+) | MUTATION_AUTHORITY_PATHS
 
 LIVE_PROMOTION_PATHS = frozenset(
     {
