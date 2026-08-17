@@ -59,18 +59,24 @@ def test_deployment_docs_keep_both_workstation_helpers_visible():
     assert "./scripts/server_git_update.sh" in handoff
 
 
-def test_server_updater_runs_preflight_before_checkout_install_or_restart():
+def test_server_updater_runs_two_bound_phases_before_mutation():
     script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
 
-    preflight = script.index("deployment-preflight")
-    verify = script.index("verify-deployment-preflight")
+    candidate_extract = script.index("worktree add --detach")
+    preliminary = script.index('run_preflight_collect "preliminary"')
+    stop = script.rindex("\nstop_writer_service\n")
+    final_backup = script.index("create_schema_evidence final")
+    final_collect = script.index('run_preflight_collect "final"')
+    final_verify = script.index('run_preflight_verify "final"')
     checkout = script.index('git merge --ff-only "$EXPECTED_COMMIT"')
     install = script.index("python -m pip install -e .")
-    stop = script.rindex("systemctl stop telegram-kol.service")
+    updater_install = script.index('deploy/telegram-kol-update "$updater_candidate"')
     start = script.rindex("systemctl start telegram-kol.service")
-    assert preflight < stop < verify < checkout < install < start
-    assert script.count("run_preflight") >= 3
+    assert candidate_extract < preliminary < stop
+    assert stop < final_backup < final_collect
+    assert final_collect < final_verify < checkout < install < updater_install < start
     assert "PYTHONPATH=$stage_dir/src" in script
+    assert "telegram_kol_research.deployment_preflight_cli" in script
     assert "worktree add --detach" in script
     assert 'update-ref "refs/heads/$BRANCH" "$previous_commit" "$EXPECTED_COMMIT"' in script
     assert script.index("checkout_mutated=1") < script.index("python -m pip install -e .")
@@ -83,14 +89,23 @@ def test_server_updater_runs_preflight_before_checkout_install_or_restart():
     assert "BLOCK" in script
 
 
-def test_bootstrap_installs_only_sha_verified_helper_from_expected_commit():
+def test_bootstrap_executes_sha_verified_temporary_without_installing_it():
     script = (ROOT / "scripts/bootstrap_server_updater.sh").read_text(encoding="utf-8")
 
     assert "git -C \"$app_dir\" show" in script
     assert "sha256sum" in script
     assert "UPDATER_SHA256" in script
     assert "__EMPTY__" in script
-    assert script.index("sha256sum") < script.index("/usr/local/bin/telegram-kol-update")
+    execute = script.rindex('"$temporary"')
+    assert script.index("sha256sum") < execute
+    assert "/usr/local/bin/telegram-kol-update" not in script[:execute]
+
+
+def test_powershell_bootstrap_also_executes_temporary_without_installing_it():
+    script = (ROOT / "scripts/server_git_update.ps1").read_text(encoding="utf-8")
+
+    execute = script.rindex('"$temporary"')
+    assert "/usr/local/bin/telegram-kol-update" not in script[:execute]
 
 
 def test_server_updater_refuses_unpinned_or_mismatched_remote_commit():

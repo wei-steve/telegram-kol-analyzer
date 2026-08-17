@@ -28,7 +28,7 @@ previous_arg="${PREVIOUS_LIVE_SNAPSHOT_PATH:-__EMPTY__}"
 authorization_arg="${LIVE_PROMOTION_AUTHORIZATION:-__EMPTY__}"
 
 # The server extracts the helper from the exact reviewed commit and verifies it
-# against the reviewed workstation copy before installing or executing it.
+# against the reviewed workstation copy before executing the temporary file.
 exec ssh -i "$KEY_PATH" "$SERVER" bash -s -- \
   "$EXPECTED_COMMIT" "$BRANCH" "$UPDATER_SHA256" "$CHANGE_CLASS" \
   "$shadow_arg" "$previous_arg" "$authorization_arg" <<'REMOTE'
@@ -45,10 +45,10 @@ git -C "$app_dir" fetch origin "$branch"
 [ "$(git -C "$app_dir" rev-parse FETCH_HEAD)" = "$expected_commit" ]
 git -C "$app_dir" show "$expected_commit:deploy/telegram-kol-update" >"$temporary"
 [ "$(sha256sum "$temporary" | awk '{print $1}')" = "$expected_sha" ]
-install -o root -g root -m 0755 "$temporary" /usr/local/bin/telegram-kol-update
+chmod 0755 "$temporary"
 EXPECTED_COMMIT="$expected_commit" CHANGE_CLASS="$change_class" BRANCH="$branch" \
 REVIEWED_SHADOW_EVIDENCE_PATH="$shadow_path" \
 PREVIOUS_LIVE_SNAPSHOT_PATH="$previous_snapshot" \
 LIVE_PROMOTION_AUTHORIZATION="$authorization" \
-  /usr/local/bin/telegram-kol-update
+  "$temporary"
 REMOTE

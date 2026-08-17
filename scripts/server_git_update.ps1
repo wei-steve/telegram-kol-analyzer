@@ -35,12 +35,12 @@ git -C "$app_dir" fetch origin "$branch"
 [ "$(git -C "$app_dir" rev-parse FETCH_HEAD)" = "$expected_commit" ]
 git -C "$app_dir" show "$expected_commit:deploy/telegram-kol-update" >"$temporary"
 [ "$(sha256sum "$temporary" | awk '{print $1}')" = "$expected_sha" ]
-install -o root -g root -m 0755 "$temporary" /usr/local/bin/telegram-kol-update
+chmod 0755 "$temporary"
 EXPECTED_COMMIT="$expected_commit" CHANGE_CLASS="$change_class" BRANCH="$branch" \
 REVIEWED_SHADOW_EVIDENCE_PATH="$shadow_path" \
 PREVIOUS_LIVE_SNAPSHOT_PATH="$previous_snapshot" \
 LIVE_PROMOTION_AUTHORIZATION="$authorization" \
-  /usr/local/bin/telegram-kol-update
+  "$temporary"
 '@
 $encodedBootstrap = [Convert]::ToBase64String(
     [Text.Encoding]::UTF8.GetBytes($bootstrapScript)
