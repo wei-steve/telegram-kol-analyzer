@@ -19,6 +19,13 @@ import sqlite3
 import tempfile
 from typing import Any, Mapping
 
+from .deployment_work_evidence import (
+    DeploymentWorkEvidenceError,
+    WORK_EVIDENCE_ADAPTERS,
+    classify_deployment_work,
+    collect_work_evidence,
+)
+
 
 DEPLOYMENT_CHANGE_CLASSES = frozenset(
     {"code", "schema_compatible", "execution_writer", "live_promotion"}
@@ -46,7 +53,6 @@ _ARTIFACT_KEYS = frozenset(
 _MAX_ARTIFACT_BYTES = 32_768
 _MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
 _DEFAULT_TTL = timedelta(minutes=5)
-_DEFAULT_ACTIVE_WINDOW = timedelta(minutes=10)
 _DEFAULT_SNAPSHOT_MAX_AGE = timedelta(minutes=5)
 _DEFAULT_SHADOW_EVIDENCE_MAX_AGE = timedelta(days=7)
 _MIN_SHADOW_OBSERVATION = timedelta(minutes=30)
@@ -88,9 +94,8 @@ class DeploymentPreflightInputError(ValueError):
 @dataclass(frozen=True, slots=True)
 class DeploymentPreflightFacts:
     database_watermark: Mapping[str, int]
-    fresh_active_work: Mapping[str, int]
-    historical_active_residue_count: int
-    historical_unknown_outcome_count: int
+    work_classification_counts: Mapping[str, Mapping[str, int]]
+    work_evidence_fingerprint: str
     protected_open_position_count: int
     exchange_snapshot_available: bool
     exchange_snapshot_complete: bool
@@ -113,9 +118,8 @@ class DeploymentPreflightFacts:
                 "trade_signal_max_id": 0,
                 "execution_event_max_id": 0,
             },
-            fresh_active_work={},
-            historical_active_residue_count=0,
-            historical_unknown_outcome_count=0,
+            work_classification_counts={},
+            work_evidence_fingerprint=sha256(b"[]").hexdigest(),
             protected_open_position_count=0,
             exchange_snapshot_available=False,
             exchange_snapshot_complete=False,
@@ -136,16 +140,19 @@ class DeploymentPreflightFacts:
                 str(key): _bounded_count(value)
                 for key, value in sorted(self.database_watermark.items())
             },
-            "fresh_active_work": {
-                str(key): _bounded_count(value)
-                for key, value in sorted(self.fresh_active_work.items())
-                if _bounded_count(value) > 0
+            "work_classification_counts": {
+                str(classification): {
+                    str(source): _bounded_count(value)
+                    for source, value in sorted(sources.items())
+                    if _bounded_count(value) > 0
+                }
+                for classification, sources in sorted(
+                    self.work_classification_counts.items()
+                )
+                if sources
             },
-            "historical_active_residue_count": _bounded_count(
-                self.historical_active_residue_count
-            ),
-            "historical_unknown_outcome_count": _bounded_count(
-                self.historical_unknown_outcome_count
+            "work_evidence_fingerprint": _validate_sha256_fingerprint(
+                self.work_evidence_fingerprint
             ),
             "protected_open_position_count": _bounded_count(
                 self.protected_open_position_count
@@ -172,226 +179,6 @@ class DeploymentPreflightFacts:
         }
 
 
-@dataclass(frozen=True, slots=True)
-class _TableWorkSpec:
-    output_name: str
-    table: str
-    state_column: str
-    active_states: tuple[str, ...]
-    unknown_states: tuple[str, ...] = ()
-    time_column: str = "updated_at"
-
-
-_WORK_SPECS = (
-    _TableWorkSpec(
-        "execution_order_legs",
-        "execution_order_legs",
-        "status",
-        (
-            "submitting",
-            "cancel_submitting",
-            "submit_unknown",
-            "unknown_exchange_outcome",
-            "unknown",
-        ),
-        ("submit_unknown", "unknown_exchange_outcome", "unknown"),
-    ),
-    _TableWorkSpec(
-        "instruction_items",
-        "message_instruction_items",
-        "status",
-        ("pending", "executing", "unknown"),
-        ("unknown",),
-    ),
-    _TableWorkSpec(
-        "trade_signals",
-        "trade_signals",
-        "status",
-        (
-            "pending",
-            "processing",
-            "unknown_exchange_outcome",
-            "partial_submission_failed",
-        ),
-        ("unknown_exchange_outcome", "partial_submission_failed"),
-    ),
-    _TableWorkSpec(
-        "execution_contracts",
-        "instruction_execution_contracts",
-        "state",
-        ("pending", "deferred", "submitting", "submit_unknown"),
-        ("submit_unknown",),
-    ),
-    _TableWorkSpec(
-        "strategy_revisions",
-        "strategy_revision_batches",
-        "status",
-        (
-            "planned",
-            "cancelling_old_entries",
-            "old_entries_terminal",
-            "submitting_replacements",
-            "rebuilding",
-            "reconciling",
-            "recovery_required",
-        ),
-        ("recovery_required",),
-    ),
-    _TableWorkSpec(
-        "management_batches",
-        "strategy_management_batches",
-        "status",
-        (
-            "ready",
-            "pending",
-            "reserved",
-            "submitted",
-            "submit_unknown",
-            "executing",
-            "reconciling",
-            "protection_ready",
-            "partial_failed",
-            "recovery_required",
-        ),
-        ("submit_unknown", "partial_failed", "recovery_required"),
-    ),
-    _TableWorkSpec(
-        "management_legs",
-        "strategy_management_legs",
-        "status",
-        (
-            "planned",
-            "reserved",
-            "submitted",
-            "submit_unknown",
-            "recovery_required",
-        ),
-        ("submit_unknown", "recovery_required"),
-    ),
-    _TableWorkSpec(
-        "management_components",
-        "strategy_management_components",
-        "status",
-        (
-            "pending",
-            "preflighting",
-            "submitting",
-            "awaiting_exchange",
-            "definitely_rejected",
-            "recovery_required",
-        ),
-        ("recovery_required",),
-    ),
-    _TableWorkSpec(
-        "position_mutations",
-        "position_mutation_intents",
-        "status",
-        (
-            "reserved",
-            "submitting",
-            "submitted",
-            "submit_unknown",
-            "recovery_required",
-        ),
-        ("submit_unknown", "recovery_required"),
-    ),
-    _TableWorkSpec(
-        "position_closes",
-        "bound_position_close_reservations",
-        "status",
-        (
-            "reserved",
-            "submitted",
-            "submit_unknown",
-            "unknown_exchange_outcome",
-            "recovery_required",
-        ),
-        ("submit_unknown", "unknown_exchange_outcome", "recovery_required"),
-    ),
-    _TableWorkSpec(
-        "backup_stop_orders",
-        "position_backup_stop_orders",
-        "status",
-        ("submitting", "pending_readback", "unknown_exchange_outcome"),
-        ("pending_readback", "unknown_exchange_outcome"),
-    ),
-    _TableWorkSpec(
-        "take_profit_orders",
-        "position_take_profit_orders",
-        "status",
-        ("cancel_requested",),
-        ("cancel_requested",),
-    ),
-    _TableWorkSpec(
-        "protection_legs",
-        "position_protection_legs",
-        "status",
-        (
-            "planned",
-            "waiting_fill",
-            "submitting",
-            "protection_recovery_pending",
-        ),
-        ("protection_recovery_pending",),
-    ),
-    _TableWorkSpec(
-        "protection_intents",
-        "trigger_protection_intents",
-        "recovery_state",
-        ("pending", "submitting", "retrying"),
-        ("submitting", "retrying"),
-    ),
-    _TableWorkSpec(
-        "protection_rescues",
-        "trigger_protection_stop_rescues",
-        "status",
-        ("ready", "reserved", "submitted", "submit_unknown", "recovery_required"),
-        ("submit_unknown", "recovery_required"),
-    ),
-    _TableWorkSpec(
-        "trigger_take_profit_convergences",
-        "trigger_take_profit_convergences",
-        "status",
-        ("ready", "reserved", "submitted", "submit_unknown"),
-        ("submit_unknown",),
-    ),
-    _TableWorkSpec(
-        "break_even_convergences",
-        "strategy_break_even_convergences",
-        "status",
-        (
-            "planned",
-            "claimed",
-            "preflight_verified",
-            "deciding_by_market",
-            "executing_market_decisions",
-            "recovery_required",
-        ),
-        ("recovery_required",),
-    ),
-    _TableWorkSpec(
-        "break_even_convergence_legs",
-        "strategy_break_even_convergence_legs",
-        "status",
-        ("decision_reserved", "submit_unknown", "recovery_required"),
-        ("submit_unknown", "recovery_required"),
-    ),
-    _TableWorkSpec(
-        "source_deletions",
-        "source_message_deletion_exits",
-        "state",
-        (
-            "pending",
-            "cancelling_entries",
-            "closing_positions",
-            "reconciling",
-            "recovery_required",
-        ),
-        ("recovery_required",),
-    ),
-)
-
-
 def build_deployment_preflight_artifact(
     *,
     expected_commit: str,
@@ -411,12 +198,15 @@ def build_deployment_preflight_artifact(
     fact_json = facts.to_json()
     blocking: set[str] = set()
     warnings: set[str] = set()
-    if fact_json["fresh_active_work"]:
-        blocking.add("fresh_active_exchange_work")
-    if int(fact_json["historical_active_residue_count"]) > 0:
-        warnings.add("historical_active_residue_present")
-    if int(fact_json["historical_unknown_outcome_count"]) > 0:
-        warnings.add("historical_unknown_outcomes_present")
+    try:
+        work_decision = classify_deployment_work(
+            counts=facts.work_classification_counts,
+            change_class=normalized_class,
+        )
+    except DeploymentWorkEvidenceError as exc:
+        raise DeploymentPreflightInputError(str(exc)) from exc
+    blocking.update(work_decision.blocking_reason_codes)
+    warnings.update(work_decision.warning_reason_codes)
     if int(fact_json["protected_open_position_count"]) > 0:
         warnings.add("protected_open_positions_present")
     if int(fact_json["unprotected_open_position_count"]) > 0:
@@ -586,27 +376,21 @@ def collect_deployment_preflight_facts(
     reviewed_shadow_evidence_path: str | Path | None = None,
     expected_commit: str | None = None,
     explicit_live_authorization: bool = False,
-    active_window: timedelta = _DEFAULT_ACTIVE_WINDOW,
 ) -> DeploymentPreflightFacts:
     """Collect bounded facts through query-only SQLite and a persisted snapshot."""
 
     normalized_class = _validate_change_class(change_class)
     checked_at = _aware_utc(now)
     shadow_claim = _read_shadow_evidence_claim(reviewed_shadow_evidence_path)
-    if active_window <= timedelta(0) or active_window > timedelta(hours=1):
-        raise DeploymentPreflightInputError("active_window_invalid")
-    cutoff = (checked_at - active_window).replace(tzinfo=None).isoformat(" ")
     database = Path(database_path).resolve()
     if not database.is_file() or database.stat().st_size <= 0:
         raise DeploymentPreflightInputError("database_schema_incomplete")
 
     expected_tables = set(_BASE_REQUIRED_TABLES) | {"position_protection_ledger"} | {
-        *(spec.table for spec in _WORK_SPECS),
+        *(adapter.table for adapter in WORK_EVIDENCE_ADAPTERS),
     }
     uri = database.as_uri() + "?mode=ro"
-    fresh: dict[str, int] = {}
-    historical_active = 0
-    historical_unknown = 0
+    work_summary = None
     stop_ownership: set[tuple[str, str, str, str]] = set()
     shadow_observation: Mapping[str, int] | None = None
     available: set[str] = set()
@@ -643,56 +427,11 @@ def collect_deployment_preflight_facts(
                     connection, "execution_events"
                 ),
             }
-            for spec in _WORK_SPECS:
-                if spec.table not in available:
-                    continue
-                columns = {
-                    str(row[1])
-                    for row in connection.execute(
-                        f"PRAGMA table_info({_safe_identifier(spec.table)})"
-                    ).fetchall()
-                }
-                if not {spec.state_column, spec.time_column}.issubset(columns):
-                    raise DeploymentPreflightInputError(
-                        "database_schema_incomplete"
-                    )
-                active_placeholders = ",".join("?" for _ in spec.active_states)
-                base = (
-                    f"FROM {_safe_identifier(spec.table)} "
-                    f"WHERE {_safe_identifier(spec.state_column)} "
-                    f"IN ({active_placeholders})"
-                )
-                current = int(
-                    connection.execute(
-                        "SELECT COUNT(*) "
-                        + base
-                        + f" AND {_safe_identifier(spec.time_column)} >= ?",
-                        (*spec.active_states, cutoff),
-                    ).fetchone()[0]
-                )
-                if current:
-                    fresh[spec.output_name] = current
-                historical_active += int(
-                    connection.execute(
-                        "SELECT COUNT(*) "
-                        + base
-                        + f" AND {_safe_identifier(spec.time_column)} < ?",
-                        (*spec.active_states, cutoff),
-                    ).fetchone()[0]
-                )
-                if spec.unknown_states:
-                    unknown_placeholders = ",".join(
-                        "?" for _ in spec.unknown_states
-                    )
-                    historical_unknown += int(
-                        connection.execute(
-                            f"SELECT COUNT(*) FROM {_safe_identifier(spec.table)} "
-                            f"WHERE {_safe_identifier(spec.state_column)} "
-                            f"IN ({unknown_placeholders}) "
-                            f"AND {_safe_identifier(spec.time_column)} < ?",
-                            (*spec.unknown_states, cutoff),
-                        ).fetchone()[0]
-                    )
+            work_summary = collect_work_evidence(
+                connection,
+                available_tables=available,
+                now=checked_at,
+            )
             if "position_protection_ledger" in available:
                 ledger_columns = {
                     str(row[1])
@@ -731,6 +470,8 @@ def collect_deployment_preflight_facts(
             connection.rollback()
     except DeploymentPreflightInputError:
         raise
+    except DeploymentWorkEvidenceError as exc:
+        raise DeploymentPreflightInputError(str(exc)) from exc
     except sqlite3.Error as exc:
         raise DeploymentPreflightInputError("database_read_incomplete") from exc
 
@@ -770,9 +511,12 @@ def collect_deployment_preflight_facts(
     )
     return DeploymentPreflightFacts(
         database_watermark=watermark,
-        fresh_active_work=fresh,
-        historical_active_residue_count=historical_active,
-        historical_unknown_outcome_count=historical_unknown,
+        work_classification_counts=work_summary.counts if work_summary else {},
+        work_evidence_fingerprint=(
+            work_summary.fingerprint
+            if work_summary
+            else sha256(b"[]").hexdigest()
+        ),
         protected_open_position_count=snapshot["protected_open_position_count"],
         exchange_snapshot_available=snapshot["available"],
         exchange_snapshot_complete=snapshot["complete"],
@@ -1590,6 +1334,12 @@ def _bounded_count(value: object) -> int:
         raise DeploymentPreflightInputError("preflight_count_invalid")
     if value > 1_000_000_000:
         raise DeploymentPreflightInputError("preflight_count_unbounded")
+    return value
+
+
+def _validate_sha256_fingerprint(value: object) -> str:
+    if not isinstance(value, str) or not _SHADOW_EVIDENCE_RE.fullmatch(value):
+        raise DeploymentPreflightInputError("deployment_evidence_malformed")
     return value
 
 

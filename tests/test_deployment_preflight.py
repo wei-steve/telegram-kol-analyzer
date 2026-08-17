@@ -30,9 +30,8 @@ def _facts(**changes) -> DeploymentPreflightFacts:
             "trade_signal_max_id": 4,
             "execution_event_max_id": 7,
         },
-        fresh_active_work={},
-        historical_active_residue_count=0,
-        historical_unknown_outcome_count=0,
+        work_classification_counts={},
+        work_evidence_fingerprint=hashlib.sha256(b"[]").hexdigest(),
         protected_open_position_count=0,
         exchange_snapshot_available=True,
         exchange_snapshot_complete=True,
@@ -57,14 +56,14 @@ def _build(change_class: str, facts: DeploymentPreflightFacts):
     )
 
 
-def test_fresh_active_exchange_write_blocks_every_change_class():
+def test_in_flight_write_blocks_every_change_class():
     artifact = _build(
         "code",
-        _facts(fresh_active_work={"trade_signals": 1}),
+        _facts(work_classification_counts={"in_flight_write": {"trade_signals": 1}}),
     )
 
     assert artifact["decision"] == "BLOCK"
-    assert "fresh_active_exchange_work" in artifact["reason_codes"]
+    assert "deployment_in_flight_write" in artifact["reason_codes"]
 
 
 def test_protected_open_position_is_a_warning_not_a_blocker():
@@ -77,14 +76,14 @@ def test_protected_open_position_is_a_warning_not_a_blocker():
     assert artifact["reason_codes"] == ["protected_open_positions_present"]
 
 
-def test_historical_unknown_outcome_is_a_warning_not_a_blocker():
+def test_unknown_outcome_blocks_even_when_old():
     artifact = _build(
         "code",
-        _facts(historical_unknown_outcome_count=3),
+        _facts(work_classification_counts={"unknown_outcome": {"execution_contracts": 3}}),
     )
 
-    assert artifact["decision"] == "WARN"
-    assert artifact["reason_codes"] == ["historical_unknown_outcomes_present"]
+    assert artifact["decision"] == "BLOCK"
+    assert artifact["reason_codes"] == ["deployment_unknown_outcome"]
 
 
 @pytest.mark.parametrize(
@@ -365,8 +364,10 @@ def test_blocking_artifact_with_warnings_remains_verifiable():
     artifact = _build(
         "execution_writer",
         _facts(
-            fresh_active_work={"position_mutations": 1},
-            historical_unknown_outcome_count=1,
+            work_classification_counts={
+                "in_flight_write": {"position_mutations": 1},
+                "unknown_outcome": {"execution_contracts": 1},
+            },
             protected_open_position_count=2,
             exchange_snapshot_complete=False,
         ),
@@ -544,8 +545,12 @@ def test_collector_is_read_only_bounded_and_does_not_emit_position_ids(tmp_path)
     )
 
     assert hashlib.sha256(database.read_bytes()).hexdigest() == before
-    assert facts.fresh_active_work == {"trade_signals": 1}
-    assert facts.historical_unknown_outcome_count == 1
+    assert facts.work_classification_counts["in_flight_write"] == {
+        "trade_signals": 1
+    }
+    assert facts.work_classification_counts["unknown_outcome"] == {
+        "execution_contracts": 1
+    }
     assert facts.protected_open_position_count == 1
     assert facts.exchange_snapshot_complete is True
     assert facts.exchange_snapshot_stable is True
@@ -595,109 +600,126 @@ def test_collector_opens_one_explicit_read_transaction(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("table", "state_column", "state", "fact_name"),
+    ("table", "state_column", "state", "fact_name", "classification"),
     [
         (
             "position_mutation_intents",
             "status",
             "submit_unknown",
             "position_mutations",
+            "unknown_outcome",
         ),
         (
             "strategy_management_batches",
             "status",
             "protection_ready",
             "management_batches",
+            "restart_safe_wait",
         ),
         (
             "message_instruction_items",
             "status",
             "pending",
             "instruction_items",
+            "restart_safe_wait",
         ),
         (
             "strategy_management_components",
             "status",
             "definitely_rejected",
             "management_components",
+            "restart_safe_wait",
         ),
         (
             "bound_position_close_reservations",
             "status",
             "unknown_exchange_outcome",
             "position_closes",
+            "unknown_outcome",
         ),
         (
             "trigger_protection_intents",
             "recovery_state",
             "submitting",
             "protection_intents",
+            "in_flight_write",
         ),
         (
             "execution_order_legs",
             "status",
             "cancel_submitting",
             "execution_order_legs",
+            "in_flight_write",
         ),
         (
             "strategy_revision_batches",
             "status",
             "submitting_replacements",
             "strategy_revisions",
+            "in_flight_write",
         ),
         (
             "strategy_management_legs",
             "status",
             "submit_unknown",
             "management_legs",
+            "unknown_outcome",
         ),
         (
             "position_backup_stop_orders",
             "status",
             "unknown_exchange_outcome",
             "backup_stop_orders",
+            "unknown_outcome",
         ),
         (
             "position_take_profit_orders",
             "status",
             "cancel_requested",
             "take_profit_orders",
+            "unknown_outcome",
         ),
         (
             "strategy_management_batches",
             "status",
             "submit_unknown",
             "management_batches",
+            "unknown_outcome",
         ),
         (
             "source_message_deletion_exits",
             "state",
             "recovery_required",
             "source_deletions",
+            "unknown_outcome",
         ),
         (
             "trigger_protection_stop_rescues",
             "status",
             "submit_unknown",
             "protection_rescues",
+            "unknown_outcome",
         ),
         (
             "trigger_take_profit_convergences",
             "status",
             "reserved",
             "trigger_take_profit_convergences",
+            "in_flight_write",
         ),
         (
             "strategy_break_even_convergences",
             "status",
             "executing_market_decisions",
             "break_even_convergences",
+            "in_flight_write",
         ),
         (
             "strategy_break_even_convergence_legs",
             "status",
             "decision_reserved",
             "break_even_convergence_legs",
+            "in_flight_write",
         ),
     ],
 )
@@ -707,6 +729,7 @@ def test_collector_blocks_fresh_nonterminal_writer_states(
     state_column,
     state,
     fact_name,
+    classification,
 ):
     database = tmp_path / "research.db"
     _create_preflight_database(database)
@@ -730,7 +753,7 @@ def test_collector_blocks_fresh_nonterminal_writer_states(
         now=NOW,
     )
 
-    assert facts.fresh_active_work == {fact_name: 1}
+    assert facts.work_classification_counts[classification][fact_name] == 1
 
 
 def test_unprotected_open_position_blocks_deployment(tmp_path):
@@ -1240,7 +1263,7 @@ def test_collector_accepts_current_application_schema(tmp_path):
         now=NOW,
     )
 
-    assert facts.fresh_active_work == {}
+    assert facts.work_classification_counts == {}
     assert facts.database_watermark == {
         "raw_message_max_id": 0,
         "instruction_item_max_id": 0,

@@ -130,7 +130,7 @@ def test_deployment_preflight_cli_writes_verifiable_json(tmp_path):
     payload = json.loads(result.output)
     assert payload == json.loads(output.read_text(encoding="utf-8"))
     assert payload["decision"] == "BLOCK"
-    assert "fresh_active_exchange_work" in payload["reason_codes"]
+    assert "deployment_in_flight_write" in payload["reason_codes"]
 
 
 def test_verify_deployment_preflight_cli_rejects_expired_artifact(tmp_path):
