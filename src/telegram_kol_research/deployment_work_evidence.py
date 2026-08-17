@@ -12,6 +12,26 @@ from typing import Callable, Literal
 MAX_EVIDENCE_COUNT = 1_000_000_000
 MAX_EVIDENCE_ROWS = 100_000
 EVIDENCE_REGISTRY_VERSION = 1
+_TERMINAL_EXECUTION_LEG_STATUSES = frozenset(
+    {
+        "closed",
+        "cancelled",
+        "canceled",
+        "failed",
+        "expired",
+        "invalidated",
+        "rejected",
+        "error",
+        "manually_cancelled",
+        "manually_closed",
+        "exchange_cancelled",
+        "filled",
+        "completed",
+        "done",
+        "succeeded",
+        "success",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,35 +372,19 @@ def _collect_execution_bindings(connection: sqlite3.Connection) -> EvidenceTally
     }
     active_legs = {"submitting", "cancel_submitting"}
     unknown_legs = {"submit_unknown", "unknown_exchange_outcome"}
-    known_legs = active_legs | unknown_legs | {
+    known_legs = active_legs | unknown_legs | _TERMINAL_EXECUTION_LEG_STATUSES | {
         "unknown",
         "pending",
         "open",
         "submitted",
         "active",
-        "filled",
         "partially_filled",
-        "closed",
-        "cancelled",
-        "failed",
-        "expired",
-        "invalidated",
         "inconsistent",
         "confirmed",
         "partial",
-        "manually_closed",
-        "exchange_cancelled",
-        "rejected",
-        "canceled",
-        "error",
         "live",
         "partiallyfilled",
         "partial_filled",
-        "done",
-        "completed",
-        "succeeded",
-        "success",
-        "manually_cancelled",
     }
     for binding_status, leg_statuses in grouped.values():
         if not isinstance(binding_status, str) or binding_status not in known_binding:
@@ -504,6 +508,7 @@ def _collect_management_batches(connection: sqlite3.Connection) -> EvidenceTally
         "submit_unknown",
         "unknown_exchange_outcome",
         "awaiting_exchange",
+        "submitted",
     }
     queued_children = {
         "pending",
@@ -514,7 +519,6 @@ def _collect_management_batches(connection: sqlite3.Connection) -> EvidenceTally
     }
     known_children = active_children | unknown_children | {
         *queued_children,
-        "submitted",
         "succeeded",
         "failed",
         "blocked",
@@ -549,7 +553,13 @@ def _collect_management_batches(connection: sqlite3.Connection) -> EvidenceTally
             totals["active_write"] += 1
         elif status in {"submitted", "submit_unknown"}:
             totals["unknown_outcome"] += 1
-        elif status in {"ready", "protection_ready", "reserved", "reconciling"}:
+        elif status in {
+            "ready",
+            "protection_ready",
+            "reserved",
+            "reconciling",
+            "partial_failed",
+        }:
             totals["queued_work"] += 1
         elif status == "recovery_required":
             if reason == "deferred_entry_cancel_race_detected":
@@ -563,7 +573,6 @@ def _collect_management_batches(connection: sqlite3.Connection) -> EvidenceTally
             "blocked",
             "resolved",
             "failed",
-            "partial_failed",
         }:
             totals["inactive"] += 1
         else:
@@ -584,7 +593,7 @@ def _collect_trigger_protection(connection: sqlite3.Connection) -> EvidenceTally
         return EvidenceTally(invalid_evidence=1)
     totals = {field.name: 0 for field in fields(EvidenceTally)}
     terminal_bindings = {"closed", "cancelled", "completed", "failed", "resolved", "superseded"}
-    terminal_legs = {"closed", "cancelled", "failed", "expired", "invalidated"}
+    terminal_legs = _TERMINAL_EXECUTION_LEG_STATUSES
     for recovery_state, binding_status, leg_status in rows:
         if not all(isinstance(value, str) and value for value in (recovery_state, binding_status, leg_status)):
             totals["invalid_evidence"] += 1
@@ -634,15 +643,9 @@ def _collect_trade_signals(connection: sqlite3.Connection) -> EvidenceTally:
     if not bounded:
         return EvidenceTally(invalid_evidence=1)
     totals = {field.name: 0 for field in fields(EvidenceTally)}
-    verified_leg_states = {
+    verified_leg_states = _TERMINAL_EXECUTION_LEG_STATUSES | {
         "active",
-        "filled",
         "partially_filled",
-        "closed",
-        "cancelled",
-        "failed",
-        "expired",
-        "invalidated",
     }
     for _signal_id, chat_id, message_id, symbol, side, status in rows:
         if not isinstance(status, str):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -220,6 +221,66 @@ def test_verify_recollects_and_verifies_exact_facts(tmp_path: Path) -> None:
 
     assert result.returncode == 0
     assert "decision=PASS" in result.stdout
+
+
+def test_final_requires_saved_preliminary_fingerprint(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    preliminary_path = tmp_path / "preliminary.json"
+    assert _run(*_collect_args(inputs, preliminary_path)).returncode == 0
+    preliminary = json.loads(preliminary_path.read_text(encoding="utf-8"))
+    final_path = tmp_path / "final.json"
+    final_args = [
+        *_collect_args(inputs, final_path),
+        "--preliminary-artifact",
+        str(preliminary_path),
+    ]
+    phase_index = final_args.index("preliminary")
+    final_args[phase_index] = "final"
+
+    missing_fingerprint = _run(*final_args)
+    assert missing_fingerprint.returncode == 4
+
+    collected = _run(
+        *final_args,
+        "--preliminary-fingerprint",
+        str(preliminary["fingerprint"]),
+    )
+    assert collected.returncode == 0
+    assert "decision=PASS" in collected.stdout
+
+
+def test_final_rejects_parent_resigned_after_phase_a(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    preliminary_path = tmp_path / "preliminary.json"
+    assert _run(*_collect_args(inputs, preliminary_path)).returncode == 0
+    preliminary = json.loads(preliminary_path.read_text(encoding="utf-8"))
+    saved_fingerprint = str(preliminary["fingerprint"])
+    preliminary["evidence_counts"]["inactive"] = 1
+    payload = dict(preliminary)
+    payload.pop("fingerprint")
+    preliminary["fingerprint"] = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    preliminary_path.write_text(json.dumps(preliminary), encoding="utf-8")
+    final_path = tmp_path / "final.json"
+    final_args = [
+        *_collect_args(inputs, final_path),
+        "--preliminary-artifact",
+        str(preliminary_path),
+        "--preliminary-fingerprint",
+        saved_fingerprint,
+    ]
+    final_args[final_args.index("preliminary")] = "final"
+
+    result = _run(*final_args)
+
+    assert result.returncode == 4
+    assert not final_path.exists()
 
 
 def test_unreadable_artifact_and_invalid_json_return_four(tmp_path: Path) -> None:

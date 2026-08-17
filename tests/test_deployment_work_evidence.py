@@ -611,7 +611,7 @@ def test_authoritative_terminal_execution_leg_statuses_are_inactive(
     _assert_only_category(collect_deployment_evidence(database), "inactive")
 
 
-def test_authoritative_partial_failed_management_batch_is_inactive(
+def test_authoritative_partial_failed_management_batch_is_queued(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "management-partial-failed.db"
@@ -623,7 +623,7 @@ def test_authoritative_partial_failed_management_batch_is_inactive(
             "VALUES (1, 'partial_failed', 'operator_review_required', 'live')"
         )
 
-    _assert_only_category(collect_deployment_evidence(database), "inactive")
+    _assert_only_category(collect_deployment_evidence(database), "queued_work")
 
 
 @pytest.mark.parametrize(
@@ -633,6 +633,7 @@ def test_authoritative_partial_failed_management_batch_is_inactive(
         ("preflighting", "queued_work"),
         ("recovery_required", "queued_work"),
         ("awaiting_exchange", "unknown_outcome"),
+        ("submitted", "unknown_outcome"),
         ("definitely_rejected", "inactive"),
         ("operator_required", "inactive"),
         ("confirmed", "inactive"),
@@ -663,8 +664,14 @@ def test_authoritative_management_component_statuses_are_contextual(
     )
 
 
-def test_closed_parent_protection_recovery_is_inactive(tmp_path: Path) -> None:
-    database = tmp_path / "closed-protection.db"
+@pytest.mark.parametrize(
+    "leg_status", ["closed", "manually_closed", "exchange_cancelled"]
+)
+def test_closed_parent_protection_recovery_is_inactive(
+    tmp_path: Path,
+    leg_status: str,
+) -> None:
+    database = tmp_path / f"closed-protection-{leg_status}.db"
     _create_registered_tables(database)
     with sqlite3.connect(database) as connection:
         connection.execute(
@@ -675,12 +682,13 @@ def test_closed_parent_protection_recovery_is_inactive(tmp_path: Path) -> None:
         connection.execute(
             "INSERT INTO execution_order_legs "
             "(id, execution_binding_id, purpose, status) "
-            "VALUES (1, 1, 'entry', 'closed')"
+            "VALUES (1, 1, 'entry', ?)",
+            (leg_status,),
         )
         connection.execute(
             "INSERT INTO trigger_protection_intents "
             "(id, execution_binding_id, execution_order_leg_id, recovery_state) "
-            "VALUES (1, 1, 1, 'recovery_required')"
+            "VALUES (1, 1, 1, 'submit_unknown')"
         )
 
     _assert_only_category(collect_deployment_evidence(database), "inactive")
@@ -712,11 +720,17 @@ def _insert_partial_submission(
     )
 
 
-def test_verified_partial_submission_projection_is_inactive(tmp_path: Path) -> None:
-    database = tmp_path / "verified-partial.db"
+@pytest.mark.parametrize(
+    "terminal_status", ["closed", "manually_closed", "exchange_cancelled"]
+)
+def test_verified_partial_submission_projection_is_inactive(
+    tmp_path: Path,
+    terminal_status: str,
+) -> None:
+    database = tmp_path / f"verified-partial-{terminal_status}.db"
     _create_registered_tables(database)
     with sqlite3.connect(database) as connection:
-        _insert_partial_submission(connection, second_leg_status="closed")
+        _insert_partial_submission(connection, second_leg_status=terminal_status)
 
     _assert_only_category(collect_deployment_evidence(database), "inactive")
 

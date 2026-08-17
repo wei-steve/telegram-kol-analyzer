@@ -96,6 +96,7 @@ def build_final_deployment_preflight_artifact(
     schema_verification: Mapping[str, object],
     database_watermark: Mapping[str, object],
     preliminary_artifact: Mapping[str, object],
+    preliminary_fingerprint: str,
     now: datetime,
 ) -> dict[str, object]:
     normalized_now = _aware_utc(now)
@@ -107,6 +108,7 @@ def build_final_deployment_preflight_artifact(
         production_commit=production,
         candidate_commit=candidate,
         surface=normalized_surface,
+        expected_fingerprint=preliminary_fingerprint,
         now=normalized_now,
     )
     watermark = _watermark(database_watermark)
@@ -137,6 +139,7 @@ def verify_deployment_preflight_artifact(
     schema_verification: Mapping[str, object],
     database_watermark: Mapping[str, object],
     preliminary_artifact: Mapping[str, object] | None = None,
+    preliminary_fingerprint: str | None = None,
     now: datetime,
 ) -> str:
     phase = _phase(expected_phase)
@@ -177,6 +180,7 @@ def verify_deployment_preflight_artifact(
             production_commit=str(expected_facts["production_commit"]),
             candidate_commit=str(expected_facts["candidate_commit"]),
             surface=expected_surface,
+            expected_fingerprint=preliminary_fingerprint,
             now=_aware_utc(now),
         )
         if normalized["parent_fingerprint"] != parent["fingerprint"]:
@@ -185,7 +189,7 @@ def verify_deployment_preflight_artifact(
             parent["database_watermark"],
             normalized["database_watermark"],
         )
-    elif preliminary_artifact is not None:
+    elif preliminary_artifact is not None or preliminary_fingerprint is not None:
         raise DeploymentPreflightInputError("preflight_artifact_parent_invalid")
     return decision
 
@@ -298,6 +302,7 @@ def _validate_parent(
     production_commit: str,
     candidate_commit: str,
     surface: Mapping[str, object],
+    expected_fingerprint: str | None,
     now: datetime,
 ) -> dict[str, object]:
     try:
@@ -307,6 +312,10 @@ def _validate_parent(
             "preflight_artifact_parent_invalid"
         ) from exc
     _validate_fingerprint(parent)
+    if parent["fingerprint"] != _hash(expected_fingerprint, "parent"):
+        raise DeploymentPreflightInputError(
+            "preflight_artifact_parent_fingerprint_mismatch"
+        )
     _validate_times(parent, now=now)
     expected = {
         "production_commit": production_commit,

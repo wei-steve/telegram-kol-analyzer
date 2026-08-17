@@ -97,6 +97,7 @@ def _verify(
     schema: dict[str, bool] | None = None,
     watermark: dict[str, int] | None = None,
     preliminary: dict[str, object] | None = None,
+    saved_parent_fingerprint: str | None = None,
     now: datetime = NOW,
 ) -> str:
     return verify_deployment_preflight_artifact(
@@ -110,6 +111,15 @@ def _verify(
         schema_verification=schema or _schema(),
         database_watermark=watermark or _watermark(),
         preliminary_artifact=preliminary,
+        preliminary_fingerprint=(
+            saved_parent_fingerprint
+            if saved_parent_fingerprint is not None
+            else (
+                str(preliminary["fingerprint"])
+                if preliminary is not None
+                else None
+            )
+        ),
         now=now,
     )
 
@@ -148,6 +158,7 @@ def test_final_binds_one_direct_preliminary_parent() -> None:
         schema_verification=_schema(),
         database_watermark=_watermark(11),
         preliminary_artifact=preliminary,
+        preliminary_fingerprint=str(preliminary["fingerprint"]),
         now=NOW + timedelta(seconds=30),
     )
 
@@ -178,6 +189,7 @@ def test_final_rejects_blocked_preliminary_parent() -> None:
             schema_verification=_schema(),
             database_watermark=_watermark(11),
             preliminary_artifact=blocked_parent,
+            preliminary_fingerprint=str(blocked_parent["fingerprint"]),
             now=NOW + timedelta(seconds=30),
         )
 
@@ -193,6 +205,7 @@ def test_final_verifier_rejects_blocked_direct_parent() -> None:
         schema_verification=_schema(),
         database_watermark=_watermark(11),
         preliminary_artifact=allowed_parent,
+        preliminary_fingerprint=str(allowed_parent["fingerprint"]),
         now=NOW + timedelta(seconds=30),
     )
     blocked_parent = _preliminary(evidence=_evidence(active_write=1))
@@ -208,6 +221,78 @@ def test_final_verifier_rejects_blocked_direct_parent() -> None:
             phase="final",
             watermark=_watermark(11),
             preliminary=blocked_parent,
+            now=NOW + timedelta(seconds=30),
+        )
+
+
+def test_final_rejects_resigned_block_parent_against_saved_fingerprint() -> None:
+    blocked_parent = _preliminary(evidence=_evidence(active_write=1))
+    saved_fingerprint = str(blocked_parent["fingerprint"])
+    resigned_parent = dict(blocked_parent)
+    resigned_parent["evidence_counts"] = {
+        "active_write": 0,
+        "unknown_outcome": 0,
+        "queued_work": 0,
+        "inactive": 1,
+        "invalid_evidence": 0,
+    }
+    resigned_parent["decision"] = "PASS"
+    resigned_parent["reason_codes"] = []
+    _rehash(resigned_parent)
+
+    with pytest.raises(
+        DeploymentPreflightInputError,
+        match="parent_fingerprint_mismatch",
+    ):
+        build_final_deployment_preflight_artifact(
+            production_commit=PRODUCTION,
+            candidate_commit=CANDIDATE,
+            surface=_surface(),
+            evidence=_evidence(),
+            snapshot_status=_snapshot(),
+            schema_verification=_schema(),
+            database_watermark=_watermark(11),
+            preliminary_artifact=resigned_parent,
+            preliminary_fingerprint=saved_fingerprint,
+            now=NOW + timedelta(seconds=30),
+        )
+
+
+def test_final_verifier_rejects_resigned_parent_against_saved_fingerprint() -> None:
+    allowed_parent = _preliminary()
+    saved_fingerprint = str(allowed_parent["fingerprint"])
+    final = build_final_deployment_preflight_artifact(
+        production_commit=PRODUCTION,
+        candidate_commit=CANDIDATE,
+        surface=_surface(),
+        evidence=_evidence(),
+        snapshot_status=_snapshot(),
+        schema_verification=_schema(),
+        database_watermark=_watermark(11),
+        preliminary_artifact=allowed_parent,
+        preliminary_fingerprint=saved_fingerprint,
+        now=NOW + timedelta(seconds=30),
+    )
+    resigned_parent = dict(allowed_parent)
+    resigned_parent["evidence_counts"] = {
+        "active_write": 0,
+        "unknown_outcome": 0,
+        "queued_work": 0,
+        "inactive": 1,
+        "invalid_evidence": 0,
+    }
+    _rehash(resigned_parent)
+
+    with pytest.raises(
+        DeploymentPreflightInputError,
+        match="parent_fingerprint_mismatch",
+    ):
+        _verify(
+            final,
+            phase="final",
+            watermark=_watermark(11),
+            preliminary=resigned_parent,
+            saved_parent_fingerprint=saved_fingerprint,
             now=NOW + timedelta(seconds=30),
         )
 
@@ -242,6 +327,7 @@ def test_final_rejects_wrong_parent_fingerprint() -> None:
         schema_verification=_schema(),
         database_watermark=_watermark(),
         preliminary_artifact=preliminary,
+        preliminary_fingerprint=str(preliminary["fingerprint"]),
         now=NOW + timedelta(seconds=10),
     )
     final["parent_fingerprint"] = "f" * 64
@@ -269,6 +355,7 @@ def test_final_rejects_watermark_rollback() -> None:
             schema_verification=_schema(),
             database_watermark=_watermark(9),
             preliminary_artifact=preliminary,
+            preliminary_fingerprint=str(preliminary["fingerprint"]),
             now=NOW + timedelta(seconds=10),
         )
 
@@ -359,6 +446,7 @@ def test_preliminary_cannot_contain_parent_and_final_cannot_chain_final() -> Non
             schema_verification=_schema(),
             database_watermark=_watermark(),
             preliminary_artifact=final_parent,
+            preliminary_fingerprint=str(valid_preliminary["fingerprint"]),
             now=NOW,
         )
 

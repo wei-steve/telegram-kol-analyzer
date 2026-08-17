@@ -69,6 +69,7 @@ def _parser() -> argparse.ArgumentParser:
     collect.add_argument("--phase", required=True, choices=("preliminary", "final"))
     collect.add_argument("--output", required=True)
     collect.add_argument("--preliminary-artifact")
+    collect.add_argument("--preliminary-fingerprint")
 
     verify = subcommands.add_parser("verify")
     _add_fact_arguments(verify)
@@ -79,6 +80,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     verify.add_argument("--input", required=True)
     verify.add_argument("--preliminary-artifact")
+    verify.add_argument("--preliminary-fingerprint")
     return parser
 
 
@@ -117,7 +119,10 @@ def _collect_command(arguments: argparse.Namespace) -> int:
     surface, evidence, snapshot, schema, watermark, now = _facts(arguments)
     phase = str(arguments.phase)
     if phase == "preliminary":
-        if arguments.preliminary_artifact is not None:
+        if (
+            arguments.preliminary_artifact is not None
+            or arguments.preliminary_fingerprint is not None
+        ):
             raise _CliInputError("cli_parent_invalid")
         artifact = build_preliminary_deployment_preflight_artifact(
             production_commit=arguments.production_commit,
@@ -130,7 +135,10 @@ def _collect_command(arguments: argparse.Namespace) -> int:
             now=now,
         )
     else:
-        if arguments.preliminary_artifact is None:
+        if (
+            arguments.preliminary_artifact is None
+            or arguments.preliminary_fingerprint is None
+        ):
             raise _CliInputError("cli_parent_missing")
         artifact = build_final_deployment_preflight_artifact(
             production_commit=arguments.production_commit,
@@ -143,6 +151,7 @@ def _collect_command(arguments: argparse.Namespace) -> int:
             preliminary_artifact=read_deployment_preflight_artifact(
                 arguments.preliminary_artifact
             ),
+            preliminary_fingerprint=arguments.preliminary_fingerprint,
             now=now,
         )
     write_deployment_preflight_artifact(arguments.output, artifact)
@@ -154,12 +163,18 @@ def _verify_command(arguments: argparse.Namespace) -> int:
     phase = str(arguments.expected_phase)
     preliminary = None
     if phase == "final":
-        if arguments.preliminary_artifact is None:
+        if (
+            arguments.preliminary_artifact is None
+            or arguments.preliminary_fingerprint is None
+        ):
             raise _CliInputError("cli_parent_missing")
         preliminary = read_deployment_preflight_artifact(
             arguments.preliminary_artifact
         )
-    elif arguments.preliminary_artifact is not None:
+    elif (
+        arguments.preliminary_artifact is not None
+        or arguments.preliminary_fingerprint is not None
+    ):
         raise _CliInputError("cli_parent_invalid")
     artifact = read_deployment_preflight_artifact(arguments.input)
     decision = verify_deployment_preflight_artifact(
@@ -173,6 +188,7 @@ def _verify_command(arguments: argparse.Namespace) -> int:
         schema_verification=schema,
         database_watermark=watermark,
         preliminary_artifact=preliminary,
+        preliminary_fingerprint=arguments.preliminary_fingerprint,
         now=now,
     )
     return _report({"phase": phase, "decision": decision, "reason_codes": artifact["reason_codes"]})
