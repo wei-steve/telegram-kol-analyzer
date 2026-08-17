@@ -49,6 +49,14 @@ WORKER_CLAIM_PATHS = _source_paths(
     "trigger_protection_rescue_worker.py",
 )
 
+INDIRECT_WRITER_PATHS = _source_paths(
+    "backup_stop_repair.py",
+    "position_management_liveness_recovery.py",
+    "position_management_remediation.py",
+    "strategy_management_planner.py",
+    "telegram_bot_commands.py",
+)
+
 WRITER_SURFACE_PATHS = frozenset(
     _source_paths(
         "auto_trade_execution.py",
@@ -91,6 +99,7 @@ WRITER_SURFACE_PATHS = frozenset(
     | MUTATION_AUTHORITY_PATHS
     | OUTCOME_AUTHORITY_PATHS
     | WORKER_CLAIM_PATHS
+    | INDIRECT_WRITER_PATHS
 )
 
 SCHEMA_PATHS = frozenset(
@@ -208,6 +217,8 @@ def _writer_fingerprint(root: Path, commit: str) -> str:
             mode, object_type, object_id = metadata.decode("ascii").split(" ", 2)
             path = raw_path.decode("utf-8")
             if path in WRITER_SURFACE_PATHS:
+                if object_type != "blob":
+                    raise WriterSurfaceError("git_tree_invalid")
                 entries[path] = (mode, object_type, object_id)
     except (UnicodeDecodeError, ValueError) as exc:
         raise WriterSurfaceError("git_tree_invalid") from exc
@@ -220,6 +231,9 @@ def _writer_fingerprint(root: Path, commit: str) -> str:
             record = f"{path}\0missing\0"
         else:
             mode, object_type, object_id = entry
+            object_check = _git(root, "cat-file", "-e", f"{object_id}^{{blob}}")
+            if object_check.returncode != 0:
+                raise WriterSurfaceError("git_tree_invalid")
             record = f"{path}\0{mode}\0{object_type}\0{object_id}\0"
         digest.update(record.encode("utf-8"))
     return digest.hexdigest()

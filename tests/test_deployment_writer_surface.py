@@ -265,6 +265,27 @@ def test_non_commit_object_fails_closed(tmp_path: Path) -> None:
         )
 
 
+def test_missing_referenced_writer_blob_fails_closed(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    _init_repository(repository)
+    production = _baseline(repository)
+    blob = _git(
+        repository,
+        "rev-parse",
+        f"{production}:src/telegram_kol_research/deepcoin_client.py",
+    )
+    loose_object = repository / ".git/objects" / blob[:2] / blob[2:]
+    assert loose_object.is_file()
+    loose_object.unlink()
+
+    with pytest.raises(WriterSurfaceError, match="git_tree_invalid"):
+        classify_candidate_surface(
+            repository=repository,
+            production_commit=production,
+            candidate_commit=production,
+        )
+
+
 def test_repository_must_be_the_git_root(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     _init_repository(repository)
@@ -325,8 +346,10 @@ def _post_call_site_paths(source_root: Path, methods: set[str]) -> set[str]:
         tree = ast.parse(source.read_text(encoding="utf-8"))
         if any(
             isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr in methods
+            and (
+                (isinstance(node.func, ast.Attribute) and node.func.attr in methods)
+                or (isinstance(node.func, ast.Name) and node.func.id in methods)
+            )
             for node in ast.walk(tree)
         ) or any(
             isinstance(node, ast.Constant)
@@ -370,3 +393,26 @@ def test_indirect_authority_and_worker_primitives_remain_in_manifest() -> None:
         "src/telegram_kol_research/instruction_execution_projection.py",
         "src/telegram_kol_research/strategy_management_market_decisions.py",
     } <= WRITER_SURFACE_PATHS
+
+
+def test_high_level_mutation_and_claim_callers_are_writer_sensitive() -> None:
+    high_level_writer_calls = {
+        "submit_exact_position_sltp",
+        "execute_management_batch",
+        "execute_deepcoin_management_signal",
+        "execute_trigger_protection_stop_rescue",
+        "execute_trigger_take_profit_convergence",
+        "create_management_batch",
+        "create_management_batch_in_session",
+    }
+
+    call_sites = _post_call_site_paths(SOURCE_ROOT, high_level_writer_calls)
+
+    assert {
+        "src/telegram_kol_research/backup_stop_repair.py",
+        "src/telegram_kol_research/position_management_liveness_recovery.py",
+        "src/telegram_kol_research/position_management_remediation.py",
+        "src/telegram_kol_research/strategy_management_planner.py",
+        "src/telegram_kol_research/telegram_bot_commands.py",
+    } <= call_sites
+    assert call_sites <= WRITER_SURFACE_PATHS

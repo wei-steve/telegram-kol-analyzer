@@ -138,7 +138,7 @@ def _create_registered_tables(
     *,
     backup_columns: str = (
         "id INTEGER PRIMARY KEY, venue TEXT, pos_id TEXT, order_id TEXT, "
-        "status TEXT"
+        "client_order_id TEXT, status TEXT"
     ),
     source_columns: str = (
         "id INTEGER PRIMARY KEY, source_event_id INTEGER, raw_message_id INTEGER, "
@@ -182,8 +182,9 @@ def test_backup_missing_is_valid_inactive_evidence(tmp_path: Path) -> None:
     with sqlite3.connect(database) as connection:
         connection.execute(
             "INSERT INTO position_backup_stop_orders "
-            "(id, venue, pos_id, order_id, status) "
-            "VALUES (1, 'deepcoin', 'position-redacted', 'order-redacted', 'missing')"
+            "(id, venue, pos_id, order_id, client_order_id, status) "
+            "VALUES (1, 'deepcoin', 'position-redacted', 'order-redacted', "
+            "'client-redacted', 'missing')"
         )
 
     snapshot = collect_deployment_evidence(database)
@@ -274,6 +275,44 @@ def test_malformed_registered_value_fails_closed(tmp_path: Path) -> None:
     assert snapshot.counts == DeploymentEvidenceCounts(invalid_evidence=1)
 
 
+def test_active_backup_without_exchange_order_identity_fails_closed(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "active-without-order.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO position_backup_stop_orders "
+            "(id, venue, pos_id, client_order_id, status) "
+            "VALUES (1, 'deepcoin', 'position-redacted', 'client-redacted', 'active')"
+        )
+
+    snapshot = collect_deployment_evidence(database)
+
+    assert snapshot.counts == DeploymentEvidenceCounts(invalid_evidence=1)
+
+
+def test_duplicate_backup_exchange_order_identity_fails_closed(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "duplicate-order.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.executemany(
+            "INSERT INTO position_backup_stop_orders "
+            "(id, venue, pos_id, order_id, client_order_id, status) "
+            "VALUES (?, 'deepcoin', ?, 'shared-order', ?, 'active')",
+            [
+                (1, "position-a", "client-a"),
+                (2, "position-b", "client-b"),
+            ],
+        )
+
+    snapshot = collect_deployment_evidence(database)
+
+    assert snapshot.counts == DeploymentEvidenceCounts(invalid_evidence=1)
+
+
 def test_collection_uses_uri_read_only_and_query_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -319,7 +358,8 @@ def test_collection_result_is_bounded_and_sanitized(tmp_path: Path) -> None:
     with sqlite3.connect(database) as connection:
         connection.execute(
             "INSERT INTO position_backup_stop_orders "
-            "(id, venue, pos_id, order_id, status) VALUES (1, ?, ?, ?, 'missing')",
+            "(id, venue, pos_id, order_id, client_order_id, status) "
+            "VALUES (1, ?, ?, ?, 'client-redacted', 'missing')",
             (secret_values[2], secret_values[0], secret_values[3]),
         )
         connection.execute(

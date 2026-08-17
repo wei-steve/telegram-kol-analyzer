@@ -167,7 +167,7 @@ def _bounded_rows(
 def _collect_backup_stop_orders(connection: sqlite3.Connection) -> EvidenceTally:
     rows, bounded = _bounded_rows(
         connection,
-        "SELECT venue, pos_id, order_id, status "
+        "SELECT venue, pos_id, order_id, client_order_id, status "
         "FROM position_backup_stop_orders ORDER BY id",
     )
     if not bounded:
@@ -180,29 +180,51 @@ def _collect_backup_stop_orders(connection: sqlite3.Connection) -> EvidenceTally
         "unknown_exchange_outcome",
     }
     live_keys: dict[tuple[str, str], int] = {}
-    for venue, pos_id, _order_id, status in rows:
+    order_keys: dict[tuple[str, str], int] = {}
+    for venue, pos_id, order_id, _client_order_id, status in rows:
         if isinstance(status, str) and status in live_statuses:
             if isinstance(venue, str) and venue and isinstance(pos_id, str) and pos_id:
                 key = (venue, pos_id)
                 live_keys[key] = live_keys.get(key, 0) + 1
+        if (
+            isinstance(venue, str)
+            and venue
+            and isinstance(order_id, str)
+            and order_id
+        ):
+            key = (venue, order_id)
+            order_keys[key] = order_keys.get(key, 0) + 1
     duplicate_keys = {key for key, count in live_keys.items() if count > 1}
+    duplicate_orders = {key for key, count in order_keys.items() if count > 1}
 
     totals = {field.name: 0 for field in fields(EvidenceTally)}
-    totals["invalid_evidence"] += len(duplicate_keys)
-    for venue, pos_id, _order_id, status in rows:
-        if (
+    totals["invalid_evidence"] += len(duplicate_keys) + len(duplicate_orders)
+    for venue, pos_id, order_id, client_order_id, status in rows:
+        duplicate_position = (
             isinstance(venue, str)
             and isinstance(pos_id, str)
             and (venue, pos_id) in duplicate_keys
-        ):
+        )
+        duplicate_order = (
+            isinstance(venue, str)
+            and isinstance(order_id, str)
+            and (venue, order_id) in duplicate_orders
+        )
+        if duplicate_position or duplicate_order:
             continue
         if (
             not isinstance(venue, str)
             or not venue
             or not isinstance(pos_id, str)
             or not pos_id
+            or not isinstance(client_order_id, str)
+            or not client_order_id
             or not isinstance(status, str)
             or not status
+        ):
+            totals["invalid_evidence"] += 1
+        elif status in {"active", "missing", "cancelled"} and (
+            not isinstance(order_id, str) or not order_id
         ):
             totals["invalid_evidence"] += 1
         elif status == "submitting":
@@ -288,7 +310,14 @@ WORK_EVIDENCE_ADAPTERS = (
     EvidenceAdapter(
         name="position_backup_stop_orders",
         required_tables=("position_backup_stop_orders",),
-        required_columns=("id", "venue", "pos_id", "order_id", "status"),
+        required_columns=(
+            "id",
+            "venue",
+            "pos_id",
+            "order_id",
+            "client_order_id",
+            "status",
+        ),
         collect=_collect_backup_stop_orders,
     ),
     EvidenceAdapter(
