@@ -56,6 +56,10 @@ _BASE_KEYS = frozenset(
 class DeploymentPreflightInputError(ValueError):
     """The preflight inputs or artifact cannot authorize a deployment."""
 
+    def __init__(self, reason_code: str) -> None:
+        self.reason_code = str(reason_code)
+        super().__init__(self.reason_code)
+
 
 def build_preliminary_deployment_preflight_artifact(
     *,
