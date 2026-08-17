@@ -127,5 +127,4 @@ Implementation follows strict RED/GREEN TDD:
    classification, and an independent Critical/Important review.
 6. Require a new explicit push approval, then rerun the same server candidate
    test set and read-only Phase A. A passing shadow still requires a separate
-   deployment approval.
-
+  deployment approval.
