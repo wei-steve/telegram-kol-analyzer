@@ -9,7 +9,11 @@ from pathlib import Path
 import sys
 from typing import Mapping, Sequence
 
-from .deployment_change_surface import ChangeSurfaceError, classify_change_surface
+from .deployment_change_surface import (
+    ChangeSurfaceError,
+    bind_phase_restart_surface_counts,
+    classify_change_surface,
+)
 from .deployment_preflight import (
     DeploymentPreflightInputError,
     build_final_deployment_preflight_artifact,
@@ -87,8 +91,33 @@ def _surface(args: argparse.Namespace, counts: Mapping[str, Mapping[str, int]]):
     )
 
 
+def _artifact_work_counts(
+    artifact: Mapping[str, object],
+) -> Mapping[str, Mapping[str, int]]:
+    checked = artifact.get("checked_facts")
+    if not isinstance(checked, Mapping):
+        raise DeploymentPreflightInputError("preflight_artifact_facts_invalid")
+    counts = checked.get("work_classification_counts")
+    if not isinstance(counts, Mapping):
+        raise DeploymentPreflightInputError("preflight_artifact_facts_invalid")
+    return counts
+
+
 def _collect(args: argparse.Namespace) -> int:
     checked_at = _now(args.now)
+    preliminary = None
+    if args.phase == "final":
+        if args.preliminary_artifact is None:
+            raise DeploymentPreflightInputError(
+                "preliminary_artifact_required"
+            )
+        preliminary = read_deployment_preflight_artifact(
+            args.preliminary_artifact
+        )
+    elif args.preliminary_artifact is not None:
+        raise DeploymentPreflightInputError(
+            "preliminary_artifact_unexpected"
+        )
     initial_surface = _surface(args, {})
     facts = collect_deployment_preflight_facts(
         database_path=args.database,
@@ -102,7 +131,13 @@ def _collect(args: argparse.Namespace) -> int:
         expected_commit=args.candidate_commit,
         explicit_live_authorization=args.authorize_live_promotion,
     )
-    change_surface = _surface(args, facts.work_classification_counts)
+    surface_counts = facts.work_classification_counts
+    if preliminary is not None:
+        surface_counts = bind_phase_restart_surface_counts(
+            _artifact_work_counts(preliminary),
+            surface_counts,
+        )
+    change_surface = _surface(args, surface_counts)
     if change_surface.effective_change_class != initial_surface.effective_change_class:
         facts = collect_deployment_preflight_facts(
             database_path=args.database,
@@ -116,13 +151,15 @@ def _collect(args: argparse.Namespace) -> int:
             expected_commit=args.candidate_commit,
             explicit_live_authorization=args.authorize_live_promotion,
         )
-        change_surface = _surface(args, facts.work_classification_counts)
+        surface_counts = facts.work_classification_counts
+        if preliminary is not None:
+            surface_counts = bind_phase_restart_surface_counts(
+                _artifact_work_counts(preliminary),
+                surface_counts,
+            )
+        change_surface = _surface(args, surface_counts)
 
     if args.phase == "preliminary":
-        if args.preliminary_artifact is not None:
-            raise DeploymentPreflightInputError(
-                "preliminary_artifact_unexpected"
-            )
         artifact = build_preliminary_deployment_preflight_artifact(
             production_commit=args.production_commit,
             candidate_commit=args.candidate_commit,
@@ -132,13 +169,7 @@ def _collect(args: argparse.Namespace) -> int:
             now=checked_at,
         )
     else:
-        if args.preliminary_artifact is None:
-            raise DeploymentPreflightInputError(
-                "preliminary_artifact_required"
-            )
-        preliminary = read_deployment_preflight_artifact(
-            args.preliminary_artifact
-        )
+        assert preliminary is not None
         artifact = build_final_deployment_preflight_artifact(
             preliminary_artifact=preliminary,
             production_commit=args.production_commit,
@@ -161,7 +192,6 @@ def _verify(args: argparse.Namespace) -> int:
     counts = checked_facts.get("work_classification_counts")
     if not isinstance(counts, Mapping):
         raise DeploymentPreflightInputError("preflight_artifact_facts_invalid")
-    change_surface = _surface(args, counts)
     preliminary = None
     if args.phase == "final":
         if args.preliminary_artifact is None:
@@ -171,8 +201,13 @@ def _verify(args: argparse.Namespace) -> int:
         preliminary = read_deployment_preflight_artifact(
             args.preliminary_artifact
         )
+        counts = bind_phase_restart_surface_counts(
+            _artifact_work_counts(preliminary),
+            counts,
+        )
     elif args.preliminary_artifact is not None:
         raise DeploymentPreflightInputError("preliminary_artifact_unexpected")
+    change_surface = _surface(args, counts)
     decision = verify_phase_bound_deployment_preflight_artifact(
         artifact,
         phase=args.phase,

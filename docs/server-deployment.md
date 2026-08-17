@@ -157,9 +157,10 @@ The server updater then:
 2. Runs the candidate commit from a detached staging worktree, collects all
    SQLite facts in one read transaction, and compares two independently
    versioned Deepcoin captures when the change is writer-sensitive.
-3. Refuses fresh active work and any unprotected open position for every change
-   class. Historical unknown rows and protected open positions are warnings,
-   not silent passes.
+3. Refuses every in-flight or unknown outcome regardless of age and any
+   unprotected open position. Restart-safe/history rows and protected open
+   positions are explicit warnings only for `code`/`schema_compatible`; they
+   block writer-sensitive changes.
 4. After the preliminary gate passes, stops the sole exchange-writer service,
    repeats preflight, and keeps the service stopped through artifact
    verification, checkout, installation, and startup. Failure restarts the old
@@ -198,11 +199,13 @@ LIVE_PROMOTION_AUTHORIZATION=I_AUTHORIZE_LIVE_PROMOTION \
 ```
 
 The workstation helper bootstraps the updater safely on first use: it extracts
-`deploy/telegram-kol-update` from the exact expected commit on the server,
-compares its SHA-256 with the reviewed local file, and only then installs and
-executes it. This avoids depending on an older checkout or older installed
-helper. For `schema_compatible`, the candidate code migrates a disposable copy
-of the verified backup; the live database remains unchanged until deployment.
+`deploy/telegram-kol-update` from the exact expected commit into a temporary
+mode-0700 path, compares its SHA-256 with the reviewed local file, and executes
+that temporary copy. It does not install the candidate updater before Phase B.
+Only after final authorization and checkout does the updater install the
+versioned server helper. For `schema_compatible`, the candidate code migrates a
+disposable copy of the verified backup; the live database remains unchanged
+until deployment.
 
 ### Evidence-based two-phase deployment gate
 

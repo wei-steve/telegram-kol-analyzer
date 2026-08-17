@@ -89,6 +89,14 @@ def test_deployment_documentation_records_two_phase_evidence_policy():
         assert "push approval and deployment approval are separate" in normalized
         assert "fresh_active_exchange_work" not in text
 
+    deployment = (ROOT / "docs/server-deployment.md").read_text(encoding="utf-8")
+    runbook = " ".join(
+        (ROOT / "docs/runbook.md").read_text(encoding="utf-8").split()
+    )
+    assert "Historical unknown rows and protected open positions are warnings" not in deployment
+    assert "installs and executes it" not in deployment
+    assert "旧 unknown 和已保护活仓是显式 `WARN`" not in runbook
+
 
 def test_server_updater_runs_two_bound_phases_before_mutation():
     script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")

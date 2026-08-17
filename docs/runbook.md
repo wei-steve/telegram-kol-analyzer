@@ -1779,8 +1779,10 @@ checkout、安装和重启前失败关闭。
 - source-message deletion job；
 - 历史 unknown 残留、活仓数、快照完整性和数据库水位。
 
-任意新鲜在途操作或未证明止损保护的活仓都是 `BLOCK`。旧 unknown 和已保护活仓是显式
-`WARN`，不能被隐藏为 PASS。对 `execution_writer` 和 `live_promotion`，
+任意在途操作或 unknown outcome 无论年龄都是 `BLOCK`；未证明止损保护的
+活仓也是 `BLOCK`。只有 restart-safe/history residue 和已保护活仓才可在
+`code`/`schema_compatible` 下显式 `WARN`，不能被隐藏为 PASS。对
+`execution_writer` 和 `live_promotion`，
 止损只能由仓位自身的 SL 字段，或同时精确匹配 `posId` 与 durable ledger `ordId` 的 TPSL 证明；
 同品种同方向的其他订单不构成 ownership。
 交易所快照必须是两个不同 version/抓取时间的独立采集，且规范化事实一致；

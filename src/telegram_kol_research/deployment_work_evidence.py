@@ -137,7 +137,10 @@ WORK_EVIDENCE_ADAPTERS = (
         in_flight=("processing",),
         unknown=("unknown_exchange_outcome", "partial_submission_failed"),
         terminal=("submitted", "succeeded", "failed", "skipped", "completed"),
-        restart_surface=("src/telegram_kol_research/auto_trade_execution.py",),
+        restart_surface=(
+            "src/telegram_kol_research/auto_trade_execution.py",
+            "src/telegram_kol_research/trade_signals.py",
+        ),
     ),
     _adapter(
         "execution_contracts",
@@ -219,6 +222,7 @@ WORK_EVIDENCE_ADAPTERS = (
         unknown=("awaiting_exchange", "recovery_required"),
         terminal=("confirmed", "operator_required", "safely_skipped"),
         restart_surface=(
+            "src/telegram_kol_research/strategy_management_components.py",
             "src/telegram_kol_research/strategy_management_composite_reconciliation.py",
             "src/telegram_kol_research/strategy_management_composite_executor.py",
         ),
@@ -306,6 +310,7 @@ WORK_EVIDENCE_ADAPTERS = (
         terminal=("verified", "failed", "blocked"),
         restart_surface=(
             "src/telegram_kol_research/strategy_management_executor.py",
+            "src/telegram_kol_research/trigger_protection_rescue_worker.py",
         ),
     ),
     _adapter(
@@ -318,6 +323,8 @@ WORK_EVIDENCE_ADAPTERS = (
         terminal=("completed", "conflicted", "blocked", "failed"),
         restart_surface=(
             "src/telegram_kol_research/position_take_profit_orders.py",
+            "src/telegram_kol_research/trigger_take_profit_convergence.py",
+            "src/telegram_kol_research/trigger_take_profit_convergence_executor.py",
         ),
     ),
     _adapter(
@@ -341,6 +348,8 @@ WORK_EVIDENCE_ADAPTERS = (
             "shadow_planned",
         ),
         restart_surface=(
+            "src/telegram_kol_research/break_even_convergence_executor.py",
+            "src/telegram_kol_research/break_even_convergence_planner.py",
             "src/telegram_kol_research/break_even_convergence_worker.py",
         ),
     ),
@@ -364,6 +373,8 @@ WORK_EVIDENCE_ADAPTERS = (
             "shadow_planned",
         ),
         restart_surface=(
+            "src/telegram_kol_research/break_even_convergence_executor.py",
+            "src/telegram_kol_research/break_even_convergence_planner.py",
             "src/telegram_kol_research/break_even_convergence_worker.py",
         ),
     ),
@@ -376,6 +387,7 @@ WORK_EVIDENCE_ADAPTERS = (
         unknown=("recovery_required",),
         terminal=("succeeded", "blocked", "failed"),
         restart_surface=(
+            "src/telegram_kol_research/source_message_deletion.py",
             "src/telegram_kol_research/source_message_deletion_worker.py",
         ),
     ),

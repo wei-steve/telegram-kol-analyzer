@@ -9,8 +9,10 @@ import pytest
 from telegram_kol_research.deployment_change_surface import (
     ChangeSurfaceError,
     EXECUTION_WRITER_PATHS,
+    bind_phase_restart_surface_counts,
     classify_change_surface,
 )
+from telegram_kol_research.deployment_work_evidence import WORK_EVIDENCE_ADAPTERS
 
 
 def _git(repository, *args):
@@ -121,6 +123,38 @@ def test_restart_residue_requires_unchanged_reviewed_handler(tmp_path):
     assert "restart_compatibility_changed" in unsafe.blocking_reason_codes
 
 
+def test_phase_b_preserves_phase_a_restart_handler_universe(tmp_path):
+    repository, base = _repository(tmp_path)
+    candidate = _commit(repository, "README.md", "candidate\n", "candidate")
+    preliminary_counts = {
+        "restart_safe_wait": {"management_batches": 1}
+    }
+    final_counts = {"terminal": {"management_batches": 1}}
+
+    preliminary_surface = classify_change_surface(
+        repository=repository,
+        production_commit=base,
+        candidate_commit=candidate,
+        requested_change_class="code",
+        work_classification_counts=preliminary_counts,
+    )
+    final_surface = classify_change_surface(
+        repository=repository,
+        production_commit=base,
+        candidate_commit=candidate,
+        requested_change_class="code",
+        work_classification_counts=bind_phase_restart_surface_counts(
+            preliminary_counts,
+            final_counts,
+        ),
+    )
+
+    assert (
+        final_surface.restart_handler_fingerprint
+        == preliminary_surface.restart_handler_fingerprint
+    )
+
+
 def test_unknown_git_object_fails_closed(tmp_path):
     repository, base = _repository(tmp_path)
 
@@ -171,6 +205,40 @@ def test_each_reviewed_direct_exchange_writer_upgrades_change_class(
 
     assert facts.effective_change_class == "execution_writer"
     assert facts.underdeclared is True
+    assert facts.registry_version == 2
+
+
+def test_trade_signal_retry_and_state_transitions_are_writer_sensitive(tmp_path):
+    repository, base = _repository(tmp_path)
+    candidate = _commit(
+        repository,
+        "src/telegram_kol_research/trade_signals.py",
+        "changed retry semantics\n",
+        "trade signal transition",
+    )
+
+    facts = classify_change_surface(
+        repository=repository,
+        production_commit=base,
+        candidate_commit=candidate,
+        requested_change_class="code",
+        work_classification_counts={
+            "historical_residue": {"trade_signals": 1}
+        },
+    )
+
+    assert facts.effective_change_class == "execution_writer"
+    assert facts.underdeclared is True
+
+
+def test_every_restart_handler_is_registered_as_writer_sensitive():
+    restart_handlers = {
+        path
+        for adapter in WORK_EVIDENCE_ADAPTERS
+        for path in adapter.restart_surface_files
+    }
+
+    assert restart_handlers <= EXECUTION_WRITER_PATHS
 
 
 def test_registered_writer_paths_exist_in_review_repository():
@@ -228,4 +296,19 @@ def test_reviewed_retirement_exception_breaks_on_risk_path_change(tmp_path):
         _git(repository, "worktree", "remove", "--force", str(worktree))
 
     assert facts.effective_change_class == "live_promotion"
+    assert facts.underdeclared is True
+
+
+def test_post_retirement_writer_fix_keeps_retired_live_authority_exempt():
+    repository = Path(__file__).resolve().parents[1]
+    candidate = _git(repository, "rev-parse", "HEAD")
+
+    facts = classify_change_surface(
+        repository=repository,
+        production_commit="2274d90bd2b1a5bb7e7ed1c420c30e925d2bbdfa",
+        candidate_commit=candidate,
+        requested_change_class="schema_compatible",
+    )
+
+    assert facts.effective_change_class == "execution_writer"
     assert facts.underdeclared is True

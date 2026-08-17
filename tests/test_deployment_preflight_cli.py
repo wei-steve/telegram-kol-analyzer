@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 
 from telegram_kol_research.db import create_session_factory
@@ -145,6 +146,66 @@ def test_standalone_cli_rejects_final_without_preliminary(tmp_path):
 
     assert result.returncode == 4
     assert "preliminary_artifact_required" in result.stderr
+
+
+def test_final_cli_allows_restart_safe_work_to_become_terminal(tmp_path):
+    repository, production, candidate = _repository(tmp_path)
+    database = tmp_path / "research.db"
+    preliminary_output = tmp_path / "preliminary.json"
+    final_output = tmp_path / "final.json"
+    create_session_factory(database)
+    database_now = NOW.replace(tzinfo=None).isoformat(sep=" ")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            INSERT INTO strategy_management_batches (
+                idempotency_fingerprint, raw_message_id,
+                recognition_decision_id, recognition_generation,
+                target_lifecycle_id, strategy_instance_id,
+                execution_binding_id, intent, effective_action,
+                execution_mode, partial_round_before, status,
+                target_fingerprint, target_snapshot_json,
+                planned_at, created_at, updated_at
+            ) VALUES (?, 1, 1, 'generation', 1, 'strategy', 1,
+                      'cancel_entry', 'cancel_entry', 'disabled', 0,
+                      'submitted', ?, '{}', ?, ?, ?)
+            """,
+            ("a" * 64, "b" * 64, database_now, database_now, database_now),
+        )
+
+    preliminary = _run(
+        "collect",
+        "--repository", repository,
+        "--production-commit", production,
+        "--candidate-commit", candidate,
+        "--requested-change-class", "code",
+        "--phase", "preliminary",
+        "--database", database,
+        "--output", preliminary_output,
+        "--now", NOW.isoformat(),
+    )
+    assert preliminary.returncode == 2, preliminary_output.read_text(encoding="utf-8")
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE strategy_management_batches SET status = 'succeeded'"
+        )
+
+    final = _run(
+        "collect",
+        "--repository", repository,
+        "--production-commit", production,
+        "--candidate-commit", candidate,
+        "--requested-change-class", "code",
+        "--phase", "final",
+        "--database", database,
+        "--output", final_output,
+        "--preliminary-artifact", preliminary_output,
+        "--now", (NOW.replace(minute=1)).isoformat(),
+    )
+
+    assert final.returncode == 2, final.stderr
+    assert json.loads(final_output.read_text(encoding="utf-8"))["phase"] == "final"
 
 
 def test_standalone_cli_maps_parser_errors_to_malformed_exit_code():

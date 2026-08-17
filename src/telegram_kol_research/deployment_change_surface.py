@@ -15,7 +15,7 @@ from .deployment_work_evidence import (
 )
 
 
-CHANGE_SURFACE_REGISTRY_VERSION = 1
+CHANGE_SURFACE_REGISTRY_VERSION = 2
 _CLASS_RANK = {
     "code": 0,
     "schema_compatible": 1,
@@ -47,30 +47,41 @@ EXECUTION_WRITER_PATHS = frozenset(
     {
         "src/telegram_kol_research/auto_trade_execution.py",
         "src/telegram_kol_research/break_even_convergence_executor.py",
+        "src/telegram_kol_research/break_even_convergence_planner.py",
+        "src/telegram_kol_research/break_even_convergence_worker.py",
         "src/telegram_kol_research/cli.py",
         "src/telegram_kol_research/deepcoin_client.py",
         "src/telegram_kol_research/deepcoin_execution_actions.py",
         "src/telegram_kol_research/entry_revision_executor.py",
         "src/telegram_kol_research/execution_bindings.py",
         "src/telegram_kol_research/instruction_execution_reconciliation.py",
+        "src/telegram_kol_research/instruction_execution_contracts.py",
         "src/telegram_kol_research/legacy_conditional_cancel.py",
         "src/telegram_kol_research/native_tpsl_migration.py",
+        "src/telegram_kol_research/message_instruction_items.py",
         "src/telegram_kol_research/position_mutation_gateway.py",
         "src/telegram_kol_research/position_mutation_intents.py",
         "src/telegram_kol_research/position_protection_legs.py",
         "src/telegram_kol_research/position_take_profit_orders.py",
         "src/telegram_kol_research/recovery_live_submit.py",
         "src/telegram_kol_research/source_message_deletion_worker.py",
+        "src/telegram_kol_research/source_message_deletion.py",
         "src/telegram_kol_research/strategy_management_batches.py",
         "src/telegram_kol_research/strategy_management_composite_executor.py",
         "src/telegram_kol_research/strategy_management_composite_reconciliation.py",
+        "src/telegram_kol_research/strategy_management_components.py",
         "src/telegram_kol_research/strategy_management_executor.py",
         "src/telegram_kol_research/strategy_management_reconciliation.py",
         "src/telegram_kol_research/strategy_management_worker.py",
+        "src/telegram_kol_research/strategy_revision_planner.py",
         "src/telegram_kol_research/system_operator_bot.py",
         "src/telegram_kol_research/terminal_entry_cleanup.py",
+        "src/telegram_kol_research/trade_signals.py",
         "src/telegram_kol_research/trigger_backup_stop_executor.py",
         "src/telegram_kol_research/trigger_take_profit_convergence_executor.py",
+        "src/telegram_kol_research/trigger_take_profit_convergence.py",
+        "src/telegram_kol_research/trigger_protection_intents.py",
+        "src/telegram_kol_research/trigger_protection_rescue_worker.py",
         "src/telegram_kol_research/web_app.py",
     }
 )
@@ -90,10 +101,6 @@ _RETIREMENT_REVIEW_COMMIT = "7813150b7b33cd8ce3d90a6145889c6fef192dc7"
 _REVIEWED_RETIREMENT_RISK_PATHS = frozenset(
     LIVE_PROMOTION_PATHS | EXECUTION_WRITER_PATHS
 )
-# Filled from the exact reviewed production-to-retirement Git object pair.
-_REVIEWED_RETIREMENT_RISK_FINGERPRINT = (
-    "93b0572cf030c067a1a1b82500d2cd7cb4ef42ce95358d757c95ad14a695e763"
-)
 
 
 class ChangeSurfaceError(ValueError):
@@ -110,6 +117,40 @@ class ChangeSurfaceFacts:
     restart_compatibility_changed: bool
     restart_handler_fingerprint: str
     blocking_reason_codes: tuple[str, ...]
+
+
+def bind_phase_restart_surface_counts(
+    preliminary_counts: Mapping[str, Mapping[str, int]],
+    current_counts: Mapping[str, Mapping[str, int]],
+) -> dict[str, dict[str, int]]:
+    """Keep Phase A's restart-handler universe fixed through Phase B."""
+
+    bound: dict[str, dict[str, int]] = {}
+    for classification, source_counts in current_counts.items():
+        if not isinstance(classification, str) or not isinstance(
+            source_counts, Mapping
+        ):
+            raise ChangeSurfaceError("change_surface_malformed")
+        bound[classification] = dict(source_counts)
+    for classification in ("restart_safe_wait", "historical_residue"):
+        source_counts = preliminary_counts.get(classification, {})
+        if not isinstance(source_counts, Mapping):
+            raise ChangeSurfaceError("change_surface_malformed")
+        target = bound.setdefault(classification, {})
+        for source, count in source_counts.items():
+            if (
+                not isinstance(source, str)
+                or not isinstance(count, int)
+                or isinstance(count, bool)
+                or count < 0
+            ):
+                raise ChangeSurfaceError("change_surface_malformed")
+            if count > 0:
+                current = target.get(source, 0)
+                if not isinstance(current, int) or isinstance(current, bool):
+                    raise ChangeSurfaceError("change_surface_malformed")
+                target[source] = max(current, count)
+    return bound
 
 
 def classify_change_surface(
@@ -135,16 +176,15 @@ def classify_change_surface(
         candidate,
         changes,
     )
-    reviewed_retirement = _matches_reviewed_retirement(
-        root,
-        production,
-        candidate,
-    )
-
     observed = "code"
     for path in changes:
         path_class = "code"
-        if path in _REVIEWED_RETIREMENT_RISK_PATHS and reviewed_retirement:
+        if _is_unchanged_reviewed_retirement_path(
+            root,
+            production,
+            candidate,
+            path,
+        ):
             path_class = "code"
         elif path in LIVE_PROMOTION_PATHS:
             path_class = "live_promotion"
@@ -238,39 +278,33 @@ def _surface_fingerprint(
     return _fingerprint(facts)
 
 
-def _matches_reviewed_retirement(
+def _is_unchanged_reviewed_retirement_path(
     repository: Path,
     production: str,
     candidate: str,
+    path: str,
 ) -> bool:
-    if production != _RETIREMENT_PRODUCTION_COMMIT:
+    if (
+        production != _RETIREMENT_PRODUCTION_COMMIT
+        or path not in _REVIEWED_RETIREMENT_RISK_PATHS
+    ):
         return False
-    current = _selected_path_fingerprint(
-        repository,
-        production,
-        candidate,
-        _REVIEWED_RETIREMENT_RISK_PATHS,
-    )
-    return bool(_REVIEWED_RETIREMENT_RISK_FINGERPRINT) and (
-        current == _REVIEWED_RETIREMENT_RISK_FINGERPRINT
-    )
-
-
-def _selected_path_fingerprint(
-    repository: Path,
-    production: str,
-    candidate: str,
-    paths: frozenset[str],
-) -> str:
-    return _fingerprint(
+    ancestry = subprocess.run(
         [
-            {
-                "path": path,
-                "production_blob": _blob(repository, production, path),
-                "candidate_blob": _blob(repository, candidate, path),
-            }
-            for path in sorted(paths)
-        ]
+            "git",
+            "-C",
+            str(repository),
+            "merge-base",
+            "--is-ancestor",
+            _RETIREMENT_REVIEW_COMMIT,
+            candidate,
+        ],
+        check=False,
+        capture_output=True,
+    )
+    return ancestry.returncode == 0 and (
+        _blob(repository, candidate, path)
+        == _blob(repository, _RETIREMENT_REVIEW_COMMIT, path)
     )
 
 

@@ -146,8 +146,13 @@ For management rows, `submitted` or `reconciling` is not automatically safe.
 The adapter must prove that the candidate retains read-only reconciliation or
 idempotent reconciliation semantics and that there is no unknown mutation
 intent. Batch 119 qualifies without a special case because its durable evidence
-matches that generic rule and the retirement candidate does not change the
-management writer/reconciler surface.
+matches that generic rule. The original retirement-only candidate did not
+change the management writer/reconciler surface. During Task 6 review, however,
+the terminal-entry cleanup path was proved to lack durable pre-submit ownership;
+closing that prerequisite changes an exchange writer boundary. The combined
+candidate is therefore `execution_writer`, not `schema_compatible`, and must
+BLOCK on restart-safe/history residue rather than inherit the retirement-only
+exception.
 
 ## Candidate Change-Surface Validation
 
@@ -293,8 +298,9 @@ database must show:
 - Batch-119-shaped residue classified generically as restart-safe/history;
 - zero `in_flight_write`;
 - zero `unknown_outcome`;
-- `schema_compatible` WARN;
-- `execution_writer` BLOCK for the same residue;
+- policy-only `schema_compatible` WARN and `execution_writer` BLOCK for the
+  same sanitized facts;
+- exact combined candidate classified `execution_writer` and BLOCK;
 - zero database writes, notifications, and exchange writes.
 
 Verify that production SHA, service, tracked files, and database remain

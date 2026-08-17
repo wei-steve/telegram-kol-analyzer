@@ -790,8 +790,10 @@ Write only sanitized mode-0600 artifacts under `/run/telegram-kol`. Require:
 in_flight_write = 0
 unknown_outcome = 0
 Batch-119-shaped management facts = restart_safe_wait or historical_residue
-schema_compatible = WARN
-execution_writer = BLOCK
+policy-only schema_compatible evaluation = WARN
+policy-only execution_writer evaluation = BLOCK
+exact candidate effective class = execution_writer
+exact candidate decision = BLOCK
 database writes = 0
 notifications = 0
 exchange writes = 0
@@ -800,6 +802,17 @@ exchange writes = 0
 Repeat the shadow collection after at least one reconciliation heartbeat and
 prove the safety fingerprint is unchanged even though `updated_at` changed.
 
+The policy-only evaluations reuse the same sanitized fact snapshot without
+claiming that the exact candidate belongs to both classes. The reviewed
+candidate now includes the Task 6 terminal-entry cleanup
+pre-submit ownership repair. Its exact production-to-candidate surface must
+therefore resolve to `execution_writer`; requesting `schema_compatible` is
+underdeclared and BLOCK. The two class results above remain a policy proof, but
+the current combined candidate is expected to take the `execution_writer =
+BLOCK` branch while restart-safe/history residue exists. Stop after recording
+that shadow result. Do not request deployment approval for this SHA, split out
+an unsafe gate-only candidate, or add a commit/Batch119 exception.
+
 **Step 5: Re-prove production immutability**
 
 Verify production SHA, active service, tracked-file count, database watermark,
@@ -807,14 +820,18 @@ settings, and MiMo v1 authority are unchanged. Remove disposable candidate
 test artifacts and databases; retain only the reviewed sanitized shadow
 summary if the runbook requires it.
 
-Stop and request a separate deployment approval. A successful shadow is not
-deployment authorization.
+Stop and request a separate deployment approval only for a future candidate
+whose exact effective class receives an allowed Phase A and Phase B decision.
+A successful shadow is not deployment authorization; the current combined
+`execution_writer` candidate is expected to remain blocked.
 
-**Step 6: Deploy only after that approval**
+**Step 6: Deploy only after that approval (not applicable to the current SHA)**
 
-Run the reviewed helper with exact branch, SHA, and `schema_compatible`. Accept
-only phase-A and phase-B PASS/WARN artifacts. If either is BLOCK or malformed,
-leave/restore the prior service and report the exact reason.
+Run the reviewed helper only with the exact effective class for that future
+candidate. Never request `schema_compatible` for a candidate classified as
+`execution_writer`. Accept only phase-A and phase-B PASS/WARN artifacts. If
+either is BLOCK or malformed, leave/restore the prior service and report the
+exact reason.
 
 After success verify:
 
