@@ -82,6 +82,12 @@ case "${1:-}" in
     else
       printf 'worktree-remove\n' >>"$HARNESS_LOG"
       [ -f "$HARNESS_STATE/worktree_registered" ] || exit 1
+      if [ -n "${HARNESS_WORKTREE_REMOVE_SIGNAL:-}" ] && [ ! -f "$HARNESS_STATE/worktree_remove_signaled" ]; then
+        touch "$HARNESS_STATE/worktree_remove_signaled"
+        kill -"$HARNESS_WORKTREE_REMOVE_SIGNAL" "$PPID"
+        exit 128
+      fi
+      [ "${HARNESS_WORKTREE_REMOVE_FAIL:-0}" != "1" ] || exit 1
       rm -f "$HARNESS_STATE/worktree_registered"
       /bin/rm -rf -- "${4:-}"
     fi
@@ -296,6 +302,10 @@ chmod 0755 "$target"
 set -euo pipefail
 printf 'durable-updater-move\n' >>"$HARNESS_LOG"
 [ "${HARNESS_DURABLE_MOVE_FAIL:-0}" != "1" ] || exit 1
+if [ "${HARNESS_DURABLE_MOVE_FAIL_AFTER:-0}" = "1" ]; then
+  /bin/mv "$@"
+  exit 1
+fi
 exec /bin/mv "$@"
 ''',
     )
@@ -307,7 +317,25 @@ printf 'http-health\n' >>"$HARNESS_LOG"
 [ "${HARNESS_HTTP_FAIL:-0}" != "1" ]
 ''',
     )
-    _write_executable(fake_bin / "flock", "#!/usr/bin/env bash\nexit 0\n")
+    _write_executable(
+        fake_bin / "flock",
+        '#!/usr/bin/env bash\n[ "${HARNESS_FLOCK_FAIL:-0}" != "1" ]\n',
+    )
+    _write_executable(
+        fake_bin / "rm",
+        r'''#!/usr/bin/env bash
+set -euo pipefail
+case " $* " in
+  *telegram-kol-updater-backup.*)
+    [ "${HARNESS_FINAL_BACKUP_REMOVE_FAIL:-0}" != "1" ] || exit 1
+    ;;
+  *schema-dry-run-*)
+    [ "${HARNESS_FINAL_DRY_RUN_REMOVE_FAIL:-0}" != "1" ] || exit 1
+    ;;
+esac
+exec /bin/rm "$@"
+''',
+    )
     _write_executable(
         fake_bin / "timeout",
         '#!/usr/bin/env bash\nshift 2\nexec "$@"\n',
@@ -517,7 +545,8 @@ def test_stop_fault_reasserts_old_service_without_checkout(
 
     result = run(HARNESS_STOP_MODE=mode)
 
-    assert result.returncode != 0
+    expected = {"fail": 4, "nonzero_inactive": 4, "term": 143, "int": 130}
+    assert result.returncode == expected[mode]
     events = _events(log)
     assert "checkout" not in events
     assert "rollback-start" in events
@@ -592,7 +621,7 @@ def test_schema_fault_never_reaches_active_check_or_stop(
         **{fault: "1"},
     )
 
-    assert result.returncode != 0
+    assert result.returncode == 4
     events = _events(log)
     assert "active-check-1" not in events
     assert "stop" not in events
@@ -602,6 +631,8 @@ def test_schema_fault_never_reaches_active_check_or_stop(
     ("fault", "value"),
     (
         ("HARNESS_REMOTE_HEAD", OTHER),
+        ("HARNESS_FETCH_RC", "1"),
+        ("HARNESS_FLOCK_FAIL", "1"),
         ("HARNESS_STATUS_FAIL", "1"),
         ("HARNESS_DIRTY", "1"),
         ("HARNESS_CURRENT_BRANCH", "codex/wrong"),
@@ -657,7 +688,7 @@ def test_poststop_fault_restores_old_checkout_package_updater_and_service(
 
     result = run(**{fault: "1"})
 
-    assert result.returncode != 0
+    assert result.returncode == 4
     assert (state / "head").read_text().strip() == PREVIOUS
     assert (state / "branch").read_text().strip() == PREVIOUS
     events = _events(log)
@@ -725,6 +756,64 @@ def test_rollback_failure_is_hard_failure(
 
     assert result.returncode == 4
     assert "ROLLBACK FAILED" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("fault", "extra"),
+    (
+        ("HARNESS_WORKTREE_REMOVE_FAIL", {}),
+        ("HARNESS_FINAL_BACKUP_REMOVE_FAIL", {}),
+        (
+            "HARNESS_FINAL_DRY_RUN_REMOVE_FAIL",
+            {"HARNESS_CHANGED_PATH": "src/telegram_kol_research/models.py"},
+        ),
+    ),
+)
+def test_final_cleanup_failure_rolls_back_instead_of_applying_candidate(
+    updater_harness,
+    fault: str,
+    extra: dict[str, str],
+) -> None:
+    run, _, state = updater_harness
+
+    result = run(**{fault: "1"}, **extra)
+
+    assert result.returncode == 4
+    assert (state / "head").read_text().strip() == PREVIOUS
+    assert (state / "branch").read_text().strip() == PREVIOUS
+
+
+def test_hard_rollback_failure_preserves_recovery_materials(
+    updater_harness,
+) -> None:
+    run, log, _ = updater_harness
+
+    result = run(
+        HARNESS_DURABLE_MOVE_FAIL_AFTER="1",
+        HARNESS_UPDATER_RESTORE_FAIL="1",
+    )
+
+    assert result.returncode == 4
+    assert "ROLLBACK FAILED" in result.stderr
+    assert list(log.parent.glob("telegram-kol-updater-backup.*"))
+    assert list(log.parent.glob("telegram-kol-stage.*"))
+    assert "worktree-remove" not in _events(log)
+    assert (log.parent / "durable-updater").read_text() == "candidate updater\n"
+
+
+@pytest.mark.parametrize(("signal", "expected"), (("TERM", 143), ("INT", 130)))
+def test_signal_during_final_cleanup_rolls_back_candidate(
+    updater_harness,
+    signal: str,
+    expected: int,
+) -> None:
+    run, _, state = updater_harness
+
+    result = run(HARNESS_WORKTREE_REMOVE_SIGNAL=signal)
+
+    assert result.returncode == expected
+    assert (state / "head").read_text().strip() == PREVIOUS
+    assert (state / "branch").read_text().strip() == PREVIOUS
 
 
 def test_http_health_is_bounded_and_uses_required_endpoint() -> None:

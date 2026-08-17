@@ -36,7 +36,7 @@ fi
 exec 9>"$LOCK_PATH"
 if ! flock -n 9; then
   echo "Another deployment is already running." >&2
-  exit 3
+  exit 4
 fi
 
 stage_dir=""
@@ -49,7 +49,10 @@ stop_attempted=0
 checkout_mutated=0
 updater_installed=0
 deployment_finalized=0
-previous_commit="$(git -C "$APP_DIR" rev-parse HEAD)"
+if ! previous_commit="$(git -C "$APP_DIR" rev-parse HEAD)"; then
+  echo "Could not read the production rollback commit." >&2
+  exit 4
+fi
 
 wait_for_unit_inactive() {
   local remaining=$((STOP_TIMEOUT_SECONDS * 4)) state
@@ -68,8 +71,10 @@ cleanup_schema_dry_run() {
   if [ -z "$schema_dry_run" ]; then return 0; fi
   case "$schema_dry_run" in
     "$BACKUP_DIR"/schema-dry-run-*)
-      rm -f -- "$schema_dry_run" "$schema_dry_run-wal" \
-        "$schema_dry_run-shm" "$schema_dry_run-journal"
+      if ! rm -f -- "$schema_dry_run" "$schema_dry_run-wal" \
+        "$schema_dry_run-shm" "$schema_dry_run-journal"; then
+        return 1
+      fi
       schema_dry_run=""
       ;;
     *)
@@ -131,7 +136,7 @@ cleanup() {
     fi
     if [ "$rollback_ok" -ne 1 ]; then
       echo "ROLLBACK FAILED; telegram-kol.service may remain stopped." >&2
-      status=4
+      exit 4
     fi
   fi
 
@@ -139,12 +144,13 @@ cleanup() {
     if [ "$stage_registered" -eq 1 ]; then
       git -C "$APP_DIR" worktree remove --force "$stage_dir" >/dev/null 2>&1 || true
     else
-      rmdir -- "$stage_dir" >/dev/null 2>&1 || true
+      git -C "$APP_DIR" worktree remove --force "$stage_dir" >/dev/null 2>&1 || \
+        rmdir -- "$stage_dir" >/dev/null 2>&1 || true
     fi
   fi
   cleanup_schema_dry_run || true
-  [ -z "$updater_candidate" ] || rm -f -- "$updater_candidate"
-  [ -z "$updater_backup" ] || rm -f -- "$updater_backup"
+  [ -z "$updater_candidate" ] || rm -f -- "$updater_candidate" || true
+  [ -z "$updater_backup" ] || rm -f -- "$updater_backup" || true
   exit "$status"
 }
 trap cleanup EXIT
@@ -152,8 +158,14 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 cd "$APP_DIR"
-git fetch origin "$BRANCH"
-remote_head="$(git rev-parse FETCH_HEAD)"
+if ! git fetch origin "$BRANCH"; then
+  echo "Could not fetch the deployment branch." >&2
+  exit 4
+fi
+if ! remote_head="$(git rev-parse FETCH_HEAD)"; then
+  echo "Could not read the fetched deployment commit." >&2
+  exit 4
+fi
 if [ "$remote_head" != "$EXPECTED_COMMIT" ]; then
   echo "Remote branch does not match EXPECTED_COMMIT." >&2
   exit 4
@@ -170,14 +182,23 @@ current_branch="$(git symbolic-ref --quiet --short HEAD)" || {
   echo "Production checkout must be attached to the deployment branch." >&2
   exit 4
 }
-branch_commit="$(git rev-parse "refs/heads/$BRANCH")"
+if ! branch_commit="$(git rev-parse "refs/heads/$BRANCH")"; then
+  echo "Could not read the production branch rollback point." >&2
+  exit 4
+fi
 if [ "$current_branch" != "$BRANCH" ] || [ "$branch_commit" != "$previous_commit" ]; then
   echo "Production branch is not an exact rollback point." >&2
   exit 4
 fi
 
-stage_dir="$(mktemp -d "$STAGE_PARENT/telegram-kol-stage.XXXXXX")"
-chmod 0700 "$stage_dir"
+if ! stage_dir="$(mktemp -d "$STAGE_PARENT/telegram-kol-stage.XXXXXX")"; then
+  echo "Could not create the candidate staging directory." >&2
+  exit 4
+fi
+if ! chmod 0700 "$stage_dir"; then
+  echo "Could not secure the candidate staging directory." >&2
+  exit 4
+fi
 if ! git worktree add --detach "$stage_dir" "$EXPECTED_COMMIT" >/dev/null; then
   echo "Could not stage the exact candidate commit." >&2
   exit 4
@@ -203,11 +224,11 @@ case "$schema_diff_status" in
 esac
 
 create_schema_backup_and_dry_run() {
-  install -d -m 0700 "$BACKUP_DIR"
-  cleanup_schema_dry_run
+  if ! install -d -m 0700 "$BACKUP_DIR"; then return 1; fi
+  if ! cleanup_schema_dry_run; then return 1; fi
   schema_backup="$BACKUP_DIR/research-deployment-${EXPECTED_COMMIT}-$(date -u +%Y%m%dT%H%M%SZ).db"
   schema_dry_run="$BACKUP_DIR/schema-dry-run-${EXPECTED_COMMIT}-$$.db"
-  "${candidate_python[@]}" - schema "$DATABASE_PATH" "$schema_backup" "$schema_dry_run" <<'PY'
+  if ! "${candidate_python[@]}" - schema "$DATABASE_PATH" "$schema_backup" "$schema_dry_run" <<'PY'
 import os
 from pathlib import Path
 import sqlite3
@@ -282,10 +303,16 @@ with sqlite3.connect(Path(dry_run_path).resolve().as_uri() + "?mode=ro", uri=Tru
 if backup_watermark != dry_run_watermark:
     raise RuntimeError("migration dry-run watermark changed")
 PY
+  then
+    return 1
+  fi
 }
 
 if [ "$schema_changed" -eq 1 ]; then
-  create_schema_backup_and_dry_run
+  if ! create_schema_backup_and_dry_run; then
+    echo "Schema backup or migration dry-run failed." >&2
+    exit 4
+  fi
 fi
 
 run_active_write_check() {
@@ -349,38 +376,74 @@ stop_writer_service
 run_active_write_check
 
 checkout_mutated=1
-git checkout "$BRANCH"
-git merge --ff-only "$EXPECTED_COMMIT"
+if ! git checkout "$BRANCH"; then
+  echo "Candidate checkout failed." >&2
+  exit 4
+fi
+if ! git merge --ff-only "$EXPECTED_COMMIT"; then
+  echo "Candidate fast-forward failed." >&2
+  exit 4
+fi
 if [ "$(git rev-parse HEAD)" != "$EXPECTED_COMMIT" ]; then
   echo "Production checkout did not reach EXPECTED_COMMIT." >&2
   exit 4
 fi
-env "PYTHONPATH=$APP_DIR/src" "$APP_DIR/.venv/bin/python" -m pip install -e "$APP_DIR"
-systemctl start telegram-kol.service
-systemctl is-active --quiet telegram-kol.service
+if ! env "PYTHONPATH=$APP_DIR/src" "$APP_DIR/.venv/bin/python" -m pip install -e "$APP_DIR"; then
+  echo "Candidate package installation failed." >&2
+  exit 4
+fi
+if ! systemctl start telegram-kol.service; then
+  echo "Candidate service start failed." >&2
+  exit 4
+fi
+if ! systemctl is-active --quiet telegram-kol.service; then
+  echo "Candidate service did not become active." >&2
+  exit 4
+fi
 if ! verify_http_health; then
   echo "Candidate HTTP health verification failed." >&2
   exit 4
 fi
 
 if [ -f "$UPDATER_PATH" ]; then
-  updater_backup="$(mktemp "$STAGE_PARENT/telegram-kol-updater-backup.XXXXXX")"
-  cp -p -- "$UPDATER_PATH" "$updater_backup"
+  if ! updater_backup="$(mktemp "$STAGE_PARENT/telegram-kol-updater-backup.XXXXXX")"; then
+    echo "Could not create the durable-updater backup." >&2
+    exit 4
+  fi
+  if ! cp -p -- "$UPDATER_PATH" "$updater_backup"; then
+    echo "Could not back up the durable updater." >&2
+    exit 4
+  fi
 fi
 updater_candidate="${UPDATER_PATH}.candidate.$$"
-install -o root -g root -m 0755 "$stage_dir/deploy/telegram-kol-update" "$updater_candidate"
+if ! install -o root -g root -m 0755 "$stage_dir/deploy/telegram-kol-update" "$updater_candidate"; then
+  echo "Could not stage the durable updater." >&2
+  exit 4
+fi
 updater_installed=1
-mv -f -- "$updater_candidate" "$UPDATER_PATH"
+if ! mv -f -- "$updater_candidate" "$UPDATER_PATH"; then
+  echo "Could not install the durable updater." >&2
+  exit 4
+fi
 updater_candidate=""
 
+if ! git -C "$APP_DIR" worktree remove --force "$stage_dir" >/dev/null; then
+  echo "Could not remove the candidate worktree." >&2
+  exit 4
+fi
+stage_dir=""
+stage_registered=0
+if ! cleanup_schema_dry_run; then
+  echo "Could not remove the disposable schema copy." >&2
+  exit 4
+fi
+if [ -n "$updater_backup" ] && ! rm -f -- "$updater_backup"; then
+  echo "Could not remove the durable-updater backup." >&2
+  exit 4
+fi
+updater_backup=""
 deployment_finalized=1
 stop_attempted=0
 checkout_mutated=0
 updater_installed=0
-git -C "$APP_DIR" worktree remove --force "$stage_dir" >/dev/null
-stage_dir=""
-stage_registered=0
-cleanup_schema_dry_run
-[ -z "$updater_backup" ] || rm -f -- "$updater_backup"
-updater_backup=""
 trap - EXIT INT TERM
