@@ -19,6 +19,7 @@ import sqlite3
 import tempfile
 from typing import Any, Mapping
 
+from .deployment_change_surface import ChangeSurfaceFacts
 from .deployment_work_evidence import (
     DeploymentWorkEvidenceError,
     WORK_EVIDENCE_ADAPTERS,
@@ -36,7 +37,7 @@ _WRITER_SENSITIVE_CHANGE_CLASSES = frozenset(
 )
 _EXPECTED_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _SHADOW_EVIDENCE_RE = re.compile(r"[0-9a-f]{64}")
-_ARTIFACT_KEYS = frozenset(
+_LEGACY_ARTIFACT_KEYS = frozenset(
     {
         "schema_version",
         "expected_commit",
@@ -50,6 +51,32 @@ _ARTIFACT_KEYS = frozenset(
         "fingerprint",
     }
 )
+_PHASE_ARTIFACT_KEYS = frozenset(
+    {
+        "schema_version",
+        "phase",
+        "production_commit",
+        "candidate_commit",
+        "requested_change_class",
+        "effective_change_class",
+        "policy_version",
+        "surface_registry_version",
+        "change_surface_fingerprint",
+        "restart_handler_fingerprint",
+        "changed_path_count",
+        "change_surface_underdeclared",
+        "restart_compatibility_changed",
+        "decision",
+        "database_watermark",
+        "checked_facts",
+        "reason_codes",
+        "preliminary_fingerprint",
+        "created_at",
+        "expires_at",
+        "fingerprint",
+    }
+)
+DEPLOYMENT_PREFLIGHT_POLICY_VERSION = 1
 _MAX_ARTIFACT_BYTES = 32_768
 _MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
 _DEFAULT_TTL = timedelta(minutes=5)
@@ -274,7 +301,7 @@ def verify_deployment_preflight_artifact(
 ) -> str:
     """Verify identity, expiry, shape, and fingerprint of one artifact."""
 
-    if not isinstance(artifact, Mapping) or set(artifact) != _ARTIFACT_KEYS:
+    if not isinstance(artifact, Mapping) or set(artifact) != _LEGACY_ARTIFACT_KEYS:
         raise DeploymentPreflightInputError("preflight_artifact_shape_invalid")
     commit = _validate_expected_commit(expected_commit)
     normalized_class = _validate_change_class(change_class)
@@ -293,6 +320,384 @@ def verify_deployment_preflight_artifact(
     unsigned = {key: value for key, value in artifact.items() if key != "fingerprint"}
     if not _constant_time_equal(fingerprint, _artifact_fingerprint(unsigned)):
         raise DeploymentPreflightInputError("preflight_artifact_fingerprint_mismatch")
+    try:
+        created_at = _aware_utc(datetime.fromisoformat(str(artifact["created_at"])))
+        expires_at = _aware_utc(datetime.fromisoformat(str(artifact["expires_at"])))
+    except (TypeError, ValueError) as exc:
+        raise DeploymentPreflightInputError(
+            "preflight_artifact_time_invalid"
+        ) from exc
+    checked_at = _aware_utc(now)
+    if expires_at <= created_at or expires_at - created_at > timedelta(minutes=15):
+        raise DeploymentPreflightInputError("preflight_artifact_time_invalid")
+    if checked_at < created_at - timedelta(seconds=30):
+        raise DeploymentPreflightInputError("preflight_artifact_from_future")
+    if checked_at >= expires_at:
+        raise DeploymentPreflightInputError("preflight_artifact_expired")
+    if not isinstance(artifact.get("database_watermark"), Mapping):
+        raise DeploymentPreflightInputError("preflight_artifact_watermark_invalid")
+    if not isinstance(artifact.get("checked_facts"), Mapping):
+        raise DeploymentPreflightInputError("preflight_artifact_facts_invalid")
+    reasons = artifact.get("reason_codes")
+    if (
+        not isinstance(reasons, list)
+        or len(reasons) > 32
+        or any(not isinstance(value, str) or len(value) > 96 for value in reasons)
+        or reasons != sorted(set(reasons))
+    ):
+        raise DeploymentPreflightInputError("preflight_artifact_reasons_invalid")
+    return str(decision)
+
+
+def build_preliminary_deployment_preflight_artifact(
+    *,
+    production_commit: str,
+    candidate_commit: str,
+    requested_change_class: str,
+    change_surface: ChangeSurfaceFacts,
+    facts: DeploymentPreflightFacts,
+    now: datetime,
+    ttl: timedelta = _DEFAULT_TTL,
+) -> dict[str, object]:
+    """Build phase A evidence, which can authorize only a service-stop attempt."""
+
+    return _build_phase_bound_deployment_preflight_artifact(
+        phase="preliminary",
+        production_commit=production_commit,
+        candidate_commit=candidate_commit,
+        requested_change_class=requested_change_class,
+        change_surface=change_surface,
+        facts=facts,
+        preliminary_fingerprint=None,
+        now=now,
+        ttl=ttl,
+    )
+
+
+def build_final_deployment_preflight_artifact(
+    *,
+    preliminary_artifact: Mapping[str, object],
+    production_commit: str,
+    candidate_commit: str,
+    requested_change_class: str,
+    change_surface: ChangeSurfaceFacts,
+    facts: DeploymentPreflightFacts,
+    now: datetime,
+    ttl: timedelta = _DEFAULT_TTL,
+) -> dict[str, object]:
+    """Build phase B evidence only from one valid matching phase A artifact."""
+
+    checked_at = _aware_utc(now)
+    preliminary_decision = verify_phase_bound_deployment_preflight_artifact(
+        preliminary_artifact,
+        phase="preliminary",
+        production_commit=production_commit,
+        candidate_commit=candidate_commit,
+        requested_change_class=requested_change_class,
+        change_surface=change_surface,
+        now=checked_at,
+    )
+    if preliminary_decision == "BLOCK":
+        raise DeploymentPreflightInputError("preliminary_artifact_blocked")
+    preliminary_watermark = preliminary_artifact.get("database_watermark")
+    if not isinstance(preliminary_watermark, Mapping):
+        raise DeploymentPreflightInputError("preflight_artifact_watermark_invalid")
+    final_watermark = facts.to_json()["database_watermark"]
+    _validate_watermark_transition(preliminary_watermark, final_watermark)
+    preliminary_fingerprint = preliminary_artifact.get("fingerprint")
+    if not isinstance(preliminary_fingerprint, str):
+        raise DeploymentPreflightInputError(
+            "preflight_artifact_fingerprint_invalid"
+        )
+    return _build_phase_bound_deployment_preflight_artifact(
+        phase="final",
+        production_commit=production_commit,
+        candidate_commit=candidate_commit,
+        requested_change_class=requested_change_class,
+        change_surface=change_surface,
+        facts=facts,
+        preliminary_fingerprint=preliminary_fingerprint,
+        now=checked_at,
+        ttl=ttl,
+    )
+
+
+def verify_phase_bound_deployment_preflight_artifact(
+    artifact: Mapping[str, object],
+    *,
+    phase: str,
+    production_commit: str,
+    candidate_commit: str,
+    requested_change_class: str,
+    change_surface: ChangeSurfaceFacts,
+    now: datetime,
+    preliminary_artifact: Mapping[str, object] | None = None,
+) -> str:
+    """Verify one schema-v2 artifact and its exact Git/surface identity."""
+
+    if not isinstance(artifact, Mapping) or set(artifact) != _PHASE_ARTIFACT_KEYS:
+        raise DeploymentPreflightInputError("preflight_artifact_shape_invalid")
+    normalized_phase = _validate_phase(phase)
+    production = _validate_expected_commit(production_commit)
+    candidate = _validate_expected_commit(candidate_commit)
+    requested = _validate_change_class(requested_change_class)
+    _validate_change_surface(change_surface, requested_change_class=requested)
+    if artifact.get("schema_version") != 2:
+        raise DeploymentPreflightInputError("preflight_artifact_version_invalid")
+    if artifact.get("phase") != normalized_phase:
+        raise DeploymentPreflightInputError("preflight_artifact_phase_mismatch")
+    if artifact.get("production_commit") != production:
+        raise DeploymentPreflightInputError("preflight_artifact_commit_mismatch")
+    if artifact.get("candidate_commit") != candidate:
+        raise DeploymentPreflightInputError("preflight_artifact_commit_mismatch")
+    if artifact.get("requested_change_class") != requested:
+        raise DeploymentPreflightInputError("preflight_artifact_class_mismatch")
+    if artifact.get("effective_change_class") != change_surface.effective_change_class:
+        raise DeploymentPreflightInputError("preflight_artifact_class_mismatch")
+    expected_surface_values = {
+        "policy_version": DEPLOYMENT_PREFLIGHT_POLICY_VERSION,
+        "surface_registry_version": change_surface.registry_version,
+        "change_surface_fingerprint": change_surface.change_surface_fingerprint,
+        "restart_handler_fingerprint": change_surface.restart_handler_fingerprint,
+        "changed_path_count": change_surface.changed_path_count,
+        "change_surface_underdeclared": change_surface.underdeclared,
+        "restart_compatibility_changed": (
+            change_surface.restart_compatibility_changed
+        ),
+    }
+    if any(artifact.get(key) != value for key, value in expected_surface_values.items()):
+        raise DeploymentPreflightInputError("preflight_artifact_surface_mismatch")
+    decision = _verify_common_artifact_fields(artifact, now=now)
+    parent_fingerprint = artifact.get("preliminary_fingerprint")
+    if normalized_phase == "preliminary":
+        if parent_fingerprint is not None:
+            raise DeploymentPreflightInputError("preflight_artifact_parent_invalid")
+    else:
+        if not isinstance(parent_fingerprint, str) or not _SHADOW_EVIDENCE_RE.fullmatch(
+            parent_fingerprint
+        ):
+            raise DeploymentPreflightInputError("preflight_artifact_parent_invalid")
+        if preliminary_artifact is None:
+            raise DeploymentPreflightInputError(
+                "preflight_artifact_parent_required"
+            )
+        verify_phase_bound_deployment_preflight_artifact(
+            preliminary_artifact,
+            phase="preliminary",
+            production_commit=production,
+            candidate_commit=candidate,
+            requested_change_class=requested,
+            change_surface=change_surface,
+            now=now,
+        )
+        if preliminary_artifact.get("fingerprint") != parent_fingerprint:
+            raise DeploymentPreflightInputError(
+                "preflight_artifact_parent_mismatch"
+            )
+    return decision
+
+
+def _build_phase_bound_deployment_preflight_artifact(
+    *,
+    phase: str,
+    production_commit: str,
+    candidate_commit: str,
+    requested_change_class: str,
+    change_surface: ChangeSurfaceFacts,
+    facts: DeploymentPreflightFacts,
+    preliminary_fingerprint: str | None,
+    now: datetime,
+    ttl: timedelta,
+) -> dict[str, object]:
+    normalized_phase = _validate_phase(phase)
+    production = _validate_expected_commit(production_commit)
+    candidate = _validate_expected_commit(candidate_commit)
+    requested = _validate_change_class(requested_change_class)
+    _validate_change_surface(change_surface, requested_change_class=requested)
+    checked_at = _aware_utc(now)
+    if ttl <= timedelta(0) or ttl > timedelta(minutes=15):
+        raise DeploymentPreflightInputError("preflight_ttl_invalid")
+    if normalized_phase == "preliminary" and preliminary_fingerprint is not None:
+        raise DeploymentPreflightInputError("preflight_artifact_parent_invalid")
+    if normalized_phase == "final" and (
+        not isinstance(preliminary_fingerprint, str)
+        or not _SHADOW_EVIDENCE_RE.fullmatch(preliminary_fingerprint)
+    ):
+        raise DeploymentPreflightInputError("preflight_artifact_parent_invalid")
+    fact_json = facts.to_json()
+    blocking, warnings = _classify_phase_facts(
+        facts=facts,
+        fact_json=fact_json,
+        effective_change_class=change_surface.effective_change_class,
+        require_schema_evidence=normalized_phase == "final",
+    )
+    blocking.update(change_surface.blocking_reason_codes)
+    decision = "BLOCK" if blocking else "WARN" if warnings else "PASS"
+    body: dict[str, object] = {
+        "schema_version": 2,
+        "phase": normalized_phase,
+        "production_commit": production,
+        "candidate_commit": candidate,
+        "requested_change_class": requested,
+        "effective_change_class": change_surface.effective_change_class,
+        "policy_version": DEPLOYMENT_PREFLIGHT_POLICY_VERSION,
+        "surface_registry_version": change_surface.registry_version,
+        "change_surface_fingerprint": change_surface.change_surface_fingerprint,
+        "restart_handler_fingerprint": change_surface.restart_handler_fingerprint,
+        "changed_path_count": _bounded_count(change_surface.changed_path_count),
+        "change_surface_underdeclared": bool(change_surface.underdeclared),
+        "restart_compatibility_changed": bool(
+            change_surface.restart_compatibility_changed
+        ),
+        "decision": decision,
+        "database_watermark": fact_json.pop("database_watermark"),
+        "checked_facts": fact_json,
+        "reason_codes": sorted(blocking | warnings),
+        "preliminary_fingerprint": preliminary_fingerprint,
+        "created_at": checked_at.isoformat(),
+        "expires_at": (checked_at + ttl).isoformat(),
+    }
+    body["fingerprint"] = _artifact_fingerprint(body)
+    if len(_canonical_json(body).encode("utf-8")) > _MAX_ARTIFACT_BYTES:
+        raise DeploymentPreflightInputError("preflight_artifact_too_large")
+    return body
+
+
+def _classify_phase_facts(
+    *,
+    facts: DeploymentPreflightFacts,
+    fact_json: Mapping[str, object],
+    effective_change_class: str,
+    require_schema_evidence: bool,
+) -> tuple[set[str], set[str]]:
+    blocking: set[str] = set()
+    warnings: set[str] = set()
+    try:
+        work_decision = classify_deployment_work(
+            counts=facts.work_classification_counts,
+            change_class=effective_change_class,
+        )
+    except DeploymentWorkEvidenceError as exc:
+        raise DeploymentPreflightInputError(str(exc)) from exc
+    blocking.update(work_decision.blocking_reason_codes)
+    warnings.update(work_decision.warning_reason_codes)
+    if int(fact_json["protected_open_position_count"]) > 0:
+        warnings.add("protected_open_positions_present")
+    if int(fact_json["unprotected_open_position_count"]) > 0:
+        blocking.add("unprotected_open_positions_present")
+    snapshot_complete = all(
+        bool(fact_json[key])
+        for key in (
+            "exchange_snapshot_available",
+            "exchange_snapshot_complete",
+            "exchange_snapshot_fresh",
+            "exchange_snapshot_stable",
+        )
+    )
+    if not snapshot_complete:
+        target = (
+            blocking
+            if effective_change_class in _WRITER_SENSITIVE_CHANGE_CLASSES
+            else warnings
+        )
+        target.add("exchange_snapshot_incomplete")
+    if require_schema_evidence and effective_change_class == "schema_compatible":
+        if not isinstance(facts.schema_backup_valid, bool) or not isinstance(
+            facts.schema_migration_dry_run_valid, bool
+        ):
+            raise DeploymentPreflightInputError(
+                "preflight_schema_evidence_invalid"
+            )
+        if facts.schema_backup_valid is not True:
+            blocking.add("schema_backup_unavailable")
+        if facts.schema_migration_dry_run_valid is not True:
+            blocking.add("schema_migration_dry_run_failed")
+    if effective_change_class == "live_promotion":
+        if (
+            not facts.reviewed_shadow_evidence
+            or not isinstance(facts.reviewed_shadow_evidence_fingerprint, str)
+            or not _SHADOW_EVIDENCE_RE.fullmatch(
+                facts.reviewed_shadow_evidence_fingerprint
+            )
+        ):
+            blocking.add("reviewed_shadow_evidence_missing")
+        if not facts.explicit_live_authorization:
+            blocking.add("live_promotion_authorization_missing")
+    return blocking, warnings
+
+
+def _validate_change_surface(
+    change_surface: ChangeSurfaceFacts,
+    *,
+    requested_change_class: str,
+) -> None:
+    if not isinstance(change_surface, ChangeSurfaceFacts):
+        raise DeploymentPreflightInputError("preflight_artifact_surface_invalid")
+    if change_surface.effective_change_class not in DEPLOYMENT_CHANGE_CLASSES:
+        raise DeploymentPreflightInputError("preflight_artifact_surface_invalid")
+    if change_surface.registry_version <= 0:
+        raise DeploymentPreflightInputError("preflight_artifact_surface_invalid")
+    _validate_sha256_fingerprint(change_surface.change_surface_fingerprint)
+    _validate_sha256_fingerprint(change_surface.restart_handler_fingerprint)
+    _bounded_count(change_surface.changed_path_count)
+    requested_rank = _change_class_rank(requested_change_class)
+    effective_rank = _change_class_rank(change_surface.effective_change_class)
+    if effective_rank < requested_rank:
+        raise DeploymentPreflightInputError("preflight_artifact_class_mismatch")
+
+
+def _change_class_rank(value: str) -> int:
+    return {
+        "code": 0,
+        "schema_compatible": 1,
+        "execution_writer": 2,
+        "live_promotion": 3,
+    }[value]
+
+
+def _validate_phase(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized not in {"preliminary", "final"}:
+        raise DeploymentPreflightInputError("preflight_artifact_phase_invalid")
+    return normalized
+
+
+def _validate_watermark_transition(
+    preliminary: Mapping[str, object],
+    final: Mapping[str, object],
+) -> None:
+    if set(preliminary) != set(final):
+        raise DeploymentPreflightInputError("preflight_watermark_invalid")
+    for key, initial in preliminary.items():
+        later = final.get(key)
+        if not _is_nonnegative_plain_int(initial) or not _is_nonnegative_plain_int(
+            later
+        ):
+            raise DeploymentPreflightInputError("preflight_watermark_invalid")
+        if int(later) < int(initial):
+            raise DeploymentPreflightInputError("preflight_watermark_regression")
+
+
+def _verify_common_artifact_fields(
+    artifact: Mapping[str, object],
+    *,
+    now: datetime,
+) -> str:
+    decision = artifact.get("decision")
+    if decision not in DEPLOYMENT_PREFLIGHT_DECISIONS:
+        raise DeploymentPreflightInputError("preflight_artifact_decision_invalid")
+    fingerprint = artifact.get("fingerprint")
+    if not isinstance(fingerprint, str) or not _SHADOW_EVIDENCE_RE.fullmatch(
+        fingerprint
+    ):
+        raise DeploymentPreflightInputError(
+            "preflight_artifact_fingerprint_invalid"
+        )
+    unsigned = {key: value for key, value in artifact.items() if key != "fingerprint"}
+    if not _constant_time_equal(fingerprint, _artifact_fingerprint(unsigned)):
+        raise DeploymentPreflightInputError(
+            "preflight_artifact_fingerprint_mismatch"
+        )
     try:
         created_at = _aware_utc(datetime.fromisoformat(str(artifact["created_at"])))
         expires_at = _aware_utc(datetime.fromisoformat(str(artifact["expires_at"])))

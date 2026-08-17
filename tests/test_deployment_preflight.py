@@ -12,14 +12,33 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deployment_preflight import (
     DeploymentPreflightFacts,
     DeploymentPreflightInputError,
+    build_final_deployment_preflight_artifact,
+    build_preliminary_deployment_preflight_artifact,
     build_deployment_preflight_artifact,
     collect_deployment_preflight_facts,
     verify_deployment_preflight_artifact,
+    verify_phase_bound_deployment_preflight_artifact,
 )
+from telegram_kol_research.deployment_change_surface import ChangeSurfaceFacts
 
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
 EXPECTED_COMMIT = "a" * 40
+CANDIDATE_COMMIT = "b" * 40
+
+
+def _surface(change_class="schema_compatible", **changes):
+    base = ChangeSurfaceFacts(
+        registry_version=1,
+        effective_change_class=change_class,
+        underdeclared=False,
+        changed_path_count=3,
+        change_surface_fingerprint="c" * 64,
+        restart_compatibility_changed=False,
+        restart_handler_fingerprint="d" * 64,
+        blocking_reason_codes=(),
+    )
+    return replace(base, **changes)
 
 
 def _facts(**changes) -> DeploymentPreflightFacts:
@@ -357,6 +376,205 @@ def test_artifact_has_bounded_contract_and_verifiable_expiry():
             expected_commit=EXPECTED_COMMIT,
             change_class="code",
             now=NOW + timedelta(minutes=6),
+        )
+
+
+def test_preliminary_phase_artifact_binds_commits_class_and_surface():
+    artifact = build_preliminary_deployment_preflight_artifact(
+        production_commit=EXPECTED_COMMIT,
+        candidate_commit=CANDIDATE_COMMIT,
+        requested_change_class="schema_compatible",
+        change_surface=_surface(),
+        facts=_facts(
+            schema_backup_valid=None,
+            schema_migration_dry_run_valid=None,
+        ),
+        now=NOW,
+    )
+
+    assert artifact["schema_version"] == 2
+    assert artifact["phase"] == "preliminary"
+    assert artifact["production_commit"] == EXPECTED_COMMIT
+    assert artifact["candidate_commit"] == CANDIDATE_COMMIT
+    assert artifact["requested_change_class"] == "schema_compatible"
+    assert artifact["effective_change_class"] == "schema_compatible"
+    assert artifact["preliminary_fingerprint"] is None
+    assert artifact["decision"] == "PASS"
+    assert verify_phase_bound_deployment_preflight_artifact(
+        artifact,
+        phase="preliminary",
+        production_commit=EXPECTED_COMMIT,
+        candidate_commit=CANDIDATE_COMMIT,
+        requested_change_class="schema_compatible",
+        change_surface=_surface(),
+        now=NOW,
+    ) == "PASS"
+
+
+def test_final_phase_binds_preliminary_and_blocks_new_unknown_outcome():
+    preliminary_facts = _facts(
+        schema_backup_valid=None,
+        schema_migration_dry_run_valid=None,
+    )
+    preliminary = build_preliminary_deployment_preflight_artifact(
+        production_commit=EXPECTED_COMMIT,
+        candidate_commit=CANDIDATE_COMMIT,
+        requested_change_class="schema_compatible",
+        change_surface=_surface(),
+        facts=preliminary_facts,
+        now=NOW,
+    )
+    final_facts = replace(
+        preliminary_facts,
+        work_classification_counts={
+            "unknown_outcome": {"execution_order_legs": 1}
+        },
+        schema_backup_valid=True,
+        schema_migration_dry_run_valid=True,
+    )
+
+    artifact = build_final_deployment_preflight_artifact(
+        preliminary_artifact=preliminary,
+        production_commit=EXPECTED_COMMIT,
+        candidate_commit=CANDIDATE_COMMIT,
+        requested_change_class="schema_compatible",
+        change_surface=_surface(),
+        facts=final_facts,
+        now=NOW + timedelta(minutes=1),
+    )
+
+    assert artifact["phase"] == "final"
+    assert artifact["preliminary_fingerprint"] == preliminary["fingerprint"]
+    assert artifact["decision"] == "BLOCK"
+    assert "deployment_unknown_outcome" in artifact["reason_codes"]
+
+
+def test_final_phase_rejects_parent_identity_and_watermark_drift():
+    preliminary = build_preliminary_deployment_preflight_artifact(
+        production_commit=EXPECTED_COMMIT,
+        candidate_commit=CANDIDATE_COMMIT,
+        requested_change_class="schema_compatible",
+        change_surface=_surface(),
+        facts=_facts(),
+        now=NOW,
+    )
+    final_facts = replace(
+        _facts(),
+        database_watermark={
+            "raw_message_max_id": 9,
+            "instruction_item_max_id": 8,
+            "trade_signal_max_id": 4,
+            "execution_event_max_id": 7,
+        },
+        schema_backup_valid=True,
+        schema_migration_dry_run_valid=True,
+    )
+
+    with pytest.raises(DeploymentPreflightInputError, match="watermark_regression"):
+        build_final_deployment_preflight_artifact(
+            preliminary_artifact=preliminary,
+            production_commit=EXPECTED_COMMIT,
+            candidate_commit=CANDIDATE_COMMIT,
+            requested_change_class="schema_compatible",
+            change_surface=_surface(),
+            facts=final_facts,
+            now=NOW + timedelta(minutes=1),
+        )
+    with pytest.raises(DeploymentPreflightInputError, match="class_mismatch"):
+        build_final_deployment_preflight_artifact(
+            preliminary_artifact=preliminary,
+            production_commit=EXPECTED_COMMIT,
+            candidate_commit=CANDIDATE_COMMIT,
+            requested_change_class="code",
+            change_surface=_surface("code"),
+            facts=replace(
+                _facts(),
+                schema_backup_valid=True,
+                schema_migration_dry_run_valid=True,
+            ),
+            now=NOW + timedelta(minutes=1),
+        )
+
+
+def test_final_artifact_cannot_be_reused_as_preliminary_parent():
+    preliminary = build_preliminary_deployment_preflight_artifact(
+        production_commit=EXPECTED_COMMIT,
+        candidate_commit=CANDIDATE_COMMIT,
+        requested_change_class="schema_compatible",
+        change_surface=_surface(),
+        facts=_facts(),
+        now=NOW,
+    )
+    final_facts = replace(
+        _facts(),
+        schema_backup_valid=True,
+        schema_migration_dry_run_valid=True,
+    )
+    final = build_final_deployment_preflight_artifact(
+        preliminary_artifact=preliminary,
+        production_commit=EXPECTED_COMMIT,
+        candidate_commit=CANDIDATE_COMMIT,
+        requested_change_class="schema_compatible",
+        change_surface=_surface(),
+        facts=final_facts,
+        now=NOW + timedelta(minutes=1),
+    )
+
+    with pytest.raises(DeploymentPreflightInputError, match="phase_mismatch"):
+        build_final_deployment_preflight_artifact(
+            preliminary_artifact=final,
+            production_commit=EXPECTED_COMMIT,
+            candidate_commit=CANDIDATE_COMMIT,
+            requested_change_class="schema_compatible",
+            change_surface=_surface(),
+            facts=final_facts,
+            now=NOW + timedelta(minutes=2),
+        )
+
+
+def test_final_artifact_requires_parent_on_verify_and_boolean_schema_evidence():
+    preliminary = build_preliminary_deployment_preflight_artifact(
+        production_commit=EXPECTED_COMMIT,
+        candidate_commit=CANDIDATE_COMMIT,
+        requested_change_class="schema_compatible",
+        change_surface=_surface(),
+        facts=_facts(),
+        now=NOW,
+    )
+    final_facts = replace(
+        _facts(),
+        schema_backup_valid=True,
+        schema_migration_dry_run_valid=True,
+    )
+    final = build_final_deployment_preflight_artifact(
+        preliminary_artifact=preliminary,
+        production_commit=EXPECTED_COMMIT,
+        candidate_commit=CANDIDATE_COMMIT,
+        requested_change_class="schema_compatible",
+        change_surface=_surface(),
+        facts=final_facts,
+        now=NOW + timedelta(minutes=1),
+    )
+
+    with pytest.raises(DeploymentPreflightInputError, match="parent_required"):
+        verify_phase_bound_deployment_preflight_artifact(
+            final,
+            phase="final",
+            production_commit=EXPECTED_COMMIT,
+            candidate_commit=CANDIDATE_COMMIT,
+            requested_change_class="schema_compatible",
+            change_surface=_surface(),
+            now=NOW + timedelta(minutes=1),
+        )
+    with pytest.raises(DeploymentPreflightInputError, match="schema_evidence_invalid"):
+        build_final_deployment_preflight_artifact(
+            preliminary_artifact=preliminary,
+            production_commit=EXPECTED_COMMIT,
+            candidate_commit=CANDIDATE_COMMIT,
+            requested_change_class="schema_compatible",
+            change_surface=_surface(),
+            facts=replace(final_facts, schema_backup_valid="true"),
+            now=NOW + timedelta(minutes=1),
         )
 
 
