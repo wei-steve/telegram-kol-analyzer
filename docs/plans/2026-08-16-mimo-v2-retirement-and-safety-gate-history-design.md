@@ -152,4 +152,3 @@ If the old runtime fails before any exchange request can occur, restore the
 previous reviewed Git SHA through the same deployment helper and preflight. Do
 not restore an older database after a request might have reached the exchange.
 The retirement itself performs no exchange request and no database mutation.
-

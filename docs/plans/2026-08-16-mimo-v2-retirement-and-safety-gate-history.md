@@ -283,4 +283,3 @@ notifications, or historical replays used for testing.
 Leave production unchanged at `2274d90`, preserve the reviewed branch, and
 report the exact bounded preflight reason. Do not resume Batch119 recovery or
 redesign the gate in this task.
-
