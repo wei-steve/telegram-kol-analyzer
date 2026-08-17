@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from contextlib import asynccontextmanager, nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 import asyncio
@@ -43,7 +43,6 @@ from telegram_kol_research.authoritative_recognition import (
     process_authoritative_message,
 )
 from telegram_kol_research.message_evidence import build_message_input_fingerprint
-from telegram_kol_research.mimo_contract_circuit import load_mimo_contract_circuit
 from telegram_kol_research.app_logging import (
     configure_application_logging,
     read_log_page,
@@ -214,7 +213,6 @@ from telegram_kol_research.trading_settings import (
     SymbolEntryThresholds,
     load_trading_settings,
     save_trading_settings,
-    trading_settings_from_payload,
 )
 from telegram_kol_research.context_resolution import resolve_contextual_strategy
 from telegram_kol_research.context_resolution_worker import (
@@ -3827,73 +3825,6 @@ def _message_operation_supervisor_watermark_is_valid(app: FastAPI) -> bool:
         return False
 
 
-def _trading_settings_response(session_factory) -> dict[str, Any]:
-    payload = load_trading_settings(session_factory).to_dict()
-    payload["mimo_contract_circuit"] = asdict(
-        load_mimo_contract_circuit(session_factory)
-    )
-    return payload
-
-
-def _validate_mimo_contract_activation(
-    session_factory,
-    *,
-    payload: dict[str, Any],
-) -> None:
-    current = load_trading_settings(session_factory)
-    candidate = trading_settings_from_payload({**current.to_dict(), **payload})
-    if (
-        candidate.mimo_contract_mode == "v1"
-        and candidate.mimo_v2_activation_after_raw_message_id
-        != current.mimo_v2_activation_after_raw_message_id
-    ):
-        raise ValueError("mimo v1 rollback must preserve the activation watermark")
-    if candidate.mimo_contract_mode != "v2_live_adapter":
-        return
-    is_activation = current.mimo_contract_mode != "v2_live_adapter"
-    watermark_changed = (
-        candidate.mimo_v2_activation_after_raw_message_id
-        != current.mimo_v2_activation_after_raw_message_id
-    )
-    if not is_activation and not watermark_changed:
-        return
-    with session_factory() as session:
-        latest_raw_id = session.execute(select(func.max(RawMessage.id))).scalar_one()
-    safe_minimum = int(latest_raw_id or 0)
-    watermark = candidate.mimo_v2_activation_after_raw_message_id
-    if watermark <= 0 or watermark < safe_minimum:
-        raise ValueError(
-            "mimo v2 requires an explicit future-message watermark at or above "
-            f"the current maximum raw message ID ({safe_minimum})"
-        )
-
-
-def _require_expected_mimo_contract_state(
-    current,
-    *,
-    payload: dict[str, Any],
-) -> None:
-    if (
-        "mimo_contract_expected_mode" not in payload
-        or "mimo_contract_expected_watermark" not in payload
-    ):
-        raise ValueError("mimo contract changes require the expected current state")
-    expected_mode = str(payload["mimo_contract_expected_mode"])
-    try:
-        expected_watermark = int(payload["mimo_contract_expected_watermark"])
-    except (TypeError, ValueError) as exc:
-        raise ValueError("mimo contract expected watermark must be an integer") from exc
-    if (
-        expected_mode != current.mimo_contract_mode
-        or expected_watermark
-        != current.mimo_v2_activation_after_raw_message_id
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="mimo contract settings changed; reload before saving",
-        )
-
-
 def create_web_app(
     database_path: str | Path,
     media_root: str | Path | None = None,
@@ -6097,9 +6028,6 @@ def create_web_app(
                 "ai_prompt_views": build_ai_prompt_views(ai_recognition_config),
                 "recognition_profiles": list_recognition_profiles(),
                 "trading_settings": load_trading_settings(app.state.session_factory),
-                "mimo_contract_circuit": load_mimo_contract_circuit(
-                    app.state.session_factory
-                ),
             },
         )
 
@@ -6696,7 +6624,7 @@ def create_web_app(
 
     @app.get("/api/trading-settings")
     def get_trading_settings():
-        return _trading_settings_response(app.state.session_factory)
+        return load_trading_settings(app.state.session_factory).to_dict()
 
     @app.get("/api/trading-settings/symbols")
     async def list_trading_setting_symbols():
@@ -6770,60 +6698,15 @@ def create_web_app(
             # rejects the global allowlist.
             refresh_status = await orchestrator.refresh_once()
         try:
-            current = load_trading_settings(app.state.session_factory)
-            candidate = trading_settings_from_payload(
-                {**current.to_dict(), **payload}
-            )
-            mimo_contract_change = (
-                candidate.mimo_contract_mode != current.mimo_contract_mode
-                or candidate.mimo_v2_activation_after_raw_message_id
-                != current.mimo_v2_activation_after_raw_message_id
-            )
-            if mimo_contract_change:
-                async with app.state.telegram_operation_lock:
-                    locked_current = load_trading_settings(
-                        app.state.session_factory
-                    )
-                    _require_expected_mimo_contract_state(
-                        locked_current,
-                        payload=payload,
-                    )
-                    _validate_mimo_contract_activation(
-                        app.state.session_factory,
-                        payload=payload,
-                    )
-                    response = save_trading_settings(
-                        app.state.session_factory,
-                        payload,
-                        updated_at=app.state.now_provider(),
-                    ).to_dict()
-            else:
-                payload_without_unchanged_mimo = dict(payload)
-                payload_without_unchanged_mimo.pop("mimo_contract_mode", None)
-                payload_without_unchanged_mimo.pop(
-                    "mimo_v2_activation_after_raw_message_id",
-                    None,
-                )
-                payload_without_unchanged_mimo.pop(
-                    "mimo_contract_expected_mode",
-                    None,
-                )
-                payload_without_unchanged_mimo.pop(
-                    "mimo_contract_expected_watermark",
-                    None,
-                )
-                response = save_trading_settings(
-                    app.state.session_factory,
-                    payload_without_unchanged_mimo,
-                    updated_at=app.state.now_provider(),
-                ).to_dict()
+            response = save_trading_settings(
+                app.state.session_factory,
+                payload,
+                updated_at=app.state.now_provider(),
+            ).to_dict()
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if refresh_status is not None:
             response["contract_specs"] = refresh_status
-        response["mimo_contract_circuit"] = asdict(
-            load_mimo_contract_circuit(app.state.session_factory)
-        )
         return response
 
     @app.post("/api/messages/{raw_message_id}/recognize")

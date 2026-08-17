@@ -111,12 +111,6 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
     "media_assets": {
         "ocr_text": "ALTER TABLE media_assets ADD COLUMN ocr_text TEXT",
     },
-    "message_evidence_versions": {
-        "mimo_recognition_run_id": (
-            "ALTER TABLE message_evidence_versions ADD COLUMN "
-            "mimo_recognition_run_id INTEGER REFERENCES mimo_recognition_runs(id)"
-        ),
-    },
     "signal_candidates": {
         "source_id": "ALTER TABLE signal_candidates ADD COLUMN source_id INTEGER",
         "event_type": "ALTER TABLE signal_candidates ADD COLUMN event_type VARCHAR(64) NOT NULL DEFAULT 'entry_signal'",
@@ -479,28 +473,6 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
 }
 
 SQLITE_COMPAT_INDEXES: dict[str, str] = {
-    "ix_message_evidence_versions_mimo_recognition_run_id": (
-        "CREATE INDEX IF NOT EXISTS "
-        "ix_message_evidence_versions_mimo_recognition_run_id "
-        "ON message_evidence_versions (mimo_recognition_run_id)"
-    ),
-    "ix_mimo_recognition_runs_message_status_created": (
-        "CREATE INDEX IF NOT EXISTS "
-        "ix_mimo_recognition_runs_message_status_created "
-        "ON mimo_recognition_runs (raw_message_id, status, created_at)"
-    ),
-    "ix_mimo_recognition_runs_status_created": (
-        "CREATE INDEX IF NOT EXISTS ix_mimo_recognition_runs_status_created "
-        "ON mimo_recognition_runs (status, created_at)"
-    ),
-    "ix_mimo_recognition_attempts_run_created": (
-        "CREATE INDEX IF NOT EXISTS ix_mimo_recognition_attempts_run_created "
-        "ON mimo_recognition_attempts (run_id, created_at)"
-    ),
-    "ix_mimo_recognition_attempts_status_created": (
-        "CREATE INDEX IF NOT EXISTS ix_mimo_recognition_attempts_status_created "
-        "ON mimo_recognition_attempts (status, created_at)"
-    ),
     "uq_strategy_revision_batches_entry_assembly": (
         "CREATE UNIQUE INDEX IF NOT EXISTS "
         "uq_strategy_revision_batches_entry_assembly "

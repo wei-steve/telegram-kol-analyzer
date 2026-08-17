@@ -19,9 +19,6 @@ from telegram_kol_research.models import (
     MediaAsset,
     MessageRecognition,
     MessageEvidenceVersion,
-    MessageInstructionItem,
-    MimoRecognitionAttempt,
-    MimoRecognitionRun,
     RawMessage,
     RecognitionDecision,
     PositionAttributionAudit,
@@ -38,7 +35,6 @@ from telegram_kol_research.models import (
     TriggerProtectionStopRescue,
     utc_now,
 )
-from telegram_kol_research.mimo_v2_contract import parse_mimo_v2_payload
 from telegram_kol_research.time_utils import normalize_to_utc_naive, utc_naive_to_local
 from telegram_kol_research.reporting import (
     format_entry_assembly_summary,
@@ -60,49 +56,6 @@ STRATEGY_TIME_DISPLAY_FIELDS = (
     "latest_event_at",
 )
 MAX_MEDIA_ASSETS_PER_MESSAGE = 3
-
-MIMO_INTENT_LABELS = {
-    "new_strategy": "新策略",
-    "entry_confirmation": "入场确认",
-    "position_management": "仓位管理",
-    "exit": "退出仓位",
-    "cancel_entry": "取消入场",
-    "strategy_revision": "修改策略",
-    "entry_context": "入场上下文",
-    "position_report": "仓位报告",
-    "market_commentary": "市场评论",
-    "non_trading": "非交易信息",
-    "unclear": "意图不明",
-}
-MIMO_ACTION_LABELS = {
-    "entry": "新建入场",
-    "confirm_entry": "确认入场",
-    "entry_fragment": "入场片段",
-    "cancel_pending_entry": "取消待入场委托",
-    "replace_entry": "替换入场计划",
-    "full_exit": "全部退出",
-    "partial_exit": "部分退出",
-    "partial_take_profit": "分批止盈",
-    "move_stop_to_protect": "移动止损保护",
-    "hold_update": "继续持有更新",
-    "risk_update": "风险参数更新",
-}
-MIMO_IMAGE_TYPE_LABELS = {
-    "strategy_screenshot": "策略截图",
-    "position_screenshot": "持仓截图",
-    "order_screenshot": "委托截图",
-    "market_chart": "市场图表",
-    "profit_review": "盈亏复盘",
-    "advertisement": "广告",
-    "unrelated": "无关图片",
-    "unknown": "未知图片",
-}
-MIMO_IMAGE_QUALITY_LABELS = {
-    "clear": "清晰",
-    "blurry": "模糊",
-    "cropped": "已裁剪",
-    "unreadable": "无法读取",
-}
 
 
 def load_runtime_agent_metrics(
@@ -688,53 +641,6 @@ def _serialize_raw_messages(
         .all()
     )
     evidence_by_msg_id = {row.raw_message_id: row for row in evidence_rows}
-    mimo_runs = (
-        session.query(MimoRecognitionRun)
-        .filter(MimoRecognitionRun.raw_message_id.in_(raw_message_ids))
-        .order_by(
-            MimoRecognitionRun.raw_message_id.asc(),
-            MimoRecognitionRun.id.asc(),
-        )
-        .all()
-    )
-    mimo_runs_by_msg_id: dict[int, list[MimoRecognitionRun]] = {}
-    for run in mimo_runs:
-        mimo_runs_by_msg_id.setdefault(run.raw_message_id, []).append(run)
-    mimo_run_ids = [int(run.id) for run in mimo_runs]
-    mimo_attempts = (
-        session.query(MimoRecognitionAttempt)
-        .filter(MimoRecognitionAttempt.run_id.in_(mimo_run_ids))
-        .order_by(
-            MimoRecognitionAttempt.run_id.asc(),
-            MimoRecognitionAttempt.ordinal.asc(),
-        )
-        .all()
-        if mimo_run_ids
-        else []
-    )
-    mimo_attempts_by_run_id: dict[int, list[MimoRecognitionAttempt]] = {}
-    for attempt in mimo_attempts:
-        mimo_attempts_by_run_id.setdefault(attempt.run_id, []).append(attempt)
-    evidence_asset_ids: set[int] = set()
-    for evidence in evidence_rows:
-        image_evidence = _safe_json_dict(evidence.image_evidence_json)
-        images = image_evidence.get("images")
-        if not isinstance(images, list):
-            continue
-        for image in images:
-            asset_id = image.get("asset_id") if isinstance(image, dict) else None
-            if isinstance(asset_id, int) and not isinstance(asset_id, bool):
-                evidence_asset_ids.add(asset_id)
-    evidence_media_by_id = {
-        int(media.id): media
-        for media in (
-            session.query(MediaAsset)
-            .filter(MediaAsset.id.in_(evidence_asset_ids))
-            .all()
-            if evidence_asset_ids
-            else []
-        )
-    }
     context_links = (
         session.query(StrategyMessageLink, StrategyThread)
         .join(StrategyThread, StrategyThread.id == StrategyMessageLink.strategy_thread_id)
@@ -777,19 +683,6 @@ def _serialize_raw_messages(
         candidates_by_msg_id.setdefault(c.raw_message_id, []).append(c)
         if c.raw_message_id not in cand_by_msg_id:
             cand_by_msg_id[c.raw_message_id] = c
-    candidate_ids = [int(candidate.id) for candidate in all_candidates]
-    instruction_items = (
-        session.query(MessageInstructionItem)
-        .filter(MessageInstructionItem.signal_candidate_id.in_(candidate_ids))
-        .all()
-        if candidate_ids
-        else []
-    )
-    instruction_items_by_candidate_id: dict[int, list[MessageInstructionItem]] = {}
-    for item in instruction_items:
-        instruction_items_by_candidate_id.setdefault(
-            int(item.signal_candidate_id), []
-        ).append(item)
 
     # Strategy-record links must follow the exact candidate relation.  Do not
     # infer ownership from message symbol/side, and fail closed if legacy data
@@ -813,18 +706,6 @@ def _serialize_raw_messages(
         media_assets = media_by_msg_id.get(raw_message.id, [])
         media_asset_rows = _serialize_media_assets(media_assets)
         selected_candidate = cand_by_msg_id.get(raw_message.id)
-        current_authoritative_candidates = [
-            candidate
-            for candidate in candidates_by_msg_id.get(raw_message.id, [])
-            if candidate.parse_source == "mimo_authoritative"
-            and (
-                not instruction_items_by_candidate_id.get(int(candidate.id))
-                or any(
-                    item.retired_at is None
-                    for item in instruction_items_by_candidate_id[int(candidate.id)]
-                )
-            )
-        ]
         lifecycle_ids = (
             lifecycle_ids_by_candidate_id.get(selected_candidate.id, [])
             if selected_candidate is not None
@@ -832,15 +713,6 @@ def _serialize_raw_messages(
         )
         decision = decisions_by_msg_id.get(raw_message.id)
         semantic_review = _serialize_semantic_review(decision)
-        message_evidence = evidence_by_msg_id.get(raw_message.id)
-        mimo_analysis = _serialize_mimo_analysis(
-            recognition=rec_by_msg_id.get(raw_message.id),
-            decision=decision,
-            evidence=message_evidence,
-            runs=mimo_runs_by_msg_id.get(raw_message.id, []),
-            attempts_by_run_id=mimo_attempts_by_run_id,
-            media_by_id=evidence_media_by_id,
-        )
         matching_bindings = bindings_by_message_key.get(
             (int(raw_message.chat_id), int(raw_message.message_id)), []
         )
@@ -889,13 +761,6 @@ def _serialize_raw_messages(
                     candidate=selected_candidate,
                     media_assets=media_assets,
                 ),
-                "mimo_analysis": mimo_analysis,
-                "system_acceptance": _serialize_system_acceptance(
-                    recognition=rec_by_msg_id.get(raw_message.id),
-                    decision=decision,
-                    candidates=current_authoritative_candidates,
-                    mimo_analysis=mimo_analysis,
-                ),
                 "semantic_review": semantic_review,
                 "execution_outcome": _serialize_execution_outcome(
                     decision,
@@ -928,613 +793,6 @@ def _serialize_raw_messages(
         )
 
     return rows
-
-
-def _serialize_mimo_analysis(
-    *,
-    recognition: MessageRecognition | None,
-    decision: RecognitionDecision | None,
-    evidence: MessageEvidenceVersion | None,
-    runs: list[MimoRecognitionRun],
-    attempts_by_run_id: dict[int, list[MimoRecognitionAttempt]],
-    media_by_id: dict[int, MediaAsset],
-) -> dict[str, object] | None:
-    """Serialize stored MiMo facts without reinterpreting source prose."""
-
-    if evidence is None and not runs and recognition is None and decision is None:
-        return None
-    has_mimo_provenance = bool(runs) or any(
-        "mimo" in str(value or "").lower()
-        for value in (
-            evidence.model if evidence is not None else None,
-            decision.authoritative_model if decision is not None else None,
-            recognition.engine if recognition is not None else None,
-        )
-    )
-    if not has_mimo_provenance:
-        return None
-    legacy_payload = (
-        _safe_json_dict(decision.authoritative_payload_json)
-        if decision is not None
-        else {}
-    )
-    normalized = (
-        _safe_json_dict(evidence.normalized_evidence_json)
-        if evidence is not None
-        else {}
-    )
-    text_evidence = (
-        _safe_json_dict(evidence.text_evidence_json)
-        if evidence is not None
-        else {}
-    )
-    image_evidence = (
-        _safe_json_dict(evidence.image_evidence_json)
-        if evidence is not None
-        else {}
-    )
-    contract_version = str(normalized.get("contract_version") or "")
-    linked_run = None
-    if evidence is not None and evidence.mimo_recognition_run_id is not None:
-        linked_run = next(
-            (
-                run
-                for run in runs
-                if int(run.id) == int(evidence.mimo_recognition_run_id)
-            ),
-            None,
-        )
-    if linked_run is None:
-        linked_run = next(
-            (run for run in reversed(runs) if run.became_authoritative),
-            runs[-1] if runs else None,
-        )
-    runtime = _serialize_mimo_runtime(
-        run=linked_run,
-        runs=runs,
-        attempts_by_run_id=attempts_by_run_id,
-    )
-    is_v2 = contract_version == "mimo-authoritative-v2" or (
-        linked_run is not None
-        and linked_run.contract_version == "mimo-authoritative-v2"
-    )
-    projection = _serialize_mimo_projection(
-        is_v2=is_v2,
-        is_historical_v1=linked_run is None,
-        evidence=evidence,
-        normalized=normalized,
-        text_evidence=text_evidence,
-        image_evidence=image_evidence,
-    )
-    semantic_projection_allowed = (
-        not is_v2 or projection.get("status") == "completed"
-    )
-    raw_images = image_evidence.get("images") if semantic_projection_allowed else []
-    raw_images = raw_images if isinstance(raw_images, list) else []
-    images = [
-        _serialize_mimo_image(
-            item,
-            evidence_raw_message_id=(
-                int(evidence.raw_message_id) if evidence is not None else None
-            ),
-            media_by_id=media_by_id,
-        )
-        for item in raw_images
-        if isinstance(item, dict)
-    ]
-    raw_intents = (
-        normalized.get("intents")
-        if is_v2 and semantic_projection_allowed
-        else []
-    )
-    raw_intents = raw_intents if isinstance(raw_intents, list) else []
-    attempts_recorded = any(attempts_by_run_id.get(int(run.id), []) for run in runs)
-    per_image_recorded = bool(
-        raw_images
-        and all(
-            isinstance(item, dict)
-            and bool(str(item.get("summary") or "").strip())
-            for item in raw_images
-        )
-    )
-    result_format = (
-        "v2"
-        if is_v2
-        else "v1"
-        if linked_run is not None
-        else "historical_v1"
-    )
-    projected_summary = (
-        normalized.get("summary")
-        or normalized.get("reason")
-        or legacy_payload.get("summary")
-        or (recognition.summary if recognition is not None else None)
-        or legacy_payload.get("reason")
-    )
-    projected_confidence = (
-        normalized.get("confidence")
-        if "confidence" in normalized
-        else legacy_payload.get("confidence")
-    )
-    projected_conflicts = (
-        image_evidence.get("conflicts")
-        if isinstance(image_evidence.get("conflicts"), list)
-        else []
-    )
-    if is_v2 and not semantic_projection_allowed:
-        projected_summary = None
-        projected_confidence = None
-        projected_conflicts = []
-    return {
-        "format": result_format,
-        "version_label": (
-            "MiMo v1回退结果"
-            if linked_run is not None and linked_run.run_kind == "v1_fallback"
-            else "MiMo v1结果"
-            if result_format == "v1"
-            else None
-        ),
-        "history_label": (
-            "MiMo 历史结果 · v1格式"
-            if result_format == "historical_v1"
-            else None
-        ),
-        "runtime": runtime,
-        "summary": projected_summary,
-        "confidence": projected_confidence,
-        "intents": [
-            _serialize_mimo_intent(item)
-            for item in raw_intents
-            if isinstance(item, dict)
-        ],
-        "evidence": {
-            "text": text_evidence,
-            "images": images,
-            "conflicts": projected_conflicts,
-        },
-        "projection": projection,
-        "detail_flags": {
-            "attempts_recorded": attempts_recorded,
-            "per_image_evidence_recorded": per_image_recorded,
-        },
-        "legacy_result": (
-            {
-                "status": (
-                    decision.authoritative_status
-                    if decision is not None
-                    else recognition.status if recognition is not None else None
-                ),
-                "reason": (
-                    legacy_payload.get("reason")
-                    or (recognition.reason if recognition is not None else None)
-                ),
-                "model": (
-                    decision.authoritative_model
-                    if decision is not None
-                    else recognition.engine if recognition is not None else None
-                ),
-            }
-            if not is_v2
-            else None
-        ),
-        "legacy_image_evidence": image_evidence if not is_v2 else None,
-    }
-
-
-def _serialize_mimo_projection(
-    *,
-    is_v2: bool,
-    is_historical_v1: bool,
-    evidence: MessageEvidenceVersion | None,
-    normalized: dict[str, object],
-    text_evidence: dict[str, object],
-    image_evidence: dict[str, object],
-) -> dict[str, object]:
-    if not is_v2:
-        return {
-            "status": "historical" if is_historical_v1 else "v1",
-            "reason_code": None,
-        }
-    if evidence is None:
-        return {
-            "status": "not_available",
-            "reason_code": "canonical_result_not_persisted",
-        }
-    canonical = {
-        "contract_version": normalized.get("contract_version"),
-        "summary": normalized.get("summary"),
-        "confidence": normalized.get("confidence"),
-        "intents": normalized.get("intents"),
-        "evidence": {
-            "text": text_evidence,
-            "images": image_evidence.get("images") or [],
-            "conflicts": image_evidence.get("conflicts") or [],
-        },
-    }
-    try:
-        parse_mimo_v2_payload(canonical)
-    except ValueError:
-        return {
-            "status": "failed",
-            "reason_code": "stored_v2_contract_invalid",
-        }
-    return {"status": "completed", "reason_code": None}
-
-
-def _serialize_mimo_runtime(
-    *,
-    run: MimoRecognitionRun | None,
-    runs: list[MimoRecognitionRun],
-    attempts_by_run_id: dict[int, list[MimoRecognitionAttempt]],
-) -> dict[str, object] | None:
-    if run is None:
-        return None
-    prior_by_id = {int(item.id): item for item in runs}
-    lineage = [run]
-    prior = prior_by_id.get(int(run.retry_of_run_id or 0))
-    seen_run_ids = {int(run.id)}
-    while prior is not None and int(prior.id) not in seen_run_ids:
-        lineage.append(prior)
-        seen_run_ids.add(int(prior.id))
-        prior = prior_by_id.get(int(prior.retry_of_run_id or 0))
-    lineage.reverse()
-    whole_run_retry_count = max(0, len(lineage) - 1)
-    attempts = [
-        (lineage_run, attempt)
-        for lineage_run in lineage
-        for attempt in attempts_by_run_id.get(int(lineage_run.id), [])
-    ]
-    attempt_count = sum(
-        max(
-            int(lineage_run.attempt_count),
-            len(attempts_by_run_id.get(int(lineage_run.id), [])),
-        )
-        for lineage_run in lineage
-    )
-    fallback_from = None
-    fallback_source = None
-    if run.run_kind == "v1_fallback" and run.retry_of_run_id is not None:
-        previous = prior_by_id.get(int(run.retry_of_run_id))
-        fallback_from = previous.contract_version if previous is not None else None
-        if previous is not None:
-            fallback_source = {
-                "contract_version": previous.contract_version,
-                "error_code": previous.final_error_code,
-                "error_message": previous.final_error_message,
-            }
-    if run.status == "running":
-        status = "running"
-        status_label = "MiMo识别进行中"
-    elif run.status == "failed":
-        status = "failed"
-        status_label = "MiMo识别失败"
-    elif run.run_kind == "v1_fallback":
-        status = "fallback"
-        status_label = "MiMo v2失败，已使用v1结果"
-    else:
-        status = "completed"
-        status_label = "MiMo识别成功"
-    duration_ms = None
-    first_started_at = lineage[0].started_at
-    if run.completed_at is not None and first_started_at is not None:
-        duration_ms = max(
-            0,
-            round((run.completed_at - first_started_at).total_seconds() * 1000),
-        )
-    return {
-        "status": status,
-        "status_label": status_label,
-        "model": run.model,
-        "contract_version": run.contract_version,
-        "input_kind": run.input_kind,
-        "attempt_count": attempt_count,
-        "provider_retry_count": sum(
-            max(
-                0,
-                max(
-                    int(lineage_run.attempt_count),
-                    len(attempts_by_run_id.get(int(lineage_run.id), [])),
-                )
-                - 1,
-            )
-            for lineage_run in lineage
-        ),
-        "whole_run_retry_count": whole_run_retry_count,
-        "duration_ms": duration_ms,
-        "attempts": [
-            {
-                "run_id": int(lineage_run.id),
-                "run_kind": lineage_run.run_kind,
-                "contract_version": lineage_run.contract_version,
-                "ordinal": int(attempt.ordinal),
-                "status": attempt.status,
-                "duration_ms": int(attempt.duration_ms),
-                "error_code": attempt.error_code,
-                "error_message": attempt.error_message,
-                "selected": int(lineage_run.id) == int(run.id)
-                and int(attempt.ordinal) == int(run.selected_attempt_ordinal or 0),
-            }
-            for lineage_run, attempt in attempts
-        ],
-        "run_history": [
-            {
-                "run_id": int(lineage_run.id),
-                "run_kind": lineage_run.run_kind,
-                "contract_version": lineage_run.contract_version,
-                "status": lineage_run.status,
-                "error_code": lineage_run.final_error_code,
-                "error_message": lineage_run.final_error_message,
-                "became_authoritative": bool(lineage_run.became_authoritative),
-            }
-            for lineage_run in lineage
-        ],
-        "retry_count": whole_run_retry_count,
-        "final_error_code": run.final_error_code,
-        "final_error_message": run.final_error_message,
-        "error_code": run.final_error_code,
-        "error_message": run.final_error_message,
-        "became_authoritative": bool(run.became_authoritative),
-        "fallback_from": fallback_from,
-        "fallback_source": fallback_source,
-    }
-
-
-def _serialize_mimo_intent(intent: dict[str, object]) -> dict[str, object]:
-    intent_type = str(intent.get("intent_type") or "unclear")
-    action = intent.get("action")
-    action = action if isinstance(action, dict) else None
-    action_kind = str(action.get("kind") or "") if action is not None else None
-    target = action.get("target") if action is not None else None
-    action_payload = (
-        {
-            "kind": action_kind,
-            "action_label": MIMO_ACTION_LABELS.get(action_kind, action_kind),
-            "target": target if isinstance(target, dict) else {},
-            "strategy": (
-                action.get("strategy")
-                if isinstance(action.get("strategy"), dict)
-                else None
-            ),
-            "parameters": (
-                action.get("parameters")
-                if isinstance(action.get("parameters"), dict)
-                else {}
-            ),
-        }
-        if action is not None and action_kind
-        else None
-    )
-    return {
-        "intent_type": intent_type,
-        "intent_label": MIMO_INTENT_LABELS.get(intent_type, intent_type),
-        "action": action_payload,
-        "action_kind": action_kind,
-        "action_label": (
-            MIMO_ACTION_LABELS.get(action_kind, action_kind)
-            if action_kind
-            else None
-        ),
-        "target": target if isinstance(target, dict) else {},
-        "strategy": (
-            action.get("strategy")
-            if action is not None and isinstance(action.get("strategy"), dict)
-            else None
-        ),
-        "parameters": (
-            action.get("parameters")
-            if action is not None and isinstance(action.get("parameters"), dict)
-            else {}
-        ),
-        "confidence": intent.get("confidence"),
-        "reason": intent.get("reason"),
-        "evidence_refs": (
-            intent.get("evidence_refs")
-            if isinstance(intent.get("evidence_refs"), list)
-            else []
-        ),
-    }
-
-
-def _serialize_mimo_image(
-    image: dict[str, object],
-    *,
-    evidence_raw_message_id: int | None,
-    media_by_id: dict[int, MediaAsset],
-) -> dict[str, object]:
-    try:
-        asset_id = int(image.get("asset_id"))
-    except (TypeError, ValueError):
-        asset_id = 0
-    media = media_by_id.get(asset_id)
-    if (
-        media is not None
-        and evidence_raw_message_id is not None
-        and int(media.raw_message_id) != evidence_raw_message_id
-    ):
-        media = None
-    image_type = image.get("image_type")
-    quality = image.get("quality")
-    return {
-        "asset_id": asset_id or None,
-        "image_type": image_type,
-        "image_type_label": MIMO_IMAGE_TYPE_LABELS.get(image_type, image_type),
-        "quality": quality,
-        "quality_label": MIMO_IMAGE_QUALITY_LABELS.get(quality, quality),
-        "observed_text": image.get("observed_text"),
-        "summary": image.get("summary"),
-        "fields": image.get("fields") if isinstance(image.get("fields"), dict) else {},
-        "confidence": image.get("confidence"),
-        "media": (
-            {
-                "id": int(media.id),
-                "kind": media.kind,
-                "mime_type": media.mime_type,
-                "local_path": media.local_path,
-            }
-            if media is not None
-            else None
-        ),
-        "raw_evidence": dict(image),
-    }
-
-
-def _serialize_system_acceptance(
-    *,
-    recognition: MessageRecognition | None,
-    decision: RecognitionDecision | None,
-    candidates: list[SignalCandidate],
-    mimo_analysis: dict[str, object] | None,
-) -> dict[str, object] | None:
-    if decision is None and recognition is None:
-        return None
-    automation_status = decision.automation_status if decision is not None else None
-    reason_code = decision.automation_reason if decision is not None else None
-    authoritative_status = (
-        decision.authoritative_status
-        if decision is not None
-        else recognition.status if recognition is not None else None
-    )
-    projected_intents = (
-        mimo_analysis.get("intents")
-        if isinstance(mimo_analysis, dict)
-        and isinstance(mimo_analysis.get("intents"), list)
-        else []
-    )
-    intent_rows: list[dict[str, object]] = []
-    accepted_candidate_ids: set[int] = set()
-    for ordinal, intent in enumerate(projected_intents, start=1):
-        if not isinstance(intent, dict):
-            continue
-        action = intent.get("action")
-        action = action if isinstance(action, dict) else None
-        action_kind = str(action.get("kind") or "") if action is not None else ""
-        if not action_kind:
-            intent_rows.append(
-                {
-                    "ordinal": ordinal,
-                    "intent_type": intent.get("intent_type"),
-                    "intent_label": intent.get("intent_label"),
-                    "action_kind": None,
-                    "action_label": None,
-                    "status": "not_actionable",
-                    "reason_code": None,
-                    "candidate_ids": [],
-                }
-            )
-            continue
-        matching = [
-            candidate
-            for candidate in candidates
-            if _candidate_matches_mimo_intent(candidate, action)
-        ]
-        candidate_ids = [int(candidate.id) for candidate in matching]
-        if len(candidate_ids) == 1:
-            accepted_candidate_ids.update(candidate_ids)
-        intent_rows.append(
-            {
-                "ordinal": ordinal,
-                "intent_type": intent.get("intent_type"),
-                "intent_label": intent.get("intent_label"),
-                "action_kind": action_kind,
-                "action_label": action.get("action_label"),
-                "status": (
-                    "accepted"
-                    if len(matching) == 1
-                    else "ambiguous"
-                    if len(matching) > 1
-                    else "rejected"
-                ),
-                "reason_code": (
-                    None
-                    if len(matching) == 1
-                    else "ambiguous_candidate_projection"
-                    if len(matching) > 1
-                    else reason_code or "not_projected"
-                ),
-                "candidate_ids": candidate_ids,
-            }
-        )
-
-    actionable_rows = [
-        row for row in intent_rows if row["status"] != "not_actionable"
-    ]
-    accepted_rows = [row for row in actionable_rows if row["status"] == "accepted"]
-    admission_failure_reasons = {
-        "target_unresolved",
-        "mimo_authoritative_failed",
-        "mimo_authoritative_not_safely_applied",
-    }
-    if authoritative_status == "识别失败" and not accepted_rows:
-        status = "failed"
-        status_label = "系统未安全接纳"
-    elif actionable_rows and len(accepted_rows) == len(actionable_rows):
-        status = "accepted"
-        status_label = "系统已接纳"
-    elif accepted_rows:
-        status = "partial"
-        status_label = "系统部分接纳"
-    elif reason_code in admission_failure_reasons:
-        status = "failed"
-        status_label = "系统未安全接纳"
-    elif candidates and not actionable_rows and reason_code != "mimo_no_action":
-        status = "accepted"
-        status_label = "系统已接纳"
-        accepted_candidate_ids.update(int(candidate.id) for candidate in candidates)
-    else:
-        status = "not_accepted"
-        status_label = "系统未接纳可执行动作"
-    return {
-        "status": status,
-        "status_label": status_label,
-        "reason_code": reason_code,
-        "accepted_candidate_count": len(accepted_candidate_ids),
-        "intents": intent_rows,
-        "automation_status": automation_status,
-    }
-
-
-def _candidate_matches_mimo_intent(
-    candidate: SignalCandidate,
-    action: dict[str, object],
-) -> bool:
-    action_kind = str(action.get("kind") or "")
-    candidate_action = _candidate_action_kind(candidate)
-    if action_kind != candidate_action:
-        return False
-    target = action.get("target")
-    target = target if isinstance(target, dict) else {}
-    lifecycle_id = target.get("lifecycle_id")
-    if lifecycle_id is not None and candidate.target_lifecycle_id != int(lifecycle_id):
-        return False
-    strategy = action.get("strategy")
-    if action_kind == "entry" and isinstance(strategy, dict):
-        symbol = str(strategy.get("symbol") or "").upper()
-        side = str(strategy.get("side") or "").lower()
-        if symbol and str(candidate.symbol or "").upper() != symbol:
-            return False
-        if side and str(candidate.side or "").lower() != side:
-            return False
-    return True
-
-
-def _candidate_action_kind(candidate: SignalCandidate) -> str:
-    management_action = str(candidate.management_action or "")
-    aliases = {
-        "cancel_entry": "cancel_pending_entry",
-        "exit_full": "full_exit",
-        "exit_partial": "partial_exit",
-        "adjust_stop_loss": "move_stop_to_protect",
-        "move_stop_to_break_even": "move_stop_to_protect",
-    }
-    if management_action:
-        return aliases.get(management_action, management_action)
-    event_type = str(candidate.event_type or "")
-    return {
-        "entry_signal": "entry",
-        "entry_confirm": "confirm_entry",
-        "strategy_revision": "replace_entry",
-        "close_signal": "full_exit",
-    }.get(event_type, event_type)
 
 
 def _serialize_context_resolution(
@@ -1816,12 +1074,9 @@ def _serialize_semantic_review(
         return None
 
     payload: dict[str, object] = {}
-    review_payload_json = (
-        decision.comparison_payload_json or decision.auxiliary_payload_json
-    )
-    if review_payload_json:
+    if decision.comparison_payload_json:
         try:
-            loaded = json.loads(review_payload_json)
+            loaded = json.loads(decision.comparison_payload_json)
         except (json.JSONDecodeError, TypeError):
             loaded = None
         if isinstance(loaded, dict):
@@ -1838,8 +1093,7 @@ def _serialize_semantic_review(
         conflict_types = []
     conflict_types = [item for item in conflict_types if isinstance(item, str)]
 
-    legacy_auxiliary = bool(decision.auxiliary_model and not decision.comparison_model)
-    status = "completed" if legacy_auxiliary else decision.comparison_status or "pending"
+    status = decision.comparison_status or "pending"
     if status == "failed" or decision.agreement_status == "authoritative_failed":
         severity = "failed"
         label = "失败"
@@ -1863,9 +1117,6 @@ def _serialize_semantic_review(
     ):
         severity = "agreed"
         label = "一致"
-    elif legacy_auxiliary:
-        severity = "legacy"
-        label = decision.auxiliary_status or "历史辅助复核"
     elif status == "completed":
         severity = "unclassified"
         label = "待重新复核"
@@ -1881,7 +1132,7 @@ def _serialize_semantic_review(
         "label": label,
         "reason": reason,
         "conflict_types": conflict_types,
-        "model": decision.comparison_model or decision.auxiliary_model,
+        "model": decision.comparison_model,
     }
 
 

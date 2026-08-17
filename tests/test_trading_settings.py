@@ -54,8 +54,6 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     assert settings.instruction_execution_entry_after_item_id == 0
     assert settings.instruction_execution_management_after_item_id == 0
     assert settings.deepcoin_contract_specs_mode == "static"
-    assert settings.mimo_contract_mode == "v1"
-    assert settings.mimo_v2_activation_after_raw_message_id == 0
     assert not hasattr(settings, "entry_preamble_live_chat_ids")
 
 
@@ -146,39 +144,6 @@ def test_multi_instruction_watermark_fails_closed(value):
     with pytest.raises(ValueError, match="multi_instruction_activation"):
         trading_settings_from_payload(
             {"multi_instruction_activation_after_raw_message_id": value}
-        )
-
-
-@pytest.mark.parametrize("mode", ["v1", "v2_live_adapter"])
-def test_mimo_contract_rollout_settings_round_trip(tmp_path, mode):
-    session_factory = create_session_factory(tmp_path / "mimo-settings.db")
-
-    saved = save_trading_settings(
-        session_factory,
-        {
-            "mimo_contract_mode": mode,
-            "mimo_v2_activation_after_raw_message_id": 42,
-        },
-    )
-
-    assert saved.mimo_contract_mode == mode
-    assert saved.mimo_v2_activation_after_raw_message_id == 42
-    loaded = load_trading_settings(session_factory)
-    assert loaded.mimo_contract_mode == mode
-    assert loaded.mimo_v2_activation_after_raw_message_id == 42
-
-
-@pytest.mark.parametrize("value", ["shadow", "v2", "live", True, [], {}, 1, None])
-def test_mimo_contract_mode_fails_closed(value):
-    with pytest.raises(ValueError, match="mimo_contract_mode"):
-        trading_settings_from_payload({"mimo_contract_mode": value})
-
-
-@pytest.mark.parametrize("value", [-1, True, "42", 1.5, None])
-def test_mimo_v2_activation_watermark_fails_closed(value):
-    with pytest.raises(ValueError, match="mimo_v2_activation_after_raw_message_id"):
-        trading_settings_from_payload(
-            {"mimo_v2_activation_after_raw_message_id": value}
         )
 
 

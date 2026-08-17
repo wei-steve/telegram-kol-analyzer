@@ -9,7 +9,6 @@ from typing import Any
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.prompt_defaults import (
-    MIMO_V2_AUTHORITATIVE_PROMPT,
     MIMO_VISION_PROMPT,
     SHARED_TRADING_PROMPT,
 )
@@ -44,29 +43,11 @@ def compose_trading_prompt(
     *,
     model_kind: str,
     context: str,
-    contract_version: str = "v1",
 ) -> PromptComposition:
     if model_kind not in {"deepseek", "mimo"}:
         raise PromptCompositionError(
             f"unsupported trading model kind: {model_kind}"
         )
-    if contract_version not in {"v1", "v2"}:
-        raise PromptCompositionError(
-            f"unsupported trading contract version: {contract_version}"
-        )
-    if contract_version == "v2":
-        if model_kind != "mimo":
-            raise PromptCompositionError("MiMo v2 contract is only available to MiMo")
-        prompt = resolve_active_prompt(
-            session_factory,
-            MIMO_V2_AUTHORITATIVE_PROMPT,
-        )
-        return PromptComposition(
-            system_prompt=prompt.content.strip(),
-            context=context,
-            version_map={prompt.prompt_key: prompt.version_id},
-        )
-
     shared = resolve_active_prompt(session_factory, SHARED_TRADING_PROMPT)
     prompts = [shared]
     if model_kind == "mimo":
@@ -154,64 +135,6 @@ def validate_prompt_content(
             for marker in ("图片", "截图", "图表", "image", "screenshot")
         ):
             errors.append("MiMo 图片模板必须包含图片读取规则")
-    elif validation_profile == "mimo_v2_authoritative":
-        required_schema_markers = (
-            '"contract_version": "mimo-authoritative-v2"',
-            '"summary"',
-            '"confidence"',
-            '"intents"',
-            '"intent_type"',
-            '"action"',
-            '"kind"',
-            '"target"',
-            '"strategy"',
-            '"parameters"',
-            '"reason"',
-            '"evidence_refs"',
-            '"evidence"',
-            '"text"',
-            '"images"',
-            '"asset_id"',
-            '"image_type"',
-            '"quality"',
-            '"observed_text"',
-            '"fields"',
-            '"source"',
-            '"conflicts"',
-        )
-        required_contract_markers = (
-            "new_strategy | entry_confirmation | position_management | exit | cancel_entry | "
-            "strategy_revision | entry_context | position_report | "
-            "market_commentary | non_trading | unclear",
-            "entry | confirm_entry | entry_fragment | cancel_pending_entry | "
-            "replace_entry | full_exit | partial_exit | partial_take_profit | "
-            "move_stop_to_protect | hold_update | risk_update",
-            "entry_confirmation + confirm_entry",
-            "entry_context + entry_fragment",
-            "leg_allocation=[0.5,0.5]",
-            "supplemental_entry",
-            "strategy_screenshot、position_screenshot、order_screenshot、"
-            "market_chart、profit_review、advertisement、unrelated、unknown",
-            "clear、blurry、cropped、unreadable",
-            "source 只能是 text、image、both",
-            "text:observed_text",
-            "image:<asset_id>:observed_text",
-            "生命周期事件与仓位管理",
-            "图文证据分离",
-            "每张图片",
-            "不得静默合并",
-            "不得把旧上下文复制成当前意图",
-            "只输出一个 JSON 对象",
-            "不得添加额外字段",
-        )
-        for marker in required_schema_markers:
-            if marker not in normalized:
-                errors.append(f"MiMo v2 模板缺少必需字段 {marker}")
-        for marker in required_contract_markers:
-            if marker not in normalized:
-                errors.append(f"MiMo v2 模板缺少必需契约 {marker}")
-        if normalized.count('"contract_version": "mimo-authoritative-v2"') != 1:
-            errors.append("MiMo v2 模板必须且只能定义一次契约版本")
     elif validation_profile == "semantic_disagreement_review":
         required_schema_markers = (
             '"independent_action"',

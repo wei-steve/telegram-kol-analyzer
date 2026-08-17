@@ -379,22 +379,6 @@ def publish_prompt_draft(
         )
         if draft.validated_at is None or not validation_result or not validation_result.get("success"):
             raise PromptRegistryConflict("draft requires successful validation")
-        if definition.validation_profile == "mimo_v2_authoritative":
-            from telegram_kol_research.prompt_composition import (
-                validate_prompt_content,
-            )
-
-            validation = validate_prompt_content(
-                definition.prompt_key,
-                draft.content,
-                validation_profile=definition.validation_profile,
-                required_variables=_decode_tuple(definition.required_variables_json),
-            )
-            if not validation.success:
-                raise PromptRegistryValidationError(
-                    "MiMo v2 draft failed closed-contract validation: "
-                    + "; ".join(validation.errors)
-                )
         active = session.get(AiPromptVersion, definition.active_version_id)
         if active is not None:
             active.status = "superseded"

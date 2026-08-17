@@ -1,6 +1,5 @@
-import json
-from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -10,14 +9,9 @@ from telegram_kol_research.message_evidence import (
     load_current_message_evidence,
     normalize_entry_strategy_fragments,
     normalize_mimo_evidence,
-    persist_mimo_v2_message_evidence,
     save_message_evidence_version,
 )
-from telegram_kol_research.mimo_v2_contract import parse_mimo_v2_payload
-from telegram_kol_research.mimo_v2_execution_adapter import (
-    adapt_mimo_v2_to_current_payload,
-)
-from telegram_kol_research.models import MediaAsset, MimoRecognitionRun, RawMessage
+from telegram_kol_research.models import RawMessage
 from telegram_kol_research.prompt_defaults import DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT
 
 
@@ -270,183 +264,6 @@ def _message(session_factory) -> RawMessage:
         session.refresh(row)
         session.expunge(row)
         return row
-
-
-def _parsed_v2_result(*, asset_ids: tuple[int, int]):
-    first_asset_id, second_asset_id = asset_ids
-    return parse_mimo_v2_payload(
-        {
-            "contract_version": "mimo-authoritative-v2",
-            "summary": "管理已有 ETH 空单并保留两张图片证据",
-            "confidence": 0.94,
-            "intents": [
-                {
-                    "intent_type": "position_management",
-                    "action": {
-                        "kind": "move_stop_to_protect",
-                        "target": {"lifecycle_id": 790, "thread_id": 52},
-                        "strategy": None,
-                        "parameters": {"stop_loss": "1940"},
-                    },
-                    "reason": "消息明确要求移动止损到1940",
-                    "confidence": 0.95,
-                    "evidence_refs": [
-                        "text:stop_loss",
-                        f"image:{first_asset_id}:symbol",
-                        f"image:{second_asset_id}:side",
-                    ],
-                }
-            ],
-            "evidence": {
-                "text": {
-                    "observed_text": "移动止损到1940",
-                    "fields": {
-                        "stop_loss": {
-                            "value": "1940",
-                            "source": "text",
-                            "confidence": 0.98,
-                        }
-                    },
-                },
-                "images": [
-                    {
-                        "asset_id": first_asset_id,
-                        "image_type": "position_screenshot",
-                        "quality": "clear",
-                        "observed_text": "ETHUSDT 永续，空",
-                        "summary": "ETHUSDT空仓持仓截图",
-                        "fields": {
-                            "symbol": {
-                                "value": "ETH",
-                                "source": "image",
-                                "confidence": 0.99,
-                            }
-                        },
-                        "confidence": 0.97,
-                    },
-                    {
-                        "asset_id": second_asset_id,
-                        "image_type": "order_screenshot",
-                        "quality": "cropped",
-                        "observed_text": "空，止损1940",
-                        "summary": "止损委托截图",
-                        "fields": {
-                            "side": {
-                                "value": "short",
-                                "source": "image",
-                                "confidence": 0.96,
-                            }
-                        },
-                        "confidence": 0.91,
-                    },
-                ],
-                "conflicts": ["第二张图被裁剪，无法确认完整委托号"],
-            },
-        }
-    )
-
-
-def test_v2_evidence_preserves_each_image_and_links_authoritative_run(tmp_path):
-    session_factory = create_session_factory(tmp_path / "v2-evidence.db")
-    message = _message(session_factory)
-    with session_factory() as session:
-        first = MediaAsset(
-            raw_message_id=message.id,
-            telegram_file_id="photo-1",
-            kind="photo",
-            mime_type="image/jpeg",
-        )
-        second = MediaAsset(
-            raw_message_id=message.id,
-            telegram_file_id="photo-2",
-            kind="photo",
-            mime_type="image/png",
-        )
-        session.add_all([first, second])
-        session.flush()
-        asset_ids = (first.id, second.id)
-        parsed_result = _parsed_v2_result(asset_ids=asset_ids)
-        adapted_result = adapt_mimo_v2_to_current_payload(parsed_result)
-        run = MimoRecognitionRun(
-            raw_message_id=message.id,
-            run_kind="v2_authoritative",
-            contract_version="mimo-authoritative-v2",
-            model="mimo-v2.5",
-            input_kind="text+image",
-            input_fingerprint="sha256:analysis-input",
-            prompt_versions_json='{"mimo_v2":12}',
-            status="completed",
-            attempt_count=1,
-            selected_attempt_ordinal=1,
-            became_authoritative=True,
-            canonical_payload_fingerprint=adapted_result.canonical_v2_fingerprint,
-            projection_fingerprint="b" * 64,
-            completed_at=datetime(2026, 8, 11, 12, tzinfo=UTC),
-        )
-        session.add(run)
-        session.commit()
-        run_id = run.id
-
-    saved = persist_mimo_v2_message_evidence(
-        session_factory,
-        raw_message_id=message.id,
-        result=parsed_result,
-        run_id=run_id,
-        model="mimo-v2.5",
-        prompt_versions={"mimo_v2": 12},
-        media_root=tmp_path / "media",
-    )
-
-    text_evidence = json.loads(saved.text_evidence_json)
-    image_evidence = json.loads(saved.image_evidence_json)
-    normalized = json.loads(saved.normalized_evidence_json)
-    assert text_evidence["observed_text"] == "移动止损到1940"
-    assert [row["asset_id"] for row in image_evidence["images"]] == list(asset_ids)
-    assert image_evidence["images"][0]["summary"] == "ETHUSDT空仓持仓截图"
-    assert image_evidence["images"][1]["quality"] == "cropped"
-    assert image_evidence["conflicts"] == [
-        "第二张图被裁剪，无法确认完整委托号"
-    ]
-    assert normalized["contract_version"] == "mimo-authoritative-v2"
-    assert normalized["intents"][0]["intent_type"] == "position_management"
-    assert normalized["intents"][0]["evidence_refs"][1].startswith("image:")
-    assert json.loads(adapted_result.canonical_v2_json) == {
-        **normalized,
-        "evidence": {
-            "text": text_evidence,
-            "images": image_evidence["images"],
-            "conflicts": image_evidence["conflicts"],
-        },
-    }
-    assert saved.mimo_recognition_run_id == run_id
-    assert "data:image" not in saved.image_evidence_json
-
-
-def test_v2_evidence_rejects_image_asset_from_another_message(tmp_path):
-    session_factory = create_session_factory(tmp_path / "v2-foreign-image.db")
-    message = _message(session_factory)
-    with session_factory() as session:
-        other = RawMessage(
-            chat_id=-1001,
-            message_id=1461,
-            posted_at=datetime(2026, 7, 21, 9, 4, tzinfo=UTC),
-            text="other",
-        )
-        session.add(other)
-        session.flush()
-        first = MediaAsset(raw_message_id=message.id, kind="photo")
-        foreign = MediaAsset(raw_message_id=other.id, kind="photo")
-        session.add_all([first, foreign])
-        session.commit()
-        asset_ids = (first.id, foreign.id)
-
-    with pytest.raises(ValueError, match="mimo_v2_image_asset_mismatch"):
-        persist_mimo_v2_message_evidence(
-            session_factory,
-            raw_message_id=message.id,
-            result=_parsed_v2_result(asset_ids=asset_ids),
-            media_root=tmp_path / "media",
-        )
 
 
 def test_save_message_evidence_is_idempotent_for_same_input(tmp_path):
