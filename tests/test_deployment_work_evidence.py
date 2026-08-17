@@ -547,6 +547,122 @@ def test_paused_management_with_unknown_attempted_child_is_unknown(
     _assert_only_category(collect_deployment_evidence(database), "unknown_outcome")
 
 
+@pytest.mark.parametrize(
+    ("table", "foreign_key"),
+    [
+        ("execution_order_legs", "execution_binding_id"),
+        ("strategy_management_components", "management_batch_id"),
+    ],
+)
+def test_orphan_execution_children_are_invalid_evidence(
+    tmp_path: Path,
+    table: str,
+    foreign_key: str,
+) -> None:
+    database = tmp_path / f"orphan-{table}.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            f"INSERT INTO {table} (id, {foreign_key}, status) "
+            "VALUES (1, 999, 'submitting')"
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "invalid_evidence")
+
+
+@pytest.mark.parametrize("binding_status", ["stale"])
+def test_authoritative_terminal_binding_statuses_are_inactive(
+    tmp_path: Path,
+    binding_status: str,
+) -> None:
+    database = tmp_path / f"binding-{binding_status}.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO execution_bindings "
+            "(id, chat_id, message_id, symbol, side, status) "
+            "VALUES (1, 10, 20, 'BTC', 'long', ?)",
+            (binding_status,),
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "inactive")
+
+
+@pytest.mark.parametrize("leg_status", ["manually_closed", "exchange_cancelled"])
+def test_authoritative_terminal_execution_leg_statuses_are_inactive(
+    tmp_path: Path,
+    leg_status: str,
+) -> None:
+    database = tmp_path / f"leg-{leg_status}.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO execution_bindings "
+            "(id, chat_id, message_id, symbol, side, status) "
+            "VALUES (1, 10, 20, 'BTC', 'long', 'stale')"
+        )
+        connection.execute(
+            "INSERT INTO execution_order_legs "
+            "(id, execution_binding_id, purpose, status) "
+            "VALUES (1, 1, 'entry', ?)",
+            (leg_status,),
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "inactive")
+
+
+def test_authoritative_partial_failed_management_batch_is_inactive(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "management-partial-failed.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO strategy_management_batches "
+            "(id, status, reason_code, execution_mode) "
+            "VALUES (1, 'partial_failed', 'operator_review_required', 'live')"
+        )
+
+    _assert_only_category(collect_deployment_evidence(database), "inactive")
+
+
+@pytest.mark.parametrize(
+    ("component_status", "expected_category"),
+    [
+        ("pending", "queued_work"),
+        ("preflighting", "queued_work"),
+        ("recovery_required", "queued_work"),
+        ("awaiting_exchange", "unknown_outcome"),
+        ("definitely_rejected", "inactive"),
+        ("operator_required", "inactive"),
+        ("confirmed", "inactive"),
+        ("safely_skipped", "inactive"),
+    ],
+)
+def test_authoritative_management_component_statuses_are_contextual(
+    tmp_path: Path,
+    component_status: str,
+    expected_category: str,
+) -> None:
+    database = tmp_path / f"component-{component_status}.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO strategy_management_batches "
+            "(id, status, reason_code, execution_mode) "
+            "VALUES (1, 'recovery_required', 'operator_review_required', 'live')"
+        )
+        connection.execute(
+            "INSERT INTO strategy_management_components "
+            "(id, management_batch_id, status) VALUES (1, 1, ?)",
+            (component_status,),
+        )
+
+    _assert_only_category(
+        collect_deployment_evidence(database), expected_category
+    )
+
+
 def test_closed_parent_protection_recovery_is_inactive(tmp_path: Path) -> None:
     database = tmp_path / "closed-protection.db"
     _create_registered_tables(database)

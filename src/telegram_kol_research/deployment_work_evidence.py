@@ -327,7 +327,15 @@ def _collect_execution_bindings(connection: sqlite3.Connection) -> EvidenceTally
         if leg_status is not None:
             current[1].append(leg_status)
 
+    orphan_legs = connection.execute(
+        "SELECT COUNT(*) FROM execution_order_legs AS l "
+        "LEFT JOIN execution_bindings AS b "
+        "ON b.id = l.execution_binding_id WHERE b.id IS NULL"
+    ).fetchone()
     totals = {field.name: 0 for field in fields(EvidenceTally)}
+    if orphan_legs is None or not isinstance(orphan_legs[0], int):
+        return EvidenceTally(invalid_evidence=1)
+    totals["invalid_evidence"] += min(orphan_legs[0], MAX_EVIDENCE_COUNT)
     known_binding = {
         "open",
         "active",
@@ -338,6 +346,9 @@ def _collect_execution_bindings(connection: sqlite3.Connection) -> EvidenceTally
         "failed",
         "resolved",
         "superseded",
+        "stale",
+        "rejected",
+        "expired",
     }
     active_legs = {"submitting", "cancel_submitting"}
     unknown_legs = {"submit_unknown", "unknown_exchange_outcome"}
@@ -354,6 +365,22 @@ def _collect_execution_bindings(connection: sqlite3.Connection) -> EvidenceTally
         "failed",
         "expired",
         "invalidated",
+        "inconsistent",
+        "confirmed",
+        "partial",
+        "manually_closed",
+        "exchange_cancelled",
+        "rejected",
+        "canceled",
+        "error",
+        "live",
+        "partiallyfilled",
+        "partial_filled",
+        "done",
+        "completed",
+        "succeeded",
+        "success",
+        "manually_cancelled",
     }
     for binding_status, leg_statuses in grouped.values():
         if not isinstance(binding_status, str) or binding_status not in known_binding:
@@ -461,19 +488,42 @@ def _collect_management_batches(connection: sqlite3.Connection) -> EvidenceTally
         if component_status is not None:
             current[3].append(component_status)
 
+    orphan_components = connection.execute(
+        "SELECT COUNT(*) FROM strategy_management_components AS c "
+        "LEFT JOIN strategy_management_batches AS b "
+        "ON b.id = c.management_batch_id WHERE b.id IS NULL"
+    ).fetchone()
     totals = {field.name: 0 for field in fields(EvidenceTally)}
+    if orphan_components is None or not isinstance(orphan_components[0], int):
+        return EvidenceTally(invalid_evidence=1)
+    totals["invalid_evidence"] += min(
+        orphan_components[0], MAX_EVIDENCE_COUNT
+    )
     active_children = {"submitting", "cancel_submitting"}
-    unknown_children = {"submit_unknown", "unknown_exchange_outcome"}
-    known_children = active_children | unknown_children | {
+    unknown_children = {
+        "submit_unknown",
+        "unknown_exchange_outcome",
+        "awaiting_exchange",
+    }
+    queued_children = {
         "pending",
         "ready",
         "reserved",
+        "preflighting",
+        "recovery_required",
+    }
+    known_children = active_children | unknown_children | {
+        *queued_children,
         "submitted",
         "succeeded",
         "failed",
         "blocked",
         "resolved",
         "cancelled",
+        "definitely_rejected",
+        "operator_required",
+        "confirmed",
+        "safely_skipped",
     }
     temporary_visibility = {
         "protection_missing_cancellable_order_id",
@@ -493,6 +543,8 @@ def _collect_management_batches(connection: sqlite3.Connection) -> EvidenceTally
             totals["active_write"] += 1
         elif any(child in unknown_children for child in component_statuses):
             totals["unknown_outcome"] += 1
+        elif any(child in queued_children for child in component_statuses):
+            totals["queued_work"] += 1
         elif status == "executing":
             totals["active_write"] += 1
         elif status in {"submitted", "submit_unknown"}:
@@ -506,7 +558,13 @@ def _collect_management_batches(connection: sqlite3.Connection) -> EvidenceTally
                 totals["inactive"] += 1
         elif status == "blocked" and reason in temporary_visibility:
             totals["queued_work"] += 1
-        elif status in {"succeeded", "blocked", "resolved", "failed"}:
+        elif status in {
+            "succeeded",
+            "blocked",
+            "resolved",
+            "failed",
+            "partial_failed",
+        }:
             totals["inactive"] += 1
         else:
             totals["invalid_evidence"] += 1

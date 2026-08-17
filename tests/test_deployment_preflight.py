@@ -162,6 +162,56 @@ def test_final_binds_one_direct_preliminary_parent() -> None:
     ) == "PASS"
 
 
+def test_final_rejects_blocked_preliminary_parent() -> None:
+    blocked_parent = _preliminary(evidence=_evidence(active_write=1))
+
+    with pytest.raises(
+        DeploymentPreflightInputError,
+        match="parent_decision_blocked",
+    ):
+        build_final_deployment_preflight_artifact(
+            production_commit=PRODUCTION,
+            candidate_commit=CANDIDATE,
+            surface=_surface(),
+            evidence=_evidence(),
+            snapshot_status=_snapshot(),
+            schema_verification=_schema(),
+            database_watermark=_watermark(11),
+            preliminary_artifact=blocked_parent,
+            now=NOW + timedelta(seconds=30),
+        )
+
+
+def test_final_verifier_rejects_blocked_direct_parent() -> None:
+    allowed_parent = _preliminary()
+    final = build_final_deployment_preflight_artifact(
+        production_commit=PRODUCTION,
+        candidate_commit=CANDIDATE,
+        surface=_surface(),
+        evidence=_evidence(),
+        snapshot_status=_snapshot(),
+        schema_verification=_schema(),
+        database_watermark=_watermark(11),
+        preliminary_artifact=allowed_parent,
+        now=NOW + timedelta(seconds=30),
+    )
+    blocked_parent = _preliminary(evidence=_evidence(active_write=1))
+    final["parent_fingerprint"] = blocked_parent["fingerprint"]
+    _rehash(final)
+
+    with pytest.raises(
+        DeploymentPreflightInputError,
+        match="parent_decision_blocked",
+    ):
+        _verify(
+            final,
+            phase="final",
+            watermark=_watermark(11),
+            preliminary=blocked_parent,
+            now=NOW + timedelta(seconds=30),
+        )
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

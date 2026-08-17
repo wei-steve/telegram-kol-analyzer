@@ -325,6 +325,10 @@ def _validate_parent(
     )
     if parent["decision"] != decision or parent["reason_codes"] != reasons:
         raise DeploymentPreflightInputError("preflight_artifact_parent_semantic_invalid")
+    if decision == "BLOCK":
+        raise DeploymentPreflightInputError(
+            "preflight_artifact_parent_decision_blocked"
+        )
     parent["database_watermark"] = _watermark(parent["database_watermark"])
     return parent
 
