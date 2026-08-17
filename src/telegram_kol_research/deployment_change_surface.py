@@ -15,7 +15,7 @@ from .deployment_work_evidence import (
 )
 
 
-CHANGE_SURFACE_REGISTRY_VERSION = 3
+CHANGE_SURFACE_REGISTRY_VERSION = 4
 _CLASS_RANK = {
     "code": 0,
     "schema_compatible": 1,
@@ -53,6 +53,19 @@ MUTATION_AUTHORITY_PATHS = frozenset(
         "src/telegram_kol_research/protection_ledger.py",
         "src/telegram_kol_research/recovery_live_submit_gate.py",
         "src/telegram_kol_research/source_message_deletion.py",
+    }
+)
+
+OUTCOME_AUTHORITY_PATHS = frozenset(
+    {
+        "src/telegram_kol_research/instruction_execution_entry_adapter.py",
+        "src/telegram_kol_research/instruction_execution_management_adapter.py",
+        "src/telegram_kol_research/instruction_execution_outcomes.py",
+        "src/telegram_kol_research/instruction_execution_projection.py",
+        "src/telegram_kol_research/recovery_order_confirmation.py",
+        "src/telegram_kol_research/strategy_management_contracts.py",
+        "src/telegram_kol_research/strategy_management_market_decisions.py",
+        "src/telegram_kol_research/strategy_management_market_policy.py",
     }
 )
 
@@ -97,7 +110,7 @@ EXECUTION_WRITER_PATHS = frozenset(
         "src/telegram_kol_research/trigger_protection_rescue_worker.py",
         "src/telegram_kol_research/web_app.py",
     }
-) | MUTATION_AUTHORITY_PATHS
+) | MUTATION_AUTHORITY_PATHS | OUTCOME_AUTHORITY_PATHS
 
 LIVE_PROMOTION_PATHS = frozenset(
     {
@@ -205,6 +218,13 @@ def classify_change_surface(
             path_class = "execution_writer"
         elif path in SCHEMA_PATHS or path.startswith("migrations/"):
             path_class = "schema_compatible"
+        elif path in DEPLOYMENT_GUARD_PATHS:
+            path_class = "code"
+        elif path.startswith("src/telegram_kol_research/"):
+            # Runtime helpers are writer-sensitive by default. A new indirect
+            # authority, projector, payload builder, or retry primitive must
+            # never silently inherit the ordinary-code deployment policy.
+            path_class = "execution_writer"
         if _CLASS_RANK[path_class] > _CLASS_RANK[observed]:
             observed = path_class
     effective = max((requested, observed), key=_CLASS_RANK.__getitem__)
@@ -299,7 +319,10 @@ def _is_unchanged_reviewed_retirement_path(
 ) -> bool:
     if (
         production != _RETIREMENT_PRODUCTION_COMMIT
-        or path not in _REVIEWED_RETIREMENT_RISK_PATHS
+        or (
+            path not in _REVIEWED_RETIREMENT_RISK_PATHS
+            and not path.startswith("src/telegram_kol_research/")
+        )
     ):
         return False
     ancestry = subprocess.run(

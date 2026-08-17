@@ -11,6 +11,7 @@ from telegram_kol_research.deployment_change_surface import (
     ChangeSurfaceError,
     EXECUTION_WRITER_PATHS,
     MUTATION_AUTHORITY_PATHS,
+    OUTCOME_AUTHORITY_PATHS,
     bind_phase_restart_surface_counts,
     classify_change_surface,
 )
@@ -207,7 +208,7 @@ def test_each_reviewed_direct_exchange_writer_upgrades_change_class(
 
     assert facts.effective_change_class == "execution_writer"
     assert facts.underdeclared is True
-    assert facts.registry_version == 3
+    assert facts.registry_version == 4
 
 
 def test_trade_signal_retry_and_state_transitions_are_writer_sensitive(tmp_path):
@@ -289,6 +290,63 @@ def test_mutation_serializers_and_write_gates_are_registered():
             authority_modules.add(path.relative_to(repository).as_posix())
 
     assert authority_modules <= EXECUTION_WRITER_PATHS
+
+
+def test_unknown_outcome_interpreters_are_writer_sensitive(tmp_path):
+    repository, base = _repository(tmp_path)
+    candidate = _commit(
+        repository,
+        "src/telegram_kol_research/instruction_execution_outcomes.py",
+        "map unknown to verified\n",
+        "outcome drift",
+    )
+
+    facts = classify_change_surface(
+        repository=repository,
+        production_commit=base,
+        candidate_commit=candidate,
+        requested_change_class="code",
+        work_classification_counts={
+            "historical_residue": {"execution_contracts": 1}
+        },
+    )
+
+    assert facts.effective_change_class == "execution_writer"
+    assert facts.underdeclared is True
+
+
+def test_outcome_authority_primitives_are_explicitly_registered():
+    assert OUTCOME_AUTHORITY_PATHS == {
+        "src/telegram_kol_research/instruction_execution_entry_adapter.py",
+        "src/telegram_kol_research/instruction_execution_management_adapter.py",
+        "src/telegram_kol_research/instruction_execution_outcomes.py",
+        "src/telegram_kol_research/instruction_execution_projection.py",
+        "src/telegram_kol_research/recovery_order_confirmation.py",
+        "src/telegram_kol_research/strategy_management_contracts.py",
+        "src/telegram_kol_research/strategy_management_market_decisions.py",
+        "src/telegram_kol_research/strategy_management_market_policy.py",
+    }
+    assert OUTCOME_AUTHORITY_PATHS <= EXECUTION_WRITER_PATHS
+
+
+def test_unregistered_runtime_source_fails_safe_as_writer_sensitive(tmp_path):
+    repository, base = _repository(tmp_path)
+    candidate = _commit(
+        repository,
+        "src/telegram_kol_research/future_execution_helper.py",
+        "runtime behavior\n",
+        "new runtime helper",
+    )
+
+    facts = classify_change_surface(
+        repository=repository,
+        production_commit=base,
+        candidate_commit=candidate,
+        requested_change_class="code",
+    )
+
+    assert facts.effective_change_class == "execution_writer"
+    assert facts.underdeclared is True
 
 
 def test_every_restart_handler_is_registered_as_writer_sensitive():

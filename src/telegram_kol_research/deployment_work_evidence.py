@@ -151,7 +151,11 @@ WORK_EVIDENCE_ADAPTERS = (
         unknown=("submit_unknown",),
         terminal=("verified", "failed", "expired"),
         restart_surface=(
+            "src/telegram_kol_research/instruction_execution_entry_adapter.py",
+            "src/telegram_kol_research/instruction_execution_management_adapter.py",
             "src/telegram_kol_research/instruction_execution_contracts.py",
+            "src/telegram_kol_research/instruction_execution_outcomes.py",
+            "src/telegram_kol_research/instruction_execution_projection.py",
             "src/telegram_kol_research/instruction_execution_reconciliation.py",
         ),
     ),
@@ -189,6 +193,9 @@ WORK_EVIDENCE_ADAPTERS = (
         progress=("last_progress_at",),
         restart_surface=(
             "src/telegram_kol_research/strategy_management_batches.py",
+            "src/telegram_kol_research/strategy_management_contracts.py",
+            "src/telegram_kol_research/strategy_management_market_decisions.py",
+            "src/telegram_kol_research/strategy_management_market_policy.py",
             "src/telegram_kol_research/strategy_management_reconciliation.py",
             "src/telegram_kol_research/strategy_management_worker.py",
         ),
@@ -223,6 +230,9 @@ WORK_EVIDENCE_ADAPTERS = (
         terminal=("confirmed", "operator_required", "safely_skipped"),
         restart_surface=(
             "src/telegram_kol_research/strategy_management_components.py",
+            "src/telegram_kol_research/strategy_management_contracts.py",
+            "src/telegram_kol_research/strategy_management_market_decisions.py",
+            "src/telegram_kol_research/strategy_management_market_policy.py",
             "src/telegram_kol_research/strategy_management_composite_reconciliation.py",
             "src/telegram_kol_research/strategy_management_composite_executor.py",
         ),
