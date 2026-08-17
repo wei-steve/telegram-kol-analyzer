@@ -468,6 +468,21 @@ def verify_phase_bound_deployment_preflight_artifact(
     if any(artifact.get(key) != value for key, value in expected_surface_values.items()):
         raise DeploymentPreflightInputError("preflight_artifact_surface_mismatch")
     decision = _verify_common_artifact_fields(artifact, now=now)
+    facts, fact_json = _facts_from_phase_artifact(artifact)
+    blocking, warnings = _classify_phase_facts(
+        facts=facts,
+        fact_json=fact_json,
+        effective_change_class=change_surface.effective_change_class,
+        require_schema_evidence=normalized_phase == "final",
+    )
+    blocking.update(change_surface.blocking_reason_codes)
+    expected_decision = "BLOCK" if blocking else "WARN" if warnings else "PASS"
+    if decision != expected_decision or artifact.get("reason_codes") != sorted(
+        blocking | warnings
+    ):
+        raise DeploymentPreflightInputError(
+            "preflight_artifact_semantics_mismatch"
+        )
     parent_fingerprint = artifact.get("preliminary_fingerprint")
     if normalized_phase == "preliminary":
         if parent_fingerprint is not None:
@@ -506,6 +521,95 @@ def verify_phase_bound_deployment_preflight_artifact(
             )
         _validate_watermark_transition(preliminary_watermark, final_watermark)
     return decision
+
+
+def _facts_from_phase_artifact(
+    artifact: Mapping[str, object],
+) -> tuple[DeploymentPreflightFacts, Mapping[str, object]]:
+    checked = artifact.get("checked_facts")
+    watermark = artifact.get("database_watermark")
+    required_checked_keys = {
+        "work_classification_counts",
+        "work_evidence_fingerprint",
+        "protected_open_position_count",
+        "unprotected_open_position_count",
+        "exchange_snapshot_available",
+        "exchange_snapshot_complete",
+        "exchange_snapshot_fresh",
+        "exchange_snapshot_stable",
+        "schema_backup_valid",
+        "schema_migration_dry_run_valid",
+        "prior_schema_missing_table_count",
+        "reviewed_shadow_evidence",
+        "reviewed_shadow_evidence_fingerprint",
+        "explicit_live_authorization",
+    }
+    if (
+        not isinstance(checked, Mapping)
+        or set(checked) != required_checked_keys
+        or not isinstance(watermark, Mapping)
+        or not isinstance(checked.get("work_classification_counts"), Mapping)
+    ):
+        raise DeploymentPreflightInputError("preflight_artifact_facts_invalid")
+    boolean_keys = {
+        "exchange_snapshot_available",
+        "exchange_snapshot_complete",
+        "exchange_snapshot_fresh",
+        "exchange_snapshot_stable",
+        "reviewed_shadow_evidence",
+        "explicit_live_authorization",
+    }
+    if any(not isinstance(checked.get(key), bool) for key in boolean_keys):
+        raise DeploymentPreflightInputError("preflight_artifact_facts_invalid")
+    for key in ("schema_backup_valid", "schema_migration_dry_run_valid"):
+        if checked.get(key) is not None and not isinstance(checked.get(key), bool):
+            raise DeploymentPreflightInputError("preflight_artifact_facts_invalid")
+    count_keys = {
+        "protected_open_position_count",
+        "unprotected_open_position_count",
+        "prior_schema_missing_table_count",
+    }
+    if any(not _is_nonnegative_plain_int(checked.get(key)) for key in count_keys):
+        raise DeploymentPreflightInputError("preflight_artifact_facts_invalid")
+    try:
+        facts = DeploymentPreflightFacts(
+            database_watermark=watermark,
+            work_classification_counts=checked["work_classification_counts"],
+            work_evidence_fingerprint=str(checked["work_evidence_fingerprint"]),
+            protected_open_position_count=int(
+                checked["protected_open_position_count"]
+            ),
+            unprotected_open_position_count=int(
+                checked["unprotected_open_position_count"]
+            ),
+            exchange_snapshot_available=checked["exchange_snapshot_available"],
+            exchange_snapshot_complete=checked["exchange_snapshot_complete"],
+            exchange_snapshot_fresh=checked["exchange_snapshot_fresh"],
+            exchange_snapshot_stable=checked["exchange_snapshot_stable"],
+            schema_backup_valid=checked["schema_backup_valid"],
+            schema_migration_dry_run_valid=checked[
+                "schema_migration_dry_run_valid"
+            ],
+            prior_schema_missing_table_count=int(
+                checked["prior_schema_missing_table_count"]
+            ),
+            reviewed_shadow_evidence=checked["reviewed_shadow_evidence"],
+            reviewed_shadow_evidence_fingerprint=checked[
+                "reviewed_shadow_evidence_fingerprint"
+            ],
+            explicit_live_authorization=checked[
+                "explicit_live_authorization"
+            ],
+        )
+        normalized = facts.to_json()
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise DeploymentPreflightInputError(
+            "preflight_artifact_facts_invalid"
+        ) from exc
+    normalized_watermark = normalized.pop("database_watermark")
+    if normalized != dict(checked) or normalized_watermark != dict(watermark):
+        raise DeploymentPreflightInputError("preflight_artifact_facts_invalid")
+    return facts, checked
 
 
 def _build_phase_bound_deployment_preflight_artifact(

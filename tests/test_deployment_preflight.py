@@ -662,6 +662,48 @@ def test_final_verifier_rechecks_parent_decision_and_watermark_transition():
             preliminary_artifact=blocked_parent,
         )
 
+    unsafe_final = build_final_deployment_preflight_artifact(
+        preliminary_artifact=preliminary,
+        production_commit=EXPECTED_COMMIT,
+        candidate_commit=CANDIDATE_COMMIT,
+        requested_change_class="schema_compatible",
+        change_surface=_surface(),
+        facts=replace(
+            _facts(),
+            work_classification_counts={
+                "unknown_outcome": {"execution_order_legs": 1}
+            },
+            schema_backup_valid=True,
+            schema_migration_dry_run_valid=True,
+        ),
+        now=NOW + timedelta(minutes=1),
+    )
+    forged_pass = dict(unsafe_final, decision="PASS", reason_codes=[])
+    forged_pass["fingerprint"] = hashlib.sha256(
+        json.dumps(
+            {
+                key: value
+                for key, value in forged_pass.items()
+                if key != "fingerprint"
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    with pytest.raises(DeploymentPreflightInputError, match="semantics_mismatch"):
+        verify_phase_bound_deployment_preflight_artifact(
+            forged_pass,
+            phase="final",
+            production_commit=EXPECTED_COMMIT,
+            candidate_commit=CANDIDATE_COMMIT,
+            requested_change_class="schema_compatible",
+            change_surface=_surface(),
+            now=NOW + timedelta(minutes=1),
+            preliminary_artifact=preliminary,
+        )
+
 
 def test_blocking_artifact_with_warnings_remains_verifiable():
     artifact = _build(

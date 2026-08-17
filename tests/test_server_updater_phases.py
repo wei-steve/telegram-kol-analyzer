@@ -82,6 +82,7 @@ case "${1:-}" in
     ;;
   stop)
     if [ "${HARNESS_STOP_STAYS_ACTIVE:-0}" != "1" ]; then touch "$HARNESS_STATE/stopped"; fi
+    if [ "${HARNESS_STOP_RETURNS_NONZERO:-0}" = "1" ]; then exit 1; fi
     ;;
   start)
     if [ "${HARNESS_START_FAIL_ONCE:-0}" = "1" ] && [ ! -f "$HARNESS_STATE/start_failed" ]; then
@@ -120,7 +121,10 @@ if [[ " $* " = *"telegram_kol_research.deployment_preflight_cli"* ]] || [[ " $* 
     mkdir -p "$(dirname "$output")"
     printf '{}\n' >"$output"
   fi
-  if [[ " $* " = *" verify "* ]] || [[ " $* " = *" verify-deployment-preflight "* ]]; then exit 0; fi
+  if [[ " $* " = *" verify "* ]] || [[ " $* " = *" verify-deployment-preflight "* ]]; then
+    if [ "$phase" = "final" ]; then exit "${HARNESS_FINAL_VERIFY_RESULT:-0}"; fi
+    exit "${HARNESS_PRELIMINARY_VERIFY_RESULT:-0}"
+  fi
   if [ "$phase" = "preliminary" ]; then exit "${HARNESS_PRELIMINARY_RESULT:-0}"; fi
   exit "${HARNESS_FINAL_RESULT:-0}"
 fi
@@ -146,6 +150,10 @@ exit 0
         "#!/usr/bin/env bash\nexit 0\n",
     )
     _write_executable(
+        fake_bin / "timeout",
+        '#!/usr/bin/env bash\nshift 2\nexec "$@"\n',
+    )
+    _write_executable(
         fake_bin / "mv",
         '#!/usr/bin/env bash\nprintf \'mv %s\\n\' "$*" >>"$HARNESS_LOG"\nexit 0\n',
     )
@@ -163,7 +171,7 @@ exit 0
                 "EXPECTED_COMMIT": CANDIDATE,
                 "CHANGE_CLASS": "code",
                 "BRANCH": "codex/test",
-                "STOP_TIMEOUT_SECONDS": "0",
+                "STOP_TIMEOUT_SECONDS": "1",
                 "HARNESS_LOG": str(log),
                 "HARNESS_STATE": str(state),
                 "HARNESS_PREVIOUS": PREVIOUS,
@@ -224,13 +232,37 @@ def test_final_pass_mutates_only_after_final_verification(updater_harness):
 
 
 def test_stop_timeout_aborts_before_final_collection(updater_harness):
-    run, log, _ = updater_harness
+    run, log, state = updater_harness
     result = run(HARNESS_STOP_STAYS_ACTIVE="1")
     events = _events(log)
 
     assert result.returncode == 4
     assert not any(" collect " in line and " final " in line for line in events)
+    assert not (state / "stopped").exists()
+
+
+def test_nonzero_stop_that_left_service_inactive_restarts_old_service(
+    updater_harness,
+):
+    run, log, state = updater_harness
+    result = run(HARNESS_STOP_RETURNS_NONZERO="1")
+    events = _events(log)
+
+    assert result.returncode == 4
     assert "systemctl start telegram-kol.service" in events
+    assert not any(" collect " in line and " final " in line for line in events)
+    assert not (state / "stopped").exists()
+
+
+def test_final_verify_syntax_failure_restarts_without_mutation(updater_harness):
+    run, log, state = updater_harness
+    result = run(HARNESS_FINAL_VERIFY_RESULT="4")
+    events = _events(log)
+
+    assert result.returncode == 4
+    assert "systemctl start telegram-kol.service" in events
+    assert not any(" checkout codex/test" in line for line in events)
+    assert not (state / "stopped").exists()
 
 
 @pytest.mark.parametrize("failure", ["HARNESS_PIP_FAIL_ONCE", "HARNESS_START_FAIL_ONCE"])

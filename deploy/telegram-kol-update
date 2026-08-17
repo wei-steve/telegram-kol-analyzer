@@ -29,8 +29,8 @@ if [[ ! "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]; then
   echo "BRANCH contains unsupported characters." >&2
   exit 4
 fi
-if [[ ! "$STOP_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
-  echo "STOP_TIMEOUT_SECONDS must be a non-negative integer." >&2
+if [[ ! "$STOP_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "STOP_TIMEOUT_SECONDS must be a positive integer." >&2
   exit 4
 fi
 if [ "$CHANGE_CLASS" = "live_promotion" ]; then
@@ -100,7 +100,12 @@ cleanup() {
   trap - EXIT INT TERM
   if [ "$service_stopped" -eq 1 ]; then
     rollback_ok=1
-    systemctl stop telegram-kol.service || rollback_ok=0
+    if systemctl is-active --quiet telegram-kol.service; then
+      set +e
+      timeout --foreground "${STOP_TIMEOUT_SECONDS}s" systemctl stop telegram-kol.service
+      set -e
+      if systemctl is-active --quiet telegram-kol.service; then rollback_ok=0; fi
+    fi
     if [ "$checkout_mutated" -eq 1 ]; then
       if [ "$rollback_ok" -eq 1 ]; then
         git -C "$APP_DIR" checkout --detach "$previous_commit" >/dev/null 2>&1 || rollback_ok=0
@@ -239,8 +244,19 @@ run_preflight_verify() {
 }
 
 stop_writer_service() {
-  systemctl stop telegram-kol.service
-  service_stopped=1
+  set +e
+  timeout --foreground "${STOP_TIMEOUT_SECONDS}s" systemctl stop telegram-kol.service
+  local stop_status=$?
+  set -e
+  if [ "$stop_status" -ne 0 ]; then
+    if systemctl is-active --quiet telegram-kol.service; then
+      echo "Exchange-writer service stop command failed while still active." >&2
+      exit 4
+    fi
+    service_stopped=1
+    echo "Exchange-writer service stop command failed after becoming inactive." >&2
+    exit 4
+  fi
   local started_at=$SECONDS
   while systemctl is-active --quiet telegram-kol.service; do
     if [ $((SECONDS - started_at)) -ge "$STOP_TIMEOUT_SECONDS" ]; then
@@ -249,6 +265,7 @@ stop_writer_service() {
     fi
     sleep 0.25
   done
+  service_stopped=1
 }
 
 preliminary_artifact="$PREFLIGHT_DIR/preliminary-$EXPECTED_COMMIT.json"

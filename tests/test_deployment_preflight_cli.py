@@ -145,3 +145,10 @@ def test_standalone_cli_rejects_final_without_preliminary(tmp_path):
 
     assert result.returncode == 4
     assert "preliminary_artifact_required" in result.stderr
+
+
+def test_standalone_cli_maps_parser_errors_to_malformed_exit_code():
+    result = _run("verify", "--phase", "bogus")
+
+    assert result.returncode == 4
+    assert "preflight_cli_arguments_invalid" in result.stderr

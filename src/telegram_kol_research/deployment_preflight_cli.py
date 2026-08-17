@@ -24,8 +24,15 @@ from .deployment_preflight import (
 _EXIT_CODES = {"PASS": 0, "WARN": 2, "BLOCK": 3}
 
 
+class _PreflightArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise DeploymentPreflightInputError(
+            "preflight_cli_arguments_invalid"
+        )
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="deployment-preflight")
+    parser = _PreflightArgumentParser(prog="deployment-preflight")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     collect = subparsers.add_parser("collect")

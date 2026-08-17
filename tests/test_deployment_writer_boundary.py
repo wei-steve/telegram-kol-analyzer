@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from telegram_kol_research.deployment_preflight import (
     build_preliminary_deployment_preflight_artifact,
     collect_deployment_preflight_facts,
 )
+from telegram_kol_research.deployment_work_evidence import WORK_EVIDENCE_ADAPTERS
 from telegram_kol_research.models import ExecutionBinding, ExecutionOrderLeg
 
 
@@ -30,11 +32,15 @@ PUBLIC_POST_OWNERS = {
     "place_order": (
         "execution_order_legs",
         "trade_signals",
+        "strategy_revision_batches",
         "tests/test_instruction_execution_fault_injection.py",
     ),
     "trigger_order": (
         "execution_order_legs",
         "position_protection_legs",
+        "trade_signals",
+        "trigger_protection_intents",
+        "strategy_revision_batches",
         "tests/test_instruction_execution_fault_injection.py",
     ),
     "set_position_sltp": (
@@ -51,13 +57,20 @@ PUBLIC_POST_OWNERS = {
         "tests/test_instruction_execution_fault_injection.py",
     ),
     "cancel_order": (
+        "trade_signals",
         "strategy_management_components",
+        "strategy_management_batches",
         "strategy_revision_batches",
         "tests/test_strategy_management_reconciliation.py",
     ),
     "cancel_trigger_order": (
+        "trade_signals",
         "strategy_management_components",
+        "strategy_management_batches",
+        "strategy_revision_batches",
         "trigger_protection_intents",
+        "position_mutation_intents",
+        "position_backup_stop_orders",
         "tests/test_strategy_management_reconciliation.py",
     ),
 }
@@ -100,6 +113,37 @@ PRIVATE_POST_CALL_SITES = {
     "_set_position_sltp_unchecked": {"position_mutation_gateway.py"},
     "_cancel_position_sltp_unchecked": {"position_mutation_gateway.py"},
     "_place_position_close_unchecked": {"position_mutation_gateway.py"},
+}
+
+# (source file, enclosing function, client method) ->
+# (number of syntactic calls, durable in-flight owner, exact regression test).
+CALL_SITE_CONTRACTS = {
+    ("deepcoin_execution_actions.py", "cancel_entry_order", "cancel_trigger_order"): (1, "trade_signals", "tests/test_auto_trade_execution.py::test_unknown_management_submission_does_not_retry_or_block_same_message_entry"),
+    ("deepcoin_execution_actions.py", "cancel_entry_order", "cancel_order"): (1, "trade_signals", "tests/test_auto_trade_execution.py::test_unknown_management_submission_does_not_retry_or_block_same_message_entry"),
+    ("deepcoin_execution_actions.py", "cancel_revision_entry_leg", "cancel_trigger_order"): (1, "strategy_revision_batches", "tests/test_entry_revision_executor.py::test_entry_revision_unknown_cancel_is_recovery_required"),
+    ("deepcoin_execution_actions.py", "cancel_revision_entry_leg", "cancel_order"): (1, "strategy_revision_batches", "tests/test_entry_revision_executor.py::test_entry_revision_unknown_cancel_is_recovery_required"),
+    ("deepcoin_execution_actions.py", "cancel_pending_entry_legs", "cancel_trigger_order"): (1, "trade_signals", "tests/test_terminal_entry_cleanup.py::test_terminal_entry_cleanup_persists_unknown_when_post_cancel_history_fails"),
+    ("deepcoin_execution_actions.py", "cancel_pending_entry_legs", "cancel_order"): (1, "trade_signals", "tests/test_terminal_entry_cleanup.py::test_terminal_entry_cleanup_persists_unknown_when_post_cancel_history_fails"),
+    ("deepcoin_execution_actions.py", "recreate_trigger_entry_tpsl", "cancel_trigger_order"): (1, "trade_signals", "tests/test_auto_trade_execution.py::test_unknown_management_submission_does_not_retry_or_block_same_message_entry"),
+    ("deepcoin_execution_actions.py", "recreate_trigger_entry_tpsl", "trigger_order"): (1, "trade_signals", "tests/test_auto_trade_execution.py::test_unknown_management_submission_does_not_retry_or_block_same_message_entry"),
+    ("entry_revision_executor.py", "execute_entry_revision", "cancel_trigger_order"): (1, "strategy_revision_batches", "tests/test_entry_revision_executor.py::test_entry_revision_unknown_cancel_is_recovery_required"),
+    ("entry_revision_executor.py", "execute_entry_revision", "cancel_order"): (1, "strategy_revision_batches", "tests/test_entry_revision_executor.py::test_entry_revision_unknown_cancel_is_recovery_required"),
+    ("entry_revision_executor.py", "execute_entry_revision", "trigger_order"): (1, "strategy_revision_batches", "tests/test_entry_revision_executor.py::test_headroom_change_at_replacement_boundary_fails_closed"),
+    ("entry_revision_executor.py", "execute_entry_revision", "place_order"): (1, "strategy_revision_batches", "tests/test_entry_revision_executor.py::test_market_replacement_is_never_submitted_without_protected_path"),
+    ("legacy_conditional_cancel.py", "apply_reviewed_legacy_conditional_cancel_plan", "cancel_trigger_order"): (1, "position_mutation_intents", "tests/test_legacy_conditional_cancel.py::test_apply_does_not_mark_cancelled_on_unconfirmed_response"),
+    ("native_tpsl_migration.py", "apply_native_tpsl_migration_plan", "cancel_trigger_order"): (1, "position_backup_stop_orders", "tests/test_native_tpsl_migration.py::test_migration_never_marks_legacy_cancelled_without_exact_success_response"),
+    ("recovery_live_submit.py", "_submit_recovery_signal_direct", "place_order"): (1, "trade_signals", "tests/test_instruction_execution_fault_injection.py::test_crash_after_http_send_before_response_is_quarantined_by_real_writer"),
+    ("recovery_live_submit.py", "_submit_recovery_signal_direct", "trigger_order"): (2, "trade_signals", "tests/test_recovery_live_submit.py::test_v2_generic_post_call_error_is_unknown_and_not_retried"),
+    ("recovery_live_submit.py", "_submit_trigger_with_protection_intent", "trigger_order"): (1, "trigger_protection_intents", "tests/test_recovery_live_submit.py::test_trigger_parent_event_is_durable_before_later_submission_bookkeeping_crashes"),
+    ("recovery_live_submit.py", "_cancel_unprotected_order", "cancel_order"): (1, "trade_signals", "tests/test_recovery_live_submit.py::test_market_submit_persists_binding_when_position_protection_fails"),
+    ("strategy_management_executor.py", "_cancel_deferred_entry_legs", "cancel_trigger_order"): (1, "strategy_management_batches", "tests/test_strategy_management_executor.py::test_deferred_cancel_failure_transition_conflict_is_explicit"),
+    ("strategy_management_executor.py", "_cancel_deferred_entry_legs", "cancel_order"): (1, "strategy_management_batches", "tests/test_strategy_management_executor.py::test_deferred_cancel_failure_transition_conflict_is_explicit"),
+}
+
+PRIVATE_CALL_SITE_CONTRACTS = {
+    ("position_mutation_gateway.py", "cancel_owned_position_sltp", "_cancel_position_sltp_unchecked"): (1, "position_mutation_intents", "tests/test_position_mutation_gateway.py::test_exact_owner_cancellation_is_submitted_once"),
+    ("position_mutation_gateway.py", "set_exact_position_sltp", "_set_position_sltp_unchecked"): (1, "position_mutation_intents", "tests/test_position_mutation_gateway.py::test_submitted_set_intent_is_confirmed_only_by_exact_pending_readback"),
+    ("position_mutation_gateway.py", "close_exact_position", "_place_position_close_unchecked"): (1, "position_mutation_intents", "tests/test_position_mutation_gateway.py::test_cancel_and_close_intents_confirm_from_terminal_snapshots"),
 }
 
 
@@ -168,6 +212,51 @@ def _production_call_sites(method: str) -> set[str]:
     return call_sites
 
 
+def _call_site_counts(*, private_strings: bool = False) -> Counter:
+    expected_methods = (
+        set(PRIVATE_POST_OWNERS) if private_strings else set(PUBLIC_POST_OWNERS)
+    )
+    counts: Counter = Counter()
+    for source in (ROOT / "src/telegram_kol_research").glob("*.py"):
+        if source == CLIENT:
+            continue
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        functions = list(
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        functions.extend(
+            method
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            for method in node.body
+            if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+        for function in functions:
+            for node in ast.walk(function):
+                if private_strings:
+                    if isinstance(node, ast.Constant) and node.value in expected_methods:
+                        counts[(source.name, function.name, str(node.value))] += 1
+                elif (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in expected_methods
+                ):
+                    counts[(source.name, function.name, node.func.attr)] += 1
+    return counts
+
+
+def _fault_test_exists(reference: str) -> bool:
+    path_value, test_name = reference.split("::", 1)
+    tree = ast.parse((ROOT / path_value).read_text(encoding="utf-8-sig"))
+    return any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == test_name
+        for node in tree.body
+    )
+
+
 def test_every_deepcoin_post_entry_point_has_a_declared_durable_owner():
     posting = _posting_methods()
     public = {name for name in posting if not name.startswith("_")}
@@ -185,6 +274,23 @@ def test_every_deepcoin_post_entry_point_has_a_declared_durable_owner():
         test_paths = [value for value in declarations if value.startswith("tests/")]
         assert test_paths
         assert all((ROOT / value).is_file() for value in test_paths)
+
+
+def test_every_production_post_call_site_binds_owner_and_fault_test():
+    registered_tables = {adapter.table for adapter in WORK_EVIDENCE_ADAPTERS}
+    expected_public = Counter(
+        {key: contract[0] for key, contract in CALL_SITE_CONTRACTS.items()}
+    )
+    expected_private = Counter(
+        {key: contract[0] for key, contract in PRIVATE_CALL_SITE_CONTRACTS.items()}
+    )
+
+    assert _call_site_counts() == expected_public
+    assert _call_site_counts(private_strings=True) == expected_private
+    for contract in (*CALL_SITE_CONTRACTS.values(), *PRIVATE_CALL_SITE_CONTRACTS.values()):
+        _, owner_table, fault_test = contract
+        assert owner_table in registered_tables
+        assert _fault_test_exists(fault_test)
 
 
 def _surface() -> ChangeSurfaceFacts:
