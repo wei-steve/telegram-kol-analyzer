@@ -253,7 +253,9 @@ def cleanup_terminal_entry_legs(
                     deepcoin_client=tracked_client,
                     executed_at=now,
                     allow_position_bound_remainder=allow_position_bound_remainder,
-                    live_execution_gate=live_execution_gate,
+                    # This second pass is reconciliation only. A transiently
+                    # absent order must never authorize another cancel POST.
+                    live_execution_gate=lambda: False,
                 )
             except Exception:
                 mark_trade_signal_failed(

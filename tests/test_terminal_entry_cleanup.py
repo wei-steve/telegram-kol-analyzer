@@ -771,6 +771,50 @@ def test_terminal_entry_cleanup_does_not_retry_unknown_regular_cancel(tmp_path):
         assert signal.status == "unknown_exchange_outcome"
 
 
+def test_terminal_entry_cleanup_readback_flap_cannot_repeat_cancel_post(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    lifecycle_id, _ = _seed_cleanup_target(session_factory)
+
+    class FlappingUnknownClient(TriggerCancelClient):
+        def __init__(self):
+            super().__init__(session_factory=session_factory)
+            self.pending_reads = 0
+            self.cancel_calls = 0
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            self.pending_reads += 1
+            self.calls.append(("list_trigger_orders_pending", inst_id))
+            if self.pending_reads == 2:
+                return []
+            return list(self.trigger_orders)
+
+        def cancel_trigger_order(self, payload):
+            self._record_signal_status_at_cancel()
+            self.cancel_calls += 1
+            raise RuntimeError("transport outcome unknown")
+
+    client = FlappingUnknownClient()
+
+    result = cleanup_terminal_entry_legs(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        deepcoin_client=client,
+        reason="manual_full_close",
+        cleaned_at=NOW,
+    )
+
+    assert result.status == "unknown"
+    assert client.cancel_calls == 1
+    assert client.signal_statuses_at_cancel == ["processing"]
+    with session_factory() as session:
+        signal = (
+            session.query(TradeSignal)
+            .filter(TradeSignal.source_type == "terminal_entry_cleanup")
+            .one()
+        )
+        assert signal.status == "unknown_exchange_outcome"
+
+
 def test_terminal_entry_cleanup_is_idempotent_after_confirmation(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     lifecycle_id, _ = _seed_cleanup_target(session_factory)

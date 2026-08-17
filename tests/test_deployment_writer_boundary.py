@@ -99,6 +99,7 @@ PUBLIC_POST_CALL_SITES = {
         "entry_revision_executor.py",
         "recovery_live_submit.py",
         "strategy_management_executor.py",
+        "terminal_entry_cleanup.py",
     },
     "cancel_trigger_order": {
         "deepcoin_execution_actions.py",
@@ -106,6 +107,7 @@ PUBLIC_POST_CALL_SITES = {
         "legacy_conditional_cancel.py",
         "native_tpsl_migration.py",
         "strategy_management_executor.py",
+        "terminal_entry_cleanup.py",
     },
 }
 
@@ -138,6 +140,8 @@ CALL_SITE_CONTRACTS = {
     ("recovery_live_submit.py", "_cancel_unprotected_order", "cancel_order"): (1, "trade_signals", "tests/test_recovery_live_submit.py::test_market_submit_persists_binding_when_position_protection_fails"),
     ("strategy_management_executor.py", "_cancel_deferred_entry_legs", "cancel_trigger_order"): (1, "strategy_management_batches", "tests/test_strategy_management_executor.py::test_deferred_cancel_failure_transition_conflict_is_explicit"),
     ("strategy_management_executor.py", "_cancel_deferred_entry_legs", "cancel_order"): (1, "strategy_management_batches", "tests/test_strategy_management_executor.py::test_deferred_cancel_failure_transition_conflict_is_explicit"),
+    ("terminal_entry_cleanup.py", "cancel_trigger_order", "cancel_trigger_order"): (1, "trade_signals", "tests/test_terminal_entry_cleanup.py::test_terminal_entry_cleanup_readback_flap_cannot_repeat_cancel_post"),
+    ("terminal_entry_cleanup.py", "cancel_order", "cancel_order"): (1, "trade_signals", "tests/test_terminal_entry_cleanup.py::test_terminal_entry_cleanup_does_not_retry_unknown_regular_cancel"),
 }
 
 PRIVATE_CALL_SITE_CONTRACTS = {
