@@ -244,10 +244,11 @@ change `/opt/telegram-kol-analyzer`.
 
 **Step 3: Test against a disposable database copy**
 
-Copy the production database into a private candidate artifact directory on
-`/opt`, open it only with the candidate code, run the focused retirement,
-migration, v1-authority, and deployment-preflight tests, then delete the
-disposable database. Record zero production writes and zero exchange calls.
+Use SQLite's online backup API to create a coherent disposable copy of the
+production database in a private candidate artifact directory on `/opt`. Open
+only that copy with the candidate code, run the focused retirement, migration,
+v1-authority, and deployment-preflight tests, then delete the disposable
+database. Record zero production writes and zero exchange calls.
 
 ### Task 6: Deploy only through the unchanged preflight
 
@@ -265,7 +266,7 @@ candidate SHA is exact, and no time-sensitive strategy operation is active.
 powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1 \
   -Branch codex/mimo-v2-retirement-rollback \
   -ExpectedCommit <reviewed-40-character-sha> \
-  -ChangeClass code
+  -ChangeClass schema_compatible
 ```
 
 The helper must stop on `BLOCK`, malformed evidence, SHA mismatch, failed
@@ -274,9 +275,12 @@ bypass or edit the preflight result.
 
 **Step 3: Verify production if deployment succeeds**
 
-Verify exact SHA, clean tracked files, active service, Web health, v1-only
-recognition behavior, unchanged database audit counts, and no exchange writes,
-notifications, or historical replays used for testing.
+Before invoking the helper, capture fresh read-only audit counts and verify
+`non_v1_runs=0` and both orphan counts are zero. After deployment, verify exact
+SHA, clean tracked files, active service, Web health, v1-only recognition,
+nondecreasing audit counts with no non-v1 or orphaned rows, and stable retired
+audit counts across the post-restart health window. Also verify that no exchange
+write, notification, or historical replay was used for testing.
 
 **Step 4: Stop safely if deployment is blocked**
 

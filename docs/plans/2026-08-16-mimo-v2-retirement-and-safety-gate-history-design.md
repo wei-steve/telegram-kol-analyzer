@@ -29,18 +29,22 @@ designs, and deploy only through the existing fail-closed deployment preflight.
 
 ## Database Decision
 
-Production already contains the MiMo-era audit schema:
+Production already contains the MiMo-era audit schema. A read-only check at
+`2026-08-17T01:03:54Z` observed:
 
-- `mimo_recognition_runs`: 689 rows;
-- `mimo_recognition_attempts`: 689 rows;
+- `mimo_recognition_runs`: 692 rows;
+- `mimo_recognition_attempts`: 692 rows;
 - `mimo_contract_circuit_state`: 0 rows;
-- `message_evidence_versions.mimo_recognition_run_id`: 678 non-null links.
+- `message_evidence_versions.mimo_recognition_run_id`: 681 non-null links.
 
 Every recorded run is `v1_authoritative`; there are no production v2 runs.
 The references are internally complete, with zero orphaned evidence or attempt
-links. The retirement therefore performs no database downgrade. It does not
-drop tables, delete rows, clear foreign keys, edit settings, or remove the
-watermark. The pre-v2 code ignores the additive legacy schema safely.
+links. The row totals grow while the current v1 service records new audits, so
+they are observations rather than deployment constants. Deployment captures a
+fresh baseline and verifies no loss, no non-v1 run, and no orphaned reference.
+The retirement therefore performs no database downgrade. It does not drop
+tables, delete rows, clear foreign keys, edit settings, or remove the watermark.
+The pre-v2 code ignores the additive legacy schema safely.
 
 The tables are recorded as retired legacy schema. A future recognition redesign
 must use a new contract and an explicitly versioned migration; it must not
@@ -139,11 +143,13 @@ Local verification must prove:
 Server verification must prove:
 
 - the fetched branch resolves to the exact reviewed SHA;
-- deployment preflight allows the code-only change;
+- deployment preflight allows the `schema_compatible` rollback;
 - database backup and migration checks pass without destructive downgrade;
 - the production service returns active and healthy after restart;
 - the production SHA is the exact retirement SHA;
 - MiMo v1 remains the only runtime recognition path;
+- fresh audit invariants show no lost rows, non-v1 run, or orphaned reference,
+  and the retired audit counts stop growing after the rollback;
 - no notification, historical replay, or exchange write is used as a test.
 
 ## Rollback Of This Retirement
