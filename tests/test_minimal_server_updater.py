@@ -78,8 +78,11 @@ case "${1:-}" in
       [ "${HARNESS_WORKTREE_FAIL:-0}" != "1" ] || exit 1
       mkdir -p "${4}/deploy" "${4}/src/telegram_kol_research"
       printf 'candidate updater\n' >"${4}/deploy/telegram-kol-update"
+      touch "$HARNESS_STATE/worktree_registered"
     else
       printf 'worktree-remove\n' >>"$HARNESS_LOG"
+      [ -f "$HARNESS_STATE/worktree_registered" ] || exit 1
+      rm -f "$HARNESS_STATE/worktree_registered"
       /bin/rm -rf -- "${4:-}"
     fi
     ;;
@@ -620,6 +623,17 @@ def test_precondition_fault_never_stops_or_mutates(
     events = _events(log)
     assert "stop" not in events
     assert "checkout" not in events
+
+
+def test_failed_worktree_add_removes_the_exact_empty_stage_directory(
+    updater_harness,
+) -> None:
+    run, log, _ = updater_harness
+
+    result = run(HARNESS_WORKTREE_FAIL="1")
+
+    assert result.returncode == 4
+    assert not list(log.parent.glob("telegram-kol-stage.*"))
 
 
 @pytest.mark.parametrize(

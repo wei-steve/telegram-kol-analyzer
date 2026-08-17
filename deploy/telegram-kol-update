@@ -40,6 +40,7 @@ if ! flock -n 9; then
 fi
 
 stage_dir=""
+stage_registered=0
 schema_backup=""
 schema_dry_run=""
 updater_backup=""
@@ -135,7 +136,11 @@ cleanup() {
   fi
 
   if [ -n "$stage_dir" ] && [ -d "$stage_dir" ]; then
-    git -C "$APP_DIR" worktree remove --force "$stage_dir" >/dev/null 2>&1 || true
+    if [ "$stage_registered" -eq 1 ]; then
+      git -C "$APP_DIR" worktree remove --force "$stage_dir" >/dev/null 2>&1 || true
+    else
+      rmdir -- "$stage_dir" >/dev/null 2>&1 || true
+    fi
   fi
   cleanup_schema_dry_run || true
   [ -z "$updater_candidate" ] || rm -f -- "$updater_candidate"
@@ -177,6 +182,7 @@ if ! git worktree add --detach "$stage_dir" "$EXPECTED_COMMIT" >/dev/null; then
   echo "Could not stage the exact candidate commit." >&2
   exit 4
 fi
+stage_registered=1
 candidate_python=(env "PYTHONPATH=$stage_dir/src" "$APP_DIR/.venv/bin/python")
 
 schema_changed=0
@@ -373,6 +379,7 @@ checkout_mutated=0
 updater_installed=0
 git -C "$APP_DIR" worktree remove --force "$stage_dir" >/dev/null
 stage_dir=""
+stage_registered=0
 cleanup_schema_dry_run
 [ -z "$updater_backup" ] || rm -f -- "$updater_backup"
 updater_backup=""
