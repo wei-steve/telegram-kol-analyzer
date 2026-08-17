@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 from pathlib import Path
+from typing import Sequence
 
 
 class ActiveWriteCheckError(ValueError):
@@ -122,3 +124,21 @@ def count_active_exchange_writes(database_path: str | Path) -> int:
     if failed or cleanup_failed:
         raise ActiveWriteCheckError("active_write_check_failed") from None
     return total
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    values = list(sys.argv[1:] if argv is None else argv)
+    if len(values) != 1:
+        print("ERROR active_write_check_failed", file=sys.stderr)
+        return 4
+    try:
+        count = count_active_exchange_writes(values[0])
+    except ActiveWriteCheckError:
+        print("ERROR active_write_check_failed", file=sys.stderr)
+        return 4
+    print(f"active_write_count={count}")
+    return 0 if count == 0 else 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

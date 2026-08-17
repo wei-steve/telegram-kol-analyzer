@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
+import os
 from pathlib import Path
+import subprocess
+import sys
 from typing import Any
 
 import pytest
@@ -11,6 +14,9 @@ from telegram_kol_research.deployment_active_write_check import (
     ActiveWriteCheckError,
     count_active_exchange_writes,
 )
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _create_authority_database(path: Path) -> Path:
@@ -329,3 +335,75 @@ def test_sum_is_bounded(
     )
 
     assert count_active_exchange_writes(database) == 1_000_000
+
+
+def _run_cli(*arguments: object) -> subprocess.CompletedProcess[str]:
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(ROOT / "src")
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "telegram_kol_research.deployment_active_write_check",
+            *(str(argument) for argument in arguments),
+        ],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_cli_zero_is_exact_and_bounded(tmp_path: Path) -> None:
+    database = _create_authority_database(tmp_path / "research.db")
+
+    result = _run_cli(database)
+
+    assert result.returncode == 0
+    assert result.stdout == "active_write_count=0\n"
+    assert result.stderr == ""
+
+
+def test_cli_active_is_exact_and_bounded(tmp_path: Path) -> None:
+    database = _create_authority_database(tmp_path / "research.db")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO trade_signals (id, status) VALUES (1, 'submitting')"
+        )
+
+    result = _run_cli(database)
+
+    assert result.returncode == 3
+    assert result.stdout == "active_write_count=1\n"
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        (),
+        ("first.db", "second.db"),
+    ),
+)
+def test_cli_invalid_arguments_fail_without_details(
+    arguments: tuple[str, ...],
+) -> None:
+    result = _run_cli(*arguments)
+
+    assert result.returncode == 4
+    assert result.stdout == ""
+    assert result.stderr == "ERROR active_write_check_failed\n"
+
+
+def test_cli_invalid_database_does_not_leak_details(tmp_path: Path) -> None:
+    sensitive_name = tmp_path / "secret-client-payload.db"
+
+    result = _run_cli(sensitive_name)
+
+    assert result.returncode == 4
+    assert result.stdout == ""
+    assert result.stderr == "ERROR active_write_check_failed\n"
+    combined_output = result.stdout + result.stderr
+    assert str(sensitive_name) not in combined_output
+    assert "secret-client-payload" not in combined_output
