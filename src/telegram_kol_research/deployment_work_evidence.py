@@ -50,6 +50,7 @@ class WorkEvidenceAdapter:
     terminal_states: frozenset[str]
     progress_columns: tuple[str, ...] = ()
     origin_columns: tuple[str, ...] = ("created_at", "planned_at", "reserved_at")
+    restart_surface_files: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +69,7 @@ def _adapter(
     unknown: Collection[str] = (),
     terminal: Collection[str] = (),
     progress: tuple[str, ...] = (),
+    restart_surface: tuple[str, ...] = (),
 ) -> WorkEvidenceAdapter:
     return WorkEvidenceAdapter(
         output_name=output_name,
@@ -78,6 +80,7 @@ def _adapter(
         unknown_states=frozenset(unknown),
         terminal_states=frozenset(terminal),
         progress_columns=progress,
+        restart_surface_files=restart_surface,
     )
 
 
@@ -108,6 +111,10 @@ WORK_EVIDENCE_ADAPTERS = (
             "failed",
             "rejected",
         ),
+        restart_surface=(
+            "src/telegram_kol_research/execution_bindings.py",
+            "src/telegram_kol_research/instruction_execution_reconciliation.py",
+        ),
     ),
     _adapter(
         "instruction_items",
@@ -118,6 +125,10 @@ WORK_EVIDENCE_ADAPTERS = (
         unknown=("unknown",),
         terminal=("submitted", "succeeded", "failed"),
         progress=("last_progress_at",),
+        restart_surface=(
+            "src/telegram_kol_research/message_instruction_items.py",
+            "src/telegram_kol_research/instruction_execution_reconciliation.py",
+        ),
     ),
     _adapter(
         "trade_signals",
@@ -127,6 +138,7 @@ WORK_EVIDENCE_ADAPTERS = (
         in_flight=("processing",),
         unknown=("unknown_exchange_outcome", "partial_submission_failed"),
         terminal=("submitted", "succeeded", "failed", "skipped", "completed"),
+        restart_surface=("src/telegram_kol_research/auto_trade_execution.py",),
     ),
     _adapter(
         "execution_contracts",
@@ -136,6 +148,10 @@ WORK_EVIDENCE_ADAPTERS = (
         in_flight=("submitting",),
         unknown=("submit_unknown",),
         terminal=("verified", "failed", "expired"),
+        restart_surface=(
+            "src/telegram_kol_research/instruction_execution_contracts.py",
+            "src/telegram_kol_research/instruction_execution_reconciliation.py",
+        ),
     ),
     _adapter(
         "strategy_revisions",
@@ -149,6 +165,10 @@ WORK_EVIDENCE_ADAPTERS = (
         ),
         unknown=("recovery_required",),
         terminal=("succeeded", "failed", "blocked"),
+        restart_surface=(
+            "src/telegram_kol_research/entry_revision_executor.py",
+            "src/telegram_kol_research/strategy_revision_planner.py",
+        ),
     ),
     _adapter(
         "management_batches",
@@ -165,6 +185,11 @@ WORK_EVIDENCE_ADAPTERS = (
         unknown=("submit_unknown", "partial_failed", "recovery_required"),
         terminal=("succeeded", "blocked", "resolved"),
         progress=("last_progress_at",),
+        restart_surface=(
+            "src/telegram_kol_research/strategy_management_batches.py",
+            "src/telegram_kol_research/strategy_management_reconciliation.py",
+            "src/telegram_kol_research/strategy_management_worker.py",
+        ),
     ),
     _adapter(
         "management_legs",
@@ -181,6 +206,10 @@ WORK_EVIDENCE_ADAPTERS = (
             "failed",
             "inconsistent",
         ),
+        restart_surface=(
+            "src/telegram_kol_research/strategy_management_reconciliation.py",
+            "src/telegram_kol_research/strategy_management_worker.py",
+        ),
     ),
     _adapter(
         "management_components",
@@ -190,6 +219,10 @@ WORK_EVIDENCE_ADAPTERS = (
         in_flight=("preflighting", "submitting"),
         unknown=("awaiting_exchange", "recovery_required"),
         terminal=("confirmed", "operator_required", "safely_skipped"),
+        restart_surface=(
+            "src/telegram_kol_research/strategy_management_composite_reconciliation.py",
+            "src/telegram_kol_research/strategy_management_composite_executor.py",
+        ),
     ),
     _adapter(
         "position_mutations",
@@ -199,6 +232,9 @@ WORK_EVIDENCE_ADAPTERS = (
         in_flight=("reserved", "submitting"),
         unknown=("submit_unknown", "recovery_required"),
         terminal=("confirmed", "rejected", "blocked"),
+        restart_surface=(
+            "src/telegram_kol_research/position_mutation_intents.py",
+        ),
     ),
     _adapter(
         "position_closes",
@@ -212,6 +248,9 @@ WORK_EVIDENCE_ADAPTERS = (
             "recovery_required",
         ),
         terminal=("confirmed", "failed", "rejected", "blocked", "closed"),
+        restart_surface=(
+            "src/telegram_kol_research/deepcoin_execution_actions.py",
+        ),
     ),
     _adapter(
         "backup_stop_orders",
@@ -220,6 +259,9 @@ WORK_EVIDENCE_ADAPTERS = (
         in_flight=("submitting",),
         unknown=("pending_readback", "unknown_exchange_outcome"),
         terminal=("active", "verified", "filled", "cancelled", "expired", "failed"),
+        restart_surface=(
+            "src/telegram_kol_research/position_backup_stop_orders.py",
+        ),
     ),
     _adapter(
         "take_profit_orders",
@@ -227,6 +269,9 @@ WORK_EVIDENCE_ADAPTERS = (
         "status",
         unknown=("cancel_requested",),
         terminal=("active", "cancelled", "expired", "filled"),
+        restart_surface=(
+            "src/telegram_kol_research/position_take_profit_orders.py",
+        ),
     ),
     _adapter(
         "protection_legs",
@@ -236,6 +281,9 @@ WORK_EVIDENCE_ADAPTERS = (
         in_flight=("submitting",),
         unknown=("protection_recovery_pending",),
         terminal=("verified", "filled", "cancelled", "failed"),
+        restart_surface=(
+            "src/telegram_kol_research/position_protection_legs.py",
+        ),
     ),
     _adapter(
         "protection_intents",
@@ -245,6 +293,9 @@ WORK_EVIDENCE_ADAPTERS = (
         in_flight=("submitting",),
         unknown=("retrying",),
         terminal=("adopted", "resolved", "failed", "blocked"),
+        restart_surface=(
+            "src/telegram_kol_research/trigger_protection_intents.py",
+        ),
     ),
     _adapter(
         "protection_rescues",
@@ -254,6 +305,9 @@ WORK_EVIDENCE_ADAPTERS = (
         in_flight=("reserved",),
         unknown=("submit_unknown", "recovery_required"),
         terminal=("verified", "failed", "blocked"),
+        restart_surface=(
+            "src/telegram_kol_research/strategy_management_executor.py",
+        ),
     ),
     _adapter(
         "trigger_take_profit_convergences",
@@ -263,6 +317,9 @@ WORK_EVIDENCE_ADAPTERS = (
         in_flight=("reserved",),
         unknown=("submit_unknown",),
         terminal=("completed", "conflicted", "blocked", "failed"),
+        restart_surface=(
+            "src/telegram_kol_research/position_take_profit_orders.py",
+        ),
     ),
     _adapter(
         "break_even_convergences",
@@ -277,6 +334,9 @@ WORK_EVIDENCE_ADAPTERS = (
         ),
         unknown=("recovery_required",),
         terminal=("completed", "succeeded", "blocked", "failed"),
+        restart_surface=(
+            "src/telegram_kol_research/break_even_convergence_worker.py",
+        ),
     ),
     _adapter(
         "break_even_convergence_legs",
@@ -292,6 +352,9 @@ WORK_EVIDENCE_ADAPTERS = (
             "blocked",
             "failed",
         ),
+        restart_surface=(
+            "src/telegram_kol_research/break_even_convergence_worker.py",
+        ),
     ),
     _adapter(
         "source_deletions",
@@ -301,6 +364,9 @@ WORK_EVIDENCE_ADAPTERS = (
         in_flight=("cancelling_entries", "closing_positions"),
         unknown=("recovery_required",),
         terminal=("succeeded", "blocked", "failed"),
+        restart_surface=(
+            "src/telegram_kol_research/source_message_deletion_worker.py",
+        ),
     ),
 )
 
