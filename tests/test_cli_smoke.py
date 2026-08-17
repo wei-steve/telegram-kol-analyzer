@@ -1,6 +1,7 @@
 from typer.testing import CliRunner
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -154,7 +155,20 @@ def test_mimo_v2_replay_cli_exits_nonzero_when_gate_fails(tmp_path, monkeypatch)
     assert json.loads(result.output)["passed"] is False
 
 
-def test_legacy_deployment_preflight_cli_is_retired(tmp_path):
+@pytest.mark.parametrize(
+    "module_name",
+    (
+        "telegram_kol_research.deployment_preflight",
+        "telegram_kol_research.deployment_preflight_cli",
+        "telegram_kol_research.deployment_work_evidence",
+        "telegram_kol_research.deployment_writer_surface",
+    ),
+)
+def test_retired_deployment_gate_modules_are_absent(module_name):
+    assert importlib.util.find_spec(module_name) is None
+
+
+def test_legacy_deployment_preflight_cli_is_unknown(tmp_path):
     result = CliRunner().invoke(
         app,
         [
@@ -170,14 +184,12 @@ def test_legacy_deployment_preflight_cli_is_retired(tmp_path):
         ],
     )
 
-    assert result.exit_code == 4
-    assert json.loads(result.output) == {
-        "decision": "MALFORMED",
-        "reason_codes": ["legacy_preflight_interface_retired"],
-    }
+    assert result.exit_code == 2
+    assert "No such command 'deployment-preflight'" in result.output
+    assert not (tmp_path / "unused.json").exists()
 
 
-def test_legacy_verify_deployment_preflight_cli_cannot_authorize(tmp_path):
+def test_legacy_verify_deployment_preflight_cli_is_unknown(tmp_path):
     result = CliRunner().invoke(
         app,
         [
@@ -191,11 +203,8 @@ def test_legacy_verify_deployment_preflight_cli_cannot_authorize(tmp_path):
         ],
     )
 
-    assert result.exit_code == 4
-    assert json.loads(result.output) == {
-        "decision": "MALFORMED",
-        "reason_codes": ["preflight_artifact_unreadable"],
-    }
+    assert result.exit_code == 2
+    assert "No such command 'verify-deployment-preflight'" in result.output
 
 
 def _canonical_json(value):
