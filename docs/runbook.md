@@ -1780,10 +1780,14 @@ writer fingerprint 和 schema diff，操作员无降级或 BLOCK 豁免参数。
 | --- | --- |
 | 已注册执行证据无法解释 | `BLOCK` |
 | 交易所写入正在进行 | `BLOCK` |
-| 写入可能已发送但无完整终态证明 | `BLOCK` |
+| 写入结果未知且 writer fingerprint 改变 | `BLOCK` |
+| 写入结果未知但 writer fingerprint 未变 | `WARN` |
 | 有可队列工作且 writer fingerprint 改变 | `BLOCK` |
 | 有可队列工作但 writer fingerprint 未变 | `WARN` |
 | 终态、永久暂停或其他 inactive 证据 | `PASS` |
+
+WARN 由精确 Git fingerprint 和聚合证据自动计算，并绑定进 Phase A/Phase B artifact；
+它不是操作员 override，不能豁免 invalid evidence 或 active exchange write。
 
 检测到 schema 变更时，自动执行 SQLite online backup、backup `quick_check`、
 候选代码对可丢弃副本的 migration dry-run 和水位核对；任一失败均在停服前拒绝。

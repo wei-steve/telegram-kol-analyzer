@@ -171,11 +171,12 @@ fingerprint. Its stable results are `0=PASS`, `2=WARN`, `3=BLOCK`, and
 `4=invalid`. A detected schema change automatically requires an online backup,
 `quick_check`, candidate migration dry-run, and watermark verification.
 
-Queued work is WARN when the writer fingerprint is unchanged and BLOCK when it
-changes. Invalid registered evidence, an active exchange write, or a genuinely
-unknown exchange outcome is always BLOCK. Mutation-side failures restore the
-previous checkout, package, and service; artifacts are sanitized and mode
-`0600`.
+Queued work or an unknown exchange outcome is WARN when the writer fingerprint
+is unchanged and BLOCK when it changes. Invalid registered evidence and an
+active exchange write always BLOCK. WARN is computed from exact Git facts and
+bound into the artifact; it is not an operator override. Mutation-side failures
+restore the previous checkout, package, and service; artifacts are sanitized
+and mode `0600`.
 
 The gate-only candidate keeps MiMo v1 authoritative and leaves dormant MiMo v2
 runtime, prompt, schema, replay, and activation behavior unchanged. It must not

@@ -166,10 +166,15 @@ The automatic decision table is intentionally small:
 |---|---|
 | Invalid registered execution evidence | `BLOCK` |
 | Active exchange write | `BLOCK` |
-| Attempted exchange mutation without complete terminal proof | `BLOCK` |
+| Unknown outcome and changed writer fingerprint | `BLOCK` |
+| Unknown outcome and unchanged writer fingerprint | `WARN` |
 | Queued work and changed writer fingerprint | `BLOCK` |
 | Queued work and unchanged writer fingerprint | `WARN` |
 | Inactive, terminal, or permanently paused evidence | `PASS` |
+
+The WARN result is computed from the exact Git fingerprint and bound into both
+preflight artifacts. It is not an operator override and cannot excuse invalid
+evidence or an active exchange write.
 
 The server updater then:
 
