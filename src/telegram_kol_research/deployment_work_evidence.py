@@ -336,7 +336,13 @@ def _collect_source_deletion_exits(connection: sqlite3.Connection) -> EvidenceTa
                 totals["inactive"] += 1
             else:
                 totals["invalid_evidence"] += 1
-        elif state in {"pending", "waiting", "closing_positions", "reconciling"}:
+        elif state in {
+            "pending",
+            "waiting",
+            "cancelling_entries",
+            "closing_positions",
+            "reconciling",
+        }:
             if any(value is not None for value in target_values):
                 totals["queued_work"] += 1
             else:

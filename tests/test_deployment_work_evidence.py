@@ -324,19 +324,34 @@ def test_unbound_source_without_target_or_claim_is_inactive(tmp_path: Path) -> N
     assert snapshot.counts == DeploymentEvidenceCounts(inactive=1)
 
 
-@pytest.mark.parametrize("state", ["closing_positions", "reconciling"])
+@pytest.mark.parametrize(
+    ("state", "claimed"),
+    [
+        ("cancelling_entries", True),
+        ("closing_positions", False),
+        ("reconciling", False),
+    ],
+)
 def test_source_deletion_orchestration_states_are_queued(
     tmp_path: Path,
     state: str,
+    claimed: bool,
 ) -> None:
     database = tmp_path / f"source-{state}.db"
     _create_registered_tables(database)
     with sqlite3.connect(database) as connection:
         connection.execute(
             "INSERT INTO source_message_deletion_exits "
-            "(id, source_event_id, raw_message_id, state) "
-            "VALUES (1, 11, 22, ?)",
-            (state,),
+            "(id, source_event_id, raw_message_id, target_lifecycle_id, "
+            "execution_binding_id, strategy_instance_id, target_fingerprint, "
+            "state, claim_token, claimed_at) "
+            "VALUES (1, 11, 22, 33, 44, 'strategy-redacted', "
+            "'fingerprint-redacted', ?, ?, ?)",
+            (
+                state,
+                "claim-redacted" if claimed else None,
+                "2026-08-17T00:00:00Z" if claimed else None,
+            ),
         )
 
     _assert_only_category(collect_deployment_evidence(database), "queued_work")

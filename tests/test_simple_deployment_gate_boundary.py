@@ -56,7 +56,7 @@ APPROVED_INTERFACE_ENTRIES = {
     ),
     "src/telegram_kol_research/deployment_work_evidence.py": (
         "100644",
-        "bdc51ec2f509d39095bfe19017191dd5eea4e706",
+        "38e0b03defbb8e13aaa9ecef6bc6fc1c037e0a78",
     ),
     "src/telegram_kol_research/deployment_writer_surface.py": (
         "100644",
