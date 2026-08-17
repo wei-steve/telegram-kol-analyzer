@@ -578,6 +578,91 @@ def test_final_artifact_requires_parent_on_verify_and_boolean_schema_evidence():
         )
 
 
+def test_final_verifier_rechecks_parent_decision_and_watermark_transition():
+    preliminary = build_preliminary_deployment_preflight_artifact(
+        production_commit=EXPECTED_COMMIT,
+        candidate_commit=CANDIDATE_COMMIT,
+        requested_change_class="schema_compatible",
+        change_surface=_surface(),
+        facts=_facts(),
+        now=NOW,
+    )
+    final = build_final_deployment_preflight_artifact(
+        preliminary_artifact=preliminary,
+        production_commit=EXPECTED_COMMIT,
+        candidate_commit=CANDIDATE_COMMIT,
+        requested_change_class="schema_compatible",
+        change_surface=_surface(),
+        facts=replace(
+            _facts(),
+            schema_backup_valid=True,
+            schema_migration_dry_run_valid=True,
+        ),
+        now=NOW + timedelta(minutes=1),
+    )
+    regressed = dict(final)
+    regressed["database_watermark"] = {
+        **final["database_watermark"],
+        "raw_message_max_id": 9,
+    }
+    regressed["fingerprint"] = hashlib.sha256(
+        json.dumps(
+            {key: value for key, value in regressed.items() if key != "fingerprint"},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    with pytest.raises(DeploymentPreflightInputError, match="watermark_regression"):
+        verify_phase_bound_deployment_preflight_artifact(
+            regressed,
+            phase="final",
+            production_commit=EXPECTED_COMMIT,
+            candidate_commit=CANDIDATE_COMMIT,
+            requested_change_class="schema_compatible",
+            change_surface=_surface(),
+            now=NOW + timedelta(minutes=1),
+            preliminary_artifact=preliminary,
+        )
+
+    blocked_parent = build_preliminary_deployment_preflight_artifact(
+        production_commit=EXPECTED_COMMIT,
+        candidate_commit=CANDIDATE_COMMIT,
+        requested_change_class="schema_compatible",
+        change_surface=_surface(),
+        facts=replace(
+            _facts(),
+            work_classification_counts={
+                "unknown_outcome": {"execution_order_legs": 1}
+            },
+        ),
+        now=NOW,
+    )
+    rebound = dict(final, preliminary_fingerprint=blocked_parent["fingerprint"])
+    rebound["fingerprint"] = hashlib.sha256(
+        json.dumps(
+            {key: value for key, value in rebound.items() if key != "fingerprint"},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    with pytest.raises(DeploymentPreflightInputError, match="preliminary_artifact_blocked"):
+        verify_phase_bound_deployment_preflight_artifact(
+            rebound,
+            phase="final",
+            production_commit=EXPECTED_COMMIT,
+            candidate_commit=CANDIDATE_COMMIT,
+            requested_change_class="schema_compatible",
+            change_surface=_surface(),
+            now=NOW + timedelta(minutes=1),
+            preliminary_artifact=blocked_parent,
+        )
+
+
 def test_blocking_artifact_with_warnings_remains_verifiable():
     artifact = _build(
         "execution_writer",

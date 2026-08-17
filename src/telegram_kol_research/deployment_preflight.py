@@ -481,7 +481,7 @@ def verify_phase_bound_deployment_preflight_artifact(
             raise DeploymentPreflightInputError(
                 "preflight_artifact_parent_required"
             )
-        verify_phase_bound_deployment_preflight_artifact(
+        preliminary_decision = verify_phase_bound_deployment_preflight_artifact(
             preliminary_artifact,
             phase="preliminary",
             production_commit=production,
@@ -490,10 +490,21 @@ def verify_phase_bound_deployment_preflight_artifact(
             change_surface=change_surface,
             now=now,
         )
+        if preliminary_decision == "BLOCK":
+            raise DeploymentPreflightInputError("preliminary_artifact_blocked")
         if preliminary_artifact.get("fingerprint") != parent_fingerprint:
             raise DeploymentPreflightInputError(
                 "preflight_artifact_parent_mismatch"
             )
+        preliminary_watermark = preliminary_artifact.get("database_watermark")
+        final_watermark = artifact.get("database_watermark")
+        if not isinstance(preliminary_watermark, Mapping) or not isinstance(
+            final_watermark, Mapping
+        ):
+            raise DeploymentPreflightInputError(
+                "preflight_artifact_watermark_invalid"
+            )
+        _validate_watermark_transition(preliminary_watermark, final_watermark)
     return decision
 
 
