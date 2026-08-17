@@ -30,6 +30,8 @@ from telegram_kol_research.position_authority_lock import (
     serialized_position_authority_mutation,
 )
 from telegram_kol_research.trade_signals import (
+    TradeSignalClaimError,
+    claim_pending_trade_signal,
     enqueue_trade_signal,
     mark_trade_signal_failed,
     mark_trade_signal_submitted,
@@ -48,6 +50,25 @@ class TerminalEntryCleanupResult:
     leg_ids: tuple[int, ...]
     order_ids: tuple[str, ...]
     event_ids: tuple[int, ...]
+
+
+class _CancelWriteTracker:
+    """Remember whether this cleanup invocation crossed an exchange write boundary."""
+
+    def __init__(self, delegate: DeepcoinTradingClientProtocol) -> None:
+        self._delegate = delegate
+        self.cancel_attempted = False
+
+    def __getattr__(self, name: str):
+        return getattr(self._delegate, name)
+
+    def cancel_trigger_order(self, payload):
+        self.cancel_attempted = True
+        return self._delegate.cancel_trigger_order(payload)
+
+    def cancel_order(self, payload):
+        self.cancel_attempted = True
+        return self._delegate.cancel_order(payload)
 
 
 @serialized_position_authority_mutation
@@ -149,10 +170,31 @@ def cleanup_terminal_entry_legs(
         **signal_values,
     )
     try:
+        trade_signal = claim_pending_trade_signal(
+            session_factory,
+            signal_id=trade_signal.id,
+            claimed_at=now,
+        )
+    except TradeSignalClaimError:
+        return _with_notification(
+            session_factory,
+            TerminalEntryCleanupResult(
+                status="unknown",
+                binding_id=binding_id,
+                lifecycle_id=lifecycle_id_value,
+                leg_ids=leg_ids,
+                order_ids=order_ids,
+                event_ids=_event_ids_for_signal(session_factory, trade_signal.id),
+            ),
+            reason=reason,
+            created_at=now,
+        )
+    tracked_client = _CancelWriteTracker(deepcoin_client)
+    try:
         result = cancel_pending_entry_legs(
             session_factory,
             trade_signal=trade_signal,
-            deepcoin_client=deepcoin_client,
+            deepcoin_client=tracked_client,
             executed_at=now,
             allow_position_bound_remainder=allow_position_bound_remainder,
             live_execution_gate=live_execution_gate,
@@ -163,6 +205,12 @@ def cleanup_terminal_entry_legs(
             signal_id=trade_signal.id,
             error=str(exc),
             failed_at=now,
+            expected_status="processing",
+            terminal_status=(
+                "unknown_exchange_outcome"
+                if tracked_client.cancel_attempted
+                else "failed"
+            ),
         )
         blocked_reasons = {
             "ambiguous_pending_entry_identity",
@@ -192,7 +240,7 @@ def cleanup_terminal_entry_legs(
         )
     except Exception:
         still_visible = _entry_order_is_still_visible(
-            deepcoin_client,
+            tracked_client,
             instrument_id=instrument_id,
             order_ids=set(order_ids),
             client_order_ids=set(client_order_ids),
@@ -202,7 +250,7 @@ def cleanup_terminal_entry_legs(
                 result = cancel_pending_entry_legs(
                     session_factory,
                     trade_signal=trade_signal,
-                    deepcoin_client=deepcoin_client,
+                    deepcoin_client=tracked_client,
                     executed_at=now,
                     allow_position_bound_remainder=allow_position_bound_remainder,
                     live_execution_gate=live_execution_gate,
@@ -213,6 +261,12 @@ def cleanup_terminal_entry_legs(
                     signal_id=trade_signal.id,
                     error="terminal_entry_cleanup_exchange_outcome_unknown",
                     failed_at=now,
+                    expected_status="processing",
+                    terminal_status=(
+                        "unknown_exchange_outcome"
+                        if tracked_client.cancel_attempted
+                        else "failed"
+                    ),
                 )
                 return _with_notification(
                     session_factory,
@@ -235,6 +289,12 @@ def cleanup_terminal_entry_legs(
                 signal_id=trade_signal.id,
                 error="terminal_entry_cleanup_exchange_outcome_unknown",
                 failed_at=now,
+                expected_status="processing",
+                terminal_status=(
+                    "unknown_exchange_outcome"
+                    if tracked_client.cancel_attempted
+                    else "failed"
+                ),
             )
             return _with_notification(
                 session_factory,
@@ -282,6 +342,7 @@ def cleanup_terminal_entry_legs(
         signal_id=trade_signal.id,
         result=result,
         processed_at=now,
+        expected_status="processing",
     )
     return _with_notification(
         session_factory,

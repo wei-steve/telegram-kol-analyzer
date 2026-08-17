@@ -6,6 +6,7 @@ from telegram_kol_research.models import (
     ExecutionEvent,
     ExecutionOrderLeg,
     StrategyLifecycle,
+    TradeSignal,
 )
 from telegram_kol_research.terminal_entry_cleanup import (
     cleanup_terminal_entry_legs,
@@ -79,6 +80,7 @@ class TriggerCancelClient:
         absent_initially=False,
         history_state=None,
         history_row_extra=None,
+        session_factory=None,
     ):
         self.remains_after_cancel = remains_after_cancel
         self.trigger_orders = (
@@ -98,6 +100,8 @@ class TriggerCancelClient:
             else "canceled" if absent_initially else None
         )
         self.history_row_extra = dict(history_row_extra or {})
+        self.session_factory = session_factory
+        self.signal_statuses_at_cancel = []
         self.calls = []
 
     def list_trigger_orders_pending(self, *, inst_id):
@@ -108,7 +112,18 @@ class TriggerCancelClient:
         self.calls.append(("list_open_orders", inst_id))
         return []
 
+    def _record_signal_status_at_cancel(self):
+        if self.session_factory is not None:
+            with self.session_factory() as session:
+                signal = (
+                    session.query(TradeSignal)
+                    .filter(TradeSignal.source_type == "terminal_entry_cleanup")
+                    .one()
+                )
+                self.signal_statuses_at_cancel.append(signal.status)
+
     def cancel_trigger_order(self, payload):
+        self._record_signal_status_at_cancel()
         self.calls.append(("cancel_trigger_order", payload["ordId"]))
         if not self.remains_after_cancel:
             self.trigger_orders = []
@@ -137,11 +152,12 @@ class TriggerCancelClient:
 
 
 class UnknownTriggerCancelClient(TriggerCancelClient):
-    def __init__(self, *, disappears):
-        super().__init__()
+    def __init__(self, *, disappears, session_factory=None):
+        super().__init__(session_factory=session_factory)
         self.disappears = disappears
 
     def cancel_trigger_order(self, payload):
+        self._record_signal_status_at_cancel()
         self.calls.append(("cancel_trigger_order", payload["ordId"]))
         if self.disappears:
             self.trigger_orders = []
@@ -149,10 +165,49 @@ class UnknownTriggerCancelClient(TriggerCancelClient):
         raise RuntimeError("transport outcome unknown")
 
 
+class RegularCancelClient(TriggerCancelClient):
+    def __init__(self, *, session_factory):
+        super().__init__(session_factory=session_factory)
+        self.regular_orders = list(self.trigger_orders)
+        self.trigger_orders = []
+
+    def list_open_orders(self, *, inst_id):
+        self.calls.append(("list_open_orders", inst_id))
+        return list(self.regular_orders)
+
+    def cancel_order(self, payload):
+        self._record_signal_status_at_cancel()
+        self.calls.append(("cancel_order", payload["ordId"]))
+        self.regular_orders = []
+        self.history_state = "canceled"
+        return {"code": "0"}
+
+    def list_order_history(self, *, inst_id=None):
+        if self.history_state is None:
+            return []
+        return [
+            {
+                "ordId": "entry-order-2",
+                "clOrdId": "entry-client-2",
+                "state": self.history_state,
+            }
+        ]
+
+    def list_trigger_order_history(self, *, inst_id):
+        return []
+
+
+class UnknownRegularCancelClient(RegularCancelClient):
+    def cancel_order(self, payload):
+        self._record_signal_status_at_cancel()
+        self.calls.append(("cancel_order", payload["ordId"]))
+        raise RuntimeError("transport outcome unknown")
+
+
 def test_terminal_entry_cleanup_cancels_exact_trigger_and_confirms_readback(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     lifecycle_id, binding_id = _seed_cleanup_target(session_factory)
-    client = TriggerCancelClient()
+    client = TriggerCancelClient(session_factory=session_factory)
 
     result = cleanup_terminal_entry_legs(
         session_factory,
@@ -172,6 +227,7 @@ def test_terminal_entry_cleanup_cancels_exact_trigger_and_confirms_readback(tmp_
         ("list_trigger_orders_pending", "BTC-USDT-SWAP"),
         ("list_open_orders", "BTC-USDT-SWAP"),
     ]
+    assert client.signal_statuses_at_cancel == ["processing"]
     with session_factory() as session:
         leg = (
             session.query(ExecutionOrderLeg)
@@ -189,6 +245,24 @@ def test_terminal_entry_cleanup_cancels_exact_trigger_and_confirms_readback(tmp_
         assert binding.order_id == "position-order"
         assert notification.status == "resolved"
         assert notification.notification_status == "pending"
+
+
+def test_terminal_entry_cleanup_claims_before_regular_cancel_write(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    lifecycle_id, _ = _seed_cleanup_target(session_factory)
+    client = RegularCancelClient(session_factory=session_factory)
+
+    result = cleanup_terminal_entry_legs(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        deepcoin_client=client,
+        reason="manual_full_close",
+        cleaned_at=NOW,
+    )
+
+    assert result.status == "resolved"
+    assert client.signal_statuses_at_cancel == ["processing"]
+    assert client.calls.count(("cancel_order", "entry-order-2")) == 1
 
 
 def test_terminal_entry_cleanup_marks_exact_already_absent_order_terminal(tmp_path):
@@ -428,6 +502,13 @@ def test_terminal_entry_cleanup_requires_terminal_evidence_before_cancel_write(
 
     assert result.status == "blocked"
     assert client.cancel_calls == 0
+    with session_factory() as session:
+        signal = (
+            session.query(TradeSignal)
+            .filter(TradeSignal.source_type == "terminal_entry_cleanup")
+            .one()
+        )
+        assert signal.status == "failed"
 
 
 def test_terminal_entry_cleanup_persists_unknown_when_post_cancel_history_fails(
@@ -555,14 +636,32 @@ def test_terminal_entry_cleanup_blocks_when_cancelled_order_remains_visible(tmp_
     )
 
     assert result.status == "blocked"
+    assert client.calls.count(("cancel_trigger_order", "entry-order-2")) == 1
     with session_factory() as session:
         leg = (
             session.query(ExecutionOrderLeg)
             .filter(ExecutionOrderLeg.order_id == "entry-order-2")
             .one()
         )
+        signal = (
+            session.query(TradeSignal)
+            .filter(TradeSignal.source_type == "terminal_entry_cleanup")
+            .one()
+        )
         assert leg.status == "pending"
         assert leg.terminal_reason is None
+        assert signal.status == "unknown_exchange_outcome"
+
+    repeated = cleanup_terminal_entry_legs(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        deepcoin_client=client,
+        reason="manual_full_close",
+        cleaned_at=NOW,
+    )
+
+    assert repeated.status == "unknown"
+    assert client.calls.count(("cancel_trigger_order", "entry-order-2")) == 1
 
 
 def test_terminal_entry_cleanup_resolves_unknown_response_only_after_absent_readback(
@@ -597,7 +696,10 @@ def test_terminal_entry_cleanup_does_not_retry_unknown_cancel_while_order_remain
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
     lifecycle_id, _ = _seed_cleanup_target(session_factory)
-    client = UnknownTriggerCancelClient(disappears=False)
+    client = UnknownTriggerCancelClient(
+        disappears=False,
+        session_factory=session_factory,
+    )
 
     result = cleanup_terminal_entry_legs(
         session_factory,
@@ -608,6 +710,7 @@ def test_terminal_entry_cleanup_does_not_retry_unknown_cancel_while_order_remain
     )
 
     assert result.status == "unknown"
+    assert client.signal_statuses_at_cancel == ["processing"]
     assert client.calls.count(("cancel_trigger_order", "entry-order-2")) == 1
     with session_factory() as session:
         leg = (
@@ -615,7 +718,57 @@ def test_terminal_entry_cleanup_does_not_retry_unknown_cancel_while_order_remain
             .filter(ExecutionOrderLeg.order_id == "entry-order-2")
             .one()
         )
+        signal = (
+            session.query(TradeSignal)
+            .filter(TradeSignal.source_type == "terminal_entry_cleanup")
+            .one()
+        )
         assert leg.status == "pending"
+        assert signal.status == "unknown_exchange_outcome"
+
+    repeated = cleanup_terminal_entry_legs(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        deepcoin_client=client,
+        reason="manual_full_close",
+        cleaned_at=NOW,
+    )
+
+    assert repeated.status == "unknown"
+    assert client.calls.count(("cancel_trigger_order", "entry-order-2")) == 1
+
+
+def test_terminal_entry_cleanup_does_not_retry_unknown_regular_cancel(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    lifecycle_id, _ = _seed_cleanup_target(session_factory)
+    client = UnknownRegularCancelClient(session_factory=session_factory)
+
+    first = cleanup_terminal_entry_legs(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        deepcoin_client=client,
+        reason="manual_full_close",
+        cleaned_at=NOW,
+    )
+    second = cleanup_terminal_entry_legs(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        deepcoin_client=client,
+        reason="manual_full_close",
+        cleaned_at=NOW,
+    )
+
+    assert first.status == "unknown"
+    assert second.status == "unknown"
+    assert client.signal_statuses_at_cancel == ["processing"]
+    assert client.calls.count(("cancel_order", "entry-order-2")) == 1
+    with session_factory() as session:
+        signal = (
+            session.query(TradeSignal)
+            .filter(TradeSignal.source_type == "terminal_entry_cleanup")
+            .one()
+        )
+        assert signal.status == "unknown_exchange_outcome"
 
 
 def test_terminal_entry_cleanup_is_idempotent_after_confirmation(tmp_path):
