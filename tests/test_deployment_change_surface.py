@@ -188,8 +188,8 @@ def test_registered_writer_paths_exist_in_review_repository():
 def test_every_direct_deepcoin_write_caller_is_registered():
     repository = Path(__file__).resolve().parents[1]
     pattern = re.compile(
-        r"\.(?:place_order|set_position_sltp|cancel_position_sltp|"
-        r"cancel_order|cancel_trigger_order)\("
+        r"\.(?:place_order|trigger_order|set_position_sltp|replace_order_sltp|"
+        r"cancel_position_sltp|cancel_order|cancel_trigger_order)\("
     )
     direct_callers = {
         path.relative_to(repository).as_posix()

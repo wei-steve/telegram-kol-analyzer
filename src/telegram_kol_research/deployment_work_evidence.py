@@ -553,14 +553,14 @@ def _aggregate_adapter_rows(
     for column in adapter.required_columns:
         identifier = _identifier(column)
         malformed_parts.extend(
-            (f"{identifier} IS NULL", f"julianday({identifier}) IS NULL")
+            (f"{identifier} IS NULL", _invalid_timestamp_sql(identifier))
         )
     for column in evidence_columns:
         if column in adapter.required_columns:
             continue
         identifier = _identifier(column)
         malformed_parts.append(
-            f"({identifier} IS NOT NULL AND julianday({identifier}) IS NULL)"
+            f"({identifier} IS NOT NULL AND {_invalid_timestamp_sql(identifier)})"
         )
     if "created_at" in evidence_columns:
         created = _identifier("created_at")
@@ -621,6 +621,7 @@ def _unregistered_state_table_count(
     available_tables: Collection[str],
 ) -> int:
     registered = {adapter.table for adapter in WORK_EVIDENCE_ADAPTERS}
+    state_columns = {adapter.state_column for adapter in WORK_EVIDENCE_ADAPTERS}
     allowed = registered | set(_NON_WORK_STATE_TABLES)
     unregistered = 0
     for table in sorted(set(available_tables) - allowed):
@@ -630,11 +631,33 @@ def _unregistered_state_table_count(
                 f"PRAGMA table_info({_identifier(table)})"
             ).fetchall()
         }
-        if columns.intersection({"state", "status"}):
+        if columns.intersection(state_columns):
             unregistered += 1
     if unregistered > _MAX_BOUNDED_COUNT:
         raise DeploymentWorkEvidenceError("deployment_evidence_malformed")
     return unregistered
+
+
+def _invalid_timestamp_sql(identifier: str) -> str:
+    return (
+        "("
+        f"typeof({identifier}) != 'text' "
+        f"OR length({identifier}) < 19 "
+        f"OR length({identifier}) > 26 "
+        f"OR substr({identifier}, 5, 1) != '-' "
+        f"OR substr({identifier}, 8, 1) != '-' "
+        f"OR substr({identifier}, 11, 1) != ' ' "
+        f"OR substr({identifier}, 14, 1) != ':' "
+        f"OR substr({identifier}, 17, 1) != ':' "
+        f"OR substr({identifier}, 1, 19) GLOB '*[^0-9 :.-]*' "
+        f"OR strftime('%Y-%m-%d', {identifier}) != substr({identifier}, 1, 10) "
+        f"OR strftime('%H:%M:%S', {identifier}) != substr({identifier}, 12, 8) "
+        f"OR (length({identifier}) > 19 AND substr({identifier}, 20, 1) != '.') "
+        f"OR (length({identifier}) = 20) "
+        f"OR (length({identifier}) > 20 "
+        f"AND substr({identifier}, 21) GLOB '*[^0-9]*')"
+        ")"
+    )
 
 
 def _identifier(value: str) -> str:

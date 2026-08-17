@@ -243,7 +243,11 @@ def test_missing_required_origin_column_fails_closed():
         )
 
 
-def test_invalid_timestamp_evidence_is_malformed():
+@pytest.mark.parametrize(
+    "timestamp",
+    ["not-a-timestamp", "123", "0", "2026-02-30 00:00:00"],
+)
+def test_invalid_timestamp_evidence_is_malformed(timestamp):
     connection = sqlite3.connect(":memory:")
     connection.execute(
         "CREATE TABLE execution_order_legs "
@@ -251,7 +255,8 @@ def test_invalid_timestamp_evidence_is_malformed():
     )
     connection.execute(
         "INSERT INTO execution_order_legs (id, status, created_at) "
-        "VALUES (1, 'submitted', 'not-a-timestamp')"
+        "VALUES (1, 'submitted', ?)",
+        (timestamp,),
     )
 
     result = collect_work_evidence(
@@ -341,14 +346,15 @@ def test_unknown_source_name_is_rejected_by_policy():
         )
 
 
-def test_unregistered_execution_state_table_is_malformed():
+@pytest.mark.parametrize("state_column", ["status", "state", "recovery_state"])
+def test_unregistered_execution_state_table_is_malformed(state_column):
     connection = sqlite3.connect(":memory:")
     connection.execute(
         "CREATE TABLE future_execution_writes "
-        "(id INTEGER PRIMARY KEY, status TEXT, created_at TEXT)"
+        f"(id INTEGER PRIMARY KEY, {state_column} TEXT, created_at TEXT)"
     )
     connection.execute(
-        "INSERT INTO future_execution_writes (status, created_at) "
+        f"INSERT INTO future_execution_writes ({state_column}, created_at) "
         "VALUES ('reserved', CURRENT_TIMESTAMP)"
     )
 
