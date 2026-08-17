@@ -5,8 +5,7 @@ APP_DIR="${APP_DIR:-/opt/telegram-kol-analyzer}"
 BRANCH="${BRANCH:-codex/deepcoin-auto-trading-v1}"
 EXPECTED_COMMIT="${EXPECTED_COMMIT:?set EXPECTED_COMMIT to the reviewed 40-character commit}"
 DATABASE_PATH="${DATABASE_PATH:-$APP_DIR/data/research.db}"
-LIVE_SNAPSHOT_PATH="${LIVE_SNAPSHOT_PATH:-$APP_DIR/data/web_cache/deepcoin_live_positions.json}"
-PREFLIGHT_DIR="${PREFLIGHT_DIR:-/run/telegram-kol}"
+BACKUP_DIR="${BACKUP_DIR:-$APP_DIR/data/backups}"
 STOP_TIMEOUT_SECONDS="${STOP_TIMEOUT_SECONDS:-30}"
 UPDATER_PATH="${UPDATER_PATH:-/usr/local/bin/telegram-kol-update}"
 LOCK_PATH="${LOCK_PATH:-/run/telegram-kol-update.lock}"
@@ -41,13 +40,14 @@ if ! flock -n 9; then
 fi
 
 stage_dir=""
+schema_backup=""
+schema_dry_run=""
+updater_backup=""
+updater_candidate=""
 stop_attempted=0
 checkout_mutated=0
 updater_installed=0
-updater_backup=""
-updater_candidate=""
-schema_backup=""
-schema_dry_run=""
+deployment_finalized=0
 previous_commit="$(git -C "$APP_DIR" rev-parse HEAD)"
 
 wait_for_unit_inactive() {
@@ -64,14 +64,17 @@ wait_for_unit_inactive() {
 }
 
 cleanup_schema_dry_run() {
-  if [ -z "$schema_dry_run" ]; then return; fi
+  if [ -z "$schema_dry_run" ]; then return 0; fi
   case "$schema_dry_run" in
-    "$APP_DIR"/data/backups/schema-dry-run-*)
+    "$BACKUP_DIR"/schema-dry-run-*)
       rm -f -- "$schema_dry_run" "$schema_dry_run-wal" \
         "$schema_dry_run-shm" "$schema_dry_run-journal"
       schema_dry_run=""
       ;;
-    *) echo "Refusing to remove unexpected schema dry-run path." >&2; return 1 ;;
+    *)
+      echo "Refusing to remove unexpected schema dry-run path." >&2
+      return 1
+      ;;
   esac
 }
 
@@ -85,10 +88,10 @@ restore_updater() {
 }
 
 cleanup() {
-  status=$?
+  local status=$? rollback_ok=1 inactive_status branch_commit
   trap - EXIT INT TERM
-  if [ "$stop_attempted" -eq 1 ]; then
-    rollback_ok=1
+
+  if [ "$stop_attempted" -eq 1 ] && [ "$deployment_finalized" -ne 1 ]; then
     if [ "$checkout_mutated" -eq 1 ]; then
       set +e
       timeout --foreground "${STOP_TIMEOUT_SECONDS}s" systemctl stop telegram-kol.service
@@ -120,15 +123,17 @@ cleanup() {
     fi
     if [ "$rollback_ok" -eq 1 ]; then restore_updater || rollback_ok=0; fi
     if [ "$rollback_ok" -eq 1 ]; then
-      if ! systemctl start telegram-kol.service || ! systemctl is-active --quiet telegram-kol.service; then
-        echo "Rollback restored files but could not restore a healthy service." >&2
-        status=4
-      fi
-    else
+      systemctl start telegram-kol.service || rollback_ok=0
+    fi
+    if [ "$rollback_ok" -eq 1 ]; then
+      systemctl is-active --quiet telegram-kol.service || rollback_ok=0
+    fi
+    if [ "$rollback_ok" -ne 1 ]; then
       echo "ROLLBACK FAILED; telegram-kol.service may remain stopped." >&2
       status=4
     fi
   fi
+
   if [ -n "$stage_dir" ] && [ -d "$stage_dir" ]; then
     git -C "$APP_DIR" worktree remove --force "$stage_dir" >/dev/null 2>&1 || true
   fi
@@ -165,250 +170,149 @@ if [ "$current_branch" != "$BRANCH" ] || [ "$branch_commit" != "$previous_commit
   echo "Production branch is not an exact rollback point." >&2
   exit 4
 fi
+
 stage_dir="$(mktemp -d "$STAGE_PARENT/telegram-kol-stage.XXXXXX")"
 chmod 0700 "$stage_dir"
-git worktree add --detach "$stage_dir" "$EXPECTED_COMMIT" >/dev/null
-candidate_python=(env "PYTHONPATH=$stage_dir/src" "$APP_DIR/.venv/bin/python")
-candidate_cli=("${candidate_python[@]}" -m telegram_kol_research.deployment_preflight_cli)
-
-install -d -m 0700 "$PREFLIGHT_DIR"
-surface_path="$PREFLIGHT_DIR/surface-$EXPECTED_COMMIT.json"
-umask 077
-set +e
-"${candidate_cli[@]}" surface --repository "$stage_dir" \
-  --production-commit "$previous_commit" --candidate-commit "$EXPECTED_COMMIT" \
-  >"$surface_path"
-surface_status=$?
-set -e
-if [ "$surface_status" -ne 0 ]; then
-  echo "Candidate surface classification failed." >&2
+if ! git worktree add --detach "$stage_dir" "$EXPECTED_COMMIT" >/dev/null; then
+  echo "Could not stage the exact candidate commit." >&2
   exit 4
 fi
-chmod 0600 "$surface_path"
-schema_changed="$("${candidate_python[@]}" - surface "$surface_path" <<'PY'
-import json, sys
-with open(sys.argv[2], "rb") as source:
-    raw = source.read(65537)
-if len(raw) > 65536:
-    raise SystemExit(4)
-value = json.loads(raw)
-changed = value.get("schema_changed")
-if not isinstance(changed, bool):
-    raise SystemExit(4)
-print("true" if changed else "false")
-PY
-)"
+candidate_python=(env "PYTHONPATH=$stage_dir/src" "$APP_DIR/.venv/bin/python")
 
-schema_status_path="$PREFLIGHT_DIR/schema-$EXPECTED_COMMIT.json"
-create_schema_evidence() {
-  install -d -m 0700 "$APP_DIR/data/backups"
+schema_changed=0
+set +e
+git -C "$APP_DIR" diff --quiet "$previous_commit" "$EXPECTED_COMMIT" -- \
+  src/telegram_kol_research/models.py \
+  src/telegram_kol_research/db.py \
+  migrations
+schema_diff_status=$?
+set -e
+case "$schema_diff_status" in
+  0) ;;
+  1) schema_changed=1 ;;
+  *)
+    echo "Could not classify schema paths." >&2
+    exit 4
+    ;;
+esac
+
+create_schema_backup_and_dry_run() {
+  install -d -m 0700 "$BACKUP_DIR"
   cleanup_schema_dry_run
-  schema_backup="$APP_DIR/data/backups/research-preflight-${EXPECTED_COMMIT}-$(date -u +%Y%m%dT%H%M%SZ).db"
-  schema_dry_run="$APP_DIR/data/backups/schema-dry-run-${EXPECTED_COMMIT}-$$.db"
-  "${candidate_python[@]}" - schema "$DATABASE_PATH" "$schema_backup" \
-    "$schema_dry_run" "$schema_status_path" <<'PY'
-import json, os, sqlite3, sys
+  schema_backup="$BACKUP_DIR/research-deployment-${EXPECTED_COMMIT}-$(date -u +%Y%m%dT%H%M%SZ).db"
+  schema_dry_run="$BACKUP_DIR/schema-dry-run-${EXPECTED_COMMIT}-$$.db"
+  "${candidate_python[@]}" - schema "$DATABASE_PATH" "$schema_backup" "$schema_dry_run" <<'PY'
+import os
 from pathlib import Path
+import sqlite3
+import sys
 
-_, source_path, backup_path, dry_run_path, status_path = sys.argv[1:]
+_, mode, source_path, backup_path, dry_run_path = sys.argv
+if mode != "schema":
+    raise SystemExit(4)
 
-def reserve(path):
+
+def reserve(path: str) -> None:
     descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     os.close(descriptor)
 
-def watermark(connection):
-    result = {}
+
+def watermark(connection: sqlite3.Connection) -> tuple[int, int]:
+    values: list[int] = []
     for table in ("raw_messages", "execution_events"):
         exists = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
         ).fetchone()
         if exists is None:
             raise RuntimeError("required watermark table missing")
-        result[table] = int(
-            connection.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table}").fetchone()[0]
-        )
-    return result
+        value = connection.execute(
+            f"SELECT COALESCE(MAX(id), 0) FROM {table}"
+        ).fetchone()[0]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError("invalid watermark")
+        values.append(value)
+    return values[0], values[1]
+
 
 reserve(backup_path)
-source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
+source_uri = Path(source_path).resolve().as_uri() + "?mode=ro"
+source = sqlite3.connect(source_uri, uri=True)
 backup = sqlite3.connect(backup_path)
 try:
     source.execute("PRAGMA query_only=ON")
+    if source.execute("PRAGMA query_only").fetchone() != (1,):
+        raise RuntimeError("source is not query only")
     source.backup(backup)
 finally:
     backup.close()
     source.close()
-with sqlite3.connect(f"file:{backup_path}?mode=ro", uri=True) as checked:
+
+with sqlite3.connect(Path(backup_path).resolve().as_uri() + "?mode=ro", uri=True) as checked:
     checked.execute("PRAGMA query_only=ON")
     if checked.execute("PRAGMA quick_check").fetchone() != ("ok",):
         raise RuntimeError("schema backup quick_check failed")
     backup_watermark = watermark(checked)
 
 reserve(dry_run_path)
-source = sqlite3.connect(f"file:{backup_path}?mode=ro", uri=True)
+backup = sqlite3.connect(Path(backup_path).resolve().as_uri() + "?mode=ro", uri=True)
 dry_run = sqlite3.connect(dry_run_path)
 try:
-    source.backup(dry_run)
+    backup.execute("PRAGMA query_only=ON")
+    backup.backup(dry_run)
 finally:
     dry_run.close()
-    source.close()
+    backup.close()
+
 from telegram_kol_research.db import create_session_factory
+
 factory = create_session_factory(dry_run_path)
 factory.kw["bind"].dispose()
-with sqlite3.connect(f"file:{dry_run_path}?mode=ro", uri=True) as checked:
+with sqlite3.connect(Path(dry_run_path).resolve().as_uri() + "?mode=ro", uri=True) as checked:
     checked.execute("PRAGMA query_only=ON")
     if checked.execute("PRAGMA quick_check").fetchone() != ("ok",):
         raise RuntimeError("migration dry-run quick_check failed")
     dry_run_watermark = watermark(checked)
 if backup_watermark != dry_run_watermark:
     raise RuntimeError("migration dry-run watermark changed")
-
-payload = {"backup_verified": True, "migration_dry_run_verified": True, "watermark_verified": True}
-target = Path(status_path)
-temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-    json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
-    handle.write("\n")
-    handle.flush()
-    os.fsync(handle.fileno())
-os.replace(temporary, target)
-os.chmod(target, 0o600)
 PY
 }
 
-if [ "$schema_changed" = "true" ]; then
-  create_schema_evidence
+if [ "$schema_changed" -eq 1 ]; then
+  create_schema_backup_and_dry_run
 fi
 
-snapshot_status_path=""
-watermark_path=""
-create_gate_facts() {
-  local phase="$1"
-  snapshot_status_path="$PREFLIGHT_DIR/snapshot-${phase}-$EXPECTED_COMMIT.json"
-  watermark_path="$PREFLIGHT_DIR/watermark-${phase}-$EXPECTED_COMMIT.json"
-  "${candidate_python[@]}" - facts "$DATABASE_PATH" "$LIVE_SNAPSHOT_PATH" \
-    "$snapshot_status_path" "$watermark_path" "$schema_status_path" <<'PY'
-import json, os, sqlite3, sys
-from decimal import Decimal, InvalidOperation
-from pathlib import Path
-
-_, database_path, live_snapshot_path, snapshot_path, watermark_path, schema_path = sys.argv[1:]
-
-def write_json(path, value):
-    target = Path(path)
-    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-    descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        json.dump(value, handle, sort_keys=True, separators=(",", ":"))
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, target)
-    os.chmod(target, 0o600)
-
-uri = Path(database_path).resolve().as_uri() + "?mode=ro"
-with sqlite3.connect(uri, uri=True) as connection:
-    connection.execute("PRAGMA query_only=ON")
-    connection.execute("BEGIN")
-    watermark = {}
-    for table in ("raw_messages", "execution_events"):
-        exists = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-        ).fetchone()
-        if exists is None:
-            raise RuntimeError("required watermark table missing")
-        watermark[table] = int(
-            connection.execute(f"SELECT COALESCE(MAX(id), 0) FROM {table}").fetchone()[0]
-        )
-    connection.rollback()
-
-complete = False
-protected = 0
-try:
-    source = Path(live_snapshot_path)
-    if source.stat().st_size > 8_000_000:
-        raise ValueError("snapshot too large")
-    envelope = json.loads(source.read_bytes())
-    body = envelope["payload"]
-    live = body["_live_source"]
-    positions = live["positions"]
-    tpsl_orders = live["tpsl_orders"]
-    complete = bool(
-        envelope.get("schema_version") == 1
-        and isinstance(envelope.get("version"), str)
-        and envelope.get("version")
-        and isinstance(body, dict)
-        and body.get("error") in (None, "")
-        and isinstance(positions, list)
-        and len(positions) <= 500
-        and isinstance(tpsl_orders, list)
-        and len(tpsl_orders) <= 1000
-        and live.get("tpsl_evidence_available") is True
-    )
-    if complete:
-        for row in positions:
-            if not isinstance(row, dict):
-                complete = False
-                break
-            try:
-                is_open = Decimal(str(row.get("pos"))) > 0
-                has_stop = Decimal(str(row.get("slTriggerPx") or "0")) > 0
-            except (InvalidOperation, TypeError, ValueError):
-                complete = False
-                break
-            if is_open and has_stop:
-                protected += 1
-except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-    complete = False
-    protected = 0
-
-write_json(snapshot_path, {"complete": complete, "protected_live_positions": protected})
-write_json(watermark_path, watermark)
-if not Path(schema_path).is_file():
-    write_json(schema_path, {"backup_verified": False, "migration_dry_run_verified": False, "watermark_verified": False})
-PY
-}
-
-run_candidate_gate() {
+run_active_write_check() {
+  local output status
   set +e
-  "${candidate_cli[@]}" "$@"
-  local result=$?
+  output="$("${candidate_python[@]}" -m \
+    telegram_kol_research.deployment_active_write_check "$DATABASE_PATH" 2>&1)"
+  status=$?
   set -e
-  case "$result" in
-    0) ;;
-    2) echo "Deployment preflight returned verified WARN." >&2 ;;
-    3) echo "Deployment preflight returned BLOCK." >&2; exit 3 ;;
-    *) echo "Deployment preflight input or verification failed." >&2; exit 4 ;;
+  case "$status" in
+    0)
+      if [ "$output" != "active_write_count=0" ]; then
+        echo "Deployment active-write check failed." >&2
+        exit 4
+      fi
+      ;;
+    3)
+      echo "Deployment refused: active exchange write." >&2
+      exit 3
+      ;;
+    *)
+      echo "Deployment active-write check failed." >&2
+      exit 4
+      ;;
   esac
-  GATE_RESULT="$result"
-}
-
-run_preflight() {
-  local command="$1" phase="$2" artifact="$3"
-  shift 3
-  local args=(
-    "$command" --repository "$stage_dir"
-    --production-commit "$previous_commit" --candidate-commit "$EXPECTED_COMMIT"
-    --database-path "$DATABASE_PATH"
-    --snapshot-status "$snapshot_status_path"
-    --schema-verification "$schema_status_path"
-    --database-watermark "$watermark_path"
-  )
-  if [ "$command" = "collect" ]; then
-    args+=(--phase "$phase" --output "$artifact")
-  else
-    args+=(--expected-phase "$phase" --input "$artifact")
-  fi
-  args+=("$@")
-  run_candidate_gate "${args[@]}"
 }
 
 stop_writer_service() {
+  local stop_status
   stop_attempted=1
   set +e
   timeout --foreground "${STOP_TIMEOUT_SECONDS}s" systemctl stop telegram-kol.service
-  local stop_status=$?
+  stop_status=$?
   set -e
   if [ "$stop_status" -ne 0 ]; then
     echo "Exchange-writer service stop command failed." >&2
@@ -420,52 +324,41 @@ stop_writer_service() {
   fi
 }
 
-preliminary_artifact="$PREFLIGHT_DIR/preliminary-$EXPECTED_COMMIT.json"
-create_gate_facts preliminary
-run_preflight collect preliminary "$preliminary_artifact"
-preliminary_collect_result="$GATE_RESULT"
-run_preflight verify preliminary "$preliminary_artifact"
-if [ "$GATE_RESULT" != "$preliminary_collect_result" ]; then
-  echo "Preliminary collect and verify decisions disagree." >&2
-  exit 4
-fi
-preliminary_fingerprint="$("${candidate_python[@]}" - fingerprint "$preliminary_artifact" <<'PY'
-import json, re, sys
-with open(sys.argv[2], "rb") as source:
-    raw = source.read(65537)
-if len(raw) > 65536:
-    raise SystemExit(4)
-value = json.loads(raw)
-fingerprint = value.get("fingerprint")
-if not isinstance(fingerprint, str) or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None:
-    raise SystemExit(4)
-print(fingerprint)
-PY
-)"
+verify_http_health() {
+  local attempt=1
+  while [ "$attempt" -le 20 ]; do
+    if curl -fsS --max-time 2 -o /dev/null \
+      http://127.0.0.1:8000/api/trading-settings; then
+      return 0
+    fi
+    if [ "$attempt" -eq 20 ]; then break; fi
+    attempt=$((attempt + 1))
+    sleep 0.5
+  done
+  return 1
+}
 
+run_active_write_check
 stop_writer_service
-
-final_artifact="$PREFLIGHT_DIR/final-$EXPECTED_COMMIT.json"
-create_gate_facts final
-parent_args=(--preliminary-artifact "$preliminary_artifact" --preliminary-fingerprint "$preliminary_fingerprint")
-run_preflight collect final "$final_artifact" "${parent_args[@]}"
-final_collect_result="$GATE_RESULT"
-run_preflight verify final "$final_artifact" "${parent_args[@]}"
-if [ "$GATE_RESULT" != "$final_collect_result" ]; then
-  echo "Final collect and verify decisions disagree." >&2
-  exit 4
-fi
+run_active_write_check
 
 checkout_mutated=1
 git checkout "$BRANCH"
 git merge --ff-only "$EXPECTED_COMMIT"
-[ "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT" ] || exit 4
+if [ "$(git rev-parse HEAD)" != "$EXPECTED_COMMIT" ]; then
+  echo "Production checkout did not reach EXPECTED_COMMIT." >&2
+  exit 4
+fi
 env "PYTHONPATH=$APP_DIR/src" "$APP_DIR/.venv/bin/python" -m pip install -e "$APP_DIR"
 systemctl start telegram-kol.service
 systemctl is-active --quiet telegram-kol.service
+if ! verify_http_health; then
+  echo "Candidate HTTP health verification failed." >&2
+  exit 4
+fi
 
 if [ -f "$UPDATER_PATH" ]; then
-  updater_backup="$PREFLIGHT_DIR/updater-backup-$EXPECTED_COMMIT-$$"
+  updater_backup="$(mktemp "$STAGE_PARENT/telegram-kol-updater-backup.XXXXXX")"
   cp -p -- "$UPDATER_PATH" "$updater_backup"
 fi
 updater_candidate="${UPDATER_PATH}.candidate.$$"
@@ -474,6 +367,7 @@ updater_installed=1
 mv -f -- "$updater_candidate" "$UPDATER_PATH"
 updater_candidate=""
 
+deployment_finalized=1
 stop_attempted=0
 checkout_mutated=0
 updater_installed=0

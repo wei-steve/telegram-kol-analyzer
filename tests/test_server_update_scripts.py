@@ -27,7 +27,7 @@ def test_embedded_python_helpers_are_syntax_valid():
     updater = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
     helpers = re.findall(r"<<'PY'\n(.*?)\nPY", updater, flags=re.DOTALL)
 
-    assert len(helpers) == 4
+    assert len(helpers) == 1
     for helper in helpers:
         compile(helper, "deploy/telegram-kol-update", "exec")
 
@@ -77,17 +77,22 @@ def test_deployment_docs_keep_both_workstation_helpers_visible():
     assert "./scripts/server_git_update.sh" in handoff
 
 
-def test_server_updater_runs_preflight_before_checkout_install_or_restart():
+def test_server_updater_runs_two_active_checks_before_checkout_and_install():
     script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
 
-    preflight = script.index("deployment_preflight_cli")
-    verify = script.index("run_preflight verify preliminary")
+    first_check = script.index("\nrun_active_write_check\n")
+    stop = script.index("\nstop_writer_service\n", first_check)
+    second_check = script.index("\nrun_active_write_check\n", first_check + 1)
     checkout = script.index('git merge --ff-only "$EXPECTED_COMMIT"')
     install = script.rindex(' -m pip install -e "$APP_DIR"')
-    stop = script.index("\nstop_writer_service\n")
     start = script.rindex("systemctl start telegram-kol.service")
-    assert preflight < verify < stop < checkout < install < start
-    assert script.count("run_preflight") >= 4
+    health = script.index("if ! verify_http_health", start)
+    updater_install = script.rindex(
+        'install -o root -g root -m 0755 "$stage_dir/deploy/telegram-kol-update"'
+    )
+    assert first_check < stop < second_check < checkout < install < start
+    assert start < health < updater_install
+    assert script.count("\nrun_active_write_check\n") == 2
     assert "PYTHONPATH=$stage_dir/src" in script
     assert "worktree add --detach" in script
     assert 'update-ref "refs/heads/$BRANCH" "$previous_commit" "$EXPECTED_COMMIT"' in script
@@ -100,10 +105,20 @@ def test_server_updater_runs_preflight_before_checkout_install_or_restart():
     assert "schema_changed" in script
     assert "sqlite3" in script
     assert "os.O_EXCL" in script
-    assert "BLOCK" in script
     assert script.rindex("updater_installed=1") < script.index(
         'mv -f -- "$updater_candidate" "$UPDATER_PATH"'
     )
+
+
+def test_server_updater_detects_schema_changes_only_by_git_paths():
+    script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
+
+    assert 'git -C "$APP_DIR" diff --quiet' in script
+    assert "src/telegram_kol_research/models.py" in script
+    assert "src/telegram_kol_research/db.py" in script
+    assert "migrations" in script
+    assert "CHANGE_CLASS" not in script
+    assert "fingerprint" not in script
 
 
 def test_bootstrap_installs_only_sha_verified_helper_from_expected_commit():
@@ -130,7 +145,8 @@ def test_server_updater_refuses_unpinned_or_mismatched_remote_commit():
 def test_schema_dry_run_uses_persistent_disk_and_is_always_removed():
     script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
 
-    assert '$APP_DIR/data/backups/schema-dry-run-' in script
+    assert 'BACKUP_DIR="${BACKUP_DIR:-$APP_DIR/data/backups}"' in script
+    assert '$BACKUP_DIR/schema-dry-run-' in script
     assert "cleanup_schema_dry_run" in script
     assert script.count("cleanup_schema_dry_run") >= 3
-    assert '$PREFLIGHT_DIR/schema-dry-run-' not in script
+    assert "PREFLIGHT_DIR" not in script
