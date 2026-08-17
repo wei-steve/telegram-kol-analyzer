@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import inspect
+from pathlib import Path
+import sqlite3
 
 import pytest
 
+import telegram_kol_research.deployment_work_evidence as evidence_module
 from telegram_kol_research.deployment_work_evidence import (
     MAX_EVIDENCE_COUNT,
     DeploymentEvidenceCounts,
+    collect_deployment_evidence,
     decide_deployment,
 )
 
@@ -126,3 +131,207 @@ def test_decision_has_no_operator_override_or_time_inputs() -> None:
     assert not {"override", "change_class", "created_at", "updated_at"} & set(
         parameters
     )
+
+
+def _create_registered_tables(
+    database: Path,
+    *,
+    backup_columns: str = (
+        "id INTEGER PRIMARY KEY, venue TEXT, pos_id TEXT, order_id TEXT, "
+        "status TEXT"
+    ),
+    source_columns: str = (
+        "id INTEGER PRIMARY KEY, source_event_id INTEGER, raw_message_id INTEGER, "
+        "target_lifecycle_id INTEGER, execution_binding_id INTEGER, "
+        "strategy_instance_id TEXT, target_fingerprint TEXT, state TEXT, "
+        "claim_token TEXT, claimed_at TEXT"
+    ),
+) -> None:
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            f"CREATE TABLE position_backup_stop_orders ({backup_columns})"
+        )
+        connection.execute(
+            f"CREATE TABLE source_message_deletion_exits ({source_columns})"
+        )
+
+
+def test_recognition_audit_tables_are_not_execution_evidence(tmp_path: Path) -> None:
+    database = tmp_path / "audit.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE mimo_recognition_runs (id INTEGER, status TEXT)"
+        )
+        connection.execute(
+            "CREATE TABLE mimo_recognition_attempts (id INTEGER, state TEXT)"
+        )
+        connection.execute("INSERT INTO mimo_recognition_runs VALUES (1, 'mystery')")
+        connection.execute(
+            "INSERT INTO mimo_recognition_attempts VALUES (1, 'unknown')"
+        )
+
+    snapshot = collect_deployment_evidence(database)
+
+    assert snapshot.counts == DeploymentEvidenceCounts()
+
+
+def test_backup_missing_is_valid_inactive_evidence(tmp_path: Path) -> None:
+    database = tmp_path / "backup.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO position_backup_stop_orders "
+            "(id, venue, pos_id, order_id, status) "
+            "VALUES (1, 'deepcoin', 'position-redacted', 'order-redacted', 'missing')"
+        )
+
+    snapshot = collect_deployment_evidence(database)
+
+    assert snapshot.counts == DeploymentEvidenceCounts(inactive=1)
+
+
+def test_unbound_source_without_target_or_claim_is_inactive(tmp_path: Path) -> None:
+    database = tmp_path / "source.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO source_message_deletion_exits "
+            "(id, source_event_id, state) VALUES (1, 11, 'unbound')"
+        )
+
+    snapshot = collect_deployment_evidence(database)
+
+    assert snapshot.counts == DeploymentEvidenceCounts(inactive=1)
+
+
+def test_unknown_state_in_registered_table_is_invalid_only(tmp_path: Path) -> None:
+    database = tmp_path / "unknown.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO position_backup_stop_orders "
+            "(id, venue, pos_id, status) "
+            "VALUES (1, 'deepcoin', 'position-redacted', 'invented')"
+        )
+
+    snapshot = collect_deployment_evidence(database)
+
+    assert snapshot.counts == DeploymentEvidenceCounts(invalid_evidence=1)
+
+
+def test_unregistered_status_table_is_ignored(tmp_path: Path) -> None:
+    database = tmp_path / "unregistered.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE unrelated_jobs (id INTEGER, status TEXT)")
+        connection.execute("INSERT INTO unrelated_jobs VALUES (1, 'submitting')")
+
+    snapshot = collect_deployment_evidence(database)
+
+    assert snapshot.counts == DeploymentEvidenceCounts()
+
+
+def test_missing_required_registered_column_fails_closed(tmp_path: Path) -> None:
+    database = tmp_path / "missing-column.db"
+    _create_registered_tables(database, backup_columns="id INTEGER, status TEXT")
+
+    snapshot = collect_deployment_evidence(database)
+
+    assert snapshot.counts == DeploymentEvidenceCounts(invalid_evidence=1)
+
+
+def test_conflicting_duplicate_projection_fails_closed(tmp_path: Path) -> None:
+    database = tmp_path / "duplicate.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.executemany(
+            "INSERT INTO source_message_deletion_exits "
+            "(id, source_event_id, state) VALUES (?, 11, ?)",
+            [(1, "unbound"), (2, "pending")],
+        )
+
+    snapshot = collect_deployment_evidence(database)
+
+    assert snapshot.counts.invalid_evidence == 1
+    assert snapshot.counts.active_write == 0
+    assert snapshot.counts.unknown_outcome == 0
+    assert snapshot.counts.queued_work == 0
+    assert snapshot.counts.inactive == 0
+
+
+def test_malformed_registered_value_fails_closed(tmp_path: Path) -> None:
+    database = tmp_path / "malformed.db"
+    _create_registered_tables(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO position_backup_stop_orders "
+            "(id, venue, pos_id, status) VALUES (1, 'deepcoin', 'position-redacted', NULL)"
+        )
+
+    snapshot = collect_deployment_evidence(database)
+
+    assert snapshot.counts == DeploymentEvidenceCounts(invalid_evidence=1)
+
+
+def test_collection_uses_uri_read_only_and_query_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "readonly.db"
+    _create_registered_tables(database)
+    original_connect = sqlite3.connect
+    calls: list[tuple[object, bool]] = []
+    statements: list[str] = []
+
+    class RecordingConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            statements.append(str(sql))
+            return super().execute(sql, parameters)
+
+    def recording_connect(database_value, *args, **kwargs):
+        calls.append((database_value, bool(kwargs.get("uri"))))
+        kwargs["factory"] = RecordingConnection
+        return original_connect(database_value, *args, **kwargs)
+
+    monkeypatch.setattr(evidence_module.sqlite3, "connect", recording_connect)
+
+    before = database.read_bytes()
+    collect_deployment_evidence(database)
+
+    assert calls == [(f"{database.resolve().as_uri()}?mode=ro", True)]
+    assert any(statement.strip().upper() == "PRAGMA QUERY_ONLY=ON" for statement in statements)
+    assert database.read_bytes() == before
+    assert not database.with_name(f"{database.name}-wal").exists()
+    assert not database.with_name(f"{database.name}-shm").exists()
+
+
+def test_collection_result_is_bounded_and_sanitized(tmp_path: Path) -> None:
+    database = tmp_path / "sanitized.db"
+    _create_registered_tables(database)
+    secret_values = (
+        "row-identifier-987",
+        "private-message-text",
+        "BTC-USDT",
+        "exchange-order-secret",
+        "api-credential-secret",
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO position_backup_stop_orders "
+            "(id, venue, pos_id, order_id, status) VALUES (1, ?, ?, ?, 'missing')",
+            (secret_values[2], secret_values[0], secret_values[3]),
+        )
+        connection.execute(
+            "CREATE TABLE unrelated_payloads "
+            "(message_text TEXT, payload TEXT, credential TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO unrelated_payloads VALUES (?, ?, ?)",
+            (secret_values[1], '{"private": true}', secret_values[4]),
+        )
+
+    rendered = repr(asdict(collect_deployment_evidence(database)))
+
+    assert len(rendered) < 1_024
+    assert all(secret not in rendered for secret in secret_values)
