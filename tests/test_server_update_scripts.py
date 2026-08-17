@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import subprocess
 
 
@@ -22,19 +23,36 @@ def test_update_scripts_are_syntax_valid():
     )
 
 
-def test_workstation_helpers_require_commit_and_change_class():
+def test_embedded_python_helpers_are_syntax_valid():
+    updater = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
+    helpers = re.findall(r"<<'PY'\n(.*?)\nPY", updater, flags=re.DOTALL)
+
+    assert len(helpers) == 4
+    for helper in helpers:
+        compile(helper, "deploy/telegram-kol-update", "exec")
+
+
+def test_workstation_helpers_require_only_branch_and_exact_commit():
     shell = (ROOT / "scripts/server_git_update.sh").read_text(encoding="utf-8")
     powershell = (ROOT / "scripts/server_git_update.ps1").read_text(encoding="utf-8")
 
     assert 'EXPECTED_COMMIT="${EXPECTED_COMMIT:?' in shell
-    assert 'CHANGE_CLASS="${CHANGE_CLASS:?' in shell
     assert "bootstrap_server_updater.sh" in shell
     assert "[Parameter(Mandatory = $true)]" in powershell
     assert "$ExpectedCommit" in powershell
-    assert "$ChangeClass" in powershell
+    assert "$ChangeClass" not in powershell
     assert "$LASTEXITCODE -ne 0" in powershell
     assert "Get-FileHash -Algorithm SHA256" in powershell
     assert "git -C \"$app_dir\" show" in powershell
+    forbidden = (
+        "CHANGE_CLASS",
+        "ChangeClass",
+        "live_promotion",
+        "AuthorizeLivePromotion",
+        "operator override",
+    )
+    assert all(value not in shell for value in forbidden)
+    assert all(value not in powershell for value in forbidden)
 
 
 def test_shell_workstation_helper_preserves_safe_transport_checks():
@@ -62,25 +80,30 @@ def test_deployment_docs_keep_both_workstation_helpers_visible():
 def test_server_updater_runs_preflight_before_checkout_install_or_restart():
     script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
 
-    preflight = script.index("deployment-preflight")
-    verify = script.index("verify-deployment-preflight")
+    preflight = script.index("deployment_preflight_cli")
+    verify = script.index("run_preflight verify preliminary")
     checkout = script.index('git merge --ff-only "$EXPECTED_COMMIT"')
-    install = script.index("python -m pip install -e .")
-    stop = script.rindex("systemctl stop telegram-kol.service")
+    install = script.rindex(' -m pip install -e "$APP_DIR"')
+    stop = script.index("\nstop_writer_service\n")
     start = script.rindex("systemctl start telegram-kol.service")
-    assert preflight < stop < verify < checkout < install < start
-    assert script.count("run_preflight") >= 3
+    assert preflight < verify < stop < checkout < install < start
+    assert script.count("run_preflight") >= 4
     assert "PYTHONPATH=$stage_dir/src" in script
     assert "worktree add --detach" in script
     assert 'update-ref "refs/heads/$BRANCH" "$previous_commit" "$EXPECTED_COMMIT"' in script
-    assert script.index("checkout_mutated=1") < script.index("python -m pip install -e .")
-    assert "ROLLBACK FAILED; telegram-kol.service remains stopped." in script
+    assert script.index("checkout_mutated=1") < script.rindex(
+        ' -m pip install -e "$APP_DIR"'
+    )
+    assert "ROLLBACK FAILED; telegram-kol.service may remain stopped." in script
     assert 'if [ "$rollback_ok" -eq 1 ]; then' in script
     assert "git pull" not in script
-    assert "schema_compatible" in script
+    assert "schema_changed" in script
     assert "sqlite3" in script
     assert "os.O_EXCL" in script
     assert "BLOCK" in script
+    assert script.rindex("updater_installed=1") < script.index(
+        'mv -f -- "$updater_candidate" "$UPDATER_PATH"'
+    )
 
 
 def test_bootstrap_installs_only_sha_verified_helper_from_expected_commit():
@@ -89,15 +112,17 @@ def test_bootstrap_installs_only_sha_verified_helper_from_expected_commit():
     assert "git -C \"$app_dir\" show" in script
     assert "sha256sum" in script
     assert "UPDATER_SHA256" in script
-    assert "__EMPTY__" in script
-    assert script.index("sha256sum") < script.index("/usr/local/bin/telegram-kol-update")
+    assert "chmod 0700" in script
+    assert "mktemp -d" in script
+    assert "install -o root" not in script
+    assert script.index("sha256sum") < script.index('bash "$temporary/updater"')
 
 
 def test_server_updater_refuses_unpinned_or_mismatched_remote_commit():
     script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
 
     assert 'EXPECTED_COMMIT="${EXPECTED_COMMIT:?' in script
-    assert 'CHANGE_CLASS="${CHANGE_CLASS:?' in script
+    assert "CHANGE_CLASS" not in script
     assert 'remote_head="$(git rev-parse FETCH_HEAD)"' in script
     assert 'if [ "$remote_head" != "$EXPECTED_COMMIT" ]' in script
 
