@@ -78,13 +78,22 @@ set -euo pipefail
 printf 'systemctl %s\n' "$*" >>"$HARNESS_LOG"
 case "${1:-}" in
   is-active)
+    if [ -f "$HARNESS_STATE/deferred_stop" ] && [ ! -f "$HARNESS_STATE/start_after_deferred" ]; then
+      exit 0
+    fi
     [ ! -f "$HARNESS_STATE/stopped" ]
     ;;
   stop)
+    if [ "${HARNESS_STOP_DEFERRED:-0}" = "1" ]; then
+      touch "$HARNESS_STATE/deferred_stop"
+      exit 1
+    fi
     if [ "${HARNESS_STOP_STAYS_ACTIVE:-0}" != "1" ]; then touch "$HARNESS_STATE/stopped"; fi
+    if [ "${HARNESS_SIGNAL_DURING_STOP:-0}" = "1" ]; then kill -TERM "$PPID"; fi
     if [ "${HARNESS_STOP_RETURNS_NONZERO:-0}" = "1" ]; then exit 1; fi
     ;;
   start)
+    if [ -f "$HARNESS_STATE/deferred_stop" ]; then touch "$HARNESS_STATE/start_after_deferred"; fi
     if [ "${HARNESS_START_FAIL_ONCE:-0}" = "1" ] && [ ! -f "$HARNESS_STATE/start_failed" ]; then
       touch "$HARNESS_STATE/start_failed"
       exit 1
@@ -262,6 +271,22 @@ def test_final_verify_syntax_failure_restarts_without_mutation(updater_harness):
     assert result.returncode == 4
     assert "systemctl start telegram-kol.service" in events
     assert not any(" checkout codex/test" in line for line in events)
+    assert not (state / "stopped").exists()
+
+
+@pytest.mark.parametrize(
+    "fault", ["HARNESS_STOP_DEFERRED", "HARNESS_SIGNAL_DURING_STOP"]
+)
+def test_stop_attempt_failure_or_signal_always_reasserts_old_service_active(
+    updater_harness, fault
+):
+    run, log, state = updater_harness
+    result = run(**{fault: "1"})
+    events = _events(log)
+
+    assert result.returncode != 0
+    assert "systemctl start telegram-kol.service" in events
+    assert not any(" collect " in line and " final " in line for line in events)
     assert not (state / "stopped").exists()
 
 

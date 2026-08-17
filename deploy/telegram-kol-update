@@ -66,6 +66,7 @@ fi
 
 stage_dir=""
 service_stopped=0
+stop_attempted=0
 checkout_mutated=0
 updater_installed=0
 updater_backup=""
@@ -98,9 +99,9 @@ restore_updater() {
 cleanup() {
   status=$?
   trap - EXIT INT TERM
-  if [ "$service_stopped" -eq 1 ]; then
+  if [ "$stop_attempted" -eq 1 ]; then
     rollback_ok=1
-    if systemctl is-active --quiet telegram-kol.service; then
+    if [ "$checkout_mutated" -eq 1 ] && systemctl is-active --quiet telegram-kol.service; then
       set +e
       timeout --foreground "${STOP_TIMEOUT_SECONDS}s" systemctl stop telegram-kol.service
       set -e
@@ -148,7 +149,9 @@ cleanup() {
   [ -z "$updater_backup" ] || rm -f -- "$updater_backup"
   exit "$status"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 cd "$APP_DIR"
 git fetch origin "$BRANCH"
@@ -244,6 +247,7 @@ run_preflight_verify() {
 }
 
 stop_writer_service() {
+  stop_attempted=1
   set +e
   timeout --foreground "${STOP_TIMEOUT_SECONDS}s" systemctl stop telegram-kol.service
   local stop_status=$?
@@ -299,6 +303,7 @@ updater_installed=1
 systemctl start telegram-kol.service
 systemctl is-active --quiet telegram-kol.service
 service_stopped=0
+stop_attempted=0
 checkout_mutated=0
 updater_installed=0
 git -C "$APP_DIR" worktree remove --force "$stage_dir" >/dev/null
