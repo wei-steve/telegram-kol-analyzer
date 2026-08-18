@@ -674,6 +674,64 @@ def test_management_worker_lifespan_starts_once_and_is_cancelled(tmp_path):
     assert app.state.strategy_management_worker_task is None
 
 
+def test_loop_lag_monitor_lifespan_starts_and_is_cancelled(tmp_path):
+    app = create_web_app(database_path=tmp_path / "research.db")
+
+    assert app.state.loop_lag_monitor is not None
+    assert app.state.loop_lag_monitor_task is None
+
+    with TestClient(app):
+        task = app.state.loop_lag_monitor_task
+        assert task is not None
+        assert not task.done()
+
+    assert task.cancelled()
+    assert app.state.loop_lag_monitor_task is None
+
+
+def test_loop_health_endpoint_reports_monitor_snapshot(tmp_path):
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        now_provider=lambda: datetime(2026, 8, 18, 12, 0, tzinfo=UTC),
+    )
+    app.state.loop_lag_monitor.record_lag(1500.0)
+    app.state.loop_lag_monitor.record_lag(4500.0)
+
+    with TestClient(app) as client:
+        response = client.get("/api/runtime/loop-health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["samples"] >= 2
+    assert payload["max_ms"] >= 4500.0
+    assert payload["stall_count"] >= 1
+    assert payload["worst_stall_ms"] >= 4500.0
+    assert payload["last_stall_at"] == "2026-08-18T12:00:00+00:00"
+    assert payload["now"] == "2026-08-18T12:00:00+00:00"
+    assert payload["uptime_seconds"] >= 0.0
+    for key in ("p50_ms", "p95_ms", "p99_ms", "window_seconds"):
+        assert key in payload
+
+
+def test_loop_health_endpoint_touches_neither_database_nor_exchange(tmp_path):
+    def failing_deepcoin_client_factory():
+        raise AssertionError("loop health must not call the exchange")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=failing_deepcoin_client_factory,
+    )
+
+    def failing_session_factory():
+        raise AssertionError("loop health must not touch the database")
+
+    with TestClient(app) as client:
+        app.state.session_factory = failing_session_factory
+        response = client.get("/api/runtime/loop-health")
+
+    assert response.status_code == 200
+
+
 def test_break_even_worker_lifespan_starts_once_and_is_cancelled(tmp_path):
     started = threading.Event()
     stopped = threading.Event()
