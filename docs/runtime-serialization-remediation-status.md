@@ -16,8 +16,8 @@ local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v
 design_version: 1
 current_phase: 1.5
 phase_name: unblock-operator-maintenance
-phase_status: claimed          # planned | claimed | in_progress | completed
-claimed_by: session-45794fed   # claimed 2026-08-18 for phase 1b
+phase_status: in_progress      # planned | claimed | in_progress | completed
+claimed_by: session-45794fed   # phase 1b tasks 1-4 done; task 5 (deploy) blocked, see below
 current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-1b-unblock-operator-maintenance.md
 last_completed_phase: 1
 last_completed_commit: fd748d7aa7bf14acdf6c83d81fa137d1cdbab672
@@ -30,6 +30,11 @@ phase_1_code_commit: fd748d7aa7bf14acdf6c83d81fa137d1cdbab672
 phase_1_local_suite_before: 5644   # passed, 1 skipped, on the merged branch at e61dbf1
 phase_1_local_suite_after: 5661    # passed, 1 skipped, 0 failed; delta 17 equals the 17 tests phase 1 adds
 phase_1_worst_stall_criterion_met: false   # see the phase 1 unmet-criterion section below
+phase_1b_code_commit: 06f916c5be8963b30dd87bc596c269c73dc641f7   # PUSHED but NOT DEPLOYED
+phase_1b_local_suite_before: 5661   # passed, 1 skipped, at fd748d7
+phase_1b_local_suite_after: 5664    # passed, 1 skipped, 0 failed; delta 3 equals the 3 tests added
+deploy_branch_ahead_of_production: true   # branch tip 06f916c, production fd748d7. Phase 1b is committed and pushed but never deployed.
+loop_lag_after_phase1b_p99_ms: null   # not measured; phase 1b was not deployed
 baseline_captured: true   # 64.9 minutes of real traffic, 2026-08-18 17:16 UTC
 phase_0_blocking_call_census:   # Task 4 Step 3 — verbatim discovered set, 2026-08-18
   - "strategy_management_worker.run_strategy_management_worker_loop -> run_strategy_management_worker_tick"
@@ -61,6 +66,9 @@ server_verification:
   - "phase-1-after (2026-08-18 19:56 UTC, uptime 3803 s = 63.4 min of real traffic, no restart in the window): samples 5975, window_seconds 3802.336, p50_ms 0.919, p95_ms 12.183, p99_ms 6765.435, max_ms 15356.616, stall_count 103, worst_stall_ms 15356.616, last_stall_at 2026-08-18T19:56:12Z. Against the Phase 0 baseline: p95 8311.911 -> 12.183 ms, a 682x drop and the single largest change; p99 8777.887 -> 6765.435 ms, down 22.9 percent; stall rate one per 10.7 s -> one per 36.9 s, a 3.45x drop; derived loop unavailability ~76 percent -> 21.4 percent (requested sleep 2987.5 s of a 3802.3 s window leaves 814.8 s of lag). The loop is now healthy the large majority of the time instead of the small minority."
   - "phase-1-unmet-criterion: worst_stall_ms did NOT improve. 15356.616 ms after versus 15160.203 ms at baseline - marginally worse, and nowhere near the tens of milliseconds the phase file predicted; stall_count did not reach zero either. The phase file anticipated exactly this and prescribed the response: another blocking call is still on the loop, record it and do not guess further in this session. Journal evidence: stalls of 6975.6 ms and 6197.1 ms were logged at 02:53:01 and 02:54:16 CST, both after the 02:52:47 restart. The prime suspect is the one remaining census entry, system_operator_bot.run_runtime_incident_notification_loop, which calls run_operator_maintenance_tick synchronously every 5 s with a database read and a Deepcoin client build. Ruled out while gathering evidence: lifecycle_monitor candle fetches, which look alarming in the journal but run in an async def (_fetch_candles_full) and are ordinary Gate.io network timeouts predating the deploy. NOT fixed here - it is outside Phase 1 scope and has no owning phase yet."
   - "phase-1-behavior-unchanged: partially proven, and the gap is stated rather than rounded up. strategy_management_batches shows 1 batch touched (status reconciling) in the 63 min after the restart versus 0 rows in the comparable 63 min before it, so management work does still execute and did not regress. Break-even convergence could NOT be positively verified: strategy_break_even_convergences holds 2 rows whose last update is 2026-08-03, so there was no convergence work to do in either window. The loop is running and its tick raised nothing - zero 'worker tick failed' entries in the journal since the restart - but an idle path is not a proven path. First real convergence after this deploy should be checked."
+
+  - "phase-1b-local (2026-08-18, session-45794fed): tasks 1-4 done. system_operator_bot._run_operator_maintenance_cycle now holds the settings read, the Deepcoin client construction, run_operator_maintenance_tick, and the client close as one unit, submitted to Phase 1s EXISTING shared max_workers=1 executor via run_on_management_worker. A separate pool was considered and rejected: all three ticks were mutually exclusive before Phase 1 only because all three ran on the loop, and a separate pool would introduce three-way concurrency on paths touching execution contracts, entry admissions and the exchange - the exact change Phase 1s design constraint exists to prevent. KNOWN_BLOCKING_CALLS is now EMPTY and the census passes with zero discovered offenders. One accepted divergence, recorded not hidden: close() now runs inside the submitted unit, so an exception it raises is swallowed by the loops pre-existing except Exception instead of escaping the while loop and killing the task; the alternative closes an httpx.Client back on the event loop. 3 tests added (operator loop responsiveness, operator and management ticks observably sharing one mgmt-worker thread with zero overlap, and client build/use/close all on the same worker thread in that order). Full suite 5664 passed, 1 skipped, 0 failed, 405s; before was 5661, delta 3 equals exactly the tests added."
+  - "phase-1b-deploy-BLOCKED (2026-08-18): NOT DEPLOYED. 06f916c is committed and pushed to codex/deepcoin-auto-trading-v1 (87706a6..06f916c, fast-forward), but scripts/server_git_update.sh was refused by the local agent permission layer, three attempts. Production remains at fd748d7 (Phase 1). THE DEPLOY BRANCH IS THEREFORE AHEAD OF PRODUCTION - anyone reading git alone will think Phase 1b is live and it is not. Pre-deploy evidence was captured before the attempt: live position snapshot 14847 bytes, and a final Phase 1 reading at 2026-08-18 20:35 UTC over a 4554.7 s window (samples 7200 = ring buffer saturated, p50_ms 0.938, p95_ms 9.672, p99_ms 6716.13, max_ms 10055.917 within the retained window, stall_count 166 at 6173 s uptime, worst_stall_ms 15356.616 all-time). Remaining step: run EXPECTED_COMMIT=06f916c5be8963b30dd87bc596c269c73dc641f7 ./scripts/server_git_update.sh from a checkout of that commit, then measure 60 minutes and compare worst_stall_ms and stall_count against Phase 1s 15356.616 and 166."
 
 ```
 
@@ -98,7 +106,7 @@ the 2026-08-18 incident.
 |---|---|---|
 | 0 | `phase-0-loop-health-observability.md` | **completed** 2026-08-18, deployed a00561b, baseline captured |
 | 1 | `phase-1-unblock-event-loop.md` | **completed** 2026-08-18, deployed fd748d7, p95 8312 -> 12 ms; one criterion unmet |
-| 1b | `phase-1b-unblock-operator-maintenance.md` | claimed 2026-08-18 — Phase 2's own prerequisite is unmet until this lands |
+| 1b | `phase-1b-unblock-operator-maintenance.md` | in_progress — code done and pushed (`06f916c`), **deploy blocked** |
 | 2 | `phase-2-per-chat-lock-sharding.md` | planned |
 | 3 | `phase-3-compensation-window-repair.md` | planned |
 | 4 | `phase-4-durable-job-shadow-enqueue.md` | planned |
