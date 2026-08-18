@@ -46,3 +46,6 @@ videos/alpha-farm/.hyperframes/
 # Keep the redacted Alpha Farm example manifest versioned.
 !videos/alpha-farm/data/
 !videos/alpha-farm/data/kol-showcase.example.json
+
+# Claude Code personal settings — machine-specific, must not reach the public repo
+.claude/settings.local.json
