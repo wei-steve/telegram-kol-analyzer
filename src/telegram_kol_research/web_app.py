@@ -72,6 +72,7 @@ from telegram_kol_research.runtime_incident_adapters import (
     capture_monitor_state,
     capture_notification_failure,
 )
+from telegram_kol_research.runtime_loop_health import LoopLagMonitor
 from telegram_kol_research.production_safety_monitor import (
     capture_uncaptured_runtime_incident_sources,
 )
@@ -3956,6 +3957,13 @@ def create_web_app(
     async def lifespan(app: FastAPI):
         try:
             app.state.web_event_loop = asyncio.get_running_loop()
+            if app.state.loop_lag_monitor_task is None:
+                app.state.loop_lag_monitor_task = asyncio.create_task(
+                    app.state.loop_lag_monitor.run()
+                )
+                app.state.loop_lag_monitor_task.add_done_callback(
+                    _log_background_task_result("loop_lag_monitor_task")
+                )
             if (
                 app.state.contract_spec_refresh_orchestrator is not None
                 and app.state.contract_spec_refresh_task is None
@@ -4190,6 +4198,16 @@ def create_web_app(
                 )
             yield
         finally:
+            loop_lag_monitor_task = app.state.loop_lag_monitor_task
+            if loop_lag_monitor_task is not None:
+                loop_lag_monitor_task.cancel()
+                try:
+                    await loop_lag_monitor_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.loop_lag_monitor_task = None
             contract_spec_refresh_task = app.state.contract_spec_refresh_task
             if contract_spec_refresh_task is not None:
                 contract_spec_refresh_task.cancel()
@@ -4584,6 +4602,8 @@ def create_web_app(
     app.state.runtime_incident_notification_task = None
     app.state.position_snapshot_startup_task = None
     app.state.position_snapshot_refresh_task = None
+    app.state.loop_lag_monitor = LoopLagMonitor(now_provider=app.state.now_provider)
+    app.state.loop_lag_monitor_task = None
     app.state.web_event_loop = None
     app.state.telegram_auth_loader = load_telegram_auth_config
     app.state.telegram_client_factory = create_telegram_client
@@ -4746,6 +4766,22 @@ def create_web_app(
             limit=limit,
             level=normalized_level,
         )
+
+    @app.get("/api/runtime/loop-health")
+    async def api_runtime_loop_health():
+        """Report event loop lag. No database, no exchange, no locks.
+
+        Declared ``async`` on purpose: the snapshot is pure in-memory work, so
+        answering it must not depend on a threadpool that may itself be
+        saturated when the loop is degraded.
+        """
+
+        monitor = app.state.loop_lag_monitor
+        return {
+            **monitor.snapshot(),
+            "now": app.state.now_provider().isoformat(),
+            "uptime_seconds": monitor.uptime_seconds(),
+        }
 
     @app.get("/api/runtime-agent/read-only-exchange-snapshot")
     def api_runtime_agent_read_only_exchange_snapshot(request: Request):
