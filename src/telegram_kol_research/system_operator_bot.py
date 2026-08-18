@@ -37,6 +37,9 @@ from telegram_kol_research.message_instruction_items import (
     finish_message_instruction_summary_delivery,
 )
 from telegram_kol_research.time_utils import utc_naive_to_local
+from telegram_kol_research.runtime_worker_executor import (
+    run_on_management_worker,
+)
 from telegram_kol_research.reporting import (
     format_entry_assembly_summary,
     format_entry_revision_summary,
@@ -2561,6 +2564,49 @@ async def run_strategy_management_notification_loop(
         await asyncio.sleep(max(0.1, float(interval_seconds)))
 
 
+def _run_operator_maintenance_cycle(
+    session_factory,
+    *,
+    deepcoin_client_factory=None,
+) -> None:
+    """Run one operator maintenance cycle as a single blocking unit.
+
+    The settings read, the exchange client construction, the tick, and the
+    client close all stay on one thread: the client's lifecycle must not be
+    split across threads, and closing an ``httpx.Client`` back on the event
+    loop would reintroduce the blocking call this indirection removes.
+    """
+
+    execution_client = None
+    try:
+        execution_settings = load_trading_settings(session_factory)
+        execution_mode = str(
+            execution_settings.instruction_execution_contract_mode
+        )
+        if execution_mode != "disabled":
+            if deepcoin_client_factory is None:
+                from telegram_kol_research.deepcoin_client import (
+                    build_deepcoin_client_from_env,
+                )
+
+                execution_client = build_deepcoin_client_from_env()
+            else:
+                execution_client = deepcoin_client_factory()
+        run_operator_maintenance_tick(
+            session_factory,
+            now=datetime.now(UTC),
+            execution_contract_mode=execution_mode,
+            execution_entry_after_item_id=int(
+                execution_settings.instruction_execution_entry_after_item_id
+            ),
+            execution_reconciliation_client=execution_client,
+        )
+    finally:
+        close_client = getattr(execution_client, "close", None)
+        if callable(close_client):
+            close_client()
+
+
 async def run_runtime_incident_notification_loop(
     *,
     session_factory,
@@ -2579,38 +2625,16 @@ async def run_runtime_incident_notification_loop(
     else:
         feature_config = runtime_config
     while True:
-        execution_client = None
         try:
-            execution_settings = load_trading_settings(session_factory)
-            execution_mode = str(
-                execution_settings.instruction_execution_contract_mode
-            )
-            if execution_mode != "disabled":
-                if deepcoin_client_factory is None:
-                    from telegram_kol_research.deepcoin_client import (
-                        build_deepcoin_client_from_env,
-                    )
-
-                    execution_client = build_deepcoin_client_from_env()
-                else:
-                    execution_client = deepcoin_client_factory()
-            run_operator_maintenance_tick(
+            await run_on_management_worker(
+                _run_operator_maintenance_cycle,
                 session_factory,
-                now=datetime.now(UTC),
-                execution_contract_mode=execution_mode,
-                execution_entry_after_item_id=int(
-                    execution_settings.instruction_execution_entry_after_item_id
-                ),
-                execution_reconciliation_client=execution_client,
+                deepcoin_client_factory=deepcoin_client_factory,
             )
         except asyncio.CancelledError:
             raise
         except Exception:
             pass
-        finally:
-            close_client = getattr(execution_client, "close", None)
-            if callable(close_client):
-                close_client()
         try:
             await deliver_runtime_incident_notifications(
                 session_factory,

@@ -12,16 +12,9 @@ from pathlib import Path
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src" / "telegram_kol_research"
 
-# Every entry must name the phase that removes it.
-KNOWN_BLOCKING_CALLS = frozenset(
-    {
-        # Discovered by the Phase 0 census, beyond the two already identified.
-        # Recorded in docs/runtime-serialization-remediation-status.md; not yet
-        # assigned to a remediation phase.
-        "system_operator_bot.run_runtime_incident_notification_loop"
-        " -> run_operator_maintenance_tick",
-    }
-)
+# Every entry must name the phase that removes it. Empty since Phase 1b: from
+# here on, ANY synchronous tick called from an async while-loop fails the suite.
+KNOWN_BLOCKING_CALLS: frozenset[str] = frozenset()
 
 
 def _module_level_sync_functions(tree: ast.Module) -> set[str]:
