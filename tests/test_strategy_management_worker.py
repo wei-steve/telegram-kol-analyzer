@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -1384,3 +1385,128 @@ def test_disabled_shadow_max_one_prioritizes_recovery_and_never_claims_ready():
 
     assert result.recovered == 1
     assert events == ["recovery"]
+
+
+def _drive_strategy_loop(monkeypatch, *, tick_wrapper, ticks_wanted):
+    """Run the real loop until ``ticks_wanted`` ticks have run, then cancel."""
+
+    import asyncio
+
+    from telegram_kol_research import strategy_management_worker as worker
+    from telegram_kol_research.runtime_worker_executor import (
+        shutdown_management_worker_executor,
+    )
+
+    real_tick = worker.run_strategy_management_worker_tick
+    done = threading.Event()
+    calls = {"count": 0}
+
+    def patched(session_factory, **kwargs):
+        calls["count"] += 1
+        try:
+            return tick_wrapper(real_tick, session_factory, **kwargs)
+        finally:
+            if calls["count"] >= ticks_wanted:
+                done.set()
+
+    monkeypatch.setattr(
+        worker, "run_strategy_management_worker_tick", patched
+    )
+    monkeypatch.setattr(
+        worker,
+        "load_trading_settings",
+        lambda _session_factory: SimpleNamespace(
+            live_management_execution_enabled=True
+        ),
+    )
+
+    async def scenario():
+        task = asyncio.create_task(
+            worker.run_strategy_management_worker_loop(
+                session_factory=object(),
+                deepcoin_client_factory=lambda: object(),
+                interval_seconds=0.01,
+                max_batches=1,
+                now_provider=lambda: NOW,
+            )
+        )
+        try:
+            await asyncio.wait_for(asyncio.to_thread(done.wait, 10.0), 15.0)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        shutdown_management_worker_executor(wait=True)
+
+    assert done.is_set()
+
+
+def test_worker_loop_cursor_lane_alternation_survives_the_thread_offload():
+    """The loop still owns one cursor, and the lanes still alternate."""
+
+    monkeypatch = pytest.MonkeyPatch()
+    lanes: list[str] = []
+    cursors: list[int] = []
+
+    def wrapper(real_tick, session_factory, **kwargs):
+        cursor = kwargs["cursor"]
+        lanes.append(cursor.next_lane)
+        cursors.append(id(cursor))
+        return real_tick(
+            session_factory,
+            batch_lister=lambda *_args, **_kwargs: [],
+            **kwargs,
+        )
+
+    try:
+        _drive_strategy_loop(monkeypatch, tick_wrapper=wrapper, ticks_wanted=4)
+    finally:
+        monkeypatch.undo()
+
+    assert lanes[:4] == ["executable", "recovery", "executable", "recovery"]
+    assert len(set(cursors)) == 1
+
+
+def test_worker_loop_runs_the_tick_off_the_event_loop_thread():
+    monkeypatch = pytest.MonkeyPatch()
+    main_thread = threading.current_thread().name
+    tick_threads: list[str] = []
+
+    def wrapper(real_tick, session_factory, **kwargs):
+        tick_threads.append(threading.current_thread().name)
+        return real_tick(
+            session_factory,
+            batch_lister=lambda *_args, **_kwargs: [],
+            **kwargs,
+        )
+
+    try:
+        _drive_strategy_loop(monkeypatch, tick_wrapper=wrapper, ticks_wanted=2)
+    finally:
+        monkeypatch.undo()
+
+    assert tick_threads
+    assert all(name != main_thread for name in tick_threads)
+    assert all(name.startswith("mgmt-worker") for name in tick_threads)
+
+
+def test_worker_loop_keeps_running_after_a_tick_raises():
+    monkeypatch = pytest.MonkeyPatch()
+    attempts: list[int] = []
+
+    def wrapper(real_tick, session_factory, **kwargs):
+        attempts.append(len(attempts))
+        raise RuntimeError("tick exploded")
+
+    try:
+        _drive_strategy_loop(monkeypatch, tick_wrapper=wrapper, ticks_wanted=3)
+    finally:
+        monkeypatch.undo()
+
+    assert len(attempts) >= 3

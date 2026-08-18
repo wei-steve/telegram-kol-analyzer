@@ -732,6 +732,51 @@ def test_loop_health_endpoint_touches_neither_database_nor_exchange(tmp_path):
     assert response.status_code == 200
 
 
+def test_lifespan_shutdown_releases_the_management_worker_executor(tmp_path):
+    from telegram_kol_research import runtime_worker_executor
+
+    runtime_worker_executor.shutdown_management_worker_executor(wait=True)
+    app = create_web_app(database_path=tmp_path / "research.db")
+
+    with TestClient(app):
+        executor = runtime_worker_executor.get_management_worker_executor()
+        assert not getattr(executor, "_shutdown", False)
+
+    assert executor._shutdown is True
+    assert runtime_worker_executor._executor is None
+    runtime_worker_executor.shutdown_management_worker_executor(wait=True)
+
+
+def test_lifespan_shutdown_does_not_hang_while_a_tick_is_in_flight(tmp_path):
+    from telegram_kol_research import runtime_worker_executor
+
+    runtime_worker_executor.shutdown_management_worker_executor(wait=True)
+    release = threading.Event()
+    started = threading.Event()
+
+    def blocking_tick():
+        started.set()
+        release.wait(30.0)
+        return "done"
+
+    app = create_web_app(database_path=tmp_path / "research.db")
+    try:
+        with TestClient(app):
+            executor = runtime_worker_executor.get_management_worker_executor()
+            future = executor.submit(blocking_tick)
+            assert started.wait(timeout=5)
+            began = time.perf_counter()
+        elapsed = time.perf_counter() - began
+
+        assert elapsed < 5.0
+        assert runtime_worker_executor._executor is None
+    finally:
+        release.set()
+
+    assert future.result(timeout=10) == "done"
+    runtime_worker_executor.shutdown_management_worker_executor(wait=True)
+
+
 def test_break_even_worker_lifespan_starts_once_and_is_cancelled(tmp_path):
     started = threading.Event()
     stopped = threading.Event()

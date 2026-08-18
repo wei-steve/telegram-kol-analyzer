@@ -73,6 +73,9 @@ from telegram_kol_research.runtime_incident_adapters import (
     capture_notification_failure,
 )
 from telegram_kol_research.runtime_loop_health import LoopLagMonitor
+from telegram_kol_research.runtime_worker_executor import (
+    shutdown_management_worker_executor,
+)
 from telegram_kol_research.production_safety_monitor import (
     capture_uncaptured_runtime_incident_sources,
 )
@@ -4289,6 +4292,11 @@ def create_web_app(
                 except Exception:
                     pass
                 app.state.break_even_convergence_worker_task = None
+            # Both worker loops submit their blocking ticks here, so the
+            # executor is released only after both tasks are cancelled. The
+            # shutdown never waits: a tick already in flight finishes on its
+            # own thread, exactly as it did when it ran on the event loop.
+            shutdown_management_worker_executor(wait=False)
             source_deletion_worker_task = (
                 app.state.source_message_deletion_worker_task
             )

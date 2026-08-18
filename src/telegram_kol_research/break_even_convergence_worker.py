@@ -19,6 +19,9 @@ from telegram_kol_research.break_even_convergence_planner import (
     BreakEvenConvergencePlanningError,
     plan_or_adopt_break_even_convergence,
 )
+from telegram_kol_research.runtime_worker_executor import (
+    run_on_management_worker,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
     PositionProtectionLeg,
@@ -341,13 +344,16 @@ async def run_break_even_convergence_worker_loop(
 
     while True:
         try:
-            run_break_even_convergence_worker_tick(
+            await run_on_management_worker(
+                run_break_even_convergence_worker_tick,
                 session_factory,
                 deepcoin_client_factory=deepcoin_client_factory,
                 processed_at=(
                     now_provider() if now_provider is not None else datetime.now(UTC)
                 ),
             )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception("automatic break-even worker tick failed")
         await asyncio.sleep(max(0.01, float(interval_seconds)))

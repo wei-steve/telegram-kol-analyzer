@@ -14,6 +14,9 @@ from telegram_kol_research.execution_bindings import (
     load_deepcoin_execution_reconciliation_snapshot,
     reconcile_deepcoin_execution_bindings,
 )
+from telegram_kol_research.runtime_worker_executor import (
+    run_on_management_worker,
+)
 from telegram_kol_research.strategy_management_batches import (
     ManagementLegCreate,
     ManagementBatchRecord,
@@ -905,6 +908,36 @@ def _advance_temporary_visibility_retry(session_factory, *, batch_id: int, now: 
         session.commit()
 
 
+def _load_settings_and_run_strategy_management_tick(
+    session_factory,
+    *,
+    deepcoin_client_factory,
+    max_batches: int,
+    cursor: StrategyManagementWorkerCursor,
+    now_provider=None,
+    contract_spec_provider=None,
+) -> None:
+    """Run one settings read plus one tick as a single blocking unit.
+
+    Both are blocking, and they are submitted together so they stay on the same
+    thread and the pairing remains atomic, exactly as it was when both ran
+    inline on the event loop.
+    """
+
+    settings = load_trading_settings(session_factory)
+    run_strategy_management_worker_tick(
+        session_factory,
+        deepcoin_client_factory=deepcoin_client_factory,
+        max_batches=max_batches,
+        allow_execution=settings.live_management_execution_enabled,
+        cursor=cursor,
+        processed_at=(
+            now_provider() if now_provider is not None else datetime.now(UTC)
+        ),
+        contract_spec_provider=contract_spec_provider,
+    )
+
+
 async def run_strategy_management_worker_loop(
     *,
     session_factory,
@@ -919,18 +952,17 @@ async def run_strategy_management_worker_loop(
     cursor = StrategyManagementWorkerCursor()
     while True:
         try:
-            settings = load_trading_settings(session_factory)
-            run_strategy_management_worker_tick(
+            await run_on_management_worker(
+                _load_settings_and_run_strategy_management_tick,
                 session_factory,
                 deepcoin_client_factory=deepcoin_client_factory,
                 max_batches=max_batches,
-                allow_execution=settings.live_management_execution_enabled,
                 cursor=cursor,
-                processed_at=(
-                    now_provider() if now_provider is not None else datetime.now(UTC)
-                ),
+                now_provider=now_provider,
                 contract_spec_provider=contract_spec_provider,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception("strategy management worker tick failed")
         await asyncio.sleep(max(0.01, float(interval_seconds)))

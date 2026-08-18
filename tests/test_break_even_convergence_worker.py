@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 from telegram_kol_research.break_even_convergence_worker import (
     run_break_even_convergence_worker_tick,
@@ -288,3 +289,112 @@ def test_proven_tp1_fill_is_planned_and_executed_in_live_mode(tmp_path):
         assert convergence.trigger_identity == "tp-proven-1"
         assert convergence.execution_mode == "live"
     assert calls
+
+
+def test_both_worker_loops_share_one_single_worker_executor():
+    """Both loops must stay mutually exclusive after the thread offload.
+
+    Before Phase 1 the two ticks could not overlap only because both ran on the
+    event loop. They now run on a shared ``max_workers=1`` executor, which
+    preserves that exactly. Giving either loop its own pool would silently
+    introduce concurrency on shared management batches and protection state,
+    so this test asserts the observable consequence: same thread, no overlap.
+    """
+
+    import asyncio
+    import threading
+    import time
+
+    import pytest
+
+    from telegram_kol_research import break_even_convergence_worker as be_worker
+    from telegram_kol_research import strategy_management_worker as mgmt_worker
+    from telegram_kol_research.runtime_worker_executor import (
+        shutdown_management_worker_executor,
+    )
+
+    monkeypatch = pytest.MonkeyPatch()
+    shutdown_management_worker_executor(wait=True)
+
+    guard = threading.Lock()
+    active: list[str] = []
+    overlaps: list[tuple[str, ...]] = []
+    threads: set[str] = set()
+    seen: set[str] = set()
+    both_ran = threading.Event()
+
+    def _record(label: str):
+        with guard:
+            active.append(label)
+            if len(active) > 1:
+                overlaps.append(tuple(active))
+            threads.add(threading.current_thread().name)
+        time.sleep(0.01)
+        with guard:
+            active.remove(label)
+            seen.add(label)
+            if seen == {"management", "break-even"}:
+                both_ran.set()
+
+    monkeypatch.setattr(
+        mgmt_worker,
+        "run_strategy_management_worker_tick",
+        lambda *_args, **_kwargs: _record("management"),
+    )
+    monkeypatch.setattr(
+        mgmt_worker,
+        "load_trading_settings",
+        lambda _session_factory: SimpleNamespace(
+            live_management_execution_enabled=True
+        ),
+    )
+    monkeypatch.setattr(
+        be_worker,
+        "run_break_even_convergence_worker_tick",
+        lambda *_args, **_kwargs: _record("break-even"),
+    )
+
+    async def scenario():
+        tasks = [
+            asyncio.create_task(
+                mgmt_worker.run_strategy_management_worker_loop(
+                    session_factory=object(),
+                    deepcoin_client_factory=lambda: object(),
+                    interval_seconds=0.01,
+                    max_batches=1,
+                    now_provider=lambda: NOW,
+                )
+            ),
+            asyncio.create_task(
+                be_worker.run_break_even_convergence_worker_loop(
+                    object(),
+                    deepcoin_client_factory=lambda: object(),
+                    interval_seconds=0.01,
+                    now_provider=lambda: NOW,
+                )
+            ),
+        ]
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(both_ran.wait, 10.0), 15.0
+            )
+            await asyncio.sleep(0.2)
+        finally:
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        monkeypatch.undo()
+        shutdown_management_worker_executor(wait=True)
+
+    assert seen == {"management", "break-even"}
+    assert overlaps == []
+    assert len(threads) == 1
+    assert next(iter(threads)).startswith("mgmt-worker")

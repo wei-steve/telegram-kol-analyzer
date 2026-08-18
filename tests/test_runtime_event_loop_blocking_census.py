@@ -15,12 +15,6 @@ SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src" / "telegram_kol_resear
 # Every entry must name the phase that removes it.
 KNOWN_BLOCKING_CALLS = frozenset(
     {
-        # Phase 1 moves this tick off the event loop.
-        "strategy_management_worker.run_strategy_management_worker_loop"
-        " -> run_strategy_management_worker_tick",
-        # Phase 1 moves this tick off the event loop.
-        "break_even_convergence_worker.run_break_even_convergence_worker_loop"
-        " -> run_break_even_convergence_worker_tick",
         # Discovered by the Phase 0 census, beyond the two already identified.
         # Recorded in docs/runtime-serialization-remediation-status.md; not yet
         # assigned to a remediation phase.
