@@ -16,8 +16,8 @@ local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v
 design_version: 1
 current_phase: 1
 phase_name: unblock-event-loop
-phase_status: planned          # planned | claimed | in_progress | completed
-claimed_by: none               # phase 0 complete; phase 1 unclaimed
+phase_status: claimed          # planned | claimed | in_progress | completed
+claimed_by: session-45794fed   # claimed 2026-08-18 for phase 1
 current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-1-unblock-event-loop.md
 last_completed_phase: 0
 last_completed_commit: a00561bf7683091ae0a48471cbfc2af1e6b9fa8c
