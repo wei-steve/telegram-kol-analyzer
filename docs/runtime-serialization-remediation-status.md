@@ -14,18 +14,18 @@ deploy_branch: codex/deepcoin-auto-trading-v1   # matches the updater default; n
 integration_branch: codex/phase0-deploy-integration  # merged onto origin/deploy_branch (302c1ae); push this to deploy_branch
 local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v1 is 118 commits diverged from origin and is checked out in /private/tmp/tg-risk-routing.wmF2Vj. Do not use it. origin/codex/deepcoin-auto-trading-v1 is authoritative.
 design_version: 1
-current_phase: 0
-phase_name: loop-health-observability
-phase_status: in_progress      # planned | claimed | in_progress | completed
-claimed_by: none               # released 2026-08-18; tasks 1-5 done, task 6 (deploy + baseline) remains
-current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-0-loop-health-observability.md
-last_completed_phase: none
-last_completed_commit: none
+current_phase: 1
+phase_name: unblock-event-loop
+phase_status: planned          # planned | claimed | in_progress | completed
+claimed_by: none               # phase 0 complete; phase 1 unclaimed
+current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-1-unblock-event-loop.md
+last_completed_phase: 0
+last_completed_commit: a00561bf7683091ae0a48471cbfc2af1e6b9fa8c
 phase_0_code_commit: 816e296   # tasks 1-5; reviewed 2026-08-18. Task 6 (deploy + baseline) outstanding
 last_deployed_commit: a00561bf7683091ae0a48471cbfc2af1e6b9fa8c
 production_commit: a00561bf7683091ae0a48471cbfc2af1e6b9fa8c  # deployed 2026-08-18 16:12 UTC; was 302c1ae before this phase
 production_commit_before_phase_0: 302c1ae467b98bc954ac2a25cc4a33a8d09f48f9  # rollback target
-baseline_captured: false
+baseline_captured: true   # 64.9 minutes of real traffic, 2026-08-18 17:16 UTC
 phase_0_blocking_call_census:   # Task 4 Step 3 — verbatim discovered set, 2026-08-18
   - "strategy_management_worker.run_strategy_management_worker_loop -> run_strategy_management_worker_tick"
   - "break_even_convergence_worker.run_break_even_convergence_worker_loop -> run_break_even_convergence_worker_tick"
@@ -34,16 +34,21 @@ phase_0_census_third_offender_note: "The third entry is beyond the two the phase
 phase_0_local_suite_before: 5562   # tests collected at 816e296^ (0a61dfd)
 phase_0_local_suite_after: 5576    # 5575 passed, 1 skipped
 phase_0_partial_work_in_tree: false  # committed as 816e296 on 2026-08-18
-loop_lag_baseline_p99_ms: null
+loop_lag_baseline_p99_ms: 8777.887
 loop_lag_after_phase1_p99_ms: null
 local_tests:
   - "phase-0-partial: commit 816e296 covers Tasks 1 and 2 only (LoopLagMonitor plus lifespan wiring). Written by an earlier session, not independently reviewed. Verified after the fact with .venv (Python 3.12.12) because .venv313b has no bin/python: 11 focused tests pass, tests/test_web_app.py passes 194, and the complete suite passes 5575 with 1 skipped and 17 known deprecation warnings. Task 3 (loop-health endpoint), Task 4 (census allowlist recorded in the status file), Task 5 (suite baseline recorded), and Task 6 (deploy plus 60-minute production baseline) are all still outstanding."
-  - "phase-0-review-and-local-completion (2026-08-18, session-04451098): reviewed 816e296 against Tasks 1-3 rather than assuming it. Correction to the entry above: 816e296 in fact also contains Task 3 — GET /api/runtime/loop-health at src/telegram_kol_research/web_app.py:4770 plus three tests in tests/test_web_app.py. Review findings: LoopLagMonitor meets every Task 1 requirement (run/snapshot keys, deque(maxlen=7200) ring buffer, stall_threshold_ms=3000 with one warning per 60s via _last_stall_log_monotonic, injectable monotonic/now_provider/sleeper, no sleeping in tests); the lifespan wiring at web_app.py:3960 and the shutdown block at web_app.py:4201 match the existing contract_spec_refresh_task pattern byte-for-byte; the endpoint is declared async so it never depends on the shared threadpool. No defects found; no code changes were needed. Local runs with .venv (Python 3.12.12): tests/test_runtime_loop_health.py plus tests/test_runtime_event_loop_blocking_census.py 11 passed; tests/test_web_app.py 194 passed; full suite 5575 passed, 1 skipped, 17 known deprecation warnings, 352s. Suite baseline is exact, not approximate: collection at 816e296^ (0a61dfd, run in a throwaway worktree) is 5562 tests; collection at HEAD is 5576; delta 14 equals exactly the 14 tests 816e296 added (11 + 3), and the after run has zero failures. Task 6 (deploy plus 60-minute production baseline) is the only outstanding item and is blocked — see the Phase 0 Task 6 blocker section below."
+  - "phase-0-review-and-local-completion (2026-08-18, session-04451098): reviewed 816e296 against Tasks 1-3 rather than assuming it. Correction to the entry above: 816e296 in fact also contains Task 3 — GET /api/runtime/loop-health at src/telegram_kol_research/web_app.py:4770 plus three tests in tests/test_web_app.py. Review findings: LoopLagMonitor meets every Task 1 requirement (run/snapshot keys, deque(maxlen=7200) ring buffer, stall_threshold_ms=3000 with one warning per 60s via _last_stall_log_monotonic, injectable monotonic/now_provider/sleeper, no sleeping in tests); the lifespan wiring at web_app.py:3960 and the shutdown block at web_app.py:4201 match the existing contract_spec_refresh_task pattern byte-for-byte; the endpoint is declared async so it never depends on the shared threadpool. No defects found; no code changes were needed. Local runs with .venv (Python 3.12.12): tests/test_runtime_loop_health.py plus tests/test_runtime_event_loop_blocking_census.py 11 passed; tests/test_web_app.py 194 passed; full suite 5575 passed, 1 skipped, 17 known deprecation warnings, 352s. Suite baseline is exact, not approximate: collection at 816e296^ (0a61dfd, run in a throwaway worktree) is 5562 tests; collection at HEAD is 5576; delta 14 equals exactly the 14 tests 816e296 added (11 + 3), and the after run has zero failures. Task 6 (deploy plus 60-minute production baseline) was outstanding at the time of this entry; it was completed later the same day — see the server_verification entries and the 'how it was actually deployed' section."
 phase_0_deploy_delta: "302c1ae -> 6620613 is 4074 insertions and 0 deletions across 19 files. Production code touched: runtime_loop_health.py (new, 142 lines) and web_app.py (+36). The rest is docs (3341 lines) and tests (377). No existing line is modified or removed."
 phase_0_merged_suite: "5644 passed, 1 skipped, 0 failed on codex/phase0-deploy-integration (385s). Deploy branch alone collects 5631; merged collects 5645; delta 14 equals exactly the tests Phase 0 adds."
 server_verification:
-  - "phase-0-deploy (2026-08-18 16:12 UTC): DEPLOYED. Pushed codex/phase0-deploy-integration to codex/deepcoin-auto-trading-v1 as a fast-forward (302c1ae..a00561b, no force). Ran scripts/server_git_update.sh with EXPECTED_COMMIT=a00561bf7683091ae0a48471cbfc2af1e6b9fa8c CHANGE_CLASS=code; exit 0. Verified over ssh afterwards: HEAD=a00561b on codex/deepcoin-auto-trading-v1, telegram-kol.service active since 2026-08-19 00:12:02 CST, and GET /api/runtime/loop-health answers. FIRST ATTEMPT FAILED SAFELY and is worth recording: the script was run from the main checkout, which sits on codex/mimo-v1-baseline, so its deploy/telegram-kol-update hashed to e70aa550... while the server extracted a7e30187... from a00561b. The updater SHA256 guard refused and exited silently with production untouched at 302c1ae. The script must be run from a checkout of the commit being deployed. The guard worked as designed."
-  - "phase-0-baseline: NOT YET CAPTURED. First reading at uptime 123s, 2 minutes after the restart: samples 67, p50 1.161 ms, p95 8473.065 ms, p99 15160.203 ms, max 15160.203 ms, stall_count 10, worst_stall_ms 15160.203, window 122.885 s. This is NOT the baseline and must not be recorded as one: it covers only service startup, which loads positions and contract specs and syncs the exchange. It is logged only to show the endpoint answers and that the instrument registers stalls. The 60-minute steady-state capture across real message traffic is still outstanding, so baseline_captured stays false and loop_lag_baseline_p99_ms stays null." Nothing was pushed and nothing was deployed in this session. Task 6 is blocked on deploy-branch lineage (see the Phase 0 Task 6 blocker section); the updater fast-forwards, and 816e296 is not a descendant of origin/codex/deepcoin-auto-trading-v1 (302c1ae). No production baseline exists, so loop_lag_baseline_p99_ms stays null and baseline_captured stays false."
+  - "phase-0-deploy (2026-08-18 16:12 UTC): DEPLOYED. Pushed codex/phase0-deploy-integration to codex/deepcoin-auto-trading-v1 as a fast-forward (302c1ae..a00561b, no force). Ran scripts/server_git_update.sh with EXPECTED_COMMIT=a00561bf7683091ae0a48471cbfc2af1e6b9fa8c CHANGE_CLASS=code; exit 0. Verified over ssh: HEAD=a00561b on codex/deepcoin-auto-trading-v1, telegram-kol.service active since 2026-08-19 00:12:02 CST, GET /api/runtime/loop-health answers."
+  - "phase-0-deploy-first-attempt-failed-safely: the first run was issued from the main checkout, which sits on codex/mimo-v1-baseline, so its deploy/telegram-kol-update hashed to e70aa550 while the server extracted a7e30187 from a00561b. The updater SHA256 guard refused and exited silently with production untouched at 302c1ae. Run the script from a checkout of the commit being deployed. The guard worked as designed."
+  - "phase-0-baseline: CAPTURED 2026-08-18 17:16:57 UTC at uptime 3893 s, i.e. 64.9 minutes of real message traffic with no restart in between. samples 1886, window_seconds 3892.504, p50_ms 1.076, p95_ms 8311.911, p99_ms 8777.887, max_ms 15160.203, stall_count 365, worst_stall_ms 15160.203, last_stall_at 2026-08-18T17:16:53Z."
+  - "phase-0-baseline-journal: 61 'event loop stalled' warnings over the same window. That 61 is NOT the episode count. Logging is rate limited to one warning per 60 s, and 61 warnings across 64.9 minutes is exactly that limiter saturating, so the journal proves stalls were near continuous rather than counting them. stall_count 365 is the real episode count: one stall of 3 s or more every 10.7 s. Logged durations alternate around 6.1 s and 8.0 s at a ~62 s cadence; treat that alternation as a hypothesis about two recurring blockers, not a finding, since the limiter samples only the first stall per window."
+  - "phase-0-baseline-derived: the worst number is not a field in the payload. At interval 0.5 s an unblocked loop would have produced about 7785 samples in 3892.5 s; it produced 1886. Requested sleep totals 942.5 s, so 2950.0 s of the 3892.5 s window was lag: the event loop was unavailable roughly 76 percent of wall clock. The distribution is bimodal, not uniformly degraded, since p50 is 1.076 ms. That shape is the signature of discrete blocking calls rather than general overload, consistent with the census, and is what Phase 1 must move off the loop. Phase 1 is measured against loop_lag_baseline_p99_ms = 8777.887."
+  - "phase-0-endpoint-limitation: GET /api/runtime/loop-health does NOT satisfy the phase file requirement that it stay answerable while the loop is degraded. It is declared async, so it runs on the loop it measures and is unavailable for as long as the loop is blocked. Observed directly: a capture using curl --max-time 10 failed against a 15 s stall. Declaring it async was deliberate and does avoid the saturated shared executor, but the tradeoff was never stated. Workaround in use: retry with --max-time 40. Recorded, not fixed, because Phase 0 is observation only. Anyone querying this endpoint during an incident must expect it to time out."
+  - "phase-0-first-reading-after-deploy: superseded by the baseline above, kept for the record. At uptime 123 s, 2 minutes after the restart: samples 67, p50_ms 1.161, p95_ms 8473.065, p99_ms 15160.203, max_ms 15160.203, stall_count 10, worst_stall_ms 15160.203, window 122.885 s. Not usable as a baseline because it covers only service startup, which loads positions and contract specs and syncs the exchange."
 ```
 
 ## Claim protocol — read this before starting any phase
@@ -78,7 +83,7 @@ the 2026-08-18 incident.
 
 | Phase | File | Status |
 |---|---|---|
-| 0 | `phase-0-loop-health-observability.md` | in_progress — tasks 1-5 done, task 6 blocked |
+| 0 | `phase-0-loop-health-observability.md` | **completed** 2026-08-18, deployed a00561b, baseline captured |
 | 1 | `phase-1-unblock-event-loop.md` | planned |
 | 2 | `phase-2-per-chat-lock-sharding.md` | planned |
 | 3 | `phase-3-compensation-window-repair.md` | planned |
@@ -112,96 +117,92 @@ rather than assuming it is correct, then continue from Task 3.
 `src/telegram_kol_research/bound_close_writer_quiescence.py` is also untracked
 but predates this remediation and is unrelated to it — leave it alone.
 
-## Phase 0 Task 6 blocker — deploy branch lineage
+## Phase 0 — COMPLETE
 
-Task 6 deploys `816e296` with `-ChangeClass code` and then captures a 60-minute
-production baseline. It was **not** attempted, for a reason that no amount of
-waiting fixes:
+Deployed `a00561b` on 2026-08-18 16:12 UTC and captured a 64.9-minute production
+baseline. The completion criteria are met: the monitor runs in production, the
+endpoint answers, the baseline is recorded, the census passes with an explicit
+three-entry allowlist, and no trading behavior changed.
 
-- `816e296` is on `codex/mimo-v1-baseline`.
-- `deploy_branch` is `codex/deepcoin-auto-trading-v1`, currently `302c1ae` on the
-  remote.
-- The two diverged at `2274d90`. The deploy branch is **32 commits ahead** of
-  that point; the remediation branch carries **4 commits** the deploy branch does
-  not have (`72d726b`, `2fc0ad2`, `0a61dfd`, `816e296`).
+**The baseline, for Phase 1 to be measured against:**
 
-Step 9 of the updater is `git merge --ff-only <ExpectedCommit>`, so deploying
-`816e296` onto `codex/deepcoin-auto-trading-v1` fails: it is not a descendant of
-`302c1ae`. This is not a preflight `BLOCK` and it is not a safe-window problem —
-the deployment cannot even reach the preflight.
+| | |
+|---|---|
+| p50 | 1.076 ms |
+| p95 | 8311.911 ms |
+| **p99** | **8777.887 ms** |
+| max | 15160.203 ms |
+| stall episodes (>=3 s) | 365 in 64.9 min — one every 10.7 s |
+| worst stall | 15160.203 ms |
+| **loop unavailable** | **~76% of wall clock** |
 
-Resolving it means integrating the remediation work onto the deploy branch (merge
-or rebase `codex/mimo-v1-baseline` onto `codex/deepcoin-auto-trading-v1`, retest,
-push), which is a branch-integration decision affecting 32 commits of unrelated
-production work. That is outside an observation-only phase and was left for the
-user. Nothing was pushed and nothing was deployed.
+The 76% is derived, not reported: 1886 samples where an unblocked loop would
+have produced ~7785, leaving 2950.0 s of lag in a 3892.5 s window.
 
-Remaining Task 6 steps once the lineage is resolved:
+The distribution is bimodal — p50 is about 1 ms — so the loop is either healthy
+or blocked for seconds, never mildly slow. That is the signature of discrete
+blocking calls, matching the census, and it is what Phase 1 must fix.
 
-1. Push the integrated commit to `codex/deepcoin-auto-trading-v1`; confirm with
-   `git branch -r --contains HEAD`.
-2. `powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1 -ExpectedCommit <40-hex> -ChangeClass code`
-3. Let it run at least 60 minutes across real message traffic, then
-   `ssh -i ~/.ssh/tecent.pem root@43.167.220.225 'curl -s http://127.0.0.1:8000/api/runtime/loop-health'`
-   and record `p50_ms`, `p95_ms`, `p99_ms`, `max_ms`, `stall_count`,
-   `worst_stall_ms` into `loop_lag_baseline_p99_ms` and the ledger, plus the
-   journal stall-episode count and worst duration.
+Two things were found and deliberately **not** fixed, because Phase 0 is
+observation only:
 
-Until that is done, `baseline_captured` stays `false`, Phase 0 stays
-`in_progress`, and **Phase 1 must not start** — Phase 1's whole purpose is to be
-measured against this baseline.
+1. A third blocking call beyond the two the phase file named
+   (`system_operator_bot`, see `phase_0_blocking_call_census`).
+2. The loop-health endpoint cannot answer while the loop is stalled, which is
+   the one completion criterion the phase file wrote that the implementation
+   does not actually satisfy (see `phase-0-endpoint-limitation`).
 
-## Phase 0 Task 6 — lineage resolved, deploy still not run
+## Phase 0 Task 6 — how it was actually deployed
 
-The blocker above is resolved locally. Correcting its framing: the two branches
-did **not** entangle 32 commits of unrelated work. `codex/mimo-v1-baseline`
-carried nothing but this remediation — 3 planning-doc commits plus Phase 0's
-code — and all mimo v2 work predates the `2274d90` fork point, so both branches
-already had it. The deploy branch's 32 commits are entirely the deployment-gate
-work and are untouched.
+`codex/mimo-v1-baseline` could not be deployed directly: the updater
+fast-forwards, and it was not a descendant of the deploy branch. Correcting the
+framing that was written while that was still unresolved — the branches never
+entangled 32 commits of unrelated work. `codex/mimo-v1-baseline` carried nothing
+but this remediation (3 planning-doc commits plus Phase 0's code), and all mimo
+v2 work predates the `2274d90` fork point, so both branches already had it. The
+deploy branch's 32 commits are entirely the deployment-gate work and were never
+touched.
 
 `codex/phase0-deploy-integration` is `origin/codex/deepcoin-auto-trading-v1`
 (302c1ae) with `codex/mimo-v1-baseline` merged in. **Zero conflicts.**
 
 Verified on the merged branch, not on either branch alone:
 
-- Full suite: **5644 passed, 1 skipped, 0 failed** (385s, `.venv`, Python 3.12.12).
-- Exact counts: deploy branch alone collects 5631; merged collects 5645; the
+- Full suite: **5644 passed, 1 skipped, 0 failed** (385 s, `.venv`, Python 3.12.12).
+- Exact counts: the deploy branch alone collects 5631; merged collects 5645; the
   delta of 14 is exactly the 14 tests Phase 0 adds. No test was lost to the merge.
 - Imports were proven to resolve to the merged worktree, not the main checkout,
-  before the run was trusted (`pythonpath = ["src"]` wins over the editable
-  `.pth`).
+  before the run was trusted (`pythonpath = ["src"]` wins over the editable `.pth`).
 - The census re-run on the merged tree still returns exactly the 3 allowlisted
   offenders, so the deploy branch's 32 commits introduced no new blocking call.
 
-**Nothing has been pushed and nothing has been deployed.** Remaining steps:
+Production before the deploy was verified read-only over ssh to be `302c1ae`,
+exactly the tip of the remote deploy branch, which is what made the blast radius
+knowable: 4074 insertions, 0 deletions, of which only 178 lines
+(`runtime_loop_health.py` plus 36 lines in `web_app.py`) are production code.
+
+Then, from a checkout of the commit being deployed:
 
 ```bash
 git push origin codex/phase0-deploy-integration:codex/deepcoin-auto-trading-v1
-git rev-parse codex/phase0-deploy-integration   # 40-hex for -ExpectedCommit
+EXPECTED_COMMIT=a00561bf7683091ae0a48471cbfc2af1e6b9fa8c CHANGE_CLASS=code ./scripts/server_git_update.sh
 ```
 
-Then, from the repository root:
+The push was a fast-forward (`302c1ae..a00561b`, no force). The updater exited 0.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1 -ExpectedCommit <40-hex> -ChangeClass code
-```
+**The first attempt failed, and the reason matters for every later phase.** It
+was run from the main checkout, which sits on `codex/mimo-v1-baseline`, so the
+local `deploy/telegram-kol-update` hashed to `e70aa550` while the server
+extracted `a7e30187` from `a00561b`. The SHA256 guard refused and exited
+silently, leaving production untouched at `302c1ae`. There is a bash equivalent
+of the PowerShell command — `scripts/server_git_update.sh`, driven by
+environment variables — which matters because the workstation in use has no
+PowerShell. **Run it from a checkout of the commit being deployed, or the guard
+will refuse.**
 
-The push is a fast-forward: the merge commit's first parent is 302c1ae, so the
-updater's `git merge --ff-only` accepts it. If `deployment-preflight` returns
-`BLOCK`, read the reason, wait, and record it — do not retry blindly.
-
-After it runs at least 60 minutes across real message traffic:
-
-```bash
-ssh -i ~/.ssh/tecent.pem root@43.167.220.225 'curl -s http://127.0.0.1:8000/api/runtime/loop-health'
-```
-
-Record `p50_ms`, `p95_ms`, `p99_ms`, `max_ms`, `stall_count`, `worst_stall_ms`
-into `loop_lag_baseline_p99_ms` and `server_verification`, plus the journal
-stall-episode count and worst duration. Only then is Phase 0 complete and Phase 1
-allowed to start.
-
+Rollback target if needed: `302c1ae467b98bc954ac2a25cc4a33a8d09f48f9`, same
+change class. No schema migration and no persisted state, so nothing else has to
+be reversed.
 ## Deployment reminder
 
 Code is edited locally, pushed to GitHub, and pulled onto the server by the gated
