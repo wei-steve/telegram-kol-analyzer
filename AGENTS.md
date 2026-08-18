@@ -35,3 +35,28 @@ powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1
 
 - If the browser/web reader gets `403 Forbidden` for Deepcoin docs, retry from the local shell with PowerShell/.NET HTTP requests. The docs page `https://www.deepcoin.com/docs/zh/authentication` was confirmed readable from the local environment with HTTP `200 OK` on 2026-07-05.
 - The authentication page title is `接入指南 | DeepCoin API`. It documents API URL `https://api.deepcoin.com`, private REST headers `DC-ACCESS-KEY`, `DC-ACCESS-SIGN`, `DC-ACCESS-TIMESTAMP`, and `DC-ACCESS-PASSPHRASE`, and the signing string `timestamp + method + requestPath + body` using HMAC SHA256 with Base64 output.
+
+# Runtime Serialization Remediation
+
+- When the user says `请执行运行时串行化整改的下一个阶段`, first read:
+  1. `docs/runtime-serialization-remediation-status.md`
+  2. the single file named by its `current_phase_file`
+- **Claim the phase before touching any file.** If the status file shows the
+  phase is `claimed` or `in_progress` by another session, stop and say so. Two
+  sessions took the same phase on 2026-08-18 and collided in the shared
+  checkout. The claim protocol is in the status file.
+- **Never run `git add -A` in this repository.** Multiple sessions share this one
+  checkout, so `-A` commits other sessions' unfinished work. Stage explicit
+  paths and verify with `git diff --cached --name-only` before committing.
+- Do not read the other phase files. Each phase file is self-contained on
+  purpose, so that one session handles exactly one phase without accumulating
+  context.
+- The design rationale is in
+  `docs/plans/2026-08-18-runtime-serialization-remediation-design.md`. Read it
+  only if the phase file's stated root cause is unclear.
+- Implement exactly one phase per user turn. End the session by updating
+  `docs/runtime-serialization-remediation-status.md` as that phase file
+  instructs, recording what was proven and what remains outstanding.
+- This remediation changes when and on which thread recognition and execution
+  run. It must never change what they decide. Any phase that appears to require
+  a change in trading semantics has been misread — stop and report instead.
