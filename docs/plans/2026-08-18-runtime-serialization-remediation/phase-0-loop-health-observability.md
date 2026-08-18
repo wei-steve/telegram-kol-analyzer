@@ -26,24 +26,23 @@ saturate. This phase turns that suspicion into numbers.
 
 ## Before you start: partial work may already exist
 
-A parallel session began this phase and was stopped part way. Check the working
-tree before writing anything:
+A parallel session completed Tasks 1 and 2 and was stopped. That work is
+committed as `816e296`:
 
 [local]
 
 ```bash
-git status --short
+git show --stat 816e296
 ```
 
-If `src/telegram_kol_research/runtime_loop_health.py`,
-`tests/test_runtime_loop_health.py`,
-`tests/test_runtime_event_loop_blocking_census.py`, or modifications to
-`src/telegram_kol_research/web_app.py` are present, Tasks 1 and 2 are partly
-done. That work is **unreviewed** and its tests are not confirmed to pass.
+It adds `LoopLagMonitor` in `src/telegram_kol_research/runtime_loop_health.py`,
+wires it into the Web lifespan, and adds the census test. Its tests pass — 11
+focused, 194 in `tests/test_web_app.py`, and the full suite at 5575 passed with
+1 skipped — but the code has **not been independently reviewed**.
 
-Review it against Tasks 1 and 2 below and complete or correct it. Do not assume
-it is right, and do not assume it is wrong. Do not delete it without asking the
-user.
+Start by reviewing `816e296` against Tasks 1 and 2 below. Do not assume it is
+right and do not assume it is wrong. Then continue from **Task 3**; Tasks 3, 4,
+5, and 6 are all still outstanding.
 
 `src/telegram_kol_research/bound_close_writer_quiescence.py` is unrelated to this
 remediation — leave it alone.
