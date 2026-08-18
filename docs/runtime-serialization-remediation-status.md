@@ -22,8 +22,9 @@ current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phas
 last_completed_phase: none
 last_completed_commit: none
 phase_0_code_commit: 816e296   # tasks 1-5; reviewed 2026-08-18. Task 6 (deploy + baseline) outstanding
-last_deployed_commit: none
-production_commit: 302c1ae467b98bc954ac2a25cc4a33a8d09f48f9  # verified read-only over ssh 2026-08-18; branch codex/deepcoin-auto-trading-v1, telegram-kol.service active. Production is exactly the tip of origin/deploy_branch, so deploying the integration branch adds Phase 0 and nothing else.
+last_deployed_commit: a00561bf7683091ae0a48471cbfc2af1e6b9fa8c
+production_commit: a00561bf7683091ae0a48471cbfc2af1e6b9fa8c  # deployed 2026-08-18 16:12 UTC; was 302c1ae before this phase
+production_commit_before_phase_0: 302c1ae467b98bc954ac2a25cc4a33a8d09f48f9  # rollback target
 baseline_captured: false
 phase_0_blocking_call_census:   # Task 4 Step 3 — verbatim discovered set, 2026-08-18
   - "strategy_management_worker.run_strategy_management_worker_loop -> run_strategy_management_worker_tick"
@@ -41,7 +42,8 @@ local_tests:
 phase_0_deploy_delta: "302c1ae -> 6620613 is 4074 insertions and 0 deletions across 19 files. Production code touched: runtime_loop_health.py (new, 142 lines) and web_app.py (+36). The rest is docs (3341 lines) and tests (377). No existing line is modified or removed."
 phase_0_merged_suite: "5644 passed, 1 skipped, 0 failed on codex/phase0-deploy-integration (385s). Deploy branch alone collects 5631; merged collects 5645; delta 14 equals exactly the tests Phase 0 adds."
 server_verification:
-  - "phase-0: none. Nothing was pushed and nothing was deployed in this session. Task 6 is blocked on deploy-branch lineage (see the Phase 0 Task 6 blocker section); the updater fast-forwards, and 816e296 is not a descendant of origin/codex/deepcoin-auto-trading-v1 (302c1ae). No production baseline exists, so loop_lag_baseline_p99_ms stays null and baseline_captured stays false."
+  - "phase-0-deploy (2026-08-18 16:12 UTC): DEPLOYED. Pushed codex/phase0-deploy-integration to codex/deepcoin-auto-trading-v1 as a fast-forward (302c1ae..a00561b, no force). Ran scripts/server_git_update.sh with EXPECTED_COMMIT=a00561bf7683091ae0a48471cbfc2af1e6b9fa8c CHANGE_CLASS=code; exit 0. Verified over ssh afterwards: HEAD=a00561b on codex/deepcoin-auto-trading-v1, telegram-kol.service active since 2026-08-19 00:12:02 CST, and GET /api/runtime/loop-health answers. FIRST ATTEMPT FAILED SAFELY and is worth recording: the script was run from the main checkout, which sits on codex/mimo-v1-baseline, so its deploy/telegram-kol-update hashed to e70aa550... while the server extracted a7e30187... from a00561b. The updater SHA256 guard refused and exited silently with production untouched at 302c1ae. The script must be run from a checkout of the commit being deployed. The guard worked as designed."
+  - "phase-0-baseline: NOT YET CAPTURED. First reading at uptime 123s, 2 minutes after the restart: samples 67, p50 1.161 ms, p95 8473.065 ms, p99 15160.203 ms, max 15160.203 ms, stall_count 10, worst_stall_ms 15160.203, window 122.885 s. This is NOT the baseline and must not be recorded as one: it covers only service startup, which loads positions and contract specs and syncs the exchange. It is logged only to show the endpoint answers and that the instrument registers stalls. The 60-minute steady-state capture across real message traffic is still outstanding, so baseline_captured stays false and loop_lag_baseline_p99_ms stays null." Nothing was pushed and nothing was deployed in this session. Task 6 is blocked on deploy-branch lineage (see the Phase 0 Task 6 blocker section); the updater fast-forwards, and 816e296 is not a descendant of origin/codex/deepcoin-auto-trading-v1 (302c1ae). No production baseline exists, so loop_lag_baseline_p99_ms stays null and baseline_captured stays false."
 ```
 
 ## Claim protocol — read this before starting any phase
