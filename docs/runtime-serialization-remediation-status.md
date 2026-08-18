@@ -203,6 +203,33 @@ will refuse.**
 Rollback target if needed: `302c1ae467b98bc954ac2a25cc4a33a8d09f48f9`, same
 change class. No schema migration and no persisted state, so nothing else has to
 be reversed.
+## Before Phase 1 starts — read this
+
+Three things about this rollout are not derivable from the phase files, and one
+of them will stop a Phase 1 deployment cold if it is discovered too late.
+
+1. **Phase 1 deploys as `execution_writer`, which requires a live position
+   snapshot captured *before* the deployment starts, not during it.** The
+   updater refuses the class without `PREVIOUS_LIVE_SNAPSHOT_PATH`
+   (`-PreviousLiveSnapshotPath` in the PowerShell wrapper). Capture it as the
+   first step of the deploy task, not when the updater complains.
+2. **This workstation has no PowerShell.** Use the bash equivalent, which takes
+   its arguments as environment variables:
+   `EXPECTED_COMMIT=<40-hex> CHANGE_CLASS=execution_writer PREVIOUS_LIVE_SNAPSHOT_PATH=<path> ./scripts/server_git_update.sh`
+3. **Run the deploy script from a checkout of the commit being deployed.** The
+   updater compares the SHA256 of the local `deploy/telegram-kol-update` against
+   the copy inside the deployed commit and exits silently on a mismatch. This
+   cost one confusing failure in Phase 0.
+
+The authoritative checkout for this rollout is the worktree
+`.worktrees/runtime-serialization` on branch `codex/phase0-deploy-integration`,
+which is what gets pushed to `deploy_branch`. `codex/mimo-v1-baseline` is
+superseded — its copy of this file is frozen and says so.
+
+Phase 1 must also shrink `KNOWN_BLOCKING_CALLS` in
+`tests/test_runtime_event_loop_blocking_census.py`; the census asserts equality,
+so it fails until the allowlist matches reality.
+
 ## Deployment reminder
 
 Code is edited locally, pushed to GitHub, and pulled onto the server by the gated
