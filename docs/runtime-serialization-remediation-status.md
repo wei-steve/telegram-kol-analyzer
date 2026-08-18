@@ -14,8 +14,8 @@ deploy_branch: codex/deepcoin-auto-trading-v1   # matches the updater default; n
 design_version: 1
 current_phase: 0
 phase_name: loop-health-observability
-phase_status: in_progress      # planned | claimed | in_progress | completed
-claimed_by: none               # released; tasks 1-2 done, tasks 3-6 remain. # session id or a name you choose; see the claim protocol
+phase_status: claimed          # planned | claimed | in_progress | completed
+claimed_by: session-04451098   # claimed 2026-08-18; tasks 1-2 done, tasks 3-6 remain
 current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-0-loop-health-observability.md
 last_completed_phase: none
 last_completed_commit: none
