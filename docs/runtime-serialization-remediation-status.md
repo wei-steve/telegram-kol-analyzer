@@ -11,6 +11,8 @@ design_doc: docs/plans/2026-08-18-runtime-serialization-remediation-design.md
 index_doc: docs/plans/2026-08-18-runtime-serialization-remediation.md
 deployment_doc: docs/plans/2026-08-18-runtime-serialization-remediation/deployment-procedure.md
 deploy_branch: codex/deepcoin-auto-trading-v1   # matches the updater default; no -Branch needed
+integration_branch: codex/phase0-deploy-integration  # merged onto origin/deploy_branch (302c1ae); push this to deploy_branch
+local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v1 is 118 commits diverged from origin and is checked out in /private/tmp/tg-risk-routing.wmF2Vj. Do not use it. origin/codex/deepcoin-auto-trading-v1 is authoritative.
 design_version: 1
 current_phase: 0
 phase_name: loop-health-observability
@@ -36,6 +38,7 @@ loop_lag_after_phase1_p99_ms: null
 local_tests:
   - "phase-0-partial: commit 816e296 covers Tasks 1 and 2 only (LoopLagMonitor plus lifespan wiring). Written by an earlier session, not independently reviewed. Verified after the fact with .venv (Python 3.12.12) because .venv313b has no bin/python: 11 focused tests pass, tests/test_web_app.py passes 194, and the complete suite passes 5575 with 1 skipped and 17 known deprecation warnings. Task 3 (loop-health endpoint), Task 4 (census allowlist recorded in the status file), Task 5 (suite baseline recorded), and Task 6 (deploy plus 60-minute production baseline) are all still outstanding."
   - "phase-0-review-and-local-completion (2026-08-18, session-04451098): reviewed 816e296 against Tasks 1-3 rather than assuming it. Correction to the entry above: 816e296 in fact also contains Task 3 — GET /api/runtime/loop-health at src/telegram_kol_research/web_app.py:4770 plus three tests in tests/test_web_app.py. Review findings: LoopLagMonitor meets every Task 1 requirement (run/snapshot keys, deque(maxlen=7200) ring buffer, stall_threshold_ms=3000 with one warning per 60s via _last_stall_log_monotonic, injectable monotonic/now_provider/sleeper, no sleeping in tests); the lifespan wiring at web_app.py:3960 and the shutdown block at web_app.py:4201 match the existing contract_spec_refresh_task pattern byte-for-byte; the endpoint is declared async so it never depends on the shared threadpool. No defects found; no code changes were needed. Local runs with .venv (Python 3.12.12): tests/test_runtime_loop_health.py plus tests/test_runtime_event_loop_blocking_census.py 11 passed; tests/test_web_app.py 194 passed; full suite 5575 passed, 1 skipped, 17 known deprecation warnings, 352s. Suite baseline is exact, not approximate: collection at 816e296^ (0a61dfd, run in a throwaway worktree) is 5562 tests; collection at HEAD is 5576; delta 14 equals exactly the 14 tests 816e296 added (11 + 3), and the after run has zero failures. Task 6 (deploy plus 60-minute production baseline) is the only outstanding item and is blocked — see the Phase 0 Task 6 blocker section below."
+phase_0_merged_suite: "5644 passed, 1 skipped, 0 failed on codex/phase0-deploy-integration (385s). Deploy branch alone collects 5631; merged collects 5645; delta 14 equals exactly the tests Phase 0 adds."
 server_verification:
   - "phase-0: none. Nothing was pushed and nothing was deployed in this session. Task 6 is blocked on deploy-branch lineage (see the Phase 0 Task 6 blocker section); the updater fast-forwards, and 816e296 is not a descendant of origin/codex/deepcoin-auto-trading-v1 (302c1ae). No production baseline exists, so loop_lag_baseline_p99_ms stays null and baseline_captured stays false."
 ```
@@ -144,6 +147,57 @@ Remaining Task 6 steps once the lineage is resolved:
 Until that is done, `baseline_captured` stays `false`, Phase 0 stays
 `in_progress`, and **Phase 1 must not start** — Phase 1's whole purpose is to be
 measured against this baseline.
+
+## Phase 0 Task 6 — lineage resolved, deploy still not run
+
+The blocker above is resolved locally. Correcting its framing: the two branches
+did **not** entangle 32 commits of unrelated work. `codex/mimo-v1-baseline`
+carried nothing but this remediation — 3 planning-doc commits plus Phase 0's
+code — and all mimo v2 work predates the `2274d90` fork point, so both branches
+already had it. The deploy branch's 32 commits are entirely the deployment-gate
+work and are untouched.
+
+`codex/phase0-deploy-integration` is `origin/codex/deepcoin-auto-trading-v1`
+(302c1ae) with `codex/mimo-v1-baseline` merged in. **Zero conflicts.**
+
+Verified on the merged branch, not on either branch alone:
+
+- Full suite: **5644 passed, 1 skipped, 0 failed** (385s, `.venv`, Python 3.12.12).
+- Exact counts: deploy branch alone collects 5631; merged collects 5645; the
+  delta of 14 is exactly the 14 tests Phase 0 adds. No test was lost to the merge.
+- Imports were proven to resolve to the merged worktree, not the main checkout,
+  before the run was trusted (`pythonpath = ["src"]` wins over the editable
+  `.pth`).
+- The census re-run on the merged tree still returns exactly the 3 allowlisted
+  offenders, so the deploy branch's 32 commits introduced no new blocking call.
+
+**Nothing has been pushed and nothing has been deployed.** Remaining steps:
+
+```bash
+git push origin codex/phase0-deploy-integration:codex/deepcoin-auto-trading-v1
+git rev-parse codex/phase0-deploy-integration   # 40-hex for -ExpectedCommit
+```
+
+Then, from the repository root:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1 -ExpectedCommit <40-hex> -ChangeClass code
+```
+
+The push is a fast-forward: the merge commit's first parent is 302c1ae, so the
+updater's `git merge --ff-only` accepts it. If `deployment-preflight` returns
+`BLOCK`, read the reason, wait, and record it — do not retry blindly.
+
+After it runs at least 60 minutes across real message traffic:
+
+```bash
+ssh -i ~/.ssh/tecent.pem root@43.167.220.225 'curl -s http://127.0.0.1:8000/api/runtime/loop-health'
+```
+
+Record `p50_ms`, `p95_ms`, `p99_ms`, `max_ms`, `stall_count`, `worst_stall_ms`
+into `loop_lag_baseline_p99_ms` and `server_verification`, plus the journal
+stall-episode count and worst duration. Only then is Phase 0 complete and Phase 1
+allowed to start.
 
 ## Deployment reminder
 
