@@ -14,11 +14,11 @@ deploy_branch: codex/deepcoin-auto-trading-v1   # matches the updater default; n
 integration_branch: codex/phase0-deploy-integration  # merged onto origin/deploy_branch (302c1ae); push this to deploy_branch
 local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v1 is 118 commits diverged from origin and is checked out in /private/tmp/tg-risk-routing.wmF2Vj. Do not use it. origin/codex/deepcoin-auto-trading-v1 is authoritative.
 design_version: 1
-current_phase: 2
-phase_name: per-chat-lock-sharding
-phase_status: completed        # planned | claimed | in_progress | completed
-claimed_by: none               # phase 1 complete and deployed; phase 2 unclaimed
-current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-2-per-chat-lock-sharding.md
+current_phase: 1.5
+phase_name: unblock-operator-maintenance
+phase_status: claimed          # planned | claimed | in_progress | completed
+claimed_by: session-45794fed   # claimed 2026-08-18 for phase 1b
+current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-1b-unblock-operator-maintenance.md
 last_completed_phase: 1
 last_completed_commit: fd748d7aa7bf14acdf6c83d81fa137d1cdbab672
 phase_0_code_commit: 816e296   # tasks 1-5; reviewed 2026-08-18. Task 6 (deploy + baseline) outstanding
@@ -98,6 +98,7 @@ the 2026-08-18 incident.
 |---|---|---|
 | 0 | `phase-0-loop-health-observability.md` | **completed** 2026-08-18, deployed a00561b, baseline captured |
 | 1 | `phase-1-unblock-event-loop.md` | **completed** 2026-08-18, deployed fd748d7, p95 8312 -> 12 ms; one criterion unmet |
+| 1b | `phase-1b-unblock-operator-maintenance.md` | claimed 2026-08-18 — Phase 2's own prerequisite is unmet until this lands |
 | 2 | `phase-2-per-chat-lock-sharding.md` | planned |
 | 3 | `phase-3-compensation-window-repair.md` | planned |
 | 4 | `phase-4-durable-job-shadow-enqueue.md` | planned |
