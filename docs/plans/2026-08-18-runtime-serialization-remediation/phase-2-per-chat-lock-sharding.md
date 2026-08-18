@@ -235,18 +235,16 @@ unstage it with `git restore --staged <path>` before committing.
 
 **Deployment is a gated updater, not a manual pull.** Follow
 `docs/plans/2026-08-18-runtime-serialization-remediation/deployment-procedure.md`.
-This phase deploys with `-ChangeClass execution_writer`.
+There are no change classes on this branch — the only required argument is the
+commit, and schema changes are detected automatically.
 
-Because the class is `execution_writer`, capture a prior independent live
-position snapshot first and pass `-PreviousLiveSnapshotPath`.
+[local] Commit, push to the branch recorded as `deploy_branch` in the status
+file, confirm the commit is on the remote, then run
+`scripts/server_git_update.ps1` with that 40-hex SHA and `-Branch <deploy_branch>`.
 
-[local] Commit, push to the deploy branch recorded as `deploy_branch` in the
-status file, confirm the commit is on the remote, then run
-`scripts/server_git_update.ps1` with that 40-hex SHA and the change class above.
-
-The updater enforces the safe window itself through `deployment-preflight`
-before it stops the service. If it returns `BLOCK`, read the reason, wait, and
-record it — do not retry blindly.
+The updater enforces the safe window itself with an active-write check, before
+and after it stops the service. Exit code 3 means an exchange write is genuinely
+in flight — wait and retry later, do not work around it.
 
 Confirm the system behaves exactly as before and that `message_lock_mode` reads
 `global`.
@@ -292,7 +290,7 @@ deploy — `deployment-procedure.md` rollback level 1, and always the first thin
 to reach for.
 
 If the code itself must go, redeploy the previous known good 40-hex SHA with
-`-ChangeClass execution_writer`. There is no database migration in this phase.
+There is no database migration in this phase.
 
 ## Status file update
 

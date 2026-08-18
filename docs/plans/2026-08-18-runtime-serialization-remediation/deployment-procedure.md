@@ -3,6 +3,13 @@
 > Every phase file references this document for its deploy task. It is the one
 > place the deployment mechanics are written down, so they cannot drift between
 > phases. Read this together with your phase file; do not read other phase files.
+>
+> Verified against `deploy/telegram-kol-update` (448 lines) and
+> `scripts/server_git_update.ps1` as they exist on this branch. An earlier draft
+> of this document described a different, older updater that had a
+> `CHANGE_CLASS` parameter and a `deployment-preflight` gate. **Neither exists
+> here.** If you find `-ChangeClass` anywhere in these plans, it is stale — the
+> only required argument is the commit.
 
 ## The actual pipeline
 
@@ -12,91 +19,87 @@ ever instruct that.
 
 ```text
 [local]  edit -> test -> commit -> push to origin/<deploy branch>
-[local]  scripts/server_git_update.ps1 -ExpectedCommit <40-hex> -ChangeClass <class>
+[local]  scripts/server_git_update.ps1 -ExpectedCommit <40-hex>
             |
             v  ssh
 [server] deploy/telegram-kol-update, run as /usr/local/bin/telegram-kol-update
-         1. fetch origin/<branch>, assert FETCH_HEAD == ExpectedCommit
+         1. assert EXPECTED_COMMIT is 40 hex chars; fetch origin/<branch>
          2. assert the updater's own SHA256 matches the one in that commit
          3. assert telegram-kol.service is currently active
          4. take /run/telegram-kol-update.lock (one deployment at a time)
-         5. schema_compatible only: SQLite backup + migration dry run
-         6. deployment-preflight  <- gate 1, refuses to interrupt live work
-         7. systemctl stop telegram-kol.service
-         8. deployment-preflight + verify-deployment-preflight  <- gate 2
-         9. git checkout <branch> && git merge --ff-only <ExpectedCommit>
-        10. pip install -e .
-        11. reinstall the updater from the deployed commit
-        12. systemctl start telegram-kol.service, assert active
+         5. stage the candidate commit in a scratch worktree
+         6. auto-detect schema change by diffing models.py, db.py, migrations
+            between the deployed commit and the candidate; if changed, take a
+            SQLite backup and run a migration dry run with PRAGMA quick_check
+            and a watermark comparison
+         7. active-write check          <- gate 1, refuses to interrupt live work
+         8. systemctl stop telegram-kol.service (bounded by STOP_TIMEOUT_SECONDS)
+         9. active-write check again    <- gate 2, now that no writer can start
+        10. git checkout <branch> && git merge --ff-only <EXPECTED_COMMIT>
+        11. pip install -e .
+        12. install the updater from the deployed commit
+        13. systemctl start telegram-kol.service, assert active
+        14. verify HTTP health: GET /api/trading-settings, up to 20 attempts
 ```
 
-Three consequences that phase files depend on:
+Any failure after step 8 triggers an automatic rollback that restores the
+previously deployed commit, resets the branch ref, restores the previous updater
+binary, and restarts the service. If that rollback itself fails, the updater
+prints `ROLLBACK FAILED; telegram-kol.service may remain stopped.` — treat that
+as an incident, not a retry.
 
-- **The safe window is enforced, not asserted.** Step 6 is what stops a
-  deployment from interrupting a time-sensitive strategy operation. A phase that
-  says "prove a safe window" means: expect the preflight to pass, and if it
-  returns `BLOCK`, do not retry blindly — read the reason, wait, and record it.
-- **The server fast-forwards.** `git merge --ff-only` means the pushed commit
-  must be a descendant of what the server has. Never rewrite pushed history on
-  the deploy branch.
-- **The updater deploys itself.** Step 11 installs the updater from the commit
-  being deployed. Changing `deploy/telegram-kol-update` is therefore
-  self-applying and needs care — this matters in Phase 6.
+## What the safe-window gate actually checks
+
+Steps 7 and 9 run `telegram_kol_research.deployment_active_write_check` against
+the production database. It counts rows in in-flight states, including:
+
+- `position_backup_stop_orders` with status `submitting`
+- `execution_order_legs` with status `submitting` or `cancel_submitting`
+- `instruction_execution_contracts` with state `submitting`
+- `strategy_management_components` with status `submitting` or `cancel_submitting`
+- `strategy_management_batches` with status `executing`
+- `strategy_revision_batches` with status `submitting_replacements`
+
+The deployment proceeds only on `active_write_count=0`. Exit code 3 means
+`Deployment refused: active exchange write.`
+
+So when a phase file says "prove a safe window", it means: expect this check to
+pass. If it exits 3, an order is genuinely in flight — wait and retry later.
+Do not work around it.
+
+## No change classes
+
+There is no `CHANGE_CLASS`, no `-ChangeClass`, no `-PreviousLiveSnapshotPath`,
+no `-ReviewedShadowEvidencePath`, and no `-AuthorizeLivePromotion` on this
+branch. Every phase in this remediation deploys the same way.
+
+Schema changes are **detected automatically** in step 6 by diffing
+`src/telegram_kol_research/models.py`, `src/telegram_kol_research/db.py`, and
+`migrations`. Phase 4 adds a table and therefore trips that detection on its own;
+it needs no flag and no special argument. Keep the backup and dry-run evidence
+the updater produces — Phase 4 depends on it.
 
 ## The deploy branch
 
-The updater's default branch is `codex/deepcoin-auto-trading-v1`
-(`deploy/telegram-kol-update:5`, and the `-Branch` default in
-`scripts/server_git_update.ps1`).
+`deploy/telegram-kol-update:5` defaults `BRANCH` to
+`codex/deepcoin-auto-trading-v1`, and `scripts/server_git_update.ps1` has the
+same default.
 
-This remediation is committed to that same branch, recorded as `deploy_branch` in
-`docs/runtime-serialization-remediation-status.md`. Because it matches the
-updater default, `-Branch` does not need to be passed. Confirm the value in the
-status file before the first deployment rather than assuming it.
+This remediation lives on its own branch, recorded as `deploy_branch` in
+`docs/runtime-serialization-remediation-status.md`, because the local
+`codex/deepcoin-auto-trading-v1` had diverged from the pushed one. **Pass
+`-Branch` explicitly on every deployment in every phase**, and confirm the value
+in the status file first rather than assuming the default is right.
 
-The server fast-forwards onto that branch, so every phase commits and pushes
-there. Do not deploy from a different branch without passing `-Branch`, and never
-rewrite pushed history on it.
-
-## Change class per phase
-
-`CHANGE_CLASS` selects which gates run. Passing too weak a class skips a gate
-that exists for a reason.
-
-| Phase | Change class | Why |
-|---|---|---|
-| 0 | `code` | Additive observability only; no writer path, no schema |
-| 1 | `execution_writer` | Changes the thread the management and break-even writers run on |
-| 2 | `execution_writer` | Changes concurrency on the path that reaches order submission |
-| 3 | `execution_writer` | Recovery loop invokes `authoritative_processor`, which can execute |
-| 4 | `schema_compatible` | Adds the `message_processing_jobs` table and its index |
-| 5 | `execution_writer` | Adds a worker that submits orders |
-| 6 | `code` plus special handling | See the Phase 6 note below |
-
-Rules attached to these classes, from `deploy/telegram-kol-update:28-42`:
-
-- `execution_writer` and `live_promotion` **require** `-PreviousLiveSnapshotPath`
-  pointing at a prior independent live position snapshot. Capture it before
-  starting the deployment, not during.
-- `live_promotion` additionally requires `-ReviewedShadowEvidencePath` and
-  `-AuthorizeLivePromotion`. No phase in this remediation deploys as
-  `live_promotion`: the mode changes in phases 2, 4, and 5 are trading-settings
-  flips, not deployments.
-- `schema_compatible` triggers a SQLite backup and a migration dry run before and
-  after the service stops. Phase 4 depends on that evidence.
+The server fast-forwards (step 10), so never rewrite pushed history on the
+deploy branch.
 
 ## Standard deployment command
 
 Run from the local machine, from the repository root:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1 -ExpectedCommit <40-hex-sha> -ChangeClass <class>
-```
-
-For a writer-sensitive class, add the snapshot argument:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1 -ExpectedCommit <40-hex-sha> -ChangeClass execution_writer -PreviousLiveSnapshotPath /opt/telegram-kol-analyzer/data/web_cache/deepcoin_live_positions.json
+powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1 -ExpectedCommit <40-hex-sha> -Branch <deploy_branch from the status file>
 ```
 
 Get the SHA from the pushed commit:
@@ -124,6 +127,7 @@ cosmetic:
   that environment has no `bin/python` and cannot run the suite; `.venv`
   (Python 3.12.12) works and imports the package from `src/`. Verify before
   trusting either.
+
 - `[server]` — anything that touches the real Telegram session, the Deepcoin API
   (the key is IP-allowlisted to the server), production data, or the live HTTP
   endpoints. Reach it over ssh:
@@ -144,9 +148,8 @@ Three independent levels, in increasing cost:
    Reverting is a settings change: it takes effect immediately, with no deploy
    and no restart. This is always the first rollback to reach for.
 2. **Deploy the previous commit.** Run the same script with the previous known
-   good 40-hex SHA and the same change class. The updater's own failure path
-   already restores the previous commit if a deployment fails midway
-   (`previous_commit` and its cleanup trap).
+   good 40-hex SHA. The updater also rolls back on its own if a deployment fails
+   after the service stops.
 3. **Revert and redeploy.** Commit a revert locally, push, deploy it. Needed only
    when the previous commit is not a valid target.
 
@@ -156,9 +159,10 @@ That is stated in each of those phase files.
 ## Phase 6 note
 
 Phase 6 splits `telegram-kol.service` into three units. The updater hardcodes
-that service name in its precondition (`systemctl is-active --quiet
-telegram-kol.service`, step 3) and in its stop and start steps. It also
-reinstalls itself from the deployed commit.
+that service name in nine places, including its precondition
+(`deploy/telegram-kol-update:31`), the stop path (`:347`), the start and active
+assertions (`:395`, `:399`), and the rollback path (`:103`, `:132`, `:135`). It
+also reinstalls itself from the deployed commit (`:419`, `:424`).
 
 So the updater must be taught about the new topology **in a deployment that
 happens while the old topology is still running**, and the split itself is a

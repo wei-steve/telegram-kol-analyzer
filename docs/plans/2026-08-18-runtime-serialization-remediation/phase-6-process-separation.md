@@ -150,15 +150,19 @@ reorder it after the split.**
 - Modify: `scripts/server_git_update.ps1`
 - Modify: `tests/test_server_update_scripts.py`
 
-The gated updater hardcodes the single service in three places:
+The gated updater hardcodes the single service name in nine places
+(`deploy/telegram-kol-update`, 448 lines):
 
-- `systemctl is-active --quiet telegram-kol.service` as a precondition, which
-  **fails outright** once that unit is gone (`deploy/telegram-kol-update:48`)
-- `systemctl stop telegram-kol.service` before the checkout moves
-- `systemctl start telegram-kol.service` plus an active assertion afterwards
+- the precondition `systemctl is-active --quiet telegram-kol.service` (`:31`),
+  which **fails outright** once that unit is gone
+- the ActiveState poll used to confirm the unit stopped (`:60`)
+- the bounded stop (`:347`) and the start plus active assertion (`:395`, `:399`)
+- the automatic rollback path, which stops, restores, restarts, and re-asserts
+  the same unit (`:103`, `:132`, `:135`, `:138`)
 
-It also reinstalls itself from the commit being deployed
-(`install -o root -g root -m 0755 deploy/telegram-kol-update /usr/local/bin/telegram-kol-update`).
+It also reinstalls itself from the commit being deployed, via a candidate file
+that is moved into place atomically (`:419`, `:424`), keeping a backup it
+restores on rollback (`:90`).
 
 Two consequences:
 
@@ -191,8 +195,7 @@ identically. This task changes which units are cycled, nothing else.
 
 **Step 4 — Deploy the topology-aware updater by itself, first**
 
-Deploy this change alone, as `-ChangeClass code`, while the single unit is still
-running. Confirm it deploys successfully and that the installed
+Deploy this change alone, while the single unit is still running. Confirm it deploys successfully and that the installed
 `/usr/local/bin/telegram-kol-update` is the new version. Only then continue.
 
 This is the one deployment in the whole remediation that must be verified twice:
@@ -250,15 +253,16 @@ unstage it with `git restore --staged <path>` before committing.
 
 **Deployment is a gated updater, not a manual pull.** Follow
 `docs/plans/2026-08-18-runtime-serialization-remediation/deployment-procedure.md`.
-This phase deploys with `-ChangeClass code`.
+There are no change classes on this branch — the only required argument is the
+commit, and schema changes are detected automatically.
 
-[local] Commit, push to the deploy branch recorded as `deploy_branch` in the
-status file, confirm the commit is on the remote, then run
-`scripts/server_git_update.ps1` with that 40-hex SHA and the change class above.
+[local] Commit, push to the branch recorded as `deploy_branch` in the status
+file, confirm the commit is on the remote, then run
+`scripts/server_git_update.ps1` with that 40-hex SHA and `-Branch <deploy_branch>`.
 
-The updater enforces the safe window itself through `deployment-preflight`
-before it stops the service. If it returns `BLOCK`, read the reason, wait, and
-record it — do not retry blindly.
+The updater enforces the safe window itself with an active-write check, before
+and after it stops the service. Exit code 3 means an exchange write is genuinely
+in flight — wait and retry later, do not work around it.
 
 Confirm behavior is identical. The role selector is live but selecting the current
 topology. Let it run one full trading session before splitting.

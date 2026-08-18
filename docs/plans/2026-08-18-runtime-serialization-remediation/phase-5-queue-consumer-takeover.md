@@ -206,18 +206,16 @@ unstage it with `git restore --staged <path>` before committing.
 
 **Deployment is a gated updater, not a manual pull.** Follow
 `docs/plans/2026-08-18-runtime-serialization-remediation/deployment-procedure.md`.
-This phase deploys with `-ChangeClass execution_writer`.
+There are no change classes on this branch — the only required argument is the
+commit, and schema changes are detected automatically.
 
-Because the class is `execution_writer`, capture a prior independent live
-position snapshot first and pass `-PreviousLiveSnapshotPath`.
+[local] Commit, push to the branch recorded as `deploy_branch` in the status
+file, confirm the commit is on the remote, then run
+`scripts/server_git_update.ps1` with that 40-hex SHA and `-Branch <deploy_branch>`.
 
-[local] Commit, push to the deploy branch recorded as `deploy_branch` in the
-status file, confirm the commit is on the remote, then run
-`scripts/server_git_update.ps1` with that 40-hex SHA and the change class above.
-
-The updater enforces the safe window itself through `deployment-preflight`
-before it stops the service. If it returns `BLOCK`, read the reason, wait, and
-record it — do not retry blindly.
+The updater enforces the safe window itself with an active-write check, before
+and after it stops the service. Exit code 3 means an exchange write is genuinely
+in flight — wait and retry later, do not work around it.
 
 Confirm the mode is `shadow` and behavior is unchanged. The refactor from Task 1
 is live at this point, so verify recognition and execution still work normally
@@ -269,7 +267,7 @@ no deploy — `deployment-procedure.md` rollback level 1.
 
 Jobs already claimed complete on their own; new work returns to the inline path.
 The table and the worker stay in place, inert. If the code must go, redeploy the
-previous known good SHA with `-ChangeClass execution_writer`.
+previous known good SHA.
 
 ## Status file update
 

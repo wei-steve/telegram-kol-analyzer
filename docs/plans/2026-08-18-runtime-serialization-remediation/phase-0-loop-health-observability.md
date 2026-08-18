@@ -214,15 +214,16 @@ observation, but the safe-window rule still applies.
 
 **Deployment is a gated updater, not a manual pull.** Follow
 `docs/plans/2026-08-18-runtime-serialization-remediation/deployment-procedure.md`.
-This phase deploys with `-ChangeClass code`.
+There are no change classes on this branch — the only required argument is the
+commit, and schema changes are detected automatically.
 
-[local] Commit, push to the deploy branch recorded as `deploy_branch` in the
-status file, confirm the commit is on the remote, then run
-`scripts/server_git_update.ps1` with that 40-hex SHA and the change class above.
+[local] Commit, push to the branch recorded as `deploy_branch` in the status
+file, confirm the commit is on the remote, then run
+`scripts/server_git_update.ps1` with that 40-hex SHA and `-Branch <deploy_branch>`.
 
-The updater enforces the safe window itself through `deployment-preflight`
-before it stops the service. If it returns `BLOCK`, read the reason, wait, and
-record it — do not retry blindly.
+The updater enforces the safe window itself with an active-write check, before
+and after it stops the service. Exit code 3 means an exchange write is genuinely
+in flight — wait and retry later, do not work around it.
 
 If the preflight blocks and no window opens in this session, stop, leave the
 phase `in_progress`, and record the outstanding server step in the status file.
@@ -255,8 +256,7 @@ worst duration.
 ## Rollback
 
 No settings flag exists in this phase, so rollback is a redeploy: run
-`server_git_update.ps1` with the previous known good 40-hex SHA and
-`-ChangeClass code`. See `deployment-procedure.md`, rollback level 2.
+`server_git_update.ps1` with the previous known good 40-hex SHA. See `deployment-procedure.md`, rollback level 2.
 
 The module and endpoint are inert without the lifespan task, and there is no
 database migration and no persisted state, so nothing else has to be reversed.

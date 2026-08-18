@@ -237,18 +237,16 @@ unstage it with `git restore --staged <path>` before committing.
 
 **Deployment is a gated updater, not a manual pull.** Follow
 `docs/plans/2026-08-18-runtime-serialization-remediation/deployment-procedure.md`.
-This phase deploys with `-ChangeClass execution_writer`.
+There are no change classes on this branch — the only required argument is the
+commit, and schema changes are detected automatically.
 
-Because the class is `execution_writer`, capture a prior independent live
-position snapshot first and pass `-PreviousLiveSnapshotPath`.
+[local] Commit, push to the branch recorded as `deploy_branch` in the status
+file, confirm the commit is on the remote, then run
+`scripts/server_git_update.ps1` with that 40-hex SHA and `-Branch <deploy_branch>`.
 
-[local] Commit, push to the deploy branch recorded as `deploy_branch` in the
-status file, confirm the commit is on the remote, then run
-`scripts/server_git_update.ps1` with that 40-hex SHA and the change class above.
-
-The updater enforces the safe window itself through `deployment-preflight`
-before it stops the service. If it returns `BLOCK`, read the reason, wait, and
-record it — do not retry blindly.
+The updater enforces the safe window itself with an active-write check, before
+and after it stops the service. Exit code 3 means an exchange write is genuinely
+in flight — wait and retry later, do not work around it.
 
 Also confirm no management batch is mid-submission before starting. If the
 preflight blocks and no window opens in this session, stop, leave the phase
@@ -290,8 +288,8 @@ purpose of this phase is that nothing changes except responsiveness.
 ## Rollback
 
 No settings flag exists in this phase, so rollback is a redeploy of the previous
-known good 40-hex SHA with `-ChangeClass execution_writer` and a fresh
-`-PreviousLiveSnapshotPath`. See `deployment-procedure.md`, rollback level 2.
+known good 40-hex SHA. See
+`deployment-procedure.md`, rollback level 2.
 
 There is no database change and no persisted state, so the revert is complete.
 The Phase 0 monitor stays in place and keeps reporting throughout.

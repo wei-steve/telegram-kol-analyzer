@@ -10,7 +10,8 @@ project: runtime-serialization-remediation
 design_doc: docs/plans/2026-08-18-runtime-serialization-remediation-design.md
 index_doc: docs/plans/2026-08-18-runtime-serialization-remediation.md
 deployment_doc: docs/plans/2026-08-18-runtime-serialization-remediation/deployment-procedure.md
-deploy_branch: codex/deepcoin-auto-trading-v1   # matches the updater default; no -Branch needed
+deploy_branch: codex/runtime-serialization-remediation   # NOT the updater default; pass -Branch every time
+branch_base: origin/codex/deepcoin-auto-trading-v1 @ 302c1ae   # the branch the server actually fetches
 design_version: 1
 current_phase: 0
 phase_name: loop-health-observability
@@ -101,9 +102,30 @@ but predates this remediation and is unrelated to it — leave it alone.
 
 Code is edited locally, pushed to GitHub, and pulled onto the server by the gated
 updater `deploy/telegram-kol-update`, driven from the local machine by
-`scripts/server_git_update.ps1` with an exact 40-hex commit and a change class.
-Nobody runs `git pull` on the server by hand. `deploy_branch` above is the branch
-the server fetches; set it before the first deployment.
+`scripts/server_git_update.ps1` with an exact 40-hex commit. Nobody runs
+`git pull` on the server by hand.
+
+There are **no change classes** on this branch. The only required argument is the
+commit; schema changes are detected automatically. An earlier draft of these
+plans described an older updater with a `CHANGE_CLASS` parameter and a
+`deployment-preflight` gate — that updater is not what the server runs. See
+`deployment-procedure.md`.
+
+## Why this branch exists
+
+On 2026-08-18 the local `codex/deepcoin-auto-trading-v1` was found to have
+diverged from the pushed branch of the same name a week earlier, at `2274d90`:
+
+- pushed branch: 32 commits, simplifying the deployment gate — **this is what the
+  server fetches**, and the user confirmed it is the version to keep
+- local branch: 118 commits, of which 19 are an abandoned mimo recognition v2
+  rebuild; the rest are unrelated work that has not been assessed
+
+Rather than resolve that divergence first, this remediation was branched from the
+pushed branch so it can proceed against the code the server actually runs. The
+local branch's 118 commits are preserved on GitHub as
+`origin/codex/protect-deepcoin-auto-trading-v1-442f6538-20260817` and are a
+separate matter.
 
 ## How to update this file
 

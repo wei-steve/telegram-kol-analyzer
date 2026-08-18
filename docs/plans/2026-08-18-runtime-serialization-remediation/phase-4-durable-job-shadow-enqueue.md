@@ -197,19 +197,20 @@ unstage it with `git restore --staged <path>` before committing.
 
 **Deployment is a gated updater, not a manual pull.** Follow
 `docs/plans/2026-08-18-runtime-serialization-remediation/deployment-procedure.md`.
-This phase deploys with `-ChangeClass schema_compatible`.
+There are no change classes on this branch — the only required argument is the
+commit, and schema changes are detected automatically.
 
-Because the class is `schema_compatible`, the updater takes a SQLite backup
-and runs a migration dry run before and after the service stops. Keep that
-evidence; this phase depends on it.
+This phase adds a table, so the updater's automatic schema detection trips: it
+takes a SQLite backup and runs a migration dry run with `PRAGMA quick_check` and
+a watermark comparison. Keep that evidence — this phase depends on it.
 
-[local] Commit, push to the deploy branch recorded as `deploy_branch` in the
-status file, confirm the commit is on the remote, then run
-`scripts/server_git_update.ps1` with that 40-hex SHA and the change class above.
+[local] Commit, push to the branch recorded as `deploy_branch` in the status
+file, confirm the commit is on the remote, then run
+`scripts/server_git_update.ps1` with that 40-hex SHA and `-Branch <deploy_branch>`.
 
-The updater enforces the safe window itself through `deployment-preflight`
-before it stops the service. If it returns `BLOCK`, read the reason, wait, and
-record it — do not retry blindly.
+The updater enforces the safe window itself with an active-write check, before
+and after it stops the service. Exit code 3 means an exchange write is genuinely
+in flight — wait and retry later, do not work around it.
 
 After it completes, confirm the table exists and is empty, and that
 `message_pipeline_mode` reads `inline`.
@@ -266,7 +267,7 @@ restart and no deploy — `deployment-procedure.md` rollback level 1.
 
 Leave the table in place. Nothing reads it, an unused table is harmless, and
 dropping it would be a destructive migration for no benefit. If the code must go,
-redeploy the previous known good SHA with `-ChangeClass code` — the table already
+redeploy the previous known good SHA — the table already
 exists on the server, so the rollback deployment is not schema-affecting.
 
 ## Status file update
