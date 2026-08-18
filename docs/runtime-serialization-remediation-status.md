@@ -14,18 +14,20 @@ deploy_branch: codex/deepcoin-auto-trading-v1   # matches the updater default; n
 design_version: 1
 current_phase: 0
 phase_name: loop-health-observability
-phase_status: planned          # planned | claimed | in_progress | completed
-claimed_by: none               # session id or a name you choose; see the claim protocol
+phase_status: in_progress      # planned | claimed | in_progress | completed
+claimed_by: none               # released; tasks 1-2 done, tasks 3-6 remain. # session id or a name you choose; see the claim protocol
 current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-0-loop-health-observability.md
 last_completed_phase: none
 last_completed_commit: none
+phase_0_code_commit: 816e296   # tasks 1-2 only; endpoint/census/baseline outstanding
 last_deployed_commit: none
 production_commit: unknown
 baseline_captured: false
-phase_0_partial_work_in_tree: true   # see the note below before starting phase 0
+phase_0_partial_work_in_tree: false  # committed as 816e296 on 2026-08-18
 loop_lag_baseline_p99_ms: null
 loop_lag_after_phase1_p99_ms: null
-local_tests: []
+local_tests:
+  - "phase-0-partial: commit 816e296 covers Tasks 1 and 2 only (LoopLagMonitor plus lifespan wiring). Written by an earlier session, not independently reviewed. Verified after the fact with .venv (Python 3.12.12) because .venv313b has no bin/python: 11 focused tests pass, tests/test_web_app.py passes 194, and the complete suite passes 5575 with 1 skipped and 17 known deprecation warnings. Task 3 (loop-health endpoint), Task 4 (census allowlist recorded in the status file), Task 5 (suite baseline recorded), and Task 6 (deploy plus 60-minute production baseline) are all still outstanding."
 server_verification: []
 ```
 
@@ -73,10 +75,10 @@ All phase files live in
 `docs/plans/2026-08-18-runtime-serialization-remediation/`, alongside
 `deployment-procedure.md`, which every phase uses for its deploy step.
 
-## Uncommitted Phase 0 work already in the working tree
+## Phase 0 partial work (resolved, kept for context)
 
-A parallel session began Phase 0 and was stopped part way. As of 2026-08-18 the
-working tree contains, uncommitted:
+A parallel session began Phase 0 and was stopped part way. Its work is now
+committed as `816e296` and the working tree is clean. It contained:
 
 - `src/telegram_kol_research/runtime_loop_health.py` (new, ~142 lines,
   `LoopLagMonitor` implemented)
@@ -86,12 +88,11 @@ working tree contains, uncommitted:
   `LoopLagMonitor`, constructs `app.state.loop_lag_monitor`, starts
   `loop_lag_monitor_task` in the lifespan, cancels it on shutdown)
 
-This work has **not been reviewed** and its tests have not been confirmed to
-pass. Roughly it covers Phase 0 Tasks 1 and 2.
+It covers Phase 0 Tasks 1 and 2. Its tests were run after the fact and pass, but
+the code has **not been independently reviewed**.
 
-The Phase 0 session must start by reviewing it against the phase file rather
-than assuming it is correct or assuming the tree is clean. Do not delete it
-without checking with the user first.
+The Phase 0 session must start by reviewing `816e296` against Tasks 1 and 2
+rather than assuming it is correct, then continue from Task 3.
 
 `src/telegram_kol_research/bound_close_writer_quiescence.py` is also untracked
 but predates this remediation and is unrelated to it — leave it alone.
