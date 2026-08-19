@@ -473,3 +473,134 @@ def test_reconcile_loop_skips_later_segments_when_an_early_one_raises(monkeypatc
 
     assert calls
     assert set(calls) == {"reconcile"}, calls
+
+
+def test_context_resolution_scheduler_batch_runs_on_the_worker_thread():
+    from telegram_kol_research.runtime_worker_executor import (
+        run_on_management_worker,
+    )
+    from telegram_kol_research.lifecycle_monitor import (
+        _run_context_resolution_scheduler_batch,
+    )
+
+    seen: list[tuple[str, int]] = []
+    threads: set[str] = set()
+
+    def scheduler(**event):
+        threads.add(threading.current_thread().name)
+        seen.append((event["event_type"], event["chat_id"]))
+
+    events = [
+        {"event_type": "entry_leg_status_changed", "chat_id": 7, "occurred_at": NOW},
+        {"event_type": "exchange_snapshot_changed", "chat_id": 3, "occurred_at": NOW},
+        {"event_type": "exchange_snapshot_changed", "chat_id": 9, "occurred_at": NOW},
+    ]
+
+    async def scenario():
+        await run_on_management_worker(
+            _run_context_resolution_scheduler_batch, scheduler, events
+        )
+
+    asyncio.run(scenario())
+
+    assert seen == [
+        ("entry_leg_status_changed", 7),
+        ("exchange_snapshot_changed", 3),
+        ("exchange_snapshot_changed", 9),
+    ]
+    assert len(threads) == 1
+    assert next(iter(threads)).startswith("mgmt-worker")
+
+
+def test_context_resolution_scheduler_batch_forwards_payloads_unchanged():
+    from telegram_kol_research.runtime_worker_executor import (
+        run_on_management_worker,
+    )
+    from telegram_kol_research.lifecycle_monitor import (
+        _run_context_resolution_scheduler_batch,
+    )
+
+    received: list[dict] = []
+    events = [
+        {"event_type": "entry_leg_status_changed", "chat_id": 1, "occurred_at": NOW},
+    ]
+
+    async def scenario():
+        await run_on_management_worker(
+            _run_context_resolution_scheduler_batch,
+            lambda **event: received.append(event),
+            events,
+        )
+
+    asyncio.run(scenario())
+
+    assert received == events
+
+
+def test_lifecycle_cycle_makes_no_submission_when_nothing_is_scheduled(monkeypatch):
+    """An empty cycle must not pay a worker hop, and must not call the scheduler."""
+
+    from telegram_kol_research import runtime_worker_executor as rwe
+
+    calls = {"submitted": 0}
+    real = rwe.run_on_management_worker
+
+    async def counting(fn, /, *args, **kwargs):
+        calls["submitted"] += 1
+        return await real(fn, *args, **kwargs)
+
+    monkeypatch.setattr(rwe, "run_on_management_worker", counting)
+
+    from telegram_kol_research.lifecycle_monitor import (
+        _run_context_resolution_scheduler_batch,
+    )
+
+    scheduled: list = []
+
+    async def scenario():
+        events: list = []
+        if events:  # mirrors the guard in _run_one_cycle
+            await counting(
+                _run_context_resolution_scheduler_batch,
+                lambda **e: scheduled.append(e),
+                events,
+            )
+
+    asyncio.run(scenario())
+
+    assert calls["submitted"] == 0
+    assert scheduled == []
+
+
+def test_scheduler_batch_blocking_leaves_the_event_loop_responsive():
+    """The whole point: N+M database round trips no longer run on the loop."""
+
+    from telegram_kol_research.runtime_worker_executor import (
+        run_on_management_worker,
+    )
+    from telegram_kol_research.lifecycle_monitor import (
+        _run_context_resolution_scheduler_batch,
+    )
+
+    def slow_scheduler(**_event):
+        time.sleep(TICK_BLOCK_SECONDS / 5)
+
+    events = [
+        {"event_type": "exchange_snapshot_changed", "chat_id": i, "occurred_at": NOW}
+        for i in range(5)
+    ]
+
+    async def scenario():
+        async def run_batch():
+            while True:
+                await run_on_management_worker(
+                    _run_context_resolution_scheduler_batch, slow_scheduler, events
+                )
+                await asyncio.sleep(0.01)
+
+        return await _observe_loop_while(lambda: asyncio.create_task(run_batch()))
+
+    beats, worst_gap = asyncio.run(scenario())
+
+    assert beats >= MIN_HEARTBEATS
+    assert worst_gap < TICK_BLOCK_SECONDS

@@ -25,6 +25,9 @@ from sqlalchemy import and_, exists, func, or_
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.live_updates import LiveUpdateBroker
+from telegram_kol_research.runtime_worker_executor import (
+    run_on_management_worker,
+)
 from telegram_kol_research.lifecycle_exit_intents import (
     has_live_execution_binding,
     record_lifecycle_exit_intent,
@@ -249,6 +252,18 @@ class LifecycleMonitorConfig:
 
 
 # ── monitor ──────────────────────────────────────────────────────────
+
+
+def _run_context_resolution_scheduler_batch(scheduler, events) -> None:
+    """Replay one cycle's scheduler events on a worker thread, in order.
+
+    The scheduler is an injected callback that reaches
+    ``context_resolution_worker.schedule_context_reanalysis``, which queries and
+    writes the database. It ran on the event loop until Phase 1e.
+    """
+
+    for event in events:
+        scheduler(**event)
 
 
 class LifecycleMonitor:
@@ -605,19 +620,30 @@ class LifecycleMonitor:
                     )
                     .all()
                 )
+            scheduled_events: list[dict[str, Any]] = []
             for transition in all_transitions:
                 chat_id = chat_ids.get(transition.signal_id)
                 if chat_id is not None:
-                    self._context_resolution_scheduler(
-                        event_type="entry_leg_status_changed",
-                        chat_id=int(chat_id),
-                        occurred_at=transition.occurred_at or now,
-                    )
+                    scheduled_events.append({
+                        "event_type": "entry_leg_status_changed",
+                        "chat_id": int(chat_id),
+                        "occurred_at": transition.occurred_at or now,
+                    })
             for chat_id in sorted({int(signal.chat_id) for signal in all_signals}):
-                self._context_resolution_scheduler(
-                    event_type="exchange_snapshot_changed",
-                    chat_id=chat_id,
-                    occurred_at=now,
+                scheduled_events.append({
+                    "event_type": "exchange_snapshot_changed",
+                    "chat_id": chat_id,
+                    "occurred_at": now,
+                })
+            # Each scheduled event runs a ContextResolutionAttempt JOIN RawMessage
+            # query and then writes, so N transitions plus M chats used to mean
+            # N+M database round trips on the event loop. Submitted as one batch
+            # because the originals ran back to back with nothing between them.
+            if scheduled_events:
+                await run_on_management_worker(
+                    _run_context_resolution_scheduler_batch,
+                    self._context_resolution_scheduler,
+                    scheduled_events,
                 )
         if self._context_resolution_worker is not None:
             await asyncio.to_thread(self._context_resolution_worker)
