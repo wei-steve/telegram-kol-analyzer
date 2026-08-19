@@ -12,7 +12,7 @@ ever instruct that.
 
 ```text
 [local]  edit -> test -> commit -> push to origin/<deploy branch>
-[local]  scripts/server_git_update.ps1 -ExpectedCommit <40-hex> -ChangeClass <class>
+[local]  EXPECTED_COMMIT=<40-hex branch tip> ./scripts/server_git_update.sh
             |
             v  ssh
 [server] deploy/telegram-kol-update, run as /usr/local/bin/telegram-kol-update
@@ -20,14 +20,15 @@ ever instruct that.
          2. assert the updater's own SHA256 matches the one in that commit
          3. assert telegram-kol.service is currently active
          4. take /run/telegram-kol-update.lock (one deployment at a time)
-         5. schema_compatible only: SQLite backup + migration dry run
-         6. deployment-preflight  <- gate 1, refuses to interrupt live work
+         5. auto-detected schema change only: SQLite backup + migration dry run
+         6. deployment_active_write_check  <- gate 1, refuses on an active exchange write
          7. systemctl stop telegram-kol.service
-         8. deployment-preflight + verify-deployment-preflight  <- gate 2
+         8. deployment_active_write_check again  <- gate 2
          9. git checkout <branch> && git merge --ff-only <ExpectedCommit>
         10. pip install -e .
-        11. reinstall the updater from the deployed commit
-        12. systemctl start telegram-kol.service, assert active
+        11. systemctl start telegram-kol.service, assert active
+        12. verify_http_health polls /api/trading-settings, then reinstall the
+            updater from the deployed commit
 ```
 
 Three consequences that phase files depend on:
@@ -58,59 +59,70 @@ The server fast-forwards onto that branch, so every phase commits and pushes
 there. Do not deploy from a different branch without passing `-Branch`, and never
 rewrite pushed history on it.
 
-## Change class per phase
+## There is no change class — corrected 2026-08-19 (Phase 1b)
 
-`CHANGE_CLASS` selects which gates run. Passing too weak a class skips a gate
-that exists for a reason.
+Earlier versions of this document, and every phase file, specified a
+`-ChangeClass` per phase and a `-PreviousLiveSnapshotPath` for writer-sensitive
+phases. **None of those arguments exist.**
 
-| Phase | Change class | Why |
-|---|---|---|
-| 0 | `code` | Additive observability only; no writer path, no schema |
-| 1 | `execution_writer` | Changes the thread the management and break-even writers run on |
-| 2 | `execution_writer` | Changes concurrency on the path that reaches order submission |
-| 3 | `execution_writer` | Recovery loop invokes `authoritative_processor`, which can execute |
-| 4 | `schema_compatible` | Adds the `message_processing_jobs` table and its index |
-| 5 | `execution_writer` | Adds a worker that submits orders |
-| 6 | `code` plus special handling | See the Phase 6 note below |
+- `deploy/telegram-kol-update` reads only `EXPECTED_COMMIT` and `BRANCH`.
+- `scripts/server_git_update.sh` exports only `SERVER`, `KEY_PATH`, `BRANCH`,
+  `EXPECTED_COMMIT`.
+- `scripts/server_git_update.ps1` has no `-ChangeClass` parameter.
 
-Rules attached to these classes, from `deploy/telegram-kol-update:28-42`:
+Phase 0's recorded `CHANGE_CLASS=code` was an inert environment variable, not a
+gate selection. Setting these does nothing; it does not weaken a gate, but it
+also does not select one, and believing otherwise gives false assurance.
 
-- `execution_writer` and `live_promotion` **require** `-PreviousLiveSnapshotPath`
-  pointing at a prior independent live position snapshot. Capture it before
-  starting the deployment, not during.
-- `live_promotion` additionally requires `-ReviewedShadowEvidencePath` and
-  `-AuthorizeLivePromotion`. No phase in this remediation deploys as
-  `live_promotion`: the mode changes in phases 2, 4, and 5 are trading-settings
-  flips, not deployments.
-- `schema_compatible` triggers a SQLite backup and a migration dry run before and
-  after the service stops. Phase 4 depends on that evidence.
+What the updater actually enforces, on every deployment regardless of what the
+change contains:
+
+- **Safe window** — `telegram_kol_research.deployment_active_write_check`, run
+  immediately before *and* immediately after the service stop. Exit 3 means
+  "refused: active exchange write". This is automatic; there is nothing for a
+  phase to pass in, and nothing a phase can skip.
+- **Schema** — auto-detected by diffing `src/telegram_kol_research/models.py`,
+  `src/telegram_kol_research/db.py` and `migrations/` between the current and
+  candidate commits. A detected change triggers the SQLite backup and migration
+  dry run by itself.
+- **Health** — `verify_http_health` polls `/api/trading-settings` up to 20 times
+  after start; the cleanup trap rolls production back to the previous commit if
+  any step fails.
+
+Capturing a live position snapshot before a writer-sensitive deployment is still
+worth doing as evidence. The updater simply has no argument to receive it.
 
 ## Standard deployment command
 
-Run from the local machine, from the repository root:
+Run from the local machine, **from a checkout of the commit being deployed** —
+the updater compares the SHA256 of the local `deploy/telegram-kol-update`
+against the copy inside that commit and exits silently on a mismatch. This cost
+one confusing failure in Phase 0.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1 -ExpectedCommit <40-hex-sha> -ChangeClass <class>
+```bash
+EXPECTED_COMMIT=<40-hex> ./scripts/server_git_update.sh
 ```
 
-For a writer-sensitive class, add the snapshot argument:
+There is a PowerShell wrapper, `scripts/server_git_update.ps1`, but this
+workstation has no PowerShell. Use the bash path.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1 -ExpectedCommit <40-hex-sha> -ChangeClass execution_writer -PreviousLiveSnapshotPath /opt/telegram-kol-analyzer/data/web_cache/deepcoin_live_positions.json
-```
+**`EXPECTED_COMMIT` must be the current tip of the deploy branch, not merely the
+commit whose change you care about.** Step 1 asserts
+`FETCH_HEAD == EXPECTED_COMMIT`, so if any further commit — even a docs-only one
+— has been pushed since, the deployment fails at the bootstrap with exit 1 and
+production is untouched. This cost one failed attempt in Phase 1b.
 
-Get the SHA from the pushed commit:
+Get the tip, and confirm it is actually on the remote before deploying:
 
 ```bash
 git rev-parse HEAD
-```
-
-Confirm it is actually on the remote before deploying — the server fetches from
-origin, so an unpushed commit fails at step 1:
-
-```bash
 git branch -r --contains HEAD
 ```
+
+**Capture the updater's exit code without a pipe.** `cmd | tail` reports
+`tail`'s status, not the updater's — Phase 1 cited an exit code that was
+actually `tail`'s. Redirect to a file and read `$?`, then verify HEAD, service
+state and the endpoint over ssh regardless.
 
 ## Where each kind of command runs
 
@@ -144,23 +156,28 @@ Three independent levels, in increasing cost:
    Reverting is a settings change: it takes effect immediately, with no deploy
    and no restart. This is always the first rollback to reach for.
 2. **Deploy the previous commit.** Run the same script with the previous known
-   good 40-hex SHA and the same change class. The updater's own failure path
-   already restores the previous commit if a deployment fails midway
-   (`previous_commit` and its cleanup trap).
+   good 40-hex SHA — no class argument exists. Note the SHA must be reachable
+   as the branch tip the server fetches, so a rollback may need a revert commit
+   pushed on top rather than an older SHA passed directly. The updater's own
+   failure path already restores the previous commit if a deployment fails
+   midway (`previous_commit` and its cleanup trap).
 3. **Revert and redeploy.** Commit a revert locally, push, deploy it. Needed only
    when the previous commit is not a valid target.
 
-Phases 0, 1, and 3 have no settings flag, so their rollback is level 2 or 3.
+Phases 0, 1, 1b, and 3 have no settings flag, so their rollback is level 2 or 3.
 That is stated in each of those phase files.
 
 ## Phase 6 note
 
 Phase 6 splits `telegram-kol.service` into three units. The updater hardcodes
 that service name in its precondition (`systemctl is-active --quiet
-telegram-kol.service`, step 3) and in its stop and start steps. It also
-reinstalls itself from the deployed commit.
+telegram-kol.service`, step 3), in its stop and start steps, and in
+`verify_http_health`. It also reinstalls itself from the deployed commit, and
+the bash wrappers (`scripts/server_git_update.sh`,
+`scripts/bootstrap_server_updater.sh`) must be taught alongside it — those are
+the paths actually in use.
 
 So the updater must be taught about the new topology **in a deployment that
 happens while the old topology is still running**, and the split itself is a
-manual, out-of-band maintenance step, not a `server_git_update.ps1` run. Phase 6
+manual, out-of-band maintenance step, not a `server_git_update.sh` run. Phase 6
 covers this; do not attempt to shortcut it.

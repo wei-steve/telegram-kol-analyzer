@@ -5,6 +5,14 @@
 > Line anchors in this file were verified against commit `2fc0ad2`. If a line
 > number no longer matches, the symbol name next to it is authoritative — search
 > for that instead of trusting the number.
+> **Corrected 2026-08-19 (Phase 1b).** The updater takes **no change class and no
+> snapshot argument**. `-ChangeClass`, `CHANGE_CLASS`, `-PreviousLiveSnapshotPath`
+> and `PREVIOUS_LIVE_SNAPSHOT_PATH` do not exist and are silently ignored. Deploy
+> with `EXPECTED_COMMIT=<current branch tip> ./scripts/server_git_update.sh`, run
+> from a checkout of that commit. The safe window is enforced automatically by
+> `deployment_active_write_check` before and after the service stop, and schema
+> handling is auto-detected. See `deployment-procedure.md`.
+
 
 **Goal:** Stop web traffic, recognition, and execution from sharing one process
 and one event loop, so that load or a fault in one can no longer perturb the
@@ -148,6 +156,9 @@ reorder it after the split.**
 **Files:**
 - Modify: `deploy/telegram-kol-update`
 - Modify: `scripts/server_git_update.ps1`
+- Modify: `scripts/server_git_update.sh` and `scripts/bootstrap_server_updater.sh`
+  — these are the paths actually used; the PowerShell wrapper is not (this
+  workstation has no PowerShell). Missing them ships a half-taught updater.
 - Modify: `tests/test_server_update_scripts.py`
 
 The gated updater hardcodes the single service in three places:
@@ -191,7 +202,7 @@ identically. This task changes which units are cycled, nothing else.
 
 **Step 4 — Deploy the topology-aware updater by itself, first**
 
-Deploy this change alone, as `-ChangeClass code`, while the single unit is still
+Deploy this change alone while the single unit is still
 running. Confirm it deploys successfully and that the installed
 `/usr/local/bin/telegram-kol-update` is the new version. Only then continue.
 
@@ -203,6 +214,9 @@ Run a trivial follow-up deployment to prove the updater did not break itself.
 
 **Files:**
 - Modify: `scripts/server_git_update.ps1`
+- Modify: `scripts/server_git_update.sh` and `scripts/bootstrap_server_updater.sh`
+  — these are the paths actually used; the PowerShell wrapper is not (this
+  workstation has no PowerShell). Missing them ships a half-taught updater.
 - Modify: `deploy/telegram-kol-update`
 - Modify: `tests/test_server_update_scripts.py`
 
@@ -234,6 +248,8 @@ git add src/telegram_kol_research/web_app.py \
   deploy/systemd/ \
   deploy/telegram-kol-update \
   scripts/server_git_update.ps1 \
+  scripts/server_git_update.sh \
+  scripts/bootstrap_server_updater.sh \
   tests/test_runtime_role_selection.py \
   tests/test_process_boundary_authority.py \
   tests/test_server_update_scripts.py
@@ -250,11 +266,14 @@ unstage it with `git restore --staged <path>` before committing.
 
 **Deployment is a gated updater, not a manual pull.** Follow
 `docs/plans/2026-08-18-runtime-serialization-remediation/deployment-procedure.md`.
-This phase deploys with `-ChangeClass code`.
+This phase deploys with `EXPECTED_COMMIT=<current branch tip> ./scripts/server_git_update.sh` (there is no change class — see the correction note at the top of this file).
 
 [local] Commit, push to the deploy branch recorded as `deploy_branch` in the
 status file, confirm the commit is on the remote, then run
-`scripts/server_git_update.ps1` with that 40-hex SHA and the change class above.
+`EXPECTED_COMMIT=<that 40-hex SHA> ./scripts/server_git_update.sh` from a checkout
+of that commit. The SHA must be the branch tip the server will fetch, not merely
+the commit you care about — the updater asserts `FETCH_HEAD == EXPECTED_COMMIT`
+and refuses otherwise. This workstation has no PowerShell.
 
 The updater enforces the safe window itself through `deployment-preflight`
 before it stops the service. If it returns `BLOCK`, read the reason, wait, and
@@ -270,7 +289,7 @@ still the only thing running.
 
 **Step 3 — Split during a proven safe window**
 
-The split itself is **not** a `server_git_update.ps1` run. The code is already
+The split itself is **not** a `server_git_update.sh` run. The code is already
 deployed by then; this step only changes which units are enabled. It is a manual,
 out-of-band maintenance action performed over ssh.
 

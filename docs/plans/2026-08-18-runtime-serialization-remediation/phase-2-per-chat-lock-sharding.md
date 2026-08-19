@@ -5,6 +5,14 @@
 > Line anchors in this file were verified against commit `2fc0ad2`. If a line
 > number no longer matches, the symbol name next to it is authoritative — search
 > for that instead of trusting the number.
+> **Corrected 2026-08-19 (Phase 1b).** The updater takes **no change class and no
+> snapshot argument**. `-ChangeClass`, `CHANGE_CLASS`, `-PreviousLiveSnapshotPath`
+> and `PREVIOUS_LIVE_SNAPSHOT_PATH` do not exist and are silently ignored. Deploy
+> with `EXPECTED_COMMIT=<current branch tip> ./scripts/server_git_update.sh`, run
+> from a checkout of that commit. The safe window is enforced automatically by
+> `deployment_active_write_check` before and after the service stop, and schema
+> handling is auto-detected. See `deployment-procedure.md`.
+
 
 **Goal:** Stop one group's slow message from delaying every other group's
 messages, by replacing the single process-global message lock with per-chat
@@ -235,14 +243,18 @@ unstage it with `git restore --staged <path>` before committing.
 
 **Deployment is a gated updater, not a manual pull.** Follow
 `docs/plans/2026-08-18-runtime-serialization-remediation/deployment-procedure.md`.
-This phase deploys with `-ChangeClass execution_writer`.
+This phase deploys with `EXPECTED_COMMIT=<current branch tip> ./scripts/server_git_update.sh` (there is no change class — see the correction note at the top of this file).
 
-Because the class is `execution_writer`, capture a prior independent live
-position snapshot first and pass `-PreviousLiveSnapshotPath`.
+There is no snapshot argument to pass. Capturing a prior independent live
+position snapshot before deploying is still worth doing as evidence, but the
+updater has no way to consume it.
 
 [local] Commit, push to the deploy branch recorded as `deploy_branch` in the
 status file, confirm the commit is on the remote, then run
-`scripts/server_git_update.ps1` with that 40-hex SHA and the change class above.
+`EXPECTED_COMMIT=<that 40-hex SHA> ./scripts/server_git_update.sh` from a checkout
+of that commit. The SHA must be the branch tip the server will fetch, not merely
+the commit you care about — the updater asserts `FETCH_HEAD == EXPECTED_COMMIT`
+and refuses otherwise. This workstation has no PowerShell.
 
 The updater enforces the safe window itself through `deployment-preflight`
 before it stops the service. If it returns `BLOCK`, read the reason, wait, and
@@ -292,7 +304,7 @@ deploy — `deployment-procedure.md` rollback level 1, and always the first thin
 to reach for.
 
 If the code itself must go, redeploy the previous known good 40-hex SHA with
-`-ChangeClass execution_writer`. There is no database migration in this phase.
+the same command. There is no database migration in this phase.
 
 ## Status file update
 
