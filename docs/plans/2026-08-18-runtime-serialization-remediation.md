@@ -72,6 +72,7 @@ Details and per-phase change classes are in `deployment-procedure.md`.
 - `2026-08-18-runtime-serialization-remediation/phase-0-loop-health-observability.md`
 - `2026-08-18-runtime-serialization-remediation/phase-1-unblock-event-loop.md`
 - `2026-08-18-runtime-serialization-remediation/phase-2-per-chat-lock-sharding.md`
+- `2026-08-18-runtime-serialization-remediation/phase-2f-close-position-authority-coverage-gaps.md` (added 2026-08-19: Phase 2's Task 1 found `position_authority_lock` coverage incomplete; this closes the gap before `per_chat` can be reconsidered)
 - `2026-08-18-runtime-serialization-remediation/phase-3-compensation-window-repair.md`
 - `2026-08-18-runtime-serialization-remediation/phase-4-durable-job-shadow-enqueue.md`
 - `2026-08-18-runtime-serialization-remediation/phase-5-queue-consumer-takeover.md`

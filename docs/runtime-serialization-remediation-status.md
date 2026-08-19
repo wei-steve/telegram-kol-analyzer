@@ -14,22 +14,23 @@ deploy_branch: codex/deepcoin-auto-trading-v1   # matches the updater default; n
 integration_branch: codex/phase0-deploy-integration  # merged onto origin/deploy_branch (302c1ae); push this to deploy_branch
 local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v1 is 118 commits diverged from origin and is checked out in /private/tmp/tg-risk-routing.wmF2Vj. Do not use it. origin/codex/deepcoin-auto-trading-v1 is authoritative.
 design_version: 1
-current_phase: 3
-phase_name: compensation-window-repair
+current_phase: 2f
+phase_name: close-position-authority-coverage-gaps
 phase_status: planned          # planned | claimed | in_progress | completed
-claimed_by: none               # phase 2 claim released 2026-08-19; see phase_2_* fields below before starting phase 3
-current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-3-compensation-window-repair.md
+claimed_by: none               # phase 2 claim released 2026-08-19; user chose to close the gap before phase 3 - see phase_2_* fields below
+current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-2f-close-position-authority-coverage-gaps.md
 last_completed_phase: 2   # the sequence ran 0, 1, 1b, 1c, 1d, 1e, 2
 last_completed_commit: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd
-phase_2_decision_gate_failed: true   # READ BEFORE STARTING PHASE 3 - see "Phase 2 -- Task 1 decision gate FAILED" section below
-phase_2_message_lock_mode_enabled_in_production: false   # deployed dormant, default "global", and must STAY "global" until phase_2_gap_a and phase_2_gap_b both close
+phase_2f_reason: "user explicitly chose to close the gap in a dedicated phase before phase 3, 2026-08-19, when asked"
+after_phase_2f_next_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-3-compensation-window-repair.md   # resume the original sequence here once phase 2f completes
+phase_2_decision_gate_failed: true   # READ BEFORE STARTING PHASE 2f - see "Phase 2 -- Task 1 decision gate FAILED" section below
+phase_2_message_lock_mode_enabled_in_production: false   # deployed dormant, default "global", and must STAY "global" until phase_2_gap_a and phase_2_gap_b both close - phase 2f does NOT change this
 phase_2_gap_a: "recovery_live_submit._submit_recovery_signal_direct (entry-signal order submission, strategy-revision-replacement submission) is serialized only by _source_execution_lock, not position_authority_lock"
 phase_2_gap_b: "strategy_management_composite_executor.execute_composite_management_batch (composite management batch close/SLTP writes) is not serialized by anything - position_mutation_gateway.py has no lock of its own"
 phase_2_code_commit: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd   # tasks 1-4 code + task 5 suite; committed 2026-08-19
 phase_2_deployed_commit: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd
 phase_2_local_suite_before: 5684   # passed, 1 skipped, at 92e6e60
 phase_2_local_suite_after: 5710    # passed, 1 skipped, 0 failed; delta 26 equals the 26 tests phase 2 adds
-next_step_needs_user_decision: true   # whether to open a phase closing gap_a/gap_b before or after phase 3 is unset - ask the user, do not assume
 phase_0_code_commit: 816e296   # tasks 1-5; reviewed 2026-08-18. Task 6 (deploy + baseline) outstanding
 last_deployed_commit: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd
 production_commit: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd  # phase 2, deployed 2026-08-19 20:18 UTC; verified over ssh 2026-08-19 20:18 UTC
@@ -190,7 +191,8 @@ the 2026-08-18 incident.
 | 1d | `phase-1d-unblock-deepcoin-reconcile.md` | **completed** 2026-08-19, deployed `1c8a7f2` — stalls 1/37 s → 1/1250 s, loop unavailable 23.1% → 2.0% |
 | 1e | `phase-1e-unblock-context-resolution-scheduler.md` | **completed** 2026-08-19, deployed `92e6e60` — p99 236 → 80 ms; residual stalls are NOT code |
 | 2 | `phase-2-per-chat-lock-sharding.md` | **completed** 2026-08-19, deployed `3f5ed78` DORMANT — Task 1 decision gate FAILED, `per_chat` stays disabled, two gaps recorded |
-| 3 | `phase-3-compensation-window-repair.md` | planned — **read the Phase 2 gap note below before starting** |
+| 2f | `phase-2f-close-position-authority-coverage-gaps.md` | planned — closes phase 2's two gaps; user's explicit choice before phase 3 |
+| 3 | `phase-3-compensation-window-repair.md` | planned — **not blocked by phase 2f**, but resume the sequence here only after 2f completes |
 | 4 | `phase-4-durable-job-shadow-enqueue.md` | planned |
 | 5 | `phase-5-queue-consumer-takeover.md` | planned |
 | 6 | `phase-6-process-separation.md` | planned |
