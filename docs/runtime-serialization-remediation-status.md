@@ -22,19 +22,21 @@ current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phas
 last_completed_phase: 1
 last_completed_commit: fd748d7aa7bf14acdf6c83d81fa137d1cdbab672
 phase_0_code_commit: 816e296   # tasks 1-5; reviewed 2026-08-18. Task 6 (deploy + baseline) outstanding
-last_deployed_commit: fd748d7aa7bf14acdf6c83d81fa137d1cdbab672
-production_commit: fd748d7aa7bf14acdf6c83d81fa137d1cdbab672  # deployed 2026-08-18 18:52 UTC; was a00561b before phase 1
+last_deployed_commit: ee9c0d26041ef8b3e251fc392a79b5c586e76943
+production_commit: ee9c0d26041ef8b3e251fc392a79b5c586e76943  # deployed 2026-08-19 03:22 UTC; was fd748d7 before phase 1b
 production_commit_before_phase_0: 302c1ae467b98bc954ac2a25cc4a33a8d09f48f9  # rollback target
 production_commit_before_phase_1: a00561bf7683091ae0a48471cbfc2af1e6b9fa8c  # phase 1 rollback target
 phase_1_code_commit: fd748d7aa7bf14acdf6c83d81fa137d1cdbab672
 phase_1_local_suite_before: 5644   # passed, 1 skipped, on the merged branch at e61dbf1
 phase_1_local_suite_after: 5661    # passed, 1 skipped, 0 failed; delta 17 equals the 17 tests phase 1 adds
 phase_1_worst_stall_criterion_met: false   # see the phase 1 unmet-criterion section below
-phase_1b_code_commit: 06f916c5be8963b30dd87bc596c269c73dc641f7   # PUSHED but NOT DEPLOYED
+phase_1b_code_commit: 06f916c5be8963b30dd87bc596c269c73dc641f7   # the code; deployed inside ee9c0d2
+phase_1b_deployed_commit: ee9c0d26041ef8b3e251fc392a79b5c586e76943   # branch tip at deploy time = 06f916c plus two docs commits
 phase_1b_local_suite_before: 5661   # passed, 1 skipped, at fd748d7
 phase_1b_local_suite_after: 5664    # passed, 1 skipped, 0 failed; delta 3 equals the 3 tests added
-deploy_branch_ahead_of_production: true   # branch tip 06f916c, production fd748d7. Phase 1b is committed and pushed but never deployed.
-loop_lag_after_phase1b_p99_ms: null   # not measured; phase 1b was not deployed
+deploy_branch_ahead_of_production: false  # production is ee9c0d2, the branch tip, as of 2026-08-19 03:22 UTC
+loop_lag_after_phase1b_p99_ms: pending   # deployed; 60-minute production window still running as of this edit
+production_commit_before_phase_1b: fd748d7aa7bf14acdf6c83d81fa137d1cdbab672  # phase 1b rollback target
 baseline_captured: true   # 64.9 minutes of real traffic, 2026-08-18 17:16 UTC
 phase_0_blocking_call_census:   # Task 4 Step 3 — verbatim discovered set, 2026-08-18
   - "strategy_management_worker.run_strategy_management_worker_loop -> run_strategy_management_worker_tick"
@@ -68,7 +70,10 @@ server_verification:
   - "phase-1-behavior-unchanged: partially proven, and the gap is stated rather than rounded up. strategy_management_batches shows 1 batch touched (status reconciling) in the 63 min after the restart versus 0 rows in the comparable 63 min before it, so management work does still execute and did not regress. Break-even convergence could NOT be positively verified: strategy_break_even_convergences holds 2 rows whose last update is 2026-08-03, so there was no convergence work to do in either window. The loop is running and its tick raised nothing - zero 'worker tick failed' entries in the journal since the restart - but an idle path is not a proven path. First real convergence after this deploy should be checked."
 
   - "phase-1b-local (2026-08-18, session-45794fed): tasks 1-4 done. system_operator_bot._run_operator_maintenance_cycle now holds the settings read, the Deepcoin client construction, run_operator_maintenance_tick, and the client close as one unit, submitted to Phase 1s EXISTING shared max_workers=1 executor via run_on_management_worker. A separate pool was considered and rejected: all three ticks were mutually exclusive before Phase 1 only because all three ran on the loop, and a separate pool would introduce three-way concurrency on paths touching execution contracts, entry admissions and the exchange - the exact change Phase 1s design constraint exists to prevent. KNOWN_BLOCKING_CALLS is now EMPTY and the census passes with zero discovered offenders. One accepted divergence, recorded not hidden: close() now runs inside the submitted unit, so an exception it raises is swallowed by the loops pre-existing except Exception instead of escaping the while loop and killing the task; the alternative closes an httpx.Client back on the event loop. 3 tests added (operator loop responsiveness, operator and management ticks observably sharing one mgmt-worker thread with zero overlap, and client build/use/close all on the same worker thread in that order). Full suite 5664 passed, 1 skipped, 0 failed, 405s; before was 5661, delta 3 equals exactly the tests added."
-  - "phase-1b-deploy-BLOCKED (2026-08-18): NOT DEPLOYED. 06f916c is committed and pushed to codex/deepcoin-auto-trading-v1 (87706a6..06f916c, fast-forward), but scripts/server_git_update.sh was refused by the local agent permission layer, three attempts. Production remains at fd748d7 (Phase 1). THE DEPLOY BRANCH IS THEREFORE AHEAD OF PRODUCTION - anyone reading git alone will think Phase 1b is live and it is not. Pre-deploy evidence was captured before the attempt: live position snapshot 14847 bytes, and a final Phase 1 reading at 2026-08-18 20:35 UTC over a 4554.7 s window (samples 7200 = ring buffer saturated, p50_ms 0.938, p95_ms 9.672, p99_ms 6716.13, max_ms 10055.917 within the retained window, stall_count 166 at 6173 s uptime, worst_stall_ms 15356.616 all-time). Remaining step: run EXPECTED_COMMIT=06f916c5be8963b30dd87bc596c269c73dc641f7 ./scripts/server_git_update.sh from a checkout of that commit, then measure 60 minutes and compare worst_stall_ms and stall_count against Phase 1s 15356.616 and 166."
+  - "phase-1b-deploy-was-blocked-then-SUPERSEDED (2026-08-18): kept for the record only. The deploy was refused by the local agent permission layer at that time and production stayed at fd748d7. This was resolved on 2026-08-19 - see the phase-1b-deploy entry below. Do not read this entry as current state."
+
+  - "phase-1b-deploy (2026-08-19 03:22 UTC): DEPLOYED. Ran EXPECTED_COMMIT=ee9c0d26041ef8b3e251fc392a79b5c586e76943 ./scripts/server_git_update.sh from the worktree checked out at that commit; updater exit code 0. Verified over ssh: HEAD=ee9c0d2 on codex/deepcoin-auto-trading-v1, telegram-kol.service active since 2026-08-19 11:22:53 CST, /api/trading-settings returns 200. ee9c0d2 is 06f916c (the Phase 1b code) plus two docs-only commits. TWO LESSONS. First, the initial attempt passed EXPECTED_COMMIT=06f916c and failed with exit 1 at the bootstrap FETCH_HEAD assertion, because two further commits had been pushed to the branch since: the updater compares FETCH_HEAD against EXPECTED_COMMIT, so the value must be the CURRENT BRANCH TIP, not the commit you care about. Production was untouched. Second, correcting the Phase 1 record: that deploy exit code was reported as 0 but was captured through a pipe, so it was tails exit code, not the updaters. Phase 1 did deploy successfully - HEAD, service state and endpoint were all verified independently - but the exit code cited for it was not evidence. This run captured the exit code without a pipe."
+  - "phase-1b-first-reading-after-deploy: NOT a baseline, recorded so it is not mistaken for one. At uptime 152 s: samples 227, p50_ms 1.053, p95_ms 117.865, p99_ms 7469.818, max_ms 10067.971, stall_count 4, worst_stall_ms 10067.971, window 150.5 s. This covers service startup, which loads positions and contract specs and syncs the exchange, and Phase 0 already recorded that the startup window is unusable for comparison."
 
 ```
 
@@ -106,7 +111,7 @@ the 2026-08-18 incident.
 |---|---|---|
 | 0 | `phase-0-loop-health-observability.md` | **completed** 2026-08-18, deployed a00561b, baseline captured |
 | 1 | `phase-1-unblock-event-loop.md` | **completed** 2026-08-18, deployed fd748d7, p95 8312 -> 12 ms; one criterion unmet |
-| 1b | `phase-1b-unblock-operator-maintenance.md` | in_progress — code done and pushed (`06f916c`), **deploy blocked** |
+| 1b | `phase-1b-unblock-operator-maintenance.md` | in_progress — deployed `ee9c0d2` 2026-08-19 03:22 UTC; 60-min measurement pending |
 | 2 | `phase-2-per-chat-lock-sharding.md` | planned |
 | 3 | `phase-3-compensation-window-repair.md` | planned |
 | 4 | `phase-4-durable-job-shadow-enqueue.md` | planned |
