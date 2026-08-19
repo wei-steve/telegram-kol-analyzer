@@ -16,8 +16,8 @@ local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v
 design_version: 1
 current_phase: 1.5
 phase_name: unblock-operator-maintenance
-phase_status: in_progress      # planned | claimed | in_progress | completed
-claimed_by: session-45794fed   # phase 1b tasks 1-4 done; task 5 (deploy) blocked, see below
+phase_status: completed        # planned | claimed | in_progress | completed
+claimed_by: none               # phase 1b complete and deployed; NOTHING is claimed
 current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-1b-unblock-operator-maintenance.md
 last_completed_phase: 1
 last_completed_commit: fd748d7aa7bf14acdf6c83d81fa137d1cdbab672
@@ -35,7 +35,12 @@ phase_1b_deployed_commit: ee9c0d26041ef8b3e251fc392a79b5c586e76943   # branch ti
 phase_1b_local_suite_before: 5661   # passed, 1 skipped, at fd748d7
 phase_1b_local_suite_after: 5664    # passed, 1 skipped, 0 failed; delta 3 equals the 3 tests added
 deploy_branch_ahead_of_production: false  # production is ee9c0d2, the branch tip, as of 2026-08-19 03:22 UTC
-loop_lag_after_phase1b_p99_ms: pending   # deployed; 60-minute production window still running as of this edit
+loop_lag_after_phase1b_p99_ms: 7004.713   # 64.8 min, 2026-08-19 04:27 UTC. WORSE than phase 1's 6759.363
+phase_1b_worst_stall_ms: 19687.274        # phase 1 was 15356.616. Worse, not better
+phase_1b_stall_rate_unchanged: true       # 1 per 37.37 s vs phase 1's 1 per 37.36 s — identical
+phase_1b_production_effect: none          # the code is correct; it changed nothing measurable
+event_loop_still_blocked: true            # PHASE 2 REMAINS BLOCKED BY ITS OWN PREREQUISITE
+next_step_needs_user_decision: true       # widening the blocking-call census has no phase and no owner
 production_commit_before_phase_1b: fd748d7aa7bf14acdf6c83d81fa137d1cdbab672  # phase 1b rollback target
 baseline_captured: true   # 64.9 minutes of real traffic, 2026-08-18 17:16 UTC
 phase_0_blocking_call_census:   # Task 4 Step 3 — verbatim discovered set, 2026-08-18
@@ -75,6 +80,11 @@ server_verification:
   - "phase-1b-deploy (2026-08-19 03:22 UTC): DEPLOYED. Ran EXPECTED_COMMIT=ee9c0d26041ef8b3e251fc392a79b5c586e76943 ./scripts/server_git_update.sh from the worktree checked out at that commit; updater exit code 0. Verified over ssh: HEAD=ee9c0d2 on codex/deepcoin-auto-trading-v1, telegram-kol.service active since 2026-08-19 11:22:53 CST, /api/trading-settings returns 200. ee9c0d2 is 06f916c (the Phase 1b code) plus two docs-only commits. TWO LESSONS. First, the initial attempt passed EXPECTED_COMMIT=06f916c and failed with exit 1 at the bootstrap FETCH_HEAD assertion, because two further commits had been pushed to the branch since: the updater compares FETCH_HEAD against EXPECTED_COMMIT, so the value must be the CURRENT BRANCH TIP, not the commit you care about. Production was untouched. Second, correcting the Phase 1 record: that deploy exit code was reported as 0 but was captured through a pipe, so it was tails exit code, not the updaters. Phase 1 did deploy successfully - HEAD, service state and endpoint were all verified independently - but the exit code cited for it was not evidence. This run captured the exit code without a pipe."
   - "phase-1b-first-reading-after-deploy: NOT a baseline, recorded so it is not mistaken for one. At uptime 152 s: samples 227, p50_ms 1.053, p95_ms 117.865, p99_ms 7469.818, max_ms 10067.971, stall_count 4, worst_stall_ms 10067.971, window 150.5 s. This covers service startup, which loads positions and contract specs and syncs the exchange, and Phase 0 already recorded that the startup window is unusable for comparison."
 
+  - "phase-1b-after (2026-08-19 04:27 UTC, uptime 3886 s = 64.8 min of real traffic, no restart in the window): samples 6030, window_seconds 3884.374, p50_ms 0.911, p95_ms 7.213, p99_ms 7004.713, max_ms 19687.274, stall_count 104, worst_stall_ms 19687.274. THE CHANGE HAD NO EFFECT. Stall rate is the decisive number and it is unchanged to four significant figures: 104 stalls over 3886.1 s of uptime is one per 37.37 s, against Phase 1s 589 over 22006.0 s which is one per 37.36 s. p99 went from 6759.363 to 7004.713 (worse), worst_stall_ms from 15356.616 to 19687.274 (worse), derived loop unavailability from 21.2 to 22.4 percent (worse), p95 from 8.491 to 7.213 (better). Every one of those deltas is within run-to-run noise; the stall rate being identical is not noise, it is the signal. Note when reading the raw payload: stall_count is a cumulative counter over uptime while samples and window_seconds are limited by the 7200-sample ring buffer, so rates must be computed against uptime_seconds, not window_seconds - Phase 1s buffer was saturated at a 22006 s uptime."
+  - "phase-1b-conclusion: the operator maintenance tick was NOT the cause of the stalls. That is a real finding, not a failure of the change. run_operator_maintenance_tick genuinely ran on the event loop every 5 seconds with a database read and a Deepcoin client, it genuinely no longer does, the census is genuinely empty, and production is genuinely no better. The AST census has therefore exhausted what it can see: KNOWN_BLOCKING_CALLS is empty and multi-second stalls continue at one per 37 seconds. Whatever is blocking the loop is invisible to a census that looks only for same-module sync functions named *_tick or *_once called inside an async while-loop. Journal evidence over the window: 50 rate-limited warnings (the limiter saturating again, so near continuous), logged durations clustering between 6.1 s and 10.7 s with a single 19.7 s outlier. Per the phase file this is recorded and NOT pursued: widening the census is its own task and has no owning phase."
+  - "phase-1b-behavior-unchanged: strategy_management_batches shows 2 batches touched and message_instruction_items 2 rows touched in the 65 min after the restart, and there were zero 'worker tick failed' entries. The operator maintenance path reaches entry-admission and instruction-execution reconciliation, and message_instruction_items moving is consistent with it still running. runtime_incidents saw no new rows, so the notification delivery path was idle and is unproven, same gap as break-even convergence in Phase 1."
+  - "phase-1b-keep-do-not-revert: Phase 1b stays deployed. It is correct code that removes a real database read and a real exchange client construction from the event loop on a 5-second interval, and it keeps the census at zero so the next regression is caught. Its null production result means that call was not the bottleneck, not that the change is wrong. Rollback target if ever needed is fd748d7."
+
 ```
 
 ## Claim protocol — read this before starting any phase
@@ -111,7 +121,7 @@ the 2026-08-18 incident.
 |---|---|---|
 | 0 | `phase-0-loop-health-observability.md` | **completed** 2026-08-18, deployed a00561b, baseline captured |
 | 1 | `phase-1-unblock-event-loop.md` | **completed** 2026-08-18, deployed fd748d7, p95 8312 -> 12 ms; one criterion unmet |
-| 1b | `phase-1b-unblock-operator-maintenance.md` | in_progress — deployed `ee9c0d2` 2026-08-19 03:22 UTC; 60-min measurement pending |
+| 1b | `phase-1b-unblock-operator-maintenance.md` | **completed** 2026-08-19, deployed `ee9c0d2` — census now empty, but **zero production effect** |
 | 2 | `phase-2-per-chat-lock-sharding.md` | planned |
 | 3 | `phase-3-compensation-window-repair.md` | planned |
 | 4 | `phase-4-durable-job-shadow-enqueue.md` | planned |
@@ -325,6 +335,74 @@ git push origin codex/phase0-deploy-integration:codex/deepcoin-auto-trading-v1
 EXPECTED_COMMIT=fd748d7aa7bf14acdf6c83d81fa137d1cdbab672 ./scripts/server_git_update.sh
 ```
 
+## Phase 1b — COMPLETE, and it changed nothing in production
+
+Deployed `ee9c0d2` on 2026-08-19 03:22 UTC and measured 64.8 minutes of real
+traffic. The code did exactly what it was written to do. Production did not
+improve at all.
+
+| | Phase 1 | after Phase 1b | |
+|---|---|---|---|
+| p50 | 0.918 ms | 0.911 ms | flat |
+| p95 | 8.491 ms | 7.213 ms | noise |
+| p99 | 6759.363 ms | 7004.713 ms | slightly worse |
+| **stall rate** | **1 per 37.36 s** | **1 per 37.37 s** | **identical** |
+| worst stall | 15356.616 ms | 19687.274 ms | worse |
+| loop unavailable | 21.2% | 22.4% | slightly worse |
+
+The stall rate matching to four significant figures is the finding. Everything
+else in that table is run-to-run noise; that number is not.
+
+**Read `stall_count` correctly.** It is a cumulative counter over process
+uptime, while `samples` and `window_seconds` are capped by the 7200-sample ring
+buffer. Phase 1's reading had a saturated buffer at 22006 s of uptime, so its
+589 stalls span the whole uptime, not the 4569 s window shown. Rates must be
+computed against `uptime_seconds`. Comparing raw counts, or counts against
+`window_seconds`, gives a wrong answer here.
+
+**The conclusion is a real finding, not a failed change.**
+`run_operator_maintenance_tick` genuinely ran on the event loop every 5 seconds
+with a database read and a Deepcoin client construction. It genuinely no longer
+does. `KNOWN_BLOCKING_CALLS` is genuinely empty. And production is genuinely no
+better. So that call was not the bottleneck.
+
+**The AST census has now exhausted what it can see.** It looks for a same-module
+synchronous function named `*_tick` or `*_once`, called directly inside an
+`async while` loop. Every such call is gone, and the loop still stalls for six to
+ten seconds, once every thirty-seven seconds, with a 19.7 s outlier in this
+window. Whatever remains does not have that shape.
+
+Per the phase file, this is recorded and **not** pursued here. Widening the
+census is its own task, it has no owning phase, and choosing to open it is the
+user's call.
+
+**Phase 1b stays deployed.** It removes a real database read and a real exchange
+client construction from the loop on a five-second interval, and it holds the
+census at zero so the next regression is caught. Rollback target if ever needed:
+`fd748d7`.
+
+## What is actually known about the remaining blocker
+
+Stated as evidence, not as a hypothesis to act on:
+
+- The distribution is bimodal. p50 is 0.911 ms and p95 is 7.213 ms, so the loop
+  is healthy the overwhelming majority of the time, then blocked for seconds.
+- Stalls arrive at a strikingly regular rate — one per ~37 s across both a
+  65-minute and a 6-hour observation.
+- Logged durations cluster between 6.1 s and 10.7 s. The 3 s threshold and the
+  one-warning-per-60 s limiter mean the journal shows only the first stall of
+  each minute, so this is a sample, not the distribution.
+- Ruled out by measurement: both management worker ticks (Phase 1), the operator
+  maintenance tick (Phase 1b).
+- Ruled out by inspection: `lifecycle_monitor` candle fetches — they are noisy in
+  the journal but run in an `async def` and are ordinary Gate.io timeouts.
+
+What the census cannot see, and what a widened investigation would have to cover:
+synchronous work inside an `async def` that is not named `*_tick`/`*_once`;
+blocking calls reached through an awaited coroutine; synchronous database or
+HTTP work in request handlers and in the Telethon message path; and CPU-bound
+work that blocks without any I/O call at all.
+
 ## Before Phase 2 starts — read this
 
 Points 1 and 2 below replace the Phase 1 version of this section, which was
@@ -344,16 +422,17 @@ updater" above.
    the copy inside the deployed commit and exits silently on a mismatch. This
    cost one confusing failure in Phase 0; Phase 1 avoided it by deploying from
    the worktree.
-4. **Phase 2 is measured against a loop that is fast but not stall-free.**
-   `loop_lag_after_phase1_p99_ms` is 6765.435 with a worst stall of 15356.616 ms
-   still present, because the `system_operator_bot` blocking call remains on the
-   loop. Do not attribute that residual tail to Phase 2's own changes.
-5. **The unowned blocking call needs a phase.**
-   `system_operator_bot.run_runtime_incident_notification_loop` ->
-   `run_operator_maintenance_tick` is the last entry in `KNOWN_BLOCKING_CALLS`
-   and the prime suspect for every remaining multi-second stall. It is not
-   assigned to any phase. Assigning it is a decision for the user, not for the
-   next phase session to help itself to.
+4. **Phase 2's own prerequisite is still NOT met.** It says: "Do not attempt
+   this phase while the event loop can still be blocked — the two effects would
+   be indistinguishable in production." After Phase 1b the loop still stalls
+   once every 37 seconds, for six to ten seconds at a time. Phase 2 introduces
+   real parallelism; measuring it against this loop cannot separate its effect
+   from the residual blocker. **Phase 2 should not start yet.**
+5. **The next step is an investigation that has no phase and no owner.** The
+   census is empty and the stalls remain, so finding the real blocker means
+   widening how it is looked for — see "What is actually known about the
+   remaining blocker" above. Opening that task is a decision for the user, not
+   for the next session to help itself to.
 
 The authoritative checkout for this rollout is the worktree
 `.worktrees/runtime-serialization` on branch `codex/phase0-deploy-integration`,
