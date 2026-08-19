@@ -713,6 +713,24 @@ def test_loop_health_endpoint_reports_monitor_snapshot(tmp_path):
         assert key in payload
 
 
+def test_loop_health_endpoint_exposes_stall_attribution(tmp_path):
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        now_provider=lambda: datetime(2026, 8, 19, 12, 0, tzinfo=UTC),
+    )
+    attributor = app.state.loop_lag_monitor.attributor
+    attributor.attach_loop_thread(threading.get_ident())
+
+    with TestClient(app) as client:
+        response = client.get("/api/runtime/loop-health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["watchdog_attached"] is True
+    assert payload["stall_captures"] >= 0
+    assert isinstance(payload["recent_stall_stacks"], list)
+
+
 def test_loop_health_endpoint_touches_neither_database_nor_exchange(tmp_path):
     def failing_deepcoin_client_factory():
         raise AssertionError("loop health must not call the exchange")
