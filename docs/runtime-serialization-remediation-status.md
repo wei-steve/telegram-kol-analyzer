@@ -14,11 +14,11 @@ deploy_branch: codex/deepcoin-auto-trading-v1   # matches the updater default; n
 integration_branch: codex/phase0-deploy-integration  # merged onto origin/deploy_branch (302c1ae); push this to deploy_branch
 local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v1 is 118 commits diverged from origin and is checked out in /private/tmp/tg-risk-routing.wmF2Vj. Do not use it. origin/codex/deepcoin-auto-trading-v1 is authoritative.
 design_version: 1
-current_phase: 1.5
-phase_name: unblock-operator-maintenance
-phase_status: completed        # planned | claimed | in_progress | completed
-claimed_by: none               # phase 1b complete and deployed; NOTHING is claimed
-current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-1b-unblock-operator-maintenance.md
+current_phase: 1.75
+phase_name: stall-attribution
+phase_status: claimed          # planned | claimed | in_progress | completed
+claimed_by: session-45794fed   # claimed 2026-08-19 for phase 1c
+current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-1c-stall-attribution.md
 last_completed_phase: 1
 last_completed_commit: fd748d7aa7bf14acdf6c83d81fa137d1cdbab672
 phase_0_code_commit: 816e296   # tasks 1-5; reviewed 2026-08-18. Task 6 (deploy + baseline) outstanding
@@ -122,7 +122,8 @@ the 2026-08-18 incident.
 | 0 | `phase-0-loop-health-observability.md` | **completed** 2026-08-18, deployed a00561b, baseline captured |
 | 1 | `phase-1-unblock-event-loop.md` | **completed** 2026-08-18, deployed fd748d7, p95 8312 -> 12 ms; one criterion unmet |
 | 1b | `phase-1b-unblock-operator-maintenance.md` | **completed** 2026-08-19, deployed `ee9c0d2` — census now empty, but **zero production effect** |
-| 2 | `phase-2-per-chat-lock-sharding.md` | planned |
+| 1c | `phase-1c-stall-attribution.md` | claimed 2026-08-19 — capture the loop's stack while it is blocked, instead of guessing again |
+| 2 | `phase-2-per-chat-lock-sharding.md` | planned — blocked, prerequisite unmet |
 | 3 | `phase-3-compensation-window-repair.md` | planned |
 | 4 | `phase-4-durable-job-shadow-enqueue.md` | planned |
 | 5 | `phase-5-queue-consumer-takeover.md` | planned |
