@@ -14,16 +14,26 @@ deploy_branch: codex/deepcoin-auto-trading-v1   # matches the updater default; n
 integration_branch: codex/phase0-deploy-integration  # merged onto origin/deploy_branch (302c1ae); push this to deploy_branch
 local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v1 is 118 commits diverged from origin and is checked out in /private/tmp/tg-risk-routing.wmF2Vj. Do not use it. origin/codex/deepcoin-auto-trading-v1 is authoritative.
 design_version: 1
-current_phase: 2
-phase_name: per-chat-lock-sharding
-phase_status: claimed          # planned | claimed | in_progress | completed
-claimed_by: session-phase2-lockshard-0819  # phases 0-1e all complete and deployed; phase 2 claimed 2026-08-19
-current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-2-per-chat-lock-sharding.md
-last_completed_phase: 1e   # the sequence ran 0, 1, 1b, 1c, 1d, 1e
-last_completed_commit: 92e6e60a0985a81208064f785e2454bcafd99bfe
+current_phase: 3
+phase_name: compensation-window-repair
+phase_status: planned          # planned | claimed | in_progress | completed
+claimed_by: none               # phase 2 claim released 2026-08-19; see phase_2_* fields below before starting phase 3
+current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-3-compensation-window-repair.md
+last_completed_phase: 2   # the sequence ran 0, 1, 1b, 1c, 1d, 1e, 2
+last_completed_commit: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd
+phase_2_decision_gate_failed: true   # READ BEFORE STARTING PHASE 3 - see "Phase 2 -- Task 1 decision gate FAILED" section below
+phase_2_message_lock_mode_enabled_in_production: false   # deployed dormant, default "global", and must STAY "global" until phase_2_gap_a and phase_2_gap_b both close
+phase_2_gap_a: "recovery_live_submit._submit_recovery_signal_direct (entry-signal order submission, strategy-revision-replacement submission) is serialized only by _source_execution_lock, not position_authority_lock"
+phase_2_gap_b: "strategy_management_composite_executor.execute_composite_management_batch (composite management batch close/SLTP writes) is not serialized by anything - position_mutation_gateway.py has no lock of its own"
+phase_2_code_commit: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd   # tasks 1-4 code + task 5 suite; committed 2026-08-19
+phase_2_deployed_commit: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd
+phase_2_local_suite_before: 5684   # passed, 1 skipped, at 92e6e60
+phase_2_local_suite_after: 5710    # passed, 1 skipped, 0 failed; delta 26 equals the 26 tests phase 2 adds
+next_step_needs_user_decision: true   # whether to open a phase closing gap_a/gap_b before or after phase 3 is unset - ask the user, do not assume
 phase_0_code_commit: 816e296   # tasks 1-5; reviewed 2026-08-18. Task 6 (deploy + baseline) outstanding
-last_deployed_commit: 92e6e60a0985a81208064f785e2454bcafd99bfe
-production_commit: 92e6e60a0985a81208064f785e2454bcafd99bfe  # phase 1e, deployed 2026-08-19 11:29 UTC; verified over ssh 2026-08-19 12:4x
+last_deployed_commit: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd
+production_commit: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd  # phase 2, deployed 2026-08-19 20:18 UTC; verified over ssh 2026-08-19 20:18 UTC
+production_commit_before_phase_2_deploy: 92e6e60a0985a81208064f785e2454bcafd99bfe  # rollback target for phase 2's code (no schema change)
 production_commit_before_phase_0: 302c1ae467b98bc954ac2a25cc4a33a8d09f48f9  # rollback target
 production_commit_before_phase_1: a00561bf7683091ae0a48471cbfc2af1e6b9fa8c  # phase 1 rollback target
 phase_1_code_commit: fd748d7aa7bf14acdf6c83d81fa137d1cdbab672
@@ -133,6 +143,12 @@ server_verification:
   - "phase-1e-host-evidence (measured 2026-08-19 12:35 UTC, after the window, NOT during a stall - so this is correlational, not proven causation): the server has 1965 MB of RAM with 689 MB free and 477 MB of its 1024 MB swap in use. The telegram-kol process itself reports VmRSS 209476 kB and VmSwap 21888 kB, so roughly 21.9 MB of it is on disk. vmstat showed non-zero swap-in (si 292 and 152 KB/s across consecutive samples). Meanwhile CPU steal is 0 and load average is 0.60 on 2 cores, which rules out host CPU oversubscription and local CPU contention. Memory pressure with active paging is therefore the leading explanation for a loop that stalls seconds while idle in select: page faults on a swapped-out process stall it in the kernel, where no Python frame can show it. Confirming this needs sampling during a stall, or simply more RAM."
   - "phase-1e-the-arc: against the Phase 0 production baseline, the whole of phases 1 through 1e moved the loop from p99 8777.887 ms to 79.914 ms (110x), from one stall per 10.7 s to one per 1248.1 s (117x), and from 76 percent unavailable to 1.2 percent (63x). Phase 2s prerequisite - that the loop can no longer be blocked - is now met by any reasonable reading."
 
+  - "phase-2-task1-DECISION-GATE-FAILED (2026-08-19, session-phase2-lockshard-0819): traced every exchange-mutation leaf reachable from auto_trade_executor and checked each against position_authority_lock coverage, per the phase file's explicit Task 1 instruction. Verdict: FALSE, coverage is incomplete. Three leaves ARE covered - cancel_revision_entry_leg (deepcoin_execution_actions.py, @serialized_position_authority_mutation), execute_management_batch (strategy_management_executor.py, same decorator), reconcile_deepcoin_execution_bindings (execution_bindings.py, `with position_authority_lock():` directly, matching the Phase 1c stall captures at position_authority_lock.py:17). TWO are not: (gap A) recovery_live_submit._submit_recovery_signal_direct - reached from both process_trade_signal_live (entry-signal submission) and submit_strategy_revision_replacement_live (revision-replacement submission) - is decorated @serialized_source_message_execution, which acquires _source_execution_lock (source_message_deletion.py), a DIFFERENT RLock object, not position_authority_lock; its leaf writes (deepcoin_client.place_order/trigger_order, submit_exact_position_sltp via position_mutation_gateway.py, upsert_execution_binding/upsert_execution_order_leg) all run under that other lock only. (gap B) strategy_management_composite_executor.execute_composite_management_batch - the composite/'management v2' close-revise-partial-close path, reached whenever a management candidate carries management_contract_json - imports position_authority_lock nowhere in the file; its close_exact_position and submit_exact_position_sltp calls go through the same unlocked position_mutation_gateway.py, which provides only a DB-backed intent state machine (idempotency), not mutual exclusion. Today this is harmless because the single global message lock already prevents two messages of any kind from being in flight at once; per-chat sharding would remove that accidental protection and let e.g. chat A's entry submission (gap A, under _source_execution_lock) run truly concurrently with chat B's composite management close (gap B, under nothing) for the same or a different symbol. Per the phase file's Task 1 decision gate: 'if any exchange mutation path ... is not covered ... do not enable per-chat sharding in this phase. Finish Tasks 2 and 3, leave the flag disabled, record the gap, and stop.' That is what this session did. tests/test_position_authority_boundary_coverage.py encodes both the three covered leaves and the two gap leaves as parametrized regression guards, plus one explicit decision-gate assertion, so a future session that closes the gaps (or accidentally loses existing coverage) gets a failing test rather than silent drift."
+  - "phase-2-tasks-2-4-local (2026-08-19, session-phase2-lockshard-0819): built the dormant infrastructure regardless of the Task 1 gate, per the phase file's explicit instruction. Task 2: src/telegram_kol_research/keyed_async_locks.py, KeyedAsyncLockRegistry - per-key asyncio.Lock created on first use via a refcounted guard (asyncio.Lock protecting the dict), dropped the instant refcount reaches zero and the lock is unlocked so a long uptime with many distinct chat_ids does not grow the registry without bound; lock_all() acquires every currently-known key's lock in a sorted(keys, key=repr) order, which is what makes two concurrent lock_all() calls deadlock-free (proven with a real two-key contest, not just asserted). 7 tests. Task 3: new src/telegram_kol_research/message_lock_provider.py, MessageLockProvider - mode() reads trading_settings.message_lock_mode fresh from the database on every call (no caching), so the flag is flippable without a restart; in 'global' mode it always returns the same shared asyncio.Lock regardless of chat_id (byte-for-byte the old single-lock behavior), in 'per_chat' mode it delegates to the registry. trading_settings.py gained message_lock_mode: Literal['global','per_chat'] = 'global' following the existing _mimo_contract_mode two-value-literal pattern exactly. telegram_live_listener.py: handle_new_message and handle_deleted_message now resolve their lock via resolve_lock_context(operation_lock, chat_id) instead of using operation_lock directly, preserving the None-fallback and raw-Lock-object contract that tests/test_reconcile_live_history.py and tests/test_telegram_live_listener.py already exercised, unmodified. run_periodic_reconcile now branches on resolve_message_lock_mode(operation_lock): 'none' and 'global' both wrap the ENTIRE run_reconcile_once call exactly as before (global is not merely 'the default', it is verified byte-for-byte identical); only 'per_chat' changes shape, passing a new chat_operation_lock parameter into run_reconcile_once, which the recovery-loop and per-dialog loop now acquire individually PER MESSAGE (extracted into _process_recovery_candidate and _process_dialog_raw_message closures so the lock scope is exactly one message's chain), never around dialog discovery or the Telegram fetch calls. web_app.py wires up app.state.message_lock_registry and app.state.message_lock_provider at the same point telegram_operation_lock is constructed, and both /api/refresh and the mimo-contract-mode-change guard in /api/trading-settings switch from `async with app.state.telegram_operation_lock:` to `async with app.state.message_lock_provider.lock_all():` (global mode: identical, since lock_all() returns that same object). Task 4: tests/test_live_listener_chat_isolation.py, 4 tests against the real wiring (run_live_listener + run_reconcile_once + a real MessageLockProvider/KeyedAsyncLockRegistry/session_factory, only persist_live_message_event and the authoritative processor faked) - a slow chat A does not delay chat B in per_chat mode; the same chat still serializes in arrival order in per_chat mode; global mode is provably byte-for-byte (chat B does not even start while chat A is in flight, opposite of per_chat); a per_chat reconcile pass processing chat A's recovery backlog does not block a live message in chat B. CAUGHT AND FIXED DURING THIS SESSION, not left in: the first implementation had resolve_message_lock_mode/resolve_lock_context called directly (synchronously) inside run_periodic_reconcile's `while True:` loop, which is itself a fresh, real synchronous database read (load_trading_settings) added to an unconditional loop - exactly the shape tests/test_runtime_event_loop_blocking_census.py exists to catch, and it did: it flagged both calls by name before this was committed. Fixed by wrapping both in asyncio.to_thread at the two call sites inside the while-loop only; handle_new_message/handle_deleted_message's per-message resolve call was deliberately left synchronous and direct, matching the codebase's own established precedent (e.g. web_app.py's _run_authoritative_processor already reads trading_settings synchronously per-message, off the loop via the existing asyncio.to_thread(authoritative_processor, ...) wrapper one level up; the four bot-command-loop blocking calls Phase 1d found and left unfixed are the same 'event-driven, not timer-driven' category) - the census does not flag it because it is not inside a while-loop, and a single indexed-key SQLite read per live message is the same order of cost as reads already happening elsewhere on this path."
+  - "phase-2-task5-suite (2026-08-19): full local suite with .venv (Python 3.12.12): 5710 passed, 1 skipped, 0 failed, 390s. Before (at 92e6e60) was 5684 passed, 1 skipped; delta 26 equals exactly the tests this phase adds (7 keyed-lock-registry + 6 architecture/boundary-coverage + 4 chat-isolation + 9 trading-settings message_lock_mode round-trip and fails-closed cases). The blocking-call census (tests/test_runtime_event_loop_blocking_census.py) passes with KNOWN_BLOCKING_CALLS unchanged from before this phase - no new allowlist entry was needed once the to_thread fix above was applied."
+  - "phase-2-deploy (2026-08-19 20:18 UTC): DEPLOYED DORMANT, per Task 6 Step 1 only - Steps 2 and 3 (prove the disable path, enable per_chat) were not attempted, because Task 1's decision gate failed and per_chat has no safe path to production this phase. Fast-forward pushed 92e6e60..3f5ed78 to codex/deepcoin-auto-trading-v1 (2 commits: the phase-2 claim, then the phase-2 code), confirmed origin/codex/deepcoin-auto-trading-v1 was an ancestor of HEAD first. Ran EXPECTED_COMMIT=3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd ./scripts/server_git_update.sh from this worktree, checked out at that exact commit; exit code 0, captured without a pipe. The curl connection-refused lines near the end of the updater's own output are verify_http_health's retry loop during the service restart, same as every prior phase's deploy - not a failure signal by themselves. Independently verified over ssh (not inferred from the updater's exit code): HEAD=3f5ed78 on codex/deepcoin-auto-trading-v1, telegram-kol.service active since 2026-08-20 04:18:38 CST, GET /api/trading-settings returns 200 with message_lock_mode: 'global' in the payload (confirms dormant, not merely 'default' - this is what the settings row actually contains in production right now), GET /api/runtime/loop-health answers (uptime 12.1 s at read time, so not a baseline reading, just a liveness check: samples 23, stall_count 0, watchdog_attached true)."
+  - "phase-2-not-attempted: Task 6 Steps 2 and 3, and therefore the phase file's own completion criteria 'per_chat enabled in production, with the disable path proven working beforehand' and 'one full trading session observed with no new incident class', are NOT met and will not be attempted until a future phase closes phase_2_gap_a and phase_2_gap_b (see the decision-gate entry above and the 'Phase 2 -- Task 1 decision gate FAILED' section below). This is the outcome the phase file's own Task 1 anticipated and explicitly prescribed a stop for, not an incomplete session."
+
 ```
 
 ## Claim protocol — read this before starting any phase
@@ -173,8 +189,8 @@ the 2026-08-18 incident.
 | 1c | `phase-1c-stall-attribution.md` | **completed** 2026-08-19, deployed `93d1dfb` — blocker NAMED: the deepcoin reconcile loop |
 | 1d | `phase-1d-unblock-deepcoin-reconcile.md` | **completed** 2026-08-19, deployed `1c8a7f2` — stalls 1/37 s → 1/1250 s, loop unavailable 23.1% → 2.0% |
 | 1e | `phase-1e-unblock-context-resolution-scheduler.md` | **completed** 2026-08-19, deployed `92e6e60` — p99 236 → 80 ms; residual stalls are NOT code |
-| 2 | `phase-2-per-chat-lock-sharding.md` | planned — blocked, prerequisite unmet |
-| 3 | `phase-3-compensation-window-repair.md` | planned |
+| 2 | `phase-2-per-chat-lock-sharding.md` | **completed** 2026-08-19, deployed `3f5ed78` DORMANT — Task 1 decision gate FAILED, `per_chat` stays disabled, two gaps recorded |
+| 3 | `phase-3-compensation-window-repair.md` | planned — **read the Phase 2 gap note below before starting** |
 | 4 | `phase-4-durable-job-shadow-enqueue.md` | planned |
 | 5 | `phase-5-queue-consumer-takeover.md` | planned |
 | 6 | `phase-6-process-separation.md` | planned |
@@ -634,7 +650,82 @@ Against the Phase 0 production baseline:
 | stall rate | 1 per 10.7 s | 1 per 1248.1 s | **117×** |
 | loop unavailable | 76% | 1.2% | **63×** |
 
-## Handoff note for the Phase 2 session
+## Phase 2 — Task 1's decision gate FAILED; per_chat sharding stays dormant
+
+Deployed `3f5ed78` on 2026-08-19 20:18 UTC. This phase's own Task 1 required
+answering one question before writing any sharding code: is every exchange
+mutation path reachable from `auto_trade_executor` already serialized by
+`position_authority_lock`, independent of the message lock this phase
+replaces? The phase file was explicit about what a "no" means: *"do not
+enable per-chat sharding in this phase. Finish Tasks 2 and 3, leave the flag
+disabled, record the gap, and stop."* The answer is no, and this is that
+stop.
+
+**Two gaps, both live production code paths, neither hypothetical:**
+
+1. Entry-signal order submission and strategy-revision-replacement
+   submission (`recovery_live_submit._submit_recovery_signal_direct`) are
+   serialized by `_source_execution_lock`, a *different* lock object
+   (`source_message_deletion.py`), not `position_authority_lock`.
+2. Composite management batch execution
+   (`strategy_management_composite_executor.execute_composite_management_batch`
+   — the "management v2" close/revise/partial-close path) is serialized by
+   **nothing**. `position_mutation_gateway.py`, which both this path and the
+   covered ones eventually call, provides a DB-backed intent state machine
+   for idempotency, not mutual exclusion of its own.
+
+Three other leaves genuinely are covered — `cancel_revision_entry_leg`,
+`execute_management_batch`, `reconcile_deepcoin_execution_bindings` — which
+is what makes this a real gap rather than a total absence of the pattern
+this phase depends on.
+
+**Why this is not an active incident.** The single process-wide message lock
+this phase exists to replace is, today, an accidental second boundary: it
+guarantees only one message is ever in flight anywhere, so gap 1 and gap 2
+can never actually race each other in production right now. Enabling
+`per_chat` would remove exactly that accidental protection — a chat A entry
+submission (under `_source_execution_lock`) could then run concurrently with
+a chat B composite management close (under nothing) — which is precisely the
+scenario Task 1 exists to rule out before sharding ships live.
+
+**What shipped anyway, per the phase file's own instruction:** Tasks 2, 3 and
+4 — `KeyedAsyncLockRegistry`, `MessageLockProvider`, the `message_lock_mode`
+flag (default and required value: `"global"`), and the chat-isolation tests
+proving the mechanism works correctly in isolation. All of it is dormant.
+`message_lock_mode` reads `"global"` in production, confirmed over ssh after
+deploy, and every code path in `global` mode is proven byte-for-byte
+identical to pre-Phase-2 behavior (see the chat-isolation test suite).
+Deploying this dormant is safe regardless of the gap, because nothing it adds
+can execute unless the flag is flipped — and flipping it is exactly what
+Task 1 says not to do yet.
+
+**Completion criteria, read honestly:** "Task 1's boundary verification
+passed, or its gap is recorded and the flag was deliberately left disabled"
+— met, via the second branch. "Chat isolation and same-chat ordering tests
+pass" — met. "`per_chat` enabled in production, with the disable path proven
+working beforehand" and "one full trading session observed with no new
+incident class" — **not met, and not attempted**, because the phase file's
+own Task 1 forbids attempting them under these findings.
+
+**Rollback**, if ever needed even though nothing is enabled: redeploy
+`92e6e60a0985a81208064f785e2454bcafd99bfe` (the pre-Phase-2 production
+commit) with the same updater command. No schema change, no persisted state
+beyond the new `message_lock_mode` settings key, which defaults to `"global"`
+on any row that predates it.
+
+**Opening a gap-closing phase is the user's call, not a session's to assume.**
+Closing gap 1 means either routing `_submit_recovery_signal_direct` through
+`position_authority_lock` in addition to `_source_execution_lock`, or making
+a documented case that the two locks together provide equivalent exclusion —
+which, per the Task 1 trace, they do not today. Closing gap 2 means adding
+`position_authority_lock` coverage to
+`execute_composite_management_batch`, following the same pattern
+`execute_management_batch` already uses. Until one or both close,
+`message_lock_mode` must stay `"global"` and Phase 2's remaining Task 6 steps
+(prove the disable path, enable `per_chat`, observe a trading session) stay
+un-started.
+
+## Handoff note for the Phase 2 session (superseded — kept for context)
 
 Phases 0, 1, 1b, 1c, 1d and 1e are complete and deployed. Production runs
 `92e6e60`, verified over ssh, not inferred from git.
@@ -655,11 +746,13 @@ exchange mutation. There is already evidence for that question: two Phase 1c
 stall captures were blocked at `position_authority_lock.py:17`, a
 `threading.Lock` taken on the event loop. Start from that, not from scratch.
 
-## Before Phase 2 starts — read this
+## Before Phase 2 starts — read this (superseded — kept for context)
 
 Points 1 and 2 below replace the Phase 1 version of this section, which was
 wrong about the updater's interface. See "the procedure docs are wrong about the
-updater" above.
+updater" above. Point 5 below (the reconcile-loop blocker) was resolved by
+Phases 1c/1d before Phase 2 started; it is stale, kept for the historical
+record only. For the current state, see "Before Phase 3 starts" below.
 
 1. **There is no change class and no snapshot argument.** Do not try to pass
    `-ChangeClass`, `CHANGE_CLASS`, `-PreviousLiveSnapshotPath`, or
@@ -702,6 +795,27 @@ superseded — its copy of this file is frozen and says so.
 The census in `tests/test_runtime_event_loop_blocking_census.py` asserts
 equality, so any phase that removes a blocking call must shrink
 `KNOWN_BLOCKING_CALLS` in the same commit or the suite fails.
+
+## Before Phase 3 starts — read this
+
+1. **`message_lock_mode` stays `"global"`. Do not flip it as part of Phase 3
+   or any unrelated work.** Phase 2's Task 1 found two exchange-mutation
+   paths not covered by `position_authority_lock` (see "Phase 2 — Task 1's
+   decision gate FAILED" above). `per_chat` has no owning phase yet, and
+   opening one is the user's decision — ask, do not assume either that they
+   want it opened next or that it should wait.
+2. **Phase 3 is unrelated to Phase 2's gap** (compensation-window-repair, per
+   the index doc) and can proceed independently — the gap only blocks
+   `message_lock_mode: per_chat`, nothing else. It is not an active
+   production incident: the single global message lock Phase 2 left in place
+   already prevents the two uncovered paths from ever racing each other.
+3. **Deployment mechanics are unchanged from Phase 2** — see "There is no
+   change class" above and "Before Phase 2 starts" for the still-accurate
+   points (1-3: no `-ChangeClass`, no PowerShell on this workstation, run
+   the deploy script from a checkout of the exact commit).
+4. **The authoritative checkout is still**
+   `.worktrees/runtime-serialization` on branch `codex/phase0-deploy-integration`.
+   `codex/mimo-v1-baseline`'s copy of this file remains frozen and superseded.
 
 ## Deployment reminder
 
