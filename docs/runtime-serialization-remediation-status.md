@@ -16,8 +16,8 @@ local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v
 design_version: 1
 current_phase: 1.75
 phase_name: stall-attribution
-phase_status: claimed          # planned | claimed | in_progress | completed
-claimed_by: session-45794fed   # claimed 2026-08-19 for phase 1c
+phase_status: completed        # planned | claimed | in_progress | completed
+claimed_by: none               # phase 1c complete; the blocker is NAMED but NOT FIXED
 current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-1c-stall-attribution.md
 last_completed_phase: 1
 last_completed_commit: fd748d7aa7bf14acdf6c83d81fa137d1cdbab672
@@ -40,7 +40,11 @@ phase_1b_worst_stall_ms: 19687.274        # phase 1 was 15356.616. Worse, not be
 phase_1b_stall_rate_unchanged: true       # 1 per 37.37 s vs phase 1's 1 per 37.36 s — identical
 phase_1b_production_effect: none          # the code is correct; it changed nothing measurable
 event_loop_still_blocked: true            # PHASE 2 REMAINS BLOCKED BY ITS OWN PREREQUISITE
-next_step_needs_user_decision: true       # widening the blocking-call census has no phase and no owner
+phase_1c_deployed_commit: 93d1dfb483c34cea88ec9b7ca9adff7aa6bcaa2d   # stall attribution, observation only
+phase_1c_blocker_found: "web_app.run_deepcoin_execution_reconcile_loop:7807 -> execution_bindings.reconcile_deepcoin_execution_bindings"
+phase_1c_blocker_interval_seconds: 30     # 30 s sleep plus 6-10 s blocking = the measured 37.36 s stall period
+phase_1c_captures: 20                     # distinct, over 25 min of steady state; 19 under the reconcile loop
+next_step_needs_user_decision: true       # fixing the named blocker has no phase and no owner
 production_commit_before_phase_1b: fd748d7aa7bf14acdf6c83d81fa137d1cdbab672  # phase 1b rollback target
 baseline_captured: true   # 64.9 minutes of real traffic, 2026-08-18 17:16 UTC
 phase_0_blocking_call_census:   # Task 4 Step 3 — verbatim discovered set, 2026-08-18
@@ -85,6 +89,13 @@ server_verification:
   - "phase-1b-behavior-unchanged: strategy_management_batches shows 2 batches touched and message_instruction_items 2 rows touched in the 65 min after the restart, and there were zero 'worker tick failed' entries. The operator maintenance path reaches entry-admission and instruction-execution reconciliation, and message_instruction_items moving is consistent with it still running. runtime_incidents saw no new rows, so the notification delivery path was idle and is unproven, same gap as break-even convergence in Phase 1."
   - "phase-1b-keep-do-not-revert: Phase 1b stays deployed. It is correct code that removes a real database read and a real exchange client construction from the event loop on a 5-second interval, and it keeps the census at zero so the next regression is caught. Its null production result means that call was not the bottleneck, not that the change is wrong. Rollback target if ever needed is fd748d7."
 
+  - "phase-1c-local (2026-08-19, session-45794fed): LoopStallAttributor added to runtime_loop_health.py. It is a plain OS daemon thread, not a coroutine, because the loop cannot report on itself while blocked - the same reason the Phase 0 endpoint times out during a stall. LoopLagMonitor.run() records threading.get_ident() once and calls note_checkin() every iteration; the watchdog polls 4x a second and, when the check-in gap crosses the threshold, reads that threads frame from sys._current_frames() and formats its stack. One capture per episode, rate limited to the existing 60 s window, bounded to 5 captures and 25 frames. The frame table is only read when a capture is warranted, so steady-state cost is a clock comparison. Captures surface in the journal AND in GET /api/runtime/loop-health. 13 tests added, none of which sleep or need a real stall (injected clock and frame table): no capture before attach, none while checking in normally, capture once the gap crosses, exactly one per episode, rate limit across episodes, missing thread id and failing frame provider both degrade to a recorded reason, bounded captures and stack depth, daemon thread, idempotent start. Full suite 5677 passed, 1 skipped, 0 failed, 394s; before 5664, delta 13 exactly."
+  - "phase-1c-ANSWER (2026-08-19 08:17-08:42 UTC): THE BLOCKER IS NAMED. Outcome 1 of the three the phase file listed - the stacks name a Python frame. 20 distinct captures over 25 minutes of steady state (uptime 97 s to 1481 s, so not a startup artifact). NINETEEN OF TWENTY are under src/telegram_kol_research/web_app.py:7807, run_deepcoin_execution_reconcile_loop, which calls execution_bindings.reconcile_deepcoin_execution_bindings SYNCHRONOUSLY on the event loop. blocked_ms across the captures ranges 3006 to 7513. The innermost frames are spread across the whole reconcile routine rather than one hot line - deepcoin_client.py:598 _request (the synchronous httpx exchange call, 3 captures), execution_bindings.py:2211 _exchange_row_matches_leg, :2287 _has_prior_authoritative_position_audit .all(), :2601 _post_entry_protection_mutated_binding_ids .all(), :4564 _apply_recorded_terminal_entry_events .all(), :1246 the leg-matching genexpr, position_take_profit_orders.py:229 .one_or_none(), and position_authority_lock.py:17. So the whole routine is seconds long: exchange HTTP plus many SQLite queries plus Python-level matching over legs, all on the loop."
+  - "phase-1c-numbers-all-reconcile: the loops interval is `interval_seconds: int = 30` (web_app.py:7793). 30 s of sleep plus 6-10 s of blocking predicts a 36-40 s stall period; the measured rate was one per 37.36 s across a 6-hour window and one per 37.37 s across a 65-minute window. Each iteration also calls deepcoin_client_factory() and reaches list_open_orders, whose httpx timeout is 15 s - which accounts for the 15356.6 ms and 19687.3 ms outliers. And it is a timer, which is why the stall rate was a metronome while production handled only 1-16 messages an hour. Three previously unexplained observations, one cause."
+  - "phase-1c-why-the-census-missed-it: this call hits BOTH blind spots at once. discover_blocking_calls() matches a call whose function name ends in _tick or _once AND which is defined in the same module. reconcile_deepcoin_execution_bindings ends in neither, and it is imported from execution_bindings into web_app. Either condition alone would have caught it. That is how KNOWN_BLOCKING_CALLS reached empty while the loop kept stalling, and it is why Phase 1b looked like a contradiction. The census needs widening before it can be trusted as a gate."
+  - "phase-1c-secondary-findings: two things worth carrying forward, neither pursued here. (1) ONE capture of the twenty was not under the reconcile loop at all: the loop was idle in asyncio base_events _run_once at self._selector.select(timeout) while 7513 ms of lag accrued. An idle selector cannot be the loop being busy, so that episode is outcome 3 - a process-level pause such as GC, swap, or CPU starvation. One in twenty, mechanism unknown, recorded not chased. (2) TWO captures were blocked at position_authority_lock.py:17, `with _POSITION_AUTHORITY_LOCK:`, a threading.Lock acquired ON the event loop. Phase 1 moved the management ticks onto a worker thread, so a lock that used to serialize work already serialized by the loop can now be held by that worker while the loop waits on it. Whether Phase 1 made this reachable, or it was always reachable, is not established here."
+  - "phase-1c-not-fixed-by-design: Phase 1c is observation only and fixed nothing. Production runs 93d1dfb, which adds the watchdog and changes no trading behavior. The named blocker is still on the event loop. Rollback target if the watchdog is ever unwanted: ee9c0d2."
+
 ```
 
 ## Claim protocol — read this before starting any phase
@@ -122,7 +133,7 @@ the 2026-08-18 incident.
 | 0 | `phase-0-loop-health-observability.md` | **completed** 2026-08-18, deployed a00561b, baseline captured |
 | 1 | `phase-1-unblock-event-loop.md` | **completed** 2026-08-18, deployed fd748d7, p95 8312 -> 12 ms; one criterion unmet |
 | 1b | `phase-1b-unblock-operator-maintenance.md` | **completed** 2026-08-19, deployed `ee9c0d2` — census now empty, but **zero production effect** |
-| 1c | `phase-1c-stall-attribution.md` | claimed 2026-08-19 — capture the loop's stack while it is blocked, instead of guessing again |
+| 1c | `phase-1c-stall-attribution.md` | **completed** 2026-08-19, deployed `93d1dfb` — blocker NAMED: the deepcoin reconcile loop |
 | 2 | `phase-2-per-chat-lock-sharding.md` | planned — blocked, prerequisite unmet |
 | 3 | `phase-3-compensation-window-repair.md` | planned |
 | 4 | `phase-4-durable-job-shadow-enqueue.md` | planned |
@@ -382,27 +393,68 @@ client construction from the loop on a five-second interval, and it holds the
 census at zero so the next regression is caught. Rollback target if ever needed:
 `fd748d7`.
 
-## What is actually known about the remaining blocker
+## Phase 1c — THE BLOCKER IS NAMED
 
-Stated as evidence, not as a hypothesis to act on:
+Deployed `93d1dfb` on 2026-08-19 08:17 UTC. It captured a stall stack **twelve
+seconds after startup** and 20 distinct stacks over the next 25 minutes.
 
-- The distribution is bimodal. p50 is 0.911 ms and p95 is 7.213 ms, so the loop
-  is healthy the overwhelming majority of the time, then blocked for seconds.
-- Stalls arrive at a strikingly regular rate — one per ~37 s across both a
-  65-minute and a 6-hour observation.
-- Logged durations cluster between 6.1 s and 10.7 s. The 3 s threshold and the
-  one-warning-per-60 s limiter mean the journal shows only the first stall of
-  each minute, so this is a sample, not the distribution.
-- Ruled out by measurement: both management worker ticks (Phase 1), the operator
-  maintenance tick (Phase 1b).
-- Ruled out by inspection: `lifecycle_monitor` candle fetches — they are noisy in
-  the journal but run in an `async def` and are ordinary Gate.io timeouts.
+**Nineteen of twenty point at the same place:**
 
-What the census cannot see, and what a widened investigation would have to cover:
-synchronous work inside an `async def` that is not named `*_tick`/`*_once`;
-blocking calls reached through an awaited coroutine; synchronous database or
-HTTP work in request handlers and in the Telethon message path; and CPU-bound
-work that blocks without any I/O call at all.
+```
+web_app.py:7807   run_deepcoin_execution_reconcile_loop      <- async def, 30 s interval
+  → execution_bindings.py:439    reconcile_deepcoin_execution_bindings   <- SYNCHRONOUS, on the loop
+  → execution_bindings.py:1040   _apply_reconcile_snapshot
+  → ... exchange HTTP, SQLite queries, leg matching ...
+```
+
+The innermost frames are spread across the whole routine, not concentrated on
+one line — `deepcoin_client.py:598 _request` (the synchronous httpx call),
+several `.all()` and `.one_or_none()` SQLAlchemy queries in
+`execution_bindings.py`, the leg-matching generator at `:1246`, and
+`position_authority_lock.py:17`. The entire reconcile is seconds long, and all
+of it runs on the event loop.
+
+**Every unexplained number now has one cause.** The loop's interval is
+`interval_seconds: int = 30`.
+
+| Observation | Explanation |
+|---|---|
+| stalls every 37.36 s | 30 s sleep + 6–10 s blocking |
+| durations 6–10 s | exchange round trip + many SQLite queries + Python matching |
+| outliers at 15.4 s and 19.7 s | `list_open_orders` on an `httpx` client with a **15 s** timeout |
+| rate independent of traffic | it is a timer; production sees 1–16 messages/hour |
+
+Captured `blocked_ms` ranged 3006–7513 across the 20 samples.
+
+## Why three rounds of census missed it
+
+`discover_blocking_calls()` matches a call that is **(a)** named `*_tick` or
+`*_once` **and (b)** defined in the same module. `reconcile_deepcoin_execution_bindings`
+is neither — it is imported from `execution_bindings` into `web_app`.
+
+**It hits both blind spots at once.** Either condition alone would have caught
+it. That is how `KNOWN_BLOCKING_CALLS` reached empty while the loop kept
+stalling, and it is why Phase 1b's null result looked like a contradiction
+rather than a clue. The census cannot be trusted as a gate until it is widened.
+
+## Two secondary findings, neither pursued
+
+1. **One capture of twenty was not the loop being busy at all.** It showed the
+   loop idle in `base_events._run_once` at `self._selector.select(timeout)`
+   while 7513 ms of lag accrued. An idle selector cannot be blocking work, so
+   that episode is a process-level pause — GC, swap, or CPU starvation.
+   One in twenty. Mechanism unknown, recorded not chased.
+2. **Two captures were blocked acquiring a `threading.Lock` on the event loop**
+   (`position_authority_lock.py:17`). Phase 1 moved the management ticks onto a
+   worker thread, so a lock that previously only serialized work the loop was
+   already serializing can now be held by that worker while the loop waits.
+   Whether Phase 1 made this reachable or it always was is not established here.
+
+## Phase 1c fixed nothing, by design
+
+Production runs `93d1dfb`, which adds the watchdog and changes no trading
+behavior. The named blocker is still on the event loop. Rollback target if the
+watchdog is ever unwanted: `ee9c0d2`.
 
 ## Before Phase 2 starts — read this
 
@@ -429,11 +481,17 @@ updater" above.
    once every 37 seconds, for six to ten seconds at a time. Phase 2 introduces
    real parallelism; measuring it against this loop cannot separate its effect
    from the residual blocker. **Phase 2 should not start yet.**
-5. **The next step is an investigation that has no phase and no owner.** The
-   census is empty and the stalls remain, so finding the real blocker means
-   widening how it is looked for — see "What is actually known about the
-   remaining blocker" above. Opening that task is a decision for the user, not
-   for the next session to help itself to.
+5. **The blocker is now named, and fixing it has no phase and no owner.**
+   `run_deepcoin_execution_reconcile_loop` at `web_app.py:7807` calls
+   `reconcile_deepcoin_execution_bindings` synchronously on the loop every 30
+   seconds. Opening the phase that fixes it is the user's decision, not
+   something the next session may help itself to. Note the shape is identical to
+   Phase 1's, and the same design constraint applies: this loop reaches the same
+   execution-binding and protection state as the management ticks, so it belongs
+   on the **existing shared `mgmt-worker` executor**, not a new one.
+6. **Widen the census before trusting it again.** It matched only same-module
+   `*_tick`/`*_once` calls and therefore reported zero offenders while this one
+   ran every 30 seconds.
 
 The authoritative checkout for this rollout is the worktree
 `.worktrees/runtime-serialization` on branch `codex/phase0-deploy-integration`,
