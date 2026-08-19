@@ -74,6 +74,7 @@ from telegram_kol_research.runtime_incident_adapters import (
 )
 from telegram_kol_research.runtime_loop_health import LoopLagMonitor
 from telegram_kol_research.runtime_worker_executor import (
+    run_on_management_worker,
     shutdown_management_worker_executor,
 )
 from telegram_kol_research.production_safety_monitor import (
@@ -7789,6 +7790,19 @@ def create_web_app(
     return app
 
 
+def _build_deepcoin_reconcile_client(deepcoin_client_factory, *, now_provider=None):
+    """Build the reconcile client and stamp the run, as one blocking unit.
+
+    Constructing the client reaches the exchange, so it belongs on the worker
+    thread with the reconcile it feeds. The timestamp is taken here so it keeps
+    its original position: after the client exists, before any reconcile work.
+    """
+
+    client = deepcoin_client_factory()
+    synced_at = now_provider() if now_provider is not None else datetime.now(UTC)
+    return client, synced_at
+
+
 async def run_deepcoin_execution_reconcile_loop(
     *,
     session_factory,
@@ -7801,10 +7815,14 @@ async def run_deepcoin_execution_reconcile_loop(
 ) -> None:
     while True:
         try:
-            client = deepcoin_client_factory()
-            synced_at = now_provider() if now_provider is not None else datetime.now(UTC)
+            client, synced_at = await run_on_management_worker(
+                _build_deepcoin_reconcile_client,
+                deepcoin_client_factory,
+                now_provider=now_provider,
+            )
             if hasattr(client, "list_open_orders"):
-                reconcile_deepcoin_execution_bindings(
+                await run_on_management_worker(
+                    reconcile_deepcoin_execution_bindings,
                     session_factory,
                     client=client,
                     recovered_at=synced_at,
@@ -7820,7 +7838,8 @@ async def run_deepcoin_execution_reconcile_loop(
                         session_factory, config=system_operator_bot_config,
                         delivered_at=synced_at,
                     )
-            sync_manual_closed_deepcoin_positions(
+            await run_on_management_worker(
+                sync_manual_closed_deepcoin_positions,
                 session_factory,
                 client=client,
                 synced_at=synced_at,
@@ -7831,6 +7850,8 @@ async def run_deepcoin_execution_reconcile_loop(
                     config=terminal_entry_cleanup_bot_config,
                     delivered_at=synced_at,
                 )
+        except asyncio.CancelledError:
+            raise
         except DeepcoinClientError as exc:
             logger.warning("Deepcoin execution reconcile skipped: %s", exc)
         except Exception:

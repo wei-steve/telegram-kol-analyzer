@@ -334,3 +334,142 @@ def test_operator_cycle_closes_its_client_on_the_worker_thread(monkeypatch):
     assert [name for name, _ in events] == ["build", "tick", "close"]
     assert len({thread for _, thread in events}) == 1
     assert events[0][1].startswith("mgmt-worker")
+
+
+def _start_reconcile_loop(*, session_factory=None, client=None) -> asyncio.Task:
+    from telegram_kol_research import web_app
+
+    return asyncio.create_task(
+        web_app.run_deepcoin_execution_reconcile_loop(
+            session_factory=session_factory if session_factory is not None else object(),
+            deepcoin_client_factory=lambda: client if client is not None else object(),
+            interval_seconds=1,
+            now_provider=lambda: NOW,
+        )
+    )
+
+
+def test_deepcoin_reconcile_loop_leaves_the_event_loop_responsive(monkeypatch):
+    """Phase 1c attributed 19 of 20 production stalls to this loop."""
+
+    from telegram_kol_research import web_app
+
+    class _Client:
+        def list_open_orders(self):  # presence enables the reconcile branch
+            return []
+
+    monkeypatch.setattr(
+        web_app, "reconcile_deepcoin_execution_bindings", _blocking_tick
+    )
+    monkeypatch.setattr(
+        web_app, "sync_manual_closed_deepcoin_positions", lambda *a, **k: None
+    )
+    monkeypatch.setattr(web_app, "system_operator_bot_enabled", lambda _c: False)
+
+    async def scenario():
+        return await _observe_loop_while(
+            lambda: _start_reconcile_loop(client=_Client())
+        )
+
+    beats, worst_gap = asyncio.run(scenario())
+
+    assert beats >= MIN_HEARTBEATS
+    assert worst_gap < TICK_BLOCK_SECONDS
+
+
+def test_deepcoin_reconcile_runs_on_the_shared_management_worker_thread(monkeypatch):
+    from telegram_kol_research import web_app
+
+    class _Client:
+        def list_open_orders(self):
+            return []
+
+    threads: set[str] = set()
+    ran = threading.Event()
+
+    def record(*_args, **_kwargs) -> None:
+        threads.add(threading.current_thread().name)
+        ran.set()
+
+    monkeypatch.setattr(web_app, "reconcile_deepcoin_execution_bindings", record)
+    monkeypatch.setattr(web_app, "sync_manual_closed_deepcoin_positions", record)
+    monkeypatch.setattr(web_app, "system_operator_bot_enabled", lambda _c: False)
+
+    async def scenario():
+        task = _start_reconcile_loop(client=_Client())
+        try:
+            await asyncio.wait_for(asyncio.to_thread(ran.wait, 10.0), 15.0)
+            await asyncio.sleep(0.05)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(scenario())
+
+    assert len(threads) == 1
+    assert next(iter(threads)).startswith("mgmt-worker")
+
+
+def test_reconcile_loop_skips_later_segments_when_an_early_one_raises(monkeypatch):
+    """Splitting the body across submissions must not change ordering on error.
+
+    In the original the whole body sat in one try, so a raise in the reconcile
+    skipped the manual-close sync and every delivery after it. The segmented
+    version must behave identically.
+    """
+
+    from telegram_kol_research import web_app
+
+    class _Client:
+        def list_open_orders(self):
+            return []
+
+    calls: list[str] = []
+    raised = threading.Event()
+
+    def exploding_reconcile(*_args, **_kwargs) -> None:
+        calls.append("reconcile")
+        raised.set()
+        raise RuntimeError("reconcile exploded")
+
+    def later_sync(*_args, **_kwargs) -> None:
+        calls.append("sync_manual_closed")
+
+    async def later_delivery(*_args, **_kwargs) -> int:
+        calls.append("delivery")
+        return 0
+
+    monkeypatch.setattr(
+        web_app, "reconcile_deepcoin_execution_bindings", exploding_reconcile
+    )
+    monkeypatch.setattr(web_app, "sync_manual_closed_deepcoin_positions", later_sync)
+    monkeypatch.setattr(web_app, "system_operator_bot_enabled", lambda _c: True)
+    monkeypatch.setattr(
+        web_app, "deliver_pending_position_attribution_incidents", later_delivery
+    )
+    monkeypatch.setattr(
+        web_app, "deliver_pending_position_protection_incidents", later_delivery
+    )
+    monkeypatch.setattr(
+        web_app, "deliver_terminal_entry_cleanup_notifications", later_delivery
+    )
+
+    async def scenario():
+        task = _start_reconcile_loop(client=_Client())
+        try:
+            await asyncio.wait_for(asyncio.to_thread(raised.wait, 10.0), 15.0)
+            await asyncio.sleep(0.1)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(scenario())
+
+    assert calls
+    assert set(calls) == {"reconcile"}, calls
