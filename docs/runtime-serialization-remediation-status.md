@@ -16,8 +16,8 @@ local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v
 design_version: 1
 current_phase: 2f
 phase_name: close-position-authority-coverage-gaps
-phase_status: planned          # planned | claimed | in_progress | completed
-claimed_by: none               # phase 2 claim released 2026-08-19; user chose to close the gap before phase 3 - see phase_2_* fields below
+phase_status: claimed          # planned | claimed | in_progress | completed
+claimed_by: session-phase2f-close-gaps-0819               # claimed 2026-08-19 to execute phase-2f-close-position-authority-coverage-gaps.md
 current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-2f-close-position-authority-coverage-gaps.md
 last_completed_phase: 2   # the sequence ran 0, 1, 1b, 1c, 1d, 1e, 2
 last_completed_commit: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd
