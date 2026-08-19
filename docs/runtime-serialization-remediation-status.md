@@ -16,8 +16,8 @@ local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v
 design_version: 1
 current_phase: 2
 phase_name: per-chat-lock-sharding
-phase_status: planned          # planned | claimed | in_progress | completed
-claimed_by: none               # phases 0-1e all complete and deployed; phase 2 unclaimed
+phase_status: claimed          # planned | claimed | in_progress | completed
+claimed_by: session-phase2-lockshard-0819  # phases 0-1e all complete and deployed; phase 2 claimed 2026-08-19
 current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-2-per-chat-lock-sharding.md
 last_completed_phase: 1e   # the sequence ran 0, 1, 1b, 1c, 1d, 1e
 last_completed_commit: 92e6e60a0985a81208064f785e2454bcafd99bfe
