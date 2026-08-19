@@ -86,6 +86,7 @@ class TradingSettings:
     instruction_execution_management_after_item_id: int = 0
     deepcoin_contract_specs_mode: Literal["static", "shadow", "live"] = "static"
     mimo_contract_mode: Literal["v1", "v2_live_adapter"] = "v1"
+    message_lock_mode: Literal["global", "per_chat"] = "global"
     mimo_v2_activation_after_raw_message_id: int = 0
     default_max_loss_usdt: float = 20.0
     daily_max_loss_usdt: float = 500.0
@@ -395,6 +396,9 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
     mimo_contract_mode = _mimo_contract_mode(
         raw.get("mimo_contract_mode", defaults.mimo_contract_mode)
     )
+    message_lock_mode = _message_lock_mode(
+        raw.get("message_lock_mode", defaults.message_lock_mode)
+    )
     mimo_v2_activation_after_raw_message_id = _nonnegative_int_setting(
         raw.get(
             "mimo_v2_activation_after_raw_message_id",
@@ -436,6 +440,7 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         mimo_v2_activation_after_raw_message_id=(
             mimo_v2_activation_after_raw_message_id
         ),
+        message_lock_mode=message_lock_mode,
         default_max_loss_usdt=_positive_float(
             raw.get("default_max_loss_usdt"),
             defaults.default_max_loss_usdt,
@@ -584,6 +589,15 @@ def _mimo_contract_mode(
     normalized = value.strip().lower()
     if normalized not in {"v1", "v2_live_adapter"}:
         raise ValueError("mimo_contract_mode must be v1 or v2_live_adapter")
+    return normalized
+
+
+def _message_lock_mode(value: Any) -> Literal["global", "per_chat"]:
+    if not isinstance(value, str):
+        raise ValueError("message_lock_mode must be global or per_chat")
+    normalized = value.strip().lower()
+    if normalized not in {"global", "per_chat"}:
+        raise ValueError("message_lock_mode must be global or per_chat")
     return normalized
 
 

@@ -1,0 +1,305 @@
+"""Phase 2 Task 4: chat isolation and ordering under message_lock_mode.
+
+These exercise the real wiring in telegram_live_listener.py - run_live_listener
+plus run_reconcile_once - against a real MessageLockProvider and
+KeyedAsyncLockRegistry, with persist_live_message_event and the authoritative
+processor faked out (no real network, no real AI recognition). Slowness is
+simulated with asyncio.Event / threading.Event gates so ordering is asserted
+deterministically rather than by timing.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+
+from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.keyed_async_locks import KeyedAsyncLockRegistry
+from telegram_kol_research.message_lock_provider import MessageLockProvider
+from telegram_kol_research.models import RawMessage
+from telegram_kol_research.models import utc_now
+from telegram_kol_research.telegram_live_listener import run_live_listener
+from telegram_kol_research.telegram_live_listener import run_reconcile_once
+from telegram_kol_research.trading_settings import save_trading_settings
+
+
+class _ChatEvent:
+    def __init__(self, *, chat_id: int, label: str) -> None:
+        self.chat_id = chat_id
+        self.label = label
+
+
+class _FakeListenerClient:
+    def __init__(self) -> None:
+        self.handlers = []
+
+    async def connect(self):
+        pass
+
+    def add_event_handler(self, handler, event):
+        self.handlers.append((handler, event))
+
+    async def run_until_disconnected(self):
+        pass
+
+
+def _make_provider(session_factory, *, mode: str) -> MessageLockProvider:
+    save_trading_settings(session_factory, {"message_lock_mode": mode})
+    return MessageLockProvider(
+        session_factory=session_factory,
+        global_lock=asyncio.Lock(),
+        registry=KeyedAsyncLockRegistry(),
+    )
+
+
+async def _fake_discover_dialogs_none(client):
+    return []
+
+
+async def _fake_fetch_no_messages(client, dialog, limit, media_root="data/media"):
+    return []
+
+
+def test_per_chat_mode_a_slow_chat_does_not_delay_another_chat(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    provider = _make_provider(session_factory, mode="per_chat")
+    client = _FakeListenerClient()
+    order: list[str] = []
+    a_started = asyncio.Event()
+    release_a = asyncio.Event()
+
+    async def fake_persist(**kwargs):
+        event = kwargs["event"]
+        order.append(f"start:{event.label}")
+        if event.label == "a":
+            a_started.set()
+            await release_a.wait()
+        order.append(f"end:{event.label}")
+        return {}
+
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.persist_live_message_event",
+        fake_persist,
+    )
+
+    async def scenario():
+        await run_live_listener(
+            client=client,
+            session_factory=session_factory,
+            broker=None,
+            target_titles=set(),
+            operation_lock=provider,
+        )
+        handler, _ = client.handlers[0]
+        task_a = asyncio.create_task(handler(_ChatEvent(chat_id=111, label="a")))
+        await a_started.wait()
+        task_b = asyncio.create_task(handler(_ChatEvent(chat_id=222, label="b")))
+        await asyncio.wait_for(task_b, timeout=5.0)
+        assert order == ["start:a", "start:b", "end:b"]
+        release_a.set()
+        await asyncio.wait_for(task_a, timeout=5.0)
+
+    asyncio.run(scenario())
+
+    assert order == ["start:a", "start:b", "end:b", "end:a"]
+
+
+def test_per_chat_mode_serializes_the_same_chat_in_arrival_order(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    provider = _make_provider(session_factory, mode="per_chat")
+    client = _FakeListenerClient()
+    order: list[str] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def fake_persist(**kwargs):
+        event = kwargs["event"]
+        order.append(f"start:{event.label}")
+        if event.label == "first":
+            first_started.set()
+            await release_first.wait()
+        order.append(f"end:{event.label}")
+        return {}
+
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.persist_live_message_event",
+        fake_persist,
+    )
+
+    async def scenario():
+        await run_live_listener(
+            client=client,
+            session_factory=session_factory,
+            broker=None,
+            target_titles=set(),
+            operation_lock=provider,
+        )
+        handler, _ = client.handlers[0]
+        task_first = asyncio.create_task(
+            handler(_ChatEvent(chat_id=111, label="first"))
+        )
+        await first_started.wait()
+        task_second = asyncio.create_task(
+            handler(_ChatEvent(chat_id=111, label="second"))
+        )
+        await asyncio.sleep(0.02)
+        assert order == ["start:first"]
+        release_first.set()
+        await asyncio.wait_for(
+            asyncio.gather(task_first, task_second), timeout=5.0
+        )
+
+    asyncio.run(scenario())
+
+    assert order == ["start:first", "end:first", "start:second", "end:second"]
+
+
+def test_global_mode_is_byte_for_byte_the_old_behavior(tmp_path, monkeypatch):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    assert (
+        _load_mode(session_factory) == "global"
+    ), "message_lock_mode must default to global"
+    provider = _make_provider(session_factory, mode="global")
+    client = _FakeListenerClient()
+    order: list[str] = []
+    a_started = asyncio.Event()
+    release_a = asyncio.Event()
+
+    async def fake_persist(**kwargs):
+        event = kwargs["event"]
+        order.append(f"start:{event.label}")
+        if event.label == "a":
+            a_started.set()
+            await release_a.wait()
+        order.append(f"end:{event.label}")
+        return {}
+
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.persist_live_message_event",
+        fake_persist,
+    )
+
+    async def scenario():
+        await run_live_listener(
+            client=client,
+            session_factory=session_factory,
+            broker=None,
+            target_titles=set(),
+            operation_lock=provider,
+        )
+        handler, _ = client.handlers[0]
+        task_a = asyncio.create_task(handler(_ChatEvent(chat_id=111, label="a")))
+        await a_started.wait()
+        task_b = asyncio.create_task(handler(_ChatEvent(chat_id=222, label="b")))
+        await asyncio.sleep(0.02)
+        # Different chats still serialize on the single shared lock: b has not
+        # even started while a is in flight.
+        assert order == ["start:a"]
+        release_a.set()
+        await asyncio.wait_for(asyncio.gather(task_a, task_b), timeout=5.0)
+
+    asyncio.run(scenario())
+
+    assert order == ["start:a", "end:a", "start:b", "end:b"]
+
+
+def _load_mode(session_factory) -> str:
+    from telegram_kol_research.trading_settings import load_trading_settings
+
+    return load_trading_settings(session_factory).message_lock_mode
+
+
+def test_per_chat_reconcile_pass_does_not_block_a_live_message_in_another_chat(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    provider = _make_provider(session_factory, mode="per_chat")
+    with session_factory() as session:
+        session.add(
+            RawMessage(
+                chat_id=111,
+                message_id=1,
+                text="needs recovery",
+                archived_target_group=True,
+                posted_at=utc_now(),
+            )
+        )
+        session.commit()
+
+    order: list[str] = []
+    reconcile_started = threading.Event()
+    release_reconcile = threading.Event()
+
+    def slow_authoritative_processor(raw_message_id):
+        order.append(f"reconcile-start:{raw_message_id}")
+        reconcile_started.set()
+        assert release_reconcile.wait(5.0)
+        order.append(f"reconcile-end:{raw_message_id}")
+
+        class _Assessment:
+            agreement_status = "authoritative_ok"
+
+        class _Result:
+            automation = None
+            recognition = None
+            assessment = _Assessment()
+
+        return _Result()
+
+    async def fake_persist(**kwargs):
+        event = kwargs["event"]
+        order.append(f"live-start:{event.label}")
+        order.append(f"live-end:{event.label}")
+        return {}
+
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.persist_live_message_event",
+        fake_persist,
+    )
+
+    client = _FakeListenerClient()
+
+    async def _discover_one_dialog(client):
+        return [{"id": 111, "title": "Chat A", "archived": True}]
+
+    async def scenario():
+        await run_live_listener(
+            client=client,
+            session_factory=session_factory,
+            broker=None,
+            target_titles=set(),
+            operation_lock=provider,
+        )
+        handler, _ = client.handlers[0]
+
+        reconcile_task = asyncio.create_task(
+            run_reconcile_once(
+                client=object(),
+                session_factory=session_factory,
+                broker=None,
+                target_titles={"Chat A"},
+                authoritative_processor=slow_authoritative_processor,
+                discover_dialogs_fn=_discover_one_dialog,
+                fetch_dialog_messages_fn=_fake_fetch_no_messages,
+                chat_operation_lock=provider,
+            )
+        )
+        await asyncio.to_thread(reconcile_started.wait, 5.0)
+
+        live_task = asyncio.create_task(
+            handler(_ChatEvent(chat_id=222, label="live"))
+        )
+        await asyncio.wait_for(live_task, timeout=5.0)
+        assert order == ["reconcile-start:1", "live-start:live", "live-end:live"]
+
+        release_reconcile.set()
+        await asyncio.wait_for(reconcile_task, timeout=5.0)
+
+    asyncio.run(scenario())
+
+    assert order == [
+        "reconcile-start:1",
+        "live-start:live",
+        "live-end:live",
+        "reconcile-end:1",
+    ]

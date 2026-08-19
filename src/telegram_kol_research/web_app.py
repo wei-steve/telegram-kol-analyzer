@@ -68,6 +68,8 @@ from telegram_kol_research.runtime_agent_production_audit import (
     project_bounded_production_audit,
     run_bounded_production_audit_command,
 )
+from telegram_kol_research.keyed_async_locks import KeyedAsyncLockRegistry
+from telegram_kol_research.message_lock_provider import MessageLockProvider
 from telegram_kol_research.runtime_incident_adapters import (
     capture_monitor_state,
     capture_notification_failure,
@@ -4167,7 +4169,7 @@ def create_web_app(
                     context_resolution_worker=app.state.context_resolution_worker,
                     system_operator_bot_config=app.state.system_operator_bot_config,
                     notification_bot_config=app.state.notification_bot_config,
-                    operation_lock=app.state.telegram_operation_lock,
+                    operation_lock=app.state.message_lock_provider,
                     source_deletion_recorder=app.state.source_deletion_recorder,
                 )
                 app.state.reconcile_task = asyncio.create_task(
@@ -4179,7 +4181,7 @@ def create_web_app(
                         target_titles=app.state.live_target_titles,
                         media_root=app.state.media_root,
                         interval_seconds=app.state.reconcile_interval_seconds,
-                        operation_lock=app.state.telegram_operation_lock,
+                        operation_lock=app.state.message_lock_provider,
                         strategy_alert_config=app.state.strategy_alert_config,
                         strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
                         authoritative_processor=app.state.authoritative_processor,
@@ -4619,6 +4621,12 @@ def create_web_app(
     app.state.reconcile_once_runner = run_reconcile_once
     app.state.telegram_session_lock_factory = acquire_telegram_session_lock
     app.state.telegram_operation_lock = asyncio.Lock()
+    app.state.message_lock_registry = KeyedAsyncLockRegistry()
+    app.state.message_lock_provider = MessageLockProvider(
+        session_factory=app.state.session_factory,
+        global_lock=app.state.telegram_operation_lock,
+        registry=app.state.message_lock_registry,
+    )
     app.state.asset_version = _static_asset_version()
 
     @app.middleware("http")
@@ -4671,7 +4679,7 @@ def create_web_app(
                 context_resolution_worker=app.state.context_resolution_worker,
                 system_operator_bot_config=app.state.system_operator_bot_config,
                 notification_bot_config=app.state.notification_bot_config,
-                operation_lock=app.state.telegram_operation_lock,
+                operation_lock=app.state.message_lock_provider,
                 source_deletion_recorder=app.state.source_deletion_recorder,
             )
         reconcile_task = app.state.reconcile_task
@@ -4685,7 +4693,7 @@ def create_web_app(
                     target_titles=app.state.live_target_titles,
                     media_root=app.state.media_root,
                     interval_seconds=app.state.reconcile_interval_seconds,
-                    operation_lock=app.state.telegram_operation_lock,
+                    operation_lock=app.state.message_lock_provider,
                     strategy_alert_config=app.state.strategy_alert_config,
                     strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
                     authoritative_processor=app.state.authoritative_processor,
@@ -6825,7 +6833,7 @@ def create_web_app(
                 != current.mimo_v2_activation_after_raw_message_id
             )
             if mimo_contract_change:
-                async with app.state.telegram_operation_lock:
+                async with app.state.message_lock_provider.lock_all():
                     locked_current = load_trading_settings(
                         app.state.session_factory
                     )
@@ -7499,7 +7507,7 @@ def create_web_app(
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
         async def run_refresh():
-            async with app.state.telegram_operation_lock:
+            async with app.state.message_lock_provider.lock_all():
                 await maybe_await(getattr(telegram_client, "connect", lambda: None)())
                 try:
                     reconcile_kwargs = _filter_callable_kwargs(

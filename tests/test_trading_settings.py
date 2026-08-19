@@ -56,6 +56,7 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     assert settings.deepcoin_contract_specs_mode == "static"
     assert settings.mimo_contract_mode == "v1"
     assert settings.mimo_v2_activation_after_raw_message_id == 0
+    assert settings.message_lock_mode == "global"
     assert not hasattr(settings, "entry_preamble_live_chat_ids")
 
 
@@ -172,6 +173,24 @@ def test_mimo_contract_rollout_settings_round_trip(tmp_path, mode):
 def test_mimo_contract_mode_fails_closed(value):
     with pytest.raises(ValueError, match="mimo_contract_mode"):
         trading_settings_from_payload({"mimo_contract_mode": value})
+
+
+@pytest.mark.parametrize("mode", ["global", "per_chat"])
+def test_message_lock_mode_round_trips_and_defaults_to_global(tmp_path, mode):
+    session_factory = create_session_factory(tmp_path / "message-lock-settings.db")
+
+    assert load_trading_settings(session_factory).message_lock_mode == "global"
+
+    saved = save_trading_settings(session_factory, {"message_lock_mode": mode})
+
+    assert saved.message_lock_mode == mode
+    assert load_trading_settings(session_factory).message_lock_mode == mode
+
+
+@pytest.mark.parametrize("value", ["shadow", "per-chat", True, [], {}, 1, None])
+def test_message_lock_mode_fails_closed(value):
+    with pytest.raises(ValueError, match="message_lock_mode"):
+        trading_settings_from_payload({"message_lock_mode": value})
 
 
 @pytest.mark.parametrize("value", [-1, True, "42", 1.5, None])
