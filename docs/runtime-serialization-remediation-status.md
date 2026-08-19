@@ -14,16 +14,16 @@ deploy_branch: codex/deepcoin-auto-trading-v1   # matches the updater default; n
 integration_branch: codex/phase0-deploy-integration  # merged onto origin/deploy_branch (302c1ae); push this to deploy_branch
 local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v1 is 118 commits diverged from origin and is checked out in /private/tmp/tg-risk-routing.wmF2Vj. Do not use it. origin/codex/deepcoin-auto-trading-v1 is authoritative.
 design_version: 1
-current_phase: 1.75
-phase_name: unblock-context-resolution-scheduler
-phase_status: completed        # planned | claimed | in_progress | completed
-claimed_by: none               # phase 1e complete and deployed; NOTHING is claimed
-current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-1e-unblock-context-resolution-scheduler.md
-last_completed_phase: 1
-last_completed_commit: fd748d7aa7bf14acdf6c83d81fa137d1cdbab672
+current_phase: 2
+phase_name: per-chat-lock-sharding
+phase_status: planned          # planned | claimed | in_progress | completed
+claimed_by: none               # phases 0-1e all complete and deployed; phase 2 unclaimed
+current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-2-per-chat-lock-sharding.md
+last_completed_phase: 1e   # the sequence ran 0, 1, 1b, 1c, 1d, 1e
+last_completed_commit: 92e6e60a0985a81208064f785e2454bcafd99bfe
 phase_0_code_commit: 816e296   # tasks 1-5; reviewed 2026-08-18. Task 6 (deploy + baseline) outstanding
-last_deployed_commit: ee9c0d26041ef8b3e251fc392a79b5c586e76943
-production_commit: ee9c0d26041ef8b3e251fc392a79b5c586e76943  # deployed 2026-08-19 03:22 UTC; was fd748d7 before phase 1b
+last_deployed_commit: 92e6e60a0985a81208064f785e2454bcafd99bfe
+production_commit: 92e6e60a0985a81208064f785e2454bcafd99bfe  # phase 1e, deployed 2026-08-19 11:29 UTC; verified over ssh 2026-08-19 12:4x
 production_commit_before_phase_0: 302c1ae467b98bc954ac2a25cc4a33a8d09f48f9  # rollback target
 production_commit_before_phase_1: a00561bf7683091ae0a48471cbfc2af1e6b9fa8c  # phase 1 rollback target
 phase_1_code_commit: fd748d7aa7bf14acdf6c83d81fa137d1cdbab672
@@ -67,6 +67,7 @@ residual_stall_leading_explanation: "host memory pressure and swap, not code: 47
 application_level_loop_blocking_believed_cleared: true  # with the caveat that 1 of 3 stalls was not captured
 next_step_needs_user_decision: true       # fixing the named blocker has no phase and no owner
 production_commit_before_phase_1b: fd748d7aa7bf14acdf6c83d81fa137d1cdbab672  # phase 1b rollback target
+production_commit_before_phase_2: 92e6e60a0985a81208064f785e2454bcafd99bfe  # phase 2 rollback target (level 2; level 1 is the settings flag)
 baseline_captured: true   # 64.9 minutes of real traffic, 2026-08-18 17:16 UTC
 phase_0_blocking_call_census:   # Task 4 Step 3 — verbatim discovered set, 2026-08-18
   - "strategy_management_worker.run_strategy_management_worker_loop -> run_strategy_management_worker_tick"
@@ -632,6 +633,27 @@ Against the Phase 0 production baseline:
 | p99 | 8777.887 ms | 79.914 ms | **110×** |
 | stall rate | 1 per 10.7 s | 1 per 1248.1 s | **117×** |
 | loop unavailable | 76% | 1.2% | **63×** |
+
+## Handoff note for the Phase 2 session
+
+Phases 0, 1, 1b, 1c, 1d and 1e are complete and deployed. Production runs
+`92e6e60`, verified over ssh, not inferred from git.
+
+**Phase 2 is a different kind of change from everything before it.** Phases 1
+through 1e were strictly threading moves — "changes threading, never
+concurrency" was the sentence that made each of them low risk. Phase 2 genuinely
+introduces parallelism that did not exist, on a path that reaches order
+submission. Its safety comes from a different place: it ships behind the
+`message_lock_mode` trading setting, deploys dormant, and rolls back with a
+settings flip that needs no deploy and no restart.
+
+Do not enable the flag in the same step as the deploy. Deploy dormant, confirm
+the service is healthy, then enable deliberately.
+
+Phase 2's Task 1 asks whether the position authority boundary really covers
+exchange mutation. There is already evidence for that question: two Phase 1c
+stall captures were blocked at `position_authority_lock.py:17`, a
+`threading.Lock` taken on the event loop. Start from that, not from scratch.
 
 ## Before Phase 2 starts — read this
 
