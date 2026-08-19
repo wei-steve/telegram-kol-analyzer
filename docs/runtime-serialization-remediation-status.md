@@ -15,10 +15,10 @@ integration_branch: codex/phase0-deploy-integration  # merged onto origin/deploy
 local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v1 is 118 commits diverged from origin and is checked out in /private/tmp/tg-risk-routing.wmF2Vj. Do not use it. origin/codex/deepcoin-auto-trading-v1 is authoritative.
 design_version: 1
 current_phase: 1.75
-phase_name: stall-attribution
-phase_status: completed        # planned | claimed | in_progress | completed
-claimed_by: none               # phase 1c complete; the blocker is NAMED but NOT FIXED
-current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-1c-stall-attribution.md
+phase_name: unblock-deepcoin-reconcile
+phase_status: claimed          # planned | claimed | in_progress | completed
+claimed_by: session-45794fed   # claimed 2026-08-19 for phase 1d
+current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-1d-unblock-deepcoin-reconcile.md
 last_completed_phase: 1
 last_completed_commit: fd748d7aa7bf14acdf6c83d81fa137d1cdbab672
 phase_0_code_commit: 816e296   # tasks 1-5; reviewed 2026-08-18. Task 6 (deploy + baseline) outstanding
@@ -134,6 +134,7 @@ the 2026-08-18 incident.
 | 1 | `phase-1-unblock-event-loop.md` | **completed** 2026-08-18, deployed fd748d7, p95 8312 -> 12 ms; one criterion unmet |
 | 1b | `phase-1b-unblock-operator-maintenance.md` | **completed** 2026-08-19, deployed `ee9c0d2` — census now empty, but **zero production effect** |
 | 1c | `phase-1c-stall-attribution.md` | **completed** 2026-08-19, deployed `93d1dfb` — blocker NAMED: the deepcoin reconcile loop |
+| 1d | `phase-1d-unblock-deepcoin-reconcile.md` | claimed 2026-08-19 — move the named blocker onto the shared executor |
 | 2 | `phase-2-per-chat-lock-sharding.md` | planned — blocked, prerequisite unmet |
 | 3 | `phase-3-compensation-window-repair.md` | planned |
 | 4 | `phase-4-durable-job-shadow-enqueue.md` | planned |
