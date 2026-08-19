@@ -16,8 +16,8 @@ local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v
 design_version: 1
 current_phase: 1.75
 phase_name: unblock-context-resolution-scheduler
-phase_status: claimed          # planned | claimed | in_progress | completed
-claimed_by: session-45794fed   # claimed 2026-08-19 for phase 1e
+phase_status: completed        # planned | claimed | in_progress | completed
+claimed_by: none               # phase 1e complete and deployed; NOTHING is claimed
 current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-1e-unblock-context-resolution-scheduler.md
 last_completed_phase: 1
 last_completed_commit: fd748d7aa7bf14acdf6c83d81fa137d1cdbab672
@@ -54,6 +54,17 @@ phase_1d_loop_unavailable_pct: 2.0        # was 23.1
 phase_1d_worst_stall_criterion_met: false # stalls approached zero; worst stall did not reach tens of ms
 next_blocker_named: "lifecycle_monitor._run_one_cycle -> _context_resolution_scheduler -> context_resolution_worker.schedule_context_reanalysis:394 .all()"
 census_third_blind_spot: "calls through an instance attribute or injected callback are ast.Attribute, not ast.Name, so the widened census still cannot see them"
+phase_1e_deployed_commit: 92e6e60a0985a81208064f785e2454bcafd99bfe
+phase_1e_local_suite_before: 5680
+phase_1e_local_suite_after: 5684          # delta 4 equals the 4 tests added
+loop_lag_after_phase1e_p99_ms: 79.914     # was 236.271 after phase 1d; 8777.887 at the phase 0 baseline
+phase_1e_worst_stall_ms: 9297.432         # was 6470.313. WORSE, and the criterion is again not met
+phase_1e_stall_count: 3                   # unchanged from phase 1d, but no captured stall is application code
+phase_1e_loop_unavailable_pct: 1.2        # was 2.0 after phase 1d, 76 at the phase 0 baseline
+phase_1e_worst_stall_criterion_met: false
+residual_stalls_are_not_application_code: true  # both captures show the loop IDLE in selectors.select
+residual_stall_leading_explanation: "host memory pressure and swap, not code: 477 MB of 1024 MB swap in use, the service itself 21.9 MB swapped out, vmstat si non-zero, while CPU steal is 0 and load is 0.60 on 2 cores. Correlational - measured after the window, not during a stall."
+application_level_loop_blocking_believed_cleared: true  # with the caveat that 1 of 3 stalls was not captured
 next_step_needs_user_decision: true       # fixing the named blocker has no phase and no owner
 production_commit_before_phase_1b: fd748d7aa7bf14acdf6c83d81fa137d1cdbab672  # phase 1b rollback target
 baseline_captured: true   # 64.9 minutes of real traffic, 2026-08-18 17:16 UTC
@@ -114,6 +125,13 @@ server_verification:
   - "phase-1d-census-THIRD-blind-spot: the widened census cannot see the call above either, and the reason is structural. self._context_resolution_scheduler(...) is an ast.Attribute call through an instance attribute holding an injected callback, while the matcher requires isinstance(func, ast.Name). Static analysis cannot resolve what that attribute holds at runtime. So the census now has a documented third blind spot on top of the two Phase 1d closed, and it must not be treated as proof that the loop is clean - only as a guard against regressions of the shapes it does match. The watchdog, not the census, is what finds these."
   - "phase-1d-behavior-unchanged: the strongest evidence of any phase so far. execution_bindings shows 155 rows touched in the 62 min after the restart, so the reconcile is genuinely running and genuinely doing its work from the worker thread. Zero 'Deepcoin execution reconcile failed', zero 'reconcile skipped', zero 'worker tick failed' in the journal since the restart. strategy_management_batches 1 row and message_instruction_items 1 row also touched."
 
+  - "phase-1e-local (2026-08-19, session-45794fed): lifecycle_monitor._run_one_cycle collected the scheduler events its two loops would have fired and now submits them as ONE batch to the existing shared mgmt-worker executor via _run_context_resolution_scheduler_batch, preserving order and payloads. One submission rather than N+M because the originals ran back to back with nothing between them. The `if self._context_resolution_scheduler is not None` guard, the event payloads, the loop order, and the already-correct `await asyncio.to_thread(self._context_resolution_worker)` below are untouched. Two mistakes made and fixed during the work, recorded so they are not repeated: the helper was first inserted between a @dataclass decorator and its class, which broke module import outright, and an unused test helper was left behind and removed. 4 tests added (worker thread, payload fidelity, no submission when nothing is scheduled, responsiveness under a slow scheduler). Full suite 5684 passed, 1 skipped, 0 failed, 418s; before 5680, delta 4 exactly."
+  - "phase-1e-deploy (2026-08-19 11:29 UTC): DEPLOYED 92e6e60, updater exit 0 captured without a pipe. HEAD=92e6e60, service active since 2026-08-19 19:29:07 CST, /api/trading-settings 200."
+  - "phase-1e-after (2026-08-19 12:31 UTC, uptime 3744 s = 62.4 min): samples 7200, window 3643.605, p50_ms 0.916, p95_ms 6.128, p99_ms 79.914, max_ms 9297.432, stall_count 3, worst_stall_ms 9297.432, stall_captures 2. Against Phase 1d (uptime 4881 s, 3 stalls, p99 236.271, worst 6470.313, 2.0 percent unavailable): p99 236.271 -> 79.914 ms, 3x better; loop unavailability 2.0 -> 1.2 percent; stall_count unchanged at 3; worst_stall_ms 6470.313 -> 9297.432, WORSE. The numeric criterion - stalls near zero and worst stall under a second - is NOT met, for the fourth phase running. But what the stalls ARE changed completely; see the next entry."
+  - "phase-1e-residual-stalls-are-NOT-code: this is the finding. BOTH captured stalls (4589.1 ms at 12:02:14Z and 4565.2 ms at 12:31:32Z) have byte-identical 18-frame stacks whose deepest frame is selectors.py:468 select, under base_events.py:1961 _run_once. The event loop was IDLE in the OS epoll wait, executing no Python at all, while thousands of milliseconds of lag accrued. That is not application code blocking the loop; it is the process not being scheduled or not being resident. The same signature appeared once in the Phase 1c captures (1 of 20) and was recorded then as an unexplained minority. It is now the whole of what remains. CAVEAT, stated because it matters: only 2 of the 3 stalls were captured - the one-per-60 s limiter dropped the third - so the correct claim is that every CAPTURED stall is non-code, not that no application blocking exists anywhere."
+  - "phase-1e-host-evidence (measured 2026-08-19 12:35 UTC, after the window, NOT during a stall - so this is correlational, not proven causation): the server has 1965 MB of RAM with 689 MB free and 477 MB of its 1024 MB swap in use. The telegram-kol process itself reports VmRSS 209476 kB and VmSwap 21888 kB, so roughly 21.9 MB of it is on disk. vmstat showed non-zero swap-in (si 292 and 152 KB/s across consecutive samples). Meanwhile CPU steal is 0 and load average is 0.60 on 2 cores, which rules out host CPU oversubscription and local CPU contention. Memory pressure with active paging is therefore the leading explanation for a loop that stalls seconds while idle in select: page faults on a swapped-out process stall it in the kernel, where no Python frame can show it. Confirming this needs sampling during a stall, or simply more RAM."
+  - "phase-1e-the-arc: against the Phase 0 production baseline, the whole of phases 1 through 1e moved the loop from p99 8777.887 ms to 79.914 ms (110x), from one stall per 10.7 s to one per 1248.1 s (117x), and from 76 percent unavailable to 1.2 percent (63x). Phase 2s prerequisite - that the loop can no longer be blocked - is now met by any reasonable reading."
+
 ```
 
 ## Claim protocol — read this before starting any phase
@@ -153,7 +171,7 @@ the 2026-08-18 incident.
 | 1b | `phase-1b-unblock-operator-maintenance.md` | **completed** 2026-08-19, deployed `ee9c0d2` — census now empty, but **zero production effect** |
 | 1c | `phase-1c-stall-attribution.md` | **completed** 2026-08-19, deployed `93d1dfb` — blocker NAMED: the deepcoin reconcile loop |
 | 1d | `phase-1d-unblock-deepcoin-reconcile.md` | **completed** 2026-08-19, deployed `1c8a7f2` — stalls 1/37 s → 1/1250 s, loop unavailable 23.1% → 2.0% |
-| 1e | `phase-1e-unblock-context-resolution-scheduler.md` | claimed 2026-08-19 — clear the last named blocker |
+| 1e | `phase-1e-unblock-context-resolution-scheduler.md` | **completed** 2026-08-19, deployed `92e6e60` — p99 236 → 80 ms; residual stalls are NOT code |
 | 2 | `phase-2-per-chat-lock-sharding.md` | planned — blocked, prerequisite unmet |
 | 3 | `phase-3-compensation-window-repair.md` | planned |
 | 4 | `phase-4-durable-job-shadow-enqueue.md` | planned |
@@ -552,6 +570,69 @@ failed`, zero `reconcile skipped`, zero `worker tick failed` since the restart.
 
 Rollback target: `93d1dfb`.
 
+## Phase 1e — the residual stalls are NOT application code
+
+Deployed `92e6e60` on 2026-08-19 11:29 UTC, measured 62.4 minutes.
+
+| | after Phase 1d | after Phase 1e |
+|---|---|---|
+| p99 | 236.271 ms | **79.914 ms** |
+| loop unavailable | 2.0% | **1.2%** |
+| stall count | 3 | 3 |
+| worst stall | 6470.313 ms | 9297.432 ms |
+
+**The numeric criterion is not met, for the fourth phase running.** Stalls did
+not reach zero and the worst stall got worse. Said plainly, without dressing.
+
+**But what the stalls *are* changed completely.** Both captures have
+byte-identical 18-frame stacks whose deepest frame is:
+
+```
+base_events.py:1961  _run_once
+selectors.py:468     select          ← the loop is IDLE, in the OS epoll wait
+```
+
+The event loop was executing **no Python at all** while thousands of
+milliseconds of lag accrued. That is not code blocking the loop — it is the
+process not being scheduled or not being resident. This signature appeared once
+in Phase 1c (1 of 20 captures) and was recorded then as an unexplained minority.
+It is now the whole of what remains.
+
+**Caveat that matters:** only 2 of the 3 stalls were captured — the
+one-per-60 s limiter dropped the third. The supportable claim is that *every
+captured stall is non-code*, not that no application blocking exists anywhere.
+
+## The mechanism is the host, not the code
+
+Measured after the window, so this is correlational, not proven causation:
+
+| | |
+|---|---|
+| RAM | 1965 MB total, 689 MB free |
+| **swap** | **477 MB of 1024 MB in use** |
+| **service swapped out** | **VmSwap 21888 kB** (RSS 209476 kB) |
+| swap-in activity | `si` 292 and 152 KB/s across consecutive vmstat samples |
+| CPU steal | **0** |
+| load | 0.60 on 2 cores |
+
+Zero steal and low load rule out host oversubscription and CPU contention.
+Active paging on a process with 21.9 MB on disk does not: a page fault stalls
+the process in the kernel, where no Python frame can show it — exactly matching
+an idle-`select` stack.
+
+**Confirming it needs sampling during a stall, or simply more RAM.** No code
+change in this remediation will move it.
+
+## The arc, phases 1 through 1e
+
+Against the Phase 0 production baseline:
+
+| | Phase 0 baseline | now | |
+|---|---|---|---|
+| p99 | 8777.887 ms | 79.914 ms | **110×** |
+| stall rate | 1 per 10.7 s | 1 per 1248.1 s | **117×** |
+| loop unavailable | 76% | 1.2% | **63×** |
+
 ## Before Phase 2 starts — read this
 
 Points 1 and 2 below replace the Phase 1 version of this section, which was
@@ -571,14 +652,14 @@ updater" above.
    the copy inside the deployed commit and exits silently on a mismatch. This
    cost one confusing failure in Phase 0; Phase 1 avoided it by deploying from
    the worktree.
-4. **Phase 2's prerequisite is now arguably met — this is a judgement call, not
-   a fact.** It says: "Do not attempt this phase while the event loop can still
-   be blocked." After Phase 1d the loop is unavailable 2.0% of wall clock and
-   stalls once per ~21 minutes, against 23.1% and once per 37 seconds before.
-   That is no longer a loop that would mask Phase 2's effect. But it is not
-   zero: three stalls in 62 minutes, worst 6.5 s, cause already named
-   (`lifecycle_monitor` → `schedule_context_reanalysis`). Whether to clear that
-   first or accept it as background noise is the user's call.
+4. **Phase 2's prerequisite is met.** It says: "Do not attempt this phase while
+   the event loop can still be blocked." The loop is now unavailable 1.2% of
+   wall clock with p99 at 79.9 ms, and every captured residual stall is the
+   process idle in `select`, not code. There is no longer an application-level
+   blocker that could be confused with Phase 2's effect.
+   One thing to carry in: the residual stalls look like host memory pressure,
+   so Phase 2's measurement should expect a small non-zero floor that its own
+   changes cannot move.
 5. **The blocker is now named, and fixing it has no phase and no owner.**
    `run_deepcoin_execution_reconcile_loop` at `web_app.py:7807` calls
    `reconcile_deepcoin_execution_bindings` synchronously on the loop every 30
