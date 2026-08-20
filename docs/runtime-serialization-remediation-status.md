@@ -14,26 +14,33 @@ deploy_branch: codex/deepcoin-auto-trading-v1   # matches the updater default; n
 integration_branch: codex/phase0-deploy-integration  # merged onto origin/deploy_branch (302c1ae); push this to deploy_branch
 local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v1 is 118 commits diverged from origin and is checked out in /private/tmp/tg-risk-routing.wmF2Vj. Do not use it. origin/codex/deepcoin-auto-trading-v1 is authoritative.
 design_version: 1
-current_phase: 2f
-phase_name: close-position-authority-coverage-gaps
-phase_status: claimed          # planned | claimed | in_progress | completed
-claimed_by: session-phase2f-close-gaps-0819               # claimed 2026-08-19 to execute phase-2f-close-position-authority-coverage-gaps.md
-current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-2f-close-position-authority-coverage-gaps.md
-last_completed_phase: 2   # the sequence ran 0, 1, 1b, 1c, 1d, 1e, 2
-last_completed_commit: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd
+current_phase: 3
+phase_name: compensation-window-repair
+phase_status: planned          # planned | claimed | in_progress | completed
+claimed_by: none               # phase 2f completed and released 2026-08-20; see phase_2f_* fields below before starting phase 3
+current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-3-compensation-window-repair.md
+last_completed_phase: 2f   # the sequence ran 0, 1, 1b, 1c, 1d, 1e, 2, 2f
+last_completed_commit: 8122f15ba653e900ee88352b18f570d500bd65c4
 phase_2f_reason: "user explicitly chose to close the gap in a dedicated phase before phase 3, 2026-08-19, when asked"
-after_phase_2f_next_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-3-compensation-window-repair.md   # resume the original sequence here once phase 2f completes
-phase_2_decision_gate_failed: true   # READ BEFORE STARTING PHASE 2f - see "Phase 2 -- Task 1 decision gate FAILED" section below
-phase_2_message_lock_mode_enabled_in_production: false   # deployed dormant, default "global", and must STAY "global" until phase_2_gap_a and phase_2_gap_b both close - phase 2f does NOT change this
-phase_2_gap_a: "recovery_live_submit._submit_recovery_signal_direct (entry-signal order submission, strategy-revision-replacement submission) is serialized only by _source_execution_lock, not position_authority_lock"
-phase_2_gap_b: "strategy_management_composite_executor.execute_composite_management_batch (composite management batch close/SLTP writes) is not serialized by anything - position_mutation_gateway.py has no lock of its own"
+phase_2f_code_commit: 8122f15ba653e900ee88352b18f570d500bd65c4   # tasks 0-4; committed 2026-08-20 (session started 2026-08-19, deploy landed just past UTC midnight)
+phase_2f_deployed_commit: 8122f15ba653e900ee88352b18f570d500bd65c4
+phase_2f_local_suite_before: 5710   # passed, 1 skipped, at 3f5ed78
+phase_2f_local_suite_after: 5713    # passed, 1 skipped, 0 failed; delta 3 equals the 3 tests phase 2f adds
+phase_2f_gap_a_closed: true   # recovery_live_submit._submit_recovery_signal_direct now also holds position_authority_lock (stacked outside @serialized_source_message_execution)
+phase_2f_gap_b_closed: true   # strategy_management_composite_executor.execute_composite_management_batch now holds position_authority_lock around its whole body
+phase_2f_lock_ordering_precedent: "position_authority_lock outer, source_execution_lock inner - matches the pre-existing stacking order in deepcoin_execution_actions.recreate_trigger_entry_tpsl, so gap A introduces no new lock-ordering risk"
+phase_2_per_chat_prerequisite_now_met: true   # tests/test_position_authority_boundary_coverage.py::test_per_chat_sharding_prerequisite_gap_is_closed passes; KNOWN_UNCOVERED_LEAVES is empty
+phase_2_message_lock_mode_enabled_in_production: false   # STILL "global" - phase 2f closed the prerequisite gap but did NOT enable per_chat; that is a separate, explicit decision for a future session
+phase_2_gap_a: "recovery_live_submit._submit_recovery_signal_direct (entry-signal order submission, strategy-revision-replacement submission) was serialized only by _source_execution_lock, not position_authority_lock - CLOSED by phase 2f"
+phase_2_gap_b: "strategy_management_composite_executor.execute_composite_management_batch (composite management batch close/SLTP writes) was not serialized by anything - CLOSED by phase 2f"
 phase_2_code_commit: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd   # tasks 1-4 code + task 5 suite; committed 2026-08-19
 phase_2_deployed_commit: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd
 phase_2_local_suite_before: 5684   # passed, 1 skipped, at 92e6e60
 phase_2_local_suite_after: 5710    # passed, 1 skipped, 0 failed; delta 26 equals the 26 tests phase 2 adds
 phase_0_code_commit: 816e296   # tasks 1-5; reviewed 2026-08-18. Task 6 (deploy + baseline) outstanding
-last_deployed_commit: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd
-production_commit: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd  # phase 2, deployed 2026-08-19 20:18 UTC; verified over ssh 2026-08-19 20:18 UTC
+last_deployed_commit: 8122f15ba653e900ee88352b18f570d500bd65c4
+production_commit: 8122f15ba653e900ee88352b18f570d500bd65c4  # phase 2f, deployed 2026-08-20 00:39 UTC; verified over ssh 2026-08-20 00:39 UTC
+production_commit_before_phase_2f_deploy: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd  # rollback target for phase 2f's code (no schema change)
 production_commit_before_phase_2_deploy: 92e6e60a0985a81208064f785e2454bcafd99bfe  # rollback target for phase 2's code (no schema change)
 production_commit_before_phase_0: 302c1ae467b98bc954ac2a25cc4a33a8d09f48f9  # rollback target
 production_commit_before_phase_1: a00561bf7683091ae0a48471cbfc2af1e6b9fa8c  # phase 1 rollback target
@@ -149,6 +156,11 @@ server_verification:
   - "phase-2-task5-suite (2026-08-19): full local suite with .venv (Python 3.12.12): 5710 passed, 1 skipped, 0 failed, 390s. Before (at 92e6e60) was 5684 passed, 1 skipped; delta 26 equals exactly the tests this phase adds (7 keyed-lock-registry + 6 architecture/boundary-coverage + 4 chat-isolation + 9 trading-settings message_lock_mode round-trip and fails-closed cases). The blocking-call census (tests/test_runtime_event_loop_blocking_census.py) passes with KNOWN_BLOCKING_CALLS unchanged from before this phase - no new allowlist entry was needed once the to_thread fix above was applied."
   - "phase-2-deploy (2026-08-19 20:18 UTC): DEPLOYED DORMANT, per Task 6 Step 1 only - Steps 2 and 3 (prove the disable path, enable per_chat) were not attempted, because Task 1's decision gate failed and per_chat has no safe path to production this phase. Fast-forward pushed 92e6e60..3f5ed78 to codex/deepcoin-auto-trading-v1 (2 commits: the phase-2 claim, then the phase-2 code), confirmed origin/codex/deepcoin-auto-trading-v1 was an ancestor of HEAD first. Ran EXPECTED_COMMIT=3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd ./scripts/server_git_update.sh from this worktree, checked out at that exact commit; exit code 0, captured without a pipe. The curl connection-refused lines near the end of the updater's own output are verify_http_health's retry loop during the service restart, same as every prior phase's deploy - not a failure signal by themselves. Independently verified over ssh (not inferred from the updater's exit code): HEAD=3f5ed78 on codex/deepcoin-auto-trading-v1, telegram-kol.service active since 2026-08-20 04:18:38 CST, GET /api/trading-settings returns 200 with message_lock_mode: 'global' in the payload (confirms dormant, not merely 'default' - this is what the settings row actually contains in production right now), GET /api/runtime/loop-health answers (uptime 12.1 s at read time, so not a baseline reading, just a liveness check: samples 23, stall_count 0, watchdog_attached true)."
   - "phase-2-not-attempted: Task 6 Steps 2 and 3, and therefore the phase file's own completion criteria 'per_chat enabled in production, with the disable path proven working beforehand' and 'one full trading session observed with no new incident class', are NOT met and will not be attempted until a future phase closes phase_2_gap_a and phase_2_gap_b (see the decision-gate entry above and the 'Phase 2 -- Task 1 decision gate FAILED' section below). This is the outcome the phase file's own Task 1 anticipated and explicitly prescribed a stop for, not an incomplete session."
+  - "phase-2f-task0-lock-ordering (2026-08-19/20): before writing any code, checked whether stacking position_authority_lock outside _submit_recovery_signal_direct's existing @serialized_source_message_execution could invert lock order anywhere else in the codebase (both are threading.RLock; reentrant on the same thread, but a fixed cross-lock order must hold everywhere or two threads acquiring them in opposite orders can deadlock). Found a pre-existing, already-live precedent: deepcoin_execution_actions.recreate_trigger_entry_tpsl already stacks @serialized_position_authority_mutation directly above @serialized_source_message_execution (position lock outer, source-execution lock inner) - grep-verified at deepcoin_execution_actions.py:1654-1656. Adopted the same order for gap A, so this introduces no NEW lock-ordering risk, only a second call site using an order the codebase already exercises safely. Gap B (execute_composite_management_batch) only ever needed to acquire position_authority_lock alone - it does not call into anything that acquires _source_execution_lock - so no ordering question arises there."
+  - "phase-2f-tasks1-3-local (2026-08-19/20): Gap A closed by adding @serialized_position_authority_mutation as the outermost decorator on _submit_recovery_signal_direct (recovery_live_submit.py), stacked above the pre-existing @serialized_source_message_execution and @_report_entry_submission_progress - a 1-line functional change (plus the import). Gap B closed by adding the same decorator directly on execute_composite_management_batch (strategy_management_composite_executor.py), following the exact pattern execute_management_batch already used - also a 1-line functional change. Both proved with a real thread-based test, not a source-text check: a simulated mutation holds position_authority_lock on one thread while a second thread calls the now-covered function, and the test asserts the second thread cannot proceed (does not reach the exchange write, or does not even begin loading its batch) until the first thread releases the lock - tests/test_recovery_live_submit.py::test_submit_recovery_signal_direct_is_covered_by_position_authority_lock and tests/test_strategy_management_executor.py::test_execute_composite_management_batch_is_covered_by_position_authority_lock. tests/test_position_authority_boundary_coverage.py restructured: both leaves moved from KNOWN_UNCOVERED_LEAVES (now empty, kept as an empty list rather than deleted so a future regression has somewhere to be recorded) into COVERED_LEAVES; the old 'decision gate NOT met' assertion was replaced with test_per_chat_sharding_prerequisite_gap_is_closed, which asserts the opposite and is explicit that this closes the PREREQUISITE for per_chat, not per_chat itself."
+  - "phase-2f-task4-suite: full local suite with .venv (Python 3.12.12), run independently twice (once by the executing session before it was interrupted by an API session-limit error immediately before its own commit step, and once more by the session that took over to finish Tasks 4-5 and verify the interrupted session's uncommitted work before trusting it): 5713 passed, 1 skipped, 0 failed both times, ~390-411s. Before (at 3f5ed78) was 5710 passed, 1 skipped; delta 3 equals exactly the tests this phase adds (1 in test_recovery_live_submit.py, 1 in test_strategy_management_executor.py, and a net +1 in test_position_authority_boundary_coverage.py after removing one test and adding two)."
+  - "phase-2f-deploy (2026-08-20 00:39 UTC): DEPLOYED. Fast-forward pushed 3f5ed78..8122f15 to codex/deepcoin-auto-trading-v1 (2 commits: the phase-2f claim, then the phase-2f code), confirmed origin/codex/deepcoin-auto-trading-v1 was an ancestor of HEAD first. Ran EXPECTED_COMMIT=8122f15ba653e900ee88352b18f570d500bd65c4 ./scripts/server_git_update.sh from this worktree, checked out at that exact commit; exit code 0, captured without a pipe. The curl connection-refused lines near the end of the updater's own output are verify_http_health's retry loop during the service restart, consistent with every prior phase's deploy. Independently verified over ssh: HEAD=8122f15 on codex/deepcoin-auto-trading-v1, telegram-kol.service active since 2026-08-20 08:39:27 CST (=00:39:27 UTC), zero journal entries at priority err or above in the 2 minutes since restart, GET /api/trading-settings returns 200 with message_lock_mode: 'global' (unchanged by this phase, confirming it stayed dormant) and auto_trade_enabled: true, GET /api/runtime/loop-health answers with stall_count 0 at uptime 9.98s (a liveness check only, not a baseline - too early to compare against Phase 1e's p99). position_attribution_audits (3251 rows total) and position_protection_incidents (313 rows total) were read as a pre-deploy-activity snapshot only, most recent row 2026-08-19 22:47:50 predating this deploy by hours; not enough time had passed at verification time to observe any post-deploy row, so this does NOT yet demonstrate 'no new incident class' - that requires a longer observation window this session did not run."
+  - "phase-2f-conclusion: Phase 2's own Task 1 decision gate now passes - tests/test_position_authority_boundary_coverage.py::test_per_chat_sharding_prerequisite_gap_is_closed passes, KNOWN_UNCOVERED_LEAVES is empty. This makes the PREREQUISITE for message_lock_mode=per_chat true. It does NOT enable per_chat, which stays 'global' in production and remains a separate, explicit decision - Phase 2's own Task 6 Steps 2 (prove the disable path) and 3 (enable and observe a full trading session) are still un-started and still require their own session with real multi-group traffic to observe, not something this phase or the next one may infer from a lock now being present in the code."
 
 ```
 
@@ -191,8 +203,8 @@ the 2026-08-18 incident.
 | 1d | `phase-1d-unblock-deepcoin-reconcile.md` | **completed** 2026-08-19, deployed `1c8a7f2` — stalls 1/37 s → 1/1250 s, loop unavailable 23.1% → 2.0% |
 | 1e | `phase-1e-unblock-context-resolution-scheduler.md` | **completed** 2026-08-19, deployed `92e6e60` — p99 236 → 80 ms; residual stalls are NOT code |
 | 2 | `phase-2-per-chat-lock-sharding.md` | **completed** 2026-08-19, deployed `3f5ed78` DORMANT — Task 1 decision gate FAILED, `per_chat` stays disabled, two gaps recorded |
-| 2f | `phase-2f-close-position-authority-coverage-gaps.md` | planned — closes phase 2's two gaps; user's explicit choice before phase 3 |
-| 3 | `phase-3-compensation-window-repair.md` | planned — **not blocked by phase 2f**, but resume the sequence here only after 2f completes |
+| 2f | `phase-2f-close-position-authority-coverage-gaps.md` | **completed** 2026-08-20, deployed `8122f15` — both gaps closed, per_chat prerequisite now met, `per_chat` still NOT enabled |
+| 3 | `phase-3-compensation-window-repair.md` | planned |
 | 4 | `phase-4-durable-job-shadow-enqueue.md` | planned |
 | 5 | `phase-5-queue-consumer-takeover.md` | planned |
 | 6 | `phase-6-process-separation.md` | planned |
@@ -727,6 +739,68 @@ which, per the Task 1 trace, they do not today. Closing gap 2 means adding
 (prove the disable path, enable `per_chat`, observe a trading session) stay
 un-started.
 
+## Phase 2f — both position-authority coverage gaps closed
+
+Deployed `8122f15` on 2026-08-20 00:39 UTC. The user was asked directly
+whether to open a dedicated phase to close Phase 2's two gaps before
+resuming the original phase sequence, or defer it; they chose to close it
+first. This phase is that closing work, and nothing else — `message_lock_mode`
+is untouched and still reads `"global"` in production.
+
+**What changed, in one line each.** Gap A: `_submit_recovery_signal_direct`
+(`recovery_live_submit.py`) gained `@serialized_position_authority_mutation`
+as its outermost decorator, stacked above the pre-existing
+`@serialized_source_message_execution`. Gap B:
+`execute_composite_management_batch`
+(`strategy_management_composite_executor.py`) gained the same decorator,
+following the exact pattern `execute_management_batch` already used. Neither
+function's logic changed — only when mutual exclusion is held.
+
+**The lock-ordering question was checked, not assumed.** Stacking two
+different `RLock`-backed decorators only avoids deadlock if every caller
+that holds one never acquires the other in the opposite order somewhere
+else. Before writing gap A's fix, the codebase was searched for existing
+precedent: `deepcoin_execution_actions.recreate_trigger_entry_tpsl` already
+stacks `@serialized_position_authority_mutation` directly above
+`@serialized_source_message_execution` — position lock outer, source-execution
+lock inner — and has run in production through every prior phase with no
+reported deadlock. Gap A's fix uses the identical order, so it adds a second
+call site to an already-safe pattern rather than inventing a new one. Gap B
+never touches `_source_execution_lock` at all, so no ordering question
+applies there.
+
+**Coverage is proven, not asserted.** Each fix has a thread-based test that
+holds `position_authority_lock` from a separate thread and shows the
+now-covered function genuinely cannot proceed — cannot reach its exchange
+write (gap A), cannot even load its own batch (gap B) — until that lock is
+released. `tests/test_position_authority_boundary_coverage.py`, the
+architecture test Phase 2 wrote for exactly this purpose, now has an empty
+`KNOWN_UNCOVERED_LEAVES` and an explicit
+`test_per_chat_sharding_prerequisite_gap_is_closed` in place of the old
+"gate not met" assertion.
+
+**One session, one interruption, independently re-verified.** The session
+executing this phase committed its claim, then Tasks 0-3, then ran the full
+suite (5713 passed, 1 skipped) — and was cut off by an API session-limit
+error immediately before its own commit for Tasks 1-3. The next session that
+picked this up did not trust that state on faith: it re-read every diff,
+independently re-ran the full suite (same result, 5713/1/0), then completed
+the commit and deploy. Both runs agree, and the numbers match what the
+interrupted session reported before it stopped.
+
+**What this phase does NOT do.** It does not enable `per_chat`. It does not
+run Phase 2's Task 6 Steps 2 (prove the disable path) or 3 (enable and
+observe one full trading session with real multi-group traffic) — those
+still require their own session, deliberately, per the original instruction
+that enabling the flag must be asked about separately from shipping the
+infrastructure that makes it safe to ask about. What this phase does
+establish is that the question can now honestly be asked: Phase 2's Task 1
+decision gate, re-run, passes.
+
+**Rollback**, if ever needed: redeploy `3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd`
+(the pre-Phase-2f production commit) with the same updater command. No
+schema change, no persisted state.
+
 ## Handoff note for the Phase 2 session (superseded — kept for context)
 
 Phases 0, 1, 1b, 1c, 1d and 1e are complete and deployed. Production runs
@@ -802,15 +876,17 @@ equality, so any phase that removes a blocking call must shrink
 
 1. **`message_lock_mode` stays `"global"`. Do not flip it as part of Phase 3
    or any unrelated work.** Phase 2's Task 1 found two exchange-mutation
-   paths not covered by `position_authority_lock` (see "Phase 2 — Task 1's
-   decision gate FAILED" above). `per_chat` has no owning phase yet, and
-   opening one is the user's decision — ask, do not assume either that they
-   want it opened next or that it should wait.
-2. **Phase 3 is unrelated to Phase 2's gap** (compensation-window-repair, per
-   the index doc) and can proceed independently — the gap only blocks
-   `message_lock_mode: per_chat`, nothing else. It is not an active
-   production incident: the single global message lock Phase 2 left in place
-   already prevents the two uncovered paths from ever racing each other.
+   paths not covered by `position_authority_lock`; Phase 2f
+   (`phase-2f-close-position-authority-coverage-gaps.md`, deployed `8122f15`)
+   closed both, so the *prerequisite* for `per_chat` is now met — but
+   enabling it (Phase 2's own Task 6 Steps 2-3: prove the disable path,
+   enable and observe a full trading session with real multi-group traffic)
+   was deliberately not attempted and has no owning phase yet. Opening that
+   is the user's decision — ask, do not assume either that they want it
+   opened next or that it should wait.
+2. **Phase 3 is unrelated to Phase 2/2f** (compensation-window-repair, per
+   the index doc) and can proceed independently regardless of whether
+   `per_chat` is ever enabled.
 3. **Deployment mechanics are unchanged from Phase 2** — see "There is no
    change class" above and "Before Phase 2 starts" for the still-accurate
    points (1-3: no `-ChangeClass`, no PowerShell on this workstation, run
