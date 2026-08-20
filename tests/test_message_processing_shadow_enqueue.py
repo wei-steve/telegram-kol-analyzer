@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import telegram_kol_research.telegram_live_listener as live_listener_module
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.live_updates import LiveUpdateBroker
@@ -430,6 +431,57 @@ def test_history_reconcile_shadow_marks_failed_and_preserves_exception(tmp_path)
                 authoritative_processor=lambda _raw_message_id: (_ for _ in ()).throw(
                     RuntimeError("history recognition exploded")
                 ),
+                discover_dialogs_fn=discover_dialogs,
+                fetch_dialog_messages_fn=fetch_messages,
+            )
+        )
+
+    with session_factory() as session:
+        job = session.query(MessageProcessingJob).one()
+
+    assert job.status == "failed"
+    assert job.last_reason == "history_reconcile_error:RuntimeError"
+
+
+def test_history_reconcile_shadow_marks_failed_when_later_inline_step_fails(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "history-late-failed.db")
+    save_trading_settings(session_factory, {"message_pipeline_mode": "shadow"})
+
+    async def discover_dialogs(_client):
+        return [{"id": 9001, "title": "VIP BTC Room", "archived": True}]
+
+    async def fetch_messages(_client, _dialog, **_kwargs):
+        return [
+            {
+                "chat_id": 9001,
+                "message_id": 77,
+                "sender_id": 501,
+                "sender_name": "VIP BTC Room",
+                "text": "message 77",
+                "posted_at": BASE_NOW,
+                "media": None,
+            }
+        ]
+
+    monkeypatch.setattr(
+        live_listener_module,
+        "persist_trade_ideas_from_candidates",
+        lambda _session_factory: (_ for _ in ()).throw(
+            RuntimeError("history trade merge exploded")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="history trade merge exploded"):
+        asyncio.run(
+            run_reconcile_once(
+                client=object(),
+                session_factory=session_factory,
+                broker=None,
+                target_titles={"VIP BTC Room"},
+                authoritative_processor=lambda _raw_message_id: _processing_result(),
                 discover_dialogs_fn=discover_dialogs,
                 fetch_dialog_messages_fn=fetch_messages,
             )

@@ -1536,6 +1536,12 @@ async def run_reconcile_once(
                             await _process_dialog_raw_message(raw_message)
                     else:
                         await _process_dialog_raw_message(raw_message)
+                with session_factory() as session:
+                    inserted_candidates += max(
+                        0,
+                        session.query(SignalCandidate).count()
+                        - candidate_count_before,
+                    )
             except BaseException as exc:
                 await _try_mark_shadow_processing_jobs_terminal(
                     session_factory,
@@ -1546,43 +1552,47 @@ async def run_reconcile_once(
                     ),
                 )
                 raise
-            with session_factory() as session:
-                inserted_candidates += max(
-                    0,
-                    session.query(SignalCandidate).count() - candidate_count_before,
-                )
         else:
             logger.error(
                 "history recognition authority unavailable "
                 "reason=authoritative_processor_required"
             )
-        if authoritative_processor is not None:
-            trade_stats = persist_trade_ideas_from_candidates(session_factory)
-            inserted_trade_ideas += trade_stats["inserted_trade_ideas"]
-        dialog_title = str(dialog.get("title") or "")
-        if (
-            strategy_alert_config is not None
-            and (
-                strategy_alert_enabled_for_title is None
-                or strategy_alert_enabled_for_title(dialog_title)
-            )
-        ):
-            for record in inserted_records:
-                await strategy_alert_processor(
-                    session_factory=session_factory,
-                    record=record,
-                    chat_title=dialog_title,
-                    config=strategy_alert_config,
-                    recognition_result=recognition_by_key.get(
-                        (record.chat_id, record.message_id)
-                    ),
+        try:
+            if authoritative_processor is not None:
+                trade_stats = persist_trade_ideas_from_candidates(session_factory)
+                inserted_trade_ideas += trade_stats["inserted_trade_ideas"]
+            dialog_title = str(dialog.get("title") or "")
+            if (
+                strategy_alert_config is not None
+                and (
+                    strategy_alert_enabled_for_title is None
+                    or strategy_alert_enabled_for_title(dialog_title)
                 )
-        await _try_mark_shadow_processing_jobs_terminal(
-            session_factory,
-            raw_message_ids=history_shadow_raw_message_ids,
-            status="succeeded",
-            last_reason="history_reconcile_completed",
-        )
+            ):
+                for record in inserted_records:
+                    await strategy_alert_processor(
+                        session_factory=session_factory,
+                        record=record,
+                        chat_title=dialog_title,
+                        config=strategy_alert_config,
+                        recognition_result=recognition_by_key.get(
+                            (record.chat_id, record.message_id)
+                        ),
+                    )
+            await _try_mark_shadow_processing_jobs_terminal(
+                session_factory,
+                raw_message_ids=history_shadow_raw_message_ids,
+                status="succeeded",
+                last_reason="history_reconcile_completed",
+            )
+        except BaseException as exc:
+            await _try_mark_shadow_processing_jobs_terminal(
+                session_factory,
+                raw_message_ids=history_shadow_raw_message_ids,
+                status="failed",
+                last_reason=f"history_reconcile_error:{type(exc).__name__}",
+            )
+            raise
 
     return {
         "matched_dialogs": len(matched_dialogs),
