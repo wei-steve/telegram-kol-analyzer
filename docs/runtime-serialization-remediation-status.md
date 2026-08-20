@@ -16,8 +16,8 @@ local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v
 design_version: 1
 current_phase: 4
 phase_name: durable-job-shadow-enqueue
-phase_status: planned          # planned | claimed | in_progress | completed
-claimed_by: none               # phase 3 completed and released 2026-08-20
+phase_status: claimed          # planned | claimed | in_progress | completed
+claimed_by: codex-phase4-20260820-root-f509217
 current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-4-durable-job-shadow-enqueue.md
 last_completed_phase: 3   # the sequence ran 0, 1, 1b, 1c, 1d, 1e, 2, 2f, 3
 last_completed_commit: 3eabde7c3c6e7e2edfc43c60c435c5a4da5975a3
