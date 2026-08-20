@@ -190,6 +190,15 @@ def _enqueue_shadow_processing_jobs(
                     "completed_at": None,
                     "shadow": True,
                 },
+                where=or_(
+                    MessageProcessingJob.shadow.is_(True),
+                    and_(
+                        MessageProcessingJob.shadow.is_(False),
+                        MessageProcessingJob.status == "pending",
+                        MessageProcessingJob.claim_token.is_(None),
+                        MessageProcessingJob.claimed_at.is_(None),
+                    ),
+                ),
             )
         else:
             # Queue authority may adopt a terminal Phase-4 shadow row only when
@@ -226,6 +235,21 @@ def _enqueue_shadow_processing_jobs(
             )
         session.execute(statement)
         session.commit()
+        if is_shadow:
+            admitted_ids = {
+                int(raw_message_id)
+                for (raw_message_id,) in session.query(
+                    MessageProcessingJob.raw_message_id
+                )
+                .filter(
+                    MessageProcessingJob.raw_message_id.in_(
+                        [int(row.id) for row in rows]
+                    ),
+                    MessageProcessingJob.shadow.is_(True),
+                )
+                .all()
+            }
+            return [int(row.id) for row in rows if int(row.id) in admitted_ids]
         return [int(row.id) for row in rows]
 
 
@@ -1153,7 +1177,10 @@ async def recover_missing_authoritative_decisions(
         now=now,
         message_limit=message_limit,
     )
-    if load_trading_settings(session_factory).message_pipeline_mode == "queue":
+    pipeline_mode = load_trading_settings(
+        session_factory
+    ).message_pipeline_mode
+    if pipeline_mode == "queue":
         await _try_enqueue_shadow_processing_jobs(
             session_factory,
             raw_message_ids=[
@@ -1174,6 +1201,11 @@ async def recover_missing_authoritative_decisions(
             raw_message_ids=[int(raw_message.id)],
             last_reason="recovery_enqueued",
         )
+        if (
+            pipeline_mode == "shadow"
+            and int(raw_message.id) not in shadow_raw_message_ids
+        ):
+            return
         try:
             processing_result = await asyncio.to_thread(
                 authoritative_processor,
@@ -1249,6 +1281,11 @@ async def recover_missing_authoritative_decisions(
             raw_message_ids=[int(raw_message.id)],
             last_reason="recovery_enqueued",
         )
+        if (
+            pipeline_mode == "shadow"
+            and int(raw_message.id) not in shadow_raw_message_ids
+        ):
+            continue
         try:
             classification = _classify_expired_authoritative_recovery_gap(
                 raw_message=raw_message,
