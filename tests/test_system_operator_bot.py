@@ -68,6 +68,7 @@ from telegram_kol_research.system_operator_bot import (
     format_position_attribution_incident_message,
     format_position_protection_incident_message,
     deliver_pending_position_attribution_incidents,
+    format_stall_induced_expiry_notification,
     load_notification_bot_config,
     load_system_operator_bot_config,
     send_semantic_disagreement_notification,
@@ -3019,6 +3020,42 @@ def test_format_ai_recognition_conflict_review_message_includes_both_model_resul
     assert "已按 MiMo 结果继续" in message
     assert "已暂停" not in message
     assert "今日两次BTC策略都没有入场" in message
+
+
+def test_format_stall_induced_expiry_notification_names_the_burst_not_one_message():
+    message = format_stall_induced_expiry_notification(
+        {
+            "expired_count": 3,
+            "raw_message_ids": [101, 102, 103],
+            "chat_titles": ["VIP BTC Room", "ETH Signals"],
+            "occurred_at": datetime(2026, 8, 19, 12, 31, 32, tzinfo=UTC),
+        }
+    )
+
+    assert "系统故障" in message
+    assert "3 条消息" in message
+    assert "101" in message and "102" in message and "103" in message
+    assert "VIP BTC Room" in message
+    assert "ETH Signals" in message
+    assert "请人工复核" in message
+
+
+def test_format_stall_induced_expiry_notification_truncates_long_id_lists():
+    message = format_stall_induced_expiry_notification(
+        {
+            "expired_count": 25,
+            "raw_message_ids": list(range(1, 26)),
+            "chat_titles": [],
+            "occurred_at": datetime(2026, 8, 19, 12, 31, 32, tzinfo=UTC),
+        }
+    )
+
+    assert "25 条消息" in message
+    assert "..." in message
+    id_line = next(line for line in message.splitlines() if line.startswith("消息内部ID"))
+    assert "20" in id_line
+    assert "21" not in id_line
+    assert "25" not in id_line
 
 
 def test_format_semantic_disagreement_notification_is_critical_and_evidence_backed():

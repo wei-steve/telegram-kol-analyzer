@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from datetime import timedelta
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -49,6 +50,7 @@ from telegram_kol_research.system_operator_bot import (
     deliver_message_instruction_summary_notification,
     deliver_pending_message_instruction_summaries,
     send_ai_recognition_conflict_review,
+    send_stall_induced_expiry_notification,
     system_operator_bot_enabled,
 )
 from telegram_kol_research.telegram_client import (
@@ -61,11 +63,19 @@ from telegram_kol_research.telegram_client import (
     maybe_await,
 )
 from telegram_kol_research.trade_merge import persist_trade_ideas_from_candidates
+from telegram_kol_research.trading_settings import load_trading_settings
 
 
 logger = logging.getLogger(__name__)
 AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS = 60.0
+# Phase 3: superseded as the effective value by
+# TradingSettings.authoritative_gap_recovery_max_age_minutes (default 15.0,
+# read fresh on every recovery pass via _load_gap_recovery_candidates). Kept
+# as a literal 15-minute reference point; no code path reads this constant
+# anymore.
 AUTHORITATIVE_GAP_RECOVERY_MAX_AGE = timedelta(minutes=15)
+DEFAULT_AUTHORITATIVE_GAP_RECOVERY_INTERVAL_SECONDS = 20.0
+DEFAULT_STALL_EXPIRY_NOTIFICATION_MIN_INTERVAL_SECONDS = 300.0
 
 _CRYPTO_FAILURE_TERMS = (
     "BTC", "ETH", "SOL", "DOGE", "BNB", "XRP", "ADA", "SUI", "ZEC",
@@ -512,16 +522,107 @@ def _is_low_value_external_market_failure(text: str) -> bool:
     return not has_crypto_marker and not has_position_marker
 
 
+EXPIRED_AFTER_SYSTEM_STALL = "expired_after_system_stall"
+EXPIRED_STALE_INSTRUCTION = "expired_stale_instruction"
+
+
+def _classify_expired_authoritative_recovery_gap(
+    *,
+    raw_message: RawMessage,
+    now: datetime,
+    loop_lag_snapshot: dict[str, Any] | None,
+) -> str:
+    """Classify why a message never got a decision before its window closed.
+
+    ``expired_after_system_stall`` when a recorded event-loop stall overlaps
+    the message's lifetime window (``posted_at`` .. ``now``) - the drop is a
+    production incident, not a business decision, and is routed to the
+    system operator. ``expired_stale_instruction`` otherwise, including
+    whenever overlap cannot be established (no ``posted_at``, no snapshot, no
+    recorded stall): the quieter classification is the fail-safe default when
+    the evidence is missing, not just when it is negative.
+    """
+
+    posted_at = raw_message.posted_at
+    if posted_at is None or not loop_lag_snapshot:
+        return EXPIRED_STALE_INSTRUCTION
+    last_stall_at_raw = loop_lag_snapshot.get("last_stall_at")
+    if not last_stall_at_raw:
+        return EXPIRED_STALE_INSTRUCTION
+    try:
+        last_stall_at = datetime.fromisoformat(str(last_stall_at_raw))
+    except ValueError:
+        return EXPIRED_STALE_INSTRUCTION
+    if last_stall_at.tzinfo is None:
+        last_stall_at = last_stall_at.replace(tzinfo=UTC)
+    normalized_posted_at = (
+        posted_at if posted_at.tzinfo is not None else posted_at.replace(tzinfo=UTC)
+    )
+    normalized_now = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+    if normalized_posted_at <= last_stall_at <= normalized_now:
+        return EXPIRED_AFTER_SYSTEM_STALL
+    return EXPIRED_STALE_INSTRUCTION
+
+
+class StallExpiryNotificationRateLimiter:
+    """Bound stall-induced expiry notifications to at most one per window.
+
+    A single stall can expire a whole backlog of messages in one recovery
+    pass. Without this, that burst would produce one Telegram message per
+    expired message. This tracks only the monotonic time of the last
+    notification actually sent and refuses another until
+    ``min_interval_seconds`` has passed, no matter how many separate calls
+    ask - "a bounded number of notifications, not one per message."
+    """
+
+    def __init__(
+        self,
+        *,
+        min_interval_seconds: float = (
+            DEFAULT_STALL_EXPIRY_NOTIFICATION_MIN_INTERVAL_SECONDS
+        ),
+        monotonic: Callable[[], float] | None = None,
+    ) -> None:
+        self._min_interval_seconds = max(0.0, float(min_interval_seconds))
+        self._monotonic = monotonic or time.monotonic
+        self._last_notified_monotonic: float | None = None
+
+    def should_notify(self) -> bool:
+        now = self._monotonic()
+        last = self._last_notified_monotonic
+        if last is not None and now - last < self._min_interval_seconds:
+            return False
+        self._last_notified_monotonic = now
+        return True
+
+
+_STALL_EXPIRY_NOTIFICATION_RATE_LIMITER = StallExpiryNotificationRateLimiter()
+
+
 def _record_expired_authoritative_recovery_gap(
     session_factory,
     *,
     raw_message: RawMessage,
+    classification: str = EXPIRED_STALE_INSTRUCTION,
 ) -> None:
-    """Persist a visible, non-executing terminal result for a stale gap."""
+    """Persist a visible, non-executing terminal result for a stale gap.
+
+    ``classification`` records *why* the gap was never recovered -
+    :data:`EXPIRED_AFTER_SYSTEM_STALL` (a production incident) or
+    :data:`EXPIRED_STALE_INSTRUCTION` (an ordinary timeout) - as an
+    additional field. The persisted ``automation_reason`` stays exactly
+    ``"authoritative_gap_recovery_expired"`` regardless of classification,
+    because existing callers and tests already depend on that exact string;
+    only the summary text and the new ``expiry_classification`` payload key
+    vary.
+    """
 
     reason = "authoritative_gap_recovery_expired"
     summary = (
-        "消息未在 15 分钟内完成权威识别；为防止执行过期信号，未自动交易。"
+        "消息未在窗口期内完成权威识别，原因为系统故障（事件循环阻塞）；"
+        "为防止执行过期信号，未自动交易。"
+        if classification == EXPIRED_AFTER_SYSTEM_STALL
+        else "消息未在 15 分钟内完成权威识别；为防止执行过期信号，未自动交易。"
     )
     save_terminal_authoritative_decision(
         session_factory,
@@ -530,7 +631,11 @@ def _record_expired_authoritative_recovery_gap(
             input_kind="recovery_guard",
             authoritative_model="recovery_guard",
             authoritative_status="识别失败",
-            authoritative_payload={"reason": reason, "summary": summary},
+            authoritative_payload={
+                "reason": reason,
+                "summary": summary,
+                "expiry_classification": classification,
+            },
             auxiliary_model=None,
             auxiliary_status=None,
             auxiliary_payload=None,
@@ -766,6 +871,237 @@ def _is_usable_downloaded_media_path(
     return is_usable_image_file(candidate)
 
 
+def _load_gap_recovery_candidates(
+    session_factory,
+    *,
+    chat_titles_by_id: dict[int, str],
+    now: datetime,
+    message_limit: int,
+) -> tuple[list[RawMessage], list[RawMessage]]:
+    """Synchronous DB read: raw messages missing a decision, split by age.
+
+    Reads the currently configured recovery window fresh from
+    ``trading_settings`` on every call (Task 3: no restart needed to widen
+    it after a stall) and returns ``(missing_decision_messages,
+    expired_messages)``. Callers that must not block the event loop run this
+    through ``asyncio.to_thread`` - it is a plain synchronous function
+    specifically so that works.
+    """
+
+    if not chat_titles_by_id:
+        return [], []
+    settings = load_trading_settings(session_factory)
+    recovery_cutoff = now - timedelta(
+        minutes=settings.authoritative_gap_recovery_max_age_minutes
+    )
+    with session_factory() as session:
+        missing_decision_query = (
+            session.query(RawMessage)
+            .outerjoin(
+                RecognitionDecision,
+                RecognitionDecision.raw_message_id == RawMessage.id,
+            )
+            .filter(RawMessage.chat_id.in_(chat_titles_by_id))
+            .filter(RecognitionDecision.id.is_(None))
+        )
+        missing_decision_messages = (
+            missing_decision_query.filter(RawMessage.posted_at >= recovery_cutoff)
+            .order_by(
+                RawMessage.posted_at.asc(),
+                RawMessage.message_id.asc(),
+                RawMessage.id.asc(),
+            )
+            .limit(message_limit)
+            .all()
+        )
+        expired_messages = (
+            missing_decision_query.filter(
+                or_(
+                    RawMessage.posted_at < recovery_cutoff,
+                    RawMessage.posted_at.is_(None),
+                )
+            )
+            .order_by(
+                RawMessage.posted_at.asc(),
+                RawMessage.message_id.asc(),
+                RawMessage.id.asc(),
+            )
+            .limit(message_limit)
+            .all()
+        )
+    return missing_decision_messages, expired_messages
+
+
+async def recover_missing_authoritative_decisions(
+    session_factory,
+    *,
+    chat_titles_by_id: dict[int, str],
+    authoritative_processor: Callable[[int], Any] | None,
+    message_limit: int = 50,
+    system_operator_bot_config: Any | None = None,
+    notification_bot_config: Any | None = None,
+    system_operator_conflict_sender=send_ai_recognition_conflict_review,
+    stall_expiry_notification_sender=send_stall_induced_expiry_notification,
+    authoritative_failure_retry_delay_seconds: float = (
+        AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS
+    ),
+    chat_operation_lock: Callable[[int], Any] | None = None,
+    loop_lag_snapshot_provider: Callable[[], dict[str, Any]] | None = None,
+    expiry_notification_rate_limiter: "StallExpiryNotificationRateLimiter | None" = (
+        None
+    ),
+    now_provider: Callable[[], datetime] = utc_now,
+) -> dict[str, int]:
+    """Recover authoritative decisions for messages with no decision row yet.
+
+    Performs **no Telegram network calls** of any kind - ``chat_titles_by_id``
+    is supplied entirely by the caller, from local configuration or the
+    database, never from ``discover_dialogs``. This is exactly the recovery
+    logic ``run_reconcile_once`` used to run inline; calling it from there
+    keeps that function's observable behavior unchanged, and it is also what
+    lets :func:`run_authoritative_gap_recovery_loop` run it on its own fast
+    cadence, independent of the (slow, Telegram-coupled) periodic reconcile
+    pass.
+
+    ``chat_operation_lock``, when given, is a callable resolving a per-chat
+    lock context manager (``message_lock_mode="per_chat"`` only), held around
+    each recovered message's processing chain individually - identical to
+    what ``run_reconcile_once``'s own recovery loop already does. In every
+    other mode this stays ``None``; the caller is responsible for any lock it
+    wants held around the call as a whole (both ``run_reconcile_once`` and
+    ``run_authoritative_gap_recovery_loop`` follow the same
+    ``resolve_message_lock_mode``/``resolve_lock_context`` convention for
+    that).
+
+    Expiry classification (Task 2) uses ``loop_lag_snapshot_provider``, a
+    zero-argument callable returning a
+    :class:`~telegram_kol_research.runtime_loop_health.LoopLagMonitor`
+    snapshot, when supplied. Messages classified
+    :data:`EXPIRED_AFTER_SYSTEM_STALL` never trigger more than one aggregate
+    notification per ``expiry_notification_rate_limiter`` window, no matter
+    how many expire in this pass.
+    """
+
+    result: dict[str, int] = {
+        "recovered_messages": 0,
+        "expired_recovery_messages": 0,
+        EXPIRED_AFTER_SYSTEM_STALL: 0,
+        EXPIRED_STALE_INSTRUCTION: 0,
+    }
+    if authoritative_processor is None or not chat_titles_by_id:
+        return result
+
+    now = now_provider()
+    missing_decision_messages, expired_messages = await asyncio.to_thread(
+        _load_gap_recovery_candidates,
+        session_factory,
+        chat_titles_by_id=chat_titles_by_id,
+        now=now,
+        message_limit=message_limit,
+    )
+
+    async def _process_recovery_candidate(raw_message) -> None:
+        try:
+            processing_result = await asyncio.to_thread(
+                authoritative_processor,
+                raw_message.id,
+            )
+        except Exception:
+            logger.exception(
+                "authoritative recognition recovery failed: raw_message_id=%s",
+                raw_message.id,
+            )
+            return
+        notification_payload = _build_authoritative_notification_payload(
+            raw_message=raw_message,
+            chat_title=chat_titles_by_id.get(raw_message.chat_id, ""),
+            processing_result=processing_result,
+        )
+        if notification_payload is not None and system_operator_bot_enabled(
+            system_operator_bot_config
+        ):
+            _handle_authoritative_failure_notification(
+                session_factory=session_factory,
+                raw_message_id=raw_message.id,
+                sender=system_operator_conflict_sender,
+                config=system_operator_bot_config,
+                payload=notification_payload,
+                retry_processor=authoritative_processor,
+                retry_delay_seconds=authoritative_failure_retry_delay_seconds,
+            )
+        await _deliver_authoritative_instruction_summary(
+            processing_result=processing_result,
+            session_factory=session_factory,
+            raw_message_id=raw_message.id,
+            chat_title=chat_titles_by_id.get(raw_message.chat_id, ""),
+            notification_bot_config=notification_bot_config,
+        )
+        result["recovered_messages"] += 1
+
+    for raw_message in missing_decision_messages:
+        if chat_operation_lock is not None:
+            async with chat_operation_lock(int(raw_message.chat_id)):
+                await _process_recovery_candidate(raw_message)
+        else:
+            await _process_recovery_candidate(raw_message)
+
+    stall_expired: list[RawMessage] = []
+    loop_lag_snapshot = (
+        loop_lag_snapshot_provider() if loop_lag_snapshot_provider is not None else None
+    )
+    for raw_message in expired_messages:
+        classification = _classify_expired_authoritative_recovery_gap(
+            raw_message=raw_message,
+            now=now,
+            loop_lag_snapshot=loop_lag_snapshot,
+        )
+        await asyncio.to_thread(
+            _record_expired_authoritative_recovery_gap,
+            session_factory,
+            raw_message=raw_message,
+            classification=classification,
+        )
+        result["expired_recovery_messages"] += 1
+        result[classification] += 1
+        if classification == EXPIRED_AFTER_SYSTEM_STALL:
+            stall_expired.append(raw_message)
+
+    if (
+        stall_expired
+        and stall_expiry_notification_sender is not None
+        and system_operator_bot_enabled(system_operator_bot_config)
+    ):
+        rate_limiter = (
+            expiry_notification_rate_limiter
+            or _STALL_EXPIRY_NOTIFICATION_RATE_LIMITER
+        )
+        if rate_limiter.should_notify():
+            try:
+                await stall_expiry_notification_sender(
+                    config=system_operator_bot_config,
+                    payload={
+                        "expired_count": len(stall_expired),
+                        "raw_message_ids": [
+                            message.id for message in stall_expired
+                        ],
+                        "chat_titles": sorted(
+                            {
+                                chat_titles_by_id.get(message.chat_id, "")
+                                for message in stall_expired
+                                if chat_titles_by_id.get(message.chat_id)
+                            }
+                        ),
+                        "occurred_at": now,
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "stall-induced authoritative gap expiry notification failed"
+                )
+
+    return result
+
+
 async def run_reconcile_once(
     *,
     client: Any,
@@ -782,12 +1118,14 @@ async def run_reconcile_once(
     system_operator_bot_config: Any | None = None,
     notification_bot_config: Any | None = None,
     system_operator_conflict_sender=send_ai_recognition_conflict_review,
+    stall_expiry_notification_sender=send_stall_induced_expiry_notification,
     authoritative_failure_retry_delay_seconds: float = (
         AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS
     ),
     discover_dialogs_fn=discover_dialogs,
     fetch_dialog_messages_fn=fetch_dialog_messages,
     chat_operation_lock: Callable[[int], Any] | None = None,
+    loop_lag_snapshot_provider: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, int]:
     """Fetch a recent overlap window and persist only messages newer than the history checkpoint.
 
@@ -818,95 +1156,23 @@ async def run_reconcile_once(
             for dialog in matched_dialogs
             if dialog.get("id") is not None
         }
-        recovery_cutoff = utc_now() - AUTHORITATIVE_GAP_RECOVERY_MAX_AGE
-        with session_factory() as session:
-            missing_decision_query = (
-                session.query(RawMessage)
-                .outerjoin(
-                    RecognitionDecision,
-                    RecognitionDecision.raw_message_id == RawMessage.id,
-                )
-                .filter(RawMessage.chat_id.in_(chat_titles_by_id))
-                .filter(RecognitionDecision.id.is_(None))
-            )
-            missing_decision_messages = (
-                missing_decision_query.filter(
-                    RawMessage.posted_at >= recovery_cutoff
-                )
-                .order_by(
-                    RawMessage.posted_at.asc(),
-                    RawMessage.message_id.asc(),
-                    RawMessage.id.asc(),
-                )
-                .limit(message_limit)
-                .all()
-            )
-            expired_messages = (
-                missing_decision_query.filter(
-                    or_(
-                        RawMessage.posted_at < recovery_cutoff,
-                        RawMessage.posted_at.is_(None),
-                    )
-                )
-                .order_by(
-                    RawMessage.posted_at.asc(),
-                    RawMessage.message_id.asc(),
-                    RawMessage.id.asc(),
-                )
-                .limit(message_limit)
-                .all()
-            )
-        async def _process_recovery_candidate(raw_message) -> None:
-            nonlocal recovered_messages
-            try:
-                processing_result = await asyncio.to_thread(
-                    authoritative_processor,
-                    raw_message.id,
-                )
-            except Exception:
-                logger.exception(
-                    "authoritative recognition recovery failed: raw_message_id=%s",
-                    raw_message.id,
-                )
-                return
-            notification_payload = _build_authoritative_notification_payload(
-                raw_message=raw_message,
-                chat_title=chat_titles_by_id.get(raw_message.chat_id, ""),
-                processing_result=processing_result,
-            )
-            if notification_payload is not None and system_operator_bot_enabled(
-                system_operator_bot_config
-            ):
-                _handle_authoritative_failure_notification(
-                    session_factory=session_factory,
-                    raw_message_id=raw_message.id,
-                    sender=system_operator_conflict_sender,
-                    config=system_operator_bot_config,
-                    payload=notification_payload,
-                    retry_processor=authoritative_processor,
-                    retry_delay_seconds=authoritative_failure_retry_delay_seconds,
-                )
-            await _deliver_authoritative_instruction_summary(
-                processing_result=processing_result,
-                session_factory=session_factory,
-                raw_message_id=raw_message.id,
-                chat_title=chat_titles_by_id.get(raw_message.chat_id, ""),
-                notification_bot_config=notification_bot_config,
-            )
-            recovered_messages += 1
-
-        for raw_message in missing_decision_messages:
-            if chat_operation_lock is not None:
-                async with chat_operation_lock(int(raw_message.chat_id)):
-                    await _process_recovery_candidate(raw_message)
-            else:
-                await _process_recovery_candidate(raw_message)
-        for raw_message in expired_messages:
-            _record_expired_authoritative_recovery_gap(
-                session_factory,
-                raw_message=raw_message,
-            )
-            expired_recovery_messages += 1
+        recovery_result = await recover_missing_authoritative_decisions(
+            session_factory,
+            chat_titles_by_id=chat_titles_by_id,
+            authoritative_processor=authoritative_processor,
+            message_limit=message_limit,
+            system_operator_bot_config=system_operator_bot_config,
+            notification_bot_config=notification_bot_config,
+            system_operator_conflict_sender=system_operator_conflict_sender,
+            stall_expiry_notification_sender=stall_expiry_notification_sender,
+            authoritative_failure_retry_delay_seconds=(
+                authoritative_failure_retry_delay_seconds
+            ),
+            chat_operation_lock=chat_operation_lock,
+            loop_lag_snapshot_provider=loop_lag_snapshot_provider,
+        )
+        recovered_messages = recovery_result["recovered_messages"]
+        expired_recovery_messages = recovery_result["expired_recovery_messages"]
 
     history_checkpoints: dict[int, int] = {}
     with session_factory() as session:
@@ -1102,6 +1368,7 @@ async def run_periodic_reconcile(
     authoritative_failure_retry_delay_seconds: float = (
         AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS
     ),
+    loop_lag_snapshot_provider: Callable[[], dict[str, Any]] | None = None,
 ) -> None:
     """Periodically replay a small recent history window for missed-message recovery.
 
@@ -1113,6 +1380,12 @@ async def run_periodic_reconcile(
     call itself, and ``run_reconcile_once`` instead takes a per-chat lock
     around each message's own processing chain, so the reconcile pass no
     longer freezes chats it is not currently touching.
+
+    ``loop_lag_snapshot_provider`` is forwarded to ``run_reconcile_once`` so
+    that if this slow, Telegram-coupled pass is ever the one that observes an
+    expiry (normally the fast ``run_authoritative_gap_recovery_loop`` catches
+    it first), the stall-vs-stale classification is available here too, not
+    only on the fast path.
     """
 
     while True:
@@ -1169,4 +1442,108 @@ async def run_periodic_reconcile(
                     notification_bot_config=notification_bot_config,
                     authoritative_failure_retry_delay_seconds=authoritative_failure_retry_delay_seconds,
                 )
+        await asyncio.sleep(interval_seconds)
+
+
+async def run_authoritative_gap_recovery_loop(
+    *,
+    session_factory,
+    authoritative_processor: Callable[[int], Any] | None,
+    chat_titles_by_id_provider: Callable[[], dict[int, str]],
+    interval_seconds: float = DEFAULT_AUTHORITATIVE_GAP_RECOVERY_INTERVAL_SECONDS,
+    message_limit: int = 50,
+    operation_lock: Any | None = None,
+    system_operator_bot_config: Any | None = None,
+    notification_bot_config: Any | None = None,
+    system_operator_conflict_sender=send_ai_recognition_conflict_review,
+    stall_expiry_notification_sender=send_stall_induced_expiry_notification,
+    authoritative_failure_retry_delay_seconds: float = (
+        AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS
+    ),
+    loop_lag_snapshot_provider: Callable[[], dict[str, Any]] | None = None,
+) -> None:
+    """Recover missing authoritative decisions on a fast, network-free cadence.
+
+    This is the Phase 3 Task 1 compensator: independent of the slow,
+    Telegram-fetch-coupled periodic reconcile pass, it resolves
+    ``chat_titles_by_id`` on every tick via ``chat_titles_by_id_provider`` -
+    local configuration or the database, **never** ``discover_dialogs`` - so
+    a stalled or unhealthy Telegram session cannot also block recovery of
+    already-persisted local messages. ``chat_titles_by_id_provider`` is
+    called through ``asyncio.to_thread`` so that even a database-backed
+    provider cannot block the loop; the actual recovery work
+    (:func:`recover_missing_authoritative_decisions`) already offloads its
+    own synchronous work the same way.
+
+    Lock wiring matches ``run_periodic_reconcile`` exactly, using the same
+    ``resolve_message_lock_mode``/``resolve_lock_context`` helpers rather
+    than inventing a new convention: ``operation_lock=None`` is unlocked
+    (test opt-out only); a plain lock-like object is "global" mode and is
+    held around the *entire* recovery call, exactly like
+    ``run_periodic_reconcile`` wraps ``run_reconcile_once``; a
+    :class:`~telegram_kol_research.message_lock_provider.MessageLockProvider`
+    in "per_chat" mode is instead threaded through as ``chat_operation_lock``
+    so each recovered message's chain takes its own chat's lock - never
+    lock-free when a lock is configured, since this loop invokes the same
+    ``authoritative_processor`` as the live path.
+    """
+
+    async def _run_once(
+        chat_titles_by_id: dict[int, str],
+        *,
+        chat_operation_lock: Callable[[int], Any] | None,
+    ) -> None:
+        await recover_missing_authoritative_decisions(
+            session_factory,
+            chat_titles_by_id=chat_titles_by_id,
+            authoritative_processor=authoritative_processor,
+            message_limit=message_limit,
+            system_operator_bot_config=system_operator_bot_config,
+            notification_bot_config=notification_bot_config,
+            system_operator_conflict_sender=system_operator_conflict_sender,
+            stall_expiry_notification_sender=stall_expiry_notification_sender,
+            authoritative_failure_retry_delay_seconds=(
+                authoritative_failure_retry_delay_seconds
+            ),
+            chat_operation_lock=chat_operation_lock,
+            loop_lag_snapshot_provider=loop_lag_snapshot_provider,
+        )
+
+    while True:
+        try:
+            if authoritative_processor is not None:
+                # Off the loop: the provider may be database-backed, and
+                # this runs every iteration of an unconditional while-loop -
+                # exactly the shape the event-loop blocking census exists to
+                # catch.
+                chat_titles_by_id = await asyncio.to_thread(
+                    chat_titles_by_id_provider
+                )
+                if chat_titles_by_id:
+                    mode = await asyncio.to_thread(
+                        resolve_message_lock_mode, operation_lock
+                    )
+                    if mode == "per_chat":
+                        await _run_once(
+                            chat_titles_by_id,
+                            chat_operation_lock=operation_lock,
+                        )
+                    elif mode == "none":
+                        await _run_once(
+                            chat_titles_by_id,
+                            chat_operation_lock=None,
+                        )
+                    else:
+                        lock_cm = await asyncio.to_thread(
+                            resolve_lock_context, operation_lock, None
+                        )
+                        async with lock_cm:
+                            await _run_once(
+                                chat_titles_by_id,
+                                chat_operation_lock=None,
+                            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("authoritative gap recovery loop tick failed")
         await asyncio.sleep(interval_seconds)

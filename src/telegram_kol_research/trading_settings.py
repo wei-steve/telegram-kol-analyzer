@@ -87,6 +87,7 @@ class TradingSettings:
     deepcoin_contract_specs_mode: Literal["static", "shadow", "live"] = "static"
     mimo_contract_mode: Literal["v1", "v2_live_adapter"] = "v1"
     message_lock_mode: Literal["global", "per_chat"] = "global"
+    authoritative_gap_recovery_max_age_minutes: float = 15.0
     mimo_v2_activation_after_raw_message_id: int = 0
     default_max_loss_usdt: float = 20.0
     daily_max_loss_usdt: float = 500.0
@@ -399,6 +400,10 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
     message_lock_mode = _message_lock_mode(
         raw.get("message_lock_mode", defaults.message_lock_mode)
     )
+    authoritative_gap_recovery_max_age_minutes = _positive_float(
+        raw.get("authoritative_gap_recovery_max_age_minutes"),
+        defaults.authoritative_gap_recovery_max_age_minutes,
+    )
     mimo_v2_activation_after_raw_message_id = _nonnegative_int_setting(
         raw.get(
             "mimo_v2_activation_after_raw_message_id",
@@ -441,6 +446,9 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
             mimo_v2_activation_after_raw_message_id
         ),
         message_lock_mode=message_lock_mode,
+        authoritative_gap_recovery_max_age_minutes=(
+            authoritative_gap_recovery_max_age_minutes
+        ),
         default_max_loss_usdt=_positive_float(
             raw.get("default_max_loss_usdt"),
             defaults.default_max_loss_usdt,

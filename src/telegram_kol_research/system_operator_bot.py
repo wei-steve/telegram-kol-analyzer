@@ -1109,6 +1109,46 @@ def format_ai_recognition_conflict_review_message(payload: dict[str, Any]) -> st
     return "\n".join(lines)
 
 
+def format_stall_induced_expiry_notification(payload: dict[str, Any]) -> str:
+    """Format the aggregate notice for a burst of stall-induced gap expiry.
+
+    One notification stands for the whole burst a single recovery pass may
+    expire after a stall - never one per message - so the wording says "N
+    messages", not "message #X".
+    """
+
+    expired_count = int(payload.get("expired_count") or 0)
+    raw_message_ids = [str(item) for item in (payload.get("raw_message_ids") or [])]
+    chat_titles = [str(item) for item in (payload.get("chat_titles") or []) if item]
+    shown_ids = raw_message_ids[:20]
+    lines = [
+        "【系统故障导致信号丢失告警】",
+        (
+            f"因系统故障（事件循环阻塞），{expired_count} 条消息未能在窗口期内"
+            "完成权威识别，已按过期处理，未自动交易。"
+        ),
+        f"涉及群组: {', '.join(chat_titles) if chat_titles else '-'}",
+        (
+            f"消息内部ID: {', '.join(shown_ids) if shown_ids else '-'}"
+            + ("..." if len(raw_message_ids) > len(shown_ids) else "")
+        ),
+        f"记录时间: {_format_local_time(payload.get('occurred_at'))}",
+        "这是系统性故障导致的信号丢失，不是正常的过期判定，请人工复核。",
+    ]
+    return "\n".join(lines)
+
+
+async def send_stall_induced_expiry_notification(
+    *,
+    config: SystemOperatorBotConfig,
+    payload: dict[str, Any],
+) -> None:
+    await send_system_operator_bot_message(
+        config=config,
+        text=format_stall_induced_expiry_notification(payload),
+    )
+
+
 def format_semantic_disagreement_notification(payload: dict[str, Any]) -> str:
     """Format a final critical semantic review as a read-only audit notice."""
 

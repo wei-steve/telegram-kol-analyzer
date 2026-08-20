@@ -264,7 +264,11 @@ from telegram_kol_research.telegram_live_listener import (
     launch_live_listener_task,
     run_live_listener,
 )
-from telegram_kol_research.telegram_live_listener import run_periodic_reconcile, run_reconcile_once
+from telegram_kol_research.telegram_live_listener import (
+    run_authoritative_gap_recovery_loop,
+    run_periodic_reconcile,
+    run_reconcile_once,
+)
 from telegram_kol_research.telegram_bot_commands import (
     run_system_operator_bot_command_loop,
     run_telegram_bot_command_loop,
@@ -3914,6 +3918,8 @@ def create_web_app(
     reconcile_runner=None,
     reconcile_interval_seconds: int = 300,
     reconcile_startup_delay_seconds: int | None = None,
+    authoritative_gap_recovery_runner=None,
+    authoritative_gap_recovery_interval_seconds: float = 20.0,
     group_config: GroupConfig | None = None,
     group_config_path: str | Path | None = None,
     recovery_runner=None,
@@ -4027,6 +4033,32 @@ def create_web_app(
             app.state.lifecycle_monitor_task = asyncio.create_task(
                 app.state.lifecycle_monitor.run_loop()
             )
+            if app.state.authoritative_gap_recovery_loop_task is None:
+                app.state.authoritative_gap_recovery_loop_task = asyncio.create_task(
+                    app.state.authoritative_gap_recovery_runner(
+                        session_factory=app.state.session_factory,
+                        authoritative_processor=app.state.authoritative_processor,
+                        chat_titles_by_id_provider=(
+                            lambda: _group_label_by_chat_id(app.state.group_config)
+                        ),
+                        interval_seconds=(
+                            app.state.authoritative_gap_recovery_interval_seconds
+                        ),
+                        operation_lock=app.state.message_lock_provider,
+                        system_operator_bot_config=(
+                            app.state.system_operator_bot_config
+                        ),
+                        notification_bot_config=app.state.notification_bot_config,
+                        loop_lag_snapshot_provider=(
+                            app.state.loop_lag_monitor.snapshot
+                        ),
+                    )
+                )
+                app.state.authoritative_gap_recovery_loop_task.add_done_callback(
+                    _log_background_task_result(
+                        "authoritative_gap_recovery_loop_task"
+                    )
+                )
             app.state.deepcoin_reconcile_task = asyncio.create_task(
                 _run_reconcile_after_startup_delay(
                     runner=app.state.deepcoin_reconcile_runner,
@@ -4272,6 +4304,18 @@ def create_web_app(
             lcm_http = getattr(app.state, "lifecycle_monitor_http", None)
             if lcm_http is not None:
                 await lcm_http.aclose()
+            gap_recovery_loop_task = getattr(
+                app.state, "authoritative_gap_recovery_loop_task", None
+            )
+            if gap_recovery_loop_task is not None:
+                gap_recovery_loop_task.cancel()
+                try:
+                    await gap_recovery_loop_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.authoritative_gap_recovery_loop_task = None
             # ── live listener shutdown ──
             management_worker_task = app.state.strategy_management_worker_task
             if management_worker_task is not None:
@@ -4606,6 +4650,13 @@ def create_web_app(
         else reconcile_startup_delay_seconds
     )
     app.state.reconcile_task = None
+    app.state.authoritative_gap_recovery_runner = (
+        authoritative_gap_recovery_runner or run_authoritative_gap_recovery_loop
+    )
+    app.state.authoritative_gap_recovery_interval_seconds = (
+        authoritative_gap_recovery_interval_seconds
+    )
+    app.state.authoritative_gap_recovery_loop_task = None
     app.state.deepcoin_reconcile_task = None
     app.state.telegram_bot_command_task = None
     app.state.system_operator_bot_command_task = None

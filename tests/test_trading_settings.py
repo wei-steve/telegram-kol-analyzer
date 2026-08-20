@@ -193,6 +193,38 @@ def test_message_lock_mode_fails_closed(value):
         trading_settings_from_payload({"message_lock_mode": value})
 
 
+def test_authoritative_gap_recovery_max_age_minutes_defaults_and_round_trips(tmp_path):
+    session_factory = create_session_factory(tmp_path / "gap-recovery-window.db")
+
+    # Default is unchanged from the hardcoded 15-minute constant it replaces.
+    assert (
+        load_trading_settings(session_factory).authoritative_gap_recovery_max_age_minutes
+        == 15.0
+    )
+
+    saved = save_trading_settings(
+        session_factory, {"authoritative_gap_recovery_max_age_minutes": 45.0}
+    )
+
+    assert saved.authoritative_gap_recovery_max_age_minutes == 45.0
+    assert (
+        load_trading_settings(session_factory).authoritative_gap_recovery_max_age_minutes
+        == 45.0
+    )
+
+
+@pytest.mark.parametrize("value", [0, -5, "not-a-number", None])
+def test_authoritative_gap_recovery_max_age_minutes_fails_open_to_default(value):
+    """Invalid values fail OPEN to the safe 15-minute default, not raise -
+    matching every other ``_positive_float`` setting in this module, so a bad
+    payload cannot brick settings load and silently disable recovery."""
+
+    settings = trading_settings_from_payload(
+        {"authoritative_gap_recovery_max_age_minutes": value}
+    )
+    assert settings.authoritative_gap_recovery_max_age_minutes == 15.0
+
+
 @pytest.mark.parametrize("value", [-1, True, "42", 1.5, None])
 def test_mimo_v2_activation_watermark_fails_closed(value):
     with pytest.raises(ValueError, match="mimo_v2_activation_after_raw_message_id"):
