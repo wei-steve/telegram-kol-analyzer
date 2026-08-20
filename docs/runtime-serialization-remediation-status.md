@@ -14,13 +14,28 @@ deploy_branch: codex/deepcoin-auto-trading-v1   # matches the updater default; n
 integration_branch: codex/phase0-deploy-integration  # merged onto origin/deploy_branch (302c1ae); push this to deploy_branch
 local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v1 is 118 commits diverged from origin and is checked out in /private/tmp/tg-risk-routing.wmF2Vj. Do not use it. origin/codex/deepcoin-auto-trading-v1 is authoritative.
 design_version: 1
-current_phase: 4
-phase_name: durable-job-shadow-enqueue
-phase_status: claimed          # planned | claimed | in_progress | completed
-claimed_by: codex-phase4-20260820-root-f509217
-current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-4-durable-job-shadow-enqueue.md
-last_completed_phase: 3   # the sequence ran 0, 1, 1b, 1c, 1d, 1e, 2, 2f, 3
-last_completed_commit: 3eabde7c3c6e7e2edfc43c60c435c5a4da5975a3
+current_phase: 5
+phase_name: queue-consumer-takeover
+phase_status: planned          # planned | claimed | in_progress | completed
+claimed_by: none
+current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-5-queue-consumer-takeover.md
+last_completed_phase: 4   # the sequence ran 0, 1, 1b, 1c, 1d, 1e, 2, 2f, 3, 4
+last_completed_commit: 3bd53553af51ba4619ed3703bade2028514af4b6
+phase_4_claim_commit: cc2bf45e1799ec16b9e974ad78fd23e78309a0c9
+phase_4_initial_code_commit: dae09efc699c94261c4245f88f4f7523d8ca667c
+phase_4_history_enqueue_fix_commit: 6527c08fda70a5500cf747072288c499a1fa2f4d
+phase_4_terminal_tracking_fix_commit: 3bd53553af51ba4619ed3703bade2028514af4b6
+phase_4_deployed_commit: 3bd53553af51ba4619ed3703bade2028514af4b6
+phase_4_local_suite_after: 5762   # 5761 passed, 1 skipped, 0 failed, 17 known warnings, 417.14s
+phase_4_message_lock_mode_unchanged: true   # production remained global before, during, and after every Phase 4 deploy and shadow observation
+phase_4_pipeline_mode_final: shadow   # default remains inline; the previously proven shadow -> inline off switch remains available without restart
+phase_4_shadow_watermark: 11779
+phase_4_shadow_window_utc: "2026-08-20T07:56:51Z through 2026-08-20T08:58:36Z (61m45s), including gated restart at 07:57 UTC"
+phase_4_shadow_window_traffic: "36 raw messages across 10 distinct chats; 36 shadow jobs; 36 recognition decisions; execution_events 3629 -> 3632"
+phase_4_final_parity: "missing_job_count=0, orphan_job_count=0, stuck_pending_count=0, pending=0, succeeded=28, failed=8"
+phase_4_real_inline_finding: "All 8 failed jobs were terminalized as history_reconcile_error:MultipleResultsFound and all 8 already had RecognitionDecision rows. This is a real pre-existing late history-reconcile inline failure surfaced by shadow bookkeeping, not a shadow write failure; zero shadow enqueue/terminal-update failure log lines were observed. The final follow-up fix expands failure terminalization through candidate counting, trade merge, and strategy-alert delivery so these incidents no longer remain falsely stuck pending. Do not erase or backfill these evidence rows."
+phase_4_trading_impact: "No deviation attributable to shadow bookkeeping. During the real window one pre-existing strategy-management close submitted and two pre-existing live-signal trigger entries submitted; shadow code issued no exchange reads or writes and no consumer exists. Exchange moved from 1 position/0 regular/5 BTC triggers/3 TPSL before the window to 0 position/0 regular/4 BTC triggers/0 TPSL after the close; the final BTC trigger query succeeded, and zero live positions means no position TPSL was required. active_write_count was 0 at every deploy gate and final verification."
+phase_4_migration_rehearsal: "Production online-backup copy and separate dry-run copy at candidate dae09ef, evidence /opt/telegram-kol-analyzer/data/backups/phase4-rehearsal-evidence-dae09efc699c94261c4245f88f4f7523d8ca667c-20260820T062103Z.json: quick_check ok before/after, tables 80 -> 81 with only message_processing_jobs new, unique raw_message_id index present, job count 0, changed_existing_counts empty; raw_messages 11755, recognition_decisions 11754, execution_events 3620 unchanged. Backup and dry-run DB files remain beside the evidence JSON; updater also preserved research-deployment-dae09efc699c94261c4245f88f4f7523d8ca667c-20260820T062302Z.db."
 phase_3_reason: "executed per the standing instruction to run exactly the phase named by current_phase_file"
 phase_3_code_commit: 3eabde7c3c6e7e2edfc43c60c435c5a4da5975a3   # tasks 1-5; committed 2026-08-20
 phase_3_deployed_commit: 3eabde7c3c6e7e2edfc43c60c435c5a4da5975a3
@@ -51,8 +66,8 @@ phase_2_deployed_commit: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd
 phase_2_local_suite_before: 5684   # passed, 1 skipped, at 92e6e60
 phase_2_local_suite_after: 5710    # passed, 1 skipped, 0 failed; delta 26 equals the 26 tests phase 2 adds
 phase_0_code_commit: 816e296   # tasks 1-5; reviewed 2026-08-18. Task 6 (deploy + baseline) outstanding
-last_deployed_commit: e30e209ab192bd962e47bc6505256e2b03f95ae9
-production_commit: e30e209ab192bd962e47bc6505256e2b03f95ae9  # phase 3 follow-up fix, deployed 2026-08-20 02:16:55 UTC; verified over ssh 2026-08-20 02:17 UTC
+last_deployed_commit: 3bd53553af51ba4619ed3703bade2028514af4b6
+production_commit: 3bd53553af51ba4619ed3703bade2028514af4b6  # Phase 4 final follow-up, deployed 2026-08-20 07:56 UTC and gated-restarted in shadow at 07:57 UTC
 production_commit_before_phase_3_followup_fix: 3eabde7c3c6e7e2edfc43c60c435c5a4da5975a3  # rollback target for the follow-up fix alone (no schema change)
 production_commit_before_phase_3_deploy: 8122f15ba653e900ee88352b18f570d500bd65c4  # rollback target for phase 3's code (no schema change)
 production_commit_before_phase_2f_deploy: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd  # rollback target for phase 2f's code (no schema change)
@@ -67,7 +82,7 @@ phase_1b_code_commit: 06f916c5be8963b30dd87bc596c269c73dc641f7   # the code; dep
 phase_1b_deployed_commit: ee9c0d26041ef8b3e251fc392a79b5c586e76943   # branch tip at deploy time = 06f916c plus two docs commits
 phase_1b_local_suite_before: 5661   # passed, 1 skipped, at fd748d7
 phase_1b_local_suite_after: 5664    # passed, 1 skipped, 0 failed; delta 3 equals the 3 tests added
-deploy_branch_ahead_of_production: false  # production is ee9c0d2, the branch tip, as of 2026-08-19 03:22 UTC
+deploy_branch_ahead_of_production: true  # only the Phase 4 completion/status documentation commit is expected ahead; production code is exactly 3bd5355
 loop_lag_after_phase1b_p99_ms: 7004.713   # 64.8 min, 2026-08-19 04:27 UTC. WORSE than phase 1's 6759.363
 phase_1b_worst_stall_ms: 19687.274        # phase 1 was 15356.616. Worse, not better
 phase_1b_stall_rate_unchanged: true       # 1 per 37.37 s vs phase 1's 1 per 37.36 s — identical
@@ -113,12 +128,15 @@ phase_0_partial_work_in_tree: false  # committed as 816e296 on 2026-08-18
 loop_lag_baseline_p99_ms: 8777.887
 loop_lag_after_phase1_p99_ms: 6765.435   # 63.4 min, 2026-08-18 19:56 UTC; baseline was 8777.887
 local_tests:
+  - "phase-4-final (2026-08-20, codex-phase4-20260820-root-f509217): TDD reproduced the late history-reconcile terminalization gap before the final fix: tests/test_message_processing_shadow_enqueue.py::test_history_reconcile_shadow_marks_failed_when_later_inline_step_fails failed because the job stayed pending after persist_trade_ideas_from_candidates raised. Commit 3bd5355 expands the existing BaseException terminal guard without changing inline call order or exception propagation; focused file then passed 20 tests. Full suite on the exact final code commit passed 5761, skipped 1, failed 0, with 17 known warnings in 417.14s. Earlier Phase 4 full suite at 6527c08 passed 5760, skipped 1, failed 0; the one-test delta is exactly this regression test."
   - "phase-0-partial: commit 816e296 covers Tasks 1 and 2 only (LoopLagMonitor plus lifespan wiring). Written by an earlier session, not independently reviewed. Verified after the fact with .venv (Python 3.12.12) because .venv313b has no bin/python: 11 focused tests pass, tests/test_web_app.py passes 194, and the complete suite passes 5575 with 1 skipped and 17 known deprecation warnings. Task 3 (loop-health endpoint), Task 4 (census allowlist recorded in the status file), Task 5 (suite baseline recorded), and Task 6 (deploy plus 60-minute production baseline) are all still outstanding."
   - "phase-0-review-and-local-completion (2026-08-18, session-04451098): reviewed 816e296 against Tasks 1-3 rather than assuming it. Correction to the entry above: 816e296 in fact also contains Task 3 — GET /api/runtime/loop-health at src/telegram_kol_research/web_app.py:4770 plus three tests in tests/test_web_app.py. Review findings: LoopLagMonitor meets every Task 1 requirement (run/snapshot keys, deque(maxlen=7200) ring buffer, stall_threshold_ms=3000 with one warning per 60s via _last_stall_log_monotonic, injectable monotonic/now_provider/sleeper, no sleeping in tests); the lifespan wiring at web_app.py:3960 and the shutdown block at web_app.py:4201 match the existing contract_spec_refresh_task pattern byte-for-byte; the endpoint is declared async so it never depends on the shared threadpool. No defects found; no code changes were needed. Local runs with .venv (Python 3.12.12): tests/test_runtime_loop_health.py plus tests/test_runtime_event_loop_blocking_census.py 11 passed; tests/test_web_app.py 194 passed; full suite 5575 passed, 1 skipped, 17 known deprecation warnings, 352s. Suite baseline is exact, not approximate: collection at 816e296^ (0a61dfd, run in a throwaway worktree) is 5562 tests; collection at HEAD is 5576; delta 14 equals exactly the 14 tests 816e296 added (11 + 3), and the after run has zero failures. Task 6 (deploy plus 60-minute production baseline) was outstanding at the time of this entry; it was completed later the same day — see the server_verification entries and the 'how it was actually deployed' section."
   - "phase-1 (2026-08-18, session-45794fed): all seven local tasks done. New src/telegram_kol_research/runtime_worker_executor.py owns one lazily created ThreadPoolExecutor(max_workers=1, thread_name_prefix='mgmt-worker') with get_management_worker_executor, shutdown_management_worker_executor(wait) and run_on_management_worker. Both loops now submit to it: the strategy management loop submits _load_settings_and_run_strategy_management_tick so load_trading_settings and the tick stay atomic on one thread, and the break-even loop submits its tick directly. Both gained an explicit `except asyncio.CancelledError: raise` ahead of the broad except. The census allowlist lost both entries and now holds only the system_operator_bot offender. web_app.py calls shutdown_management_worker_executor(wait=False) in the lifespan after both worker tasks are cancelled; wait=False is deliberate so shutdown cannot hang, and an in-flight tick still finishes on its own thread exactly as it did when it ran on the loop. 17 tests added: 8 executor, 3 strategy-loop (cursor lane alternation still executable/recovery/executable/recovery on one cursor object, tick runs off the loop thread, loop survives a raising tick), 1 break-even (both loops observably share one thread with zero overlap - the guard against someone later splitting the pools), 3 responsiveness including one that reproduces the pre-Phase-1 shape and proves the guard fails on it, 2 web_app shutdown. Full suite with .venv (Python 3.12.12): 5661 passed, 1 skipped, 0 failed, 403s. Before was 5644 passed, 1 skipped; delta 17 equals exactly the 17 tests added. Import resolution was confirmed to point at the worktree, not the main checkout, before the run was trusted."
 phase_0_deploy_delta: "302c1ae -> 6620613 is 4074 insertions and 0 deletions across 19 files. Production code touched: runtime_loop_health.py (new, 142 lines) and web_app.py (+36). The rest is docs (3341 lines) and tests (377). No existing line is modified or removed."
 phase_0_merged_suite: "5644 passed, 1 skipped, 0 failed on codex/phase0-deploy-integration (385s). Deploy branch alone collects 5631; merged collects 5645; delta 14 equals exactly the tests Phase 0 adds."
 server_verification:
+  - "phase-4-production-complete (2026-08-20 06:21-08:59 UTC): production DB-copy migration rehearsal passed before the first deploy and preserved the exact backup/dry-run/evidence files named by phase_4_migration_rehearsal. Gated updater deployments with exact EXPECTED_COMMIT values succeeded for dae09ef, 6527c08, and final 3bd5355; production HEAD is exactly 3bd5355, service active since the required in-shadow restart at 2026-08-20 15:57:20 CST, message_lock_mode remained global, and message_pipeline_mode remains shadow. The disable path was proven before leaving shadow on: shadow created a job for raw 11756, switching inline suppressed a job for raw 11757, then a fresh watermark was used for the final window."
+  - "phase-4-shadow-window (watermark 11779, 2026-08-20 07:56:51-08:58:36 UTC): 61m45s of real multi-group traffic spanning the gated in-shadow restart; 36 raw messages across 10 chats, exactly 36 jobs and 36 decisions. Final parity: missing 0, orphan 0, stuck pending 0, pending 0, succeeded 28, failed 8. All failures were explicit terminal history_reconcile_error:MultipleResultsFound findings and all had decisions; zero shadow enqueue/terminal-update failure log lines. Execution events changed 3629->3632 through existing trading paths (one strategy-management close, two live-signal trigger entries). Read-only exchange checks showed 1 position/0 regular/5 BTC triggers/3 TPSL before, then 0 position/0 regular/4 BTC triggers/0 TPSL after the legitimate close; final BTC trigger query succeeded, no position remained requiring TPSL, and active_write_count=0. No consumer exists and no behavior deviation was attributable to Phase 4."
   - "phase-0-deploy (2026-08-18 16:12 UTC): DEPLOYED. Pushed codex/phase0-deploy-integration to codex/deepcoin-auto-trading-v1 as a fast-forward (302c1ae..a00561b, no force). Ran scripts/server_git_update.sh with EXPECTED_COMMIT=a00561bf7683091ae0a48471cbfc2af1e6b9fa8c CHANGE_CLASS=code; exit 0. Verified over ssh: HEAD=a00561b on codex/deepcoin-auto-trading-v1, telegram-kol.service active since 2026-08-19 00:12:02 CST, GET /api/runtime/loop-health answers."
   - "phase-0-deploy-first-attempt-failed-safely: the first run was issued from the main checkout, which sits on codex/mimo-v1-baseline, so its deploy/telegram-kol-update hashed to e70aa550 while the server extracted a7e30187 from a00561b. The updater SHA256 guard refused and exited silently with production untouched at 302c1ae. Run the script from a checkout of the commit being deployed. The guard worked as designed."
   - "phase-0-baseline: CAPTURED 2026-08-18 17:16:57 UTC at uptime 3893 s, i.e. 64.9 minutes of real message traffic with no restart in between. samples 1886, window_seconds 3892.504, p50_ms 1.076, p95_ms 8311.911, p99_ms 8777.887, max_ms 15160.203, stall_count 365, worst_stall_ms 15160.203, last_stall_at 2026-08-18T17:16:53Z."
@@ -231,7 +249,7 @@ the 2026-08-18 incident.
 | 2 | `phase-2-per-chat-lock-sharding.md` | **completed** 2026-08-19, deployed `3f5ed78` DORMANT — Task 1 decision gate FAILED, `per_chat` stays disabled, two gaps recorded |
 | 2f | `phase-2f-close-position-authority-coverage-gaps.md` | **completed** 2026-08-20, deployed `8122f15` — both gaps closed, per_chat prerequisite now met, `per_chat` still NOT enabled |
 | 3 | `phase-3-compensation-window-repair.md` | **completed** 2026-08-20, deployed `3eabde7` then follow-up fix `e30e209` — fast loop decoupled from Telegram fetch; a real gap (raw_message 11683) was observed and recovered end to end |
-| 4 | `phase-4-durable-job-shadow-enqueue.md` | planned |
+| 4 | `phase-4-durable-job-shadow-enqueue.md` | **completed** 2026-08-20, deployed `3bd5355` — 61m45s shadow, 36 messages/10 chats, parity missing/orphan/stuck all zero; 8 real late-inline failures recorded terminally |
 | 5 | `phase-5-queue-consumer-takeover.md` | planned |
 | 6 | `phase-6-process-separation.md` | planned |
 
