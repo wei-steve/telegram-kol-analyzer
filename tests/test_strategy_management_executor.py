@@ -30,10 +30,15 @@ def test_entry_revision_reduction_delegates_to_management_path_only():
     assert calls[0]["source"] == "entry_revision"
     assert calls[0]["target_remaining_quantity"] == "0.010"
 
+from threading import Event, Thread
+
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_client import (
     DeepcoinDefiniteRejection,
     DeepcoinRequestOutcomeUnknown,
+)
+from telegram_kol_research.position_authority_lock import (
+    serialized_position_authority_mutation,
 )
 from telegram_kol_research.execution_events import list_execution_events
 from telegram_kol_research.models import (
@@ -6047,6 +6052,129 @@ def test_composite_batch_with_componentless_second_leg_freezes_before_writes(
     assert result.reason_code == "management_instruction_component_topology_invalid"
     assert client.cancel_calls == []
     assert client.close_calls == []
+
+
+def test_execute_composite_management_batch_is_covered_by_position_authority_lock(
+    tmp_path,
+    monkeypatch,
+):
+    """Phase 2f gap B: composite batch execution must now hold
+    position_authority_lock. Before this phase, this function never imported
+    position_authority_lock at all and relied only on the accidental
+    protection of the single global message lock.
+
+    Same technique as tests/test_position_authority_lock.py: hold the
+    authority lock from a simulated mutation on one thread and prove
+    execute_composite_management_batch cannot even begin its body (its very
+    first statement, loading the batch) until that lock is released.
+    """
+
+    import telegram_kol_research.strategy_management_composite_executor as composite_executor_module
+
+    session_factory = create_session_factory(
+        tmp_path / "composite-position-authority.db"
+    )
+    batch_id, _component_id = _persist_composite_consumption_component(
+        session_factory
+    )
+    # Same "componentless second leg" setup as
+    # test_composite_batch_with_componentless_second_leg_freezes_before_writes,
+    # chosen deliberately so the batch reaches a deterministic
+    # recovery_required outcome with zero exchange writes - this test proves
+    # lock coverage of the function's entry, not any particular exchange call.
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, batch_id)
+        first_leg = (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=batch.execution_binding_id)
+            .one()
+        )
+        second_entry = ExecutionOrderLeg(
+            execution_binding_id=first_leg.execution_binding_id,
+            strategy_instance_id=first_leg.strategy_instance_id,
+            leg_index=1,
+            purpose="entry",
+            order_kind="market",
+            pos_id="pos-composite-2",
+            venue="deepcoin",
+            attribution_status="verified",
+            response_json='{"data":{"posId":"pos-composite-2"}}',
+            status="active",
+        )
+        session.add(second_entry)
+        session.flush()
+        session.add(
+            StrategyManagementLeg(
+                management_batch_id=batch.id,
+                execution_order_leg_id=second_entry.id,
+                pos_id="pos-composite-2",
+                leg_index=1,
+                status="planned",
+                preflight_size="10",
+                planned_close_size="5",
+                avg_entry_price="64000",
+                quantity_step="1",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+    mutation_entered = Event()
+    release_mutation = Event()
+    batch_body_entered = Event()
+
+    @serialized_position_authority_mutation
+    def simulated_exchange_mutation():
+        mutation_entered.set()
+        assert release_mutation.wait(timeout=2)
+
+    original_load_management_batch = composite_executor_module.load_management_batch
+
+    def observing_load_management_batch(*args, **kwargs):
+        batch_body_entered.set()
+        return original_load_management_batch(*args, **kwargs)
+
+    monkeypatch.setattr(
+        composite_executor_module,
+        "load_management_batch",
+        observing_load_management_batch,
+    )
+
+    mutation_thread = Thread(target=simulated_exchange_mutation)
+    mutation_thread.start()
+    assert mutation_entered.wait(timeout=1)
+
+    results = []
+    errors = []
+
+    def run_batch():
+        try:
+            results.append(
+                composite_executor_module.execute_composite_management_batch(
+                    session_factory,
+                    batch_id=batch_id,
+                    deepcoin_client=_CompositeConsumptionClient(),
+                    contract_spec_provider=None,
+                    live_execution_gate=lambda: True,
+                    now_provider=lambda: NOW,
+                )
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    batch_thread = Thread(target=run_batch)
+    batch_thread.start()
+
+    assert batch_body_entered.wait(timeout=0.1) is False
+    release_mutation.set()
+    mutation_thread.join(timeout=2)
+    batch_thread.join(timeout=2)
+
+    assert not errors, errors
+    assert batch_body_entered.is_set()
+    assert results and results[0].status == "recovery_required"
+    assert mutation_thread.is_alive() is False
+    assert batch_thread.is_alive() is False
 
 
 def test_composite_completion_boundary_validates_and_persists_success_notification(tmp_path):

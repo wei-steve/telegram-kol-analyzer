@@ -14,6 +14,9 @@ from telegram_kol_research.models import (
     StrategyManagementComponent,
     StrategyManagementLeg,
 )
+from telegram_kol_research.position_authority_lock import (
+    serialized_position_authority_mutation,
+)
 from telegram_kol_research.position_mutation_authority import (
     PositionMutationAuthorityError,
     build_position_mutation_authority,
@@ -71,6 +74,7 @@ class CompositeComponentExecutionResult:
     close_intent_ids: tuple[int, ...] = ()
 
 
+@serialized_position_authority_mutation
 def execute_composite_management_batch(
     session_factory,
     *,

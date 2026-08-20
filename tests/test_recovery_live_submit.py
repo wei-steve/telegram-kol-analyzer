@@ -45,6 +45,9 @@ from telegram_kol_research.recovery_live_submit import submit_entry_draft_revisi
 from telegram_kol_research.recovery_live_submit import load_entry_draft_revision_authority
 from telegram_kol_research.recovery_live_submit import submit_strategy_revision_replacement_live
 from telegram_kol_research.recovery_live_submit import _load_matching_position_ids
+from telegram_kol_research.position_authority_lock import (
+    serialized_position_authority_mutation,
+)
 from telegram_kol_research.deepcoin_execution_actions import _exact_exchange_order_id
 from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
 from telegram_kol_research.recovery_scan import RecoveryDecision
@@ -1447,6 +1450,74 @@ def test_source_deletion_waits_until_exchange_identity_is_durably_ledgered(
         deletion_exit = session.query(SourceMessageDeletionExit).one()
         assert deletion_exit.execution_binding_id == binding.id
         assert deletion_exit.strategy_instance_id == binding.strategy_instance_id
+
+
+def test_submit_recovery_signal_direct_is_covered_by_position_authority_lock(
+    tmp_path,
+):
+    """Phase 2f gap A: the entry-submission path must now also hold
+    position_authority_lock, not only _source_execution_lock.
+
+    Same technique as tests/test_position_authority_lock.py: hold the
+    authority lock from a simulated mutation on one thread and prove the
+    real submission path cannot reach its exchange write until that lock is
+    released.
+    """
+
+    session_factory = create_session_factory(tmp_path / "position-authority.db")
+    _persist_ready_item(session_factory)
+    _persist_lifecycle(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    mutation_entered = Event()
+    release_mutation = Event()
+    exchange_write_reached = Event()
+
+    @serialized_position_authority_mutation
+    def simulated_exchange_mutation():
+        mutation_entered.set()
+        assert release_mutation.wait(timeout=2)
+
+    class Client(_FakeDeepcoinClient):
+        def trigger_order(self, order_payload):
+            exchange_write_reached.set()
+            return super().trigger_order(order_payload)
+
+    mutation_thread = Thread(target=simulated_exchange_mutation)
+    mutation_thread.start()
+    assert mutation_entered.wait(timeout=1)
+
+    results = []
+    errors = []
+
+    def submit():
+        try:
+            results.append(
+                submit_recovery_order_live(
+                    session_factory,
+                    chat_id=100,
+                    message_id=55,
+                    symbol="BTC",
+                    side="long",
+                    deepcoin_client=Client(),
+                    contract_spec_provider=_StaticContractSpecProvider(),
+                )
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    submit_thread = Thread(target=submit)
+    submit_thread.start()
+
+    assert exchange_write_reached.wait(timeout=0.1) is False
+    release_mutation.set()
+    mutation_thread.join(timeout=2)
+    submit_thread.join(timeout=2)
+
+    assert not errors, errors
+    assert exchange_write_reached.is_set()
+    assert results and results[0]["submitted"] is True
+    assert mutation_thread.is_alive() is False
+    assert submit_thread.is_alive() is False
 
 
 def test_process_next_trade_signal_live_consumes_pending_signal(tmp_path):

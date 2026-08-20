@@ -77,6 +77,9 @@ from telegram_kol_research.trade_signals import load_trade_signal
 from telegram_kol_research.trade_signals import mark_trade_signal_failed
 from telegram_kol_research.trade_signals import mark_trade_signal_submitted
 from telegram_kol_research.trading_settings import load_trading_settings
+from telegram_kol_research.position_authority_lock import (
+    serialized_position_authority_mutation,
+)
 from telegram_kol_research.source_message_deletion import (
     serialized_source_message_execution,
     source_identity_execution_barrier,
@@ -1137,6 +1140,7 @@ def _require_current_contract_spec_matches_queued(
         raise RecoveryLiveSubmitError("queued_contract_spec_snapshot_mismatch")
 
 
+@serialized_position_authority_mutation
 @serialized_source_message_execution
 @_report_entry_submission_progress
 def _submit_recovery_signal_direct(
