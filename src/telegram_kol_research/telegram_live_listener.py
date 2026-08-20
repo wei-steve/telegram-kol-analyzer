@@ -1409,6 +1409,7 @@ async def run_periodic_reconcile(
                 notification_bot_config=notification_bot_config,
                 authoritative_failure_retry_delay_seconds=authoritative_failure_retry_delay_seconds,
                 chat_operation_lock=operation_lock,
+                loop_lag_snapshot_provider=loop_lag_snapshot_provider,
             )
         elif mode == "none":
             await run_reconcile_once(
@@ -1424,6 +1425,7 @@ async def run_periodic_reconcile(
                 system_operator_bot_config=system_operator_bot_config,
                 notification_bot_config=notification_bot_config,
                 authoritative_failure_retry_delay_seconds=authoritative_failure_retry_delay_seconds,
+                loop_lag_snapshot_provider=loop_lag_snapshot_provider,
             )
         else:
             lock_cm = await asyncio.to_thread(resolve_lock_context, operation_lock, None)
@@ -1441,6 +1443,7 @@ async def run_periodic_reconcile(
                     system_operator_bot_config=system_operator_bot_config,
                     notification_bot_config=notification_bot_config,
                     authoritative_failure_retry_delay_seconds=authoritative_failure_retry_delay_seconds,
+                    loop_lag_snapshot_provider=loop_lag_snapshot_provider,
                 )
         await asyncio.sleep(interval_seconds)
 

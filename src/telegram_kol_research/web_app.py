@@ -4220,6 +4220,7 @@ def create_web_app(
                         system_operator_bot_config=app.state.system_operator_bot_config,
                         notification_bot_config=app.state.notification_bot_config,
                         startup_delay_seconds=app.state.reconcile_startup_delay_seconds,
+                        loop_lag_snapshot_provider=app.state.loop_lag_monitor.snapshot,
                     )
                 )
             if (
@@ -4751,6 +4752,7 @@ def create_web_app(
                     system_operator_bot_config=app.state.system_operator_bot_config,
                     notification_bot_config=app.state.notification_bot_config,
                     startup_delay_seconds=0,
+                    loop_lag_snapshot_provider=app.state.loop_lag_monitor.snapshot,
                 )
             )
 

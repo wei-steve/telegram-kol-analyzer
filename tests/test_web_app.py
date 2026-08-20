@@ -674,6 +674,46 @@ def test_management_worker_lifespan_starts_once_and_is_cancelled(tmp_path):
     assert app.state.strategy_management_worker_task is None
 
 
+def test_authoritative_gap_recovery_loop_lifespan_starts_and_is_cancelled(tmp_path):
+    started = threading.Event()
+    stopped = threading.Event()
+    calls = []
+
+    async def fake_gap_recovery_loop(**kwargs):
+        calls.append(kwargs)
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        authoritative_gap_recovery_runner=fake_gap_recovery_loop,
+        authoritative_gap_recovery_interval_seconds=7,
+    )
+
+    with TestClient(app):
+        assert started.wait(timeout=1)
+        assert len(calls) == 1
+        assert calls[0]["session_factory"] is app.state.session_factory
+        assert calls[0]["authoritative_processor"] is app.state.authoritative_processor
+        assert calls[0]["interval_seconds"] == 7
+        assert calls[0]["operation_lock"] is app.state.message_lock_provider
+        assert calls[0]["system_operator_bot_config"] is (
+            app.state.system_operator_bot_config
+        )
+        assert calls[0]["notification_bot_config"] is app.state.notification_bot_config
+        assert calls[0]["loop_lag_snapshot_provider"] == (
+            app.state.loop_lag_monitor.snapshot
+        )
+        assert callable(calls[0]["chat_titles_by_id_provider"])
+        assert app.state.authoritative_gap_recovery_loop_task is not None
+
+    assert stopped.wait(timeout=1)
+    assert app.state.authoritative_gap_recovery_loop_task is None
+
+
 def test_loop_lag_monitor_lifespan_starts_and_is_cancelled(tmp_path):
     app = create_web_app(database_path=tmp_path / "research.db")
 
