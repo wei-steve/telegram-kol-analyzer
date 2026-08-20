@@ -16,8 +16,8 @@ local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v
 design_version: 1
 current_phase: 3
 phase_name: compensation-window-repair
-phase_status: planned          # planned | claimed | in_progress | completed
-claimed_by: none               # phase 2f completed and released 2026-08-20; see phase_2f_* fields below before starting phase 3
+phase_status: claimed          # planned | claimed | in_progress | completed
+claimed_by: session-phase3-compwindow-0819   # claimed 2026-08-19, executing phase-3-compensation-window-repair.md
 current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-3-compensation-window-repair.md
 last_completed_phase: 2f   # the sequence ran 0, 1, 1b, 1c, 1d, 1e, 2, 2f
 last_completed_commit: 8122f15ba653e900ee88352b18f570d500bd65c4
