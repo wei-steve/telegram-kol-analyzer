@@ -14,13 +14,24 @@ deploy_branch: codex/deepcoin-auto-trading-v1   # matches the updater default; n
 integration_branch: codex/phase0-deploy-integration  # merged onto origin/deploy_branch (302c1ae); push this to deploy_branch
 local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v1 is 118 commits diverged from origin and is checked out in /private/tmp/tg-risk-routing.wmF2Vj. Do not use it. origin/codex/deepcoin-auto-trading-v1 is authoritative.
 design_version: 1
-current_phase: 3
-phase_name: compensation-window-repair
-phase_status: claimed          # planned | claimed | in_progress | completed
-claimed_by: session-phase3-compwindow-0819   # claimed 2026-08-19, executing phase-3-compensation-window-repair.md
-current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-3-compensation-window-repair.md
-last_completed_phase: 2f   # the sequence ran 0, 1, 1b, 1c, 1d, 1e, 2, 2f
-last_completed_commit: 8122f15ba653e900ee88352b18f570d500bd65c4
+current_phase: 4
+phase_name: durable-job-shadow-enqueue
+phase_status: planned          # planned | claimed | in_progress | completed
+claimed_by: none               # phase 3 completed and released 2026-08-20
+current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-4-durable-job-shadow-enqueue.md
+last_completed_phase: 3   # the sequence ran 0, 1, 1b, 1c, 1d, 1e, 2, 2f, 3
+last_completed_commit: 3eabde7c3c6e7e2edfc43c60c435c5a4da5975a3
+phase_3_reason: "executed per the standing instruction to run exactly the phase named by current_phase_file"
+phase_3_code_commit: 3eabde7c3c6e7e2edfc43c60c435c5a4da5975a3   # tasks 1-5; committed 2026-08-20
+phase_3_deployed_commit: 3eabde7c3c6e7e2edfc43c60c435c5a4da5975a3
+phase_3_local_suite_before: 5714   # 5713 passed, 1 skipped, at 3ed642a (the claim commit, no code yet) - collected in a throwaway worktree
+phase_3_local_suite_after: 5732    # 5731 passed, 1 skipped, 0 failed, 400.6s; delta 18 equals exactly the tests phase 3 adds (11 in tests/test_authoritative_gap_recovery_loop.py, 5 in tests/test_trading_settings.py, 2 in tests/test_system_operator_bot.py)
+phase_3_message_lock_mode_unchanged: true   # confirmed "global" in production both before and after this deploy; phase 3 does not touch the flag, only wires the new loop through the same resolve_message_lock_mode/resolve_lock_context convention run_periodic_reconcile already uses
+phase_3_recovery_latency_observed: "MEASURED, not idealized. raw_message_id=11683 (posted 2026-08-20 01:48:30 UTC, arriving within seconds of the post-deploy restart at 01:48:58 UTC) had no decision; run_authoritative_gap_recovery_loop found and retried it repeatedly starting within its first pass, but it did not get a real decision until 01:56:00 UTC - a 7.5-minute recovery, not the sub-20s figure the phase's own docstrings describe for the uncontended case. A second, unrelated message (11693, posted 02:00:44 UTC) was picked up and resolved by the ordinary LIVE PATH (mimo-v2.5, not recovery_guard) in about 3 minutes with zero recovery-loop involvement - normal live-path latency, confirming the loop stays idle when it should."
+phase_3_recovery_contention_finding: "The 7.5-minute delay for 11683 was caused by repeated collisions with a PRE-EXISTING, un-modified guard: authoritative_recognition.assess_message_authoritatively's claim_message_evidence_extraction (authoritative_recognition.py:775), which raises RuntimeError('message evidence extraction already in progress') when a claim is already held. 44 collisions were logged for this one raw_message_id between 01:50:06 and 01:52:07 UTC (all caught by _process_recovery_candidate's own except-block and logged, never propagating, never crashing anything), then zero further collisions - the claim eventually cleared and the next attempt succeeded. This is a genuine, previously-latent interaction: the OLD recovery path only ran every 300s via run_periodic_reconcile, so it rarely collided with an in-flight live-path claim; the NEW 20s-cadence loop collides with it far more often by design, since Task 1 explicitly requires the new loop to invoke the same authoritative_processor as the live path rather than skip it. Nothing in Phase 3's own code holds or races that claim - it is entirely inside authoritative_recognition.py, untouched by this phase. Recorded as a finding for a future session, not fixed here: it is out of Phase 3's scope (which is the recovery *loop and its lock/expiry semantics*, not the evidence-extraction claim mechanism it calls into), and it self-resolved without intervention, with no bad trade and no crash - message 11683 eventually got a correct, real (non-recovery_guard) decision, agreement_status=agreed, non-strategy."
+phase_3_recovery_loop_idle_confirmed: true   # zero 'recovery failed' log lines and zero err-level journal entries in the 10 minutes preceding the final verification read (02:02-02:12 UTC window), service otherwise healthy and processing live traffic normally throughout
+phase_3_no_discover_dialogs_confirmed: "grep of the deployed source at 3eabde7 for run_authoritative_gap_recovery_loop's body: zero references to discover_dialogs or a Telegram client object, matching the design and the test_recover_missing_authoritative_decisions_has_no_client_parameter regression test"
+phase_2f_reason: "user explicitly chose to close the gap in a dedicated phase before phase 3, 2026-08-19, when asked"
 phase_2f_reason: "user explicitly chose to close the gap in a dedicated phase before phase 3, 2026-08-19, when asked"
 phase_2f_code_commit: 8122f15ba653e900ee88352b18f570d500bd65c4   # tasks 0-4; committed 2026-08-20 (session started 2026-08-19, deploy landed just past UTC midnight)
 phase_2f_deployed_commit: 8122f15ba653e900ee88352b18f570d500bd65c4
@@ -38,8 +49,9 @@ phase_2_deployed_commit: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd
 phase_2_local_suite_before: 5684   # passed, 1 skipped, at 92e6e60
 phase_2_local_suite_after: 5710    # passed, 1 skipped, 0 failed; delta 26 equals the 26 tests phase 2 adds
 phase_0_code_commit: 816e296   # tasks 1-5; reviewed 2026-08-18. Task 6 (deploy + baseline) outstanding
-last_deployed_commit: 8122f15ba653e900ee88352b18f570d500bd65c4
-production_commit: 8122f15ba653e900ee88352b18f570d500bd65c4  # phase 2f, deployed 2026-08-20 00:39 UTC; verified over ssh 2026-08-20 00:39 UTC
+last_deployed_commit: 3eabde7c3c6e7e2edfc43c60c435c5a4da5975a3
+production_commit: 3eabde7c3c6e7e2edfc43c60c435c5a4da5975a3  # phase 3, deployed 2026-08-20 01:48:58 UTC; verified over ssh through 02:12 UTC
+production_commit_before_phase_3_deploy: 8122f15ba653e900ee88352b18f570d500bd65c4  # rollback target for phase 3's code (no schema change)
 production_commit_before_phase_2f_deploy: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd  # rollback target for phase 2f's code (no schema change)
 production_commit_before_phase_2_deploy: 92e6e60a0985a81208064f785e2454bcafd99bfe  # rollback target for phase 2's code (no schema change)
 production_commit_before_phase_0: 302c1ae467b98bc954ac2a25cc4a33a8d09f48f9  # rollback target
@@ -162,6 +174,16 @@ server_verification:
   - "phase-2f-deploy (2026-08-20 00:39 UTC): DEPLOYED. Fast-forward pushed 3f5ed78..8122f15 to codex/deepcoin-auto-trading-v1 (2 commits: the phase-2f claim, then the phase-2f code), confirmed origin/codex/deepcoin-auto-trading-v1 was an ancestor of HEAD first. Ran EXPECTED_COMMIT=8122f15ba653e900ee88352b18f570d500bd65c4 ./scripts/server_git_update.sh from this worktree, checked out at that exact commit; exit code 0, captured without a pipe. The curl connection-refused lines near the end of the updater's own output are verify_http_health's retry loop during the service restart, consistent with every prior phase's deploy. Independently verified over ssh: HEAD=8122f15 on codex/deepcoin-auto-trading-v1, telegram-kol.service active since 2026-08-20 08:39:27 CST (=00:39:27 UTC), zero journal entries at priority err or above in the 2 minutes since restart, GET /api/trading-settings returns 200 with message_lock_mode: 'global' (unchanged by this phase, confirming it stayed dormant) and auto_trade_enabled: true, GET /api/runtime/loop-health answers with stall_count 0 at uptime 9.98s (a liveness check only, not a baseline - too early to compare against Phase 1e's p99). position_attribution_audits (3251 rows total) and position_protection_incidents (313 rows total) were read as a pre-deploy-activity snapshot only, most recent row 2026-08-19 22:47:50 predating this deploy by hours; not enough time had passed at verification time to observe any post-deploy row, so this does NOT yet demonstrate 'no new incident class' - that requires a longer observation window this session did not run."
   - "phase-2f-conclusion: Phase 2's own Task 1 decision gate now passes - tests/test_position_authority_boundary_coverage.py::test_per_chat_sharding_prerequisite_gap_is_closed passes, KNOWN_UNCOVERED_LEAVES is empty. This makes the PREREQUISITE for message_lock_mode=per_chat true. It does NOT enable per_chat, which stays 'global' in production and remains a separate, explicit decision - Phase 2's own Task 6 Steps 2 (prove the disable path) and 3 (enable and observe a full trading session) are still un-started and still require their own session with real multi-group traffic to observe, not something this phase or the next one may infer from a lock now being present in the code."
 
+  - "phase-3-local (2026-08-20, session-phase3-compwindow-0819): Task 1 (telegram_live_listener.py) extracted the inline recovery block that used to live inside run_reconcile_once into two pieces - a synchronous _load_gap_recovery_candidates(session_factory, chat_titles_by_id, now, message_limit) that reads TradingSettings.authoritative_gap_recovery_max_age_minutes fresh on every call and runs the same missing/expired queries as before, and an async recover_missing_authoritative_decisions(...) that offloads that read via asyncio.to_thread, performs no Telegram calls of any kind (no client parameter, no discover_dialogs_fn parameter - asserted directly by a signature-introspection test), and preserves the exact per-message lock-acquisition shape run_reconcile_once's own recovery loop already used. run_reconcile_once now calls this extracted function instead of running the block inline; a dedicated test proves its observable behavior (recovered_messages/expired_recovery_messages counts, the persisted automation_reason, notification suppression) is unchanged. A new run_authoritative_gap_recovery_loop (default interval 20s, DEFAULT_AUTHORITATIVE_GAP_RECOVERY_INTERVAL_SECONDS) resolves chat_titles_by_id every tick via an injected chat_titles_by_id_provider (wired in web_app.py to _group_label_by_chat_id(app.state.group_config) - local configuration, no Telegram), off the loop via asyncio.to_thread, and follows run_periodic_reconcile's own resolve_message_lock_mode/resolve_lock_context three-way branch verbatim (none/per_chat/global) rather than inventing new wiring - in 'global' mode (production's only enabled mode) the whole recovery call is wrapped in the single shared lock, exactly like run_periodic_reconcile wraps run_reconcile_once, so it cannot run concurrently with the live path or the old reconcile pass. Task 2: expiry is now classified via _classify_expired_authoritative_recovery_gap as EXPIRED_AFTER_SYSTEM_STALL (a recorded loop-lag-monitor stall overlapped the message's posted_at..now window) or EXPIRED_STALE_INSTRUCTION (no evidence of overlap, including when posted_at or the snapshot is missing - the quiet classification is the fail-safe default). The persisted automation_reason stays the literal string 'authoritative_gap_recovery_expired' for every classification, unchanged from before this phase, because tests/test_reconcile_live_history.py already asserts that exact string; only a new expiry_classification key inside the JSON payload and the Chinese summary text vary. Stall-induced expiries schedule at most one aggregate Telegram notification per StallExpiryNotificationRateLimiter window (default 300s, injectable monotonic clock, no sleeping in tests) via a new format_stall_induced_expiry_notification/send_stall_induced_expiry_notification pair in system_operator_bot.py, naming the whole burst ('N messages'), never one notification per message. Expired messages are still never auto-executed in either classification - expiry stays fail-safe, matching Task 2 Step 3 exactly. Task 3: trading_settings.py gained authoritative_gap_recovery_max_age_minutes: float = 15.0, parsed with the existing _positive_float helper (fails OPEN to the 15.0 default on any invalid value, matching every other float setting in this module, not raise), so the previously-hardcoded AUTHORITATIVE_GAP_RECOVERY_MAX_AGE constant is now a dead reference kept only as documentation - no code path reads it anymore. Default is numerically unchanged (15.0 minutes), so behavior does not change until an operator flips it."
+  - "phase-3-task5-suite: full local suite with .venv (Python 3.12.12): 5731 passed, 1 skipped, 0 failed, 400.6s. Before (collected in a throwaway worktree at 3ed642a, the phase-3 claim commit with no code yet) was 5713 passed, 1 skipped, 5714 collected; after collects 5732; delta 18 equals exactly the tests this phase adds (11 in the new tests/test_authoritative_gap_recovery_loop.py covering all 6 of Task 4's required assertions plus rate-limiter unit tests, 5 in tests/test_trading_settings.py for the new setting's round-trip and fail-open behavior, 2 in tests/test_system_operator_bot.py for the new notification formatter). The blocking-call census (tests/test_runtime_event_loop_blocking_census.py) passes unchanged - no new allowlist entry needed; every new synchronous read this phase adds is wrapped in asyncio.to_thread at its call site."
+  - "phase-3-pre-deploy-snapshot (2026-08-20 01:09:50 UTC): live position snapshot read from the server (data/web_cache/deepcoin_live_positions.json) as pre-deploy evidence: positions [], open_orders [] - zero open positions or working orders at deploy time, the safest possible window for a writer-adjacent deploy even though this phase touches no exchange-mutation code."
+  - "phase-3-deploy (2026-08-20 01:48:xx UTC / 09:48:58 CST service restart): DEPLOYED. Fast-forward pushed 3ed642a..3eabde7 to codex/deepcoin-auto-trading-v1 (2 commits: the phase-3 claim, then the phase-3 code), confirmed origin/codex/deepcoin-auto-trading-v1 was an ancestor of HEAD first. Ran EXPECTED_COMMIT=3eabde7c3c6e7e2edfc43c60c435c5a4da5975a3 ./scripts/server_git_update.sh from this worktree, checked out at that exact commit; exit code 0, captured without a pipe. The curl connection-refused lines near the end of the updater's own output are verify_http_health's retry loop during the service restart, consistent with every prior phase's deploy. Independently verified over ssh (not inferred from the updater's exit code): HEAD=3eabde7 on codex/deepcoin-auto-trading-v1, telegram-kol.service active since 2026-08-20 09:48:58 CST, ActiveEnterTimestamp confirmed, zero journal entries at priority err or above in the first several minutes after restart. GET /api/trading-settings returns 200 with message_lock_mode: 'global' (unchanged, confirms this phase did not touch the flag) and the new authoritative_gap_recovery_max_age_minutes: 15.0 (confirms the setting round-trips through production with its unchanged default). GET /api/runtime/loop-health answers 200 throughout."
+  - "phase-3-source-level-confirmation: grepped the DEPLOYED source directly over ssh (not the local worktree) for run_authoritative_gap_recovery_loop's body - zero references to discover_dialogs or a Telegram client, matching Task 1 Step 2's requirement and the local regression test. Also grepped the whole deployed src/ tree for the literal string 'authoritative recognition recovery failed' (the log line inside _process_recovery_candidate) and confirmed it exists in exactly one place - src/telegram_kol_research/telegram_live_listener.py:1011 - so every journal occurrence of that message is unambiguously attributable to recover_missing_authoritative_decisions (reached from either run_reconcile_once or the new fast loop), not some other code path."
+  - "phase-3-real-gap-recovery-observed (2026-08-20 01:48-01:56 UTC): a REAL gap-recovery event happened during verification, not a synthetic one - no test data was inserted. raw_message_id=11683 (chat 米哥会员群-11分组, a genuinely configured, enabled group per config/groups.yaml) arrived at 01:48:30 UTC, seconds before the 01:48:58 UTC restart, and had no RecognitionDecision row. It was independently confirmed missing via direct sqlite3 queries against data/research.db on the server (not inferred from logs), then watched via a polling Monitor until it resolved. It DID resolve, at 01:56:00 UTC, with a real decision from authoritative_model='mimo-v2.5' (not recovery_guard - a genuine, successful recognition, agreement_status=agreed, non-strategy), NOT an expiry fallback. Measured recovery latency for this message: 7.5 minutes (01:48:30 posted to 01:56:00 decided). This IS the 'recovery latency improvement measured and recorded' the phase file's Task 6 Step 3 and completion criteria ask for, reported honestly rather than idealized - see the next entry for why it is 7.5 minutes and not the sub-20s figure the docstrings describe for the uncontended case."
+  - "phase-3-recovery-contention-finding: see phase_3_recovery_contention_finding in the YAML block above for the full account. Summary: 44 collisions with a PRE-EXISTING (not modified by this phase), DB-backed claim/lease guard inside authoritative_recognition.assess_message_authoritatively (claim_message_evidence_extraction, authoritative_recognition.py:775) were logged for raw_message_id=11683 between 01:50:06 and 01:52:07 UTC, each one caught by _process_recovery_candidate's own except-block, logged as an ERROR, and never propagating or crashing anything - then zero further collisions, and a successful decision four minutes later. The 20s-cadence loop is far more likely to collide with an in-flight live-path claim than the old 300s reconcile ever was, precisely because Task 1 requires it to invoke the same authoritative_processor as the live path rather than skip contested messages. This is a genuine interaction effect worth a future session's attention (e.g., recognizing 'already in progress' as an expected, quiet-retry condition rather than an ERROR-level failure), but it is out of Phase 3's scope - the claim mechanism itself lives entirely in authoritative_recognition.py, which this phase does not touch - and it did not cause any incorrect trade, crash, or lasting production impact."
+  - "phase-3-idle-and-live-path-confirmed (verified through 2026-08-20 02:12 UTC, about 24 minutes of production uptime): after the one contended message resolved, ZERO further 'recovery failed' log lines and ZERO err-level journal entries were observed in the 10 minutes preceding the final check. Direct DB query at that time found exactly 2 rows still missing a decision: raw_message_id=11693 (posted 02:00:44 UTC, 3 minutes old, evidently still in flight) and raw_message_id=8793 (posted 2026-06-13, a pre-existing historical outlier from over two months before this phase, unrelated to it and out of scope to backfill). 11693 was watched to resolution: it got a real decision from authoritative_model='mimo-v2.5' at 02:03:51 UTC - about 3 minutes after posting, via the ORDINARY LIVE PATH with zero recovery-loop involvement (no 'recovery failed' log for this id) - confirming Task 6 Step 4 directly: normal live messages are still processed by the live path, not by the recovery loop, and the recovery loop is idle during healthy operation. Also spot-checked the 7 other most recent messages (11685-11692): all show authoritative_model='mimo-v2.5' with posted-to-decided latency of roughly 1-2.5 minutes, consistent normal live-path behavior, none via recovery_guard."
+  - "phase-3-stopping-point-decision: NOT stopping here - current_phase advanced to 4 per the phase file's own explicit instruction. Phase 3's own completion criteria are met: the loop runs independently of the Telegram fetch pass on a fast cadence off the event loop under the correct (global-mode-verified) lock; expiry is classified, recorded, and would notify (rate-limited) if stall-induced expiry actually occurred - none did during this observation window, both classifications were exercised only in local tests; the window is configurable with the default numerically unchanged; recovery latency was measured and recorded honestly, including the contention finding above rather than a rounded-up number; the loop was observed idle during healthy operation. Phases 4-6 (durable job queue, queue consumer takeover, process separation) address a different failure class - losing in-flight work on restart, and web traffic perturbing execution - not the silent-backlog-loss problem Phase 3 targets, so there is no dependency reason to stop, and the project's established pattern across every prior phase has been to advance immediately. The claim-contention finding above is recorded for whichever future session next touches authoritative_recognition.py or the recovery loop's retry behavior, not as a blocker."
+
 ```
 
 ## Claim protocol — read this before starting any phase
@@ -204,7 +226,7 @@ the 2026-08-18 incident.
 | 1e | `phase-1e-unblock-context-resolution-scheduler.md` | **completed** 2026-08-19, deployed `92e6e60` — p99 236 → 80 ms; residual stalls are NOT code |
 | 2 | `phase-2-per-chat-lock-sharding.md` | **completed** 2026-08-19, deployed `3f5ed78` DORMANT — Task 1 decision gate FAILED, `per_chat` stays disabled, two gaps recorded |
 | 2f | `phase-2f-close-position-authority-coverage-gaps.md` | **completed** 2026-08-20, deployed `8122f15` — both gaps closed, per_chat prerequisite now met, `per_chat` still NOT enabled |
-| 3 | `phase-3-compensation-window-repair.md` | planned |
+| 3 | `phase-3-compensation-window-repair.md` | **completed** 2026-08-20, deployed `3eabde7` — fast loop decoupled from Telegram fetch; a real gap (raw_message 11683) was observed and recovered end to end |
 | 4 | `phase-4-durable-job-shadow-enqueue.md` | planned |
 | 5 | `phase-5-queue-consumer-takeover.md` | planned |
 | 6 | `phase-6-process-separation.md` | planned |
@@ -894,6 +916,97 @@ equality, so any phase that removes a blocking call must shrink
 4. **The authoritative checkout is still**
    `.worktrees/runtime-serialization` on branch `codex/phase0-deploy-integration`.
    `codex/mimo-v1-baseline`'s copy of this file remains frozen and superseded.
+
+## Phase 3 — compensation window repair, completed
+
+Deployed `3eabde7` on 2026-08-20 (service restart 01:48:58 UTC). `message_lock_mode`
+is untouched and still reads `"global"` in production, confirmed over ssh both
+before and after this deploy.
+
+**What shipped, in one paragraph each.** Task 1:
+`recover_missing_authoritative_decisions` in `telegram_live_listener.py` is the
+old inline recovery block from `run_reconcile_once`, extracted so it takes no
+Telegram client and no `discover_dialogs_fn` — verified both by a signature
+test and by grepping the *deployed* source directly. `run_reconcile_once` now
+calls it, proven behaviorally unchanged by a dedicated regression test. A new
+`run_authoritative_gap_recovery_loop` runs it independently every 20 seconds
+(`DEFAULT_AUTHORITATIVE_GAP_RECOVERY_INTERVAL_SECONDS`), resolving
+`chat_titles_by_id` from `_group_label_by_chat_id(app.state.group_config)` —
+local configuration, never Telegram — and follows `run_periodic_reconcile`'s
+own `resolve_message_lock_mode`/`resolve_lock_context` wiring exactly instead
+of inventing a new convention. Task 2: expiry is now classified
+`expired_after_system_stall` or `expired_stale_instruction` using the
+loop-lag-monitor snapshot against the message's `posted_at`..`now` window; a
+stall-induced burst gets at most one rate-limited aggregate notification
+(`StallExpiryNotificationRateLimiter`, default 300s), never one per message;
+expiry stays fail-safe in both classifications — nothing is ever auto-executed
+from the expired path. The persisted `automation_reason` deliberately did NOT
+change (`"authoritative_gap_recovery_expired"` for every classification),
+because existing tests already depend on that exact string; only a new
+`expiry_classification` payload key and the Chinese summary text vary by
+classification. Task 3: the hardcoded 15-minute constant is now
+`TradingSettings.authoritative_gap_recovery_max_age_minutes` (default `15.0`,
+fails open to that default on any invalid value, matching every other float
+setting in this module) — behavior is numerically unchanged until an operator
+flips it.
+
+**The recovery latency claim is measured, not idealized — and the honest
+number is worse than the phase file's own docstrings imply for the
+uncontended case.** A real gap was observed during verification (not
+synthetic test data): `raw_message_id=11683` arrived seconds before the
+deploy's restart and had no decision. It took **7.5 minutes**
+(01:48:30 → 01:56:00 UTC) to recover, not the sub-20s figure a single clean
+pass would produce, because the new loop's 20s cadence collided 44 times with
+a pre-existing, unmodified DB-backed claim guard inside
+`authoritative_recognition.assess_message_authoritatively`
+(`claim_message_evidence_extraction`) while the live path already held it.
+Every collision was caught, logged, and harmless — no crash, no bad trade,
+the message eventually got a real, correct decision. This is a genuine
+interaction effect Phase 3's faster cadence surfaces more often than the old
+300s cadence did, recorded for a future session rather than fixed here (the
+claim mechanism lives entirely in `authoritative_recognition.py`, outside
+this phase's files). A second, unrelated message (`11693`) was independently
+observed resolving through the ordinary live path in ~3 minutes with zero
+recovery-loop involvement, and the loop logged zero further activity in the
+10 minutes preceding final verification — confirming Task 6 Step 4 (the loop
+stays idle when the live path is healthy) directly, not by inference.
+
+**Rollback**, if ever needed: redeploy `8122f15ba653e900ee88352b18f570d500bd65c4`
+(the pre-Phase-3 production commit) with the same updater command. No schema
+change, no persisted state beyond the new
+`authoritative_gap_recovery_max_age_minutes` settings key, which defaults to
+`15.0` on any row that predates it — numerically identical to the constant it
+replaces.
+
+## Before Phase 4 starts — read this
+
+1. **`message_lock_mode` still stays `"global"`.** Phase 3 did not touch it,
+   did not need to, and confirmed it unchanged over ssh. Enabling `per_chat`
+   remains Phase 2's own un-started Task 6 Steps 2-3, a separate decision the
+   user has not yet been asked to make in this context.
+2. **A live interaction finding from Phase 3, worth reading before touching
+   the recovery/recognition paths again**: `authoritative_recognition.py`'s
+   `claim_message_evidence_extraction` claim/lease guard (raises
+   `RuntimeError("message evidence extraction already in progress")`) collides
+   far more often now that gap recovery runs every 20s instead of every 300s.
+   Not a Phase 3 defect and not fixed by Phase 3 — see
+   `phase_3_recovery_contention_finding` in the YAML block and the "Phase 3"
+   section above for the full account. A future session touching either the
+   recovery loop or that claim mechanism should know this collision is
+   expected and currently logged at ERROR level even though it is harmless
+   and self-resolving.
+3. **Phase 4 (durable-job-shadow-enqueue) is a different failure class** than
+   Phases 0-3: it addresses losing in-flight work on restart, not silent
+   backlog loss from a stall (which Phase 3 now compensates for) or the event
+   loop being blocked (which Phases 1-1e fixed). Read
+   `phase-4-durable-job-shadow-enqueue.md` fresh; do not assume anything about
+   its scope from this section.
+4. **Deployment mechanics are unchanged** — see "There is no change class"
+   and "Before Phase 2 starts" above for the still-accurate points (no
+   `-ChangeClass`, no PowerShell on this workstation, run the deploy script
+   from a checkout of the exact commit being deployed).
+5. **The authoritative checkout is still**
+   `.worktrees/runtime-serialization` on branch `codex/phase0-deploy-integration`.
 
 ## Deployment reminder
 
