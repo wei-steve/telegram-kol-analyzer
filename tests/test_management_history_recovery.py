@@ -12,6 +12,7 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    PositionMutationIntent,
     RawMessage,
     RecognitionDecision,
     StrategyLifecycle,
@@ -135,6 +136,149 @@ def _seed_batch(tmp_path, *, batch_status="recovery_required", leg_status="plann
         ),
     )
     return session_factory, batch.id
+
+
+def _seed_identityless_submission_batch(tmp_path):
+    session_factory, batch_id = _seed_batch(
+        tmp_path,
+        batch_status="recovery_required",
+        leg_status="submitted",
+    )
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, batch_id)
+        leg = session.query(StrategyManagementLeg).filter_by(
+            management_batch_id=batch_id
+        ).one()
+        batch.reason_code = "management_close_submission_identity_missing"
+        leg.status = "inconsistent"
+        leg.client_order_id = None
+        leg.exchange_order_id = None
+        leg.request_json = None
+        leg.response_json = None
+        leg.last_error = (
+            '{"reason":"management_close_submission_identity_missing"}'
+        )
+        session.commit()
+    return session_factory, batch_id
+
+
+def test_identityless_submission_with_exact_zero_submission_evidence_can_resolve(
+    tmp_path,
+):
+    from telegram_kol_research.management_history_recovery import (
+        plan_management_history_recovery,
+    )
+
+    session_factory, batch_id = _seed_identityless_submission_batch(tmp_path)
+
+    decision = plan_management_history_recovery(
+        session_factory,
+        batch_id=batch_id,
+        snapshot=_snapshot(),
+        planned_at=NOW,
+    )
+
+    assert decision.status == "ready"
+    assert decision.decision == "terminal_no_submission"
+    assert decision.reason_code == "ready"
+    assert decision.evidence["exchange"] == {
+        "durable_submission_evidence": False,
+        "exact_order_matches": 0,
+        "positions_complete": True,
+    }
+
+
+def test_identityless_submission_refuses_incomplete_exchange_snapshot(tmp_path):
+    from telegram_kol_research.management_history_recovery import (
+        plan_management_history_recovery,
+    )
+
+    session_factory, batch_id = _seed_identityless_submission_batch(tmp_path)
+
+    decision = plan_management_history_recovery(
+        session_factory,
+        batch_id=batch_id,
+        snapshot=_snapshot(errors={"order_history": "timeout"}),
+        planned_at=NOW,
+    )
+
+    assert decision.status == "refused"
+    assert decision.reason_code == "exchange_snapshot_incomplete"
+
+
+@pytest.mark.parametrize(
+    "durable_evidence",
+    [
+        "client_order_id",
+        "exchange_order_id",
+        "request_json",
+        "response_json",
+        "position_mutation_intent",
+        "execution_event",
+    ],
+)
+def test_identityless_submission_refuses_any_durable_submission_evidence(
+    tmp_path,
+    durable_evidence,
+):
+    from telegram_kol_research.management_history_recovery import (
+        plan_management_history_recovery,
+    )
+
+    session_factory, batch_id = _seed_identityless_submission_batch(tmp_path)
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, batch_id)
+        leg = session.query(StrategyManagementLeg).filter_by(
+            management_batch_id=batch_id
+        ).one()
+        if durable_evidence == "client_order_id":
+            leg.client_order_id = "TMCLIENT1"
+        elif durable_evidence == "exchange_order_id":
+            leg.exchange_order_id = "close-1"
+        elif durable_evidence == "request_json":
+            leg.request_json = '{"instId":"BTC-USDT-SWAP"}'
+        elif durable_evidence == "response_json":
+            leg.response_json = '{"code":"0"}'
+        elif durable_evidence == "position_mutation_intent":
+            session.add(
+                PositionMutationIntent(
+                    idempotency_key="history-close-evidence",
+                    venue="deepcoin",
+                    operation="close_position",
+                    strategy_instance_id=batch.strategy_instance_id,
+                    execution_binding_id=batch.execution_binding_id,
+                    execution_order_leg_id=leg.execution_order_leg_id,
+                    pos_id=leg.pos_id,
+                    authority_fingerprint="a" * 64,
+                    request_fingerprint="b" * 64,
+                    status="reserved",
+                    request_json="{}",
+                    reserved_at=NOW,
+                )
+            )
+        else:
+            session.add(
+                ExecutionEvent(
+                    execution_binding_id=batch.execution_binding_id,
+                    strategy_instance_id=batch.strategy_instance_id,
+                    venue="deepcoin",
+                    action="strategy_management_close_submit",
+                    status="submitted",
+                    pos_id=leg.pos_id,
+                    created_at=NOW,
+                )
+            )
+        session.commit()
+
+    decision = plan_management_history_recovery(
+        session_factory,
+        batch_id=batch_id,
+        snapshot=_snapshot(),
+        planned_at=NOW,
+    )
+
+    assert decision.status == "refused"
+    assert decision.reason_code == "zero_submission_evidence_conflict"
 
 
 def test_planned_batch_with_complete_zero_submission_evidence_can_resolve(tmp_path):
@@ -557,6 +701,52 @@ def test_apply_is_fingerprint_guarded_and_idempotent(tmp_path):
         assert batch.status == "resolved"
         assert batch.reason_code == "history_no_submission_confirmed"
         assert leg.status == "failed"
+        assert (
+            session.query(ExecutionEvent)
+            .filter_by(action="management_history_recovery")
+            .count()
+            == 1
+        )
+
+
+def test_identityless_zero_submission_apply_terminalizes_once(tmp_path):
+    from telegram_kol_research.management_history_recovery import (
+        apply_management_history_recovery,
+        plan_management_history_recovery,
+    )
+
+    session_factory, batch_id = _seed_identityless_submission_batch(tmp_path)
+    decision = plan_management_history_recovery(
+        session_factory,
+        batch_id=batch_id,
+        snapshot=_snapshot(),
+        planned_at=NOW,
+    )
+
+    first = apply_management_history_recovery(
+        session_factory,
+        decision=decision,
+        expected_fingerprint=decision.evidence_fingerprint,
+        applied_at=NOW + timedelta(seconds=1),
+    )
+    second = apply_management_history_recovery(
+        session_factory,
+        decision=decision,
+        expected_fingerprint=decision.evidence_fingerprint,
+        applied_at=NOW + timedelta(seconds=2),
+    )
+
+    assert first.status == "resolved"
+    assert second.status == "already_resolved"
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, batch_id)
+        leg = session.query(StrategyManagementLeg).filter_by(
+            management_batch_id=batch_id
+        ).one()
+        assert batch.status == "resolved"
+        assert batch.reason_code == "history_no_submission_confirmed"
+        assert leg.status == "failed"
+        assert leg.last_error == '{"reason": "history_no_submission_confirmed"}'
         assert (
             session.query(ExecutionEvent)
             .filter_by(action="management_history_recovery")

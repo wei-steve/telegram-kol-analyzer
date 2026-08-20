@@ -283,6 +283,15 @@ def reconcile_strategy_management_batches(
                 counts["frozen"] += 1
                 continue
 
+            if batch.status == "executing" and all(
+                str(leg.status or "") == "planned" for leg in legs
+            ):
+                # The worker claimed the parent, but no per-leg reservation
+                # completed.  That durable boundary proves no exchange call
+                # started; leave the batch for the worker's restart path.
+                counts["pending"] += 1
+                continue
+
             binding = session.get(ExecutionBinding, batch.execution_binding_id)
             expected_instrument = normalize_deepcoin_swap_instrument(binding.symbol)
 
@@ -414,6 +423,19 @@ def reconcile_strategy_management_batches(
                     batch,
                     status="partial_failed",
                     reason="one_or_more_close_legs_failed",
+                    now=now,
+                )
+                counts["frozen"] += 1
+            elif any(
+                _load_json_object(leg.last_error).get("reason")
+                == "management_close_submission_identity_missing"
+                for leg in legs
+            ):
+                _freeze_batch(
+                    session,
+                    batch,
+                    status="recovery_required",
+                    reason="management_close_submission_identity_missing",
                     now=now,
                 )
                 counts["frozen"] += 1
@@ -825,6 +847,19 @@ def _reconcile_leg(
         return
 
     if leg.status == "inconsistent":
+        return
+
+    if leg.status in {"submitted", "partial"} and not (
+        leg.client_order_id or leg.exchange_order_id
+    ):
+        leg.status = "inconsistent"
+        leg.last_error = _json(
+            {"reason": "management_close_submission_identity_missing"}
+        )
+        leg.last_exchange_snapshot_json = _leg_snapshot(
+            leg, position_rows, matching_orders
+        )
+        leg.updated_at = now
         return
 
     if leg.status in {"reserved", "submit_unknown"}:

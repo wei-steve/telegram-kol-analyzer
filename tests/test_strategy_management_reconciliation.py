@@ -585,6 +585,65 @@ def test_submitted_position_delta_without_exact_order_evidence_does_not_succeed(
     }
 
 
+def test_all_planned_executing_batch_remains_available_for_worker_restart(
+    tmp_path,
+):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf, initial_status="planned")
+    with sf() as session:
+        stored_batch = session.get(StrategyManagementBatch, batch.id)
+        stored_leg = session.query(StrategyManagementLeg).filter_by(
+            management_batch_id=batch.id
+        ).one()
+        stored_batch.status = "executing"
+        stored_batch.reason_code = None
+        stored_leg.client_order_id = None
+        session.commit()
+
+    result = _reconcile_management(
+        sf,
+        positions=[_position("pos-1", "2")],
+        orders=[],
+    )
+
+    stored = load_management_batch(sf, batch.id)
+    assert result.pending == 1
+    assert stored.status == "executing"
+    assert stored.reason_code is None
+    assert stored.legs[0].status == "planned"
+    assert stored.legs[0].client_order_id is None
+    assert stored.legs[0].exchange_order_id is None
+
+
+def test_identityless_submitted_leg_freezes_for_operator_recovery(tmp_path):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf)
+    with sf() as session:
+        stored_leg = session.query(StrategyManagementLeg).filter_by(
+            management_batch_id=batch.id
+        ).one()
+        stored_leg.client_order_id = None
+        stored_leg.exchange_order_id = None
+        stored_leg.request_json = None
+        stored_leg.response_json = None
+        session.commit()
+
+    result = _reconcile_management(
+        sf,
+        positions=[_position("pos-1", "2")],
+        orders=[],
+    )
+
+    stored = load_management_batch(sf, batch.id)
+    assert result.frozen == 1
+    assert stored.status == "recovery_required"
+    assert stored.reason_code == "management_close_submission_identity_missing"
+    assert stored.legs[0].status == "inconsistent"
+    assert stored.legs[0].last_error == {
+        "reason": "management_close_submission_identity_missing"
+    }
+
+
 def test_durable_order_and_client_ids_on_disconnected_rows_are_ambiguous(tmp_path):
     sf = create_session_factory(tmp_path / "research.db")
     batch = _persist_batch(sf)

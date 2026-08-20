@@ -100,6 +100,32 @@ def plan_management_history_recovery(
             )
 
         if (
+            batch.reason_code
+            == "management_close_submission_identity_missing"
+        ):
+            if (
+                not all(str(leg.status) == "inconsistent" for leg in legs)
+                or any(
+                    leg.client_order_id is not None
+                    or leg.exchange_order_id is not None
+                    or leg.request_json is not None
+                    or leg.response_json is not None
+                    for leg in legs
+                )
+                or _has_durable_close_submission(session, batch, legs)
+            ):
+                return _refusal(
+                    int(batch.id),
+                    "zero_submission_evidence_conflict",
+                    source_fingerprint=source_fingerprint,
+                )
+            decision_name = "terminal_no_submission"
+            exchange_evidence = {
+                "durable_submission_evidence": False,
+                "exact_order_matches": 0,
+                "positions_complete": True,
+            }
+        elif (
             batch.status == "partial_failed"
             and batch.reason_code
             in {
@@ -240,7 +266,7 @@ def apply_management_history_recovery(
         before_status = str(batch.status)
         if decision.decision == "terminal_no_submission":
             for leg in legs:
-                if leg.status == "planned":
+                if leg.status in {"planned", "inconsistent"}:
                     leg.status = "failed"
                     leg.last_error = json.dumps(
                         {"reason": "history_no_submission_confirmed"},
