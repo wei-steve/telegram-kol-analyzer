@@ -23,11 +23,14 @@ last_completed_phase: 4   # the sequence ran 0, 1, 1b, 1c, 1d, 1e, 2, 2f, 3, 4
 last_completed_commit: 3bd53553af51ba4619ed3703bade2028514af4b6
 phase_5_claim_commit: ba975ff1e82ab4d1da2b45ecc09ccf48cb24f261
 phase_5_code_commit: eaaa255f95f6c0889c86db5b674e458f3e2e5e56
-phase_5_deployed_commit: 81cb75ed1c1bcd718eada69dde189293ea2a921c
+phase_5_deployed_commit: 7a54411ebb0907cd04c33fe3b474f4b5b54ecfb8
 phase_5_blocker_recovery_plan_commit: b77be48658ea3efffc7f568a9f2773283672cc04
 phase_5_blocker_recovery_code_commit: a2ae02f4f9012e4901b3c06d2221917efeabb882
 phase_5_blocker_recovery_deployed_commit: 81cb75ed1c1bcd718eada69dde189293ea2a921c
 phase_5_queue_rollback_fix_commit: 77ec2149d4dbe6f54af7571a2c9756d2d3532fed
+phase_5_queue_rollback_fix_deployed_commit: 7a54411ebb0907cd04c33fe3b474f4b5b54ecfb8
+phase_5_queue_cutover_at_utc: "2026-08-20T17:10:28.789382Z"
+phase_5_midtraffic_restart_at_utc: "2026-08-20T17:24:32Z"
 phase_5_blocker_recovery_focused_tests: 126   # 126 passed, 0 failed in 9.99s
 phase_5_blocker_recovery_local_suite: 5790   # 5789 passed, 1 skipped, 0 failed, 17 known warnings, 429.12s
 phase_5_queue_rollback_fix_focused_tests: 51   # 51 passed, 0 failed in 4.65s
@@ -35,9 +38,9 @@ phase_5_queue_rollback_fix_local_suite: 5792   # 5791 passed, 1 skipped, 0 faile
 phase_5_local_suite_after_task_1: 5763   # 5762 passed, 1 skipped, 0 failed; pure extraction gate before consumer work
 phase_5_local_suite_after: 5779   # 5778 passed, 1 skipped, 0 failed, 17 known warnings, 440.50s
 phase_5_message_lock_mode_unchanged: true   # production remains global
-phase_5_pipeline_mode_final: shadow   # queue has NOT been enabled; production remains on the Phase 4 authority path
-phase_5_rollout_status: "production remains global/shadow and queue is disabled. Batch 119 was safely frozen, rehearsed on a production database copy, and resolved once with exact fingerprint evidence. The first real rollback-boundary drill then exposed a claimed-queue-job adoption race; rollback to shadow succeeded, no order was submitted, and local fix 77ec214 passed focused and full suites, but it is not yet pushed or deployed."
-phase_5_outstanding: "Push and gated-deploy exact rollback fix 77ec214 with production left in global/shadow. Repeat the full shadow -> queue -> shadow drill with an in-flight shadow job and an in-flight claimed queue job, proving exactly one job authority, one recognition decision, and no duplicate execution outcome at both boundaries. Only after that proof and a fresh safe-window check may queue be enabled. Then observe one complete real trading session, deliberately restart mid-traffic with a durable pending/claimed job and prove resume, verify missing/orphan/stuck/backlog plus loop lag, and compare execution_events and Deepcoin regular/trigger order history directly for duplicate orders. Do not start Phase 6."
+phase_5_pipeline_mode_final: queue   # enabled 2026-08-20 17:10:28 UTC after the repaired rollback-boundary proof
+phase_5_rollout_status: "production is global/queue at exact deployed commit 7a54411. The repaired real shadow -> queue -> shadow boundary drill passed with one authority and one decision at each in-flight transition. Queue was then enabled through a double-read quiet-window gate. A deliberate gated restart while job 200/raw 11961 was claimed proved stale-claim resume: claimed_at advanced 17:24:13 -> 17:29:13 with stale_claim_reclaimed, then the job succeeded with one decision and zero execution events. The required complete real-session observation is still in progress."
+phase_5_outstanding: "Keep Phase 5 in_progress until at least 60 minutes have elapsed from the final queue cutover with real traffic. At the end, verify missing_job_count=0, orphan_job_count=0, stuck_pending_count=0, no growing backlog, low pending age, healthy loop lag, service/global/queue state, and complete direct Deepcoin reads. Compare post-cutover execution_events with regular and trigger order history for duplicate submissions; do not infer safety from internal counters alone. If evidence is complete and clean, finish Phase 5 and move only the status pointer to Phase 6 without implementing Phase 6."
 phase_5_blocker_diagnosis: "Resolved 2026-08-20 16:25:58 UTC. Read-only production checks first proved the historical race: batch 119 remained reconciling and rewrote updated_at every ~30 seconds; leg 103 had no client/exchange id, request, response, close intent, or close execution event. Deployed fix 81cb75e froze it recovery_required/management_close_submission_identity_missing. Recovery dry-run on the rehearsal copy and production matched evidence fingerprint 326f060ea379b57ce5d8be4eeeb572159e135af60611770fbac09f6c6d93a040 and source fingerprint 4dd05f60e53615bc1e32e988a87519f0b9c58aae82c9074ad6db9d2ddb466bdd. One production apply resolved the batch history_no_submission_confirmed, failed leg 103, and wrote audit event 3643; positions, regular orders, and all 12 pending trigger ids were unchanged."
 phase_5_blocker_recovery_rehearsal: "Preserved /opt/telegram-kol-analyzer/data/backups/phase5-batch119-recovery-backup-81cb75e-20260820T162200Z.db and separate rehearsal copy phase5-batch119-recovery-rehearsal-81cb75e-20260820T162200Z.db. Evidence JSON before/after and CLI dry-run/apply outputs remain in the same directory. quick_check ok before/after; 81 table snapshots matched backup to rehearsal before apply. After rehearsal only strategy_management_batches and strategy_management_legs hashes changed and execution_events count changed 3642 -> 3643; all other table hashes/counts were identical."
 phase_5_migration_rehearsal: "not applicable: Phase 5 changes no model, db bootstrap, or migration file; the Phase 4 message_processing_jobs schema was already rehearsed, backed up, migrated, and observed in production. The gated updater auto-detected no schema delta for eaaa255, so it performed no migration."
@@ -86,8 +89,8 @@ phase_2_deployed_commit: 3f5ed78096f33d5dda59400a3a90dcf9bcb9c4cd
 phase_2_local_suite_before: 5684   # passed, 1 skipped, at 92e6e60
 phase_2_local_suite_after: 5710    # passed, 1 skipped, 0 failed; delta 26 equals the 26 tests phase 2 adds
 phase_0_code_commit: 816e296   # tasks 1-5; reviewed 2026-08-18. Task 6 (deploy + baseline) outstanding
-last_deployed_commit: 81cb75ed1c1bcd718eada69dde189293ea2a921c
-production_commit: 81cb75ed1c1bcd718eada69dde189293ea2a921c  # Phase 5 batch-119 recovery code, gated restart 2026-08-20 16:20:48 UTC; mode is shadow
+last_deployed_commit: 7a54411ebb0907cd04c33fe3b474f4b5b54ecfb8
+production_commit: 7a54411ebb0907cd04c33fe3b474f4b5b54ecfb8  # Phase 5 rollback-boundary fix; global/queue since 17:10:28 UTC, gated mid-traffic restart at 17:24:32 UTC
 production_commit_before_phase_5: 3bd53553af51ba4619ed3703bade2028514af4b6
 production_commit_before_phase_3_followup_fix: 3eabde7c3c6e7e2edfc43c60c435c5a4da5975a3  # rollback target for the follow-up fix alone (no schema change)
 production_commit_before_phase_3_deploy: 8122f15ba653e900ee88352b18f570d500bd65c4  # rollback target for phase 3's code (no schema change)
