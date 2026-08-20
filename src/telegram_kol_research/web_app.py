@@ -93,6 +93,7 @@ from telegram_kol_research.models import (
     ExecutionOrderLeg,
     MediaAsset,
     MessageEvidenceVersion,
+    MessageProcessingJob,
     PositionBackupStopOrder,
     PositionProtectionLedger,
     RecognitionDecision,
@@ -4851,6 +4852,95 @@ def create_web_app(
             **monitor.snapshot(),
             "now": app.state.now_provider().isoformat(),
             "uptime_seconds": monitor.uptime_seconds(),
+        }
+
+    @app.get("/api/runtime/message-pipeline-parity")
+    def api_runtime_message_pipeline_parity(
+        after_raw_message_id: int = 0,
+        limit: int = 1000,
+        stuck_after_seconds: int = 300,
+    ):
+        """Project bounded shadow-job parity without consuming or mutating jobs."""
+
+        if after_raw_message_id < 0:
+            raise HTTPException(
+                status_code=422,
+                detail="after_raw_message_id must be nonnegative",
+            )
+        if not 1 <= limit <= 5000:
+            raise HTTPException(status_code=422, detail="limit must be 1..5000")
+        if not 1 <= stuck_after_seconds <= 86400:
+            raise HTTPException(
+                status_code=422,
+                detail="stuck_after_seconds must be 1..86400",
+            )
+
+        now = app.state.now_provider()
+        with app.state.session_factory() as session:
+            recent_raw_rows = (
+                session.query(RawMessage.id)
+                .filter(RawMessage.id > after_raw_message_id)
+                .order_by(RawMessage.id.desc())
+                .limit(limit + 1)
+                .all()
+            )
+            truncated = len(recent_raw_rows) > limit
+            raw_ids = sorted(
+                int(row.id) for row in recent_raw_rows[:limit]
+            )
+            window_start = min(raw_ids) if raw_ids else None
+            window_end = max(raw_ids) if raw_ids else None
+            if window_start is None or window_end is None:
+                job_rows = []
+            else:
+                bounded_job_rows = (
+                    session.query(MessageProcessingJob)
+                    .filter(
+                        MessageProcessingJob.raw_message_id >= window_start,
+                        MessageProcessingJob.raw_message_id <= window_end,
+                        MessageProcessingJob.shadow.is_(True),
+                    )
+                    .order_by(MessageProcessingJob.raw_message_id.desc())
+                    .limit(limit + 1)
+                    .all()
+                )
+                truncated = truncated or len(bounded_job_rows) > limit
+                job_rows = bounded_job_rows[:limit]
+
+        raw_id_set = set(raw_ids)
+        job_raw_id_set = {int(job.raw_message_id) for job in job_rows}
+        status_breakdown = {
+            status: sum(1 for job in job_rows if job.status == status)
+            for status in ("pending", "claimed", "succeeded", "failed", "expired")
+        }
+        pending_ages = []
+        for job in job_rows:
+            if job.status != "pending":
+                continue
+            enqueued_at = job.enqueued_at
+            if enqueued_at.tzinfo is None:
+                enqueued_at = enqueued_at.replace(tzinfo=UTC)
+            pending_ages.append(max(0.0, (now - enqueued_at).total_seconds()))
+
+        return {
+            "after_raw_message_id": after_raw_message_id,
+            "limit": limit,
+            "truncated": truncated,
+            "window_start_raw_message_id": window_start,
+            "window_end_raw_message_id": window_end,
+            "raw_messages": len(raw_ids),
+            "shadow_jobs": len(job_rows),
+            "missing_job_count": len(raw_id_set - job_raw_id_set),
+            "orphan_job_count": len(job_raw_id_set - raw_id_set),
+            "stuck_pending_count": sum(
+                1 for age in pending_ages if age >= stuck_after_seconds
+            ),
+            "status_breakdown": status_breakdown,
+            "oldest_pending_age_seconds": (
+                max(pending_ages) if pending_ages else None
+            ),
+            "stuck_after_seconds": stuck_after_seconds,
+            "now": now.isoformat(),
         }
 
     @app.get("/api/runtime-agent/read-only-exchange-snapshot")

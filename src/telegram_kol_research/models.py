@@ -77,6 +77,57 @@ class RawMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class MessageProcessingJob(Base):
+    """Dormant durable record mirroring inline processing for one raw message."""
+
+    __tablename__ = "message_processing_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'claimed', 'succeeded', 'failed', 'expired')",
+            name="ck_message_processing_jobs_status",
+        ),
+        Index(
+            "uq_message_processing_jobs_raw_message_id",
+            "raw_message_id",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False
+    )
+    chat_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="pending",
+        server_default=sql_text("'pending'"),
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=sql_text("'0'"),
+    )
+    next_attempt_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
+    claim_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_reason: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    enqueued_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    shadow: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default=sql_text("'1'"),
+    )
+
+
 class TelegramSourceMessageEvent(Base):
     """Immutable evidence that Telegram reported a source-message event."""
 

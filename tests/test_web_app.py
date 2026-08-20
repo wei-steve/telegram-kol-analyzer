@@ -56,6 +56,7 @@ from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import MessageEvidenceVersion
+from telegram_kol_research.models import MessageProcessingJob
 from telegram_kol_research.models import PositionProtectionLedger
 from telegram_kol_research.models import PositionBackupStopOrder
 from telegram_kol_research.models import PositionTakeProfitOrder
@@ -788,6 +789,144 @@ def test_loop_health_endpoint_touches_neither_database_nor_exchange(tmp_path):
         response = client.get("/api/runtime/loop-health")
 
     assert response.status_code == 200
+
+
+def test_message_pipeline_parity_reports_bounded_missing_orphan_and_stuck_jobs(
+    tmp_path,
+):
+    now = datetime(2026, 8, 20, 12, 0, tzinfo=UTC)
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        now_provider=lambda: now,
+    )
+    with app.state.session_factory() as session:
+        raw_messages = [
+            RawMessage(
+                chat_id=100,
+                message_id=index,
+                text=f"message {index}",
+                posted_at=now - timedelta(minutes=index),
+            )
+            for index in range(1, 6)
+        ]
+        session.add_all(raw_messages)
+        session.commit()
+        for raw_message in raw_messages:
+            session.refresh(raw_message)
+        session.add_all(
+            [
+                MessageProcessingJob(
+                    raw_message_id=raw_messages[0].id,
+                    chat_id=100,
+                    status="succeeded",
+                    enqueued_at=now - timedelta(minutes=4),
+                    completed_at=now - timedelta(minutes=3),
+                    shadow=True,
+                ),
+                MessageProcessingJob(
+                    raw_message_id=raw_messages[1].id,
+                    chat_id=100,
+                    status="pending",
+                    enqueued_at=now - timedelta(minutes=10),
+                    shadow=True,
+                ),
+                MessageProcessingJob(
+                    raw_message_id=raw_messages[2].id,
+                    chat_id=100,
+                    status="failed",
+                    enqueued_at=now - timedelta(minutes=2),
+                    completed_at=now - timedelta(minutes=1),
+                    shadow=True,
+                ),
+                MessageProcessingJob(
+                    raw_message_id=raw_messages[3].id,
+                    chat_id=100,
+                    status="succeeded",
+                    enqueued_at=now - timedelta(minutes=2),
+                    completed_at=now - timedelta(minutes=1),
+                    shadow=True,
+                ),
+            ]
+        )
+        session.commit()
+        session.delete(raw_messages[2])
+        session.commit()
+        raw_message_ids = [raw_message.id for raw_message in raw_messages]
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/runtime/message-pipeline-parity",
+            params={"after_raw_message_id": 0, "limit": 100, "stuck_after_seconds": 300},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "after_raw_message_id": 0,
+        "limit": 100,
+        "truncated": False,
+        "window_start_raw_message_id": raw_message_ids[0],
+        "window_end_raw_message_id": raw_message_ids[4],
+        "raw_messages": 4,
+        "shadow_jobs": 4,
+        "missing_job_count": 1,
+        "orphan_job_count": 1,
+        "stuck_pending_count": 1,
+        "status_breakdown": {
+            "pending": 1,
+            "claimed": 0,
+            "succeeded": 2,
+            "failed": 1,
+            "expired": 0,
+        },
+        "oldest_pending_age_seconds": 600.0,
+        "stuck_after_seconds": 300,
+        "now": now.isoformat(),
+    }
+
+
+def test_message_pipeline_parity_limits_the_recent_raw_message_window(tmp_path):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    with app.state.session_factory() as session:
+        session.add_all(
+            [
+                RawMessage(chat_id=100, message_id=index, text=str(index))
+                for index in range(1, 6)
+            ]
+        )
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/runtime/message-pipeline-parity",
+            params={"limit": 2},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["raw_messages"] == 2
+    assert payload["missing_job_count"] == 2
+    assert payload["truncated"] is True
+    assert payload["window_start_raw_message_id"] == 4
+    assert payload["window_end_raw_message_id"] == 5
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"after_raw_message_id": -1},
+        {"limit": 0},
+        {"limit": 5001},
+        {"stuck_after_seconds": 0},
+        {"stuck_after_seconds": 86401},
+    ],
+)
+def test_message_pipeline_parity_rejects_unbounded_parameters(tmp_path, params):
+    app = create_web_app(database_path=tmp_path / "research.db")
+
+    with TestClient(app) as client:
+        response = client.get("/api/runtime/message-pipeline-parity", params=params)
+
+    assert response.status_code == 422
 
 
 def test_lifespan_shutdown_releases_the_management_worker_executor(tmp_path):

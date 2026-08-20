@@ -18,6 +18,14 @@ POSITION_OWNERSHIP_UNIQUE_INDEX_SQL = (
     "ON execution_order_legs (venue, pos_id) "
     "WHERE pos_id IS NOT NULL AND pos_id != ''"
 )
+MESSAGE_PROCESSING_JOB_RAW_MESSAGE_UNIQUE_INDEX_NAME = (
+    "uq_message_processing_jobs_raw_message_id"
+)
+MESSAGE_PROCESSING_JOB_RAW_MESSAGE_UNIQUE_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS "
+    "uq_message_processing_jobs_raw_message_id "
+    "ON message_processing_jobs (raw_message_id)"
+)
 MANAGEMENT_BATCH_IDEMPOTENCY_INDEX_NAME = (
     "uq_strategy_management_batches_idempotency"
 )
@@ -479,6 +487,9 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
 }
 
 SQLITE_COMPAT_INDEXES: dict[str, str] = {
+    MESSAGE_PROCESSING_JOB_RAW_MESSAGE_UNIQUE_INDEX_NAME: (
+        MESSAGE_PROCESSING_JOB_RAW_MESSAGE_UNIQUE_INDEX_SQL
+    ),
     "ix_message_evidence_versions_mimo_recognition_run_id": (
         "CREATE INDEX IF NOT EXISTS "
         "ix_message_evidence_versions_mimo_recognition_run_id "
