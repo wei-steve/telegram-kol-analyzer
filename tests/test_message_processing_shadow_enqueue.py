@@ -11,6 +11,7 @@ from telegram_kol_research.models import MessageProcessingJob, RawMessage
 from telegram_kol_research.telegram_live_listener import (
     persist_live_message_event,
     recover_missing_authoritative_decisions,
+    run_reconcile_once,
 )
 from telegram_kol_research.trading_settings import (
     load_trading_settings,
@@ -338,3 +339,104 @@ def test_recovery_shadow_marks_expired_without_executing(tmp_path):
     assert job.raw_message_id == raw_message_id
     assert job.status == "expired"
     assert job.last_reason == "recovery_expired:expired_stale_instruction"
+
+
+def test_history_reconcile_shadow_enqueues_every_insert_before_processing(tmp_path):
+    session_factory = create_session_factory(tmp_path / "history-shadow.db")
+    save_trading_settings(session_factory, {"message_pipeline_mode": "shadow"})
+    observed_statuses = []
+
+    async def discover_dialogs(_client):
+        return [{"id": 9001, "title": "VIP BTC Room", "archived": True}]
+
+    async def fetch_messages(_client, _dialog, **_kwargs):
+        return [
+            {
+                "chat_id": 9001,
+                "message_id": message_id,
+                "sender_id": 501,
+                "sender_name": "VIP BTC Room",
+                "text": f"message {message_id}",
+                "posted_at": BASE_NOW - timedelta(seconds=message_id),
+                "media": None,
+            }
+            for message_id in (77, 78)
+        ]
+
+    def authoritative_processor(raw_message_id):
+        with session_factory() as session:
+            observed_statuses.append(
+                session.query(MessageProcessingJob.status)
+                .filter(MessageProcessingJob.raw_message_id == raw_message_id)
+                .scalar()
+            )
+        return _processing_result()
+
+    asyncio.run(
+        run_reconcile_once(
+            client=object(),
+            session_factory=session_factory,
+            broker=None,
+            target_titles={"VIP BTC Room"},
+            authoritative_processor=authoritative_processor,
+            discover_dialogs_fn=discover_dialogs,
+            fetch_dialog_messages_fn=fetch_messages,
+        )
+    )
+
+    with session_factory() as session:
+        jobs = (
+            session.query(MessageProcessingJob)
+            .order_by(MessageProcessingJob.raw_message_id)
+            .all()
+        )
+
+    assert observed_statuses == ["pending", "pending"]
+    assert len(jobs) == 2
+    assert [job.status for job in jobs] == ["succeeded", "succeeded"]
+    assert [job.last_reason for job in jobs] == [
+        "history_reconcile_completed",
+        "history_reconcile_completed",
+    ]
+
+
+def test_history_reconcile_shadow_marks_failed_and_preserves_exception(tmp_path):
+    session_factory = create_session_factory(tmp_path / "history-failed.db")
+    save_trading_settings(session_factory, {"message_pipeline_mode": "shadow"})
+
+    async def discover_dialogs(_client):
+        return [{"id": 9001, "title": "VIP BTC Room", "archived": True}]
+
+    async def fetch_messages(_client, _dialog, **_kwargs):
+        return [
+            {
+                "chat_id": 9001,
+                "message_id": 77,
+                "sender_id": 501,
+                "sender_name": "VIP BTC Room",
+                "text": "message 77",
+                "posted_at": BASE_NOW,
+                "media": None,
+            }
+        ]
+
+    with pytest.raises(RuntimeError, match="history recognition exploded"):
+        asyncio.run(
+            run_reconcile_once(
+                client=object(),
+                session_factory=session_factory,
+                broker=None,
+                target_titles={"VIP BTC Room"},
+                authoritative_processor=lambda _raw_message_id: (_ for _ in ()).throw(
+                    RuntimeError("history recognition exploded")
+                ),
+                discover_dialogs_fn=discover_dialogs,
+                fetch_dialog_messages_fn=fetch_messages,
+            )
+        )
+
+    with session_factory() as session:
+        job = session.query(MessageProcessingJob).one()
+
+    assert job.status == "failed"
+    assert job.last_reason == "history_reconcile_error:RuntimeError"

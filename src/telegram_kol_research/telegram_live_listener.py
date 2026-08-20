@@ -1475,10 +1475,17 @@ async def run_reconcile_once(
             broker=broker,
         )
         inserted_messages += stats["inserted_messages"]
+        inserted_keys = stats.get("inserted_message_keys") or []
+        history_shadow_raw_message_ids = (
+            await _try_enqueue_shadow_processing_jobs(
+                session_factory,
+                message_keys=inserted_keys,
+                last_reason="history_reconcile_enqueued",
+            )
+        )
         inserted_records = filter_records_by_inserted_message_keys(records, stats)
         recognition_by_key: dict[tuple[int, int], Any] = {}
         if authoritative_processor is not None:
-            inserted_keys = stats.get("inserted_message_keys") or []
             with session_factory() as session:
                 raw_messages = (
                     session.query(RawMessage)
@@ -1522,12 +1529,23 @@ async def run_reconcile_once(
                     notification_bot_config=notification_bot_config,
                 )
 
-            for raw_message in raw_messages:
-                if chat_operation_lock is not None:
-                    async with chat_operation_lock(int(raw_message.chat_id)):
+            try:
+                for raw_message in raw_messages:
+                    if chat_operation_lock is not None:
+                        async with chat_operation_lock(int(raw_message.chat_id)):
+                            await _process_dialog_raw_message(raw_message)
+                    else:
                         await _process_dialog_raw_message(raw_message)
-                else:
-                    await _process_dialog_raw_message(raw_message)
+            except BaseException as exc:
+                await _try_mark_shadow_processing_jobs_terminal(
+                    session_factory,
+                    raw_message_ids=history_shadow_raw_message_ids,
+                    status="failed",
+                    last_reason=(
+                        f"history_reconcile_error:{type(exc).__name__}"
+                    ),
+                )
+                raise
             with session_factory() as session:
                 inserted_candidates += max(
                     0,
@@ -1559,6 +1577,12 @@ async def run_reconcile_once(
                         (record.chat_id, record.message_id)
                     ),
                 )
+        await _try_mark_shadow_processing_jobs_terminal(
+            session_factory,
+            raw_message_ids=history_shadow_raw_message_ids,
+            status="succeeded",
+            last_reason="history_reconcile_completed",
+        )
 
     return {
         "matched_dialogs": len(matched_dialogs),
