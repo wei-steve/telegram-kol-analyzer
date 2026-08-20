@@ -867,7 +867,11 @@ def test_message_pipeline_parity_reports_bounded_missing_orphan_and_stuck_jobs(
         "window_start_raw_message_id": raw_message_ids[0],
         "window_end_raw_message_id": raw_message_ids[4],
         "raw_messages": 4,
+        "pipeline_mode": "inline",
+        "observed_job_kind": "shadow",
+        "jobs": 4,
         "shadow_jobs": 4,
+        "queue_jobs": 0,
         "missing_job_count": 1,
         "orphan_job_count": 1,
         "stuck_pending_count": 1,
@@ -908,6 +912,52 @@ def test_message_pipeline_parity_limits_the_recent_raw_message_window(tmp_path):
     assert payload["truncated"] is True
     assert payload["window_start_raw_message_id"] == 4
     assert payload["window_end_raw_message_id"] == 5
+
+
+def test_message_pipeline_parity_observes_authoritative_queue_jobs(tmp_path):
+    now = datetime(2026, 8, 20, 12, 0, tzinfo=UTC)
+
+    async def dormant_worker(**_kwargs):
+        await asyncio.Event().wait()
+
+    app = create_web_app(
+        database_path=tmp_path / "queue-parity.db",
+        now_provider=lambda: now,
+        message_processing_worker_runner=dormant_worker,
+    )
+    save_trading_settings(
+        app.state.session_factory,
+        {"message_pipeline_mode": "queue"},
+    )
+    with app.state.session_factory() as session:
+        raw = RawMessage(chat_id=100, message_id=1, text="BTC 多")
+        session.add(raw)
+        session.flush()
+        session.add(
+            MessageProcessingJob(
+                raw_message_id=raw.id,
+                chat_id=100,
+                status="pending",
+                enqueued_at=now - timedelta(minutes=10),
+                shadow=False,
+            )
+        )
+        session.commit()
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/runtime/message-pipeline-parity",
+            params={"stuck_after_seconds": 300},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["pipeline_mode"] == "queue"
+    assert payload["observed_job_kind"] == "queue"
+    assert payload["queue_jobs"] == 1
+    assert payload["shadow_jobs"] == 0
+    assert payload["missing_job_count"] == 0
+    assert payload["stuck_pending_count"] == 1
 
 
 @pytest.mark.parametrize(
@@ -1036,6 +1086,39 @@ def test_source_deletion_worker_lifespan_starts_dormant_runner_and_stops(tmp_pat
 
     assert stopped.wait(timeout=1)
     assert app.state.source_message_deletion_worker_task is None
+
+
+def test_queue_mode_api_starts_and_shadow_stops_message_worker_without_restart(
+    tmp_path,
+):
+    app = create_web_app(
+        database_path=tmp_path / "pipeline-mode-switch.db",
+        message_processing_worker_interval_seconds=0.01,
+    )
+
+    with TestClient(app) as client:
+        assert app.state.message_processing_worker_task is None
+        queue_response = client.post(
+            "/api/trading-settings",
+            json={"message_pipeline_mode": "queue"},
+        )
+        assert queue_response.status_code == 200
+        assert queue_response.json()["message_pipeline_mode"] == "queue"
+        assert queue_response.json()["message_lock_mode"] == "global"
+        assert app.state.message_processing_worker_task is not None
+
+        shadow_response = client.post(
+            "/api/trading-settings",
+            json={"message_pipeline_mode": "shadow"},
+        )
+        assert shadow_response.status_code == 200
+        deadline = time.monotonic() + 1
+        while (
+            app.state.message_processing_worker_task is not None
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert app.state.message_processing_worker_task is None
 
 
 def test_lifespan_disconnects_shared_telegram_client_before_stopping_listener(tmp_path):

@@ -87,7 +87,7 @@ class TradingSettings:
     deepcoin_contract_specs_mode: Literal["static", "shadow", "live"] = "static"
     mimo_contract_mode: Literal["v1", "v2_live_adapter"] = "v1"
     message_lock_mode: Literal["global", "per_chat"] = "global"
-    message_pipeline_mode: Literal["inline", "shadow"] = "inline"
+    message_pipeline_mode: Literal["inline", "shadow", "queue"] = "inline"
     authoritative_gap_recovery_max_age_minutes: float = 15.0
     mimo_v2_activation_after_raw_message_id: int = 0
     default_max_loss_usdt: float = 20.0
@@ -614,12 +614,12 @@ def _message_lock_mode(value: Any) -> Literal["global", "per_chat"]:
     return normalized
 
 
-def _message_pipeline_mode(value: Any) -> Literal["inline", "shadow"]:
+def _message_pipeline_mode(value: Any) -> Literal["inline", "shadow", "queue"]:
     if not isinstance(value, str):
-        raise ValueError("message_pipeline_mode must be inline or shadow")
+        raise ValueError("message_pipeline_mode must be inline, shadow, or queue")
     normalized = value.strip().lower()
-    if normalized not in {"inline", "shadow"}:
-        raise ValueError("message_pipeline_mode must be inline or shadow")
+    if normalized not in {"inline", "shadow", "queue"}:
+        raise ValueError("message_pipeline_mode must be inline, shadow, or queue")
     return normalized
 
 

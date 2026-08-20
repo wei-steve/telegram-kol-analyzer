@@ -11,7 +11,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 from sqlalchemy import tuple_
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -23,6 +23,7 @@ from telegram_kol_research.message_recognition import (
     filter_records_by_inserted_message_keys,
 )
 from telegram_kol_research.media_retention import resolve_media_path
+from telegram_kol_research.message_processing_worker import process_message_job
 from telegram_kol_research.message_lock_provider import (
     resolve_lock_context,
     resolve_message_lock_mode,
@@ -129,11 +130,17 @@ def _enqueue_shadow_processing_jobs(
     message_keys: list[tuple[int, int]] | None = None,
     raw_message_ids: list[int] | None = None,
     last_reason: str,
+    pipeline_mode_override: str | None = None,
 ) -> list[int]:
-    """Idempotently create dormant jobs when shadow mode is enabled."""
+    """Idempotently create shadow or authoritative queue jobs by mode."""
 
-    if load_trading_settings(session_factory).message_pipeline_mode != "shadow":
+    pipeline_mode = (
+        pipeline_mode_override
+        or load_trading_settings(session_factory).message_pipeline_mode
+    )
+    if pipeline_mode not in {"shadow", "queue"}:
         return []
+    is_shadow = pipeline_mode == "shadow"
     with session_factory() as session:
         query = session.query(RawMessage.id, RawMessage.chat_id)
         if raw_message_ids is not None:
@@ -164,13 +171,13 @@ def _enqueue_shadow_processing_jobs(
                     "attempt_count": 0,
                     "last_reason": last_reason,
                     "enqueued_at": utc_now(),
-                    "shadow": True,
+                    "shadow": is_shadow,
                 }
                 for row in rows
             ]
         )
-        session.execute(
-            insert_statement.on_conflict_do_update(
+        if is_shadow:
+            statement = insert_statement.on_conflict_do_update(
                 index_elements=["raw_message_id"],
                 set_={
                     "chat_id": insert_statement.excluded.chat_id,
@@ -184,7 +191,40 @@ def _enqueue_shadow_processing_jobs(
                     "shadow": True,
                 },
             )
-        )
+        else:
+            # Queue authority may adopt a terminal Phase-4 shadow row only when
+            # recovery has proved the message still lacks a decision. A pending
+            # shadow row can be inline work in flight at the mode boundary and
+            # must never be promoted or consumed.
+            statement = insert_statement.on_conflict_do_update(
+                index_elements=["raw_message_id"],
+                set_={
+                    "chat_id": insert_statement.excluded.chat_id,
+                    "status": "pending",
+                    "attempt_count": 0,
+                    "next_attempt_at": None,
+                    "claim_token": None,
+                    "claimed_at": None,
+                    "last_reason": last_reason,
+                    "enqueued_at": insert_statement.excluded.enqueued_at,
+                    "completed_at": None,
+                    "shadow": False,
+                },
+                where=and_(
+                    MessageProcessingJob.shadow.is_(True),
+                    or_(
+                        MessageProcessingJob.status.in_(
+                            ("succeeded", "failed", "expired")
+                        ),
+                        and_(
+                            MessageProcessingJob.status == "pending",
+                            MessageProcessingJob.enqueued_at
+                            <= utc_now() - timedelta(minutes=5),
+                        ),
+                    ),
+                ),
+            )
+        session.execute(statement)
         session.commit()
         return [int(row.id) for row in rows]
 
@@ -279,6 +319,7 @@ async def _persist_live_message_event_inline(
     shadow_enqueue_hook: (
         Callable[[list[tuple[int, int]]], Awaitable[None]] | None
     ) = None,
+    run_post_persist_processing: bool = True,
 ) -> dict[str, int]:
     """Normalize and persist one live Telegram event into the existing raw ingest flow.
 
@@ -329,37 +370,7 @@ async def _persist_live_message_event_inline(
         broker=broker,
     )
     inserted_keys = stats.get("inserted_message_keys") or []
-    if shadow_enqueue_hook is not None:
-        await shadow_enqueue_hook(inserted_keys)
-    event_chat_id = int(getattr(event, "chat_id"))
     event_time = getattr(message, "edit_date", None) or getattr(message, "date", None) or utc_now()
-    if context_resolution_scheduler is not None:
-        await asyncio.to_thread(
-            context_resolution_scheduler,
-            event_type="next_same_chat_message",
-            chat_id=event_chat_id,
-            occurred_at=event_time,
-        )
-        if getattr(message, "edit_date", None) is not None:
-            with session_factory() as session:
-                edited_raw_id = (
-                    session.query(RawMessage.id)
-                    .filter(
-                        RawMessage.chat_id == event_chat_id,
-                        RawMessage.message_id == int(getattr(message, "id")),
-                    )
-                    .scalar()
-                )
-            if edited_raw_id is not None:
-                await asyncio.to_thread(
-                    context_resolution_scheduler,
-                    event_type="message_edited",
-                    raw_message_id=int(edited_raw_id),
-                    occurred_at=event_time,
-                )
-
-    # ── Immediately run AI recognition on every newly persisted message ──
-    recog_result = None
     live_ai_config = ai_recognition_config
     if ai_recognition_config_path is not None:
         live_ai_config = load_ai_recognition_config(ai_recognition_config_path)
@@ -409,90 +420,50 @@ async def _persist_live_message_event_inline(
                     chat_id,
                     reply_to_message_id,
                 )
-        with session_factory() as session:
-            raw_message = (
-                session.query(RawMessage)
-                .filter(
-                    RawMessage.chat_id == chat_id,
-                    RawMessage.message_id == message_id,
-                )
-                .one_or_none()
+    if shadow_enqueue_hook is not None:
+        await shadow_enqueue_hook(inserted_keys)
+    with session_factory() as session:
+        raw_message_id = (
+            session.query(RawMessage.id)
+            .filter(
+                RawMessage.chat_id == int(record.chat_id),
+                RawMessage.message_id == int(record.message_id),
             )
-        if raw_message is not None:
-            if authoritative_processor is not None:
-                processing_result = await asyncio.to_thread(
-                    authoritative_processor,
-                    raw_message.id,
-                )
-                recog_result = processing_result.recognition
-                if (
-                    processing_result.assessment.agreement_status
-                    == "authoritative_failed"
-                    and system_operator_bot_enabled(system_operator_bot_config)
-                ):
-                    conflict_payload = _build_authoritative_notification_payload(
-                        raw_message=raw_message,
-                        chat_title=chat_title,
-                        processing_result=processing_result,
-                    )
-                    _handle_authoritative_failure_notification(
-                        session_factory=session_factory,
-                        raw_message_id=raw_message.id,
-                        sender=system_operator_conflict_sender,
-                        config=system_operator_bot_config,
-                        payload=conflict_payload,
-                        retry_processor=authoritative_processor,
-                        retry_delay_seconds=authoritative_failure_retry_delay_seconds,
-                    )
-                await _deliver_authoritative_instruction_summary(
-                    processing_result=processing_result,
-                    session_factory=session_factory,
-                    raw_message_id=raw_message.id,
-                    chat_title=chat_title,
-                    notification_bot_config=notification_bot_config,
-                )
-                if context_resolution_scheduler is not None:
-                    await asyncio.to_thread(
-                        context_resolution_scheduler,
-                        event_type="evidence_version_changed",
-                        raw_message_id=int(raw_message.id),
-                        occurred_at=event_time,
-                    )
-            else:
-                logger.error(
-                    "recognition authority unavailable raw_message_id=%s "
-                    "reason=authoritative_processor_required",
-                    raw_message.id,
-                )
-                stats["recognition_status"] = (
-                    "authoritative_processor_required"
-                )
-
-    if (
-        strategy_alert_config is not None
-        and chat_title
-        and (
-            strategy_alert_enabled_for_title is None
-            or strategy_alert_enabled_for_title(chat_title)
+            .scalar()
         )
-    ):
-        await strategy_alert_processor(
-            session_factory=session_factory,
-            record=record,
+    if raw_message_id is not None and run_post_persist_processing:
+        await process_message_job(
+            session_factory,
+            raw_message_id=int(raw_message_id),
             chat_title=chat_title,
-            config=strategy_alert_config,
-            recognition_result=recog_result,
+            record=record,
+            recognition_enabled=bool(inserted_keys and live_ai_config is not None),
+            strategy_alert_config=strategy_alert_config,
+            strategy_alert_enabled_for_title=strategy_alert_enabled_for_title,
+            strategy_alert_processor=strategy_alert_processor,
+            authoritative_processor=authoritative_processor,
+            context_resolution_scheduler=context_resolution_scheduler,
+            context_resolution_worker=context_resolution_worker,
+            authoritative_failure_retry_delay_seconds=(
+                authoritative_failure_retry_delay_seconds
+            ),
+            system_operator_bot_config=system_operator_bot_config,
+            notification_bot_config=notification_bot_config,
+            system_operator_conflict_sender=system_operator_conflict_sender,
         )
-    if context_resolution_worker is not None:
-        await asyncio.to_thread(context_resolution_worker)
+        if inserted_keys and live_ai_config is not None and authoritative_processor is None:
+            stats["recognition_status"] = "authoritative_processor_required"
     return stats
 
 
 @wraps(_persist_live_message_event_inline)
 async def persist_live_message_event(*args, **kwargs) -> dict[str, int]:
-    """Run the unchanged inline chain while mirroring its lifecycle in shadow."""
+    """Persist once, then select exactly one inline or queue authority."""
 
     session_factory = kwargs.get("session_factory")
+    pipeline_mode = (
+        await asyncio.to_thread(load_trading_settings, session_factory)
+    ).message_pipeline_mode
     shadow_raw_message_ids: list[int] = []
 
     async def enqueue_after_persist(
@@ -502,27 +473,35 @@ async def persist_live_message_event(*args, **kwargs) -> dict[str, int]:
             await _try_enqueue_shadow_processing_jobs(
                 session_factory,
                 message_keys=inserted_keys,
-                last_reason="inline_enqueued",
+                last_reason=(
+                    "queue_enqueued"
+                    if pipeline_mode == "queue"
+                    else "inline_enqueued"
+                ),
+                pipeline_mode_override=pipeline_mode,
             )
         )
 
     kwargs["shadow_enqueue_hook"] = enqueue_after_persist
+    kwargs["run_post_persist_processing"] = pipeline_mode != "queue"
     try:
         result = await _persist_live_message_event_inline(*args, **kwargs)
     except BaseException as exc:
+        if pipeline_mode == "shadow":
+            await _try_mark_shadow_processing_jobs_terminal(
+                session_factory,
+                raw_message_ids=shadow_raw_message_ids,
+                status="failed",
+                last_reason=f"inline_error:{type(exc).__name__}",
+            )
+        raise
+    if pipeline_mode == "shadow":
         await _try_mark_shadow_processing_jobs_terminal(
             session_factory,
             raw_message_ids=shadow_raw_message_ids,
-            status="failed",
-            last_reason=f"inline_error:{type(exc).__name__}",
+            status="succeeded",
+            last_reason="inline_completed",
         )
-        raise
-    await _try_mark_shadow_processing_jobs_terminal(
-        session_factory,
-        raw_message_ids=shadow_raw_message_ids,
-        status="succeeded",
-        last_reason="inline_completed",
-    )
     return result
 
 
@@ -1174,6 +1153,20 @@ async def recover_missing_authoritative_decisions(
         now=now,
         message_limit=message_limit,
     )
+    if load_trading_settings(session_factory).message_pipeline_mode == "queue":
+        await _try_enqueue_shadow_processing_jobs(
+            session_factory,
+            raw_message_ids=[
+                int(raw_message.id)
+                for raw_message in [
+                    *missing_decision_messages,
+                    *expired_messages,
+                ]
+            ],
+            last_reason="recovery_enqueued",
+            pipeline_mode_override="queue",
+        )
+        return result
 
     async def _process_recovery_candidate(raw_message) -> None:
         shadow_raw_message_ids = await _try_enqueue_shadow_processing_jobs(
@@ -1361,6 +1354,7 @@ async def run_reconcile_once(
     """
 
     repair_history_checkpoints(session_factory)
+    pipeline_mode = load_trading_settings(session_factory).message_pipeline_mode
     if system_operator_bot_enabled(notification_bot_config):
         await deliver_pending_message_instruction_summaries(
             session_factory,
@@ -1413,7 +1407,9 @@ async def run_reconcile_once(
     inserted_candidates = 0
     inserted_trade_ideas = 0
     recognition_status = (
-        "authoritative"
+        "queued"
+        if pipeline_mode == "queue"
+        else "authoritative"
         if authoritative_processor is not None
         else "authoritative_processor_required"
     )
@@ -1481,11 +1477,12 @@ async def run_reconcile_once(
                 session_factory,
                 message_keys=inserted_keys,
                 last_reason="history_reconcile_enqueued",
+                pipeline_mode_override=pipeline_mode,
             )
         )
         inserted_records = filter_records_by_inserted_message_keys(records, stats)
         recognition_by_key: dict[tuple[int, int], Any] = {}
-        if authoritative_processor is not None:
+        if authoritative_processor is not None and pipeline_mode != "queue":
             with session_factory() as session:
                 raw_messages = (
                     session.query(RawMessage)
@@ -1552,18 +1549,19 @@ async def run_reconcile_once(
                     ),
                 )
                 raise
-        else:
+        elif authoritative_processor is None:
             logger.error(
                 "history recognition authority unavailable "
                 "reason=authoritative_processor_required"
             )
         try:
-            if authoritative_processor is not None:
+            if authoritative_processor is not None and pipeline_mode != "queue":
                 trade_stats = persist_trade_ideas_from_candidates(session_factory)
                 inserted_trade_ideas += trade_stats["inserted_trade_ideas"]
             dialog_title = str(dialog.get("title") or "")
             if (
-                strategy_alert_config is not None
+                pipeline_mode != "queue"
+                and strategy_alert_config is not None
                 and (
                     strategy_alert_enabled_for_title is None
                     or strategy_alert_enabled_for_title(dialog_title)

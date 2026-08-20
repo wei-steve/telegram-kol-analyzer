@@ -80,7 +80,7 @@ def _add_raw_message(
         return raw_message.id
 
 
-@pytest.mark.parametrize("mode", ["inline", "shadow"])
+@pytest.mark.parametrize("mode", ["inline", "shadow", "queue"])
 def test_message_pipeline_mode_round_trips_and_defaults_to_inline(tmp_path, mode):
     session_factory = create_session_factory(tmp_path / "settings.db")
 

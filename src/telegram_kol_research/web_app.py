@@ -70,6 +70,9 @@ from telegram_kol_research.runtime_agent_production_audit import (
 )
 from telegram_kol_research.keyed_async_locks import KeyedAsyncLockRegistry
 from telegram_kol_research.message_lock_provider import MessageLockProvider
+from telegram_kol_research.message_processing_worker import (
+    run_message_processing_worker_loop,
+)
 from telegram_kol_research.runtime_incident_adapters import (
     capture_monitor_state,
     capture_notification_failure,
@@ -184,6 +187,7 @@ from telegram_kol_research.strategy_records import (
 from telegram_kol_research.strategy_alerts import (
     StrategyAlertConfig,
     load_strategy_alert_config,
+    process_strategy_alert_for_record,
     strategy_alerts_enabled,
 )
 from telegram_kol_research.config import (
@@ -3945,6 +3949,8 @@ def create_web_app(
     source_message_deletion_worker_runner=None,
     source_message_deletion_worker_interval_seconds: float = 5.0,
     source_message_deletion_worker_max_jobs: int = 10,
+    message_processing_worker_runner=None,
+    message_processing_worker_interval_seconds: float = 0.5,
     runtime_agent_production_audit_runner=None,
     runtime_agent_telegram_evidence_runner=None,
     runtime_incident_config: RuntimeIncidentConfig | None = None,
@@ -4179,6 +4185,7 @@ def create_web_app(
                 app.state.system_operator_bot_command_task.add_done_callback(
                     _log_background_task_result("system_operator_bot_command_task")
                 )
+            await ensure_message_processing_worker_mode()
             if (
                 app.state.live_target_titles
                 and app.state.telegram_client is not None
@@ -4319,6 +4326,18 @@ def create_web_app(
                     pass
                 app.state.authoritative_gap_recovery_loop_task = None
             # ── live listener shutdown ──
+            message_processing_worker_task = (
+                app.state.message_processing_worker_task
+            )
+            if message_processing_worker_task is not None:
+                message_processing_worker_task.cancel()
+                try:
+                    await message_processing_worker_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.message_processing_worker_task = None
             management_worker_task = app.state.strategy_management_worker_task
             if management_worker_task is not None:
                 management_worker_task.cancel()
@@ -4609,6 +4628,13 @@ def create_web_app(
         1, int(strategy_management_worker_max_batches)
     )
     app.state.strategy_management_worker_task = None
+    app.state.message_processing_worker_runner = (
+        message_processing_worker_runner or run_message_processing_worker_loop
+    )
+    app.state.message_processing_worker_interval_seconds = max(
+        0.01, float(message_processing_worker_interval_seconds)
+    )
+    app.state.message_processing_worker_task = None
     app.state.break_even_convergence_worker_runner = (
         break_even_convergence_worker_runner
         or run_break_even_convergence_worker_loop
@@ -4697,6 +4723,83 @@ def create_web_app(
                 "public, max-age=31536000, immutable"
             )
         return response
+
+    async def ensure_message_processing_worker_mode() -> None:
+        mode = load_trading_settings(
+            app.state.session_factory
+        ).message_pipeline_mode
+        task = app.state.message_processing_worker_task
+        if task is not None and task.done():
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("message processing worker task failed")
+            app.state.message_processing_worker_task = None
+            task = None
+        if mode != "queue" or task is not None:
+            return
+
+        async def notify_terminal_failure(claim, reason) -> None:
+            config = app.state.system_operator_bot_config
+            if not system_operator_bot_enabled(config):
+                return
+            await send_system_operator_bot_message(
+                config=config,
+                text=(
+                    "⚠️ 消息处理队列任务终止失败\n"
+                    f"raw_message_id: {claim.raw_message_id}\n"
+                    f"chat_id: {claim.chat_id}\n"
+                    f"reason: {reason}"
+                ),
+            )
+
+        app.state.message_processing_worker_task = asyncio.create_task(
+            app.state.message_processing_worker_runner(
+                session_factory=app.state.session_factory,
+                interval_seconds=(
+                    app.state.message_processing_worker_interval_seconds
+                ),
+                process_kwargs={
+                    "recognition_enabled": True,
+                    "strategy_alert_config": app.state.strategy_alert_config,
+                    "strategy_alert_enabled_for_title": (
+                        app.state.strategy_alert_enabled_for_title
+                    ),
+                    "strategy_alert_processor": process_strategy_alert_for_record,
+                    "authoritative_processor": app.state.authoritative_processor,
+                    "context_resolution_scheduler": (
+                        app.state.context_resolution_scheduler
+                    ),
+                    "context_resolution_worker": app.state.context_resolution_worker,
+                    "system_operator_bot_config": (
+                        app.state.system_operator_bot_config
+                    ),
+                    "notification_bot_config": app.state.notification_bot_config,
+                    "system_operator_conflict_sender": (
+                        send_ai_recognition_conflict_review
+                    ),
+                },
+                chat_title_provider=lambda chat_id: {
+                    int(group.chat_id): group.chat_title
+                    for group in app.state.group_config.groups
+                    if group.chat_id is not None
+                }.get(int(chat_id)),
+                loop_lag_snapshot_provider=app.state.loop_lag_monitor.snapshot,
+                terminal_failure_notifier=notify_terminal_failure,
+            )
+        )
+        app.state.message_processing_worker_task.add_done_callback(
+            _log_background_task_result("message_processing_worker_task")
+        )
+        def clear_completed_message_processing_worker(done_task) -> None:
+            if app.state.message_processing_worker_task is done_task:
+                app.state.message_processing_worker_task = None
+
+        app.state.message_processing_worker_task.add_done_callback(
+            clear_completed_message_processing_worker
+        )
 
     async def ensure_live_tasks_match_targets() -> None:
         if not app.state.live_target_titles:
@@ -4860,7 +4963,7 @@ def create_web_app(
         limit: int = 1000,
         stuck_after_seconds: int = 300,
     ):
-        """Project bounded shadow-job parity without consuming or mutating jobs."""
+        """Project bounded active-pipeline parity without consuming jobs."""
 
         if after_raw_message_id < 0:
             raise HTTPException(
@@ -4876,6 +4979,10 @@ def create_web_app(
             )
 
         now = app.state.now_provider()
+        pipeline_mode = load_trading_settings(
+            app.state.session_factory
+        ).message_pipeline_mode
+        observed_shadow = pipeline_mode != "queue"
         with app.state.session_factory() as session:
             recent_raw_rows = (
                 session.query(RawMessage.id)
@@ -4898,7 +5005,7 @@ def create_web_app(
                     .filter(
                         MessageProcessingJob.raw_message_id >= window_start,
                         MessageProcessingJob.raw_message_id <= window_end,
-                        MessageProcessingJob.shadow.is_(True),
+                        MessageProcessingJob.shadow.is_(observed_shadow),
                     )
                     .order_by(MessageProcessingJob.raw_message_id.desc())
                     .limit(limit + 1)
@@ -4929,7 +5036,11 @@ def create_web_app(
             "window_start_raw_message_id": window_start,
             "window_end_raw_message_id": window_end,
             "raw_messages": len(raw_ids),
-            "shadow_jobs": len(job_rows),
+            "pipeline_mode": pipeline_mode,
+            "observed_job_kind": "shadow" if observed_shadow else "queue",
+            "jobs": len(job_rows),
+            "shadow_jobs": sum(1 for job in job_rows if job.shadow),
+            "queue_jobs": sum(1 for job in job_rows if not job.shadow),
             "missing_job_count": len(raw_id_set - job_raw_id_set),
             "orphan_job_count": len(job_raw_id_set - raw_id_set),
             "stuck_pending_count": sum(
@@ -7015,6 +7126,7 @@ def create_web_app(
                 ).to_dict()
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        await ensure_message_processing_worker_mode()
         if refresh_status is not None:
             response["contract_specs"] = refresh_status
         response["mimo_contract_circuit"] = asdict(
