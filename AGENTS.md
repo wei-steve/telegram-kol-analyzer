@@ -1,14 +1,82 @@
 # Project Workflow
 
-- Make code changes locally. Local checks are useful for syntax/unit coverage that does not require secrets or network identity, but real project verification must run on the server because the Telegram session, Deepcoin API IP allowlist, and production keys only work there.
-- Push reviewed local commits to GitHub on `codex/deepcoin-auto-trading-v1`.
-- Update production by pulling from GitHub on the server, reinstalling the editable package, and restarting `telegram-kol.service`.
-- Send no notifications during active work, including commentary updates, tool calls, tests, reviews, commits, pushes, deployments, or other intermediate progress. Send exactly one notification only when the current turn's work stops and control is being returned to the user, whether because the task completed, work paused for user input, or progress is blocked. Immediately before that final response, run `python3 "$(git rev-parse --show-toplevel)/scripts/codex_telegram_notify.py" "<short non-sensitive status summary>"`. Telegram is the primary stop notification. Never include credentials or sensitive values in the summary. If Telegram delivery fails, use `osascript -e 'display notification "工作已停止，请查看 Codex。" with title "Telegram 获取消息项目"'` as the fallback and clearly report the Telegram failure in the final response. If both notification methods are unavailable, state that clearly in the final response.
+- Make code changes locally. Local checks are sufficient for documentation,
+  static configuration, and code paths whose acceptance does not depend on
+  secrets or network identity. Run the production-dependent part of verification
+  on the server only when acceptance actually depends on the live Telegram
+  session, Deepcoin API IP allowlist, production keys, or deployed runtime state.
+- Push reviewed local commits to GitHub on `codex/deepcoin-auto-trading-v1` when
+  the active plan or user request calls for integration. Deploy only when the
+  phase or user request requires production verification; a local code change
+  does not by itself authorize or require a deployment.
+- Send no Telegram notifications during active work. Concise in-app commentary
+  is allowed at meaningful milestones, state changes, or blockers; do not stream
+  repetitive polling or unchanged status. Send exactly one Telegram notification
+  when the current turn's work stops and control is being returned to the user,
+  whether because the task completed, work paused for user input, or progress is
+  blocked. Immediately before that final response, run
+  `python3 "$(git rev-parse --show-toplevel)/scripts/codex_telegram_notify.py" "<short non-sensitive status summary>"`.
+  Telegram is the primary stop notification. Never include credentials or
+  sensitive values in the summary. If Telegram delivery fails, use
+  `osascript -e 'display notification "工作已停止，请查看 Codex。" with title "Telegram 获取消息项目"'`
+  as the fallback and clearly report the Telegram failure in the final response.
+  If both notification methods are unavailable, state that clearly in the final
+  response.
 - Prefer the existing helper after pushing:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1
 ```
+
+# Risk-Adaptive Verification
+
+- Use the lowest verification level that fully covers the change's actual risk.
+  Do not automatically turn vague language such as "full session", "complete
+  evidence", or "real verification" into the highest-cost interpretation.
+  Explicit user requirements and phase-specific checks that directly address the
+  phase's core failure mode still take precedence.
+- **L0 — documentation or static configuration:** run only relevant formatting,
+  parsing, or static checks. No full suite, deployment, restart, or production
+  observation is required.
+- **L1 — additive dormant or shadow behavior with no authority takeover and no
+  exchange write:** run focused tests while developing and one full suite on the
+  final code candidate. After deployment, observe either 15 continuous minutes
+  or 5 real messages, whichever comes first. A restart and complete exchange
+  history are not required unless the change directly concerns lifecycle or
+  trading protection.
+- **L2 — authority cutover, durable consumer, recovery, or process separation:**
+  run focused concurrency/recovery/rollback tests while developing and one full
+  suite on the final code candidate. Observe 30 continuous minutes and at least
+  5 real messages; try to cover 2 chats. If 5 messages do not arrive within the
+  30-minute window, stop rather than extending the observation indefinitely,
+  leave the phase `in_progress`, and record the limited traffic. Restart once
+  only when restart recovery or process lifecycle is part of the phase's core
+  claim. Check backlog, duplicate processing, and direct exchange history when
+  the path can affect execution.
+- **L3 — schema change, production data repair, or exchange-write semantics:**
+  require an exact change and rollback plan. Rehearse on a production database
+  copy only when schema/bootstrap/migration files change or a production data
+  mutation is planned. Preserve a backup, `PRAGMA quick_check`, and before/after
+  counts for affected and critical business tables; do not hash every table
+  unless an anomaly requires a wider audit. Any change to real exchange-write
+  semantics requires separate explicit user approval.
+- During development, use focused tests for each edit. Run the full suite once
+  after all production-code changes are assembled into the final candidate. If
+  production code changes after that run, it becomes a new final candidate: run
+  the affected focused tests and one final full suite on that candidate.
+  Documentation-only changes after the run do not require another full suite.
+- Concentrate production checks at no more than four normal checkpoints:
+  pre-deploy, post-cutover, post-restart when required, and observation end. Use
+  a quiet server-side monitor between checkpoints and report only state changes,
+  anomalies, and the final summary instead of emitting repetitive polling.
+- Treat an incomplete external query as unknown, never as zero or healthy. One
+  reasoned retry is allowed. If the retry is still incomplete, fail closed,
+  leave the phase `in_progress`, and record the missing evidence instead of
+  retrying indefinitely.
+- Keep raw JSON, detailed order rows, and long logs in a server-side evidence
+  file. Status documents and final responses should record only the commit,
+  window, modes, required metrics, anomalies, and evidence path. Expand evidence
+  only when a required gate fails or an anomaly appears.
 
 # Runtime Incident AI Agent
 
@@ -29,6 +97,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1
   operation. If a safe deployment window cannot be proven, finish local work,
   leave the phase `in_progress`, and record the exact server verification still
   required.
+- Apply the shared Risk-Adaptive Verification levels above to testing,
+  deployment, restart, observation, and evidence collection for this workflow.
 - Documentation-only phases do not require a production service restart.
 
 # Deepcoin API Docs
@@ -57,6 +127,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1
 - Implement exactly one phase per user turn. End the session by updating
   `docs/runtime-serialization-remediation-status.md` as that phase file
   instructs, recording what was proven and what remains outstanding.
+- Apply the shared Risk-Adaptive Verification levels above. A phase file's
+  functional and semantic acceptance criteria remain authoritative, but generic
+  observation or evidence language does not by itself require a 60-minute
+  window, repeated full-suite runs, continuous interactive polling, or a
+  whole-database audit.
 - This remediation changes when and on which thread recognition and execution
   run. It must never change what they decide. Any phase that appears to require
   a change in trading semantics has been misread — stop and report instead.
