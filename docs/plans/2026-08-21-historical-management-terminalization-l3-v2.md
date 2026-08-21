@@ -541,3 +541,70 @@ new explicit authorization naming the exact plan fingerprint, repair timestamp,
 confirmation token, backup and rollback artifacts, production apply, post-apply
 verification, read-only Deepcoin recheck, and service start. Any mismatch must
 produce zero writes and leave the service stopped.
+
+## 13. Production apply and fail-closed startup result
+
+The user explicitly authorized the exact section-12 production plan, its
+confirmation token, contingent exact rollback, post-apply read-only exchange
+verification, and service start. Before mutation, all artifact hashes matched,
+the service remained stopped, the production database still matched all 47
+before rows, and a new GET-only Deepcoin snapshot again proved all seven
+positions terminal with no current live/open/pending match.
+
+The production CAS transaction changed exactly 47 rows. Before service start:
+
+- `PRAGMA quick_check=ok`;
+- every affected and critical table count was unchanged;
+- all `47/47` plan after rows matched exactly;
+- all six batches were `resolved` and the complete `recovery_required` set was
+  empty;
+- all seven execution legs, six bindings, and six lifecycles had their planned
+  terminal business states;
+- a second GET-only Deepcoin snapshot passed with TPSL conflicts and unowned
+  pending rows both zero;
+- exchange writes remained zero.
+
+The service was then started and reached `active/running`, with HTTP settings
+still `global/queue`. On startup, existing execution-binding reconciliation
+observed terminal entry legs and canonically rewrote bindings
+`282,283,292,307,313` from `last_exchange_status=historical_cleanup_terminal`
+to `entry_legs_terminal`, refreshing only `recovered_at` and `updated_at`.
+Their `status=closed` and `pos_id=NULL` values remained intact. The other 42
+plan rows remained byte-exact.
+
+This is normal behavior implemented by `_derive_binding_from_entry_legs`, but
+it violated the authorized byte-exact post-start gate. The service was stopped
+again. The authorized original rollback was attempted once and correctly
+refused with `database_state_mixed`, `writes=0`, because those five rows no
+longer matched the original rollback CAS predicates. No weakened or ad-hoc
+rollback was attempted.
+
+Current production state is fail-closed:
+
+- service: `inactive/dead`;
+- database: `quick_check=ok`, critical counts unchanged;
+- plan byte-exact after rows: `42/47`;
+- semantic terminal after rows: `47/47`;
+- recovery-required batches: zero;
+- production repair writes: 47;
+- rollback writes: zero;
+- exchange writes, deployments, pushes, and message replays: zero;
+- pristine backup SHA unchanged.
+
+Additional private evidence in the section-12 directory:
+
+| Artifact | SHA-256 |
+|---|---|
+| `pre-apply-exchange-recheck.json` | `803ba29cb9cb58d847ccee08bbbe51604b17df8e8d85ddd1b7bc168d2222b495` |
+| `post-apply-db-verification.json` | `b378841fb9d2b4e0e75c33927bc76668aee4724e5c759273274b845dd4ad3083` |
+| `post-apply-exchange-recheck.json` | `2578c593fa6e1d80ca6aa28376cc02fd940f932facb22f2e92d7a2c6e603f9fc` |
+| `post-start-canonicalization-diagnostic.json` | `093fdf4d74f8c4210fcd7c0036fb8ae1b036d23f7ea717ac3eddc30ab3dd7eae` |
+| `rollback-refusal.json` | `298022e09f06d398a2095d2bfed8a3ae514eeaf7d173e4141df5bfaae570d5f9` |
+| `production-apply-paused-summary.json` | `285da8640ed4dd3ba1e4fb0d8f3b2992c0dc6b6dfb086c9616ddfd6ec1f68e4b` |
+
+No further production action is authorized. The recommended next decision is
+to accept `entry_legs_terminal` as the stable runtime-canonical binding
+projection and authorize service start plus semantic terminal verification,
+without another database repair. If exact historical rollback is instead
+required, the old rollback fingerprint cannot be reused; a new current-state
+rollback plan and copy rehearsal require separate authorization.
