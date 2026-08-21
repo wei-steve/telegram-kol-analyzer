@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import sqlite3
 from datetime import UTC, datetime
 
@@ -273,7 +274,7 @@ def _seed_database(path):
     connection.execute(
         "INSERT INTO execution_order_legs VALUES "
         "(531,307,'strategy-144','entry','active',NULL,'verified',"
-        "'1001124899621086','sibling-order','sibling-client',"
+        "'1001124899621086','1001124898123056','TKDBK4331E2',"
         "'{\"policy_version\":2}','2026-08-21 17:30:00.000000',"
         "'2026-08-21 17:30:00.000000')"
     )
@@ -308,19 +309,39 @@ def _complete_exchange_evidence():
         "batches": batches,
         "sibling": {
             "snapshot_complete": True,
+            "classification": "historical_terminal/informational",
             "binding_id": 307,
             "execution_order_leg_id": 531,
             "pos_id": "1001124899621086",
             "attribution_status": "verified",
             "leg_status": "active",
-            "live_position_match_count": 1,
-            "protection_complete": True,
-            "ownership_conflicts": [],
+            "binding_execution_leg_ids": [530, 531],
+            "terminal_execution_leg_ids": [530, 531],
+            "position_history": [{
+                "instId": "BTC-USDT-SWAP",
+                "posId": "1001124899621086",
+                "posSide": "short",
+                "pos": "8",
+                "closePos": "8",
+                "closeAvgPx": "73200",
+                "uTime": "1787268377000",
+            }],
+            "positions": [],
+            "open_orders": [],
+            "pending_trigger_orders": [],
+            "position_history_error": None,
+            "unconfirmed_mutation_intent_ids": [],
+            "owned_stop_order_id": "1001124899621085",
+            "owned_stop_trigger_price": "73200",
+            "owned_stop_u_time": "1787268377000",
+            "raw_evidence_sha256": "2b0d981ae2fa6564402463b264c6e36d08f57d1dfff14836ac9b2fdb17907698",
+            "derived_evidence_sha256": "e8e9acbe43fc20fd4189905ba74ba84a089d6023eab032056d4ad2a448a8493b",
+            "exchange_write_count": 0,
         },
     }
 
 
-def test_build_plan_has_exact_45_action_matrix(tmp_path):
+def test_build_plan_has_exact_47_action_matrix(tmp_path):
     try:
         from telegram_kol_research.historical_management_terminalization import (
             build_terminalization_plan,
@@ -338,7 +359,7 @@ def test_build_plan_has_exact_45_action_matrix(tmp_path):
         code_sha="f" * 40,
     )
 
-    assert plan.action_count == 45
+    assert plan.action_count == 47
     assert len(plan.plan_fingerprint) == 64
     assert len(plan.database_fingerprint) == 64
     assert len(plan.exchange_fingerprint) == 64
@@ -351,12 +372,18 @@ def test_build_plan_has_exact_45_action_matrix(tmp_path):
         action for action in plan.actions
         if action.table == "execution_bindings" and action.pk == 307
     )
-    assert binding_307.after["status"] == "active"
-    assert binding_307.after["pos_id"] == "1001124899621086"
-    assert not any(
+    assert binding_307.after["status"] == "closed"
+    assert binding_307.after["pos_id"] is None
+    assert any(
         action.table == "strategy_lifecycles" and action.pk == 910
         for action in plan.actions
     )
+    sibling_leg = next(
+        action for action in plan.actions
+        if action.table == "execution_order_legs" and action.pk == 531
+    )
+    assert sibling_leg.after["status"] == "closed"
+    assert sibling_leg.after["pos_id"] == "1001124899621086"
 
 
 def test_plan_refuses_wrong_exact_exchange_instrument(tmp_path):
@@ -431,12 +458,12 @@ def test_apply_is_cas_idempotent_and_rollback_restores_exact_rows(tmp_path):
         database_path,
         plan=plan,
         expected_plan_fingerprint=plan.plan_fingerprint,
-        expected_action_count=45,
+        expected_action_count=47,
         expected_repair_ts_utc=plan.repair_ts_utc,
         confirmation_token=plan.confirmation_token,
     )
     assert applied.status == "applied"
-    assert applied.changed_row_count == 45
+    assert applied.changed_row_count == 47
     assert applied.quick_check == "ok"
     assert applied.table_counts_before == applied.table_counts_after
 
@@ -444,7 +471,7 @@ def test_apply_is_cas_idempotent_and_rollback_restores_exact_rows(tmp_path):
         database_path,
         plan=plan,
         expected_plan_fingerprint=plan.plan_fingerprint,
-        expected_action_count=45,
+        expected_action_count=47,
         expected_repair_ts_utc=plan.repair_ts_utc,
         confirmation_token=plan.confirmation_token,
     )
@@ -455,11 +482,11 @@ def test_apply_is_cas_idempotent_and_rollback_restores_exact_rows(tmp_path):
         database_path,
         plan=plan,
         expected_rollback_fingerprint=plan.rollback_fingerprint,
-        expected_action_count=45,
+        expected_action_count=47,
         confirmation_token=plan.confirmation_token,
     )
     assert rolled_back.status == "rolled_back"
-    assert rolled_back.changed_row_count == 45
+    assert rolled_back.changed_row_count == 47
     assert rolled_back.quick_check == "ok"
     assert _database_digest(database_path) == original_digest
 
@@ -494,7 +521,7 @@ def test_apply_refuses_drift_before_any_write(tmp_path):
             database_path,
             plan=plan,
             expected_plan_fingerprint=plan.plan_fingerprint,
-            expected_action_count=45,
+            expected_action_count=47,
             expected_repair_ts_utc=plan.repair_ts_utc,
             confirmation_token=plan.confirmation_token,
         )
@@ -529,14 +556,14 @@ def test_plan_json_round_trip_and_rollback_sql_are_exact(tmp_path):
     assert plan_path.stat().st_mode & 0o777 == 0o600
     assert rollback_sql.startswith("BEGIN IMMEDIATE;\n")
     assert rollback_sql.rstrip().endswith("COMMIT;")
-    assert rollback_sql.count("UPDATE ") == 45
+    assert rollback_sql.count("UPDATE ") == 47
     assert loaded.rollback_fingerprint in rollback_sql
 
     apply_terminalization_plan(
         database_path,
         plan=loaded,
         expected_plan_fingerprint=loaded.plan_fingerprint,
-        expected_action_count=45,
+        expected_action_count=47,
         expected_repair_ts_utc=loaded.repair_ts_utc,
         confirmation_token=loaded.confirmation_token,
     )
@@ -557,6 +584,40 @@ def test_plan_json_round_trip_and_rollback_sql_are_exact(tmp_path):
             "target_position_not_terminal",
         ),
         (lambda value: value.pop("sibling"), "batch_144_sibling_missing"),
+        (
+            lambda value: value["sibling"].update(position_history=[]),
+            "batch_144_sibling_history_not_unique",
+        ),
+        (
+            lambda value: value["sibling"]["position_history"].append(
+                dict(value["sibling"]["position_history"][0])
+            ),
+            "batch_144_sibling_history_not_unique",
+        ),
+        (
+            lambda value: value["sibling"]["position_history"][0].update(
+                closePos="7"
+            ),
+            "batch_144_sibling_full_close_unproven",
+        ),
+        (
+            lambda value: value["sibling"]["positions"].append(
+                {"posId": "1001124899621086"}
+            ),
+            "batch_144_sibling_not_terminal",
+        ),
+        (
+            lambda value: value["sibling"]["open_orders"].append(
+                {"posId": "1001124899621086"}
+            ),
+            "batch_144_sibling_not_terminal",
+        ),
+        (
+            lambda value: value["sibling"]["pending_trigger_orders"].append(
+                {"posId": "1001124899621086"}
+            ),
+            "batch_144_sibling_not_terminal",
+        ),
         (
             lambda value: value["batches"].update({"999": {}}),
             "exchange_target_set_changed",
@@ -600,6 +661,18 @@ def test_plan_refuses_incomplete_or_changed_external_state(tmp_path, mutate, rea
             "batch_changed",
         ),
         ("DELETE FROM execution_order_legs WHERE id=531", "batch_144_sibling_missing"),
+        (
+            "INSERT INTO execution_order_legs VALUES "
+            "(532,307,'strategy-144','entry','active',NULL,'verified',"
+            "'other-pos','other-order','other-client','{}',NULL,NULL)",
+            "batch_144_binding_leg_set_changed",
+        ),
+        (
+            "INSERT INTO execution_order_legs VALUES "
+            "(532,999,'other-strategy','entry','active',NULL,'verified',"
+            "'1001124899621086','other-order','other-client','{}',NULL,NULL)",
+            "batch_144_sibling_not_unique",
+        ),
     ],
 )
 def test_plan_refuses_local_target_or_identity_drift(tmp_path, statement, reason):
@@ -624,3 +697,197 @@ def test_plan_refuses_local_target_or_identity_drift(tmp_path, statement, reason
             code_sha="f" * 40,
         )
     assert _database_digest(database_path) == drift_digest
+
+
+def test_v2_evidence_directory_normalizes_terminal_sibling(tmp_path):
+    from telegram_kol_research.historical_management_terminalization import (
+        load_exchange_evidence_directory,
+    )
+
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir(mode=0o700)
+    documents = {
+        "management-batches.json": {
+            "output_complete": True,
+            "batches_returned": 146,
+            "batches_truncated": False,
+            "malformed_field_count": 0,
+            "malformed_row_count": 0,
+            "snapshot_status": "stable",
+            "snapshot_validation": "ok",
+            "all_history_legs_complete": True,
+            "counts": {"recovery_required": 6},
+        },
+        "protection-incidents.json": {
+            "exchange_snapshot_complete": True,
+            "counts": {"current_risk": 0},
+            "snapshot_validation": "ok",
+        },
+        "tpsl-ownership.json": {
+            "exchange_write_count": 0,
+            "conflicts": [],
+            "unowned_pending_order_ids": [],
+            "owned_pending_count": 8,
+            "pending_tpsl_count": 8,
+        },
+        "six-batches-local-chain.json": [
+            {"batch": {"id": batch_id}} for batch_id in TARGETS
+        ],
+        "six-batches-classification.json": {
+            "exchange_snapshot_errors": {},
+            "position_history_errors": {},
+            "batches": [],
+        },
+        "six-batches-exchange-chain.json": {
+            "snapshot_errors": {},
+            "position_history_errors": {},
+            "batches": {},
+        },
+    }
+    for batch_id, target in TARGETS.items():
+        documents["six-batches-classification.json"]["batches"].append({
+            "batch_id": batch_id,
+            "classification": "historical_terminal/informational",
+            "local": {
+                "batch_status": "recovery_required",
+                "lifecycle_id": target["lifecycle"],
+                "binding_id": target["binding"],
+                "execution_leg_id": target["execution_leg"],
+                "attribution_status": "verified",
+                "pos_id": target["pos_id"],
+                "unique_execution_leg_owner_count": 1,
+                "unique_binding_owner_count": 1,
+                "mutation_intent_states": [{"status": "confirmed"}],
+            },
+            "exchange": {
+                "live_position_count": 0,
+                "open_order_count": 0,
+                "pending_tpsl_count": 0,
+                "position_history_count": 1,
+            },
+        })
+        documents["six-batches-exchange-chain.json"]["batches"][str(batch_id)] = {
+            "target": {
+                "id": batch_id,
+                "instrument": target["instrument"],
+                "binding_pos_id": target["pos_id"],
+                "execution_order_leg_id": target["execution_leg"],
+                "leg_pos_id": target["pos_id"],
+            },
+            "matched": {
+                "positions": [],
+                "open_orders": [],
+                "pending_trigger_orders": [],
+            },
+            "position_history": _complete_exchange_evidence()["batches"][str(batch_id)]["position_history"],
+            "position_history_error": None,
+        }
+
+    base_hashes = {}
+    for name, payload in documents.items():
+        path = evidence_dir / name
+        path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        os.chmod(path, 0o600)
+        base_hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    raw = {
+        "snapshot_complete": True,
+        "exchange_write_count": 0,
+        "target": {
+            "binding_id": 307,
+            "execution_order_leg_id": 531,
+            "instrument": "BTC-USDT-SWAP",
+            "side": "short",
+            "pos_id": "1001124899621086",
+        },
+        "local": {
+            "execution_legs": [
+                {"id": 530, "execution_binding_id": 307},
+                {
+                    "id": 531,
+                    "execution_binding_id": 307,
+                    "status": "active",
+                    "attribution_status": "verified",
+                    "pos_id": "1001124899621086",
+                },
+            ],
+            "mutation_intents": [
+                {"pos_id": "1001124899621086", "status": "confirmed"}
+            ],
+            "protection_ledger": [{
+                "execution_order_leg_id": 531,
+                "pos_id": "1001124899621086",
+                "order_id": "1001124899621085",
+                "purpose": "stop_loss",
+                "status": "verified",
+            }],
+        },
+        "exchange": {
+            "exact_live_matches": [],
+            "exact_open_order_matches": [],
+            "exact_pending_trigger_matches": [],
+            "exact_position_history_matches": _complete_exchange_evidence()["sibling"]["position_history"],
+        },
+    }
+    raw_path = evidence_dir / "batch-144-sibling-terminality.json"
+    raw_path.write_text(json.dumps(raw, sort_keys=True, separators=(",", ":")))
+    os.chmod(raw_path, 0o600)
+    raw_hash = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+    derived = {
+        "source_sha256": raw_hash,
+        "classification": "historical_terminal/informational",
+        "exchange_write_count": 0,
+        "checks": {"all_exact_terminal_gates": True},
+        "corrected_scope": {
+            "terminal_execution_leg_ids": [530, 531],
+            "remaining_binding_307_execution_leg_ids": [],
+            "binding_307": "closed",
+            "lifecycle_910": "exited",
+        },
+        "action_matrix": {"total": 47},
+        "exact_close_evidence": {
+            "owned_triggered_stop_order_id": "1001124899621085",
+            "stop_trigger_price": "73200",
+            "stop_uTime": "1787268377000",
+        },
+    }
+    derived_path = evidence_dir / "batch-144-sibling-terminality-derived.json"
+    derived_path.write_text(json.dumps(derived, sort_keys=True, separators=(",", ":")))
+    os.chmod(derived_path, 0o600)
+    derived_hash = hashlib.sha256(derived_path.read_bytes()).hexdigest()
+
+    normalized = load_exchange_evidence_directory(
+        evidence_dir,
+        expected_sibling_raw_sha256=raw_hash,
+        expected_sibling_derived_sha256=derived_hash,
+        expected_base_hashes=base_hashes,
+    )
+
+    assert normalized["sibling"]["classification"] == "historical_terminal/informational"
+    assert normalized["sibling"]["position_history"][0]["closePos"] == "8"
+    assert normalized["sibling"]["terminal_execution_leg_ids"] == [530, 531]
+
+
+def test_load_fresh_normalized_exchange_evidence_requires_exact_private_hash(tmp_path):
+    from telegram_kol_research.historical_management_terminalization import (
+        HistoricalManagementTerminalizationRefused,
+        load_fresh_normalized_exchange_evidence,
+    )
+
+    path = tmp_path / "fresh-seven-exchange-evidence.json"
+    path.write_text(
+        json.dumps(_complete_exchange_evidence(), sort_keys=True, separators=(",", ":"))
+    )
+    os.chmod(path, 0o600)
+    expected_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    loaded = load_fresh_normalized_exchange_evidence(
+        path, expected_sha256=expected_hash
+    )
+    assert loaded["exchange_write_count"] == 0
+    assert set(loaded["batches"]) == {str(value) for value in TARGETS}
+
+    with pytest.raises(
+        HistoricalManagementTerminalizationRefused, match="evidence_hash_mismatch"
+    ):
+        load_fresh_normalized_exchange_evidence(path, expected_sha256="0" * 64)

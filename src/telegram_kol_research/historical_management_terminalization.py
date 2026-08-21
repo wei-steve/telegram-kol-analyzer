@@ -19,6 +19,7 @@ from typing import Any, Mapping
 
 
 TARGET_BATCH_IDS = (123, 127, 129, 133, 144, 146)
+EXPECTED_ACTION_COUNT = 47
 REPAIR_REASON = "historical_position_fully_closed"
 TERMINAL_LEG_REASON = "historical_exchange_position_closed"
 
@@ -185,7 +186,7 @@ def build_terminalization_plan(
     repair_ts: datetime,
     code_sha: str,
 ) -> TerminalizationPlan:
-    """Build the exact 45-action plan without opening the database writable."""
+    """Build the exact 47-action plan without opening the database writable."""
 
     resolved = Path(database_path).expanduser().resolve()
     if not resolved.is_file():
@@ -230,7 +231,7 @@ def build_terminalization_plan(
         actions, database_evidence = _build_actions(
             connection, repair_db_value=repair_db_value
         )
-        if len(actions) != 45:
+        if len(actions) != EXPECTED_ACTION_COUNT:
             raise HistoricalManagementTerminalizationRefused("action_count_changed")
         connection.rollback()
     finally:
@@ -282,7 +283,8 @@ def build_terminalization_plan(
 def load_exchange_evidence_directory(
     directory: str | Path,
     *,
-    expected_sibling_sha256: str,
+    expected_sibling_raw_sha256: str,
+    expected_sibling_derived_sha256: str,
     expected_base_hashes: Mapping[str, str] = _BASE_EVIDENCE_SHA256,
 ) -> dict[str, Any]:
     """Normalize the exact private evidence bundle without exchange access."""
@@ -291,7 +293,12 @@ def load_exchange_evidence_directory(
     if not root.is_dir() or root.stat().st_mode & 0o077:
         raise HistoricalManagementTerminalizationRefused("evidence_directory_not_private")
     expected_hashes = dict(expected_base_hashes)
-    expected_hashes["batch-144-live-sibling.json"] = expected_sibling_sha256
+    expected_hashes["batch-144-sibling-terminality.json"] = (
+        expected_sibling_raw_sha256
+    )
+    expected_hashes["batch-144-sibling-terminality-derived.json"] = (
+        expected_sibling_derived_sha256
+    )
     documents: dict[str, Any] = {}
     actual_hashes: dict[str, str] = {}
     for name, expected_hash in expected_hashes.items():
@@ -440,7 +447,140 @@ def load_exchange_evidence_directory(
             "position_history_error": chain.get("position_history_error"),
         }
 
-    sibling = documents["batch-144-live-sibling.json"]
+    sibling_raw = documents["batch-144-sibling-terminality.json"]
+    sibling_derived = documents["batch-144-sibling-terminality-derived.json"]
+    if not isinstance(sibling_raw, dict) or not isinstance(sibling_derived, dict):
+        raise HistoricalManagementTerminalizationRefused(
+            "batch_144_sibling_evidence_invalid"
+        )
+    _require_values(
+        sibling_raw,
+        {"snapshot_complete": True, "exchange_write_count": 0},
+        "batch_144_sibling_snapshot_incomplete",
+    )
+    _require_values(
+        sibling_raw.get("target", {}),
+        {
+            "binding_id": 307,
+            "execution_order_leg_id": 531,
+            "instrument": "BTC-USDT-SWAP",
+            "side": "short",
+            "pos_id": "1001124899621086",
+        },
+        "batch_144_sibling_identity_changed",
+    )
+    local_sibling = sibling_raw.get("local", {})
+    sibling_legs = local_sibling.get("execution_legs")
+    if not isinstance(sibling_legs, list) or {
+        row.get("id") for row in sibling_legs if isinstance(row, dict)
+    } != {530, 531}:
+        raise HistoricalManagementTerminalizationRefused(
+            "batch_144_binding_leg_set_changed"
+        )
+    sibling_leg = next(
+        (row for row in sibling_legs if isinstance(row, dict) and row.get("id") == 531),
+        None,
+    )
+    if not isinstance(sibling_leg, dict):
+        raise HistoricalManagementTerminalizationRefused(
+            "batch_144_sibling_missing"
+        )
+    _require_values(
+        sibling_leg,
+        {
+            "execution_binding_id": 307,
+            "status": "active",
+            "attribution_status": "verified",
+            "pos_id": "1001124899621086",
+        },
+        "batch_144_sibling_changed",
+    )
+    sibling_mutations = [
+        row
+        for row in local_sibling.get("mutation_intents", [])
+        if isinstance(row, dict) and row.get("pos_id") == "1001124899621086"
+    ]
+    if any(row.get("status") != "confirmed" for row in sibling_mutations):
+        raise HistoricalManagementTerminalizationRefused(
+            "mutation_intent_unconfirmed"
+        )
+    sibling_ledger = local_sibling.get("protection_ledger", [])
+    if not any(
+        isinstance(row, dict)
+        and row.get("execution_order_leg_id") == 531
+        and row.get("pos_id") == "1001124899621086"
+        and str(row.get("order_id")) == "1001124899621085"
+        and row.get("purpose") == "stop_loss"
+        and row.get("status") == "verified"
+        for row in sibling_ledger
+    ):
+        raise HistoricalManagementTerminalizationRefused(
+            "batch_144_owned_stop_unproven"
+        )
+    raw_hash = actual_hashes["batch-144-sibling-terminality.json"]
+    _require_values(
+        sibling_derived,
+        {
+            "source_sha256": raw_hash,
+            "classification": "historical_terminal/informational",
+            "exchange_write_count": 0,
+        },
+        "batch_144_derived_evidence_invalid",
+    )
+    derived_checks = sibling_derived.get("checks")
+    if not isinstance(derived_checks, dict) or not derived_checks or not all(
+        value is True for value in derived_checks.values()
+    ):
+        raise HistoricalManagementTerminalizationRefused(
+            "batch_144_derived_checks_failed"
+        )
+    _require_values(
+        sibling_derived.get("corrected_scope", {}),
+        {
+            "terminal_execution_leg_ids": [530, 531],
+            "remaining_binding_307_execution_leg_ids": [],
+            "binding_307": "closed",
+            "lifecycle_910": "exited",
+        },
+        "batch_144_derived_scope_changed",
+    )
+    if sibling_derived.get("action_matrix", {}).get("total") != EXPECTED_ACTION_COUNT:
+        raise HistoricalManagementTerminalizationRefused(
+            "batch_144_derived_action_count_changed"
+        )
+    sibling_exchange = sibling_raw.get("exchange", {})
+    close_evidence = sibling_derived.get("exact_close_evidence", {})
+    sibling = {
+        "snapshot_complete": True,
+        "classification": "historical_terminal/informational",
+        "binding_id": 307,
+        "execution_order_leg_id": 531,
+        "pos_id": "1001124899621086",
+        "attribution_status": "verified",
+        "leg_status": "active",
+        "binding_execution_leg_ids": [530, 531],
+        "terminal_execution_leg_ids": [530, 531],
+        "position_history": sibling_exchange.get(
+            "exact_position_history_matches"
+        ),
+        "positions": sibling_exchange.get("exact_live_matches"),
+        "open_orders": sibling_exchange.get("exact_open_order_matches"),
+        "pending_trigger_orders": sibling_exchange.get(
+            "exact_pending_trigger_matches"
+        ),
+        "position_history_error": None,
+        "unconfirmed_mutation_intent_ids": [],
+        "owned_stop_order_id": close_evidence.get(
+            "owned_triggered_stop_order_id"
+        ),
+        "owned_stop_trigger_price": close_evidence.get("stop_trigger_price"),
+        "owned_stop_u_time": close_evidence.get("stop_uTime"),
+        "raw_evidence_sha256": raw_hash,
+        "derived_evidence_sha256": actual_hashes[
+            "batch-144-sibling-terminality-derived.json"
+        ],
+        "exchange_write_count": 0,
+    }
     normalized = {
         "snapshot_complete": True,
         "snapshot_errors": {},
@@ -452,6 +592,39 @@ def load_exchange_evidence_directory(
         "sibling": sibling,
     }
     return _validate_exchange_evidence(normalized)
+
+
+def load_fresh_normalized_exchange_evidence(
+    path: str | Path, *, expected_sha256: str
+) -> dict[str, Any]:
+    """Load one freshly captured seven-position read-only evidence file."""
+
+    resolved = Path(path).expanduser().resolve()
+    if (
+        not resolved.is_file()
+        or resolved.stat().st_mode & 0o077
+        or len(expected_sha256) != 64
+        or any(ch not in "0123456789abcdef" for ch in expected_sha256)
+    ):
+        raise HistoricalManagementTerminalizationRefused(
+            "fresh_evidence_file_invalid"
+        )
+    content = resolved.read_bytes()
+    if hashlib.sha256(content).hexdigest() != expected_sha256:
+        raise HistoricalManagementTerminalizationRefused(
+            "evidence_hash_mismatch"
+        )
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise HistoricalManagementTerminalizationRefused(
+            "evidence_json_invalid"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise HistoricalManagementTerminalizationRefused(
+            "fresh_evidence_payload_invalid"
+        )
+    return _validate_exchange_evidence(payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -483,7 +656,10 @@ def apply_terminalization_plan(
     _validate_plan_integrity(plan)
     if expected_plan_fingerprint != plan.plan_fingerprint:
         raise HistoricalManagementTerminalizationRefused("plan_fingerprint_mismatch")
-    if expected_action_count != 45 or expected_action_count != plan.action_count:
+    if (
+        expected_action_count != EXPECTED_ACTION_COUNT
+        or expected_action_count != plan.action_count
+    ):
         raise HistoricalManagementTerminalizationRefused("action_count_mismatch")
     if expected_repair_ts_utc != plan.repair_ts_utc:
         raise HistoricalManagementTerminalizationRefused("repair_timestamp_mismatch")
@@ -505,7 +681,10 @@ def rollback_terminalization_plan(
     _validate_plan_integrity(plan)
     if expected_rollback_fingerprint != plan.rollback_fingerprint:
         raise HistoricalManagementTerminalizationRefused("rollback_fingerprint_mismatch")
-    if expected_action_count != 45 or expected_action_count != plan.action_count:
+    if (
+        expected_action_count != EXPECTED_ACTION_COUNT
+        or expected_action_count != plan.action_count
+    ):
         raise HistoricalManagementTerminalizationRefused("action_count_mismatch")
     if confirmation_token != plan.confirmation_token:
         raise HistoricalManagementTerminalizationRefused("confirmation_token_mismatch")
@@ -536,7 +715,10 @@ def write_terminalization_plan(
 
 def load_terminalization_plan(path: str | Path) -> TerminalizationPlan:
     payload = json.loads(Path(path).expanduser().resolve().read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or payload.pop("action_count", None) != 45:
+    if (
+        not isinstance(payload, dict)
+        or payload.pop("action_count", None) != EXPECTED_ACTION_COUNT
+    ):
         raise HistoricalManagementTerminalizationRefused("plan_json_invalid")
     raw_actions = payload.get("actions")
     if not isinstance(raw_actions, list):
@@ -875,10 +1057,23 @@ def _build_actions(
             "terminal_reason": None,
             "attribution_status": "verified",
             "pos_id": "1001124899621086",
+            "order_id": "1001124898123056",
+            "client_order_id": "TKDBK4331E2",
         },
         "batch_144_sibling_changed",
     )
-    rows_by_kind["execution_legs"].append({"batch_144_sibling_unchanged": sibling})
+    rows_by_kind["execution_legs"].append(sibling)
+    binding_leg_ids = [
+        int(row[0])
+        for row in connection.execute(
+            "SELECT id FROM execution_order_legs "
+            "WHERE execution_binding_id=307 ORDER BY id"
+        )
+    ]
+    if binding_leg_ids != [530, 531]:
+        raise HistoricalManagementTerminalizationRefused(
+            "batch_144_binding_leg_set_changed"
+        )
     sibling_owner_rows = connection.execute(
         "SELECT id,execution_binding_id FROM execution_order_legs "
         "WHERE pos_id='1001124899621086' AND attribution_status='verified' "
@@ -927,8 +1122,6 @@ def _build_actions(
         )
         actions.append(TerminalizationAction("strategy_management_batches", row["id"], row, after))
     for row in rows_by_kind["execution_legs"]:
-        if "batch_144_sibling_unchanged" in row:
-            continue
         after = dict(row)
         after.update(
             status="closed", terminal_reason=TERMINAL_LEG_REASON,
@@ -937,22 +1130,13 @@ def _build_actions(
         actions.append(TerminalizationAction("execution_order_legs", row["id"], row, after))
     for row in rows_by_kind["bindings"]:
         after = dict(row)
-        if row["id"] == 307:
-            after.update(
-                status="active", pos_id="1001124899621086",
-                last_exchange_status="position_ownership_verified",
-                recovered_at=repair_db_value, updated_at=repair_db_value,
-            )
-        else:
-            after.update(
-                status="closed", pos_id=None,
-                last_exchange_status="historical_cleanup_terminal",
-                recovered_at=repair_db_value, updated_at=repair_db_value,
-            )
+        after.update(
+            status="closed", pos_id=None,
+            last_exchange_status="historical_cleanup_terminal",
+            recovered_at=repair_db_value, updated_at=repair_db_value,
+        )
         actions.append(TerminalizationAction("execution_bindings", row["id"], row, after))
     for row in rows_by_kind["lifecycles"]:
-        if row["id"] == 910:
-            continue
         after = dict(row)
         after.update(
             lifecycle_status="exited", exit_reason="exchange_closed",
@@ -997,18 +1181,59 @@ def _validate_exchange_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
     sibling = payload.get("sibling")
     expected_sibling = {
         "snapshot_complete": True,
+        "classification": "historical_terminal/informational",
         "binding_id": 307,
         "execution_order_leg_id": 531,
         "pos_id": "1001124899621086",
         "attribution_status": "verified",
         "leg_status": "active",
-        "live_position_match_count": 1,
-        "protection_complete": True,
-        "ownership_conflicts": [],
+        "binding_execution_leg_ids": [530, 531],
+        "terminal_execution_leg_ids": [530, 531],
+        "position_history_error": None,
+        "unconfirmed_mutation_intent_ids": [],
+        "owned_stop_order_id": "1001124899621085",
+        "owned_stop_trigger_price": "73200",
+        "owned_stop_u_time": "1787268377000",
+        "exchange_write_count": 0,
     }
     if not isinstance(sibling, dict):
         raise HistoricalManagementTerminalizationRefused("batch_144_sibling_missing")
     _require_values(sibling, expected_sibling, "batch_144_sibling_unproven")
+    for key in ("raw_evidence_sha256", "derived_evidence_sha256"):
+        value = sibling.get(key)
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(ch not in "0123456789abcdef" for ch in value)
+        ):
+            raise HistoricalManagementTerminalizationRefused(
+                "batch_144_sibling_evidence_hash_invalid"
+            )
+    if sibling.get("positions") or sibling.get("open_orders") or sibling.get(
+        "pending_trigger_orders"
+    ):
+        raise HistoricalManagementTerminalizationRefused(
+            "batch_144_sibling_not_terminal"
+        )
+    history = sibling.get("position_history")
+    if not isinstance(history, list) or len(history) != 1:
+        raise HistoricalManagementTerminalizationRefused(
+            "batch_144_sibling_history_not_unique"
+        )
+    row = history[0]
+    if (
+        not isinstance(row, dict)
+        or row.get("instId") != "BTC-USDT-SWAP"
+        or row.get("posId") != "1001124899621086"
+        or row.get("posSide") != "short"
+        or not _same_positive_number(row.get("pos"), "8")
+        or not _same_positive_number(row.get("closePos"), "8")
+        or row.get("closeAvgPx") != sibling.get("owned_stop_trigger_price")
+        or row.get("uTime") != sibling.get("owned_stop_u_time")
+    ):
+        raise HistoricalManagementTerminalizationRefused(
+            "batch_144_sibling_full_close_unproven"
+        )
     return payload
 
 
@@ -1103,7 +1328,10 @@ def _validate_plan_integrity(plan: TerminalizationPlan) -> None:
         or tuple(plan.target_batch_ids) != TARGET_BATCH_IDS
     ):
         raise HistoricalManagementTerminalizationRefused("plan_target_contract_invalid")
-    if plan.exchange_write_count != 0 or plan.action_count != 45:
+    if (
+        plan.exchange_write_count != 0
+        or plan.action_count != EXPECTED_ACTION_COUNT
+    ):
         raise HistoricalManagementTerminalizationRefused("plan_action_contract_invalid")
     if set(plan.table_counts) != set(_COUNT_TABLES):
         raise HistoricalManagementTerminalizationRefused("plan_table_counts_invalid")
@@ -1111,9 +1339,9 @@ def _validate_plan_integrity(plan: TerminalizationPlan) -> None:
         "strategy_management_components": 16,
         "strategy_management_legs": 6,
         "strategy_management_batches": 6,
-        "execution_order_legs": 6,
+        "execution_order_legs": 7,
         "execution_bindings": 6,
-        "strategy_lifecycles": 5,
+        "strategy_lifecycles": 6,
     }
     actual_matrix = {
         table: sum(action.table == table for action in plan.actions)
@@ -1190,8 +1418,6 @@ def _validate_invariant_rows(
                         "database_invariant_changed"
                     )
                 continue
-            if kind == "execution_legs" and "batch_144_sibling_unchanged" in stored:
-                stored = stored["batch_144_sibling_unchanged"]
             if not isinstance(stored, dict) or not isinstance(stored.get("id"), int):
                 raise HistoricalManagementTerminalizationRefused("database_evidence_invalid")
             if (table, stored["id"]) in action_keys:
@@ -1290,8 +1516,8 @@ def main(argv: list[str] | None = None) -> int:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--apply", action="store_true")
     mode.add_argument("--rollback", action="store_true")
-    parser.add_argument("--evidence-directory")
-    parser.add_argument("--expected-sibling-sha256")
+    parser.add_argument("--fresh-exchange-evidence-file")
+    parser.add_argument("--expected-fresh-exchange-evidence-sha256")
     parser.add_argument("--repair-ts-utc")
     parser.add_argument("--code-sha")
     parser.add_argument("--output-plan")
@@ -1334,8 +1560,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         required = {
-            "evidence_directory": args.evidence_directory,
-            "expected_sibling_sha256": args.expected_sibling_sha256,
+            "fresh_exchange_evidence_file": args.fresh_exchange_evidence_file,
+            "expected_fresh_exchange_evidence_sha256": (
+                args.expected_fresh_exchange_evidence_sha256
+            ),
             "repair_ts_utc": args.repair_ts_utc,
             "code_sha": args.code_sha,
             "output_plan": args.output_plan,
@@ -1343,9 +1571,9 @@ def main(argv: list[str] | None = None) -> int:
         }
         if any(value is None for value in required.values()):
             raise HistoricalManagementTerminalizationRefused("dry_run_arguments_missing")
-        evidence = load_exchange_evidence_directory(
-            args.evidence_directory,
-            expected_sibling_sha256=args.expected_sibling_sha256,
+        evidence = load_fresh_normalized_exchange_evidence(
+            args.fresh_exchange_evidence_file,
+            expected_sha256=args.expected_fresh_exchange_evidence_sha256,
         )
         plan = build_terminalization_plan(
             args.database_path,
