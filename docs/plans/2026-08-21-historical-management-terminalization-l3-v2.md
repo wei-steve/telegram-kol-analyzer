@@ -496,3 +496,48 @@ The next safe authorization is deliberately two-stage:
 
 Any service state, target set, external state, row value, or artifact mismatch
 must perform zero writes and leave the service stopped for operator review.
+
+## 12. Stable production preparation checkpoint
+
+On 2026-08-21 the user authorized only the first stage described in section
+11.3: controlled service stop, fresh read-only exchange evidence, a new private
+online backup, and a stable production-targeted dry-run. Production apply,
+rollback, service start, deployment, push, replay, and exchange writes remained
+unauthorized and were not performed.
+
+The service was stopped from `active` to `inactive/dead` after the production
+SHA, `global/queue` modes, exact six-batch recovery set, binding-307 leg set,
+and mutation-intent gates passed. The service remains stopped pending review.
+
+Private evidence directory, mode `0700` with files mode `0600`:
+
+`/opt/telegram-kol-analyzer/data/evidence/historical-management-terminalization-v2-production-prep-20260821T194505Z/`
+
+Stable artifact values:
+
+| Artifact or gate | Exact value |
+|---|---|
+| Fresh exchange evidence SHA-256 | `ad61027cc248698e5c024bc278752dd9c82dcdf2371f40016020d61443874897` |
+| Fresh diagnostic SHA-256 | `39a504737f03f8e39f9e403e881942057cd4a20e52057b0df00405410448e465` |
+| Online backup SHA-256 | `7eac021570988ba96b7d823e3cc3b462e0ca38a26482988d8827c036f094016f` |
+| Production plan SHA-256 | `bfa20d27b1aa7f50a61771bd0be968b4e6c6f89753d327747284166eb1d659bb` |
+| Rollback SQL SHA-256 | `7777b8c81cee404d1f2ab14f0c8528f2e4da831f489db983a4df3ae2f6ce1959` |
+| Plan fingerprint | `a6cae23f7c349b49638dc33e969d17e52eb48e1de266064dcf0d4b67485567dc` |
+| Action fingerprint | `c2eb97e543e78b33e7dadc0b58ee8062b98ad60c2b664033f175de3a3fc5e9d9` |
+| Rollback fingerprint | `9be189f86d0617dbae573934ba0dadbc0d55e6690c648c6a0ebe02b053eed575` |
+| Database fingerprint | `2de264e1544ffb3e7df558cbde3cbc389f16db23beddc2ed26f627b03f994e42` |
+| Exchange fingerprint | `8f66af80e22bbea5bf26066f143e2a666bd9607e5bf09427fa149b9bd0ebb91d` |
+| Repair timestamp | `2026-08-21T19:48:56+00:00` |
+
+All seven exact positions again had one unique full-close history row and zero
+live/open/pending matches. TPSL conflicts, unowned pending rows, and exchange
+writes remained zero. Production and backup both matched all 47 plan before
+rows exactly, all affected and critical table counts matched, and both passed
+`PRAGMA quick_check`.
+
+The confirmation token is intentionally retained only in the private plan and
+operator handoff, not this repository document. The next operation requires a
+new explicit authorization naming the exact plan fingerprint, repair timestamp,
+confirmation token, backup and rollback artifacts, production apply, post-apply
+verification, read-only Deepcoin recheck, and service start. Any mismatch must
+produce zero writes and leave the service stopped.
