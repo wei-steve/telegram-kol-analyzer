@@ -1,5 +1,10 @@
 # Historical Management Terminalization L3 V2 Implementation Plan
 
+> **Status (2026-08-21):** The separately authorized V2 implementation and
+> production-copy rehearsal are complete. Sections 1, 6, and 10 retain the
+> authorization boundary that existed before that checkpoint; section 11 is
+> the authoritative execution record and current production boundary.
+
 > **For Codex:** Execute this plan only after a new explicit implementation and
 > production-copy rehearsal authorization. Do not use the superseded 45-action
 > plan or its tool unchanged. Do not use subagents for this operation.
@@ -374,3 +379,120 @@ The next safe authorization is:
 
 Do not authorize production apply until that checkpoint has completed and the
 exact artifacts have been reviewed.
+
+## 11. Authorized V2 implementation and rehearsal record
+
+The user subsequently authorized the section-10 checkpoint, but did not
+authorize a production database mutation, deployment, push, replay, or exchange
+write. The completed local tool commit is:
+
+`2f1affd01c0e50e728bb169e2cb3019a6790ed9a`
+
+The focused L3 verification passed with 50 tests:
+
+```text
+pytest -q tests/test_historical_management_terminalization.py \
+  tests/test_management_history_recovery.py
+```
+
+`git diff --check`, module compilation, and CLI help parsing also passed. No
+shared runtime worker or exchange-write implementation was changed.
+
+### 11.1 Fresh read-only evidence and private backup
+
+Evidence directory, mode `0700` with files mode `0600`:
+
+`/opt/telegram-kol-analyzer/data/evidence/historical-management-terminalization-v2-rehearsal-20260821T192857Z/`
+
+Key immutable artifacts:
+
+| Artifact | SHA-256 |
+|---|---|
+| `fresh-seven-exchange-evidence.json` | `aa4a218a9c90f58b8f34b5fb8138e323cfe32078601ca31a30920901b5307aa8` |
+| `fresh-seven-exchange-diagnostic.json` | `cd437133497354adc109edb838909942057c48fe24f3b59e235a0bd948c7b085` |
+| `research-online-backup.db` | `10b20bb1dc83d6d50afd72646a9c71698b61cdb1a4c165b0eafc2b6825ca18cb` |
+| `backup-metadata.json` | `e92789ff42fa72f96dc02e15f9f8ef094eb6a04922d2dc76fc9bb5a0c59afac3` |
+| `terminalization-plan.json` | `456ecb2a38e6914c17006e5b6c06f821bf2be18d90dad4272af90a359196e2d2` |
+| `rollback.sql` | `0b9e52110a592b9365d6b843339309c9c6953c12ff006f1a968af492cf80f86d` |
+| `rehearsal-summary.json` | `87ee3ee8df54d41d28ed84e4e951d73dc2909d06b959c0b8d3e3717841cf6e2f` |
+
+All seven exact positions had one unique full-close history row with
+`closePos == pos` and zero exact matches in live positions, regular open
+orders, and pending TPSL. The account TPSL audit observed eight pending TPSL,
+all owned, with zero conflicts, zero unowned rows, and zero exchange writes.
+
+The production source passed `PRAGMA quick_check`. The pristine backup and an
+independent rehearsal copy were created with `sqlite3.Connection.backup`; all
+critical table counts matched. The pre-existing production database mode was
+recorded as `0666` but was not changed. Both newly created database artifacts
+are mode `0600`.
+
+### 11.2 Exact dry-run and copy-only result
+
+The dry-run produced this exact 47-action matrix:
+
+| Table | Actions |
+|---|---:|
+| `strategy_management_components` | 16 |
+| `strategy_management_legs` | 6 |
+| `strategy_management_batches` | 6 |
+| `execution_order_legs` | 7 |
+| `execution_bindings` | 6 |
+| `strategy_lifecycles` | 6 |
+| **Total** | **47** |
+
+Exact rehearsal values:
+
+- repair timestamp: `2026-08-21T19:33:03+00:00`;
+- plan fingerprint:
+  `347f0f54a4b60e9ce36e1e4b67b99e2c6672a8bf75c5702b1ed1d9aa172ba54d`;
+- action fingerprint:
+  `3b8fcc18318eeed732bcf78236a745ef63d549b5ba44b0cbb37f75cb5ee71494`;
+- rollback fingerprint:
+  `29504e76fc7d154b05f04864ce4afd4bdbf287f3e82e7f9eaef3c9f9f3fa0501`;
+- database fingerprint:
+  `606b4dffe099b5305f55917c683b8dc3f38a5354c76571648725bdfa9c04c944`.
+
+The first copy apply attempt intentionally remained zero-write because the
+operator supplied the original `Z` timestamp spelling while the plan stored
+the canonical `+00:00` spelling. The exact gate returned
+`repair_timestamp_mismatch`, `writes=0`. Using the value serialized in the
+plan then proved:
+
+- apply: `47` changed rows, `quick_check=ok`;
+- identical reapply: `already_applied`, `0` changed rows;
+- applied-state check: exact `47/47` after rows;
+- rollback: `47` changed rows, `quick_check=ok`;
+- rollback-state check: exact `47/47` before rows;
+- pristine backup SHA unchanged and every affected/critical table count
+  unchanged.
+
+### 11.3 Current fail-closed production boundary
+
+The final production read-only check found the same exact six-batch recovery
+set and `47/47` semantic before-state matches. The active runtime had,
+however, refreshed `updated_at` on execution legs `496,497,511,530,540` after
+the online backup. Exact before-state matches were therefore only `42/47`.
+The rehearsed plan is now evidence only and **must not** be used for production
+apply. Its exact CAS gate correctly fails closed.
+
+At the final checkpoint the service was active, modes were `global/queue`, all
+three databases passed `PRAGMA quick_check`, and the operation counts remained:
+
+- production database writes: zero;
+- exchange writes: zero;
+- deployments: zero;
+- pushes: zero.
+
+The next safe authorization is deliberately two-stage:
+
+1. authorize a controlled production service stop plus a new read-only
+   seven-position snapshot, new private online backup, and new stable dry-run;
+   still do not apply;
+2. review the newly generated exact plan/rollback fingerprints, repair
+   timestamp, confirmation token, backup SHA, and paths, then separately
+   authorize the exact 47-row production apply, verification, read-only
+   Deepcoin recheck, and service start.
+
+Any service state, target set, external state, row value, or artifact mismatch
+must perform zero writes and leave the service stopped for operator review.
