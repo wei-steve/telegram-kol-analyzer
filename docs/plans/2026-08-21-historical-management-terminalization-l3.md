@@ -611,3 +611,47 @@ operation requires a new explicit authorization to collect one new complete
 read-only sibling snapshot with diagnostic output persisted even when a gate
 fails, then resume the copy-only rehearsal. Production apply remains
 unauthorized.
+
+## 12. Re-authorized sibling diagnostic result (2026-08-21)
+
+The single new read-only snapshot authorized after section 11 was collected.
+The diagnostic was persisted regardless of outcome at:
+
+`/opt/telegram-kol-analyzer/data/evidence/historical-management-terminalization-rehearsal-20260821T180621Z/batch-144-live-sibling.json`
+
+Its mode is `0600 root:root` and its SHA-256 is
+`80504336d0271f8dc6fed8a841b81f642c447351efef61cada477897623e801a`.
+It records only the read methods `list_positions` and
+`list_trigger_orders_pending`, with `exchange_write_count=0`.
+
+The gate failed with complete, affirmative evidence rather than an API error:
+
+- the local sibling leg 531 remains the unique verified local owner of
+  `posId=1001124899621086` and remains `active` under binding 307;
+- the exact sibling `posId` has zero matches in the current live-position
+  snapshot;
+- neither current live position is the sibling; both are unrelated BTC longs;
+- the account has eight pending TPSL rows, all eight owned, with zero ownership
+  conflicts and zero unowned rows;
+- the sibling has zero current owned pending-protection rows;
+- the raw pending-trigger response had twelve rows, of which the ownership
+  audit classified eight as TPSL.
+
+Therefore the batch-144 live-sibling exception in sections 4 and 5 is no
+longer proven current. The 45-action plan is invalid and must not be generated
+or rehearsed. No dry-run plan, plan fingerprint, or rollback SQL was produced;
+the production copy was not mutated.
+
+After the failed gate, the production database still returned
+`PRAGMA quick_check=ok`, its recovery-required set remained exactly
+`[123,127,129,133,144,146]`, the backup SHA-256 remained
+`c7322019ebf44afca43cea7f59d518ee37739ee9f133cca34363e662c972b246`,
+and `telegram-kol.service` remained active at deployed SHA
+`fdaff6b12d0aa4470e9bfcc63239c8541c01c5ff`.
+
+The next safe step is a newly authorized read-only redesign: obtain exact
+position-history and current-order proof for sibling
+`1001124899621086`, determine whether binding 307 and lifecycle 910 may now be
+terminalized, and produce a new exact action count and fingerprints. The
+existing 45-action authorization cannot be reused. Production apply remains
+unauthorized.
