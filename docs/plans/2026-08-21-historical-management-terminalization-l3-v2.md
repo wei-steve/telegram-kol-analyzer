@@ -608,3 +608,40 @@ projection and authorize service start plus semantic terminal verification,
 without another database repair. If exact historical rollback is instead
 required, the old rollback fingerprint cannot be reused; a new current-state
 rollback plan and copy rehearsal require separate authorization.
+
+## 14. Runtime-canonical terminal state accepted
+
+The user explicitly accepted the stable runtime projection for all six closed
+bindings: `status=closed`, `pos_id=NULL`, and `last_exchange_status` equal to
+either `historical_cleanup_terminal` or `entry_legs_terminal`, with
+reconciliation allowed to refresh `recovered_at` and `updated_at`. This
+authorization allowed service start only, with no direct database mutation or
+rollback.
+
+The pre-start semantic gate passed with `quick_check=ok`, no
+`recovery_required` batches, all six target batches resolved, all seven target
+execution legs closed, all six bindings closed with NULL position summaries,
+and all six lifecycles exited. The service then started successfully.
+
+A bounded 65-second reconciliation observation sampled the core state 14
+times. No core field regressed. Final acceptance state:
+
+- service: `active/running`;
+- modes: `message_lock_mode=global`, `message_pipeline_mode=queue`;
+- database: `PRAGMA quick_check=ok`;
+- batches `123,127,129,133,144,146`: resolved;
+- execution legs `496,497,503,511,530,531,540`: closed;
+- bindings `282,283,287,292,307,313`: closed with `pos_id=NULL`;
+- lifecycles `816,819,834,859,910,921`: exited;
+- bindings `282,283,292,307,313`: `entry_legs_terminal`;
+- binding `287`: `historical_cleanup_terminal`;
+- direct database writes in this acceptance step: zero;
+- rollback invocations in this acceptance step: zero;
+- exchange API writes, deployments, pushes, and message replays: zero.
+
+Private acceptance evidence:
+
+`/opt/telegram-kol-analyzer/data/evidence/historical-management-terminalization-v2-production-prep-20260821T194505Z/semantic-start-acceptance.json`
+
+SHA-256:
+`022b965155dc351f30a6483cb9786ad33240d0af40181813b5c4507590e41e00`
