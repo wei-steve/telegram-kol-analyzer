@@ -23,6 +23,17 @@ def _processing_result():
     )
 
 
+def _authoritative_failure_result(reason):
+    return SimpleNamespace(
+        recognition=SimpleNamespace(status="识别失败", reason=reason),
+        assessment=SimpleNamespace(
+            agreement_status="authoritative_failed",
+            mimo=SimpleNamespace(error_message=reason),
+        ),
+        automation={"status": "skipped", "reason": "mimo_authoritative_failed"},
+    )
+
+
 def test_process_message_job_runs_the_post_persist_chain_from_raw_id(tmp_path):
     session_factory = create_session_factory(tmp_path / "worker.db")
     with session_factory() as session:
@@ -286,11 +297,7 @@ def test_consumer_never_claims_dormant_shadow_rows(tmp_path):
 def test_returned_authoritative_failure_uses_durable_retry(tmp_path):
     session_factory = create_session_factory(tmp_path / "authoritative-failed.db")
     _add_job(session_factory, chat_id=1, message_id=1)
-    failed_result = SimpleNamespace(
-        recognition=SimpleNamespace(status="识别失败"),
-        assessment=SimpleNamespace(agreement_status="authoritative_failed"),
-        automation={"status": "skipped", "reason": "authoritative_failed"},
-    )
+    failed_result = _authoritative_failure_result("provider timeout")
 
     result = asyncio.run(
         run_message_processing_worker_tick(
@@ -308,3 +315,94 @@ def test_returned_authoritative_failure_uses_durable_retry(tmp_path):
     assert job.status == "pending"
     assert job.attempt_count == 1
     assert job.last_reason == "processing_error:AuthoritativeProcessingFailed"
+
+
+def test_empty_input_authoritative_failure_settles_once_without_retry_or_notifier(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "empty-input-terminal.db")
+    _add_job(session_factory, chat_id=1, message_id=1)
+    failed_result = _authoritative_failure_result(
+        "message has no readable text or image"
+    )
+    notifications = []
+    downstream = []
+
+    async def strategy_processor(**_kwargs):
+        downstream.append("strategy")
+
+    result = asyncio.run(
+        run_message_processing_worker_tick(
+            session_factory,
+            now=NOW,
+            process_kwargs={
+                "authoritative_processor": lambda _raw_id: failed_result,
+                "strategy_alert_config": SimpleNamespace(),
+                "strategy_alert_processor": strategy_processor,
+                "context_resolution_worker": lambda: downstream.append("context"),
+            },
+            chat_title_provider=lambda _chat_id: "group",
+            terminal_failure_notifier=lambda claim, reason: notifications.append(
+                (claim.raw_message_id, reason)
+            ),
+        )
+    )
+
+    assert result.succeeded == 1
+    assert result.retried == 0
+    assert result.failed == 0
+    assert notifications == []
+    assert downstream == []
+    with session_factory() as session:
+        job = session.query(MessageProcessingJob).one()
+    assert job.status == "succeeded"
+    assert job.attempt_count == 0
+    assert job.next_attempt_at is None
+    assert job.completed_at == NOW.replace(tzinfo=None)
+    assert job.last_reason == "terminal_authoritative_failure:empty_input"
+
+
+def test_empty_input_terminal_outcome_releases_same_chat_lane(tmp_path):
+    session_factory = create_session_factory(tmp_path / "empty-input-lane.db")
+    first_raw_id = _add_job(session_factory, chat_id=1, message_id=1)
+    second_raw_id = _add_job(session_factory, chat_id=1, message_id=2)
+    processed = []
+
+    def processor(raw_message_id):
+        processed.append(raw_message_id)
+        if raw_message_id == first_raw_id:
+            return _authoritative_failure_result(
+                "message has no readable text or image"
+            )
+        return _processing_result()
+
+    first = asyncio.run(
+        run_message_processing_worker_tick(
+            session_factory,
+            now=NOW,
+            process_kwargs={"authoritative_processor": processor},
+        )
+    )
+    second = asyncio.run(
+        run_message_processing_worker_tick(
+            session_factory,
+            now=NOW + timedelta(seconds=1),
+            process_kwargs={"authoritative_processor": processor},
+        )
+    )
+
+    assert first.succeeded == 1
+    assert first.retried == 0
+    assert second.succeeded == 1
+    assert processed == [first_raw_id, second_raw_id]
+    with session_factory() as session:
+        jobs = (
+            session.query(MessageProcessingJob)
+            .order_by(MessageProcessingJob.id.asc())
+            .all()
+        )
+    assert [job.status for job in jobs] == ["succeeded", "succeeded"]
+    assert [job.last_reason for job in jobs] == [
+        "terminal_authoritative_failure:empty_input",
+        "worker_completed",
+    ]

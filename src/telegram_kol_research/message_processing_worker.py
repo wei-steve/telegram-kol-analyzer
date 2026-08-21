@@ -24,6 +24,12 @@ DEFAULT_CLAIM_STALE_AFTER = timedelta(minutes=5)
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_RETRY_BASE_SECONDS = 15.0
 DEFAULT_RETRY_MAX_SECONDS = 300.0
+_EMPTY_INPUT_AUTHORITATIVE_FAILURE_REASON = (
+    "message has no readable text or image"
+)
+_TERMINAL_EMPTY_INPUT_QUEUE_REASON = (
+    "terminal_authoritative_failure:empty_input"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +53,26 @@ class MessageProcessingWorkerResult:
 
 class AuthoritativeProcessingFailed(RuntimeError):
     """A returned authoritative failure that the durable queue must retry."""
+
+
+class TerminalAuthoritativeProcessingFailed(RuntimeError):
+    """A returned authoritative failure that is fully handled without retry."""
+
+    queue_reason = _TERMINAL_EMPTY_INPUT_QUEUE_REASON
+
+
+def _is_terminal_empty_input_authoritative_failure(
+    processing_result: Any,
+) -> bool:
+    assessment = getattr(processing_result, "assessment", None)
+    if getattr(assessment, "agreement_status", None) != "authoritative_failed":
+        return False
+    mimo = getattr(assessment, "mimo", None)
+    error_message = getattr(mimo, "error_message", None)
+    return (
+        isinstance(error_message, str)
+        and error_message.strip() == _EMPTY_INPUT_AUTHORITATIVE_FAILURE_REASON
+    )
 
 
 async def process_message_job(
@@ -163,6 +189,12 @@ async def process_message_job(
                 == "authoritative_failed"
                 and not retry_authoritative_failure
             ):
+                if _is_terminal_empty_input_authoritative_failure(
+                    processing_result
+                ):
+                    raise TerminalAuthoritativeProcessingFailed(
+                        _TERMINAL_EMPTY_INPUT_QUEUE_REASON
+                    )
                 raise AuthoritativeProcessingFailed(
                     "authoritative processor returned authoritative_failed"
                 )
@@ -495,6 +527,18 @@ async def run_message_processing_worker_tick(
         except asyncio.CancelledError:
             # Leave the durable claim for lease-based restart recovery.
             raise
+        except TerminalAuthoritativeProcessingFailed as exc:
+            settled = await asyncio.to_thread(
+                _settle_message_processing_job,
+                session_factory,
+                claim=claim,
+                status="succeeded",
+                reason=exc.queue_reason,
+                completed_at=tick_time,
+            )
+            if settled:
+                counts["succeeded"] += 1
+            return
         except BaseException as exc:
             status, reason = await asyncio.to_thread(
                 _defer_or_fail_message_processing_job,
