@@ -2606,7 +2606,7 @@ def run_production_safety_monitor(
     )
 
     successful_audit_date = state.last_full_audit_date
-    if audit is not None and _audit_result_is_healthy(audit):
+    if audit is not None and _audit_result_is_complete(audit):
         successful_audit_date = checked_at.astimezone(_SHANGHAI).date().isoformat()
     base_state = MonitorState(
         last_window_at=(checked_at if window_sources_complete else since).isoformat(),
@@ -3221,6 +3221,13 @@ def _audit_result_is_healthy(audit: Mapping[str, Any]) -> bool:
     details: dict[str, Any] = {}
     _evaluate_audit(audit, reasons, details)
     return not reasons
+
+
+def _audit_result_is_complete(audit: Mapping[str, Any]) -> bool:
+    reasons: set[str] = set()
+    details: dict[str, Any] = {}
+    _evaluate_audit(audit, reasons, details)
+    return not {"audit_incomplete", "malformed_snapshot"}.intersection(reasons)
 
 
 def _run_maybe_awaitable(value: object) -> object:

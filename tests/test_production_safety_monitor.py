@@ -4941,6 +4941,105 @@ def test_successful_daily_audit_records_shanghai_date(tmp_path):
     assert load_monitor_state(state_path).last_full_audit_date == "2026-07-16"
 
 
+def test_complete_abnormal_daily_audit_records_date_and_skips_same_day_rerun(
+    tmp_path,
+):
+    state_path = tmp_path / "complete-abnormal-audit-state.json"
+    config = SimpleNamespace(bot_token="token", chat_id="chat")
+    deliveries = []
+    abnormal_audit = _healthy_audit(
+        counts={
+            "blocked": 0,
+            "partial_failed": 0,
+            "submit_unknown": 0,
+            "recovery_required": 1,
+        }
+    )
+    first_adapters = _RecordingAdapters(audit=abnormal_audit)
+    second_adapters = _RecordingAdapters(audit=abnormal_audit)
+
+    first = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=first_adapters,
+        now=datetime(2026, 8, 21, 1, 0, tzinfo=UTC),
+        notify=True,
+        load_bot_config=lambda: config,
+        send_bot_message=lambda **payload: deliveries.append(payload),
+    )
+    first_state = load_monitor_state(state_path)
+    second = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=second_adapters,
+        now=datetime(2026, 8, 21, 1, 30, tzinfo=UTC),
+        notify=True,
+        load_bot_config=lambda: config,
+        send_bot_message=lambda **payload: deliveries.append(payload),
+    )
+    second_state = load_monitor_state(state_path)
+
+    assert first.result.reason_codes == ("audit_abnormal",)
+    assert "audit_incomplete" not in first.result.reason_codes
+    assert first_state.last_full_audit_date == "2026-08-21"
+    assert first_adapters.calls[-1] == "audit"
+    assert "audit" not in second_adapters.calls
+    assert second.notification_status == "not_needed"
+    assert second_state.active_reason_codes == ("audit_abnormal",)
+    assert len(deliveries) == 1
+
+
+@pytest.mark.parametrize(
+    "audit_overrides",
+    [
+        {"snapshot_status": "snapshot_unstable"},
+        {"snapshot_validation": "not_run"},
+        {"output_complete": False},
+        {
+            "legacy_pending_management": {
+                "complete": False,
+                "truncated": False,
+                "scan_truncated": False,
+            }
+        },
+    ],
+    ids=(
+        "unstable_snapshot",
+        "invalid_snapshot",
+        "incomplete_output",
+        "incomplete_legacy_scan",
+    ),
+)
+def test_incomplete_daily_audit_does_not_record_date_and_retries_next_cycle(
+    tmp_path,
+    audit_overrides,
+):
+    state_path = tmp_path / "incomplete-audit-state.json"
+    first_adapters = _RecordingAdapters(audit=_healthy_audit(**audit_overrides))
+    second_adapters = _RecordingAdapters(audit=_healthy_audit(**audit_overrides))
+
+    first = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=first_adapters,
+        now=datetime(2026, 8, 21, 1, 0, tzinfo=UTC),
+        notify=False,
+    )
+    second = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=second_adapters,
+        now=datetime(2026, 8, 21, 1, 30, tzinfo=UTC),
+        notify=False,
+    )
+
+    assert "audit_incomplete" in first.result.reason_codes
+    assert load_monitor_state(state_path).last_full_audit_date is None
+    assert first_adapters.calls[-1] == "audit"
+    assert second_adapters.calls[-1] == "audit"
+    assert second.audit_ran is True
+
+
 def test_nonzero_audit_with_healthy_json_is_unhealthy_and_not_recorded(
     tmp_path, monkeypatch
 ):
