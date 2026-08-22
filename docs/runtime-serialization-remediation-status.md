@@ -16,11 +16,15 @@ local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v
 design_version: 1
 current_phase: 6
 phase_name: process-separation
-phase_status: completed          # planned | claimed | in_progress | completed
+phase_status: planned          # planned | claimed | in_progress | completed
 claimed_by: null
 current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-6-process-separation.md
 last_completed_phase: 5   # the sequence ran 0, 1, 1b, 1c, 1d, 1e, 2, 2f, 3, 4, 5
 last_completed_commit: 7a54411ebb0907cd04c33fe3b474f4b5b54ecfb8
+phase_6_queue_soak_original_requirement_hours: 168
+phase_6_queue_soak_user_accepted_minimum_hours: 37
+phase_6_queue_soak_duration_override: "USER-APPROVED 2026-08-22: the owner accepts 37 hours of stable global/queue production operation as sufficient and waives only the phase file's one-week waiting duration so Phase 6 may be claimed after normal exclusive preflight. At the decision timestamp 2026-08-22T06:19:13Z, 37h08m44s had elapsed since the 2026-08-20T17:10:28.789382Z queue cutover."
+phase_6_queue_soak_override_scope: "duration only. Do not waive Phase 6 Task 1 SQLite concurrency, process authority, or Telegram session decision gates; the safe deployment window, L2 verification, rollback, recognition/strategy/position/execution semantic invariants, message_lock_mode=global, and message_pipeline_mode=queue all remain mandatory."
 phase_5_claim_commit: ba975ff1e82ab4d1da2b45ecc09ccf48cb24f261
 phase_5_code_commit: eaaa255f95f6c0889c86db5b674e458f3e2e5e56
 phase_5_deployed_commit: 7a54411ebb0907cd04c33fe3b474f4b5b54ecfb8
@@ -292,7 +296,7 @@ the 2026-08-18 incident.
 | 3 | `phase-3-compensation-window-repair.md` | **completed** 2026-08-20, deployed `3eabde7` then follow-up fix `e30e209` — fast loop decoupled from Telegram fetch; a real gap (raw_message 11683) was observed and recovered end to end |
 | 4 | `phase-4-durable-job-shadow-enqueue.md` | **completed** 2026-08-20, deployed `3bd5355` — 61m45s shadow, 36 messages/10 chats, parity missing/orphan/stuck all zero; 8 real late-inline failures recorded terminally |
 | 5 | `phase-5-queue-consumer-takeover.md` | **completed** 2026-08-20, deployed `7a54411` — global/queue; repaired boundary rollback, claimed-job restart resume, 62m26s real traffic, parity and direct exchange duplicate audit passed |
-| 6 | `phase-6-process-separation.md` | planned |
+| 6 | `phase-6-process-separation.md` | **planned** — owner waived only the one-week duration after 37h08m44s of global/queue operation; all Task 1 and L2 gates remain mandatory |
 
 All phase files live in
 `docs/plans/2026-08-18-runtime-serialization-remediation/`, alongside
