@@ -490,6 +490,9 @@ class ProductionSafetyAdapters:
     message_operation_coverage_url: str = (
         "http://127.0.0.1:8000/api/runtime-incidents/message-operation-coverage"
     )
+    live_position_sizes_url: str = (
+        "http://127.0.0.1:8000/api/runtime-incidents/live-position-sizes"
+    )
     monitor_capture_token: str | None = None
     service_name: str = "telegram-kol.service"
     audit_command: tuple[str, ...] = (
@@ -584,15 +587,15 @@ class ProductionSafetyAdapters:
         )
 
     def read_composite_invariants(self, *, now: datetime) -> tuple[str, ...]:
-        snapshot_path = self.live_position_snapshot_path or (
-            self.database_path.parent
-            / "web_cache"
-            / "deepcoin_live_positions.json"
+        live_position_sizes = read_monitor_live_position_sizes(
+            self.live_position_sizes_url,
+            token=self.monitor_capture_token,
+            now=now,
         )
         return read_composite_management_invariants(
             self.database_path,
             now=now,
-            live_position_snapshot_path=snapshot_path,
+            live_position_sizes=live_position_sizes,
         )
 
     def read_entry_preamble_invariants(self, *, now: datetime) -> tuple[str, ...]:
@@ -2147,11 +2150,16 @@ def read_composite_management_invariants(
     *,
     now: datetime,
     stale_after: timedelta = timedelta(minutes=15),
+    live_position_sizes: Mapping[str, Decimal] | None = None,
     live_position_snapshot_path: str | Path | None = None,
     connect=sqlite3.connect,
 ) -> tuple[str, ...]:
     """Read only bounded composite-v2 safety invariants from persisted evidence."""
 
+    if live_position_sizes is not None and live_position_snapshot_path is not None:
+        raise ValueError(
+            "live_position_sizes and live_position_snapshot_path are mutually exclusive"
+        )
     checked_at = _require_aware_datetime(now).astimezone(UTC).replace(tzinfo=None)
     stale_before = checked_at - stale_after
     required_tables = {
@@ -2184,7 +2192,10 @@ def read_composite_management_invariants(
         batch_ids = [int(row[0]) for row in batches]
         if not batch_ids:
             return ()
-        live_position_sizes = (
+        observed_live_position_sizes = (
+            live_position_sizes
+            if live_position_sizes is not None
+            else
             _read_fresh_live_position_sizes(
                 live_position_snapshot_path, now=now
             )
@@ -2323,8 +2334,9 @@ def read_composite_management_invariants(
                 except (KeyError, TypeError, ValueError, InvalidOperation, json.JSONDecodeError):
                     continue
                 live_size = (
-                    live_position_sizes.get(str(leg[3]), Decimal("0"))
-                    if live_position_snapshot_path is not None
+                    observed_live_position_sizes.get(str(leg[3]), Decimal("0"))
+                    if live_position_sizes is not None
+                    or live_position_snapshot_path is not None
                     else remaining
                 )
                 if retained > live_size:
@@ -2411,6 +2423,114 @@ def read_loopback_settings(
         ),
         "entry_revision_v2_mode": payload.get("entry_revision_v2_mode"),
     }
+
+
+def read_monitor_live_position_sizes(
+    url: str,
+    *,
+    token: str | None,
+    now: datetime,
+    timeout_seconds: float = 30.0,
+    max_age: timedelta = timedelta(minutes=5),
+    max_future_skew: timedelta = timedelta(seconds=30),
+) -> dict[str, Decimal]:
+    """Read and validate the authenticated live-position size projection."""
+
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "::1"}
+        or parsed.port != 8000
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        != "/api/runtime-incidents/live-position-sizes"
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "live-position URL must use the fixed loopback endpoint"
+        )
+    if not isinstance(token, str) or not re.fullmatch(
+        r"[A-Za-z0-9_-]{32,128}", token
+    ):
+        raise ValueError("live-position token unavailable")
+    checked_at = _require_aware_datetime(now).astimezone(UTC)
+    body = bytearray()
+    with httpx.stream(
+        "GET",
+        url,
+        headers={"x-monitor-capture-token": token},
+        timeout=timeout_seconds,
+        trust_env=False,
+    ) as response:
+        response.raise_for_status()
+        for chunk in response.iter_bytes():
+            body.extend(chunk)
+            if len(body) > 32_768:
+                raise ValueError("live-position response too large")
+    try:
+        payload = json.loads(
+            body,
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_json_constant,
+        )
+        if not isinstance(payload, Mapping) or set(payload) != {
+            "schema_version",
+            "complete",
+            "captured_at",
+            "positions",
+        }:
+            raise ValueError("invalid fields")
+        if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+            raise ValueError("invalid schema version")
+        if payload["complete"] is not True:
+            raise ValueError("incomplete projection")
+        captured_at_raw = payload["captured_at"]
+        if not isinstance(captured_at_raw, str):
+            raise ValueError("invalid capture timestamp")
+        captured_at = datetime.fromisoformat(captured_at_raw)
+        if captured_at.tzinfo is None:
+            raise ValueError("capture timestamp must be aware")
+        captured_at = captured_at.astimezone(UTC)
+        if (
+            captured_at < checked_at - max_age
+            or captured_at > checked_at + max_future_skew
+        ):
+            raise ValueError("capture timestamp outside allowed window")
+        positions = payload["positions"]
+        if not isinstance(positions, list) or len(positions) > 100:
+            raise ValueError("invalid position list")
+        result: dict[str, Decimal] = {}
+        for row in positions:
+            if not isinstance(row, Mapping) or set(row) != {
+                "pos_id",
+                "size_text",
+            }:
+                raise ValueError("invalid position row")
+            position_id = row["pos_id"]
+            size_text = row["size_text"]
+            if (
+                not isinstance(position_id, str)
+                or not position_id
+                or position_id != position_id.strip()
+                or position_id in result
+            ):
+                raise ValueError("invalid position identity")
+            if (
+                not isinstance(size_text, str)
+                or not size_text
+                or size_text != size_text.strip()
+                or len(size_text) > 128
+            ):
+                raise ValueError("invalid position size")
+            size = Decimal(size_text)
+            if not size.is_finite() or size < 0 or abs(size.adjusted()) > 64:
+                raise ValueError("invalid position size")
+            result[position_id] = size
+        return result
+    except (KeyError, TypeError, ValueError, InvalidOperation, json.JSONDecodeError) as exc:
+        raise ValueError("invalid live-position projection") from exc
 
 
 def read_message_operation_coverage(

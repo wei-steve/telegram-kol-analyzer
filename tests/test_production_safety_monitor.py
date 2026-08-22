@@ -1714,6 +1714,148 @@ def test_entry_preamble_monitor_does_not_truncate_recent_boundary(tmp_path):
     ) == ()
 
 
+def _seed_live_size_composite_monitor(database):
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE strategy_management_batches (
+          id INTEGER PRIMARY KEY, status TEXT, management_contract_json TEXT
+        );
+        CREATE TABLE strategy_management_legs (
+          id INTEGER PRIMARY KEY, management_batch_id INTEGER,
+          execution_order_leg_id INTEGER, pos_id TEXT
+        );
+        CREATE TABLE strategy_management_components (
+          id INTEGER PRIMARY KEY, management_batch_id INTEGER,
+          strategy_management_leg_id INTEGER, component_kind TEXT,
+          status TEXT, desired_json TEXT, evidence_json TEXT,
+          last_progress_at TEXT, updated_at TEXT
+        );
+        CREATE TABLE position_mutation_intents (
+          id INTEGER PRIMARY KEY, idempotency_key TEXT, operation TEXT,
+          status TEXT
+        );
+        CREATE TABLE position_protection_ledger (
+          id INTEGER PRIMARY KEY, execution_order_leg_id INTEGER, pos_id TEXT,
+          purpose TEXT, size_text TEXT, status TEXT
+        );
+        INSERT INTO strategy_management_batches VALUES (
+          1, 'succeeded', '{"required_components":["converge_partial_close"]}'
+        );
+        INSERT INTO strategy_management_legs VALUES (1, 1, 11, 'position-1');
+        INSERT INTO strategy_management_components VALUES (
+          1, 1, 1, 'converge_partial_close', 'confirmed',
+          '{"target_remaining_size":"1"}', '[{"order_id":"close-1"}]',
+          '2026-08-22 01:00:00', '2026-08-22 01:00:00'
+        );
+        INSERT INTO position_protection_ledger VALUES (
+          1, 11, 'position-1', 'take_profit', '0.5', 'verified'
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+
+def test_composite_monitor_uses_supplied_live_position_sizes(tmp_path):
+    database = tmp_path / "composite-live-sizes.db"
+    _seed_live_size_composite_monitor(database)
+
+    codes = read_composite_management_invariants(
+        database,
+        now=datetime(2026, 8, 22, 1, 0, tzinfo=UTC),
+        live_position_sizes={"position-1": monitor_module.Decimal("0.25")},
+    )
+
+    assert codes == ("live_position_retained_tp_oversized",)
+
+
+def test_composite_monitor_rejects_live_size_mapping_and_legacy_path(tmp_path):
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        read_composite_management_invariants(
+            tmp_path / "unused.db",
+            now=datetime(2026, 8, 22, 1, 0, tzinfo=UTC),
+            live_position_sizes={},
+            live_position_snapshot_path=tmp_path / "legacy.json",
+        )
+
+
+def test_production_composite_adapter_uses_endpoint_without_cache(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "composite-adapter.db"
+    _seed_live_size_composite_monitor(database)
+    calls = []
+    monkeypatch.setattr(
+        monitor_module,
+        "read_monitor_live_position_sizes",
+        lambda url, **kwargs: (
+            calls.append((url, kwargs))
+            or {"position-1": monitor_module.Decimal("0.25")}
+        ),
+        raising=False,
+    )
+    missing_cache = tmp_path / "must-not-be-read.json"
+    adapters = ProductionSafetyAdapters(
+        database_path=database,
+        live_position_snapshot_path=missing_cache,
+        monitor_capture_token="m" * 43,
+    )
+
+    codes = adapters.read_composite_invariants(
+        now=datetime(2026, 8, 22, 1, 0, tzinfo=UTC)
+    )
+
+    assert codes == ("live_position_retained_tp_oversized",)
+    assert missing_cache.exists() is False
+    assert calls == [
+        (
+            "http://127.0.0.1:8000/api/runtime-incidents/live-position-sizes",
+            {
+                "token": "m" * 43,
+                "now": datetime(2026, 8, 22, 1, 0, tzinfo=UTC),
+            },
+        )
+    ]
+
+
+def test_production_composite_adapter_failure_never_falls_back_to_cache(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "composite-adapter-failure.db"
+    _seed_live_size_composite_monitor(database)
+    stale_cache = tmp_path / "stale-cache.json"
+    stale_cache.write_text("provider-secret-cache", encoding="utf-8")
+    monkeypatch.setattr(
+        monitor_module,
+        "read_monitor_live_position_sizes",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("provider-secret-endpoint")
+        ),
+        raising=False,
+    )
+    production_adapter = ProductionSafetyAdapters(
+        database_path=database,
+        live_position_snapshot_path=stale_cache,
+        monitor_capture_token="m" * 43,
+    )
+
+    class CompositeFailureAdapters(_RecordingAdapters):
+        def read_composite_invariants(self, *, now):
+            return production_adapter.read_composite_invariants(now=now)
+
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=tmp_path / "state.json",
+        adapters=CompositeFailureAdapters(),
+        now=datetime(2026, 8, 22, 1, 0, tzinfo=UTC),
+        notify=False,
+    )
+
+    assert outcome.result.reason_codes == ("adapter_failure",)
+    assert outcome.result.details["adapter_failures"] == ("composite",)
+
+
 def test_composite_monitor_reader_detects_persisted_faults_without_writes(tmp_path):
     database = tmp_path / "composite-monitor.db"
     connection = sqlite3.connect(database)
@@ -4955,6 +5097,260 @@ def test_message_operation_coverage_reader_rejects_oversized_response(monkeypatc
             "http://127.0.0.1:8000/api/runtime-incidents/message-operation-coverage",
             token="c" * 43,
         )
+
+
+def _monitor_live_position_payload(**overrides):
+    payload = {
+        "schema_version": 1,
+        "complete": True,
+        "captured_at": "2026-08-22T00:59:30+00:00",
+        "positions": [
+            {"pos_id": "position-1", "size_text": "0.2500"},
+            {"pos_id": "position-2", "size_text": "1"},
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_monitor_live_position_sizes_reader_is_strict_authenticated_and_no_proxy(
+    monkeypatch,
+):
+    calls = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield json.dumps(_monitor_live_position_payload()).encode("utf-8")
+
+    def stream(*args, **kwargs):
+        calls.append((args, kwargs))
+        return Response()
+
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setattr(monitor_module.httpx, "stream", stream)
+
+    sizes = monitor_module.read_monitor_live_position_sizes(
+        "http://127.0.0.1:8000/api/runtime-incidents/live-position-sizes",
+        token="m" * 43,
+        now=datetime(2026, 8, 22, 1, 0, tzinfo=UTC),
+    )
+
+    assert sizes == {
+        "position-1": monitor_module.Decimal("0.2500"),
+        "position-2": monitor_module.Decimal("1"),
+    }
+    assert calls == [
+        (
+            (
+                "GET",
+                "http://127.0.0.1:8000/api/runtime-incidents/live-position-sizes",
+            ),
+            {
+                "headers": {"x-monitor-capture-token": "m" * 43},
+                "timeout": 30.0,
+                "trust_env": False,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://127.0.0.1:8000/api/runtime-incidents/live-position-sizes",
+        "http://example.com/api/runtime-incidents/live-position-sizes",
+        "http://127.0.0.1:9000/api/runtime-incidents/live-position-sizes",
+        "http://127.0.0.1:8000/api/runtime-incidents/other",
+        "http://127.0.0.1:8000/api/runtime-incidents/live-position-sizes?q=1",
+    ],
+)
+def test_monitor_live_position_sizes_reader_rejects_nonfixed_url_before_http(
+    monkeypatch, url
+):
+    monkeypatch.setattr(
+        monitor_module.httpx,
+        "stream",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("HTTP called")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="fixed loopback"):
+        monitor_module.read_monitor_live_position_sizes(
+            url,
+            token="m" * 43,
+            now=datetime(2026, 8, 22, 1, 0, tzinfo=UTC),
+        )
+
+
+@pytest.mark.parametrize("token", [None, "short", "!" * 43])
+def test_monitor_live_position_sizes_reader_rejects_invalid_token_before_http(
+    monkeypatch, token
+):
+    monkeypatch.setattr(
+        monitor_module.httpx,
+        "stream",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("HTTP called")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="token unavailable"):
+        monitor_module.read_monitor_live_position_sizes(
+            "http://127.0.0.1:8000/api/runtime-incidents/live-position-sizes",
+            token=token,
+            now=datetime(2026, 8, 22, 1, 0, tzinfo=UTC),
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {**_monitor_live_position_payload(), "extra": True},
+        _monitor_live_position_payload(schema_version=2),
+        _monitor_live_position_payload(complete=False, positions=[]),
+        _monitor_live_position_payload(captured_at="2026-08-22T00:59:30"),
+        _monitor_live_position_payload(captured_at="2026-08-22T00:54:59+00:00"),
+        _monitor_live_position_payload(captured_at="2026-08-22T01:01:00+00:00"),
+        _monitor_live_position_payload(
+            positions=[
+                {"pos_id": "position-1", "size_text": "1"},
+                {"pos_id": "position-1", "size_text": "2"},
+            ]
+        ),
+        _monitor_live_position_payload(
+            positions=[
+                {"pos_id": f"position-{index}", "size_text": "1"}
+                for index in range(101)
+            ]
+        ),
+        _monitor_live_position_payload(
+            positions=[{"pos_id": "position-1", "size_text": "-1"}]
+        ),
+        _monitor_live_position_payload(
+            positions=[{"pos_id": "position-1", "size_text": "NaN"}]
+        ),
+        _monitor_live_position_payload(
+            positions=[{"pos_id": "position-1", "size_text": "Infinity"}]
+        ),
+        _monitor_live_position_payload(
+            positions=[{"pos_id": "position-1", "size_text": 1}]
+        ),
+        _monitor_live_position_payload(
+            positions=[{"pos_id": "", "size_text": "1"}]
+        ),
+        _monitor_live_position_payload(
+            positions=[
+                {"pos_id": "position-1", "size_text": "1", "extra": True}
+            ]
+        ),
+    ],
+)
+def test_monitor_live_position_sizes_reader_rejects_invalid_projection(
+    monkeypatch, payload
+):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield json.dumps(payload).encode("utf-8")
+
+    monkeypatch.setattr(
+        monitor_module.httpx,
+        "stream",
+        lambda *args, **kwargs: Response(),
+    )
+
+    with pytest.raises(ValueError, match="live-position"):
+        monitor_module.read_monitor_live_position_sizes(
+            "http://127.0.0.1:8000/api/runtime-incidents/live-position-sizes",
+            token="m" * 43,
+            now=datetime(2026, 8, 22, 1, 0, tzinfo=UTC),
+        )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"schema_version":1,"schema_version":1}',
+        b"x" * 32_769,
+    ],
+)
+def test_monitor_live_position_sizes_reader_rejects_duplicate_or_oversized_body(
+    monkeypatch, body
+):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield body
+
+    monkeypatch.setattr(
+        monitor_module.httpx,
+        "stream",
+        lambda *args, **kwargs: Response(),
+    )
+
+    with pytest.raises((ValueError, json.JSONDecodeError)):
+        monitor_module.read_monitor_live_position_sizes(
+            "http://127.0.0.1:8000/api/runtime-incidents/live-position-sizes",
+            token="m" * 43,
+            now=datetime(2026, 8, 22, 1, 0, tzinfo=UTC),
+        )
+
+
+def test_monitor_live_position_sizes_reader_rejects_non_200_without_raw_body(
+    monkeypatch,
+):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            raise RuntimeError("monitor endpoint unavailable")
+
+        def iter_bytes(self):
+            yield b"provider-secret-body"
+
+    monkeypatch.setattr(
+        monitor_module.httpx,
+        "stream",
+        lambda *args, **kwargs: Response(),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        monitor_module.read_monitor_live_position_sizes(
+            "http://127.0.0.1:8000/api/runtime-incidents/live-position-sizes",
+            token="m" * 43,
+            now=datetime(2026, 8, 22, 1, 0, tzinfo=UTC),
+        )
+    assert "provider-secret-body" not in str(exc_info.value)
 
 
 def test_successful_daily_audit_records_shanghai_date(tmp_path):
