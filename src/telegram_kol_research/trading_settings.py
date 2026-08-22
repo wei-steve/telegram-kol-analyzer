@@ -89,6 +89,7 @@ class TradingSettings:
     message_lock_mode: Literal["global", "per_chat"] = "global"
     message_pipeline_mode: Literal["inline", "shadow", "queue"] = "inline"
     worker_command_mode: Literal["inline", "shadow", "queue"] = "inline"
+    semantic_review_enabled: bool = False
     authoritative_gap_recovery_max_age_minutes: float = 15.0
     mimo_v2_activation_after_raw_message_id: int = 0
     default_max_loss_usdt: float = 20.0
@@ -456,6 +457,11 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         message_lock_mode=message_lock_mode,
         message_pipeline_mode=message_pipeline_mode,
         worker_command_mode=worker_command_mode,
+        semantic_review_enabled=_boolean_setting(
+            raw,
+            "semantic_review_enabled",
+            defaults.semantic_review_enabled,
+        ),
         authoritative_gap_recovery_max_age_minutes=(
             authoritative_gap_recovery_max_age_minutes
         ),

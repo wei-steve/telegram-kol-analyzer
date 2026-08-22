@@ -58,6 +58,7 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     assert settings.mimo_v2_activation_after_raw_message_id == 0
     assert settings.message_lock_mode == "global"
     assert settings.worker_command_mode == "inline"
+    assert settings.semantic_review_enabled is False
     assert not hasattr(settings, "entry_preamble_live_chat_ids")
 
 
@@ -86,6 +87,35 @@ def test_worker_command_mode_rejects_values_that_could_enable_unknown_authority(
 ):
     with pytest.raises(ValueError, match="worker_command_mode"):
         trading_settings_from_payload({"worker_command_mode": value})
+
+
+def test_semantic_review_enabled_round_trips_without_changing_runtime_modes(tmp_path):
+    session_factory = create_session_factory(tmp_path / "semantic-review-settings.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "message_lock_mode": "global",
+            "message_pipeline_mode": "queue",
+            "worker_command_mode": "shadow",
+        },
+    )
+
+    enabled = save_trading_settings(
+        session_factory, {"semantic_review_enabled": True}
+    )
+    reloaded = load_trading_settings(session_factory)
+
+    assert enabled.semantic_review_enabled is True
+    assert reloaded.semantic_review_enabled is True
+    assert reloaded.message_lock_mode == "global"
+    assert reloaded.message_pipeline_mode == "queue"
+    assert reloaded.worker_command_mode == "shadow"
+
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None, [], {}])
+def test_semantic_review_enabled_rejects_non_boolean_values(value):
+    with pytest.raises(ValueError, match="semantic_review_enabled"):
+        trading_settings_from_payload({"semantic_review_enabled": value})
 
 
 def test_revision_target_min_confidence_round_trips_independently(tmp_path):

@@ -26,6 +26,19 @@ def test_trading_settings_js_submits_adjacent_entry_modes(tmp_path):
     assert "entry_revision_v2_mode: String(formData.get('entry_revision_v2_mode')" in source
 
 
+def test_trading_settings_assets_expose_default_off_semantic_review_toggle(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    page = client.get("/more-panel").text
+    source = client.get("/static/app.js").text
+
+    assert 'name="semantic_review_enabled"' in page
+    assert "开启 DeepSeek 辅助复核" in page
+    assert 'name="semantic_review_enabled" checked' not in page
+    assert "semantic_review_enabled: Boolean(" in source
+    assert "[name=\"semantic_review_enabled\"]" in source
+
+
 def test_trading_symbol_assets_preserve_decimal_threshold_state(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 

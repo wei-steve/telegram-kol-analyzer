@@ -1593,6 +1593,51 @@ def test_worker_command_mode_api_round_trips_without_changing_message_modes(
     assert reloaded.json()["message_pipeline_mode"] == "queue"
 
 
+def test_semantic_review_enabled_api_round_trips_without_changing_runtime_modes(
+    tmp_path,
+):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    save_trading_settings(
+        app.state.session_factory,
+        {
+            "message_lock_mode": "global",
+            "message_pipeline_mode": "queue",
+            "worker_command_mode": "shadow",
+        },
+    )
+    client = TestClient(app)
+
+    default = client.get("/api/trading-settings")
+    enabled = client.post(
+        "/api/trading-settings", json={"semantic_review_enabled": True}
+    )
+    reloaded = client.get("/api/trading-settings")
+
+    assert default.status_code == 200
+    assert default.json()["semantic_review_enabled"] is False
+    assert enabled.status_code == 200
+    assert reloaded.json()["semantic_review_enabled"] is True
+    assert reloaded.json()["message_lock_mode"] == "global"
+    assert reloaded.json()["message_pipeline_mode"] == "queue"
+    assert reloaded.json()["worker_command_mode"] == "shadow"
+
+
+def test_semantic_review_enabled_api_rejects_non_boolean_without_changing_state(
+    tmp_path,
+):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    response = client.post(
+        "/api/trading-settings", json={"semantic_review_enabled": "false"}
+    )
+
+    assert response.status_code == 422
+    assert "semantic_review_enabled" in response.json()["detail"]
+    assert client.get("/api/trading-settings").json()[
+        "semantic_review_enabled"
+    ] is False
+
+
 def test_trading_settings_api_round_trips_mimo_v2_future_activation(tmp_path):
     app = create_web_app(database_path=tmp_path / "research.db")
     with app.state.session_factory() as session:

@@ -334,6 +334,10 @@
             <span>开启上下文二次判断（仅实盘模式和白名单群组）</span>
           </label>
           <label class="trading-toggle-row">
+            <input type="checkbox" name="semantic_review_enabled" {% if trading_settings.semantic_review_enabled %}checked{% endif %} />
+            <span>开启 DeepSeek 辅助复核</span>
+          </label>
+          <label class="trading-toggle-row">
             <input type="checkbox" name="telegram_source_deletion_exit_enabled" {% if trading_settings.telegram_source_deletion_exit_enabled %}checked{% endif %} />
             <span>开启 Telegram 原策略删除后的紧急撤单与市价离场（实盘写入）</span>
           </label>
