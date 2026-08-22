@@ -50,9 +50,9 @@ planned -> claimed -> in_progress -> completed
 The implementation session must append concise, non-secret facts here:
 
 ```yaml
-candidate_commit: null
-focused_tests: "adapter contract: 11 passed + 13 passed; live endpoint: 13 passed; fresh composite: 53 passed; updater and installer: 106 passed, 1 skipped in 82.05s"
-full_suite: null
+candidate_commit: 556f53592436ab21f49281acda3448cf7037010e
+focused_tests: "final monitor and web: 350 passed in 4.61s; final updater and installer: 108 passed, 1 skipped in 85.37s"
+full_suite: "5888 passed, 1 skipped, 17 warnings in 442.65s (0:07:22)"
 deployed_commit: null
 production_window: null
 real_messages_observed: null
@@ -65,7 +65,7 @@ queue_backlog_verified: null
 duplicate_processing_verified: null
 loop_health_verified: null
 evidence_path: null
-outstanding: "final focused groups and one full suite, then exact-SHA push/deploy authorization"
+outstanding: "exact-SHA push/deploy authorization required"
 ```
 
 Keep raw JSON, long logs, position rows, and detailed monitor output in a server-side evidence file. Do not place credentials, message contents, provider responses, or exchange payloads in this document.
