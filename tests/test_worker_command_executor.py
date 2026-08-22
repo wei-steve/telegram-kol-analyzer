@@ -127,6 +127,171 @@ def test_sync_adapter_preserves_domain_arguments_result_and_notification_order(
     )
 
 
+def test_sync_adapter_rejects_unknown_effects_policy_before_client_construction(
+    tmp_path,
+):
+    import telegram_kol_research.worker_command_executor as executor
+
+    session_factory = create_session_factory(tmp_path / "invalid-sync-policy.db")
+    claim = _claim(
+        session_factory,
+        command_type="sync_deepcoin_execution",
+        request={"effects_policy": "unknown"},
+    )
+    factory_calls = []
+    dependencies = executor.WorkerCommandDependencies(
+        session_factory=session_factory,
+        deepcoin_client_factory=lambda: factory_calls.append(True) or object(),
+        contract_spec_provider="contract-provider",
+        now_provider=lambda: NOW,
+    )
+
+    with pytest.raises(
+        executor.WorkerCommandMappedError,
+        match="invalid sync effects policy",
+    ):
+        asyncio.run(
+            executor.execute_worker_command_adapter(
+                claim,
+                dependencies=dependencies,
+            )
+        )
+
+    assert factory_calls == []
+
+
+def test_sync_adapter_reconcile_only_blocks_mutation_and_notification(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.worker_command_executor as executor
+
+    session_factory = create_session_factory(tmp_path / "reconcile-only-sync.db")
+    claim = _claim(
+        session_factory,
+        command_type="sync_deepcoin_execution",
+        request={"effects_policy": "reconcile_only"},
+    )
+    calls = []
+
+    class Client:
+        def list_positions(self):
+            return [{"posId": "position-1", "sz": "1"}]
+
+        def list_open_orders(self):
+            return []
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id=None):
+            return []
+
+        def list_position_history(self, *, inst_id, pos_id):
+            return []
+
+        def submit_order(self, _payload):
+            raise AssertionError("submit must be unreachable")
+
+        def cancel_order(self, _payload):
+            raise AssertionError("cancel must be unreachable")
+
+        def amend_order(self, _payload):
+            raise AssertionError("amend must be unreachable")
+
+        def close_position(self, _payload):
+            raise AssertionError("close must be unreachable")
+
+    original_client = Client()
+
+    def reject_full_reconcile(*_args, **_kwargs):
+        raise AssertionError("full reconciler must be unreachable")
+
+    def fake_read_only_reconcile(
+        session_factory, *, client, recovered_at
+    ):
+        assert client.list_positions() == [{"posId": "position-1", "sz": "1"}]
+        for name in ("submit_order", "cancel_order", "amend_order", "close_position"):
+            with pytest.raises(AttributeError):
+                getattr(client, name)
+        calls.append(("read_only_reconcile", session_factory, recovered_at))
+        return SimpleNamespace(active=3, open=4, stale=5)
+
+    def fake_sync(
+        session_factory,
+        *,
+        client,
+        synced_at,
+        allow_exchange_mutations,
+    ):
+        assert client.list_open_orders() == []
+        with pytest.raises(AttributeError):
+            getattr(client, "cancel_order")
+        calls.append(
+            (
+                "manual_sync",
+                session_factory,
+                synced_at,
+                allow_exchange_mutations,
+            )
+        )
+        return SimpleNamespace(
+            checked=7,
+            manually_closed=2,
+            skipped_without_pos_id=1,
+        )
+
+    async def unexpected_delivery(*_args, **_kwargs):
+        calls.append(("unexpected_delivery",))
+
+    monkeypatch.setattr(
+        executor,
+        "reconcile_deepcoin_execution_bindings",
+        reject_full_reconcile,
+    )
+    monkeypatch.setattr(
+        executor,
+        "reconcile_deepcoin_execution_bindings_read_only",
+        fake_read_only_reconcile,
+        raising=False,
+    )
+    monkeypatch.setattr(executor, "sync_manual_closed_deepcoin_positions", fake_sync)
+    dependencies = executor.WorkerCommandDependencies(
+        session_factory=session_factory,
+        deepcoin_client_factory=lambda: original_client,
+        contract_spec_provider="must-not-be-used",
+        now_provider=lambda: NOW,
+        notification_bot_config=_config("notification-chat"),
+        system_operator_bot_config=_config("operator-chat"),
+        attribution_incident_deliverer=unexpected_delivery,
+        protection_incident_deliverer=unexpected_delivery,
+        cleanup_notification_deliverer=unexpected_delivery,
+    )
+
+    result = asyncio.run(
+        executor.execute_worker_command_adapter(claim, dependencies=dependencies)
+    )
+
+    assert result.http_status == 200
+    assert result.body == {
+        "checked": 7,
+        "manually_closed": 2,
+        "skipped_without_pos_id": 1,
+        "reconciled_active": 3,
+        "reconciled_open": 4,
+        "reconciled_stale": 5,
+    }
+    assert calls == [
+        ("read_only_reconcile", session_factory, NOW),
+        ("manual_sync", session_factory, NOW, False),
+    ]
+
+
 def test_close_adapter_preserves_domain_arguments_result_and_cleanup_order(
     tmp_path, monkeypatch
 ):

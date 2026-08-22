@@ -15,6 +15,7 @@ from telegram_kol_research.deepcoin_execution_actions import (
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.execution_bindings import (
     reconcile_deepcoin_execution_bindings,
+    reconcile_deepcoin_execution_bindings_read_only,
     sync_manual_closed_deepcoin_positions,
 )
 from telegram_kol_research.models import WorkerCommandJob, utc_now
@@ -42,6 +43,20 @@ from telegram_kol_research.trading_settings import load_trading_settings
 
 logger = logging.getLogger(__name__)
 DEFAULT_WORKER_COMMAND_LEASE = timedelta(minutes=5)
+SYNC_EFFECTS_FULL = "full"
+SYNC_EFFECTS_RECONCILE_ONLY = "reconcile_only"
+_SYNC_READ_METHODS = frozenset(
+    {
+        "list_positions",
+        "list_open_orders",
+        "read_trigger_orders_pending",
+        "list_trigger_orders_pending",
+        "list_order_history",
+        "list_trade_fills",
+        "list_trigger_order_history",
+        "list_position_history",
+    }
+)
 
 
 IncidentDeliverer = Callable[..., Awaitable[Any]]
@@ -98,6 +113,18 @@ class WorkerCommandModeTransitionError(ValueError):
         )
         self.claimed = int(claimed)
         self.executing = int(executing)
+
+
+class _ReadOnlyDeepcoinClientFacade:
+    __slots__ = ("_client",)
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    def __getattr__(self, name: str) -> Any:
+        if name not in _SYNC_READ_METHODS:
+            raise AttributeError(name)
+        return getattr(self._client, name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,7 +295,7 @@ async def execute_worker_command_adapter(
 
     try:
         if claim.command_type == "sync_deepcoin_execution":
-            return await _execute_sync(dependencies)
+            return await _execute_sync(claim.request, dependencies)
         if claim.command_type == "close_bound_position":
             return await _execute_close(claim.request, dependencies)
         if claim.command_type == "recovery_live_submit":
@@ -324,11 +351,25 @@ def _mapped_adapter_error(
     )
 
 
+def _parse_sync_effects_policy(request: dict[str, Any]) -> str:
+    if request == {}:
+        return SYNC_EFFECTS_FULL
+    if request == {"effects_policy": SYNC_EFFECTS_RECONCILE_ONLY}:
+        return SYNC_EFFECTS_RECONCILE_ONLY
+    raise ValueError("invalid sync effects policy")
+
+
 async def _execute_sync(
+    request: dict[str, Any],
     dependencies: WorkerCommandDependencies,
 ) -> WorkerCommandExecutionResult:
-    body = await asyncio.to_thread(_run_sync_blocking, dependencies)
-    if isinstance(
+    effects_policy = _parse_sync_effects_policy(request)
+    body = await asyncio.to_thread(
+        _run_sync_blocking,
+        dependencies,
+        effects_policy=effects_policy,
+    )
+    if effects_policy == SYNC_EFFECTS_FULL and isinstance(
         dependencies.notification_bot_config,
         SystemOperatorBotConfig,
     ):
@@ -342,7 +383,7 @@ async def _execute_sync(
             config=dependencies.notification_bot_config,
             delivered_at=dependencies.now_provider(),
         )
-    if isinstance(
+    if effects_policy == SYNC_EFFECTS_FULL and isinstance(
         dependencies.system_operator_bot_config,
         SystemOperatorBotConfig,
     ):
@@ -354,8 +395,37 @@ async def _execute_sync(
     return WorkerCommandExecutionResult(http_status=200, body=body)
 
 
-def _run_sync_blocking(dependencies: WorkerCommandDependencies) -> dict[str, int]:
-    client = dependencies.deepcoin_client_factory()
+def _run_sync_blocking(
+    dependencies: WorkerCommandDependencies,
+    *,
+    effects_policy: str = SYNC_EFFECTS_FULL,
+) -> dict[str, int]:
+    original_client = dependencies.deepcoin_client_factory()
+    client = (
+        _ReadOnlyDeepcoinClientFacade(original_client)
+        if effects_policy == SYNC_EFFECTS_RECONCILE_ONLY
+        else original_client
+    )
+    if effects_policy == SYNC_EFFECTS_RECONCILE_ONLY:
+        reconcile_result = reconcile_deepcoin_execution_bindings_read_only(
+            dependencies.session_factory,
+            client=client,
+            recovered_at=dependencies.now_provider(),
+        )
+        result = sync_manual_closed_deepcoin_positions(
+            dependencies.session_factory,
+            client=client,
+            synced_at=dependencies.now_provider(),
+            allow_exchange_mutations=False,
+        )
+        return {
+            "checked": result.checked,
+            "manually_closed": result.manually_closed,
+            "skipped_without_pos_id": result.skipped_without_pos_id,
+            "reconciled_active": reconcile_result.active,
+            "reconciled_open": reconcile_result.open,
+            "reconciled_stale": reconcile_result.stale,
+        }
     reconcile_result = (
         reconcile_deepcoin_execution_bindings(
             dependencies.session_factory,
