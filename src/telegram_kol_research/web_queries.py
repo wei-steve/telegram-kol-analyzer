@@ -1840,6 +1840,15 @@ def _serialize_semantic_review(
 
     legacy_auxiliary = bool(decision.auxiliary_model and not decision.comparison_model)
     status = "completed" if legacy_auxiliary else decision.comparison_status or "pending"
+    if decision.agreement_status == "review_disabled":
+        return {
+            "status": "review_disabled",
+            "severity": "disabled",
+            "label": "辅助复核已关闭",
+            "reason": None,
+            "conflict_types": [],
+            "model": None,
+        }
     if status == "failed" or decision.agreement_status == "authoritative_failed":
         severity = "failed"
         label = "失败"

@@ -4311,6 +4311,41 @@ def test_message_detail_renders_authoritative_semantic_review_states(tmp_path):
     assert "历史记录没有语义分歧等级，需重新复核" in response.text
 
 
+def test_message_detail_renders_review_disabled_without_deepseek_claim(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw = RawMessage(chat_id=77, message_id=88, text="BTC short")
+        session.add(raw)
+        session.flush()
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw.id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="非策略",
+                authoritative_payload_json="{}",
+                agreement_status="review_disabled",
+                differences_json="[]",
+                comparison_status="completed",
+                comparison_model="historical-deepseek-model",
+            )
+        )
+        session.commit()
+
+    response = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/77/detail/tab/messages"
+    )
+
+    assert response.status_code == 200
+    assert "AI复核：辅助复核已关闭" in response.text
+    assert "复核模型：historical-deepseek-model" not in response.text
+    assert "AI复核：一致" not in response.text
+    assert "AI复核：失败" not in response.text
+    assert "AI复核：等待中" not in response.text
+    assert 'role="alert"' not in response.text
+
+
 def test_critical_semantic_review_opens_outer_ai_disclosure_for_non_strategy(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)

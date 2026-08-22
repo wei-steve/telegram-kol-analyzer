@@ -12,9 +12,14 @@ from telegram_kol_research.message_operation_contracts import (
     append_message_operation_item,
     create_message_operation_contract,
     get_message_operation_contract,
+    run_message_operation_shadow_once,
     transition_message_operation_contract,
 )
-from telegram_kol_research.models import MessageOperationContract, RawMessage
+from telegram_kol_research.models import (
+    MessageOperationContract,
+    RawMessage,
+    RecognitionDecision,
+)
 
 
 NOW = datetime(2026, 8, 8, 16, 0, tzinfo=UTC)
@@ -82,6 +87,36 @@ def test_one_contract_per_raw_message_and_policy(tmp_path):
     assert second.id == first.id
     with session_factory() as session:
         assert session.query(MessageOperationContract).count() == 1
+
+
+def test_review_disabled_physical_completed_does_not_block_shadow_scan(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw = _raw_message(session_factory)
+    with session_factory() as session:
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw.id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="非策略",
+                authoritative_payload_json='{"recognition_result":"非策略"}',
+                agreement_status="review_disabled",
+                differences_json="[]",
+                comparison_status="completed",
+            )
+        )
+        session.commit()
+
+    result = run_message_operation_shadow_once(
+        session_factory,
+        after_raw_message_id=0,
+        limit=10,
+        now=NOW,
+    )
+
+    assert result["pending_blocked"] == 0
+    assert result["model_calls"] == 0
+    assert result["last_scanned_raw_message_id"] == raw.id
 
 
 def test_items_are_idempotent_bounded_and_ordered(tmp_path):

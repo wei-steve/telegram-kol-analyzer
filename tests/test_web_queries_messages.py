@@ -516,6 +516,39 @@ def test_load_group_messages_serializes_semantic_review_decisions_in_one_bulk_qu
     }
 
 
+def test_load_group_messages_projects_review_disabled_without_model_claim(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        message = RawMessage(chat_id=9, message_id=11, text="BTC short")
+        session.add(message)
+        session.flush()
+        session.add(
+            RecognitionDecision(
+                raw_message_id=message.id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="非策略",
+                authoritative_payload_json="{}",
+                agreement_status="review_disabled",
+                differences_json="[]",
+                comparison_status="completed",
+                comparison_model="historical-deepseek-model",
+            )
+        )
+        session.commit()
+
+    rows = load_group_messages(session_factory, chat_id=9, limit=10)
+
+    assert rows[0]["semantic_review"] == {
+        "status": "review_disabled",
+        "severity": "disabled",
+        "label": "辅助复核已关闭",
+        "reason": None,
+        "conflict_types": [],
+        "model": None,
+    }
+
+
 def test_load_group_messages_distinguishes_submission_from_exchange_confirmation(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:

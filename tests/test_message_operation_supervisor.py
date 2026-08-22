@@ -613,6 +613,53 @@ def test_disabled_coverage_snapshot_is_database_free_clean_rollback():
     )
 
 
+def test_review_disabled_physical_completed_is_terminal_for_coverage(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "coverage.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=77, message_id=9271, text="BTC short")
+        session.add(raw)
+        session.flush()
+        raw_id = raw.id
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw_id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="非策略",
+                authoritative_payload_json='{"recognition_result":"非策略"}',
+                agreement_status="review_disabled",
+                differences_json="[]",
+                comparison_status="completed",
+            )
+        )
+        session.commit()
+    projected = []
+
+    def project(_session_factory, *, raw_message_id):
+        projected.append(raw_message_id)
+        return None
+
+    monkeypatch.setattr(
+        supervisor_module,
+        "project_message_operation_contract",
+        project,
+    )
+
+    snapshot = supervisor_module.build_message_operation_coverage_snapshot(
+        session_factory,
+        after_raw_message_id=0,
+        supervisor_last_success_at=NOW,
+        observed_at=NOW,
+        limit=10,
+    )
+
+    assert projected == [raw_id]
+    assert snapshot["executable_messages_total"] == 0
+
+
 def test_multi_instruction_completeness_flags_missing_and_hidden_siblings(tmp_path):
     session_factory = create_session_factory(tmp_path / "multi-completeness.db")
     save_trading_settings(
