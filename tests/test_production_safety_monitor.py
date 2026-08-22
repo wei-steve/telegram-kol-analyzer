@@ -4725,6 +4725,39 @@ def test_monitor_incident_capture_projection_is_closed_and_bounded():
     }
 
 
+def test_monitor_incident_capture_projection_accepts_every_monitor_adapter():
+    projection = build_monitor_incident_capture_projection(
+        checked_at=datetime(2026, 8, 22, 1, 0, tzinfo=UTC),
+        reason_codes=("adapter_failure",),
+        adapter_failures=(
+            "service",
+            "head",
+            "settings",
+            "journal",
+            "events",
+            "audit",
+            "composite",
+            "coverage",
+            "entry_preamble",
+        ),
+        notification_status="suppressed",
+        monitor_error=None,
+    )
+
+    assert projection["adapter_failures"] == sorted(
+        monitor_module.MONITOR_ADAPTER_NAMES
+    )
+
+
+def test_entry_preamble_adapter_failure_is_preserved_by_evaluator():
+    result = evaluate_monitor_snapshot(
+        _snapshot(adapter_failures=("entry_preamble",)), EXPECTATIONS
+    )
+
+    assert result.reason_codes == ("adapter_failure",)
+    assert result.details["adapter_failures"] == ("entry_preamble",)
+
+
 def test_monitor_incident_capture_client_is_fixed_loopback_no_proxy(monkeypatch):
     calls = []
 

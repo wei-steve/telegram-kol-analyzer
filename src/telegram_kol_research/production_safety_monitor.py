@@ -155,7 +155,7 @@ _RECONCILIATION_SIGNAL_COLUMNS = frozenset(
         "payload_json",
     }
 )
-_ADAPTER_NAMES = frozenset(
+MONITOR_ADAPTER_NAMES = frozenset(
     {
         "service",
         "head",
@@ -165,6 +165,7 @@ _ADAPTER_NAMES = frozenset(
         "audit",
         "composite",
         "coverage",
+        "entry_preamble",
     }
 )
 _MONITOR_CAPTURE_REASON_CODES = frozenset(
@@ -269,7 +270,7 @@ def build_monitor_incident_capture_projection(
     reasons = sorted(
         set(reason_codes).intersection(_MONITOR_CAPTURE_REASON_CODES)
     )
-    failures = sorted(set(adapter_failures).intersection(_ADAPTER_NAMES))
+    failures = sorted(set(adapter_failures).intersection(MONITOR_ADAPTER_NAMES))
     notification_error = (
         monitor_error
         if notification_status in {"config_missing", "delivery_failed"}
@@ -4551,7 +4552,11 @@ def _safe_adapter_failures(value: object) -> tuple[str, ...] | None:
         return None
     failures: set[str] = set()
     for item in value:
-        failures.add(item if isinstance(item, str) and item in _ADAPTER_NAMES else "unknown")
+        failures.add(
+            item
+            if isinstance(item, str) and item in MONITOR_ADAPTER_NAMES
+            else "unknown"
+        )
     return tuple(sorted(failures))
 
 

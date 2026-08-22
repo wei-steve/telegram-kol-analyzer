@@ -6724,6 +6724,111 @@ def test_monitor_incident_writer_requires_loopback_and_dedicated_token(tmp_path)
         assert row.incident_type == "monitor_adapter_failure"
 
 
+def test_monitor_incident_writer_accepts_every_monitor_adapter(
+    tmp_path, monkeypatch
+):
+    token = "m" * 43
+    captured = []
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"monitor_adapter_failure"}),
+            monitor_capture_token=token,
+        ),
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "capture_monitor_state",
+        lambda *args, **kwargs: captured.append(kwargs) or [],
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "capture_uncaptured_runtime_incident_sources",
+        lambda *args, **kwargs: 0,
+    )
+
+    response = TestClient(app, client=("127.0.0.1", 50000)).post(
+        "/api/runtime-incidents/monitor-capture",
+        headers={"x-monitor-capture-token": token},
+        json={
+            "schema_version": 1,
+            "checked_at": "2026-08-22T01:00:00+00:00",
+            "reason_codes": ["adapter_failure"],
+            "adapter_failures": [
+                "service",
+                "head",
+                "settings",
+                "journal",
+                "events",
+                "audit",
+                "composite",
+                "coverage",
+                "entry_preamble",
+            ],
+            "notification_error": None,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"accepted": True, "captured": 0}
+    assert captured[0]["adapter_failures"] == (
+        "service",
+        "head",
+        "settings",
+        "journal",
+        "events",
+        "audit",
+        "composite",
+        "coverage",
+        "entry_preamble",
+    )
+
+
+@pytest.mark.parametrize("unknown_adapter", ["unknown"])
+def test_monitor_incident_writer_rejects_unknown_adapter_without_capture(
+    tmp_path, monkeypatch, unknown_adapter
+):
+    token = "m" * 43
+    capture_calls = []
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            capture_types=frozenset({"monitor_adapter_failure"}),
+            monitor_capture_token=token,
+        ),
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "capture_monitor_state",
+        lambda *args, **kwargs: capture_calls.append("monitor") or [],
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "capture_notification_failure",
+        lambda *args, **kwargs: capture_calls.append("notification"),
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "capture_uncaptured_runtime_incident_sources",
+        lambda *args, **kwargs: capture_calls.append("sources") or 0,
+    )
+
+    response = TestClient(app, client=("127.0.0.1", 50000)).post(
+        "/api/runtime-incidents/monitor-capture",
+        headers={"x-monitor-capture-token": token},
+        json={
+            "schema_version": 1,
+            "checked_at": "2026-08-22T01:00:00+00:00",
+            "reason_codes": ["adapter_failure"],
+            "adapter_failures": [unknown_adapter],
+            "notification_error": None,
+        },
+    )
+
+    assert response.status_code == 422
+    assert capture_calls == []
+
+
 @pytest.mark.parametrize(
     "body",
     [

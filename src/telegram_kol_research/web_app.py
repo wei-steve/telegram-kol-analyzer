@@ -83,6 +83,7 @@ from telegram_kol_research.runtime_worker_executor import (
     shutdown_management_worker_executor,
 )
 from telegram_kol_research.production_safety_monitor import (
+    MONITOR_ADAPTER_NAMES,
     capture_uncaptured_runtime_incident_sources,
 )
 from telegram_kol_research.gate_market_data import GateMarketDataProvider
@@ -5276,10 +5277,9 @@ def create_web_app(
                 )
                 or len(set(reason_codes)) != len(reason_codes)
                 or not isinstance(adapter_failures, list)
-                or len(adapter_failures) > 6
+                or len(adapter_failures) > len(MONITOR_ADAPTER_NAMES)
                 or any(
-                    failure
-                    not in {"service", "head", "settings", "journal", "events", "audit"}
+                    failure not in MONITOR_ADAPTER_NAMES
                     for failure in adapter_failures
                 )
                 or len(set(adapter_failures)) != len(adapter_failures)
