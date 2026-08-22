@@ -224,6 +224,9 @@ from telegram_kol_research.runtime_incident_handoff import (
     load_latest_runtime_incident_handoff_artifact,
 )
 from telegram_kol_research.runtime_incidents import get_runtime_incident
+from telegram_kol_research.worker_command_reconciliation import (
+    reconcile_worker_command_by_id,
+)
 from telegram_kol_research.raw_ingest import (
     NormalizedMessageRecord,
     normalize_message_payload,
@@ -5988,6 +5991,39 @@ def backfill_canonical_tpsl_ledger(
                 "actions": [asdict(row) for row in plan.actions],
                 "refusals": [asdict(row) for row in plan.refusals],
                 "applied": result.applied if result is not None else 0,
+                "exchange_write_count": 0,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("worker-command-reconcile")
+def worker_command_reconcile(
+    command_id: str = typer.Option(..., "--command-id"),
+    database_path: Path = typer.Option(
+        Path("data/research.db"), "--database-path"
+    ),
+    apply_confirmed: bool = typer.Option(False, "--apply-confirmed"),
+) -> None:
+    """Audit one uncertain worker command; apply only a confirmed outcome."""
+
+    session_factory = create_session_factory(database_path)
+    report = reconcile_worker_command_by_id(
+        session_factory,
+        command_id=command_id,
+        deepcoin_client_factory=build_deepcoin_client_from_env,
+        apply_confirmed=apply_confirmed,
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "mode": "apply_confirmed" if apply_confirmed else "dry_run",
+                "command_id": report.command_id,
+                "outcome": report.outcome,
+                "reason": report.reason,
+                "applied": report.applied,
                 "exchange_write_count": 0,
             },
             ensure_ascii=False,
