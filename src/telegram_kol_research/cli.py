@@ -184,6 +184,17 @@ from telegram_kol_research.models import (
 )
 from telegram_kol_research.models import SyncCheckpoint
 from telegram_kol_research.recognition_decisions import update_recognition_execution_outcome
+from telegram_kol_research.semantic_review_control import (
+    SemanticReviewControlError,
+    SemanticReviewDisablePlan,
+    SemanticReviewRollbackPlan,
+    SemanticReviewRollbackTarget,
+    SemanticReviewTarget,
+    apply_semantic_review_disable_plan,
+    apply_semantic_review_rollback_plan,
+    build_semantic_review_disable_plan,
+    build_semantic_review_rollback_plan,
+)
 from telegram_kol_research.reporting import load_leaderboard_rows, write_report
 from telegram_kol_research.config import load_runtime_incident_config
 from telegram_kol_research.runtime_agent_tools import (
@@ -6030,6 +6041,195 @@ def worker_command_reconcile(
             sort_keys=True,
         )
     )
+
+
+def _semantic_review_disable_plan_from_dict(
+    payload: dict[str, Any],
+) -> SemanticReviewDisablePlan:
+    return SemanticReviewDisablePlan(
+        database_identity=str(payload["database_identity"]),
+        cutoff=str(payload["cutoff"]),
+        status_counts={
+            str(key): int(value)
+            for key, value in dict(payload["status_counts"]).items()
+        },
+        running_count=int(payload["running_count"]),
+        targets=tuple(
+            SemanticReviewTarget(**target)
+            for target in payload["targets"]
+        ),
+        quick_check=str(payload["quick_check"]),
+        provider_call_count=int(payload.get("provider_call_count", 0)),
+        notification_count=int(payload.get("notification_count", 0)),
+        exchange_write_count=int(payload.get("exchange_write_count", 0)),
+        plan_sha=str(payload["plan_sha"]),
+    )
+
+
+def _write_semantic_review_evidence(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _semantic_review_rollback_plan_from_dict(
+    payload: dict[str, Any],
+) -> SemanticReviewRollbackPlan:
+    return SemanticReviewRollbackPlan(
+        database_identity=str(payload["database_identity"]),
+        preimage_plan_sha=str(payload["preimage_plan_sha"]),
+        targets=tuple(
+            SemanticReviewRollbackTarget(
+                raw_message_id=int(target["raw_message_id"]),
+                preimage=SemanticReviewTarget(**target["preimage"]),
+                current_row_fingerprint=str(target["current_row_fingerprint"]),
+            )
+            for target in payload["targets"]
+        ),
+        quick_check=str(payload["quick_check"]),
+        provider_call_count=int(payload.get("provider_call_count", 0)),
+        notification_count=int(payload.get("notification_count", 0)),
+        exchange_write_count=int(payload.get("exchange_write_count", 0)),
+        plan_sha=str(payload["plan_sha"]),
+    )
+
+
+@app.command("semantic-review-terminalize")
+def semantic_review_terminalize(
+    database_path: Path = typer.Option(..., "--database-path"),
+    plan_output: Path = typer.Option(..., "--plan-output"),
+    apply: bool = typer.Option(False, "--apply"),
+    expected_plan_sha: str | None = typer.Option(None, "--expected-plan-sha"),
+) -> None:
+    """Plan by default, or apply an exact semantic-review terminalization plan."""
+
+    resolved_path = database_path.expanduser().resolve()
+    if not resolved_path.is_file():
+        typer.echo("Refusing terminalization: database does not exist.", err=True)
+        raise typer.Exit(code=2)
+    if apply and (
+        expected_plan_sha is None
+        or re.fullmatch(r"[0-9a-f]{64}", expected_plan_sha) is None
+    ):
+        typer.echo(
+            "Refusing apply: --expected-plan-sha must be an exact 64-hex value.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    try:
+        session_factory = create_existing_session_factory(resolved_path)
+        if apply:
+            stored = json.loads(plan_output.read_text(encoding="utf-8"))
+            plan_payload = stored.get("plan", stored)
+            plan = _semantic_review_disable_plan_from_dict(plan_payload)
+            result = apply_semantic_review_disable_plan(
+                session_factory,
+                plan,
+                expected_plan_sha=expected_plan_sha or "",
+                applied_at=datetime.now(UTC),
+            )
+        else:
+            plan = build_semantic_review_disable_plan(
+                session_factory,
+                cutoff=datetime.now(UTC),
+            )
+            result = None
+        evidence = {
+            "mode": "apply" if apply else "dry_run",
+            "plan_sha": plan.plan_sha,
+            "status_counts": plan.status_counts,
+            "running_count": plan.running_count,
+            "target_count": len(plan.targets),
+            "changed_count": result.changed_count if result is not None else 0,
+            "quick_check": plan.quick_check,
+            "provider_call_count": 0,
+            "notification_count": 0,
+            "exchange_write_count": 0,
+            "post_apply_sha": (
+                result.post_apply_sha if result is not None else None
+            ),
+            "plan": plan.to_dict(),
+        }
+        _write_semantic_review_evidence(plan_output, evidence)
+    except (KeyError, TypeError, ValueError, OSError, SemanticReviewControlError) as exc:
+        typer.echo(f"Refusing terminalization: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(evidence, ensure_ascii=False, sort_keys=True))
+
+
+@app.command("semantic-review-terminalize-rollback")
+def semantic_review_terminalize_rollback(
+    database_path: Path = typer.Option(..., "--database-path"),
+    preimage_plan: Path = typer.Option(..., "--preimage-plan"),
+    plan_output: Path = typer.Option(..., "--plan-output"),
+    apply: bool = typer.Option(False, "--apply"),
+    expected_plan_sha: str | None = typer.Option(None, "--expected-plan-sha"),
+) -> None:
+    """Plan by default, or apply an exact targeted semantic-review rollback."""
+
+    resolved_path = database_path.expanduser().resolve()
+    if not resolved_path.is_file():
+        typer.echo("Refusing rollback: database does not exist.", err=True)
+        raise typer.Exit(code=2)
+    if not preimage_plan.expanduser().resolve().is_file():
+        typer.echo("Refusing rollback: preimage plan does not exist.", err=True)
+        raise typer.Exit(code=2)
+    if apply and (
+        expected_plan_sha is None
+        or re.fullmatch(r"[0-9a-f]{64}", expected_plan_sha) is None
+    ):
+        typer.echo(
+            "Refusing rollback: --expected-plan-sha must be an exact 64-hex value.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    try:
+        session_factory = create_existing_session_factory(resolved_path)
+        if apply:
+            stored = json.loads(plan_output.read_text(encoding="utf-8"))
+            plan = _semantic_review_rollback_plan_from_dict(
+                stored.get("plan", stored)
+            )
+            result = apply_semantic_review_rollback_plan(
+                session_factory,
+                plan,
+                expected_plan_sha=expected_plan_sha or "",
+            )
+        else:
+            stored_preimage = json.loads(
+                preimage_plan.read_text(encoding="utf-8")
+            )
+            disable_plan = _semantic_review_disable_plan_from_dict(
+                stored_preimage.get("plan", stored_preimage)
+            )
+            plan = build_semantic_review_rollback_plan(
+                session_factory,
+                preimage_plan=disable_plan,
+            )
+            result = None
+        evidence = {
+            "mode": "apply" if apply else "dry_run",
+            "plan_sha": plan.plan_sha,
+            "preimage_plan_sha": plan.preimage_plan_sha,
+            "target_count": len(plan.targets),
+            "changed_count": result.changed_count if result is not None else 0,
+            "quick_check": plan.quick_check,
+            "provider_call_count": 0,
+            "notification_count": 0,
+            "exchange_write_count": 0,
+            "post_rollback_sha": (
+                result.post_rollback_sha if result is not None else None
+            ),
+            "plan": plan.to_dict(),
+        }
+        _write_semantic_review_evidence(plan_output, evidence)
+    except (KeyError, TypeError, ValueError, OSError, SemanticReviewControlError) as exc:
+        typer.echo(f"Refusing rollback: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(evidence, ensure_ascii=False, sort_keys=True))
 
 
 @app.command("media-dedupe")
