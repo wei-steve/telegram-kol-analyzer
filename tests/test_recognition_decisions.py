@@ -69,6 +69,7 @@ def _save_and_finalize(session_factory, record):
         authoritative_generation=saved.comparison_claim_token,
         automation_status="skipped",
         automation_reason="test_setup",
+        semantic_review_enabled=True,
     )
 
 
@@ -110,6 +111,7 @@ def test_new_authoritative_decision_is_unclaimable_until_automation_finalizes(tm
         authoritative_generation=saved.comparison_claim_token,
         automation_status="submitted",
         automation_reason="close_position",
+        semantic_review_enabled=True,
     )
 
     assert finalized.comparison_status == "pending"
@@ -139,6 +141,7 @@ def test_stale_automation_generation_cannot_publish_new_rerecognition(tmp_path):
             authoritative_generation=first.comparison_claim_token,
             automation_status="submitted",
             automation_reason="stale_close",
+            semantic_review_enabled=True,
         )
 
     with session_factory() as session:
@@ -157,9 +160,41 @@ def test_stale_automation_generation_cannot_publish_new_rerecognition(tmp_path):
         authoritative_generation=second.comparison_claim_token,
         automation_status="skipped",
         automation_reason="new_generation",
+        semantic_review_enabled=True,
     )
     assert finalized.comparison_status == "pending"
     assert finalized.automation_reason == "new_generation"
+
+
+def test_disabled_semantic_review_finalizes_as_compatible_terminal_state(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id = _raw_message(session_factory)
+    saved = save_pending_authoritative_decision(session_factory, _record(raw_id))
+    assert claim_authoritative_execution(
+        session_factory,
+        raw_message_id=raw_id,
+        authoritative_generation=saved.comparison_claim_token,
+    )
+
+    finalized = finalize_authoritative_automation_outcome(
+        session_factory,
+        raw_message_id=raw_id,
+        authoritative_generation=saved.comparison_claim_token,
+        automation_status="submitted",
+        automation_reason="close_position",
+        semantic_review_enabled=False,
+    )
+
+    assert finalized.comparison_status == "completed"
+    assert finalized.agreement_status == "review_disabled"
+    assert finalized.automation_status == "submitted"
+    assert finalized.automation_reason == "close_position"
+    assert finalized.comparison_claim_token is None
+    assert claim_next_semantic_review(
+        session_factory,
+        now=datetime(2026, 7, 13, 12, 0),
+        stale_before=datetime(2026, 7, 13, 11, 55),
+    ) is None
 
 
 def test_terminal_authoritative_failure_preserves_notification_metadata(tmp_path):

@@ -1754,6 +1754,7 @@ def test_unchanged_rerecognition_preserves_completed_review_through_execution_ga
         authoritative_generation=second.authoritative_generation,
         automation_status="skipped",
         automation_reason="test",
+        semantic_review_enabled=True,
     )
     assert finalized.comparison_status == "completed"
     with session_factory() as session:
@@ -1816,14 +1817,20 @@ def test_process_authoritative_message_persists_pending_before_mimo_and_auto_tra
         lambda *args, **kwargs: events.append("claim_execution") or True,
         raising=False,
     )
-    monkeypatch.setattr(
-        "telegram_kol_research.authoritative_recognition.finalize_authoritative_automation_outcome",
-        lambda *args, **kwargs: events.append("persist_automation")
-        or SimpleNamespace(
+    finalization_policies = []
+
+    def finalize(*args, **kwargs):
+        events.append("persist_automation")
+        finalization_policies.append(kwargs.get("semantic_review_enabled"))
+        return SimpleNamespace(
             agreement_status="pending",
             differences_json="[]",
             comparison_status="pending",
-        ),
+        )
+
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.finalize_authoritative_automation_outcome",
+        finalize,
     )
     monkeypatch.setattr(
         "telegram_kol_research.authoritative_recognition._has_current_mimo_candidate",
@@ -1848,6 +1855,7 @@ def test_process_authoritative_message_persists_pending_before_mimo_and_auto_tra
         "persist_automation",
     ]
     assert events.index("auto_trade") < events.index("persist_automation")
+    assert finalization_policies == [False]
     assert result.assessment.agreement_status == "pending"
     assert result.assessment.deepseek_payload is None
     assert result.automation == {"status": "executed", "reason": "close_submitted"}
@@ -2076,7 +2084,8 @@ def test_running_generation_blocks_new_process_until_it_finalizes(tmp_path, monk
     assert result.automation["reason"] == "generation-a"
     with session_factory() as session:
         decision = session.query(RecognitionDecision).one()
-        assert decision.comparison_status == "pending"
+        assert decision.comparison_status == "completed"
+        assert decision.agreement_status == "review_disabled"
         assert decision.automation_reason == "generation-a"
 
 
@@ -2171,7 +2180,8 @@ def test_running_generation_rejects_nested_mimo_failure_without_overwrite(
     assert result.automation["reason"] == "generation-a"
     with session_factory() as session:
         decision = session.query(RecognitionDecision).one()
-        assert decision.comparison_status == "pending"
+        assert decision.comparison_status == "completed"
+        assert decision.agreement_status == "review_disabled"
         assert decision.comparison_claim_token is None
         assert decision.automation_reason == "generation-a"
 

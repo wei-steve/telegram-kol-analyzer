@@ -291,11 +291,33 @@ def finalize_authoritative_automation_outcome(
     authoritative_generation: str,
     automation_status: str,
     automation_reason: str | None,
+    semantic_review_enabled: bool,
 ) -> RecognitionDecision:
     """Atomically publish one generation's automation result for review."""
 
     with session_factory() as session:
         now = utc_now()
+        review_values = (
+            {
+                "comparison_status": case(
+                    (
+                        RecognitionDecision.agreement_status == "pending",
+                        "pending",
+                    ),
+                    else_="completed",
+                ),
+                "comparison_claim_token": None,
+                "comparison_started_at": None,
+            }
+            if semantic_review_enabled
+            else {
+                "agreement_status": "review_disabled",
+                "comparison_status": "completed",
+                "comparison_next_attempt_at": None,
+                "comparison_started_at": None,
+                "comparison_claim_token": None,
+            }
+        )
         result = session.execute(
             update(RecognitionDecision)
             .where(
@@ -307,16 +329,8 @@ def finalize_authoritative_automation_outcome(
             .values(
                 automation_status=automation_status,
                 automation_reason=automation_reason,
-                comparison_status=case(
-                    (
-                        RecognitionDecision.agreement_status == "pending",
-                        "pending",
-                    ),
-                    else_="completed",
-                ),
-                comparison_claim_token=None,
-                comparison_started_at=None,
                 updated_at=now,
+                **review_values,
             )
         )
         if result.rowcount != 1:

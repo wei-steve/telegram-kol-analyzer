@@ -1462,12 +1462,16 @@ def process_authoritative_message(
             automation_reason=automation_reason,
         )
     else:
+        semantic_review_enabled = load_trading_settings(
+            session_factory
+        ).semantic_review_enabled
         finalized = finalize_authoritative_automation_outcome(
             session_factory,
             raw_message_id=raw_message_id,
             authoritative_generation=assessment.authoritative_generation,
             automation_status=automation_status,
             automation_reason=automation_reason,
+            semantic_review_enabled=semantic_review_enabled,
         )
         assessment = replace(
             assessment,
