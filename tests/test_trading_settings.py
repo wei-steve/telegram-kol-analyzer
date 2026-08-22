@@ -57,7 +57,35 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     assert settings.mimo_contract_mode == "v1"
     assert settings.mimo_v2_activation_after_raw_message_id == 0
     assert settings.message_lock_mode == "global"
+    assert settings.worker_command_mode == "inline"
     assert not hasattr(settings, "entry_preamble_live_chat_ids")
+
+
+@pytest.mark.parametrize("mode", ["inline", "shadow", "queue"])
+def test_worker_command_mode_round_trips_without_changing_message_modes(
+    tmp_path, mode
+):
+    session_factory = create_session_factory(tmp_path / "worker-command-settings.db")
+    save_trading_settings(
+        session_factory,
+        {"message_lock_mode": "global", "message_pipeline_mode": "queue"},
+    )
+
+    saved = save_trading_settings(session_factory, {"worker_command_mode": mode})
+    reloaded = load_trading_settings(session_factory)
+
+    assert saved.worker_command_mode == mode
+    assert reloaded.worker_command_mode == mode
+    assert reloaded.message_lock_mode == "global"
+    assert reloaded.message_pipeline_mode == "queue"
+
+
+@pytest.mark.parametrize("value", ["unsafe", "", True, False, [], {}, 1, None])
+def test_worker_command_mode_rejects_values_that_could_enable_unknown_authority(
+    value,
+):
+    with pytest.raises(ValueError, match="worker_command_mode"):
+        trading_settings_from_payload({"worker_command_mode": value})
 
 
 def test_revision_target_min_confidence_round_trips_independently(tmp_path):

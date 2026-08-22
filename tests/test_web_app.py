@@ -1570,6 +1570,28 @@ def test_trading_settings_api_returns_fresh_fixed_entry_defaults(tmp_path):
     }
 
 
+def test_worker_command_mode_api_round_trips_without_changing_message_modes(
+    tmp_path,
+):
+    app = create_web_app(database_path=tmp_path / "research.db")
+    save_trading_settings(
+        app.state.session_factory,
+        {"message_lock_mode": "global", "message_pipeline_mode": "queue"},
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/trading-settings", json={"worker_command_mode": "shadow"}
+    )
+    reloaded = client.get("/api/trading-settings")
+
+    assert response.status_code == 200
+    assert response.json()["worker_command_mode"] == "shadow"
+    assert reloaded.json()["worker_command_mode"] == "shadow"
+    assert reloaded.json()["message_lock_mode"] == "global"
+    assert reloaded.json()["message_pipeline_mode"] == "queue"
+
+
 def test_trading_settings_api_round_trips_mimo_v2_future_activation(tmp_path):
     app = create_web_app(database_path=tmp_path / "research.db")
     with app.state.session_factory() as session:
