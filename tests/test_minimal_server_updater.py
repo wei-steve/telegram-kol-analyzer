@@ -168,7 +168,7 @@ case "${1:-}" in
       fi
       printf 'monitor-timer-%s\n' "$unit_state" >>"$HARNESS_LOG"
       log_plain_state=0
-    elif [ "${2:-}" = "telegram-kol-monitor.service" ] || [ "${2:-}" = "telegram-kol-monitor-diagnostic.service" ]; then
+    elif [ "${2:-}" = "telegram-kol-monitor.service" ] || [ "${2:-}" = "telegram-kol-monitor-diagnostic.service" ] || [ "${2:-}" = "telegram-kol-monitor-test-notification.service" ]; then
       unit_state="${HARNESS_MONITOR_ONESHOT_STATE:-inactive}"
       printf 'monitor-oneshot-%s\n' "$unit_state" >>"$HARNESS_LOG"
       log_plain_state=0
@@ -328,6 +328,13 @@ if [ "${1:-}" = "-m" ] && [ "${2:-}" = "pip" ]; then
   fi
   exit 0
 fi
+if [ "${1:-}" = "-c" ] && [[ "${2:-}" = *"monitor-pin-rewrite"* ]]; then
+  printf 'monitor-pin-rewrite\n' >>"$HARNESS_LOG"
+  MONITOR_REWRITE_HEAD="$5" perl -0pe '
+    s/^TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=[^\r\n]*/TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=$ENV{MONITOR_REWRITE_HEAD}/m
+  ' "$3" >"$4"
+  exit 0
+fi
 if [ "${1:-}" = "-" ] && [ "${2:-}" = "schema" ]; then
   printf 'online-backup\n' >>"$HARNESS_LOG"
   [ "${HARNESS_SCHEMA_BACKUP_FAIL:-0}" != "1" ] || exit 1
@@ -453,7 +460,13 @@ exec /bin/rm "$@"
                 marker.unlink()
         if monitor_env.is_symlink() or monitor_env.exists():
             monitor_env.unlink()
-        if installation in {"complete", "env_only", "malformed", "symlink"}:
+        if installation in {
+            "complete",
+            "env_only",
+            "malformed",
+            "symlink",
+            "no_final_newline",
+        }:
             monitor_env.write_text(
                 "MONITOR_SECRET=must-not-be-printed\n"
                 f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={OTHER}\n"
@@ -461,6 +474,12 @@ exec /bin/rm "$@"
                 encoding="utf-8",
             )
             monitor_env.chmod(0o600)
+        if installation == "no_final_newline":
+            monitor_env.write_bytes(
+                b"MONITOR_SECRET=must-not-be-printed\n"
+                + f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={OTHER}\n".encode()
+                + b"MONITOR_SETTING=preserve-without-final-newline"
+            )
         if installation == "malformed":
             monitor_env.write_text(
                 monitor_env.read_text(encoding="utf-8")
@@ -601,6 +620,31 @@ def test_monitor_pin_transaction_wraps_successful_cutover(updater_harness) -> No
     )
     assert (state / "monitor_timer_enabled").exists()
     assert (state / "monitor_timer_active").exists()
+
+
+def test_monitor_pin_preserves_non_head_bytes_without_final_newline(
+    updater_harness,
+) -> None:
+    run, log, _ = updater_harness
+    monitor_env = log.parent / "telegram-kol-monitor.env"
+
+    result = run(HARNESS_MONITOR_INSTALLATION="no_final_newline")
+
+    assert result.returncode == 0, result.stderr
+    assert monitor_env.read_bytes() == (
+        b"MONITOR_SECRET=must-not-be-printed\n"
+        + f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={CANDIDATE}\n".encode()
+        + b"MONITOR_SETTING=preserve-without-final-newline"
+    )
+
+
+def test_monitor_waits_for_every_installed_oneshot(updater_harness) -> None:
+    run, log, _ = updater_harness
+
+    result = run()
+
+    assert result.returncode == 0, result.stderr
+    assert _events(log).count("monitor-oneshot-inactive") == 3
 
 
 def test_absent_monitor_preserves_existing_updater_behavior(updater_harness) -> None:

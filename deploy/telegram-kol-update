@@ -16,6 +16,7 @@ MONITOR_TIMER="telegram-kol-monitor.timer"
 MONITOR_ONESHOT_UNITS=(
   "telegram-kol-monitor.service"
   "telegram-kol-monitor-diagnostic.service"
+  "telegram-kol-monitor-test-notification.service"
 )
 if [ "${UPDATER_TEST_MODE:-0}" = "1" ]; then
   if [ "$APP_DIR" = "/opt/telegram-kol-analyzer" ] || [ -z "$monitor_env_override" ]; then
@@ -185,16 +186,24 @@ sync_monitor_expected_head() {
   if [[ ! "$target_commit" =~ ^[0-9a-f]{40}$ ]]; then return 1; fi
   if ! validate_monitor_env_file; then return 1; fi
   candidate="$(mktemp "${MONITOR_ENV_FILE}.candidate.XXXXXX")" || return 1
-  if ! awk -v expected="$target_commit" '
-    BEGIN { count = 0 }
-    /^TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=/ {
-      print "TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=" expected
-      count += 1
-      next
-    }
-    { print }
-    END { if (count != 1) exit 4 }
-  ' "$MONITOR_ENV_FILE" >"$candidate"; then
+  if ! "$APP_DIR/.venv/bin/python" -c '# monitor-pin-rewrite
+import re
+import sys
+from pathlib import Path
+
+source_path, candidate_path, target_commit = sys.argv[1:]
+source = Path(source_path).read_bytes()
+pattern = re.compile(
+    br"(?m)^TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=[^\r\n]*"
+)
+matches = pattern.findall(source)
+if len(matches) != 1:
+    raise SystemExit(4)
+replacement = (
+    b"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=" + target_commit.encode("ascii")
+)
+Path(candidate_path).write_bytes(pattern.sub(lambda _: replacement, source, count=1))
+' "$MONITOR_ENV_FILE" "$candidate" "$target_commit"; then
     rm -f -- "$candidate"
     return 1
   fi

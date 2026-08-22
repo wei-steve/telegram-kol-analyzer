@@ -128,6 +128,7 @@ def test_server_updater_transactions_monitor_expected_head_and_timer_state():
     assert monitor_stop < previous_pin < application_stop < checkout
     assert checkout < health < candidate_pin < restore
     assert 'MONITOR_TIMER="telegram-kol-monitor.timer"' in script
+    assert '"telegram-kol-monitor-test-notification.service"' in script
     assert 'MONITOR_ENV_FILE="/etc/telegram-kol-monitor.env"' in script
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=" in script
     assert "git reset" not in script
